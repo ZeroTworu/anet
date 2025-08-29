@@ -1,13 +1,15 @@
 [workspace]
 resolver = "2"
-members = ["anet-server", "anet-client"]
-default-members = ["anet-server", "anet-client"]
+members = ["anet-server", "anet-client", "anet-common"]
+default-members = ["anet-server", "anet-client", "anet-common"]
 
 [workspace.dependencies]
 tun = { version = "0.8.3", features = ["async"] }
 tokio = {version = "1.47.1", features = ["rt-multi-thread", "time"]}
 env_logger = "0.11.8"
+log = { version = "0.4.22", default-features = false}
 tokio-rustls = "0.26.2"
+tokio-util = "0.7.16"
 rustls = "0.23.31"
 anyhow = "1.0.99"
 serde = {version = "1.0.219", features = ["derive"]}

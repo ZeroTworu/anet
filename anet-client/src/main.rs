@@ -1,6 +1,5 @@
-use anyhow::Result;
 use anet_client::client;
-
+use anyhow::Result;
 
 #[tokio::main]
 async fn main() -> Result<()> {
