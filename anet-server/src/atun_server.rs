@@ -1,13 +1,12 @@
 use anyhow::{Context, Result};
-use bytes::BytesMut;
 use futures::{SinkExt, StreamExt};
 use log::{debug, error, info};
-use packet::{Error, ip::Packet as IpPacket};
 use std::net::Ipv4Addr;
 use tokio::sync::mpsc;
-use tokio_util::codec::{Decoder, Encoder, Framed};
+use tokio_util::codec::Framed;
 use tun::{AsyncDevice, Configuration};
 use tokio::process::Command;
+use anet_common::codecs::RawIpCodec;
 
 #[derive(Clone)]
 pub struct TunParams {
@@ -66,7 +65,7 @@ impl TunManager {
         let async_dev: AsyncDevice =
             tun::create_as_async(&config).context("Failed to create async TUN device")?;
 
-        let framed = Framed::new(async_dev, IPPacketCodec);
+        let framed = Framed::new(async_dev, RawIpCodec::new());
         let (mut sink, mut stream) = framed.split();
 
 
@@ -90,8 +89,7 @@ impl TunManager {
                 match item {
                     Ok(pkt) => {
                         debug!("TUN -> TLS");
-                        let raw = pkt.as_ref().to_vec();
-                        if let Err(e) = tx_from_tun.send(raw).await {
+                        if let Err(e) = tx_from_tun.send(pkt).await {
                             error!("Failed to deliver packet from TUN: {e}");
                             break;
                         }
@@ -151,37 +149,6 @@ impl TunManager {
             .wait()
             .await?;
 
-        Ok(())
-    }
-}
-
-pub struct IPPacketCodec;
-
-impl Decoder for IPPacketCodec {
-    type Item = IpPacket<BytesMut>;
-    type Error = Error;
-
-    fn decode(&mut self, buf: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        if buf.is_empty() {
-            return Ok(None);
-        }
-        let buf = buf.split_to(buf.len());
-        Ok(match IpPacket::no_payload(buf) {
-            Ok(pkt) => Some(pkt),
-            Err(err) => {
-                // Log и пропускаем битый фрейм
-                info!("decode error {err:?}");
-                None
-            }
-        })
-    }
-}
-
-impl Encoder<Vec<u8>> for IPPacketCodec {
-    type Error = Error;
-
-    fn encode(&mut self, item: Vec<u8>, dst: &mut BytesMut) -> Result<(), Self::Error> {
-        dst.extend_from_slice(&item);
         Ok(())
     }
 }

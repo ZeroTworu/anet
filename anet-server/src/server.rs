@@ -79,12 +79,9 @@ impl ANetServer {
     }
 
     pub async fn run(&self) -> anyhow::Result<()> {
-        // Настоящая инициализация TUN
         TunManager::setup_tun_routing("anet-server", self.cfg.external_if.as_str()).await?;
         let (tx_to_tun, mut rx_from_tun) = self.tun_manager.run().await?;
-        // Подменяем self.tx_to_tun — клонируем в локальную переменную, т.к. self неизменяемый
 
-        // Копии для задач
         let router_for_tun = self.router.clone();
 
         // Диспетчер: читает из TUN и отправляет соответствующему клиенту
@@ -93,17 +90,15 @@ impl ANetServer {
                 if pkt.len() > 4 {
                     if let Some(dst) = extract_ip_dst(&pkt) {
                         if let Some(client_tx) = router_for_tun.find(&dst).await {
-                            // Отправляем сырой IP-пакет клиенту
                             debug!("Send to {}", dst);
                             if let Err(e) = client_tx.send(pkt).await {
                                 error!("Route to {dst} present but send failed: {e}");
                             }
                         } else {
-                            // Нет маршрута — логируем для отладки
                             info!("No route for dst {dst}");
                         }
                     } else {
-                        info!("Non-IPv4 or too-short packet from TUN, dropped");
+                        debug!("Non-IPv4 or too-short packet from TUN, dropped, {:?}", &pkt);
                     }
                 }
             }
@@ -117,12 +112,12 @@ impl ANetServer {
             let router = self.router.clone();
             let tx_to_tun_conn = tx_to_tun.clone();
             let ip_pool = self.ip_pool.clone();
-            let auth_phrase = self.cfg.clone().auth_phrase;
+            let auth_phrase = self.cfg.auth_phrase.clone();
             tokio::spawn(async move {
                 match acceptor.accept(socket).await {
                     Ok(tls_stream) => {
                         info!("Accepted connection from {}", peer);
-                        if let Err(e) = handle_client(tls_stream, router, tx_to_tun_conn, ip_pool, auth_phrase).await {
+                        if let Err(e) = handle_client(tls_stream, &router, tx_to_tun_conn, &ip_pool, auth_phrase).await {
                             error!("[{}] client task error: {e:?}", peer);
                         }
                     }
@@ -136,34 +131,34 @@ impl ANetServer {
 
 async fn handle_client(
     tls_stream: tokio_rustls::server::TlsStream<TcpStream>,
-    router: Router,
+    router: &Router,
     tx_to_tun: mpsc::Sender<Vec<u8>>,
-    ip_pool: IpPool,
+    ip_pool: &IpPool,
     auth_phrase: String,
 ) -> anyhow::Result<()> {
+
     let (reader, mut writer) = tokio::io::split(tls_stream);
     let mut reader = tokio::io::BufReader::new(reader);
-
-    // 1) Первая строка — AuthRequest
     let mut line = String::new();
     let n = reader.read_line(&mut line).await?;
+
     if n == 0 {
-        anyhow::bail!("client closed before auth");
+        anyhow::bail!("Client closed before auth");
     }
 
     let assigned_ip: Ipv4Addr = match serde_json::from_str::<Message>(&line) {
         Ok(Message::AuthRequest(auth_request)) => {
             if auth_request.key != auth_phrase {
-                anyhow::bail!("auth failed: wrong auth phrase");
+                anyhow::bail!("Auth failed: wrong auth phrase");
             }
             let used = router.allocated_ips().await;
             ip_pool.allocate(&used).context("No free IPs")?
         }
-        Ok(_) => anyhow::bail!("first message must be AuthRequest"),
-        Err(e) => anyhow::bail!("failed to parse auth request: {e}"),
+        Ok(_) => anyhow::bail!("First message must be AuthRequest"),
+        Err(e) => anyhow::bail!("Failed to parse auth request: {e}"),
     };
 
-    // 2) Отправляем AuthResponse (важно добавить \n, клиент читает по read_line)
+
     let response = Message::AuthResponse(AssignedIp {
         ip: assigned_ip.to_string(),
         netmask: ip_pool.netmask.to_string(),
@@ -172,31 +167,33 @@ async fn handle_client(
     let response_line = serde_json::to_string(&response)? + "\n";
     writer.write_all(response_line.as_bytes()).await?;
 
-    // 3) Готовим канал для отправки пакетов этому клиенту
+
     let (tx_to_client, mut rx_to_client) = mpsc::channel::<Vec<u8>>(1024);
     router.insert(assigned_ip, tx_to_client.clone()).await;
 
-    // 4) Писатель: Server → Client (ClientTrafficSend)
-    let mut writer_clone = writer;
+    // Server -> Client (ClientTrafficSend) -> TLS
     let writer_task = tokio::spawn(async move {
         while let Some(pkt) = rx_to_client.recv().await {
             let msg = Message::ClientTrafficSend(ClientTrafficSend { encrypted_packet: pkt });
             debug!("Sent ClientTrafficSend to client");
-            let line = match serde_json::to_string(&msg) {
-                Ok(mut s) => { s.push('\n'); s }
+
+            match serde_json::to_string(&msg) {
+                Ok(mut s) => {
+                    s.push('\n');
+                    if let Err(e) = writer.write_all(s.as_bytes()).await {
+                        error!("Write to client failed: {e}");
+                        break;
+                    }
+                }
                 Err(e) => {
-                    error!("serialize ClientTrafficSend failed: {e}");
+                    error!("Serialize ClientTrafficSend failed: {e}");
                     continue;
                 }
             };
-            if let Err(e) = writer_clone.write_all(line.as_bytes()).await {
-                error!("write to client failed: {e}");
-                break;
-            }
         }
     });
 
-    // 5) Читатель: Client → Server (ClientTrafficReceive) → в TUN
+    // Client -> Server (ClientTrafficReceive) -> TUN
     let reader_task = tokio::spawn(async move {
         let mut r = reader;
         let mut line = String::new();
@@ -205,7 +202,7 @@ async fn handle_client(
             let n = match r.read_line(&mut line).await {
                 Ok(n) => n,
                 Err(e) => {
-                    error!("read from client failed: {e}");
+                    error!("Read from client failed: {e}");
                     break;
                 }
             };
@@ -216,18 +213,18 @@ async fn handle_client(
 
             match serde_json::from_str::<Message>(&line) {
                 Ok(Message::ClientTrafficReceive(ClientTrafficReceive { encrypted_packet })) => {
-                    info!("Receive ClientTrafficReceive from server");
-                    // В этой версии "encrypted_packet" — просто сырой IP-пакет.
+                    debug!("Receive ClientTrafficReceive from client");
+
                     if let Err(e) = tx_to_tun.send(encrypted_packet).await {
-                        error!("send to TUN failed: {e}");
+                        error!("Send to TUN failed: {e}");
                         break;
                     }
                 }
                 Ok(other) => {
-                    info!("unexpected message: {:?}", other);
+                    info!("Unexpected message: {:?}", other);
                 }
                 Err(_) => {
-                    error!("failed to parse message: {}", line.trim_end());
+                    error!("Failed to parse message: {}", line.trim_end());
                 }
             }
         }

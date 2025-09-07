@@ -90,7 +90,12 @@ version = "0.1.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
+ "bytes",
+ "log",
+ "packet",
  "serde",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -99,12 +104,10 @@ version = "0.1.0"
 dependencies = [
  "anet-common",
  "anyhow",
- "bytes",
  "clap",
  "env_logger",
  "futures",
  "log",
- "packet",
  "rustls",
  "rustls-pemfile",
  "serde_json",

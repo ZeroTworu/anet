@@ -18,6 +18,4 @@ yaml-rust2 = { workspace = true }
 
 rustls-pemfile = "2.2.0"
 futures = "0.3.31"
-packet = {version = "0.1.4", features = ["serde"]}
-bytes = "1.10.1"
 anet-common = { path = "../anet-common"}
