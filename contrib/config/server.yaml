@@ -1,0 +1,11 @@
+network:
+  mask: "255.255.255.0"
+  net: "10.0.0.0"
+  gateway: "10.0.0.1"
+  self_ip: "10.0.0.2"
+server:
+  auth_phrase: "test_test_test"
+  cert_path: "./cert.pem"
+  key_path: "./key.pem"
+  bind_to: "0.0.0.0:8443"
+  external_if: "eth0"

@@ -1,0 +1,4 @@
+client:
+  address: "127.0.0.1:8443"
+  auth_phrase: "test_test_test"
+  cert_path: "./cert.pem"

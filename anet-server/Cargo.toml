@@ -13,6 +13,9 @@ log = {workspace = true}
 anyhow = {workspace = true}
 serde_json = {workspace = true}
 tokio-util = {workspace = true}
+clap = {workspace = true}
+yaml-rust2 = { workspace = true }
+
 rustls-pemfile = "2.2.0"
 futures = "0.3.31"
 packet = {version = "0.1.4", features = ["serde"]}

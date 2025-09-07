@@ -5,7 +5,7 @@ default-members = ["anet-server", "anet-client", "anet-common"]
 
 [workspace.dependencies]
 tun = { version = "0.8.3", features = ["async"] }
-tokio = {version = "1.47.1", features = ["rt-multi-thread", "time"]}
+tokio = {version = "1.47.1", features = ["rt-multi-thread", "time", "process", "fs"]}
 env_logger = "0.11.8"
 log = { version = "0.4.22", default-features = false}
 tokio-rustls = "0.26.2"
@@ -14,11 +14,19 @@ rustls = "0.23.31"
 anyhow = "1.0.99"
 serde = {version = "1.0.219", features = ["derive"]}
 serde_json = "1.0.143"
+serde-protobuf = "0.8.2"
+yaml-rust2 = "0.10.1"
+clap = { version = "4.5.47", default-features = false, features = ["std", "derive"] }
+
 
 [profile.release.package.anet-client]
 debug = 2
 codegen-units = 1
 
 [profile.release.package.anet-server]
+debug = 2
+codegen-units = 1
+
+[profile.release.package.anet-common]
 debug = 2
 codegen-units = 1

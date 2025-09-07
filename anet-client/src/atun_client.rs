@@ -1,14 +1,14 @@
 use anyhow::{Context, Result};
 use bytes::BytesMut;
-use futures::StreamExt;
-use log::{error, info};
-use packet::{Error, ip::Packet};
+use futures::{SinkExt, StreamExt};
+use log::{debug, error, info};
+use packet::{Error, ip::Packet as IpPacket};
 use std::net::Ipv4Addr;
-use tokio_util::{
-    codec::{Decoder, FramedRead},
-    sync::CancellationToken,
-};
-use tun::Configuration;
+use tokio::io::AsyncReadExt;
+use tokio::sync::mpsc;
+use tokio_util::codec::{Decoder, Encoder, Framed};
+use tun::{AsyncDevice, Configuration};
+use anet_common::protocol::AssignedIp;
 
 #[derive(Clone)]
 pub struct TunParams {
@@ -31,6 +31,7 @@ impl Default for TunParams {
     }
 }
 
+#[derive(Clone)]
 pub struct TunManager {
     params: TunParams,
 }
@@ -42,17 +43,19 @@ impl TunManager {
         }
     }
 
-    pub fn set_ip_address(&mut self, ip_address: &str) -> Result<()> {
-        let address: Ipv4Addr = ip_address.parse().context("Invalid IP address format")?;
+    pub fn set_ip_network_params(&mut self, params: &AssignedIp) -> Result<()> {
+        let address: Ipv4Addr = params.ip.parse().context("Invalid IP address format")?;
+        let netmask: Ipv4Addr = params.netmask.parse().context("Invalid NETMASK address format")?;
+        let gateway: Ipv4Addr = params.gateway.parse().context("Invalid GATEWAY address format")?;
 
         self.params.address = Some(address);
-        self.params.netmask = Some(Ipv4Addr::new(255, 255, 255, 0));
-        self.params.destination = Some(Ipv4Addr::new(10, 0, 0, 1));
+        self.params.netmask = Some(netmask);
+        self.params.destination = Some(gateway);
 
         Ok(())
     }
 
-    fn create_config(&self) -> Result<Configuration> {
+    fn create_config(&self) -> Configuration {
         let mut binding = Configuration::default();
         let mut config = binding
             .tun_name(&self.params.name)
@@ -69,6 +72,7 @@ impl TunManager {
 
         if let Some(destination) = self.params.destination {
             config = config.destination(destination);
+
         }
 
         #[cfg(target_os = "linux")]
@@ -78,52 +82,76 @@ impl TunManager {
             });
         }
 
-        #[cfg(target_os = "windows")]
+        #[cfg(windows)]
         {
-            config = config.platform_config(|config| {
-                use uuid::Uuid;
-                let guid = Uuid::new_v4().to_u128_le();
-                config.device_guid(guid);
-            });
+            config = config.ring_capacity(67108864);
         }
 
-        Ok(config.clone())
+
+        config.clone()
     }
 
-    pub async fn start_processing(&mut self, token: CancellationToken) -> Result<()> {
+    pub fn create_as_async(&self) -> AsyncDevice {
+        let config = self.create_config();
+        match tun::create_as_async(&config) {
+            Ok(dev) => {
+                info!("Device created");
+                dev
+            }
+            Err(e) => {
+                error!("Error creating device {:?}", e);
+                panic!("Error creating device {:?}", e)
+            }
+        }
+    }
+
+    pub async fn start_processing(
+        &mut self,
+        tx_to_tls: mpsc::Sender<Vec<u8>>,
+        mut rx_from_tun: mpsc::Receiver<Vec<u8>>,
+    ) -> Result<()> {
         if self.params.address.is_none() {
             return Err(anyhow::anyhow!(
                 "IP address must be set before starting processing"
             ));
         }
 
-        let config = self.create_config()?;
-        let async_dev =
-            tun::create_as_async(&config).context("Failed to create async TUN device")?;
-
-        let mut stream = FramedRead::new(async_dev, IPPacketCodec);
+        let mut async_dev = self.create_as_async();
+        let mut read_buf = vec![0u8; 65536]; // Буфер 64K
 
         info!("Starting TUN packet processing on client...");
+
         loop {
             tokio::select! {
-                _ = token.cancelled() => {
-                    info!("Shutting down TUN processing...");
-                    break;
-                }
-                packet = stream.next() => {
-                    match packet {
-                        Some(Ok(pkt)) => {
-                            info!("Client received packet: {:?}", pkt);
-                        }
-                        Some(Err(err)) => {
-                            error!("Error reading packet: {:?}", err);
-                        }
-                        None => {
+            result = async_dev.read(&mut read_buf) => {
+                match result {
+                    Ok(n) => {
+                        let packet = read_buf[..n].to_vec();
+                        if let Err(e) = tx_to_tls.send(packet).await {
+                            error!("Failed to send to TLS channel: {}", e);
                             break;
                         }
+                        debug!("TUN -> TLS");
+                    }
+                    Err(err) => {
+                        error!("Error reading from TUN: {:?}", err);
+                        break;
                     }
                 }
             }
+            packet = rx_from_tun.recv() => {
+                match packet {
+                    Some(pkt) => {
+                        debug!("TLS -> TUN");
+                        if let Err(e) = async_dev.send(&pkt).await {
+                            error!("TLS -> TUN: {}", e);
+                            break;
+                        }
+                    }
+                    None => break,
+                }
+            }
+        }
         }
 
         Ok(())
@@ -144,7 +172,7 @@ impl TunManager {
 pub struct IPPacketCodec;
 
 impl Decoder for IPPacketCodec {
-    type Item = Packet<BytesMut>;
+    type Item = IpPacket<BytesMut>;
     type Error = Error;
 
     fn decode(&mut self, buf: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
@@ -153,12 +181,21 @@ impl Decoder for IPPacketCodec {
         }
 
         let buf = buf.split_to(buf.len());
-        Ok(match Packet::no_payload(buf) {
+        Ok(match IpPacket::no_payload(buf) {
             Ok(pkt) => Some(pkt),
             Err(err) => {
                 error!("error {err:?}");
                 None
             }
         })
+    }
+}
+
+impl Encoder<Vec<u8>> for IPPacketCodec {
+    type Error = Error;
+
+    fn encode(&mut self, item: Vec<u8>, dst: &mut BytesMut) -> Result<(), Self::Error> {
+        dst.extend_from_slice(&item);
+        Ok(())
     }
 }

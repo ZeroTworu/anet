@@ -5,10 +5,5 @@ edition = "2024"
 
 [dependencies]
 serde = {workspace = true}
-uuid = { version = "1.18.0", features = ["v4"] }
-tokio = {workspace = true}
-tun = {workspace = true}
-futures = "0.3.31"
-packet = {version = "0.1.4", features = ["serde"]}
-bytes = "1.10.1"
+aes-gcm = "0.10.3"
 anyhow = "1.0.99"
