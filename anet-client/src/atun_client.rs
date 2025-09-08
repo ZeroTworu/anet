@@ -2,6 +2,7 @@ use anet_common::protocol::AssignedIp;
 use anyhow::{Context, Result};
 use log::{debug, error, info};
 use std::net::Ipv4Addr;
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tun::{AsyncDevice, Configuration};
@@ -104,46 +105,46 @@ impl TunManager {
             ));
         }
 
-        let mut async_dev = self.create_as_async();
+        let async_dev = Arc::new(self.create_as_async());
         let mut buffer = vec![0u8; 65536 * 10]; // 640KB буфер
+        let cloned_async_dev = async_dev.clone();
 
-        info!("Starting TUN packet processing on client...");
-
-        loop {
-            tokio::select! {
-                // Обертываем чтение в async block
-                read_result = async {
-                    async_dev.recv(&mut buffer).await
-                } => {
-                    match read_result {
-                        Ok(n) => {
-                            let packet = buffer[..n].to_vec();
-                            if let Err(e) = tx_to_tls.send(packet).await {
-                                error!("Failed to send to TLS channel: {}", e);
-                                break;
-                            }
-                            debug!("TUN -> TLS: {} bytes", n);
-                        }
-                        Err(err) => {
-                            error!("Error reading from TUN: {:?}", err);
+        tokio::spawn(async move {
+            loop {
+                match &async_dev.recv(&mut buffer).await {
+                    Ok(n) => {
+                        let packet = buffer[..*n].to_vec();
+                        if let Err(e) = tx_to_tls.send(packet).await {
+                            error!("Failed to send to TLS channel: {}", e);
                             break;
                         }
+                        debug!("TUN -> TLS: {} bytes", n);
                     }
-                }
-                packet = rx_from_tun.recv() => {
-                    match packet {
-                        Some(pkt) => {
-                            debug!("TLS -> TUN: {} bytes", pkt.len());
-                            if let Err(e) = async_dev.send(&pkt).await {
-                                error!("TLS -> TUN: {}", e);
-                                break;
-                            }
-                        }
-                        None => break,
+                    Err(err) => {
+                        error!("Error reading from TUN: {:?}", err);
+                        break;
                     }
                 }
             }
-        }
+        });
+
+        tokio::spawn(async move {
+            loop {
+                let packet = rx_from_tun.recv().await;
+                match packet {
+                    Some(pkt) => {
+                        debug!("TLS -> TUN: {} bytes", pkt.len());
+                        if let Err(e) = cloned_async_dev.send(&pkt).await {
+                            error!("TLS -> TUN: {}", e);
+                            break;
+                        }
+                    }
+                    None => break,
+                }
+            }
+        });
+
+        info!("Starting TUN packet processing on client...");
 
         Ok(())
     }
