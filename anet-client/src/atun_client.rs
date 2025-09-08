@@ -97,7 +97,7 @@ impl TunManager {
     pub async fn start_processing(
         &mut self,
         tx_to_tls: mpsc::Sender<Vec<u8>>,
-        mut rx_from_tun: mpsc::Receiver<Vec<u8>>,
+        mut rx_to_tun: mpsc::Receiver<Vec<u8>>,
     ) -> Result<()> {
         if self.params.address.is_none() {
             return Err(anyhow::anyhow!(
@@ -111,9 +111,9 @@ impl TunManager {
 
         tokio::spawn(async move {
             loop {
-                match &async_dev.recv(&mut buffer).await {
+                match async_dev.recv(&mut buffer).await {
                     Ok(n) => {
-                        let packet = buffer[..*n].to_vec();
+                        let packet = buffer[..n].to_vec();
                         if let Err(e) = tx_to_tls.send(packet).await {
                             error!("Failed to send to TLS channel: {}", e);
                             break;
@@ -130,7 +130,7 @@ impl TunManager {
 
         tokio::spawn(async move {
             loop {
-                let packet = rx_from_tun.recv().await;
+                let packet = rx_to_tun.recv().await;
                 match packet {
                     Some(pkt) => {
                         debug!("TLS -> TUN: {} bytes", pkt.len());

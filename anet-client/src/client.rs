@@ -1,7 +1,6 @@
 use std::{sync::Arc, time::Duration};
 
 use crate::atun_client::TunManager;
-use crate::exchange::Exchange;
 use anet_common::protocol::{
     AuthRequest, ClientTrafficReceive, Message as AnetMessage, message::Content,
 };
@@ -13,6 +12,7 @@ use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::{ClientConfig, RootCertStore};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
+use tokio::sync::mpsc;
 use tokio::time::sleep;
 use tokio_rustls::TlsConnector;
 
@@ -49,12 +49,9 @@ impl ANetClient {
     }
     pub async fn connect(&self, server_addr: &str, auth_phrase: &str) -> Result<()> {
         info!("Connecting to {} ...", server_addr);
-        let exchange = Exchange::new();
-        let tx_to_tun = exchange.frame_channels.tx_to_tun.clone();
-        let tx_to_tls = exchange.tls_channels.tx_to_tls.clone();
+        let (tx_to_tun, rx_from_tun) = mpsc::channel(1024);
 
-        let rx_from_tun = exchange.frame_channels.rx_from_tun;
-        let mut rx_from_tls = exchange.tls_channels.rx_from_tls;
+        let (tx_to_tls, mut rx_from_tls) = mpsc::channel(1024);
 
         let stream = connect_with_retry(server_addr, MAX_RETRIES).await?;
 
