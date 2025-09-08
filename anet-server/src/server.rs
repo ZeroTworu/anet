@@ -3,7 +3,7 @@ use std::{collections::HashMap, fs::File, io::BufReader, net::Ipv4Addr, sync::Ar
 use anyhow::Context;
 use bytes::Bytes;
 use log::{debug, error, info};
-use prost::Message as ProstMessage;
+use prost::Message;
 use rustls::ServerConfig;
 use rustls::pki_types::CertificateDer;
 use std::collections::HashSet;
@@ -16,7 +16,9 @@ use crate::atun_server::TunManager;
 use crate::atun_server::TunParams;
 use crate::config::Config;
 use crate::ip_pool::IpPool;
-use anet_common::protocol::{ClientTrafficReceive, ClientTrafficSend, Message, message};
+use anet_common::protocol::{
+    ClientTrafficReceive, ClientTrafficSend, Message as AnetMessage, message::Content,
+};
 
 type ClientTx = mpsc::Sender<Vec<u8>>;
 
@@ -164,10 +166,10 @@ async fn handle_client(
     }
 
     // Декодируем protobuf сообщение
-    let message = Message::decode(Bytes::from(msg_buf))?;
+    let message: AnetMessage = Message::decode(Bytes::from(msg_buf))?;
 
     let assigned_ip: Ipv4Addr = match message.content {
-        Some(message::Content::AuthRequest(auth_request)) => {
+        Some(Content::AuthRequest(auth_request)) => {
             if auth_request.key != auth_phrase {
                 anyhow::bail!("Auth failed: wrong auth phrase");
             }
@@ -178,8 +180,8 @@ async fn handle_client(
     };
 
     // Формируем ответ
-    let response = Message {
-        content: Some(message::Content::AuthResponse(anet_common::AssignedIp {
+    let response = AnetMessage {
+        content: Some(Content::AuthResponse(anet_common::AssignedIp {
             ip: assigned_ip.to_string(),
             netmask: ip_pool.netmask.to_string(),
             gateway: ip_pool.gateway.to_string(),
@@ -202,8 +204,8 @@ async fn handle_client(
     // Server -> Client (ClientTrafficSend) -> TLS
     let writer_task = tokio::spawn(async move {
         while let Some(pkt) = rx_to_client.recv().await {
-            let msg = Message {
-                content: Some(message::Content::ClientTrafficSend(ClientTrafficSend {
+            let msg = AnetMessage {
+                content: Some(Content::ClientTrafficSend(ClientTrafficSend {
                     encrypted_packet: pkt,
                 })),
             };
@@ -245,7 +247,7 @@ async fn handle_client(
                 break;
             }
 
-            let message = match Message::decode(Bytes::from(msg_buf)) {
+            let message: AnetMessage = match Message::decode(Bytes::from(msg_buf)) {
                 Ok(msg) => msg,
                 Err(e) => {
                     error!("Failed to parse message: {e}");
@@ -254,9 +256,7 @@ async fn handle_client(
             };
 
             match message.content {
-                Some(message::Content::ClientTrafficReceive(ClientTrafficReceive {
-                    encrypted_packet,
-                })) => {
+                Some(Content::ClientTrafficReceive(ClientTrafficReceive { encrypted_packet })) => {
                     debug!("Receive ClientTrafficReceive from client");
 
                     if let Err(e) = tx_to_tun.send(encrypted_packet).await {

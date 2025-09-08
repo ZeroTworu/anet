@@ -2,7 +2,9 @@ use std::{sync::Arc, time::Duration};
 
 use crate::atun_client::TunManager;
 use crate::exchange::Exchange;
-use anet_common::protocol;
+use anet_common::protocol::{
+    AuthRequest, ClientTrafficReceive, Message as AnetMessage, message::Content,
+};
 use anyhow::Result;
 use bytes::Bytes;
 use log::{debug, error, info};
@@ -66,12 +68,10 @@ impl ANetClient {
         let (reader, mut writer) = tokio::io::split(tls_stream);
         let mut reader = BufReader::new(reader);
 
-        let auth_request = protocol::Message {
-            content: Some(protocol::message::Content::AuthRequest(
-                protocol::AuthRequest {
-                    key: auth_phrase.to_string(),
-                },
-            )),
+        let auth_request = AnetMessage {
+            content: Some(Content::AuthRequest(AuthRequest {
+                key: auth_phrase.to_string(),
+            })),
         };
         let mut request_data = Vec::new();
         auth_request.encode(&mut request_data)?;
@@ -90,11 +90,11 @@ impl ANetClient {
         let mut response_buf = vec![0u8; msg_len];
         reader.read_exact(&mut response_buf).await?;
 
-        let response: protocol::Message = Message::decode(Bytes::from(response_buf))?;
+        let response: AnetMessage = Message::decode(Bytes::from(response_buf))?;
         let mut tun_manager = self.tun_manager.clone();
 
         match response.content {
-            Some(protocol::message::Content::AuthResponse(assigned_ip)) => {
+            Some(Content::AuthResponse(assigned_ip)) => {
                 info!("Success! Assigned IP: {}", assigned_ip.ip);
                 tun_manager.set_ip_network_params(&assigned_ip.into())?;
                 info!("Current TUN configuration: {}", tun_manager.get_info());
@@ -123,9 +123,8 @@ impl ANetClient {
                         }
 
                         match Message::decode(Bytes::from(msg_buf)) {
-                            Ok(protocol::Message {
-                                content:
-                                    Some(protocol::message::Content::ClientTrafficSend(traffic)),
+                            Ok(AnetMessage {
+                                content: Some(Content::ClientTrafficSend(traffic)),
                             }) => {
                                 debug!("Received ClientTrafficSend from server");
                                 if let Err(e) = tx_to_tun.send(traffic.encrypted_packet).await {
@@ -145,12 +144,10 @@ impl ANetClient {
 
                 loop {
                     if let Some(tls_data) = rx_from_tls.recv().await {
-                        let message = protocol::Message {
-                            content: Some(protocol::message::Content::ClientTrafficReceive(
-                                protocol::ClientTrafficReceive {
-                                    encrypted_packet: tls_data,
-                                },
-                            )),
+                        let message = AnetMessage {
+                            content: Some(Content::ClientTrafficReceive(ClientTrafficReceive {
+                                encrypted_packet: tls_data,
+                            })),
                         };
 
                         let mut data = Vec::new();

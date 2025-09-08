@@ -1,0 +1,66 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+jobs:
+  build:
+    uses: "./.github/workflows/build-components.yaml"
+
+  package-and-release:
+    runs-on: "ubuntu-latest"
+    needs: "build"
+    steps:
+      - uses: "actions/checkout@v4"
+        with:
+          fetch-depth: "0"
+
+      - name: "Download all artifacts"
+        uses: "actions/download-artifact@v4"
+        with:
+          path: "artifacts"
+
+      - name: "Set version from tag"
+        run: "echo \"VERSION=${GITHUB_REF#refs/tags/v}\" >> $GITHUB_ENV"
+
+      - name: "Prepare files for packaging"
+        run: |
+          mkdir -p release_files/server release_files/client-linux release_files/client-windows
+          
+          cp artifacts/anet-server/anet-server release_files/server/
+          cp artifacts/anet-client-linux/anet-client release_files/client-linux/
+          cp artifacts/anet-client-windows/anet-client.exe release_files/client-windows/
+
+          cp contrib/config/server.yaml release_files/server/
+          cp contrib/config/client.yaml release_files/client-linux/
+          cp contrib/config/client.yaml release_files/client-windows/
+
+          # get wintun.dl
+          cd release_files/client-windows
+          WINTUN_VERSION="0.14.1"
+          WINTUN_URL="https://www.wintun.net/builds/wintun-${WINTUN_VERSION}.zip"
+          curl -sLO "$WINTUN_URL"
+          unzip "wintun-${WINTUN_VERSION}.zip"
+          cp "wintun/bin/amd64/wintun.dll" .
+          rm -rf "wintun" "wintun-${WINTUN_VERSION}.zip"
+
+      - name: "Create zip archives"
+        run: |
+          cd release_files
+          zip -r "server_${VERSION}.zip" server/
+          zip -r "client-linux_${VERSION}.zip" client-linux/
+          zip -r "client-windows_${VERSION}.zip" client-windows/
+
+      - name: "Create Release"
+        uses: "softprops/action-gh-release@v1"
+        with:
+          tag_name: ${{ github.ref }}
+          name: Release ${{ github.ref }}
+          files: |
+            release_files/server_${{ env.VERSION }}.zip
+            release_files/client-linux_${{ env.VERSION }}.zip
+            release_files/client-windows_${{ env.VERSION }}.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

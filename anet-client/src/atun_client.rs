@@ -75,7 +75,7 @@ impl TunManager {
         if let Some(destination) = self.params.destination {
             config = config.destination(destination);
         }
-        
+
         config.clone()
     }
 
@@ -151,9 +151,9 @@ impl TunManager {
     pub fn get_info(&self) -> String {
         format!(
             "Address: {:?}, Netmask: {:?}, Destination: {:?}, Name: {}, MTU: {}",
-            self.params.address,
-            self.params.netmask,
-            self.params.destination,
+            self.params.address.unwrap(),
+            self.params.netmask.unwrap(),
+            self.params.destination.unwrap(),
             self.params.name,
             self.params.mtu
         )

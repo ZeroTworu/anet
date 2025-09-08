@@ -1,4 +1,4 @@
-name: "Build Client"
+name: Build
 
 on:
   push:
@@ -6,70 +6,5 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-linux-server:
-    runs-on: "ubuntu-latest"
-    steps:
-      - uses: "actions/checkout@v4"
-
-      - name: "Install musl tools"
-        run: "sudo apt-get install -y musl-tools"
-
-      - name: "Install Rust"
-        uses: "actions-rs/toolchain@v1"
-        with:
-          toolchain: "stable"
-          target: "x86_64-unknown-linux-musl"
-          override: "true"
-
-      - name: "Build Server"
-        run: "RUSTFLAGS=\"-C target-feature=+crt-static\" cargo build --release --package anet-server --target x86_64-unknown-linux-musl"
-
-      - name: "Upload artifact"
-        uses: "actions/upload-artifact@v4"
-        with:
-          name: "anet-server"
-          path: "target/x86_64-unknown-linux-musl/release/anet-server"
-
-  build-linux-client:
-    runs-on: "ubuntu-latest"
-    steps:
-      - uses: "actions/checkout@v4"
-
-      - name: "Install musl tools"
-        run: "sudo apt-get install -y musl-tools"
-
-      - name: "Install Rust"
-        uses: "actions-rs/toolchain@v1"
-        with:
-          toolchain: "stable"
-          target: "x86_64-unknown-linux-musl"
-          override: "true"
-
-      - name: "Build Client (Linux)"
-        run: "RUSTFLAGS=\"-C target-feature=+crt-static\" cargo build --release --package anet-client --target x86_64-unknown-linux-musl"
-
-      - name: "Upload artifact"
-        uses: "actions/upload-artifact@v4"
-        with:
-          name: "anet-client-linux"
-          path: "target/x86_64-unknown-linux-musl/release/anet-client"
-
-  build-windows-client:
-    runs-on: "windows-latest"
-    steps:
-      - uses: "actions/checkout@v4"
-
-      - name: "Install Rust"
-        uses: "actions-rs/toolchain@v1"
-        with:
-          toolchain: "stable"
-          override: "true"
-
-      - name: "Build Client (Windows MSVC)"
-        run: "cargo build --release --package anet-client"
-
-      - name: "Upload artifact"
-        uses: "actions/upload-artifact@v4"
-        with:
-          name: "anet-client-windows.exe"
-          path: "target/release/anet-client.exe"
+  build:
+    uses: "./.github/workflows/build-components.yaml"
