@@ -4,8 +4,8 @@ use log::{debug, error, info};
 use std::net::Ipv4Addr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
+use tokio::time::Duration;
 use tun::{AsyncDevice, Configuration};
-
 #[derive(Clone)]
 pub struct TunParams {
     pub address: Option<Ipv4Addr>,
@@ -105,22 +105,46 @@ impl TunManager {
         }
 
         let async_dev = self.create_as_async();
-        let mut buffer = vec![0u8; 65536 * 10]; // 640KB буфер
         let (mut tun_reader, mut tun_writer) = tokio::io::split(async_dev);
+        let mut tun_buffer = vec![0u8; 65536];
+
         tokio::spawn(async move {
+            let mut batch = Vec::with_capacity(32);
+            let mut interval = tokio::time::interval(Duration::from_micros(500));
+
             loop {
-                match tun_reader.read(&mut buffer).await {
+                match tun_reader.read(&mut tun_buffer).await {
                     Ok(n) => {
-                        let packet = buffer[..n].to_vec();
-                        if let Err(e) = tx_to_tls.send(packet).await {
-                            error!("Failed to send to TLS channel: {}", e);
-                            break;
+                        if n > 0 {
+                            batch.push(tun_buffer[..n].to_vec());
+
+                            if batch.len() >= 32 {
+                                for pkt in batch.drain(..) {
+                                    if let Err(e) = tx_to_tls.send(pkt).await {
+                                        error!("Failed to send to TLS: {}", e);
+                                        return;
+                                    }
+                                }
+                            }
                         }
-                        debug!("TUN -> TLS: {} bytes", n);
                     }
-                    Err(err) => {
-                        error!("Error reading from TUN: {:?}", err);
-                        break;
+                    Err(e) => {
+                        error!("Failed to read from TUN: {}", e);
+                        return;
+                    }
+                }
+
+                if !batch.is_empty() {
+                    tokio::select! {
+                        _ = interval.tick() => {
+                            for pkt in batch.drain(..) {
+                                if let Err(e) = tx_to_tls.send(pkt).await {
+                                    error!("Failed to send to TLS: {}", e);
+                                    return;
+                                }
+                            }
+                        }
+                        _ = tokio::time::sleep(Duration::from_micros(100)) => {}
                     }
                 }
             }

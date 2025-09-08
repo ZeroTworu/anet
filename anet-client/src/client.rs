@@ -37,9 +37,14 @@ impl ANetClient {
             let _ = root_store.add(cert);
         }
 
-        let tls_config = ClientConfig::builder()
+        let mut tls_config = ClientConfig::builder()
             .with_root_certificates(root_store)
             .with_no_client_auth();
+
+        tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        tls_config.enable_early_data = true;
+        tls_config.enable_sni = true;
+
         info!("ANet Client manager created");
         let connector = TlsConnector::from(Arc::new(tls_config));
         Ok(Self {
