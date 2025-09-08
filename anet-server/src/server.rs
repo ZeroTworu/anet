@@ -119,6 +119,7 @@ impl ANetServer {
             let ip_pool = self.ip_pool.clone();
             let auth_phrase = self.cfg.auth_phrase.clone();
 
+            // Если не запустить в отдельном потоке - новые клиенты не подрубятся.
             tokio::spawn(async move {
                 match acceptor.accept(socket).await {
                     Ok(tls_stream) => {

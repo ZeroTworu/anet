@@ -113,7 +113,7 @@ impl TunManager {
             tokio::select! {
                 // Обертываем чтение в async block
                 read_result = async {
-                    async_dev.read(&mut buffer).await
+                    async_dev.recv(&mut buffer).await
                 } => {
                     match read_result {
                         Ok(n) => {
@@ -134,7 +134,7 @@ impl TunManager {
                     match packet {
                         Some(pkt) => {
                             debug!("TLS -> TUN: {} bytes", pkt.len());
-                            if let Err(e) = async_dev.write_all(&pkt).await {
+                            if let Err(e) = async_dev.send(&pkt).await {
                                 error!("TLS -> TUN: {}", e);
                                 break;
                             }
