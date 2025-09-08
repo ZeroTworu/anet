@@ -1,7 +1,15 @@
-use std::{collections::HashMap, fs::File, io::BufReader, net::Ipv4Addr, sync::Arc};
+use std::{fs::File, io::BufReader, net::Ipv4Addr, sync::Arc};
 
+use crate::atun_server::TunManager;
+use anet_common::tun_params::TunParams;
+use crate::config::Config;
+use crate::ip_pool::IpPool;
+use anet_common::protocol::{
+    ClientTrafficReceive, ClientTrafficSend, Message as AnetMessage, message::Content,
+};
 use anyhow::Context;
 use bytes::Bytes;
+use dashmap::DashMap;
 use log::{debug, error, info};
 use prost::Message;
 use rustls::ServerConfig;
@@ -9,40 +17,144 @@ use rustls::pki_types::CertificateDer;
 use std::collections::HashSet;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::mpsc;
+use tokio::time::{Duration, interval};
 use tokio_rustls::TlsAcceptor;
+use std::os::unix::io::{AsRawFd, FromRawFd};
+use socket2::{Socket, TcpKeepalive};
 
-use crate::atun_server::TunManager;
-use crate::atun_server::TunParams;
-use crate::config::Config;
-use crate::ip_pool::IpPool;
-use anet_common::protocol::{
-    ClientTrafficReceive, ClientTrafficSend, Message as AnetMessage, message::Content,
-};
 
 type ClientTx = mpsc::Sender<Vec<u8>>;
 
-#[derive(Clone, Default)]
-struct Router {
-    inner: Arc<RwLock<HashMap<Ipv4Addr, ClientTx>>>,
+#[derive(Clone)]
+pub struct Router {
+    map: Arc<DashMap<Ipv4Addr, ClientTx>>,
 }
 
 impl Router {
-    async fn insert(&self, ip: Ipv4Addr, tx: ClientTx) {
-        self.inner.write().await.insert(ip, tx);
+    pub fn new() -> Self {
+        Self {
+            map: Arc::new(DashMap::new()),
+        }
     }
 
-    async fn remove(&self, ip: &Ipv4Addr) {
-        self.inner.write().await.remove(ip);
+    pub fn insert(&self, ip: Ipv4Addr, tx: ClientTx) {
+        self.map.insert(ip, tx);
     }
 
-    async fn find(&self, ip: &Ipv4Addr) -> Option<ClientTx> {
-        self.inner.read().await.get(ip).cloned()
+    pub fn remove(&self, ip: &Ipv4Addr) {
+        info!("{:?} disconnected", ip);
+        self.map.remove(ip);
     }
 
-    async fn allocated_ips(&self) -> HashSet<Ipv4Addr> {
-        self.inner.read().await.keys().cloned().collect()
+    #[inline]
+    pub fn find(&self, ip: &Ipv4Addr) -> Option<ClientTx> {
+        match self.map.get(ip) {
+            Some(tx) => Some(tx.clone()),
+            None => None,
+        }
     }
+
+    pub fn allocated_ips(&self) -> HashSet<Ipv4Addr> {
+        let mut result = HashSet::new();
+
+        for entry in self.map.iter() {
+            result.insert(*entry.key());
+        }
+
+        result
+    }
+}
+
+struct PacketBatcher {
+    batch_size: usize,
+    batch_timeout: Duration,
+}
+
+impl PacketBatcher {
+    fn new(batch_size: usize, batch_timeout_ms: u64) -> Self {
+        Self {
+            batch_size,
+            batch_timeout: Duration::from_millis(batch_timeout_ms),
+        }
+    }
+
+    async fn process_batches(&self, mut rx_from_tun: mpsc::Receiver<Vec<u8>>, router: &Router) {
+        let mut batch = Vec::with_capacity(self.batch_size);
+        let mut interval = interval(self.batch_timeout);
+
+        loop {
+            tokio::select! {
+                biased; // Добавляем biased для приоритизации пакетов
+
+                pkt = rx_from_tun.recv() => {
+                    if let Some(pkt) = pkt {
+                        if pkt.len() > 4 {
+                            batch.push(pkt);
+
+                            if batch.len() >= self.batch_size {
+                                Self::process_batch(&batch, &router).await;
+                                batch.clear();
+                                batch.reserve(self.batch_size);
+                            }
+                        }
+                    }
+                }
+                _ = interval.tick() => {
+                    if !batch.is_empty() {
+                        Self::process_batch(&batch, &router).await;
+                        batch.clear();
+                        batch.reserve(self.batch_size);
+                    }
+                }
+            }
+        }
+    }
+
+    async fn process_batch(batch: &Vec<Vec<u8>>, router: &Router) {
+        for pkt in batch {
+            if let Some(dst) = extract_ip_dst(&pkt) {
+                if let Some(client_tx) = router.find(&dst) {
+                    if let Err(e) = client_tx.send(pkt.to_vec()).await {
+                        error!("Route to {dst} present but send failed: {e}");
+                    }
+                } else {
+                    info!("No route for dst {dst}");
+                }
+            } else {
+                debug!("Non-IPv4 or too-short packet from TLS, dropped");
+            }
+        }
+    }
+}
+
+fn optimize_tcp_connection(stream: &tokio::net::TcpStream) -> anyhow::Result<()> {
+    // Получаем raw file descriptor из tokio TcpStream
+    let raw_fd = stream.as_raw_fd();
+
+    // Создаем socket2::Socket из raw file descriptor
+    // SAFETY: Мы гарантируем, что raw_fd валиден и не будет использоваться
+    // другими частями кода одновременно
+    let socket = unsafe { Socket::from_raw_fd(raw_fd) };
+
+    // Увеличиваем размеры буферов
+    socket.set_recv_buffer_size(1024 * 1024)?; // 1MB
+    socket.set_send_buffer_size(1024 * 1024)?; // 1MB
+
+    // Включаем TCP_NODELAY для уменьшения задержки
+    socket.set_tcp_nodelay(true)?;
+
+    // Настраиваем keepalive
+    let keepalive = TcpKeepalive::new()
+        .with_time(Duration::from_secs(60))
+        .with_interval(Duration::from_secs(10))
+        .with_retries(3);
+    socket.set_tcp_keepalive(&keepalive)?;
+
+    // Не закрываем сокет, так как он все еще используется tokio
+    std::mem::forget(socket);
+
+    Ok(())
 }
 
 pub struct ANetServer {
@@ -75,7 +187,7 @@ impl ANetServer {
 
         Ok(Self {
             tls_acceptor: acceptor,
-            router: Router::default(),
+            router: Router::new(),
             tun_manager,
             ip_pool,
             cfg: cfg.clone(),
@@ -84,28 +196,14 @@ impl ANetServer {
 
     pub async fn run(&self) -> anyhow::Result<()> {
         TunManager::setup_tun_routing("anet-server", self.cfg.external_if.as_str()).await?;
-        let (tx_to_tun, mut rx_from_tun) = self.tun_manager.run().await?;
+        let (tx_to_tun, rx_from_tun) = self.tun_manager.run().await?;
 
         let router_for_tun = self.router.clone();
 
         // Диспетчер: читает из TUN и отправляет соответствующему клиенту
         tokio::spawn(async move {
-            while let Some(pkt) = rx_from_tun.recv().await {
-                if pkt.len() > 4 {
-                    if let Some(dst) = extract_ip_dst(&pkt) {
-                        if let Some(client_tx) = router_for_tun.find(&dst).await {
-                            debug!("Send to {}", dst);
-                            if let Err(e) = client_tx.send(pkt).await {
-                                error!("Route to {dst} present but send failed: {e}");
-                            }
-                        } else {
-                            info!("No route for dst {dst}");
-                        }
-                    } else {
-                        debug!("Non-IPv4 or too-short packet from TUN, dropped, {:?}", &pkt);
-                    }
-                }
-            }
+            let batcher = PacketBatcher::new(50, 1);
+            batcher.process_batches(rx_from_tun, &router_for_tun).await;
         });
 
         let listener = TcpListener::bind(self.cfg.bind_to.as_str()).await?;
@@ -113,9 +211,10 @@ impl ANetServer {
 
         loop {
             let (socket, peer) = listener.accept().await?;
+            let _ = optimize_tcp_connection(&socket);
             let acceptor = self.tls_acceptor.clone();
             let router = self.router.clone();
-            let tx_to_tun_conn = tx_to_tun.clone();
+            let tx_to_tun = tx_to_tun.clone();
             let ip_pool = self.ip_pool.clone();
             let auth_phrase = self.cfg.auth_phrase.clone();
 
@@ -124,14 +223,9 @@ impl ANetServer {
                 match acceptor.accept(socket).await {
                     Ok(tls_stream) => {
                         info!("Accepted connection from {}", peer);
-                        if let Err(e) = handle_client(
-                            tls_stream,
-                            &router,
-                            tx_to_tun_conn,
-                            &ip_pool,
-                            auth_phrase,
-                        )
-                        .await
+                        if let Err(e) =
+                            handle_client(tls_stream, &router, tx_to_tun, &ip_pool, auth_phrase)
+                                .await
                         {
                             error!("[{}] client task error: {e:?}", peer);
                         }
@@ -174,7 +268,7 @@ async fn handle_client(
             if auth_request.key != auth_phrase {
                 anyhow::bail!("Auth failed: wrong auth phrase");
             }
-            let used = router.allocated_ips().await;
+            let used = router.allocated_ips();
             ip_pool.allocate(&used).context("No free IPs")?
         }
         _ => anyhow::bail!("First message must be AuthRequest"),
@@ -200,7 +294,7 @@ async fn handle_client(
     writer.write_all(&response_data).await?;
 
     let (tx_to_client, mut rx_to_client) = mpsc::channel::<Vec<u8>>(1024);
-    router.insert(assigned_ip, tx_to_client.clone()).await;
+    router.insert(assigned_ip, tx_to_client.clone());
 
     // Server -> Client (ClientTrafficSend) -> TLS
     let writer_task = tokio::spawn(async move {
@@ -275,13 +369,12 @@ async fn handle_client(
         }
     });
 
-    // Ожидаем завершения любой из задач, чистим маршрутизатор
     tokio::select! {
         _ = writer_task => {},
         _ = reader_task => {},
     }
 
-    router.remove(&assigned_ip).await;
+    router.remove(&assigned_ip);
     Ok(())
 }
 
@@ -308,15 +401,15 @@ fn load_tls_config(cert_path: &str, key_path: &str) -> anyhow::Result<ServerConf
     Ok(cfg)
 }
 
+#[inline]
 fn extract_ip_dst(pkt: &[u8]) -> Option<Ipv4Addr> {
     if pkt.len() < 20 {
-        log::debug!("Packet too short: len={}", pkt.len());
         return None;
     }
-    let ver = pkt[0] >> 4;
-    if ver != 4 {
-        log::debug!("Not IPv4: first_byte=0x{:02x}", pkt[0]);
+
+    if (pkt[0] >> 4) != 4 {
         return None;
     }
+
     Some(Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]))
 }

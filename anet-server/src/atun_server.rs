@@ -1,33 +1,12 @@
 use anet_common::codecs::RawIpCodec;
+use anet_common::tun_params::TunParams;
 use anyhow::{Context, Result};
 use futures::{SinkExt, StreamExt};
 use log::{debug, error, info};
-use std::net::Ipv4Addr;
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio_util::codec::Framed;
 use tun::{AsyncDevice, Configuration};
-
-#[derive(Clone)]
-pub struct TunParams {
-    pub address: Ipv4Addr,
-    pub netmask: Ipv4Addr,
-    pub gateway: Ipv4Addr,
-    pub name: String,
-    pub mtu: u16,
-}
-
-impl Default for TunParams {
-    fn default() -> Self {
-        Self {
-            address: Ipv4Addr::new(10, 0, 0, 2),
-            netmask: Ipv4Addr::new(255, 255, 255, 0),
-            gateway: Ipv4Addr::new(10, 0, 0, 1),
-            name: "anet-server".to_string(),
-            mtu: 1500,
-        }
-    }
-}
 
 pub struct TunManager {
     params: TunParams,
@@ -182,7 +161,12 @@ impl TunManager {
             .spawn()?
             .wait()
             .await?;
-
+        // явное указание маршрута для VPN подсети
+        Command::new("ip")
+            .args(&["route", "add", "10.1.0.0/24", "dev", tun])
+            .spawn()?
+            .wait()
+            .await?;
         Ok(())
     }
 }

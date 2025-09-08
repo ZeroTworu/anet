@@ -1,5 +1,4 @@
 use std::{sync::Arc, time::Duration};
-
 use crate::atun_client::TunManager;
 use anet_common::protocol::{
     AuthRequest, ClientTrafficReceive, Message as AnetMessage, message::Content,
@@ -15,6 +14,10 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
 use tokio_rustls::TlsConnector;
+#[cfg(windows)]
+use windows_sys::Win32::Networking::WinSock;
+#[cfg(windows)]
+use std::os::windows::io::AsRawSocket;
 
 const MAX_RETRIES: u32 = 5;
 
@@ -59,6 +62,10 @@ impl ANetClient {
         let (tx_to_tls, mut rx_from_tls) = mpsc::channel(1024);
 
         let stream = connect_with_retry(server_addr, MAX_RETRIES).await?;
+        #[cfg(windows)]
+        {
+            set_windows_keepalive(&stream)?;
+        }
 
         info!("Connected to server: {}", server_addr);
 
@@ -195,4 +202,43 @@ async fn connect_with_retry(server_addr: &str, max_retries: u32) -> Result<TcpSt
             }
         }
     }
+}
+
+#[cfg(windows)]
+fn set_windows_keepalive(stream: &tokio::net::TcpStream) -> anyhow::Result<()> {
+    use windows_sys::Win32::Networking::WinSock;
+
+    let keepalive: u32 = 1;
+    let keepalive_time: u32 = 60000; // 60 секунд в миллисекундах
+    let keepalive_interval: u32 = 10000; // 10 секунд в миллисекундах
+    let socket= stream.as_raw_socket() as WinSock::SOCKET;
+    unsafe {
+        // Включаем keepalive
+        WinSock::setsockopt(
+            socket,
+            WinSock::SOL_SOCKET,
+            WinSock::SO_KEEPALIVE,
+            &keepalive as *const _ as *const _,
+            std::mem::size_of::<u32>() as i32,
+        );
+
+        // Устанавливаем параметры keepalive
+        WinSock::setsockopt(
+            socket,
+            WinSock::IPPROTO_TCP,
+            WinSock::TCP_KEEPIDLE,
+            &keepalive_time as *const _ as *const _,
+            std::mem::size_of::<u32>() as i32,
+        );
+
+        WinSock::setsockopt(
+            socket,
+            WinSock::IPPROTO_TCP,
+            WinSock::TCP_KEEPINTVL,
+            &keepalive_interval as *const _ as *const _,
+            std::mem::size_of::<u32>() as i32,
+        );
+    }
+
+    Ok(())
 }

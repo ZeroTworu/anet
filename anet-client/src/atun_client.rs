@@ -1,4 +1,5 @@
 use anet_common::protocol::AssignedIp;
+use anet_common::tun_params::TunParams;
 use anyhow::{Context, Result};
 use log::{debug, error, info};
 use std::net::Ipv4Addr;
@@ -6,26 +7,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio::time::Duration;
 use tun::{AsyncDevice, Configuration};
-#[derive(Clone)]
-pub struct TunParams {
-    pub address: Option<Ipv4Addr>,
-    pub netmask: Option<Ipv4Addr>,
-    pub destination: Option<Ipv4Addr>,
-    pub name: String,
-    pub mtu: u16,
-}
-
-impl Default for TunParams {
-    fn default() -> Self {
-        Self {
-            address: None,
-            netmask: None,
-            destination: None,
-            name: "anet-client".to_string(),
-            mtu: 1500,
-        }
-    }
-}
 
 #[derive(Clone)]
 pub struct TunManager {
@@ -35,7 +16,7 @@ pub struct TunManager {
 impl TunManager {
     pub fn new() -> Self {
         Self {
-            params: TunParams::default(),
+            params: TunParams::default_client(),
         }
     }
 
@@ -50,9 +31,9 @@ impl TunManager {
             .parse()
             .context("Invalid GATEWAY address format")?;
 
-        self.params.address = Some(address);
-        self.params.netmask = Some(netmask);
-        self.params.destination = Some(gateway);
+        self.params.address = address;
+        self.params.netmask = netmask;
+        self.params.gateway = gateway;
 
         Ok(())
     }
@@ -64,17 +45,11 @@ impl TunManager {
             .mtu(self.params.mtu)
             .up();
 
-        if let Some(address) = self.params.address {
-            config = config.address(address);
-        }
+        config = config.address(&self.params.address);
 
-        if let Some(netmask) = self.params.netmask {
-            config = config.netmask(netmask);
-        }
+        config = config.netmask(&self.params.netmask);
 
-        if let Some(destination) = self.params.destination {
-            config = config.destination(destination);
-        }
+        config = config.destination(&self.params.gateway);
 
         config.clone()
     }
@@ -98,11 +73,6 @@ impl TunManager {
         tx_to_tls: mpsc::Sender<Vec<u8>>,
         mut rx_to_tun: mpsc::Receiver<Vec<u8>>,
     ) -> Result<()> {
-        if self.params.address.is_none() {
-            return Err(anyhow::anyhow!(
-                "IP address must be set before starting processing"
-            ));
-        }
 
         let async_dev = self.create_as_async();
         let (mut tun_reader, mut tun_writer) = tokio::io::split(async_dev);
@@ -174,9 +144,9 @@ impl TunManager {
     pub fn get_info(&self) -> String {
         format!(
             "Address: {:?}, Netmask: {:?}, Destination: {:?}, Name: {}, MTU: {}",
-            self.params.address.unwrap(),
-            self.params.netmask.unwrap(),
-            self.params.destination.unwrap(),
+            self.params.address,
+            self.params.netmask,
+            self.params.gateway,
             self.params.name,
             self.params.mtu
         )
