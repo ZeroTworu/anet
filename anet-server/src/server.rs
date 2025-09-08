@@ -1,22 +1,22 @@
 use std::{collections::HashMap, fs::File, io::BufReader, net::Ipv4Addr, sync::Arc};
 
 use anyhow::Context;
+use bytes::Bytes;
 use log::{debug, error, info};
-use rustls::pki_types::CertificateDer;
+use prost::Message as ProstMessage;
 use rustls::ServerConfig;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, RwLock};
-use tokio_rustls::TlsAcceptor;
+use rustls::pki_types::CertificateDer;
 use std::collections::HashSet;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{RwLock, mpsc};
+use tokio_rustls::TlsAcceptor;
 
-use anet_common::protocol::{
-    AssignedIp, ClientTrafficReceive, ClientTrafficSend, Message,
-};
 use crate::atun_server::TunManager;
-use crate::ip_pool::IpPool;
-use crate::config::Config;
 use crate::atun_server::TunParams;
+use crate::config::Config;
+use crate::ip_pool::IpPool;
+use anet_common::protocol::{ClientTrafficReceive, ClientTrafficSend, Message, message};
 
 type ClientTx = mpsc::Sender<Vec<u8>>;
 
@@ -24,13 +24,16 @@ type ClientTx = mpsc::Sender<Vec<u8>>;
 struct Router {
     inner: Arc<RwLock<HashMap<Ipv4Addr, ClientTx>>>,
 }
+
 impl Router {
     async fn insert(&self, ip: Ipv4Addr, tx: ClientTx) {
         self.inner.write().await.insert(ip, tx);
     }
+
     async fn remove(&self, ip: &Ipv4Addr) {
         self.inner.write().await.remove(ip);
     }
+
     async fn find(&self, ip: &Ipv4Addr) -> Option<ClientTx> {
         self.inner.read().await.get(ip).cloned()
     }
@@ -56,16 +59,15 @@ impl ANetServer {
             netmask: cfg.mask.parse().unwrap(),
             gateway: cfg.gateway.parse().unwrap(),
             address: cfg.self_ip.parse().unwrap(),
-
             name: "anet-server".to_string(),
             mtu: 1500,
         };
         let tun_manager = TunManager::new_with_params(params);
         let ip_pool = IpPool::new(
-            cfg.net.parse().unwrap(),       // сеть
-            cfg.mask.parse().unwrap(),  // маска
-            cfg.gateway.parse().unwrap(),       // шлюз
-            cfg.self_ip.parse().unwrap(),       // сервер
+            cfg.net.parse().unwrap(),
+            cfg.mask.parse().unwrap(),
+            cfg.gateway.parse().unwrap(),
+            cfg.self_ip.parse().unwrap(),
         );
         info!("Server TUN configuration: {}", tun_manager.get_info());
 
@@ -106,18 +108,28 @@ impl ANetServer {
 
         let listener = TcpListener::bind(self.cfg.bind_to.as_str()).await?;
         info!("Listening on {}", self.cfg.bind_to.as_str());
-          loop {
+
+        loop {
             let (socket, peer) = listener.accept().await?;
             let acceptor = self.tls_acceptor.clone();
             let router = self.router.clone();
             let tx_to_tun_conn = tx_to_tun.clone();
             let ip_pool = self.ip_pool.clone();
             let auth_phrase = self.cfg.auth_phrase.clone();
+
             tokio::spawn(async move {
                 match acceptor.accept(socket).await {
                     Ok(tls_stream) => {
                         info!("Accepted connection from {}", peer);
-                        if let Err(e) = handle_client(tls_stream, &router, tx_to_tun_conn, &ip_pool, auth_phrase).await {
+                        if let Err(e) = handle_client(
+                            tls_stream,
+                            &router,
+                            tx_to_tun_conn,
+                            &ip_pool,
+                            auth_phrase,
+                        )
+                        .await
+                        {
                             error!("[{}] client task error: {e:?}", peer);
                         }
                     }
@@ -128,7 +140,6 @@ impl ANetServer {
     }
 }
 
-
 async fn handle_client(
     tls_stream: tokio_rustls::server::TlsStream<TcpStream>,
     router: &Router,
@@ -136,37 +147,54 @@ async fn handle_client(
     ip_pool: &IpPool,
     auth_phrase: String,
 ) -> anyhow::Result<()> {
-
     let (reader, mut writer) = tokio::io::split(tls_stream);
     let mut reader = tokio::io::BufReader::new(reader);
-    let mut line = String::new();
-    let n = reader.read_line(&mut line).await?;
 
-    if n == 0 {
-        anyhow::bail!("Client closed before auth");
+    // Читаем длину сообщения
+    let mut len_buf = [0u8; 4];
+    if let Err(e) = reader.read_exact(&mut len_buf).await {
+        anyhow::bail!("Failed to read message length: {}", e);
+    }
+    let msg_len = u32::from_be_bytes(len_buf) as usize;
+
+    // Читаем само сообщение
+    let mut msg_buf = vec![0u8; msg_len];
+    if let Err(e) = reader.read_exact(&mut msg_buf).await {
+        anyhow::bail!("Failed to read message: {}", e);
     }
 
-    let assigned_ip: Ipv4Addr = match serde_json::from_str::<Message>(&line) {
-        Ok(Message::AuthRequest(auth_request)) => {
+    // Декодируем protobuf сообщение
+    let message = Message::decode(Bytes::from(msg_buf))?;
+
+    let assigned_ip: Ipv4Addr = match message.content {
+        Some(message::Content::AuthRequest(auth_request)) => {
             if auth_request.key != auth_phrase {
                 anyhow::bail!("Auth failed: wrong auth phrase");
             }
             let used = router.allocated_ips().await;
             ip_pool.allocate(&used).context("No free IPs")?
         }
-        Ok(_) => anyhow::bail!("First message must be AuthRequest"),
-        Err(e) => anyhow::bail!("Failed to parse auth request: {e}"),
+        _ => anyhow::bail!("First message must be AuthRequest"),
     };
 
+    // Формируем ответ
+    let response = Message {
+        content: Some(message::Content::AuthResponse(anet_common::AssignedIp {
+            ip: assigned_ip.to_string(),
+            netmask: ip_pool.netmask.to_string(),
+            gateway: ip_pool.gateway.to_string(),
+        })),
+    };
 
-    let response = Message::AuthResponse(AssignedIp {
-        ip: assigned_ip.to_string(),
-        netmask: ip_pool.netmask.to_string(),
-        gateway: ip_pool.gateway.to_string(),
-    });
-    let response_line = serde_json::to_string(&response)? + "\n";
-    writer.write_all(response_line.as_bytes()).await?;
+    // Кодируем ответ
+    let mut response_data = Vec::new();
+    response.encode(&mut response_data)?;
 
+    // Отправляем длину и данные
+    writer
+        .write_all(&(response_data.len() as u32).to_be_bytes())
+        .await?;
+    writer.write_all(&response_data).await?;
 
     let (tx_to_client, mut rx_to_client) = mpsc::channel::<Vec<u8>>(1024);
     router.insert(assigned_ip, tx_to_client.clone()).await;
@@ -174,45 +202,61 @@ async fn handle_client(
     // Server -> Client (ClientTrafficSend) -> TLS
     let writer_task = tokio::spawn(async move {
         while let Some(pkt) = rx_to_client.recv().await {
-            let msg = Message::ClientTrafficSend(ClientTrafficSend { encrypted_packet: pkt });
-            debug!("Sent ClientTrafficSend to client");
-
-            match serde_json::to_string(&msg) {
-                Ok(mut s) => {
-                    s.push('\n');
-                    if let Err(e) = writer.write_all(s.as_bytes()).await {
-                        error!("Write to client failed: {e}");
-                        break;
-                    }
-                }
-                Err(e) => {
-                    error!("Serialize ClientTrafficSend failed: {e}");
-                    continue;
-                }
+            let msg = Message {
+                content: Some(message::Content::ClientTrafficSend(ClientTrafficSend {
+                    encrypted_packet: pkt,
+                })),
             };
+
+            let mut data = Vec::new();
+            if let Err(e) = msg.encode(&mut data) {
+                error!("Serialize ClientTrafficSend failed: {e}");
+                continue;
+            }
+
+            if let Err(e) = writer.write_all(&(data.len() as u32).to_be_bytes()).await {
+                error!("Write to client failed: {e}");
+                break;
+            }
+            if let Err(e) = writer.write_all(&data).await {
+                error!("Write to client failed: {e}");
+                break;
+            }
+            debug!("Sent ClientTrafficSend to client");
         }
     });
 
     // Client -> Server (ClientTrafficReceive) -> TUN
     let reader_task = tokio::spawn(async move {
         let mut r = reader;
-        let mut line = String::new();
-        loop {
-            line.clear();
-            let n = match r.read_line(&mut line).await {
-                Ok(n) => n,
-                Err(e) => {
-                    error!("Read from client failed: {e}");
-                    break;
-                }
-            };
-            if n == 0 {
+        let mut len_buf = [0u8; 4];
 
+        loop {
+            // Читаем длину сообщения
+            if let Err(e) = r.read_exact(&mut len_buf).await {
+                error!("Read from client failed (length): {e}");
+                break;
+            }
+            let msg_len = u32::from_be_bytes(len_buf) as usize;
+
+            let mut msg_buf = vec![0u8; msg_len];
+            if let Err(e) = r.read_exact(&mut msg_buf).await {
+                error!("Read from client failed (message): {e}");
                 break;
             }
 
-            match serde_json::from_str::<Message>(&line) {
-                Ok(Message::ClientTrafficReceive(ClientTrafficReceive { encrypted_packet })) => {
+            let message = match Message::decode(Bytes::from(msg_buf)) {
+                Ok(msg) => msg,
+                Err(e) => {
+                    error!("Failed to parse message: {e}");
+                    continue;
+                }
+            };
+
+            match message.content {
+                Some(message::Content::ClientTrafficReceive(ClientTrafficReceive {
+                    encrypted_packet,
+                })) => {
                     debug!("Receive ClientTrafficReceive from client");
 
                     if let Err(e) = tx_to_tun.send(encrypted_packet).await {
@@ -220,17 +264,17 @@ async fn handle_client(
                         break;
                     }
                 }
-                Ok(other) => {
+                Some(other) => {
                     info!("Unexpected message: {:?}", other);
                 }
-                Err(_) => {
-                    error!("Failed to parse message: {}", line.trim_end());
+                None => {
+                    error!("Empty message received");
                 }
             }
         }
     });
 
-    // 6) Ожидаем завершения любой из задач, чистим маршрутизатор.
+    // Ожидаем завершения любой из задач, чистим маршрутизатор
     tokio::select! {
         _ = writer_task => {},
         _ = reader_task => {},

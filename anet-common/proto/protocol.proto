@@ -1,0 +1,28 @@
+syntax = "proto3";
+
+message AuthRequest {
+    string key = 1;
+}
+
+message AssignedIp {
+    string ip = 1;
+    string netmask = 2;
+    string gateway = 3;
+}
+
+message ClientTrafficReceive {
+    bytes encrypted_packet = 1;
+}
+
+message ClientTrafficSend {
+    bytes encrypted_packet = 1;
+}
+
+message Message {
+    oneof content {
+        AuthRequest auth_request = 1;
+        AssignedIp auth_response = 2;
+        ClientTrafficReceive client_traffic_receive = 3;
+        ClientTrafficSend client_traffic_send = 4;
+    }
+}

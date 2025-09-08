@@ -1,7 +1,7 @@
-use std::io;
-use tokio_util::codec::{Decoder, Encoder};
 use bytes::BytesMut;
 use log::{error, warn};
+use std::io;
+use tokio_util::codec::{Decoder, Encoder};
 
 pub struct RawIpCodec {
     max_packet_size: usize,
@@ -30,7 +30,11 @@ impl Decoder for RawIpCodec {
 
         // Проверяем, не превышает ли пакет максимальный размер
         if src.len() > self.max_packet_size {
-            warn!("Packet too large: {} bytes, truncating to {}", src.len(), self.max_packet_size);
+            warn!(
+                "Packet too large: {} bytes, truncating to {}",
+                src.len(),
+                self.max_packet_size
+            );
             let data = src.split_to(self.max_packet_size).to_vec();
             src.clear();
             return Ok(Some(data));
@@ -50,7 +54,7 @@ impl Encoder<Vec<u8>> for RawIpCodec {
             error!("Packet too large to send: {} bytes", item.len());
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("Packet too large: {} bytes", item.len())
+                format!("Packet too large: {} bytes", item.len()),
             ));
         }
 

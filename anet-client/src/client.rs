@@ -2,12 +2,14 @@ use std::{sync::Arc, time::Duration};
 
 use crate::atun_client::TunManager;
 use crate::exchange::Exchange;
-use anet_common::protocol::{AuthRequest, ClientTrafficReceive, Message};
+use anet_common::protocol;
 use anyhow::Result;
+use bytes::Bytes;
 use log::{debug, error, info};
+use prost::Message;
 use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::{ClientConfig, RootCertStore};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::time::sleep;
 use tokio_rustls::TlsConnector;
@@ -64,21 +66,39 @@ impl ANetClient {
         let (reader, mut writer) = tokio::io::split(tls_stream);
         let mut reader = BufReader::new(reader);
 
-        let auth_request = Message::AuthRequest(AuthRequest {
-            key: auth_phrase.to_string(),
-        });
-        let request_data = serde_json::to_string(&auth_request)? + "\n";
-        writer.write_all(request_data.as_bytes()).await?;
+        let auth_request = protocol::Message {
+            content: Some(protocol::message::Content::AuthRequest(
+                protocol::AuthRequest {
+                    key: auth_phrase.to_string(),
+                },
+            )),
+        };
+        let mut request_data = Vec::new();
+        auth_request.encode(&mut request_data)?;
+
+        writer
+            .write_all(&(request_data.len() as u32).to_be_bytes())
+            .await?;
+        writer.write_all(&request_data).await?;
+
         info!("Authentication request sent");
-        let mut line = String::new();
-        reader.read_line(&mut line).await?;
+
+        let mut len_buf = [0u8; 4];
+        reader.read_exact(&mut len_buf).await?;
+        let msg_len = u32::from_be_bytes(len_buf) as usize;
+
+        let mut response_buf = vec![0u8; msg_len];
+        reader.read_exact(&mut response_buf).await?;
+
+        let response: protocol::Message = Message::decode(Bytes::from(response_buf))?;
         let mut tun_manager = self.tun_manager.clone();
 
-        match serde_json::from_str::<Message>(&line) {
-            Ok(Message::AuthResponse(assigned_ip)) => {
+        match response.content {
+            Some(protocol::message::Content::AuthResponse(assigned_ip)) => {
                 info!("Success! Assigned IP: {}", assigned_ip.ip);
-                tun_manager.set_ip_network_params(&assigned_ip)?;
+                tun_manager.set_ip_network_params(&assigned_ip.into())?;
                 info!("Current TUN configuration: {}", tun_manager.get_info());
+
                 tokio::spawn(async move {
                     if let Err(e) = &tun_manager.start_processing(tx_to_tls, rx_from_tun).await {
                         error!("TUN processing error: {}", e);
@@ -86,29 +106,38 @@ impl ANetClient {
                 });
 
                 tokio::spawn(async move {
-                    let mut line = String::new();
+                    let mut len_buf = [0u8; 4];
                     loop {
-                        line.clear();
-                        if let Err(e) = reader.read_line(&mut line).await {
-                            error!("Failed to read from TLS: {}", e);
+                        // Читаем длину сообщения
+                        if let Err(e) = reader.read_exact(&mut len_buf).await {
+                            error!("Failed to read message length from TLS: {}", e);
                             break;
                         }
 
-                        if !line.is_empty() {
-                            match serde_json::from_str::<Message>(&line) {
-                                Ok(Message::ClientTrafficSend(traffic)) => {
-                                    debug!("Received ClientTrafficSend from server");
-                                    if let Err(e) = tx_to_tun.send(traffic.encrypted_packet).await {
-                                        error!("Failed to send to TUN: {}", e);
-                                        break;
-                                    }
+                        let msg_len = u32::from_be_bytes(len_buf) as usize;
+                        let mut msg_buf = vec![0u8; msg_len];
+
+                        if let Err(e) = reader.read_exact(&mut msg_buf).await {
+                            error!("Failed to read message from TLS: {}", e);
+                            break;
+                        }
+
+                        match Message::decode(Bytes::from(msg_buf)) {
+                            Ok(protocol::Message {
+                                content:
+                                    Some(protocol::message::Content::ClientTrafficSend(traffic)),
+                            }) => {
+                                debug!("Received ClientTrafficSend from server");
+                                if let Err(e) = tx_to_tun.send(traffic.encrypted_packet).await {
+                                    error!("Failed to send to TUN: {}", e);
+                                    break;
                                 }
-                                Ok(other) => {
-                                    info!("Received other message type: {:?}", other);
-                                }
-                                Err(e) => {
-                                    error!("Failed to parse message: {}, err: {}", line, e);
-                                }
+                            }
+                            Ok(other) => {
+                                info!("Received other message type: {:?}", other);
+                            }
+                            Err(e) => {
+                                error!("Failed to parse message: {}", e);
                             }
                         }
                     }
@@ -116,20 +145,30 @@ impl ANetClient {
 
                 loop {
                     if let Some(tls_data) = rx_from_tls.recv().await {
-                        let message = Message::ClientTrafficReceive(ClientTrafficReceive {
-                            encrypted_packet: tls_data,
-                        });
-                        let json = serde_json::to_string(&message)? + "\n";
-                        writer.write_all(json.as_bytes()).await?;
+                        let message = protocol::Message {
+                            content: Some(protocol::message::Content::ClientTrafficReceive(
+                                protocol::ClientTrafficReceive {
+                                    encrypted_packet: tls_data,
+                                },
+                            )),
+                        };
+
+                        let mut data = Vec::new();
+                        message.encode(&mut data)?;
+
+                        // Отправляем длину и данные
+                        writer.write_all(&(data.len() as u32).to_be_bytes()).await?;
+                        writer.write_all(&data).await?;
+
                         debug!("Sent ClientTrafficReceive to server");
                     }
                 }
             }
-            Ok(_) => {
+            Some(_) => {
                 error!("Unexpected response type");
             }
-            Err(e) => {
-                error!("Failed to parse response: {}", e);
+            None => {
+                error!("Empty response received");
             }
         }
 

@@ -13,24 +13,22 @@ pub struct TunChannels {
 impl TunChannels {
     pub fn new() -> Self {
         let (tx_to_framed, rx_from_framed) = mpsc::channel(100);
-        Self{
+        Self {
             rx_from_tun: rx_from_framed,
             tx_to_tun: tx_to_framed,
         }
     }
-
 }
 
 impl TlsChannels {
     pub fn new() -> Self {
         let (tx_to_tls, rx_from_tls) = mpsc::channel(100);
-        Self{
+        Self {
             tx_to_tls,
             rx_from_tls,
         }
     }
 }
-
 
 pub struct Exchange {
     pub tls_channels: TlsChannels,
@@ -38,8 +36,8 @@ pub struct Exchange {
 }
 
 impl Exchange {
-    pub fn new() -> Self{
-        Self{
+    pub fn new() -> Self {
+        Self {
             tls_channels: TlsChannels::new(),
             frame_channels: TunChannels::new(),
         }

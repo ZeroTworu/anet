@@ -1,6 +1,6 @@
 use clap::Parser;
 use tokio::fs::read_to_string;
-use yaml_rust2::{YamlLoader};
+use yaml_rust2::YamlLoader;
 
 #[derive(Debug, Clone)]
 pub struct Config {

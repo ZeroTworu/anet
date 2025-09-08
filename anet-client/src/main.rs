@@ -1,6 +1,6 @@
 use anet_client::client::ANetClient;
-use anyhow::Result;
 use anet_client::config::load;
+use anyhow::Result;
 
 #[tokio::main]
 async fn main() -> Result<()> {

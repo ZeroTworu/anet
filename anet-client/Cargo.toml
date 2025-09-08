@@ -11,15 +11,10 @@ rustls = {workspace = true}
 env_logger = {workspace = true}
 log = {workspace = true}
 anyhow = {workspace = true}
-serde_json = {workspace = true}
 clap = {workspace = true}
 yaml-rust2 = { workspace = true }
-uuid = "1.18.1"
-rustls-pemfile = "2.2.0"
-
-futures = "0.3.31"
-tokio-util = "0.7.16"
-packet = {version = "0.1.4", features = ["serde"]}
-bytes = "1.10.1"
+prost = {workspace = true}
+bytes = {workspace = true}
+rustls-pemfile = {workspace = true}
 
 anet-common = { path = "../anet-common"}

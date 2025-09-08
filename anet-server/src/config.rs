@@ -27,7 +27,7 @@ pub async fn load() -> anyhow::Result<Config> {
     let settings = YamlLoader::load_from_str(&yaml)?;
     let server = &settings[0]["server"];
     let network = &settings[0]["network"];
-    let cfg = Config{
+    let cfg = Config {
         mask: network["mask"].as_str().unwrap().to_string(),
         net: network["net"].as_str().unwrap().to_string(),
         gateway: network["gateway"].as_str().unwrap().to_string(),

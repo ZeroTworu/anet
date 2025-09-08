@@ -1,7 +1,7 @@
+use anet_server::config::load;
 use anet_server::server;
 use anyhow::Result;
 use server::ANetServer;
-use anet_server::config::load;
 
 #[tokio::main]
 async fn main() -> Result<()> {

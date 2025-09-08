@@ -1,10 +1,10 @@
+use anet_common::protocol::AssignedIp;
 use anyhow::{Context, Result};
 use log::{debug, error, info};
 use std::net::Ipv4Addr;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tun::{AsyncDevice, Configuration};
-use anet_common::protocol::AssignedIp;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[derive(Clone)]
 pub struct TunParams {
@@ -41,8 +41,14 @@ impl TunManager {
 
     pub fn set_ip_network_params(&mut self, params: &AssignedIp) -> Result<()> {
         let address: Ipv4Addr = params.ip.parse().context("Invalid IP address format")?;
-        let netmask: Ipv4Addr = params.netmask.parse().context("Invalid NETMASK address format")?;
-        let gateway: Ipv4Addr = params.gateway.parse().context("Invalid GATEWAY address format")?;
+        let netmask: Ipv4Addr = params
+            .netmask
+            .parse()
+            .context("Invalid NETMASK address format")?;
+        let gateway: Ipv4Addr = params
+            .gateway
+            .parse()
+            .context("Invalid GATEWAY address format")?;
 
         self.params.address = Some(address);
         self.params.netmask = Some(netmask);
@@ -68,22 +74,8 @@ impl TunManager {
 
         if let Some(destination) = self.params.destination {
             config = config.destination(destination);
-
         }
-
-        #[cfg(target_os = "linux")]
-        {
-            config = config.platform_config(|config| {
-                config.ensure_root_privileges(true);
-            });
-        }
-
-        #[cfg(windows)]
-        {
-             config = config.ring_capacity(67108864);
-        }
-
-
+        
         config.clone()
     }
 
@@ -108,8 +100,8 @@ impl TunManager {
     ) -> Result<()> {
         if self.params.address.is_none() {
             return Err(anyhow::anyhow!(
-            "IP address must be set before starting processing"
-        ));
+                "IP address must be set before starting processing"
+            ));
         }
 
         let mut async_dev = self.create_as_async();
@@ -119,38 +111,38 @@ impl TunManager {
 
         loop {
             tokio::select! {
-            // Обертываем чтение в async block
-            read_result = async {
-                async_dev.read(&mut buffer).await
-            } => {
-                match read_result {
-                    Ok(n) => {
-                        let packet = buffer[..n].to_vec();
-                        if let Err(e) = tx_to_tls.send(packet).await {
-                            error!("Failed to send to TLS channel: {}", e);
-                            break;
+                // Обертываем чтение в async block
+                read_result = async {
+                    async_dev.read(&mut buffer).await
+                } => {
+                    match read_result {
+                        Ok(n) => {
+                            let packet = buffer[..n].to_vec();
+                            if let Err(e) = tx_to_tls.send(packet).await {
+                                error!("Failed to send to TLS channel: {}", e);
+                                break;
+                            }
+                            debug!("TUN -> TLS: {} bytes", n);
                         }
-                        debug!("TUN -> TLS: {} bytes", n);
-                    }
-                    Err(err) => {
-                        error!("Error reading from TUN: {:?}", err);
-                        break;
-                    }
-                }
-            }
-            packet = rx_from_tun.recv() => {
-                match packet {
-                    Some(pkt) => {
-                        debug!("TLS -> TUN: {} bytes", pkt.len());
-                        if let Err(e) = async_dev.write_all(&pkt).await {
-                            error!("TLS -> TUN: {}", e);
+                        Err(err) => {
+                            error!("Error reading from TUN: {:?}", err);
                             break;
                         }
                     }
-                    None => break,
+                }
+                packet = rx_from_tun.recv() => {
+                    match packet {
+                        Some(pkt) => {
+                            debug!("TLS -> TUN: {} bytes", pkt.len());
+                            if let Err(e) = async_dev.write_all(&pkt).await {
+                                error!("TLS -> TUN: {}", e);
+                                break;
+                            }
+                        }
+                        None => break,
+                    }
                 }
             }
-        }
         }
 
         Ok(())

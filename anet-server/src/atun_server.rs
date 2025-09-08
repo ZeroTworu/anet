@@ -1,12 +1,12 @@
+use anet_common::codecs::RawIpCodec;
 use anyhow::{Context, Result};
 use futures::{SinkExt, StreamExt};
 use log::{debug, error, info};
 use std::net::Ipv4Addr;
+use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio_util::codec::Framed;
 use tun::{AsyncDevice, Configuration};
-use tokio::process::Command;
-use anet_common::codecs::RawIpCodec;
 
 #[derive(Clone)]
 pub struct TunParams {
@@ -35,16 +35,21 @@ pub struct TunManager {
 
 impl TunManager {
     pub fn new() -> Self {
-        Self { params: TunParams::default() }
+        Self {
+            params: TunParams::default(),
+        }
     }
-    
+
     pub fn new_with_params(params: TunParams) -> Self {
         Self { params }
     }
 
     fn create_config(&self) -> Result<Configuration> {
         let mut binding = Configuration::default();
-        let mut config = binding.tun_name(&self.params.name).mtu(self.params.mtu).up();
+        let mut config = binding
+            .tun_name(&self.params.name)
+            .mtu(self.params.mtu)
+            .up();
 
         config = config.address(self.params.address);
         config = config.netmask(self.params.netmask);
@@ -59,7 +64,7 @@ impl TunManager {
 
         Ok(config.clone())
     }
-    
+
     pub async fn run(&self) -> Result<(mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>)> {
         let config = self.create_config()?;
         let async_dev: AsyncDevice =
@@ -67,7 +72,6 @@ impl TunManager {
 
         let framed = Framed::new(async_dev, RawIpCodec::new());
         let (mut sink, mut stream) = framed.split();
-
 
         let (tx_to_tun, mut rx_to_tun) = mpsc::channel::<Vec<u8>>(1024);
 
@@ -81,7 +85,6 @@ impl TunManager {
                 }
             }
         });
-
 
         tokio::spawn(async move {
             info!("Starting TUN packet processing on server...");
@@ -124,13 +127,31 @@ impl TunManager {
 
         // Чистим старые правила
         Command::new("iptables")
-            .args(&["-t", "nat", "-D", "POSTROUTING", "-o", external, "-j", "MASQUERADE"])
+            .args(&[
+                "-t",
+                "nat",
+                "-D",
+                "POSTROUTING",
+                "-o",
+                external,
+                "-j",
+                "MASQUERADE",
+            ])
             .spawn()
             .ok(); // игнорим ошибку если правила ещё нет
 
         // Добавляем MASQUERADE
         Command::new("iptables")
-            .args(&["-t", "nat", "-A", "POSTROUTING", "-o", external, "-j", "MASQUERADE"])
+            .args(&[
+                "-t",
+                "nat",
+                "-A",
+                "POSTROUTING",
+                "-o",
+                external,
+                "-j",
+                "MASQUERADE",
+            ])
             .spawn()?
             .wait()
             .await?;
@@ -144,7 +165,20 @@ impl TunManager {
 
         // Разрешаем форвардинг eth→tun
         Command::new("iptables")
-            .args(&["-A", "FORWARD", "-i", external, "-o", tun, "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT"])
+            .args(&[
+                "-A",
+                "FORWARD",
+                "-i",
+                external,
+                "-o",
+                tun,
+                "-m",
+                "state",
+                "--state",
+                "RELATED,ESTABLISHED",
+                "-j",
+                "ACCEPT",
+            ])
             .spawn()?
             .wait()
             .await?;

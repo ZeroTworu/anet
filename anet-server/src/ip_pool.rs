@@ -1,5 +1,5 @@
-use std::net::Ipv4Addr;
 use std::collections::HashSet;
+use std::net::Ipv4Addr;
 
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub struct IpPool {
@@ -11,7 +11,12 @@ pub struct IpPool {
 
 impl IpPool {
     pub fn new(network: Ipv4Addr, netmask: Ipv4Addr, gateway: Ipv4Addr, server: Ipv4Addr) -> Self {
-        Self { network, netmask, gateway, server }
+        Self {
+            network,
+            netmask,
+            gateway,
+            server,
+        }
     }
 
     pub fn allocate(&self, used: &HashSet<Ipv4Addr>) -> Option<Ipv4Addr> {
