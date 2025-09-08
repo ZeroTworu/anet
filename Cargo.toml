@@ -29,3 +29,17 @@ codegen-units = 1
 [profile.release.package.anet-common]
 debug = 2
 codegen-units = 1
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = 'abort'
+incremental = false
+
+
+[profile.release.package."*"]
+opt-level = 3
+
+[build]
+rustflags = ["-C", "target-cpu=native", "-C", "opt-level=3", "-C", "lto=yes"]
