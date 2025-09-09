@@ -31,10 +31,10 @@ impl TunManager {
             .gateway
             .parse()
             .context("Invalid GATEWAY address format")?;
-
         self.params.address = address;
         self.params.netmask = netmask;
         self.params.gateway = gateway;
+        self.params.mtu = params.mtu as u16;
         self.is_set = true;
         Ok(())
     }

@@ -12,6 +12,10 @@ pub struct AssignedIp {
     pub netmask: ::prost::alloc::string::String,
     #[prost(string, tag = "3")]
     pub gateway: ::prost::alloc::string::String,
+    #[prost(int32, tag = "4")]
+    pub mtu: i32,
+    #[prost(string, tag = "5")]
+    pub crypto_key: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ClientTrafficReceive {

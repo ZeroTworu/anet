@@ -39,8 +39,6 @@ pub fn optimize_tcp_connection(stream: &TcpStream) -> anyhow::Result<()> {
 
     #[cfg(windows)]
     {
-        use windows_sys::Win32::Networking::WinSock;
-
         let raw_socket = stream.as_raw_socket() as WinSock::SOCKET;
 
         let recv_buf_size: i32 = 1024 * 1024;

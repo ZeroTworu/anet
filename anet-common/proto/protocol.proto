@@ -8,6 +8,8 @@ message AssignedIp {
     string ip = 1;
     string netmask = 2;
     string gateway = 3;
+    int32 mtu = 4;
+    string crypto_key = 5;
 }
 
 message ClientTrafficReceive {

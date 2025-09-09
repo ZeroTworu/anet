@@ -10,7 +10,7 @@ use prost::Message;
 use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::{ClientConfig, RootCertStore};
 use std::{sync::Arc, time::Duration};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
@@ -30,18 +30,20 @@ impl ANetClient {
         let cert_file = std::fs::File::open(ca_crt_path)?;
         let mut cert_reader = std::io::BufReader::new(cert_file);
 
-        let certs =
-            rustls_pemfile::certs(&mut cert_reader).collect::<Result<Vec<CertificateDer>, _>>()?;
+        let certs = rustls_pemfile::certs(&mut cert_reader)
+            .collect::<Result<Vec<CertificateDer>, _>>()?;
 
         for cert in certs {
             let _ = root_store.add(cert);
         }
 
+        // Используем безопасные настройки по умолчанию
         let mut tls_config = ClientConfig::builder()
             .with_root_certificates(root_store)
             .with_no_client_auth();
 
-        tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        // Оптимизация TLS параметров
+        tls_config.alpn_protocols = vec![b"h2".to_vec()];
         tls_config.enable_early_data = true;
         tls_config.enable_sni = true;
 
@@ -59,7 +61,7 @@ impl ANetClient {
         let (tx_to_tls, mut rx_from_tls) = mpsc::channel(1024);
 
         let stream = connect_with_retry(server_addr, MAX_RETRIES).await?;
-        let _ = optimize_tcp_connection(&stream);
+        //let _ = optimize_tcp_connection(&stream);
 
         info!("Connected to server: {}", server_addr);
 
@@ -68,8 +70,7 @@ impl ANetClient {
         let tls_stream = self.tls_connector.connect(server_name, stream).await?;
         info!("TLS connection established");
 
-        let (reader, mut writer) = tokio::io::split(tls_stream);
-        let mut reader = BufReader::new(reader);
+        let (mut reader, mut writer) = tokio::io::split(tls_stream);
 
         let auth_request = AnetMessage {
             content: Some(Content::AuthRequest(AuthRequest {
@@ -130,7 +131,6 @@ impl ANetClient {
                     error!("Failed to read message length from TLS: {}", e);
                     break;
                 }
-
                 let msg_len = u32::from_be_bytes(len_buf) as usize;
                 let mut msg_buf = vec![0u8; msg_len];
 
@@ -160,28 +160,45 @@ impl ANetClient {
         });
 
         let writer_task = tokio::spawn(async move {
+            let mut flush_interval = tokio::time::interval(Duration::from_millis(10));
             info!("TUN -> TLS task started.");
+
             loop {
-                if let Some(tls_data) = rx_from_tls.recv().await {
-                    let message = AnetMessage {
-                        content: Some(Content::ClientTrafficReceive(ClientTrafficReceive {
-                            encrypted_packet: tls_data,
-                        })),
-                    };
+                tokio::select! {
+                biased;
 
-                    let mut data = Vec::new();
-                    //  Убрать unwrap!
-                    message.encode(&mut data).unwrap();
+                tls_data = rx_from_tls.recv() => {
+                    if let Some(tls_data) = tls_data {
+                        let message = AnetMessage {
+                            content: Some(Content::ClientTrafficReceive(ClientTrafficReceive {
+                                encrypted_packet: tls_data,
+                            })),
+                        };
 
-                    // Отправляем длину и данные
-                    writer
-                        .write_all(&(data.len() as u32).to_be_bytes())
-                        .await
-                        .unwrap();
-                    writer.write_all(&data).await.unwrap();
+                        let mut data = Vec::new();
+                        if let Err(e) = message.encode(&mut data) {
+                            error!("Failed to encode message: {}", e);
+                            continue;
+                        }
 
-                    debug!("Sent ClientTrafficReceive to server");
+                        // Отправляем длину и данные
+                        if let Err(e) = writer.write_all(&(data.len() as u32).to_be_bytes()).await {
+                            error!("Failed to write to server: {}", e);
+                            break;
+                        }
+                        if let Err(e) = writer.write_all(&data).await {
+                            error!("Failed to write to server: {}", e);
+                            break;
+                        }
+                    }
                 }
+                _ = flush_interval.tick() => {
+                    if let Err(e) = writer.flush().await {
+                        error!("Failed to flush writer: {}", e);
+                        break;
+                    }
+                }
+            }
             }
         });
 
@@ -190,12 +207,8 @@ impl ANetClient {
             _ = writer_task => {}
             _ = reader_task => {}
         }
-        // main loop-залуп
-        loop {
-            sleep(Duration::from_secs(2)).await;
-        }
 
-        info!("Shutting down...");
+        Ok(())
     }
 }
 

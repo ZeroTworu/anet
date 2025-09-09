@@ -6,16 +6,24 @@ pub struct IpPool {
     pub network: Ipv4Addr,
     pub netmask: Ipv4Addr,
     pub gateway: Ipv4Addr,
+    pub mtu: u16,
     server: Ipv4Addr,
 }
 
 impl IpPool {
-    pub fn new(network: Ipv4Addr, netmask: Ipv4Addr, gateway: Ipv4Addr, server: Ipv4Addr) -> Self {
+    pub fn new(
+        network: Ipv4Addr,
+        netmask: Ipv4Addr,
+        gateway: Ipv4Addr,
+        server: Ipv4Addr,
+        mtu: u16,
+    ) -> Self {
         Self {
             network,
             netmask,
             gateway,
             server,
+            mtu,
         }
     }
 

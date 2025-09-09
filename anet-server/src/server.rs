@@ -152,6 +152,7 @@ impl ANetServer {
             cfg.mask.parse().unwrap(),
             cfg.gateway.parse().unwrap(),
             cfg.self_ip.parse().unwrap(),
+            cfg.mtu,
         );
         info!("Server TUN configuration: {}", tun_manager.get_info());
 
@@ -224,6 +225,10 @@ async fn handle_client(
     }
     let msg_len = u32::from_be_bytes(len_buf) as usize;
 
+    if msg_len > 65536 {
+        anyhow::bail!("Message too long, {} bytes", msg_len);
+    }
+
     let mut msg_buf = vec![0u8; msg_len];
     if let Err(e) = reader.read_exact(&mut msg_buf).await {
         anyhow::bail!("Failed to read message: {}", e);
@@ -247,6 +252,8 @@ async fn handle_client(
             ip: assigned_ip.to_string(),
             netmask: ip_pool.netmask.to_string(),
             gateway: ip_pool.gateway.to_string(),
+            mtu: ip_pool.mtu as i32,
+            crypto_key: "dsds".to_string(),
         })),
     };
 
@@ -258,7 +265,7 @@ async fn handle_client(
         .await?;
     writer.write_all(&response_data).await?;
 
-    let (tx_to_client, mut rx_to_client) = mpsc::channel::<Vec<u8>>(1024);
+    let (tx_to_client, mut rx_to_client) = mpsc::channel::<Vec<u8>>(8192);
     router.insert(assigned_ip, tx_to_client.clone());
 
     // Server -> Client (ClientTrafficSend) -> TLS
@@ -343,24 +350,26 @@ async fn handle_client(
 }
 
 fn load_tls_config(cert_path: &str, key_path: &str) -> anyhow::Result<ServerConfig> {
-    let cert_file =
-        File::open(cert_path).context(format!("Failed to open certificate file: {}", cert_path))?;
+    let cert_file = File::open(cert_path)
+        .context(format!("Failed to open certificate file: {}", cert_path))?;
     let mut cert_reader = BufReader::new(cert_file);
     let certs = rustls_pemfile::certs(&mut cert_reader)
         .collect::<Result<Vec<CertificateDer>, _>>()
         .context("Failed to parse certificate")?;
 
-    let key_file =
-        File::open(key_path).context(format!("Failed to open key file: {}", key_path))?;
+    let key_file = File::open(key_path)
+        .context(format!("Failed to open key file: {}", key_path))?;
     let mut key_reader = BufReader::new(key_file);
     let key = rustls_pemfile::private_key(&mut key_reader)
         .context("Failed to read private key")?
         .context("No private key found")?;
 
-    let cfg = ServerConfig::builder()
+    let mut cfg = ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .context("Failed to create server config")?;
+
+    cfg.alpn_protocols = vec![b"h2".to_vec()];
 
     Ok(cfg)
 }
