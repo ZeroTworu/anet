@@ -16,6 +16,7 @@ use prost::Message;
 use rustls::ServerConfig;
 use rustls::pki_types::CertificateDer;
 use std::collections::HashSet;
+use std::io::IoSlice;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
@@ -118,7 +119,7 @@ impl PacketBatcher {
                         error!("Route to {dst} present but send failed: {e}");
                     }
                 } else {
-                    info!("No route for dst {dst}");
+                    debug!("No route for dst {dst}");
                 }
             } else {
                 debug!("Non-IPv4 or too-short packet from TLS, dropped");
@@ -268,38 +269,37 @@ async fn handle_client(
     let (tx_to_client, mut rx_to_client) = mpsc::channel::<Vec<u8>>(8192);
     router.insert(assigned_ip, tx_to_client.clone());
 
-    // Server -> Client (ClientTrafficSend) -> TLS
+    // Server -> Client (ClientTrafficSend) | (Server TUN -> TLS)
     let writer_task = tokio::spawn(async move {
+        let mut data = Vec::new();
         while let Some(pkt) = rx_to_client.recv().await {
             let msg = AnetMessage {
                 content: Some(Content::ClientTrafficSend(ClientTrafficSend {
                     encrypted_packet: pkt,
                 })),
             };
-
-            let mut data = Vec::new();
             if let Err(e) = msg.encode(&mut data) {
                 error!("Serialize ClientTrafficSend failed: {e}");
                 continue;
             }
 
-            if let Err(e) = writer.write_all(&(data.len() as u32).to_be_bytes()).await {
-                error!("Write to client failed: {e}");
+            let header = (data.len() as u32).to_be_bytes();
+            let slices = [IoSlice::new(&header), IoSlice::new(&data)];
+
+            if let Err(e) = writer.write_vectored(&slices).await {
+                error!("Error sending data to client {}", e);
                 break;
             }
-            if let Err(e) = writer.write_all(&data).await {
-                error!("Write to client failed: {e}");
-                break;
-            }
-            debug!("Sent ClientTrafficSend to client");
+
+            debug!("Sent ClientTrafficSend to client, bytes: {}", data.len());
+            data.clear();
         }
     });
 
-    // Client -> Server (ClientTrafficReceive) -> TUN
+    // Client -> Server (ClientTrafficReceive) | (Client TUN -> TLS)
     let reader_task = tokio::spawn(async move {
         let mut r = reader;
         let mut len_buf = [0u8; 4];
-
         loop {
             if let Err(e) = r.read_exact(&mut len_buf).await {
                 error!("Read from client failed (length): {e}");
@@ -350,15 +350,15 @@ async fn handle_client(
 }
 
 fn load_tls_config(cert_path: &str, key_path: &str) -> anyhow::Result<ServerConfig> {
-    let cert_file = File::open(cert_path)
-        .context(format!("Failed to open certificate file: {}", cert_path))?;
+    let cert_file =
+        File::open(cert_path).context(format!("Failed to open certificate file: {}", cert_path))?;
     let mut cert_reader = BufReader::new(cert_file);
     let certs = rustls_pemfile::certs(&mut cert_reader)
         .collect::<Result<Vec<CertificateDer>, _>>()
         .context("Failed to parse certificate")?;
 
-    let key_file = File::open(key_path)
-        .context(format!("Failed to open key file: {}", key_path))?;
+    let key_file =
+        File::open(key_path).context(format!("Failed to open key file: {}", key_path))?;
     let mut key_reader = BufReader::new(key_file);
     let key = rustls_pemfile::private_key(&mut key_reader)
         .context("Failed to read private key")?

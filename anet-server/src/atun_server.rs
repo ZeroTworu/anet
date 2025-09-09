@@ -41,6 +41,7 @@ impl TunManager {
     }
 
     pub async fn run(&self) -> Result<(mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>)> {
+        info!("Starting TUN packet processing on server...");
         let config = self.create_config()?;
         let async_dev: AsyncDevice =
             tun::create_as_async(&config).context("Failed to create async TUN device")?;
@@ -62,7 +63,6 @@ impl TunManager {
         });
 
         tokio::spawn(async move {
-            info!("Starting TUN packet processing on server...");
             while let Some(item) = stream.next().await {
                 match item {
                     Ok(pkt) => {

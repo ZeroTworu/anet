@@ -87,6 +87,7 @@ dependencies = [
  "aes-gcm",
  "anyhow",
  "bytes",
+ "libc",
  "log",
  "prost",
  "prost-build",

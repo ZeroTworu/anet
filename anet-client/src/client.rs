@@ -9,6 +9,7 @@ use log::{debug, error, info, warn};
 use prost::Message;
 use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::{ClientConfig, RootCertStore};
+use std::io::IoSlice;
 use std::{sync::Arc, time::Duration};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -30,8 +31,8 @@ impl ANetClient {
         let cert_file = std::fs::File::open(ca_crt_path)?;
         let mut cert_reader = std::io::BufReader::new(cert_file);
 
-        let certs = rustls_pemfile::certs(&mut cert_reader)
-            .collect::<Result<Vec<CertificateDer>, _>>()?;
+        let certs =
+            rustls_pemfile::certs(&mut cert_reader).collect::<Result<Vec<CertificateDer>, _>>()?;
 
         for cert in certs {
             let _ = root_store.add(cert);
@@ -61,7 +62,7 @@ impl ANetClient {
         let (tx_to_tls, mut rx_from_tls) = mpsc::channel(1024);
 
         let stream = connect_with_retry(server_addr, MAX_RETRIES).await?;
-        //let _ = optimize_tcp_connection(&stream);
+        let _ = optimize_tcp_connection(&stream);
 
         info!("Connected to server: {}", server_addr);
 
@@ -165,40 +166,39 @@ impl ANetClient {
 
             loop {
                 tokio::select! {
-                biased;
+                    biased;
 
-                tls_data = rx_from_tls.recv() => {
-                    if let Some(tls_data) = tls_data {
-                        let message = AnetMessage {
-                            content: Some(Content::ClientTrafficReceive(ClientTrafficReceive {
-                                encrypted_packet: tls_data,
-                            })),
-                        };
+                    tls_data = rx_from_tls.recv() => {
+                        if let Some(tls_data) = tls_data {
+                            let message = AnetMessage {
+                                content: Some(Content::ClientTrafficReceive(ClientTrafficReceive {
+                                    encrypted_packet: tls_data,
+                                })),
+                            };
 
-                        let mut data = Vec::new();
-                        if let Err(e) = message.encode(&mut data) {
-                            error!("Failed to encode message: {}", e);
-                            continue;
+                            let mut data = Vec::new();
+                            if let Err(e) = message.encode(&mut data) {
+                                error!("Failed to encode message: {}", e);
+                                continue;
+                            }
+
+                            let header = (data.len() as u32).to_be_bytes();
+                            let slices = [IoSlice::new(&header), IoSlice::new(&data)];
+
+                            if let Err(e) = writer.write_vectored(&slices).await {
+                                error!("Error sending data to server {}", e);
+                                break;
+                            }
+
                         }
-
-                        // Отправляем длину и данные
-                        if let Err(e) = writer.write_all(&(data.len() as u32).to_be_bytes()).await {
-                            error!("Failed to write to server: {}", e);
-                            break;
-                        }
-                        if let Err(e) = writer.write_all(&data).await {
-                            error!("Failed to write to server: {}", e);
+                    }
+                    _ = flush_interval.tick() => {
+                        if let Err(e) = writer.flush().await {
+                            error!("Failed to flush writer: {}", e);
                             break;
                         }
                     }
                 }
-                _ = flush_interval.tick() => {
-                    if let Err(e) = writer.flush().await {
-                        error!("Failed to flush writer: {}", e);
-                        break;
-                    }
-                }
-            }
             }
         });
 
