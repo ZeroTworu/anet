@@ -1,4 +1,5 @@
 use anet_common::codecs::RawIpCodec;
+use anet_common::consts::{CHANNEL_BUFFER_SIZE, PACKETS_TO_YIELD};
 use anet_common::tun_params::TunParams;
 use anyhow::{Context, Result};
 use futures::{SinkExt, StreamExt};
@@ -8,7 +9,6 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio_util::codec::Framed;
 use tun::{AsyncDevice, Configuration};
-
 pub struct TunManager {
     params: TunParams,
     network: Ipv4Addr,
@@ -49,20 +49,29 @@ impl TunManager {
         let framed = Framed::new(async_dev, RawIpCodec::new());
         let (mut sink, mut stream) = framed.split();
 
-        let (tx_to_tun, mut rx_to_tun) = mpsc::channel::<Vec<u8>>(1024);
+        let (tx_to_tun, mut rx_to_tun) = mpsc::channel::<Vec<u8>>(CHANNEL_BUFFER_SIZE);
 
-        let (tx_from_tun, rx_from_tun) = mpsc::channel::<Vec<u8>>(1024);
+        let (tx_from_tun, rx_from_tun) = mpsc::channel::<Vec<u8>>(CHANNEL_BUFFER_SIZE);
 
         tokio::spawn(async move {
+            let mut packet_count = 0;
             while let Some(pkt) = rx_to_tun.recv().await {
                 debug!("TLS -> TUN");
+
                 if let Err(e) = sink.send(pkt).await {
                     error!("Failed to write to TUN: {e}");
+                }
+
+                packet_count += 1;
+                if packet_count == PACKETS_TO_YIELD {
+                    packet_count = 0;
+                    tokio::task::yield_now().await;
                 }
             }
         });
 
         tokio::spawn(async move {
+            let mut packet_count = 0;
             while let Some(item) = stream.next().await {
                 match item {
                     Ok(pkt) => {
@@ -73,6 +82,11 @@ impl TunManager {
                         }
                     }
                     Err(err) => error!("Error reading packet from TUN: {err:?}"),
+                }
+                packet_count += 1;
+                if packet_count == PACKETS_TO_YIELD {
+                    packet_count = 0;
+                    tokio::task::yield_now().await;
                 }
             }
         });

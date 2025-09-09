@@ -1,10 +1,11 @@
 use crate::atun_client::TunManager;
+use anet_common::consts::MAX_PACKET_SIZE;
 use anet_common::protocol::{
     AuthRequest, ClientTrafficReceive, Message as AnetMessage, message::Content,
 };
 use anet_common::tcp::optimize_tcp_connection;
 use anyhow::Result;
-use bytes::Bytes;
+use bytes::{Buf, Bytes, BytesMut};
 use log::{debug, error, info, warn};
 use prost::Message;
 use rustls::pki_types::{CertificateDer, ServerName};
@@ -57,9 +58,9 @@ impl ANetClient {
     }
     pub async fn connect(&self, server_addr: &str, auth_phrase: &str) -> Result<()> {
         info!("Connecting to {} ...", server_addr);
-        let (tx_to_tun, rx_from_tun) = mpsc::channel(1024);
+        let (tx_to_tun, rx_from_tun) = mpsc::channel(8192);
 
-        let (tx_to_tls, mut rx_from_tls) = mpsc::channel(1024);
+        let (tx_to_tls, mut rx_from_tls) = mpsc::channel(8192);
 
         let stream = connect_with_retry(server_addr, MAX_RETRIES).await?;
         let _ = optimize_tcp_connection(&stream);
@@ -126,35 +127,49 @@ impl ANetClient {
         let reader_task = tokio::spawn(async move {
             info!("TLS -> TUN task started.");
             let mut len_buf = [0u8; 4];
+            let mut read_buffer = BytesMut::with_capacity(MAX_PACKET_SIZE);
             loop {
                 // Читаем длину сообщения
-                if let Err(e) = reader.read_exact(&mut len_buf).await {
-                    error!("Failed to read message length from TLS: {}", e);
-                    break;
-                }
-                let msg_len = u32::from_be_bytes(len_buf) as usize;
-                let mut msg_buf = vec![0u8; msg_len];
+                let n = reader.read_buf(&mut read_buffer).await;
+                match n {
+                    Ok(n) => {
+                        if n == 0 {
+                            break; // closed
+                        }
 
-                if let Err(e) = reader.read_exact(&mut msg_buf).await {
-                    error!("Failed to read message from TLS: {}", e);
-                    break;
-                }
+                        while read_buffer.len() >= 4 {
+                            len_buf.copy_from_slice(&read_buffer[0..4]);
+                            let msg_len = u32::from_be_bytes(len_buf) as usize;
 
-                match Message::decode(Bytes::from(msg_buf)) {
-                    Ok(AnetMessage {
-                        content: Some(Content::ClientTrafficSend(traffic)),
-                    }) => {
-                        debug!("Received ClientTrafficSend from server");
-                        if let Err(e) = tx_to_tun.send(traffic.encrypted_packet).await {
-                            error!("Failed to send to TUN: {}", e);
-                            break;
+                            if read_buffer.len() < 4 + msg_len {
+                                break;
+                            }
+
+                            read_buffer.advance(4);
+
+                            let message_data = read_buffer.split_to(msg_len);
+
+                            match Message::decode(Bytes::from(message_data)) {
+                                Ok(AnetMessage {
+                                    content: Some(Content::ClientTrafficSend(traffic)),
+                                }) => {
+                                    debug!("TLS -> TUN, size: {}", traffic.encrypted_packet.len());
+                                    if let Err(e) = tx_to_tun.send(traffic.encrypted_packet).await {
+                                        error!("Failed to send to TUN: {}", e);
+                                        break;
+                                    }
+                                }
+                                Ok(other) => {
+                                    info!("Received other message type: {:?}", other);
+                                }
+                                Err(e) => {
+                                    error!("Failed to parse message: {}", e);
+                                }
+                            }
                         }
                     }
-                    Ok(other) => {
-                        info!("Received other message type: {:?}", other);
-                    }
                     Err(e) => {
-                        error!("Failed to parse message: {}", e);
+                        error!("TLS -> TUN, Read error: {}", e);
                     }
                 }
             }
@@ -167,7 +182,6 @@ impl ANetClient {
             loop {
                 tokio::select! {
                     biased;
-
                     tls_data = rx_from_tls.recv() => {
                         if let Some(tls_data) = tls_data {
                             let message = AnetMessage {
@@ -184,7 +198,7 @@ impl ANetClient {
 
                             let header = (data.len() as u32).to_be_bytes();
                             let slices = [IoSlice::new(&header), IoSlice::new(&data)];
-
+                            debug!("TUN -> TLS, size: {}", slices.len());
                             if let Err(e) = writer.write_vectored(&slices).await {
                                 error!("Error sending data to server {}", e);
                                 break;

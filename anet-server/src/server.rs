@@ -3,13 +3,14 @@ use std::{fs::File, io::BufReader, net::Ipv4Addr, sync::Arc};
 use crate::atun_server::TunManager;
 use crate::config::Config;
 use crate::ip_pool::IpPool;
+use anet_common::consts::{MAX_PACKET_SIZE, PACKETS_TO_YIELD};
 use anet_common::protocol::{
     ClientTrafficReceive, ClientTrafficSend, Message as AnetMessage, message::Content,
 };
 use anet_common::tcp::optimize_tcp_connection;
 use anet_common::tun_params::TunParams;
 use anyhow::Context;
-use bytes::Bytes;
+use bytes::{Buf, Bytes, BytesMut};
 use dashmap::DashMap;
 use log::{debug, error, info};
 use prost::Message;
@@ -226,7 +227,7 @@ async fn handle_client(
     }
     let msg_len = u32::from_be_bytes(len_buf) as usize;
 
-    if msg_len > 65536 {
+    if msg_len > MAX_PACKET_SIZE {
         anyhow::bail!("Message too long, {} bytes", msg_len);
     }
 
@@ -269,9 +270,10 @@ async fn handle_client(
     let (tx_to_client, mut rx_to_client) = mpsc::channel::<Vec<u8>>(8192);
     router.insert(assigned_ip, tx_to_client.clone());
 
-    // Server -> Client (ClientTrafficSend) | (Server TUN -> TLS)
+    // Server -> Client (ClientTrafficSend) | (TUN -> TLS)
     let writer_task = tokio::spawn(async move {
         let mut data = Vec::new();
+        let mut packet_count = 0;
         while let Some(pkt) = rx_to_client.recv().await {
             let msg = AnetMessage {
                 content: Some(Content::ClientTrafficSend(ClientTrafficSend {
@@ -285,57 +287,83 @@ async fn handle_client(
 
             let header = (data.len() as u32).to_be_bytes();
             let slices = [IoSlice::new(&header), IoSlice::new(&data)];
-
+            debug!("TUN -> TLS, size: {}", data.len());
             if let Err(e) = writer.write_vectored(&slices).await {
                 error!("Error sending data to client {}", e);
                 break;
             }
-
-            debug!("Sent ClientTrafficSend to client, bytes: {}", data.len());
             data.clear();
+
+            packet_count += 1;
+            if packet_count == PACKETS_TO_YIELD {
+                packet_count = 0;
+                tokio::task::yield_now().await;
+            }
         }
     });
 
-    // Client -> Server (ClientTrafficReceive) | (Client TUN -> TLS)
+    // Client -> Server (ClientTrafficReceive) | (TLS -> TUN)
     let reader_task = tokio::spawn(async move {
-        let mut r = reader;
         let mut len_buf = [0u8; 4];
+        let mut read_buffer = BytesMut::with_capacity(MAX_PACKET_SIZE);
+        let mut packet_count = 0;
         loop {
-            if let Err(e) = r.read_exact(&mut len_buf).await {
-                error!("Read from client failed (length): {e}");
-                break;
-            }
-            let msg_len = u32::from_be_bytes(len_buf) as usize;
+            let n = reader.read_buf(&mut read_buffer).await;
+            match n {
+                Ok(n) => {
+                    if n == 0 {
+                        break; // closed
+                    }
 
-            let mut msg_buf = vec![0u8; msg_len];
-            if let Err(e) = r.read_exact(&mut msg_buf).await {
-                error!("Read from client failed (message): {e}");
-                break;
-            }
+                    while read_buffer.len() >= 4 {
+                        len_buf.copy_from_slice(&read_buffer[0..4]);
+                        let msg_len = u32::from_be_bytes(len_buf) as usize;
 
-            let message: AnetMessage = match Message::decode(Bytes::from(msg_buf)) {
-                Ok(msg) => msg,
-                Err(e) => {
-                    error!("Failed to parse message: {e}");
-                    continue;
-                }
-            };
+                        if read_buffer.len() < 4 + msg_len {
+                            break;
+                        }
 
-            match message.content {
-                Some(Content::ClientTrafficReceive(ClientTrafficReceive { encrypted_packet })) => {
-                    debug!("Receive ClientTrafficReceive from client");
+                        read_buffer.advance(4);
 
-                    if let Err(e) = tx_to_tun.send(encrypted_packet).await {
-                        error!("Send to TUN failed: {e}");
-                        break;
+                        let message_data = read_buffer.split_to(msg_len);
+
+                        let message: AnetMessage = match Message::decode(Bytes::from(message_data))
+                        {
+                            Ok(msg) => msg,
+                            Err(e) => {
+                                error!("Failed to parse message: {e}");
+                                continue;
+                            }
+                        };
+
+                        debug!("TLS -> TUN, size: {}", msg_len);
+
+                        match message.content {
+                            Some(Content::ClientTrafficReceive(ClientTrafficReceive {
+                                encrypted_packet,
+                            })) => {
+                                if let Err(e) = tx_to_tun.send(encrypted_packet).await {
+                                    error!("Send to TUN failed: {e}");
+                                    break;
+                                }
+                            }
+                            Some(other) => {
+                                info!("Unexpected message: {:?}", other);
+                            }
+                            None => {
+                                error!("Empty message received");
+                            }
+                        }
                     }
                 }
-                Some(other) => {
-                    info!("Unexpected message: {:?}", other);
+                Err(e) => {
+                    error!("Client -> Server (ClientTrafficReceive), Read Error: {}", e);
                 }
-                None => {
-                    error!("Empty message received");
-                }
+            }
+            packet_count += 1;
+            if packet_count == PACKETS_TO_YIELD {
+                packet_count = 0;
+                tokio::task::yield_now().await;
             }
         }
     });

@@ -1,4 +1,4 @@
-use bytes::BytesMut;
+use bytes::{Buf, BytesMut};
 use log::{error, warn};
 use std::io;
 use tokio_util::codec::{Decoder, Encoder};
@@ -60,5 +60,37 @@ impl Encoder<Vec<u8>> for RawIpCodec {
 
         dst.extend_from_slice(&item);
         Ok(())
+    }
+}
+
+pub struct AnetCodec;
+
+impl Decoder for AnetCodec {
+    type Item = BytesMut;
+    type Error = std::io::Error;
+
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        if src.len() < 4 {
+            return Ok(None);
+        }
+
+        // Читаем длину сообщения
+        let len = {
+            let mut len_bytes = [0u8; 4];
+            len_bytes.copy_from_slice(&src[0..4]);
+            u32::from_be_bytes(len_bytes) as usize
+        };
+
+        // Проверяем, есть ли полное сообщение
+        if src.len() < 4 + len {
+            src.reserve(4 + len - src.len());
+            return Ok(None);
+        }
+
+        // Пропускаем байты длины
+        src.advance(4);
+
+        // Возвращаем данные сообщения
+        Ok(Some(src.split_to(len)))
     }
 }

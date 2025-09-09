@@ -1,3 +1,4 @@
+use anet_common::consts::MAX_PACKET_SIZE;
 use anet_common::protocol::AssignedIp;
 use anet_common::tun_params::TunParams;
 use anyhow::{Context, Result};
@@ -76,7 +77,8 @@ impl TunManager {
     ) -> Result<()> {
         let async_dev = self.create_as_async();
         let (mut tun_reader, mut tun_writer) = tokio::io::split(async_dev);
-        let mut tun_buffer = vec![0u8; 65536];
+        // Ссаный костыль из-за windows
+        let mut tun_buffer = vec![0u8; MAX_PACKET_SIZE];
 
         tokio::spawn(async move {
             loop {
