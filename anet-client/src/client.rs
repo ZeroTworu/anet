@@ -1,23 +1,20 @@
-use std::{sync::Arc, time::Duration};
 use crate::atun_client::TunManager;
 use anet_common::protocol::{
     AuthRequest, ClientTrafficReceive, Message as AnetMessage, message::Content,
 };
+use anet_common::tcp::optimize_tcp_connection;
 use anyhow::Result;
 use bytes::Bytes;
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use prost::Message;
 use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::{ClientConfig, RootCertStore};
+use std::{sync::Arc, time::Duration};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
 use tokio_rustls::TlsConnector;
-#[cfg(windows)]
-use windows_sys::Win32::Networking::WinSock;
-#[cfg(windows)]
-use std::os::windows::io::AsRawSocket;
 
 const MAX_RETRIES: u32 = 5;
 
@@ -62,10 +59,7 @@ impl ANetClient {
         let (tx_to_tls, mut rx_from_tls) = mpsc::channel(1024);
 
         let stream = connect_with_retry(server_addr, MAX_RETRIES).await?;
-        #[cfg(windows)]
-        {
-            set_windows_keepalive(&stream)?;
-        }
+        let _ = optimize_tcp_connection(&stream);
 
         info!("Connected to server: {}", server_addr);
 
@@ -107,68 +101,6 @@ impl ANetClient {
                 info!("Success! Assigned IP: {}", assigned_ip.ip);
                 tun_manager.set_ip_network_params(&assigned_ip.into())?;
                 info!("Current TUN configuration: {}", tun_manager.get_info());
-
-                tokio::spawn(async move {
-                    if let Err(e) = &tun_manager.start_processing(tx_to_tls, rx_from_tun).await {
-                        error!("TUN processing error: {}", e);
-                    }
-                });
-
-                tokio::spawn(async move {
-                    let mut len_buf = [0u8; 4];
-                    loop {
-                        // Читаем длину сообщения
-                        if let Err(e) = reader.read_exact(&mut len_buf).await {
-                            error!("Failed to read message length from TLS: {}", e);
-                            break;
-                        }
-
-                        let msg_len = u32::from_be_bytes(len_buf) as usize;
-                        let mut msg_buf = vec![0u8; msg_len];
-
-                        if let Err(e) = reader.read_exact(&mut msg_buf).await {
-                            error!("Failed to read message from TLS: {}", e);
-                            break;
-                        }
-
-                        match Message::decode(Bytes::from(msg_buf)) {
-                            Ok(AnetMessage {
-                                content: Some(Content::ClientTrafficSend(traffic)),
-                            }) => {
-                                debug!("Received ClientTrafficSend from server");
-                                if let Err(e) = tx_to_tun.send(traffic.encrypted_packet).await {
-                                    error!("Failed to send to TUN: {}", e);
-                                    break;
-                                }
-                            }
-                            Ok(other) => {
-                                info!("Received other message type: {:?}", other);
-                            }
-                            Err(e) => {
-                                error!("Failed to parse message: {}", e);
-                            }
-                        }
-                    }
-                });
-
-                loop {
-                    if let Some(tls_data) = rx_from_tls.recv().await {
-                        let message = AnetMessage {
-                            content: Some(Content::ClientTrafficReceive(ClientTrafficReceive {
-                                encrypted_packet: tls_data,
-                            })),
-                        };
-
-                        let mut data = Vec::new();
-                        message.encode(&mut data)?;
-
-                        // Отправляем длину и данные
-                        writer.write_all(&(data.len() as u32).to_be_bytes()).await?;
-                        writer.write_all(&data).await?;
-
-                        debug!("Sent ClientTrafficReceive to server");
-                    }
-                }
             }
             Some(_) => {
                 error!("Unexpected response type");
@@ -176,9 +108,94 @@ impl ANetClient {
             None => {
                 error!("Empty response received");
             }
+        };
+
+        if !tun_manager.is_set {
+            warn!("TUN manager is disabled, shutting down");
+            return Ok(());
         }
 
-        Ok(())
+        let tun_task = tokio::spawn(async move {
+            if let Err(e) = &tun_manager.start_processing(tx_to_tls, rx_from_tun).await {
+                error!("TUN processing error: {}", e);
+            }
+        });
+
+        let reader_task = tokio::spawn(async move {
+            info!("TLS -> TUN task started.");
+            let mut len_buf = [0u8; 4];
+            loop {
+                // Читаем длину сообщения
+                if let Err(e) = reader.read_exact(&mut len_buf).await {
+                    error!("Failed to read message length from TLS: {}", e);
+                    break;
+                }
+
+                let msg_len = u32::from_be_bytes(len_buf) as usize;
+                let mut msg_buf = vec![0u8; msg_len];
+
+                if let Err(e) = reader.read_exact(&mut msg_buf).await {
+                    error!("Failed to read message from TLS: {}", e);
+                    break;
+                }
+
+                match Message::decode(Bytes::from(msg_buf)) {
+                    Ok(AnetMessage {
+                        content: Some(Content::ClientTrafficSend(traffic)),
+                    }) => {
+                        debug!("Received ClientTrafficSend from server");
+                        if let Err(e) = tx_to_tun.send(traffic.encrypted_packet).await {
+                            error!("Failed to send to TUN: {}", e);
+                            break;
+                        }
+                    }
+                    Ok(other) => {
+                        info!("Received other message type: {:?}", other);
+                    }
+                    Err(e) => {
+                        error!("Failed to parse message: {}", e);
+                    }
+                }
+            }
+        });
+
+        let writer_task = tokio::spawn(async move {
+            info!("TUN -> TLS task started.");
+            loop {
+                if let Some(tls_data) = rx_from_tls.recv().await {
+                    let message = AnetMessage {
+                        content: Some(Content::ClientTrafficReceive(ClientTrafficReceive {
+                            encrypted_packet: tls_data,
+                        })),
+                    };
+
+                    let mut data = Vec::new();
+                    //  Убрать unwrap!
+                    message.encode(&mut data).unwrap();
+
+                    // Отправляем длину и данные
+                    writer
+                        .write_all(&(data.len() as u32).to_be_bytes())
+                        .await
+                        .unwrap();
+                    writer.write_all(&data).await.unwrap();
+
+                    debug!("Sent ClientTrafficReceive to server");
+                }
+            }
+        });
+
+        tokio::select! {
+            _ = tun_task => {}
+            _ = writer_task => {}
+            _ = reader_task => {}
+        }
+        // main loop-залуп
+        loop {
+            sleep(Duration::from_secs(2)).await;
+        }
+
+        info!("Shutting down...");
     }
 }
 
@@ -202,43 +219,4 @@ async fn connect_with_retry(server_addr: &str, max_retries: u32) -> Result<TcpSt
             }
         }
     }
-}
-
-#[cfg(windows)]
-fn set_windows_keepalive(stream: &tokio::net::TcpStream) -> anyhow::Result<()> {
-    use windows_sys::Win32::Networking::WinSock;
-
-    let keepalive: u32 = 1;
-    let keepalive_time: u32 = 60000; // 60 секунд в миллисекундах
-    let keepalive_interval: u32 = 10000; // 10 секунд в миллисекундах
-    let socket= stream.as_raw_socket() as WinSock::SOCKET;
-    unsafe {
-        // Включаем keepalive
-        WinSock::setsockopt(
-            socket,
-            WinSock::SOL_SOCKET,
-            WinSock::SO_KEEPALIVE,
-            &keepalive as *const _ as *const _,
-            std::mem::size_of::<u32>() as i32,
-        );
-
-        // Устанавливаем параметры keepalive
-        WinSock::setsockopt(
-            socket,
-            WinSock::IPPROTO_TCP,
-            WinSock::TCP_KEEPIDLE,
-            &keepalive_time as *const _ as *const _,
-            std::mem::size_of::<u32>() as i32,
-        );
-
-        WinSock::setsockopt(
-            socket,
-            WinSock::IPPROTO_TCP,
-            WinSock::TCP_KEEPINTVL,
-            &keepalive_interval as *const _ as *const _,
-            std::mem::size_of::<u32>() as i32,
-        );
-    }
-
-    Ok(())
 }

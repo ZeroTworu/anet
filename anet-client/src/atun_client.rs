@@ -5,18 +5,19 @@ use log::{debug, error, info};
 use std::net::Ipv4Addr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
-use tokio::time::Duration;
 use tun::{AsyncDevice, Configuration};
 
 #[derive(Clone)]
 pub struct TunManager {
     params: TunParams,
+    pub is_set: bool,
 }
 
 impl TunManager {
     pub fn new() -> Self {
         Self {
             params: TunParams::default_client(),
+            is_set: false,
         }
     }
 
@@ -34,7 +35,7 @@ impl TunManager {
         self.params.address = address;
         self.params.netmask = netmask;
         self.params.gateway = gateway;
-
+        self.is_set = true;
         Ok(())
     }
 
@@ -58,7 +59,7 @@ impl TunManager {
         let config = self.create_config();
         match tun::create_as_async(&config) {
             Ok(dev) => {
-                info!("Device created");
+                info!("TUN Device created.");
                 dev
             }
             Err(e) => {
@@ -73,48 +74,25 @@ impl TunManager {
         tx_to_tls: mpsc::Sender<Vec<u8>>,
         mut rx_to_tun: mpsc::Receiver<Vec<u8>>,
     ) -> Result<()> {
-
         let async_dev = self.create_as_async();
         let (mut tun_reader, mut tun_writer) = tokio::io::split(async_dev);
         let mut tun_buffer = vec![0u8; 65536];
 
         tokio::spawn(async move {
-            let mut batch = Vec::with_capacity(32);
-            let mut interval = tokio::time::interval(Duration::from_micros(500));
-
             loop {
                 match tun_reader.read(&mut tun_buffer).await {
                     Ok(n) => {
                         if n > 0 {
-                            batch.push(tun_buffer[..n].to_vec());
-
-                            if batch.len() >= 32 {
-                                for pkt in batch.drain(..) {
-                                    if let Err(e) = tx_to_tls.send(pkt).await {
-                                        error!("Failed to send to TLS: {}", e);
-                                        return;
-                                    }
-                                }
+                            let pkt = tun_buffer[..n].to_vec();
+                            debug!("TUN -> TLS: {} bytes", pkt.len());
+                            if let Err(e) = tx_to_tls.send(pkt).await {
+                                error!("Error TUN -> TLS: {:?}", e);
                             }
                         }
                     }
                     Err(e) => {
                         error!("Failed to read from TUN: {}", e);
                         return;
-                    }
-                }
-
-                if !batch.is_empty() {
-                    tokio::select! {
-                        _ = interval.tick() => {
-                            for pkt in batch.drain(..) {
-                                if let Err(e) = tx_to_tls.send(pkt).await {
-                                    error!("Failed to send to TLS: {}", e);
-                                    return;
-                                }
-                            }
-                        }
-                        _ = tokio::time::sleep(Duration::from_micros(100)) => {}
                     }
                 }
             }
@@ -127,7 +105,7 @@ impl TunManager {
                     Some(pkt) => {
                         debug!("TLS -> TUN: {} bytes", pkt.len());
                         if let Err(e) = tun_writer.write_all(&pkt).await {
-                            error!("TLS -> TUN: {}", e);
+                            error!("Error TLS -> TUN: {:?}", e);
                             break;
                         }
                     }

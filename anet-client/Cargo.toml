@@ -16,5 +16,5 @@ yaml-rust2 = { workspace = true }
 prost = {workspace = true}
 bytes = {workspace = true}
 rustls-pemfile = {workspace = true}
-windows-sys = { version = "0.61.0", features = ["Win32_Networking_WinSock"] }
+
 anet-common = { path = "../anet-common"}

@@ -77,7 +77,6 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tun",
- "windows-sys 0.61.0",
  "yaml-rust2",
 ]
 
@@ -91,7 +90,10 @@ dependencies = [
  "log",
  "prost",
  "prost-build",
+ "socket2",
+ "tokio",
  "tokio-util",
+ "windows-sys 0.61.0",
 ]
 
 [[package]]
@@ -109,7 +111,6 @@ dependencies = [
  "prost",
  "rustls",
  "rustls-pemfile",
- "socket2",
  "tokio",
  "tokio-rustls",
  "tokio-util",

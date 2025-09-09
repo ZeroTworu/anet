@@ -5,7 +5,7 @@ default-members = ["anet-server", "anet-client", "anet-common"]
 
 [workspace.dependencies]
 tun = { version = "0.8.3", features = ["async"] }
-tokio = {version = "1.47.1", features = ["rt-multi-thread", "time", "process", "fs"]}
+tokio = {version = "1.47.1", features = ["rt-multi-thread", "time", "process", "fs", "net"]}
 env_logger = "0.11.8"
 log = { version = "0.4.22", default-features = false}
 tokio-rustls = "0.26.2"

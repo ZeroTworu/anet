@@ -1,12 +1,13 @@
 use std::{fs::File, io::BufReader, net::Ipv4Addr, sync::Arc};
 
 use crate::atun_server::TunManager;
-use anet_common::tun_params::TunParams;
 use crate::config::Config;
 use crate::ip_pool::IpPool;
 use anet_common::protocol::{
     ClientTrafficReceive, ClientTrafficSend, Message as AnetMessage, message::Content,
 };
+use anet_common::tcp::optimize_tcp_connection;
+use anet_common::tun_params::TunParams;
 use anyhow::Context;
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -20,9 +21,6 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, interval};
 use tokio_rustls::TlsAcceptor;
-use std::os::unix::io::{AsRawFd, FromRawFd};
-use socket2::{Socket, TcpKeepalive};
-
 
 type ClientTx = mpsc::Sender<Vec<u8>>;
 
@@ -39,11 +37,12 @@ impl Router {
     }
 
     pub fn insert(&self, ip: Ipv4Addr, tx: ClientTx) {
+        info!("{:?} success auth.", ip);
         self.map.insert(ip, tx);
     }
 
     pub fn remove(&self, ip: &Ipv4Addr) {
-        info!("{:?} disconnected", ip);
+        info!("{:?} disconnected.", ip);
         self.map.remove(ip);
     }
 
@@ -85,7 +84,7 @@ impl PacketBatcher {
 
         loop {
             tokio::select! {
-                biased; // Добавляем biased для приоритизации пакетов
+                biased;
 
                 pkt = rx_from_tun.recv() => {
                     if let Some(pkt) = pkt {
@@ -128,35 +127,6 @@ impl PacketBatcher {
     }
 }
 
-fn optimize_tcp_connection(stream: &tokio::net::TcpStream) -> anyhow::Result<()> {
-    // Получаем raw file descriptor из tokio TcpStream
-    let raw_fd = stream.as_raw_fd();
-
-    // Создаем socket2::Socket из raw file descriptor
-    // SAFETY: Мы гарантируем, что raw_fd валиден и не будет использоваться
-    // другими частями кода одновременно
-    let socket = unsafe { Socket::from_raw_fd(raw_fd) };
-
-    // Увеличиваем размеры буферов
-    socket.set_recv_buffer_size(1024 * 1024)?; // 1MB
-    socket.set_send_buffer_size(1024 * 1024)?; // 1MB
-
-    // Включаем TCP_NODELAY для уменьшения задержки
-    socket.set_tcp_nodelay(true)?;
-
-    // Настраиваем keepalive
-    let keepalive = TcpKeepalive::new()
-        .with_time(Duration::from_secs(60))
-        .with_interval(Duration::from_secs(10))
-        .with_retries(3);
-    socket.set_tcp_keepalive(&keepalive)?;
-
-    // Не закрываем сокет, так как он все еще используется tokio
-    std::mem::forget(socket);
-
-    Ok(())
-}
-
 pub struct ANetServer {
     tls_acceptor: TlsAcceptor,
     router: Router,
@@ -173,10 +143,10 @@ impl ANetServer {
             netmask: cfg.mask.parse().unwrap(),
             gateway: cfg.gateway.parse().unwrap(),
             address: cfg.self_ip.parse().unwrap(),
-            name: "anet-server".to_string(),
-            mtu: 1500,
+            name: cfg.if_name.parse().unwrap(),
+            mtu: cfg.mtu,
         };
-        let tun_manager = TunManager::new_with_params(params);
+        let tun_manager = TunManager::new(params, cfg.net.parse().unwrap());
         let ip_pool = IpPool::new(
             cfg.net.parse().unwrap(),
             cfg.mask.parse().unwrap(),
@@ -195,12 +165,13 @@ impl ANetServer {
     }
 
     pub async fn run(&self) -> anyhow::Result<()> {
-        TunManager::setup_tun_routing("anet-server", self.cfg.external_if.as_str()).await?;
         let (tx_to_tun, rx_from_tun) = self.tun_manager.run().await?;
+        self.tun_manager
+            .setup_tun_routing(self.cfg.external_if.as_str())
+            .await?;
 
         let router_for_tun = self.router.clone();
 
-        // Диспетчер: читает из TUN и отправляет соответствующему клиенту
         tokio::spawn(async move {
             let batcher = PacketBatcher::new(50, 1);
             batcher.process_batches(rx_from_tun, &router_for_tun).await;
@@ -247,20 +218,17 @@ async fn handle_client(
     let (reader, mut writer) = tokio::io::split(tls_stream);
     let mut reader = tokio::io::BufReader::new(reader);
 
-    // Читаем длину сообщения
     let mut len_buf = [0u8; 4];
     if let Err(e) = reader.read_exact(&mut len_buf).await {
         anyhow::bail!("Failed to read message length: {}", e);
     }
     let msg_len = u32::from_be_bytes(len_buf) as usize;
 
-    // Читаем само сообщение
     let mut msg_buf = vec![0u8; msg_len];
     if let Err(e) = reader.read_exact(&mut msg_buf).await {
         anyhow::bail!("Failed to read message: {}", e);
     }
 
-    // Декодируем protobuf сообщение
     let message: AnetMessage = Message::decode(Bytes::from(msg_buf))?;
 
     let assigned_ip: Ipv4Addr = match message.content {
@@ -274,7 +242,6 @@ async fn handle_client(
         _ => anyhow::bail!("First message must be AuthRequest"),
     };
 
-    // Формируем ответ
     let response = AnetMessage {
         content: Some(Content::AuthResponse(anet_common::AssignedIp {
             ip: assigned_ip.to_string(),
@@ -283,11 +250,9 @@ async fn handle_client(
         })),
     };
 
-    // Кодируем ответ
     let mut response_data = Vec::new();
     response.encode(&mut response_data)?;
 
-    // Отправляем длину и данные
     writer
         .write_all(&(response_data.len() as u32).to_be_bytes())
         .await?;
@@ -329,7 +294,6 @@ async fn handle_client(
         let mut len_buf = [0u8; 4];
 
         loop {
-            // Читаем длину сообщения
             if let Err(e) = r.read_exact(&mut len_buf).await {
                 error!("Read from client failed (length): {e}");
                 break;

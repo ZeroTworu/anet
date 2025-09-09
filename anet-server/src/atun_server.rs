@@ -3,6 +3,7 @@ use anet_common::tun_params::TunParams;
 use anyhow::{Context, Result};
 use futures::{SinkExt, StreamExt};
 use log::{debug, error, info};
+use std::net::Ipv4Addr;
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio_util::codec::Framed;
@@ -10,17 +11,12 @@ use tun::{AsyncDevice, Configuration};
 
 pub struct TunManager {
     params: TunParams,
+    network: Ipv4Addr,
 }
 
 impl TunManager {
-    pub fn new() -> Self {
-        Self {
-            params: TunParams::default(),
-        }
-    }
-
-    pub fn new_with_params(params: TunParams) -> Self {
-        Self { params }
+    pub fn new(params: TunParams, network: Ipv4Addr) -> Self {
+        Self { params, network }
     }
 
     fn create_config(&self) -> Result<Configuration> {
@@ -95,7 +91,7 @@ impl TunManager {
         )
     }
 
-    pub async fn setup_tun_routing(tun: &str, external: &str) -> anyhow::Result<()> {
+    pub async fn setup_tun_routing(&self, external: &str) -> anyhow::Result<()> {
         // Включаем форвардинг пакетов
         Command::new("sysctl")
             .arg("-w")
@@ -137,7 +133,16 @@ impl TunManager {
 
         // Разрешаем форвардинг tun→eth
         Command::new("iptables")
-            .args(&["-A", "FORWARD", "-i", tun, "-o", external, "-j", "ACCEPT"])
+            .args(&[
+                "-A",
+                "FORWARD",
+                "-i",
+                self.params.name.as_str(),
+                "-o",
+                external,
+                "-j",
+                "ACCEPT",
+            ])
             .spawn()?
             .wait()
             .await?;
@@ -150,7 +155,7 @@ impl TunManager {
                 "-i",
                 external,
                 "-o",
-                tun,
+                self.params.name.as_str(),
                 "-m",
                 "state",
                 "--state",
@@ -162,11 +167,41 @@ impl TunManager {
             .wait()
             .await?;
         // явное указание маршрута для VPN подсети
+        let prefix = self.netmask_to_prefix(self.params.netmask)?;
+        let net = format!("{}/{}", self.network, prefix);
         Command::new("ip")
-            .args(&["route", "add", "10.1.0.0/24", "dev", tun])
+            .args(&[
+                "route",
+                "replace",
+                net.as_str(),
+                "dev",
+                self.params.name.as_str(),
+            ])
             .spawn()?
             .wait()
             .await?;
+        info!("IP routing configured successfully");
         Ok(())
+    }
+
+    /// Преобразует маску в формате Ipv4Addr в префикс CIDR
+    fn netmask_to_prefix(&self, netmask: Ipv4Addr) -> Result<u8, anyhow::Error> {
+        let octets = netmask.octets();
+        let mask = u32::from_be_bytes(octets);
+
+        // Проверяем что маска валидна (последовательность единиц followed by нулей)
+        if !self.is_valid_netmask(mask) {
+            return Err(anyhow::anyhow!("Invalid netmask: {}", netmask));
+        }
+
+        // Считаем количество установленных битов
+        Ok(mask.count_ones() as u8)
+    }
+
+    /// Проверяет что маска является валидной сетевой маской
+    fn is_valid_netmask(&self, mask: u32) -> bool {
+        // Маска должна быть последовательностью единиц followed by нулей
+        let inverted = !mask;
+        inverted & (inverted + 1) == 0
     }
 }
