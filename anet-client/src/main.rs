@@ -12,8 +12,8 @@ use tokio::signal::windows::ctrl_c;
 async fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let cfg = load().await?;
-    let client = ANetClient::new(&cfg.cert_path)?;
-    client.connect(&cfg.address, &cfg.auth_phrase).await?;
+    let client = ANetClient::new(&cfg)?;
+    client.connect().await?;
 
     #[cfg(unix)]
     let mut sig = signal(SignalKind::terminate())?;

@@ -17,7 +17,10 @@ yaml-rust2 = { workspace = true }
 prost = {workspace = true}
 bytes = {workspace = true}
 rustls-pemfile = {workspace = true}
+base64 = {workspace = true}
 
 dashmap = "7.0.0-rc2"
 futures = "0.3.31"
 anet-common = { path = "../anet-common"}
+rand = "0.9.2"
+

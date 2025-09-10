@@ -17,6 +17,7 @@ prost = "0.14.1"
 yaml-rust2 = "0.10.1"
 clap = { version = "4.5.47", default-features = false, features = ["std", "derive"] }
 rustls-pemfile = "2.2.0"
+base64 = "0.22.1"
 
 [profile.release.package.anet-client]
 debug = 2
@@ -40,6 +41,3 @@ incremental = false
 
 [profile.release.package."*"]
 opt-level = 3
-
-[build]
-rustflags = ["-C", "target-cpu=native", "-C", "opt-level=3", "-C", "lto=yes"]

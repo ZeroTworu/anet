@@ -31,9 +31,10 @@ pub fn optimize_tcp_connection(stream: &TcpStream) -> anyhow::Result<()> {
 
         // Настройка keepalive
         let keepalive = TcpKeepalive::new()
-            .with_time(Duration::from_secs(300))
-            .with_interval(Duration::from_secs(75))
-            .with_retries(5);
+            .with_time(Duration::from_secs(60))
+            .with_interval(Duration::from_secs(15))
+            .with_retries(4);
+
         socket.set_tcp_keepalive(&keepalive)?;
 
         // Включаем TCP QuickACK для быстрого подтверждения пакетов

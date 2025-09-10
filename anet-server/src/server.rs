@@ -1,9 +1,12 @@
 use std::{fs::File, io::BufReader, net::Ipv4Addr, sync::Arc};
 
 use crate::atun_server::TunManager;
+use crate::client::Client;
 use crate::config::Config;
 use crate::ip_pool::IpPool;
-use anet_common::consts::{MAX_PACKET_SIZE, PACKETS_TO_YIELD};
+use crate::router::{PacketBatcher, Router};
+use crate::utils::{generate_crypto_key, generate_uid};
+use anet_common::consts;
 use anet_common::protocol::{
     ClientTrafficReceive, ClientTrafficSend, Message as AnetMessage, message::Content,
 };
@@ -11,123 +14,16 @@ use anet_common::tcp::optimize_tcp_connection;
 use anet_common::tun_params::TunParams;
 use anyhow::Context;
 use bytes::{Buf, Bytes, BytesMut};
-use dashmap::DashMap;
 use log::{debug, error, info};
 use prost::Message;
 use rustls::ServerConfig;
 use rustls::pki_types::CertificateDer;
-use std::collections::HashSet;
 use std::io::IoSlice;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
-use tokio::time::{Duration, interval};
+use tokio::time::Duration;
 use tokio_rustls::TlsAcceptor;
-
-type ClientTx = mpsc::Sender<Vec<u8>>;
-
-#[derive(Clone)]
-pub struct Router {
-    map: Arc<DashMap<Ipv4Addr, ClientTx>>,
-}
-
-impl Router {
-    pub fn new() -> Self {
-        Self {
-            map: Arc::new(DashMap::new()),
-        }
-    }
-
-    pub fn insert(&self, ip: Ipv4Addr, tx: ClientTx) {
-        info!("{:?} success auth.", ip);
-        self.map.insert(ip, tx);
-    }
-
-    pub fn remove(&self, ip: &Ipv4Addr) {
-        info!("{:?} disconnected.", ip);
-        self.map.remove(ip);
-    }
-
-    #[inline]
-    pub fn find(&self, ip: &Ipv4Addr) -> Option<ClientTx> {
-        match self.map.get(ip) {
-            Some(tx) => Some(tx.clone()),
-            None => None,
-        }
-    }
-
-    pub fn allocated_ips(&self) -> HashSet<Ipv4Addr> {
-        let mut result = HashSet::new();
-
-        for entry in self.map.iter() {
-            result.insert(*entry.key());
-        }
-
-        result
-    }
-}
-
-struct PacketBatcher {
-    batch_size: usize,
-    batch_timeout: Duration,
-}
-
-impl PacketBatcher {
-    fn new(batch_size: usize, batch_timeout_ms: u64) -> Self {
-        Self {
-            batch_size,
-            batch_timeout: Duration::from_millis(batch_timeout_ms),
-        }
-    }
-
-    async fn process_batches(&self, mut rx_from_tun: mpsc::Receiver<Vec<u8>>, router: &Router) {
-        let mut batch = Vec::with_capacity(self.batch_size);
-        let mut interval = interval(self.batch_timeout);
-
-        loop {
-            tokio::select! {
-                biased;
-
-                pkt = rx_from_tun.recv() => {
-                    if let Some(pkt) = pkt {
-                        if pkt.len() > 4 {
-                            batch.push(pkt);
-
-                            if batch.len() >= self.batch_size {
-                                Self::process_batch(&batch, &router).await;
-                                batch.clear();
-                                batch.reserve(self.batch_size);
-                            }
-                        }
-                    }
-                }
-                _ = interval.tick() => {
-                    if !batch.is_empty() {
-                        Self::process_batch(&batch, &router).await;
-                        batch.clear();
-                        batch.reserve(self.batch_size);
-                    }
-                }
-            }
-        }
-    }
-
-    async fn process_batch(batch: &Vec<Vec<u8>>, router: &Router) {
-        for pkt in batch {
-            if let Some(dst) = extract_ip_dst(&pkt) {
-                if let Some(client_tx) = router.find(&dst) {
-                    if let Err(e) = client_tx.send(pkt.to_vec()).await {
-                        error!("Route to {dst} present but send failed: {e}");
-                    }
-                } else {
-                    debug!("No route for dst {dst}");
-                }
-            } else {
-                debug!("Non-IPv4 or too-short packet from TLS, dropped");
-            }
-        }
-    }
-}
 
 pub struct ANetServer {
     tls_acceptor: TlsAcceptor,
@@ -227,7 +123,7 @@ async fn handle_client(
     }
     let msg_len = u32::from_be_bytes(len_buf) as usize;
 
-    if msg_len > MAX_PACKET_SIZE {
+    if msg_len > consts::MAX_PACKET_SIZE {
         anyhow::bail!("Message too long, {} bytes", msg_len);
     }
 
@@ -248,14 +144,14 @@ async fn handle_client(
         }
         _ => anyhow::bail!("First message must be AuthRequest"),
     };
-
+    let crypto_key = generate_crypto_key();
     let response = AnetMessage {
         content: Some(Content::AuthResponse(anet_common::AssignedIp {
             ip: assigned_ip.to_string(),
             netmask: ip_pool.netmask.to_string(),
             gateway: ip_pool.gateway.to_string(),
             mtu: ip_pool.mtu as i32,
-            crypto_key: "dsds".to_string(),
+            crypto_key: crypto_key.to_string(),
         })),
     };
 
@@ -267,35 +163,47 @@ async fn handle_client(
         .await?;
     writer.write_all(&response_data).await?;
 
-    let (tx_to_client, mut rx_to_client) = mpsc::channel::<Vec<u8>>(8192);
-    router.insert(assigned_ip, tx_to_client.clone());
+    let (tx_to_client, mut rx_to_client) = mpsc::channel::<Vec<u8>>(consts::CHANNEL_BUFFER_SIZE);
+
+    let client = Arc::new(Client::new(tx_to_client, generate_uid(), crypto_key));
+    router.insert(assigned_ip, client.clone());
 
     // Server -> Client (ClientTrafficSend) | (TUN -> TLS)
     let writer_task = tokio::spawn(async move {
         let mut data = Vec::new();
         let mut packet_count = 0;
+
         while let Some(pkt) = rx_to_client.recv().await {
             let msg = AnetMessage {
                 content: Some(Content::ClientTrafficSend(ClientTrafficSend {
                     encrypted_packet: pkt,
                 })),
             };
+
             if let Err(e) = msg.encode(&mut data) {
-                error!("Serialize ClientTrafficSend failed: {e}");
+                error!("TUN -> TLS, serialize ClientTrafficSend failed: {e}");
                 continue;
             }
 
             let header = (data.len() as u32).to_be_bytes();
             let slices = [IoSlice::new(&header), IoSlice::new(&data)];
             debug!("TUN -> TLS, size: {}", data.len());
-            if let Err(e) = writer.write_vectored(&slices).await {
-                error!("Error sending data to client {}", e);
+
+            let write_result = tokio::time::timeout(
+                Duration::from_secs(consts::WRITE_TIMEOUT_SECONDS),
+                writer.write_vectored(&slices),
+            )
+            .await;
+
+            if let Err(e) = write_result {
+                error!("TUN -> TLS, write timeout or error: {e}");
                 break;
             }
+
             data.clear();
 
             packet_count += 1;
-            if packet_count == PACKETS_TO_YIELD {
+            if packet_count == consts::PACKETS_TO_YIELD {
                 packet_count = 0;
                 tokio::task::yield_now().await;
             }
@@ -305,12 +213,16 @@ async fn handle_client(
     // Client -> Server (ClientTrafficReceive) | (TLS -> TUN)
     let reader_task = tokio::spawn(async move {
         let mut len_buf = [0u8; 4];
-        let mut read_buffer = BytesMut::with_capacity(MAX_PACKET_SIZE);
+        let mut read_buffer = BytesMut::with_capacity(consts::MAX_PACKET_SIZE);
         let mut packet_count = 0;
         loop {
-            let n = reader.read_buf(&mut read_buffer).await;
-            match n {
-                Ok(n) => {
+            let read_result = tokio::time::timeout(
+                Duration::from_secs(consts::READ_TIMEOUT_SECONDS),
+                reader.read_buf(&mut read_buffer),
+            )
+            .await;
+            match read_result {
+                Ok(Ok(n)) => {
                     if n == 0 {
                         break; // closed
                     }
@@ -331,7 +243,7 @@ async fn handle_client(
                         {
                             Ok(msg) => msg,
                             Err(e) => {
-                                error!("Failed to parse message: {e}");
+                                error!("TLS -> TUN, failed to parse message: {e}");
                                 continue;
                             }
                         };
@@ -343,25 +255,30 @@ async fn handle_client(
                                 encrypted_packet,
                             })) => {
                                 if let Err(e) = tx_to_tun.send(encrypted_packet).await {
-                                    error!("Send to TUN failed: {e}");
+                                    error!("TLS -> TUN, send to TUN failed: {e}");
                                     break;
                                 }
                             }
                             Some(other) => {
-                                info!("Unexpected message: {:?}", other);
+                                info!("TLS -> TUN, unexpected message: {:?}", other);
                             }
                             None => {
-                                error!("Empty message received");
+                                error!("TLS -> TUN, empty message received");
                             }
                         }
                     }
                 }
-                Err(e) => {
-                    error!("Client -> Server (ClientTrafficReceive), Read Error: {}", e);
+                Ok(Err(e)) => {
+                    error!("TLS -> TUN, Read Error: {}", e);
+                    break;
+                }
+                Err(_) => {
+                    error!("TLS -> TUN, Read timeout - closing connection");
+                    break;
                 }
             }
             packet_count += 1;
-            if packet_count == PACKETS_TO_YIELD {
+            if packet_count == consts::PACKETS_TO_YIELD {
                 packet_count = 0;
                 tokio::task::yield_now().await;
             }
@@ -400,17 +317,4 @@ fn load_tls_config(cert_path: &str, key_path: &str) -> anyhow::Result<ServerConf
     cfg.alpn_protocols = vec![b"h2".to_vec()];
 
     Ok(cfg)
-}
-
-#[inline]
-fn extract_ip_dst(pkt: &[u8]) -> Option<Ipv4Addr> {
-    if pkt.len() < 20 {
-        return None;
-    }
-
-    if (pkt[0] >> 4) != 4 {
-        return None;
-    }
-
-    Some(Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]))
 }

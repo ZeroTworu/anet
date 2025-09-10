@@ -3,6 +3,10 @@ use aes_gcm::{
     aead::{Aead, AeadCore, KeyInit, OsRng},
 };
 use anyhow::Result;
+use base64::{
+    Engine as _, alphabet,
+    engine::{self, general_purpose},
+};
 
 #[derive(Clone)]
 pub struct Crypto {
@@ -10,6 +14,16 @@ pub struct Crypto {
 }
 
 impl Crypto {
+    pub fn new_from_key(key_str: String) -> Self {
+        let key_bytes = engine::GeneralPurpose::new(&alphabet::URL_SAFE, general_purpose::NO_PAD)
+            .decode(key_str)
+            .unwrap();
+
+        let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
+        let cipher = Aes256Gcm::new(key);
+        Self { cipher }
+    }
+
     pub fn new(key: &[u8; 32]) -> Self {
         let key = Key::<Aes256Gcm>::from_slice(key);
         let cipher = Aes256Gcm::new(key);
