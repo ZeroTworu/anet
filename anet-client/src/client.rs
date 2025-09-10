@@ -61,7 +61,7 @@ impl ANetClient {
             tls_connector: connector,
             server_addr: cfg.address.to_string(),
             auth_phrase: cfg.auth_phrase.to_string(),
-          })
+        })
     }
 
     pub async fn connect(&self) -> Result<()> {
@@ -72,8 +72,7 @@ impl ANetClient {
             match self.try_connect().await {
                 Ok(()) => {
                     info!("Connection established successfully");
-                    retry_count = 0;
-                    delay = INITIAL_DELAY;
+                    break Ok(());
                 }
                 Err(e) => {
                     retry_count += 1;
@@ -225,7 +224,7 @@ impl ANetClient {
                         }
                         Err(e) => {
                             error!("TLS -> TUN, error: {}", e);
-                              if let Err(e) =
+                            if let Err(e) =
                                 reconnect(&server_addr, &auth_phrase, &tls_connector).await
                             {
                                 error!("Reconnection failed: {}", e);

@@ -197,7 +197,8 @@ async fn handle_client(
 
             if let Err(e) = write_result {
                 error!("TUN -> TLS, write timeout or error: {e}");
-                break;
+                writer.flush().await.unwrap();
+                continue;
             }
 
             data.clear();
