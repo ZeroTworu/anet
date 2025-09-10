@@ -86,12 +86,6 @@ impl PacketBatcher {
                         batch.clear();
                         batch.reserve(self.batch_size);
                     }
-
-                    // Обновляем приоритеты каждые 10 секунд
-                    // if last_priority_update.elapsed() > Duration::from_secs(10) {
-                    //     last_priority_update = Instant::now();
-                    //     Self::update_priorities(router, last_priority_update.elapsed().as_secs()).await;
-                    // }
                 }
             }
         }

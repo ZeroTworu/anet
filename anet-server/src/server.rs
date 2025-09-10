@@ -22,7 +22,6 @@ use std::io::IoSlice;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
-use tokio::time::Duration;
 use tokio_rustls::TlsAcceptor;
 
 pub struct ANetServer {
@@ -189,22 +188,13 @@ async fn handle_client(
             let slices = [IoSlice::new(&header), IoSlice::new(&data)];
             debug!("TUN -> TLS, size: {}", data.len());
 
-            let write_result = tokio::time::timeout(
-                Duration::from_secs(consts::WRITE_TIMEOUT_SECONDS),
-                writer.write_vectored(&slices),
-            )
-            .await;
-
-            if let Err(e) = write_result {
-                error!("TUN -> TLS, write timeout or error: {e}");
-                writer.flush().await.unwrap();
-                continue;
+            if let Err(e) = writer.write_vectored(&slices).await {
+                error!("Error sending data to client {}", e);
             }
-
             data.clear();
 
             packet_count += 1;
-            if packet_count == consts::PACKETS_TO_YIELD {
+            if packet_count >= consts::PACKETS_TO_YIELD {
                 packet_count = 0;
                 tokio::task::yield_now().await;
             }
@@ -217,17 +207,12 @@ async fn handle_client(
         let mut read_buffer = BytesMut::with_capacity(consts::MAX_PACKET_SIZE);
         let mut packet_count = 0;
         loop {
-            let read_result = tokio::time::timeout(
-                Duration::from_secs(consts::READ_TIMEOUT_SECONDS),
-                reader.read_buf(&mut read_buffer),
-            )
-            .await;
-            match read_result {
-                Ok(Ok(n)) => {
+            let n = reader.read_buf(&mut read_buffer).await;
+            match n {
+                Ok(n) => {
                     if n == 0 {
                         break; // closed
                     }
-
                     while read_buffer.len() >= 4 {
                         len_buf.copy_from_slice(&read_buffer[0..4]);
                         let msg_len = u32::from_be_bytes(len_buf) as usize;
@@ -269,17 +254,13 @@ async fn handle_client(
                         }
                     }
                 }
-                Ok(Err(e)) => {
+                Err(e) => {
                     error!("TLS -> TUN, Read Error: {}", e);
-                    break;
-                }
-                Err(_) => {
-                    error!("TLS -> TUN, Read timeout - closing connection");
                     break;
                 }
             }
             packet_count += 1;
-            if packet_count == consts::PACKETS_TO_YIELD {
+            if packet_count >= consts::PACKETS_TO_YIELD {
                 packet_count = 0;
                 tokio::task::yield_now().await;
             }

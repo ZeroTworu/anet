@@ -10,32 +10,47 @@ use tokio::signal::unix::{SignalKind, signal};
 use tokio::signal::windows::ctrl_c;
 
 fn generate_ascii_art(build_type: &str, commit_hash: &str, build_time: &str) -> String {
+    // Обрезаем строки до нужной длины, чтобы они помещались в рамку
+    let build_type_display = if build_type.len() > 10 {
+        &build_type[..10]
+    } else {
+        build_type
+    };
+    let commit_hash_display = if commit_hash.len() > 7 {
+        &commit_hash[..7]
+    } else {
+        commit_hash
+    };
+    let build_time_display = if build_time.len() > 19 {
+        &build_time[..19]
+    } else {
+        build_time
+    };
+
     format!(
         r#"
-        ╔═══════════════════════════════════════════════════════════════╗
-        ║                                                               ║
-        ║               █████╗ ███╗   ██╗███████╗████████╗              ║
-        ║               ██╔══██╗████╗  ██║██╔════╝╚══██╔══╝             ║
-        ║               ███████║██╔██╗ ██║█████╗     ██║                ║
-        ║               ██╔══██║██║╚██╗██║██╔══╝     ██║                ║
-        ║               ██║  ██║██║ ╚████║███████╗   ██║                ║
-        ║               ╚═╝  ╚═╝╚═╝  ╚═══╝╚══════╝   ╚═╝                ║
-        ║                                                               ║
-        ╠═══════════════════════════════════════════════════════════════╣
-        ║                                                               ║
-        ║                   Build Type: {:16}                           ║
-        ║                   Commit Hash: {:16}                          ║
-        ║                   Build Time:  {:16}                          ║
-        ║                                                               ║
-        ║           >> Welcome to the digital revolution! <<            ║
-        ║                                                               ║
-        ╚═══════════════════════════════════════════════════════════════╝
+                    ╔═══════════════════════════════════════════════════════════════╗
+                    ║                                                               ║
+                    ║                 █████╗ ███╗   ██╗███████╗████████╗            ║
+                    ║                 ██╔══██╗████╗  ██║██╔════╝╚══██╔══╝           ║
+                    ║                 ███████║██╔██╗ ██║█████╗     ██║              ║
+                    ║                 ██╔══██║██║╚██╗██║██╔══╝     ██║              ║
+                    ║                 ██║  ██║██║ ╚████║███████╗   ██║              ║
+                    ║                 ╚═╝  ╚═╝╚═╝  ╚═══╝╚══════╝   ╚═╝              ║
+                    ║                           by Hanyuufag                        ║
+                    ╠═══════════════════════════════════════════════════════════════╣
+                    ║                                                               ║
+                    ║                   Build Type: {:<16}                ║
+                    ║                   Commit Hash: {:<16}               ║
+                    ║                   Build Time:  {:<19}            ║
+                    ║                                                               ║
+                    ║               >> Welcome to the digital revolution! <<        ║
+                    ║                                                               ║
+                    ╚═══════════════════════════════════════════════════════════════╝
 "#,
-        build_type, commit_hash, build_time
+        build_type_display, commit_hash_display, build_time_display
     )
 }
-
-
 
 #[tokio::main]
 async fn main() -> Result<()> {

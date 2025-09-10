@@ -1,3 +1,4 @@
+use std::io::Write;
 use anet_common::consts::MAX_PACKET_SIZE;
 use anet_common::protocol::AssignedIp;
 use anet_common::tun_params::TunParams;
@@ -48,10 +49,13 @@ impl TunManager {
             .up();
 
         config = config.address(&self.params.address);
-
         config = config.netmask(&self.params.netmask);
-
         config = config.destination(&self.params.gateway);
+
+        #[cfg(windows)]
+        {
+            config = config.ring_capacity(67108864);
+        }
 
         config.clone()
     }
@@ -86,7 +90,6 @@ impl TunManager {
                     Ok(n) => {
                         if n > 0 {
                             let pkt = tun_buffer[..n].to_vec();
-                            debug!("TUN -> TLS: {} bytes", pkt.len());
                             if let Err(e) = tx_to_tls.send(pkt).await {
                                 error!("Error TUN -> TLS: {:?}", e);
                             }
@@ -101,14 +104,20 @@ impl TunManager {
         });
 
         tokio::spawn(async move {
+            let mut packet_count = 0;
             loop {
                 let packet = rx_to_tun.recv().await;
                 match packet {
                     Some(pkt) => {
-                        debug!("TLS -> TUN: {} bytes", pkt.len());
                         if let Err(e) = tun_writer.write_all(&pkt).await {
+                            tun_writer.flush().await.unwrap();
                             error!("Error TLS -> TUN: {:?}", e);
                             break;
+                        }
+                        packet_count += 1;
+                        if packet_count >= 20 {
+                            packet_count = 0;
+                           tokio::task::yield_now().await;
                         }
                     }
                     None => break,

@@ -19,10 +19,14 @@ fn main() {
 
     // Получаем хэш коммита
     let commit_hash = if let Ok(hash) = env::var("GITHUB_SHA") {
-        // CI/CD сборка - используем переменную из окружения
-        hash
+        // CI/CD сборка - используем переменную из окружения и обрезаем до 7 символов
+        if hash.len() > 7 {
+            hash[..7].to_string()
+        } else {
+            hash
+        }
     } else {
-        // Локальная сборка - пытаемся получить из git
+        // Локальная сборка - пытаемся получить из git (уже короткий)
         Command::new("git")
             .args(&["rev-parse", "--short", "HEAD"])
             .output()
@@ -43,6 +47,9 @@ fn main() {
         .unwrap()
         .as_secs();
 
+    // Форматируем время вручную без внешних зависимостей
+    let datetime = format_timestamp(build_time);
+
     // Определяем тип сборки
     let build_type = if env::var("GITHUB_SHA").is_ok() {
         "CI/CD"
@@ -52,7 +59,7 @@ fn main() {
 
     // Записываем константы в файл
     writeln!(f, "pub const COMMIT_HASH: &str = \"{}\";", commit_hash).unwrap();
-    writeln!(f, "pub const BUILD_TIME: &str = \"{}\";", format_timestamp(build_time)).unwrap();
+    writeln!(f, "pub const BUILD_TIME: &str = \"{}\";", datetime).unwrap();
     writeln!(f, "pub const BUILD_TYPE: &str = \"{}\";", build_type).unwrap();
 
     // Перекомпилируем при изменении build.rs
@@ -66,4 +73,3 @@ fn main() {
         target
     );
 }
-

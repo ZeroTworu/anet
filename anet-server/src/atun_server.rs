@@ -3,12 +3,13 @@ use anet_common::consts::{CHANNEL_BUFFER_SIZE, PACKETS_TO_YIELD};
 use anet_common::tun_params::TunParams;
 use anyhow::{Context, Result};
 use futures::{SinkExt, StreamExt};
-use log::{debug, error, info};
+use log::{error, info};
 use std::net::Ipv4Addr;
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio_util::codec::Framed;
 use tun::{AsyncDevice, Configuration};
+
 pub struct TunManager {
     params: TunParams,
     network: Ipv4Addr,
@@ -56,14 +57,12 @@ impl TunManager {
         tokio::spawn(async move {
             let mut packet_count = 0;
             while let Some(pkt) = rx_to_tun.recv().await {
-                debug!("TLS -> TUN");
-
                 if let Err(e) = sink.send(pkt).await {
                     error!("Failed to write to TUN: {e}");
                 }
 
                 packet_count += 1;
-                if packet_count == PACKETS_TO_YIELD {
+                if packet_count >= PACKETS_TO_YIELD {
                     packet_count = 0;
                     tokio::task::yield_now().await;
                 }
@@ -75,7 +74,6 @@ impl TunManager {
             while let Some(item) = stream.next().await {
                 match item {
                     Ok(pkt) => {
-                        debug!("TUN -> TLS");
                         if let Err(e) = tx_from_tun.send(pkt).await {
                             error!("Failed to deliver packet from TUN: {e}");
                             break;
@@ -84,7 +82,7 @@ impl TunManager {
                     Err(err) => error!("Error reading packet from TUN: {err:?}"),
                 }
                 packet_count += 1;
-                if packet_count == PACKETS_TO_YIELD {
+                if packet_count >= PACKETS_TO_YIELD {
                     packet_count = 0;
                     tokio::task::yield_now().await;
                 }
