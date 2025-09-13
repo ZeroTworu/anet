@@ -23,17 +23,20 @@ pub fn optimize_tcp_connection(stream: &TcpStream) -> anyhow::Result<()> {
         let socket = unsafe { Socket::from_raw_fd(raw_fd) };
 
         // Поэкспериментируем с разными размерами буферов
-        socket.set_send_buffer_size(64 * 1024)?;
+        // socket.set_send_buffer_size(1024 * 1024)?;
+        // socket.set_recv_buffer_size(1024 * 1024)?;
 
         // Включаем TCP_NODELAY для уменьшения задержки
         socket.set_tcp_nodelay(true)?;
         socket.set_nonblocking(true)?;
+        socket.set_tcp_nodelay(false)?;
+        socket.set_linger(Some(Duration::from_secs(30)))?;
 
         // Настройка keepalive
         let keepalive = TcpKeepalive::new()
-            .with_time(Duration::from_secs(60))
+            .with_time(Duration::from_secs(300))
             .with_interval(Duration::from_secs(15))
-            .with_retries(4);
+            .with_retries(8);
 
         socket.set_tcp_keepalive(&keepalive)?;
 
@@ -63,22 +66,6 @@ pub fn optimize_tcp_connection(stream: &TcpStream) -> anyhow::Result<()> {
         std::mem::forget(socket);
     }
 
-    #[cfg(windows)]
-    {
-        let raw_socket = stream.as_raw_socket() as WinSock::SOCKET;
-
-        let recv_buf_size: i32 = 1024 * 1024;
-
-        unsafe {
-            WinSock::setsockopt(
-                raw_socket,
-                WinSock::SOL_SOCKET,
-                WinSock::SO_RCVBUF,
-                &recv_buf_size as *const _ as *const _,
-                std::mem::size_of::<i32>() as i32,
-            );
-        }
-    }
 
     Ok(())
 }
