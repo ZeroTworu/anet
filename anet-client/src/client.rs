@@ -6,9 +6,10 @@ use anet_common::protocol::{
     AuthRequest, ClientTrafficReceive, Message as AnetMessage, message::Content,
 };
 use anet_common::tcp::optimize_tcp_connection;
+use anet_common::tun_params::TunParams;
 use anyhow::Result;
 use bytes::{Buf, Bytes, BytesMut};
-use log::{debug, error, info, warn};
+use log::{debug, error, info};
 use prost::Message;
 use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::{ClientConfig, RootCertStore};
@@ -26,7 +27,7 @@ const INITIAL_DELAY: u64 = 2;
 const MAX_DELAY: u64 = 60;
 
 pub struct ANetClient {
-    tun_manager: TunManager,
+    pub tun_manager: TunManager,
     tls_connector: TlsConnector,
     server_addr: String,
     auth_phrase: String,
@@ -64,15 +65,15 @@ impl ANetClient {
         })
     }
 
-    pub async fn connect(&self) -> Result<()> {
+    pub async fn connect(&self) -> Result<TunParams> {
         let mut retry_count = 0;
         let mut delay = INITIAL_DELAY;
 
         loop {
             match self.try_connect().await {
-                Ok(()) => {
+                Ok(params) => {
                     info!("Connection established successfully");
-                    break Ok(());
+                    break Ok(params.clone());
                 }
                 Err(e) => {
                     retry_count += 1;
@@ -96,7 +97,7 @@ impl ANetClient {
         }
     }
 
-    async fn try_connect(&self) -> Result<()> {
+    async fn try_connect(&self) -> Result<TunParams> {
         let (tx_to_tun, rx_from_tun) = mpsc::channel(8192);
         let (tx_to_tls, mut rx_from_tls) = mpsc::channel(8192);
 
@@ -153,8 +154,7 @@ impl ANetClient {
         };
 
         if !tun_manager.is_set {
-            warn!("TUN manager is disabled, shutting down");
-            return Ok(());
+            error!("TUN manager is disabled, shutting down");
         }
 
         let tun_task = tokio::spawn({
@@ -291,7 +291,7 @@ impl ANetClient {
             _ = writer_task => {}
         }
 
-        Ok(())
+        Ok(tun_manager.params)
     }
 }
 

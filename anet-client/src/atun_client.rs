@@ -1,9 +1,8 @@
-use std::io::Write;
-use anet_common::consts::MAX_PACKET_SIZE;
+use anet_common::consts::{MAX_PACKET_SIZE, PACKETS_TO_YIELD};
 use anet_common::protocol::AssignedIp;
 use anet_common::tun_params::TunParams;
 use anyhow::{Context, Result};
-use log::{debug, error, info};
+use log::{error, info};
 use std::net::Ipv4Addr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
@@ -11,7 +10,7 @@ use tun::{AsyncDevice, Configuration};
 
 #[derive(Clone)]
 pub struct TunManager {
-    params: TunParams,
+    pub params: TunParams,
     pub is_set: bool,
 }
 
@@ -74,6 +73,7 @@ impl TunManager {
         }
     }
 
+    #[inline]
     pub async fn start_processing(
         &mut self,
         tx_to_tls: mpsc::Sender<Vec<u8>>,
@@ -115,9 +115,9 @@ impl TunManager {
                             break;
                         }
                         packet_count += 1;
-                        if packet_count >= 20 {
+                        if packet_count >= PACKETS_TO_YIELD {
                             packet_count = 0;
-                           tokio::task::yield_now().await;
+                            tokio::task::yield_now().await;
                         }
                     }
                     None => break,

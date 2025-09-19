@@ -6,6 +6,10 @@ use log::info;
 
 #[cfg(unix)]
 use tokio::signal::unix::{SignalKind, signal};
+
+#[cfg(unix)]
+use anet_client::lrm::LinuxRouteManager;
+
 #[cfg(windows)]
 use tokio::signal::windows::ctrl_c;
 
@@ -60,15 +64,34 @@ async fn main() -> Result<()> {
     println!("{}", ascii_art);
     let cfg = load().await?;
     let client = ANetClient::new(&cfg)?;
-    client.connect().await?;
+
+    let params = client.connect().await?;
+
+    #[cfg(unix)]
+    let mut linux_router = LinuxRouteManager::new(
+        &params,
+        cfg.address.split(':').collect::<Vec<&str>>()[0].to_string(),
+    );
+
+    #[cfg(unix)]
+    linux_router.backup_original_routes()?;
+
+    #[cfg(unix)]
+    linux_router.setup_vpn_routing()?;
 
     #[cfg(unix)]
     let mut sig = signal(SignalKind::terminate())?;
+
     #[cfg(windows)]
     let mut sig = ctrl_c()?;
+
     info!("Press Ctrl-C to exit.");
 
     sig.recv().await;
+
+    #[cfg(unix)]
+    linux_router.restore_original_routing()?;
+
     info!("Shutting down...");
     Ok(())
 }

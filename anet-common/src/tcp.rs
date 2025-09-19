@@ -29,7 +29,6 @@ pub fn optimize_tcp_connection(stream: &TcpStream) -> anyhow::Result<()> {
         // Включаем TCP_NODELAY для уменьшения задержки
         socket.set_tcp_nodelay(true)?;
         socket.set_nonblocking(true)?;
-        socket.set_tcp_nodelay(false)?;
         socket.set_linger(Some(Duration::from_secs(30)))?;
 
         // Настройка keepalive
@@ -65,7 +64,6 @@ pub fn optimize_tcp_connection(stream: &TcpStream) -> anyhow::Result<()> {
         }
         std::mem::forget(socket);
     }
-
 
     Ok(())
 }
