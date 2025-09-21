@@ -1,5 +1,5 @@
 use anet_common::consts::{MAX_PACKET_SIZE, PACKETS_TO_YIELD};
-use anet_common::protocol::AssignedIp;
+use anet_common::protocol::AuthResponse;
 use anet_common::tun_params::TunParams;
 use anyhow::{Context, Result};
 use log::{error, info};
@@ -22,7 +22,7 @@ impl TunManager {
         }
     }
 
-    pub fn set_ip_network_params(&mut self, params: &AssignedIp) -> Result<()> {
+    pub fn set_ip_network_params(&mut self, params: &AuthResponse) -> Result<()> {
         let address: Ipv4Addr = params.ip.parse().context("Invalid IP address format")?;
         let netmask: Ipv4Addr = params
             .netmask
@@ -79,6 +79,8 @@ impl TunManager {
         tx_to_tls: mpsc::Sender<Vec<u8>>,
         mut rx_to_tun: mpsc::Receiver<Vec<u8>>,
     ) -> Result<()> {
+        info!("{}", self.get_info());
+
         let async_dev = self.create_as_async();
         let (mut tun_reader, mut tun_writer) = tokio::io::split(async_dev);
         // Ссаный костыль из-за windows

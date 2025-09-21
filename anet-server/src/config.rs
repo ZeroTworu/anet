@@ -15,6 +15,7 @@ pub struct Config {
     pub external_if: String,
     pub if_name: String,
     pub mtu: u16,
+    pub udp_port: u32,
 }
 
 #[derive(Debug, Parser)]
@@ -42,6 +43,7 @@ pub async fn load() -> anyhow::Result<Config> {
         key_path: server["key_path"].as_str().unwrap().to_string(),
         bind_to: server["bind_to"].as_str().unwrap().to_string(),
         external_if: server["external_if"].as_str().unwrap().to_string(),
+        udp_port: server["udp_port"].as_str().unwrap().parse::<u32>().unwrap(),
     };
     Ok(cfg)
 }

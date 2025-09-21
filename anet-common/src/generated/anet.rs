@@ -5,7 +5,7 @@ pub struct AuthRequest {
     pub key: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct AssignedIp {
+pub struct AuthResponse {
     #[prost(string, tag = "1")]
     pub ip: ::prost::alloc::string::String,
     #[prost(string, tag = "2")]
@@ -14,22 +14,27 @@ pub struct AssignedIp {
     pub gateway: ::prost::alloc::string::String,
     #[prost(int32, tag = "4")]
     pub mtu: i32,
-    #[prost(string, tag = "5")]
-    pub crypto_key: ::prost::alloc::string::String,
+    /// 32-байтовый ключ для ChaCha20Poly1305
+    #[prost(bytes = "vec", tag = "5")]
+    pub crypto_key: ::prost::alloc::vec::Vec<u8>,
+    /// Порт для UDP соединения
+    #[prost(uint32, tag = "6")]
+    pub udp_port: u32,
+    #[prost(string, tag = "7")]
+    pub client_id: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct ClientTrafficReceive {
-    #[prost(bytes = "vec", tag = "1")]
-    pub encrypted_packet: ::prost::alloc::vec::Vec<u8>,
-}
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct ClientTrafficSend {
-    #[prost(bytes = "vec", tag = "1")]
-    pub encrypted_packet: ::prost::alloc::vec::Vec<u8>,
+pub struct UdpHandshake {
+    /// 16-байтовый идентификатор клиента
+    #[prost(string, tag = "1")]
+    pub client_id: ::prost::alloc::string::String,
+    /// Метка времени для защиты от replay-атак
+    #[prost(uint64, tag = "2")]
+    pub timestamp: u64,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Message {
-    #[prost(oneof = "message::Content", tags = "1, 2, 3, 4")]
+    #[prost(oneof = "message::Content", tags = "1, 2, 3")]
     pub content: ::core::option::Option<message::Content>,
 }
 /// Nested message and enum types in `Message`.
@@ -39,10 +44,8 @@ pub mod message {
         #[prost(message, tag = "1")]
         AuthRequest(super::AuthRequest),
         #[prost(message, tag = "2")]
-        AuthResponse(super::AssignedIp),
+        AuthResponse(super::AuthResponse),
         #[prost(message, tag = "3")]
-        ClientTrafficReceive(super::ClientTrafficReceive),
-        #[prost(message, tag = "4")]
-        ClientTrafficSend(super::ClientTrafficSend),
+        UdpHandshake(super::UdpHandshake),
     }
 }

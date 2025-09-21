@@ -2,18 +2,22 @@ use base64::{
     Engine as _, alphabet,
     engine::{self, general_purpose},
 };
-use rand::Rng;
+use chacha20poly1305::aead::rand_core::RngCore;
+use rand;
 use std::net::Ipv4Addr;
 
-pub fn generate_crypto_key() -> String {
-    let mut rng = rand::rng();
-    let key: [u8; 32] = rng.random();
-    engine::GeneralPurpose::new(&alphabet::URL_SAFE, general_purpose::NO_PAD).encode(key)
+pub fn generate_crypto_key() -> [u8; 32] {
+    let mut rng = rand::thread_rng();
+    let mut crypto_key = [0u8; 32];
+    rng.fill_bytes(&mut crypto_key);
+    crypto_key
 }
 
 pub fn generate_uid() -> String {
-    let mut rng = rand::rng();
-    format!("{:x}", rng.random::<u64>())
+    let mut rng = rand::thread_rng();
+    let mut client_id = [0u8; 16];
+    rng.fill_bytes(&mut client_id);
+    engine::GeneralPurpose::new(&alphabet::URL_SAFE, general_purpose::NO_PAD).encode(client_id)
 }
 
 #[inline]

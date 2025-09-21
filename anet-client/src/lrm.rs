@@ -1,4 +1,4 @@
-use anet_common::tun_params::TunParams;
+use anet_common::AuthResponse;
 use anyhow::{Context, Result};
 use log::{info, warn};
 use std::net::Ipv4Addr;
@@ -14,10 +14,10 @@ pub struct LinuxRouteManager {
 }
 
 impl LinuxRouteManager {
-    pub fn new(params: &TunParams, vpn_server_ip: String) -> Self {
+    pub fn new(params: &AuthResponse, vpn_server_ip: String) -> Self {
         Self {
-            vpn_gateway: params.gateway,
-            vpn_interface: params.name.clone(),
+            vpn_gateway: params.gateway.parse().unwrap(),
+            vpn_interface: "anet-client".to_string(),
             original_gateway: None,
             original_interface: None,
             vpn_server_ip,
@@ -144,7 +144,7 @@ impl LinuxRouteManager {
             if !status.success() {
                 // Добавляем таблицу
                 let _ = Command::new("sh")
-                    .args(&["-c", "echo '200 vpn' | sudo tee -a /etc/iproute2/rt_tables"]);
+                    .args(&["-c", "echo '200 vpn' | tee -a /etc/iproute2/rt_tables"]);
             }
         }
     }

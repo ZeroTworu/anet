@@ -1,4 +1,6 @@
 #![allow(dead_code)]
 #![allow(clippy::all)]
 
-include!("_.rs");
+mod anet;
+
+include!("anet.rs");
