@@ -6,13 +6,12 @@ use crate::config::Config;
 use crate::ip_pool::IpPool;
 use crate::utils::{generate_crypto_key, generate_uid};
 use anet_common::AuthResponse;
-use anet_common::consts::{PACKET_TYPE_DATA, PACKET_TYPE_HANDSHAKE};
+use anet_common::encryption::Cipher;
+use anet_common::consts::{MAX_PACKET_SIZE, PACKET_TYPE_DATA, PACKET_TYPE_HANDSHAKE};
 use anet_common::protocol::{Message as AnetMessage, message::Content};
 use anet_common::tun_params::TunParams;
 use anyhow::Context;
-use bytes::Bytes;
-use chacha20poly1305::aead::generic_array::GenericArray;
-use chacha20poly1305::{AeadInPlace, ChaCha20Poly1305, KeyInit};
+use bytes::{BufMut, Bytes, BytesMut};
 use log::{debug, error, info, warn};
 use prost::Message;
 use rustls::ServerConfig;
@@ -27,7 +26,7 @@ use tokio_rustls::{TlsAcceptor, server::TlsStream};
 
 #[derive(Clone)]
 struct UdpClient {
-    cipher: ChaCha20Poly1305,
+    cipher: Cipher,
     last_seen: std::time::Instant,
     client_id: String,
     assigned_ip: String,
@@ -38,7 +37,7 @@ pub struct ANetServer {
     ip_pool: IpPool,
     cfg: Config,
     udp_clients: Arc<Mutex<HashMap<SocketAddr, UdpClient>>>,
-    uid_to_key: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+    uid_to_key: Arc<Mutex<HashMap<String, [u8; 32]>>>,
     tun_manager: TunManager,
     ip_to_addr: Arc<Mutex<HashMap<String, SocketAddr>>>,
     client_id_to_ip: Arc<Mutex<HashMap<String, String>>>,
@@ -100,7 +99,6 @@ impl ANetServer {
         tokio::spawn(async move {
             while let Some(packet) = rx_from_tun.recv().await {
                 if packet.len() < 20 {
-                    error!("Packet too short to parse IP header");
                     continue;
                 }
 
@@ -130,34 +128,27 @@ impl ANetServer {
                         };
 
                         // Шифруем пакет для этого клиента
-                        let mut nonce_bytes = [0u8; 12];
-                        nonce_bytes[4..].copy_from_slice(&sequence.to_be_bytes());
-                        let nonce = GenericArray::from_slice(&nonce_bytes);
+                        let nonce = Cipher::generate_nonce(sequence);
 
-                        let mut encrypted_data = packet.clone();
-                        if let Err(e) =
-                            client
-                                .cipher
-                                .encrypt_in_place(nonce, b"", &mut encrypted_data)
-                        {
-                            error!("Encryption failed: {}", e);
-                            continue;
-                        }
+                        // Шифруем пакет
+                        match client.cipher.encrypt(&nonce, packet) {
+                            Ok(encrypted_data) => {
+                                // Формируем пакет: [тип: 1 байт][sequence: 8 байт][зашифрованные данные]
+                                let mut data = BytesMut::with_capacity(1 + 8 + encrypted_data.len());
+                                data.put_u8(PACKET_TYPE_DATA);
+                                data.put_u64(sequence);
+                                data.extend_from_slice(&encrypted_data);
 
-                        // [тип: 1 байт][sequence: 8 байт][зашифрованные данные]
-                        let mut data = Vec::with_capacity(1 + 8 + encrypted_data.len());
-                        data.push(PACKET_TYPE_DATA);
-                        data.extend_from_slice(&sequence.to_be_bytes());
-                        data.extend_from_slice(&encrypted_data);
-
-                        // send
-                        if let Err(e) = udp_socket_for_tun.send_to(&data, addr).await {
-                            error!("Failed to send UDP packet: {}", e);
-
-                            // Если отправка не удалась
-                            // Удаляем его sequence number
-                            let mut seq_nums = sequence_numbers.lock().await;
-                            seq_nums.remove(&addr);
+                                // Отправляем
+                                if let Err(e) = udp_socket_for_tun.send_to(&data, addr).await {
+                                    error!("Failed to send UDP packet: {}", e);
+                                    let mut seq_nums = sequence_numbers.lock().await;
+                                    seq_nums.remove(&addr);
+                                }
+                            }
+                            Err(e) => {
+                                error!("Encryption failed: {}", e);
+                            }
                         }
                     } else {
                         warn!("Client not found for addr: {}", addr);
@@ -177,11 +168,11 @@ impl ANetServer {
         let client_id_to_ip = self.client_id_to_ip.clone();
 
         tokio::spawn(async move {
-            let mut buffer = [0u8; 65536];
+            let mut buffer = vec![0u8; MAX_PACKET_SIZE];
             loop {
                 match udp_socket_for_task.recv_from(&mut buffer).await {
                     Ok((len, addr)) => {
-                        let data = buffer[..len].to_vec();
+                        let data = Bytes::copy_from_slice(&buffer[..len]);
                         let mut clients = udp_clients_for_task.lock().await;
 
                         if let Some(client) = clients.get_mut(&addr) {
@@ -195,7 +186,7 @@ impl ANetServer {
 
                             // Обрабатываем пакет
                             if let Err(e) =
-                                Self::handle_udp_data(data.clone(), client_clone, tx_to_tun.clone())
+                                Self::handle_udp_data(data, client_clone, tx_to_tun.clone())
                                     .await
                             {
                                 error!("Failed to handle UDP packet: {}", e);
@@ -213,7 +204,7 @@ impl ANetServer {
                                 data,
                                 addr,
                             )
-                            .await
+                                .await
                             {
                                 error!("Failed to handle UDP handshake: {}", e);
                             }
@@ -287,7 +278,7 @@ impl ANetServer {
                             uid_to_key,
                             client_id_to_ip,
                         )
-                        .await
+                            .await
                         {
                             error!("Error handling TLS auth: {}", e);
                         }
@@ -302,13 +293,13 @@ impl ANetServer {
 
     async fn handle_udp_handshake(
         udp_clients: Arc<Mutex<HashMap<SocketAddr, UdpClient>>>,
-        uid_to_key: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+        uid_to_key: Arc<Mutex<HashMap<String, [u8; 32]>>>,
         ip_to_addr: Arc<Mutex<HashMap<String, SocketAddr>>>,
         client_id_to_ip: Arc<Mutex<HashMap<String, String>>>,
-        data: Vec<u8>,
+        data: Bytes,
         addr: SocketAddr,
     ) -> anyhow::Result<()> {
-        let message: AnetMessage = Message::decode(Bytes::from(data))?;
+        let message: AnetMessage = Message::decode(data)?;
 
         match message.content {
             Some(Content::UdpHandshake(handshake)) => {
@@ -335,7 +326,7 @@ impl ANetServer {
                     anyhow::bail!("No IP allocated for client_id: {}", handshake.client_id);
                 }
 
-                let cipher = ChaCha20Poly1305::new(GenericArray::from_slice(&crypto_key.unwrap()));
+                let cipher = Cipher::new(&crypto_key.unwrap());
                 let assigned_ip = assigned_ip.unwrap();
 
                 // Добавляем клиента
@@ -361,16 +352,16 @@ impl ANetServer {
     }
 
     async fn handle_udp_data(
-        data: Vec<u8>,
+        data: Bytes,
         client: UdpClient,
-        tx_to_tun: mpsc::Sender<Vec<u8>>,
+        tx_to_tun: mpsc::Sender<Bytes>,
     ) -> anyhow::Result<()> {
         if data.is_empty() {
             return Err(anyhow::anyhow!("Empty UDP packet"));
         }
 
         let packet_type = data[0];
-        let packet_data = &data[1..];
+        let packet_data = data.slice(1..);
 
         match packet_type {
             PACKET_TYPE_DATA => {
@@ -379,35 +370,30 @@ impl ANetServer {
                     return Err(anyhow::anyhow!("Data packet too short"));
                 }
 
-                let sequence_bytes: [u8; 8] = packet_data[0..8].try_into().unwrap();
+                let sequence_bytes: [u8; 8] = packet_data[0..8].try_into()?;
                 let sequence = u64::from_be_bytes(sequence_bytes);
-                let encrypted_data = &packet_data[8..];
 
                 // Расшифровываем пакет
-                let mut nonce_bytes = [0u8; 12];
-                nonce_bytes[4..].copy_from_slice(&sequence.to_be_bytes());
-                let nonce = GenericArray::from_slice(&nonce_bytes);
-
-                let mut decrypted_data = encrypted_data.to_vec();
-                if let Err(e) = client
-                    .cipher
-                    .decrypt_in_place(nonce, b"", &mut decrypted_data)
-                {
-                    error!("Decryption failed: {}", e);
-                    return Err(anyhow::anyhow!("Decryption failed: {}", e));
+                let nonce = Cipher::generate_nonce(sequence);
+                let encrypted_data = packet_data.slice(8..);
+                match client.cipher.decrypt(&nonce, encrypted_data) {
+                    Ok(decrypted) => {
+                        // -> TUN
+                        if let Err(e) = tx_to_tun.send(decrypted).await {
+                            error!("Failed to send to TUN: {}", e);
+                            return Err(anyhow::anyhow!("Failed to send to TUN: {}", e));
+                        }
+                    }
+                    Err(e) => {
+                        error!("Decryption failed: {}", e);
+                        return Err(anyhow::anyhow!("Decryption failed: {}", e));
+                    }
                 }
-
-                // -> TUN
-                if let Err(e) = tx_to_tun.send(decrypted_data.to_vec()).await {
-                    error!("Failed to send to TUN: {}", e);
-                    return Err(anyhow::anyhow!("Failed to send to TUN: {}", e));
-                }
-
                 Ok(())
             }
             PACKET_TYPE_HANDSHAKE => {
                 // Handshake
-                let message: AnetMessage = Message::decode(Bytes::from(packet_data.to_vec()))?;
+                let message: AnetMessage = Message::decode(packet_data)?;
                 match message.content {
                     Some(Content::UdpHandshake(handshake)) => {
                         error!(
@@ -429,7 +415,7 @@ async fn handle_tls_auth(
     ip_pool: IpPool,
     auth_phrase: String,
     udp_port: u32,
-    uid_to_key: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+    uid_to_key: Arc<Mutex<HashMap<String, [u8; 32]>>>,
     client_id_to_ip: Arc<Mutex<HashMap<String, String>>>,
 ) -> anyhow::Result<()> {
     let (mut reader, mut writer) = tokio::io::split(tls_stream);
@@ -438,6 +424,10 @@ async fn handle_tls_auth(
     let mut len_buf = [0u8; 4];
     reader.read_exact(&mut len_buf).await?;
     let msg_len = u32::from_be_bytes(len_buf) as usize;
+
+    if msg_len > MAX_PACKET_SIZE {
+        return Err(anyhow::anyhow!("msg_len > MAX_PACKET_SIZE"));
+    }
 
     let mut msg_buf = vec![0u8; msg_len];
     reader.read_exact(&mut msg_buf).await?;
@@ -455,7 +445,7 @@ async fn handle_tls_auth(
         _ => anyhow::bail!("First message must be AuthRequest"),
     };
 
-    let crypto_key = generate_crypto_key().to_vec();
+    let crypto_key = generate_crypto_key();
     let client_id = generate_uid();
 
     // Сохраняем ключ и привязку client_id к IP
@@ -467,7 +457,7 @@ async fn handle_tls_auth(
         .lock()
         .await
         .insert(client_id.clone(), assigned_ip.to_string());
-
+    let crypto_key = crypto_key.to_vec();
     let response = AnetMessage {
         content: Some(Content::AuthResponse(AuthResponse {
             ip: assigned_ip.to_string(),

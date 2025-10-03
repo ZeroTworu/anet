@@ -1,4 +1,4 @@
-use anet_common::codecs::RawIpCodec;
+use anet_common::codecs::TunCodec;
 use anet_common::consts::{CHANNEL_BUFFER_SIZE, PACKETS_TO_YIELD};
 use anet_common::tun_params::TunParams;
 use anyhow::{Context, Result};
@@ -9,6 +9,7 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio_util::codec::Framed;
 use tun::{AsyncDevice, Configuration};
+use bytes::Bytes;
 
 pub struct TunManager {
     params: TunParams,
@@ -41,18 +42,18 @@ impl TunManager {
         Ok(config.clone())
     }
 
-    pub async fn run(&self) -> Result<(mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>)> {
+    pub async fn run(&self) -> Result<(mpsc::Sender<Bytes>, mpsc::Receiver<Bytes>)> {
         info!("Starting TUN packet processing on server...");
         let config = self.create_config()?;
         let async_dev: AsyncDevice =
             tun::create_as_async(&config).context("Failed to create async TUN device")?;
 
-        let framed = Framed::new(async_dev, RawIpCodec::new());
+        let framed = Framed::new(async_dev, TunCodec::new(1900));
         let (mut sink, mut stream) = framed.split();
 
-        let (tx_to_tun, mut rx_to_tun) = mpsc::channel::<Vec<u8>>(CHANNEL_BUFFER_SIZE);
+        let (tx_to_tun, mut rx_to_tun) = mpsc::channel::<Bytes>(CHANNEL_BUFFER_SIZE);
 
-        let (tx_from_tun, rx_from_tun) = mpsc::channel::<Vec<u8>>(CHANNEL_BUFFER_SIZE);
+        let (tx_from_tun, rx_from_tun) = mpsc::channel::<Bytes>(CHANNEL_BUFFER_SIZE);
 
         tokio::spawn(async move {
             let mut packet_count = 0;

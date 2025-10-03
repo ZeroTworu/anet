@@ -1,14 +1,12 @@
-// anet-client/src/client.rs
 use crate::atun_client::TunManager;
 use crate::config::Config;
-use anet_common::consts::{PACKET_TYPE_DATA, CHANNEL_BUFFER_SIZE};
+use anet_common::consts::{PACKET_TYPE_DATA, CHANNEL_BUFFER_SIZE, MAX_PACKET_SIZE};
 use anet_common::protocol::{
     AuthRequest, AuthResponse, Message as AnetMessage, UdpHandshake, message::Content,
 };
 use anyhow::Result;
 use bytes::Bytes;
-use chacha20poly1305::aead::generic_array::GenericArray;
-use chacha20poly1305::{AeadInPlace, ChaCha20Poly1305, KeyInit};
+use anet_common::encryption::Cipher;
 use log::{error, info, warn};
 use prost::Message;
 use rustls::pki_types::{CertificateDer, ServerName};
@@ -20,7 +18,6 @@ use tokio::sync::mpsc;
 use tokio::time::sleep;
 use tokio_rustls::TlsConnector;
 
-// Наверно то же в константы надо?
 const MAX_RETRIES: u32 = 5;
 const INITIAL_DELAY: u64 = 2;
 const MAX_DELAY: u64 = 60;
@@ -176,7 +173,7 @@ impl ANetClient {
         socket.send(&handshake_data).await?;
         let socket = Arc::new(socket);
         // Настраиваем шифрование
-        let cipher = ChaCha20Poly1305::new(GenericArray::from_slice(&auth_response.crypto_key));
+        let cipher = Cipher::new(&auth_response.crypto_key);
 
         // Запускаем обработку пакетов
         let (tx_to_tun, rx_from_tun) = mpsc::channel(CHANNEL_BUFFER_SIZE);
@@ -191,13 +188,13 @@ impl ANetClient {
             }
         });
 
-        // Задача для отправки пакетов через UDP
+        // Задача для приёма пакетов через UDP
         let recv_task = tokio::spawn({
             let socket = socket.clone();
             let cipher = cipher.clone();
             let tx_to_tun = tx_to_tun.clone();
             async move {
-                let mut buffer = [0u8; 65536];
+                let mut buffer = vec![0u8; MAX_PACKET_SIZE];
                 loop {
                     match socket.recv(&mut buffer).await {
                         Ok(len) => {
@@ -205,39 +202,38 @@ impl ANetClient {
                                 error!("Packet too short");
                                 continue;
                             }
-
-                            let packet_type = buffer[0];
-                            let packet_data = &buffer[1..len];
+                            // Создаем Bytes из полученных данных
+                            let packet = Bytes::copy_from_slice(&buffer[..len]);
+                            let packet_type = packet[0];
 
                             match packet_type {
                                 PACKET_TYPE_DATA => {
-                                    // Бинарный формат [sequence: 8 байт][зашифрованные данные]
-                                    if packet_data.len() < 8 {
+                                    // Проверяем минимальный размер пакета: тип + sequence + минимальные данные
+                                    if packet.len() < 1 + 8 + 1 {
                                         error!("Data packet too short");
                                         continue;
                                     }
 
-                                    let sequence_bytes: [u8; 8] =
-                                        packet_data[0..8].try_into().unwrap();
-                                    let sequence = u64::from_be_bytes(sequence_bytes);
-                                    let encrypted_data = &packet_data[8..];
+                                    // Извлекаем sequence number (байты 1-8)
+                                    let sequence_bytes = packet.slice(1..9);
+                                    let sequence = u64::from_be_bytes(sequence_bytes.as_ref().try_into().unwrap());
+
+                                    // Извлекаем зашифрованные данные (байты 9 и дальше)
+                                    let encrypted_data = packet.slice(9..);
 
                                     // Расшифровываем пакет
-                                    let mut nonce_bytes = [0u8; 12];
-                                    nonce_bytes[4..].copy_from_slice(&sequence.to_be_bytes());
-                                    let nonce = GenericArray::from_slice(&nonce_bytes);
+                                    let nonce = Cipher::generate_nonce(sequence);
 
-                                    let mut decrypted_data = encrypted_data.to_vec();
-                                    if let Err(e) =
-                                        cipher.decrypt_in_place(nonce, b"", &mut decrypted_data)
-                                    {
-                                        error!("Decryption failed: {}", e);
-                                        continue;
-                                    }
-
-                                    // Отправляем в TUN
-                                    if let Err(e) = tx_to_tun.send(decrypted_data).await {
-                                        error!("Failed to send to TUN: {}", e);
+                                    match cipher.decrypt(&nonce, encrypted_data) {
+                                        Ok(decrypted) => {
+                                            // Отправляем в TUN
+                                            if let Err(e) = tx_to_tun.send(decrypted).await {
+                                                error!("Failed to send to TUN: {}", e);
+                                            }
+                                        }
+                                        Err(e) => {
+                                            error!("Decryption failed: {}", e);
+                                        }
                                     }
                                 }
                                 _ => {
@@ -264,15 +260,15 @@ impl ANetClient {
                     sequence += 1;
 
                     // Шифруем пакет
-                    let mut nonce_bytes = [0u8; 12];
-                    nonce_bytes[4..].copy_from_slice(&sequence.to_be_bytes());
-                    let nonce = GenericArray::from_slice(&nonce_bytes);
+                    let nonce = Cipher::generate_nonce(sequence);
 
-                    let mut encrypted_data = packet.clone();
-                    if let Err(e) = cipher.encrypt_in_place(nonce, b"", &mut encrypted_data) {
-                        error!("Encryption failed: {}", e);
-                        continue;
-                    }
+                    let encrypted_data = match cipher.encrypt(&nonce, packet) {
+                        Ok(data) => data,
+                        Err(e) => {
+                            error!("Encryption failed: {}", e);
+                            continue;
+                        }
+                    };
 
                     // Формируем бинарный пакет: [тип: 1 байт][sequence: 8 байт][зашифрованные данные]
                     let mut data = Vec::with_capacity(1 + 8 + encrypted_data.len());

@@ -7,6 +7,7 @@ use std::net::Ipv4Addr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tun::{AsyncDevice, Configuration};
+use bytes::{Bytes};
 
 #[derive(Clone)]
 pub struct TunManager {
@@ -73,46 +74,48 @@ impl TunManager {
         }
     }
 
-    #[inline]
     pub async fn start_processing(
         &mut self,
-        tx_to_tls: mpsc::Sender<Vec<u8>>,
-        mut rx_to_tun: mpsc::Receiver<Vec<u8>>,
+        tx_to_tls: mpsc::Sender<Bytes>,
+        mut rx_to_tun: mpsc::Receiver<Bytes>,
     ) -> Result<()> {
         info!("{}", self.get_info());
 
         let async_dev = self.create_as_async();
         let (mut tun_reader, mut tun_writer) = tokio::io::split(async_dev);
-        // Ссаный костыль из-за windows
-        let mut tun_buffer = vec![0u8; MAX_PACKET_SIZE];
 
-        tokio::spawn(async move {
-            loop {
-                match tun_reader.read(&mut tun_buffer).await {
-                    Ok(n) => {
-                        if n > 0 {
-                            let pkt = tun_buffer[..n].to_vec();
-                            if let Err(e) = tx_to_tls.send(pkt).await {
-                                error!("Error TUN -> TLS: {:?}", e);
+        // Задача для чтения из TUN и отправки в сеть
+        tokio::spawn({
+            let tx_to_tls = tx_to_tls.clone();
+            async move {
+                let mut buffer = vec![0u8; MAX_PACKET_SIZE];
+                loop {
+                    match tun_reader.read(&mut buffer).await {
+                        Ok(n) => {
+                            if n > 0 {
+                                let packet = Bytes::copy_from_slice(&buffer[..n]);
+                                if let Err(e) = tx_to_tls.send(packet).await {
+                                    error!("Error TUN -> TLS: {:?}", e);
+                                    break;
+                                }
                             }
                         }
-                    }
-                    Err(e) => {
-                        error!("Failed to read from TUN: {}", e);
-                        return;
+                        Err(e) => {
+                            error!("Failed to read from TUN: {}", e);
+                            break;
+                        }
                     }
                 }
             }
         });
 
+        // Задача для записи в TUN из сети
         tokio::spawn(async move {
             let mut packet_count = 0;
             loop {
-                let packet = rx_to_tun.recv().await;
-                match packet {
-                    Some(pkt) => {
-                        if let Err(e) = tun_writer.write_all(&pkt).await {
-                            tun_writer.flush().await.unwrap();
+                match rx_to_tun.recv().await {
+                    Some(packet) => {
+                        if let Err(e) = tun_writer.write_all(&packet).await {
                             error!("Error TLS -> TUN: {:?}", e);
                             break;
                         }
@@ -122,13 +125,14 @@ impl TunManager {
                             tokio::task::yield_now().await;
                         }
                     }
-                    None => break,
+                    None => {
+                        break;
+                    }
                 }
             }
         });
 
         info!("Starting TUN packet processing on client...");
-
         Ok(())
     }
 
