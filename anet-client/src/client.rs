@@ -150,6 +150,7 @@ impl ANetClient {
             self.server_addr.split(':').next().unwrap(),
             auth_response.udp_port
         );
+        info!("UDP will connect to {}", udp_addr);
         let socket = UdpSocket::bind("0.0.0.0:0").await?;
 
         socket.connect(&udp_addr).await?;
