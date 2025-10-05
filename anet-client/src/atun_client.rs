@@ -1,4 +1,4 @@
-use anet_common::consts::{MAX_PACKET_SIZE, PACKETS_TO_YIELD};
+use anet_common::consts::MAX_PACKET_SIZE;
 use anet_common::protocol::AuthResponse;
 use anet_common::tun_params::TunParams;
 use anyhow::{Context, Result};
@@ -111,18 +111,12 @@ impl TunManager {
 
         // Задача для записи в TUN из сети
         tokio::spawn(async move {
-            let mut packet_count = 0;
             loop {
                 match rx_to_tun.recv().await {
                     Some(packet) => {
                         if let Err(e) = tun_writer.write_all(&packet).await {
                             error!("Error TLS -> TUN: {:?}", e);
                             break;
-                        }
-                        packet_count += 1;
-                        if packet_count >= PACKETS_TO_YIELD {
-                            packet_count = 0;
-                            tokio::task::yield_now().await;
                         }
                     }
                     None => {

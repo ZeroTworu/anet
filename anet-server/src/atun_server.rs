@@ -1,5 +1,5 @@
 use anet_common::codecs::TunCodec;
-use anet_common::consts::{CHANNEL_BUFFER_SIZE, PACKETS_TO_YIELD};
+use anet_common::consts::CHANNEL_BUFFER_SIZE;
 use anet_common::tun_params::TunParams;
 use anyhow::{Context, Result};
 use futures::{SinkExt, StreamExt};
@@ -48,7 +48,7 @@ impl TunManager {
         let async_dev: AsyncDevice =
             tun::create_as_async(&config).context("Failed to create async TUN device")?;
 
-        let framed = Framed::new(async_dev, TunCodec::new(1900));
+        let framed = Framed::new(async_dev, TunCodec::new(self.params.mtu as usize));
         let (mut sink, mut stream) = framed.split();
 
         let (tx_to_tun, mut rx_to_tun) = mpsc::channel::<Bytes>(CHANNEL_BUFFER_SIZE);
@@ -56,22 +56,14 @@ impl TunManager {
         let (tx_from_tun, rx_from_tun) = mpsc::channel::<Bytes>(CHANNEL_BUFFER_SIZE);
 
         tokio::spawn(async move {
-            let mut packet_count = 0;
             while let Some(pkt) = rx_to_tun.recv().await {
                 if let Err(e) = sink.send(pkt).await {
                     error!("Failed to write to TUN: {e}");
-                }
-
-                packet_count += 1;
-                if packet_count >= PACKETS_TO_YIELD {
-                    packet_count = 0;
-                    tokio::task::yield_now().await;
                 }
             }
         });
 
         tokio::spawn(async move {
-            let mut packet_count = 0;
             while let Some(item) = stream.next().await {
                 match item {
                     Ok(pkt) => {
@@ -81,11 +73,6 @@ impl TunManager {
                         }
                     }
                     Err(err) => error!("Error reading packet from TUN: {err:?}"),
-                }
-                packet_count += 1;
-                if packet_count >= PACKETS_TO_YIELD {
-                    packet_count = 0;
-                    tokio::task::yield_now().await;
                 }
             }
         });
@@ -113,32 +100,34 @@ impl TunManager {
             .wait()
             .await?;
 
-        // Чистим старые правила
+        // ОЧИСТКА всех старых правил
+        let _ = Command::new("iptables")
+            .args(&["-F"])
+            .spawn()?.wait().await?;
+
+        let _ = Command::new("iptables")
+            .args(&["-t", "nat", "-F"])
+            .spawn()?.wait().await?;
+
+        // Устанавливаем политики по умолчанию
         Command::new("iptables")
-            .args(&[
-                "-t",
-                "nat",
-                "-D",
-                "POSTROUTING",
-                "-o",
-                external,
-                "-j",
-                "MASQUERADE",
-            ])
-            .spawn()
-            .ok(); // игнорим ошибку если правила ещё нет
+            .args(&["-P", "INPUT", "ACCEPT"])
+            .spawn()?.wait().await?;
+
+        Command::new("iptables")
+            .args(&["-P", "FORWARD", "ACCEPT"])
+            .spawn()?.wait().await?;
+
+        Command::new("iptables")
+            .args(&["-P", "OUTPUT", "ACCEPT"])
+            .spawn()?.wait().await?;
 
         // Добавляем MASQUERADE
         Command::new("iptables")
             .args(&[
-                "-t",
-                "nat",
-                "-A",
-                "POSTROUTING",
-                "-o",
-                external,
-                "-j",
-                "MASQUERADE",
+                "-t", "nat", "-A", "POSTROUTING",
+                "-o", external,
+                "-j", "MASQUERADE"
             ])
             .spawn()?
             .wait()
@@ -147,52 +136,39 @@ impl TunManager {
         // Разрешаем форвардинг tun→eth
         Command::new("iptables")
             .args(&[
-                "-A",
-                "FORWARD",
-                "-i",
-                self.params.name.as_str(),
-                "-o",
-                external,
-                "-j",
-                "ACCEPT",
+                "-A", "FORWARD",
+                "-i", self.params.name.as_str(),
+                "-o", external,
+                "-j", "ACCEPT"
             ])
             .spawn()?
             .wait()
             .await?;
 
-        // Разрешаем форвардинг eth→tun
+        // Разрешаем форвардинг eth→tun (только ответные пакеты)
         Command::new("iptables")
             .args(&[
-                "-A",
-                "FORWARD",
-                "-i",
-                external,
-                "-o",
-                self.params.name.as_str(),
-                "-m",
-                "state",
-                "--state",
-                "RELATED,ESTABLISHED",
-                "-j",
-                "ACCEPT",
+                "-A", "FORWARD",
+                "-i", external,
+                "-o", self.params.name.as_str(),
+                "-j", "ACCEPT"
             ])
             .spawn()?
             .wait()
             .await?;
-        // явное указание маршрута для VPN подсети
+
+        // Явное указание маршрута для VPN подсети
         let prefix = self.netmask_to_prefix(self.params.netmask)?;
         let net = format!("{}/{}", self.network, prefix);
         Command::new("ip")
             .args(&[
-                "route",
-                "replace",
-                net.as_str(),
-                "dev",
-                self.params.name.as_str(),
+                "route", "replace", net.as_str(),
+                "dev", self.params.name.as_str()
             ])
             .spawn()?
             .wait()
             .await?;
+
         info!("IP routing configured successfully");
         Ok(())
     }
