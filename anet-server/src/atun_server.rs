@@ -1,15 +1,15 @@
-use anet_common::codecs::TunCodec;
-use anet_common::consts::CHANNEL_BUFFER_SIZE;
+use anet_common::consts::{CHANNEL_BUFFER_SIZE, MAX_PACKET_SIZE};
 use anet_common::tun_params::TunParams;
 use anyhow::{Context, Result};
-use futures::{SinkExt, StreamExt};
 use log::{error, info};
 use std::net::Ipv4Addr;
+use std::os::fd::AsRawFd;
 use tokio::process::Command;
 use tokio::sync::mpsc;
-use tokio_util::codec::Framed;
-use tun::{AsyncDevice, Configuration};
+use tun:: Configuration;
 use bytes::Bytes;
+use tokio_uring::net::UnixStream;
+use std::os::unix::io::FromRawFd;
 
 pub struct TunManager {
     params: TunParams,
@@ -32,52 +32,68 @@ impl TunManager {
         config = config.netmask(self.params.netmask);
         config = config.destination(self.params.gateway);
 
-        #[cfg(target_os = "linux")]
-        {
-            config = config.platform_config(|config| {
-                config.ensure_root_privileges(true);
-            });
-        }
+
+        config = config.platform_config(|config| {
+            config.ensure_root_privileges(true);
+        });
+
 
         Ok(config.clone())
     }
 
     pub async fn run(&self) -> Result<(mpsc::Sender<Bytes>, mpsc::Receiver<Bytes>)> {
-        info!("Starting TUN packet processing on server...");
+        info!("Starting TUN packet processing on server with io_uring...");
+
         let config = self.create_config()?;
-        let async_dev: AsyncDevice =
-            tun::create_as_async(&config).context("Failed to create async TUN device")?;
+        let tun_device = tun::create(&config).context("Failed to create TUN device")?;
+        let tun_fd = tun_device.as_raw_fd();
 
-        let framed = Framed::new(async_dev, TunCodec::new(self.params.mtu as usize));
-        let (mut sink, mut stream) = framed.split();
-
-        let (tx_to_tun, mut rx_to_tun) = mpsc::channel::<Bytes>(CHANNEL_BUFFER_SIZE);
-
+        let (tx_to_tun, rx_to_tun) = mpsc::channel::<Bytes>(CHANNEL_BUFFER_SIZE);
         let (tx_from_tun, rx_from_tun) = mpsc::channel::<Bytes>(CHANNEL_BUFFER_SIZE);
 
-        tokio::spawn(async move {
-            while let Some(pkt) = rx_to_tun.recv().await {
-                if let Err(e) = sink.send(pkt).await {
-                    error!("Failed to write to TUN: {e}");
-                }
-            }
-        });
+        let reader_stream = unsafe { UnixStream::from_raw_fd(libc::dup(tun_fd)) };
+        let writer_stream = unsafe { UnixStream::from_raw_fd(libc::dup(tun_fd)) };
 
-        tokio::spawn(async move {
-            while let Some(item) = stream.next().await {
-                match item {
-                    Ok(pkt) => {
-                        if let Err(e) = tx_from_tun.send(pkt).await {
-                            error!("Failed to deliver packet from TUN: {e}");
+        tokio_uring::spawn(Self::tun_reader_task(reader_stream, tx_from_tun));
+        tokio_uring::spawn(Self::tun_writer_task(writer_stream, rx_to_tun));
+
+        Ok((tx_to_tun, rx_from_tun))
+    }
+
+    async fn tun_reader_task(stream: UnixStream, tx_from_tun: mpsc::Sender<Bytes>) {
+        loop {
+            let buffer = vec![0u8; MAX_PACKET_SIZE];
+            let (res, buf) = stream.read(buffer).await;
+            match  res {
+                Ok(n) => {
+                    if n > 0 {
+                        let packet = Bytes::copy_from_slice(&buf[..n]);
+                        if let Err(e) = tx_from_tun.send(packet).await {
+                            error!("Failed to send packet from TUN: {}", e);
                             break;
                         }
                     }
-                    Err(err) => error!("Error reading packet from TUN: {err:?}"),
+                }
+                Err(e) => {
+                    error!("Error reading from TUN: {}", e);
+                    break;
                 }
             }
-        });
+        }
+    }
 
-        Ok((tx_to_tun, rx_from_tun))
+    async fn tun_writer_task(stream: UnixStream, mut rx_to_tun: mpsc::Receiver<Bytes>) {
+        while let Some(packet) = rx_to_tun.recv().await {
+            let (res, _) = stream.write_all(packet.to_vec()).await;
+            match res  {
+                Err(e) => {
+                    error!("Error writing to TUN: {}", e);
+                    break;
+                },
+                Ok(_) => {}
+
+            }
+        }
     }
 
     pub fn get_info(&self) -> String {

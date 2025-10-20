@@ -18,11 +18,12 @@ use rustls::ServerConfig;
 use rustls::pki_types::CertificateDer;
 use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 use tokio::time::{Duration, interval};
 use tokio_rustls::{TlsAcceptor, server::TlsStream};
+use tokio_uring::net::UdpSocket;
 
 #[derive(Clone)]
 struct UdpClient {
@@ -54,7 +55,7 @@ impl ANetServer {
             name: cfg.if_name.parse().unwrap(),
             mtu: cfg.mtu,
         };
-        let tun_manager = TunManager::new(params, cfg.net.parse().unwrap());
+        let tun_manager = TunManager::new(params, cfg.net.parse()?);
         let ip_pool = IpPool::new(
             cfg.net.parse().unwrap(),
             cfg.mask.parse().unwrap(),
@@ -80,11 +81,10 @@ impl ANetServer {
         let tcp_listener = TcpListener::bind(self.cfg.bind_to.as_str()).await?;
 
         let udp_socket: UdpSocket =
-            UdpSocket::bind(format!("0.0.0.0:{}", self.cfg.udp_port)).await?;
+            UdpSocket::bind(format!("0.0.0.0:{}", self.cfg.udp_port).parse().unwrap()).await?;
 
         info!("Bind on {} for TCP, and ", self.cfg.bind_to.as_str());
         let udp_socket = Arc::new(udp_socket);
-
         let (tx_to_tun, mut rx_from_tun) = self.tun_manager.run().await?;
         self.tun_manager
             .setup_tun_routing(self.cfg.external_if.as_str())
@@ -96,7 +96,7 @@ impl ANetServer {
         let ip_to_addr_for_tun = self.ip_to_addr.clone();
         let sequence_numbers = Arc::new(Mutex::new(HashMap::<SocketAddr, u64>::new()));
 
-        tokio::spawn(async move {
+        tokio_uring::spawn(async move {
             while let Some(packet) = rx_from_tun.recv().await {
                 if packet.len() < 20 {
                     continue;
@@ -140,10 +140,14 @@ impl ANetServer {
                                 data.extend_from_slice(&encrypted_data);
 
                                 // Отправляем
-                                if let Err(e) = udp_socket_for_tun.send_to(&data, addr).await {
-                                    error!("Failed to send UDP packet: {}", e);
-                                    let mut seq_nums = sequence_numbers.lock().await;
-                                    seq_nums.remove(&addr);
+                                let (sended, _) = udp_socket_for_tun.send_to(data.to_vec(), addr).await;
+                                match sended {
+                                    Ok(_) => (),
+                                    Err(e) => {
+                                        error!("Failed to send UDP packet: {}", e);
+                                        let mut seq_nums = sequence_numbers.lock().await;
+                                        seq_nums.remove(&addr);
+                                    }
                                 }
                             }
                             Err(e) => {
@@ -167,10 +171,14 @@ impl ANetServer {
         let ip_to_addr_for_udp = self.ip_to_addr.clone();
         let client_id_to_ip = self.client_id_to_ip.clone();
 
-        tokio::spawn(async move {
+        tokio_uring::spawn(async move {
             let mut buffer = vec![0u8; MAX_PACKET_SIZE];
             loop {
-                match udp_socket_for_task.recv_from(&mut buffer).await {
+
+                let (result, buf) = udp_socket_for_task.recv_from(buffer).await;
+                buffer = buf;
+
+                match result {
                     Ok((len, addr)) => {
                         let data = Bytes::copy_from_slice(&buffer[..len]);
                         let mut clients = udp_clients_for_task.lock().await;
@@ -186,8 +194,7 @@ impl ANetServer {
 
                             // Обрабатываем пакет
                             if let Err(e) =
-                                Self::handle_udp_data(data, client_clone, tx_to_tun.clone())
-                                    .await
+                                Self::handle_udp_data(data, client_clone, tx_to_tun.clone()).await
                             {
                                 error!("Failed to handle UDP packet: {}", e);
                             }
@@ -221,7 +228,7 @@ impl ANetServer {
         let client_id_to_ip_for_cleanup = self.client_id_to_ip.clone();
         let ip_pool_for_cleanup = self.ip_pool.clone();
 
-        tokio::spawn(async move {
+        tokio_uring::spawn(async move {
             let mut interval = interval(Duration::from_secs(30));
             loop {
                 interval.tick().await;
@@ -267,7 +274,7 @@ impl ANetServer {
             let uid_to_key = self.uid_to_key.clone();
             let client_id_to_ip = self.client_id_to_ip.clone();
 
-            tokio::spawn(async move {
+            tokio_uring::spawn(async move {
                 match acceptor.accept(socket).await {
                     Ok(tls_stream) => {
                         if let Err(e) = handle_tls_auth(
