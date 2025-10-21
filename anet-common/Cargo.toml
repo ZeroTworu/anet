@@ -4,12 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-tokio = {workspace = true}
-tokio-util = {workspace = true}
 bytes = {workspace = true}
-log = {workspace = true}
 prost = {workspace = true}
-ring = "0.16"
+chacha20poly1305 = {workspace = true}
+aes-gcm = "0.10.3"
+aead = { version = "0.5.2", features = ["getrandom"] }
 
 [build-dependencies]
 prost-build = "0.14.1"

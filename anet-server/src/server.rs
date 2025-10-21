@@ -6,42 +6,44 @@ use crate::config::Config;
 use crate::ip_pool::IpPool;
 use crate::utils::{generate_crypto_key, generate_uid};
 use anet_common::AuthResponse;
+use anet_common::consts::{
+    BATCH_SEND_SIZE, MAX_PACKET_SIZE, PACKET_TYPE_DATA, UDP_HANDSHAKE_TIMEOUT_SECONDS,
+};
 use anet_common::encryption::Cipher;
-use anet_common::consts::{MAX_PACKET_SIZE, PACKET_TYPE_DATA, PACKET_TYPE_HANDSHAKE};
 use anet_common::protocol::{Message as AnetMessage, message::Content};
 use anet_common::tun_params::TunParams;
 use anyhow::Context;
-use bytes::{BufMut, Bytes, BytesMut};
-use log::{debug, error, info, warn};
+use bytes::{Bytes, BytesMut};
+use log::{error, info};
 use prost::Message;
 use rustls::ServerConfig;
 use rustls::pki_types::CertificateDer;
 use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 use tokio::time::{Duration, interval};
-use tokio_rustls::{TlsAcceptor, server::TlsStream};
-use tokio_uring::net::UdpSocket;
+use tokio_rustls::TlsAcceptor;
 
 #[derive(Clone)]
 struct UdpClient {
     cipher: Cipher,
     last_seen: std::time::Instant,
     client_id: String,
-    assigned_ip: String,
+    addr: SocketAddr,
+    sequence: u64,
 }
 
 pub struct ANetServer {
     tls_acceptor: TlsAcceptor,
     ip_pool: IpPool,
     cfg: Config,
-    udp_clients: Arc<Mutex<HashMap<SocketAddr, UdpClient>>>,
-    uid_to_key: Arc<Mutex<HashMap<String, [u8; 32]>>>,
     tun_manager: TunManager,
-    ip_to_addr: Arc<Mutex<HashMap<String, SocketAddr>>>,
+    uid_to_key: Arc<Mutex<HashMap<String, [u8; 32]>>>,
     client_id_to_ip: Arc<Mutex<HashMap<String, String>>>,
+    clients_by_ip: Arc<Mutex<HashMap<String, UdpClient>>>,
+    addr_to_ip: Arc<Mutex<HashMap<SocketAddr, String>>>,
 }
 
 impl ANetServer {
@@ -49,18 +51,18 @@ impl ANetServer {
         let tls_cfg = load_tls_config(cfg.cert_path.as_str(), cfg.key_path.as_str())?;
         let acceptor = TlsAcceptor::from(Arc::new(tls_cfg));
         let params = TunParams {
-            netmask: cfg.mask.parse().unwrap(),
-            gateway: cfg.gateway.parse().unwrap(),
-            address: cfg.self_ip.parse().unwrap(),
-            name: cfg.if_name.parse().unwrap(),
+            netmask: cfg.mask.parse()?,
+            gateway: cfg.gateway.parse()?,
+            address: cfg.self_ip.parse()?,
+            name: cfg.if_name.clone(),
             mtu: cfg.mtu,
         };
         let tun_manager = TunManager::new(params, cfg.net.parse()?);
         let ip_pool = IpPool::new(
-            cfg.net.parse().unwrap(),
-            cfg.mask.parse().unwrap(),
-            cfg.gateway.parse().unwrap(),
-            cfg.self_ip.parse().unwrap(),
+            cfg.net.parse()?,
+            cfg.mask.parse()?,
+            cfg.gateway.parse()?,
+            cfg.self_ip.parse()?,
             cfg.mtu,
         );
         info!("Server TUN configuration: {}", tun_manager.get_info());
@@ -69,151 +71,114 @@ impl ANetServer {
             tls_acceptor: acceptor,
             ip_pool,
             cfg: cfg.clone(),
-            udp_clients: Arc::new(Mutex::new(HashMap::new())),
-            uid_to_key: Arc::new(Mutex::new(HashMap::new())),
             tun_manager,
-            ip_to_addr: Arc::new(Mutex::new(HashMap::new())),
+            uid_to_key: Arc::new(Mutex::new(HashMap::new())),
             client_id_to_ip: Arc::new(Mutex::new(HashMap::new())),
+            clients_by_ip: Arc::new(Mutex::new(HashMap::new())),
+            addr_to_ip: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
     pub async fn run(&self) -> anyhow::Result<()> {
         let tcp_listener = TcpListener::bind(self.cfg.bind_to.as_str()).await?;
+        let udp_addr = self.cfg.bind_to.as_str().split(':').collect::<Vec<&str>>()[0];
+        let udp_socket = UdpSocket::bind(format!("{}:{}", udp_addr, self.cfg.udp_port)).await?;
 
-        let udp_socket: UdpSocket =
-            UdpSocket::bind(format!("0.0.0.0:{}", self.cfg.udp_port).parse().unwrap()).await?;
-
-        info!("Bind on {} for TCP, and ", self.cfg.bind_to.as_str());
+        info!(
+            "Bind on {} for TCP, and {}:{} for UDP",
+            self.cfg.bind_to.as_str(),
+            udp_addr,
+            self.cfg.udp_port
+        );
         let udp_socket = Arc::new(udp_socket);
         let (tx_to_tun, mut rx_from_tun) = self.tun_manager.run().await?;
+
         self.tun_manager
             .setup_tun_routing(self.cfg.external_if.as_str())
             .await?;
 
-        //  TUN -> UDP
+        // TUN -> UDP
         let udp_socket_for_tun = udp_socket.clone();
-        let udp_clients_for_tun = self.udp_clients.clone();
-        let ip_to_addr_for_tun = self.ip_to_addr.clone();
-        let sequence_numbers = Arc::new(Mutex::new(HashMap::<SocketAddr, u64>::new()));
-
-        tokio_uring::spawn(async move {
+        let clients_by_ip_for_tun = self.clients_by_ip.clone();
+        tokio::spawn(async move {
+            let mut batch_to_send: Vec<(Bytes, SocketAddr)> = Vec::with_capacity(BATCH_SEND_SIZE);
             while let Some(packet) = rx_from_tun.recv().await {
-                if packet.len() < 20 {
-                    continue;
+                batch_to_send.clear();
+                if let Some(processed) =
+                    process_packet_for_sending(&clients_by_ip_for_tun, packet).await
+                {
+                    batch_to_send.push(processed);
                 }
 
-                let dst_ip = format!(
-                    "{}.{}.{}.{}",
-                    packet[16], packet[17], packet[18], packet[19]
-                );
-
-                let addr = {
-                    let ip_to_addr = ip_to_addr_for_tun.lock().await;
-                    ip_to_addr.get(&dst_ip).cloned()
-                };
-
-                if let Some(addr) = addr {
-                    let client = {
-                        let udp_clients = udp_clients_for_tun.lock().await;
-                        udp_clients.get(&addr).cloned()
-                    };
-
-                    if let Some(client) = client {
-                        // Получаем и увеличиваем sequence number для этого клиента
-                        let sequence = {
-                            let mut seq_nums = sequence_numbers.lock().await;
-                            let seq = seq_nums.entry(addr).or_insert(0);
-                            *seq += 1;
-                            *seq
-                        };
-
-                        // Шифруем пакет для этого клиента
-                        let nonce = Cipher::generate_nonce(sequence);
-
-                        // Шифруем пакет
-                        match client.cipher.encrypt(&nonce, packet) {
-                            Ok(encrypted_data) => {
-                                // Формируем пакет: [тип: 1 байт][sequence: 8 байт][зашифрованные данные]
-                                let mut data = BytesMut::with_capacity(1 + 8 + encrypted_data.len());
-                                data.put_u8(PACKET_TYPE_DATA);
-                                data.put_u64(sequence);
-                                data.extend_from_slice(&encrypted_data);
-
-                                // Отправляем
-                                let (sended, _) = udp_socket_for_tun.send_to(data.to_vec(), addr).await;
-                                match sended {
-                                    Ok(_) => (),
-                                    Err(e) => {
-                                        error!("Failed to send UDP packet: {}", e);
-                                        let mut seq_nums = sequence_numbers.lock().await;
-                                        seq_nums.remove(&addr);
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                error!("Encryption failed: {}", e);
+                for _ in 0..(BATCH_SEND_SIZE - 1) {
+                    match rx_from_tun.try_recv() {
+                        Ok(packet) => {
+                            if let Some(processed) =
+                                process_packet_for_sending(&clients_by_ip_for_tun, packet).await
+                            {
+                                batch_to_send.push(processed);
                             }
                         }
-                    } else {
-                        warn!("Client not found for addr: {}", addr);
+                        Err(_) => break,
                     }
-                } else {
-                    debug!("No client found for IP: {}", dst_ip);
+                }
+
+                for (data, addr) in &batch_to_send {
+                    if let Err(e) = udp_socket_for_tun.send_to(data, *addr).await {
+                        error!("Failed to send UDP packet to {}: {}", addr, e);
+                    }
                 }
             }
         });
 
-        //  UDP -> TUN
-        let udp_clients_for_task = self.udp_clients.clone();
+        //UDP -> TUN
+        let clients_by_ip_for_udp = self.clients_by_ip.clone();
+        let addr_to_ip_for_udp = self.addr_to_ip.clone();
+        let uid_to_key_for_udp = self.uid_to_key.clone();
+        let tx_to_tun_for_udp = tx_to_tun.clone();
+        let client_id_to_ip_for_udp = self.client_id_to_ip.clone();
         let udp_socket_for_task = udp_socket.clone();
-        let uid_to_key = self.uid_to_key.clone();
-        let tx_to_tun = tx_to_tun.clone();
-        let ip_to_addr_for_udp = self.ip_to_addr.clone();
-        let client_id_to_ip = self.client_id_to_ip.clone();
-
-        tokio_uring::spawn(async move {
+        tokio::spawn(async move {
             let mut buffer = vec![0u8; MAX_PACKET_SIZE];
             loop {
-
-                let (result, buf) = udp_socket_for_task.recv_from(buffer).await;
-                buffer = buf;
-
-                match result {
+                match udp_socket_for_task.recv_from(&mut buffer).await {
                     Ok((len, addr)) => {
+
                         let data = Bytes::copy_from_slice(&buffer[..len]);
-                        let mut clients = udp_clients_for_task.lock().await;
 
-                        if let Some(client) = clients.get_mut(&addr) {
-                            client.last_seen = std::time::Instant::now();
+                        let client_ip = { addr_to_ip_for_udp.lock().await.get(&addr).cloned() };
 
-                            // Создаем копию клиента для обработки
-                            let client_clone = client.clone();
+                        if let Some(ip) = client_ip {
+                            let cipher = {
 
-                            // Освобождаем Mutex перед асинхронной обработкой
-                            drop(clients);
-
-                            // Обрабатываем пакет
-                            if let Err(e) =
-                                Self::handle_udp_data(data, client_clone, tx_to_tun.clone()).await
-                            {
-                                error!("Failed to handle UDP packet: {}", e);
+                                let mut clients = clients_by_ip_for_udp.lock().await;
+                                if let Some(client) = clients.get_mut(&ip) {
+                                    client.last_seen = std::time::Instant::now();
+                                    Some(client.cipher.clone())
+                                } else {
+                                    None
+                                }
+                            };
+                            if let Some(cipher) = cipher {
+                                if let Err(e) =
+                                    Self::handle_udp_data(data, cipher, tx_to_tun_for_udp.clone())
+                                        .await
+                                {
+                                    error!("Failed to handle UDP packet from {}: {}", addr, e);
+                                }
                             }
                         } else {
-                            // Освобождаем Mutex перед асинхронной обработкой
-                            drop(clients);
-
-                            // Новый клиент
                             if let Err(e) = Self::handle_udp_handshake(
-                                udp_clients_for_task.clone(),
-                                uid_to_key.clone(),
-                                ip_to_addr_for_udp.clone(),
-                                client_id_to_ip.clone(),
+                                clients_by_ip_for_udp.clone(),
+                                addr_to_ip_for_udp.clone(),
+                                uid_to_key_for_udp.clone(),
+                                client_id_to_ip_for_udp.clone(),
                                 data,
                                 addr,
                             )
-                                .await
+                            .await
                             {
-                                error!("Failed to handle UDP handshake: {}", e);
+                                error!("Failed to handle UDP handshake from {}: {}", addr, e);
                             }
                         }
                     }
@@ -222,44 +187,37 @@ impl ANetServer {
             }
         });
 
-        // Очистка клиентов
-        let udp_clients_for_cleanup = self.udp_clients.clone();
-        let ip_to_addr_for_cleanup = self.ip_to_addr.clone();
-        let client_id_to_ip_for_cleanup = self.client_id_to_ip.clone();
+        // Очистки неактивных клиентов
+        let clients_by_ip_for_cleanup = self.clients_by_ip.clone();
+        let addr_to_ip_for_cleanup = self.addr_to_ip.clone();
         let ip_pool_for_cleanup = self.ip_pool.clone();
-
-        tokio_uring::spawn(async move {
+        tokio::spawn(async move {
             let mut interval = interval(Duration::from_secs(30));
             loop {
                 interval.tick().await;
-                let now = std::time::Instant::now();
-                let mut udp_clients = udp_clients_for_cleanup.lock().await;
-                let mut to_remove = Vec::new();
 
-                for (addr, client) in udp_clients.iter() {
+                let now = std::time::Instant::now();
+                let mut clients_to_remove = Vec::new();
+                let mut clients_by_ip = clients_by_ip_for_cleanup.lock().await;
+
+                for (ip, client) in clients_by_ip.iter() {
                     if now.duration_since(client.last_seen) > Duration::from_secs(60) {
-                        to_remove.push(*addr);
+                        clients_to_remove.push((ip.clone(), client.addr, client.client_id.clone()));
                     }
                 }
 
-                for addr in to_remove {
-                    if let Some(client) = udp_clients.remove(&addr) {
-                        if let Ok(ip) = client.assigned_ip.parse() {
-                            ip_pool_for_cleanup.release(ip);
+                if !clients_to_remove.is_empty() {
+                    let mut addr_to_ip = addr_to_ip_for_cleanup.lock().await;
+
+                    for (ip_str, addr, _) in &clients_to_remove {
+                        clients_by_ip.remove(ip_str);
+                        addr_to_ip.remove(addr);
+
+                        if let Ok(ip_addr) = ip_str.parse() {
+                            ip_pool_for_cleanup.release(ip_addr);
                         }
 
-                        // Удаляем из ip_to_addr
-                        let mut ip_to_addr = ip_to_addr_for_cleanup.lock().await;
-                        ip_to_addr.remove(&client.assigned_ip);
-
-                        // Удаляем из client_id_to_ip
-                        let mut client_id_to_ip = client_id_to_ip_for_cleanup.lock().await;
-                        client_id_to_ip.remove(&client.client_id);
-
-                        info!(
-                            "Removed inactive client: {} (IP: {})",
-                            addr, client.assigned_ip
-                        );
+                        info!("Removed inactive client: {} (IP: {})", addr, ip_str);
                     }
                 }
             }
@@ -274,23 +232,19 @@ impl ANetServer {
             let uid_to_key = self.uid_to_key.clone();
             let client_id_to_ip = self.client_id_to_ip.clone();
 
-            tokio_uring::spawn(async move {
-                match acceptor.accept(socket).await {
-                    Ok(tls_stream) => {
-                        if let Err(e) = handle_tls_auth(
-                            tls_stream,
-                            ip_pool,
-                            auth_phrase,
-                            udp_port,
-                            uid_to_key,
-                            client_id_to_ip,
-                        )
-                            .await
-                        {
-                            error!("Error handling TLS auth: {}", e);
-                        }
-                    }
-                    Err(e) => error!("TLS accept failed: {}", e),
+            tokio::spawn(async move {
+                if let Err(e) = handle_tls_auth(
+                    socket,
+                    acceptor,
+                    ip_pool,
+                    auth_phrase,
+                    udp_port,
+                    uid_to_key,
+                    client_id_to_ip,
+                )
+                .await
+                {
+                    error!("Error handling TLS auth: {}", e);
                 }
             });
         }
@@ -299,141 +253,105 @@ impl ANetServer {
     }
 
     async fn handle_udp_handshake(
-        udp_clients: Arc<Mutex<HashMap<SocketAddr, UdpClient>>>,
+        clients_by_ip: Arc<Mutex<HashMap<String, UdpClient>>>,
+        addr_to_ip: Arc<Mutex<HashMap<SocketAddr, String>>>,
         uid_to_key: Arc<Mutex<HashMap<String, [u8; 32]>>>,
-        ip_to_addr: Arc<Mutex<HashMap<String, SocketAddr>>>,
         client_id_to_ip: Arc<Mutex<HashMap<String, String>>>,
         data: Bytes,
         addr: SocketAddr,
     ) -> anyhow::Result<()> {
         let message: AnetMessage = Message::decode(data)?;
+        if let Some(Content::UdpHandshake(handshake)) = message.content {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs();
 
-        match message.content {
-            Some(Content::UdpHandshake(handshake)) => {
-                // Проверяем timestamp для защиты от replay-атак
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)?
-                    .as_secs();
+            if now.saturating_sub(handshake.timestamp) > UDP_HANDSHAKE_TIMEOUT_SECONDS {
+                anyhow::bail!("Handshake timestamp too old from {}", addr);
+            }
 
-                if now - handshake.timestamp > 30 {
-                    anyhow::bail!("Handshake timestamp too old");
-                }
-                // Ключ шифрования
-                let crypto_key = uid_to_key.lock().await.get(&handshake.client_id).cloned();
-                if crypto_key.is_none() {
-                    anyhow::bail!("Missing client key for client_id: {}", handshake.client_id);
-                }
-                // Выделенный IP
-                let assigned_ip = client_id_to_ip
+            let crypto_key = { uid_to_key.lock().await.get(&handshake.client_id).cloned() };
+
+            let assigned_ip = {
+                client_id_to_ip
                     .lock()
                     .await
                     .get(&handshake.client_id)
-                    .cloned();
-                if assigned_ip.is_none() {
-                    anyhow::bail!("No IP allocated for client_id: {}", handshake.client_id);
-                }
+                    .cloned()
+            };
 
-                let cipher = Cipher::new(&crypto_key.unwrap());
-                let assigned_ip = assigned_ip.unwrap();
-
-                // Добавляем клиента
-                let mut clients = udp_clients.lock().await;
-                clients.insert(
+            if let (Some(key), Some(ip)) = (crypto_key, assigned_ip) {
+                let client = UdpClient {
+                    cipher: Cipher::new(&key),
+                    last_seen: std::time::Instant::now(),
+                    client_id: handshake.client_id.clone(),
                     addr,
-                    UdpClient {
-                        cipher,
-                        last_seen: std::time::Instant::now(),
-                        client_id: handshake.client_id.clone(),
-                        assigned_ip: assigned_ip.clone(),
-                    },
-                );
+                    sequence: 0,
+                };
 
-                // Добавляем в ip_to_addr
-                ip_to_addr.lock().await.insert(assigned_ip.clone(), addr);
+                clients_by_ip.lock().await.insert(ip.clone(), client);
+                addr_to_ip.lock().await.insert(addr, ip.clone());
 
-                info!("New UDP client connected: {} (IP: {})", addr, assigned_ip);
+                info!("New UDP client connected: {} (IP: {})", addr, ip);
+
                 Ok(())
+            } else {
+                anyhow::bail!("Client info not found for handshake from {}", addr)
             }
-            _ => anyhow::bail!("Expected UDP handshake"),
+        } else {
+            anyhow::bail!("Expected UDP handshake from {}", addr)
         }
     }
 
     async fn handle_udp_data(
         data: Bytes,
-        client: UdpClient,
+        cipher: Cipher,
         tx_to_tun: mpsc::Sender<Bytes>,
     ) -> anyhow::Result<()> {
         if data.is_empty() {
-            return Err(anyhow::anyhow!("Empty UDP packet"));
+            return Ok(());
         }
-
         let packet_type = data[0];
-        let packet_data = data.slice(1..);
 
         match packet_type {
             PACKET_TYPE_DATA => {
-                //  [sequence: 8 байт][зашифрованные данные]
-                if packet_data.len() < 8 {
-                    return Err(anyhow::anyhow!("Data packet too short"));
+                if data.len() < 9 {
+                    anyhow::bail!("Data packet too short");
                 }
 
-                let sequence_bytes: [u8; 8] = packet_data[0..8].try_into()?;
-                let sequence = u64::from_be_bytes(sequence_bytes);
-
-                // Расшифровываем пакет
+                let sequence = u64::from_be_bytes(data[1..9].try_into()?);
+                let encrypted_data = data.slice(9..);
                 let nonce = Cipher::generate_nonce(sequence);
-                let encrypted_data = packet_data.slice(8..);
-                match client.cipher.decrypt(&nonce, encrypted_data) {
-                    Ok(decrypted) => {
-                        // -> TUN
-                        if let Err(e) = tx_to_tun.send(decrypted).await {
-                            error!("Failed to send to TUN: {}", e);
-                            return Err(anyhow::anyhow!("Failed to send to TUN: {}", e));
-                        }
-                    }
-                    Err(e) => {
-                        error!("Decryption failed: {}", e);
-                        return Err(anyhow::anyhow!("Decryption failed: {}", e));
-                    }
-                }
+                let decrypted = cipher.decrypt(&nonce, encrypted_data)?;
+
+                tx_to_tun.send(decrypted).await?;
                 Ok(())
             }
-            PACKET_TYPE_HANDSHAKE => {
-                // Handshake
-                let message: AnetMessage = Message::decode(packet_data)?;
-                match message.content {
-                    Some(Content::UdpHandshake(handshake)) => {
-                        error!(
-                            "NEVER MUST CALLED! Handshake received: {}",
-                            handshake.client_id
-                        );
-                        Ok(())
-                    }
-                    _ => Err(anyhow::anyhow!("Expected UDP handshake")),
-                }
-            }
-            _ => Err(anyhow::anyhow!("Unknown packet type: {}", packet_type)),
+            _ => anyhow::bail!("Unexpected packet type"),
         }
     }
 }
 
 async fn handle_tls_auth(
-    tls_stream: TlsStream<TcpStream>,
+    socket: TcpStream,
+    acceptor: TlsAcceptor,
     ip_pool: IpPool,
     auth_phrase: String,
     udp_port: u32,
     uid_to_key: Arc<Mutex<HashMap<String, [u8; 32]>>>,
     client_id_to_ip: Arc<Mutex<HashMap<String, String>>>,
 ) -> anyhow::Result<()> {
+    let tls_stream = acceptor.accept(socket).await?;
+
     let (mut reader, mut writer) = tokio::io::split(tls_stream);
 
-    // Читаем аутентификационный запрос
     let mut len_buf = [0u8; 4];
     reader.read_exact(&mut len_buf).await?;
+
     let msg_len = u32::from_be_bytes(len_buf) as usize;
 
     if msg_len > MAX_PACKET_SIZE {
-        return Err(anyhow::anyhow!("msg_len > MAX_PACKET_SIZE"));
+        anyhow::bail!("msg_len > MAX_PACKET_SIZE");
     }
 
     let mut msg_buf = vec![0u8; msg_len];
@@ -442,38 +360,33 @@ async fn handle_tls_auth(
     let message: AnetMessage = Message::decode(Bytes::from(msg_buf))?;
 
     let assigned_ip = match message.content {
-        Some(Content::AuthRequest(auth_request)) => {
-            if auth_request.key != auth_phrase {
-                anyhow::bail!("Auth failed: wrong auth phrase");
-            }
-
-            ip_pool.allocate().context("No free IPs")?
+        Some(Content::AuthRequest(req)) if req.key == auth_phrase => {
+            ip_pool.allocate().context("No free IPs available")?
         }
-        _ => anyhow::bail!("First message must be AuthRequest"),
+        _ => anyhow::bail!("Authentication failed"),
     };
 
     let crypto_key = generate_crypto_key();
     let client_id = generate_uid();
 
-    // Сохраняем ключ и привязку client_id к IP
     uid_to_key
         .lock()
         .await
-        .insert(client_id.clone(), crypto_key.clone());
+        .insert(client_id.clone(), crypto_key);
     client_id_to_ip
         .lock()
         .await
         .insert(client_id.clone(), assigned_ip.to_string());
-    let crypto_key = crypto_key.to_vec();
+
     let response = AnetMessage {
         content: Some(Content::AuthResponse(AuthResponse {
             ip: assigned_ip.to_string(),
             netmask: ip_pool.netmask.to_string(),
             gateway: ip_pool.gateway.to_string(),
             mtu: ip_pool.mtu as i32,
-            crypto_key,
+            crypto_key: crypto_key.to_vec(),
             udp_port,
-            client_id: client_id.clone(),
+            client_id,
         })),
     };
 
@@ -490,25 +403,61 @@ async fn handle_tls_auth(
 
 fn load_tls_config(cert_path: &str, key_path: &str) -> anyhow::Result<ServerConfig> {
     let cert_file =
-        File::open(cert_path).context(format!("Failed to open certificate file: {}", cert_path))?;
-    let mut cert_reader = BufReader::new(cert_file);
-    let certs = rustls_pemfile::certs(&mut cert_reader)
-        .collect::<Result<Vec<CertificateDer>, _>>()
-        .context("Failed to parse certificate")?;
+        File::open(cert_path).context(format!("Failed to open cert file: {}", cert_path))?;
+
+    let certs = rustls_pemfile::certs(&mut BufReader::new(cert_file))
+        .collect::<Result<Vec<CertificateDer>, _>>()?;
 
     let key_file =
         File::open(key_path).context(format!("Failed to open key file: {}", key_path))?;
-    let mut key_reader = BufReader::new(key_file);
-    let key = rustls_pemfile::private_key(&mut key_reader)
-        .context("Failed to read private key")?
-        .context("No private key found")?;
+
+    let key = rustls_pemfile::private_key(&mut BufReader::new(key_file))?
+        .context("No private key found in file")?;
 
     let mut cfg = ServerConfig::builder()
         .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .context("Failed to create server config")?;
-
+        .with_single_cert(certs, key)?;
     cfg.alpn_protocols = vec![b"h2".to_vec()];
 
     Ok(cfg)
+}
+
+async fn process_packet_for_sending(
+    clients_by_ip: &Arc<Mutex<HashMap<String, UdpClient>>>,
+    packet: Bytes,
+) -> Option<(Bytes, SocketAddr)> {
+    if packet.len() < 20 {
+        return None;
+    }
+
+    let dst_ip = format!(
+        "{}.{}.{}.{}",
+        packet[16], packet[17], packet[18], packet[19]
+    );
+
+    let (cipher, sequence, addr) = {
+        let mut clients_lock = clients_by_ip.lock().await;
+        if let Some(client) = clients_lock.get_mut(&dst_ip) {
+            client.sequence += 1;
+            (client.cipher.clone(), client.sequence, client.addr)
+        } else {
+            return None;
+        }
+    };
+
+    let nonce = Cipher::generate_nonce(sequence);
+
+    match cipher.encrypt(&nonce, packet) {
+        Ok(encrypted_data) => {
+            let mut data = BytesMut::with_capacity(1 + 8 + encrypted_data.len());
+            data.extend_from_slice(&[PACKET_TYPE_DATA]);
+            data.extend_from_slice(&sequence.to_be_bytes());
+            data.extend_from_slice(&encrypted_data);
+            Some((data.freeze(), addr))
+        }
+        Err(e) => {
+            error!("Encryption failed for client at {}: {}", addr, e);
+            None
+        }
+    }
 }

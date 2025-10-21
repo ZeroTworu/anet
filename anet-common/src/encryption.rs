@@ -1,52 +1,52 @@
-use bytes::{Bytes, BytesMut};
-use ring::aead;
-use std::convert::TryInto;
+use aead::{Aead, KeyInit, Nonce};
+use aes_gcm::{Aes256Gcm, Key};
+use bytes::{Bytes};
 use std::sync::Arc;
+use chacha20poly1305::ChaCha20Poly1305;
+
+// Заменить на `ChaCha20Poly1305` при необходимости.
+type CryptoAlgorithm = Aes256Gcm;
 
 #[derive(Clone)]
 pub struct Cipher {
-    key: Arc<aead::LessSafeKey>,
+    cipher: Arc<CryptoAlgorithm>,
 }
 
 impl Cipher {
     pub fn new(key: &[u8]) -> Self {
-        let unbound_key = aead::UnboundKey::new(&aead::CHACHA20_POLY1305, key)
-            .expect("Invalid key length");
-        let key = aead::LessSafeKey::new(unbound_key);
-        Self { key: Arc::new(key) }
+        if key.len() != 32 {
+            panic!("Invalid key length for AES-256-GCM. Must be 32 bytes.");
+        }
+
+        let key_generic: &Key<CryptoAlgorithm> = key.try_into().expect("Key must be 32 bytes");
+
+        Self {
+            cipher: Arc::new(CryptoAlgorithm::new(key_generic)),
+        }
     }
 
     #[inline]
-    pub fn encrypt(&self, nonce: &[u8], data: Bytes) -> Result<Bytes, EncryptionError> {
-        let nonce = aead::Nonce::assume_unique_for_key(nonce.try_into().unwrap());
+    pub fn encrypt(&self, nonce_bytes: &[u8], data: Bytes) -> Result<Bytes, EncryptionError> {
+        let nonce = Nonce::<CryptoAlgorithm>::from_slice(nonce_bytes);
 
-        // Конвертируем Bytes в BytesMut для in-place шифрования
-        let mut buffer = BytesMut::from(data.as_ref());
-
-        // Шифруем данные
-        self.key.seal_in_place_append_tag(nonce, aead::Aad::empty(), &mut buffer)
+        let ciphertext = self.cipher
+            .encrypt(nonce, data.as_ref())
             .map_err(|_| EncryptionError::EncryptionFailed)?;
 
-        Ok(buffer.freeze())
+        Ok(Bytes::from(ciphertext))
     }
 
     #[inline]
-    pub fn decrypt(&self, nonce: &[u8], data: Bytes) -> Result<Bytes, EncryptionError> {
-        let nonce = aead::Nonce::assume_unique_for_key(nonce.try_into().unwrap());
+    pub fn decrypt(&self, nonce_bytes: &[u8], data: Bytes) -> Result<Bytes, EncryptionError> {
 
-        // Конвертируем Bytes в BytesMut для in-place дешифрования
-        let mut buffer = BytesMut::from(data.as_ref());
+        let nonce = Nonce::<CryptoAlgorithm>::from_slice(nonce_bytes);
 
-        // Дешифруем данные
-        self.key.open_in_place(nonce, aead::Aad::empty(), &mut buffer)
+        let plaintext = self.cipher
+            .decrypt(nonce, data.as_ref())
             .map_err(|_| EncryptionError::DecryptionFailed)?;
 
-        // Убираем тег аутентификации
-        buffer.truncate(buffer.len() - aead::CHACHA20_POLY1305.tag_len());
-
-        Ok(buffer.freeze())
+        Ok(Bytes::from(plaintext))
     }
-
     pub fn generate_nonce(sequence: u64) -> [u8; 12] {
         let mut nonce = [0u8; 12];
         nonce[4..].copy_from_slice(&sequence.to_be_bytes());

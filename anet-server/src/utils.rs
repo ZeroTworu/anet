@@ -6,6 +6,7 @@ use chacha20poly1305::aead::rand_core::RngCore;
 use rand;
 use std::net::Ipv4Addr;
 
+#[inline]
 pub fn generate_crypto_key() -> [u8; 32] {
     let mut rng = rand::thread_rng();
     let mut crypto_key = [0u8; 32];
@@ -13,6 +14,7 @@ pub fn generate_crypto_key() -> [u8; 32] {
     crypto_key
 }
 
+#[inline]
 pub fn generate_uid() -> String {
     let mut rng = rand::thread_rng();
     let mut client_id = [0u8; 16];
