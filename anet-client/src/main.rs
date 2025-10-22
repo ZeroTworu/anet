@@ -3,15 +3,10 @@ use anet_client::client::ANetClient;
 use anet_client::config::load;
 use anyhow::Result;
 use log::info;
-
-#[cfg(unix)]
-use tokio::signal::unix::{SignalKind, signal};
+use tokio::signal;
 
 #[cfg(unix)]
 use anet_client::lrm::LinuxRouteManager;
-
-#[cfg(windows)]
-use tokio::signal::windows::ctrl_c;
 
 fn generate_ascii_art(build_type: &str, commit_hash: &str, build_time: &str) -> String {
     // Обрезаем строки до нужной длины, чтобы они помещались в рамку
@@ -79,15 +74,8 @@ async fn main() -> Result<()> {
     #[cfg(unix)]
     linux_router.setup_vpn_routing()?;
 
-    #[cfg(unix)]
-    let mut sig = signal(SignalKind::terminate())?;
-
-    #[cfg(windows)]
-    let mut sig = ctrl_c()?;
-
     info!("Press Ctrl-C to exit.");
-
-    sig.recv().await;
+    signal::ctrl_c().await?;
 
     #[cfg(unix)]
     linux_router.restore_original_routing()?;
