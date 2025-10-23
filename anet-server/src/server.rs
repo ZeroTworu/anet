@@ -143,15 +143,14 @@ impl ANetServer {
             loop {
                 match udp_socket_for_task.recv_from(&mut buffer).await {
                     Ok((len, addr)) => {
-
                         let data = Bytes::copy_from_slice(&buffer[..len]);
 
                         let client_ip = { addr_to_ip_for_udp.lock().await.get(&addr).cloned() };
 
                         if let Some(ip) = client_ip {
                             let cipher = {
-
                                 let mut clients = clients_by_ip_for_udp.lock().await;
+
                                 if let Some(client) = clients.get_mut(&ip) {
                                     client.last_seen = std::time::Instant::now();
                                     Some(client.cipher.clone())
@@ -167,19 +166,17 @@ impl ANetServer {
                                     error!("Failed to handle UDP packet from {}: {}", addr, e);
                                 }
                             }
-                        } else {
-                            if let Err(e) = Self::handle_udp_handshake(
-                                clients_by_ip_for_udp.clone(),
-                                addr_to_ip_for_udp.clone(),
-                                uid_to_key_for_udp.clone(),
-                                client_id_to_ip_for_udp.clone(),
-                                data,
-                                addr,
-                            )
-                            .await
-                            {
-                                error!("Failed to handle UDP handshake from {}: {}", addr, e);
-                            }
+                        } else if let Err(e) = Self::handle_udp_handshake(
+                            clients_by_ip_for_udp.clone(),
+                            addr_to_ip_for_udp.clone(),
+                            uid_to_key_for_udp.clone(),
+                            client_id_to_ip_for_udp.clone(),
+                            data,
+                            addr,
+                        )
+                        .await
+                        {
+                            error!("Failed to handle UDP handshake from {}: {}", addr, e);
                         }
                     }
                     Err(e) => error!("UDP recv error: {}", e),

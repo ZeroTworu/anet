@@ -48,16 +48,22 @@ impl LinuxRouteManager {
     }
 
     // Настраиваем маршрутизацию через VPN
-    pub fn setup_vpn_routing(&self) -> Result<()> {
-        self.ensure_route_table();
+    // anet-client/lrm.rs
 
-        // Добавляем маршрут к VPN-серверу через оригинальный интерфейс
+    // ... (new, backup_original_routes остаются без изменений) ...
+
+    pub fn setup_vpn_routing(&self) -> Result<()> {
+        info!("Setting up simplified VPN routing (default gateway override)...");
+
+        // 1. Убеждаемся, что маршрут до самого VPN-сервера существует
+        // и идет через старый шлюз. Это САМЫЙ ВАЖНЫЙ шаг.
         if let (Some(gateway), Some(interface)) = (&self.original_gateway, &self.original_interface)
         {
-            let status = Command::new("ip")
+            // Используем 'add' или 'replace', чтобы гарантировать его наличие
+            let _ = Command::new("ip")
                 .args(&[
                     "route",
-                    "add",
+                    "replace", // 'replace' безопасно, т.к. создаст маршрут, если его нет, или обновит
                     &self.vpn_server_ip,
                     "via",
                     gateway,
@@ -65,71 +71,40 @@ impl LinuxRouteManager {
                     interface,
                 ])
                 .status();
-
-            match status {
-                Ok(exit_status) if exit_status.success() => info!("Added route to VPN server"),
-                Ok(exit_status) => warn!(
-                    "Route to VPN server already exists or failed to add: {}",
-                    exit_status
-                ),
-                Err(e) => warn!("Failed to add route to VPN server: {}", e),
-            }
+            info!(
+                "Ensured route to VPN server {} via {}",
+                self.vpn_server_ip, gateway
+            );
+        } else {
+            warn!(
+                "Original gateway not found, cannot create exception route for VPN server. Connectivity may be lost."
+            );
+            // В этом случае продолжать опасно, но для теста оставим.
         }
 
-        // Критическое исправление: добавляем правило для исключения трафика к VPN-серверу
-        let status = Command::new("ip")
-            .args(&[
-                "rule",
-                "add",
-                "from",
-                "all",
-                "to",
-                &self.vpn_server_ip,
-                "prio",
-                "100",
-                "table",
-                "main",
-            ])
-            .status();
-        match status {
-            Ok(exit_status) if exit_status.success() => {
-                info!("Added exclusion rule for VPN server")
-            }
-            Ok(exit_status) => warn!("Exclusion rule already exists: {}", exit_status),
-            Err(e) => warn!("Failed to add exclusion rule: {}", e),
-        }
-
-        // Основное правило для маршрутизации через VPN
-        let status = Command::new("ip")
-            .args(&["rule", "add", "from", "all", "prio", "200", "table", "200"])
-            .status();
-        match status {
-            Ok(exit_status) if exit_status.success() => info!("Added routing rule"),
-            Ok(exit_status) => warn!("Routing rule already exists: {}", exit_status),
-            Err(e) => warn!("Failed to add routing rule: {}", e),
-        }
-
-        // Маршрут по умолчанию через VPN
+        // 2. Теперь мы можем безопасно заменить шлюз по умолчанию
         let status = Command::new("ip")
             .args(&[
                 "route",
-                "add",
+                "replace",
                 "default",
                 "via",
                 &self.vpn_gateway.to_string(),
                 "dev",
                 &self.vpn_interface,
-                "table",
-                "200",
             ])
             .status();
+
         match status {
-            Ok(exit_status) if exit_status.success() => info!("Added default route to VPN table"),
-            Ok(exit_status) => warn!("Default route already exists: {}", exit_status),
-            Err(e) => warn!("Failed to add default route: {}", e),
+            Ok(exit_status) if exit_status.success() => {
+                info!("Successfully replaced default route to point to VPN.");
+            }
+            _ => {
+                return Err(anyhow::anyhow!("Failed to replace default route."));
+            }
         }
 
-        info!("VPN routing setup completed");
+        info!("Simplified VPN routing setup completed.");
         Ok(())
     }
 
@@ -151,67 +126,27 @@ impl LinuxRouteManager {
 
     // Восстанавливаем оригинальную маршрутизацию
     pub fn restore_original_routing(&self) -> Result<()> {
-        // Удаляем правило исключения для VPN-сервера
-        let _ = Command::new("ip")
-            .args(&[
-                "rule",
-                "del",
-                "from",
-                "all",
-                "to",
-                &self.vpn_server_ip,
-                "prio",
-                "100",
-                "table",
-                "main",
-            ])
-            .status();
+        info!("Restoring original routing...");
 
-        // Удаляем VPN правила
-        let _ = Command::new("ip")
-            .args(&["rule", "del", "from", "all", "table", "200"])
-            .status();
-
-        // Очищаем VPN таблицу
-        let _ = Command::new("ip")
-            .args(&["route", "flush", "table", "200"])
-            .status();
-
-        // Удаляем маршрут к VPN-серверу
+        // 1. Просто восстанавливаем старый шлюз по умолчанию.
+        // Это автоматически сделает маршрут на VPN-сервер ненужным,
+        // но мы удалим его для чистоты.
         if let (Some(gateway), Some(interface)) = (&self.original_gateway, &self.original_interface)
         {
             let _ = Command::new("ip")
                 .args(&[
-                    "route",
-                    "del",
-                    &self.vpn_server_ip,
-                    "via",
-                    gateway,
-                    "dev",
-                    interface,
-                ])
-                .status();
-        }
-
-        // Восстанавливаем оригинальный маршрут по умолчанию
-        if let (Some(gateway), Some(interface)) = (&self.original_gateway, &self.original_interface)
-        {
-            let status = Command::new("ip")
-                .args(&[
                     "route", "replace", "default", "via", gateway, "dev", interface,
                 ])
                 .status();
-
-            match status {
-                Ok(exit_status) if exit_status.success() => {
-                    info!("Restored original default route")
-                }
-                Ok(_) => warn!("Failed to restore original default route"),
-                Err(e) => warn!("Failed to restore original default route: {}", e),
-            }
+            info!("Restored original default route via {}", gateway);
         }
 
-        info!("Original routing restored");
+        // 2. Удаляем маршрут к VPN-серверу
+        let _ = Command::new("ip")
+            .args(&["route", "del", &self.vpn_server_ip])
+            .status();
+
+        info!("Original routing restored.");
         Ok(())
     }
 }

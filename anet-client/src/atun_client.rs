@@ -2,12 +2,12 @@ use anet_common::consts::MAX_PACKET_SIZE;
 use anet_common::protocol::AuthResponse;
 use anet_common::tun_params::TunParams;
 use anyhow::{Context, Result};
+use bytes::{Bytes, BytesMut};
 use log::{error, info};
 use std::net::Ipv4Addr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tun::{AsyncDevice, Configuration};
-use bytes::{Bytes};
 
 #[derive(Clone)]
 pub struct TunManager {
@@ -88,12 +88,12 @@ impl TunManager {
         tokio::spawn({
             let tx_to_tls = tx_to_tls.clone();
             async move {
-                let mut buffer = vec![0u8; MAX_PACKET_SIZE];
+                let mut buffer = BytesMut::with_capacity(MAX_PACKET_SIZE);
                 loop {
-                    match tun_reader.read(&mut buffer).await {
+                    match tun_reader.read_buf(&mut buffer).await {
                         Ok(n) => {
                             if n > 0 {
-                                let packet = Bytes::copy_from_slice(&buffer[..n]);
+                                let packet = buffer.split_to(n).freeze();
                                 if let Err(e) = tx_to_tls.send(packet).await {
                                     error!("Error TUN -> TLS: {:?}", e);
                                     break;

@@ -1,7 +1,7 @@
 use anet_common::consts::{CHANNEL_BUFFER_SIZE, MAX_PACKET_SIZE};
 use anet_common::tun_params::TunParams;
 use anyhow::{Context, Result};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use log::{error, info};
 use std::net::Ipv4Addr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -44,15 +44,15 @@ impl TunManager {
         let (tx_from_tun, rx_from_tun) = mpsc::channel::<Bytes>(CHANNEL_BUFFER_SIZE);
 
         tokio::spawn(async move {
-            let mut buffer = vec![0u8; MAX_PACKET_SIZE];
+            let mut buffer = BytesMut::with_capacity(MAX_PACKET_SIZE);
             loop {
-                match reader.read(&mut buffer).await {
+                match reader.read_buf(&mut buffer).await {
                     Ok(0) => {
                         info!("TUN reader stream ended.");
                         break;
                     }
                     Ok(n) => {
-                        let packet = Bytes::copy_from_slice(&buffer[..n]);
+                        let packet = buffer.split_to(n).freeze();
                         if tx_from_tun.send(packet).await.is_err() {
                             break;
                         }

@@ -1,12 +1,12 @@
 use crate::atun_client::TunManager;
 use crate::config::Config;
-use anet_common::consts::{PACKET_TYPE_DATA, CHANNEL_BUFFER_SIZE, MAX_PACKET_SIZE};
+use anet_common::consts::{CHANNEL_BUFFER_SIZE, MAX_PACKET_SIZE, PACKET_TYPE_DATA};
+use anet_common::encryption::Cipher;
 use anet_common::protocol::{
     AuthRequest, AuthResponse, Message as AnetMessage, UdpHandshake, message::Content,
 };
 use anyhow::Result;
 use bytes::Bytes;
-use anet_common::encryption::Cipher;
 use log::{error, info, warn};
 use prost::Message;
 use rustls::pki_types::{CertificateDer, ServerName};
@@ -217,7 +217,9 @@ impl ANetClient {
 
                                     // Извлекаем sequence number (байты 1-8)
                                     let sequence_bytes = packet.slice(1..9);
-                                    let sequence = u64::from_be_bytes(sequence_bytes.as_ref().try_into().unwrap());
+                                    let sequence = u64::from_be_bytes(
+                                        sequence_bytes.as_ref().try_into().unwrap(),
+                                    );
 
                                     // Извлекаем зашифрованные данные (байты 9 и дальше)
                                     let encrypted_data = packet.slice(9..);

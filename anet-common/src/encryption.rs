@@ -1,8 +1,8 @@
 use aead::{Aead, KeyInit, Nonce};
 use aes_gcm::{Aes256Gcm, Key};
-use bytes::{Bytes};
-use std::sync::Arc;
+use bytes::Bytes;
 use chacha20poly1305::ChaCha20Poly1305;
+use std::sync::Arc;
 
 // Заменить на `ChaCha20Poly1305` при необходимости.
 type CryptoAlgorithm = Aes256Gcm;
@@ -29,7 +29,8 @@ impl Cipher {
     pub fn encrypt(&self, nonce_bytes: &[u8], data: Bytes) -> Result<Bytes, EncryptionError> {
         let nonce = Nonce::<CryptoAlgorithm>::from_slice(nonce_bytes);
 
-        let ciphertext = self.cipher
+        let ciphertext = self
+            .cipher
             .encrypt(nonce, data.as_ref())
             .map_err(|_| EncryptionError::EncryptionFailed)?;
 
@@ -38,10 +39,10 @@ impl Cipher {
 
     #[inline]
     pub fn decrypt(&self, nonce_bytes: &[u8], data: Bytes) -> Result<Bytes, EncryptionError> {
-
         let nonce = Nonce::<CryptoAlgorithm>::from_slice(nonce_bytes);
 
-        let plaintext = self.cipher
+        let plaintext = self
+            .cipher
             .decrypt(nonce, data.as_ref())
             .map_err(|_| EncryptionError::DecryptionFailed)?;
 
