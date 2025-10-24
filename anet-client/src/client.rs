@@ -1,6 +1,9 @@
 use crate::atun_client::TunManager;
 use crate::config::Config;
-use anet_common::consts::{CHANNEL_BUFFER_SIZE, MAX_PACKET_SIZE, PACKET_TYPE_DATA};
+use anet_common::consts::{
+    CHANNEL_BUFFER_SIZE, MAX_PACKET_SIZE, PACKET_TYPE_DATA, PACKET_TYPE_PING, PACKET_TYPE_PONG,
+    PING_PONG_INTERVAL,
+};
 use anet_common::encryption::Cipher;
 use anet_common::protocol::{
     AuthRequest, AuthResponse, Message as AnetMessage, UdpHandshake, message::Content,
@@ -11,9 +14,12 @@ use log::{error, info, warn};
 use prost::Message;
 use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::{ClientConfig, RootCertStore};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 use std::{sync::Arc, time::Duration};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
+use tokio::sync::RwLock;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
 use tokio_rustls::TlsConnector;
@@ -21,6 +27,7 @@ use tokio_rustls::TlsConnector;
 const MAX_RETRIES: u32 = 5;
 const INITIAL_DELAY: u64 = 2;
 const MAX_DELAY: u64 = 60;
+const RECONNECT_DELAY: u64 = 3;
 
 pub struct ANetClient {
     pub tun_manager: TunManager,
@@ -69,8 +76,16 @@ impl ANetClient {
             match self.authenticate_via_tls().await {
                 Ok(params) => {
                     info!("Connection established successfully");
-                    self.run_udp_connection(&params, self.tun_manager.clone())
-                        .await?;
+
+                    // Запускаем UDP соединение в отдельной задаче с мониторингом
+                    let client_clone = self.clone();
+                    let params_clone = params.clone();
+                    tokio::spawn(async move {
+                        client_clone
+                            .run_udp_connection_with_reconnect(&params_clone)
+                            .await;
+                    });
+
                     break Ok(params);
                 }
                 Err(e) => {
@@ -90,6 +105,66 @@ impl ANetClient {
 
                     sleep(Duration::from_secs(delay)).await;
                     delay = next_delay;
+                }
+            }
+        }
+    }
+
+    fn clone(&self) -> Self {
+        Self {
+            tun_manager: self.tun_manager.clone(),
+            tls_connector: self.tls_connector.clone(),
+            server_addr: self.server_addr.clone(),
+            auth_phrase: self.auth_phrase.clone(),
+        }
+    }
+
+    async fn run_udp_connection_with_reconnect(&self, initial_auth_response: &AuthResponse) {
+        let mut reconnect_attempts = 0;
+        let max_reconnect_attempts = 10;
+        let mut current_auth_response = initial_auth_response.clone();
+
+        loop {
+            info!(
+                "Starting UDP connection (attempt {})",
+                reconnect_attempts + 1
+            );
+
+            match self
+                .run_udp_connection(&current_auth_response, self.tun_manager.clone())
+                .await
+            {
+                Ok(()) => {
+                    info!("UDP connection finished normally");
+                    break;
+                }
+                Err(e) => {
+                    reconnect_attempts += 1;
+                    error!(
+                        "UDP connection failed (attempt {}): {}",
+                        reconnect_attempts, e
+                    );
+
+                    if reconnect_attempts >= max_reconnect_attempts {
+                        error!("Max UDP reconnection attempts reached, giving up");
+                        break;
+                    }
+
+                    // Пытаемся переаутентифицироваться перед следующим подключением
+                    info!("Attempting reauthentication...");
+                    match self.authenticate_via_tls().await {
+                        Ok(new_auth_response) => {
+                            current_auth_response = new_auth_response;
+                            info!("Reauthentication successful");
+                        }
+                        Err(e) => {
+                            error!("Reauthentication failed: {}", e);
+                            // Продолжаем со старыми учетными данными на следующий цикл
+                        }
+                    }
+
+                    info!("Reconnecting in {} seconds...", RECONNECT_DELAY);
+                    sleep(Duration::from_secs(RECONNECT_DELAY)).await;
                 }
             }
         }
@@ -158,8 +233,8 @@ impl ANetClient {
         info!("Starting UDP connection");
 
         let _ = tun_manager.set_ip_network_params(auth_response);
-        // Отправляем UDP handshake
 
+        // Отправляем UDP handshake
         let handshake = AnetMessage {
             content: Some(Content::UdpHandshake(UdpHandshake {
                 client_id: auth_response.client_id.clone(),
@@ -172,7 +247,15 @@ impl ANetClient {
         let mut handshake_data = Vec::new();
         handshake.encode(&mut handshake_data)?;
         socket.send(&handshake_data).await?;
-        let socket = Arc::new(socket);
+        info!(
+            "Sent UDP handshake with client_id: {}",
+            auth_response.client_id
+        );
+
+        let socket = Arc::new(RwLock::new(socket));
+        let connection_active = Arc::new(AtomicBool::new(true));
+        let last_ping_time = Arc::new(RwLock::new(Instant::now()));
+
         // Настраиваем шифрование
         let cipher = Cipher::new(&auth_response.crypto_key);
 
@@ -180,58 +263,78 @@ impl ANetClient {
         let (tx_to_tun, rx_from_tun) = mpsc::channel(CHANNEL_BUFFER_SIZE);
         let (tx_to_udp, mut rx_from_udp) = mpsc::channel(CHANNEL_BUFFER_SIZE);
 
-        let tun_task = tokio::spawn({
-            let mut tun_manager = tun_manager.clone();
-            async move {
-                if let Err(e) = tun_manager.start_processing(tx_to_udp, rx_from_tun).await {
-                    error!("TUN processing error: {}", e);
-                }
-            }
-        });
+        // Создаём TUN
+        tun_manager.start_processing(tx_to_udp, rx_from_tun).await?;
 
         // Задача для приёма пакетов через UDP
-        let recv_task = tokio::spawn({
+        let recv_task = {
             let socket = socket.clone();
             let cipher = cipher.clone();
             let tx_to_tun = tx_to_tun.clone();
-            async move {
+            let connection_active = connection_active.clone();
+            let last_ping_time = last_ping_time.clone();
+
+            tokio::spawn(async move {
                 let mut buffer = vec![0u8; MAX_PACKET_SIZE];
                 loop {
-                    match socket.recv(&mut buffer).await {
+                    if !connection_active.load(Ordering::Relaxed) {
+                        break;
+                    }
+
+                    let read_result = {
+                        let socket_guard = socket.read().await;
+                        socket_guard.recv(&mut buffer).await
+                    };
+
+                    match read_result {
                         Ok(len) => {
                             if len < 1 {
-                                error!("Packet too short");
                                 continue;
                             }
-                            // Создаем Bytes из полученных данных
+
                             let packet = Bytes::copy_from_slice(&buffer[..len]);
                             let packet_type = packet[0];
 
                             match packet_type {
+                                PACKET_TYPE_PING => {
+                                    // Обновляем время получения PING
+                                    {
+                                        let mut last_ping = last_ping_time.write().await;
+                                        *last_ping = Instant::now();
+                                    }
+                                    info!("Received PING from server, sending PONG");
+
+                                    // Отправляем PONG
+                                    let pong_packet = vec![PACKET_TYPE_PONG];
+                                    let send_result = {
+                                        let socket_guard = socket.read().await;
+                                        socket_guard.send(&pong_packet).await
+                                    };
+
+                                    if let Err(e) = send_result {
+                                        error!("Failed to send PONG: {}", e);
+                                        connection_active.store(false, Ordering::Relaxed);
+                                        break;
+                                    }
+                                }
                                 PACKET_TYPE_DATA => {
-                                    // Проверяем минимальный размер пакета: тип + sequence + минимальные данные
                                     if packet.len() < 1 + 8 + 1 {
                                         error!("Data packet too short");
                                         continue;
                                     }
 
-                                    // Извлекаем sequence number (байты 1-8)
                                     let sequence_bytes = packet.slice(1..9);
                                     let sequence = u64::from_be_bytes(
                                         sequence_bytes.as_ref().try_into().unwrap(),
                                     );
 
-                                    // Извлекаем зашифрованные данные (байты 9 и дальше)
                                     let encrypted_data = packet.slice(9..);
-
-                                    // Расшифровываем пакет
                                     let nonce = Cipher::generate_nonce(sequence);
 
                                     match cipher.decrypt(&nonce, encrypted_data) {
                                         Ok(decrypted) => {
-                                            // Отправляем в TUN
-                                            if let Err(e) = tx_to_tun.send(decrypted).await {
-                                                error!("Failed to send to TUN: {}", e);
+                                            if tx_to_tun.send(decrypted).await.is_err() {
+                                                break;
                                             }
                                         }
                                         Err(e) => {
@@ -246,23 +349,29 @@ impl ANetClient {
                         }
                         Err(e) => {
                             error!("Failed to receive UDP packet: {}", e);
+                            connection_active.store(false, Ordering::Relaxed);
+                            break;
                         }
                     }
                 }
-            }
-        });
+            })
+        };
 
         // Задача для отправки пакетов через UDP
-        let send_task = tokio::spawn({
+        let send_task = {
             let socket = socket.clone();
             let cipher = cipher.clone();
-            async move {
+            let connection_active = connection_active.clone();
+
+            tokio::spawn(async move {
                 let mut sequence: u64 = 0;
 
                 while let Some(packet) = rx_from_udp.recv().await {
-                    sequence += 1;
+                    if !connection_active.load(Ordering::Relaxed) {
+                        break;
+                    }
 
-                    // Шифруем пакет
+                    sequence += 1;
                     let nonce = Cipher::generate_nonce(sequence);
 
                     let encrypted_data = match cipher.encrypt(&nonce, packet) {
@@ -273,28 +382,70 @@ impl ANetClient {
                         }
                     };
 
-                    // Формируем бинарный пакет: [тип: 1 байт][sequence: 8 байт][зашифрованные данные]
                     let mut data = Vec::with_capacity(1 + 8 + encrypted_data.len());
                     data.push(PACKET_TYPE_DATA);
                     data.extend_from_slice(&sequence.to_be_bytes());
                     data.extend_from_slice(&encrypted_data);
 
-                    // Отправляем
-                    if let Err(e) = socket.send(&data).await {
-                        error!("Failed to send UDP packet: {}", e);
+                    let send_result = {
+                        let socket_guard = socket.read().await;
+                        socket_guard.send(&data).await
+                    };
+
+                    if send_result.is_err() {
+                        connection_active.store(false, Ordering::Relaxed);
+                        break;
                     }
                 }
-            }
-        });
+            })
+        };
 
-        // Ожидаем завершения задач
+        // Задача для мониторинга PING от сервера
+        let monitor_task = {
+            let connection_active = connection_active.clone();
+            let last_ping_time = last_ping_time.clone();
+
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(1));
+
+                loop {
+                    interval.tick().await;
+
+                    if !connection_active.load(Ordering::Relaxed) {
+                        break;
+                    }
+
+                    let time_since_last_ping = {
+                        let last_ping = last_ping_time.read().await;
+                        last_ping.elapsed()
+                    };
+
+                    if time_since_last_ping > Duration::from_secs(PING_PONG_INTERVAL) {
+                        error!(
+                            "No PING received from server for {} seconds, reconnecting...",
+                            PING_PONG_INTERVAL
+                        );
+                        connection_active.store(false, Ordering::Relaxed);
+                        break;
+                    }
+                }
+                info!("PING monitor task finished");
+            })
+        };
+
+        // Ожидаем завершения одной из задач
         tokio::select! {
-            _ = tun_task => {},
-            _ = send_task => {},
-            _ = recv_task => {},
+            _ = recv_task => info!("Receive task finished"),
+            _ = send_task => info!("Send task finished"),
+            _ = monitor_task => info!("Monitor task finished"),
         }
 
-        Ok(())
+        connection_active.store(false, Ordering::Relaxed);
+
+        // Останавливаем TUN manager
+        tun_manager.shutdown();
+
+        Err(anyhow::anyhow!("UDP connection terminated"))
     }
 }
 
@@ -313,8 +464,8 @@ async fn connect_with_backoff(server_addr: &str) -> Result<TcpStream> {
 
                 let next_delay = std::cmp::min(delay * 2, MAX_DELAY);
                 error!(
-                    "Connection failed (attempt {}): {}. Retrying in {} seconds (next retry in {} seconds)...",
-                    retries, e, delay, next_delay
+                    "Connection failed (attempt {}): {}. Retrying in {} seconds...",
+                    retries, e, delay
                 );
                 sleep(Duration::from_secs(delay)).await;
                 delay = next_delay;
