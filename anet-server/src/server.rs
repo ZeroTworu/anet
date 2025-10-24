@@ -7,14 +7,15 @@ use crate::ip_pool::IpPool;
 use crate::utils::{generate_crypto_key, generate_uid};
 use anet_common::AuthResponse;
 use anet_common::consts::{
-    BATCH_SEND_SIZE, MAX_PACKET_SIZE, PACKET_TYPE_DATA, UDP_HANDSHAKE_TIMEOUT_SECONDS,
+    BATCH_SEND_SIZE, MAX_PACKET_SIZE, PACKET_TYPE_DATA, PACKET_TYPE_PING, PACKET_TYPE_PONG,
+    UDP_HANDSHAKE_TIMEOUT_SECONDS, PING_PONG_INTERVAL
 };
 use anet_common::encryption::Cipher;
 use anet_common::protocol::{Message as AnetMessage, message::Content};
 use anet_common::tun_params::TunParams;
 use anyhow::Context;
 use bytes::{Bytes, BytesMut};
-use log::{error, info};
+use log::{error, info, debug};
 use prost::Message;
 use rustls::ServerConfig;
 use rustls::pki_types::CertificateDer;
@@ -33,6 +34,7 @@ struct UdpClient {
     client_id: String,
     addr: SocketAddr,
     sequence: u64,
+    pending_ping: bool, // Ожидает ли ответ на PING
 }
 
 pub struct ANetServer {
@@ -131,7 +133,7 @@ impl ANetServer {
             }
         });
 
-        //UDP -> TUN
+        // UDP -> TUN
         let clients_by_ip_for_udp = self.clients_by_ip.clone();
         let addr_to_ip_for_udp = self.addr_to_ip.clone();
         let uid_to_key_for_udp = self.uid_to_key.clone();
@@ -160,8 +162,7 @@ impl ANetServer {
                             };
                             if let Some(cipher) = cipher {
                                 if let Err(e) =
-                                    Self::handle_udp_data(data, cipher, tx_to_tun_for_udp.clone())
-                                        .await
+                                    Self::handle_udp_data(data, cipher, tx_to_tun_for_udp.clone(), clients_by_ip_for_udp.clone(), ip).await
                                 {
                                     error!("Failed to handle UDP packet from {}: {}", addr, e);
                                 }
@@ -174,7 +175,7 @@ impl ANetServer {
                             data,
                             addr,
                         )
-                        .await
+                            .await
                         {
                             error!("Failed to handle UDP handshake from {}: {}", addr, e);
                         }
@@ -184,38 +185,66 @@ impl ANetServer {
             }
         });
 
-        // Очистки неактивных клиентов
-        let clients_by_ip_for_cleanup = self.clients_by_ip.clone();
-        let addr_to_ip_for_cleanup = self.addr_to_ip.clone();
-        let ip_pool_for_cleanup = self.ip_pool.clone();
+        // Задача для отправки PING и проверки PONG
+        let clients_by_ip_for_ping = self.clients_by_ip.clone();
+        let addr_to_ip_for_ping = self.addr_to_ip.clone();
+        let ip_pool_for_ping = self.ip_pool.clone();
+        let udp_socket_for_ping = udp_socket.clone();
         tokio::spawn(async move {
-            let mut interval = interval(Duration::from_secs(30));
+            let mut interval = interval(Duration::from_secs(PING_PONG_INTERVAL));
             loop {
                 interval.tick().await;
 
-                let now = std::time::Instant::now();
                 let mut clients_to_remove = Vec::new();
-                let mut clients_by_ip = clients_by_ip_for_cleanup.lock().await;
+                let mut ping_sent_count = 0;
+                let mut pong_pending_count = 0;
 
-                for (ip, client) in clients_by_ip.iter() {
-                    if now.duration_since(client.last_seen) > Duration::from_secs(60) {
-                        clients_to_remove.push((ip.clone(), client.addr, client.client_id.clone()));
+                {
+                    let mut clients_by_ip = clients_by_ip_for_ping.lock().await;
+
+                    for (ip, client) in clients_by_ip.iter_mut() {
+                        if client.pending_ping {
+                            // Клиент не ответил на предыдущий PING
+                            pong_pending_count += 1;
+                            clients_to_remove.push((ip.clone(), client.addr, client.client_id.clone()));
+                            info!("Client {} (IP: {}) did not respond to PING", client.addr, ip);
+                        } else {
+                            // Отправляем новый PING
+                            let ping_packet = vec![PACKET_TYPE_PING];
+                            if let Err(e) = udp_socket_for_ping.send_to(&ping_packet, client.addr).await {
+                                error!("Failed to send PING to {}: {}", client.addr, e);
+                                clients_to_remove.push((ip.clone(), client.addr, client.client_id.clone()));
+                            } else {
+                                client.pending_ping = true;
+                                ping_sent_count += 1;
+                                debug!("Sent PING to client {} (IP: {})", client.addr, ip);
+                            }
+                        }
                     }
                 }
 
-                if !clients_to_remove.is_empty() {
-                    let mut addr_to_ip = addr_to_ip_for_cleanup.lock().await;
+                // Логируем статистику
+                if ping_sent_count > 0 || pong_pending_count > 0 {
+                    info!("PING/PONG: sent {} PINGs, {} clients pending PONG", ping_sent_count, pong_pending_count);
+                }
 
-                    for (ip_str, addr, _) in &clients_to_remove {
+                // Удаляем клиентов, которые не ответили на PING
+                if !clients_to_remove.is_empty() {
+                    let mut clients_by_ip = clients_by_ip_for_ping.lock().await;
+                    let mut addr_to_ip = addr_to_ip_for_ping.lock().await;
+
+                    for (ip_str, addr, client_id) in &clients_to_remove {
                         clients_by_ip.remove(ip_str);
                         addr_to_ip.remove(addr);
 
                         if let Ok(ip_addr) = ip_str.parse() {
-                            ip_pool_for_cleanup.release(ip_addr);
+                            ip_pool_for_ping.release(ip_addr);
                         }
 
-                        info!("Removed inactive client: {} (IP: {})", addr, ip_str);
+                        info!("Removed inactive client: {} (IP: {}, ClientID: {})", addr, ip_str, client_id);
                     }
+
+                    info!("Removed {} inactive clients", clients_to_remove.len());
                 }
             }
         });
@@ -239,7 +268,7 @@ impl ANetServer {
                     uid_to_key,
                     client_id_to_ip,
                 )
-                .await
+                    .await
                 {
                     error!("Error handling TLS auth: {}", e);
                 }
@@ -284,6 +313,7 @@ impl ANetServer {
                     client_id: handshake.client_id.clone(),
                     addr,
                     sequence: 0,
+                    pending_ping: false,
                 };
 
                 clients_by_ip.lock().await.insert(ip.clone(), client);
@@ -304,6 +334,8 @@ impl ANetServer {
         data: Bytes,
         cipher: Cipher,
         tx_to_tun: mpsc::Sender<Bytes>,
+        clients_by_ip: Arc<Mutex<HashMap<String, UdpClient>>>,
+        client_ip: String,
     ) -> anyhow::Result<()> {
         if data.is_empty() {
             return Ok(());
@@ -311,6 +343,17 @@ impl ANetServer {
         let packet_type = data[0];
 
         match packet_type {
+            PACKET_TYPE_PONG => {
+                // Обработка PONG от клиента
+                 let mut clients = clients_by_ip.lock().await;
+                    if let Some(client) = clients.get_mut(&client_ip) {
+                    client.pending_ping = false;
+                    client.last_seen = std::time::Instant::now();
+                    info!("Received PONG from client {} (IP: {})", client.addr, client_ip);
+
+                }
+                Ok(())
+            }
             PACKET_TYPE_DATA => {
                 if data.len() < 9 {
                     anyhow::bail!("Data packet too short");

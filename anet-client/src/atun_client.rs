@@ -3,16 +3,18 @@ use anet_common::protocol::AuthResponse;
 use anet_common::tun_params::TunParams;
 use anyhow::{Context, Result};
 use bytes::{Bytes, BytesMut};
-use log::{error, info};
+use log::{error, info, debug};
 use std::net::Ipv4Addr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
-use tun::{AsyncDevice, Configuration};
+use tokio::sync::broadcast;
+use tun::Configuration;
 
 #[derive(Clone)]
 pub struct TunManager {
     pub params: TunParams,
     pub is_set: bool,
+    stop_sender: Option<broadcast::Sender<()>>,
 }
 
 impl TunManager {
@@ -20,6 +22,7 @@ impl TunManager {
         Self {
             params: TunParams::default_client(),
             is_set: false,
+            stop_sender: None,
         }
     }
 
@@ -60,74 +63,100 @@ impl TunManager {
         config.clone()
     }
 
-    pub fn create_as_async(&self) -> AsyncDevice {
-        let config = self.create_config();
-        match tun::create_as_async(&config) {
-            Ok(dev) => {
-                info!("TUN Device created.");
-                dev
-            }
-            Err(e) => {
-                error!("Error creating device {:?}", e);
-                panic!("Error creating device")
-            }
-        }
-    }
-
     pub async fn start_processing(
         &mut self,
         tx_to_tls: mpsc::Sender<Bytes>,
         mut rx_to_tun: mpsc::Receiver<Bytes>,
     ) -> Result<()> {
         info!("{}", self.get_info());
+        let config = self.create_config();
 
-        let async_dev = self.create_as_async();
+        let async_dev = tun::create_as_async(&config)?;
         let (mut tun_reader, mut tun_writer) = tokio::io::split(async_dev);
 
+        // Создаем канал для остановки
+        let (stop_tx, _) = broadcast::channel(1);
+        self.stop_sender = Some(stop_tx.clone());
+
         // Задача для чтения из TUN и отправки в сеть
-        tokio::spawn({
+        let mut stop_rx_reader = stop_tx.subscribe();
+        let reader_handle = tokio::spawn({
             let tx_to_tls = tx_to_tls.clone();
             async move {
                 let mut buffer = BytesMut::with_capacity(MAX_PACKET_SIZE);
                 loop {
-                    match tun_reader.read_buf(&mut buffer).await {
-                        Ok(n) => {
-                            if n > 0 {
-                                let packet = buffer.split_to(n).freeze();
-                                if let Err(e) = tx_to_tls.send(packet).await {
-                                    error!("Error TUN -> TLS: {:?}", e);
+                    tokio::select! {
+                        result = tun_reader.read_buf(&mut buffer) => {
+                            match result {
+                                Ok(n) => {
+                                    if n > 0 {
+                                        let packet = buffer.split_to(n).freeze();
+                                        if let Err(e) = tx_to_tls.send(packet).await {
+                                            error!("Error TUN -> TLS: {:?}", e);
+                                            break;
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    error!("Failed to read from TUN: {}", e);
                                     break;
                                 }
                             }
                         }
-                        Err(e) => {
-                            error!("Failed to read from TUN: {}", e);
+                        _ = stop_rx_reader.recv() => {
+                            debug!("Stop signal received in TUN reader");
                             break;
                         }
                     }
                 }
+                debug!("TUN reader task finished");
             }
         });
 
         // Задача для записи в TUN из сети
-        tokio::spawn(async move {
+        let mut stop_rx_writer = stop_tx.subscribe();
+        let writer_handle = tokio::spawn(async move {
             loop {
-                match rx_to_tun.recv().await {
-                    Some(packet) => {
-                        if let Err(e) = tun_writer.write_all(&packet).await {
-                            error!("Error TLS -> TUN: {:?}", e);
-                            break;
+                tokio::select! {
+                    packet = rx_to_tun.recv() => {
+                        match packet {
+                            Some(packet) => {
+                                if let Err(e) = tun_writer.write_all(&packet).await {
+                                    error!("Error TLS -> TUN: {:?}", e);
+                                    break;
+                                }
+                            }
+                            None => {
+                                debug!("TUN writer channel closed");
+                                break;
+                            }
                         }
                     }
-                    None => {
+                    _ = stop_rx_writer.recv() => {
+                        debug!("Stop signal received in TUN writer");
                         break;
                     }
                 }
             }
+            debug!("TUN writer task finished");
+        });
+
+        // Задача для мониторинга завершения работы
+        tokio::spawn(async move {
+            let _ =tokio::join!(reader_handle, writer_handle);
+            info!("Both TUN tasks finished");
         });
 
         info!("Starting TUN packet processing on client...");
         Ok(())
+    }
+
+    pub fn shutdown(&mut self) {
+        if let Some(stop_tx) = &self.stop_sender {
+            let _ = stop_tx.send(());
+            debug!("Sent shutdown signal to TUN tasks");
+        }
+        self.stop_sender = None;
     }
 
     pub fn get_info(&self) -> String {

@@ -47,10 +47,6 @@ impl LinuxRouteManager {
         Ok(())
     }
 
-    // Настраиваем маршрутизацию через VPN
-    // anet-client/lrm.rs
-
-    // ... (new, backup_original_routes остаются без изменений) ...
 
     pub fn setup_vpn_routing(&self) -> Result<()> {
         info!("Setting up simplified VPN routing (default gateway override)...");
@@ -108,21 +104,6 @@ impl LinuxRouteManager {
         Ok(())
     }
 
-    // Убедимся, что таблица маршрутизации существует
-    fn ensure_route_table(&self) {
-        // Проверяем, существует ли уже таблица 200 в /etc/iproute2/rt_tables
-        let output = Command::new("grep")
-            .args(&["-q", "^200", "/etc/iproute2/rt_tables"])
-            .status();
-
-        if let Ok(status) = output {
-            if !status.success() {
-                // Добавляем таблицу
-                let _ = Command::new("sh")
-                    .args(&["-c", "echo '200 vpn' | tee -a /etc/iproute2/rt_tables"]);
-            }
-        }
-    }
 
     // Восстанавливаем оригинальную маршрутизацию
     pub fn restore_original_routing(&self) -> Result<()> {
