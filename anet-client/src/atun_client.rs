@@ -2,7 +2,7 @@ use anet_common::consts::MAX_PACKET_SIZE;
 use anet_common::protocol::AuthResponse;
 use anet_common::tun_params::TunParams;
 use anyhow::{Context, Result};
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use log::{error, info, debug};
 use std::net::Ipv4Addr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -13,7 +13,6 @@ use tun::Configuration;
 #[derive(Clone)]
 pub struct TunManager {
     pub params: TunParams,
-    pub is_set: bool,
     stop_sender: Option<broadcast::Sender<()>>,
 }
 
@@ -21,7 +20,6 @@ impl TunManager {
     pub fn new() -> Self {
         Self {
             params: TunParams::default_client(),
-            is_set: false,
             stop_sender: None,
         }
     }
@@ -40,7 +38,6 @@ impl TunManager {
         self.params.netmask = netmask;
         self.params.gateway = gateway;
         self.params.mtu = params.mtu as u16;
-        self.is_set = true;
         Ok(())
     }
 
@@ -83,14 +80,14 @@ impl TunManager {
         let reader_handle = tokio::spawn({
             let tx_to_tls = tx_to_tls.clone();
             async move {
-                let mut buffer = BytesMut::with_capacity(MAX_PACKET_SIZE);
+                let mut buffer = vec![0u8; MAX_PACKET_SIZE];
                 loop {
                     tokio::select! {
-                        result = tun_reader.read_buf(&mut buffer) => {
+                        result = tun_reader.read(&mut buffer) => {
                             match result {
                                 Ok(n) => {
                                     if n > 0 {
-                                        let packet = buffer.split_to(n).freeze();
+                                        let packet = Bytes::copy_from_slice(&buffer[..n]);
                                         if let Err(e) = tx_to_tls.send(packet).await {
                                             error!("Error TUN -> TLS: {:?}", e);
                                             break;
