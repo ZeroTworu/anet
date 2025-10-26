@@ -9,3 +9,14 @@ server_cert = """
 -----END CERTIFICATE-----
 """
 
+# Настройки TCP для Windows
+[windows_tcp]
+congestion_algorithm = "ctcp"
+enable_tcp_tuning = true
+
+# Настройки TCP для Unix/Linux
+[unix_tcp]
+preferred_algorithm = "bbr"  # bbr, cubic, reno, etc
+fallback_algorithm = "cubic"
+enable_tcp_tuning = true
+enable_additional_optimizations = true
