@@ -47,11 +47,6 @@ impl LinuxRouteManager {
         Ok(())
     }
 
-    // Настраиваем маршрутизацию через VPN
-    // anet-client/lrm.rs
-
-    // ... (new, backup_original_routes остаются без изменений) ...
-
     pub fn setup_vpn_routing(&self) -> Result<()> {
         info!("Setting up simplified VPN routing (default gateway override)...");
 

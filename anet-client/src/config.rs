@@ -1,29 +1,29 @@
 use clap::Parser;
+use serde::Deserialize;
 use tokio::fs::read_to_string;
-use yaml_rust2::YamlLoader;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     pub address: String,
     pub auth_phrase: String,
-    pub cert_path: String,
+    pub server_cert: String,
+    #[serde(default = "default_batch_size")]
+    pub batch_size: usize,
+}
+
+fn default_batch_size() -> usize {
+    8
 }
 
 #[derive(Debug, Parser)]
 pub struct Opt {
-    #[clap(short, long, default_value = "./client.yaml")]
+    #[clap(short, long, default_value = "./client.toml")]
     cfg: String,
 }
 
 pub async fn load() -> anyhow::Result<Config> {
     let opt = Opt::parse();
-    let yaml = read_to_string(&opt.cfg).await?;
-    let settings = YamlLoader::load_from_str(&yaml)?;
-    let client = &settings[0]["client"];
-    let cfg = Config {
-        address: client["address"].as_str().unwrap().to_string(),
-        auth_phrase: client["auth_phrase"].as_str().unwrap().to_string(),
-        cert_path: client["cert_path"].as_str().unwrap().to_string(),
-    };
+    let toml_str = read_to_string(&opt.cfg).await?;
+    let cfg: Config = toml::from_str(&toml_str)?;
     Ok(cfg)
 }

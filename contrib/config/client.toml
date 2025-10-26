@@ -1,0 +1,11 @@
+# ANET Client Configuration
+address = "127.0.0.1:8445"
+auth_phrase = "hauau"
+
+# Сертификат сервера.
+server_cert = """
+-----BEGIN CERTIFICATE-----
+
+-----END CERTIFICATE-----
+"""
+

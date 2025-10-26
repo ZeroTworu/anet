@@ -1,12 +1,13 @@
-use crate::atun_client::TunManager;
 use crate::config::Config;
-use anet_common::consts::{CHANNEL_BUFFER_SIZE, MAX_PACKET_SIZE, PACKET_TYPE_DATA};
+use anet_common::atun::TunManager;
+use anet_common::consts::{MAX_PACKET_SIZE, PACKET_TYPE_DATA};
 use anet_common::encryption::Cipher;
 use anet_common::protocol::{
     AuthRequest, AuthResponse, Message as AnetMessage, UdpHandshake, message::Content,
 };
+use anet_common::tun_params::TunParams;
 use anyhow::Result;
-use bytes::Bytes;
+use bytes::{BufMut, Bytes, BytesMut};
 use log::{error, info, warn};
 use prost::Message;
 use rustls::pki_types::{CertificateDer, ServerName};
@@ -14,7 +15,6 @@ use rustls::{ClientConfig, RootCertStore};
 use std::{sync::Arc, time::Duration};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
-use tokio::sync::mpsc;
 use tokio::time::sleep;
 use tokio_rustls::TlsConnector;
 
@@ -23,7 +23,6 @@ const INITIAL_DELAY: u64 = 2;
 const MAX_DELAY: u64 = 60;
 
 pub struct ANetClient {
-    pub tun_manager: TunManager,
     tls_connector: TlsConnector,
     server_addr: String,
     auth_phrase: String,
@@ -33,8 +32,9 @@ impl ANetClient {
     pub fn new(cfg: &Config) -> anyhow::Result<Self> {
         let mut root_store = RootCertStore::empty();
 
-        let cert_file = std::fs::File::open(&cfg.cert_path)?;
-        let mut cert_reader = std::io::BufReader::new(cert_file);
+        let cert_bytes = cfg.server_cert.as_bytes();
+
+        let mut cert_reader = std::io::BufReader::new(cert_bytes);
 
         let certs =
             rustls_pemfile::certs(&mut cert_reader).collect::<Result<Vec<CertificateDer>, _>>()?;
@@ -54,7 +54,6 @@ impl ANetClient {
         info!("ANet Client manager created");
         let connector = TlsConnector::from(Arc::new(tls_config));
         Ok(Self {
-            tun_manager: TunManager::new(),
             tls_connector: connector,
             server_addr: cfg.address.to_string(),
             auth_phrase: cfg.auth_phrase.to_string(),
@@ -69,8 +68,7 @@ impl ANetClient {
             match self.authenticate_via_tls().await {
                 Ok(params) => {
                     info!("Connection established successfully");
-                    self.run_udp_connection(&params, self.tun_manager.clone())
-                        .await?;
+                    self.run_udp_connection(&params).await?;
                     break Ok(params);
                 }
                 Err(e) => {
@@ -140,11 +138,7 @@ impl ANetClient {
         }
     }
 
-    async fn run_udp_connection(
-        &self,
-        auth_response: &AuthResponse,
-        mut tun_manager: TunManager,
-    ) -> Result<()> {
+    async fn run_udp_connection(&self, auth_response: &AuthResponse) -> Result<()> {
         let udp_addr = format!(
             "{}:{}",
             self.server_addr.split(':').next().unwrap(),
@@ -155,11 +149,15 @@ impl ANetClient {
 
         socket.connect(&udp_addr).await?;
 
-        info!("Starting UDP connection");
+        info!(
+            "Starting UDP connection, client ID is {}",
+            auth_response.client_id
+        );
+        let params = TunParams::from_auth_response(auth_response, "anet-client");
 
-        let _ = tun_manager.set_ip_network_params(auth_response);
+        let tun_manager = TunManager::new(params);
+
         // Отправляем UDP handshake
-
         let handshake = AnetMessage {
             content: Some(Content::UdpHandshake(UdpHandshake {
                 client_id: auth_response.client_id.clone(),
@@ -177,20 +175,11 @@ impl ANetClient {
         let cipher = Cipher::new(&auth_response.crypto_key);
 
         // Запускаем обработку пакетов
-        let (tx_to_tun, rx_from_tun) = mpsc::channel(CHANNEL_BUFFER_SIZE);
-        let (tx_to_udp, mut rx_from_udp) = mpsc::channel(CHANNEL_BUFFER_SIZE);
 
-        let tun_task = tokio::spawn({
-            let mut tun_manager = tun_manager.clone();
-            async move {
-                if let Err(e) = tun_manager.start_processing(tx_to_udp, rx_from_tun).await {
-                    error!("TUN processing error: {}", e);
-                }
-            }
-        });
+        let (tx_to_tun, mut rx_from_tun) = tun_manager.run().await?;
 
         // Задача для приёма пакетов через UDP
-        let recv_task = tokio::spawn({
+        tokio::spawn({
             let socket = socket.clone();
             let cipher = cipher.clone();
             let tx_to_tun = tx_to_tun.clone();
@@ -253,46 +242,31 @@ impl ANetClient {
         });
 
         // Задача для отправки пакетов через UDP
-        let send_task = tokio::spawn({
+        tokio::spawn({
             let socket = socket.clone();
             let cipher = cipher.clone();
             async move {
                 let mut sequence: u64 = 0;
-
-                while let Some(packet) = rx_from_udp.recv().await {
+                while let Some(packet) = rx_from_tun.recv().await {
                     sequence += 1;
-
-                    // Шифруем пакет
-                    let nonce = Cipher::generate_nonce(sequence);
-
-                    let encrypted_data = match cipher.encrypt(&nonce, packet) {
-                        Ok(data) => data,
-                        Err(e) => {
-                            error!("Encryption failed: {}", e);
-                            continue;
+                    if let Some(data_to_send) =
+                        process_packet_for_sending(&cipher, sequence, packet).await
+                    {
+                        if let Err(e) = socket.send(&data_to_send).await {
+                            warn!("UDP ERROR {}", e);
+                            break;
                         }
-                    };
-
-                    // Формируем бинарный пакет: [тип: 1 байт][sequence: 8 байт][зашифрованные данные]
-                    let mut data = Vec::with_capacity(1 + 8 + encrypted_data.len());
-                    data.push(PACKET_TYPE_DATA);
-                    data.extend_from_slice(&sequence.to_be_bytes());
-                    data.extend_from_slice(&encrypted_data);
-
-                    // Отправляем
-                    if let Err(e) = socket.send(&data).await {
-                        error!("Failed to send UDP packet: {}", e);
                     }
                 }
             }
         });
 
         // Ожидаем завершения задач
-        tokio::select! {
-            _ = tun_task => {},
-            _ = send_task => {},
-            _ = recv_task => {},
-        }
+
+        // tokio::select! {
+        //     _ = send_task => {},
+        //     _ = recv_task => {},
+        // }
 
         Ok(())
     }
@@ -319,6 +293,30 @@ async fn connect_with_backoff(server_addr: &str) -> Result<TcpStream> {
                 sleep(Duration::from_secs(delay)).await;
                 delay = next_delay;
             }
+        }
+    }
+}
+
+async fn process_packet_for_sending(
+    cipher: &Cipher,
+    sequence: u64,
+    packet: Bytes,
+) -> Option<Bytes> {
+    if packet.len() < 20 {
+        return None;
+    }
+    let nonce = Cipher::generate_nonce(sequence);
+    match cipher.encrypt(&nonce, packet) {
+        Ok(encrypted_data) => {
+            let mut data = BytesMut::with_capacity(1 + 8 + encrypted_data.len());
+            data.put_u8(PACKET_TYPE_DATA);
+            data.put_u64(sequence);
+            data.put(encrypted_data);
+            Some(data.freeze())
+        }
+        Err(e) => {
+            error!("Encryption failed: {}", e);
+            None
         }
     }
 }

@@ -34,8 +34,8 @@ jobs:
           cp artifacts/anet-client-windows/anet-client.exe release_files/client-windows/
 
           cp contrib/config/server.yaml release_files/server/
-          cp contrib/config/client.yaml release_files/client-linux/
-          cp contrib/config/client.yaml release_files/client-windows/
+          cp contrib/config/client.toml release_files/client-linux/
+          cp contrib/config/client.toml release_files/client-windows/
 
           # get wintun.dl
           cd release_files/client-windows

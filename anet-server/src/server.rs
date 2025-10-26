@@ -1,20 +1,18 @@
 use std::collections::HashMap;
 use std::{fs::File, io::BufReader, sync::Arc};
 
-use crate::atun_server::TunManager;
 use crate::config::Config;
 use crate::ip_pool::IpPool;
 use crate::utils::{generate_crypto_key, generate_uid};
 use anet_common::AuthResponse;
-use anet_common::consts::{
-    BATCH_SEND_SIZE, MAX_PACKET_SIZE, PACKET_TYPE_DATA, UDP_HANDSHAKE_TIMEOUT_SECONDS,
-};
+use anet_common::atun::TunManager;
+use anet_common::consts::{MAX_PACKET_SIZE, PACKET_TYPE_DATA, UDP_HANDSHAKE_TIMEOUT_SECONDS};
 use anet_common::encryption::Cipher;
 use anet_common::protocol::{Message as AnetMessage, message::Content};
 use anet_common::tun_params::TunParams;
 use anyhow::Context;
-use bytes::{Bytes, BytesMut};
-use log::{error, info};
+use bytes::{BufMut, Bytes, BytesMut};
+use log::{error, info, warn};
 use prost::Message;
 use rustls::ServerConfig;
 use rustls::pki_types::CertificateDer;
@@ -56,8 +54,10 @@ impl ANetServer {
             address: cfg.self_ip.parse()?,
             name: cfg.if_name.clone(),
             mtu: cfg.mtu,
+            network: Some(cfg.net.parse()?),
         };
-        let tun_manager = TunManager::new(params, cfg.net.parse()?);
+        let tun_manager = TunManager::new(params);
+
         let ip_pool = IpPool::new(
             cfg.net.parse()?,
             cfg.mask.parse()?,
@@ -65,7 +65,6 @@ impl ANetServer {
             cfg.self_ip.parse()?,
             cfg.mtu,
         );
-        info!("Server TUN configuration: {}", tun_manager.get_info());
 
         Ok(Self {
             tls_acceptor: acceptor,
@@ -101,31 +100,12 @@ impl ANetServer {
         let udp_socket_for_tun = udp_socket.clone();
         let clients_by_ip_for_tun = self.clients_by_ip.clone();
         tokio::spawn(async move {
-            let mut batch_to_send: Vec<(Bytes, SocketAddr)> = Vec::with_capacity(BATCH_SEND_SIZE);
             while let Some(packet) = rx_from_tun.recv().await {
-                batch_to_send.clear();
-                if let Some(processed) =
+                if let Some((data_to_send, addr)) =
                     process_packet_for_sending(&clients_by_ip_for_tun, packet).await
                 {
-                    batch_to_send.push(processed);
-                }
-
-                for _ in 0..(BATCH_SEND_SIZE - 1) {
-                    match rx_from_tun.try_recv() {
-                        Ok(packet) => {
-                            if let Some(processed) =
-                                process_packet_for_sending(&clients_by_ip_for_tun, packet).await
-                            {
-                                batch_to_send.push(processed);
-                            }
-                        }
-                        Err(_) => break,
-                    }
-                }
-
-                for (data, addr) in &batch_to_send {
-                    if let Err(e) = udp_socket_for_tun.send_to(data, *addr).await {
-                        error!("Failed to send UDP packet to {}: {}", addr, e);
+                    if let Err(e) = udp_socket_for_tun.send_to(&data_to_send, addr).await {
+                        warn!("UDP ERROR {} for addr: {}", e, addr);
                     }
                 }
             }
@@ -139,11 +119,11 @@ impl ANetServer {
         let client_id_to_ip_for_udp = self.client_id_to_ip.clone();
         let udp_socket_for_task = udp_socket.clone();
         tokio::spawn(async move {
-            let mut buffer = vec![0u8; MAX_PACKET_SIZE];
+            let mut buffer = BytesMut::with_capacity(MAX_PACKET_SIZE);
             loop {
-                match udp_socket_for_task.recv_from(&mut buffer).await {
+                match udp_socket_for_task.recv_buf_from(&mut buffer).await {
                     Ok((len, addr)) => {
-                        let data = Bytes::copy_from_slice(&buffer[..len]);
+                        let data = buffer.split_to(len).freeze();
 
                         let client_ip = { addr_to_ip_for_udp.lock().await.get(&addr).cloned() };
 
@@ -447,9 +427,9 @@ async fn process_packet_for_sending(
     match cipher.encrypt(&nonce, packet) {
         Ok(encrypted_data) => {
             let mut data = BytesMut::with_capacity(1 + 8 + encrypted_data.len());
-            data.extend_from_slice(&[PACKET_TYPE_DATA]);
-            data.extend_from_slice(&sequence.to_be_bytes());
-            data.extend_from_slice(&encrypted_data);
+            data.put_u8(PACKET_TYPE_DATA);
+            data.put_u64(sequence);
+            data.put(encrypted_data);
             Some((data.freeze(), addr))
         }
         Err(e) => {
