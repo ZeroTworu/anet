@@ -6,7 +6,9 @@ auth_phrase = "hauau"
 server_cert = """
 -----BEGIN CERTIFICATE-----
 
------END CERTIFICATE-----
+...........................
+
+-----END CERTIFICATE-------
 """
 
 # Настройки TCP для Windows

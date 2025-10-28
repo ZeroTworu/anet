@@ -2,7 +2,7 @@ name: Build
 
 on:
   push:
-    branches: [ "master", "test/*" ]
+    branches: [ "master", "test/*", "dev/*" ]
   workflow_dispatch:
 
 jobs:

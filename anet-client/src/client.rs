@@ -7,16 +7,19 @@ use anet_common::protocol::{
 };
 use anet_common::tun_params::TunParams;
 use anyhow::Result;
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use log::{error, info, warn};
 use prost::Message;
 use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::{ClientConfig, RootCertStore};
 use std::{sync::Arc, time::Duration};
+use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::time::sleep;
 use tokio_rustls::TlsConnector;
+use anet_common::anet_udp_socket::AnetUdpSocket;
+use quinn::{ClientConfig as QuinnClientConfig, Endpoint, EndpointConfig, TokioRuntime, crypto::rustls::QuicClientConfig};
 
 const MAX_RETRIES: u32 = 5;
 const INITIAL_DELAY: u64 = 2;
@@ -26,74 +29,41 @@ pub struct ANetClient {
     tls_connector: TlsConnector,
     server_addr: String,
     auth_phrase: String,
+    server_cert: String,
 }
 
 impl ANetClient {
     pub fn new(cfg: &Config) -> anyhow::Result<Self> {
         let mut root_store = RootCertStore::empty();
-
         let cert_bytes = cfg.server_cert.as_bytes();
-
         let mut cert_reader = std::io::BufReader::new(cert_bytes);
-
         let certs =
             rustls_pemfile::certs(&mut cert_reader).collect::<Result<Vec<CertificateDer>, _>>()?;
-
         for cert in certs {
             let _ = root_store.add(cert);
         }
-
-        let mut tls_config = ClientConfig::builder()
+        let tls_config = ClientConfig::builder()
             .with_root_certificates(root_store)
             .with_no_client_auth();
 
-        tls_config.alpn_protocols = vec![b"h2".to_vec()];
-        tls_config.enable_early_data = true;
-        tls_config.enable_sni = true;
-
-        info!("ANet Client manager created");
         let connector = TlsConnector::from(Arc::new(tls_config));
+        info!("ANET Client created");
         Ok(Self {
             tls_connector: connector,
             server_addr: cfg.address.to_string(),
             auth_phrase: cfg.auth_phrase.to_string(),
+            server_cert: cfg.server_cert.clone(),
         })
     }
 
-    pub async fn connect(&self) -> Result<AuthResponse> {
-        let mut retry_count = 0;
-        let mut delay = INITIAL_DELAY;
-
-        loop {
-            match self.authenticate_via_tls().await {
-                Ok(params) => {
-                    info!("Connection established successfully");
-                    self.run_udp_connection(&params).await?;
-                    break Ok(params);
-                }
-                Err(e) => {
-                    retry_count += 1;
-                    if retry_count >= MAX_RETRIES {
-                        error!("Max retries exceeded, stopping connection attempts");
-                        return Err(e);
-                    }
-
-                    error!(
-                        "Connection failed (attempt {}): {}. Retrying in {} seconds...",
-                        retry_count, e, delay
-                    );
-
-                    let next_delay = std::cmp::min(delay * 2, MAX_DELAY);
-                    info!("Next retry will be in {} seconds", next_delay);
-
-                    sleep(Duration::from_secs(delay)).await;
-                    delay = next_delay;
-                }
-            }
-        }
+    pub async fn connect(&self) -> Result<(Endpoint, AuthResponse)> {
+        let auth_params = self.authenticate().await?;
+        info!("Authentication successful, starting QUIC VPN session...");
+        let endpoint = self.run_quic_vpn(&auth_params).await?;
+        Ok((endpoint, auth_params))
     }
 
-    async fn authenticate_via_tls(&self) -> Result<AuthResponse> {
+    async fn authenticate(&self) -> Result<AuthResponse> {
         let stream = connect_with_backoff(&self.server_addr).await?;
 
         let server_name = ServerName::try_from("alco").expect("Invalid server name");
@@ -138,137 +108,91 @@ impl ANetClient {
         }
     }
 
-    async fn run_udp_connection(&self, auth_response: &AuthResponse) -> Result<()> {
-        let udp_addr = format!(
-            "{}:{}",
-            self.server_addr.split(':').next().unwrap(),
-            auth_response.udp_port
-        );
-        info!("UDP will connect to {}", udp_addr);
-        let socket = UdpSocket::bind("0.0.0.0:0").await?;
+    async fn run_quic_vpn(&self, auth_response: &AuthResponse) -> Result<Endpoint> {
+        // 1. Создаем РЕАЛЬНЫЙ UDP сокет и шифр для "обертки"
+        let udp_addr_str =
+            format!("{}:{}", self.server_addr.split(':').next().unwrap(), auth_response.udp_port);
+        let remote_addr: SocketAddr = udp_addr_str.parse()?;
+        let real_socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
+        let cipher = Arc::new(Cipher::new(&auth_response.crypto_key));
 
-        socket.connect(&udp_addr).await?;
+        // 2. Оборачиваем реальный сокет в нашу кастомную реализацию `AnetUdpSocket`
+        let anet_socket = Arc::new(AnetUdpSocket::new(real_socket, cipher));
 
-        info!(
-            "Starting UDP connection, client ID is {}",
-            auth_response.client_id
-        );
+        // 3. Создаем QUIC Endpoint с нашей оберткой. EndpointDriver запустится сам под капотом.
+        let mut endpoint = Endpoint::new_with_abstract_socket(
+            EndpointConfig::default(),
+            None, // Клиентский Endpoint, ему не нужен ServerConfig
+            anet_socket, // <-- Передаем нашу обертку!
+            Arc::new(TokioRuntime),
+        )?;
+        endpoint.set_default_client_config(self.build_quinn_client_config()?);
+
+        // 4. Настраиваем TunManager
         let params = TunParams::from_auth_response(auth_response, "anet-client");
-
         let tun_manager = TunManager::new(params);
-
-        // Отправляем UDP handshake
-        let handshake = AnetMessage {
-            content: Some(Content::UdpHandshake(UdpHandshake {
-                client_id: auth_response.client_id.clone(),
-                timestamp: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)?
-                    .as_secs(),
-            })),
-        };
-
-        let mut handshake_data = Vec::new();
-        handshake.encode(&mut handshake_data)?;
-        socket.send(&handshake_data).await?;
-        let socket = Arc::new(socket);
-        // Настраиваем шифрование
-        let cipher = Cipher::new(&auth_response.crypto_key);
-
-        // Запускаем обработку пакетов
-
         let (tx_to_tun, mut rx_from_tun) = tun_manager.run().await?;
 
-        // Задача для приёма пакетов через UDP
-        tokio::spawn({
-            let socket = socket.clone();
-            let cipher = cipher.clone();
-            let tx_to_tun = tx_to_tun.clone();
-            async move {
-                let mut buffer = vec![0u8; MAX_PACKET_SIZE];
-                loop {
-                    match socket.recv(&mut buffer).await {
-                        Ok(len) => {
-                            if len < 1 {
-                                error!("Packet too short");
-                                continue;
-                            }
-                            // Создаем Bytes из полученных данных
-                            let packet = Bytes::copy_from_slice(&buffer[..len]);
-                            let packet_type = packet[0];
+        // 5. Подключаемся. Вся магия "обертки" происходит под капотом, прозрачно для нас.
+        info!("Connecting to QUIC endpoint via ANET transport...");
+        let connection = endpoint.connect(remote_addr, "alco")?.await?;
+        info!("QUIC connection established with {}", connection.remote_address());
 
-                            match packet_type {
-                                PACKET_TYPE_DATA => {
-                                    // Проверяем минимальный размер пакета: тип + sequence + минимальные данные
-                                    if packet.len() < 1 + 8 + 1 {
-                                        error!("Data packet too short");
-                                        continue;
-                                    }
+        // 6. Открываем главный стрим для VPN-трафика и запускаем задачи
+        let (mut quic_tx, mut quic_rx) = connection.open_bi().await?;
+        info!("Opened bidirectional QUIC stream for VPN traffic.");
 
-                                    // Извлекаем sequence number (байты 1-8)
-                                    let sequence_bytes = packet.slice(1..9);
-                                    let sequence = u64::from_be_bytes(
-                                        sequence_bytes.as_ref().try_into().unwrap(),
-                                    );
-
-                                    // Извлекаем зашифрованные данные (байты 9 и дальше)
-                                    let encrypted_data = packet.slice(9..);
-
-                                    // Расшифровываем пакет
-                                    let nonce = Cipher::generate_nonce(sequence);
-
-                                    match cipher.decrypt(&nonce, encrypted_data) {
-                                        Ok(decrypted) => {
-                                            // Отправляем в TUN
-                                            if let Err(e) = tx_to_tun.send(decrypted).await {
-                                                error!("Failed to send to TUN: {}", e);
-                                            }
-                                        }
-                                        Err(e) => {
-                                            error!("Decryption failed: {}", e);
-                                        }
-                                    }
-                                }
-                                _ => {
-                                    warn!("Unknown packet type: {}", packet_type);
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            error!("Failed to receive UDP packet: {}", e);
-                        }
-                    }
+        let tun_to_quic_task = tokio::spawn(async move {
+            while let Some(packet) = rx_from_tun.recv().await {
+                if quic_tx.write_all(&packet).await.is_err() {
+                    error!("QUIC stream write failed. TUN->QUIC task is closing.");
+                    break;
                 }
             }
         });
 
-        // Задача для отправки пакетов через UDP
-        tokio::spawn({
-            let socket = socket.clone();
-            let cipher = cipher.clone();
-            async move {
-                let mut sequence: u64 = 0;
-                while let Some(packet) = rx_from_tun.recv().await {
-                    sequence += 1;
-                    if let Some(data_to_send) =
-                        process_packet_for_sending(&cipher, sequence, packet).await
-                    {
-                        if let Err(e) = socket.send(&data_to_send).await {
-                            warn!("UDP ERROR {}", e);
+        let quic_to_tun_task = tokio::spawn(async move {
+            let mut buf = BytesMut::with_capacity(MAX_PACKET_SIZE);
+            loop {
+                match quic_rx.read_buf(&mut buf).await {
+                    Ok(n) if n > 0 => {
+                        if tx_to_tun.send(buf.copy_to_bytes(n)).await.is_err() {
+                            error!("TUN channel write failed. QUIC->TUN task is closing.");
                             break;
                         }
                     }
+                    Ok(_) => { // Ok(0) or Ok(None) - стрим закрыт
+                        info!("QUIC receive stream closed.");
+                        break;
+                    }
+                    Err(e) => {
+                        error!("Error reading from QUIC stream: {}", e);
+                        break;
+                    }
                 }
             }
         });
 
-        // Ожидаем завершения задач
+        // Ожидаем завершения одной из задач, что будет означать конец сессии.
+        tokio::select! {
+            _ = tun_to_quic_task => info!("TUN->QUIC task finished."),
+            _ = quic_to_tun_task => info!("QUIC->TUN task finished."),
+        }
 
-        // tokio::select! {
-        //     _ = send_task => {},
-        //     _ = recv_task => {},
-        // }
+        info!("Closing QUIC connection.");
+        connection.close(0u32.into(), b"done");
+        //endpoint.wait_idle().await;
 
-        Ok(())
+        Ok(endpoint)
+    }
+
+    fn build_quinn_client_config(&self) -> Result<QuinnClientConfig> {
+        let mut root_store = RootCertStore::empty();
+        let certs = rustls_pemfile::certs(&mut self.server_cert.as_bytes()).collect::<Result<Vec<_>, _>>()?;
+        for cert in certs { root_store.add(cert)?; }
+        let client_crypto = ClientConfig::builder().with_root_certificates(root_store).with_no_client_auth();
+        let quic_config = QuicClientConfig::try_from(client_crypto)?;
+        Ok(QuinnClientConfig::new(Arc::new(quic_config)))
     }
 }
 

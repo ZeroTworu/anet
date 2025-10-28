@@ -53,6 +53,14 @@ fn generate_ascii_art(build_type: &str, commit_hash: &str, build_time: &str) -> 
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<()> {
+    if let Err(e) = rustls::crypto::ring::default_provider()
+        .install_default()
+        .map_err(|e| anyhow::anyhow!("Failed to install crypto provider: {:?}", e))
+    {
+        log::warn!("{}", e);
+        // Можно запустить процесс дальше, но проблема в том, что build() падает
+        // Return Err(e) if crucial. Here, we must prevent panic.
+    }
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let ascii_art = generate_ascii_art(BUILD_TYPE, COMMIT_HASH, BUILD_TIME);
@@ -63,7 +71,7 @@ async fn main() -> Result<()> {
 
     configure_tcp_settings(&cfg).await?;
 
-    let params = client.connect().await?;
+    let (endpoint, params) = client.connect().await?;
 
     #[cfg(unix)]
     let mut linux_router = LinuxRouteManager::new(
@@ -72,13 +80,14 @@ async fn main() -> Result<()> {
     );
 
     #[cfg(unix)]
-    linux_router.backup_original_routes()?;
-
-    #[cfg(unix)]
-    linux_router.setup_vpn_routing()?;
+    {
+        linux_router.backup_original_routes()?;
+        linux_router.setup_vpn_routing()?;
+    }
 
     info!("Press Ctrl-C to exit.");
-    signal::ctrl_c().await?;
+    endpoint.wait_idle().await;
+    // signal::ctrl_c().await?;
 
     #[cfg(unix)]
     linux_router.restore_original_routing()?;

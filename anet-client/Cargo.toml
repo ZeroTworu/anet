@@ -5,14 +5,15 @@ edition = "2024"
 
 [dependencies]
 tokio = {workspace = true}
-tokio-rustls = {workspace = true}
-rustls = {workspace = true}
+tokio-rustls = {workspace = true, features = ["ring", "aws-lc-rs"]}
+rustls = {workspace = true, features = ["ring", "aws-lc-rs"]}
 env_logger = {workspace = true}
 log = {workspace = true}
 anyhow = {workspace = true}
 clap = {workspace = true}
 prost = {workspace = true}
 bytes = {workspace = true}
+quinn = {workspace = true, features = ["rustls", "ring", "aws-lc-rs"]}
 rustls-pemfile = {workspace = true}
 
 anet-common = { path = "../anet-common"}

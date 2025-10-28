@@ -72,7 +72,7 @@ impl TunManager {
         tokio::spawn(async move {
             while let Some(packet) = rx_to_tun.recv().await {
                 if let Err(e) = writer.write_all(&packet).await {
-                    error!("Failed to write to TUN: {}", e);
+                    error!("Failed to write to TUN: {}, bytes: {:?}", e, packet);
                     break;
                 }
             }
