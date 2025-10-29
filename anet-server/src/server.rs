@@ -12,7 +12,7 @@ use anet_common::transport::AnetVpnPacket;
 use anet_common::tun_params::TunParams;
 use anyhow::{Context, Result};
 use bytes::Bytes;
-use log::{error, info};
+use log::{error, info, trace};
 use prost::Message;
 use quinn::crypto::rustls::QuicServerConfig;
 use quinn::udp::RecvMeta;
@@ -487,7 +487,7 @@ async fn handle_connection(
     // Если поток был принят, и мы до сих пор здесь, QUIC хендшейк успешен.
     // Нам нужен актуальный SocketAddr для поиска
     let established_remote_addr = connection.remote_address();
-
+    info!("Established remote addr: {}", established_remote_addr);
     // Находим VPN IP клиента. Мы должны использовать установленный established_remote_addr,
     // поскольку MultiKeyAnetUdpSocket должен был обновить `ClientTransportInfo.addr` при получении первого пакета.
     let client = {
@@ -517,12 +517,8 @@ async fn handle_connection(
         client.assigned_ip, established_remote_addr, client.session_id
     );
 
-    // ... (3 - 8. Логика роутинга и очистки остается прежней)
-
-    // 3. Создаем канал для роутинга пакетов с TUN на этот стрим
     let (tx_router, mut rx_router) = mpsc::channel::<Bytes>(64);
 
-    // 4. Регистрируем Sender handle в глобальном роутере
     quic_router
         .lock()
         .await
@@ -588,11 +584,6 @@ async fn handle_connection(
         _ = connection.closed() => info!("Connection explicitly closed by QUIC layer for {}.", client.assigned_ip),
     }
 
-    // Принудительная остановка оставшейся задачи
-
-    // tx_task.abort();
-    // rx_task.abort();
-
     // 8. Очистка состояния
     let assigned_ip_clone = client.assigned_ip.clone();
 
@@ -627,10 +618,10 @@ async fn route_tun_to_quic(
             if let Err(_e) = sender.send(packet).await {
                 // Если send fails, канал закрыт. Соединение, скорее всего, закрыто или находится в процессе закрытия.
                 // handle_connection должен позаботиться об очистке router entry.
-                log::trace!("Failed to route packet to {}. Stream closed.", dst_ip);
+                trace!("Failed to route packet to {}. Stream closed.", dst_ip);
             }
         } else {
-            log::trace!("Dropping packet to {}: no active QUIC session.", dst_ip);
+            trace!("Dropping packet to {}: no active QUIC session.", dst_ip);
         }
     }
     Ok(())

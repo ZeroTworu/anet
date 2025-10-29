@@ -2,7 +2,7 @@ include!(concat!(env!("OUT_DIR"), "/built.rs"));
 use anet_client::client::ANetClient;
 use anet_client::config::load;
 use anyhow::Result;
-use log::info;
+use log::{info, warn};
 
 #[cfg(unix)]
 use anet_client::lrm::LinuxRouteManager;
@@ -52,15 +52,15 @@ fn generate_ascii_art(build_type: &str, commit_hash: &str, build_time: &str) -> 
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<()> {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     if let Err(e) = rustls::crypto::ring::default_provider()
         .install_default()
         .map_err(|e| anyhow::anyhow!("Failed to install crypto provider: {:?}", e))
     {
-        log::warn!("{}", e);
+        warn!("{}", e);
         // Можно запустить процесс дальше, но проблема в том, что build() падает
         // Return Err(e) if crucial. Here, we must prevent panic.
     }
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let ascii_art = generate_ascii_art(BUILD_TYPE, COMMIT_HASH, BUILD_TIME);
     println!("{}", ascii_art);

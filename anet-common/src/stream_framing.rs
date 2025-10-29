@@ -56,7 +56,7 @@ pub async fn read_next_packet<R: tokio::io::AsyncRead + tokio::io::AsyncReadExt 
             Ok(Some(Bytes::from(buf)))
         }
         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-            // EOF при чтении префикса (стрим закрыт грациозно)
+            // EOF при чтении префикса
             Ok(None)
         }
         Err(e) => Err(e),

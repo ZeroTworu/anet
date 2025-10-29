@@ -37,7 +37,6 @@ impl TunManager {
 
         info!("Created TUN [{}]", self.get_info());
 
-
         let (mut reader, mut writer) = tokio::io::split(device);
 
         let (tx_to_tun, mut rx_to_tun) = mpsc::channel::<Bytes>(CHANNEL_BUFFER_SIZE);
@@ -54,11 +53,11 @@ impl TunManager {
                     Ok(n) => {
                         let packet = Bytes::copy_from_slice(&buffer[..n]);
                         match tx_from_tun.send(packet).await {
-                            Ok(_) => {},
+                            Ok(_) => {}
                             Err(e) => {
                                 error!("Failed send to channel, error: {}", e);
-                                break
-                            },
+                                break;
+                            }
                         }
                     }
                     Err(e) => {

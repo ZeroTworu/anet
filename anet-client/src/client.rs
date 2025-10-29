@@ -118,12 +118,10 @@ impl ANetClient {
         let params = TunParams::from_auth_response(auth_response, "anet-client");
 
         let tun_manager = TunManager::new(params);
-        let (tx_to_tun, mut rx_from_tun) = tun_manager.run().await?;
-        
+
         let transport_config =
             build_transport_config(&config_result.quic_transport, auth_response.mtu as u16)?;
         let transport_config_arc = Arc::new(transport_config);
-
 
         let udp_addr_str = format!(
             "{}:{}",
@@ -148,7 +146,10 @@ impl ANetClient {
 
         endpoint.set_default_client_config(client_config);
 
-        info!("Connecting to QUIC endpoint [{}] via ANET transport...", remote_addr);
+        info!(
+            "Connecting to QUIC endpoint [{}] via ANET transport...",
+            remote_addr
+        );
         let connection = endpoint.connect(remote_addr, "alco")?.await?;
         info!(
             "QUIC connection established with {}, SEID: {}",
@@ -158,9 +159,9 @@ impl ANetClient {
 
         let (mut quic_tx, mut quic_rx) = connection.open_bi().await?;
         info!("Opened bidirectional QUIC stream for VPN traffic.");
+        let (tx_to_tun, mut rx_from_tun) = tun_manager.run().await?;
 
-
-        let _tun_to_quic_task = tokio::spawn(async move {
+        tokio::spawn(async move {
             while let Some(packet) = rx_from_tun.recv().await {
                 // 1. Оборачиваем IP-пакет в транспортный фрейм [u16 длина][IP пакет]
                 let framed_packet = frame_packet(packet);
@@ -173,7 +174,7 @@ impl ANetClient {
             quic_tx.finish().unwrap();
         });
 
-        let _quic_to_tun_task = tokio::spawn(async move {
+        tokio::spawn(async move {
             loop {
                 // Используем универсальный сборщик пакетов на основе u16 префикса
                 match read_next_packet(&mut quic_rx).await {
@@ -195,15 +196,6 @@ impl ANetClient {
             }
         });
 
-        // Ожидаем завершения одной из задач, что будет означать конец сессии.
-        // tokio::select! {
-        //     _ = tun_to_quic_task => info!("TUN->QUIC task finished."),
-        //     _ = quic_to_tun_task => info!("QUIC->TUN task finished."),
-        // }
-        //
-        // info!("Closing QUIC connection.");
-        // connection.close(0u32.into(), b"done");
-
         Ok(endpoint)
     }
 
@@ -219,7 +211,8 @@ impl ANetClient {
             .with_no_client_auth();
         let quic_config = QuicClientConfig::try_from(client_crypto)?;
 
-        Ok(QuinnClientConfig::new(Arc::new(quic_config)))
+        let cfg = QuinnClientConfig::new(Arc::new(quic_config));
+        Ok(cfg)
     }
 }
 

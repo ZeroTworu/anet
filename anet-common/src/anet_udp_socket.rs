@@ -1,5 +1,6 @@
 use crate::encryption::Cipher;
 use crate::transport;
+use log::error;
 use quinn::{
     AsyncUdpSocket, UdpPoller,
     udp::{RecvMeta, Transmit},
@@ -67,7 +68,7 @@ impl AsyncUdpSocket for AnetUdpSocket {
                         Err(e)
                     }
                     Err(e) => {
-                        log::error!("AnetUdpSocket failed to send: {}", e);
+                        error!("AnetUdpSocket failed to send: {}", e);
                         // QUIC умеет обрабатывать потери, поэтому мы можем "проглотить" ошибку,
                         // возвращая Ok, чтобы не паниковать.
                         Ok(())
@@ -75,7 +76,7 @@ impl AsyncUdpSocket for AnetUdpSocket {
                 }
             }
             Err(e) => {
-                log::error!("Failed to wrap QUIC packet: {}", e);
+                error!("Failed to wrap QUIC packet: {}", e);
                 // Если не смогли зашифровать, просто пропускаем отправку.
                 Ok(())
             }
