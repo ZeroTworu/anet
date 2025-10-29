@@ -1,9 +1,7 @@
-use std::sync::Arc;
-// anet-common/src/transport.rs
 use crate::consts::PACKET_TYPE_DATA;
 use crate::encryption::Cipher;
+use anyhow::{Result, anyhow};
 use bytes::{BufMut, Bytes, BytesMut};
-use anyhow::{anyhow, Result};
 use log::trace;
 
 /// Структура, инкапсулирующая пакет ANET VPN транспортного уровня.
@@ -53,7 +51,10 @@ impl AnetVpnPacket {
         if packet_type != PACKET_TYPE_DATA {
             // Если пакет не типа DATA, мы его игнорируем, т.к. QUIC работает только с DATA
             trace!("Non-QUIC packet type received: {}", packet_type);
-            return Err(anyhow!("Non-QUIC transport packet type received: {}", packet_type));
+            return Err(anyhow!(
+                "Non-QUIC transport packet type received: {}",
+                packet_type
+            ));
         }
 
         let sequence = u64::from_be_bytes(transport_packet[1..9].try_into()?);
@@ -68,7 +69,6 @@ impl AnetVpnPacket {
             payload: decrypted_payload, // Это QUIC payload
         })
     }
-
 }
 
 pub fn wrap_packet(cipher: &Cipher, sequence: u64, payload: Bytes) -> Result<Bytes> {

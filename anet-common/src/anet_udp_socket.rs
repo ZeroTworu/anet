@@ -1,17 +1,16 @@
 use crate::encryption::Cipher;
 use crate::transport;
-use bytes::BytesMut;
 use quinn::{
-    udp::{RecvMeta, Transmit},
     AsyncUdpSocket, UdpPoller,
+    udp::{RecvMeta, Transmit},
 };
 use std::fmt::{Debug, Formatter};
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use tokio::net::UdpSocket;
 
@@ -45,14 +44,20 @@ impl Debug for AnetUdpSocket {
 impl AsyncUdpSocket for AnetUdpSocket {
     // В v0.11 create_io_poller принимает Arc<Self>
     fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
-        Box::pin(TokioUdpPoller { io: self.io.clone() })
+        Box::pin(TokioUdpPoller {
+            io: self.io.clone(),
+        })
     }
 
     fn try_send(&self, transmit: &Transmit) -> io::Result<()> {
         let seq = self.sequence.fetch_add(1, Ordering::Relaxed);
 
         // Оборачиваем пакет QUIC в наш транспортный протокол
-        match transport::wrap_packet(&self.cipher, seq, bytes::Bytes::copy_from_slice(transmit.contents)) {
+        match transport::wrap_packet(
+            &self.cipher,
+            seq,
+            bytes::Bytes::copy_from_slice(transmit.contents),
+        ) {
             Ok(wrapped_packet) => {
                 // Пытаемся отправить синхронно, как того требует API
                 match self.io.try_send_to(&wrapped_packet, transmit.destination) {
@@ -97,7 +102,9 @@ impl AsyncUdpSocket for AnetUdpSocket {
                 // "Разворачиваем" пакет
                 match transport::unwrap_packet(&self.cipher, &recv_buf[..filled_len]) {
                     Ok(unwrapped_packet) => {
-                        if bufs.is_empty() { return Poll::Ready(Ok(0)); }
+                        if bufs.is_empty() {
+                            return Poll::Ready(Ok(0));
+                        }
                         let copy_len = std::cmp::min(unwrapped_packet.len(), bufs[0].len());
                         bufs[0][..copy_len].copy_from_slice(&unwrapped_packet[..copy_len]);
 

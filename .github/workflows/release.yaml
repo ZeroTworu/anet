@@ -33,7 +33,7 @@ jobs:
           cp artifacts/anet-client-linux/anet-client release_files/client-linux/
           cp artifacts/anet-client-windows/anet-client.exe release_files/client-windows/
 
-          cp contrib/config/server.yaml release_files/server/
+          cp contrib/config/server.toml release_files/server/
           cp contrib/config/client.toml release_files/client-linux/
           cp contrib/config/client.toml release_files/client-windows/
 

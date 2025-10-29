@@ -1,50 +1,35 @@
+use anet_common::quic_settings::QuicConfig;
 use clap::Parser;
-use tokio::fs::read_to_string;
+use log::warn;
 use serde::Deserialize;
+use std::process::exit;
+use tokio::fs::read_to_string;
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct WindowsTcpConfig {
-    pub congestion_algorithm: String,
-    pub enable_tcp_tuning: bool,
+pub struct MainConfig {
+    pub address: String,
+    pub auth_phrase: String,
+    pub server_cert: String,
 }
 
-impl Default for WindowsTcpConfig {
+impl Default for MainConfig {
     fn default() -> Self {
         Self {
-            congestion_algorithm: "ctcp".to_string(),
-            enable_tcp_tuning: true,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct UnixTcpConfig {
-    pub preferred_algorithm: String,
-    pub fallback_algorithm: String,
-    pub enable_tcp_tuning: bool,
-}
-
-impl Default for UnixTcpConfig {
-    fn default() -> Self {
-        Self {
-            preferred_algorithm: "bbr".to_string(),
-            fallback_algorithm: "cubic".to_string(),
-            enable_tcp_tuning: true,
+            address: "127.0.0.1:443".to_string(),
+            auth_phrase: "test".to_string(),
+            server_cert: "test".to_string(),
         }
     }
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
-    pub address: String,
-    pub auth_phrase: String,
-    pub server_cert: String,
     #[serde(default)]
-    pub windows_tcp: WindowsTcpConfig,
-    #[serde(default)]
-    pub unix_tcp: UnixTcpConfig,
-}
+    pub main: MainConfig,
 
+    #[serde(default)]
+    pub quic_transport: QuicConfig,
+}
 
 #[derive(Debug, Parser)]
 pub struct Opt {
@@ -54,7 +39,21 @@ pub struct Opt {
 
 pub async fn load() -> anyhow::Result<Config> {
     let opt = Opt::parse();
-    let toml_str = read_to_string(&opt.cfg).await?;
-    let cfg: Config = toml::from_str(&toml_str)?;
-    Ok(cfg)
+    let toml_str = read_to_string(&opt.cfg).await;
+    match toml_str {
+        Ok(toml_str) => {
+            let cfg: Config = toml::from_str(&toml_str)?;
+            Ok(cfg)
+        }
+        Err(_) => {
+            warn!(
+                "\n\
+                Cannot find client config file in {}, use '-c' or '-cfg' \n\
+                './anet-client -c /home/anet/anet/config.toml' for example,
+                ",
+                opt.cfg,
+            );
+            exit(-1)
+        }
+    }
 }

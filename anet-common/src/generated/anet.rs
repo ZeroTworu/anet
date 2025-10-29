@@ -21,7 +21,7 @@ pub struct AuthResponse {
     #[prost(uint32, tag = "6")]
     pub udp_port: u32,
     #[prost(string, tag = "7")]
-    pub client_id: ::prost::alloc::string::String,
+    pub session_id: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct UdpHandshake {

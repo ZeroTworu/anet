@@ -1,0 +1,38 @@
+[network]
+mask = "255.255.255.0"
+net = "10.0.0.0"
+gateway = "10.0.0.1"
+mtu = 1300
+if_name = "anet-server"
+self_ip = "10.0.0.2"
+
+[server]
+auth_phrase = "test_test_test"
+cert = """"
+-----BEGIN CERTIFICATE-----
+...........................
+-----END CERTIFICATE-------
+"""
+key = """
+-----BEGIN PRIVATE KEY-----
+...........................
+-----END PRIVATE KEY-------
+"""
+bind_to = "0.0.0.0:8443"
+external_if = "eth0"
+udp_port = 8446
+
+# Настройки QUIC транспорта (аналогично клиентским)
+[quic_transport]
+# BBR обеспечивает лучшую производительность в WAN
+algorithm = "bbr"
+
+# Мы исходим из того, что клиент тоже имеет ~60мс RTT.
+expected_rtt_ms = 61
+
+# Заявленная пропускная способность.
+bandwidth_mbps = 1000
+
+stream_receive_window = 41943040 # 40 MiB (4 x BDP)
+receive_window = 167772160       # 160 MiB (4 x Stream Window)
+enable_gso = false

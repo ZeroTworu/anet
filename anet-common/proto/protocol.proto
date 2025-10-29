@@ -13,7 +13,7 @@ message AuthResponse {
     int32 mtu = 4;
     bytes crypto_key = 5;  // 32-байтовый ключ для ChaCha20Poly1305
     uint32 udp_port = 6;   // Порт для UDP соединения
-    string client_id = 7;
+    string session_id = 7;
 }
 
 message UdpHandshake {

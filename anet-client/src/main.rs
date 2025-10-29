@@ -1,9 +1,8 @@
 include!(concat!(env!("OUT_DIR"), "/built.rs"));
 use anet_client::client::ANetClient;
-use anet_client::config::{load, Config};
+use anet_client::config::load;
 use anyhow::Result;
-use log::{info, warn};
-use tokio::signal;
+use log::info;
 
 #[cfg(unix)]
 use anet_client::lrm::LinuxRouteManager;
@@ -69,14 +68,12 @@ async fn main() -> Result<()> {
     let cfg = load().await?;
     let client = ANetClient::new(&cfg)?;
 
-    configure_tcp_settings(&cfg).await?;
-
-    let (endpoint, params) = client.connect().await?;
+    let (params, endpoint) = client.connect().await?;
 
     #[cfg(unix)]
     let mut linux_router = LinuxRouteManager::new(
         &params,
-        cfg.address.split(':').collect::<Vec<&str>>()[0].to_string(),
+        cfg.main.address.split(':').collect::<Vec<&str>>()[0].to_string(),
     );
 
     #[cfg(unix)]
@@ -87,84 +84,10 @@ async fn main() -> Result<()> {
 
     info!("Press Ctrl-C to exit.");
     endpoint.wait_idle().await;
-    // signal::ctrl_c().await?;
 
     #[cfg(unix)]
     linux_router.restore_original_routing()?;
 
     info!("Shutting down...");
-    Ok(())
-}
-
-async fn configure_tcp_settings(cfg: &Config) -> Result<()> {
-    // Windows TCP настройки
-    #[cfg(windows)]
-    {
-        if !cfg.windows_tcp.enable_tcp_tuning {
-            info!("Windows TCP tuning is disabled in config");
-            return Ok(());
-        }
-
-        use anet_client::windows_tcp_tuner::WindowsTcpTuner;
-
-        info!("Detecting current TCP congestion control on Windows...");
-        match WindowsTcpTuner::get_current_algorithm() {
-            Ok(algo) => info!("Current TCP algorithm: {}", algo),
-            Err(e) => warn!("Could not detect TCP algorithm: {}", e),
-        }
-
-        info!("Setting TCP congestion control to {}...", cfg.windows_tcp.congestion_algorithm);
-        if let Err(e) = WindowsTcpTuner::set_congestion_control(&cfg.windows_tcp.congestion_algorithm) {
-            warn!("Failed to set TCP congestion control: {}", e);
-            warn!("This is not critical, but may affect performance");
-        } else {
-            info!("Successfully configured Windows TCP settings");
-        }
-    }
-
-    // Unix/Linux TCP настройки
-    #[cfg(unix)]
-    {
-        if !cfg.unix_tcp.enable_tcp_tuning {
-            info!("Unix TCP tuning is disabled in config");
-            return Ok(());
-        }
-
-        use anet_client::unix_tcp_tuner::UnixTcpTuner;
-
-        info!("Detecting current TCP congestion control on Unix...");
-        match UnixTcpTuner::get_current_algorithm() {
-            Ok(algo) => info!("Current TCP algorithm: {}", algo),
-            Err(e) => warn!("Could not detect TCP algorithm: {}", e),
-        }
-
-        match UnixTcpTuner::get_available_algorithms() {
-            Ok(algorithms) => info!("Available TCP algorithms: {:?}", algorithms),
-            Err(e) => warn!("Could not get available algorithms: {}", e),
-        }
-
-        // Пытаемся установить предпочтительный алгоритм
-        info!("Attempting to set preferred algorithm: {}...", cfg.unix_tcp.preferred_algorithm);
-        if let Err(e) = UnixTcpTuner::set_congestion_control(&cfg.unix_tcp.preferred_algorithm) {
-            warn!("Failed to set preferred algorithm: {}", e);
-
-            // Fallback на резервный алгоритм
-            info!("Attempting fallback to: {}...", cfg.unix_tcp.fallback_algorithm);
-            if let Err(e) = UnixTcpTuner::set_congestion_control(&cfg.unix_tcp.fallback_algorithm) {
-                warn!("Failed to set fallback algorithm: {}", e);
-            } else {
-                info!("Successfully configured TCP with fallback algorithm");
-            }
-        } else {
-            info!("Successfully configured TCP with preferred algorithm");
-        }
-
-        // Проверяем финальные настройки
-        match UnixTcpTuner::get_current_algorithm() {
-            Ok(algo) => info!("Final TCP algorithm: {}", algo),
-            Err(e) => warn!("Could not verify final TCP algorithm: {}", e),
-        }
-    }
-
     Ok(())
 }

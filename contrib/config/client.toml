@@ -1,7 +1,7 @@
 # ANET Client Configuration
+[main]
 address = "127.0.0.1:8445"
 auth_phrase = "hauau"
-
 # Сертификат сервера.
 server_cert = """
 -----BEGIN CERTIFICATE-----
@@ -11,14 +11,13 @@ server_cert = """
 -----END CERTIFICATE-------
 """
 
-# Настройки TCP для Windows
-[windows_tcp]
-congestion_algorithm = "ctcp"
-enable_tcp_tuning = true
-
-# Настройки TCP для Unix/Linux
-[unix_tcp]
-preferred_algorithm = "bbr"  # bbr, cubic, reno, etc
-fallback_algorithm = "cubic"
-enable_tcp_tuning = true
-enable_additional_optimizations = true
+[quic_transport]
+# BBR обеспечивает лучшую производительность в WAN
+algorithm = "bbr"
+# Мы исходим из того, что клиент тоже имеет ~60мс RTT.
+expected_rtt_ms = 61
+# Заявленная пропускная способность.
+bandwidth_mbps = 200
+stream_receive_window = 10485760 # 10 MiB
+receive_window = 41943040      # 40 MiB
+enable_gso = true

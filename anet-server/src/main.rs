@@ -3,7 +3,8 @@ use anet_server::server;
 use anyhow::Result;
 use server::ANetServer;
 
-#[tokio::main(flavor = "current_thread")]
+// #[tokio::main(flavor = "current_thread")]
+#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<()> {
     if let Err(e) = rustls::crypto::ring::default_provider()
         .install_default()

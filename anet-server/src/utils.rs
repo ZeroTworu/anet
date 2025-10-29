@@ -15,7 +15,7 @@ pub fn generate_crypto_key() -> [u8; 32] {
 }
 
 #[inline]
-pub fn generate_uid() -> String {
+pub fn generate_seid() -> String {
     let mut rng = rand::thread_rng();
     let mut client_id = [0u8; 16];
     rng.fill_bytes(&mut client_id);
