@@ -58,17 +58,7 @@ impl ANetClient {
         })
     }
 
-    pub async fn connect(&self) -> Result<(AuthResponse, Endpoint)> {
-        let auth_params = self.authenticate().await?;
-        info!("Authentication successful, starting QUIC VPN session...");
-
-        // Мы не возвращаем Endpoint, а ждем завершения QUIC сессии
-        let endpoint = self.run_quic_vpn(&auth_params).await?;
-
-        Ok((auth_params, endpoint))
-    }
-
-    async fn authenticate(&self) -> Result<AuthResponse> {
+    pub async fn authenticate(&self) -> Result<AuthResponse> {
         let stream = connect_with_backoff(&self.server_addr).await?;
 
         let server_name = ServerName::try_from("alco").expect("Invalid server name");
@@ -113,11 +103,12 @@ impl ANetClient {
         }
     }
 
-    async fn run_quic_vpn(&self, auth_response: &AuthResponse) -> Result<Endpoint> {
+    pub async fn run_quic_vpn(
+        &self,
+        auth_response: &AuthResponse,
+        tun_manager: &TunManager,
+    ) -> Result<Endpoint> {
         let config_result = load().await?;
-        let params = TunParams::from_auth_response(auth_response, "anet-client");
-
-        let tun_manager = TunManager::new(params);
 
         let transport_config =
             build_transport_config(&config_result.quic_transport, auth_response.mtu as u16)?;

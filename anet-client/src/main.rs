@@ -5,7 +5,12 @@ use anyhow::Result;
 use log::{info, warn};
 
 #[cfg(unix)]
-use anet_client::lrm::LinuxRouteManager;
+use anet_client::linux_router::LinuxRouteManager;
+
+#[cfg(windows)]
+use anet_client::windows_router::WindowsRouteManager;
+use anet_common::atun::TunManager;
+use anet_common::tun_params::TunParams;
 
 fn generate_ascii_art(build_type: &str, commit_hash: &str, build_time: &str) -> String {
     // Обрезаем строки до нужной длины, чтобы они помещались в рамку
@@ -67,14 +72,18 @@ async fn main() -> Result<()> {
 
     let cfg = load().await?;
     let client = ANetClient::new(&cfg)?;
-
-    let (params, endpoint) = client.connect().await?;
+    let server_ip_str = cfg.main.address.split(':').next().unwrap().to_string();
+    let auth_response = client.authenticate().await?;
 
     #[cfg(unix)]
-    let mut linux_router = LinuxRouteManager::new(
-        &params,
-        cfg.main.address.split(':').collect::<Vec<&str>>()[0].to_string(),
-    );
+    let mut linux_router = LinuxRouteManager::new(&auth_response.gateway.as_str(), server_ip_str);
+
+    #[cfg(windows)]
+    let mut router = WindowsRouteManager::new(&auth_response.gateway.as_str(), server_ip_str);
+
+    let tun_params = TunParams::from_auth_response(&auth_response, "anet-client");
+    let tun_manager = TunManager::new(tun_params);
+    let endpoint = client.run_quic_vpn(&auth_response, &tun_manager).await?;
 
     #[cfg(unix)]
     {
@@ -82,11 +91,17 @@ async fn main() -> Result<()> {
         linux_router.setup_vpn_routing()?;
     }
 
+    #[cfg(windows)]
+    router.setup_vpn_routing()?;
+
     info!("Press Ctrl-C to exit.");
     endpoint.wait_idle().await;
 
     #[cfg(unix)]
     linux_router.restore_original_routing()?;
+
+    #[cfg(windows)]
+    router.restore_original_routing()?;
 
     info!("Shutting down...");
     Ok(())

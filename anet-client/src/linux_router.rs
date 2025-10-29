@@ -14,9 +14,9 @@ pub struct LinuxRouteManager {
 }
 
 impl LinuxRouteManager {
-    pub fn new(params: &AuthResponse, vpn_server_ip: String) -> Self {
+    pub fn new(vpn_gateway: &str, vpn_server_ip: String) -> Self {
         Self {
-            vpn_gateway: params.gateway.parse().unwrap(),
+            vpn_gateway: vpn_gateway.parse().unwrap(),
             vpn_interface: "anet-client".to_string(),
             original_gateway: None,
             original_interface: None,
