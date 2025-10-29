@@ -115,13 +115,16 @@ impl ANetClient {
 
     async fn run_quic_vpn(&self, auth_response: &AuthResponse) -> Result<Endpoint> {
         let config_result = load().await?;
+        let params = TunParams::from_auth_response(auth_response, "anet-client");
 
-        // --- 1. Настройка TransportConfig ---
+        let tun_manager = TunManager::new(params);
+        let (tx_to_tun, mut rx_from_tun) = tun_manager.run().await?;
+        
         let transport_config =
             build_transport_config(&config_result.quic_transport, auth_response.mtu as u16)?;
         let transport_config_arc = Arc::new(transport_config);
 
-        // 1. Создаем РЕАЛЬНЫЙ UDP сокет и шифр для "обертки"
+
         let udp_addr_str = format!(
             "{}:{}",
             self.server_addr.split(':').next().unwrap(),
@@ -131,10 +134,8 @@ impl ANetClient {
         let real_socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
         let cipher = Arc::new(Cipher::new(&auth_response.crypto_key));
 
-        // 2. Оборачиваем реальный сокет в нашу кастомную реализацию `AnetUdpSocket`
         let anet_socket = Arc::new(AnetUdpSocket::new(real_socket, cipher));
 
-        // 3. Создаем QUIC Endpoint с нашей оберткой
         let mut endpoint = Endpoint::new_with_abstract_socket(
             EndpointConfig::default(),
             None,
@@ -142,19 +143,12 @@ impl ANetClient {
             Arc::new(TokioRuntime),
         )?;
 
-        // --- 4. Настройка ClientConfig с новым TransportConfig ---
         let mut client_config = self.build_quinn_client_config()?;
         client_config.transport_config(transport_config_arc);
 
         endpoint.set_default_client_config(client_config);
 
-        // 5. Настраиваем TunManager
-        let params = TunParams::from_auth_response(auth_response, "anet-client");
-        let tun_manager = TunManager::new(params);
-        let (tx_to_tun, mut rx_from_tun) = tun_manager.run().await?;
-
-        // 6. Подключаемся
-        info!("Connecting to QUIC endpoint via ANET transport...");
+        info!("Connecting to QUIC endpoint [{}] via ANET transport...", remote_addr);
         let connection = endpoint.connect(remote_addr, "alco")?.await?;
         info!(
             "QUIC connection established with {}, SEID: {}",
@@ -162,9 +156,9 @@ impl ANetClient {
             auth_response.session_id,
         );
 
-        // 7. Открываем главный стрим для VPN-трафика и запускаем задачи
         let (mut quic_tx, mut quic_rx) = connection.open_bi().await?;
         info!("Opened bidirectional QUIC stream for VPN traffic.");
+
 
         let _tun_to_quic_task = tokio::spawn(async move {
             while let Some(packet) = rx_from_tun.recv().await {
@@ -225,7 +219,6 @@ impl ANetClient {
             .with_no_client_auth();
         let quic_config = QuicClientConfig::try_from(client_crypto)?;
 
-        // Transport config будет добавлен снаружи в run_quic_vpn
         Ok(QuinnClientConfig::new(Arc::new(quic_config)))
     }
 }
