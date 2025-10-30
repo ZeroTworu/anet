@@ -3,7 +3,7 @@
 use anyhow::Result;
 use log::info;
 use quinn::congestion::{BbrConfig, ControllerFactory, CubicConfig};
-use quinn::{MtuDiscoveryConfig, TransportConfig, VarInt};
+use quinn::{MtuDiscoveryConfig, TransportConfig, VarInt, IdleTimeout};
 use serde::Deserialize;
 use std::{sync::Arc, time::Duration};
 
@@ -29,6 +29,9 @@ pub struct QuicConfig {
     pub receive_window: u64,
 
     pub enable_gso: bool,
+
+    /// Таймаут
+    pub idle_timeout_seconds: Option<u64>,
 }
 
 impl Default for QuicConfig {
@@ -42,6 +45,7 @@ impl Default for QuicConfig {
             // ~40 MiB
             receive_window: 41_943_040, // 40 MiB
             enable_gso: true,
+            idle_timeout_seconds: Some(3600),
         }
     }
 }
@@ -112,5 +116,15 @@ pub fn build_transport_config(cfg: &QuicConfig, mtu: u16) -> Result<TransportCon
         .initial_mtu(mtu.into())
         .mtu_discovery_config(Some(mtu_config));
 
+    if let Some(timeout_secs) = cfg.idle_timeout_seconds {
+        if timeout_secs > 0 {
+            let timeout_duration = Duration::from_secs(timeout_secs);
+            let timeout = IdleTimeout::try_from(timeout_duration)
+                .map_err(|e| anyhow::anyhow!("Invalid idle timeout value: {}", e))?;
+            config.max_idle_timeout(Some(timeout));
+            info!("QUIC Transport: Max Idle Timeout set to {} seconds.", timeout_secs);
+        }
+
+    }
     Ok(config)
 }
