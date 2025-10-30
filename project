@@ -1,0 +1,2376 @@
+================================================
+Файл: ./anet-client/build.rs
+================================================
+use std::env;
+use std::fs::File;
+use std::io::Write;
+use std::path::Path;
+use std::process::Command;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+fn format_timestamp(timestamp: u64) -> String {
+    let duration = Duration::from_secs(timestamp);
+    let datetime = UNIX_EPOCH + duration;
+    let datetime: chrono::DateTime<chrono::Local> = datetime.into();
+    datetime.format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
+fn main() {
+    let out_dir = env::var("OUT_DIR").unwrap();
+    let dest_path = Path::new(&out_dir).join("built.rs");
+    let mut f = File::create(&dest_path).unwrap();
+
+    // Получаем хэш коммита
+    let commit_hash = if let Ok(hash) = env::var("GITHUB_SHA") {
+        // CI/CD сборка - используем переменную из окружения и обрезаем до 7 символов
+        if hash.len() > 7 {
+            hash[..7].to_string()
+        } else {
+            hash
+        }
+    } else {
+        // Локальная сборка - пытаемся получить из git (уже короткий)
+        Command::new("git")
+            .args(&["rev-parse", "--short", "HEAD"])
+            .output()
+            .ok()
+            .and_then(|output| {
+                if output.status.success() {
+                    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| "unknown".to_string())
+    };
+
+    // Получаем время сборки в формате UNIX timestamp
+    let build_time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    // Форматируем время вручную без внешних зависимостей
+    let datetime = format_timestamp(build_time);
+
+    // Определяем тип сборки
+    let build_type = if env::var("GITHUB_SHA").is_ok() {
+        "CI/CD"
+    } else {
+        "Local dev"
+    };
+
+    // Записываем константы в файл
+    writeln!(f, "pub const COMMIT_HASH: &str = \"{}\";", commit_hash).unwrap();
+    writeln!(f, "pub const BUILD_TIME: &str = \"{}\";", datetime).unwrap();
+    writeln!(f, "pub const BUILD_TYPE: &str = \"{}\";", build_type).unwrap();
+
+    // Перекомпилируем при изменении build.rs
+    println!("cargo:rerun-if-changed=build.rs");
+    let target = std::env::var("TARGET").unwrap_or_else(|_| "unknown".to_string());
+
+    println!(
+        "cargo:warning=Compiling for: {} on {} (target: {})",
+        std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_else(|_| "unknown".to_string()),
+        std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_else(|_| "unknown".to_string()),
+        target
+    );
+}
+
+
+
+================================================
+Файл: ./anet-client/Cargo.toml
+================================================
+[package]
+name = "anet-client"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = {workspace = true}
+tokio-rustls = {workspace = true}
+rustls = {workspace = true}
+env_logger = {workspace = true}
+log = {workspace = true}
+anyhow = {workspace = true}
+clap = {workspace = true}
+prost = {workspace = true}
+bytes = {workspace = true}
+rustls-pemfile = {workspace = true}
+
+anet-common = { path = "../anet-common"}
+serde = { version = "1.0.219", features = ["derive"] }
+toml = "0.9.8"
+
+[build-dependencies]
+chrono = "0.4.42"
+
+
+================================================
+Файл: ./anet-client/src/client.rs
+================================================
+use crate::config::Config;
+use anet_common::atun::TunManager;
+use anet_common::consts::{MAX_PACKET_SIZE, PACKET_TYPE_DATA};
+use anet_common::encryption::Cipher;
+use anet_common::protocol::{
+    AuthRequest, AuthResponse, Message as AnetMessage, UdpHandshake, message::Content,
+};
+use anet_common::tun_params::TunParams;
+use anyhow::Result;
+use bytes::{BufMut, Bytes, BytesMut};
+use log::{error, info, warn};
+use prost::Message;
+use rustls::pki_types::{CertificateDer, ServerName};
+use rustls::{ClientConfig, RootCertStore};
+use std::{sync::Arc, time::Duration};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpStream, UdpSocket};
+use tokio::time::sleep;
+use tokio_rustls::TlsConnector;
+
+const MAX_RETRIES: u32 = 5;
+const INITIAL_DELAY: u64 = 2;
+const MAX_DELAY: u64 = 60;
+
+pub struct ANetClient {
+    tls_connector: TlsConnector,
+    server_addr: String,
+    auth_phrase: String,
+}
+
+impl ANetClient {
+    pub fn new(cfg: &Config) -> anyhow::Result<Self> {
+        let mut root_store = RootCertStore::empty();
+
+        let cert_bytes = cfg.server_cert.as_bytes();
+
+        let mut cert_reader = std::io::BufReader::new(cert_bytes);
+
+        let certs =
+            rustls_pemfile::certs(&mut cert_reader).collect::<Result<Vec<CertificateDer>, _>>()?;
+
+        for cert in certs {
+            let _ = root_store.add(cert);
+        }
+
+        let mut tls_config = ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+
+        tls_config.alpn_protocols = vec![b"h2".to_vec()];
+        tls_config.enable_early_data = true;
+        tls_config.enable_sni = true;
+
+        info!("ANet Client manager created");
+        let connector = TlsConnector::from(Arc::new(tls_config));
+        Ok(Self {
+            tls_connector: connector,
+            server_addr: cfg.address.to_string(),
+            auth_phrase: cfg.auth_phrase.to_string(),
+        })
+    }
+
+    pub async fn connect(&self) -> Result<AuthResponse> {
+        let mut retry_count = 0;
+        let mut delay = INITIAL_DELAY;
+
+        loop {
+            match self.authenticate_via_tls().await {
+                Ok(params) => {
+                    info!("Connection established successfully");
+                    self.run_udp_connection(&params).await?;
+                    break Ok(params);
+                }
+                Err(e) => {
+                    retry_count += 1;
+                    if retry_count >= MAX_RETRIES {
+                        error!("Max retries exceeded, stopping connection attempts");
+                        return Err(e);
+                    }
+
+                    error!(
+                        "Connection failed (attempt {}): {}. Retrying in {} seconds...",
+                        retry_count, e, delay
+                    );
+
+                    let next_delay = std::cmp::min(delay * 2, MAX_DELAY);
+                    info!("Next retry will be in {} seconds", next_delay);
+
+                    sleep(Duration::from_secs(delay)).await;
+                    delay = next_delay;
+                }
+            }
+        }
+    }
+
+    async fn authenticate_via_tls(&self) -> Result<AuthResponse> {
+        let stream = connect_with_backoff(&self.server_addr).await?;
+
+        let server_name = ServerName::try_from("alco").expect("Invalid server name");
+        let tls_stream = self.tls_connector.connect(server_name, stream).await?;
+
+        let (mut reader, mut writer) = tokio::io::split(tls_stream);
+
+        // Отправляем аутентификацию
+        let auth_request = AnetMessage {
+            content: Some(Content::AuthRequest(AuthRequest {
+                key: self.auth_phrase.clone(),
+            })),
+        };
+
+        let mut request_data = Vec::new();
+        auth_request.encode(&mut request_data)?;
+
+        writer
+            .write_all(&(request_data.len() as u32).to_be_bytes())
+            .await?;
+        writer.write_all(&request_data).await?;
+
+        // Получаем ответ с ключом и портом
+        let mut len_buf = [0u8; 4];
+        reader.read_exact(&mut len_buf).await?;
+        let msg_len = u32::from_be_bytes(len_buf) as usize;
+
+        let mut response_buf = vec![0u8; msg_len];
+        reader.read_exact(&mut response_buf).await?;
+
+        let response: AnetMessage = Message::decode(Bytes::from(response_buf))?;
+
+        match response.content {
+            Some(Content::AuthResponse(auth_response)) => {
+                if auth_response.crypto_key.len() != 32 {
+                    return Err(anyhow::anyhow!("Invalid crypto key length"));
+                }
+
+                Ok(auth_response)
+            }
+            _ => Err(anyhow::anyhow!("Unexpected response type")),
+        }
+    }
+
+    async fn run_udp_connection(&self, auth_response: &AuthResponse) -> Result<()> {
+        let udp_addr = format!(
+            "{}:{}",
+            self.server_addr.split(':').next().unwrap(),
+            auth_response.udp_port
+        );
+        info!("UDP will connect to {}", udp_addr);
+        let socket = UdpSocket::bind("0.0.0.0:0").await?;
+
+        socket.connect(&udp_addr).await?;
+
+        info!(
+            "Starting UDP connection, client ID is {}",
+            auth_response.client_id
+        );
+        let params = TunParams::from_auth_response(auth_response, "anet-client");
+
+        let tun_manager = TunManager::new(params);
+
+        // Отправляем UDP handshake
+        let handshake = AnetMessage {
+            content: Some(Content::UdpHandshake(UdpHandshake {
+                client_id: auth_response.client_id.clone(),
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)?
+                    .as_secs(),
+            })),
+        };
+
+        let mut handshake_data = Vec::new();
+        handshake.encode(&mut handshake_data)?;
+        socket.send(&handshake_data).await?;
+        let socket = Arc::new(socket);
+        // Настраиваем шифрование
+        let cipher = Cipher::new(&auth_response.crypto_key);
+
+        // Запускаем обработку пакетов
+
+        let (tx_to_tun, mut rx_from_tun) = tun_manager.run().await?;
+
+        // Задача для приёма пакетов через UDP
+        tokio::spawn({
+            let socket = socket.clone();
+            let cipher = cipher.clone();
+            let tx_to_tun = tx_to_tun.clone();
+            async move {
+                let mut buffer = vec![0u8; MAX_PACKET_SIZE];
+                loop {
+                    match socket.recv(&mut buffer).await {
+                        Ok(len) => {
+                            if len < 1 {
+                                error!("Packet too short");
+                                continue;
+                            }
+                            // Создаем Bytes из полученных данных
+                            let packet = Bytes::copy_from_slice(&buffer[..len]);
+                            let packet_type = packet[0];
+
+                            match packet_type {
+                                PACKET_TYPE_DATA => {
+                                    // Проверяем минимальный размер пакета: тип + sequence + минимальные данные
+                                    if packet.len() < 1 + 8 + 1 {
+                                        error!("Data packet too short");
+                                        continue;
+                                    }
+
+                                    // Извлекаем sequence number (байты 1-8)
+                                    let sequence_bytes = packet.slice(1..9);
+                                    let sequence = u64::from_be_bytes(
+                                        sequence_bytes.as_ref().try_into().unwrap(),
+                                    );
+
+                                    // Извлекаем зашифрованные данные (байты 9 и дальше)
+                                    let encrypted_data = packet.slice(9..);
+
+                                    // Расшифровываем пакет
+                                    let nonce = Cipher::generate_nonce(sequence);
+
+                                    match cipher.decrypt(&nonce, encrypted_data) {
+                                        Ok(decrypted) => {
+                                            // Отправляем в TUN
+                                            if let Err(e) = tx_to_tun.send(decrypted).await {
+                                                error!("Failed to send to TUN: {}", e);
+                                            }
+                                        }
+                                        Err(e) => {
+                                            error!("Decryption failed: {}", e);
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    warn!("Unknown packet type: {}", packet_type);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            error!("Failed to receive UDP packet: {}", e);
+                        }
+                    }
+                }
+            }
+        });
+
+        // Задача для отправки пакетов через UDP
+        tokio::spawn({
+            let socket = socket.clone();
+            let cipher = cipher.clone();
+            async move {
+                let mut sequence: u64 = 0;
+                while let Some(packet) = rx_from_tun.recv().await {
+                    sequence += 1;
+                    if let Some(data_to_send) =
+                        process_packet_for_sending(&cipher, sequence, packet).await
+                    {
+                        if let Err(e) = socket.send(&data_to_send).await {
+                            warn!("UDP ERROR {}", e);
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        // Ожидаем завершения задач
+
+        // tokio::select! {
+        //     _ = send_task => {},
+        //     _ = recv_task => {},
+        // }
+
+        Ok(())
+    }
+}
+
+async fn connect_with_backoff(server_addr: &str) -> Result<TcpStream> {
+    let mut retries = 0;
+    let mut delay = INITIAL_DELAY;
+
+    loop {
+        match TcpStream::connect(server_addr).await {
+            Ok(stream) => return Ok(stream),
+            Err(e) => {
+                retries += 1;
+                if retries >= MAX_RETRIES {
+                    return Err(e.into());
+                }
+
+                let next_delay = std::cmp::min(delay * 2, MAX_DELAY);
+                error!(
+                    "Connection failed (attempt {}): {}. Retrying in {} seconds (next retry in {} seconds)...",
+                    retries, e, delay, next_delay
+                );
+                sleep(Duration::from_secs(delay)).await;
+                delay = next_delay;
+            }
+        }
+    }
+}
+
+async fn process_packet_for_sending(
+    cipher: &Cipher,
+    sequence: u64,
+    packet: Bytes,
+) -> Option<Bytes> {
+    if packet.len() < 20 {
+        return None;
+    }
+    let nonce = Cipher::generate_nonce(sequence);
+    match cipher.encrypt(&nonce, packet) {
+        Ok(encrypted_data) => {
+            let mut data = BytesMut::with_capacity(1 + 8 + encrypted_data.len());
+            data.put_u8(PACKET_TYPE_DATA);
+            data.put_u64(sequence);
+            data.put(encrypted_data);
+            Some(data.freeze())
+        }
+        Err(e) => {
+            error!("Encryption failed: {}", e);
+            None
+        }
+    }
+}
+
+
+
+================================================
+Файл: ./anet-client/src/config.rs
+================================================
+use clap::Parser;
+use tokio::fs::read_to_string;
+use serde::Deserialize;
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct WindowsTcpConfig {
+    pub congestion_algorithm: String,
+    pub enable_tcp_tuning: bool,
+}
+
+impl Default for WindowsTcpConfig {
+    fn default() -> Self {
+        Self {
+            congestion_algorithm: "ctcp".to_string(),
+            enable_tcp_tuning: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UnixTcpConfig {
+    pub preferred_algorithm: String,
+    pub fallback_algorithm: String,
+    pub enable_tcp_tuning: bool,
+}
+
+impl Default for UnixTcpConfig {
+    fn default() -> Self {
+        Self {
+            preferred_algorithm: "bbr".to_string(),
+            fallback_algorithm: "cubic".to_string(),
+            enable_tcp_tuning: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Config {
+    pub address: String,
+    pub auth_phrase: String,
+    pub server_cert: String,
+    #[serde(default)]
+    pub windows_tcp: WindowsTcpConfig,
+    #[serde(default)]
+    pub unix_tcp: UnixTcpConfig,
+}
+
+
+#[derive(Debug, Parser)]
+pub struct Opt {
+    #[clap(short, long, default_value = "./client.toml")]
+    cfg: String,
+}
+
+pub async fn load() -> anyhow::Result<Config> {
+    let opt = Opt::parse();
+    let toml_str = read_to_string(&opt.cfg).await?;
+    let cfg: Config = toml::from_str(&toml_str)?;
+    Ok(cfg)
+}
+
+
+
+================================================
+Файл: ./anet-client/src/lib.rs
+================================================
+pub mod client;
+pub mod config;
+pub mod lrm;
+pub mod windows_tcp_tuner;
+pub mod unix_tcp_tuner;
+
+
+
+================================================
+Файл: ./anet-client/src/lrm.rs
+================================================
+use anet_common::AuthResponse;
+use anyhow::{Context, Result};
+use log::{info, warn};
+use std::net::Ipv4Addr;
+use std::process::Command;
+
+// код на 99% сгенерен дипсиком, т.к. я не знаю iptables
+pub struct LinuxRouteManager {
+    vpn_gateway: Ipv4Addr,
+    vpn_interface: String,
+    original_gateway: Option<String>,
+    original_interface: Option<String>,
+    vpn_server_ip: String,
+}
+
+impl LinuxRouteManager {
+    pub fn new(params: &AuthResponse, vpn_server_ip: String) -> Self {
+        Self {
+            vpn_gateway: params.gateway.parse().unwrap(),
+            vpn_interface: "anet-client".to_string(),
+            original_gateway: None,
+            original_interface: None,
+            vpn_server_ip,
+        }
+    }
+
+    // Сохраняем оригинальные маршруты
+    pub fn backup_original_routes(&mut self) -> Result<()> {
+        let output = Command::new("ip")
+            .args(&["route", "show", "default"])
+            .output()
+            .context("Failed to get default routes")?;
+
+        let output_str = String::from_utf8_lossy(&output.stdout);
+        if let Some(line) = output_str.lines().next() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 5 && parts[0] == "default" && parts[1] == "via" {
+                self.original_gateway = Some(parts[2].to_string());
+                self.original_interface = Some(parts[4].to_string());
+            }
+        }
+
+        info!(
+            "Original gateway: {:?}, interface: {:?}",
+            self.original_gateway, self.original_interface
+        );
+        Ok(())
+    }
+
+    pub fn setup_vpn_routing(&self) -> Result<()> {
+        info!("Setting up simplified VPN routing (default gateway override)...");
+
+        // 1. Убеждаемся, что маршрут до самого VPN-сервера существует
+        // и идет через старый шлюз. Это САМЫЙ ВАЖНЫЙ шаг.
+        if let (Some(gateway), Some(interface)) = (&self.original_gateway, &self.original_interface)
+        {
+            // Используем 'add' или 'replace', чтобы гарантировать его наличие
+            let _ = Command::new("ip")
+                .args(&[
+                    "route",
+                    "replace", // 'replace' безопасно, т.к. создаст маршрут, если его нет, или обновит
+                    &self.vpn_server_ip,
+                    "via",
+                    gateway,
+                    "dev",
+                    interface,
+                ])
+                .status();
+            info!(
+                "Ensured route to VPN server {} via {}",
+                self.vpn_server_ip, gateway
+            );
+        } else {
+            warn!(
+                "Original gateway not found, cannot create exception route for VPN server. Connectivity may be lost."
+            );
+            // В этом случае продолжать опасно, но для теста оставим.
+        }
+
+        // 2. Теперь мы можем безопасно заменить шлюз по умолчанию
+        let status = Command::new("ip")
+            .args(&[
+                "route",
+                "replace",
+                "default",
+                "via",
+                &self.vpn_gateway.to_string(),
+                "dev",
+                &self.vpn_interface,
+            ])
+            .status();
+
+        match status {
+            Ok(exit_status) if exit_status.success() => {
+                info!("Successfully replaced default route to point to VPN.");
+            }
+            _ => {
+                return Err(anyhow::anyhow!("Failed to replace default route."));
+            }
+        }
+
+        info!("Simplified VPN routing setup completed.");
+        Ok(())
+    }
+
+    // Восстанавливаем оригинальную маршрутизацию
+    pub fn restore_original_routing(&self) -> Result<()> {
+        info!("Restoring original routing...");
+
+        // 1. Просто восстанавливаем старый шлюз по умолчанию.
+        // Это автоматически сделает маршрут на VPN-сервер ненужным,
+        // но мы удалим его для чистоты.
+        if let (Some(gateway), Some(interface)) = (&self.original_gateway, &self.original_interface)
+        {
+            let _ = Command::new("ip")
+                .args(&[
+                    "route", "replace", "default", "via", gateway, "dev", interface,
+                ])
+                .status();
+            info!("Restored original default route via {}", gateway);
+        }
+
+        // 2. Удаляем маршрут к VPN-серверу
+        let _ = Command::new("ip")
+            .args(&["route", "del", &self.vpn_server_ip])
+            .status();
+
+        info!("Original routing restored.");
+        Ok(())
+    }
+}
+
+
+
+================================================
+Файл: ./anet-client/src/main.rs
+================================================
+include!(concat!(env!("OUT_DIR"), "/built.rs"));
+use anet_client::client::ANetClient;
+use anet_client::config::{load, Config};
+use anyhow::Result;
+use log::{info, warn};
+use tokio::signal;
+
+#[cfg(unix)]
+use anet_client::lrm::LinuxRouteManager;
+
+fn generate_ascii_art(build_type: &str, commit_hash: &str, build_time: &str) -> String {
+    // Обрезаем строки до нужной длины, чтобы они помещались в рамку
+    let build_type_display = if build_type.len() > 10 {
+        &build_type[..10]
+    } else {
+        build_type
+    };
+    let commit_hash_display = if commit_hash.len() > 7 {
+        &commit_hash[..7]
+    } else {
+        commit_hash
+    };
+    let build_time_display = if build_time.len() > 19 {
+        &build_time[..19]
+    } else {
+        build_time
+    };
+
+    format!(
+        r#"
+                    ╔═══════════════════════════════════════════════════════════════╗
+                    ║                                                               ║
+                    ║                 █████╗ ███╗   ██╗███████╗████████╗            ║
+                    ║                 ██╔══██╗████╗  ██║██╔════╝╚══██╔══╝           ║
+                    ║                 ███████║██╔██╗ ██║█████╗     ██║              ║
+                    ║                 ██╔══██║██║╚██╗██║██╔══╝     ██║              ║
+                    ║                 ██║  ██║██║ ╚████║███████╗   ██║              ║
+                    ║                 ╚═╝  ╚═╝╚═╝  ╚═══╝╚══════╝   ╚═╝              ║
+                    ║                           by Hanyuufag                        ║
+                    ╠═══════════════════════════════════════════════════════════════╣
+                    ║                                                               ║
+                    ║                   Build Type: {:<16}                ║
+                    ║                   Commit Hash: {:<16}               ║
+                    ║                   Build Time:  {:<19}            ║
+                    ║                                                               ║
+                    ║               >> Welcome to the digital revolution! <<        ║
+                    ║                                                               ║
+                    ╚═══════════════════════════════════════════════════════════════╝
+"#,
+        build_type_display, commit_hash_display, build_time_display
+    )
+}
+
+#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
+async fn main() -> Result<()> {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
+    let ascii_art = generate_ascii_art(BUILD_TYPE, COMMIT_HASH, BUILD_TIME);
+    println!("{}", ascii_art);
+
+    let cfg = load().await?;
+    let client = ANetClient::new(&cfg)?;
+
+    configure_tcp_settings(&cfg).await?;
+
+    let params = client.connect().await?;
+
+    #[cfg(unix)]
+    let mut linux_router = LinuxRouteManager::new(
+        &params,
+        cfg.address.split(':').collect::<Vec<&str>>()[0].to_string(),
+    );
+
+    #[cfg(unix)]
+    linux_router.backup_original_routes()?;
+
+    #[cfg(unix)]
+    linux_router.setup_vpn_routing()?;
+
+    info!("Press Ctrl-C to exit.");
+    signal::ctrl_c().await?;
+
+    #[cfg(unix)]
+    linux_router.restore_original_routing()?;
+
+    info!("Shutting down...");
+    Ok(())
+}
+
+async fn configure_tcp_settings(cfg: &Config) -> Result<()> {
+    // Windows TCP настройки
+    #[cfg(windows)]
+    {
+        if !cfg.windows_tcp.enable_tcp_tuning {
+            info!("Windows TCP tuning is disabled in config");
+            return Ok(());
+        }
+
+        use anet_client::windows_tcp_tuner::WindowsTcpTuner;
+
+        info!("Detecting current TCP congestion control on Windows...");
+        match WindowsTcpTuner::get_current_algorithm() {
+            Ok(algo) => info!("Current TCP algorithm: {}", algo),
+            Err(e) => warn!("Could not detect TCP algorithm: {}", e),
+        }
+
+        info!("Setting TCP congestion control to {}...", cfg.windows_tcp.congestion_algorithm);
+        if let Err(e) = WindowsTcpTuner::set_congestion_control(&cfg.windows_tcp.congestion_algorithm) {
+            warn!("Failed to set TCP congestion control: {}", e);
+            warn!("This is not critical, but may affect performance");
+        } else {
+            info!("Successfully configured Windows TCP settings");
+        }
+    }
+
+    // Unix/Linux TCP настройки
+    #[cfg(unix)]
+    {
+        if !cfg.unix_tcp.enable_tcp_tuning {
+            info!("Unix TCP tuning is disabled in config");
+            return Ok(());
+        }
+
+        use anet_client::unix_tcp_tuner::UnixTcpTuner;
+
+        info!("Detecting current TCP congestion control on Unix...");
+        match UnixTcpTuner::get_current_algorithm() {
+            Ok(algo) => info!("Current TCP algorithm: {}", algo),
+            Err(e) => warn!("Could not detect TCP algorithm: {}", e),
+        }
+
+        match UnixTcpTuner::get_available_algorithms() {
+            Ok(algorithms) => info!("Available TCP algorithms: {:?}", algorithms),
+            Err(e) => warn!("Could not get available algorithms: {}", e),
+        }
+
+        // Пытаемся установить предпочтительный алгоритм
+        info!("Attempting to set preferred algorithm: {}...", cfg.unix_tcp.preferred_algorithm);
+        if let Err(e) = UnixTcpTuner::set_congestion_control(&cfg.unix_tcp.preferred_algorithm) {
+            warn!("Failed to set preferred algorithm: {}", e);
+
+            // Fallback на резервный алгоритм
+            info!("Attempting fallback to: {}...", cfg.unix_tcp.fallback_algorithm);
+            if let Err(e) = UnixTcpTuner::set_congestion_control(&cfg.unix_tcp.fallback_algorithm) {
+                warn!("Failed to set fallback algorithm: {}", e);
+            } else {
+                info!("Successfully configured TCP with fallback algorithm");
+            }
+        } else {
+            info!("Successfully configured TCP with preferred algorithm");
+        }
+
+        // Проверяем финальные настройки
+        match UnixTcpTuner::get_current_algorithm() {
+            Ok(algo) => info!("Final TCP algorithm: {}", algo),
+            Err(e) => warn!("Could not verify final TCP algorithm: {}", e),
+        }
+    }
+
+    Ok(())
+}
+
+
+
+================================================
+Файл: ./anet-client/src/unix_tcp_tuner.rs
+================================================
+use std::process::Command;
+use std::fs;
+use log::{info, warn};
+
+pub struct UnixTcpTuner;
+
+impl UnixTcpTuner {
+    pub fn set_congestion_control(algorithm: &str) -> Result<(), String> {
+        let valid_algorithms = ["cubic", "reno", "bbr", "vegas", "westwood"];
+        if !valid_algorithms.contains(&algorithm.to_lowercase().as_str()) {
+            return Err(format!("Unsupported algorithm: {}. Use: cubic, reno, bbr, vegas, westwood", algorithm));
+        }
+
+        // Проверяем доступность алгоритма в системе
+        if !Self::is_algorithm_available(algorithm)? {
+            return Err(format!("Algorithm {} is not available on this system", algorithm));
+        }
+
+        // Пробуем установить через sysctl
+        if Self::try_sysctl(algorithm).is_ok() {
+            info!("Successfully set TCP congestion control to {} via sysctl", algorithm);
+            return Ok(());
+        }
+
+        // Пробуем записать напрямую в /proc
+        if Self::try_proc(algorithm).is_ok() {
+            info!("Successfully set TCP congestion control to {} via /proc", algorithm);
+            return Ok(());
+        }
+
+        Err("Failed to set TCP congestion control using all methods".to_string())
+    }
+
+    fn is_algorithm_available(algorithm: &str) -> Result<bool, String> {
+        let available_path = "/proc/sys/net/ipv4/tcp_available_congestion_control";
+
+        let available_algorithms = fs::read_to_string(available_path)
+            .map_err(|e| format!("Failed to read {}: {}", available_path, e))?;
+
+        Ok(available_algorithms.split_whitespace().any(|a| a == algorithm))
+    }
+
+    fn try_sysctl(algorithm: &str) -> Result<(), String> {
+        let output = Command::new("sysctl")
+            .args(&[
+                "-w",
+                &format!("net.ipv4.tcp_congestion_control={}", algorithm)
+            ])
+            .output()
+            .map_err(|e| format!("sysctl failed: {}", e))?;
+
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(String::from_utf8_lossy(&output.stderr).to_string())
+        }
+    }
+
+    fn try_proc(algorithm: &str) -> Result<(), String> {
+        let proc_path = "/proc/sys/net/ipv4/tcp_congestion_control";
+
+        fs::write(proc_path, algorithm)
+            .map_err(|e| format!("Failed to write to {}: {}", proc_path, e))
+    }
+
+    pub fn get_current_algorithm() -> Result<String, String> {
+        let proc_path = "/proc/sys/net/ipv4/tcp_congestion_control";
+
+        fs::read_to_string(proc_path)
+            .map(|s| s.trim().to_string())
+            .map_err(|e| format!("Failed to read {}: {}", proc_path, e))
+    }
+
+    pub fn get_available_algorithms() -> Result<Vec<String>, String> {
+        let available_path = "/proc/sys/net/ipv4/tcp_available_congestion_control";
+
+        let content = fs::read_to_string(available_path)
+            .map_err(|e| format!("Failed to read {}: {}", available_path, e))?;
+
+        Ok(content.split_whitespace().map(|s| s.to_string()).collect())
+    }
+
+    pub fn enable_bbr_if_available() -> Result<(), String> {
+        let available = Self::get_available_algorithms()?;
+
+        if available.contains(&"bbr".to_string()) {
+            info!("BBR is available, enabling...");
+            Self::set_congestion_control("bbr")
+        } else {
+            warn!("BBR is not available on this system. Available algorithms: {:?}", available);
+
+            // Пробуем cubic как fallback
+            if available.contains(&"cubic".to_string()) {
+                info!("Falling back to cubic");
+                Self::set_congestion_control("cubic")
+            } else if !available.is_empty() {
+                info!("Falling back to first available: {}", available[0]);
+                Self::set_congestion_control(&available[0])
+            } else {
+                Err("No TCP congestion control algorithms available".to_string())
+            }
+        }
+    }
+    
+}
+
+
+
+================================================
+Файл: ./anet-client/src/windows_tcp_tuner.rs
+================================================
+use std::process::Command;
+use log::info;
+
+pub struct WindowsTcpTuner;
+
+impl WindowsTcpTuner {
+    pub fn set_congestion_control(algorithm: &str) -> Result<(), String> {
+        let valid_algorithms = ["cubic", "ctcp", "dctcp"];
+        if !valid_algorithms.contains(&algorithm.to_lowercase().as_str()) {
+            return Err(format!("Unsupported algorithm: {}. Use: cubic, ctcp, dctcp", algorithm));
+        }
+
+        // Попробуем разные методы
+        if Self::try_powershell(algorithm).is_ok() {
+            info!("Successfully set TCP congestion control to {} via PowerShell", algorithm);
+            return Ok(());
+        }
+
+        if Self::try_netsh(algorithm).is_ok() {
+            info!("Successfully set TCP congestion control to {} via netsh", algorithm);
+            return Ok(());
+        }
+
+        if Self::try_registry(algorithm).is_ok() {
+            info!("Successfully set TCP congestion control to {} via registry", algorithm);
+            return Ok(());
+        }
+
+        Err("Failed to set TCP congestion control using all methods".to_string())
+    }
+
+    fn try_powershell(algorithm: &str) -> Result<(), String> {
+        let ps_algorithm = match algorithm.to_lowercase().as_str() {
+            "cubic" => "Cubic",
+            "ctcp" => "Ctcp",
+            "dctcp" => "Dctcp",
+            _ => return Err("Unsupported algorithm".to_string())
+        };
+
+        let output = Command::new("powershell")
+            .args(&[
+                "-Command",
+                &format!("Set-NetTCPSetting -SettingName InternetCustom -CongestionProvider {}; Write-Output 'Success'", ps_algorithm)
+            ])
+            .output()
+            .map_err(|e| format!("PowerShell failed: {}", e))?;
+
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(String::from_utf8_lossy(&output.stderr).to_string())
+        }
+    }
+
+    fn try_netsh(algorithm: &str) -> Result<(), String> {
+        let netsh_algorithm = match algorithm.to_lowercase().as_str() {
+            "cubic" => "cubic",
+            "ctcp" => "ctcp",
+            "dctcp" => "dctcp",
+            _ => return Err("Unsupported algorithm".to_string())
+        };
+
+        let output = Command::new("netsh")
+            .args(&[
+                "int", "tcp", "set", "global",
+                &format!("congestionprovider={}", netsh_algorithm)
+            ])
+            .output()
+            .map_err(|e| format!("netsh failed: {}", e))?;
+
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(String::from_utf8_lossy(&output.stderr).to_string())
+        }
+    }
+
+    fn try_registry(algorithm: &str) -> Result<(), String> {
+        let reg_algorithm = match algorithm.to_lowercase().as_str() {
+            "cubic" => "Cubic",
+            "ctcp" => "CTCP",
+            "dctcp" => "DCTCP",
+            _ => return Err("Unsupported algorithm".to_string())
+        };
+
+        let output = Command::new("reg")
+            .args(&[
+                "add",
+                "HKLM\\SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters",
+                "/v", "TcpCongestionControl",
+                "/t", "REG_SZ",
+                "/d", reg_algorithm,
+                "/f"
+            ])
+            .output()
+            .map_err(|e| format!("reg failed: {}", e))?;
+
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(String::from_utf8_lossy(&output.stderr).to_string())
+        }
+    }
+
+    pub fn get_current_algorithm() -> Result<String, String> {
+        // Сначала пробуем PowerShell
+        let output = Command::new("powershell")
+            .args(&["-Command", "Get-NetTCPSetting | Select-Object -First 1 | Select-Object -ExpandProperty CongestionProvider"])
+            .output()
+            .map_err(|e| format!("PowerShell failed: {}", e))?;
+
+        if output.status.success() {
+            let result = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !result.is_empty() {
+                return Ok(result);
+            }
+        }
+
+        // Пробуем через реестр
+        let output = Command::new("reg")
+            .args(&[
+                "query",
+                "HKLM\\SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters",
+                "/v", "TcpCongestionControl"
+            ])
+            .output()
+            .map_err(|e| format!("reg failed: {}", e))?;
+
+        if output.status.success() {
+            let output_str = String::from_utf8_lossy(&output.stdout);
+            if let Some(line) = output_str.lines().find(|l| l.contains("TcpCongestionControl")) {
+                if let Some(value) = line.split_whitespace().last() {
+                    return Ok(value.to_string());
+                }
+            }
+        }
+
+        Err("Could not determine current TCP congestion control algorithm".to_string())
+    }
+}
+
+
+
+================================================
+Файл: ./anet-common/build.rs
+================================================
+use std::io::Result;
+
+fn main() -> Result<()> {
+    let ci = std::env::var("CI").unwrap_or_default() == "true";
+
+    if !ci {
+        std::fs::create_dir_all("src/generated").unwrap();
+
+        prost_build::Config::new()
+            .out_dir("src/generated")
+            .compile_protos(&["proto/protocol.proto"], &["proto/"])?;
+    }
+
+    Ok(())
+}
+
+
+
+================================================
+Файл: ./anet-common/Cargo.toml
+================================================
+[package]
+name = "anet-common"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tun = {workspace = true}
+bytes = {workspace = true}
+prost = {workspace = true}
+tokio = {workspace = true}
+log = {workspace = true}
+anyhow = {workspace = true}
+chacha20poly1305 = {workspace = true}
+aes-gcm = "0.10.3"
+aead = { version = "0.5.2", features = ["getrandom"] }
+
+[build-dependencies]
+prost-build = "0.14.1"
+
+
+================================================
+Файл: ./anet-common/proto/protocol.proto
+================================================
+syntax = "proto3";
+
+package anet;
+
+message AuthRequest {
+    string key = 1;
+}
+
+message AuthResponse {
+    string ip = 1;
+    string netmask = 2;
+    string gateway = 3;
+    int32 mtu = 4;
+    bytes crypto_key = 5;  // 32-байтовый ключ для ChaCha20Poly1305
+    uint32 udp_port = 6;   // Порт для UDP соединения
+    string client_id = 7;
+}
+
+message UdpHandshake {
+    string client_id = 1;   // 16-байтовый идентификатор клиента
+    uint64 timestamp = 2;  // Метка времени для защиты от replay-атак
+}
+
+message Message {
+    oneof content {
+        AuthRequest auth_request = 1;
+        AuthResponse auth_response = 2;
+        UdpHandshake udp_handshake = 3;
+    }
+}
+
+
+
+================================================
+Файл: ./anet-common/src/atun.rs
+================================================
+use crate::consts::{CHANNEL_BUFFER_SIZE, MAX_PACKET_SIZE};
+use crate::tun_params::TunParams;
+use anyhow::{Context, Result};
+use bytes::Bytes;
+use log::{error, info};
+use std::net::Ipv4Addr;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::process::Command;
+use tokio::sync::mpsc;
+use tun::Configuration;
+
+#[derive(Clone)]
+pub struct TunManager {
+    params: TunParams,
+}
+
+impl TunManager {
+    pub fn new(params: TunParams) -> Self {
+        Self { params }
+    }
+
+    fn create_config(&self) -> Result<Configuration> {
+        let mut binding = Configuration::default();
+        let config = binding
+            .tun_name(&self.params.name)
+            .mtu(self.params.mtu)
+            .up()
+            .address(self.params.address)
+            .netmask(self.params.netmask)
+            .destination(self.params.gateway);
+        Ok(config.clone())
+    }
+
+    pub async fn run(&self) -> Result<(mpsc::Sender<Bytes>, mpsc::Receiver<Bytes>)> {
+        let config = self.create_config()?;
+        let device = tun::create_as_async(&config).context("Failed to create async TUN device")?;
+
+        info!("Created TUN [{}]", self.get_info());
+
+
+        let (mut reader, mut writer) = tokio::io::split(device);
+
+        let (tx_to_tun, mut rx_to_tun) = mpsc::channel::<Bytes>(CHANNEL_BUFFER_SIZE);
+        let (tx_from_tun, rx_from_tun) = mpsc::channel::<Bytes>(CHANNEL_BUFFER_SIZE);
+
+        tokio::spawn(async move {
+            let mut buffer = vec![0u8; MAX_PACKET_SIZE];
+            loop {
+                match reader.read(&mut buffer).await {
+                    Ok(0) => {
+                        info!("TUN reader stream ended.");
+                        break;
+                    }
+                    Ok(n) => {
+                        let packet = Bytes::copy_from_slice(&buffer[..n]);
+                        match tx_from_tun.send(packet).await {
+                            Ok(_) => {},
+                            Err(e) => {
+                                error!("Failed send to channel, error: {}", e);
+                                break
+                            },
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to read from TUN: {}", e);
+                        break;
+                    }
+                }
+            }
+        });
+
+        tokio::spawn(async move {
+            while let Some(packet) = rx_to_tun.recv().await {
+                if let Err(e) = writer.write_all(&packet).await {
+                    error!("Failed to write to TUN: {}", e);
+                    break;
+                }
+            }
+        });
+
+        Ok((tx_to_tun, rx_from_tun))
+    }
+
+    pub fn get_info(&self) -> String {
+        format!(
+            "Address: {}, Netmask: {}, Destination: {}, Name: {}, MTU: {}",
+            self.params.address,
+            self.params.netmask,
+            self.params.gateway,
+            self.params.name,
+            self.params.mtu
+        )
+    }
+
+    // Нагенерено нейронкой
+    pub async fn setup_tun_routing(&self, external: &str) -> anyhow::Result<()> {
+        if self.params.network.is_none() {
+            // Мы - не сервер.
+            return Ok(());
+        }
+        Command::new("sysctl")
+            .arg("-w")
+            .arg("net.ipv4.ip_forward=1")
+            .status()
+            .await?;
+        Command::new("iptables").args(&["-F"]).status().await?;
+        Command::new("iptables")
+            .args(&["-t", "nat", "-F"])
+            .status()
+            .await?;
+        Command::new("iptables")
+            .args(&["-P", "INPUT", "ACCEPT"])
+            .status()
+            .await?;
+        Command::new("iptables")
+            .args(&["-P", "FORWARD", "ACCEPT"])
+            .status()
+            .await?;
+        Command::new("iptables")
+            .args(&["-P", "OUTPUT", "ACCEPT"])
+            .status()
+            .await?;
+        Command::new("iptables")
+            .args(&[
+                "-t",
+                "nat",
+                "-A",
+                "POSTROUTING",
+                "-o",
+                external,
+                "-j",
+                "MASQUERADE",
+            ])
+            .status()
+            .await?;
+        Command::new("iptables")
+            .args(&[
+                "-A",
+                "FORWARD",
+                "-i",
+                &self.params.name,
+                "-o",
+                external,
+                "-j",
+                "ACCEPT",
+            ])
+            .status()
+            .await?;
+        Command::new("iptables")
+            .args(&[
+                "-A",
+                "FORWARD",
+                "-i",
+                external,
+                "-o",
+                &self.params.name,
+                "-j",
+                "ACCEPT",
+            ])
+            .status()
+            .await?;
+        let prefix = self.netmask_to_prefix(self.params.netmask)?;
+        let net = format!("{}/{}", self.params.network.unwrap(), prefix);
+        Command::new("ip")
+            .args(&["route", "replace", &net, "dev", &self.params.name])
+            .status()
+            .await?;
+        info!("IP routing configured successfully");
+        Ok(())
+    }
+
+    /// Преобразует маску в формате Ipv4Addr в префикс CIDR
+    fn netmask_to_prefix(&self, netmask: Ipv4Addr) -> Result<u8, anyhow::Error> {
+        let octets = netmask.octets();
+        let mask = u32::from_be_bytes(octets);
+
+        // Проверяем что маска валидна (последовательность единиц followed by нулей)
+        if !self.is_valid_netmask(mask) {
+            return Err(anyhow::anyhow!("Invalid netmask: {}", netmask));
+        }
+
+        // Считаем количество установленных битов
+        Ok(mask.count_ones() as u8)
+    }
+
+    /// Проверяет что маска является валидной сетевой маской
+    fn is_valid_netmask(&self, mask: u32) -> bool {
+        // Маска должна быть последовательностью единиц followed by нулей
+        let inverted = !mask;
+        inverted & (inverted + 1) == 0
+    }
+}
+
+
+
+================================================
+Файл: ./anet-common/src/consts.rs
+================================================
+// Все константы обсалютно научны, и соответствуют числу тараканов на лолу и кол-ву бычков в пепельнице.
+// Не научные - числу мух на потолке.
+pub const MAX_PACKET_SIZE: usize = 65535;
+
+pub const CHANNEL_BUFFER_SIZE: usize = 65535;
+
+pub const READ_TIMEOUT_SECONDS: u64 = 30;
+
+pub const WRITE_TIMEOUT_SECONDS: u64 = 30;
+
+pub const PACKET_TYPE_DATA: u8 = 0x01;
+
+pub const PACKET_TYPE_HANDSHAKE: u8 = 0x02;
+
+pub const UDP_HANDSHAKE_TIMEOUT_SECONDS: u64 = 30;
+
+
+
+================================================
+Файл: ./anet-common/src/encryption.rs
+================================================
+use aead::{Aead, KeyInit, Nonce};
+use aes_gcm::{Aes256Gcm, Key};
+use bytes::Bytes;
+use chacha20poly1305::ChaCha20Poly1305;
+use std::sync::Arc;
+
+// Заменить на `ChaCha20Poly1305` при необходимости.
+type CryptoAlgorithm = Aes256Gcm;
+
+#[derive(Clone)]
+pub struct Cipher {
+    cipher: Arc<CryptoAlgorithm>,
+}
+
+impl Cipher {
+    pub fn new(key: &[u8]) -> Self {
+        if key.len() != 32 {
+            panic!("Invalid key length for AES-256-GCM. Must be 32 bytes.");
+        }
+
+        let key_generic: &Key<CryptoAlgorithm> = key.try_into().expect("Key must be 32 bytes");
+
+        Self {
+            cipher: Arc::new(CryptoAlgorithm::new(key_generic)),
+        }
+    }
+
+    #[inline]
+    pub fn encrypt(&self, nonce_bytes: &[u8], data: Bytes) -> Result<Bytes, EncryptionError> {
+        let nonce = Nonce::<CryptoAlgorithm>::from_slice(nonce_bytes);
+
+        let ciphertext = self
+            .cipher
+            .encrypt(nonce, data.as_ref())
+            .map_err(|_| EncryptionError::EncryptionFailed)?;
+
+        Ok(Bytes::from(ciphertext))
+    }
+
+    #[inline]
+    pub fn decrypt(&self, nonce_bytes: &[u8], data: Bytes) -> Result<Bytes, EncryptionError> {
+        let nonce = Nonce::<CryptoAlgorithm>::from_slice(nonce_bytes);
+
+        let plaintext = self
+            .cipher
+            .decrypt(nonce, data.as_ref())
+            .map_err(|_| EncryptionError::DecryptionFailed)?;
+
+        Ok(Bytes::from(plaintext))
+    }
+    pub fn generate_nonce(sequence: u64) -> [u8; 12] {
+        let mut nonce = [0u8; 12];
+        nonce[4..].copy_from_slice(&sequence.to_be_bytes());
+        nonce
+    }
+}
+
+#[derive(Debug)]
+pub enum EncryptionError {
+    EncryptionFailed,
+    DecryptionFailed,
+}
+
+impl std::fmt::Display for EncryptionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EncryptionError::EncryptionFailed => write!(f, "Encryption failed"),
+            EncryptionError::DecryptionFailed => write!(f, "Decryption failed"),
+        }
+    }
+}
+
+impl std::error::Error for EncryptionError {}
+
+
+
+================================================
+Файл: ./anet-common/src/generated/anet.rs
+================================================
+// This file is @generated by prost-build.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AuthRequest {
+    #[prost(string, tag = "1")]
+    pub key: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AuthResponse {
+    #[prost(string, tag = "1")]
+    pub ip: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub netmask: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub gateway: ::prost::alloc::string::String,
+    #[prost(int32, tag = "4")]
+    pub mtu: i32,
+    /// 32-байтовый ключ для ChaCha20Poly1305
+    #[prost(bytes = "vec", tag = "5")]
+    pub crypto_key: ::prost::alloc::vec::Vec<u8>,
+    /// Порт для UDP соединения
+    #[prost(uint32, tag = "6")]
+    pub udp_port: u32,
+    #[prost(string, tag = "7")]
+    pub client_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct UdpHandshake {
+    /// 16-байтовый идентификатор клиента
+    #[prost(string, tag = "1")]
+    pub client_id: ::prost::alloc::string::String,
+    /// Метка времени для защиты от replay-атак
+    #[prost(uint64, tag = "2")]
+    pub timestamp: u64,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct Message {
+    #[prost(oneof = "message::Content", tags = "1, 2, 3")]
+    pub content: ::core::option::Option<message::Content>,
+}
+/// Nested message and enum types in `Message`.
+pub mod message {
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Content {
+        #[prost(message, tag = "1")]
+        AuthRequest(super::AuthRequest),
+        #[prost(message, tag = "2")]
+        AuthResponse(super::AuthResponse),
+        #[prost(message, tag = "3")]
+        UdpHandshake(super::UdpHandshake),
+    }
+}
+
+
+
+================================================
+Файл: ./anet-common/src/generated/mod.rs
+================================================
+[Бинарный файл или файл неподдерживаемого формата]
+
+
+
+================================================
+Файл: ./anet-common/src/lib.rs
+================================================
+pub mod atun;
+pub mod consts;
+pub mod encryption;
+pub mod generated;
+pub mod tun_params;
+
+pub use generated::*;
+pub mod protocol {
+    pub use super::*;
+}
+
+
+
+================================================
+Файл: ./anet-common/src/protocol.rs
+================================================
+include!(concat!(env!("OUT_DIR"), "/protocol.rs"));
+
+
+
+================================================
+Файл: ./anet-common/src/tun_params.rs
+================================================
+use crate::AuthResponse;
+use std::net::Ipv4Addr;
+
+#[derive(Clone)]
+pub struct TunParams {
+    pub address: Ipv4Addr,
+    pub netmask: Ipv4Addr,
+    pub gateway: Ipv4Addr,
+    pub name: String,
+    pub mtu: u16,
+
+    pub network: Option<Ipv4Addr>,
+}
+
+impl TunParams {
+    pub fn default_server() -> Self {
+        Self {
+            address: Ipv4Addr::new(10, 0, 0, 2),
+            netmask: Ipv4Addr::new(255, 255, 255, 0),
+            gateway: Ipv4Addr::new(10, 0, 0, 1),
+            name: "anet-server".to_string(),
+            mtu: 1400,
+            network: Some(Ipv4Addr::new(10, 0, 0, 0)),
+        }
+    }
+
+    pub fn default_client() -> Self {
+        Self {
+            address: Ipv4Addr::new(10, 0, 0, 2),
+            netmask: Ipv4Addr::new(255, 255, 255, 0),
+            gateway: Ipv4Addr::new(10, 0, 0, 1),
+            name: "anet-client".to_string(),
+            mtu: 1400,
+            network: None,
+        }
+    }
+
+    pub fn from_auth_response(auth_response: &AuthResponse, adapter: &str) -> Self {
+        Self {
+            address: auth_response.ip.parse().unwrap(),
+            netmask: auth_response.netmask.parse().unwrap(),
+            gateway: auth_response.gateway.parse().unwrap(),
+            name: adapter.to_string(),
+            mtu: auth_response.mtu as u16,
+            network: None,
+        }
+    }
+}
+
+
+
+================================================
+Файл: ./anet-server/build.rs
+================================================
+fn main() {
+    let target = std::env::var("TARGET").unwrap_or_else(|_| "unknown".to_string());
+
+    println!(
+        "cargo:warning=Compiling for: {} on {} (target: {})",
+        std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_else(|_| "unknown".to_string()),
+        std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_else(|_| "unknown".to_string()),
+        target
+    );
+}
+
+
+
+================================================
+Файл: ./anet-server/Cargo.toml
+================================================
+[package]
+name = "anet-server"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = {workspace = true}
+tokio-rustls = {workspace = true}
+rustls = {workspace = true}
+env_logger = {workspace = true}
+log = {workspace = true}
+anyhow = {workspace = true}
+clap = {workspace = true}
+yaml-rust2 = { workspace = true }
+prost = {workspace = true}
+bytes = {workspace = true}
+rustls-pemfile = {workspace = true}
+base64 = {workspace = true}
+rand = {workspace = true}
+chacha20poly1305 = {workspace = true}
+
+anet-common = { path = "../anet-common"}
+
+
+
+================================================
+Файл: ./anet-server/src/config.rs
+================================================
+use clap::Parser;
+use tokio::fs::read_to_string;
+use yaml_rust2::YamlLoader;
+
+#[derive(Debug, Clone)]
+pub struct Config {
+    pub mask: String,
+    pub net: String,
+    pub gateway: String,
+    pub self_ip: String,
+    pub auth_phrase: String,
+    pub cert_path: String,
+    pub key_path: String,
+    pub bind_to: String,
+    pub external_if: String,
+    pub if_name: String,
+    pub mtu: u16,
+    pub udp_port: u32,
+}
+
+#[derive(Debug, Parser)]
+pub struct Opt {
+    #[clap(short, long, default_value = "./server.yaml")]
+    cfg: String,
+}
+
+pub async fn load() -> anyhow::Result<Config> {
+    let opt = Opt::parse();
+    let yaml = read_to_string(&opt.cfg).await?;
+    let settings = YamlLoader::load_from_str(&yaml)?;
+    let server = &settings[0]["server"];
+    let network = &settings[0]["network"];
+
+    let cfg = Config {
+        mask: network["mask"].as_str().unwrap().to_string(),
+        net: network["net"].as_str().unwrap().to_string(),
+        gateway: network["gateway"].as_str().unwrap().to_string(),
+        self_ip: network["self_ip"].as_str().unwrap().to_string(),
+        if_name: network["if_name"].as_str().unwrap().to_string(),
+        mtu: network["mtu"].as_str().unwrap().parse::<u16>().unwrap(),
+        auth_phrase: server["auth_phrase"].as_str().unwrap().to_string(),
+        cert_path: server["cert_path"].as_str().unwrap().to_string(),
+        key_path: server["key_path"].as_str().unwrap().to_string(),
+        bind_to: server["bind_to"].as_str().unwrap().to_string(),
+        external_if: server["external_if"].as_str().unwrap().to_string(),
+        udp_port: server["udp_port"].as_str().unwrap().parse::<u32>().unwrap(),
+    };
+    Ok(cfg)
+}
+
+
+
+================================================
+Файл: ./anet-server/src/ip_pool.rs
+================================================
+use std::collections::HashSet;
+use std::net::Ipv4Addr;
+use std::sync::{Arc, Mutex};
+
+#[derive(Clone)]
+pub struct IpPool {
+    pub network: Ipv4Addr,
+    pub netmask: Ipv4Addr,
+    pub gateway: Ipv4Addr,
+    pub server: Ipv4Addr,
+    pub mtu: u16,
+    used: Arc<Mutex<HashSet<Ipv4Addr>>>,
+}
+
+impl IpPool {
+    pub fn new(
+        network: Ipv4Addr,
+        netmask: Ipv4Addr,
+        gateway: Ipv4Addr,
+        server: Ipv4Addr,
+        mtu: u16,
+    ) -> Self {
+        Self {
+            network,
+            netmask,
+            gateway,
+            server,
+            mtu,
+            used: Arc::new(Mutex::new(HashSet::new())),
+        }
+    }
+
+    pub fn allocate(&self) -> Option<Ipv4Addr> {
+        let net = u32::from(self.network);
+        let mask = u32::from(self.netmask);
+        let gw = self.gateway;
+        let srv = self.server;
+
+        let mut used = self.used.lock().unwrap();
+
+        for host in 1..=u32::MAX {
+            let candidate = net | host;
+            if (candidate & mask) != (net & mask) {
+                break;
+            }
+            let ip = Ipv4Addr::from(candidate);
+
+            if ip == gw || ip == srv {
+                continue;
+            }
+            if used.contains(&ip) {
+                continue;
+            }
+
+            used.insert(ip);
+            return Some(ip);
+        }
+        None
+    }
+
+    pub fn release(&self, ip: Ipv4Addr) -> bool {
+        let mut used = self.used.lock().unwrap();
+        used.remove(&ip)
+    }
+}
+
+
+
+================================================
+Файл: ./anet-server/src/lib.rs
+================================================
+pub mod config;
+pub mod ip_pool;
+pub mod server;
+pub mod utils;
+
+
+
+================================================
+Файл: ./anet-server/src/main.rs
+================================================
+use anet_server::config::load;
+use anet_server::server;
+use anyhow::Result;
+use server::ANetServer;
+
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<()> {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    let cfg = load().await?;
+
+    let server = ANetServer::new(&cfg)?;
+    server.run().await?;
+
+    Ok(())
+}
+
+
+
+================================================
+Файл: ./anet-server/src/server.rs
+================================================
+use std::collections::HashMap;
+use std::{fs::File, io::BufReader, sync::Arc};
+
+use crate::config::Config;
+use crate::ip_pool::IpPool;
+use crate::utils::{generate_crypto_key, generate_uid};
+use anet_common::AuthResponse;
+use anet_common::atun::TunManager;
+use anet_common::consts::{MAX_PACKET_SIZE, PACKET_TYPE_DATA, UDP_HANDSHAKE_TIMEOUT_SECONDS};
+use anet_common::encryption::Cipher;
+use anet_common::protocol::{Message as AnetMessage, message::Content};
+use anet_common::tun_params::TunParams;
+use anyhow::Context;
+use bytes::{BufMut, Bytes, BytesMut};
+use log::{error, info, warn};
+use prost::Message;
+use rustls::ServerConfig;
+use rustls::pki_types::CertificateDer;
+use std::net::SocketAddr;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::sync::Mutex;
+use tokio::sync::mpsc;
+use tokio::time::{Duration, interval};
+use tokio_rustls::TlsAcceptor;
+
+#[derive(Clone)]
+struct UdpClient {
+    cipher: Cipher,
+    last_seen: std::time::Instant,
+    client_id: String,
+    addr: SocketAddr,
+    sequence: u64,
+}
+
+pub struct ANetServer {
+    tls_acceptor: TlsAcceptor,
+    ip_pool: IpPool,
+    cfg: Config,
+    tun_manager: TunManager,
+    uid_to_key: Arc<Mutex<HashMap<String, [u8; 32]>>>,
+    client_id_to_ip: Arc<Mutex<HashMap<String, String>>>,
+    clients_by_ip: Arc<Mutex<HashMap<String, UdpClient>>>,
+    addr_to_ip: Arc<Mutex<HashMap<SocketAddr, String>>>,
+}
+
+impl ANetServer {
+    pub fn new(cfg: &Config) -> anyhow::Result<Self> {
+        let tls_cfg = load_tls_config(cfg.cert_path.as_str(), cfg.key_path.as_str())?;
+        let acceptor = TlsAcceptor::from(Arc::new(tls_cfg));
+        let params = TunParams {
+            netmask: cfg.mask.parse()?,
+            gateway: cfg.gateway.parse()?,
+            address: cfg.self_ip.parse()?,
+            name: cfg.if_name.clone(),
+            mtu: cfg.mtu,
+            network: Some(cfg.net.parse()?),
+        };
+        let tun_manager = TunManager::new(params);
+
+        let ip_pool = IpPool::new(
+            cfg.net.parse()?,
+            cfg.mask.parse()?,
+            cfg.gateway.parse()?,
+            cfg.self_ip.parse()?,
+            cfg.mtu,
+        );
+
+        Ok(Self {
+            tls_acceptor: acceptor,
+            ip_pool,
+            cfg: cfg.clone(),
+            tun_manager,
+            uid_to_key: Arc::new(Mutex::new(HashMap::new())),
+            client_id_to_ip: Arc::new(Mutex::new(HashMap::new())),
+            clients_by_ip: Arc::new(Mutex::new(HashMap::new())),
+            addr_to_ip: Arc::new(Mutex::new(HashMap::new())),
+        })
+    }
+
+    pub async fn run(&self) -> anyhow::Result<()> {
+        let tcp_listener = TcpListener::bind(self.cfg.bind_to.as_str()).await?;
+        let udp_addr = self.cfg.bind_to.as_str().split(':').collect::<Vec<&str>>()[0];
+        let udp_socket = UdpSocket::bind(format!("{}:{}", udp_addr, self.cfg.udp_port)).await?;
+
+        info!(
+            "Bind on {} for TCP, and {}:{} for UDP",
+            self.cfg.bind_to.as_str(),
+            udp_addr,
+            self.cfg.udp_port
+        );
+        let udp_socket = Arc::new(udp_socket);
+        let (tx_to_tun, mut rx_from_tun) = self.tun_manager.run().await?;
+
+        self.tun_manager
+            .setup_tun_routing(self.cfg.external_if.as_str())
+            .await?;
+
+        // TUN -> UDP
+        let udp_socket_for_tun = udp_socket.clone();
+        let clients_by_ip_for_tun = self.clients_by_ip.clone();
+        tokio::spawn(async move {
+            while let Some(packet) = rx_from_tun.recv().await {
+                if let Some((data_to_send, addr)) =
+                    process_packet_for_sending(&clients_by_ip_for_tun, packet).await
+                {
+                    if let Err(e) = udp_socket_for_tun.send_to(&data_to_send, addr).await {
+                        warn!("UDP ERROR {} for addr: {}", e, addr);
+                    }
+                }
+            }
+        });
+
+        //UDP -> TUN
+        let clients_by_ip_for_udp = self.clients_by_ip.clone();
+        let addr_to_ip_for_udp = self.addr_to_ip.clone();
+        let uid_to_key_for_udp = self.uid_to_key.clone();
+        let tx_to_tun_for_udp = tx_to_tun.clone();
+        let client_id_to_ip_for_udp = self.client_id_to_ip.clone();
+        let udp_socket_for_task = udp_socket.clone();
+        tokio::spawn(async move {
+            let mut buffer = BytesMut::with_capacity(MAX_PACKET_SIZE);
+            loop {
+                match udp_socket_for_task.recv_buf_from(&mut buffer).await {
+                    Ok((len, addr)) => {
+                        let data = buffer.split_to(len).freeze();
+
+                        let client_ip = { addr_to_ip_for_udp.lock().await.get(&addr).cloned() };
+
+                        if let Some(ip) = client_ip {
+                            let cipher = {
+                                let mut clients = clients_by_ip_for_udp.lock().await;
+
+                                if let Some(client) = clients.get_mut(&ip) {
+                                    client.last_seen = std::time::Instant::now();
+                                    Some(client.cipher.clone())
+                                } else {
+                                    None
+                                }
+                            };
+                            if let Some(cipher) = cipher {
+                                if let Err(e) =
+                                    Self::handle_udp_data(data, cipher, tx_to_tun_for_udp.clone())
+                                        .await
+                                {
+                                    error!("Failed to handle UDP packet from {}: {}", addr, e);
+                                }
+                            }
+                        } else if let Err(e) = Self::handle_udp_handshake(
+                            clients_by_ip_for_udp.clone(),
+                            addr_to_ip_for_udp.clone(),
+                            uid_to_key_for_udp.clone(),
+                            client_id_to_ip_for_udp.clone(),
+                            data,
+                            addr,
+                        )
+                        .await
+                        {
+                            error!("Failed to handle UDP handshake from {}: {}", addr, e);
+                        }
+                    }
+                    Err(e) => error!("UDP recv error: {}", e),
+                }
+            }
+        });
+
+        // Очистки неактивных клиентов
+        let clients_by_ip_for_cleanup = self.clients_by_ip.clone();
+        let addr_to_ip_for_cleanup = self.addr_to_ip.clone();
+        let ip_pool_for_cleanup = self.ip_pool.clone();
+        tokio::spawn(async move {
+            let mut interval = interval(Duration::from_secs(30));
+            loop {
+                interval.tick().await;
+
+                let now = std::time::Instant::now();
+                let mut clients_to_remove = Vec::new();
+                let mut clients_by_ip = clients_by_ip_for_cleanup.lock().await;
+
+                for (ip, client) in clients_by_ip.iter() {
+                    if now.duration_since(client.last_seen) > Duration::from_secs(60) {
+                        clients_to_remove.push((ip.clone(), client.addr, client.client_id.clone()));
+                    }
+                }
+
+                if !clients_to_remove.is_empty() {
+                    let mut addr_to_ip = addr_to_ip_for_cleanup.lock().await;
+
+                    for (ip_str, addr, _) in &clients_to_remove {
+                        clients_by_ip.remove(ip_str);
+                        addr_to_ip.remove(addr);
+
+                        if let Ok(ip_addr) = ip_str.parse() {
+                            ip_pool_for_cleanup.release(ip_addr);
+                        }
+
+                        info!("Removed inactive client: {} (IP: {})", addr, ip_str);
+                    }
+                }
+            }
+        });
+
+        // TLS Auth
+        while let Ok((socket, _)) = tcp_listener.accept().await {
+            let acceptor = self.tls_acceptor.clone();
+            let ip_pool = self.ip_pool.clone();
+            let auth_phrase = self.cfg.auth_phrase.clone();
+            let udp_port = self.cfg.udp_port;
+            let uid_to_key = self.uid_to_key.clone();
+            let client_id_to_ip = self.client_id_to_ip.clone();
+
+            tokio::spawn(async move {
+                if let Err(e) = handle_tls_auth(
+                    socket,
+                    acceptor,
+                    ip_pool,
+                    auth_phrase,
+                    udp_port,
+                    uid_to_key,
+                    client_id_to_ip,
+                )
+                .await
+                {
+                    error!("Error handling TLS auth: {}", e);
+                }
+            });
+        }
+
+        Ok(())
+    }
+
+    async fn handle_udp_handshake(
+        clients_by_ip: Arc<Mutex<HashMap<String, UdpClient>>>,
+        addr_to_ip: Arc<Mutex<HashMap<SocketAddr, String>>>,
+        uid_to_key: Arc<Mutex<HashMap<String, [u8; 32]>>>,
+        client_id_to_ip: Arc<Mutex<HashMap<String, String>>>,
+        data: Bytes,
+        addr: SocketAddr,
+    ) -> anyhow::Result<()> {
+        let message: AnetMessage = Message::decode(data)?;
+        if let Some(Content::UdpHandshake(handshake)) = message.content {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs();
+
+            if now.saturating_sub(handshake.timestamp) > UDP_HANDSHAKE_TIMEOUT_SECONDS {
+                anyhow::bail!("Handshake timestamp too old from {}", addr);
+            }
+
+            let crypto_key = { uid_to_key.lock().await.get(&handshake.client_id).cloned() };
+
+            let assigned_ip = {
+                client_id_to_ip
+                    .lock()
+                    .await
+                    .get(&handshake.client_id)
+                    .cloned()
+            };
+
+            if let (Some(key), Some(ip)) = (crypto_key, assigned_ip) {
+                let client = UdpClient {
+                    cipher: Cipher::new(&key),
+                    last_seen: std::time::Instant::now(),
+                    client_id: handshake.client_id.clone(),
+                    addr,
+                    sequence: 0,
+                };
+
+                clients_by_ip.lock().await.insert(ip.clone(), client);
+                addr_to_ip.lock().await.insert(addr, ip.clone());
+
+                info!("New UDP client connected: {} (IP: {})", addr, ip);
+
+                Ok(())
+            } else {
+                anyhow::bail!("Client info not found for handshake from {}", addr)
+            }
+        } else {
+            anyhow::bail!("Expected UDP handshake from {}", addr)
+        }
+    }
+
+    async fn handle_udp_data(
+        data: Bytes,
+        cipher: Cipher,
+        tx_to_tun: mpsc::Sender<Bytes>,
+    ) -> anyhow::Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        let packet_type = data[0];
+
+        match packet_type {
+            PACKET_TYPE_DATA => {
+                if data.len() < 9 {
+                    anyhow::bail!("Data packet too short");
+                }
+
+                let sequence = u64::from_be_bytes(data[1..9].try_into()?);
+                let encrypted_data = data.slice(9..);
+                let nonce = Cipher::generate_nonce(sequence);
+                let decrypted = cipher.decrypt(&nonce, encrypted_data)?;
+
+                tx_to_tun.send(decrypted).await?;
+                Ok(())
+            }
+            _ => anyhow::bail!("Unexpected packet type"),
+        }
+    }
+}
+
+async fn handle_tls_auth(
+    socket: TcpStream,
+    acceptor: TlsAcceptor,
+    ip_pool: IpPool,
+    auth_phrase: String,
+    udp_port: u32,
+    uid_to_key: Arc<Mutex<HashMap<String, [u8; 32]>>>,
+    client_id_to_ip: Arc<Mutex<HashMap<String, String>>>,
+) -> anyhow::Result<()> {
+    let tls_stream = acceptor.accept(socket).await?;
+
+    let (mut reader, mut writer) = tokio::io::split(tls_stream);
+
+    let mut len_buf = [0u8; 4];
+    reader.read_exact(&mut len_buf).await?;
+
+    let msg_len = u32::from_be_bytes(len_buf) as usize;
+
+    if msg_len > MAX_PACKET_SIZE {
+        anyhow::bail!("msg_len > MAX_PACKET_SIZE");
+    }
+
+    let mut msg_buf = vec![0u8; msg_len];
+    reader.read_exact(&mut msg_buf).await?;
+
+    let message: AnetMessage = Message::decode(Bytes::from(msg_buf))?;
+
+    let assigned_ip = match message.content {
+        Some(Content::AuthRequest(req)) if req.key == auth_phrase => {
+            ip_pool.allocate().context("No free IPs available")?
+        }
+        _ => anyhow::bail!("Authentication failed"),
+    };
+
+    let crypto_key = generate_crypto_key();
+    let client_id = generate_uid();
+
+    uid_to_key
+        .lock()
+        .await
+        .insert(client_id.clone(), crypto_key);
+    client_id_to_ip
+        .lock()
+        .await
+        .insert(client_id.clone(), assigned_ip.to_string());
+
+    let response = AnetMessage {
+        content: Some(Content::AuthResponse(AuthResponse {
+            ip: assigned_ip.to_string(),
+            netmask: ip_pool.netmask.to_string(),
+            gateway: ip_pool.gateway.to_string(),
+            mtu: ip_pool.mtu as i32,
+            crypto_key: crypto_key.to_vec(),
+            udp_port,
+            client_id,
+        })),
+    };
+
+    let mut response_data = Vec::new();
+    response.encode(&mut response_data)?;
+
+    writer
+        .write_all(&(response_data.len() as u32).to_be_bytes())
+        .await?;
+    writer.write_all(&response_data).await?;
+
+    Ok(())
+}
+
+fn load_tls_config(cert_path: &str, key_path: &str) -> anyhow::Result<ServerConfig> {
+    let cert_file =
+        File::open(cert_path).context(format!("Failed to open cert file: {}", cert_path))?;
+
+    let certs = rustls_pemfile::certs(&mut BufReader::new(cert_file))
+        .collect::<Result<Vec<CertificateDer>, _>>()?;
+
+    let key_file =
+        File::open(key_path).context(format!("Failed to open key file: {}", key_path))?;
+
+    let key = rustls_pemfile::private_key(&mut BufReader::new(key_file))?
+        .context("No private key found in file")?;
+
+    let mut cfg = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)?;
+    cfg.alpn_protocols = vec![b"h2".to_vec()];
+
+    Ok(cfg)
+}
+
+async fn process_packet_for_sending(
+    clients_by_ip: &Arc<Mutex<HashMap<String, UdpClient>>>,
+    packet: Bytes,
+) -> Option<(Bytes, SocketAddr)> {
+    if packet.len() < 20 {
+        return None;
+    }
+
+    let dst_ip = format!(
+        "{}.{}.{}.{}",
+        packet[16], packet[17], packet[18], packet[19]
+    );
+
+    let (cipher, sequence, addr) = {
+        let mut clients_lock = clients_by_ip.lock().await;
+        if let Some(client) = clients_lock.get_mut(&dst_ip) {
+            client.sequence += 1;
+            (client.cipher.clone(), client.sequence, client.addr)
+        } else {
+            return None;
+        }
+    };
+
+    let nonce = Cipher::generate_nonce(sequence);
+
+    match cipher.encrypt(&nonce, packet) {
+        Ok(encrypted_data) => {
+            let mut data = BytesMut::with_capacity(1 + 8 + encrypted_data.len());
+            data.put_u8(PACKET_TYPE_DATA);
+            data.put_u64(sequence);
+            data.put(encrypted_data);
+            Some((data.freeze(), addr))
+        }
+        Err(e) => {
+            error!("Encryption failed for client at {}: {}", addr, e);
+            None
+        }
+    }
+}
+
+
+
+================================================
+Файл: ./anet-server/src/utils.rs
+================================================
+use base64::{
+    Engine as _, alphabet,
+    engine::{self, general_purpose},
+};
+use chacha20poly1305::aead::rand_core::RngCore;
+use rand;
+use std::net::Ipv4Addr;
+
+#[inline]
+pub fn generate_crypto_key() -> [u8; 32] {
+    let mut rng = rand::thread_rng();
+    let mut crypto_key = [0u8; 32];
+    rng.fill_bytes(&mut crypto_key);
+    crypto_key
+}
+
+#[inline]
+pub fn generate_uid() -> String {
+    let mut rng = rand::thread_rng();
+    let mut client_id = [0u8; 16];
+    rng.fill_bytes(&mut client_id);
+    engine::GeneralPurpose::new(&alphabet::URL_SAFE, general_purpose::NO_PAD).encode(client_id)
+}
+
+#[inline]
+pub fn extract_ip_dst(pkt: &[u8]) -> Option<Ipv4Addr> {
+    if pkt.len() < 20 {
+        return None;
+    }
+
+    if (pkt[0] >> 4) != 4 {
+        return None;
+    }
+
+    Some(Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]))
+}
+
+
+
+================================================
+Файл: ./Cargo.toml
+================================================
+[workspace]
+resolver = "2"
+members = ["anet-server", "anet-client", "anet-common"]
+default-members = ["anet-server", "anet-client", "anet-common"]
+
+[workspace.dependencies]
+tun = { version = "0.8.3", features = ["async"] }
+tokio = {version = "1.47.1", features = ["full"]}
+env_logger = "0.11.8"
+log = { version = "0.4.22", default-features = false}
+tokio-rustls = "0.26.2"
+rustls = "0.23.31"
+anyhow = "1.0.99"
+bytes = "1.10.1"
+prost = "0.14.1"
+yaml-rust2 = "0.10.1"
+clap = { version = "4.5.47", default-features = false, features = ["std", "derive"] }
+rustls-pemfile = "2.2.0"
+base64 = "0.22.1"
+rand = { version = "0.8", features = ["std"] }
+chacha20poly1305 = "0.10.1"
+
+[profile.release.package.anet-client]
+debug = 2
+codegen-units = 1
+
+[profile.release.package.anet-server]
+debug = 2
+codegen-units = 1
+
+[profile.release.package.anet-common]
+debug = 2
+codegen-units = 1
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = 'abort'
+incremental = false
+
+
+[profile.release.package."*"]
+opt-level = 3
+
+
+
+================================================
+Файл: ./Makefile
+================================================
+.PHONY: musl cert
+
+musl:
+	RUSTFLAGS="-C target-feature=+crt-static"  cargo build --release --target x86_64-unknown-linux-musl
+
+cert:
+	openssl req -x509 -newkey ed25519 -keyout key.pem -out cert.pem -days 365 -nodes -subj "/CN=alco" -addext "subjectAltName = DNS:alco" -addext "basicConstraints=critical,CA:FALSE" -addext "keyUsage=digitalSignature,keyEncipherment"
+
+
+
+================================================
+Файл: ./print.sh
+================================================
+#!/bin/bash
+
+# Использовать find с дополнительными фильтрами
+find . -type f \
+    -not -path '*/target/*' \
+    -not -path '*Cargo.lock*' \
+    -not -path '*project*' \
+    -not -path '*contrib*' \
+    -not -path '*/\.*' \
+    -not -name '.*' | sort | while read -r file; do
+
+    echo "================================================"
+    echo "Файл: $file"
+    echo "================================================"
+
+    # Проверить, является ли файл текстовым
+    if file "$file" | grep -q text; then
+        cat "$file"
+    else
+        echo "[Бинарный файл или файл неподдерживаемого формата]"
+    fi
+
+    echo -e "\n\n"
+done
+
+
+

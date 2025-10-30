@@ -140,7 +140,7 @@ impl WindowsRouteManager {
     }
 
     /// Восстановление маршрутизации
-    pub fn restore_original_routing(&self) -> Result<()> {
+    pub fn restore_original_routing(&self) {
         info!("Restoring original Windows routing...");
 
         // 1. Удаляем исключающий маршрут к VPN Server
@@ -158,6 +158,5 @@ impl WindowsRouteManager {
             .status();
 
         info!("Windows routing cleanup finished.");
-        Ok(())
     }
 }

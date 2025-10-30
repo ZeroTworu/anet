@@ -369,9 +369,6 @@ async fn handle_auth_connection(
     auth_phrase: String,
     udp_port: u32,
 ) -> anyhow::Result<()> {
-    // NOTE: В оригинальном коде была отдельная функция handle_tls_auth.
-    // Переносим ее тело сюда для соответствия структуре вызова run_auth_listener.
-
     let tls_stream = acceptor.accept(socket).await?;
 
     let (mut reader, mut writer) = tokio::io::split(tls_stream);

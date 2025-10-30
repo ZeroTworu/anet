@@ -5,7 +5,6 @@ use anet_common::encryption::Cipher;
 use anet_common::protocol::{AuthRequest, AuthResponse, Message as AnetMessage, message::Content};
 use anet_common::quic_settings::build_transport_config;
 use anet_common::stream_framing::{frame_packet, read_next_packet};
-use anet_common::tun_params::TunParams;
 use anyhow::Result;
 use bytes::Bytes;
 use log::{error, info};
@@ -59,6 +58,7 @@ impl ANetClient {
     }
 
     pub async fn authenticate(&self) -> Result<AuthResponse> {
+        info!("Try authenticating on {}...", self.server_addr);
         let stream = connect_with_backoff(&self.server_addr).await?;
 
         let server_name = ServerName::try_from("alco").expect("Invalid server name");
@@ -192,15 +192,39 @@ impl ANetClient {
 
     fn build_quinn_client_config(&self) -> Result<QuinnClientConfig> {
         let mut root_store = RootCertStore::empty();
-        let certs = rustls_pemfile::certs(&mut self.server_cert.as_bytes())
-            .collect::<Result<Vec<_>, _>>()?;
+        let certs_result = rustls_pemfile::certs(&mut self.server_cert.as_bytes())
+            .collect::<Result<Vec<_>, _>>();
+
+        let certs = match certs_result {
+            Ok(certs) => certs,
+            Err(e) => {
+                error!("Error reading certificate: {}", e);
+                return Err(anyhow::anyhow!(e))
+            },
+        };
+
         for cert in certs {
-            root_store.add(cert)?;
+            match root_store.add(cert) {
+                Ok(_) => (),
+                Err(e) => {
+                    error!("Error adding certificate: {}", e);
+                    return Err(anyhow::anyhow!(e))
+                }
+            }
         }
+
         let client_crypto = ClientConfig::builder()
             .with_root_certificates(root_store)
             .with_no_client_auth();
-        let quic_config = QuicClientConfig::try_from(client_crypto)?;
+        let quic_config_result = QuicClientConfig::try_from(client_crypto);
+
+        let quic_config = match quic_config_result {
+            Ok(quic_config) => quic_config,
+            Err(e) => {
+                error!("Error creating QUIC client: {}", e);
+                return Err(anyhow::anyhow!(e))
+            }
+        };
 
         let cfg = QuinnClientConfig::new(Arc::new(quic_config));
         Ok(cfg)
@@ -222,8 +246,8 @@ async fn connect_with_backoff(server_addr: &str) -> Result<TcpStream> {
 
                 let next_delay = std::cmp::min(delay * 2, MAX_DELAY);
                 error!(
-                    "Connection failed (attempt {}): {}. Retrying in {} seconds (next retry in {} seconds)...",
-                    retries, e, delay, next_delay
+                    "Connection to {} failed (attempt {}): {}. Retrying in {} seconds (next retry in {} seconds)...",
+                    server_addr, retries, e, delay, next_delay
                 );
                 sleep(Duration::from_secs(delay)).await;
                 delay = next_delay;

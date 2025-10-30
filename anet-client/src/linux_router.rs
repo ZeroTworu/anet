@@ -1,4 +1,3 @@
-use anet_common::AuthResponse;
 use anyhow::{Context, Result};
 use log::{info, warn};
 use std::net::Ipv4Addr;
@@ -104,7 +103,7 @@ impl LinuxRouteManager {
     }
 
     // Восстанавливаем оригинальную маршрутизацию
-    pub fn restore_original_routing(&self) -> Result<()> {
+    pub fn restore_original_routing(&self)  {
         info!("Restoring original routing...");
 
         // 1. Просто восстанавливаем старый шлюз по умолчанию.
@@ -126,6 +125,5 @@ impl LinuxRouteManager {
             .status();
 
         info!("Original routing restored.");
-        Ok(())
     }
 }
