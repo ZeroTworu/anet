@@ -5,7 +5,7 @@ use chacha20poly1305::ChaCha20Poly1305;
 use std::sync::Arc;
 
 // Заменить на `ChaCha20Poly1305` при необходимости.
-type CryptoAlgorithm = Aes256Gcm;
+type CryptoAlgorithm = ChaCha20Poly1305;
 
 #[derive(Clone)]
 pub struct Cipher {

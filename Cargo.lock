@@ -76,6 +76,7 @@ version = "0.1.0"
 dependencies = [
  "anet-common",
  "anyhow",
+ "base64",
  "bytes",
  "chrono",
  "clap",
@@ -104,6 +105,7 @@ dependencies = [
  "prost",
  "prost-build",
  "quinn",
+ "rand 0.9.2",
  "serde",
  "tokio",
  "tun",
