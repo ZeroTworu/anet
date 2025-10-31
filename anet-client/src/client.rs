@@ -192,15 +192,15 @@ impl ANetClient {
 
     fn build_quinn_client_config(&self) -> Result<QuinnClientConfig> {
         let mut root_store = RootCertStore::empty();
-        let certs_result = rustls_pemfile::certs(&mut self.server_cert.as_bytes())
-            .collect::<Result<Vec<_>, _>>();
+        let certs_result =
+            rustls_pemfile::certs(&mut self.server_cert.as_bytes()).collect::<Result<Vec<_>, _>>();
 
         let certs = match certs_result {
             Ok(certs) => certs,
             Err(e) => {
                 error!("Error reading certificate: {}", e);
-                return Err(anyhow::anyhow!(e))
-            },
+                return Err(anyhow::anyhow!(e));
+            }
         };
 
         for cert in certs {
@@ -208,7 +208,7 @@ impl ANetClient {
                 Ok(_) => (),
                 Err(e) => {
                     error!("Error adding certificate: {}", e);
-                    return Err(anyhow::anyhow!(e))
+                    return Err(anyhow::anyhow!(e));
                 }
             }
         }
@@ -222,7 +222,7 @@ impl ANetClient {
             Ok(quic_config) => quic_config,
             Err(e) => {
                 error!("Error creating QUIC client: {}", e);
-                return Err(anyhow::anyhow!(e))
+                return Err(anyhow::anyhow!(e));
             }
         };
 

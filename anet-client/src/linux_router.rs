@@ -103,7 +103,7 @@ impl LinuxRouteManager {
     }
 
     // Восстанавливаем оригинальную маршрутизацию
-    pub fn restore_original_routing(&self)  {
+    pub fn restore_original_routing(&self) {
         info!("Restoring original routing...");
 
         // 1. Просто восстанавливаем старый шлюз по умолчанию.

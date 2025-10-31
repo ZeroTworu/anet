@@ -1,5 +1,6 @@
 use crate::AuthResponse;
 use std::net::Ipv4Addr;
+use tun::Configuration;
 
 #[derive(Clone)]
 pub struct TunParams {
@@ -44,5 +45,23 @@ impl TunParams {
             mtu: auth_response.mtu as u16,
             network: None,
         }
+    }
+    pub fn create_config(&self) -> anyhow::Result<Configuration> {
+        let mut binding = Configuration::default();
+        let config = binding
+            .tun_name(&self.name)
+            .mtu(self.mtu)
+            .up()
+            .address(self.address)
+            .netmask(self.netmask)
+            .destination(self.gateway);
+        Ok(config.clone())
+    }
+
+    pub fn get_info(&self) -> String {
+        format!(
+            "Address: {}, Netmask: {}, Destination: {}, Name: {}, MTU: {}",
+            self.address, self.netmask, self.gateway, self.name, self.mtu
+        )
     }
 }

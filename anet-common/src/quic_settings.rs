@@ -3,7 +3,7 @@
 use anyhow::Result;
 use log::info;
 use quinn::congestion::{BbrConfig, ControllerFactory, CubicConfig};
-use quinn::{MtuDiscoveryConfig, TransportConfig, VarInt, IdleTimeout};
+use quinn::{IdleTimeout, MtuDiscoveryConfig, TransportConfig, VarInt};
 use serde::Deserialize;
 use std::{sync::Arc, time::Duration};
 
@@ -122,9 +122,11 @@ pub fn build_transport_config(cfg: &QuicConfig, mtu: u16) -> Result<TransportCon
             let timeout = IdleTimeout::try_from(timeout_duration)
                 .map_err(|e| anyhow::anyhow!("Invalid idle timeout value: {}", e))?;
             config.max_idle_timeout(Some(timeout));
-            info!("QUIC Transport: Max Idle Timeout set to {} seconds.", timeout_secs);
+            info!(
+                "QUIC Transport: Max Idle Timeout set to {} seconds.",
+                timeout_secs
+            );
         }
-
     }
     Ok(config)
 }
