@@ -218,7 +218,7 @@ pub struct ANetServer {
 }
 
 impl ANetServer {
-    pub fn new(cfg: &Config) -> anyhow::Result<Self> {
+    pub fn new(cfg: &Config) -> Result<Self> {
         let tls_cfg =
             load_rustls_config_for_auth(cfg.server.cert.as_str(), cfg.server.key.as_str())?;
         let acceptor = TlsAcceptor::from(Arc::new(tls_cfg));
@@ -231,7 +231,7 @@ impl ANetServer {
             mtu: cfg.network.mtu,
             network: Some(cfg.network.net.parse()?),
         };
-        let tun_manager = TunManager::new(tun_params);
+        let tun_manager = TunManager::new(tun_params)?;
 
         let ip_pool = IpPool::new(
             cfg.network.net.parse()?,
