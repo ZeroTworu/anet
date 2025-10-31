@@ -1,6 +1,6 @@
 use crate::encryption::Cipher;
 use crate::transport;
-use log::error;
+use log::{error, info};
 use quinn::{
     AsyncUdpSocket, UdpPoller,
     udp::{RecvMeta, Transmit},
@@ -13,22 +13,70 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
+use bytes::Bytes;
 use tokio::net::UdpSocket;
+use rand::RngCore;
 
-/// Наша реализация AsyncUdpSocket, которая оборачивает стандартный Tokio UdpSocket
-/// и добавляет слой шифрования (обфускации).
+/// Улучшенная реализация AsyncUdpSocket с полным сокрытием QUIC
 pub struct AnetUdpSocket {
-    io: Arc<UdpSocket>,       // Реальный сокет
-    cipher: Arc<Cipher>,      // Шифр для "обертки"
-    sequence: Arc<AtomicU64>, // Счетчик последовательности для nonce
+    io: Arc<UdpSocket>,
+    cipher: Arc<Cipher>,
+    session_id: [u8; 16],
+    sequence: Arc<AtomicU64>,
+    handshake_sent: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl AnetUdpSocket {
-    pub fn new(io: Arc<UdpSocket>, cipher: Arc<Cipher>) -> Self {
+    pub fn new(io: Arc<UdpSocket>, cipher: Arc<Cipher>, session_id: [u8; 16]) -> Self {
         Self {
             io,
             cipher,
+            session_id,
             sequence: Arc::new(AtomicU64::new(0)),
+            handshake_sent: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    /// Отправляет initial handshake для установки соединения
+    pub async fn send_initial_handshake(&self, remote_addr: SocketAddr) -> io::Result<()> {
+        if self.handshake_sent.load(Ordering::Acquire) {
+            return Ok(());
+        }
+
+        let mut rng = rand::rng();
+        let mut client_id = [0u8; 16];
+        rng.fill_bytes(&mut client_id);
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        info!("Sending initial handshake to {} with session_id: {:?}", remote_addr, self.session_id);
+        match transport::wrap_handshake(&self.cipher, self.session_id, client_id, timestamp) {
+            Ok(handshake_packet) => {
+                // Отправляем с случайной задержкой для обфускации
+                // let delay_ms = rng.next_u32() % 100;
+                // tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms as u64)).await;
+
+                match self.io.try_send_to(&handshake_packet, remote_addr) {
+                    Ok(_) => {
+                        info!("Initial handshake sent to {}", remote_addr);
+                        self.handshake_sent.store(true, Ordering::Release);
+                        Ok(())
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        error!("Would block when sending handshake");
+                        Err(e)
+                    }
+                    Err(e) => {
+                        error!("Failed to send handshake: {}", e);
+                        Err(e)
+                    }
+                }
+            }
+            Err(e) => {
+                error!("Failed to wrap handshake: {}", e);
+                Err(io::Error::new(io::ErrorKind::Other, e.to_string()))
+            }
         }
     }
 }
@@ -41,9 +89,7 @@ impl Debug for AnetUdpSocket {
     }
 }
 
-// Реализуем трейт, который нужен `quinn::Endpoint`
 impl AsyncUdpSocket for AnetUdpSocket {
-    // В v0.11 create_io_poller принимает Arc<Self>
     fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
         Box::pin(TokioUdpPoller {
             io: self.io.clone(),
@@ -53,31 +99,35 @@ impl AsyncUdpSocket for AnetUdpSocket {
     fn try_send(&self, transmit: &Transmit) -> io::Result<()> {
         let seq = self.sequence.fetch_add(1, Ordering::Relaxed);
 
-        // Оборачиваем пакет QUIC в наш транспортный протокол
         match transport::wrap_packet(
             &self.cipher,
+            self.session_id,
             seq,
-            bytes::Bytes::copy_from_slice(transmit.contents),
+            Bytes::copy_from_slice(transmit.contents),
         ) {
             Ok(wrapped_packet) => {
-                // Пытаемся отправить синхронно, как того требует API
+                // Добавляем случайную задержку для обфускации timing analysis
+                // let mut rng = rand::rng();
+                // let should_delay = rng.random_bool(0.3); // 30% пакетов с задержкой
+                //
+                // if should_delay {
+                //     // Неблокирующая задержка - в реальности нужно было бы использовать асинхронность,
+                //     // но так как try_send синхронный, мы просто пропускаем задержку
+                //     // Допилить!
+                //     trace!("Simulating transmission delay for packet {}", seq);
+                // }
+
                 match self.io.try_send_to(&wrapped_packet, transmit.destination) {
                     Ok(_) => Ok(()),
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        // Важно правильно обрабатывать WouldBlock
-                        Err(e)
-                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => Err(e),
                     Err(e) => {
                         error!("AnetUdpSocket failed to send: {}", e);
-                        // QUIC умеет обрабатывать потери, поэтому мы можем "проглотить" ошибку,
-                        // возвращая Ok, чтобы не паниковать.
-                        Ok(())
+                        Ok(()) // QUIC обработает потерю
                     }
                 }
             }
             Err(e) => {
                 error!("Failed to wrap QUIC packet: {}", e);
-                // Если не смогли зашифровать, просто пропускаем отправку.
                 Ok(())
             }
         }
@@ -89,8 +139,7 @@ impl AsyncUdpSocket for AnetUdpSocket {
         bufs: &mut [io::IoSliceMut<'_>],
         meta: &mut [RecvMeta],
     ) -> Poll<io::Result<usize>> {
-        let mut recv_buf = vec![0u8; 65535]; // Буфер для чтения "обернутого" пакета
-
+        let mut recv_buf = vec![0u8; 65535];
         let mut read_buf = tokio::io::ReadBuf::new(&mut recv_buf);
 
         match self.io.poll_recv_from(cx, &mut read_buf) {
@@ -100,8 +149,8 @@ impl AsyncUdpSocket for AnetUdpSocket {
                     return Poll::Pending;
                 }
 
-                // "Разворачиваем" пакет
-                match transport::unwrap_packet(&self.cipher, &recv_buf[..filled_len]) {
+                // Пытаемся расшифровать как data packet
+                match transport::unwrap_packet(&self.cipher, self.session_id, &recv_buf[..filled_len]) {
                     Ok(unwrapped_packet) => {
                         if bufs.is_empty() {
                             return Poll::Ready(Ok(0));
@@ -116,10 +165,10 @@ impl AsyncUdpSocket for AnetUdpSocket {
                             dst_ip: None,
                             ecn: None,
                         };
-                        Poll::Ready(Ok(1))
+                        Poll::Ready(Ok(copy_len))
                     }
                     Err(_) => {
-                        // Не смогли расшифровать. Игнорируем пакет.
+                        // Не смогли расшифровать - возможно это handshake response, игнорируем
                         cx.waker().wake_by_ref();
                         Poll::Pending
                     }

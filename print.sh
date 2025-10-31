@@ -2,7 +2,7 @@
 
 # Использовать find с дополнительными фильтрами
 find . -type f \
-    -not -path 'target*' \
+    -not -path '*target*' \
     -not -path '*github*' \
     -not -path '*.lock*' \
     -not -path '*project*' \

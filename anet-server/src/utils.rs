@@ -1,7 +1,4 @@
-use base64::{
-    Engine as _, alphabet,
-    engine::{self, general_purpose},
-};
+use base64::{engine::general_purpose, Engine as _};
 use chacha20poly1305::aead::rand_core::RngCore;
 use rand;
 use std::net::Ipv4Addr;
@@ -17,9 +14,9 @@ pub fn generate_crypto_key() -> [u8; 32] {
 #[inline]
 pub fn generate_seid() -> String {
     let mut rng = rand::thread_rng();
-    let mut client_id = [0u8; 16];
-    rng.fill_bytes(&mut client_id);
-    engine::GeneralPurpose::new(&alphabet::URL_SAFE, general_purpose::NO_PAD).encode(client_id)
+    let mut session_id = [0u8; 16];
+    rng.fill_bytes(&mut session_id);
+    general_purpose::STANDARD.encode(session_id)
 }
 
 #[inline]

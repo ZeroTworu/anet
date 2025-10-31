@@ -17,6 +17,7 @@ quinn = {workspace = true, features = ["rustls", "ring", "aws-lc-rs"]}
 rustls-pemfile = {workspace = true}
 serde = { workspace = true, features = ["derive"] }
 toml = {workspace = true}
+base64 = {workspace = true}
 
 anet-common = { path = "../anet-common"}
 
