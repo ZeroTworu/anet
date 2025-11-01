@@ -1,4 +1,4 @@
-use base64::{engine::general_purpose, Engine as _};
+use base64::{Engine as _, engine::general_purpose};
 use chacha20poly1305::aead::rand_core::RngCore;
 use rand;
 use std::net::Ipv4Addr;
