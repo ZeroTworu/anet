@@ -1,11 +1,11 @@
 use crate::config::Config;
 use crate::ip_pool::IpPool;
-use crate::utils::{extract_ip_dst, generate_crypto_key, generate_seid};
+use crate::utils::{generate_crypto_key, generate_seid};
 use anet_common::anet_udp_socket::TokioUdpPoller;
 use anet_common::atun::TunManager;
 use anet_common::consts::MAX_PACKET_SIZE;
 use anet_common::encryption::Cipher;
-use anet_common::protocol::{AuthResponse, Message as AnetMessage, message::Content};
+use anet_common::protocol::AuthResponse;
 use anet_common::quic_settings::build_transport_config;
 use anet_common::stream_framing::{frame_packet, read_next_packet};
 use anet_common::transport;
@@ -15,7 +15,6 @@ use base64::{Engine as _, engine::general_purpose};
 use bytes::Bytes;
 use dashmap::DashMap;
 use log::{error, info, warn};
-use prost::Message;
 use quinn::crypto::rustls::QuicServerConfig;
 use quinn::udp::RecvMeta;
 use quinn::{
@@ -33,10 +32,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context as StdContext, Poll};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::net::UdpSocket;
 use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::mpsc;
-use tokio_rustls::TlsAcceptor;
 
 type StreamSender = mpsc::Sender<Bytes>;
 
@@ -51,11 +49,10 @@ struct ClientTransportInfo {
     handshake_received: bool,
 }
 
-// Упрощенный MultiKeyAnetUdpSocket - используем ту же структуру клиентов что и ANetServer
 struct MultiKeyAnetUdpSocket {
     io: Arc<UdpSocket>,
-    clients: Arc<DashMap<String, ClientTransportInfo>>, // ИЗМЕНЕНО: Mutex -> DashMap
-    pending_handshakes: Arc<DashMap<SocketAddr, String>>, // ИЗМЕНЕНО: Mutex -> DashMap
+    clients: Arc<DashMap<String, ClientTransportInfo>>,
+    pending_handshakes: Arc<DashMap<SocketAddr, String>>,
 }
 
 impl MultiKeyAnetUdpSocket {
@@ -67,7 +64,6 @@ impl MultiKeyAnetUdpSocket {
         }
     }
 
-    /// Обрабатывает входящий handshake
     fn handle_handshake(&self, remote_addr: SocketAddr, packet_data: &[u8]) -> Option<String> {
         info!(
             "Processing handshake from {}, available clients: {}",
@@ -75,7 +71,6 @@ impl MultiKeyAnetUdpSocket {
             self.clients.len()
         );
 
-        // Пробуем все известные клиенты для расшифровки handshake
         for entry in self.clients.iter() {
             let session_id_str = entry.key();
             let client_info = entry.value();
@@ -87,7 +82,6 @@ impl MultiKeyAnetUdpSocket {
                 client_info.session_id_bytes,
                 packet_data,
             ) {
-                // Проверяем timestamp для защиты от replay атак
                 let current_time = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
@@ -106,7 +100,6 @@ impl MultiKeyAnetUdpSocket {
                     remote_addr, session_id_str
                 );
 
-                // Сохраняем сопоставление адреса и session_id
                 self.pending_handshakes
                     .insert(remote_addr, session_id_str.clone());
 
@@ -145,7 +138,6 @@ impl AsyncUdpSocket for MultiKeyAnetUdpSocket {
         let cipher;
         let session_id_bytes;
 
-        // Сначала ищем по pending handshakes
         if let Some(entry) = self.pending_handshakes.get(&destination_addr) {
             let session_id_str = entry.value();
             if let Some(client_info) = self.clients.get(session_id_str) {
@@ -157,7 +149,6 @@ impl AsyncUdpSocket for MultiKeyAnetUdpSocket {
                 return Ok(());
             }
         } else {
-            // Ищем клиента по адресу
             let client_info = self
                 .clients
                 .iter()
@@ -215,7 +206,6 @@ impl AsyncUdpSocket for MultiKeyAnetUdpSocket {
 
                 let packet_slice = &recv_buf[..filled_len];
 
-                // Сначала проверяем, знаем ли мы уже этот адрес
                 let session_id_opt = self
                     .pending_handshakes
                     .get(&remote_addr)
@@ -225,7 +215,6 @@ impl AsyncUdpSocket for MultiKeyAnetUdpSocket {
                 let mut found_session_id = None;
 
                 if let Some(session_id_str) = session_id_opt {
-                    // Уже есть сопоставление - пробуем расшифровать как data packet
                     if let Some(client_info) = self.clients.get(&session_id_str) {
                         if let Ok(data_packet) = transport::unwrap_packet(
                             &client_info.cipher,
@@ -237,17 +226,15 @@ impl AsyncUdpSocket for MultiKeyAnetUdpSocket {
                         }
                     }
                 } else {
-                    // Нет сопоставления - пробуем обработать как handshake
                     if let Some(session_id_str) = self.handle_handshake(remote_addr, packet_slice) {
                         info!(
                             "Handshake processed for: {}, SEID: {}",
                             remote_addr, session_id_str
                         );
                         cx.waker().wake_by_ref();
-                        return Poll::Pending; // Handshake пакет не содержит QUIC данных
+                        return Poll::Pending;
                     }
 
-                    // Если не handshake, пробуем все известные клиенты для data packets
                     for entry in self.clients.iter() {
                         let session_id_str = entry.key();
                         let client_info = entry.value();
@@ -260,7 +247,6 @@ impl AsyncUdpSocket for MultiKeyAnetUdpSocket {
                             unwrapped_data = Some(data_packet);
                             found_session_id = Some(session_id_str.clone());
 
-                            // Обновляем адрес клиента
                             self.pending_handshakes
                                 .insert(remote_addr, session_id_str.clone());
                             break;
@@ -284,7 +270,6 @@ impl AsyncUdpSocket for MultiKeyAnetUdpSocket {
                         ecn: None,
                     };
 
-                    // Обновляем адрес в основной структуре клиентов
                     if let Some(mut client_info) = self.clients.get_mut(&session_id_str) {
                         client_info.addr = Some(remote_addr);
                     }
@@ -310,20 +295,14 @@ impl AsyncUdpSocket for MultiKeyAnetUdpSocket {
 
 pub struct ANetServer {
     cfg: Config,
-    tls_acceptor: TlsAcceptor,
     ip_pool: IpPool,
     tun_manager: TunManager,
-    // Теперь используем единую структуру клиентов
     clients: Arc<DashMap<String, ClientTransportInfo>>,
     quic_router: Arc<TokioMutex<HashMap<String, StreamSender>>>,
 }
 
 impl ANetServer {
     pub fn new(cfg: &Config) -> Result<Self> {
-        let tls_cfg =
-            load_rustls_config_for_auth(cfg.server.cert.as_str(), cfg.server.key.as_str())?;
-        let acceptor = TlsAcceptor::from(Arc::new(tls_cfg));
-
         let tun_params = TunParams {
             netmask: cfg.network.mask.parse()?,
             gateway: cfg.network.gateway.parse()?,
@@ -344,7 +323,6 @@ impl ANetServer {
 
         Ok(Self {
             cfg: cfg.clone(),
-            tls_acceptor: acceptor,
             ip_pool,
             clients: Arc::new(DashMap::new()),
             tun_manager,
@@ -353,41 +331,119 @@ impl ANetServer {
     }
 
     pub async fn run(&self) -> anyhow::Result<()> {
-        let auth_task = self.run_auth_listener();
+        let auth_task = self.run_udp_auth_handler();
         let vpn_task = self.run_quic_vpn_server();
         tokio::try_join!(auth_task, vpn_task)?;
         Ok(())
     }
 
-    async fn run_auth_listener(&self) -> Result<()> {
-        let listener = TcpListener::bind(self.cfg.server.bind_to.as_str()).await?;
-        info!(
-            "Authentication server listening on {}",
-            self.cfg.server.bind_to
-        );
+    async fn run_udp_auth_handler(&self) -> Result<()> {
+        let auth_socket = Arc::new(UdpSocket::bind(&self.cfg.server.bind_to).await?);
+        info!("UDP authentication listening on {}", self.cfg.server.bind_to);
 
-        while let Ok((socket, addr)) = listener.accept().await {
-            let acceptor = self.tls_acceptor.clone();
-            let ip_pool = self.ip_pool.clone();
-            let clients = self.clients.clone();
-            let auth_phrase = self.cfg.server.auth_phrase.clone();
-            let udp_port = self.cfg.server.udp_port;
 
-            tokio::spawn(async move {
-                if let Err(e) = handle_auth_connection(
-                    socket,
-                    acceptor,
-                    ip_pool.clone(),
-                    clients,
-                    auth_phrase,
-                    udp_port,
-                )
-                .await
-                {
-                    error!("[{}] Auth connection failed: {}", addr, e);
+        loop {
+            let mut buf = vec![0u8; 2048]; // создаем новый буфер для каждой итерации
+
+            match auth_socket.recv_from(&mut buf).await {
+                Ok((size, remote_addr)) => {
+                    // Обрезаем буфер до реального размера пакета
+                    buf.truncate(size);
+
+                    let clients = self.clients.clone();
+                    let ip_pool = self.ip_pool.clone();
+                    let auth_phrase = self.cfg.server.auth_phrase.clone();
+                    let socket_clone = Arc::clone(&auth_socket);
+                    let udp_port = self.cfg.server.udp_port;
+                    tokio::spawn(async move {
+                        if let Err(e) = Self::handle_udp_auth(
+                            remote_addr, &buf, clients, ip_pool, auth_phrase, udp_port,
+                        ).await {
+                            error!("[UDP Auth from {}] Failed: {}", remote_addr, e);
+                            // Молчаливый отказ - не отправляем ничего клиенту
+                        }
+                    });
                 }
-            });
+                Err(e) => {
+                    error!("Error receiving UDP auth packet: {}", e);
+                }
+            }
         }
+    }
+
+    async fn handle_udp_auth(
+        remote_addr: SocketAddr,
+        packet_data: &[u8],
+        clients: Arc<DashMap<String, ClientTransportInfo>>,
+        ip_pool: IpPool,
+        auth_phrase: String,
+        udp_port: u32,
+    ) -> Result<()> {
+        // В реальной реализации здесь должна быть проверка сертификата клиента
+        // Сейчас используем временное решение с предварительно созданными клиентами
+
+        let mut decrypted = None;
+        let mut valid_session_id = None;
+
+        for entry in clients.iter() {
+            let session_id_str = entry.key();
+            let client_info = entry.value();
+
+            if let Ok((received_auth_phrase, client_random)) =
+                transport::unwrap_auth_request(&client_info.cipher, client_info.session_id_bytes, packet_data)
+            {
+                if received_auth_phrase == auth_phrase {
+                    decrypted = Some((received_auth_phrase, client_random));
+                    valid_session_id = Some(session_id_str.clone());
+                    break;
+                } else {
+                    error!(
+                        "🚨 SECURITY ALERT: Valid certificate but wrong password from {} (session: {})",
+                        remote_addr, session_id_str
+                    );
+                    return Ok(());
+                }
+            }
+        }
+
+        let (_, client_random) = match decrypted {
+            Some(data) => data,
+            None => {
+                error!(
+                    "🚨 SECURITY ALERT: Invalid certificate/auth attempt from {}",
+                    remote_addr
+                );
+                return Ok(());
+            }
+        };
+
+        let session_id_str = valid_session_id.unwrap();
+
+        let crypto_key = generate_crypto_key();
+        let assigned_ip = ip_pool.allocate()
+            .context("No free IPs available")?;
+
+        if let Some(client_info) = clients.get(&session_id_str) {
+            let response_packet = transport::wrap_auth_response(
+                &client_info.cipher,
+                client_info.session_id_bytes,
+                crypto_key.to_vec(),
+                udp_port,
+                ip_pool.gateway.to_string(),
+                ip_pool.netmask.to_string(),
+                assigned_ip.to_string(),
+                ip_pool.mtu as i32,
+            )?;
+
+            let auth_socket = UdpSocket::bind("0.0.0.0:0").await?;
+            auth_socket.send_to(&response_packet, remote_addr).await?;
+
+            info!(
+                "Successful UDP authentication for {} -> {}",
+                remote_addr, assigned_ip
+            );
+        }
+
         Ok(())
     }
 
@@ -399,7 +455,6 @@ impl ANetServer {
         );
         let real_socket = Arc::new(UdpSocket::bind(&udp_listen_addr).await?);
 
-        // Используем единую структуру клиентов
         let anet_socket = Arc::new(MultiKeyAnetUdpSocket::new(
             real_socket,
             self.clients.clone(),
@@ -459,92 +514,6 @@ impl ANetServer {
     }
 }
 
-async fn handle_auth_connection(
-    socket: TcpStream,
-    acceptor: TlsAcceptor,
-    ip_pool: IpPool,
-    clients: Arc<DashMap<String, ClientTransportInfo>>, // ИЗМЕНЕНО
-    auth_phrase: String,
-    udp_port: u32,
-) -> anyhow::Result<()> {
-    let tls_stream = acceptor.accept(socket).await?;
-
-    let (mut reader, mut writer) = tokio::io::split(tls_stream);
-
-    let mut len_buf = [0u8; 4];
-    reader.read_exact(&mut len_buf).await?;
-    let msg_len = u32::from_be_bytes(len_buf) as usize;
-
-    if msg_len > MAX_PACKET_SIZE {
-        anyhow::bail!("msg_len > MAX_PACKET_SIZE");
-    }
-
-    let mut msg_buf = vec![0u8; msg_len];
-    reader.read_exact(&mut msg_buf).await?;
-
-    let message: AnetMessage = Message::decode(Bytes::from(msg_buf))?;
-
-    let assigned_ip = match message.content {
-        Some(Content::AuthRequest(req)) if req.key == auth_phrase => {
-            ip_pool.allocate().context("No free IPs available")?
-        }
-        _ => anyhow::bail!("Authentication failed"),
-    };
-
-    let crypto_key = generate_crypto_key();
-    let session_id = generate_seid();
-
-    // Декодируем session_id в байты для транспортного уровня
-    let session_id_bytes = general_purpose::STANDARD
-        .decode(&session_id)
-        .context("Failed to decode session_id")?;
-    if session_id_bytes.len() != 16 {
-        anyhow::bail!(
-            "Invalid session_id length, expected 16 bytes, got {}",
-            session_id_bytes.len()
-        );
-    }
-    let mut session_id_bytes_array = [0u8; 16];
-    session_id_bytes_array.copy_from_slice(&session_id_bytes[..16]);
-
-    let client_ip_str = assigned_ip.to_string();
-
-    let info = ClientTransportInfo {
-        cipher: Arc::new(Cipher::new(&crypto_key)),
-        addr: None,
-        sequence: Arc::new(AtomicU64::new(0)),
-        assigned_ip: client_ip_str.clone(),
-        session_id: session_id.clone(),
-        session_id_bytes: session_id_bytes_array,
-        handshake_received: false,
-    };
-
-    // ИЗМЕНЕНО: вставка в DashMap (без блокировки мьютекса)
-    clients.insert(session_id.clone(), info);
-
-    let response = AnetMessage {
-        content: Some(Content::AuthResponse(AuthResponse {
-            ip: client_ip_str.clone(),
-            netmask: ip_pool.netmask.to_string(),
-            gateway: ip_pool.gateway.to_string(),
-            mtu: ip_pool.mtu as i32,
-            crypto_key: crypto_key.to_vec(),
-            udp_port,
-            session_id: session_id.clone(),
-        })),
-    };
-
-    let mut response_data = Vec::new();
-    response.encode(&mut response_data)?;
-
-    writer
-        .write_all(&(response_data.len() as u32).to_be_bytes())
-        .await?;
-    writer.write_all(&response_data).await?;
-
-    Ok(())
-}
-
 async fn handle_incoming_quic(
     endpoint: Endpoint,
     tx_to_tun: StreamSender,
@@ -572,7 +541,7 @@ async fn handle_incoming_quic(
 async fn handle_connection(
     incoming: Incoming,
     tx_to_tun: StreamSender,
-    clients_transport_info: Arc<DashMap<String, ClientTransportInfo>>, // ИЗМЕНЕНО
+    clients_transport_info: Arc<DashMap<String, ClientTransportInfo>>,
     quic_router: Arc<TokioMutex<HashMap<String, StreamSender>>>,
     ip_pool: IpPool,
 ) -> Result<()> {
@@ -584,7 +553,6 @@ async fn handle_connection(
 
     let established_remote_addr = connection.remote_address();
 
-    // Ищем клиента по адресу, используем итератор DashMap)
     let client = {
         clients_transport_info
             .iter()
@@ -611,7 +579,6 @@ async fn handle_connection(
 
     let (tx_router, mut rx_router) = mpsc::channel::<Bytes>(1024);
 
-    // Добавляем клиента в роутер
     {
         let mut router = quic_router.lock().await;
         router.insert(client.assigned_ip.clone(), tx_router);
@@ -624,12 +591,10 @@ async fn handle_connection(
 
     let ip_for_log_tx = client.assigned_ip.clone();
 
-    // Задача: отправка данных из роутера в QUIC стрим
     let tx_task = tokio::spawn(async move {
         let mut stream = send_stream;
 
         while let Some(packet) = rx_router.recv().await {
-            // Оборачиваем пакет в транспортный фрейм
             let framed_packet = frame_packet(packet);
 
             if let Err(e) = stream.write_all(&framed_packet).await {
@@ -637,7 +602,6 @@ async fn handle_connection(
                 break;
             }
 
-            // Flush для гарантии отправки
             if let Err(e) = stream.flush().await {
                 error!("QUIC stream flush failed for {}: {}", ip_for_log_tx, e);
                 break;
@@ -649,7 +613,6 @@ async fn handle_connection(
         }
     });
 
-    // Задача: чтение данных из QUIC стрима в TUN
     let tx_to_tun_for_rx = tx_to_tun.clone();
     let ip_for_log_rx = client.assigned_ip.clone();
     let rx_task = tokio::spawn(async move {
@@ -702,13 +665,11 @@ async fn handle_connection(
     Ok(())
 }
 
-// В функции route_tun_to_quic заменим:
 async fn route_tun_to_quic(
     mut rx_from_tun: mpsc::Receiver<Bytes>,
     quic_router: Arc<TokioMutex<HashMap<String, StreamSender>>>,
 ) -> Result<()> {
     while let Some(packet) = rx_from_tun.recv().await {
-        // Проверяем что это IP пакет
         if packet.len() < 20 {
             error!("Dropping non-IP packet: {} bytes", packet.len());
             continue;
@@ -720,7 +681,7 @@ async fn route_tun_to_quic(
             continue;
         }
 
-        let dst_ip = match extract_ip_dst(&packet) {
+        let dst_ip = match crate::utils::extract_ip_dst(&packet) {
             Some(ip) => ip.to_string(),
             None => {
                 warn!("Cannot extract destination IP from packet");
@@ -750,28 +711,6 @@ async fn route_tun_to_quic(
     }
 
     Ok(())
-}
-
-fn load_rustls_config_for_auth(
-    cert_pem: &str,
-    key_pem: &str,
-) -> anyhow::Result<RustlsServerConfig> {
-    let mut cert_reader = BufReader::new(cert_pem.as_bytes());
-    let certs = rustls_pemfile::certs(&mut cert_reader)
-        .collect::<std::result::Result<Vec<CertificateDer>, std::io::Error>>()
-        .context("Failed to read or parse certificates from PEM string")?;
-
-    let mut key_reader = BufReader::new(key_pem.as_bytes());
-    let key_der = rustls_pemfile::private_key(&mut key_reader)?
-        .context("No private key found in PEM string")?;
-    let key: PrivateKeyDer<'static> = key_der.into();
-
-    let mut cfg = RustlsServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)?;
-    cfg.alpn_protocols = vec![b"h2".to_vec()];
-
-    Ok(cfg)
 }
 
 fn load_cert_and_key(
