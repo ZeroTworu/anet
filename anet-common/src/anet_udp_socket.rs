@@ -1,10 +1,12 @@
 use crate::encryption::Cipher;
 use crate::transport;
+use bytes::Bytes;
 use log::{error, info};
 use quinn::{
     AsyncUdpSocket, UdpPoller,
     udp::{RecvMeta, Transmit},
 };
+use rand::RngCore;
 use std::fmt::{Debug, Formatter};
 use std::future::Future;
 use std::io;
@@ -13,9 +15,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
-use bytes::Bytes;
 use tokio::net::UdpSocket;
-use rand::RngCore;
 
 /// Улучшенная реализация AsyncUdpSocket с полным сокрытием QUIC
 pub struct AnetUdpSocket {
@@ -50,7 +50,10 @@ impl AnetUdpSocket {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        info!("Sending initial handshake to {} with session_id: {:?}", remote_addr, self.session_id);
+        info!(
+            "Sending initial handshake to {} with session_id: {:?}",
+            remote_addr, self.session_id
+        );
         match transport::wrap_handshake(&self.cipher, self.session_id, client_id, timestamp) {
             Ok(handshake_packet) => {
                 // Отправляем с случайной задержкой для обфускации
@@ -96,6 +99,7 @@ impl AsyncUdpSocket for AnetUdpSocket {
         })
     }
 
+    #[inline]
     fn try_send(&self, transmit: &Transmit) -> io::Result<()> {
         let seq = self.sequence.fetch_add(1, Ordering::Relaxed);
 
@@ -133,6 +137,7 @@ impl AsyncUdpSocket for AnetUdpSocket {
         }
     }
 
+    #[inline]
     fn poll_recv(
         &self,
         cx: &mut Context<'_>,
@@ -150,7 +155,11 @@ impl AsyncUdpSocket for AnetUdpSocket {
                 }
 
                 // Пытаемся расшифровать как data packet
-                match transport::unwrap_packet(&self.cipher, self.session_id, &recv_buf[..filled_len]) {
+                match transport::unwrap_packet(
+                    &self.cipher,
+                    self.session_id,
+                    &recv_buf[..filled_len],
+                ) {
                     Ok(unwrapped_packet) => {
                         if bufs.is_empty() {
                             return Poll::Ready(Ok(0));

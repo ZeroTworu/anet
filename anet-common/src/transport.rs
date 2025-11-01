@@ -2,7 +2,6 @@ use crate::consts::{PACKET_TYPE_DATA, PACKET_TYPE_HANDSHAKE};
 use crate::encryption::Cipher;
 use anyhow::{Result, anyhow};
 use bytes::{BufMut, Bytes, BytesMut};
-use log:: info;
 use rand::RngCore;
 
 #[derive(Debug)]
@@ -15,8 +14,9 @@ pub struct AnetVpnPacket {
 }
 
 impl AnetVpnPacket {
+
     /// Создает новый пакет данных с обфускацией
-    pub fn new_data(session_id: [u8; 16], sequence: u64, quic_payload: Bytes) -> Self {
+     pub fn new_data(session_id: [u8; 16], sequence: u64, quic_payload: Bytes) -> Self {
         let mut rng = rand::rng();
         let padding_len = rng.next_u32() as usize % 64;
         let mut random_padding = vec![0u8; padding_len];
@@ -52,11 +52,10 @@ impl AnetVpnPacket {
     }
 
     /// Сериализует и шифрует пакет
-    pub fn wrap_and_encrypt(&self, cipher: &Cipher) -> Result<Bytes> {
 
+    pub fn wrap_and_encrypt(&self, cipher: &Cipher) -> Result<Bytes> {
         let nonce = Cipher::generate_nonce(self.sequence);
         let encrypted_data = cipher.encrypt(&nonce, self.payload.clone())?;
-
 
         let mut final_packet = BytesMut::with_capacity(16 + 1 + 8 + encrypted_data.len());
         final_packet.put_slice(&self.session_id); // 16 байт session_id
@@ -68,12 +67,12 @@ impl AnetVpnPacket {
     }
 
     /// Десериализует и расшифровывает пакет
+
     pub fn unwrap_and_decrypt(
         cipher: &Cipher,
         session_id: [u8; 16],
         transport_packet: &[u8],
     ) -> Result<Self> {
-
         if transport_packet.len() < 25 {
             return Err(anyhow!("Transport packet too short"));
         }
@@ -89,7 +88,6 @@ impl AnetVpnPacket {
 
         let nonce = Cipher::generate_nonce(sequence);
         let plaintext = cipher.decrypt(&nonce, Bytes::copy_from_slice(encrypted_data))?;
-
 
         let payload = plaintext;
         let random_padding = Bytes::new();
@@ -122,7 +120,6 @@ impl AnetVpnPacket {
     }
 }
 
-
 pub fn wrap_handshake(
     cipher: &Cipher,
     session_id: [u8; 16],
@@ -147,12 +144,8 @@ pub fn unwrap_packet(
     transport_packet: &[u8],
 ) -> Result<Bytes> {
     match AnetVpnPacket::unwrap_and_decrypt(cipher, session_id, transport_packet) {
-        Ok(wrapped) => {
-            Ok(wrapped.payload)
-        }
-        Err(e) => {
-            Err(e)
-        }
+        Ok(wrapped) => Ok(wrapped.payload),
+        Err(e) => Err(e),
     }
 }
 
@@ -167,8 +160,6 @@ pub fn unwrap_handshake(
             let timestamp = wrapped.get_timestamp()?;
             Ok((client_id, timestamp))
         }
-        Err(e) => {
-            Err(e)
-        }
+        Err(e) => Err(e),
     }
 }

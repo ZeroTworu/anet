@@ -11,8 +11,9 @@ use anet_common::stream_framing::{frame_packet, read_next_packet};
 use anet_common::transport;
 use anet_common::tun_params::TunParams;
 use anyhow::{Context, Result};
-use base64::{engine::general_purpose, Engine as _};
+use base64::{Engine as _, engine::general_purpose};
 use bytes::Bytes;
+use dashmap::DashMap;
 use log::{error, info, warn};
 use prost::Message;
 use quinn::crypto::rustls::QuicServerConfig;
@@ -28,8 +29,8 @@ use std::fmt::{Debug, Formatter};
 use std::io::{self, BufReader, IoSliceMut};
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 use std::task::{Context as StdContext, Poll};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -53,32 +54,39 @@ struct ClientTransportInfo {
 // Упрощенный MultiKeyAnetUdpSocket - используем ту же структуру клиентов что и ANetServer
 struct MultiKeyAnetUdpSocket {
     io: Arc<UdpSocket>,
-    clients: Arc<Mutex<HashMap<String, ClientTransportInfo>>>, // Теперь используем String ключи для совместимости
-    pending_handshakes: Arc<Mutex<HashMap<SocketAddr, String>>>, // Сохраняем IP -> session_id mapping
+    clients: Arc<DashMap<String, ClientTransportInfo>>, // ИЗМЕНЕНО: Mutex -> DashMap
+    pending_handshakes: Arc<DashMap<SocketAddr, String>>, // ИЗМЕНЕНО: Mutex -> DashMap
 }
 
 impl MultiKeyAnetUdpSocket {
-    fn new(io: Arc<UdpSocket>, clients: Arc<Mutex<HashMap<String, ClientTransportInfo>>>) -> Self {
+    fn new(io: Arc<UdpSocket>, clients: Arc<DashMap<String, ClientTransportInfo>>) -> Self {
         Self {
             io,
             clients,
-            pending_handshakes: Arc::new(Mutex::new(HashMap::new())),
+            pending_handshakes: Arc::new(DashMap::new()),
         }
     }
 
     /// Обрабатывает входящий handshake
     fn handle_handshake(&self, remote_addr: SocketAddr, packet_data: &[u8]) -> Option<String> {
-        let clients_guard = self.clients.lock().expect("Client mutex poisoned");
-
-        info!("Processing handshake from {}, available clients: {}", remote_addr, clients_guard.len());
+        info!(
+            "Processing handshake from {}, available clients: {}",
+            remote_addr,
+            self.clients.len()
+        );
 
         // Пробуем все известные клиенты для расшифровки handshake
-        for (session_id_str, client_info) in clients_guard.iter() {
+        for entry in self.clients.iter() {
+            let session_id_str = entry.key();
+            let client_info = entry.value();
+
             info!("Trying client with session_id: {}", session_id_str);
 
-            if let Ok((_client_id, timestamp)) =
-                transport::unwrap_handshake(&client_info.cipher, client_info.session_id_bytes, packet_data)
-            {
+            if let Ok((_client_id, timestamp)) = transport::unwrap_handshake(
+                &client_info.cipher,
+                client_info.session_id_bytes,
+                packet_data,
+            ) {
                 // Проверяем timestamp для защиты от replay атак
                 let current_time = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -86,17 +94,21 @@ impl MultiKeyAnetUdpSocket {
                     .as_secs();
 
                 if current_time.abs_diff(timestamp) > 30 {
-                    warn!("Handshake timestamp too old from {}: {} vs {}", remote_addr, timestamp, current_time);
+                    warn!(
+                        "Handshake timestamp too old from {}: {} vs {}",
+                        remote_addr, timestamp, current_time
+                    );
                     continue;
                 }
 
-                info!("Handshake received from {} for session {}", remote_addr, session_id_str);
+                info!(
+                    "Handshake received from {} for session {}",
+                    remote_addr, session_id_str
+                );
 
                 // Сохраняем сопоставление адреса и session_id
-                {
-                    let mut pending = self.pending_handshakes.lock().unwrap();
-                    pending.insert(remote_addr, session_id_str.clone());
-                }
+                self.pending_handshakes
+                    .insert(remote_addr, session_id_str.clone());
 
                 return Some(session_id_str.clone());
             } else {
@@ -104,7 +116,10 @@ impl MultiKeyAnetUdpSocket {
             }
         }
 
-        warn!("No matching session found for handshake from {}", remote_addr);
+        warn!(
+            "No matching session found for handshake from {}",
+            remote_addr
+        );
         None
     }
 }
@@ -130,12 +145,10 @@ impl AsyncUdpSocket for MultiKeyAnetUdpSocket {
         let cipher;
         let session_id_bytes;
 
-        let clients_guard = self.clients.lock().expect("Client mutex poisoned");
-
         // Сначала ищем по pending handshakes
-        let pending_guard = self.pending_handshakes.lock().unwrap();
-        if let Some(session_id_str) = pending_guard.get(&destination_addr) {
-            if let Some(client_info) = clients_guard.get(session_id_str) {
+        if let Some(entry) = self.pending_handshakes.get(&destination_addr) {
+            let session_id_str = entry.value();
+            if let Some(client_info) = self.clients.get(session_id_str) {
                 seq = client_info.sequence.fetch_add(1, Ordering::Relaxed);
                 cipher = client_info.cipher.clone();
                 session_id_bytes = client_info.session_id_bytes;
@@ -145,19 +158,27 @@ impl AsyncUdpSocket for MultiKeyAnetUdpSocket {
             }
         } else {
             // Ищем клиента по адресу
-            let client_info = clients_guard.values().find(|info| info.addr == Some(destination_addr));
+            let client_info = self
+                .clients
+                .iter()
+                .find(|entry| entry.addr == Some(destination_addr));
 
-            if let Some(info) = client_info {
-                seq = info.sequence.fetch_add(1, Ordering::Relaxed);
-                cipher = info.cipher.clone();
-                session_id_bytes = info.session_id_bytes;
+            if let Some(entry) = client_info {
+                seq = entry.sequence.fetch_add(1, Ordering::Relaxed);
+                cipher = entry.cipher.clone();
+                session_id_bytes = entry.session_id_bytes;
             } else {
                 info!("2 No client found for destination: {}", destination_addr);
                 return Ok(());
             }
         }
 
-        let packet = transport::wrap_packet(&cipher, session_id_bytes, seq, Bytes::copy_from_slice(transmit.contents));
+        let packet = transport::wrap_packet(
+            &cipher,
+            session_id_bytes,
+            seq,
+            Bytes::copy_from_slice(transmit.contents),
+        );
 
         match packet {
             Ok(wrapped_packet) => match self.io.try_send_to(&wrapped_packet, destination_addr) {
@@ -195,21 +216,22 @@ impl AsyncUdpSocket for MultiKeyAnetUdpSocket {
                 let packet_slice = &recv_buf[..filled_len];
 
                 // Сначала проверяем, знаем ли мы уже этот адрес
-                let session_id_opt = {
-                    let pending_guard = self.pending_handshakes.lock().unwrap();
-                    pending_guard.get(&remote_addr).cloned()
-                };
+                let session_id_opt = self
+                    .pending_handshakes
+                    .get(&remote_addr)
+                    .map(|entry| entry.value().clone());
 
                 let mut unwrapped_data: Option<Bytes> = None;
                 let mut found_session_id = None;
 
                 if let Some(session_id_str) = session_id_opt {
                     // Уже есть сопоставление - пробуем расшифровать как data packet
-                    let clients_guard = self.clients.lock().expect("Client mutex poisoned");
-                    if let Some(client_info) = clients_guard.get(&session_id_str) {
-                        if let Ok(data_packet) =
-                            transport::unwrap_packet(&client_info.cipher, client_info.session_id_bytes, packet_slice)
-                        {
+                    if let Some(client_info) = self.clients.get(&session_id_str) {
+                        if let Ok(data_packet) = transport::unwrap_packet(
+                            &client_info.cipher,
+                            client_info.session_id_bytes,
+                            packet_slice,
+                        ) {
                             unwrapped_data = Some(data_packet);
                             found_session_id = Some(session_id_str);
                         }
@@ -217,25 +239,30 @@ impl AsyncUdpSocket for MultiKeyAnetUdpSocket {
                 } else {
                     // Нет сопоставления - пробуем обработать как handshake
                     if let Some(session_id_str) = self.handle_handshake(remote_addr, packet_slice) {
-                        info!("Handshake processed for: {}, SEID: {}", remote_addr, session_id_str);
+                        info!(
+                            "Handshake processed for: {}, SEID: {}",
+                            remote_addr, session_id_str
+                        );
                         cx.waker().wake_by_ref();
                         return Poll::Pending; // Handshake пакет не содержит QUIC данных
                     }
 
                     // Если не handshake, пробуем все известные клиенты для data packets
-                    let clients_guard = self.clients.lock().expect("Client mutex poisoned");
-                    for (session_id_str, client_info) in clients_guard.iter() {
-                        if let Ok(data_packet) =
-                            transport::unwrap_packet(&client_info.cipher, client_info.session_id_bytes, packet_slice)
-                        {
+                    for entry in self.clients.iter() {
+                        let session_id_str = entry.key();
+                        let client_info = entry.value();
+
+                        if let Ok(data_packet) = transport::unwrap_packet(
+                            &client_info.cipher,
+                            client_info.session_id_bytes,
+                            packet_slice,
+                        ) {
                             unwrapped_data = Some(data_packet);
                             found_session_id = Some(session_id_str.clone());
 
                             // Обновляем адрес клиента
-                            {
-                                let mut pending = self.pending_handshakes.lock().unwrap();
-                                pending.insert(remote_addr, session_id_str.clone());
-                            }
+                            self.pending_handshakes
+                                .insert(remote_addr, session_id_str.clone());
                             break;
                         }
                     }
@@ -258,11 +285,8 @@ impl AsyncUdpSocket for MultiKeyAnetUdpSocket {
                     };
 
                     // Обновляем адрес в основной структуре клиентов
-                    {
-                        let mut clients_guard = self.clients.lock().expect("Client mutex poisoned");
-                        if let Some(client_info) = clients_guard.get_mut(&session_id_str) {
-                            client_info.addr = Some(remote_addr);
-                        }
+                    if let Some(mut client_info) = self.clients.get_mut(&session_id_str) {
+                        client_info.addr = Some(remote_addr);
                     }
 
                     Poll::Ready(Ok(1))
@@ -290,7 +314,7 @@ pub struct ANetServer {
     ip_pool: IpPool,
     tun_manager: TunManager,
     // Теперь используем единую структуру клиентов
-    clients: Arc<Mutex<HashMap<String, ClientTransportInfo>>>,
+    clients: Arc<DashMap<String, ClientTransportInfo>>,
     quic_router: Arc<TokioMutex<HashMap<String, StreamSender>>>,
 }
 
@@ -322,7 +346,7 @@ impl ANetServer {
             cfg: cfg.clone(),
             tls_acceptor: acceptor,
             ip_pool,
-            clients: Arc::new(Mutex::new(HashMap::new())),
+            clients: Arc::new(DashMap::new()),
             tun_manager,
             quic_router: Arc::new(TokioMutex::new(HashMap::new())),
         })
@@ -358,7 +382,7 @@ impl ANetServer {
                     auth_phrase,
                     udp_port,
                 )
-                    .await
+                .await
                 {
                     error!("[{}] Auth connection failed: {}", addr, e);
                 }
@@ -439,7 +463,7 @@ async fn handle_auth_connection(
     socket: TcpStream,
     acceptor: TlsAcceptor,
     ip_pool: IpPool,
-    clients: Arc<Mutex<HashMap<String, ClientTransportInfo>>>,
+    clients: Arc<DashMap<String, ClientTransportInfo>>, // ИЗМЕНЕНО
     auth_phrase: String,
     udp_port: u32,
 ) -> anyhow::Result<()> {
@@ -471,10 +495,14 @@ async fn handle_auth_connection(
     let session_id = generate_seid();
 
     // Декодируем session_id в байты для транспортного уровня
-    let session_id_bytes = general_purpose::STANDARD.decode(&session_id)
+    let session_id_bytes = general_purpose::STANDARD
+        .decode(&session_id)
         .context("Failed to decode session_id")?;
     if session_id_bytes.len() != 16 {
-        anyhow::bail!("Invalid session_id length, expected 16 bytes, got {}", session_id_bytes.len());
+        anyhow::bail!(
+            "Invalid session_id length, expected 16 bytes, got {}",
+            session_id_bytes.len()
+        );
     }
     let mut session_id_bytes_array = [0u8; 16];
     session_id_bytes_array.copy_from_slice(&session_id_bytes[..16]);
@@ -491,11 +519,8 @@ async fn handle_auth_connection(
         handshake_received: false,
     };
 
-    clients
-        .lock()
-        .expect("Client mutex poisoned")
-        .insert(session_id.clone(), info);
-
+    // ИЗМЕНЕНО: вставка в DashMap (без блокировки мьютекса)
+    clients.insert(session_id.clone(), info);
 
     let response = AnetMessage {
         content: Some(Content::AuthResponse(AuthResponse {
@@ -523,7 +548,7 @@ async fn handle_auth_connection(
 async fn handle_incoming_quic(
     endpoint: Endpoint,
     tx_to_tun: StreamSender,
-    clients_transport_info: Arc<Mutex<HashMap<String, ClientTransportInfo>>>,
+    clients_transport_info: Arc<DashMap<String, ClientTransportInfo>>,
     quic_router: Arc<TokioMutex<HashMap<String, StreamSender>>>,
     ip_pool: IpPool,
 ) -> Result<()> {
@@ -547,7 +572,7 @@ async fn handle_incoming_quic(
 async fn handle_connection(
     incoming: Incoming,
     tx_to_tun: StreamSender,
-    clients_transport_info: Arc<Mutex<HashMap<String, ClientTransportInfo>>>,
+    clients_transport_info: Arc<DashMap<String, ClientTransportInfo>>, // ИЗМЕНЕНО
     quic_router: Arc<TokioMutex<HashMap<String, StreamSender>>>,
     ip_pool: IpPool,
 ) -> Result<()> {
@@ -559,13 +584,12 @@ async fn handle_connection(
 
     let established_remote_addr = connection.remote_address();
 
-    // Ищем клиента по адресу
+    // Ищем клиента по адресу, используем итератор DashMap)
     let client = {
-        let clients = clients_transport_info.lock().expect("Client mutex poisoned");
-        clients
-            .values()
-            .find(|info| info.addr == Some(established_remote_addr))
-            .map(|info| info.clone())
+        clients_transport_info
+            .iter()
+            .find(|entry| entry.addr == Some(established_remote_addr))
+            .map(|entry| entry.value().clone())
     };
 
     let client = match client {
@@ -585,14 +609,17 @@ async fn handle_connection(
         client.assigned_ip, established_remote_addr, client.session_id
     );
 
-    let (tx_router, mut rx_router) = mpsc::channel::<Bytes>(1024); // Увеличиваем буфер
+    let (tx_router, mut rx_router) = mpsc::channel::<Bytes>(1024);
 
     // Добавляем клиента в роутер
     {
         let mut router = quic_router.lock().await;
         router.insert(client.assigned_ip.clone(), tx_router);
-        info!("Client {} added to quic_router. Total clients: {}",
-              client.assigned_ip, router.len());
+        info!(
+            "Client {} added to quic_router. Total clients: {}",
+            client.assigned_ip,
+            router.len()
+        );
     }
 
     let ip_for_log_tx = client.assigned_ip.clone();
@@ -602,15 +629,11 @@ async fn handle_connection(
         let mut stream = send_stream;
 
         while let Some(packet) = rx_router.recv().await {
-
             // Оборачиваем пакет в транспортный фрейм
             let framed_packet = frame_packet(packet);
 
             if let Err(e) = stream.write_all(&framed_packet).await {
-                error!(
-                    "QUIC stream write failed for {}  {}",
-                    ip_for_log_tx, e
-                );
+                error!("QUIC stream write failed for {}  {}", ip_for_log_tx, e);
                 break;
             }
 
@@ -619,13 +642,11 @@ async fn handle_connection(
                 error!("QUIC stream flush failed for {}: {}", ip_for_log_tx, e);
                 break;
             }
-
         }
 
         if let Err(e) = stream.finish() {
             error!("Error finishing QUIC stream for {}: {}", ip_for_log_tx, e);
         }
-
     });
 
     // Задача: чтение данных из QUIC стрима в TUN
@@ -637,12 +658,8 @@ async fn handle_connection(
         loop {
             match read_next_packet(&mut stream).await {
                 Ok(Some(packet)) => {
-
                     if let Err(e) = tx_to_tun_for_rx.send(packet).await {
-                        error!(
-                            "TUN channel write failed for {}  {}",
-                            ip_for_log_rx,  e
-                        );
+                        error!("TUN channel write failed for {}  {}", ip_for_log_rx, e);
                         break;
                     }
                 }
@@ -650,15 +667,11 @@ async fn handle_connection(
                     break;
                 }
                 Err(e) => {
-                    error!(
-                        "Error reading QUIC stream from {} {}",
-                        ip_for_log_rx, e
-                    );
+                    error!("Error reading QUIC stream from {} {}", ip_for_log_rx, e);
                     break;
                 }
             }
         }
-
     });
 
     tokio::select! {
@@ -667,21 +680,20 @@ async fn handle_connection(
         _ = connection.closed() => info!("QUIC connection closed for {}.", client.assigned_ip),
     }
 
-    // Очистка
     let assigned_ip_clone = client.assigned_ip.clone();
     let session_id_clone = client.session_id.clone();
 
     {
         let mut router = quic_router.lock().await;
         router.remove(&client.assigned_ip);
-        info!("Removed client {} from quic_router. Remaining clients: {}",
-              client.assigned_ip, router.len());
+        info!(
+            "Removed client {} from quic_router. Remaining clients: {}",
+            client.assigned_ip,
+            router.len()
+        );
     }
 
-    clients_transport_info
-        .lock()
-        .expect("Client mutex poisoned")
-        .remove(&session_id_clone);
+    clients_transport_info.remove(&session_id_clone);
 
     if let Ok(ip_addr) = assigned_ip_clone.parse() {
         ip_pool.release(ip_addr);
@@ -695,9 +707,7 @@ async fn route_tun_to_quic(
     mut rx_from_tun: mpsc::Receiver<Bytes>,
     quic_router: Arc<TokioMutex<HashMap<String, StreamSender>>>,
 ) -> Result<()> {
-
     while let Some(packet) = rx_from_tun.recv().await {
-
         // Проверяем что это IP пакет
         if packet.len() < 20 {
             error!("Dropping non-IP packet: {} bytes", packet.len());
@@ -718,7 +728,6 @@ async fn route_tun_to_quic(
             }
         };
 
-
         let sender_opt = {
             let router = quic_router.lock().await;
             router.get(&dst_ip).cloned()
@@ -726,17 +735,18 @@ async fn route_tun_to_quic(
 
         if let Some(sender) = sender_opt {
             match sender.send(packet).await {
-                Ok(()) => {
-                }
+                Ok(()) => {}
                 Err(e) => {
                     warn!("Failed to route packet to {}: {}", dst_ip, e);
                 }
             }
         } else {
-            warn!("Dropping packet to {}: no active QUIC session. Available sessions: {:?}",
-                      dst_ip, quic_router.lock().await.keys().collect::<Vec<_>>());
+            warn!(
+                "Dropping packet to {}: no active QUIC session. Available sessions: {:?}",
+                dst_ip,
+                quic_router.lock().await.keys().collect::<Vec<_>>()
+            );
         }
-
     }
 
     Ok(())

@@ -6,6 +6,8 @@ use anet_common::protocol::{AuthRequest, AuthResponse, Message as AnetMessage, m
 use anet_common::quic_settings::build_transport_config;
 use anet_common::stream_framing::{frame_packet, read_next_packet};
 use anyhow::{Context, Result};
+use base64::Engine;
+use base64::engine::general_purpose;
 use bytes::Bytes;
 use log::{error, info, warn};
 use prost::Message;
@@ -17,12 +19,10 @@ use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::{ClientConfig, RootCertStore};
 use std::net::SocketAddr;
 use std::{sync::Arc, time::Duration};
-use base64::Engine;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::time::sleep;
 use tokio_rustls::TlsConnector;
-use base64::engine::general_purpose;
 
 const MAX_RETRIES: u32 = 5;
 const INITIAL_DELAY: u64 = 2;
@@ -149,21 +149,21 @@ impl ANetClient {
         endpoint.set_default_client_config(client_config);
 
         info!(
-        "Connecting to QUIC endpoint [{}] via ANET transport...",
-        remote_addr
-    );
+            "Connecting to QUIC endpoint [{}] via ANET transport...",
+            remote_addr
+        );
 
         // Добавляем задержку для обработки handshake сервером
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
         let connection = endpoint.connect(remote_addr, "alco")?.await?;
         info!(
-        "QUIC connection established with {}, SEID: {}",
-        connection.remote_address(),
-        auth_response.session_id,
-    );
+            "QUIC connection established with {}, SEID: {}",
+            connection.remote_address(),
+            auth_response.session_id,
+        );
 
-        let (send_stream,  recv_stream) = connection.open_bi().await?;
+        let (send_stream, recv_stream) = connection.open_bi().await?;
         info!("Opened bidirectional QUIC stream for VPN traffic.");
 
         // Получаем каналы для TUN
@@ -188,7 +188,6 @@ impl ANetClient {
                     warn!("Unknown IP version: {} in packet from TUN", version);
                     continue;
                 }
-
 
                 // Оборачиваем IP-пакет в транспортный фрейм [u16 длина][IP пакет]
                 let framed_packet = frame_packet(packet);
@@ -310,7 +309,8 @@ async fn connect_with_backoff(server_addr: &str) -> Result<TcpStream> {
 }
 
 fn decode_session_id(session_id: &str) -> Result<[u8; 16]> {
-    let decoded = general_purpose::STANDARD.decode(session_id)
+    let decoded = general_purpose::STANDARD
+        .decode(session_id)
         .context("Failed to decode session_id from base64")?;
 
     if decoded.len() != 16 {
