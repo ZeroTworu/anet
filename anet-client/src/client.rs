@@ -173,8 +173,6 @@ impl ANetClient {
         let mut quic_sender = send_stream;
 
         tokio::spawn(async move {
-            let mut sequence: u64 = 1; // Начинаем с 1, так как 0 используется для handshake
-
             while let Some(packet) = rx_from_tun.recv().await {
                 // Проверяем, что это IP пакет (минимум 20 байт для IPv4)
                 if packet.len() < 20 {
@@ -203,8 +201,6 @@ impl ANetClient {
                     error!("QUIC stream flush failed: {}", e);
                     break;
                 }
-
-                sequence += 1;
             }
 
             // Закрываем стрим грациозно

@@ -1,5 +1,5 @@
 use aead::{Aead, KeyInit, Nonce};
-use aes_gcm::{Aes256Gcm, Key};
+use aes_gcm::Key;
 use bytes::Bytes;
 use chacha20poly1305::ChaCha20Poly1305;
 use std::sync::Arc;

@@ -22,13 +22,11 @@ use quinn::{
 };
 use rustls::ServerConfig as RustlsServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use std::collections::HashMap;
 use std::io::BufReader;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::mpsc;
 use tokio_rustls::TlsAcceptor;
 
@@ -42,7 +40,7 @@ pub struct ANetServer {
     tun_manager: TunManager,
     // Теперь используем единую структуру клиентов
     clients: Arc<DashMap<String, ClientTransportInfo>>,
-    quic_router: Arc<TokioMutex<HashMap<String, StreamSender>>>,
+    quic_router: Arc<DashMap<String, StreamSender>>,
 }
 
 impl ANetServer {
@@ -75,7 +73,7 @@ impl ANetServer {
             ip_pool,
             clients: Arc::new(DashMap::new()),
             tun_manager,
-            quic_router: Arc::new(TokioMutex::new(HashMap::new())),
+            quic_router: Arc::new(DashMap::new()),
         })
     }
 
@@ -275,7 +273,7 @@ async fn handle_incoming_quic(
     endpoint: Endpoint,
     tx_to_tun: StreamSender,
     clients_transport_info: Arc<DashMap<String, ClientTransportInfo>>,
-    quic_router: Arc<TokioMutex<HashMap<String, StreamSender>>>,
+    quic_router: Arc<DashMap<String, StreamSender>>,
     ip_pool: IpPool,
 ) -> Result<()> {
     while let Some(conn) = endpoint.accept().await {
@@ -299,7 +297,7 @@ async fn handle_connection(
     incoming: Incoming,
     tx_to_tun: StreamSender,
     clients_transport_info: Arc<DashMap<String, ClientTransportInfo>>, // ИЗМЕНЕНО
-    quic_router: Arc<TokioMutex<HashMap<String, StreamSender>>>,
+    quic_router: Arc<DashMap<String, StreamSender>>,
     ip_pool: IpPool,
 ) -> Result<()> {
     let connection = incoming.await?;
@@ -339,12 +337,11 @@ async fn handle_connection(
 
     // Добавляем клиента в роутер
     {
-        let mut router = quic_router.lock().await;
-        router.insert(client.assigned_ip.clone(), tx_router);
+        quic_router.insert(client.assigned_ip.clone(), tx_router);
         info!(
             "Client {} added to quic_router. Total clients: {}",
             client.assigned_ip,
-            router.len()
+            quic_router.len()
         );
     }
 
@@ -410,12 +407,11 @@ async fn handle_connection(
     let session_id_clone = client.session_id.clone();
 
     {
-        let mut router = quic_router.lock().await;
-        router.remove(&client.assigned_ip);
+        quic_router.remove(&client.assigned_ip);
         info!(
             "Removed client {} from quic_router. Remaining clients: {}",
             client.assigned_ip,
-            router.len()
+            quic_router.len()
         );
     }
 
@@ -431,7 +427,7 @@ async fn handle_connection(
 // В функции route_tun_to_quic заменим:
 async fn route_tun_to_quic(
     mut rx_from_tun: mpsc::Receiver<Bytes>,
-    quic_router: Arc<TokioMutex<HashMap<String, StreamSender>>>,
+    quic_router: Arc<DashMap<String, StreamSender>>,
 ) -> Result<()> {
     while let Some(packet) = rx_from_tun.recv().await {
         // Проверяем что это IP пакет
@@ -455,8 +451,7 @@ async fn route_tun_to_quic(
         };
 
         let sender_opt = {
-            let router = quic_router.lock().await;
-            router.get(&dst_ip).cloned()
+            quic_router.get(&dst_ip)
         };
 
         if let Some(sender) = sender_opt {
@@ -470,7 +465,7 @@ async fn route_tun_to_quic(
             warn!(
                 "Dropping packet to {}: no active QUIC session. Available sessions: {:?}",
                 dst_ip,
-                quic_router.lock().await.keys().collect::<Vec<_>>()
+                quic_router.iter().map(|val| val.key().clone()).collect::<Vec<_>>()
             );
         }
     }
