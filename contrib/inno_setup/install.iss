@@ -39,6 +39,7 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; Flags: unchecked
 ; 1. БИНАРНИКИ: Устанавливаются в {app} (Program Files)
 Source: "anet-client.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "wintun.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "anet.ico"; DestDir: "{app}"; Flags: ignoreversion
 
 ; 2. КОНФИГ: Устанавливается в {userappdata}\anet\. Флаг onlyifdoesntexist гарантирует, что пользовательский конфиг не будет затерт при обновлении.
 ; Note: Мы используем Flags: uninsneveruninstall, чтобы конфигурация осталась после деинсталляции.
@@ -47,10 +48,10 @@ Source: "client.toml"; DestDir: "{userappdata}\anet"; DestName: "default.toml"; 
 ; --- Icons/Shortcuts Section ---
 [Icons]
 ; 1. Ярлык запуска клиента (Меню Пуск). Клиент будет использовать UAC благодаря Реестру.
-Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Parameters: "-c ""{userappdata}\anet\default.toml"""
+Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Parameters: "-c ""{userappdata}\anet\default.toml"""; IconFilename: "{app}\anet.ico
 
 ; 1. Ярлык запуска клиента (Рабочий стол).
-Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Parameters: "-c ""{userappdata}\anet\default.toml"""; Tasks: desktopicon
+Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Parameters: "-c ""{userappdata}\anet\default.toml"""; IconFilename: "{app}\anet.ico"; Tasks: desktopicon
 
 ; 2. Ярлык для быстрого редактирования конфига (Рабочий стол). Запускает Блокнот.
 Name: "{autodesktop}\Edit ANET Config"; Filename: "notepad.exe"; Parameters: """{userappdata}\anet\default.toml"""; IconFilename: "{sys}\notepad.exe"; Tasks: desktopicon

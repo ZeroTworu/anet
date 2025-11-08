@@ -14,9 +14,8 @@ pub struct AnetVpnPacket {
 }
 
 impl AnetVpnPacket {
-
     /// Создает новый пакет данных с обфускацией
-     pub fn new_data(session_id: [u8; 16], sequence: u64, quic_payload: Bytes) -> Self {
+    pub fn new_data(session_id: [u8; 16], sequence: u64, quic_payload: Bytes) -> Self {
         let mut rng = rand::rng();
         let padding_len = rng.next_u32() as usize % 64;
         let mut random_padding = vec![0u8; padding_len];

@@ -1,5 +1,6 @@
-use crate::encryption::Cipher;
-use crate::transport;
+use anet_common::encryption::Cipher;
+use anet_common::transport;
+use anet_common::udp_poller::TokioUdpPoller;
 use bytes::Bytes;
 use log::{error, info};
 use quinn::{
@@ -8,7 +9,6 @@ use quinn::{
 };
 use rand::RngCore;
 use std::fmt::{Debug, Formatter};
-use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -193,20 +193,3 @@ impl AsyncUdpSocket for AnetUdpSocket {
     }
 }
 
-#[derive(Debug)]
-pub struct TokioUdpPoller {
-    pub io: Arc<UdpSocket>,
-}
-
-impl Future for TokioUdpPoller {
-    type Output = io::Result<()>;
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.io.poll_send_ready(cx).map(|res| res.map(|_| ()))
-    }
-}
-
-impl UdpPoller for TokioUdpPoller {
-    fn poll_writable(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut *self).poll(cx)
-    }
-}

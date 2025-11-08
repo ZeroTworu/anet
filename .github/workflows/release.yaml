@@ -49,6 +49,7 @@ jobs:
           # Для запуска ISCC скрипт должен быть в рабочем каталоге
           Copy-Item -Path "contrib\inno_setup\install.iss" -Destination "installer_source\install.iss"
           
+          # Иконка
           Copy-Item -Path "contrib\inno_setup\anet.ico" -Destination "installer_source\anet.ico"
           
           # Удаление временного каталога

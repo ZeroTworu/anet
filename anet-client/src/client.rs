@@ -1,5 +1,5 @@
 use crate::config::{Config, load};
-use anet_common::anet_udp_socket::AnetUdpSocket;
+use crate::client_udp_socket::AnetUdpSocket;
 use anet_common::atun::TunManager;
 use anet_common::encryption::Cipher;
 use anet_common::protocol::{AuthRequest, AuthResponse, Message as AnetMessage, message::Content};
