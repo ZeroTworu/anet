@@ -10,34 +10,22 @@ pub struct AnetVpnPacket {
     pub session_id: [u8; 16],
     pub sequence: u64,
     pub payload: Bytes,
-    pub random_padding: Bytes,
 }
 
 impl AnetVpnPacket {
-    /// Создает новый пакет данных с обфускацией
+    /// Создает новый пакет данных
     pub fn new_data(session_id: [u8; 16], sequence: u64, quic_payload: Bytes) -> Self {
-        let mut rng = rand::rng();
-        let padding_len = rng.next_u32() as usize % 64;
-        let mut random_padding = vec![0u8; padding_len];
-        rng.fill_bytes(&mut random_padding);
-
         Self {
             packet_type: PACKET_TYPE_DATA,
             session_id,
             sequence,
             payload: quic_payload,
-            random_padding: Bytes::from(random_padding),
         }
     }
 
     /// Создает handshake пакет для initial connection
     pub fn new_handshake(session_id: [u8; 16], client_id: [u8; 16], timestamp: u64) -> Self {
-        let mut rng = rand::rng();
-        let padding_len = rng.next_u32() as usize % 128;
-        let mut random_padding = vec![0u8; padding_len];
-        rng.fill_bytes(&mut random_padding);
-
-        let mut payload = Vec::with_capacity(16 + 8);
+        let mut payload = Vec::with_capacity(24);
         payload.extend_from_slice(&client_id);
         payload.extend_from_slice(&timestamp.to_be_bytes());
 
@@ -46,33 +34,42 @@ impl AnetVpnPacket {
             session_id,
             sequence: 0,
             payload: Bytes::from(payload),
-            random_padding: Bytes::from(random_padding),
         }
     }
 
-    /// Сериализует и шифрует пакет
-
+    /// Сериализует и шифрует пакет (полностью зашифрованный формат)
     pub fn wrap_and_encrypt(&self, cipher: &Cipher) -> Result<Bytes> {
-        let nonce = Cipher::generate_nonce(self.sequence);
-        let encrypted_data = cipher.encrypt(&nonce, self.payload.clone())?;
+        // Генерируем случайный паддинг
+        let padding = generate_random_padding();
 
-        let mut final_packet = BytesMut::with_capacity(16 + 1 + 8 + encrypted_data.len());
-        final_packet.put_slice(&self.session_id); // 16 байт session_id
-        final_packet.put_u8(self.packet_type);
-        final_packet.put_u64(self.sequence);
-        final_packet.put_slice(&encrypted_data);
+        // Создаем plaintext: packet_type + payload_length + payload + padding
+        let payload_length = self.payload.len() as u16;
+        let mut plaintext = BytesMut::with_capacity(1 + 2 + self.payload.len() + padding.len());
+
+        plaintext.put_u8(self.packet_type);           // 1 byte
+        plaintext.put_u16(payload_length);            // 2 bytes
+        plaintext.put_slice(&self.payload);           // N bytes
+        plaintext.put_slice(&padding);                // 0-127 bytes
+
+        let nonce = Cipher::generate_nonce(self.sequence);
+        let encrypted_data = cipher.encrypt(&nonce, plaintext.freeze())?;
+
+        // Формат: session_id + sequence + encrypted_data
+        let mut final_packet = BytesMut::with_capacity(16 + 8 + encrypted_data.len());
+        final_packet.put_slice(&self.session_id);     // 16 bytes
+        final_packet.put_u64(self.sequence);          // 8 bytes
+        final_packet.put_slice(&encrypted_data);      // encrypted: [type][length][payload][padding] + AEAD тег
 
         Ok(final_packet.freeze())
     }
 
-    /// Десериализует и расшифровывает пакет
-
+    /// Десериализует и расшифровывает пакет (полностью зашифрованный формат)
     pub fn unwrap_and_decrypt(
         cipher: &Cipher,
         session_id: [u8; 16],
         transport_packet: &[u8],
     ) -> Result<Self> {
-        if transport_packet.len() < 25 {
+        if transport_packet.len() < 25 { // 16 (session_id) + 8 (sequence) + 1 (минимальные зашифрованные данные)
             return Err(anyhow!("Transport packet too short"));
         }
 
@@ -81,22 +78,32 @@ impl AnetVpnPacket {
             return Err(anyhow!("Session ID mismatch"));
         }
 
-        let packet_type = transport_packet[16];
-        let sequence = u64::from_be_bytes(transport_packet[17..25].try_into()?);
-        let encrypted_data = &transport_packet[25..];
+        let sequence = u64::from_be_bytes(transport_packet[16..24].try_into()?);
+        let encrypted_data = &transport_packet[24..];
 
         let nonce = Cipher::generate_nonce(sequence);
         let plaintext = cipher.decrypt(&nonce, Bytes::copy_from_slice(encrypted_data))?;
 
-        let payload = plaintext;
-        let random_padding = Bytes::new();
+        if plaintext.len() < 3 { // минимум: packet_type (1) + payload_length (2)
+            return Err(anyhow!("Decrypted data too short"));
+        }
+
+        // Извлекаем данные из расшифрованного plaintext
+        let packet_type = plaintext[0];
+        let payload_length = u16::from_be_bytes([plaintext[1], plaintext[2]]) as usize;
+
+        if plaintext.len() < 3 + payload_length {
+            return Err(anyhow!("Payload length exceeds decrypted data"));
+        }
+
+        let payload = Bytes::from(plaintext[3..3 + payload_length].to_vec());
+        // Паддинг (plaintext[3 + payload_length..]) игнорируем
 
         Ok(Self {
             packet_type,
             session_id,
             sequence,
             payload,
-            random_padding,
         })
     }
 
@@ -118,6 +125,17 @@ impl AnetVpnPacket {
         Ok(u64::from_be_bytes(self.payload[16..24].try_into()?))
     }
 }
+
+/// Генерирует случайный паддинг переменной длины
+fn generate_random_padding() -> Bytes {
+    let mut rng = rand::rng();
+    let padding_len = rng.next_u32() as usize % 128;
+    let mut random_padding = vec![0u8; padding_len];
+    rng.fill_bytes(&mut random_padding);
+    Bytes::from(random_padding)
+}
+
+/// Публичные функции-обертки для удобства
 
 pub fn wrap_handshake(
     cipher: &Cipher,
@@ -143,7 +161,12 @@ pub fn unwrap_packet(
     transport_packet: &[u8],
 ) -> Result<Bytes> {
     match AnetVpnPacket::unwrap_and_decrypt(cipher, session_id, transport_packet) {
-        Ok(wrapped) => Ok(wrapped.payload),
+        Ok(wrapped) => {
+            if wrapped.packet_type != PACKET_TYPE_DATA {
+                return Err(anyhow!("Expected data packet, got type: {}", wrapped.packet_type));
+            }
+            Ok(wrapped.payload)
+        }
         Err(e) => Err(e),
     }
 }
@@ -155,6 +178,9 @@ pub fn unwrap_handshake(
 ) -> Result<([u8; 16], u64)> {
     match AnetVpnPacket::unwrap_and_decrypt(cipher, session_id, transport_packet) {
         Ok(wrapped) => {
+            if wrapped.packet_type != PACKET_TYPE_HANDSHAKE {
+                return Err(anyhow!("Expected handshake packet, got type: {}", wrapped.packet_type));
+            }
             let client_id = wrapped.get_client_id()?;
             let timestamp = wrapped.get_timestamp()?;
             Ok((client_id, timestamp))
