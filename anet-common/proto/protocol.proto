@@ -11,14 +11,15 @@ message AuthResponse {
     string netmask = 2;
     string gateway = 3;
     int32 mtu = 4;
-    bytes crypto_key = 5;  // 32-байтовый ключ для ChaCha20Poly1305
-    uint32 udp_port = 6;   // Порт для UDP соединения
+    bytes crypto_key = 5;
+    uint32 udp_port = 6;
     string session_id = 7;
+    bytes nonce_prefix = 8;
 }
 
 message UdpHandshake {
-    string client_id = 1;   // 16-байтовый идентификатор клиента
-    uint64 timestamp = 2;  // Метка времени для защиты от replay-атак
+    string client_id = 1;
+    uint64 timestamp = 2; 
 }
 
 message Message {

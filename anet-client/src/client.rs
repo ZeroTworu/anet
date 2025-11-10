@@ -125,16 +125,14 @@ impl ANetClient {
         let real_socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
         let cipher = Arc::new(Cipher::new(&auth_response.crypto_key));
 
-        // Конвертируем session_id из строки в [u8; 16]
-        let session_id_bytes = decode_session_id(&auth_response.session_id)?;
-        info!("Client session_id: {}", &auth_response.session_id);
+        // Получаем nonce_prefix из ответа аутентификации
+        let nonce_prefix: [u8; 4] = auth_response.nonce_prefix
+            .as_slice()
+            .try_into()
+            .context("Invalid nonce_prefix length from server")?;
+        info!("[ANet] Received nonce prefix for QUIC session");
 
-        let anet_socket = Arc::new(AnetUdpSocket::new(real_socket, cipher, session_id_bytes));
-
-        // Отправляем initial handshake перед установкой QUIC соединения
-        info!("Sending initial handshake to server...");
-        anet_socket.send_initial_handshake(remote_addr).await?;
-        info!("Initial handshake sent to server");
+        let anet_socket = Arc::new(AnetUdpSocket::new(real_socket, cipher, nonce_prefix));
 
         let mut endpoint = Endpoint::new_with_abstract_socket(
             EndpointConfig::default(),

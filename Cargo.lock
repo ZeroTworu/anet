@@ -125,6 +125,7 @@ dependencies = [
  "dashmap",
  "env_logger",
  "log",
+ "parking_lot",
  "prost",
  "quinn",
  "rand 0.8.5",

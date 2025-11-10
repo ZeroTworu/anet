@@ -1,8 +1,9 @@
 use anet_common::encryption::Cipher;
 use anet_common::transport;
+use anet_common::consts::{NONCE_PREFIX_LEN};
 use anet_common::udp_poller::TokioUdpPoller;
 use bytes::Bytes;
-use log::{error, info};
+use log::{error, info, warn, debug};
 use quinn::{
     AsyncUdpSocket, UdpPoller,
     udp::{RecvMeta, Transmit},
@@ -21,65 +22,17 @@ use tokio::net::UdpSocket;
 pub struct AnetUdpSocket {
     io: Arc<UdpSocket>,
     cipher: Arc<Cipher>,
-    session_id: [u8; 16],
+    nonce_prefix: [u8; NONCE_PREFIX_LEN],
     sequence: Arc<AtomicU64>,
-    handshake_sent: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl AnetUdpSocket {
-    pub fn new(io: Arc<UdpSocket>, cipher: Arc<Cipher>, session_id: [u8; 16]) -> Self {
+    pub fn new(io: Arc<UdpSocket>, cipher: Arc<Cipher>, nonce_prefix: [u8; NONCE_PREFIX_LEN]) -> Self {
         Self {
             io,
             cipher,
-            session_id,
+            nonce_prefix,
             sequence: Arc::new(AtomicU64::new(0)),
-            handshake_sent: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        }
-    }
-
-    /// Отправляет initial handshake для установки соединения
-    pub async fn send_initial_handshake(&self, remote_addr: SocketAddr) -> io::Result<()> {
-        if self.handshake_sent.load(Ordering::Acquire) {
-            return Ok(());
-        }
-
-        let mut rng = rand::rng();
-        let mut client_id = [0u8; 16];
-        rng.fill_bytes(&mut client_id);
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        info!(
-            "Sending initial handshake to {} with session_id: {:?}",
-            remote_addr, self.session_id
-        );
-        match transport::wrap_handshake(&self.cipher, self.session_id, client_id, timestamp) {
-            Ok(handshake_packet) => {
-                // Отправляем с случайной задержкой для обфускации
-                // let delay_ms = rng.next_u32() % 100;
-                // tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms as u64)).await;
-
-                match self.io.try_send_to(&handshake_packet, remote_addr) {
-                    Ok(_) => {
-                        info!("Initial handshake sent to {}", remote_addr);
-                        self.handshake_sent.store(true, Ordering::Release);
-                        Ok(())
-                    }
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        error!("Would block when sending handshake");
-                        Err(e)
-                    }
-                    Err(e) => {
-                        error!("Failed to send handshake: {}", e);
-                        Err(e)
-                    }
-                }
-            }
-            Err(e) => {
-                error!("Failed to wrap handshake: {}", e);
-                Err(io::Error::new(io::ErrorKind::Other, e.to_string()))
-            }
         }
     }
 }
@@ -105,33 +58,25 @@ impl AsyncUdpSocket for AnetUdpSocket {
 
         match transport::wrap_packet(
             &self.cipher,
-            self.session_id,
+            &self.nonce_prefix,
             seq,
             Bytes::copy_from_slice(transmit.contents),
         ) {
             Ok(wrapped_packet) => {
-                // Добавляем случайную задержку для обфускации timing analysis
-                // let mut rng = rand::rng();
-                // let should_delay = rng.random_bool(0.3); // 30% пакетов с задержкой
-                //
-                // if should_delay {
-                //     // Неблокирующая задержка - в реальности нужно было бы использовать асинхронность,
-                //     // но так как try_send синхронный, мы просто пропускаем задержку
-                //     // Допилить!
-                //     trace!("Simulating transmission delay for packet {}", seq);
-                // }
-
                 match self.io.try_send_to(&wrapped_packet, transmit.destination) {
                     Ok(_) => Ok(()),
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => Err(e),
                     Err(e) => {
-                        error!("AnetUdpSocket failed to send: {}", e);
-                        Ok(()) // QUIC обработает потерю
+                        // Логируем, но не паникуем. QUIC обработает потерю.
+                        warn!("[ANet] Socket send failed: {}. QUIC will retransmit.", e);
+                        Ok(())
                     }
                 }
             }
             Err(e) => {
-                error!("Failed to wrap QUIC packet: {}", e);
+                // Это серьезная ошибка в логике, логируем как error.
+                error!("[ANet] Failed to wrap QUIC packet for seq {}: {}", seq, e);
+                // Все равно возвращаем Ok, чтобы не обрушить Quinn
                 Ok(())
             }
         }
@@ -154,18 +99,15 @@ impl AsyncUdpSocket for AnetUdpSocket {
                     return Poll::Pending;
                 }
 
-                // Пытаемся расшифровать как data packet
-                match transport::unwrap_packet(
-                    &self.cipher,
-                    self.session_id,
-                    &recv_buf[..filled_len],
-                ) {
-                    Ok(unwrapped_packet) => {
-                        if bufs.is_empty() {
-                            return Poll::Ready(Ok(0));
-                        }
-                        let copy_len = std::cmp::min(unwrapped_packet.len(), bufs[0].len());
-                        bufs[0][..copy_len].copy_from_slice(&unwrapped_packet[..copy_len]);
+                let raw_packet = &recv_buf[..filled_len];
+
+                // Пытаемся расшифровать
+                match transport::unwrap_packet(&self.cipher, raw_packet) {
+                    Ok(quic_payload) => {
+                        if bufs.is_empty() { return Poll::Ready(Ok(0)); }
+
+                        let copy_len = std::cmp::min(quic_payload.len(), bufs[0].len());
+                        bufs[0][..copy_len].copy_from_slice(&quic_payload[..copy_len]);
 
                         meta[0] = RecvMeta {
                             addr: remote_addr,
@@ -174,12 +116,13 @@ impl AsyncUdpSocket for AnetUdpSocket {
                             dst_ip: None,
                             ecn: None,
                         };
-                        Poll::Ready(Ok(copy_len))
+                        Poll::Ready(Ok(1)) // Успешно обработали 1 пакет
                     }
-                    Err(_) => {
-                        // Не смогли расшифровать - возможно это handshake response, игнорируем
+                    Err(e) => {
+                        // Это может быть просто "левый" пакет в сети. Логируем на уровне debug.
+                        debug!("[ANet] Failed to unwrap packet from {}: {}. Dropping.", remote_addr, e);
                         cx.waker().wake_by_ref();
-                        Poll::Pending
+                        Poll::Pending // Сообщаем Tokio, что нужно попробовать снова
                     }
                 }
             }

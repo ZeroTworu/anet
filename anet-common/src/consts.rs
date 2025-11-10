@@ -15,3 +15,7 @@ pub const PACKET_TYPE_HANDSHAKE: u8 = 0x02;
 pub const UDP_HANDSHAKE_TIMEOUT_SECONDS: u64 = 30;
 
 pub const VPN_STREAM_WINDOW: u64 = 8_388_608;
+
+pub const NONCE_PREFIX_LEN: usize = 4;
+
+pub const NONCE_LEN: usize = 12;

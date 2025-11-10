@@ -8,6 +8,7 @@ use tokio::fs::read_to_string;
 #[derive(Debug, Clone, Deserialize)]
 pub struct MainConfig {
     pub address: String,
+    pub tun_name: String,
     pub auth_phrase: String,
     pub server_cert: String,
 }
@@ -16,6 +17,7 @@ impl Default for MainConfig {
     fn default() -> Self {
         Self {
             address: "127.0.0.1:443".to_string(),
+            tun_name: "anet-client".to_string(),
             auth_phrase: "test".to_string(),
             server_cert: "test".to_string(),
         }

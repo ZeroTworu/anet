@@ -14,21 +14,19 @@ pub struct AuthResponse {
     pub gateway: ::prost::alloc::string::String,
     #[prost(int32, tag = "4")]
     pub mtu: i32,
-    /// 32-байтовый ключ для ChaCha20Poly1305
     #[prost(bytes = "vec", tag = "5")]
     pub crypto_key: ::prost::alloc::vec::Vec<u8>,
-    /// Порт для UDP соединения
     #[prost(uint32, tag = "6")]
     pub udp_port: u32,
     #[prost(string, tag = "7")]
     pub session_id: ::prost::alloc::string::String,
+    #[prost(bytes = "vec", tag = "8")]
+    pub nonce_prefix: ::prost::alloc::vec::Vec<u8>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct UdpHandshake {
-    /// 16-байтовый идентификатор клиента
     #[prost(string, tag = "1")]
     pub client_id: ::prost::alloc::string::String,
-    /// Метка времени для защиты от replay-атак
     #[prost(uint64, tag = "2")]
     pub timestamp: u64,
 }

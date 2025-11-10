@@ -29,8 +29,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::mpsc;
 use tokio_rustls::TlsAcceptor;
-
-
+use rand::{thread_rng, RngCore};
+use parking_lot::RwLock;
+use std::sync::Mutex;
 
 
 pub struct ANetServer {
@@ -38,9 +39,11 @@ pub struct ANetServer {
     tls_acceptor: TlsAcceptor,
     ip_pool: IpPool,
     tun_manager: TunManager,
-    // Теперь используем единую структуру клиентов
-    clients: Arc<DashMap<String, ClientTransportInfo>>,
-    quic_router: Arc<DashMap<String, StreamSender>>,
+    // Карта [session_id_string] -> [ClientInfo] - для общей логики и логов
+    clients_by_seid: Arc<DashMap<String, Arc<ClientTransportInfo>>>,
+    // Карта [nonce_prefix] -> [ClientInfo] - для O(1) поиска в UDP сокете
+    clients_by_prefix: Arc<DashMap<[u8; 4], Arc<ClientTransportInfo>>>,
+    quic_router: Arc<DashMap<String, StreamSender>>
 }
 
 impl ANetServer {
@@ -71,7 +74,8 @@ impl ANetServer {
             cfg: cfg.clone(),
             tls_acceptor: acceptor,
             ip_pool,
-            clients: Arc::new(DashMap::new()),
+            clients_by_seid: Arc::new(DashMap::new()),
+            clients_by_prefix: Arc::new(DashMap::new()),
             tun_manager,
             quic_router: Arc::new(DashMap::new()),
         })
@@ -94,7 +98,8 @@ impl ANetServer {
         while let Ok((socket, addr)) = listener.accept().await {
             let acceptor = self.tls_acceptor.clone();
             let ip_pool = self.ip_pool.clone();
-            let clients = self.clients.clone();
+            let clients_by_seid = self.clients_by_seid.clone();
+            let clients_by_prefix = self.clients_by_prefix.clone();
             let auth_phrase = self.cfg.server.auth_phrase.clone();
             let udp_port = self.cfg.server.udp_port;
 
@@ -103,11 +108,12 @@ impl ANetServer {
                     socket,
                     acceptor,
                     ip_pool.clone(),
-                    clients,
+                    clients_by_seid,
+                    clients_by_prefix,
                     auth_phrase,
                     udp_port,
                 )
-                .await
+                    .await
                 {
                     error!("[{}] Auth connection failed: {}", addr, e);
                 }
@@ -127,7 +133,8 @@ impl ANetServer {
         // Используем единую структуру клиентов
         let anet_socket = Arc::new(MultiKeyAnetUdpSocket::new(
             real_socket,
-            self.clients.clone(),
+            self.clients_by_seid.clone(),
+            self.clients_by_prefix.clone(),
         ));
 
         let server_config = self.build_quinn_server_config()?;
@@ -152,7 +159,7 @@ impl ANetServer {
         let incoming_task = tokio::spawn(handle_incoming_quic(
             endpoint.clone(),
             tx_to_tun.clone(),
-            self.clients.clone(),
+            self.clients_by_seid.clone(),
             quic_router.clone(),
             self.ip_pool.clone(),
         ));
@@ -188,12 +195,24 @@ async fn handle_auth_connection(
     socket: TcpStream,
     acceptor: TlsAcceptor,
     ip_pool: IpPool,
-    clients: Arc<DashMap<String, ClientTransportInfo>>, // ИЗМЕНЕНО
+    clients_by_seid: Arc<DashMap<String, Arc<ClientTransportInfo>>>,
+    clients_by_prefix: Arc<DashMap<[u8; 4], Arc<ClientTransportInfo>>>,
     auth_phrase: String,
     udp_port: u32,
 ) -> anyhow::Result<()> {
-    let tls_stream = acceptor.accept(socket).await?;
 
+    let nonce_prefix: [u8; 4] = {
+        let mut rng = thread_rng();
+        loop {
+            let mut prefix = [0u8; 4];
+            rng.fill_bytes(&mut prefix);
+            if !clients_by_prefix.contains_key(&prefix) {
+                break prefix;
+            }
+        }
+    };
+
+    let tls_stream = acceptor.accept(socket).await?;
     let (mut reader, mut writer) = tokio::io::split(tls_stream);
 
     let mut len_buf = [0u8; 4];
@@ -219,32 +238,23 @@ async fn handle_auth_connection(
     let crypto_key = generate_crypto_key();
     let session_id = generate_seid();
 
-    // Декодируем session_id в байты для транспортного уровня
-    let session_id_bytes = general_purpose::STANDARD
-        .decode(&session_id)
-        .context("Failed to decode session_id")?;
-    if session_id_bytes.len() != 16 {
-        anyhow::bail!(
-            "Invalid session_id length, expected 16 bytes, got {}",
-            session_id_bytes.len()
-        );
-    }
-    let mut session_id_bytes_array = [0u8; 16];
-    session_id_bytes_array.copy_from_slice(&session_id_bytes[..16]);
+    info!("Generated unique nonce prefix {:?} for session {}", nonce_prefix, session_id);
 
     let client_ip_str = assigned_ip.to_string();
 
-    let info = ClientTransportInfo {
+    let info = Arc::new(ClientTransportInfo {
         cipher: Arc::new(Cipher::new(&crypto_key)),
-        addr: None,
+        addr: Arc::new(RwLock::new(None)),
         sequence: Arc::new(AtomicU64::new(0)),
         assigned_ip: client_ip_str.clone(),
         session_id: session_id.clone(),
-        session_id_bytes: session_id_bytes_array,
-    };
+        nonce_prefix,
+    });
 
-    //вставка в DashMap (без блокировки мьютекса)
-    clients.insert(session_id.clone(), info);
+    clients_by_seid.insert(session_id.clone(), info.clone());
+    clients_by_prefix.insert(nonce_prefix, info);
+
+    // ... (остальной код создания и отправки response без изменений)
 
     let response = AnetMessage {
         content: Some(Content::AuthResponse(AuthResponse {
@@ -255,15 +265,14 @@ async fn handle_auth_connection(
             crypto_key: crypto_key.to_vec(),
             udp_port,
             session_id: session_id.clone(),
+            nonce_prefix: nonce_prefix.to_vec(),
         })),
     };
 
     let mut response_data = Vec::new();
     response.encode(&mut response_data)?;
 
-    writer
-        .write_all(&(response_data.len() as u32).to_be_bytes())
-        .await?;
+    writer.write_all(&(response_data.len() as u32).to_be_bytes()).await?;
     writer.write_all(&response_data).await?;
 
     Ok(())
@@ -272,7 +281,7 @@ async fn handle_auth_connection(
 async fn handle_incoming_quic(
     endpoint: Endpoint,
     tx_to_tun: StreamSender,
-    clients_transport_info: Arc<DashMap<String, ClientTransportInfo>>,
+    clients_transport_info: Arc<DashMap<String, Arc<ClientTransportInfo>>>, // <-- Указываем Arc
     quic_router: Arc<DashMap<String, StreamSender>>,
     ip_pool: IpPool,
 ) -> Result<()> {
@@ -296,7 +305,7 @@ async fn handle_incoming_quic(
 async fn handle_connection(
     incoming: Incoming,
     tx_to_tun: StreamSender,
-    clients_transport_info: Arc<DashMap<String, ClientTransportInfo>>, // ИЗМЕНЕНО
+    clients_transport_info: Arc<DashMap<String, Arc<ClientTransportInfo>>>, // ИЗМЕНЕНО
     quic_router: Arc<DashMap<String, StreamSender>>,
     ip_pool: IpPool,
 ) -> Result<()> {
@@ -306,13 +315,16 @@ async fn handle_connection(
 
     let (send_stream, recv_stream) = connection.accept_bi().await?;
 
-    let established_remote_addr = connection.remote_address();
+    let destination_addr = connection.remote_address();
 
     // Ищем клиента по адресу, используем итератор DashMap)
     let client = {
         clients_transport_info
             .iter()
-            .find(|entry| entry.addr == Some(established_remote_addr))
+            .find(|entry| {
+                let addr_lock = entry.addr.read();
+                *addr_lock == Some(destination_addr)
+            })
             .map(|entry| entry.value().clone())
     };
 
@@ -321,7 +333,7 @@ async fn handle_connection(
         None => {
             error!(
                 "QUIC connection established but client VPN IP not resolved from transport info (Final Addr: {}). Connection rejected.",
-                established_remote_addr
+               destination_addr
             );
             connection.close(0u32.into(), b"Transport layer association failed");
             return Err(anyhow::anyhow!("IP not found for QUIC connection"));
@@ -330,7 +342,7 @@ async fn handle_connection(
 
     info!(
         "QUIC session accepted for client VPN IP: {} ({}), SEID: {}",
-        client.assigned_ip, established_remote_addr, client.session_id
+        client.assigned_ip, destination_addr, client.session_id
     );
 
     let (tx_router, mut rx_router) = mpsc::channel::<Bytes>(1024);

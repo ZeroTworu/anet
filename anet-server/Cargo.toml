@@ -21,6 +21,7 @@ quinn = {workspace = true, features = ["rustls", "ring", "aws-lc-rs"]}
 serde = { workspace = true, features = ["derive"] }
 toml = {workspace = true}
 dashmap = "7.0.0-rc2"
+parking_lot = "0.12"
 
 anet-common = { path = "../anet-common"}
 
