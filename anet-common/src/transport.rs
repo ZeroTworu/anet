@@ -1,8 +1,7 @@
-use crate::consts::{NONCE_PREFIX_LEN, NONCE_LEN};
+use crate::consts::{NONCE_LEN, NONCE_PREFIX_LEN};
 use crate::encryption::{Cipher, EncryptionError};
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use bytes::{BufMut, Bytes, BytesMut};
-
 
 /// Упаковывает и шифрует QUIC-пакет с новым протоколом
 pub fn wrap_packet(
@@ -35,11 +34,9 @@ pub fn wrap_packet(
 }
 
 /// Расшифровывает пакет, полученный от сервера
-pub fn unwrap_packet(
-    cipher: &Cipher,
-    raw_packet: &[u8],
-) -> Result<Bytes> {
-    if raw_packet.len() < NONCE_LEN + 1 { // Nonce + минимум 1 байт payload
+pub fn unwrap_packet(cipher: &Cipher, raw_packet: &[u8]) -> Result<Bytes> {
+    if raw_packet.len() < NONCE_LEN + 1 {
+        // Nonce + минимум 1 байт payload
         return Err(anyhow!("Packet too short"));
     }
 
@@ -49,7 +46,8 @@ pub fn unwrap_packet(
     // Расшифровываем
     let plaintext = cipher.decrypt(nonce, Bytes::copy_from_slice(ciphertext))?;
 
-    if plaintext.len() < 8 { // Должен быть как минимум sequence
+    if plaintext.len() < 8 {
+        // Должен быть как минимум sequence
         return Err(anyhow!("Decrypted payload too short"));
     }
 

@@ -1,14 +1,13 @@
+use anet_common::consts::NONCE_PREFIX_LEN;
 use anet_common::encryption::Cipher;
 use anet_common::transport;
-use anet_common::consts::{NONCE_PREFIX_LEN};
 use anet_common::udp_poller::TokioUdpPoller;
 use bytes::Bytes;
-use log::{error, info, warn, debug};
+use log::{debug, error, warn};
 use quinn::{
     AsyncUdpSocket, UdpPoller,
     udp::{RecvMeta, Transmit},
 };
-use rand::RngCore;
 use std::fmt::{Debug, Formatter};
 use std::io;
 use std::net::SocketAddr;
@@ -27,7 +26,11 @@ pub struct AnetUdpSocket {
 }
 
 impl AnetUdpSocket {
-    pub fn new(io: Arc<UdpSocket>, cipher: Arc<Cipher>, nonce_prefix: [u8; NONCE_PREFIX_LEN]) -> Self {
+    pub fn new(
+        io: Arc<UdpSocket>,
+        cipher: Arc<Cipher>,
+        nonce_prefix: [u8; NONCE_PREFIX_LEN],
+    ) -> Self {
         Self {
             io,
             cipher,
@@ -104,7 +107,9 @@ impl AsyncUdpSocket for AnetUdpSocket {
                 // Пытаемся расшифровать
                 match transport::unwrap_packet(&self.cipher, raw_packet) {
                     Ok(quic_payload) => {
-                        if bufs.is_empty() { return Poll::Ready(Ok(0)); }
+                        if bufs.is_empty() {
+                            return Poll::Ready(Ok(0));
+                        }
 
                         let copy_len = std::cmp::min(quic_payload.len(), bufs[0].len());
                         bufs[0][..copy_len].copy_from_slice(&quic_payload[..copy_len]);
@@ -120,7 +125,10 @@ impl AsyncUdpSocket for AnetUdpSocket {
                     }
                     Err(e) => {
                         // Это может быть просто "левый" пакет в сети. Логируем на уровне debug.
-                        debug!("[ANet] Failed to unwrap packet from {}: {}. Dropping.", remote_addr, e);
+                        debug!(
+                            "[ANet] Failed to unwrap packet from {}: {}. Dropping.",
+                            remote_addr, e
+                        );
                         cx.waker().wake_by_ref();
                         Poll::Pending // Сообщаем Tokio, что нужно попробовать снова
                     }
@@ -135,4 +143,3 @@ impl AsyncUdpSocket for AnetUdpSocket {
         self.io.local_addr()
     }
 }
-

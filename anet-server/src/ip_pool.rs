@@ -1,6 +1,6 @@
-use std::collections::HashSet;
+use dashmap::DashSet;
 use std::net::Ipv4Addr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct IpPool {
@@ -9,7 +9,7 @@ pub struct IpPool {
     pub gateway: Ipv4Addr,
     pub server: Ipv4Addr,
     pub mtu: u16,
-    used: Arc<Mutex<HashSet<Ipv4Addr>>>,
+    used: Arc<DashSet<Ipv4Addr>>,
 }
 
 impl IpPool {
@@ -26,7 +26,7 @@ impl IpPool {
             gateway,
             server,
             mtu,
-            used: Arc::new(Mutex::new(HashSet::new())),
+            used: Arc::new(DashSet::new()),
         }
     }
 
@@ -35,8 +35,6 @@ impl IpPool {
         let mask = u32::from(self.netmask);
         let gw = self.gateway;
         let srv = self.server;
-
-        let mut used = self.used.lock().unwrap();
 
         for host in 1..=u32::MAX {
             let candidate = net | host;
@@ -48,18 +46,18 @@ impl IpPool {
             if ip == gw || ip == srv {
                 continue;
             }
-            if used.contains(&ip) {
+            if self.used.contains(&ip) {
                 continue;
             }
 
-            used.insert(ip);
+            self.used.insert(ip);
             return Some(ip);
         }
         None
     }
 
     pub fn release(&self, ip: Ipv4Addr) -> bool {
-        let mut used = self.used.lock().unwrap();
-        used.remove(&ip)
+        self.used.remove(&ip);
+        self.used.contains(&ip)
     }
 }

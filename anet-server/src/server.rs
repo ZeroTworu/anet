@@ -1,7 +1,7 @@
 use crate::config::Config;
 use crate::ip_pool::IpPool;
+use crate::multikey_udp_socket::{ClientTransportInfo, MultiKeyAnetUdpSocket, StreamSender};
 use crate::utils::{extract_ip_dst, generate_crypto_key, generate_seid};
-use crate::multikey_udp_socket::{ClientTransportInfo, StreamSender, MultiKeyAnetUdpSocket};
 use anet_common::atun::TunManager;
 use anet_common::consts::MAX_PACKET_SIZE;
 use anet_common::encryption::Cipher;
@@ -10,29 +10,24 @@ use anet_common::quic_settings::build_transport_config;
 use anet_common::stream_framing::{frame_packet, read_next_packet};
 use anet_common::tun_params::TunParams;
 use anyhow::{Context, Result};
-use base64::{Engine as _, engine::general_purpose};
+use arc_swap::ArcSwapOption;
 use bytes::Bytes;
 use dashmap::DashMap;
 use log::{error, info, warn};
 use prost::Message;
 use quinn::crypto::rustls::QuicServerConfig;
-use quinn::{
-    Endpoint, EndpointConfig, Incoming, ServerConfig as QuinnServerConfig,
-    TokioRuntime,
-};
+use quinn::{Endpoint, EndpointConfig, Incoming, ServerConfig as QuinnServerConfig, TokioRuntime};
+use rand::{RngCore, thread_rng};
 use rustls::ServerConfig as RustlsServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::io::BufReader;
+use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::mpsc;
 use tokio_rustls::TlsAcceptor;
-use rand::{thread_rng, RngCore};
-use parking_lot::RwLock;
-use std::sync::Mutex;
-
 
 pub struct ANetServer {
     cfg: Config,
@@ -43,7 +38,7 @@ pub struct ANetServer {
     clients_by_seid: Arc<DashMap<String, Arc<ClientTransportInfo>>>,
     // Карта [nonce_prefix] -> [ClientInfo] - для O(1) поиска в UDP сокете
     clients_by_prefix: Arc<DashMap<[u8; 4], Arc<ClientTransportInfo>>>,
-    quic_router: Arc<DashMap<String, StreamSender>>
+    quic_router: Arc<DashMap<String, StreamSender>>,
 }
 
 impl ANetServer {
@@ -113,7 +108,7 @@ impl ANetServer {
                     auth_phrase,
                     udp_port,
                 )
-                    .await
+                .await
                 {
                     error!("[{}] Auth connection failed: {}", addr, e);
                 }
@@ -199,8 +194,7 @@ async fn handle_auth_connection(
     clients_by_prefix: Arc<DashMap<[u8; 4], Arc<ClientTransportInfo>>>,
     auth_phrase: String,
     udp_port: u32,
-) -> anyhow::Result<()> {
-
+) -> Result<()> {
     let nonce_prefix: [u8; 4] = {
         let mut rng = thread_rng();
         loop {
@@ -238,13 +232,16 @@ async fn handle_auth_connection(
     let crypto_key = generate_crypto_key();
     let session_id = generate_seid();
 
-    info!("Generated unique nonce prefix {:?} for session {}", nonce_prefix, session_id);
+    info!(
+        "Generated unique nonce prefix {:?} for session {}",
+        nonce_prefix, session_id
+    );
 
     let client_ip_str = assigned_ip.to_string();
 
     let info = Arc::new(ClientTransportInfo {
         cipher: Arc::new(Cipher::new(&crypto_key)),
-        addr: Arc::new(RwLock::new(None)),
+        addr: ArcSwapOption::new(None),
         sequence: Arc::new(AtomicU64::new(0)),
         assigned_ip: client_ip_str.clone(),
         session_id: session_id.clone(),
@@ -272,7 +269,9 @@ async fn handle_auth_connection(
     let mut response_data = Vec::new();
     response.encode(&mut response_data)?;
 
-    writer.write_all(&(response_data.len() as u32).to_be_bytes()).await?;
+    writer
+        .write_all(&(response_data.len() as u32).to_be_bytes())
+        .await?;
     writer.write_all(&response_data).await?;
 
     Ok(())
@@ -322,8 +321,12 @@ async fn handle_connection(
         clients_transport_info
             .iter()
             .find(|entry| {
-                let addr_lock = entry.addr.read();
-                *addr_lock == Some(destination_addr)
+                let current_addr = entry.addr.load();
+                // ArcSwapOption возвращает Arc<Option<T>>, поэтому нужно разыменовать
+                match &*current_addr {
+                    Some(addr) => *addr.deref() == destination_addr,
+                    None => false,
+                }
             })
             .map(|entry| entry.value().clone())
     };
@@ -333,7 +336,7 @@ async fn handle_connection(
         None => {
             error!(
                 "QUIC connection established but client VPN IP not resolved from transport info (Final Addr: {}). Connection rejected.",
-               destination_addr
+                destination_addr
             );
             connection.close(0u32.into(), b"Transport layer association failed");
             return Err(anyhow::anyhow!("IP not found for QUIC connection"));
@@ -462,9 +465,7 @@ async fn route_tun_to_quic(
             }
         };
 
-        let sender_opt = {
-            quic_router.get(&dst_ip)
-        };
+        let sender_opt = { quic_router.get(&dst_ip) };
 
         if let Some(sender) = sender_opt {
             match sender.send(packet).await {
@@ -477,7 +478,10 @@ async fn route_tun_to_quic(
             warn!(
                 "Dropping packet to {}: no active QUIC session. Available sessions: {:?}",
                 dst_ip,
-                quic_router.iter().map(|val| val.key().clone()).collect::<Vec<_>>()
+                quic_router
+                    .iter()
+                    .map(|val| val.key().clone())
+                    .collect::<Vec<_>>()
             );
         }
     }
@@ -485,10 +489,7 @@ async fn route_tun_to_quic(
     Ok(())
 }
 
-fn load_rustls_config_for_auth(
-    cert_pem: &str,
-    key_pem: &str,
-) -> anyhow::Result<RustlsServerConfig> {
+fn load_rustls_config_for_auth(cert_pem: &str, key_pem: &str) -> Result<RustlsServerConfig> {
     let mut cert_reader = BufReader::new(cert_pem.as_bytes());
     let certs = rustls_pemfile::certs(&mut cert_reader)
         .collect::<std::result::Result<Vec<CertificateDer>, std::io::Error>>()

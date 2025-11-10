@@ -1,13 +1,11 @@
-use crate::config::{Config, load};
 use crate::client_udp_socket::AnetUdpSocket;
+use crate::config::{Config, load};
 use anet_common::atun::TunManager;
 use anet_common::encryption::Cipher;
 use anet_common::protocol::{AuthRequest, AuthResponse, Message as AnetMessage, message::Content};
 use anet_common::quic_settings::build_transport_config;
 use anet_common::stream_framing::{frame_packet, read_next_packet};
 use anyhow::{Context, Result};
-use base64::Engine;
-use base64::engine::general_purpose;
 use bytes::Bytes;
 use log::{error, info, warn};
 use prost::Message;
@@ -126,7 +124,8 @@ impl ANetClient {
         let cipher = Arc::new(Cipher::new(&auth_response.crypto_key));
 
         // Получаем nonce_prefix из ответа аутентификации
-        let nonce_prefix: [u8; 4] = auth_response.nonce_prefix
+        let nonce_prefix: [u8; 4] = auth_response
+            .nonce_prefix
             .as_slice()
             .try_into()
             .context("Invalid nonce_prefix length from server")?;
@@ -300,18 +299,4 @@ async fn connect_with_backoff(server_addr: &str) -> Result<TcpStream> {
             }
         }
     }
-}
-
-fn decode_session_id(session_id: &str) -> Result<[u8; 16]> {
-    let decoded = general_purpose::STANDARD
-        .decode(session_id)
-        .context("Failed to decode session_id from base64")?;
-
-    if decoded.len() != 16 {
-        return Err(anyhow::anyhow!("Invalid session_id length"));
-    }
-
-    let mut session_id_bytes = [0u8; 16];
-    session_id_bytes.copy_from_slice(&decoded);
-    Ok(session_id_bytes)
 }

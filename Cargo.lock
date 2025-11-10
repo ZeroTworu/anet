@@ -76,7 +76,6 @@ version = "0.1.0"
 dependencies = [
  "anet-common",
  "anyhow",
- "base64",
  "bytes",
  "chrono",
  "clap",
@@ -84,7 +83,6 @@ dependencies = [
  "log",
  "prost",
  "quinn",
- "rand 0.9.2",
  "rustls",
  "rustls-pemfile",
  "serde",
@@ -106,7 +104,6 @@ dependencies = [
  "prost",
  "prost-build",
  "quinn",
- "rand 0.9.2",
  "serde",
  "tokio",
  "tun",
@@ -118,6 +115,7 @@ version = "0.1.0"
 dependencies = [
  "anet-common",
  "anyhow",
+ "arc-swap",
  "base64",
  "bytes",
  "chacha20poly1305",
@@ -125,7 +123,6 @@ dependencies = [
  "dashmap",
  "env_logger",
  "log",
- "parking_lot",
  "prost",
  "quinn",
  "rand 0.8.5",
@@ -192,6 +189,12 @@ name = "anyhow"
 version = "1.0.99"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b0674a1ddeecb70197781e945de4b3b8ffb61fa939a5597bcf48503737663100"
+
+[[package]]
+name = "arc-swap"
+version = "1.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "69f7f8c3906b62b754cd5326047894316021dcfe5a194c8ea52bdd94934a3457"
 
 [[package]]
 name = "async-channel"

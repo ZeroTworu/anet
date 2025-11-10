@@ -24,15 +24,8 @@ pub struct AuthResponse {
     pub nonce_prefix: ::prost::alloc::vec::Vec<u8>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct UdpHandshake {
-    #[prost(string, tag = "1")]
-    pub client_id: ::prost::alloc::string::String,
-    #[prost(uint64, tag = "2")]
-    pub timestamp: u64,
-}
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Message {
-    #[prost(oneof = "message::Content", tags = "1, 2, 3")]
+    #[prost(oneof = "message::Content", tags = "1, 2")]
     pub content: ::core::option::Option<message::Content>,
 }
 /// Nested message and enum types in `Message`.
@@ -43,7 +36,5 @@ pub mod message {
         AuthRequest(super::AuthRequest),
         #[prost(message, tag = "2")]
         AuthResponse(super::AuthResponse),
-        #[prost(message, tag = "3")]
-        UdpHandshake(super::UdpHandshake),
     }
 }

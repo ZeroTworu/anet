@@ -17,15 +17,9 @@ message AuthResponse {
     bytes nonce_prefix = 8;
 }
 
-message UdpHandshake {
-    string client_id = 1;
-    uint64 timestamp = 2; 
-}
-
 message Message {
     oneof content {
         AuthRequest auth_request = 1;
         AuthResponse auth_response = 2;
-        UdpHandshake udp_handshake = 3;
     }
 }
