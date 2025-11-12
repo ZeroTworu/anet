@@ -108,27 +108,26 @@ async fn main() -> Result<()> {
         }
     };
 
-    let tun_params = TunParams::from_auth_response(&auth_response, "anet-client");
-    let tun_manager = TunManager::new(tun_params);
-    let mut tun_manager = match tun_manager {
-        Ok(tun_manager) => tun_manager,
-        Err(e) => {
-            error!("Error on create TunManager: {}", e);
-            loop {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-        }
-    };
 
-    let (tx_to_tun, rx_from_tun) = tun_manager.run().await?;
+    // let mut tun_manager = match tun_manager {
+    //     Ok(tun_manager) => tun_manager,
+    //     Err(e) => {
+    //         error!("Error on create TunManager: {}", e);
+    //         loop {
+    //             tokio::time::sleep(Duration::from_secs(1)).await;
+    //         }
+    //     }
+    // };
 
-    let _tun_index = tun_manager.get_tun_index();
+    // let (tx_to_tun, rx_from_tun) = tun_manager.run().await?;
+    //
+    // let _tun_index = tun_manager.get_tun_index();
     #[cfg(unix)]
     let mut linux_router = LinuxRouteManager::new(&auth_response.gateway.as_str(), server_ip_str);
 
-    #[cfg(windows)]
-    let mut windows_router =
-        WindowsRouteManager::new(&auth_response.gateway.as_str(), server_ip_str, _tun_index);
+    // #[cfg(windows)]
+    // let mut windows_router =
+    //     WindowsRouteManager::new(&auth_response.gateway.as_str(), server_ip_str, _tun_index);
 
     #[cfg(unix)]
     {
@@ -147,7 +146,7 @@ async fn main() -> Result<()> {
 
     // ПЕРЕДАЧА DH КЛЮЧА В QUIC
     let endpoint = client
-        .run_quic_vpn(&auth_response, tx_to_tun, rx_from_tun, shared_key)
+        .run_quic_vpn(&auth_response, shared_key)
         .await;
 
     match endpoint {
@@ -165,8 +164,8 @@ async fn main() -> Result<()> {
             #[cfg(unix)]
             linux_router.restore_original_routing();
 
-            #[cfg(windows)]
-            windows_router.restore_original_routing();
+            // #[cfg(windows)]
+            // windows_router.restore_original_routing();
 
             info!("Shutdown");
             Ok(())
@@ -176,8 +175,8 @@ async fn main() -> Result<()> {
 
             #[cfg(unix)]
             linux_router.restore_original_routing();
-            #[cfg(windows)]
-            windows_router.restore_original_routing();
+            // #[cfg(windows)]
+            // windows_router.restore_original_routing();
 
             loop {
                 tokio::time::sleep(Duration::from_secs(1)).await;

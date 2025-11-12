@@ -60,11 +60,18 @@ jobs:
       # 4. Устанавливаем версию для передачи в компилятор
       - name: Set Release Version (for ISCC Define)
         shell: bash
-        # Извлекаем версию из тега (убираем 'v' в начале)
         run: |
-          VERSION=${GITHUB_REF#refs/tags/v}
-          echo "VERSION_ARG=/DMyAppVersion=$VERSION" >> $GITHUB_ENV
-          echo "Version set to: $VERSION"
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            # Для тегов: убираем 'v' в начале
+            VERSION=${GITHUB_REF#refs/tags/v}
+          else
+            # Для веток: берем только последнюю часть после '/'
+            VERSION=${GITHUB_REF##*/}
+          fi
+          # Очищаем версию от недопустимых символов
+          CLEAN_VERSION=$(echo "$VERSION" | sed 's/[\/\\:*?"<>|]/-/g')
+          echo "VERSION_ARG=/DMyAppVersion=$CLEAN_VERSION" >> $GITHUB_ENV
+          echo "Clean version set to: $CLEAN_VERSION"
 
       - name: Compile Inno Setup Installer (using ISCC.exe)
         shell: cmd

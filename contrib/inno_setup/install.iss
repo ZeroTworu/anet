@@ -48,7 +48,7 @@ Source: "client.toml"; DestDir: "{userappdata}\anet"; DestName: "default.toml"; 
 ; --- Icons/Shortcuts Section ---
 [Icons]
 ; 1. Ярлык запуска клиента (Меню Пуск). Клиент будет использовать UAC благодаря Реестру.
-Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Parameters: "-c ""{userappdata}\anet\default.toml"""; IconFilename: "{app}\anet.ico
+Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Parameters: "-c ""{userappdata}\anet\default.toml"""; IconFilename: "{app}\anet.ico"
 
 ; 1. Ярлык запуска клиента (Рабочий стол).
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Parameters: "-c ""{userappdata}\anet\default.toml"""; IconFilename: "{app}\anet.ico"; Tasks: desktopicon

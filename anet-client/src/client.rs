@@ -34,6 +34,8 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
 use x25519_dalek::{PublicKey, StaticSecret};
+use anet_common::atun::TunManager;
+use anet_common::tun_params::TunParams;
 
 const MAX_RETRIES: u32 = 10;
 const INITIAL_DELAY: u64 = 5;
@@ -399,8 +401,6 @@ impl ANetClient {
     pub async fn run_quic_vpn(
         &self,
         auth_response: &AuthResponse,
-        tx_to_tun: mpsc::Sender<Bytes>,
-        mut rx_from_tun: mpsc::Receiver<Bytes>,
         shared_key: [u8; 32],
     ) -> Result<Endpoint> {
         let config_result = load().await?;
@@ -456,6 +456,19 @@ impl ANetClient {
 
         let (send_stream, recv_stream) = connection.open_bi().await?;
         info!("Opened bidirectional QUIC stream for VPN traffic.");
+        let tun_params = TunParams::from_auth_response(&auth_response, "anet-client");
+        let mut tun_manager = TunManager::new(tun_params)?;
+        let (tx_to_tun, mut rx_from_tun) = tun_manager.run().await?;
+
+
+        // #[cfg(windows)]
+        // {
+        //     let server_ip_str = self.server_addr.split(':').next().unwrap().to_string();
+        //     let tun_index = tun_manager.get_tun_index();
+        //     let mut windows_router =
+        //         crate::windows_router::WindowsRouteManager::new(&auth_response.gateway.as_str(), server_ip_str, tun_index);
+        //     windows_router.setup_vpn_routing()?;
+        // }
 
         // Задача: чтение из TUN и отправка в QUIC
         let mut quic_sender = send_stream;
