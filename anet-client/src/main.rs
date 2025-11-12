@@ -10,8 +10,6 @@ use std::time::Duration;
 
 #[cfg(windows)]
 use anet_client::windows_router::WindowsRouteManager;
-use anet_common::atun::TunManager;
-use anet_common::tun_params::TunParams;
 
 fn generate_ascii_art(build_type: &str, commit_hash: &str, build_time: &str) -> String {
     // Обрезаем строки до нужной длины, чтобы они помещались в рамку
@@ -113,7 +111,7 @@ async fn main() -> Result<()> {
     let mut linux_router = LinuxRouteManager::new(&auth_response.gateway.as_str(), server_ip_str);
 
     #[cfg(windows)]
-    let windows_router = WindowsRouteManager::new(server_ip_str.clone());
+    let mut windows_router = WindowsRouteManager::new(server_ip_str.clone());
 
     #[cfg(unix)]
     {
