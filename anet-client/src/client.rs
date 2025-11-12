@@ -412,7 +412,6 @@ impl ANetClient {
         let remote_addr: SocketAddr = self.server_addr.parse()?;
         let real_socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
 
-        // Используем DH-derived shared_key
         let cipher = Arc::new(Cipher::new(&shared_key));
 
         let nonce_prefix: [u8; 4] = auth_response
@@ -437,42 +436,39 @@ impl ANetClient {
         endpoint.set_default_client_config(client_config);
 
         info!(
-            "Connecting to QUIC endpoint [{}] via ANET transport...",
-            remote_addr
-        );
+        "Connecting to QUIC endpoint [{}] via ANET transport...",
+        remote_addr
+    );
 
         let server_name = ServerName::try_from("alco").expect("Invalid server name");
-
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
         let connection = endpoint
             .connect(remote_addr, server_name.to_str().deref())?
             .await?;
         info!(
-            "QUIC connection established with {}, SEID: {}",
-            connection.remote_address(),
-            auth_response.session_id,
-        );
+        "QUIC connection established with {}, SEID: {}",
+        connection.remote_address(),
+        auth_response.session_id,
+    );
 
         let (send_stream, recv_stream) = connection.open_bi().await?;
         info!("Opened bidirectional QUIC stream for VPN traffic.");
+
+        // Создаем TUN интерфейс
         let tun_params = TunParams::from_auth_response(&auth_response, "anet-client");
-        let mut tun_manager = TunManager::new(tun_params)?;
+        let tun_manager = TunManager::new(tun_params);
+        let mut tun_manager = match tun_manager {
+            Ok(tun_manager) => tun_manager,
+            Err(e) => {
+                error!("Error creating TunManager: {}", e);
+                return Err(e);
+            }
+        };
+
         let (tx_to_tun, mut rx_from_tun) = tun_manager.run().await?;
 
-
-        // #[cfg(windows)]
-        // {
-        //     let server_ip_str = self.server_addr.split(':').next().unwrap().to_string();
-        //     let tun_index = tun_manager.get_tun_index();
-        //     let mut windows_router =
-        //         crate::windows_router::WindowsRouteManager::new(&auth_response.gateway.as_str(), server_ip_str, tun_index);
-        //     windows_router.setup_vpn_routing()?;
-        // }
-
-        // Задача: чтение из TUN и отправка в QUIC
+        // Задачи для обработки трафика TUN <-> QUIC
         let mut quic_sender = send_stream;
-
         tokio::spawn(async move {
             while let Some(packet) = rx_from_tun.recv().await {
                 if packet.len() < 20 {

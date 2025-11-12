@@ -95,7 +95,7 @@ async fn main() -> Result<()> {
 
     let server_ip_str = cfg.main.address.split(':').next().unwrap().to_string();
 
-    // --- DH АУТЕНТИФИКАЦИЯ (Возвращает (AuthResponse, SharedKey)) ---
+    // --- DH АУТЕНТИФИКАЦИЯ ---
     let auth_result = client.authenticate().await;
 
     let (auth_response, shared_key) = match auth_result {
@@ -108,26 +108,12 @@ async fn main() -> Result<()> {
         }
     };
 
-
-    // let mut tun_manager = match tun_manager {
-    //     Ok(tun_manager) => tun_manager,
-    //     Err(e) => {
-    //         error!("Error on create TunManager: {}", e);
-    //         loop {
-    //             tokio::time::sleep(Duration::from_secs(1)).await;
-    //         }
-    //     }
-    // };
-
-    // let (tx_to_tun, rx_from_tun) = tun_manager.run().await?;
-    //
-    // let _tun_index = tun_manager.get_tun_index();
+    // Настройка маршрутизации ДО создания TUN
     #[cfg(unix)]
     let mut linux_router = LinuxRouteManager::new(&auth_response.gateway.as_str(), server_ip_str);
 
-    // #[cfg(windows)]
-    // let mut windows_router =
-    //     WindowsRouteManager::new(&auth_response.gateway.as_str(), server_ip_str, _tun_index);
+    #[cfg(windows)]
+    let windows_router = WindowsRouteManager::new(server_ip_str.clone());
 
     #[cfg(unix)]
     {
@@ -135,16 +121,14 @@ async fn main() -> Result<()> {
         linux_router.setup_vpn_routing()?;
     }
 
-    // #[cfg(windows)]
-    // {
-    //     windows_router.setup_vpn_routing()?;
-    //     // ВИНДОКАСТЫЛЬ!
-    //     info!("Waiting for routing to stabilize...");
-    //     tokio::time::sleep(Duration::from_secs(5)).await;
-    // }
+    #[cfg(windows)]
+    {
+        windows_router.setup_exclusion_route()?;
+        info!("Exclusion route configured, waiting for stability...");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
 
-
-    // ПЕРЕДАЧА DH КЛЮЧА В QUIC
+    // Создаем TUN и запускаем QUIC
     let endpoint = client
         .run_quic_vpn(&auth_response, shared_key)
         .await;
@@ -164,8 +148,8 @@ async fn main() -> Result<()> {
             #[cfg(unix)]
             linux_router.restore_original_routing();
 
-            // #[cfg(windows)]
-            // windows_router.restore_original_routing();
+            #[cfg(windows)]
+            windows_router.restore_routing()?;
 
             info!("Shutdown");
             Ok(())
@@ -175,8 +159,9 @@ async fn main() -> Result<()> {
 
             #[cfg(unix)]
             linux_router.restore_original_routing();
-            // #[cfg(windows)]
-            // windows_router.restore_original_routing();
+
+            #[cfg(windows)]
+            windows_router.restore_routing()?;
 
             loop {
                 tokio::time::sleep(Duration::from_secs(1)).await;
