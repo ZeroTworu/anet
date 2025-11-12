@@ -1,16 +1,13 @@
 use crate::client_udp_socket::AnetUdpSocket;
 use crate::config::{Config, load};
-use anet_common::atun::TunManager;
-use anet_common::consts::{
-    AUTH_PREFIX_LEN, MAX_PACKET_SIZE, NONCE_LEN,
-};
+use anet_common::consts::{AUTH_PREFIX_LEN, MAX_PACKET_SIZE, NONCE_LEN};
 use anet_common::crypto_utils::{
     derive_shared_key, generate_auth_prefix, generate_key_fingerprint, sign_data,
 };
 use anet_common::encryption::Cipher;
 use anet_common::protocol::{
-    AuthRequest, AuthResponse, DhClientExchange, EncryptedAuthRequest,
-    EncryptedAuthResponse, Message as AnetMessage, message::Content,
+    AuthRequest, AuthResponse, DhClientExchange, EncryptedAuthRequest, EncryptedAuthResponse,
+    Message as AnetMessage, message::Content,
 };
 use anet_common::quic_settings::build_transport_config;
 use anet_common::stream_framing::{frame_packet, read_next_packet};
@@ -34,6 +31,7 @@ use std::ops::Deref;
 use std::{sync::Arc, time::Duration};
 use tokio::io::AsyncWriteExt;
 use tokio::net::UdpSocket;
+use tokio::sync::mpsc;
 use tokio::time::sleep;
 use x25519_dalek::{PublicKey, StaticSecret};
 
@@ -401,7 +399,8 @@ impl ANetClient {
     pub async fn run_quic_vpn(
         &self,
         auth_response: &AuthResponse,
-        tun_manager: &TunManager,
+        tx_to_tun: mpsc::Sender<Bytes>,
+        mut rx_from_tun: mpsc::Receiver<Bytes>,
         shared_key: [u8; 32],
     ) -> Result<Endpoint> {
         let config_result = load().await?;
@@ -457,8 +456,6 @@ impl ANetClient {
 
         let (send_stream, recv_stream) = connection.open_bi().await?;
         info!("Opened bidirectional QUIC stream for VPN traffic.");
-
-        let (tx_to_tun, mut rx_from_tun) = tun_manager.run().await?;
 
         // Задача: чтение из TUN и отправка в QUIC
         let mut quic_sender = send_stream;

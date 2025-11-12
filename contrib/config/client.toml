@@ -3,13 +3,13 @@
 # Адрес и порт TCP аутентификации сервера.
 address = "127.0.0.1:8445"
 tun_name = "anet-client"
-# Секретная фраза для аутентификации на сервере.
-auth_phrase = "some_secure_phrase"
 
-server_pub_key = "ecfNEF2kYJ4kjyUqlI8HbjZaAnPBmsSVequuoxjZppk="  # Опционально, для верификации сервера
+# Опционально, для верификации сервера
+server_pub_key = "ecfNEF2kYJ4kjyUqlI8HbjZaAnPBmsSVequuoxjZppk="
 
+# Личный ключ клиента
 [keys]
-private_key = "kvVlquSITdebNk989+GhF7no7QXMGW7i2lJtq4CdH9k="  # Личный ключ клиента
+private_key = "kvVlquSITdebNk989+GhF7no7QXMGW7i2lJtq4CdH9k="
 
 # =========================================================================
 # Настройки транспорта QUIC (Quinn Transport Configuration)
@@ -35,13 +35,13 @@ bandwidth_mbps = 200
 # Это максимальное количество данных, которое мы готовы принять на одном QUIC Stream
 # до получения подтверждения о готовности обработать еще данные (для Flow Control).
 # Если установлено в 0, вычисляется автоматически на основе expected_rtt_ms и bandwidth_mbps.
-stream_receive_window = 209715200 # 200 MiB
+stream_receive_window = 0
 
 # Максимальный размер общего окна приема для всего QUIC соединения (в байтах).
 # Должно быть в несколько раз больше stream_receive_window. Ограничивает общий буфер
 # приема для всех активных QUIC потоков.
 # Если установлено в 0, вычисляется автоматически на основе stream_receive_window.
-receive_window = 838860800        # 800 MiB
+receive_window = 0
 
 # Включить сегментацию offload (GSO/UFO). Позволяет сетевой карте
 # обрабатывать сегментацию больших QUIC пакетов (если поддерживается ядром и железом).

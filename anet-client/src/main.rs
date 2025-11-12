@@ -2,12 +2,11 @@ include!(concat!(env!("OUT_DIR"), "/built.rs"));
 
 use anet_client::client::ANetClient;
 use anet_client::config::load;
+#[cfg(unix)]
+use anet_client::linux_router::LinuxRouteManager;
 use anyhow::Result;
 use log::{error, info, warn};
 use std::time::Duration;
-
-#[cfg(unix)]
-use anet_client::linux_router::LinuxRouteManager;
 
 #[cfg(windows)]
 use anet_client::windows_router::WindowsRouteManager;
@@ -109,11 +108,9 @@ async fn main() -> Result<()> {
         }
     };
 
-
-
     let tun_params = TunParams::from_auth_response(&auth_response, "anet-client");
     let tun_manager = TunManager::new(tun_params);
-    let tun_manager = match tun_manager {
+    let mut tun_manager = match tun_manager {
         Ok(tun_manager) => tun_manager,
         Err(e) => {
             error!("Error on create TunManager: {}", e);
@@ -122,17 +119,16 @@ async fn main() -> Result<()> {
             }
         }
     };
-    let tun_index = tun_manager.get_tun_index();
+
+    let (tx_to_tun, rx_from_tun) = tun_manager.run().await?;
+
+    let _tun_index = tun_manager.get_tun_index();
     #[cfg(unix)]
     let mut linux_router = LinuxRouteManager::new(&auth_response.gateway.as_str(), server_ip_str);
 
     #[cfg(windows)]
     let mut windows_router =
-        WindowsRouteManager::new(
-            &auth_response.gateway.as_str(),
-            server_ip_str,
-            tun_index,
-        );
+        WindowsRouteManager::new(&auth_response.gateway.as_str(), server_ip_str, _tun_index);
 
     #[cfg(unix)]
     {
@@ -140,12 +136,18 @@ async fn main() -> Result<()> {
         linux_router.setup_vpn_routing()?;
     }
 
-    #[cfg(windows)]
-    windows_router.setup_vpn_routing()?;
+    // #[cfg(windows)]
+    // {
+    //     windows_router.setup_vpn_routing()?;
+    //     // ВИНДОКАСТЫЛЬ!
+    //     info!("Waiting for routing to stabilize...");
+    //     tokio::time::sleep(Duration::from_secs(5)).await;
+    // }
+
 
     // ПЕРЕДАЧА DH КЛЮЧА В QUIC
     let endpoint = client
-        .run_quic_vpn(&auth_response, &tun_manager, shared_key)
+        .run_quic_vpn(&auth_response, tx_to_tun, rx_from_tun, shared_key)
         .await;
 
     match endpoint {

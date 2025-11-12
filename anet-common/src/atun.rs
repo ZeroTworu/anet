@@ -4,69 +4,84 @@ use anyhow::{Context, Result};
 use bytes::Bytes;
 use log::{error, info};
 use std::net::Ipv4Addr;
-use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
-use tokio::sync::{Mutex, mpsc};
-use tun::{AbstractDevice, AsyncDevice};
+use tokio::sync::mpsc;
+use tun::AbstractDevice;
+
+#[derive(Debug)]
+pub struct TunChannels {
+    pub tx_to_tun: mpsc::Sender<Bytes>,
+    pub rx_from_tun: mpsc::Receiver<Bytes>,
+    pub tun_index: Option<u32>,
+}
+
+impl TunChannels {
+    pub fn new(
+        tx_to_tun: mpsc::Sender<Bytes>,
+        rx_from_tun: mpsc::Receiver<Bytes>,
+        tun_index: Option<u32>,
+    ) -> Self {
+        Self {
+            tx_to_tun,
+            rx_from_tun,
+            tun_index,
+        }
+    }
+}
 
 pub struct TunManager {
-    reader: Arc<Mutex<ReadHalf<AsyncDevice>>>,
-    writer: Arc<Mutex<WriteHalf<AsyncDevice>>>,
     params: TunParams,
-    tun_index: u32,
+    tun_index: Option<u32>,
 }
 
 impl Clone for TunManager {
     fn clone(&self) -> Self {
         Self {
-            reader: Arc::clone(&self.reader),
-            writer: Arc::clone(&self.writer),
             params: self.params.clone(),
-            tun_index: self.tun_index,
+            tun_index: self.tun_index.clone(),
         }
     }
 }
 
 impl TunManager {
     pub fn new(params: TunParams) -> Result<Self> {
-        let config = params.create_config()?;
-        let device = tun::create_as_async(&config).context("Failed to create async TUN device")?;
-        let tun_index = device.tun_index()? as u32;
-        let (reader, writer) = tokio::io::split(device);
-        info!("Created TUN with: [{}]", params.get_info());
         Ok(Self {
-            reader: Arc::new(Mutex::new(reader)),
-            writer: Arc::new(Mutex::new(writer)),
             params,
-            tun_index,
+            tun_index: None,
         })
     }
 
     pub fn get_tun_index(&self) -> u32 {
-        self.tun_index
+        if self.tun_index.is_none() {
+            error!("Attempted to get tun index from a not created device!");
+            return 0;
+        }
+        self.tun_index.unwrap()
     }
 
-    pub async fn run(&self) -> Result<(mpsc::Sender<Bytes>, mpsc::Receiver<Bytes>)> {
+    pub async fn run(&mut self) -> Result<(mpsc::Sender<Bytes>, mpsc::Receiver<Bytes>)> {
         let (tx_to_tun, mut rx_to_tun) = mpsc::channel::<Bytes>(CHANNEL_BUFFER_SIZE);
         let (tx_from_tun, rx_from_tun) = mpsc::channel::<Bytes>(CHANNEL_BUFFER_SIZE);
 
-        let reader_clone = Arc::clone(&self.reader);
-        let writer_clone = Arc::clone(&self.writer);
+        let config = self.params.create_config()?;
+        let device = tun::create_as_async(&config).context("Failed to create async TUN device")?;
+        self.tun_index = Some(device.tun_index()? as u32);
+        let (mut reader, mut writer) = tokio::io::split(device);
+
+        info!("Created TUN with: [{}]", self.params.get_info());
 
         // Задача для чтения из TUN
         tokio::spawn(async move {
             let mut buffer = vec![0u8; MAX_PACKET_SIZE];
             loop {
-                let mut reader_guard = reader_clone.lock().await;
-                match reader_guard.read(&mut buffer).await {
+                match reader.read(&mut buffer).await {
                     Ok(0) => {
                         info!("TUN reader stream ended.");
                         break;
                     }
                     Ok(n) => {
                         let packet = Bytes::copy_from_slice(&buffer[..n]);
-                        drop(reader_guard); // Освобождаем мьютекс перед отправкой
                         if let Err(e) = tx_from_tun.send(packet).await {
                             error!("Failed send to channel, error: {}", e);
                             break;
@@ -83,8 +98,7 @@ impl TunManager {
         // Задача для записи в TUN
         tokio::spawn(async move {
             while let Some(packet) = rx_to_tun.recv().await {
-                let mut writer_guard = writer_clone.lock().await;
-                if let Err(e) = writer_guard.write_all(&packet).await {
+                if let Err(e) = writer.write_all(&packet).await {
                     error!("Failed to write to TUN: {}, bytes: {:?}", e, packet);
                     break;
                 }
@@ -94,7 +108,7 @@ impl TunManager {
         Ok((tx_to_tun, rx_from_tun))
     }
 
-    pub async fn setup_tun_routing(&self, external: &str) -> anyhow::Result<()> {
+    pub async fn setup_server_tun_routing(&self, external: &str) -> Result<()> {
         if self.params.network.is_none() {
             // Мы - не сервер.
             return Ok(());

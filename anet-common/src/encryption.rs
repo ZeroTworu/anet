@@ -1,10 +1,11 @@
 use aead::{Aead, KeyInit, Nonce};
 use aes_gcm::Key;
+// use aes_gcm::Aes256Gcm;
 use bytes::Bytes;
 use chacha20poly1305::ChaCha20Poly1305;
 use std::sync::Arc;
 
-// Заменить на `ChaCha20Poly1305` при необходимости.
+// Заменить на `ChaCha20Poly1305` / `Aes256Gcm` при необходимости.
 type CryptoAlgorithm = ChaCha20Poly1305;
 
 #[derive(Clone)]

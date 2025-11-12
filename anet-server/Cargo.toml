@@ -25,3 +25,7 @@ arc-swap = "1.6"
 ed25519-dalek = {workspace = true}
 
 anet-common = { path = "../anet-common"}
+
+[[bin]]
+name = "anet-server"
+path = "src/main.rs"

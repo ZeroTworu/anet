@@ -25,3 +25,8 @@ anet-common = { path = "../anet-common"}
 
 [build-dependencies]
 chrono = "0.4.42"
+
+[[bin]]
+name = "anet-client"
+path = "src/main.rs"
+

@@ -41,7 +41,6 @@ pub struct ClientTransportInfo {
     pub session_id: String,
     pub nonce_prefix: [u8; 4],
     pub remote_addr: ArcSwap<SocketAddr>,
-    pub client_fingerprint: String,
 }
 
 pub type HandshakeData = (Bytes, SocketAddr);
@@ -49,33 +48,25 @@ pub type HandshakeData = (Bytes, SocketAddr);
 pub struct MultiKeyAnetUdpSocket {
     io: Arc<UdpSocket>,
     // Используются в handle_connection/cleanup
-    clients_by_seid: Arc<DashMap<String, Arc<ClientTransportInfo>>>,
     // O(1) для приема QUIC
     clients_by_prefix: Arc<DashMap<[u8; 4], Arc<ClientTransportInfo>>>,
     // O(1) для отправки QUIC
     clients_by_addr: Arc<DashMap<SocketAddr, Arc<ClientTransportInfo>>>,
-    // Временное хранилище DH ключей (Auth State)
-    pub temp_dh_map: Arc<DashMap<SocketAddr, TempDHInfo>>,
-
     auth_tx: mpsc::Sender<HandshakeData>,
 }
 
 impl MultiKeyAnetUdpSocket {
     pub fn new(
         io: Arc<UdpSocket>,
-        clients_by_seid: Arc<DashMap<String, Arc<ClientTransportInfo>>>,
         clients_by_prefix: Arc<DashMap<[u8; 4], Arc<ClientTransportInfo>>>,
         clients_by_addr: Arc<DashMap<SocketAddr, Arc<ClientTransportInfo>>>,
         auth_tx: mpsc::Sender<HandshakeData>,
-        temp_dh_map: Arc<DashMap<SocketAddr, TempDHInfo>>,
     ) -> Self {
         Self {
             io,
-            clients_by_seid,
             clients_by_prefix,
             clients_by_addr,
             auth_tx,
-            temp_dh_map,
         }
     }
 }

@@ -33,7 +33,6 @@ pub struct ANetServer {
     cfg: Config,
     ip_pool: IpPool,
     tun_manager: TunManager,
-    clients_by_seid: Arc<DashMap<String, Arc<ClientTransportInfo>>>,
     clients_by_prefix: Arc<DashMap<[u8; 4], Arc<ClientTransportInfo>>>,
     clients_by_addr: Arc<DashMap<SocketAddr, Arc<ClientTransportInfo>>>,
     temp_dh_map: Arc<DashMap<SocketAddr, TempDHInfo>>,
@@ -75,7 +74,6 @@ impl ANetServer {
         Ok(Self {
             cfg: cfg.clone(),
             ip_pool,
-            clients_by_seid: Arc::new(DashMap::new()),
             clients_by_prefix: Arc::new(DashMap::new()),
             clients_by_addr: Arc::new(DashMap::new()),
             temp_dh_map: Arc::new(DashMap::new()),
@@ -86,11 +84,11 @@ impl ANetServer {
         })
     }
 
-    pub async fn run(&self) -> anyhow::Result<()> {
+    pub async fn run(&mut self) -> anyhow::Result<()> {
         self.run_unified_vpn_server().await
     }
 
-    async fn run_unified_vpn_server(&self) -> Result<()> {
+    async fn run_unified_vpn_server(&mut self) -> Result<()> {
         let listen_addr = &self.cfg.server.bind_to;
 
         let real_socket = Arc::new(UdpSocket::bind(listen_addr).await?);
@@ -99,10 +97,9 @@ impl ANetServer {
             "Unified UDP listener (Auth/QUIC) started on {}",
             listen_addr
         );
-
         let (tx_to_tun, rx_from_tun) = self.tun_manager.run().await?;
         self.tun_manager
-            .setup_tun_routing(self.cfg.server.external_if.as_str())
+            .setup_server_tun_routing(self.cfg.server.external_if.as_str())
             .await?;
 
         // Создание канала для Auth трафика
@@ -111,11 +108,9 @@ impl ANetServer {
         // Инициализация диспетчера MultiKeyAnetUdpSocket
         let anet_socket = Arc::new(MultiKeyAnetUdpSocket::new(
             real_socket.clone(),
-            self.clients_by_seid.clone(),
             self.clients_by_prefix.clone(),
             self.clients_by_addr.clone(),
             tx_to_auth,
-            self.temp_dh_map.clone(),
         ));
 
         // Подъем QUINN Endpoints
@@ -130,7 +125,6 @@ impl ANetServer {
         let incoming_quic_task = tokio::spawn(handle_incoming_quic(
             endpoint.clone(),
             tx_to_tun.clone(),
-            self.clients_by_seid.clone(),
             self.quic_router.clone(),
             self.ip_pool.clone(),
             self.clients_by_prefix.clone(),
@@ -143,7 +137,6 @@ impl ANetServer {
             rx_from_auth,
             real_socket.clone(),
             self.ip_pool.clone(),
-            self.clients_by_seid.clone(),
             self.clients_by_prefix.clone(),
             self.clients_by_addr.clone(),
             self.temp_dh_map.clone(),
@@ -189,7 +182,6 @@ impl ANetServer {
 async fn handle_incoming_quic(
     endpoint: Endpoint,
     tx_to_tun: StreamSender,
-    clients_by_seid: Arc<DashMap<String, Arc<ClientTransportInfo>>>,
     quic_router: Arc<DashMap<String, StreamSender>>,
     ip_pool: IpPool,
     clients_by_prefix: Arc<DashMap<[u8; 4], Arc<ClientTransportInfo>>>,
@@ -199,7 +191,6 @@ async fn handle_incoming_quic(
         let fut = handle_connection(
             conn,
             tx_to_tun.clone(),
-            clients_by_seid.clone(),
             quic_router.clone(),
             ip_pool.clone(),
             clients_by_prefix.clone(),
@@ -248,7 +239,6 @@ async fn clear_expired_dh_sessions(temp_dh_map: Arc<DashMap<SocketAddr, TempDHIn
 async fn handle_connection(
     incoming: Incoming,
     tx_to_tun: StreamSender,
-    clients_by_seid: Arc<DashMap<String, Arc<ClientTransportInfo>>>,
     quic_router: Arc<DashMap<String, StreamSender>>,
     ip_pool: IpPool,
     clients_by_prefix: Arc<DashMap<[u8; 4], Arc<ClientTransportInfo>>>,
@@ -355,13 +345,11 @@ async fn handle_connection(
     }
 
     let assigned_ip_clone = client.assigned_ip.clone();
-    let session_id_clone = client.session_id.clone();
     let nonce_prefix_clone = client.nonce_prefix;
     let remote_addr_clone = real_remote_addr;
 
     {
         quic_router.remove(&client.assigned_ip);
-        clients_by_seid.remove(&session_id_clone);
         clients_by_prefix.remove(&nonce_prefix_clone);
         clients_by_addr.remove(remote_addr_clone.deref());
 

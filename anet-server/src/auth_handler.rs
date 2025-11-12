@@ -8,16 +8,14 @@ use anet_common::crypto_utils::{
 };
 use anet_common::encryption::Cipher;
 use anet_common::protocol::{
-    AuthRequest, AuthResponse, DhClientExchange, DhServerExchange, EncryptedAuthRequest,
-    EncryptedAuthResponse, Message as AnetMessage, message::Content,
+    AuthResponse, DhServerExchange, EncryptedAuthResponse, Message as AnetMessage, message::Content,
 };
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
-use base64::prelude::*;
 use bytes::{BufMut, Bytes, BytesMut};
 use dashmap::DashMap;
-use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
-use log::{error, info, warn};
+use ed25519_dalek::{SigningKey, VerifyingKey};
+use log::{error, info};
 use prost::Message;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -34,7 +32,6 @@ pub async fn run_auth_handler(
     mut rx_from_auth: mpsc::Receiver<HandshakeData>,
     reply_socket: Arc<UdpSocket>,
     ip_pool: IpPool,
-    clients_by_seid: Arc<DashMap<String, Arc<ClientTransportInfo>>>,
     clients_by_prefix: Arc<DashMap<[u8; 4], Arc<ClientTransportInfo>>>,
     clients_by_addr: Arc<DashMap<SocketAddr, Arc<ClientTransportInfo>>>,
     temp_dh_map: Arc<DashMap<SocketAddr, TempDHInfo>>,
@@ -47,7 +44,6 @@ pub async fn run_auth_handler(
         let allowed_clients_clone = allowed_clients.clone();
         let cert_clone = quic_cert_pem.clone();
 
-        let clients_by_seid = clients_by_seid.clone();
         let clients_by_prefix = clients_by_prefix.clone();
         let clients_by_addr = clients_by_addr.clone();
         let ip_pool = ip_pool.clone();
@@ -60,7 +56,6 @@ pub async fn run_auth_handler(
                 remote_addr,
                 &reply_socket_clone,
                 ip_pool,
-                clients_by_seid,
                 clients_by_prefix,
                 clients_by_addr,
                 temp_dh_map_clone,
@@ -82,7 +77,6 @@ async fn handle_auth_request(
     remote_addr: SocketAddr,
     socket: &Arc<UdpSocket>,
     ip_pool: IpPool,
-    clients_by_seid: Arc<DashMap<String, Arc<ClientTransportInfo>>>,
     clients_by_prefix: Arc<DashMap<[u8; 4], Arc<ClientTransportInfo>>>,
     clients_by_addr: Arc<DashMap<SocketAddr, Arc<ClientTransportInfo>>>,
     temp_dh_map: Arc<DashMap<SocketAddr, TempDHInfo>>,
@@ -252,7 +246,6 @@ async fn handle_auth_request(
             };
 
             let assigned_ip;
-            let client_ip_str;
 
             match auth_message.content {
                 Some(Content::AuthRequest(req)) => {
@@ -275,7 +268,6 @@ async fn handle_auth_request(
                             anyhow::bail!("No free IPs available")
                         }
                     };
-                    client_ip_str = assigned_ip.to_string();
                 }
                 _ => {
                     anyhow::bail!("Unexpected content in EncryptedAuthRequest.")
@@ -299,10 +291,8 @@ async fn handle_auth_request(
                 session_id: session_id.clone(),
                 nonce_prefix,
                 remote_addr: ArcSwap::new(Arc::new(remote_addr)),
-                client_fingerprint: temp_info.client_fingerprint, // ДОБАВЛЕНО
             });
 
-            clients_by_seid.insert(session_id.clone(), info.clone());
             clients_by_prefix.insert(nonce_prefix, info.clone());
             clients_by_addr.insert(remote_addr, info.clone());
 
