@@ -9,8 +9,7 @@ use tokio::fs::read_to_string;
 pub struct MainConfig {
     pub address: String,
     pub tun_name: String,
-    pub auth_phrase: String,
-    pub server_cert: String,
+    pub server_pub_key: String, // Публичный ключ сервера для верификации
 }
 
 impl Default for MainConfig {
@@ -18,8 +17,20 @@ impl Default for MainConfig {
         Self {
             address: "127.0.0.1:443".to_string(),
             tun_name: "anet-client".to_string(),
-            auth_phrase: "test".to_string(),
-            server_cert: "test".to_string(),
+            server_pub_key: "None".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ClientKeys {
+    pub private_key: String, // Base64-encoded Ed25519 private key
+}
+
+impl Default for ClientKeys {
+    fn default() -> Self {
+        Self {
+            private_key: "".to_string(),
         }
     }
 }
@@ -28,6 +39,9 @@ impl Default for MainConfig {
 pub struct Config {
     #[serde(default)]
     pub main: MainConfig,
+
+    #[serde(default)]
+    pub keys: ClientKeys,
 
     #[serde(default)]
     pub quic_transport: QuicConfig,

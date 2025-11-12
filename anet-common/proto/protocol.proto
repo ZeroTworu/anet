@@ -2,8 +2,29 @@ syntax = "proto3";
 
 package anet;
 
+message DHClientExchange {
+    bytes public_key = 1;
+    bytes client_signed_dh_key = 2;  // Подпись клиентом своего DH ключа
+    bytes client_public_key = 3;     // Публичный ключ клиента для верификации
+}
+
+message DHServerExchange {
+    bytes public_key = 1;
+    bytes server_signed_dh_key = 2;  // Подпись сервером своего DH ключа
+}
+
+message EncryptedAuthRequest {
+    bytes ciphertext = 1;
+    bytes nonce = 2;
+}
+
+message EncryptedAuthResponse {
+    bytes ciphertext = 1;
+    bytes nonce = 2;
+}
+
 message AuthRequest {
-    string key = 1;
+    string client_id = 1;
 }
 
 message AuthResponse {
@@ -11,15 +32,18 @@ message AuthResponse {
     string netmask = 2;
     string gateway = 3;
     int32 mtu = 4;
-    bytes crypto_key = 5;
-    uint32 udp_port = 6;
-    string session_id = 7;
-    bytes nonce_prefix = 8;
+    string session_id = 5;
+    bytes nonce_prefix = 6;
+    bytes quic_cert = 7;
 }
 
 message Message {
     oneof content {
-        AuthRequest auth_request = 1;
-        AuthResponse auth_response = 2;
+        DHClientExchange dh_client_exchange = 1;
+        DHServerExchange dh_server_exchange = 2;
+        EncryptedAuthRequest encrypted_auth_request = 3;
+        EncryptedAuthResponse encrypted_auth_response = 4;
+        AuthRequest auth_request = 5;
+        AuthResponse auth_response = 6;
     }
 }

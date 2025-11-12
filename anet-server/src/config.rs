@@ -6,6 +6,37 @@ use std::process::exit;
 use tokio::fs::read_to_string;
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct CryptoConfig {
+    pub quic_cert: String,
+    pub quic_key: String,
+    pub server_signing_key: String, // Приватный ключ сервера для подписи
+}
+
+impl Default for CryptoConfig {
+    fn default() -> Self {
+        Self {
+            quic_cert: "QUIC_CERT_PLACEHOLDER".to_string(),
+            quic_key: "QUIC_KEY_PLACEHOLDER".to_string(),
+            server_signing_key: "SERVER_SIGNING_KEY_PLACEHOLDER".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AuthenticationConfig {
+    pub allowed_clients: Vec<String>, // Список разрешенных fingerprint'ов клиентов
+}
+
+impl Default for AuthenticationConfig {
+    fn default() -> Self {
+        Self {
+            allowed_clients: vec![],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct NetworkConfig {
     pub mask: String,
     pub net: String,
@@ -29,24 +60,19 @@ impl Default for NetworkConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct ServerCoreConfig {
     pub auth_phrase: String,
-    pub cert: String,
-    pub key: String,
     pub bind_to: String,
     pub external_if: String,
-    pub udp_port: u32,
 }
 
 impl Default for ServerCoreConfig {
     fn default() -> Self {
         Self {
             auth_phrase: "default_secret".to_string(),
-            cert: "CERT_PLACEHOLDER".to_string(),
-            key: "KEY_PLACEHOLDER".to_string(),
             bind_to: "0.0.0.0:8443".to_string(),
             external_if: "eth0".to_string(),
-            udp_port: 8444,
         }
     }
 }
@@ -60,7 +86,13 @@ pub struct Config {
     pub server: ServerCoreConfig,
 
     #[serde(default)]
-    pub quic_transport: QuicConfig, // НОВАЯ СЕКЦИЯ
+    pub quic_transport: QuicConfig,
+
+    #[serde(default)]
+    pub crypto: CryptoConfig,
+
+    #[serde(default)]
+    pub authentication: AuthenticationConfig,
 }
 
 #[derive(Debug, Parser)]

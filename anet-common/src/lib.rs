@@ -1,5 +1,6 @@
 pub mod atun;
 pub mod consts;
+pub mod crypto_utils;
 pub mod encryption;
 pub mod generated;
 pub mod quic_settings;

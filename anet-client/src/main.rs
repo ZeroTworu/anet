@@ -95,10 +95,12 @@ async fn main() -> Result<()> {
     };
 
     let server_ip_str = cfg.main.address.split(':').next().unwrap().to_string();
-    let auth_response = client.authenticate().await;
 
-    let auth_response = match auth_response {
-        Ok(auth_response) => auth_response,
+    // --- DH АУТЕНТИФИКАЦИЯ (Возвращает (AuthResponse, SharedKey)) ---
+    let auth_result = client.authenticate().await;
+
+    let (auth_response, shared_key) = match auth_result {
+        Ok(res) => res,
         Err(e) => {
             error!("Error on auth: {}", e);
             loop {
@@ -125,7 +127,8 @@ async fn main() -> Result<()> {
             }
         }
     };
-    // Меняем роутинг __ДО__ установки реального коннекта
+
+    // Меняем роутинг
     #[cfg(unix)]
     {
         linux_router.backup_original_routes()?;
@@ -135,7 +138,10 @@ async fn main() -> Result<()> {
     #[cfg(windows)]
     windows_router.setup_vpn_routing()?;
 
-    let endpoint = client.run_quic_vpn(&auth_response, &tun_manager).await;
+    // ПЕРЕДАЧА DH КЛЮЧА В QUIC
+    let endpoint = client
+        .run_quic_vpn(&auth_response, &tun_manager, shared_key)
+        .await;
 
     match endpoint {
         Ok(endpoint) => {

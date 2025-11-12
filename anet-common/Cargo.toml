@@ -15,6 +15,11 @@ chacha20poly1305 = {workspace = true}
 aes-gcm = "0.10.3"
 aead = { version = "0.5.2", features = ["getrandom"] }
 serde = { workspace = true, features = ["derive"] }
+rand = {workspace = true}
+x25519-dalek = {workspace = true}
+ed25519-dalek = {workspace = true}
+sha2 = {workspace = true}
+base64 = "0.22.1"
 
 [build-dependencies]
 prost-build = "0.14.1"

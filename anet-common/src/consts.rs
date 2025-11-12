@@ -1,5 +1,9 @@
 // Все константы обсалютно научны, и соответствуют числу тараканов на лолу и кол-ву бычков в пепельнице.
 // Не научные - числу мух на потолке.
+// =================================================================
+// Файл: ./anet-common/src/consts.rs
+// =================================================================
+
 pub const MAX_PACKET_SIZE: usize = 65535;
 
 pub const CHANNEL_BUFFER_SIZE: usize = 65535;
@@ -10,7 +14,9 @@ pub const WRITE_TIMEOUT_SECONDS: u64 = 30;
 
 pub const PACKET_TYPE_DATA: u8 = 0x01;
 
-pub const PACKET_TYPE_HANDSHAKE: u8 = 0x02;
+pub const AUTH_MAGIC_ID_BASE: [u8; 4] = [0x7A, 0xC5, 0x1E, 0x2B];
+pub const AUTH_SALT_LEN: usize = 4;
+pub const AUTH_PREFIX_LEN: usize = 8;
 
 pub const UDP_HANDSHAKE_TIMEOUT_SECONDS: u64 = 30;
 

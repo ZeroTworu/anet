@@ -1,0 +1,16 @@
+[package]
+name = "anet-keygen"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ed25519-dalek = { workspace = true }
+rand = { workspace = true }
+base64 = { workspace = true }
+sha2 = { workspace = true }
+clap = { workspace = true }
+
+
+[[bin]]
+name = "anet-keygen"
+path = "src/main.rs"

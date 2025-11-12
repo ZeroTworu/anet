@@ -1,52 +1,49 @@
+use crate::auth_handler::run_auth_handler;
 use crate::config::Config;
 use crate::ip_pool::IpPool;
-use crate::multikey_udp_socket::{ClientTransportInfo, MultiKeyAnetUdpSocket, StreamSender};
-use crate::utils::{extract_ip_dst, generate_crypto_key, generate_seid};
+use crate::multikey_udp_socket::{
+    ClientTransportInfo, HandshakeData, MultiKeyAnetUdpSocket, StreamSender, TempDHInfo,
+};
+use crate::utils::extract_ip_dst;
 use anet_common::atun::TunManager;
 use anet_common::consts::MAX_PACKET_SIZE;
-use anet_common::encryption::Cipher;
-use anet_common::protocol::{AuthResponse, Message as AnetMessage, message::Content};
 use anet_common::quic_settings::build_transport_config;
 use anet_common::stream_framing::{frame_packet, read_next_packet};
 use anet_common::tun_params::TunParams;
 use anyhow::{Context, Result};
-use arc_swap::ArcSwapOption;
+use base64::prelude::*;
 use bytes::Bytes;
 use dashmap::DashMap;
-use log::{error, info, warn};
-use prost::Message;
+use ed25519_dalek::SigningKey;
+use log::{debug, error, info, warn};
 use quinn::crypto::rustls::QuicServerConfig;
 use quinn::{Endpoint, EndpointConfig, Incoming, ServerConfig as QuinnServerConfig, TokioRuntime};
-use rand::{RngCore, thread_rng};
 use rustls::ServerConfig as RustlsServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::io::BufReader;
+use std::net::SocketAddr;
 use std::ops::Deref;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use std::time::Duration;
+use tokio::io::AsyncWriteExt;
+use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
-use tokio_rustls::TlsAcceptor;
 
 pub struct ANetServer {
     cfg: Config,
-    tls_acceptor: TlsAcceptor,
     ip_pool: IpPool,
     tun_manager: TunManager,
-    // Карта [session_id_string] -> [ClientInfo] - для общей логики и логов
     clients_by_seid: Arc<DashMap<String, Arc<ClientTransportInfo>>>,
-    // Карта [nonce_prefix] -> [ClientInfo] - для O(1) поиска в UDP сокете
     clients_by_prefix: Arc<DashMap<[u8; 4], Arc<ClientTransportInfo>>>,
+    clients_by_addr: Arc<DashMap<SocketAddr, Arc<ClientTransportInfo>>>,
+    temp_dh_map: Arc<DashMap<SocketAddr, TempDHInfo>>,
     quic_router: Arc<DashMap<String, StreamSender>>,
+    quic_cert_pem: String,
+    server_signing_key: SigningKey,
 }
 
 impl ANetServer {
     pub fn new(cfg: &Config) -> Result<Self> {
-        let tls_cfg =
-            load_rustls_config_for_auth(cfg.server.cert.as_str(), cfg.server.key.as_str())?;
-        let acceptor = TlsAcceptor::from(Arc::new(tls_cfg));
-
         let tun_params = TunParams {
             netmask: cfg.network.mask.parse()?,
             gateway: cfg.network.gateway.parse()?,
@@ -65,83 +62,42 @@ impl ANetServer {
             cfg.network.mtu,
         );
 
+        // Загрузка ключа подписи сервера
+        let server_signing_key_bytes = BASE64_STANDARD
+            .decode(&cfg.crypto.server_signing_key)
+            .context("Failed to decode server signing key")?;
+        let server_signing_key = SigningKey::from_bytes(
+            &server_signing_key_bytes
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("Invalid server signing key length"))?,
+        );
+
         Ok(Self {
             cfg: cfg.clone(),
-            tls_acceptor: acceptor,
             ip_pool,
             clients_by_seid: Arc::new(DashMap::new()),
             clients_by_prefix: Arc::new(DashMap::new()),
+            clients_by_addr: Arc::new(DashMap::new()),
+            temp_dh_map: Arc::new(DashMap::new()),
             tun_manager,
             quic_router: Arc::new(DashMap::new()),
+            quic_cert_pem: cfg.crypto.quic_cert.clone(),
+            server_signing_key,
         })
     }
 
     pub async fn run(&self) -> anyhow::Result<()> {
-        let auth_task = self.run_auth_listener();
-        let vpn_task = self.run_quic_vpn_server();
-        tokio::try_join!(auth_task, vpn_task)?;
-        Ok(())
+        self.run_unified_vpn_server().await
     }
 
-    async fn run_auth_listener(&self) -> Result<()> {
-        let listener = TcpListener::bind(self.cfg.server.bind_to.as_str()).await?;
-        info!(
-            "Authentication server listening on {}",
-            self.cfg.server.bind_to
-        );
+    async fn run_unified_vpn_server(&self) -> Result<()> {
+        let listen_addr = &self.cfg.server.bind_to;
 
-        while let Ok((socket, addr)) = listener.accept().await {
-            let acceptor = self.tls_acceptor.clone();
-            let ip_pool = self.ip_pool.clone();
-            let clients_by_seid = self.clients_by_seid.clone();
-            let clients_by_prefix = self.clients_by_prefix.clone();
-            let auth_phrase = self.cfg.server.auth_phrase.clone();
-            let udp_port = self.cfg.server.udp_port;
-
-            tokio::spawn(async move {
-                if let Err(e) = handle_auth_connection(
-                    socket,
-                    acceptor,
-                    ip_pool.clone(),
-                    clients_by_seid,
-                    clients_by_prefix,
-                    auth_phrase,
-                    udp_port,
-                )
-                .await
-                {
-                    error!("[{}] Auth connection failed: {}", addr, e);
-                }
-            });
-        }
-        Ok(())
-    }
-
-    async fn run_quic_vpn_server(&self) -> Result<()> {
-        let udp_listen_addr = format!(
-            "{}:{}",
-            self.cfg.server.bind_to.split(':').next().unwrap(),
-            self.cfg.server.udp_port
-        );
-        let real_socket = Arc::new(UdpSocket::bind(&udp_listen_addr).await?);
-
-        // Используем единую структуру клиентов
-        let anet_socket = Arc::new(MultiKeyAnetUdpSocket::new(
-            real_socket,
-            self.clients_by_seid.clone(),
-            self.clients_by_prefix.clone(),
-        ));
-
+        let real_socket = Arc::new(UdpSocket::bind(listen_addr).await?);
         let server_config = self.build_quinn_server_config()?;
-        let endpoint = Endpoint::new_with_abstract_socket(
-            EndpointConfig::default(),
-            Some(server_config),
-            anet_socket,
-            Arc::new(TokioRuntime),
-        )?;
         info!(
-            "QUIC VPN server listening via ANET transport on {}",
-            udp_listen_addr
+            "Unified UDP listener (Auth/QUIC) started on {}",
+            listen_addr
         );
 
         let (tx_to_tun, rx_from_tun) = self.tun_manager.run().await?;
@@ -149,26 +105,70 @@ impl ANetServer {
             .setup_tun_routing(self.cfg.server.external_if.as_str())
             .await?;
 
-        let quic_router = self.quic_router.clone();
+        // Создание канала для Auth трафика
+        let (tx_to_auth, rx_from_auth) = mpsc::channel::<HandshakeData>(MAX_PACKET_SIZE);
 
-        let incoming_task = tokio::spawn(handle_incoming_quic(
+        // Инициализация диспетчера MultiKeyAnetUdpSocket
+        let anet_socket = Arc::new(MultiKeyAnetUdpSocket::new(
+            real_socket.clone(),
+            self.clients_by_seid.clone(),
+            self.clients_by_prefix.clone(),
+            self.clients_by_addr.clone(),
+            tx_to_auth,
+            self.temp_dh_map.clone(),
+        ));
+
+        // Подъем QUINN Endpoints
+        let endpoint = Endpoint::new_with_abstract_socket(
+            EndpointConfig::default(),
+            Some(server_config),
+            anet_socket,
+            Arc::new(TokioRuntime),
+        )?;
+
+        // Задачи
+        let incoming_quic_task = tokio::spawn(handle_incoming_quic(
             endpoint.clone(),
             tx_to_tun.clone(),
             self.clients_by_seid.clone(),
-            quic_router.clone(),
+            self.quic_router.clone(),
             self.ip_pool.clone(),
+            self.clients_by_prefix.clone(),
+            self.clients_by_addr.clone(),
         ));
 
-        let router_task = tokio::spawn(route_tun_to_quic(rx_from_tun, quic_router.clone()));
+        let router_task = tokio::spawn(route_tun_to_quic(rx_from_tun, self.quic_router.clone()));
 
-        let _ = tokio::try_join!(incoming_task, router_task)?;
+        let auth_handler_task = tokio::spawn(run_auth_handler(
+            rx_from_auth,
+            real_socket.clone(),
+            self.ip_pool.clone(),
+            self.clients_by_seid.clone(),
+            self.clients_by_prefix.clone(),
+            self.clients_by_addr.clone(),
+            self.temp_dh_map.clone(),
+            self.cfg.authentication.allowed_clients.clone(),
+            self.server_signing_key.clone(),
+            self.quic_cert_pem.clone(),
+        ));
 
+        let cleanup_temp_dh_task =
+            tokio::spawn(clear_expired_dh_sessions(self.temp_dh_map.clone()));
+
+        let _ = tokio::try_join!(
+            incoming_quic_task,
+            router_task,
+            auth_handler_task,
+            cleanup_temp_dh_task,
+        )?;
         Ok(())
     }
 
     fn build_quinn_server_config(&self) -> Result<QuinnServerConfig> {
-        let (certs, key) =
-            load_cert_and_key(self.cfg.server.cert.as_str(), self.cfg.server.key.as_str())?;
+        let (certs, key) = load_cert_and_key(
+            self.cfg.crypto.quic_cert.as_str(),
+            self.cfg.crypto.quic_key.as_str(),
+        )?;
 
         let server_crypto = RustlsServerConfig::builder()
             .with_no_client_auth()
@@ -186,111 +186,24 @@ impl ANetServer {
     }
 }
 
-async fn handle_auth_connection(
-    socket: TcpStream,
-    acceptor: TlsAcceptor,
-    ip_pool: IpPool,
-    clients_by_seid: Arc<DashMap<String, Arc<ClientTransportInfo>>>,
-    clients_by_prefix: Arc<DashMap<[u8; 4], Arc<ClientTransportInfo>>>,
-    auth_phrase: String,
-    udp_port: u32,
-) -> Result<()> {
-    let nonce_prefix: [u8; 4] = {
-        let mut rng = thread_rng();
-        loop {
-            let mut prefix = [0u8; 4];
-            rng.fill_bytes(&mut prefix);
-            if !clients_by_prefix.contains_key(&prefix) {
-                break prefix;
-            }
-        }
-    };
-
-    let tls_stream = acceptor.accept(socket).await?;
-    let (mut reader, mut writer) = tokio::io::split(tls_stream);
-
-    let mut len_buf = [0u8; 4];
-    reader.read_exact(&mut len_buf).await?;
-    let msg_len = u32::from_be_bytes(len_buf) as usize;
-
-    if msg_len > MAX_PACKET_SIZE {
-        anyhow::bail!("msg_len > MAX_PACKET_SIZE");
-    }
-
-    let mut msg_buf = vec![0u8; msg_len];
-    reader.read_exact(&mut msg_buf).await?;
-
-    let message: AnetMessage = Message::decode(Bytes::from(msg_buf))?;
-
-    let assigned_ip = match message.content {
-        Some(Content::AuthRequest(req)) if req.key == auth_phrase => {
-            ip_pool.allocate().context("No free IPs available")?
-        }
-        _ => anyhow::bail!("Authentication failed"),
-    };
-
-    let crypto_key = generate_crypto_key();
-    let session_id = generate_seid();
-
-    info!(
-        "Generated unique nonce prefix {:?} for session {}",
-        nonce_prefix, session_id
-    );
-
-    let client_ip_str = assigned_ip.to_string();
-
-    let info = Arc::new(ClientTransportInfo {
-        cipher: Arc::new(Cipher::new(&crypto_key)),
-        addr: ArcSwapOption::new(None),
-        sequence: Arc::new(AtomicU64::new(0)),
-        assigned_ip: client_ip_str.clone(),
-        session_id: session_id.clone(),
-        nonce_prefix,
-    });
-
-    clients_by_seid.insert(session_id.clone(), info.clone());
-    clients_by_prefix.insert(nonce_prefix, info);
-
-    // ... (остальной код создания и отправки response без изменений)
-
-    let response = AnetMessage {
-        content: Some(Content::AuthResponse(AuthResponse {
-            ip: client_ip_str.clone(),
-            netmask: ip_pool.netmask.to_string(),
-            gateway: ip_pool.gateway.to_string(),
-            mtu: ip_pool.mtu as i32,
-            crypto_key: crypto_key.to_vec(),
-            udp_port,
-            session_id: session_id.clone(),
-            nonce_prefix: nonce_prefix.to_vec(),
-        })),
-    };
-
-    let mut response_data = Vec::new();
-    response.encode(&mut response_data)?;
-
-    writer
-        .write_all(&(response_data.len() as u32).to_be_bytes())
-        .await?;
-    writer.write_all(&response_data).await?;
-
-    Ok(())
-}
-
 async fn handle_incoming_quic(
     endpoint: Endpoint,
     tx_to_tun: StreamSender,
-    clients_transport_info: Arc<DashMap<String, Arc<ClientTransportInfo>>>, // <-- Указываем Arc
+    clients_by_seid: Arc<DashMap<String, Arc<ClientTransportInfo>>>,
     quic_router: Arc<DashMap<String, StreamSender>>,
     ip_pool: IpPool,
+    clients_by_prefix: Arc<DashMap<[u8; 4], Arc<ClientTransportInfo>>>,
+    clients_by_addr: Arc<DashMap<SocketAddr, Arc<ClientTransportInfo>>>,
 ) -> Result<()> {
     while let Some(conn) = endpoint.accept().await {
         let fut = handle_connection(
             conn,
             tx_to_tun.clone(),
-            clients_transport_info.clone(),
+            clients_by_seid.clone(),
             quic_router.clone(),
             ip_pool.clone(),
+            clients_by_prefix.clone(),
+            clients_by_addr.clone(),
         );
         tokio::spawn(async move {
             if let Err(e) = fut.await {
@@ -301,35 +214,54 @@ async fn handle_incoming_quic(
     Ok(())
 }
 
+const TEMP_DH_TIMEOUT: Duration = Duration::from_secs(30);
+const TEMP_DH_CLEANUP_INTERVAL: Duration = Duration::from_secs(10);
+
+async fn clear_expired_dh_sessions(temp_dh_map: Arc<DashMap<SocketAddr, TempDHInfo>>) {
+    info!("Temporary DH state cleanup task started.");
+    loop {
+        tokio::time::sleep(TEMP_DH_CLEANUP_INTERVAL).await;
+
+        let expired_keys: Vec<SocketAddr> = temp_dh_map
+            .iter()
+            .filter_map(|entry| {
+                if entry.created_at.elapsed() > TEMP_DH_TIMEOUT {
+                    Some(*entry.key())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for key in expired_keys {
+            if temp_dh_map.remove(&key).is_some() {
+                debug!("Expired DH session cleared for {}", key);
+            }
+        }
+
+        if !temp_dh_map.is_empty() {
+            debug!("Active temporary DH sessions: {}", temp_dh_map.len());
+        }
+    }
+}
+
 async fn handle_connection(
     incoming: Incoming,
     tx_to_tun: StreamSender,
-    clients_transport_info: Arc<DashMap<String, Arc<ClientTransportInfo>>>, // ИЗМЕНЕНО
+    clients_by_seid: Arc<DashMap<String, Arc<ClientTransportInfo>>>,
     quic_router: Arc<DashMap<String, StreamSender>>,
     ip_pool: IpPool,
+    clients_by_prefix: Arc<DashMap<[u8; 4], Arc<ClientTransportInfo>>>,
+    clients_by_addr: Arc<DashMap<SocketAddr, Arc<ClientTransportInfo>>>,
 ) -> Result<()> {
     let connection = incoming.await?;
-    let remote_addr = connection.remote_address();
-    info!("QUIC negotiation started with peer: {}", remote_addr);
-
-    let (send_stream, recv_stream) = connection.accept_bi().await?;
-
     let destination_addr = connection.remote_address();
+    info!("QUIC negotiation started with peer: {}", destination_addr);
 
-    // Ищем клиента по адресу, используем итератор DashMap)
-    let client = {
-        clients_transport_info
-            .iter()
-            .find(|entry| {
-                let current_addr = entry.addr.load();
-                // ArcSwapOption возвращает Arc<Option<T>>, поэтому нужно разыменовать
-                match &*current_addr {
-                    Some(addr) => *addr.deref() == destination_addr,
-                    None => false,
-                }
-            })
-            .map(|entry| entry.value().clone())
-    };
+    // Ищем клиента по адресу, используя O(1) Lookup
+    let client = clients_by_addr
+        .get(&destination_addr)
+        .map(|entry| entry.value().clone());
 
     let client = match client {
         Some(client) => client,
@@ -343,14 +275,18 @@ async fn handle_connection(
         }
     };
 
+    let remote_addr_guard = client.remote_addr.load();
+    let real_remote_addr = remote_addr_guard.deref();
+
     info!(
         "QUIC session accepted for client VPN IP: {} ({}), SEID: {}",
-        client.assigned_ip, destination_addr, client.session_id
+        client.assigned_ip, real_remote_addr, client.session_id
     );
+
+    let (send_stream, recv_stream) = connection.accept_bi().await?;
 
     let (tx_router, mut rx_router) = mpsc::channel::<Bytes>(1024);
 
-    // Добавляем клиента в роутер
     {
         quic_router.insert(client.assigned_ip.clone(), tx_router);
         info!(
@@ -420,17 +356,21 @@ async fn handle_connection(
 
     let assigned_ip_clone = client.assigned_ip.clone();
     let session_id_clone = client.session_id.clone();
+    let nonce_prefix_clone = client.nonce_prefix;
+    let remote_addr_clone = real_remote_addr;
 
     {
         quic_router.remove(&client.assigned_ip);
+        clients_by_seid.remove(&session_id_clone);
+        clients_by_prefix.remove(&nonce_prefix_clone);
+        clients_by_addr.remove(remote_addr_clone.deref());
+
         info!(
             "Removed client {} from quic_router. Remaining clients: {}",
             client.assigned_ip,
             quic_router.len()
         );
     }
-
-    clients_transport_info.remove(&session_id_clone);
 
     if let Ok(ip_addr) = assigned_ip_clone.parse() {
         ip_pool.release(ip_addr);
@@ -489,29 +429,10 @@ async fn route_tun_to_quic(
     Ok(())
 }
 
-fn load_rustls_config_for_auth(cert_pem: &str, key_pem: &str) -> Result<RustlsServerConfig> {
-    let mut cert_reader = BufReader::new(cert_pem.as_bytes());
-    let certs = rustls_pemfile::certs(&mut cert_reader)
-        .collect::<std::result::Result<Vec<CertificateDer>, std::io::Error>>()
-        .context("Failed to read or parse certificates from PEM string")?;
-
-    let mut key_reader = BufReader::new(key_pem.as_bytes());
-    let key_der = rustls_pemfile::private_key(&mut key_reader)?
-        .context("No private key found in PEM string")?;
-    let key: PrivateKeyDer<'static> = key_der.into();
-
-    let mut cfg = RustlsServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)?;
-    cfg.alpn_protocols = vec![b"h2".to_vec()];
-
-    Ok(cfg)
-}
-
 fn load_cert_and_key(
     cert_pem: &str,
     key_pem: &str,
-) -> anyhow::Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
+) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
     let mut cert_reader = BufReader::new(cert_pem.as_bytes());
     let certs: Vec<CertificateDer> = rustls_pemfile::certs(&mut cert_reader)
         .collect::<std::result::Result<_, std::io::Error>>()
