@@ -1,162 +1,245 @@
+#[cfg(windows)]
 use anyhow::{Context, Result};
+#[cfg(windows)]
 use log::{error, info, warn};
+#[cfg(windows)]
 use std::net::Ipv4Addr;
+#[cfg(windows)]
 use std::process::Command;
 
+#[cfg(windows)]
 pub struct WindowsRouteManager {
-    vpn_gateway: Ipv4Addr,
+    vpn_gateway: String,
     vpn_server_ip: String,
     interface_metric: u32,
-    original_default_gateway: Option<String>,
+    tun_interface_index: u32,
 }
 
+#[cfg(windows)]
 impl WindowsRouteManager {
-    pub fn new(vpn_gateway: &str, vpn_server_ip: String) -> Self {
+    pub fn new(vpn_gateway: &str, vpn_server_ip: String, tun_interface_index: u32) -> Self {
         Self {
-            vpn_gateway: vpn_gateway.parse().unwrap(),
+            vpn_gateway: vpn_gateway.to_string(),
             vpn_server_ip,
-            // 50 - обычно ниже, чем метрика основной сетевой карты, что обеспечивает предпочтение
             interface_metric: 50,
-            original_default_gateway: None,
+            tun_interface_index,
         }
     }
 
-    /// Поиск оригинального шлюза по умолчанию путем парсинга вывода 'route print'.
-    /// Эта функция нестабильна и может сломаться из-за локализации или версии ОС.
-    /// Однако, это лучший способ получить его без WinAPI/iphlpapi.
-    fn get_original_default_gateway(&mut self) -> Result<()> {
+    fn add_route_using_interface(
+        &self,
+        destination: &str,
+        netmask: &str,
+        gateway: &str,
+        interface_index: u32,
+        metric: u32,
+    ) -> Result<()> {
+        // Используем PowerShell для более надежного добавления маршрута с указанием интерфейса
+        let ps_command = format!(
+            "New-NetRoute -DestinationPrefix '{}/{}' -NextHop {} -InterfaceIndex {} -RouteMetric {} -Confirm:$false",
+            destination,
+            self.cidr_from_netmask(netmask)?,
+            gateway,
+            interface_index,
+            metric
+        );
+
+        let output = Command::new("powershell")
+            .args(&["-Command", &ps_command])
+            .output()
+            .context("Failed to execute PowerShell command")?;
+
+        if output.status.success() {
+            info!("Successfully added route via PowerShell: {}/{} -> {} (interface: {}, metric {})",
+                  destination, netmask, gateway, interface_index, metric);
+            Ok(())
+        } else {
+            let error_msg = String::from_utf8_lossy(&output.stderr);
+            warn!("PowerShell failed: {}, falling back to route command", error_msg);
+
+            // Fallback к традиционной команде route
+            self.add_route_cmd(destination, netmask, gateway, metric)
+        }
+    }
+
+    fn cidr_from_netmask(&self, netmask: &str) -> Result<u8> {
+        let ip: Ipv4Addr = netmask.parse().context("Invalid netmask")?;
+        let octets = ip.octets();
+        let cidr = octets.iter().map(|&o| o.count_ones() as u8).sum();
+        Ok(cidr)
+    }
+
+    fn add_route_cmd(
+        &self,
+        destination: &str,
+        netmask: &str,
+        gateway: &str,
+        metric: u32,
+    ) -> Result<()> {
+        let status = Command::new("route")
+            .args(&[
+                "ADD",
+                destination,
+                "MASK",
+                netmask,
+                gateway,
+                "METRIC",
+                &metric.to_string(),
+                "IF",
+                &self.tun_interface_index.to_string(),
+            ])
+            .status()
+            .context("Failed to execute route command")?;
+
+        if status.success() {
+            info!("Successfully added route via command: {} -> {} via {} (interface: {}, metric {})",
+                  destination, netmask, gateway, self.tun_interface_index, metric);
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("Command failed to add route, exit status: {:?}", status))
+        }
+    }
+
+    fn delete_route_using_interface(&self, destination: &str, gateway: &str) -> Result<()> {
+        // Попробуем PowerShell сначала
+        let ps_command = format!(
+            "Remove-NetRoute -DestinationPrefix '{}/32' -NextHop {} -Confirm:$false -ErrorAction SilentlyContinue",
+            destination, gateway
+        );
+
+        let output = Command::new("powershell")
+            .args(&["-Command", &ps_command])
+            .output()
+            .context("Failed to execute PowerShell command")?;
+
+        if output.status.success() {
+            info!("Successfully deleted route via PowerShell: {} via {}", destination, gateway);
+            Ok(())
+        } else {
+            // Fallback к команде route
+            self.delete_route_cmd(destination, gateway)
+        }
+    }
+
+    fn delete_route_cmd(&self, destination: &str, gateway: &str) -> Result<()> {
+        let status = Command::new("route")
+            .args(&["DELETE", destination, gateway])
+            .status()
+            .context("Failed to execute route delete command")?;
+
+        if status.success() {
+            info!("Successfully deleted route via command: {} via {}", destination, gateway);
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("Command failed to delete route, exit status: {:?}", status))
+        }
+    }
+
+    pub fn setup_vpn_routing(&self) -> Result<()> {
+        info!("Setting up VPN routing using PowerShell/route commands with interface index {}...",
+              self.tun_interface_index);
+
+        // 1. Add exclusion route for VPN server через физический интерфейс
+        let original_gateway = self.find_original_gateway()
+            .unwrap_or_else(|e| {
+                warn!("Could not determine original gateway: {}. Using fallback.", e);
+                "192.168.1.1".to_string() // Common home router IP
+            });
+
+        let physical_interface_index = self.find_physical_interface_index(&original_gateway)
+            .unwrap_or(1); // Fallback к interface 1
+
+        // Добавляем исключающий маршрут через физический интерфейс
+        self.add_route_using_interface(
+            &self.vpn_server_ip,
+            "255.255.255.255",
+            &original_gateway,
+            physical_interface_index,
+            5,
+        )?;
+
+        // 2. Add new default route through VPN gateway using TUN interface
+        self.add_route_using_interface(
+            "0.0.0.0",
+            "0.0.0.0",
+            &self.vpn_gateway,
+            self.tun_interface_index,
+            self.interface_metric,
+        )?;
+
+        info!("VPN routing setup completed successfully");
+        Ok(())
+    }
+
+    fn find_original_gateway(&self) -> Result<String> {
         let output = Command::new("cmd")
             .args(&["/C", "route print -4"])
             .output()
             .context("Failed to run 'route print -4'")?;
 
         let output_str = String::from_utf8_lossy(&output.stdout);
-        let mut gateway_ip: Option<String> = None;
 
-        // Ищем строку, содержащую Network Destination 0.0.0.0 и Mask 0.0.0.0
         for line in output_str.lines() {
             if line.trim().starts_with("0.0.0.0") && line.contains("0.0.0.0") {
-                // Строка обычно выглядит так:
-                // 0.0.0.0        0.0.0.0         192.168.1.1        192.168.1.100     35
                 let parts: Vec<&str> = line.split_whitespace().collect();
                 if parts.len() >= 3 {
-                    // Gateway IP находится на 3 позиции (индекс 2)
-                    let ip = parts[2].trim().to_string();
-
-                    // Убеждаемся, что это не IP localhost и не наш будущий VPN Gateway
-                    if ip != "0.0.0.0" && ip != self.vpn_gateway.to_string() {
-                        gateway_ip = Some(ip);
-                        break;
+                    let ip = parts[2].trim();
+                    if ip != "0.0.0.0" && ip != &self.vpn_gateway {
+                        return Ok(ip.to_string());
                     }
                 }
             }
         }
 
-        self.original_default_gateway = gateway_ip;
+        Err(anyhow::anyhow!("No suitable original gateway found"))
+    }
 
-        info!(
-            "Original physical gateway detected: {:?}",
-            self.original_default_gateway
+    fn find_physical_interface_index(&self, gateway: &str) -> Result<u32> {
+        // Используем PowerShell чтобы найти индекс интерфейса по шлюзу
+        let ps_command = format!(
+            "Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Where-Object {{ $_.NextHop -eq '{}' }} | Select-Object -First 1 -ExpandProperty InterfaceIndex",
+            gateway
         );
 
-        if self.original_default_gateway.is_none() {
-            warn!(
-                "Failed to reliably detect original default gateway. Routing stability may suffer."
-            );
+        let output = Command::new("powershell")
+            .args(&["-Command", &ps_command])
+            .output()
+            .context("Failed to execute PowerShell command to find interface index")?;
+
+        if output.status.success() {
+            let index_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if let Ok(index) = index_str.parse::<u32>() {
+                return Ok(index);
+            }
         }
 
-        Ok(())
+        // Fallback: используем первый доступный интерфейс
+        warn!("Could not determine physical interface index for gateway {}, using default", gateway);
+        Ok(1)
     }
 
-    /// Установка маршрутизации: исключающий маршрут к серверу, затем новый шлюз по умолчанию.
-    pub fn setup_vpn_routing(&mut self) -> Result<()> {
-        info!("Setting up VPN routing for Windows (requires elevation).");
-
-        // Шаг 0: Получаем оригинальный шлюз (необходим для исключающего маршрута)
-        // Нам нужно знать это ДО установки VPN маршрута
-        self.get_original_default_gateway()?;
-
-        let server_ip = &self.vpn_server_ip;
-        let vpn_gateway = self.vpn_gateway.to_string();
-
-        if let Some(orig_gateway) = &self.original_default_gateway {
-            // 1. Устанавливаем исключающий маршрут к серверу (через оригинальный шлюз)
-            // Должен иметь низкую метрику (например, 5), чтобы маршрут к серверу был стабилен
-            let status = Command::new("route")
-                .args(&[
-                    "ADD",
-                    server_ip,
-                    "MASK",
-                    "255.255.255.255",
-                    orig_gateway,
-                    "METRIC",
-                    "5",
-                ])
-                .status();
-
-            match status {
-                Ok(exit_status) if exit_status.success() => {
-                    info!(
-                        "Established exclusion route to server {} via {}.",
-                        server_ip, orig_gateway
-                    );
-                }
-                _ => {
-                    // Это может случиться, если маршрут уже есть, но лучше предупредить.
-                    error!("Failed to add critical exclusion route to VPN server.");
-                }
-            }
-        } else {
-            warn!("Cannot create exclusion route: original gateway unknown.");
-        }
-
-        // 2. Устанавливаем новый маршрут по умолчанию через наш VPN Gateway (10.X.Y.Z)
-        let status = Command::new("route")
-            .args(&[
-                "ADD",
-                "0.0.0.0",
-                "MASK",
-                "0.0.0.0",
-                &vpn_gateway,
-                "METRIC",
-                &self.interface_metric.to_string(),
-            ])
-            .status();
-
-        match status {
-            Ok(exit_status) if exit_status.success() => {
-                info!(
-                    "Successfully added new default route via VPN ({})",
-                    vpn_gateway
-                );
-            }
-            _ => {
-                // Это не критическая ошибка, если QUIC работает, но требует ручного вмешательства/админа.
-                error!("Failed to set default route via VPN. (Need admin rights?)");
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Восстановление маршрутизации
     pub fn restore_original_routing(&self) {
         info!("Restoring original Windows routing...");
 
-        // 1. Удаляем исключающий маршрут к VPN Server
-        let _ = Command::new("route")
-            .args(&["delete", &self.vpn_server_ip])
-            .status();
+        let mut success_count = 0;
+        let mut error_count = 0;
 
-        // 2. Удаляем маршрут по умолчанию, добавленный нами.
-        // Если метрики были верными, Windows автоматически вернет старый.
-        let vpn_gateway = self.vpn_gateway.to_string();
+        // Удаляем исключающий маршрут к VPN серверу
+        if let Err(e) = self.delete_route_using_interface(&self.vpn_server_ip, &self.vpn_gateway) {
+            error!("Failed to delete exclusion route: {}", e);
+            error_count += 1;
+        } else {
+            success_count += 1;
+        }
 
-        // Удаление может потребовать IP, но не IF, так что используем минимальный набор
-        let _ = Command::new("route")
-            .args(&["delete", "0.0.0.0", "MASK", "0.0.0.0", &vpn_gateway])
-            .status();
+        // Удаляем маршрут по умолчанию через VPN
+        if let Err(e) = self.delete_route_using_interface("0.0.0.0", &self.vpn_gateway) {
+            error!("Failed to delete default route: {}", e);
+            error_count += 1;
+        } else {
+            success_count += 1;
+        }
 
-        info!("Windows routing cleanup finished.");
+        info!("Routing cleanup finished: {} successful, {} failed", success_count, error_count);
     }
 }

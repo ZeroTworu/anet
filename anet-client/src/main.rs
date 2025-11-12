@@ -109,12 +109,7 @@ async fn main() -> Result<()> {
         }
     };
 
-    #[cfg(unix)]
-    let mut linux_router = LinuxRouteManager::new(&auth_response.gateway.as_str(), server_ip_str);
 
-    #[cfg(windows)]
-    let mut windows_router =
-        WindowsRouteManager::new(&auth_response.gateway.as_str(), server_ip_str);
 
     let tun_params = TunParams::from_auth_response(&auth_response, "anet-client");
     let tun_manager = TunManager::new(tun_params);
@@ -127,8 +122,18 @@ async fn main() -> Result<()> {
             }
         }
     };
+    let tun_index = tun_manager.get_tun_index();
+    #[cfg(unix)]
+    let mut linux_router = LinuxRouteManager::new(&auth_response.gateway.as_str(), server_ip_str);
 
-    // Меняем роутинг
+    #[cfg(windows)]
+    let mut windows_router =
+        WindowsRouteManager::new(
+            &auth_response.gateway.as_str(),
+            server_ip_str,
+            tun_index,
+        );
+
     #[cfg(unix)]
     {
         linux_router.backup_original_routes()?;
@@ -147,12 +152,17 @@ async fn main() -> Result<()> {
         Ok(endpoint) => {
             info!("Press Ctrl-C to exit.");
             tokio::select! {
-                _ = tokio::signal::ctrl_c() => {},
-                _ = endpoint.wait_idle() => {},
+                _ = tokio::signal::ctrl_c() => {
+                    info!("Ctrl-C received. Exiting.");
+                },
+                _ = endpoint.wait_idle() => {
+                    warn!("Connection lost. Exiting.");
+                },
             }
 
             #[cfg(unix)]
             linux_router.restore_original_routing();
+
             #[cfg(windows)]
             windows_router.restore_original_routing();
 

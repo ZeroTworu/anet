@@ -2,14 +2,14 @@ use crate::client_udp_socket::AnetUdpSocket;
 use crate::config::{Config, load};
 use anet_common::atun::TunManager;
 use anet_common::consts::{
-    AUTH_PREFIX_LEN, MAX_PACKET_SIZE, NONCE_LEN, UDP_HANDSHAKE_TIMEOUT_SECONDS,
+    AUTH_PREFIX_LEN, MAX_PACKET_SIZE, NONCE_LEN,
 };
 use anet_common::crypto_utils::{
     derive_shared_key, generate_auth_prefix, generate_key_fingerprint, sign_data,
 };
 use anet_common::encryption::Cipher;
 use anet_common::protocol::{
-    AuthRequest, AuthResponse, DhClientExchange, DhServerExchange, EncryptedAuthRequest,
+    AuthRequest, AuthResponse, DhClientExchange, EncryptedAuthRequest,
     EncryptedAuthResponse, Message as AnetMessage, message::Content,
 };
 use anet_common::quic_settings::build_transport_config;
@@ -17,7 +17,7 @@ use anet_common::stream_framing::{frame_packet, read_next_packet};
 use anyhow::{Context, Result};
 use base64::prelude::*;
 use bytes::{BufMut, Bytes, BytesMut};
-use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use log::{error, info, warn};
 use prost::Message;
 use quinn::{
@@ -32,7 +32,7 @@ use rustls_pemfile::certs;
 use std::net::SocketAddr;
 use std::ops::Deref;
 use std::{sync::Arc, time::Duration};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::UdpSocket;
 use tokio::time::sleep;
 use x25519_dalek::{PublicKey, StaticSecret};
@@ -57,7 +57,7 @@ pub struct ANetClient {
 impl ANetClient {
     pub fn new(cfg: &Config) -> anyhow::Result<Self> {
         let mut rng = OsRng;
-        let ephemeral_secret = StaticSecret::new(&mut rng);
+        let ephemeral_secret = StaticSecret::random_from_rng(&mut rng);
 
         // Загрузка личного ключа клиента
         let private_key_bytes = BASE64_STANDARD
@@ -78,11 +78,12 @@ impl ANetClient {
             let server_pub_bytes = BASE64_STANDARD
                 .decode(&cfg.main.server_pub_key)
                 .context("Failed to decode server public key")?;
-            Some(VerifyingKey::from_bytes(
+            let server_pub_key = VerifyingKey::from_bytes(
                 &server_pub_bytes
                     .try_into()
                     .map_err(|_| anyhow::anyhow!("Invalid server public key length"))?,
-            ))
+            )?;
+            Some(server_pub_key)
         } else {
             None
         };
@@ -90,7 +91,7 @@ impl ANetClient {
         info!("ANET Client created for client ID: {}", client_id);
         Ok(Self {
             server_addr: cfg.main.address.to_string(),
-            server_public_key: None, // TODO!
+            server_public_key,
             dh_state: DHClientState {
                 ephemeral_secret,
                 signing_key,

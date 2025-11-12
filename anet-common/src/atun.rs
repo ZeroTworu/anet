@@ -8,12 +8,13 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::process::Command;
 use tokio::sync::{Mutex, mpsc};
-use tun::AsyncDevice;
+use tun::{AbstractDevice, AsyncDevice};
 
 pub struct TunManager {
     reader: Arc<Mutex<ReadHalf<AsyncDevice>>>,
     writer: Arc<Mutex<WriteHalf<AsyncDevice>>>,
     params: TunParams,
+    tun_index: u32,
 }
 
 impl Clone for TunManager {
@@ -22,6 +23,7 @@ impl Clone for TunManager {
             reader: Arc::clone(&self.reader),
             writer: Arc::clone(&self.writer),
             params: self.params.clone(),
+            tun_index: self.tun_index,
         }
     }
 }
@@ -30,14 +32,19 @@ impl TunManager {
     pub fn new(params: TunParams) -> Result<Self> {
         let config = params.create_config()?;
         let device = tun::create_as_async(&config).context("Failed to create async TUN device")?;
-
+        let tun_index = device.tun_index()? as u32;
         let (reader, writer) = tokio::io::split(device);
         info!("Created TUN with: [{}]", params.get_info());
         Ok(Self {
             reader: Arc::new(Mutex::new(reader)),
             writer: Arc::new(Mutex::new(writer)),
             params,
+            tun_index,
         })
+    }
+
+    pub fn get_tun_index(&self) -> u32 {
+        self.tun_index
     }
 
     pub async fn run(&self) -> Result<(mpsc::Sender<Bytes>, mpsc::Receiver<Bytes>)> {
