@@ -1,6 +1,7 @@
 use crate::auth_handler::run_auth_handler;
 use crate::config::Config;
 use crate::ip_pool::IpPool;
+use crate::multikey_udp_socket::StreamSender;
 use crate::multikey_udp_socket::{
     ClientTransportInfo, HandshakeData, MultiKeyAnetUdpSocket, TempDHInfo,
 };
@@ -16,19 +17,17 @@ use ed25519_dalek::SigningKey;
 use log::{debug, info};
 use quinn::crypto::rustls::QuicServerConfig;
 use quinn::{Endpoint, EndpointConfig, ServerConfig as QuinnServerConfig, TokioRuntime};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::ServerConfig as RustlsServerConfig;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::io::BufReader;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
-use crate::multikey_udp_socket::StreamSender;
 
 const TEMP_DH_TIMEOUT: Duration = Duration::from_secs(30);
 const TEMP_DH_CLEANUP_INTERVAL: Duration = Duration::from_secs(10);
-
 
 pub struct ANetServer {
     cfg: Config,
@@ -89,7 +88,10 @@ impl ANetServer {
 
         let real_socket = Arc::new(UdpSocket::bind(listen_addr).await?);
         let server_config = build_quinn_server_config(&self.cfg)?;
-        info!("Unified UDP listener (Auth/QUIC) started on {}", listen_addr);
+        info!(
+            "Unified UDP listener (Auth/QUIC) started on {}",
+            listen_addr
+        );
 
         let (tx_to_tun, rx_from_tun) = self.tun_manager.run().await?;
         self.tun_manager
@@ -143,15 +145,10 @@ impl ANetServer {
             tokio::spawn(clear_expired_dh_sessions(self.temp_dh_map.clone()));
 
         // Ожидаем завершения всех основных задач
-        let _ = tokio::try_join!(
-            vpn_handler_task,
-            auth_handler_task,
-            cleanup_temp_dh_task
-        )?;
+        let _ = tokio::try_join!(vpn_handler_task, auth_handler_task, cleanup_temp_dh_task)?;
 
         Ok(())
     }
-
 }
 
 async fn clear_expired_dh_sessions(temp_dh_map: Arc<DashMap<SocketAddr, TempDHInfo>>) {
@@ -166,10 +163,8 @@ async fn clear_expired_dh_sessions(temp_dh_map: Arc<DashMap<SocketAddr, TempDHIn
 }
 
 fn build_quinn_server_config(cfg: &Config) -> Result<QuinnServerConfig> {
-    let (certs, key) = load_cert_and_key(
-        cfg.crypto.quic_cert.as_str(),
-        cfg.crypto.quic_key.as_str(),
-    )?;
+    let (certs, key) =
+        load_cert_and_key(cfg.crypto.quic_cert.as_str(), cfg.crypto.quic_key.as_str())?;
 
     let server_crypto = RustlsServerConfig::builder()
         .with_no_client_auth()
@@ -183,7 +178,10 @@ fn build_quinn_server_config(cfg: &Config) -> Result<QuinnServerConfig> {
     Ok(server_cfg)
 }
 
-fn load_cert_and_key(cert_pem: &str, key_pem: &str) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
+fn load_cert_and_key(
+    cert_pem: &str,
+    key_pem: &str,
+) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
     let mut cert_reader = BufReader::new(cert_pem.as_bytes());
     let certs = rustls_pemfile::certs(&mut cert_reader)
         .collect::<std::result::Result<Vec<_>, _>>()

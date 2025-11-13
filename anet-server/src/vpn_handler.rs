@@ -86,17 +86,27 @@ async fn handle_connection(
         .map(|entry| entry.value().clone())
         .ok_or_else(|| {
             connection.close(0u32.into(), b"Transport layer association failed");
-            anyhow::anyhow!("QUIC connection from {} but no associated client info found", remote_addr)
+            anyhow::anyhow!(
+                "QUIC connection from {} but no associated client info found",
+                remote_addr
+            )
         })?;
 
     let client_ip = client.assigned_ip.clone();
-    info!("QUIC session accepted for client VPN IP: {} ({}), SEID: {}", client_ip, remote_addr, client.session_id);
+    info!(
+        "QUIC session accepted for client VPN IP: {} ({}), SEID: {}",
+        client_ip, remote_addr, client.session_id
+    );
 
     let (send_stream, recv_stream) = connection.accept_bi().await?;
 
     let (tx_router, mut rx_router) = mpsc::channel::<Bytes>(1024);
     quic_router.insert(client_ip.clone(), tx_router);
-    info!("Client {} added to QUIC router. Total clients: {}", client_ip, quic_router.len());
+    info!(
+        "Client {} added to QUIC router. Total clients: {}",
+        client_ip,
+        quic_router.len()
+    );
 
     let tx_task = tokio::spawn(async move {
         let mut stream = send_stream;
@@ -114,7 +124,9 @@ async fn handle_connection(
         loop {
             match read_next_packet(&mut stream).await {
                 Ok(Some(packet)) => {
-                    if tx_to_tun.send(packet).await.is_err() { break; }
+                    if tx_to_tun.send(packet).await.is_err() {
+                        break;
+                    }
                 }
                 _ => break, // Ошибка или стрим закрыт
             }
@@ -134,7 +146,11 @@ async fn handle_connection(
     if let Ok(ip_addr) = client_ip.parse() {
         ip_pool.release(ip_addr);
     }
-    info!("Client {} removed. Remaining clients: {}", client_ip, quic_router.len());
+    info!(
+        "Client {} removed. Remaining clients: {}",
+        client_ip,
+        quic_router.len()
+    );
 
     Ok(())
 }
@@ -145,9 +161,13 @@ async fn route_tun_to_quic(
     quic_router: Arc<DashMap<String, StreamSender>>,
 ) -> Result<()> {
     while let Some(packet) = rx_from_tun.recv().await {
-        if packet.len() < 20 { continue; }
+        if packet.len() < 20 {
+            continue;
+        }
         let version = packet[0] >> 4;
-        if version != 4 && version != 6 { continue; }
+        if version != 4 && version != 6 {
+            continue;
+        }
 
         let dst_ip_str = match extract_ip_dst(&packet) {
             Some(ip) => ip.to_string(),
@@ -159,7 +179,10 @@ async fn route_tun_to_quic(
 
         if let Some(sender) = quic_router.get(&dst_ip_str) {
             if sender.send(packet).await.is_err() {
-                warn!("Failed to route packet to {}: QUIC channel closed.", dst_ip_str);
+                warn!(
+                    "Failed to route packet to {}: QUIC channel closed.",
+                    dst_ip_str
+                );
             }
         } else {
             // Это нормальная ситуация, если пакет пришел для клиента, который уже отключился

@@ -2,10 +2,7 @@ use crate::ip_pool::IpPool;
 use crate::multikey_udp_socket::{ClientTransportInfo, HandshakeData, TempDHInfo};
 use crate::utils::{generate_seid, generate_unique_nonce_prefix};
 use anet_common::consts::{AUTH_PREFIX_LEN, NONCE_LEN};
-use anet_common::crypto_utils::sign_data;
-use anet_common::crypto_utils::{
-    derive_shared_key, generate_auth_prefix, generate_key_fingerprint, verify_signature,
-};
+use anet_common::crypto_utils;
 use anet_common::encryption::Cipher;
 use anet_common::protocol::{
     AuthResponse, DhServerExchange, EncryptedAuthResponse, Message as AnetMessage, message::Content,
@@ -84,8 +81,23 @@ async fn handle_auth_request(
     server_signing_key: &SigningKey,
     quic_cert_pem: &str,
 ) -> Result<()> {
-    let message: AnetMessage = Message::decode(full_packet.slice(AUTH_PREFIX_LEN..))
-        .context("Failed to decode AnetMessage during Auth flow")?;
+    // XOR взад
+    // 1. Извлекаем префикс из всего пакета
+    let prefix = &full_packet[..AUTH_PREFIX_LEN];
+
+    // 2. Извлекаем соль из префикса
+    let salt = crypto_utils::extract_salt_from_prefix(prefix)
+        .context("Failed to extract salt from request")?;
+
+    // 3. Копируем зашифрованную полезную нагрузку
+    let mut payload = full_packet.slice(AUTH_PREFIX_LEN..).to_vec();
+    info!("(S) BEFORE XOR: {:?}", payload);
+    // 4. Применяем тот же XOR с той же солью, чтобы получить исходные данные
+    crypto_utils::xor_bytes(&mut payload, &salt);
+    info!("(S) AFTER XOR: {:?}", payload);
+    // 5. Теперь декодируем Protobuf из "чистых", восстановленных данных
+    let message: AnetMessage = Message::decode(Bytes::from(payload))
+        .context("Failed to decode AnetMessage after deobfuscation")?;
 
     match message.content {
         // --- ФАЗА I (Init) ---
@@ -98,7 +110,7 @@ async fn handle_auth_request(
             )
             .map_err(|_| anyhow::anyhow!("Invalid client public key"))?;
 
-            let client_fingerprint = generate_key_fingerprint(&client_public_key);
+            let client_fingerprint = crypto_utils::generate_key_fingerprint(&client_public_key);
 
             // Проверяем, разрешен ли клиент
             if !allowed_clients.contains(&client_fingerprint) {
@@ -106,7 +118,7 @@ async fn handle_auth_request(
             }
 
             // Верифицируем подпись клиента
-            verify_signature(
+            crypto_utils::verify_signature(
                 &client_public_key,
                 &req.public_key,
                 &req.client_signed_dh_key,
@@ -138,11 +150,12 @@ async fn handle_auth_request(
             let client_pub_key = PublicKey::from(client_pub_key_bytes);
 
             // Подписываем наш DH ключ
-            let server_signed_dh_key = sign_data(server_signing_key, server_pub_key.as_bytes());
+            let server_signed_dh_key =
+                crypto_utils::sign_data(server_signing_key, server_pub_key.as_bytes());
 
             // Вычисляем K_shared
             let shared_secret = server_ephemeral_secret.diffie_hellman(&client_pub_key);
-            let shared_key = derive_shared_key(&shared_secret);
+            let shared_key = crypto_utils::derive_shared_key(&shared_secret);
             info!(
                 "[{}] Server shared key (first 8 bytes): {:02x?}",
                 remote_addr,
@@ -173,8 +186,12 @@ async fn handle_auth_request(
             let mut response_data = Vec::new();
             response_message.encode(&mut response_data)?;
 
+            // XOR пакета
+            let prefix_info = crypto_utils::generate_prefix_with_salt();
+            crypto_utils::xor_bytes(&mut response_data, &prefix_info.salt);
+
             let mut response_packet = BytesMut::new();
-            response_packet.put_slice(&generate_auth_prefix());
+            response_packet.put_slice(&prefix_info.prefix);
             response_packet.put(&response_data[..]);
 
             socket
@@ -334,10 +351,14 @@ async fn handle_auth_request(
             };
             wrapped_msg.encode(&mut final_data)?;
 
+            //Обфусцируем финальный ответ
+            let prefix_info = crypto_utils::generate_prefix_with_salt();
+            crypto_utils::xor_bytes(&mut final_data, &prefix_info.salt);
+
             // Отправка (Фаза IV)
             let mut response_packet = BytesMut::new();
-            response_packet.put_slice(&generate_auth_prefix());
-            response_packet.put(&final_data[..]);
+            response_packet.put_slice(&prefix_info.prefix);
+            response_packet.put_slice(&final_data);
 
             socket
                 .send_to(&response_packet.freeze(), remote_addr)

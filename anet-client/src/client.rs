@@ -2,9 +2,8 @@ use crate::client_udp_socket::AnetUdpSocket;
 use crate::config::{Config, load};
 use anet_common::atun::TunManager;
 use anet_common::consts::{AUTH_PREFIX_LEN, MAX_PACKET_SIZE, NONCE_LEN};
-use anet_common::crypto_utils::{
-    derive_shared_key, generate_auth_prefix, generate_key_fingerprint, sign_data,
-};
+use anet_common::crypto_utils;
+use anet_common::crypto_utils::{derive_shared_key, generate_key_fingerprint, sign_data};
 use anet_common::encryption::Cipher;
 use anet_common::protocol::{
     AuthRequest, AuthResponse, DhClientExchange, EncryptedAuthRequest, EncryptedAuthResponse,
@@ -75,17 +74,14 @@ impl ANetClient {
 
         // Загрузка публичного ключа сервера (опционально)
 
-            let server_pub_bytes = BASE64_STANDARD
-                .decode(&cfg.keys.server_pub_key)
-                .context("Failed to decode server public key")?;
-            let server_public_key = VerifyingKey::from_bytes(
-                &server_pub_bytes
-                    .try_into()
-                    .map_err(|_| anyhow::anyhow!("Invalid server public key length"))?,
-            )?;
-
-
-
+        let server_pub_bytes = BASE64_STANDARD
+            .decode(&cfg.keys.server_pub_key)
+            .context("Failed to decode server public key")?;
+        let server_public_key = VerifyingKey::from_bytes(
+            &server_pub_bytes
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("Invalid server public key length"))?,
+        )?;
 
         info!("ANET Client created for client ID: {}", client_id);
         Ok(Self {
@@ -176,8 +172,9 @@ impl ANetClient {
                         &self.server_public_key,
                         &server_pub_key_bytes,
                         &server_signature,
-                    ).context("Server signature verification failed")?;
-                    
+                    )
+                    .context("Server signature verification failed")?;
+
                     info!("Server signature verified successfully");
                     // Вычисление общего секрета K_shared
                     let server_key_array: [u8; 32] = server_pub_key_bytes
@@ -285,10 +282,21 @@ impl ANetClient {
         };
         wrapped_msg.encode(&mut final_data)?;
 
-        info!("Final encoded message size: {} bytes", final_data.len());
+        info!(
+            "Final encoded message size before XOR: {} bytes",
+            final_data.len()
+        );
+
+        let prefix_info = crypto_utils::generate_prefix_with_salt();
+        crypto_utils::xor_bytes(&mut final_data, &prefix_info.salt);
+
+        info!(
+            "Final encoded message size after XOR: {} bytes",
+            final_data.len()
+        );
 
         let mut final_packet_obf = BytesMut::new();
-        final_packet_obf.put_slice(&generate_auth_prefix());
+        final_packet_obf.put_slice(&prefix_info.prefix);
         final_packet_obf.put_slice(&final_data);
 
         let packet = final_packet_obf.freeze();
@@ -302,9 +310,11 @@ impl ANetClient {
         let mut request_data = Vec::new();
         message.encode(&mut request_data)?;
 
+        let prefix_info = crypto_utils::generate_prefix_with_salt();
+        crypto_utils::xor_bytes(&mut request_data, &prefix_info.salt);
+
         let mut packet = BytesMut::new();
-        let prefix = generate_auth_prefix();
-        packet.put_slice(&prefix);
+        packet.put_slice(&prefix_info.prefix);
         packet.put_slice(&request_data);
         Ok(packet.freeze())
     }
@@ -352,15 +362,29 @@ impl ANetClient {
         if len <= AUTH_PREFIX_LEN {
             return Err(anyhow::anyhow!("Auth response too short"));
         }
+        let prefix = &response_buf[..AUTH_PREFIX_LEN];
 
-        if !anet_common::crypto_utils::check_auth_prefix(&response_buf[..AUTH_PREFIX_LEN]) {
+        if !crypto_utils::check_auth_prefix(&prefix) {
             return Err(anyhow::anyhow!(
                 "Auth response RND-SALT prefix check failed."
             ));
         }
 
-        Message::decode(Bytes::from(response_buf[AUTH_PREFIX_LEN..len].to_vec()))
-            .context("Failed to decode Protobuf message")
+        // XOR взыд
+
+        // 1. Извлекаем соль из префикса ответа сервера
+        let salt = anet_common::crypto_utils::extract_salt_from_prefix(prefix)
+            .context("Failed to extract salt from response")?;
+
+        // 2. Копируем зашифрованную часть пакета
+        let mut payload = response_buf[AUTH_PREFIX_LEN..len].to_vec();
+
+        // 3. Применяем XOR с солью, чтобы получить чистый Protobuf
+        crypto_utils::xor_bytes(&mut payload, &salt);
+        // =============================================================
+
+        // 4. Декодируем уже "чистые" данные
+        Message::decode(Bytes::from(payload)).context("Failed to decode Protobuf message")
     }
 
     fn decrypt_auth_response(
