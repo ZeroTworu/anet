@@ -260,16 +260,12 @@ impl ANetClient {
         let mut nonce_bytes = [0u8; NONCE_LEN];
         rng.fill_bytes(&mut nonce_bytes);
 
-        info!("Encrypting with nonce: {:?}", nonce_bytes);
-
         let ciphertext = req_cipher
             .encrypt(&nonce_bytes, Bytes::from(raw_auth_request))
             .map_err(|e| {
                 error!("Failed to encrypt AuthRequest: {:?}", e);
                 anyhow::anyhow!("Failed to encrypt AuthRequest: {:?}", e)
             })?;
-
-        info!("Ciphertext size: {} bytes", ciphertext.len());
 
         let encrypted_req = EncryptedAuthRequest {
             ciphertext: ciphertext.to_vec(),
@@ -282,25 +278,14 @@ impl ANetClient {
         };
         wrapped_msg.encode(&mut final_data)?;
 
-        info!(
-            "Final encoded message size before XOR: {} bytes",
-            final_data.len()
-        );
-
         let prefix_info = crypto_utils::generate_prefix_with_salt();
         crypto_utils::xor_bytes(&mut final_data, &prefix_info.salt);
-
-        info!(
-            "Final encoded message size after XOR: {} bytes",
-            final_data.len()
-        );
 
         let mut final_packet_obf = BytesMut::new();
         final_packet_obf.put_slice(&prefix_info.prefix);
         final_packet_obf.put_slice(&final_data);
 
         let packet = final_packet_obf.freeze();
-        info!("Total packet size with prefix: {} bytes", packet.len());
 
         Ok((packet, req_cipher))
     }
@@ -468,6 +453,63 @@ impl ANetClient {
             auth_response.session_id,
         );
 
+        let stats_config = config_result.stats;
+
+        if stats_config.enabled && stats_config.interval_minutes > 0 {
+            info!(
+        "[STATS] Statistics monitor enabled. Interval: {} minute(s).",
+        stats_config.interval_minutes
+    );
+
+            let stats_conn= connection.clone();
+
+            tokio::spawn(async move {
+                let interval = Duration::from_secs(stats_config.interval_minutes * 60);
+
+                // Сохраняем предыдущее состояние для расчета дельты
+                let mut last_stats = stats_conn.stats();
+                let start_time = std::time::Instant::now();
+
+                loop {
+                    sleep(interval).await;
+
+                    if stats_conn.close_reason().is_some() {
+                        info!("[STATS] Connection closed, stopping stats monitor.");
+                        break;
+                    }
+
+                    let current_stats = stats_conn.stats();
+                    let elapsed_since_start = (std::time::Instant::now() - start_time).as_secs_f64().max(1.0);
+
+                    // --- ИСПРАВЛЕННЫЕ ПОЛЯ ---
+                    // Считаем дельту (разницу) по байтам
+                    let rx_bytes_delta = current_stats.udp_rx.bytes - last_stats.udp_rx.bytes;
+                    let tx_bytes_delta = current_stats.udp_tx.bytes - last_stats.udp_tx.bytes;
+
+                    // Переводим в мегабиты в секунду, используя время интервала
+                    let interval_secs = interval.as_secs_f64();
+                    let rx_mbps = if interval_secs > 0.0 { (rx_bytes_delta * 8) as f64 / (1000.0 * 1000.0 * interval_secs) } else { 0.0 };
+                    let tx_mbps = if interval_secs > 0.0 { (tx_bytes_delta * 8) as f64 / (1000.0 * 1000.0 * interval_secs) } else { 0.0 };
+
+                    let path = &current_stats.path;
+
+                    // --- ИСПРАВЛЕННЫЙ ФОРМАТ ВЫВОДА ---
+                    info!(
+                "[STATS] Interval: {:.1} min | RTT: {:>6.2}ms | Cwnd: {:>7.2}MB | Speed (Rx/Tx): {:>6.2} / {:>6.2} Mbps | Lost pkts (Tx): {} | MTU: {} B",
+                elapsed_since_start / 60.0,
+                path.rtt.as_secs_f64() * 1000.0,
+                path.cwnd as f64 / (1024.0 * 1024.0),
+                rx_mbps.max(0.0),
+                tx_mbps.max(0.0),
+                path.lost_packets - last_stats.path.lost_packets, // Потери, обнаруженные отправителем
+                path.current_mtu
+            );
+
+                    // Обновляем "предыдущее" состояние
+                    last_stats = current_stats;
+                }
+            });
+        }
         let (send_stream, recv_stream) = connection.open_bi().await?;
         info!("Opened bidirectional QUIC stream for VPN traffic.");
 

@@ -36,6 +36,24 @@ impl Default for ClientKeys {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct StatsConfig {
+    /// Включить или выключить периодический вывод статистики соединения.
+    pub enabled: bool,
+    /// Интервал вывода статистики в минутах.
+    pub interval_minutes: u64,
+}
+
+impl Default for StatsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false, // По умолчанию выключено, чтобы не засорять логи
+            interval_minutes: 1, // По умолчанию - раз в минуту
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub main: MainConfig,
@@ -45,6 +63,9 @@ pub struct Config {
 
     #[serde(default)]
     pub quic_transport: QuicConfig,
+
+    #[serde(default)]
+    pub stats: StatsConfig
 }
 
 #[derive(Debug, Parser)]

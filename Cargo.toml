@@ -23,7 +23,6 @@ toml = "0.9.8"
 x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }
 ed25519-dalek = { version = "2.1.1", features = ["std", "rand_core"] }
 sha2 = "0.10.9"
-rand_core = "0.6.4"
 
 [profile.release.package.anet-client]
 debug = 2
