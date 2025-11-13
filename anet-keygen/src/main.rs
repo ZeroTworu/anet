@@ -27,8 +27,8 @@ fn generate_key_pair() -> (SigningKey, VerifyingKey, String) {
     let signing_key = SigningKey::generate(&mut csprng);
     let verifying_key = signing_key.verifying_key();
 
-    let private_key_b64 = BASE64_STANDARD.encode(signing_key.to_bytes());
-    let public_key_b64 = BASE64_STANDARD.encode(verifying_key.to_bytes());
+    // let private_key_b64 = BASE64_STANDARD.encode(signing_key.to_bytes());
+    // let public_key_b64 = BASE64_STANDARD.encode(verifying_key.to_bytes());
 
     // Генерация fingerprint
     let mut hasher = Sha256::new();
