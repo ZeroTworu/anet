@@ -26,7 +26,7 @@ use tokio::sync::mpsc;
 
 pub type StreamSender = mpsc::Sender<Bytes>;
 
-// --- НОВАЯ СТРУКТУРА: Временное DH Состояние ---
+//  Временное DH Состояние
 #[derive(Clone)]
 pub struct TempDHInfo {
     pub shared_key: [u8; 32],
@@ -47,7 +47,6 @@ pub type HandshakeData = (Bytes, SocketAddr);
 
 pub struct MultiKeyAnetUdpSocket {
     io: Arc<UdpSocket>,
-    // Используются в handle_connection/cleanup
     // O(1) для приема QUIC
     clients_by_prefix: Arc<DashMap<[u8; 4], Arc<ClientTransportInfo>>>,
     // O(1) для отправки QUIC

@@ -49,8 +49,9 @@ pub struct DHClientState {
 
 pub struct ANetClient {
     server_addr: String,
-    server_public_key: Option<VerifyingKey>,
+    server_public_key: VerifyingKey,
     dh_state: DHClientState,
+    tun_name: String,
 }
 
 impl ANetClient {
@@ -73,24 +74,24 @@ impl ANetClient {
         let client_id = generate_key_fingerprint(&client_public_key);
 
         // Загрузка публичного ключа сервера (опционально)
-        let server_public_key = if cfg.main.server_pub_key != "None" {
+
             let server_pub_bytes = BASE64_STANDARD
-                .decode(&cfg.main.server_pub_key)
+                .decode(&cfg.keys.server_pub_key)
                 .context("Failed to decode server public key")?;
-            let server_pub_key = VerifyingKey::from_bytes(
+            let server_public_key = VerifyingKey::from_bytes(
                 &server_pub_bytes
                     .try_into()
                     .map_err(|_| anyhow::anyhow!("Invalid server public key length"))?,
             )?;
-            Some(server_pub_key)
-        } else {
-            None
-        };
+
+
+
 
         info!("ANET Client created for client ID: {}", client_id);
         Ok(Self {
             server_addr: cfg.main.address.to_string(),
             server_public_key,
+            tun_name: cfg.main.tun_name.to_string(),
             dh_state: DHClientState {
                 ephemeral_secret,
                 signing_key,
@@ -170,21 +171,14 @@ impl ANetClient {
                         }
                     };
 
-                    // Верификация подписи сервера (если есть публичный ключ сервера)
-                    if let Some(server_pub_key) = &self.server_public_key {
-                        anet_common::crypto_utils::verify_signature(
-                            server_pub_key,
-                            &server_pub_key_bytes,
-                            &server_signature,
-                        )
-                        .context("Server signature verification failed")?;
-                        info!("Server signature verified successfully");
-                    } else {
-                        info!(
-                            "Skipping server signature verification (no server public key configured)"
-                        );
-                    }
-
+                    // Верификация подписи сервера
+                    anet_common::crypto_utils::verify_signature(
+                        &self.server_public_key,
+                        &server_pub_key_bytes,
+                        &server_signature,
+                    ).context("Server signature verification failed")?;
+                    
+                    info!("Server signature verified successfully");
                     // Вычисление общего секрета K_shared
                     let server_key_array: [u8; 32] = server_pub_key_bytes
                         .as_slice()
@@ -454,7 +448,7 @@ impl ANetClient {
         info!("Opened bidirectional QUIC stream for VPN traffic.");
 
         // Создаем TUN интерфейс
-        let tun_params = TunParams::from_auth_response(&auth_response, "anet-client");
+        let tun_params = TunParams::from_auth_response(&auth_response, self.tun_name.as_str());
         let tun_manager = TunManager::new(tun_params);
         let mut tun_manager = match tun_manager {
             Ok(tun_manager) => tun_manager,
