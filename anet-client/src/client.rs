@@ -1,5 +1,6 @@
 use crate::client_udp_socket::AnetUdpSocket;
 use crate::config::{Config, load};
+use anet_common::atun::TunManager;
 use anet_common::consts::{AUTH_PREFIX_LEN, MAX_PACKET_SIZE, NONCE_LEN};
 use anet_common::crypto_utils::{
     derive_shared_key, generate_auth_prefix, generate_key_fingerprint, sign_data,
@@ -11,6 +12,7 @@ use anet_common::protocol::{
 };
 use anet_common::quic_settings::build_transport_config;
 use anet_common::stream_framing::{frame_packet, read_next_packet};
+use anet_common::tun_params::TunParams;
 use anyhow::{Context, Result};
 use base64::prelude::*;
 use bytes::{BufMut, Bytes, BytesMut};
@@ -31,11 +33,8 @@ use std::ops::Deref;
 use std::{sync::Arc, time::Duration};
 use tokio::io::AsyncWriteExt;
 use tokio::net::UdpSocket;
-use tokio::sync::mpsc;
 use tokio::time::sleep;
 use x25519_dalek::{PublicKey, StaticSecret};
-use anet_common::atun::TunManager;
-use anet_common::tun_params::TunParams;
 
 const MAX_RETRIES: u32 = 10;
 const INITIAL_DELAY: u64 = 5;
@@ -436,9 +435,9 @@ impl ANetClient {
         endpoint.set_default_client_config(client_config);
 
         info!(
-        "Connecting to QUIC endpoint [{}] via ANET transport...",
-        remote_addr
-    );
+            "Connecting to QUIC endpoint [{}] via ANET transport...",
+            remote_addr
+        );
 
         let server_name = ServerName::try_from("alco").expect("Invalid server name");
 
@@ -446,10 +445,10 @@ impl ANetClient {
             .connect(remote_addr, server_name.to_str().deref())?
             .await?;
         info!(
-        "QUIC connection established with {}, SEID: {}",
-        connection.remote_address(),
-        auth_response.session_id,
-    );
+            "QUIC connection established with {}, SEID: {}",
+            connection.remote_address(),
+            auth_response.session_id,
+        );
 
         let (send_stream, recv_stream) = connection.open_bi().await?;
         info!("Opened bidirectional QUIC stream for VPN traffic.");
