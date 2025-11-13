@@ -21,6 +21,7 @@ x25519-dalek = {workspace = true}
 ed25519-dalek = {workspace = true}
 base64 = {workspace = true}
 
+netdev = { version = "0.39", features = ["gateway"] }
 anet-common = { path = "../anet-common"}
 
 [build-dependencies]
