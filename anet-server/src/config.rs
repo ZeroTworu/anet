@@ -35,12 +35,11 @@ pub struct StatsConfig {
 impl Default for StatsConfig {
     fn default() -> Self {
         Self {
-            enabled: false, // По умолчанию выключено, чтобы не засорять логи
+            enabled: false,      // По умолчанию выключено, чтобы не засорять логи
             interval_minutes: 1, // По умолчанию - раз в минуту
         }
     }
 }
-
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AuthenticationConfig {
@@ -113,9 +112,6 @@ pub struct Config {
 
     #[serde(default)]
     pub authentication: AuthenticationConfig,
-
-    #[serde(default)]
-    pub stats: StatsConfig,
 }
 
 #[derive(Debug, Parser)]

@@ -65,19 +65,17 @@ fn calculate_window_from_bdp(mbps: u32, rtt_ms: u32) -> u64 {
     (bdp * 5 / 2).max(1_048_576)
 }
 
-
 pub fn build_transport_config(cfg: &QuicConfig, mtu: u16) -> Result<TransportConfig> {
     let mut config = TransportConfig::default();
     let rtt_duration = Duration::from_millis(cfg.expected_rtt_ms.max(1) as u64);
 
+    let final_receive_window = cfg
+        .receive_window
+        .unwrap_or_else(|| calculate_window_from_bdp(cfg.bandwidth_down_mbps, cfg.expected_rtt_ms));
 
-    let final_receive_window = cfg.receive_window.unwrap_or_else(|| {
-        calculate_window_from_bdp(cfg.bandwidth_down_mbps, cfg.expected_rtt_ms)
-    });
-
-    let final_send_window = cfg.send_window.unwrap_or_else(|| {
-        calculate_window_from_bdp(cfg.bandwidth_up_mbps, cfg.expected_rtt_ms)
-    });
+    let final_send_window = cfg
+        .send_window
+        .unwrap_or_else(|| calculate_window_from_bdp(cfg.bandwidth_up_mbps, cfg.expected_rtt_ms));
 
     // Stream window is usually a fraction of the connection window.
     let final_stream_receive_window = cfg.stream_receive_window.unwrap_or_else(|| {
@@ -91,12 +89,17 @@ pub fn build_transport_config(cfg: &QuicConfig, mtu: u16) -> Result<TransportCon
                 let mut bbr_config = BbrConfig::default();
                 // "Подсказываем" BBR начальное окно, чтобы он быстрее вышел на крейсерскую скорость.
                 // Это 2 * BDP, как рекомендуется в документации.
-                let initial_window = calculate_window_from_bdp(cfg.bandwidth_up_mbps, cfg.expected_rtt_ms) * 2;
+                let initial_window =
+                    calculate_window_from_bdp(cfg.bandwidth_up_mbps, cfg.expected_rtt_ms) * 2;
                 bbr_config.initial_window(initial_window.try_into()?);
-                info!("BBR configured with initial window of {} bytes.", initial_window);
+                info!(
+                    "BBR configured with initial window of {} bytes.",
+                    initial_window
+                );
                 Arc::new(bbr_config)
             }
-            _ => { // "cubic" or default
+            _ => {
+                // "cubic" or default
                 info!("QUIC Transport using CUBIC Congestion Control.");
                 Arc::new(CubicConfig::default())
             }
@@ -128,7 +131,10 @@ pub fn build_transport_config(cfg: &QuicConfig, mtu: u16) -> Result<TransportCon
         if timeout_secs > 0 {
             let timeout = IdleTimeout::try_from(Duration::from_secs(timeout_secs))?;
             config.max_idle_timeout(Some(timeout));
-            info!("QUIC Transport: Max Idle Timeout set to {} seconds.", timeout_secs);
+            info!(
+                "QUIC Transport: Max Idle Timeout set to {} seconds.",
+                timeout_secs
+            );
         }
     }
     Ok(config)

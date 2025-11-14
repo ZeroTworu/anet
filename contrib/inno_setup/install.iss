@@ -32,7 +32,7 @@ UninstallDisplayIcon={app}\anet.ico
 
 [Tasks]
 ; Задача на создание иконки (для использования в секции [Icons])
-Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; Flags: checked
+Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; Flags: checkedonce
 
 ; --- File Section ---
 [Files]

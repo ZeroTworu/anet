@@ -25,7 +25,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
-use tokio::time::sleep;
 
 const TEMP_DH_TIMEOUT: Duration = Duration::from_secs(30);
 const TEMP_DH_CLEANUP_INTERVAL: Duration = Duration::from_secs(10);
@@ -140,59 +139,6 @@ impl ANetServer {
             self.server_signing_key.clone(),
             self.quic_cert_pem.clone(),
         ));
-
-        // let stats_config = self.cfg.stats;
-        //
-        // if stats_config.enabled && stats_config.interval_minutes > 0 {
-        //     info!(
-        //         "[STATS] Statistics monitor enabled. Interval: {} minute(s).",
-        //         stats_config.interval_minutes
-        //     );
-        //
-        //     let stats_conn  = endpoint.stats().clone();
-        //
-        //     tokio::spawn(async move {
-        //         let interval = Duration::from_secs(stats_config.interval_minutes * 60);
-        //         loop {
-        //             sleep(interval).await;
-        //
-        //             if stats_conn.close_reason().is_some() {
-        //                 info!("[STATS] Connection closed, stopping stats monitor.");
-        //                 break;
-        //             }
-        //
-        //             let stats = stats_conn.stats();
-        //             let path_stats = &stats.path;
-        //             // Statistics about UDP datagrams received on a connection
-        //             let udp_rx = &stats.udp_rx;
-        //             // Statistics about UDP datagrams transmitted on a connection
-        //             let udp_tx = &stats.udp_tx;
-        //
-        //             // Собираем более подробную и читаемую статистику
-        //             info!(
-        //                 r#"
-        //                 [STATS] RTT: {:?},
-        //                     Congestion: (cwnd: {} sent packets: {}, lost_packets: {}, lost bytes: {}, black holes detected: {})
-        //                     Received: (bytes: {}, packets: {})
-        //                     Transmit: (bytes: {}, packets: {})
-        //                 "#,
-        //                 path_stats.rtt,
-        //                 path_stats.cwnd,
-        //                 path_stats.sent_packets,
-        //                 path_stats.lost_packets,
-        //                 path_stats.lost_bytes,
-        //                 path_stats.black_holes_detected,
-        //
-        //                 udp_rx.bytes,
-        //                 udp_rx.datagrams,
-        //
-        //                 udp_tx.bytes,
-        //                 udp_rx.datagrams,
-        //             );
-        //         }
-        //     });
-        // }
-
         // 3. Задача очистки устаревших сессий DH
         let cleanup_temp_dh_task =
             tokio::spawn(clear_expired_dh_sessions(self.temp_dh_map.clone()));

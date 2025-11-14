@@ -47,7 +47,7 @@ pub struct StatsConfig {
 impl Default for StatsConfig {
     fn default() -> Self {
         Self {
-            enabled: false, // По умолчанию выключено, чтобы не засорять логи
+            enabled: false,      // По умолчанию выключено, чтобы не засорять логи
             interval_minutes: 1, // По умолчанию - раз в минуту
         }
     }
@@ -65,7 +65,7 @@ pub struct Config {
     pub quic_transport: QuicConfig,
 
     #[serde(default)]
-    pub stats: StatsConfig
+    pub stats: StatsConfig,
 }
 
 #[derive(Debug, Parser)]
