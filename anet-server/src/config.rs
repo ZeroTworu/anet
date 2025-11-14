@@ -97,6 +97,22 @@ impl Default for ServerCoreConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct StealthConfig {
+    pub min_jitter_ns: u64,
+    pub max_jitter_ns: u64,
+}
+
+impl Default for StealthConfig {
+    fn default() -> Self {
+        Self {
+            min_jitter_ns: 0,
+            max_jitter_ns: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub network: NetworkConfig,
@@ -112,6 +128,9 @@ pub struct Config {
 
     #[serde(default)]
     pub authentication: AuthenticationConfig,
+
+    #[serde(default)]
+    pub stealth: StealthConfig,
 }
 
 #[derive(Debug, Parser)]

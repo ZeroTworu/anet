@@ -1,5 +1,5 @@
 use crate::client_udp_socket::AnetUdpSocket;
-use crate::config::{Config, StatsConfig};
+use crate::config::{Config, StatsConfig, StealthConfig};
 use anet_common::atun::TunManager;
 use anet_common::encryption::Cipher;
 use anet_common::protocol::AuthResponse;
@@ -13,6 +13,8 @@ use quinn::{
     ClientConfig as QuinnClientConfig, Connection, Endpoint, EndpointConfig, TokioRuntime,
     crypto::rustls::QuicClientConfig,
 };
+use rand::Rng;
+use rand::rngs::OsRng;
 use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::{ClientConfig as RustlsClientConfig, RootCertStore};
 use rustls_pemfile::certs;
@@ -27,6 +29,7 @@ use tokio::time::sleep;
 const KIB: f64 = 1024.0;
 const MIB: f64 = 1024.0 * 1024.0;
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+
 fn format_bytes(bytes: u64) -> String {
     let bytes_f = bytes as f64;
     if bytes_f < KIB {
@@ -45,6 +48,7 @@ pub struct VpnHandler {
     tun_name: String,
     stats_config: StatsConfig,
     quic_config: QuicConfig,
+    stealth_config: StealthConfig,
 }
 
 impl VpnHandler {
@@ -54,6 +58,7 @@ impl VpnHandler {
             tun_name: cfg.main.tun_name.clone(),
             stats_config: cfg.stats.clone(),
             quic_config: cfg.quic_transport.clone(),
+            stealth_config: cfg.stealth.clone(),
         })
     }
 
@@ -103,12 +108,25 @@ impl VpnHandler {
         let (tx_to_tun, mut rx_from_tun) = tun_manager.run().await?;
 
         let mut quic_sender = send_stream;
+        let min_jitter = self.stealth_config.min_jitter_ns.clone(); // Читаем из конфига
+        let max_jitter = self.stealth_config.max_jitter_ns.clone();
+
         tokio::spawn(async move {
+            let mut rng = OsRng;
+
             while let Some(packet) = rx_from_tun.recv().await {
                 if packet.len() < 20 {
                     continue;
                 }
                 let framed_packet = frame_packet(packet);
+
+                if max_jitter > min_jitter {
+                    let delay_ns = rng.gen_range(min_jitter..=max_jitter);
+                    if delay_ns > 0 {
+                        sleep(Duration::from_nanos(delay_ns)).await;
+                    }
+                }
+
                 if quic_sender.write_all(&framed_packet).await.is_err()
                     || quic_sender.flush().await.is_err()
                 {
@@ -119,7 +137,6 @@ impl VpnHandler {
             let _ = quic_sender.finish();
             info!("[VPN] TUN->QUIC task finished.");
         });
-
         let mut quic_receiver = recv_stream;
         tokio::spawn(async move {
             loop {

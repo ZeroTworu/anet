@@ -1,4 +1,5 @@
 pub(crate) mod auth_handler;
+pub(crate) mod client_registry;
 pub mod config;
 pub(crate) mod ip_pool;
 pub(crate) mod multikey_udp_socket;

@@ -22,6 +22,7 @@ pub fn frame_packet(payload: Bytes) -> Bytes {
 /// Читает ровно один IP-пакет из QUIC стрима.
 /// Возвращает None, если стрим закрыт, или Result<Bytes, io::Error>
 /// Используется в QUIC RX задаче.
+#[inline]
 pub async fn read_next_packet<R: tokio::io::AsyncRead + tokio::io::AsyncReadExt + Unpin>(
     reader: &mut R,
 ) -> io::Result<Option<Bytes>> {

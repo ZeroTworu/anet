@@ -1,63 +1,47 @@
-use crate::ip_pool::IpPool;
-use crate::multikey_udp_socket::{ClientTransportInfo, StreamSender};
+use crate::client_registry::ClientRegistry;
+use crate::config::Config;
 use crate::utils::extract_ip_dst;
+use anet_common::consts::MAX_PACKET_SIZE;
 use anet_common::stream_framing::{frame_packet, read_next_packet};
 use anyhow::Result;
 use bytes::Bytes;
-use dashmap::DashMap;
 use log::{error, info, warn};
 use quinn::{Endpoint, Incoming};
-use std::net::SocketAddr;
+use rand::Rng;
+use rand::rngs::OsRng;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
+use tokio::time::sleep;
 
-/// Главная функция-обработчик, которая запускает все задачи, связанные с VPN.
 pub async fn run_vpn_handler(
     endpoint: Endpoint,
-    tx_to_tun: StreamSender,
+    tx_to_tun: mpsc::Sender<Bytes>,
     rx_from_tun: mpsc::Receiver<Bytes>,
-    quic_router: Arc<DashMap<String, StreamSender>>,
-    ip_pool: IpPool,
-    clients_by_prefix: Arc<DashMap<[u8; 4], Arc<ClientTransportInfo>>>,
-    clients_by_addr: Arc<DashMap<SocketAddr, Arc<ClientTransportInfo>>>,
+    registry: Arc<ClientRegistry>,
+    server_config: Arc<Config>,
 ) -> Result<()> {
     info!("ANet VPN Handler task started.");
-
-    // Запускаем две основные задачи: прием новых соединений и маршрутизацию трафика из TUN.
-    let incoming_quic_task = handle_incoming_quic(
-        endpoint,
-        tx_to_tun,
-        quic_router.clone(),
-        ip_pool,
-        clients_by_prefix,
-        clients_by_addr,
-    );
-    let router_task = route_tun_to_quic(rx_from_tun, quic_router);
-
-    // Ожидаем завершения обеих задач.
+    let incoming_quic_task =
+        handle_incoming_quic(endpoint, tx_to_tun, registry.clone(), server_config);
+    let router_task = route_tun_to_quic(rx_from_tun, registry);
     tokio::try_join!(incoming_quic_task, router_task)?;
-
     Ok(())
 }
 
-/// Принимает новые QUIC-соединения и для каждого запускает `handle_connection`.
 async fn handle_incoming_quic(
     endpoint: Endpoint,
-    tx_to_tun: StreamSender,
-    quic_router: Arc<DashMap<String, StreamSender>>,
-    ip_pool: IpPool,
-    clients_by_prefix: Arc<DashMap<[u8; 4], Arc<ClientTransportInfo>>>,
-    clients_by_addr: Arc<DashMap<SocketAddr, Arc<ClientTransportInfo>>>,
+    tx_to_tun: mpsc::Sender<Bytes>,
+    registry: Arc<ClientRegistry>,
+    server_config: Arc<Config>,
 ) -> Result<()> {
     while let Some(conn) = endpoint.accept().await {
         let fut = handle_connection(
             conn,
             tx_to_tun.clone(),
-            quic_router.clone(),
-            ip_pool.clone(),
-            clients_by_prefix.clone(),
-            clients_by_addr.clone(),
+            registry.clone(),
+            server_config.clone(),
         );
         tokio::spawn(async move {
             if let Err(e) = fut.await {
@@ -68,57 +52,66 @@ async fn handle_incoming_quic(
     Ok(())
 }
 
-/// Обрабатывает одно установленное QUIC-соединение: настраивает потоки и маршрутизацию.
 async fn handle_connection(
     incoming: Incoming,
-    tx_to_tun: StreamSender,
-    quic_router: Arc<DashMap<String, StreamSender>>,
-    ip_pool: IpPool,
-    clients_by_prefix: Arc<DashMap<[u8; 4], Arc<ClientTransportInfo>>>,
-    clients_by_addr: Arc<DashMap<SocketAddr, Arc<ClientTransportInfo>>>,
+    tx_to_tun: mpsc::Sender<Bytes>,
+    registry: Arc<ClientRegistry>,
+    server_config: Arc<Config>,
 ) -> Result<()> {
     let connection = incoming.await?;
     let remote_addr = connection.remote_address();
     info!("QUIC negotiation started with peer: {}", remote_addr);
 
-    let client = clients_by_addr
-        .get(&remote_addr)
-        .map(|entry| entry.value().clone())
-        .ok_or_else(|| {
-            connection.close(0u32.into(), b"Transport layer association failed");
-            anyhow::anyhow!(
-                "QUIC connection from {} but no associated client info found",
-                remote_addr
-            )
-        })?;
+    let client_info = registry.get_by_addr(&remote_addr).ok_or_else(|| {
+        connection.close(0u32.into(), b"Transport layer association failed");
+        anyhow::anyhow!(
+            "QUIC connection from {} but no associated client info found",
+            remote_addr
+        )
+    })?;
 
-    let client_ip = client.assigned_ip.clone();
+    let client_ip = client_info.assigned_ip.clone();
     info!(
         "QUIC session accepted for client VPN IP: {} ({}), SEID: {}",
-        client_ip, remote_addr, client.session_id
+        client_ip, remote_addr, client_info.session_id
     );
 
     let (send_stream, recv_stream) = connection.accept_bi().await?;
+    let (tx_router, mut rx_router) = mpsc::channel::<Bytes>(MAX_PACKET_SIZE);
 
-    let (tx_router, mut rx_router) = mpsc::channel::<Bytes>(1024);
-    quic_router.insert(client_ip.clone(), tx_router);
-    info!(
-        "Client {} added to QUIC router. Total clients: {}",
-        client_ip,
-        quic_router.len()
-    );
+    registry.finalize_client(&client_ip, tx_router);
 
+    let stealth_config = server_config.stealth.clone();
+
+    // Arc для первой задачи
+    let client_info_for_tx = client_info.clone();
     let tx_task = tokio::spawn(async move {
         let mut stream = send_stream;
+        let mut rng = OsRng; // OsRng является Send
+        let min_jitter = stealth_config.min_jitter_ns;
+        let max_jitter = stealth_config.max_jitter_ns;
+
         while let Some(packet) = rx_router.recv().await {
             let framed_packet = frame_packet(packet);
+            if max_jitter > min_jitter {
+                let delay_ns = rng.gen_range(min_jitter..=max_jitter);
+                if delay_ns > 0 {
+                    sleep(Duration::from_nanos(delay_ns)).await;
+                }
+            }
             if stream.write_all(&framed_packet).await.is_err() || stream.flush().await.is_err() {
                 break;
             }
         }
         let _ = stream.finish();
+        info!(
+            "[VPN] Client {} TUN->QUIC task finished.",
+            client_info_for_tx.assigned_ip
+        );
     });
 
+    // Создаем второй клон Arc для второй задачи
+    let client_info_for_rx = client_info.clone();
     let rx_task = tokio::spawn(async move {
         let mut stream = recv_stream;
         loop {
@@ -128,64 +121,46 @@ async fn handle_connection(
                         break;
                     }
                 }
-                _ => break, // Ошибка или стрим закрыт
+                _ => break,
             }
         }
+        info!(
+            "[VPN] Client {} QUIC->TUN task finished.",
+            client_info_for_rx.assigned_ip
+        );
     });
+    // =============================================================
 
     tokio::select! {
-        _ = tx_task => {},
-        _ = rx_task => {},
-        _ = connection.closed() => {},
+        _ = tx_task => {
+            // Исправлена опечатка client -> client_info
+            warn!("Client {} Tx closed unexpectedly", client_info.remote_addr);
+        },
+        _ = rx_task => {
+            warn!("Client {} Rx closed unexpectedly", client_info.remote_addr);
+        },
+        _ = connection.closed() => {
+            warn!("Client {} connection closed unexpectedly", client_info.remote_addr);
+        },
     }
 
     info!("Cleaning up resources for client {}.", client_ip);
-    quic_router.remove(&client_ip);
-    clients_by_prefix.remove(&client.nonce_prefix);
-    clients_by_addr.remove(&remote_addr);
-    if let Ok(ip_addr) = client_ip.parse() {
-        ip_pool.release(ip_addr);
-    }
-    info!(
-        "Client {} removed. Remaining clients: {}",
-        client_ip,
-        quic_router.len()
-    );
-
+    registry.remove_client(&client_info);
     Ok(())
 }
 
-/// Читает пакеты из TUN, определяет IP назначения и отправляет в нужный QUIC-поток.
 async fn route_tun_to_quic(
     mut rx_from_tun: mpsc::Receiver<Bytes>,
-    quic_router: Arc<DashMap<String, StreamSender>>,
+    registry: Arc<ClientRegistry>,
 ) -> Result<()> {
     while let Some(packet) = rx_from_tun.recv().await {
         if packet.len() < 20 {
             continue;
         }
-        let version = packet[0] >> 4;
-        if version != 4 && version != 6 {
-            continue;
-        }
-
-        let dst_ip_str = match extract_ip_dst(&packet) {
-            Some(ip) => ip.to_string(),
-            None => {
-                warn!("Cannot extract destination IP from packet");
-                continue;
-            }
-        };
-
-        if let Some(sender) = quic_router.get(&dst_ip_str) {
-            if sender.send(packet).await.is_err() {
-                warn!(
-                    "Failed to route packet to {}: QUIC channel closed.",
-                    dst_ip_str
-                );
-            }
-        } else {
-            // Это нормальная ситуация, если пакет пришел для клиента, который уже отключился
+        if let Some(dst_ip) = extract_ip_dst(&packet) {
+            registry
+                .route_packet_to_client(&dst_ip.to_string(), packet)
+                .await;
         }
     }
     Ok(())

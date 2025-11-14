@@ -1,6 +1,6 @@
 use crate::consts::{CHANNEL_BUFFER_SIZE, MAX_PACKET_SIZE};
 use crate::tun_params::TunParams;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use bytes::Bytes;
 use log::{error, info};
 use std::net::Ipv4Addr;
@@ -65,7 +65,10 @@ impl TunManager {
         let (tx_from_tun, rx_from_tun) = mpsc::channel::<Bytes>(CHANNEL_BUFFER_SIZE);
 
         let config = self.params.create_config()?;
-        let device = tun::create_as_async(&config).context("Failed to create async TUN device")?;
+        let device = match tun::create_as_async(&config) {
+            Ok(device) => device,
+            Err(e) => anyhow::bail!("Failed to create async TUN device device: {}", e),
+        };
         self.tun_index = Some(device.tun_index()? as u32);
         let (mut reader, mut writer) = tokio::io::split(device);
 
