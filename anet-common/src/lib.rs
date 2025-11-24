@@ -3,6 +3,7 @@ pub mod consts;
 pub mod crypto_utils;
 pub mod encryption;
 pub mod generated;
+pub mod padding_utils;
 pub mod quic_settings;
 pub mod stream_framing;
 pub mod transport;

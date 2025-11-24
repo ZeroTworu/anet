@@ -1,7 +1,7 @@
 use crate::consts::{NONCE_LEN, NONCE_PREFIX_LEN};
 use crate::encryption::{Cipher, EncryptionError};
 use anyhow::{Result, anyhow};
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 /// Упаковывает и шифрует QUIC-пакет с новым протоколом
 pub fn wrap_packet(
@@ -9,11 +9,16 @@ pub fn wrap_packet(
     nonce_prefix: &[u8; NONCE_PREFIX_LEN],
     sequence: u64,
     quic_payload: Bytes,
+    padding_size: u16,
 ) -> Result<Bytes, EncryptionError> {
-    // Plaintext = [sequence][quic_payload]
-    let mut plaintext = BytesMut::with_capacity(8 + quic_payload.len());
+    let payload_len = quic_payload.len();
+    let total_capacity = 8 + 2 + payload_len + padding_size as usize;
+
+    let mut plaintext = BytesMut::with_capacity(total_capacity);
     plaintext.put_u64(sequence);
+    plaintext.put_u16(payload_len as u16); // Записываем длину данных
     plaintext.put(quic_payload);
+    plaintext.put_bytes(0u8, padding_size as usize); // Добиваем нулями (станут шумом)
 
     // Nonce = [prefix][sequence]
     let mut nonce = [0u8; NONCE_LEN];
@@ -44,13 +49,18 @@ pub fn unwrap_packet(cipher: &Cipher, raw_packet: &[u8]) -> Result<Bytes> {
     let (nonce, ciphertext) = raw_packet.split_at(NONCE_LEN);
 
     // Расшифровываем
-    let plaintext = cipher.decrypt(nonce, Bytes::copy_from_slice(ciphertext))?;
+    let mut plaintext = cipher.decrypt(nonce, Bytes::copy_from_slice(ciphertext))?;
 
-    if plaintext.len() < 8 {
-        // Должен быть как минимум sequence
-        return Err(anyhow!("Decrypted payload too short"));
+    if plaintext.len() < 10 {
+        return Err(anyhow!("Payload too short"));
     }
 
-    // Извлекаем QUIC-пакет (все что после 8 байт sequence)
-    Ok(plaintext.slice(8..))
+    let _seq = plaintext.get_u64();
+    let data_len = plaintext.get_u16() as usize; // Читаем длину
+
+    if data_len > plaintext.remaining() {
+        return Err(anyhow!("Malformed packet length"));
+    }
+    // Обрезаем паддинг
+    Ok(plaintext.copy_to_bytes(data_len))
 }

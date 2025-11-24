@@ -25,6 +25,7 @@ impl Default for MainConfig {
 pub struct StealthConfig {
     pub min_jitter_ns: u64,
     pub max_jitter_ns: u64,
+    pub padding_step: u16,
 }
 
 impl Default for StealthConfig {
@@ -32,6 +33,7 @@ impl Default for StealthConfig {
         Self {
             min_jitter_ns: 0, // По умолчанию выключено
             max_jitter_ns: 0,
+            padding_step: 0, // По умолчанию выключено
         }
     }
 }

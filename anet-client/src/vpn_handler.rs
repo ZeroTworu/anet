@@ -72,7 +72,12 @@ impl VpnHandler {
         let real_socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
         let cipher = Arc::new(Cipher::new(&shared_key));
         let nonce_prefix: [u8; 4] = auth_response.nonce_prefix.as_slice().try_into()?;
-        let anet_socket = Arc::new(AnetUdpSocket::new(real_socket, cipher, nonce_prefix));
+        let anet_socket = Arc::new(AnetUdpSocket::new(
+            real_socket,
+            cipher,
+            nonce_prefix,
+            self.stealth_config.clone(),
+        ));
 
         let mut endpoint = Endpoint::new_with_abstract_socket(
             EndpointConfig::default(),

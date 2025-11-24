@@ -87,6 +87,7 @@ impl ANetServer {
             real_socket.clone(),
             self.registry.clone(),
             tx_to_auth,
+            self.cfg.stealth.clone(),
         ));
 
         let endpoint = Endpoint::new_with_abstract_socket(
@@ -114,6 +115,7 @@ impl ANetServer {
             self.cfg.authentication.allowed_clients.clone(),
             self.server_signing_key.clone(),
             self.cfg.crypto.quic_cert.clone(),
+            self.cfg.stealth.padding_step.clone(),
         ));
 
         let cleanup_temp_dh_task =

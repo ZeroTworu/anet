@@ -101,17 +101,18 @@ impl Default for ServerCoreConfig {
 pub struct StealthConfig {
     pub min_jitter_ns: u64,
     pub max_jitter_ns: u64,
+    pub padding_step: u16,
 }
 
 impl Default for StealthConfig {
     fn default() -> Self {
         Self {
-            min_jitter_ns: 0,
+            min_jitter_ns: 0, // По умолчанию выключено
             max_jitter_ns: 0,
+            padding_step: 0, // По умолчанию выключено
         }
     }
 }
-
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     #[serde(default)]

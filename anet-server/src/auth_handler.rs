@@ -1,9 +1,10 @@
 use crate::client_registry::{ClientRegistry, ClientTransportInfo};
 use crate::multikey_udp_socket::{HandshakeData, TempDHInfo};
 use crate::utils::{generate_seid, generate_unique_nonce_prefix};
-use anet_common::consts::{AUTH_PREFIX_LEN, NONCE_LEN};
+use anet_common::consts::{AUTH_PREFIX_LEN, NONCE_LEN, PROTO_PAD_FIELD_OVERHEAD};
 use anet_common::crypto_utils;
 use anet_common::encryption::Cipher;
+use anet_common::padding_utils::{calculate_padding_needed, generate_random_padding};
 use anet_common::protocol::{
     AuthResponse, DhServerExchange, EncryptedAuthResponse, Message as AnetMessage, message::Content,
 };
@@ -32,6 +33,7 @@ pub async fn run_auth_handler(
     allowed_clients: Vec<String>,
     server_signing_key: SigningKey,
     quic_cert_pem: String,
+    padding_step: u16,
 ) -> Result<()> {
     info!("ANet Auth Handler task started.");
     while let Some((packet, remote_addr)) = rx_from_auth.recv().await {
@@ -52,6 +54,7 @@ pub async fn run_auth_handler(
                 &allowed_clients,
                 &server_signing_key,
                 &quic_cert_pem,
+                padding_step,
             )
             .await
             {
@@ -71,6 +74,7 @@ async fn handle_auth_request(
     allowed_clients: &[String],
     server_signing_key: &SigningKey,
     quic_cert_pem: &str,
+    padding_step: u16,
 ) -> Result<()> {
     let prefix = &full_packet[..AUTH_PREFIX_LEN];
     let salt = crypto_utils::extract_salt_from_prefix(prefix)
@@ -135,11 +139,17 @@ async fn handle_auth_request(
                     server_pub_key.as_bytes(),
                 ),
             };
-            let response_message = AnetMessage {
+            let mut response_message = AnetMessage {
                 content: Some(Content::DhServerExchange(response_payload)),
+                padding: vec![],
             };
             let mut response_data = Vec::new();
             response_message.encode(&mut response_data)?;
+
+            let current_wire_len =
+                response_message.encoded_len() + AUTH_PREFIX_LEN + PROTO_PAD_FIELD_OVERHEAD;
+            response_message.padding =
+                generate_random_padding(calculate_padding_needed(current_wire_len, padding_step));
 
             let prefix_info = crypto_utils::generate_prefix_with_salt();
             crypto_utils::xor_bytes(&mut response_data, &prefix_info.salt);
@@ -192,30 +202,40 @@ async fn handle_auth_request(
                         quic_cert: quic_cert_pem.as_bytes().to_vec(),
                     };
 
-                    let mut final_data = Vec::new();
-
-                    // --- ИСПРАВЛЕНИЕ: Генерируем nonce ОДИН раз ---
                     let mut nonce_bytes_for_response = [0u8; NONCE_LEN];
                     OsRng.fill_bytes(&mut nonce_bytes_for_response);
 
-                    AnetMessage {
+                    let mut inner_msg = AnetMessage {
+                        content: Some(Content::AuthResponse(response_payload)),
+                        padding: vec![],
+                    };
+                    let inner_len = inner_msg.encoded_len() + PROTO_PAD_FIELD_OVERHEAD;
+                    inner_msg.padding =
+                        generate_random_padding(calculate_padding_needed(inner_len, padding_step));
+
+                    let mut raw_resp = Vec::new();
+                    inner_msg.encode(&mut raw_resp)?;
+                    let ciphertext =
+                        cipher.encrypt(&nonce_bytes_for_response, Bytes::from(raw_resp))?;
+
+                    // !!! OUTER PADDING (Внешний конверт) !!!
+                    let mut outer_msg = AnetMessage {
                         content: Some(Content::EncryptedAuthResponse(EncryptedAuthResponse {
-                            ciphertext: {
-                                let mut raw_resp = Vec::new();
-                                AnetMessage {
-                                    content: Some(Content::AuthResponse(response_payload)),
-                                }
-                                .encode(&mut raw_resp)?;
-                                // Используем сгенерированный nonce для шифрования
-                                cipher
-                                    .encrypt(&nonce_bytes_for_response, Bytes::from(raw_resp))?
-                                    .to_vec()
-                            },
-                            // Используем ТОТ ЖЕ САМЫЙ nonce в сообщении
+                            ciphertext: ciphertext.to_vec(),
                             nonce: nonce_bytes_for_response.to_vec(),
                         })),
-                    }
-                    .encode(&mut final_data)?;
+                        padding: vec![],
+                    };
+
+                    let outer_wire_len =
+                        outer_msg.encoded_len() + AUTH_PREFIX_LEN + PROTO_PAD_FIELD_OVERHEAD;
+                    outer_msg.padding = generate_random_padding(calculate_padding_needed(
+                        outer_wire_len,
+                        padding_step,
+                    ));
+
+                    let mut final_data = Vec::new();
+                    outer_msg.encode(&mut final_data)?;
 
                     let prefix_info = crypto_utils::generate_prefix_with_salt();
                     crypto_utils::xor_bytes(&mut final_data, &prefix_info.salt);

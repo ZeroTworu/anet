@@ -10,7 +10,7 @@ message DHClientExchange {
 
 message DHServerExchange {
     bytes public_key = 1;
-    bytes server_signed_dh_key = 2;  // Подпись сервером своего DH ключа
+    bytes server_signed_dh_key = 2;
 }
 
 message EncryptedAuthRequest {
@@ -46,4 +46,5 @@ message Message {
         AuthRequest auth_request = 5;
         AuthResponse auth_response = 6;
     }
+    bytes padding = 7;
 }

@@ -23,3 +23,7 @@ pub const VPN_STREAM_WINDOW: u64 = 8_388_608;
 pub const NONCE_PREFIX_LEN: usize = 4;
 
 pub const NONCE_LEN: usize = 12;
+
+pub const PADDING_MTU: usize = 1450;
+
+pub const PROTO_PAD_FIELD_OVERHEAD: usize = 3;

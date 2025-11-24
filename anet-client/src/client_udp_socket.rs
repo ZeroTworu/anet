@@ -1,5 +1,7 @@
-use anet_common::consts::NONCE_PREFIX_LEN;
+use crate::config::StealthConfig;
+use anet_common::consts::{NONCE_PREFIX_LEN, PADDING_MTU};
 use anet_common::encryption::Cipher;
+use anet_common::padding_utils::calculate_padding_needed;
 use anet_common::transport;
 use anet_common::udp_poller::TokioUdpPoller;
 use bytes::Bytes;
@@ -23,6 +25,7 @@ pub struct AnetUdpSocket {
     cipher: Arc<Cipher>,
     nonce_prefix: [u8; NONCE_PREFIX_LEN],
     sequence: Arc<AtomicU64>,
+    stealth_config: StealthConfig,
 }
 
 impl AnetUdpSocket {
@@ -30,12 +33,14 @@ impl AnetUdpSocket {
         io: Arc<UdpSocket>,
         cipher: Arc<Cipher>,
         nonce_prefix: [u8; NONCE_PREFIX_LEN],
+        stealth_config: StealthConfig,
     ) -> Self {
         Self {
             io,
             cipher,
             nonce_prefix,
             sequence: Arc::new(AtomicU64::new(0)),
+            stealth_config,
         }
     }
 }
@@ -58,12 +63,26 @@ impl AsyncUdpSocket for AnetUdpSocket {
     #[inline]
     fn try_send(&self, transmit: &Transmit) -> io::Result<()> {
         let seq = self.sequence.fetch_add(1, Ordering::Relaxed);
+        // 1. Считаем полный размер пакета на проводе
+        // Overhead = 38 байт (12 Nonce + 16 Tag + 8 Seq + 2 Len)
+        let total_len = transmit.contents.len() + 38;
+
+        // 2. Считаем сколько нулей добавить
+        let padding = calculate_padding_needed(total_len, self.stealth_config.padding_step);
+
+        // *Safety check: не превышаем MTU ~1450*
+        let safe_padding = if total_len + (padding as usize) > PADDING_MTU {
+            0
+        } else {
+            padding
+        };
 
         match transport::wrap_packet(
             &self.cipher,
             &self.nonce_prefix,
             seq,
             Bytes::copy_from_slice(transmit.contents),
+            safe_padding,
         ) {
             Ok(wrapped_packet) => {
                 match self.io.try_send_to(&wrapped_packet, transmit.destination) {

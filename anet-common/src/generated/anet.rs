@@ -14,7 +14,6 @@ pub struct DhClientExchange {
 pub struct DhServerExchange {
     #[prost(bytes = "vec", tag = "1")]
     pub public_key: ::prost::alloc::vec::Vec<u8>,
-    /// Подпись сервером своего DH ключа
     #[prost(bytes = "vec", tag = "2")]
     pub server_signed_dh_key: ::prost::alloc::vec::Vec<u8>,
 }
@@ -56,6 +55,8 @@ pub struct AuthResponse {
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Message {
+    #[prost(bytes = "vec", tag = "7")]
+    pub padding: ::prost::alloc::vec::Vec<u8>,
     #[prost(oneof = "message::Content", tags = "1, 2, 3, 4, 5, 6")]
     pub content: ::core::option::Option<message::Content>,
 }

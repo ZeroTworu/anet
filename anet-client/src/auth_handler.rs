@@ -1,7 +1,8 @@
 use crate::config::Config;
-use anet_common::consts::{AUTH_PREFIX_LEN, MAX_PACKET_SIZE, NONCE_LEN};
+use anet_common::consts::{AUTH_PREFIX_LEN, MAX_PACKET_SIZE, NONCE_LEN, PROTO_PAD_FIELD_OVERHEAD};
 use anet_common::crypto_utils::{self, derive_shared_key, generate_key_fingerprint, sign_data};
 use anet_common::encryption::Cipher;
+use anet_common::padding_utils::{calculate_padding_needed, generate_random_padding};
 use anet_common::protocol::{
     AuthRequest, AuthResponse, DhClientExchange, EncryptedAuthRequest, EncryptedAuthResponse,
     Message as AnetMessage, message::Content,
@@ -32,6 +33,7 @@ pub struct AuthHandler {
     signing_key: SigningKey,
     client_public_key: VerifyingKey,
     client_id: String,
+    padding_step: u16,
 }
 
 impl AuthHandler {
@@ -66,6 +68,7 @@ impl AuthHandler {
             signing_key,
             client_public_key,
             client_id,
+            padding_step: cfg.stealth.padding_step,
         })
     }
 
@@ -99,13 +102,27 @@ impl AuthHandler {
     ) -> Result<(AuthResponse, [u8; 32])> {
         let client_pub_key = PublicKey::from(&self.ephemeral_secret);
         let client_signed_dh_key = sign_data(&self.signing_key, client_pub_key.as_bytes());
-        let dh_init_msg = AnetMessage {
+
+        let mut dh_init_msg = AnetMessage {
             content: Some(Content::DhClientExchange(DhClientExchange {
                 public_key: client_pub_key.as_bytes().to_vec(),
                 client_signed_dh_key,
                 client_public_key: self.client_public_key.to_bytes().to_vec(),
             })),
+            padding: vec![],
         };
+
+        // 1. Считаем размер на проводе: Protobuf + AuthPrefix(8) + ProtobufOverhead(approx 3)
+        // (ProtobufOverhead учтем грубо, добавив к encoded_len)
+        let current_wire_len =
+            dh_init_msg.encoded_len() + AUTH_PREFIX_LEN + PROTO_PAD_FIELD_OVERHEAD;
+
+        // 2. Считаем сколько надо добавить
+        let needed = calculate_padding_needed(current_wire_len, self.padding_step);
+
+        // 3. Генерируем и вставляем
+        dh_init_msg.padding = generate_random_padding(needed);
+
         let request_packet = self.create_obf_packet(&dh_init_msg)?;
         info!("[AUTH] Phase I: Sending DH exchange request.");
         socket
@@ -180,11 +197,22 @@ impl AuthHandler {
     }
 
     fn create_encrypted_auth_request(&self, shared_key: &[u8; 32]) -> Result<(Bytes, Cipher)> {
-        let auth_payload = AnetMessage {
+        let mut auth_payload = AnetMessage {
             content: Some(Content::AuthRequest(AuthRequest {
                 client_id: self.client_id.clone(),
             })),
+            padding: vec![],
         };
+
+        let current_wire_len =
+            auth_payload.encoded_len() + AUTH_PREFIX_LEN + PROTO_PAD_FIELD_OVERHEAD;
+
+        // 2. Считаем сколько надо добавить
+        let needed = calculate_padding_needed(current_wire_len, self.padding_step);
+
+        // 3. Генерируем и вставляем
+        auth_payload.padding = generate_random_padding(needed);
+
         let mut raw_auth_request = Vec::new();
         auth_payload.encode(&mut raw_auth_request)?;
 
@@ -197,9 +225,19 @@ impl AuthHandler {
             ciphertext: ciphertext.to_vec(),
             nonce: nonce_bytes.to_vec(),
         };
-        let wrapped_msg = AnetMessage {
+        let mut wrapped_msg = AnetMessage {
             content: Some(Content::EncryptedAuthRequest(encrypted_req)),
+            padding: vec![],
         };
+
+        let current_wire_len =
+            wrapped_msg.encoded_len() + AUTH_PREFIX_LEN + PROTO_PAD_FIELD_OVERHEAD;
+        // 2. Считаем сколько надо добавить
+        let needed = calculate_padding_needed(current_wire_len, self.padding_step);
+
+        // 3. Генерируем и вставляем
+        wrapped_msg.padding = generate_random_padding(needed);
+
         let mut final_data = Vec::new();
         wrapped_msg.encode(&mut final_data)?;
 

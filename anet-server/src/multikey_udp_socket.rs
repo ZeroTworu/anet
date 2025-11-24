@@ -1,6 +1,8 @@
 use crate::client_registry::ClientRegistry;
-use anet_common::consts::{AUTH_PREFIX_LEN, MAX_PACKET_SIZE, NONCE_LEN};
+use crate::config::StealthConfig;
+use anet_common::consts::{AUTH_PREFIX_LEN, MAX_PACKET_SIZE, NONCE_LEN, PADDING_MTU};
 use anet_common::crypto_utils::check_auth_prefix;
+use anet_common::padding_utils::calculate_padding_needed;
 use anet_common::transport;
 use anet_common::udp_poller::TokioUdpPoller;
 use bytes::Bytes;
@@ -36,6 +38,7 @@ pub struct MultiKeyAnetUdpSocket {
     io: Arc<UdpSocket>,
     registry: Arc<ClientRegistry>,
     auth_tx: mpsc::Sender<HandshakeData>,
+    stealth_config: StealthConfig,
 }
 
 impl MultiKeyAnetUdpSocket {
@@ -43,11 +46,13 @@ impl MultiKeyAnetUdpSocket {
         io: Arc<UdpSocket>,
         registry: Arc<ClientRegistry>,
         auth_tx: mpsc::Sender<HandshakeData>,
+        stealth_config: StealthConfig,
     ) -> Self {
         Self {
             io,
             registry,
             auth_tx,
+            stealth_config,
         }
     }
 }
@@ -71,11 +76,21 @@ impl AsyncUdpSocket for MultiKeyAnetUdpSocket {
     fn try_send(&self, transmit: &Transmit) -> io::Result<()> {
         if let Some(info) = self.registry.get_by_addr(&transmit.destination) {
             let seq = info.sequence.fetch_add(1, Ordering::Relaxed);
+
+            let total_len = transmit.contents.len() + 38;
+            let padding = calculate_padding_needed(total_len, self.stealth_config.padding_step);
+            let safe_padding = if total_len + (padding as usize) > PADDING_MTU {
+                0
+            } else {
+                padding
+            };
+
             match transport::wrap_packet(
                 &info.cipher,
                 &info.nonce_prefix,
                 seq,
                 Bytes::copy_from_slice(transmit.contents),
+                safe_padding,
             ) {
                 Ok(wrapped) => match self.io.try_send_to(&wrapped, transmit.destination) {
                     Ok(_) => Ok(()),
