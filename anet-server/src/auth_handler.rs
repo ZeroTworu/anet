@@ -6,7 +6,8 @@ use anet_common::crypto_utils;
 use anet_common::encryption::Cipher;
 use anet_common::padding_utils::{calculate_padding_needed, generate_random_padding};
 use anet_common::protocol::{
-    AuthResponse, DhServerExchange, EncryptedAuthResponse, Message as AnetMessage, message::Content,
+    AuthResponse, DhClientExchange, DhServerExchange, EncryptedAuthRequest, EncryptedAuthResponse,
+    Message as AnetMessage, message::Content,
 };
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
@@ -25,230 +26,268 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use x25519_dalek::{PublicKey, StaticSecret};
 
-pub async fn run_auth_handler(
-    mut rx_from_auth: mpsc::Receiver<HandshakeData>,
-    reply_socket: Arc<UdpSocket>,
+#[derive(Clone)]
+pub struct ServerAuthHandler {
+    socket: Arc<UdpSocket>,
     registry: Arc<ClientRegistry>,
     temp_dh_map: Arc<DashMap<SocketAddr, TempDHInfo>>,
-    allowed_clients: Vec<String>,
+    allowed_clients: Arc<Vec<String>>,
     server_signing_key: SigningKey,
     quic_cert_pem: String,
     padding_step: u16,
-) -> Result<()> {
-    info!("ANet Auth Handler task started.");
-    while let Some((packet, remote_addr)) = rx_from_auth.recv().await {
-        let registry = registry.clone();
-        let temp_dh_map = temp_dh_map.clone();
-        let allowed_clients = allowed_clients.clone();
-        let server_signing_key = server_signing_key.clone();
-        let quic_cert_pem = quic_cert_pem.clone();
-        let reply_socket = reply_socket.clone();
-
-        tokio::spawn(async move {
-            if let Err(e) = handle_auth_request(
-                packet,
-                remote_addr,
-                &reply_socket,
-                registry,
-                temp_dh_map,
-                &allowed_clients,
-                &server_signing_key,
-                &quic_cert_pem,
-                padding_step,
-            )
-            .await
-            {
-                error!("[AUTH] Handshake failed for {}: {}", remote_addr, e);
-            }
-        });
-    }
-    Ok(())
 }
 
-async fn handle_auth_request(
-    full_packet: Bytes,
-    remote_addr: SocketAddr,
-    socket: &Arc<UdpSocket>,
-    registry: Arc<ClientRegistry>,
-    temp_dh_map: Arc<DashMap<SocketAddr, TempDHInfo>>,
-    allowed_clients: &[String],
-    server_signing_key: &SigningKey,
-    quic_cert_pem: &str,
-    padding_step: u16,
-) -> Result<()> {
-    let prefix = &full_packet[..AUTH_PREFIX_LEN];
-    let salt = crypto_utils::extract_salt_from_prefix(prefix)
-        .unwrap()
-        .to_vec();
-    let mut payload = full_packet.slice(AUTH_PREFIX_LEN..).to_vec();
-    crypto_utils::xor_bytes(&mut payload, &salt);
-    let message: AnetMessage = Message::decode(Bytes::from(payload))?;
+impl ServerAuthHandler {
+    pub fn new(
+        socket: Arc<UdpSocket>,
+        registry: Arc<ClientRegistry>,
+        temp_dh_map: Arc<DashMap<SocketAddr, TempDHInfo>>,
+        allowed_clients: Vec<String>,
+        server_signing_key: SigningKey,
+        quic_cert_pem: String,
+        padding_step: u16,
+    ) -> Self {
+        Self {
+            socket,
+            registry,
+            temp_dh_map,
+            allowed_clients: Arc::new(allowed_clients),
+            server_signing_key,
+            quic_cert_pem,
+            padding_step,
+        }
+    }
 
-    match message.content {
-        Some(Content::DhClientExchange(req)) => {
-            let client_public_key = VerifyingKey::from_bytes(
-                &req.client_public_key
-                    .try_into()
-                    .map_err(|_| anyhow::anyhow!("Invalid key length"))?,
-            )?;
-            let client_fingerprint = crypto_utils::generate_key_fingerprint(&client_public_key);
-            if !allowed_clients.contains(&client_fingerprint) {
+    pub async fn run(self, mut rx_from_auth: mpsc::Receiver<HandshakeData>) {
+        info!("ANet Auth Handler task started.");
+        while let Some((packet, remote_addr)) = rx_from_auth.recv().await {
+            let handler = self.clone();
+            tokio::spawn(async move {
+                if let Err(e) = handler.handle_packet(packet, remote_addr).await {
+                    error!("[AUTH] Handshake failed for {}: {}", remote_addr, e);
+                }
+            });
+        }
+    }
+
+    /// Точка входа обработки пакета
+    async fn handle_packet(&self, full_packet: Bytes, remote_addr: SocketAddr) -> Result<()> {
+        let message = self.decode_packet(full_packet)?;
+
+        match message.content {
+            Some(Content::DhClientExchange(req)) => self.handle_dh_exchange(req, remote_addr).await,
+            Some(Content::EncryptedAuthRequest(enc_req)) => {
+                self.handle_encrypted_auth(enc_req, remote_addr).await
+            }
+            _ => Err(anyhow::anyhow!("Unexpected message type in handshake")),
+        }
+    }
+
+    /// Расшифровка префикса и десериализация Protobuf
+    fn decode_packet(&self, packet: Bytes) -> Result<AnetMessage> {
+        if packet.len() <= AUTH_PREFIX_LEN {
+            return Err(anyhow::anyhow!("Packet too short for auth processing"));
+        }
+        let prefix = &packet[..AUTH_PREFIX_LEN];
+        let salt = crypto_utils::extract_salt_from_prefix(prefix)
+            .context("Failed to extract salt")?
+            .to_vec();
+
+        let mut payload = packet.slice(AUTH_PREFIX_LEN..).to_vec();
+        crypto_utils::xor_bytes(&mut payload, &salt);
+
+        Message::decode(Bytes::from(payload)).context("Failed to decode Protobuf")
+    }
+
+    /// Обработка Фазы 2: Проверка подписи клиента, генерация DH, отправка ответа
+    async fn handle_dh_exchange(
+        &self,
+        req: DhClientExchange,
+        remote_addr: SocketAddr,
+    ) -> Result<()> {
+        // 1. Проверка клиента
+        let client_public_key = VerifyingKey::from_bytes(
+            &req.client_public_key
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("Invalid key length"))?,
+        )?;
+
+        let client_fingerprint = crypto_utils::generate_key_fingerprint(&client_public_key);
+        if !self.allowed_clients.contains(&client_fingerprint) {
+            return Err(anyhow::anyhow!(
+                "Client {} not in allowed list",
+                client_fingerprint
+            ));
+        }
+
+        crypto_utils::verify_signature(
+            &client_public_key,
+            &req.public_key,
+            &req.client_signed_dh_key,
+        )?;
+
+        info!(
+            "[AUTH] Client {} authenticated via signature from {}",
+            client_fingerprint, remote_addr
+        );
+
+        // 2. Генерация серверной части DH
+        let server_ephemeral_secret = StaticSecret::random_from_rng(OsRng);
+        let server_pub_key = PublicKey::from(&server_ephemeral_secret);
+
+        let client_dh_pub_array: [u8; 32] = req
+            .public_key
+            .as_slice()
+            .try_into()
+            .context("Failed to convert client DH public key")?;
+        let client_dh_pub = PublicKey::from(client_dh_pub_array);
+
+        let shared_secret = server_ephemeral_secret.diffie_hellman(&client_dh_pub);
+
+        // 3. Сохранение временного состояния
+        self.temp_dh_map.insert(
+            remote_addr,
+            TempDHInfo {
+                shared_key: crypto_utils::derive_shared_key(&shared_secret),
+                client_fingerprint,
+                created_at: Instant::now(),
+            },
+        );
+
+        // 4. Подготовка ответа
+        let response_payload = DhServerExchange {
+            public_key: server_pub_key.as_bytes().to_vec(),
+            server_signed_dh_key: crypto_utils::sign_data(
+                &self.server_signing_key,
+                server_pub_key.as_bytes(),
+            ),
+        };
+
+        let mut response_message = AnetMessage {
+            content: Some(Content::DhServerExchange(response_payload)),
+            padding: vec![],
+        };
+
+        let wire_len = response_message.encoded_len() + AUTH_PREFIX_LEN + PROTO_PAD_FIELD_OVERHEAD;
+        response_message.padding =
+            generate_random_padding(calculate_padding_needed(wire_len, self.padding_step));
+
+        self.send_obfuscated(response_message, remote_addr).await
+    }
+
+    /// Обработка Фазы 4: Расшифровка запроса, регистрация клиента, отправка сертификата
+    async fn handle_encrypted_auth(
+        &self,
+        enc_req: EncryptedAuthRequest,
+        remote_addr: SocketAddr,
+    ) -> Result<()> {
+        // 1. Получение сессионного ключа
+        let temp_info = self
+            .temp_dh_map
+            .remove(&remote_addr)
+            .map(|(_, v)| v)
+            .context("DH session expired or not found")?;
+
+        let cipher = Cipher::new(&temp_info.shared_key);
+
+        // 2. Расшифровка внутреннего запроса
+        let plaintext =
+            cipher.decrypt(enc_req.nonce.as_slice(), Bytes::from(enc_req.ciphertext))?;
+        let auth_message: AnetMessage = Message::decode(plaintext)?;
+
+        let req = match auth_message.content {
+            Some(Content::AuthRequest(r)) => r,
+            _ => {
                 return Err(anyhow::anyhow!(
-                    "Client {} not in allowed list",
-                    client_fingerprint
+                    "Invalid content inside encrypted auth request"
                 ));
             }
-            crypto_utils::verify_signature(
-                &client_public_key,
-                &req.public_key,
-                &req.client_signed_dh_key,
-            )?;
-            info!(
-                "[AUTH] Client {} authenticated via signature from {}",
-                client_fingerprint, remote_addr
-            );
+        };
 
-            let server_ephemeral_secret = StaticSecret::random_from_rng(OsRng);
-            let server_pub_key = PublicKey::from(&server_ephemeral_secret);
-
-            if req.public_key.len() != 32 {
-                return Err(anyhow::anyhow!("Invalid client DH public key length"));
-            }
-            let client_pub_key_array: [u8; 32] = req
-                .public_key
-                .as_slice()
-                .try_into()
-                .context("Failed to convert client public key to a fixed-size array")?;
-            let client_pub_key = PublicKey::from(client_pub_key_array);
-
-            let shared_secret = server_ephemeral_secret.diffie_hellman(&client_pub_key);
-
-            temp_dh_map.insert(
-                remote_addr,
-                TempDHInfo {
-                    shared_key: crypto_utils::derive_shared_key(&shared_secret),
-                    client_fingerprint,
-                    created_at: Instant::now(),
-                },
-            );
-
-            let response_payload = DhServerExchange {
-                public_key: server_pub_key.as_bytes().to_vec(),
-                server_signed_dh_key: crypto_utils::sign_data(
-                    server_signing_key,
-                    server_pub_key.as_bytes(),
-                ),
-            };
-            let mut response_message = AnetMessage {
-                content: Some(Content::DhServerExchange(response_payload)),
-                padding: vec![],
-            };
-            let mut response_data = Vec::new();
-            response_message.encode(&mut response_data)?;
-
-            let current_wire_len =
-                response_message.encoded_len() + AUTH_PREFIX_LEN + PROTO_PAD_FIELD_OVERHEAD;
-            response_message.padding =
-                generate_random_padding(calculate_padding_needed(current_wire_len, padding_step));
-
-            let prefix_info = crypto_utils::generate_prefix_with_salt();
-            crypto_utils::xor_bytes(&mut response_data, &prefix_info.salt);
-            let mut response_packet =
-                BytesMut::with_capacity(AUTH_PREFIX_LEN + response_data.len());
-            response_packet.put_slice(&prefix_info.prefix);
-            response_packet.put_slice(&response_data);
-            socket.send_to(&response_packet, remote_addr).await?;
-            Ok(())
+        if req.client_id != temp_info.client_fingerprint {
+            return Err(anyhow::anyhow!(
+                "Client ID mismatch inside encrypted tunnel"
+            ));
         }
 
-        Some(Content::EncryptedAuthRequest(enc_req)) => {
-            let temp_info = temp_dh_map
-                .remove(&remote_addr)
-                .map(|(_, v)| v)
-                .context("DH session expired or not found")?;
-            let cipher = Cipher::new(&temp_info.shared_key);
-            let plaintext =
-                cipher.decrypt(enc_req.nonce.as_slice(), Bytes::from(enc_req.ciphertext))?;
-            let auth_message: AnetMessage = Message::decode(plaintext)?;
+        // 3. Выделение ресурсов (IP, SessionID)
+        let assigned_ip = self
+            .registry
+            .allocate_ip()
+            .context("No free IPs available")?;
+        let client_ip_str = assigned_ip.to_string();
+        let nonce_prefix = generate_unique_nonce_prefix(self.registry.clone());
+        let session_id = generate_seid();
 
-            match auth_message.content {
-                Some(Content::AuthRequest(req))
-                    if req.client_id == temp_info.client_fingerprint =>
-                {
-                    let assigned_ip = registry.allocate_ip().context("No free IPs available")?;
-                    let client_ip_str = assigned_ip.to_string();
-                    let nonce_prefix = generate_unique_nonce_prefix(registry.clone());
-                    let session_id = generate_seid();
+        let client_info = Arc::new(ClientTransportInfo {
+            cipher: Arc::new(Cipher::new(&temp_info.shared_key)),
+            sequence: Arc::new(AtomicU64::new(0)),
+            assigned_ip: client_ip_str.clone(),
+            session_id: session_id.clone(),
+            nonce_prefix,
+            remote_addr: ArcSwap::new(Arc::new(remote_addr)),
+        });
 
-                    let client_info = Arc::new(ClientTransportInfo {
-                        cipher: Arc::new(Cipher::new(&temp_info.shared_key)),
-                        sequence: Arc::new(AtomicU64::new(0)),
-                        assigned_ip: client_ip_str.clone(),
-                        session_id: session_id.clone(),
-                        nonce_prefix,
-                        remote_addr: ArcSwap::new(Arc::new(remote_addr)),
-                    });
+        self.registry.pre_register_client(client_info);
 
-                    registry.pre_register_client(client_info);
+        // 4. Формирование зашифрованного ответа
+        let (netmask, gateway, mtu) = self.registry.get_network_params();
+        let response_payload = AuthResponse {
+            ip: client_ip_str,
+            netmask: netmask.to_string(),
+            gateway: gateway.to_string(),
+            mtu: mtu as i32,
+            session_id,
+            nonce_prefix: nonce_prefix.to_vec(),
+            quic_cert: self.quic_cert_pem.as_bytes().to_vec(),
+        };
 
-                    let (netmask, gateway, mtu) = registry.get_network_params();
-                    let response_payload = AuthResponse {
-                        ip: client_ip_str,
-                        netmask: netmask.to_string(),
-                        gateway: gateway.to_string(),
-                        mtu: mtu as i32,
-                        session_id,
-                        nonce_prefix: nonce_prefix.to_vec(),
-                        quic_cert: quic_cert_pem.as_bytes().to_vec(),
-                    };
+        // Внутреннее сообщение (с паддингом)
+        let mut inner_msg = AnetMessage {
+            content: Some(Content::AuthResponse(response_payload)),
+            padding: vec![],
+        };
+        let inner_len = inner_msg.encoded_len() + PROTO_PAD_FIELD_OVERHEAD;
+        inner_msg.padding =
+            generate_random_padding(calculate_padding_needed(inner_len, self.padding_step));
 
-                    let mut nonce_bytes_for_response = [0u8; NONCE_LEN];
-                    OsRng.fill_bytes(&mut nonce_bytes_for_response);
+        let mut raw_resp = Vec::new();
+        inner_msg.encode(&mut raw_resp)?;
 
-                    let mut inner_msg = AnetMessage {
-                        content: Some(Content::AuthResponse(response_payload)),
-                        padding: vec![],
-                    };
-                    let inner_len = inner_msg.encoded_len() + PROTO_PAD_FIELD_OVERHEAD;
-                    inner_msg.padding =
-                        generate_random_padding(calculate_padding_needed(inner_len, padding_step));
+        // Шифрование
+        let mut nonce_bytes = [0u8; NONCE_LEN];
+        OsRng.fill_bytes(&mut nonce_bytes);
+        let ciphertext = cipher.encrypt(&nonce_bytes, Bytes::from(raw_resp))?;
 
-                    let mut raw_resp = Vec::new();
-                    inner_msg.encode(&mut raw_resp)?;
-                    let ciphertext =
-                        cipher.encrypt(&nonce_bytes_for_response, Bytes::from(raw_resp))?;
+        // Внешнее сообщение (с паддингом)
+        let mut outer_msg = AnetMessage {
+            content: Some(Content::EncryptedAuthResponse(EncryptedAuthResponse {
+                ciphertext: ciphertext.to_vec(),
+                nonce: nonce_bytes.to_vec(),
+            })),
+            padding: vec![],
+        };
 
-                    // !!! OUTER PADDING (Внешний конверт) !!!
-                    let mut outer_msg = AnetMessage {
-                        content: Some(Content::EncryptedAuthResponse(EncryptedAuthResponse {
-                            ciphertext: ciphertext.to_vec(),
-                            nonce: nonce_bytes_for_response.to_vec(),
-                        })),
-                        padding: vec![],
-                    };
+        let outer_len = outer_msg.encoded_len() + AUTH_PREFIX_LEN + PROTO_PAD_FIELD_OVERHEAD;
+        outer_msg.padding =
+            generate_random_padding(calculate_padding_needed(outer_len, self.padding_step));
 
-                    let outer_wire_len =
-                        outer_msg.encoded_len() + AUTH_PREFIX_LEN + PROTO_PAD_FIELD_OVERHEAD;
-                    outer_msg.padding = generate_random_padding(calculate_padding_needed(
-                        outer_wire_len,
-                        padding_step,
-                    ));
+        self.send_obfuscated(outer_msg, remote_addr).await
+    }
 
-                    let mut final_data = Vec::new();
-                    outer_msg.encode(&mut final_data)?;
+    ///  Protobuf -> XOR -> UDP
+    async fn send_obfuscated(&self, message: AnetMessage, addr: SocketAddr) -> Result<()> {
+        let mut data = Vec::new();
+        message.encode(&mut data)?;
 
-                    let prefix_info = crypto_utils::generate_prefix_with_salt();
-                    crypto_utils::xor_bytes(&mut final_data, &prefix_info.salt);
-                    let mut response_packet =
-                        BytesMut::with_capacity(AUTH_PREFIX_LEN + final_data.len());
-                    response_packet.put_slice(&prefix_info.prefix);
-                    response_packet.put_slice(&final_data);
-                    socket.send_to(&response_packet, remote_addr).await?;
-                    Ok(())
-                }
-                _ => Err(anyhow::anyhow!("Invalid or mismatched AuthRequest")),
-            }
-        }
-        _ => Err(anyhow::anyhow!("Unexpected message type in handshake")),
+        let prefix_info = crypto_utils::generate_prefix_with_salt();
+        crypto_utils::xor_bytes(&mut data, &prefix_info.salt);
+
+        let mut packet = BytesMut::with_capacity(AUTH_PREFIX_LEN + data.len());
+        packet.put_slice(&prefix_info.prefix);
+        packet.put_slice(&data);
+
+        self.socket.send_to(&packet, addr).await?;
+        Ok(())
     }
 }

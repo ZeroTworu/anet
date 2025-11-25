@@ -1,9 +1,9 @@
-use crate::auth_handler::run_auth_handler;
+use crate::auth_handler::ServerAuthHandler; // <-- Используем структуру
 use crate::client_registry::ClientRegistry;
 use crate::config::Config;
 use crate::ip_pool::IpPool;
 use crate::multikey_udp_socket::{HandshakeData, MultiKeyAnetUdpSocket, TempDHInfo};
-use crate::vpn_handler::run_vpn_handler;
+use crate::vpn_handler::ServerVpnHandler; // <-- Используем структуру
 use anet_common::atun::TunManager;
 use anet_common::consts::MAX_PACKET_SIZE;
 use anet_common::quic_settings::build_transport_config;
@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use base64::prelude::*;
 use dashmap::DashMap;
 use ed25519_dalek::SigningKey;
-use log::{debug, info};
+use log::{debug, error, info};
 use quinn::crypto::rustls::QuicServerConfig;
 use quinn::{Endpoint, EndpointConfig, ServerConfig as QuinnServerConfig, TokioRuntime};
 use rustls::ServerConfig as RustlsServerConfig;
@@ -23,6 +23,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
+
+const TEMP_DH_TIMEOUT: Duration = Duration::from_secs(30);
+
+const TEMP_DH_CLEANUP_INTERVAL: Duration = Duration::from_secs(10);
 
 pub struct ANetServer {
     cfg: Config,
@@ -99,24 +103,31 @@ impl ANetServer {
 
         let cfg_arc = Arc::new(self.cfg.clone());
 
-        let vpn_handler_task = tokio::spawn(run_vpn_handler(
-            endpoint.clone(),
-            tx_to_tun,
-            rx_from_tun,
-            self.registry.clone(),
-            cfg_arc.clone(),
-        ));
+        // --- VPN HANDLER ---
+        let vpn_handler =
+            ServerVpnHandler::new(endpoint.clone(), self.registry.clone(), cfg_arc.clone());
 
-        let auth_handler_task = tokio::spawn(run_auth_handler(
-            rx_from_auth,
+        let vpn_handler_task = tokio::spawn(async move {
+            if let Err(e) = vpn_handler.run(tx_to_tun, rx_from_tun).await {
+                error!("VPN Handler critical error: {}", e);
+            }
+        });
+
+        // --- AUTH HANDLER ---
+        let auth_handler = ServerAuthHandler::new(
             real_socket,
             self.registry.clone(),
             self.temp_dh_map.clone(),
             self.cfg.authentication.allowed_clients.clone(),
             self.server_signing_key.clone(),
             self.cfg.crypto.quic_cert.clone(),
-            self.cfg.stealth.padding_step.clone(),
-        ));
+            self.cfg.stealth.padding_step,
+        );
+
+        // Запускаем цикл в таске
+        let auth_handler_task = tokio::spawn(async move {
+            auth_handler.run(rx_from_auth).await;
+        });
 
         let cleanup_temp_dh_task =
             tokio::spawn(clear_expired_dh_sessions(self.temp_dh_map.clone()));
@@ -140,8 +151,6 @@ impl ANetServer {
     }
 }
 
-const TEMP_DH_TIMEOUT: Duration = Duration::from_secs(30);
-const TEMP_DH_CLEANUP_INTERVAL: Duration = Duration::from_secs(10);
 async fn clear_expired_dh_sessions(temp_dh_map: Arc<DashMap<SocketAddr, TempDHInfo>>) {
     info!("Temporary DH state cleanup task started.");
     loop {

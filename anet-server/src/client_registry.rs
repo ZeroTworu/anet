@@ -1,5 +1,3 @@
-// anet-server/src/client_registry.rs
-
 use crate::ip_pool::IpPool;
 use crate::multikey_udp_socket::StreamSender;
 use anet_common::encryption::Cipher;
@@ -48,10 +46,13 @@ impl ClientRegistry {
 
     pub fn pre_register_client(&self, client_info: Arc<ClientTransportInfo>) {
         let remote_addr = **client_info.remote_addr.load();
+        info!(
+            "[Registry] Pre-registered client {} for address {}",
+            client_info.assigned_ip, remote_addr
+        );
         self.clients_by_prefix
             .insert(client_info.nonce_prefix, client_info.clone());
         self.clients_by_addr.insert(remote_addr, client_info);
-        //info!("[Registry] Pre-registered client {} for address {}", client_info.assigned_ip, remote_addr);
     }
 
     pub fn finalize_client(&self, client_ip: &str, router_sender: StreamSender) {
