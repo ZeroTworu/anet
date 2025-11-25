@@ -1,6 +1,7 @@
 use crate::client_udp_socket::AnetUdpSocket;
 use crate::config::{Config, StatsConfig, StealthConfig};
 use anet_common::atun::TunManager;
+use anet_common::consts::MAX_PACKET_SIZE;
 use anet_common::encryption::Cipher;
 use anet_common::protocol::AuthResponse;
 use anet_common::quic_settings::QuicConfig;
@@ -8,6 +9,7 @@ use anet_common::quic_settings::build_transport_config;
 use anet_common::stream_framing::{frame_packet, read_next_packet};
 use anet_common::tun_params::TunParams;
 use anyhow::Result;
+use bytes::Bytes;
 use log::{error, info};
 use quinn::{
     ClientConfig as QuinnClientConfig, Connection, Endpoint, EndpointConfig, TokioRuntime,
@@ -24,6 +26,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UdpSocket;
+use tokio::sync::mpsc;
 use tokio::time::sleep;
 
 const KIB: f64 = 1024.0;
@@ -113,35 +116,54 @@ impl VpnHandler {
         let (tx_to_tun, mut rx_from_tun) = tun_manager.run().await?;
 
         let mut quic_sender = send_stream;
-        let min_jitter = self.stealth_config.min_jitter_ns.clone(); // Читаем из конфига
-        let max_jitter = self.stealth_config.max_jitter_ns.clone();
+        let stealth_config = self.stealth_config.clone(); // Клонируем конфиг
 
         tokio::spawn(async move {
-            let mut rng = OsRng;
+            // Канал для "проснувшихся" пакетов
+            let (tx_ready, mut rx_ready) = mpsc::channel::<Bytes>(MAX_PACKET_SIZE); // Буфер по вкусу
 
-            while let Some(packet) = rx_from_tun.recv().await {
-                if packet.len() < 20 {
-                    continue;
+            // 1. Диспетчер (TUN -> Sleep -> Channel)
+            let mut source = rx_from_tun;
+            tokio::spawn(async move {
+                let mut rng = OsRng;
+                let min = stealth_config.min_jitter_ns;
+                let max = stealth_config.max_jitter_ns;
+
+                while let Some(packet) = source.recv().await {
+                    if packet.len() < 20 {
+                        continue;
+                    } // Фильтр мусора
+
+                    let tx = tx_ready.clone();
+                    let delay = if max > min {
+                        rng.gen_range(min..=max)
+                    } else {
+                        0
+                    };
+
+                    tokio::spawn(async move {
+                        if delay > 0 {
+                            sleep(Duration::from_nanos(delay)).await;
+                        }
+                        let _ = tx.send(packet).await;
+                    });
                 }
-                let framed_packet = frame_packet(packet);
+            });
 
-                if max_jitter > min_jitter {
-                    let delay_ns = rng.gen_range(min_jitter..=max_jitter);
-                    if delay_ns > 0 {
-                        sleep(Duration::from_nanos(delay_ns)).await;
-                    }
-                }
-
-                if quic_sender.write_all(&framed_packet).await.is_err()
+            // 2. Отправщик (Channel -> QUIC)
+            while let Some(packet) = rx_ready.recv().await {
+                let framed = frame_packet(packet);
+                if quic_sender.write_all(&framed).await.is_err()
                     || quic_sender.flush().await.is_err()
                 {
-                    error!("[VPN] QUIC stream write failed, closing TUN->QUIC task.");
+                    error!("[VPN] QUIC stream write failed.");
                     break;
                 }
             }
             let _ = quic_sender.finish();
             info!("[VPN] TUN->QUIC task finished.");
         });
+
         let mut quic_receiver = recv_stream;
         tokio::spawn(async move {
             loop {

@@ -105,23 +105,55 @@ impl ServerVpnHandler {
         let client_info_for_tx = client_info.clone();
         let tx_task = tokio::spawn(async move {
             let mut stream = send_stream;
-            let mut rng = OsRng;
-            let min_jitter = stealth_config.min_jitter_ns;
-            let max_jitter = stealth_config.max_jitter_ns;
 
-            while let Some(packet) = rx_router.recv().await {
-                let framed_packet = frame_packet(packet);
-                if max_jitter > min_jitter {
-                    let delay_ns = rng.gen_range(min_jitter..=max_jitter);
-                    if delay_ns > 0 {
-                        sleep(Duration::from_nanos(delay_ns)).await;
-                    }
+            // 1. Создаем промежуточный канал для пакетов, которые "проснулись"
+            // Размер буфера определяет, сколько пакетов может быть "в полете" (спать) одновременно
+            let (tx_ready, mut rx_ready) = mpsc::channel::<Bytes>(MAX_PACKET_SIZE);
+
+            // 2. Задача-Диспетчер: Читает из TUN, назначает задержку и спавнит ожидание
+            let mut rx_from_router = rx_router; // Твой входящий канал
+            let config_jitter = stealth_config.clone();
+
+            tokio::spawn(async move {
+                let mut rng = OsRng;
+                let min_jitter = config_jitter.min_jitter_ns;
+                let max_jitter = config_jitter.max_jitter_ns;
+
+                while let Some(packet) = rx_from_router.recv().await {
+                    let tx = tx_ready.clone();
+
+                    // Вычисляем задержку тут
+                    let delay_ns = if max_jitter > min_jitter {
+                        rng.gen_range(min_jitter..=max_jitter)
+                    } else {
+                        0
+                    };
+
+                    // Спавним задачу на каждый пакет
+                    // Это дешево в Tokio. Это позволяет пакетам обгонять друг друга.
+                    tokio::spawn(async move {
+                        if delay_ns > 0 {
+                            sleep(Duration::from_nanos(delay_ns)).await;
+                        }
+                        // Если канал полон (backpressure), мы подождем тут, не блокируя чтение новых
+                        if let Err(_) = tx.send(packet).await {
+                            // Канал закрыт (соединение разорвано), просто выходим
+                        }
+                    });
                 }
+            });
+
+            // 3. Задача-Отправщик: Читает готовые пакеты и пишет в QUIC
+            // Пакеты приходят сюда уже после сна, возможно, в другом порядке
+            while let Some(packet) = rx_ready.recv().await {
+                let framed_packet = frame_packet(packet);
+
                 if stream.write_all(&framed_packet).await.is_err() || stream.flush().await.is_err()
                 {
                     break;
                 }
             }
+
             let _ = stream.finish();
             info!(
                 "[VPN] Client {} TUN->QUIC task finished.",
