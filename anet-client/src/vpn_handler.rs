@@ -1,22 +1,20 @@
 use crate::client_udp_socket::AnetUdpSocket;
-use crate::config::{Config, StatsConfig, StealthConfig};
+use crate::config::{Config, StatsConfig};
 use anet_common::atun::TunManager;
-use anet_common::consts::MAX_PACKET_SIZE;
+use anet_common::config::StealthConfig;
 use anet_common::encryption::Cipher;
+use anet_common::jitter::bridge_with_jitter;
 use anet_common::protocol::AuthResponse;
 use anet_common::quic_settings::QuicConfig;
 use anet_common::quic_settings::build_transport_config;
-use anet_common::stream_framing::{frame_packet, read_next_packet};
+use anet_common::stream_framing::read_next_packet;
 use anet_common::tun_params::TunParams;
 use anyhow::Result;
-use bytes::Bytes;
 use log::{error, info};
 use quinn::{
     ClientConfig as QuinnClientConfig, Connection, Endpoint, EndpointConfig, TokioRuntime,
     crypto::rustls::QuicClientConfig,
 };
-use rand::Rng;
-use rand::rngs::OsRng;
 use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::{ClientConfig as RustlsClientConfig, RootCertStore};
 use rustls_pemfile::certs;
@@ -24,9 +22,7 @@ use std::net::SocketAddr;
 use std::ops::Deref;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
 use tokio::net::UdpSocket;
-use tokio::sync::mpsc;
 use tokio::time::sleep;
 
 const KIB: f64 = 1024.0;
@@ -113,57 +109,21 @@ impl VpnHandler {
         let (send_stream, recv_stream) = connection.open_bi().await?;
         let tun_params = TunParams::from_auth_response(auth_response, &self.tun_name);
         let mut tun_manager = TunManager::new(tun_params)?;
-        let (tx_to_tun, mut rx_from_tun) = tun_manager.run().await?;
+        let (tx_to_tun, rx_from_tun) = tun_manager.run().await?;
 
-        let mut quic_sender = send_stream;
+        let quic_sender = send_stream;
         let stealth_config = self.stealth_config.clone(); // Клонируем конфиг
 
+        // TUN -> QUIC (TX)
         tokio::spawn(async move {
-            // Канал для "проснувшихся" пакетов
-            let (tx_ready, mut rx_ready) = mpsc::channel::<Bytes>(MAX_PACKET_SIZE); // Буфер по вкусу
-
-            // 1. Диспетчер (TUN -> Sleep -> Channel)
-            let mut source = rx_from_tun;
-            tokio::spawn(async move {
-                let mut rng = OsRng;
-                let min = stealth_config.min_jitter_ns;
-                let max = stealth_config.max_jitter_ns;
-
-                while let Some(packet) = source.recv().await {
-                    if packet.len() < 20 {
-                        continue;
-                    } // Фильтр мусора
-
-                    let tx = tx_ready.clone();
-                    let delay = if max > min {
-                        rng.gen_range(min..=max)
-                    } else {
-                        0
-                    };
-
-                    tokio::spawn(async move {
-                        if delay > 0 {
-                            sleep(Duration::from_nanos(delay)).await;
-                        }
-                        let _ = tx.send(packet).await;
-                    });
-                }
-            });
-
-            // 2. Отправщик (Channel -> QUIC)
-            while let Some(packet) = rx_ready.recv().await {
-                let framed = frame_packet(packet);
-                if quic_sender.write_all(&framed).await.is_err()
-                    || quic_sender.flush().await.is_err()
-                {
-                    error!("[VPN] QUIC stream write failed.");
-                    break;
-                }
+            if let Err(e) = bridge_with_jitter(rx_from_tun, quic_sender, stealth_config).await {
+                error!("[VPN] TX task failed: {}", e);
+            } else {
+                info!("[VPN] TX task finished.");
             }
-            let _ = quic_sender.finish();
-            info!("[VPN] TUN->QUIC task finished.");
         });
 
+        // QUIC -> TUN (RX)
         let mut quic_receiver = recv_stream;
         tokio::spawn(async move {
             loop {
@@ -176,7 +136,7 @@ impl VpnHandler {
                     _ => break,
                 }
             }
-            info!("[VPN] QUIC->TUN task finished.");
+            info!("[VPN] RX task finished.");
         });
 
         Ok(endpoint)

@@ -1,5 +1,5 @@
 use crate::client_registry::ClientRegistry;
-use crate::config::StealthConfig;
+use anet_common::config::StealthConfig;
 use anet_common::consts::{AUTH_PREFIX_LEN, MAX_PACKET_SIZE, NONCE_LEN, PADDING_MTU};
 use anet_common::crypto_utils::check_auth_prefix;
 use anet_common::padding_utils::calculate_padding_needed;

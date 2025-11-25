@@ -1,3 +1,4 @@
+use anet_common::config::StealthConfig;
 use anet_common::quic_settings::QuicConfig;
 use clap::Parser;
 use log::warn;
@@ -96,23 +97,6 @@ impl Default for ServerCoreConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
-pub struct StealthConfig {
-    pub min_jitter_ns: u64,
-    pub max_jitter_ns: u64,
-    pub padding_step: u16,
-}
-
-impl Default for StealthConfig {
-    fn default() -> Self {
-        Self {
-            min_jitter_ns: 0, // По умолчанию выключено
-            max_jitter_ns: 0,
-            padding_step: 0, // По умолчанию выключено
-        }
-    }
-}
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     #[serde(default)]

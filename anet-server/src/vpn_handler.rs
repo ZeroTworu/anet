@@ -2,18 +2,14 @@ use crate::client_registry::ClientRegistry;
 use crate::config::Config;
 use crate::utils::extract_ip_dst;
 use anet_common::consts::MAX_PACKET_SIZE;
-use anet_common::stream_framing::{frame_packet, read_next_packet};
+use anet_common::jitter::bridge_with_jitter;
+use anet_common::stream_framing::read_next_packet;
 use anyhow::Result;
 use bytes::Bytes;
 use log::{error, info, warn};
 use quinn::{Endpoint, Incoming};
-use rand::Rng;
-use rand::rngs::OsRng;
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
-use tokio::time::sleep;
 
 pub struct ServerVpnHandler {
     endpoint: Endpoint,
@@ -96,71 +92,31 @@ impl ServerVpnHandler {
         );
 
         let (send_stream, recv_stream) = connection.accept_bi().await?;
-        let (tx_router, mut rx_router) = mpsc::channel::<Bytes>(MAX_PACKET_SIZE);
+        let (tx_router, rx_router) = mpsc::channel::<Bytes>(MAX_PACKET_SIZE);
 
         registry.finalize_client(&client_ip, tx_router);
 
         let stealth_config = server_config.stealth.clone();
 
         let client_info_for_tx = client_info.clone();
+
+        // TASK: TUN -> QUIC (TX)
         let tx_task = tokio::spawn(async move {
-            let mut stream = send_stream;
-
-            // 1. Создаем промежуточный канал для пакетов, которые "проснулись"
-            // Размер буфера определяет, сколько пакетов может быть "в полете" (спать) одновременно
-            let (tx_ready, mut rx_ready) = mpsc::channel::<Bytes>(MAX_PACKET_SIZE);
-
-            // 2. Задача-Диспетчер: Читает из TUN, назначает задержку и спавнит ожидание
-            let mut rx_from_router = rx_router; // Твой входящий канал
-            let config_jitter = stealth_config.clone();
-
-            tokio::spawn(async move {
-                let mut rng = OsRng;
-                let min_jitter = config_jitter.min_jitter_ns;
-                let max_jitter = config_jitter.max_jitter_ns;
-
-                while let Some(packet) = rx_from_router.recv().await {
-                    let tx = tx_ready.clone();
-
-                    // Вычисляем задержку тут
-                    let delay_ns = if max_jitter > min_jitter {
-                        rng.gen_range(min_jitter..=max_jitter)
-                    } else {
-                        0
-                    };
-
-                    // Спавним задачу на каждый пакет
-                    // Это дешево в Tokio. Это позволяет пакетам обгонять друг друга.
-                    tokio::spawn(async move {
-                        if delay_ns > 0 {
-                            sleep(Duration::from_nanos(delay_ns)).await;
-                        }
-                        // Если канал полон (backpressure), мы подождем тут, не блокируя чтение новых
-                        if let Err(_) = tx.send(packet).await {
-                            // Канал закрыт (соединение разорвано), просто выходим
-                        }
-                    });
-                }
-            });
-
-            // 3. Задача-Отправщик: Читает готовые пакеты и пишет в QUIC
-            // Пакеты приходят сюда уже после сна, возможно, в другом порядке
-            while let Some(packet) = rx_ready.recv().await {
-                let framed_packet = frame_packet(packet);
-
-                if stream.write_all(&framed_packet).await.is_err() || stream.flush().await.is_err()
-                {
-                    break;
-                }
+            let res = bridge_with_jitter(rx_router, send_stream, stealth_config).await;
+            if let Err(e) = res {
+                error!(
+                    "[VPN] Client {} TX error: {}",
+                    client_info_for_tx.assigned_ip, e
+                );
+            } else {
+                info!(
+                    "[VPN] Client {} TX finished.",
+                    client_info_for_tx.assigned_ip
+                );
             }
-
-            let _ = stream.finish();
-            info!(
-                "[VPN] Client {} TUN->QUIC task finished.",
-                client_info_for_tx.assigned_ip
-            );
         });
 
+        // TASK: QUIC -> TUN (RX)
         let client_info_for_rx = client_info.clone();
         let rx_task = tokio::spawn(async move {
             let mut stream = recv_stream;
@@ -175,7 +131,7 @@ impl ServerVpnHandler {
                 }
             }
             info!(
-                "[VPN] Client {} QUIC->TUN task finished.",
+                "[VPN] Client {} RX task finished.",
                 client_info_for_rx.assigned_ip
             );
         });

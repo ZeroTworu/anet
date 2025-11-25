@@ -1,8 +1,10 @@
 pub mod atun;
+pub mod config;
 pub mod consts;
 pub mod crypto_utils;
 pub mod encryption;
 pub mod generated;
+pub mod jitter;
 pub mod padding_utils;
 pub mod quic_settings;
 pub mod stream_framing;

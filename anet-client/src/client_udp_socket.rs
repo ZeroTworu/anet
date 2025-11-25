@@ -1,4 +1,4 @@
-use crate::config::StealthConfig;
+use anet_common::config::StealthConfig;
 use anet_common::consts::{NONCE_PREFIX_LEN, PADDING_MTU};
 use anet_common::encryption::Cipher;
 use anet_common::padding_utils::calculate_padding_needed;
