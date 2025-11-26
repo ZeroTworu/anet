@@ -35,6 +35,7 @@ jobs:
           path: "target/x86_64-unknown-linux-musl/release/anet-server"
 
   build-linux-client:
+
     runs-on: "ubuntu-latest"
     steps:
       - uses: "actions/checkout@v4"
@@ -58,6 +59,7 @@ jobs:
           path: "target/x86_64-unknown-linux-musl/release/anet-client"
 
   build-windows-client:
+    name: "Build Windows Client"
     runs-on: "windows-latest"
     steps:
       - uses: "actions/checkout@v4"
@@ -78,3 +80,80 @@ jobs:
         with:
           name: "anet-client-windows"
           path: "target/release/anet-client.exe"
+
+  create-installer:
+    name: "Create Windows Installer"
+    runs-on: "windows-latest"
+    needs: "build-windows-client"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 1. Скачиваем собранный клиентский бинарник
+      - name: Download Client Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: anet-client-windows
+          path: installer_source/
+
+      # 2. Установка Inno Setup через Chocolatey
+      - name: Install Inno Setup
+        shell: powershell
+        # Мы указываем флаг -y, чтобы принять все соглашения
+        run: choco install -y innosetup
+
+      # 3. Подготовка исходных файлов для компиляции
+      - name: Prepare Source Files
+        shell: powershell
+        run: |
+          # 3.1. Перемещение anet-client.exe в корень, как ожидает ISS
+          Get-ChildItem installer_source\anet-client.exe | Move-Item -Destination installer_source\anet-client.exe
+
+          # 3.2. Скачивание и размещение Wintun DLL
+          $WINTUN_VERSION="0.14.1"
+          Invoke-WebRequest -Uri "https://www.wintun.net/builds/wintun-$WINTUN_VERSION.zip" -OutFile "wintun.zip"
+          Expand-Archive -Path "wintun.zip" -DestinationPath "wintun"
+          Copy-Item -Path "wintun\wintun\bin\amd64\wintun.dll" -Destination "installer_source\wintun.dll"
+
+          # 3.3. Копирование config и ISS скрипта в рабочую директорию
+          Copy-Item -Path "contrib\config\client.toml" -Destination "installer_source\client.toml"
+
+          # Для запуска ISCC скрипт должен быть в рабочем каталоге
+          Copy-Item -Path "contrib\inno_setup\install.iss" -Destination "installer_source\install.iss"
+
+          # Иконка
+          Copy-Item -Path "contrib\inno_setup\anet.ico" -Destination "installer_source\anet.ico"
+
+          # Удаление временного каталога
+          Remove-Item wintun, wintun.zip -Recurse
+
+      # 4. Устанавливаем версию для передачи в компилятор
+      - name: Set Release Version (for ISCC Define)
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            # Для тегов: убираем 'v' в начале
+            VERSION=${GITHUB_REF#refs/tags/v}
+          else
+            # Для веток: берем только последнюю часть после '/'
+            VERSION=${GITHUB_REF##*/}
+          fi
+          # Очищаем версию от недопустимых символов
+          CLEAN_VERSION=$(echo "$VERSION" | sed 's/[\/\\:*?"<>|]/-/g')
+          echo "VERSION_ARG=/DMyAppVersion=$CLEAN_VERSION" >> $GITHUB_ENV
+          echo "Clean version set to: $CLEAN_VERSION"
+
+      - name: Compile Inno Setup Installer (using ISCC.exe)
+        shell: cmd
+        # Переходим в директорию, где лежат все исходники
+        # ISCC.exe добавится в PATH после установки Choco, но лучше указывать полный путь для стабильности
+        run: |
+          "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "%GITHUB_WORKSPACE%\installer_source\install.iss" /O"%GITHUB_WORKSPACE%\installer_source\Output" ${{ env.VERSION_ARG }}
+
+      - name: Upload Installer Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          # Установщик компилируется в installer_source/Output/
+          path: installer_source\Output\*.exe
+          name: anet-client-setup-windows
+          if-no-files-found: error
