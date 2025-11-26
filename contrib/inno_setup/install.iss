@@ -43,7 +43,7 @@ Source: "anet.ico"; DestDir: "{app}"; Flags: ignoreversion
 
 ; 2. КОНФИГ: Устанавливается в {userappdata}\anet\. Флаг onlyifdoesntexist гарантирует, что пользовательский конфиг не будет затерт при обновлении.
 ; Note: Мы используем Flags: uninsneveruninstall, чтобы конфигурация осталась после деинсталляции.
-Source: "client.toml"; DestDir: "{userappdata}\anet"; DestName: "default.toml"; Flags: onlyifdoesntexist uninsneveruninstall
+Source: "client.toml"; DestDir: "{userappdata}\anet"; DestName: "default.toml"
 
 ; --- Icons/Shortcuts Section ---
 [Icons]
