@@ -62,7 +62,7 @@ impl AuthHandler {
         )?;
 
         Ok(Self {
-            server_addr: cfg.server_addr.parse()?,
+            server_addr: cfg.main.address.parse()?,
             server_public_key,
             ephemeral_secret,
             signing_key,

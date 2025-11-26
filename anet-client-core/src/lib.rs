@@ -78,7 +78,7 @@ impl AnetClient {
         self.route_manager.backup_routes()?;
 
         // Добавляем маршрут до VPN-сервера
-        let server_ip = self.config.server_addr.split(':').next().unwrap();
+        let server_ip = self.config.main.address.split(':').next().unwrap();
         self.route_manager.add_exclusion_route(server_ip)?;
 
         // Поднимаем QUIC

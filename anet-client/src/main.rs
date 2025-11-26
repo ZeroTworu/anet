@@ -87,8 +87,9 @@ async fn main() -> Result<()> {
     println!("{}", ascii_art);
 
     let route_mgr = Box::new(DesktopRouteManager::new());
-    let tun_fac = Box::new(DesktopTunFactory::new("anet-client".to_string()));
-    let client = AnetClient::new(config.clone(), tun_fac, route_mgr);
+    let cfg = config.clone();
+    let tun_fac = Box::new(DesktopTunFactory::new(config.main.tun_name));
+    let client = AnetClient::new(cfg, tun_fac, route_mgr);
 
     client.start().await?;
 

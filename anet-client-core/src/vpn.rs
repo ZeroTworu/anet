@@ -40,7 +40,7 @@ impl VpnHandler {
             build_transport_config(&self.config.quic_transport, auth_response.mtu as u16)?;
 
         // 2. Создание сокета (AnetUdpSocket)
-        let server_addr: SocketAddr = self.config.server_addr.parse()?;
+        let server_addr: SocketAddr = self.config.main.address.parse()?;
         let real_socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
         let cipher = Arc::new(Cipher::new(&shared_key));
         let nonce_prefix: [u8; 4] = auth_response.nonce_prefix.as_slice().try_into()?;

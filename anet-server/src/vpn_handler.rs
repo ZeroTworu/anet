@@ -1,7 +1,7 @@
 use crate::client_registry::ClientRegistry;
 use crate::config::Config;
 use crate::utils::extract_ip_dst;
-use anet_common::consts::MAX_PACKET_SIZE;
+use anet_common::consts::CHANNEL_BUFFER_SIZE;
 use anet_common::jitter::bridge_with_jitter;
 use anet_common::stream_framing::read_next_packet;
 use anyhow::Result;
@@ -92,7 +92,7 @@ impl ServerVpnHandler {
         );
 
         let (send_stream, recv_stream) = connection.accept_bi().await?;
-        let (tx_router, rx_router) = mpsc::channel::<Bytes>(MAX_PACKET_SIZE);
+        let (tx_router, rx_router) = mpsc::channel::<Bytes>(CHANNEL_BUFFER_SIZE);
 
         registry.finalize_client(&client_ip, tx_router);
 

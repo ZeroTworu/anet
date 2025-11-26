@@ -3,6 +3,21 @@ use anet_common::quic_settings::QuicConfig;
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct MainConfig {
+    pub address: String,
+    pub tun_name: String,
+}
+
+impl Default for MainConfig {
+    fn default() -> Self {
+        Self {
+            address: "127.0.0.1:443".to_string(),
+            tun_name: "anet-client".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct ClientKeys {
     pub private_key: String,
     pub server_pub_key: String,
@@ -34,7 +49,8 @@ impl Default for StatsConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct CoreConfig {
-    pub server_addr: String,
+    #[serde(default)]
+    pub main: MainConfig,
 
     #[serde(default)]
     pub keys: ClientKeys,

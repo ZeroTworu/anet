@@ -1,11 +1,11 @@
-use crate::auth_handler::ServerAuthHandler; // <-- Используем структуру
+use crate::auth_handler::ServerAuthHandler;
 use crate::client_registry::ClientRegistry;
 use crate::config::Config;
 use crate::ip_pool::IpPool;
 use crate::multikey_udp_socket::{HandshakeData, MultiKeyAnetUdpSocket, TempDHInfo};
-use crate::vpn_handler::ServerVpnHandler; // <-- Используем структуру
+use crate::vpn_handler::ServerVpnHandler;
 use anet_common::atun::TunManager;
-use anet_common::consts::MAX_PACKET_SIZE;
+use anet_common::consts::CHANNEL_BUFFER_SIZE;
 use anet_common::quic_settings::build_transport_config;
 use anet_common::tun_params::TunParams;
 use anyhow::{Context, Result};
@@ -85,7 +85,7 @@ impl ANetServer {
             .setup_server_tun_routing(&self.cfg.server.external_if)
             .await?;
 
-        let (tx_to_auth, rx_from_auth) = mpsc::channel::<HandshakeData>(MAX_PACKET_SIZE);
+        let (tx_to_auth, rx_from_auth) = mpsc::channel::<HandshakeData>(CHANNEL_BUFFER_SIZE);
 
         let anet_socket = Arc::new(MultiKeyAnetUdpSocket::new(
             real_socket.clone(),
