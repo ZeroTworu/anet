@@ -1,4 +1,4 @@
-use crate::config::Config;
+use crate::config::CoreConfig;
 use anet_common::consts::{AUTH_PREFIX_LEN, MAX_PACKET_SIZE, NONCE_LEN, PROTO_PAD_FIELD_OVERHEAD};
 use anet_common::crypto_utils::{self, derive_shared_key, generate_key_fingerprint, sign_data};
 use anet_common::encryption::Cipher;
@@ -37,7 +37,7 @@ pub struct AuthHandler {
 }
 
 impl AuthHandler {
-    pub fn new(cfg: &Config) -> Result<Self> {
+    pub fn new(cfg: &CoreConfig) -> Result<Self> {
         let ephemeral_secret = StaticSecret::random_from_rng(OsRng);
 
         let private_key_bytes = BASE64_STANDARD
@@ -62,7 +62,7 @@ impl AuthHandler {
         )?;
 
         Ok(Self {
-            server_addr: cfg.main.address.parse()?,
+            server_addr: cfg.server_addr.parse()?,
             server_public_key,
             ephemeral_secret,
             signing_key,

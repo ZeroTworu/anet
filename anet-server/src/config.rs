@@ -135,7 +135,7 @@ pub async fn load() -> anyhow::Result<Config> {
         Err(_) => {
             warn!(
                 "\n\
-                Cannot find server config file in {}, use '-c' or '-cfg' \n\
+                Cannot find server config file in {}, use '-c' or '--cfg' \n\
                 './anet-server -c /home/anet/anet/config.toml' for example,
                 ",
                 opt.cfg,

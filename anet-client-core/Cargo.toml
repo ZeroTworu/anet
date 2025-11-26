@@ -1,0 +1,26 @@
+[package]
+name = "anet-client-core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = {workspace = true}
+rustls = {workspace = true, features = ["ring", "aws-lc-rs"]}
+log = {workspace = true}
+anyhow = {workspace = true}
+prost = {workspace = true}
+bytes = {workspace = true}
+quinn = {workspace = true, features = ["rustls", "ring", "aws-lc-rs"]}
+rustls-pemfile = {workspace = true}
+rand = { workspace = true }
+x25519-dalek = {workspace = true}
+ed25519-dalek = {workspace = true}
+base64 = {workspace = true}
+serde = { workspace = true, features = ["derive"] }
+
+# Наша общая либа
+anet-common = { path = "../anet-common" }
+async-trait = "0.1.89"
+
+[lib]
+path = "src/lib.rs"

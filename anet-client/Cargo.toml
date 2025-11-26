@@ -5,24 +5,21 @@ edition = "2024"
 
 [dependencies]
 tokio = {workspace = true}
-rustls = {workspace = true, features = ["ring", "aws-lc-rs"]}
-env_logger = {workspace = true}
 log = {workspace = true}
 anyhow = {workspace = true}
 clap = {workspace = true}
-prost = {workspace = true}
-bytes = {workspace = true}
-quinn = {workspace = true, features = ["rustls", "ring", "aws-lc-rs"]}
-rustls-pemfile = {workspace = true}
 serde = { workspace = true, features = ["derive"] }
 toml = {workspace = true}
-rand = { workspace = true }
-x25519-dalek = {workspace = true}
-ed25519-dalek = {workspace = true}
-base64 = {workspace = true}
+bytes = {workspace = true}
+rustls = {workspace = true}
+env_logger = {workspace = true}
+quinn = {workspace = true } # Только для типов
 
+async-trait = "0.1.89"
 netdev = { version = "0.39", features = ["gateway"] }
 anet-common = { path = "../anet-common"}
+anet-client-core = { path = "../anet-client-core"}
+
 
 [build-dependencies]
 chrono = "0.4.42"

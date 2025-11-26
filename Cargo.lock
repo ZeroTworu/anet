@@ -74,16 +74,34 @@ dependencies = [
 name = "anet-client"
 version = "0.1.0"
 dependencies = [
+ "anet-client-core",
  "anet-common",
  "anyhow",
- "base64",
+ "async-trait",
  "bytes",
  "chrono",
  "clap",
- "ed25519-dalek",
  "env_logger",
  "log",
  "netdev",
+ "quinn",
+ "rustls",
+ "serde",
+ "tokio",
+ "toml",
+]
+
+[[package]]
+name = "anet-client-core"
+version = "0.1.0"
+dependencies = [
+ "anet-common",
+ "anyhow",
+ "async-trait",
+ "base64",
+ "bytes",
+ "ed25519-dalek",
+ "log",
  "prost",
  "quinn",
  "rand 0.8.5",
@@ -91,7 +109,6 @@ dependencies = [
  "rustls-pemfile",
  "serde",
  "tokio",
- "toml",
  "x25519-dalek",
 ]
 
@@ -234,6 +251,17 @@ name = "async-task"
 version = "4.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8b75356056920673b02621b35afd0f7dda9306d03c79a30f5c56c44cf256e3de"
+
+[[package]]
+name = "async-trait"
+version = "0.1.89"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9035ad2d096bed7955a320ee7e2230574d28fd3c3a0f186cbea1ff3c7eed5dbb"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.106",
+]
 
 [[package]]
 name = "atomic-waker"

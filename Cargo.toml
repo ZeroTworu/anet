@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["anet-server", "anet-client", "anet-common", "anet-keygen"]
+members = ["anet-server", "anet-client", "anet-common", "anet-keygen", "anet-client-core"]
 default-members = ["anet-server", "anet-client", "anet-common", "anet-keygen"]
 
 [workspace.dependencies]
