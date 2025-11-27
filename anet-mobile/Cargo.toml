@@ -1,0 +1,21 @@
+[package]
+name = "anet-mobile"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { workspace = true, features = ["full"] }
+anyhow = {workspace = true}
+toml = {workspace = true}
+log = { workspace = true }
+tun = {workspace = true}
+jni = "0.21"
+android_logger = "0.15.1"
+
+anet-client-core = { path = "../anet-client-core" }
+anet-common = { path = "../anet-common" }
+bytes = { workspace = true }
+async-trait = { workspace = true }
+
+[lib]
+crate-type = ["cdylib"]

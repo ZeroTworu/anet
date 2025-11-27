@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["anet-server", "anet-client", "anet-common", "anet-keygen", "anet-client-core"]
+members = ["anet-server", "anet-client", "anet-common", "anet-keygen", "anet-client-core", "anet-mobile"]
 default-members = ["anet-server", "anet-client", "anet-common", "anet-keygen"]
 
 [workspace.dependencies]
@@ -8,7 +8,7 @@ tun = { version = "0.8.3", features = ["async"] }
 tokio = {version = "1.47.1", features = ["full"]}
 env_logger = "0.11.8"
 log = { version = "0.4.22", default-features = false}
-rustls = { version = "0.23.31", features = ["ring", "aws-lc-rs"] }
+rustls = { version = "0.23.31", default-features = false, features = ["ring"] }
 anyhow = "1.0.99"
 bytes = "1.10.1"
 prost = "0.14.1"
@@ -17,12 +17,13 @@ rustls-pemfile = "2.2.0"
 base64 = "0.22.1"
 rand = { version = "0.8", features = ["std"] }
 chacha20poly1305 = "0.10.1"
-quinn = {version = "0.11.9", features = ["rustls", "ring", "aws-lc-rs"]}
+quinn = {version = "0.11.9", features = ["rustls", "ring"]}
 serde = { version = "1.0.219", features = ["derive"] }
 toml = "0.9.8"
 x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }
 ed25519-dalek = { version = "2.1.1", features = ["std", "rand_core"] }
 sha2 = "0.10.9"
+async-trait = "0.1.89"
 
 [profile.release.package.anet-client]
 debug = 2

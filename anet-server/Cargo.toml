@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-tokio = {workspace = true}
-rustls = {workspace = true, features = ["ring", "aws-lc-rs"]}
+tokio = {workspace = true }
+rustls = {workspace = true }
 env_logger = {workspace = true}
 log = {workspace = true}
 anyhow = {workspace = true}
@@ -16,7 +16,7 @@ rustls-pemfile = {workspace = true}
 base64 = {workspace = true}
 rand = {workspace = true}
 chacha20poly1305 = {workspace = true}
-quinn = {workspace = true, features = ["rustls", "ring", "aws-lc-rs"]}
+quinn = {workspace = true }
 serde = { workspace = true, features = ["derive"] }
 toml = {workspace = true}
 x25519-dalek = {workspace = true}
