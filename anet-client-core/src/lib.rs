@@ -3,11 +3,13 @@ pub mod config;
 pub mod socket;
 pub mod traits;
 pub mod vpn;
+pub mod events;
 
 use crate::auth::AuthHandler;
 use crate::config::CoreConfig;
 use crate::traits::{RouteManager, TunFactory};
 use crate::vpn::VpnHandler;
+use crate::events::status;
 use anyhow::Result;
 use log::{error, info};
 use quinn::{Connection, Endpoint};
@@ -67,12 +69,15 @@ impl AnetClient {
         }
 
         info!("[Core] Starting...");
+        status("[Core] Starting...");
 
         // 2. Логика подключения (Auth -> QUIC -> TUN)
         let auth_handler = AuthHandler::new(&self.config)?;
         // Стучимся на сервер
         let (auth_response, shared_key) = auth_handler.authenticate().await?;
+
         info!("[Core] Authenticated. Assigned IP: {}", auth_response.ip);
+        status(format!("[Core] IP: {}", auth_response.ip));
 
         // Бэкапим маршруты
         self.route_manager.backup_routes()?;

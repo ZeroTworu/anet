@@ -14,6 +14,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
+use crate::events::status;
 
 pub struct VpnHandler {
     config: CoreConfig,
@@ -77,12 +78,12 @@ impl VpnHandler {
 
         // 5. Connect
         info!("[Core] Connecting to {}...", server_addr);
+        status(format!("[Core] Connecting to {}...", server_addr));
+
         let connection = endpoint.connect(server_addr, "alco")?.await?;
 
-        info!(
-            "[Core] Connection established. SEID: {}",
-            auth_response.session_id
-        );
+        info!("[Core] Connection established. SEID: {}", auth_response.session_id);
+        status(format!("[Core] Connection established. SEID: {}", auth_response.session_id));
 
         // 6. Запуск стримов
         let (send_stream, mut recv_stream) = connection.open_bi().await?;
@@ -114,7 +115,7 @@ impl VpnHandler {
             }
             info!("[Core] QUIC RX finished.");
         });
-
+        status("[Core] Connected!");
         Ok((endpoint, connection.clone(), tx_to_quic, rx_from_quic))
     }
 }

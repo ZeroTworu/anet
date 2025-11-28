@@ -6,11 +6,12 @@ use anet_client_core::config::{CoreConfig, ClientKeys, MainConfig, StatsConfig};
 use anet_common::config::StealthConfig;
 use anet_client_core::AnetClient;
 use anet_common::quic_settings::QuicConfig;
-use jni::objects::JClass;
-use jni::JNIEnv;
+use jni::objects::{GlobalRef, JClass, JValue};
+use jni::{JNIEnv, JavaVM};
 use log::{error, info, LevelFilter};
 use std::sync::{Arc, Mutex};
 use tokio::runtime::Runtime;
+use anet_client_core::events::{self, AnetEvent, EventHandler};
 
 // Глобальный стейт, чтобы хранить клиента между вызовами
 static CLIENT: Mutex<Option<Arc<AnetClient>>> = Mutex::new(None);
@@ -40,6 +41,36 @@ pub extern "system" fn Java_org_alco_anet_MainActivity_initLogger(
     info!("Rust Logger Initialized");
 }
 
+struct AndroidEventHandler {
+    jvm: Arc<JavaVM>,
+    // Нам нужен глобальный реф на объект, который умеет принимать события.
+    // В нашем случае это VpnService (this).
+    callback_ref: GlobalRef,
+}
+
+impl EventHandler for AndroidEventHandler {
+    fn on_event(&self, event: AnetEvent) {
+        // Присоединяемся к JVM (этот поток может быть любым)
+        if let Ok(mut env) = self.jvm.attach_current_thread() {
+            match event {
+                AnetEvent::Status(msg) => {
+                    // Конвертируем Rust String -> Java String
+                    if let Ok(jmsg) = env.new_string(msg) {
+                        // Вызываем void onStatusChanged(String msg)
+                        let _ = env.call_method(
+                            &self.callback_ref,
+                            "onStatusChanged",
+                            "(Ljava/lang/String;)V",
+                            &[JValue::Object(&jmsg)],
+                        );
+                    }
+                }
+                _ => { info!("Event called {:?}", event); }
+            }
+        }
+    }
+}
+
 
 /// Кнопка Connect
 #[unsafe(no_mangle)]
@@ -59,6 +90,13 @@ pub extern "system" fn Java_org_alco_anet_MainActivity_initLogger(
         *rt_guard = Some(Runtime::new().unwrap());
     }
     let rt = rt_guard.as_ref().unwrap();
+
+    let event_ref = this_ref.clone();
+
+    events::set_handler(Box::new(AndroidEventHandler {
+        jvm: jvm.clone(),
+        callback_ref: event_ref,
+    }));
 
     // 2. Хардкодим конфиг (для теста!)
     // Вставь сюда РЕАЛЬНЫЕ ключи и IP своего сервера

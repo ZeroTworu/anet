@@ -21,6 +21,7 @@ use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::time::sleep;
 use x25519_dalek::{PublicKey, StaticSecret};
+use crate::events::{status, warn};
 
 const MAX_RETRIES: u32 = 10;
 const INITIAL_DELAY: u64 = 5;
@@ -80,10 +81,8 @@ impl AuthHandler {
             match self.attempt_handshake(&local_socket, delay).await {
                 Ok(result) => return Ok(result),
                 Err(e) => {
-                    warn!(
-                        "[AUTH] Handshake attempt {} failed: {}. Retrying...",
-                        attempt, e
-                    );
+                    warn!("[AUTH] Handshake attempt {} failed: {}. Retrying...", attempt, e);
+                    warn(format!("[AUTH] Handshake attempt {} failed: {}", attempt, e));
                     delay = (delay * 2).min(MAX_DELAY);
                     sleep(Duration::from_secs(delay)).await;
                 }
@@ -125,6 +124,8 @@ impl AuthHandler {
 
         let request_packet = self.create_obf_packet(&dh_init_msg)?;
         info!("[AUTH] Phase I: Sending DH exchange request.");
+        status("[AUTH] Phase I: Sending DH exchange request.");
+
         socket
             .send_to(&request_packet, self.server_addr)
             .await
@@ -133,6 +134,7 @@ impl AuthHandler {
         let (response_buf, len) = self.wait_for_response(socket, delay).await?;
         let shared_key = self.handle_phase_ii_response(&response_buf, len)?;
         info!("[AUTH] Phase II complete. Shared secret derived.");
+        status("[AUTH] Phase II complete. Shared secret derived.");
 
         self.perform_phase_iii_iv(socket, shared_key, delay).await
     }
@@ -157,6 +159,7 @@ impl AuthHandler {
         )
         .context("Server signature verification failed")?;
         info!("[AUTH] Server signature verified successfully.");
+        status("[AUTH] Server signature verified successfully.");
 
         let server_key_array: [u8; 32] = server_pub_key_bytes
             .as_slice()
@@ -175,10 +178,9 @@ impl AuthHandler {
         delay: u64,
     ) -> Result<(AuthResponse, [u8; 32])> {
         let (request_packet, cipher) = self.create_encrypted_auth_request(&shared_key)?;
-        info!(
-            "[AUTH] Phase III: Sending Encrypted Auth Request ({} bytes).",
-            request_packet.len()
-        );
+        info!("[AUTH] Phase III: Sending Encrypted Auth Request ({} bytes).", request_packet.len());
+        status(format!("[AUTH] Phase III: Sending Encrypted Auth Request ({} bytes).", request_packet.len()));
+
         socket
             .send_to(&request_packet, self.server_addr)
             .await
@@ -190,6 +192,8 @@ impl AuthHandler {
         if let Some(Content::EncryptedAuthResponse(enc_res)) = response_message.content {
             let auth_response = self.decrypt_auth_response(enc_res, &cipher)?;
             info!("[AUTH] Phase IV complete: Auth Response decrypted successfully.");
+            status("[AUTH] Phase IV complete: Auth Response decrypted successfully.");
+
             Ok((auth_response, shared_key))
         } else {
             Err(anyhow::anyhow!("Unexpected Phase IV response content"))
@@ -267,7 +271,10 @@ impl AuthHandler {
         delay: u64,
     ) -> Result<(Box<[u8]>, usize)> {
         let mut buf = vec![0u8; MAX_PACKET_SIZE].into_boxed_slice();
+
         info!("[AUTH] Waiting for response for {} seconds...", delay);
+        status(format!("[AUTH] Waiting for response for {} seconds...", delay));
+
         let (len, recv_addr) =
             tokio::time::timeout(Duration::from_secs(delay), socket.recv_from(&mut buf)).await??;
         if recv_addr != self.server_addr {
