@@ -1,4 +1,5 @@
 use crate::config::CoreConfig;
+use crate::events::{status, warn};
 use anet_common::consts::{AUTH_PREFIX_LEN, MAX_PACKET_SIZE, NONCE_LEN, PROTO_PAD_FIELD_OVERHEAD};
 use anet_common::crypto_utils::{self, derive_shared_key, generate_key_fingerprint, sign_data};
 use anet_common::encryption::Cipher;
@@ -21,7 +22,6 @@ use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::time::sleep;
 use x25519_dalek::{PublicKey, StaticSecret};
-use crate::events::{status, warn};
 
 const MAX_RETRIES: u32 = 10;
 const INITIAL_DELAY: u64 = 5;
@@ -81,8 +81,14 @@ impl AuthHandler {
             match self.attempt_handshake(&local_socket, delay).await {
                 Ok(result) => return Ok(result),
                 Err(e) => {
-                    warn!("[AUTH] Handshake attempt {} failed: {}. Retrying...", attempt, e);
-                    warn(format!("[AUTH] Handshake attempt {} failed: {}", attempt, e));
+                    warn!(
+                        "[AUTH] Handshake attempt {} failed: {}. Retrying...",
+                        attempt, e
+                    );
+                    warn(format!(
+                        "[AUTH] Handshake attempt {} failed: {}",
+                        attempt, e
+                    ));
                     delay = (delay * 2).min(MAX_DELAY);
                     sleep(Duration::from_secs(delay)).await;
                 }
@@ -178,8 +184,14 @@ impl AuthHandler {
         delay: u64,
     ) -> Result<(AuthResponse, [u8; 32])> {
         let (request_packet, cipher) = self.create_encrypted_auth_request(&shared_key)?;
-        info!("[AUTH] Phase III: Sending Encrypted Auth Request ({} bytes).", request_packet.len());
-        status(format!("[AUTH] Phase III: Sending Encrypted Auth Request ({} bytes).", request_packet.len()));
+        info!(
+            "[AUTH] Phase III: Sending Encrypted Auth Request ({} bytes).",
+            request_packet.len()
+        );
+        status(format!(
+            "[AUTH] Phase III: Sending Encrypted Auth Request ({} bytes).",
+            request_packet.len()
+        ));
 
         socket
             .send_to(&request_packet, self.server_addr)
@@ -273,7 +285,10 @@ impl AuthHandler {
         let mut buf = vec![0u8; MAX_PACKET_SIZE].into_boxed_slice();
 
         info!("[AUTH] Waiting for response for {} seconds...", delay);
-        status(format!("[AUTH] Waiting for response for {} seconds...", delay));
+        status(format!(
+            "[AUTH] Waiting for response for {} seconds...",
+            delay
+        ));
 
         let (len, recv_addr) =
             tokio::time::timeout(Duration::from_secs(delay), socket.recv_from(&mut buf)).await??;

@@ -1,15 +1,15 @@
 pub mod auth;
 pub mod config;
+pub mod events;
 pub mod socket;
 pub mod traits;
 pub mod vpn;
-pub mod events;
 
 use crate::auth::AuthHandler;
 use crate::config::CoreConfig;
+use crate::events::status;
 use crate::traits::{RouteManager, TunFactory};
 use crate::vpn::VpnHandler;
-use crate::events::status;
 use anyhow::Result;
 use log::{error, info};
 use quinn::{Connection, Endpoint};
@@ -132,6 +132,8 @@ impl AnetClient {
             .set_default_route(&auth_response.gateway, &iface_name)?;
 
         info!("[Core] VPN Tunnel UP.");
+        status("[Core] VPN UP");
+        status("VPN Tunnel UP"); // Типо сигнал
 
         // 5. Сохраняем сессию
         let mut state = self.session.lock().unwrap();

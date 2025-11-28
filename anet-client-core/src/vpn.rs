@@ -1,4 +1,5 @@
 use crate::config::CoreConfig;
+use crate::events::status;
 use crate::socket::AnetUdpSocket;
 use anet_common::consts::MAX_PACKET_SIZE;
 use anet_common::encryption::Cipher;
@@ -14,7 +15,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
-use crate::events::status;
 
 pub struct VpnHandler {
     config: CoreConfig,
@@ -82,8 +82,14 @@ impl VpnHandler {
 
         let connection = endpoint.connect(server_addr, "alco")?.await?;
 
-        info!("[Core] Connection established. SEID: {}", auth_response.session_id);
-        status(format!("[Core] Connection established. SEID: {}", auth_response.session_id));
+        info!(
+            "[Core] Connection established. SEID: {}",
+            auth_response.session_id
+        );
+        status(format!(
+            "[Core] Connection established. SEID: {}",
+            auth_response.session_id
+        ));
 
         // 6. Запуск стримов
         let (send_stream, mut recv_stream) = connection.open_bi().await?;

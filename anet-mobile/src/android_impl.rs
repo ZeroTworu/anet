@@ -1,5 +1,5 @@
 use anet_client_core::traits::{RouteManager, TunFactory};
-use anet_common::consts::{MAX_PACKET_SIZE, CHANNEL_BUFFER_SIZE};
+use anet_common::consts::{CHANNEL_BUFFER_SIZE, MAX_PACKET_SIZE};
 use anet_common::protocol::AuthResponse;
 use anyhow::Result;
 use bytes::Bytes;
@@ -70,7 +70,8 @@ impl TunFactory for AndroidCallbackTunFactory {
         config.up(); // На всякий случай
 
         // 3. Создаем Async Device
-        let device = tun::create_as_async(&config).map_err(|e| anyhow::anyhow!("Failed to create async TUN: {}", e))?;
+        let device = tun::create_as_async(&config)
+            .map_err(|e| anyhow::anyhow!("Failed to create async TUN: {}", e))?;
 
         // 4. Разделяем (split)
         let (mut reader, mut writer) = tokio::io::split(device);
@@ -85,7 +86,9 @@ impl TunFactory for AndroidCallbackTunFactory {
                 match reader.read(&mut buf).await {
                     Ok(n) if n > 0 => {
                         let packet = Bytes::copy_from_slice(&buf[..n]);
-                        if tx_to_core.send(packet).await.is_err() { break; }
+                        if tx_to_core.send(packet).await.is_err() {
+                            break;
+                        }
                     }
                     Ok(_) => {}
                     Err(e) => {
@@ -99,7 +102,7 @@ impl TunFactory for AndroidCallbackTunFactory {
         tokio::spawn(async move {
             while let Some(pkt) = rx_from_core.recv().await {
                 match writer.write_all(&pkt).await {
-                    Ok(_) => {},
+                    Ok(_) => {}
                     Err(e) => {
                         error!("TUN Write Error: {}", e);
                         break;
