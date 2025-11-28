@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
-members = ["anet-server", "anet-client", "anet-common", "anet-keygen", "anet-client-core", "anet-mobile"]
-default-members = ["anet-server", "anet-client", "anet-common", "anet-keygen"]
+members = ["anet-server", "anet-client-cli", "anet-common", "anet-keygen", "anet-client-core", "anet-mobile", "anet-client-gui"]
+default-members = ["anet-server", "anet-client-cli", "anet-common", "anet-keygen", "anet-client-gui"]
 
 [workspace.dependencies]
 tun = { version = "0.8.3", features = ["async"] }
@@ -24,6 +24,7 @@ x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }
 ed25519-dalek = { version = "2.1.1", features = ["std", "rand_core"] }
 sha2 = "0.10.9"
 async-trait = "0.1.89"
+netdev = { version = "0.39", features = ["gateway"] }
 
 [profile.release.package.anet-client]
 debug = 2

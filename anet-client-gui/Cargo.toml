@@ -1,0 +1,27 @@
+[package]
+name = "anet-client-gui"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+eframe = "0.33.2"
+egui = "0.33.2"
+
+tokio = { workspace = true }
+netdev = { workspace = true }
+tun = { workspace = true }
+anyhow = { workspace = true }
+env_logger = { workspace = true }
+log = { workspace = true }
+bytes = {workspace = true}
+toml = { workspace = true }
+
+async-trait = "0.1.89"
+
+anet-client-core = { path = "../anet-client-core" }
+anet-common = { path = "../anet-common" }
+rfd = "0.16.0"
+
+[[bin]]
+name = "anet-gui"
+path = "src/main.rs"

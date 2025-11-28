@@ -10,6 +10,7 @@ jobs:
     uses: "./.github/workflows/build-components.yaml"
 
   package-and-release:
+    name: "Release"
     runs-on: "ubuntu-latest"
     needs: ["build"]
     steps:

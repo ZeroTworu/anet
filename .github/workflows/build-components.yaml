@@ -51,7 +51,7 @@ jobs:
           override: "true"
 
       - name: "Build Client (Linux)"
-        run: "RUSTFLAGS=\"-C target-feature=+crt-static\" cargo build --release --package anet-client --target x86_64-unknown-linux-musl"
+        run: "RUSTFLAGS=\"-C target-feature=+crt-static\" cargo build --release --package anet-client-cli --target x86_64-unknown-linux-musl"
 
       - uses: "actions/upload-artifact@v4"
         with:
@@ -73,13 +73,19 @@ jobs:
           toolchain: "stable"
           override: "true"
 
-      - name: "Build Client (Windows)"
-        run: "cargo build --release --package anet-client"
-
+      - name: "Build Client (CLI) (Windows)"
+        run: "cargo build --release --package anet-client-cli"
       - uses: "actions/upload-artifact@v4"
         with:
-          name: "anet-client-windows"
+          name: "anet-client-windows-cli"
           path: "target/release/anet-client.exe"
+
+      - name: "Build Client (GUI) (Windows)"
+        run: "cargo build --release --package anet-client-gui"
+      - uses: "actions/upload-artifact@v4"
+        with:
+          name: "anet-client-windows-gui"
+          path: "target/release/anet-gui.exe"
 
   create-installer:
     name: "Create Windows Installer"
@@ -88,10 +94,15 @@ jobs:
     steps:
       - name: "Checkout repository"
         uses: "actions/checkout@v4"
-      - name: "Download Client Artifact"
+      - name: "Download Client Artifact (CLI)"
         uses: "actions/download-artifact@v4"
         with:
-          name: "anet-client-windows"
+          name: "anet-client-windows-cli"
+          path: "installer_source/"
+      - name: "Download Client Artifact (GUI)"
+        uses: "actions/download-artifact@v4"
+        with:
+          name: "anet-client-windows-gui"
           path: "installer_source/"
       - name: "Install Inno Setup"
         shell: "powershell"
@@ -101,6 +112,7 @@ jobs:
         run: |
           # 3.1. Перемещение anet-client.exe в корень, как ожидает ISS
           Get-ChildItem installer_source\anet-client.exe | Move-Item -Destination installer_source\anet-client.exe
+          Get-ChildItem installer_source\anet-gui.exe | Move-Item -Destination installer_source\anet-gui.exe
 
           # 3.2. Скачивание и размещение Wintun DLL
           $WINTUN_VERSION="0.14.1"

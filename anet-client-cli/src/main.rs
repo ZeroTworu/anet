@@ -1,7 +1,7 @@
 include!(concat!(env!("OUT_DIR"), "/built.rs"));
 
-use anet_client::router::DesktopRouteManager;
-use anet_client::tun_factory::DesktopTunFactory;
+use anet_client_cli::router::DesktopRouteManager;
+use anet_client_cli::tun_factory::DesktopTunFactory;
 use anet_client_core::AnetClient;
 use anet_client_core::config::CoreConfig;
 use anyhow::Result;
