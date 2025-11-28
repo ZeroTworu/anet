@@ -8,6 +8,7 @@ on:
 jobs:
   build:
     uses: "./.github/workflows/build-components.yaml"
+
   package-and-release:
     runs-on: "ubuntu-latest"
     needs: ["build"]
@@ -16,7 +17,7 @@ jobs:
         with:
           fetch-depth: "0"
 
-      # Скачиваем ВСЕ артефакты, включая новый anet-client-setup-windows
+      # Скачиваем ВСЕ артефакты
       - name: "Download all binaries and installer artifacts"
         uses: "actions/download-artifact@v4"
         with:
@@ -29,19 +30,20 @@ jobs:
         run: |
           mkdir -p release_files/server release_files/client-linux release_files/client-windows
           
-          # Бинарники и конфиги для ZIP
+          # --- LINUX SERVER & CLIENT ---
           cp artifacts/anet-server/anet-server release_files/server/
           cp artifacts/anet-client-linux/anet-client release_files/client-linux/
           
-          # Клиентские файлы для ZIP Windows архива
+          # --- WINDOWS CLIENT ---
           CLIENT_WIN_DIR="release_files/client-windows"
           cp artifacts/anet-client-windows/anet-client.exe ${CLIENT_WIN_DIR}/
 
+          # --- CONFIGS ---
           cp contrib/config/server.toml release_files/server/
           cp contrib/config/client.toml release_files/client-linux/
           cp contrib/config/client.toml ${CLIENT_WIN_DIR}/
 
-          # Wintun, для ZIP архива с клиентом (в дополнение к инсталлятору)
+          # --- WINTUN (Windows) ---
           cd ${CLIENT_WIN_DIR}
           WINTUN_VERSION="0.14.1"
           WINTUN_URL="https://www.wintun.net/builds/wintun-${WINTUN_VERSION}.zip"
@@ -50,6 +52,16 @@ jobs:
           cp "wintun/bin/amd64/wintun.dll" .
           rm -rf "wintun" "wintun-${WINTUN_VERSION}.zip"
           cd ../..
+          
+          # --- ANDROID APK ---
+          # Ищем apk в папке артефактов (имя папки 'anet-android-apk' задается в build-components)
+          APK_SRC=$(find artifacts/anet-android-apk -name '*.apk' | head -n 1)
+          if [ -z "$APK_SRC" ]; then
+              echo "Warning: Android APK not found in artifacts!"
+          else
+              # Копируем и переименовываем с версией
+              cp "$APK_SRC" "anet-android-${VERSION}.apk"
+          fi
 
       - name: "Create zip archives"
         run: |
@@ -58,19 +70,14 @@ jobs:
           zip -r "client-linux_${VERSION}.zip" client-linux/
           zip -r "client-windows_${VERSION}.zip" client-windows/
           
-          # Перемещаем установщик, скачанный из artifacts, для включения в релиз
+          # Windows Installer
           INSTALLER_EXE=$(find ../artifacts/anet-client-setup-windows -name '*.exe')
-          
-          # Убеждаемся, что мы нашли ровно один EXE-файл.
           if [ -z "$INSTALLER_EXE" ]; then 
-              echo "Error: Windows installer EXE not found in artifacts/anet-client-setup-windows"
+              echo "Error: Windows installer EXE not found"
               exit 1
           fi
-          
-          # Копируем EXE установщик, используя имя, определенное в ISS скрипте
           cp $INSTALLER_EXE ../ANET_VPN_Client_Setup_${VERSION}_x64.exe
           cd ..
-
 
       - name: "Create Release"
         uses: "softprops/action-gh-release@v1"
@@ -82,5 +89,6 @@ jobs:
             release_files/client-linux_${{ env.VERSION }}.zip
             release_files/client-windows_${{ env.VERSION }}.zip
             ANET_VPN_Client_Setup_${{ env.VERSION }}_x64.exe
+            anet-android-${{ env.VERSION }}.apk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

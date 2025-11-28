@@ -35,7 +35,7 @@ jobs:
           path: "target/x86_64-unknown-linux-musl/release/anet-server"
 
   build-linux-client:
-
+    name: "Build Linux Client"
     runs-on: "ubuntu-latest"
     steps:
       - uses: "actions/checkout@v4"
@@ -144,3 +144,64 @@ jobs:
           path: installer_source\Output\*.exe
           name: anet-client-setup-windows
           if-no-files-found: error
+  build-android-libs:
+    name: "Build Rust for Android"
+    runs-on: "ubuntu-latest"
+    steps:
+      - uses: "actions/checkout@v4"
+
+      # Установка Android NDK и Rust таргетов
+      - name: "Setup Android NDK"
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r26d # Или какая у тебя локально
+
+      - name: "Install Rust Targets"
+        run: |
+          rustup target add aarch64-linux-android
+          rustup target add x86_64-linux-android
+
+      - name: "Install cargo-ndk"
+        run: "cargo install cargo-ndk"
+
+      - name: "Build .so libs"
+        run: |
+          cargo ndk -t aarch64-linux-android -o ./jniLibs build --release -p anet-mobile
+
+      - uses: "actions/upload-artifact@v4"
+        with:
+          name: "anet-mobile-libs"
+          path: "jniLibs/"
+  package-android-apk:
+    name: "Package Android APK"
+    runs-on: "ubuntu-latest"
+    needs: "build-android-libs" # Ждем Rust библиотеки
+    steps:
+      # 1. Скачиваем исходники Android UI (из второй репы)
+      - name: "Checkout Android UI Repo"
+        uses: actions/checkout@v4
+        with:
+          repository: "ZeroTworu/anet-android"
+          path: "android-ui"
+          # Если репа приватная, нужен token:
+          # token: ${{ secrets.MY_PAT }}
+
+      # 2. Скачиваем собранные Rust библиотеки
+      - name: "Download Rust Libs"
+        uses: actions/download-artifact@v4
+        with:
+          name: "anet-mobile-libs"
+          path: "android-ui/app/src/main/jniLibs"
+      - uses: actions/setup-java@v3
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+      - name: "Build APK"
+        run: |
+          cd android-ui
+          chmod +x gradlew
+          ./gradlew assembleDebug
+      - uses: "actions/upload-artifact@v4"
+        with:
+          name: "anet-android-apk"
+          path: "android-ui/app/build/outputs/apk/debug/app-debug.apk"
