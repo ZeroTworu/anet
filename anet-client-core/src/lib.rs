@@ -70,6 +70,7 @@ impl AnetClient {
 
         info!("[Core] Starting...");
         status("[Core] Starting...");
+        status("Connecting");
 
         // 2. Логика подключения (Auth -> QUIC -> TUN)
         let auth_handler = AuthHandler::new(&self.config)?;

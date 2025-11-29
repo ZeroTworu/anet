@@ -6,8 +6,6 @@ use anyhow::{Result};
 use async_trait::async_trait;
 use bytes::{Bytes};
 #[cfg(target_os = "windows")]
-use bytes::{BytesMut};
-#[cfg(target_os = "windows")]
 use log::{error, info, debug};
 #[cfg(target_os = "windows")]
 use std::sync::Arc;

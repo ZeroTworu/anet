@@ -26,7 +26,15 @@ sha2 = "0.10.9"
 async-trait = "0.1.89"
 netdev = { version = "0.39", features = ["gateway"] }
 
-[profile.release.package.anet-client]
+[profile.release.package.anet-client-cli]
+debug = 2
+codegen-units = 1
+
+[profile.release.package.anet-client-gui]
+debug = 2
+codegen-units = 1
+
+[profile.release.package.anet-mobile]
 debug = 2
 codegen-units = 1
 

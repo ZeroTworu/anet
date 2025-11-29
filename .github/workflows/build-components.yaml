@@ -124,10 +124,16 @@ jobs:
         with:
           name: "anet-client-windows-gui"
           path: "target/release/anet-gui.exe"
+
       - name: "Build Client (GUI - Debug Console) (Windows)"
         run: "cargo build --release --package anet-client-gui --features console"
+
+      - name: "Remove existing debug build if exists"
+        run: "if (Test-Path target/release/anet-gui-debug.exe) { Remove-Item target/release/anet-gui-debug.exe }"
+
       - name: "Rename Debug Build"
         run: "mv target/release/anet-gui.exe target/release/anet-gui-debug.exe"
+
       - uses: "actions/upload-artifact@v4"
         with:
           name: "anet-gui-debug"
@@ -152,6 +158,7 @@ jobs:
         with:
           name: "anet-client-windows-gui"
           path: "installer_source/"
+
       - name: "Download Client Artifact (GUI Debug)"
         uses: "actions/download-artifact@v4"
         with:
