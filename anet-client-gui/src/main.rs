@@ -7,7 +7,8 @@ fn main() -> Result<(), eframe::Error> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([400.0, 600.0]) // Мобильный форм-фактор
-            .with_resizable(false), // Фиксированный размер
+            .with_resizable(false) // Фиксированный размер
+            .with_drag_and_drop(true), // DnD
         ..Default::default()
     };
 

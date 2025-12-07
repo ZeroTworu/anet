@@ -6,7 +6,7 @@ use anet_client_core::AnetClient;
 use anet_client_core::config::CoreConfig;
 use anet_client_core::events::{AnetEvent, EventHandler, set_handler};
 use eframe::egui;
-use log::info;
+use std::path::PathBuf; // Добавлено для работы с путями
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use tokio::runtime::Runtime;
@@ -24,8 +24,6 @@ impl GuiEventHandler {
 
 impl EventHandler for GuiEventHandler {
     fn on_event(&self, event: AnetEvent) {
-        // Просто пересылаем событие в канал.
-        // Если получатель (UI) умер, игнорируем ошибку.
         let _ = self.tx.send(event.clone());
     }
 }
@@ -37,10 +35,7 @@ pub struct ANetApp {
     client: Option<Arc<AnetClient>>,
     logs: Arc<Mutex<Vec<String>>>,
     config_err: Option<String>,
-
-    // Состояние конфига для отображения
     config_name: String,
-
     event_rx: Receiver<AnetEvent>,
 }
 
@@ -61,10 +56,6 @@ impl ANetApp {
     fn log(&self, msg: &str) {
         if let Ok(mut logs) = self.logs.lock() {
             logs.push(format!("> {}", msg));
-            // Ограничим лог, чтобы память не текла
-            if logs.len() > 100 {
-                logs.remove(0);
-            }
         }
     }
 
@@ -100,27 +91,52 @@ impl ANetApp {
         }
     }
 
-    fn load_config(&mut self) {
+    /// Общая логика загрузки конфига по пути к файлу
+    fn load_config_from_path(&mut self, path: PathBuf) {
+        // Проверка расширения (опционально, но полезно для UX)
+        if let Some(ext) = path.extension() {
+            if ext != "toml" {
+                self.config_err = Some("Invalid file type. Please drop a .toml file".to_string());
+                self.log("Ignored non-toml file");
+                return;
+            }
+        }
+
+        let config_content = match std::fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(e) => {
+                self.config_err = Some(format!("Read error: {}", e));
+                return;
+            }
+        };
+
+        match toml::from_str::<CoreConfig>(&config_content) {
+            Ok(cfg) => {
+                let tun = Box::new(DesktopTunFactory::new(cfg.main.tun_name.clone()));
+                let route = Box::new(DesktopRouteManager::new());
+
+                self.config_err = None;
+                self.config_name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+
+                // Если клиент уже был запущен, стоило бы его остановить,
+                // но пока просто заменяем структуру (в GUI это кнопка Connect разрулит)
+                self.client = Some(Arc::new(AnetClient::new(cfg, tun, route)));
+                self.log(&format!("Config loaded: {}", self.config_name));
+            }
+            Err(e) => {
+                self.config_err = Some(e.to_string());
+                self.log("Failed to parse config TOML");
+            }
+        }
+    }
+
+    /// Открытие диалога выбора файла
+    fn open_file_dialog(&mut self) {
         if let Some(path) = rfd::FileDialog::new()
             .add_filter("TOML Config", &["toml"])
             .pick_file()
         {
-            let config_content = std::fs::read_to_string(&path).unwrap_or_default();
-            match toml::from_str::<CoreConfig>(&config_content) {
-                Ok(cfg) => {
-                    let tun = Box::new(DesktopTunFactory::new(cfg.main.tun_name.clone()));
-                    let route = Box::new(DesktopRouteManager::new());
-
-                    self.config_err = None;
-                    self.config_name = path.file_name().unwrap().to_string_lossy().to_string();
-                    self.client = Some(Arc::new(AnetClient::new(cfg, tun, route)));
-                    self.log(&format!("Config loaded: {}", self.config_name));
-                }
-                Err(e) => {
-                    self.config_err = Some(e.to_string());
-                    self.log("Failed to parse config");
-                }
-            }
+            self.load_config_from_path(path);
         }
     }
 }
@@ -129,17 +145,25 @@ impl ANetApp {
 
 impl eframe::App for ANetApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // 1. Обработка Drag-and-Drop
+        // Проверяем, есть ли сброшенные файлы. Делаем это в начале кадра.
+        if !ctx.input(|i| i.raw.dropped_files.is_empty()) {
+            let dropped_files = ctx.input(|i| i.raw.dropped_files.clone());
+            println!("{:?}", dropped_files);
+            // Берем первый файл (если перетащили несколько - берем первый)
+            if let Some(file) = dropped_files.first() {
+                if let Some(path) = &file.path {
+                    self.load_config_from_path(path.clone());
+                }
+            }
+        }
+
+        // 2. Обработка событий из канала (логи, статусы)
         while let Ok(event) = self.event_rx.try_recv() {
             match event {
                 AnetEvent::Status(msg) => {
                     self.log(&msg);
-
-                    // Можно добавить реакцию на статусы для переключения UI
-                    if msg.contains("Tunnel UP") {
-                        // self.is_connected = true (если ты хранишь стейт отдельно)
-                    }
                 }
-                // Другие типы событий
                 _ => {}
             }
         }
@@ -152,6 +176,24 @@ impl eframe::App for ANetApp {
 
         // Используем CentralPanel для всего контента
         egui::CentralPanel::default().show(ctx, |ui| {
+            // Подсветка зоны перетаскивания (визуальная индикация)
+            if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
+                let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("dnd_overlay")));
+                let screen_rect = ctx.input(|i| i.screen_rect());
+                painter.rect_filled(
+                    screen_rect,
+                    0.0,
+                    egui::Color32::from_black_alpha(100),
+                );
+                painter.text(
+                    screen_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "Drop config here",
+                    egui::FontId::proportional(32.0),
+                    egui::Color32::WHITE,
+                );
+            }
+
             // 1. Header (Top Bar)
             ui.horizontal(|ui| {
                 ui.label(
@@ -165,7 +207,7 @@ impl eframe::App for ANetApp {
                         .add(egui::Button::new(egui::RichText::new("⚙").size(24.0)).frame(false))
                         .clicked()
                     {
-                        self.load_config();
+                        self.open_file_dialog();
                     }
                 });
             });
@@ -179,11 +221,18 @@ impl eframe::App for ANetApp {
                 } else {
                     ui.label(egui::RichText::new(&self.config_name).color(egui::Color32::GRAY));
                 }
+                // Подсказка для пользователя
+                if self.client.is_none() && self.config_err.is_none() {
+                    ui.label(
+                        egui::RichText::new("(Drag .toml config here or click ⚙)")
+                            .size(10.0)
+                            .color(egui::Color32::from_gray(80)),
+                    );
+                }
             });
 
             // --- ГЛАВНАЯ КНОПКА ---
-            // Используем flexible space, чтобы отодвинуть кнопку от верха, но не слишком далеко
-            ui.add_space(ui.available_height() * 0.15); // 15% от высоты окна отступ сверху
+            ui.add_space(ui.available_height() * 0.15);
 
             ui.vertical_centered(|ui| {
                 let btn_size = egui::vec2(180.0, 180.0);
@@ -200,16 +249,14 @@ impl eframe::App for ANetApp {
                         .strong()
                         .color(egui::Color32::WHITE),
                 )
-                .min_size(btn_size)
-                .rounding(90.0) // Используй rounding, если corner_radius нет
-                .fill(btn_color);
+                    .min_size(btn_size)
+                    .rounding(90.0)
+                    .fill(btn_color);
 
                 if ui.add(btn).clicked() {
                     if self.client.is_none() {
-                        // Если конфига нет - пробуем загрузить или ругаемся
-                        self.log("Error: No config loaded! Press ⚙ to load.");
-                        // Можно сразу открыть диалог:
-                        // self.load_config();
+                        self.log("Error: No config loaded! Press ⚙ or drag file.");
+                        self.open_file_dialog();
                     } else {
                         if is_running {
                             self.stop_vpn();
@@ -239,10 +286,9 @@ impl eframe::App for ANetApp {
             });
 
             // --- ЛОГИ (Прижаты к низу) ---
-            // Забираем всё оставшееся место, но рисуем внизу
             let bottom_height = 120.0;
             ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-                ui.add_space(0.0); // Отступ от края окна
+                ui.add_space(0.0);
 
                 egui::ScrollArea::vertical()
                     .max_height(bottom_height)
@@ -267,7 +313,6 @@ impl eframe::App for ANetApp {
                 ui.label("System Logs:");
             });
 
-            // Автообновление
             ctx.request_repaint_after(std::time::Duration::from_millis(200));
         });
     }
