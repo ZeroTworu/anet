@@ -1,5 +1,3 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-
 use crate::router::DesktopRouteManager;
 use crate::tun_factory::DesktopTunFactory;
 use anet_client_core::AnetClient;
@@ -145,18 +143,18 @@ impl ANetApp {
 
 impl eframe::App for ANetApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // 1. Обработка Drag-and-Drop
-        // Проверяем, есть ли сброшенные файлы. Делаем это в начале кадра.
+        // 1. Обработка Drag-and-Drop (ЭТОГО БЛОКА НЕ БЫЛО В ВАШЕМ КОДЕ)
         if !ctx.input(|i| i.raw.dropped_files.is_empty()) {
             let dropped_files = ctx.input(|i| i.raw.dropped_files.clone());
-            println!("{:?}", dropped_files);
-            // Берем первый файл (если перетащили несколько - берем первый)
+
+            // Берем первый файл
             if let Some(file) = dropped_files.first() {
                 if let Some(path) = &file.path {
                     self.load_config_from_path(path.clone());
                 }
             }
         }
+
 
         // 2. Обработка событий из канала (логи, статусы)
         while let Ok(event) = self.event_rx.try_recv() {
@@ -174,8 +172,12 @@ impl eframe::App for ANetApp {
             .map(|c| c.is_running())
             .unwrap_or(false);
 
+        let main_frame = egui::Frame::none()
+            .fill(egui::Color32::from_rgb(18, 18, 18)) // Тот самый черный цвет
+            .inner_margin(12.0); // Отступы от краев окна
+
         // Используем CentralPanel для всего контента
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().frame(main_frame).show(ctx, |ui| {
             // Подсветка зоны перетаскивания (визуальная индикация)
             if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
                 let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("dnd_overlay")));

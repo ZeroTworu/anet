@@ -1,3 +1,5 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use anet_client_gui::app::ANetApp;
 use eframe::egui;
 
@@ -24,13 +26,24 @@ fn main() -> Result<(), eframe::Error> {
 }
 
 fn configure_styles(ctx: &egui::Context) {
-    let mut visuals = egui::Visuals::dark();
-    visuals.window_fill = egui::Color32::from_rgb(18, 18, 18); // Onyx Black #121212
-    visuals.panel_fill = egui::Color32::from_rgb(18, 18, 18);
+    // 1. Сначала берем стандартную темную тему как базу
+    let style = (*ctx.style()).clone();
+    let mut visuals = egui::Visuals::dark(); // Жестко включаем Dark Mode
 
-    // Настройка цветов виджетов
+    // 2. Настраиваем цвета фона
+    let dark_bg = egui::Color32::from_rgb(18, 18, 18); // Onyx Black
+    visuals.window_fill = dark_bg;
+    visuals.panel_fill = dark_bg;
+
+    // 3. Настраиваем цвета элементов
     visuals.widgets.noninteractive.bg_fill = egui::Color32::TRANSPARENT;
     visuals.widgets.inactive.bg_fill = egui::Color32::from_gray(40);
 
+    // Цвет обводки и текста
+    visuals.selection.bg_fill = egui::Color32::from_rgb(76, 175, 80); // Акцентный зеленый
+    visuals.selection.stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
+
     ctx.set_visuals(visuals);
+    ctx.set_style(style);
 }
+
