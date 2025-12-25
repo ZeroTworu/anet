@@ -14,27 +14,6 @@ pub struct TunParams {
 }
 
 impl TunParams {
-    pub fn default_server() -> Self {
-        Self {
-            address: Ipv4Addr::new(10, 0, 0, 2),
-            netmask: Ipv4Addr::new(255, 255, 255, 0),
-            gateway: Ipv4Addr::new(10, 0, 0, 1),
-            name: "anet-server".to_string(),
-            mtu: 1400,
-            network: Some(Ipv4Addr::new(10, 0, 0, 0)),
-        }
-    }
-
-    pub fn default_client() -> Self {
-        Self {
-            address: Ipv4Addr::new(10, 0, 0, 2),
-            netmask: Ipv4Addr::new(255, 255, 255, 0),
-            gateway: Ipv4Addr::new(10, 0, 0, 1),
-            name: "anet-client".to_string(),
-            mtu: 1400,
-            network: None,
-        }
-    }
 
     pub fn from_auth_response(auth_response: &AuthResponse, adapter: &str) -> Self {
         Self {
@@ -46,16 +25,25 @@ impl TunParams {
             network: None,
         }
     }
+
+    #[cfg(not(windows))]
     pub fn create_config(&self) -> anyhow::Result<Configuration> {
-        let mut binding = Configuration::default();
-        let config = binding
-            .tun_name(&self.name)
-            .mtu(self.mtu)
-            .up()
-            .address(self.address)
-            .netmask(self.netmask)
-            .destination(self.gateway);
-        Ok(config.clone())
+        let mut config = Configuration::default();
+        config.up();
+
+        config.tun_name(&self.name);
+        config.address(self.address);
+        config.netmask(self.netmask);
+        config.destination(self.gateway);
+        config.mtu(self.mtu);
+
+        Ok(config)
+    }
+
+    #[cfg(windows)]
+    pub fn create_config(&self) -> anyhow::Result<Configuration> {
+        let mut config = Configuration::default();
+        Ok(config)
     }
 
     pub fn get_info(&self) -> String {

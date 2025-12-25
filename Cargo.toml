@@ -4,7 +4,7 @@ members = ["anet-server", "anet-client-cli", "anet-common", "anet-keygen", "anet
 default-members = ["anet-server", "anet-client-cli", "anet-common", "anet-keygen", "anet-client-gui"]
 
 [workspace.dependencies]
-tun = { version = "0.8.3", features = ["async"] }
+tun = { version = "0.8.5", features = ["async"] }
 tokio = {version = "1.47.1", features = ["full"]}
 env_logger = "0.11.8"
 log = { version = "0.4.22", default-features = false}
