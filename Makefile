@@ -1,4 +1,4 @@
-.PHONY: all check test clean musl cert mob macos macos-gui macos-all macos-universal macos-app
+.PHONY: all check test clean musl cert mob macos macos-gui macos-all macos-universal macos-app infra
 
 # Default target
 all:
@@ -24,6 +24,9 @@ musl:
 mob:
 	cargo ndk -t x86_64-linux-android -t aarch64-linux-android -o ./android-build/jniLibs build --release -p anet-mobile
 
+# run infrastructure
+infra:
+	docker-compose -f contrib/docker/docker-compose.infra.yaml up --remove-orphans
 # Build macOS CLI client
 macos:
 	cargo build --release -p anet-client-cli
@@ -65,34 +68,5 @@ macos-universal:
 	@echo "  CLI: target/release/universal/anet-client"
 	@echo "  GUI: target/release/universal/anet-gui"
 
-# Build macOS app bundle (GUI)
-macos-app:
-	./contrib/scripts/build-macos-app.sh
-	@echo ""
-	@echo "To sign the app, run:"
-	@echo "  ./scripts/build-macos-app.sh --sign 'Developer ID Application: Your Name'"
-
-# Generate TLS certificates for QUIC
 cert:
 	openssl req -x509 -newkey ed25519 -keyout key.pem -out cert.pem -days 365 -nodes -subj "/CN=alco" -addext "subjectAltName = DNS:alco" -addext "basicConstraints=critical,CA:FALSE" -addext "keyUsage=digitalSignature,keyEncipherment"
-
-# Show help
-help:
-	@echo "ANet VPN Build Targets:"
-	@echo ""
-	@echo "  make all            - Build all components (release)"
-	@echo "  make check          - Run cargo check on workspace"
-	@echo "  make test           - Run all tests"
-	@echo "  make clean          - Clean build artifacts"
-	@echo ""
-	@echo "Platform-specific builds:"
-	@echo "  make musl           - Build static Linux binary (musl)"
-	@echo "  make mob            - Build Android libraries"
-	@echo "  make macos          - Build macOS CLI client"
-	@echo "  make macos-gui      - Build macOS GUI client"
-	@echo "  make macos-all      - Build both macOS CLI and GUI"
-	@echo "  make macos-universal - Build universal macOS binaries (Intel + ARM)"
-	@echo "  make macos-app      - Build macOS app bundle (.app)"
-	@echo ""
-	@echo "Utilities:"
-	@echo "  make cert           - Generate TLS certificates for QUIC"

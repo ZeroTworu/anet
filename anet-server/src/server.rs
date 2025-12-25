@@ -1,4 +1,5 @@
 use crate::auth_handler::ServerAuthHandler;
+use crate::auth_provider::AuthProvider;
 use crate::client_registry::ClientRegistry;
 use crate::config::Config;
 use crate::ip_pool::IpPool;
@@ -113,12 +114,18 @@ impl ANetServer {
             }
         });
 
+        let auth_provider = Arc::new(AuthProvider::new(
+            self.cfg.authentication.allowed_clients.clone(),
+            self.cfg.authentication.auth_servers.clone(),
+            self.cfg.authentication.auth_server_token.clone(),
+        ));
+
         // --- AUTH HANDLER ---
         let auth_handler = ServerAuthHandler::new(
             real_socket,
             self.registry.clone(),
             self.temp_dh_map.clone(),
-            self.cfg.authentication.allowed_clients.clone(),
+            auth_provider,
             self.server_signing_key.clone(),
             self.cfg.crypto.quic_cert.clone(),
             self.cfg.stealth.padding_step,

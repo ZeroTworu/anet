@@ -23,7 +23,7 @@ impl Default for CryptoConfig {
     }
 }
 
-// Новая структура для настроек статистики
+// структура для настроек статистики
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct StatsConfig {
@@ -44,13 +44,24 @@ impl Default for StatsConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AuthenticationConfig {
-    pub allowed_clients: Vec<String>, // Список разрешенных fingerprint'ов клиентов
+    /// Локальный список разрешенных клиентов (работает всегда)
+    pub allowed_clients: Vec<String>,
+
+    /// Список URL серверов авторизации (например, ["http://127.0.0.1:3000/api/v1"])
+    #[serde(default)]
+    pub auth_servers: Vec<String>,
+
+    /// Токен для доступа к API авторизации (X-Auth-Key)
+    #[serde(default)]
+    pub auth_server_token: String,
 }
 
 impl Default for AuthenticationConfig {
     fn default() -> Self {
         Self {
             allowed_clients: vec![],
+            auth_servers: vec![],
+            auth_server_token: "default_secret".to_string(),
         }
     }
 }

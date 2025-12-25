@@ -3,3 +3,4 @@
 *.pem
 *.sh
 android-build/*
+.env

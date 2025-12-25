@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
-members = ["anet-server", "anet-client-cli", "anet-common", "anet-keygen", "anet-client-core", "anet-mobile", "anet-client-gui"]
-default-members = ["anet-server", "anet-client-cli", "anet-common", "anet-keygen", "anet-client-gui"]
+members = ["anet-server", "anet-client-cli", "anet-common", "anet-keygen", "anet-client-core", "anet-mobile", "anet-client-gui", "anet-auth"]
+default-members = ["anet-server", "anet-client-cli", "anet-common", "anet-auth", "anet-client-gui"]
 
 
 [workspace.dependencies]

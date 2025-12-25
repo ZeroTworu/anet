@@ -26,12 +26,16 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use x25519_dalek::{PublicKey, StaticSecret};
 
+
+
+use crate::auth_provider::AuthProvider;
+
 #[derive(Clone)]
 pub struct ServerAuthHandler {
     socket: Arc<UdpSocket>,
     registry: Arc<ClientRegistry>,
     temp_dh_map: Arc<DashMap<SocketAddr, TempDHInfo>>,
-    allowed_clients: Arc<Vec<String>>,
+    auth_provider: Arc<AuthProvider>,
     server_signing_key: SigningKey,
     quic_cert_pem: String,
     padding_step: u16,
@@ -42,7 +46,7 @@ impl ServerAuthHandler {
         socket: Arc<UdpSocket>,
         registry: Arc<ClientRegistry>,
         temp_dh_map: Arc<DashMap<SocketAddr, TempDHInfo>>,
-        allowed_clients: Vec<String>,
+        auth_provider: Arc<AuthProvider>,
         server_signing_key: SigningKey,
         quic_cert_pem: String,
         padding_step: u16,
@@ -51,7 +55,7 @@ impl ServerAuthHandler {
             socket,
             registry,
             temp_dh_map,
-            allowed_clients: Arc::new(allowed_clients),
+            auth_provider,
             server_signing_key,
             quic_cert_pem,
             padding_step,
@@ -113,23 +117,34 @@ impl ServerAuthHandler {
         )?;
 
         let client_fingerprint = crypto_utils::generate_key_fingerprint(&client_public_key);
-        if !self.allowed_clients.contains(&client_fingerprint) {
+
+        if !self
+            .auth_provider
+            .is_client_allowed(&client_fingerprint)
+            .await
+        {
             return Err(anyhow::anyhow!(
-                "Client {} not in allowed list",
+                "Client {} access denied",
                 client_fingerprint
             ));
         }
 
-        crypto_utils::verify_signature(
+        let verify_result = crypto_utils::verify_signature(
             &client_public_key,
             &req.public_key,
             &req.client_signed_dh_key,
-        )?;
-
-        info!(
-            "[AUTH] Client {} authenticated via signature from {}",
-            client_fingerprint, remote_addr
         );
+        match verify_result {
+            Ok(_) => {
+                info!(
+                    "[AUTH] Client {} authenticated via signature from {}",
+                    client_fingerprint, remote_addr
+                );
+            }
+            Err(e) => {
+                anyhow::bail!("[AUTH] Failed to verify client: {}", e);
+            }
+        }
 
         // 2. Генерация серверной части DH
         let server_ephemeral_secret = StaticSecret::random_from_rng(OsRng);
