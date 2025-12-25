@@ -46,7 +46,7 @@ impl ANetApp {
             client: None,
             logs: Arc::new(Mutex::new(vec!["> System Ready...".to_string()])),
             config_err: None,
-            config_name: "No config loaded".to_string(),
+            config_name: "Файл настроек не выбран!".to_string(),
             event_rx: rx,
         }
     }
@@ -94,7 +94,7 @@ impl ANetApp {
         // Проверка расширения (опционально, но полезно для UX)
         if let Some(ext) = path.extension() {
             if ext != "toml" {
-                self.config_err = Some("Invalid file type. Please drop a .toml file".to_string());
+                self.config_err = Some("Пожалуйста выберите файл с расширением .toml ".to_string());
                 self.log("Ignored non-toml file");
                 return;
             }
@@ -103,7 +103,7 @@ impl ANetApp {
         let config_content = match std::fs::read_to_string(&path) {
             Ok(content) => content,
             Err(e) => {
-                self.config_err = Some(format!("Read error: {}", e));
+                self.config_err = Some(format!("Ошибка чтения: {}", e));
                 return;
             }
         };
@@ -143,17 +143,17 @@ impl ANetApp {
 
 impl eframe::App for ANetApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // 1. Обработка Drag-and-Drop (ЭТОГО БЛОКА НЕ БЫЛО В ВАШЕМ КОДЕ)
-        if !ctx.input(|i| i.raw.dropped_files.is_empty()) {
-            let dropped_files = ctx.input(|i| i.raw.dropped_files.clone());
-
-            // Берем первый файл
-            if let Some(file) = dropped_files.first() {
-                if let Some(path) = &file.path {
-                    self.load_config_from_path(path.clone());
-                }
-            }
-        }
+        // 1. Обработка Drag-and-Drop Отрубим пока.
+        // if !ctx.input(|i| i.raw.dropped_files.is_empty()) {
+        //     let dropped_files = ctx.input(|i| i.raw.dropped_files.clone());
+        //
+        //     // Берем первый файл
+        //     if let Some(file) = dropped_files.first() {
+        //         if let Some(path) = &file.path {
+        //             self.load_config_from_path(path.clone());
+        //         }
+        //     }
+        // }
 
 
         // 2. Обработка событий из канала (логи, статусы)
@@ -179,22 +179,22 @@ impl eframe::App for ANetApp {
         // Используем CentralPanel для всего контента
         egui::CentralPanel::default().frame(main_frame).show(ctx, |ui| {
             // Подсветка зоны перетаскивания (визуальная индикация)
-            if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
-                let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("dnd_overlay")));
-                let screen_rect = ctx.input(|i| i.screen_rect());
-                painter.rect_filled(
-                    screen_rect,
-                    0.0,
-                    egui::Color32::from_black_alpha(100),
-                );
-                painter.text(
-                    screen_rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    "Drop config here",
-                    egui::FontId::proportional(32.0),
-                    egui::Color32::WHITE,
-                );
-            }
+            // if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
+            //     let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("dnd_overlay")));
+            //     let screen_rect = ctx.input(|i| i.screen_rect());
+            //     painter.rect_filled(
+            //         screen_rect,
+            //         0.0,
+            //         egui::Color32::from_black_alpha(100),
+            //     );
+            //     painter.text(
+            //         screen_rect.center(),
+            //         egui::Align2::CENTER_CENTER,
+            //         "Drop config here",
+            //         egui::FontId::proportional(32.0),
+            //         egui::Color32::WHITE,
+            //     );
+            // }
 
             // 1. Header (Top Bar)
             ui.horizontal(|ui| {
@@ -226,8 +226,8 @@ impl eframe::App for ANetApp {
                 // Подсказка для пользователя
                 if self.client.is_none() && self.config_err.is_none() {
                     ui.label(
-                        egui::RichText::new("(Drag .toml config here or click ⚙)")
-                            .size(10.0)
+                        egui::RichText::new("(Нажмите ⚙ и выберите файл настроек)")
+                            .size(15.0)
                             .color(egui::Color32::from_gray(80)),
                     );
                 }
@@ -238,7 +238,7 @@ impl eframe::App for ANetApp {
 
             ui.vertical_centered(|ui| {
                 let btn_size = egui::vec2(180.0, 180.0);
-                let btn_text = if is_running { "STOP" } else { "CONNECT" };
+                let btn_text = if is_running { "Отключить VPN" } else { "Подключить VPN" };
                 let btn_color = if is_running {
                     egui::Color32::from_rgb(244, 67, 54)
                 } else {
@@ -270,9 +270,9 @@ impl eframe::App for ANetApp {
 
                 ui.add_space(20.0);
                 let status_text = if is_running {
-                    "SECURED"
+                    "VPN соединение установлено!"
                 } else {
-                    "DISCONNECTED"
+                    "VPN соединение не установлено."
                 };
                 let status_color = if is_running {
                     btn_color
@@ -288,32 +288,32 @@ impl eframe::App for ANetApp {
             });
 
             // --- ЛОГИ (Прижаты к низу) ---
-            let bottom_height = 120.0;
-            ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-                ui.add_space(0.0);
-
-                egui::ScrollArea::vertical()
-                    .max_height(bottom_height)
-                    .auto_shrink([false, true])
-                    .stick_to_bottom(true)
-                    .show(ui, |ui| {
-                        let logs = self.logs.lock().unwrap();
-                        for line in logs.iter().rev() {
-                            ui.horizontal(|ui| {
-                                ui.label(egui::RichText::new(">").color(egui::Color32::DARK_GRAY));
-                                ui.label(
-                                    egui::RichText::new(line)
-                                        .family(egui::FontFamily::Monospace)
-                                        .size(12.0)
-                                        .color(egui::Color32::GREEN),
-                                );
-                            });
-                        }
-                    });
-
-                ui.separator();
-                ui.label("System Logs:");
-            });
+            // let bottom_height = 120.0;
+            // ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+            //     ui.add_space(0.0);
+            //
+            //     egui::ScrollArea::vertical()
+            //         .max_height(bottom_height)
+            //         .auto_shrink([false, true])
+            //         .stick_to_bottom(true)
+            //         .show(ui, |ui| {
+            //             let logs = self.logs.lock().unwrap();
+            //             for line in logs.iter().rev() {
+            //                 ui.horizontal(|ui| {
+            //                     ui.label(egui::RichText::new(">").color(egui::Color32::DARK_GRAY));
+            //                     ui.label(
+            //                         egui::RichText::new(line)
+            //                             .family(egui::FontFamily::Monospace)
+            //                             .size(12.0)
+            //                             .color(egui::Color32::GREEN),
+            //                     );
+            //                 });
+            //             }
+            //         });
+            //
+            //     ui.separator();
+            //     ui.label("System Logs:");
+            // });
 
             ctx.request_repaint_after(std::time::Duration::from_millis(200));
         });
