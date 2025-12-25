@@ -19,7 +19,6 @@ base64 = {workspace = true}
 serde = { workspace = true, features = ["derive"] }
 async-trait = { workspace = true }
 
-
 anet-common = { path = "../anet-common" }
 
 [lib]

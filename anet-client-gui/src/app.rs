@@ -169,7 +169,7 @@ impl ANetApp {
         match toml::from_str::<CoreConfig>(&config_content) {
             Ok(cfg) => {
                 let tun = Box::new(DesktopTunFactory::new(cfg.main.tun_name.clone()));
-                let route = Box::new(DesktopRouteManager::new());
+                let route = Box::new(DesktopRouteManager::new().unwrap());
 
                 self.config_err = None;
                 self.config_name = path.file_name().unwrap_or_default().to_string_lossy().to_string();

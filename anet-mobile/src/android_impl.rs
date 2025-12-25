@@ -8,6 +8,7 @@ use jni::objects::{GlobalRef, JValue};
 use log::error;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
+use async_trait::async_trait;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tun::Configuration;
@@ -122,17 +123,19 @@ fn ip_mask_to_prefix(mask_str: &str) -> Result<u8> {
 
 // NoOp
 pub struct AndroidRouteManager;
+
+#[async_trait]
 impl RouteManager for AndroidRouteManager {
-    fn backup_routes(&self) -> Result<()> {
+    async fn backup_routes(&self) -> Result<()> {
         Ok(())
     }
-    fn add_exclusion_route(&self, _server_ip: &str) -> Result<()> {
+    async fn add_exclusion_route(&self, _server_ip: &str) -> Result<()> {
         Ok(())
     }
-    fn set_default_route(&self, _g: &str, _i: &str) -> Result<()> {
+    async fn set_default_route(&self, _g: &str, _i: &str) -> Result<()> {
         Ok(())
     }
-    fn restore_routes(&self) -> Result<()> {
+    async fn restore_routes(&self) -> Result<()> {
         Ok(())
     }
 }

@@ -1,9 +1,9 @@
 include!(concat!(env!("OUT_DIR"), "/built.rs"));
 
-use anet_client_cli::router::DesktopRouteManager;
 use anet_client_cli::tun_factory::DesktopTunFactory;
 use anet_client_core::AnetClient;
 use anet_client_core::config::CoreConfig;
+use anet_client_cli::router::DesktopRouteManager;
 use anyhow::Result;
 use clap::Parser;
 use log::{info, warn};
@@ -86,7 +86,7 @@ async fn main() -> Result<()> {
     let ascii_art = generate_ascii_art(BUILD_TYPE, COMMIT_HASH, BUILD_TIME);
     println!("{}", ascii_art);
 
-    let route_mgr = Box::new(DesktopRouteManager::new());
+    let route_mgr = Box::new(DesktopRouteManager::new()?);
     let cfg = config.clone();
     let tun_fac = Box::new(DesktopTunFactory::new(config.main.tun_name));
     let client = AnetClient::new(cfg, tun_fac, route_mgr);

@@ -1,278 +1,132 @@
 use anet_client_core::traits::RouteManager;
 use anyhow::{Context, Result};
-use log::{debug, info, warn};
-use netdev::{Interface, get_default_gateway, get_interfaces};
-use std::net::Ipv4Addr;
-use std::process::Command;
-use std::sync::Mutex;
+use async_trait::async_trait;
+use log::{info, warn, debug};
+use net_route::{Handle, Route};
+use std::net::{IpAddr, Ipv4Addr};
+use tokio::sync::Mutex; // <-- Тяжелая артиллерия
 
-/// Внутреннее состояние для хранения оригинальных маршрутов
 #[derive(Default)]
 struct RouteState {
-    original_gateway: Option<String>,
-    original_interface: Option<String>,
-    #[cfg(windows)]
-    original_interface_index: Option<u32>,
-    server_ip_cache: Option<String>,
+    original_gateway: Option<IpAddr>,
+    original_ifindex: Option<u32>,
+    server_ip_cache: Option<IpAddr>,
+    added_default_routes: Vec<Route>,
 }
 
 pub struct DesktopRouteManager {
-    state: Mutex<RouteState>,
+    handle: Handle,
+    state: Mutex<RouteState>, // <-- Tokio Mutex
 }
 
 impl DesktopRouteManager {
-    pub fn new() -> Self {
-        Self {
+    pub fn new() -> Result<Self> {
+        Ok(Self {
+            handle: Handle::new()?,
             state: Mutex::new(RouteState::default()),
-        }
-    }
-
-    fn find_default_interface_and_gateway(&self) -> Result<(String, String, u32)> {
-        let default_gateway = get_default_gateway()
-            .map_err(|e| anyhow::anyhow!("Failed to get default gateway: {}", e))?;
-
-        let gateway_ip = *default_gateway
-            .ipv4
-            .first()
-            .context("Default gateway has no IPv4 address")?;
-
-        info!(
-            "System default gateway found: IP={}, MAC={}",
-            gateway_ip, default_gateway.mac_addr
-        );
-
-        let interfaces = get_interfaces();
-        let default_interface = self
-            .find_interface_for_gateway(&interfaces, gateway_ip)
-            .context("Failed to find a suitable physical interface")?;
-
-        info!(
-            "Selected interface: '{}' (index: {}) for routing.",
-            default_interface
-                .friendly_name
-                .as_deref()
-                .unwrap_or(&default_interface.name),
-            default_interface.index
-        );
-
-        Ok((
-            gateway_ip.to_string(),
-            default_interface.name.clone(),
-            default_interface.index,
-        ))
-    }
-
-    fn find_interface_for_gateway<'a>(
-        &self,
-        interfaces: &'a [Interface],
-        gateway_ip: Ipv4Addr,
-    ) -> Result<&'a Interface> {
-        // 1. Ищем интерфейс, чья подсеть содержит шлюз
-        if let Some(iface) = interfaces.iter().find(|i| {
-            self.is_suitable_interface(i) && i.ipv4.iter().any(|net| net.contains(&gateway_ip))
-        }) {
-            debug!("Found interface '{}' via subnet match", iface.name);
-            return Ok(iface);
-        }
-
-        warn!("Gateway IP {} not found in any local subnet.", gateway_ip);
-
-        // 2. Fallback: берем первый "подходящий"
-        if let Some(iface) = interfaces.iter().find(|i| self.is_suitable_interface(i)) {
-            warn!("Fallback to interface: '{}'.", iface.name);
-            return Ok(iface);
-        }
-
-        Err(anyhow::anyhow!("No suitable network interface found."))
-    }
-
-    fn is_suitable_interface(&self, interface: &Interface) -> bool {
-        interface.is_up()
-            && interface.is_oper_up()
-            && !interface.ipv4.is_empty()
-            && !self.is_virtual_interface(interface)
-    }
-
-    fn is_virtual_interface(&self, interface: &Interface) -> bool {
-        if interface.is_loopback() || interface.is_tun() {
-            return true;
-        }
-        let name = interface
-            .friendly_name
-            .as_deref()
-            .unwrap_or(&interface.name)
-            .to_lowercase();
-
-        let virtual_keywords = [
-            "vnet",
-            "virbr",
-            "br-",
-            "docker",
-            "veth",
-            "tunnel",
-            "virtual",
-            "vpn",
-            "anet",
-            "loopback",
-            "teredo",
-            "wsl",
-            "tap",
-            "radmin",
-            "vmware",
-            "vbox",
-            "host-only",
-            "outline",
-        ];
-
-        virtual_keywords
-            .iter()
-            .any(|&kw| name.contains(kw) || interface.name.starts_with(kw))
+        })
     }
 }
 
+#[async_trait]
 impl RouteManager for DesktopRouteManager {
-    fn backup_routes(&self) -> Result<()> {
-        let (gateway, interface, index) = self.find_default_interface_and_gateway()?;
+    async fn backup_routes(&self) -> Result<()> {
+        let default_route = self.handle.default_route().await?
+            .context("No default route found in system table")?;
 
-        let mut state = self.state.lock().unwrap();
+        let gateway = default_route.gateway.context("Default route has no gateway")?;
+        let ifindex = default_route.ifindex;
+
+        info!("Backup: Gateway {} on iface {}", gateway, ifindex.unwrap());
+
+        // Tokio Mutex: lock().await
+        let mut state = self.state.lock().await;
         state.original_gateway = Some(gateway);
-        state.original_interface = Some(interface);
+        state.original_ifindex = ifindex;
 
-        #[cfg(windows)]
-        {
-            state.original_interface_index = Some(index);
-        }
-        // Чтобы подавить warning unused variable на linux
-        let _ = index;
-
-        info!("Routes backed up.");
         Ok(())
     }
 
-    fn add_exclusion_route(&self, server_ip: &str) -> Result<()> {
-        let mut state = self.state.lock().unwrap();
-        // Кэшируем IP сервера для очистки в restore()
-        state.server_ip_cache = Some(server_ip.to_string());
+    async fn add_exclusion_route(&self, server_ip: &str) -> Result<()> {
+        let server_ipv4: Ipv4Addr = server_ip.parse().context("Invalid server IP")?;
+        let server_ip = IpAddr::V4(server_ipv4);
 
-        info!("Setting exclusion route to VPN server: {}", server_ip);
+        // Держим лок через await - теперь это легально!
+        let mut state = self.state.lock().await;
 
-        #[cfg(unix)]
-        {
-            let gateway = state
-                .original_gateway
-                .as_ref()
-                .context("Gateway not backed up")?;
-            let interface = state
-                .original_interface
-                .as_ref()
-                .context("Interface not backed up")?;
+        let gateway = state.original_gateway.context("Gateway not backed up")?;
+        let ifindex = state.original_ifindex.context("Interface index not backed up")?;
 
-            let status = Command::new("ip")
-                .args([
-                    "route", "replace", server_ip, "via", gateway, "dev", interface,
-                ])
-                .status()?;
+        info!("Setting exclusion route to VPN server: {} via {}", server_ip, gateway);
 
-            if !status.success() {
-                return Err(anyhow::anyhow!("Failed to set exclusion route"));
-            }
-        }
+        let route = Route::new(server_ip, 32)
+            .with_gateway(gateway)
+            .with_ifindex(ifindex)
+            .with_metric(1);
 
-        #[cfg(windows)]
-        {
-            let gateway = state
-                .original_gateway
-                .as_ref()
-                .context("Gateway not backed up")?;
-            let index = state
-                .original_interface_index
-                .context("Interface index not backed up")?;
+        // Мы держим state, но вызываем self.handle. Это безопасно.
+        let _ = self.handle.delete(&route).await;
+        self.handle.add(&route).await.context("Failed to add exclusion route via API")?;
 
-            // Сначала удаляем старый (на всякий случай)
-            let _ = Command::new("route").args(["delete", server_ip]).output();
+        state.server_ip_cache = Some(server_ip);
 
-            let output = Command::new("route")
-                .args([
-                    "add",
-                    server_ip,
-                    "mask",
-                    "255.255.255.255",
-                    gateway,
-                    "if",
-                    &index.to_string(),
-                    "metric",
-                    "5",
-                ])
-                .output()?;
+        Ok(())
+    }
 
-            if !output.status.success() {
-                let err = String::from_utf8_lossy(&output.stderr);
-                return Err(anyhow::anyhow!("Failed to add route (Win): {}", err.trim()));
+    async fn set_default_route(&self, _gateway: &str, interface_name: &str) -> Result<()> {
+        let interfaces = netdev::get_interfaces();
+        let tun_iface = interfaces.iter()
+            .find(|i| i.name == interface_name || i.friendly_name.as_deref() == Some(interface_name))
+            .context("TUN interface not found")?;
+
+        let tun_index = tun_iface.index;
+        info!("Redirecting all traffic to TUN (index: {})", tun_index);
+
+        let routes_to_add = vec![
+            Route::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 1)
+                .with_ifindex(tun_index)
+                .with_metric(1),
+            Route::new(IpAddr::V4(Ipv4Addr::new(128, 0, 0, 0)), 1)
+                .with_ifindex(tun_index)
+                .with_metric(1),
+        ];
+
+        let mut state = self.state.lock().await;
+
+        for route in routes_to_add {
+            let _ = self.handle.delete(&route).await;
+            if let Err(e) = self.handle.add(&route).await {
+                warn!("Failed to add redirect route {:?}: {}", route, e);
+            } else {
+                state.added_default_routes.push(route);
             }
         }
 
         Ok(())
     }
 
-    fn set_default_route(&self, gateway: &str, interface_name: &str) -> Result<()> {
-        #[cfg(unix)]
-        {
-            info!("Replacing default route via VPN ({})", interface_name);
-            let status = Command::new("ip")
-                .args([
-                    "route",
-                    "replace",
-                    "default",
-                    "via",
-                    gateway,
-                    "dev",
-                    interface_name,
-                ])
-                .status()?;
-
-            if !status.success() {
-                return Err(anyhow::anyhow!("Failed to replace default route"));
-            }
-        }
-
-        #[cfg(windows)]
-        {
-            // На Windows маршрутизация обычно работает сама, если у TUN метрика ниже.
-            // Но если нужно форсировать - тут сложнее (надо менять метрики).
-            // Пока оставим warning, так как в старом коде для Win этого метода не было.
-            warn!(
-                "set_default_route is not strictly implemented for Windows in this CLI yet (relying on interface metrics)."
-            );
-        }
-
-        Ok(())
-    }
-
-    fn restore_routes(&self) -> Result<()> {
-        let state = self.state.lock().unwrap();
+    async fn restore_routes(&self) -> Result<()> {
         info!("Restoring original routing...");
+        let mut state = self.state.lock().await;
 
-        #[cfg(unix)]
-        {
-            if let (Some(gw), Some(iface)) = (&state.original_gateway, &state.original_interface) {
-                let _ = Command::new("ip")
-                    .args(["route", "replace", "default", "via", gw, "dev", iface])
-                    .status();
-            }
-
-            if let Some(server_ip) = &state.server_ip_cache {
-                let _ = Command::new("ip")
-                    .args(["route", "del", server_ip])
-                    .status();
-            }
+        // Удаляем маршруты-перенаправления
+        // Идем с конца, как настоящие самураи (LIFO)
+        while let Some(route) = state.added_default_routes.pop() {
+            debug!("Removing redirect route...");
+            let _ = self.handle.delete(&route).await;
         }
 
-        #[cfg(windows)]
-        {
-            if let Some(server_ip) = &state.server_ip_cache {
-                let _ = Command::new("route").args(["delete", server_ip]).output();
+        // Удаляем маршрут к серверу
+        if let Some(server_ip) = state.server_ip_cache.take() {
+            if let (Some(gw), Some(idx)) = (state.original_gateway, state.original_ifindex) {
+                let route = Route::new(server_ip, 32)
+                    .with_gateway(gw)
+                    .with_ifindex(idx)
+                    .with_metric(1);
+
+                info!("Removing exclusion route to {}", server_ip);
+                let _ = self.handle.delete(&route).await;
             }
-            // Дефолтный маршрут на винде обычно восстанавливается сам при падении интерфейса
         }
 
         info!("Routing restored.");

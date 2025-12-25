@@ -17,6 +17,8 @@ quinn = {workspace = true } # Только для типов
 
 async-trait = "0.1.89"
 netdev = { workspace = true }
+net-route = "0.4"
+
 anet-common = { path = "../anet-common"}
 anet-client-core = { path = "../anet-client-core"}
 

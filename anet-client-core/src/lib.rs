@@ -80,11 +80,11 @@ impl AnetClient {
         status(format!("[Core] IP: {}", auth_response.ip));
 
         // Бэкапим маршруты
-        self.route_manager.backup_routes()?;
+        self.route_manager.backup_routes().await?;
 
         // Добавляем маршрут до VPN-сервера
         let server_ip = self.config.main.address.split(':').next().unwrap();
-        self.route_manager.add_exclusion_route(server_ip)?;
+        self.route_manager.add_exclusion_route(server_ip).await?;
 
         // Поднимаем QUIC
         let vpn_handler = VpnHandler::new(self.config.clone());
@@ -129,7 +129,7 @@ impl AnetClient {
 
         // 4. Меняем дефолтный шлюз
         self.route_manager
-            .set_default_route(&auth_response.gateway, &iface_name)?;
+            .set_default_route(&auth_response.gateway, &iface_name).await?;
 
         info!("[Core] VPN Tunnel UP.");
         status("[Core] VPN UP");
@@ -168,7 +168,7 @@ impl AnetClient {
             running.endpoint.close(0u32.into(), b"Disconnected by user");
 
             // 4. Чиним маршруты (ОЧЕНЬ ВАЖНО ДЛЯ CLI)
-            if let Err(e) = self.route_manager.restore_routes() {
+            if let Err(e) = self.route_manager.restore_routes().await {
                 error!("Failed to restore routes: {}", e);
             }
 
