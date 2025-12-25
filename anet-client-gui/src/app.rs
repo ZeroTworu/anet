@@ -1,15 +1,38 @@
 use crate::router::DesktopRouteManager;
 use crate::tun_factory::DesktopTunFactory;
-use anet_client_core::AnetClient;
 use anet_client_core::config::CoreConfig;
 use anet_client_core::events::{AnetEvent, EventHandler, set_handler};
+use anet_client_core::AnetClient;
 use eframe::egui;
-use std::path::PathBuf; // Добавлено для работы с путями
-use std::sync::mpsc::{Receiver, Sender, channel};
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use tokio::runtime::Runtime;
 
-// Logs
+// --- Settings ---
+#[derive(Serialize, Deserialize, Default, Clone)] // Clone добавил для удобства
+struct AppSettings {
+    last_config_path: Option<String>,
+}
+
+impl AppSettings {
+    fn load() -> Self {
+        if let Ok(content) = std::fs::read_to_string("anet_settings.json") {
+            serde_json::from_str(&content).unwrap_or_default()
+        } else {
+            Self::default()
+        }
+    }
+
+    fn save(&self) {
+        if let Ok(content) = serde_json::to_string_pretty(self) {
+            let _ = std::fs::write("anet_settings.json", content);
+        }
+    }
+}
+
+// --- Event Handler ---
 pub struct GuiEventHandler {
     tx: Sender<AnetEvent>,
 }
@@ -26,8 +49,15 @@ impl EventHandler for GuiEventHandler {
     }
 }
 
-// --- App Struct ---
+// --- App State Enum ---
+#[derive(PartialEq, Clone, Copy)]
+enum ConnectionState {
+    Disconnected,
+    Connecting,
+    Connected,
+}
 
+// --- App Struct ---
 pub struct ANetApp {
     rt: Runtime,
     client: Option<Arc<AnetClient>>,
@@ -35,20 +65,39 @@ pub struct ANetApp {
     config_err: Option<String>,
     config_name: String,
     event_rx: Receiver<AnetEvent>,
+
+    // Новые поля
+    state: ConnectionState,
+    settings: AppSettings,
 }
 
 impl ANetApp {
     pub fn new() -> Self {
         let (tx, rx) = channel();
         set_handler(Box::new(GuiEventHandler::new(tx)));
-        Self {
+
+        let settings = AppSettings::load();
+
+        let mut app = Self {
             rt: Runtime::new().unwrap(),
             client: None,
             logs: Arc::new(Mutex::new(vec!["> System Ready...".to_string()])),
             config_err: None,
             config_name: "Файл настроек не выбран!".to_string(),
             event_rx: rx,
+            state: ConnectionState::Disconnected,
+            settings: settings.clone(),
+        };
+
+        // Автозагрузка конфига
+        if let Some(path_str) = &settings.last_config_path {
+            let path = PathBuf::from(path_str);
+            if path.exists() {
+                app.load_config_from_path(path);
+            }
         }
+
+        app
     }
 
     fn log(&self, msg: &str) {
@@ -59,15 +108,27 @@ impl ANetApp {
 
     fn start_vpn(&mut self) {
         if let Some(client) = &self.client {
+            // Переходим в состояние подключения
+            self.state = ConnectionState::Connecting;
+
             let client_clone = client.clone();
             let logs_clone = self.logs.clone();
+
+            // Внимание: Здесь мы должны как-то узнать, что подключение успешно.
+            // Сейчас AnetClient.start() блокирует поток выполнения.
+            // Поэтому состояние Connected мы выставим только если start() вернет Ok,
+            // но start() работает пока VPN работает.
+            // Значит, нам нужно ловить событие "Tunnel UP" через канал событий (AnetEvent).
+            // А пока просто запустим таску.
+
             self.rt.spawn(async move {
-                logs_clone
-                    .lock()
-                    .unwrap()
-                    .push("> Starting service...".into());
+                logs_clone.lock().unwrap().push("> Starting service...".into());
+                // В реальном клиенте тут должен быть неблокирующий запуск или мы ждем ошибку
                 match client_clone.start().await {
-                    Ok(_) => logs_clone.lock().unwrap().push("> VPN Tunnel UP".into()),
+                    Ok(_) => {
+                        // VPN остановился штатно (например, стоп вызвали)
+                        logs_clone.lock().unwrap().push("> VPN Stopped (Ok)".into())
+                    },
                     Err(e) => logs_clone.lock().unwrap().push(format!("> Error: {}", e)),
                 }
             });
@@ -78,24 +139,21 @@ impl ANetApp {
         if let Some(client) = &self.client {
             let client_clone = client.clone();
             let logs_clone = self.logs.clone();
+
+            // Тут можно сразу ставить Disconnected, либо ждать события
+            self.state = ConnectionState::Disconnected;
+
             self.rt.spawn(async move {
-                logs_clone
-                    .lock()
-                    .unwrap()
-                    .push("> Stopping service...".into());
+                logs_clone.lock().unwrap().push("> Stopping service...".into());
                 let _ = client_clone.stop().await;
-                logs_clone.lock().unwrap().push("> VPN Stopped".into());
             });
         }
     }
 
-    /// Общая логика загрузки конфига по пути к файлу
     fn load_config_from_path(&mut self, path: PathBuf) {
-        // Проверка расширения (опционально, но полезно для UX)
         if let Some(ext) = path.extension() {
             if ext != "toml" {
                 self.config_err = Some("Пожалуйста выберите файл с расширением .toml ".to_string());
-                self.log("Ignored non-toml file");
                 return;
             }
         }
@@ -116,8 +174,10 @@ impl ANetApp {
                 self.config_err = None;
                 self.config_name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
 
-                // Если клиент уже был запущен, стоило бы его остановить,
-                // но пока просто заменяем структуру (в GUI это кнопка Connect разрулит)
+                // Сохраняем путь
+                self.settings.last_config_path = Some(path.to_string_lossy().to_string());
+                self.settings.save();
+
                 self.client = Some(Arc::new(AnetClient::new(cfg, tun, route)));
                 self.log(&format!("Config loaded: {}", self.config_name));
             }
@@ -128,7 +188,6 @@ impl ANetApp {
         }
     }
 
-    /// Открытие диалога выбора файла
     fn open_file_dialog(&mut self) {
         if let Some(path) = rfd::FileDialog::new()
             .add_filter("TOML Config", &["toml"])
@@ -139,76 +198,37 @@ impl ANetApp {
     }
 }
 
-// --- UI Rendering ---
-
 impl eframe::App for ANetApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // 1. Обработка Drag-and-Drop Отрубим пока.
-        // if !ctx.input(|i| i.raw.dropped_files.is_empty()) {
-        //     let dropped_files = ctx.input(|i| i.raw.dropped_files.clone());
-        //
-        //     // Берем первый файл
-        //     if let Some(file) = dropped_files.first() {
-        //         if let Some(path) = &file.path {
-        //             self.load_config_from_path(path.clone());
-        //         }
-        //     }
-        // }
-
-
-        // 2. Обработка событий из канала (логи, статусы)
+        // 1. Обработка событий из канала
         while let Ok(event) = self.event_rx.try_recv() {
             match event {
                 AnetEvent::Status(msg) => {
                     self.log(&msg);
+                    // Эвристика для смены статуса (в идеале добавить enum в AnetEvent)
+                    if msg.contains("Tunnel UP") {
+                        self.state = ConnectionState::Connected;
+                    }
+                    if msg.contains("Error") || msg.contains("Stopped") {
+                        // Если мы были в Connecting и получили ошибку -> Disconnected
+                        // Если были Connected и получили Error -> Disconnected
+                        self.state = ConnectionState::Disconnected;
+                    }
                 }
                 _ => {}
             }
         }
 
-        let is_running = self
-            .client
-            .as_ref()
-            .map(|c| c.is_running())
-            .unwrap_or(false);
-
         let main_frame = egui::Frame::none()
-            .fill(egui::Color32::from_rgb(18, 18, 18)) // Тот самый черный цвет
-            .inner_margin(12.0); // Отступы от краев окна
+            .fill(egui::Color32::from_rgb(18, 18, 18))
+            .inner_margin(12.0);
 
-        // Используем CentralPanel для всего контента
         egui::CentralPanel::default().frame(main_frame).show(ctx, |ui| {
-            // Подсветка зоны перетаскивания (визуальная индикация)
-            // if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
-            //     let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("dnd_overlay")));
-            //     let screen_rect = ctx.input(|i| i.screen_rect());
-            //     painter.rect_filled(
-            //         screen_rect,
-            //         0.0,
-            //         egui::Color32::from_black_alpha(100),
-            //     );
-            //     painter.text(
-            //         screen_rect.center(),
-            //         egui::Align2::CENTER_CENTER,
-            //         "Drop config here",
-            //         egui::FontId::proportional(32.0),
-            //         egui::Color32::WHITE,
-            //     );
-            // }
-
-            // 1. Header (Top Bar)
+            // Header
             ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new("ANet VPN")
-                        .size(24.0)
-                        .strong()
-                        .color(egui::Color32::WHITE),
-                );
+                ui.label(egui::RichText::new("ANet VPN").size(24.0).strong().color(egui::Color32::WHITE));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .add(egui::Button::new(egui::RichText::new("⚙").size(24.0)).frame(false))
-                        .clicked()
-                    {
+                    if ui.add(egui::Button::new(egui::RichText::new("⚙").size(24.0)).frame(false)).clicked() {
                         self.open_file_dialog();
                     }
                 });
@@ -216,33 +236,57 @@ impl eframe::App for ANetApp {
 
             ui.add_space(20.0);
 
-            // 2. Config Info
+            // Config Info
             ui.vertical_centered(|ui| {
                 if let Some(err) = &self.config_err {
                     ui.label(egui::RichText::new(err).color(egui::Color32::RED));
                 } else {
                     ui.label(egui::RichText::new(&self.config_name).color(egui::Color32::GRAY));
                 }
-                // Подсказка для пользователя
                 if self.client.is_none() && self.config_err.is_none() {
-                    ui.label(
-                        egui::RichText::new("(Нажмите ⚙ и выберите файл настроек)")
-                            .size(15.0)
-                            .color(egui::Color32::from_gray(80)),
-                    );
+                    ui.label(egui::RichText::new("(Нажмите ⚙ и выберите файл настроек)").size(15.0).color(egui::Color32::from_gray(80)));
                 }
             });
 
-            // --- ГЛАВНАЯ КНОПКА ---
             ui.add_space(ui.available_height() * 0.15);
 
+            // --- MAIN BUTTON LOGIC ---
             ui.vertical_centered(|ui| {
                 let btn_size = egui::vec2(180.0, 180.0);
-                let btn_text = if is_running { "Отключить VPN" } else { "Подключить VPN" };
-                let btn_color = if is_running {
-                    egui::Color32::from_rgb(244, 67, 54)
-                } else {
-                    egui::Color32::from_rgb(76, 175, 80)
+
+                // Логика цвета и текста
+                let (btn_text, btn_color) = match self.state {
+                    ConnectionState::Disconnected => (
+                        "Подключить VPN",
+                        egui::Color32::from_rgb(76, 175, 80) // Зеленый
+                    ),
+                    ConnectionState::Connecting => {
+                        // АНИМАЦИЯ ПУЛЬСАЦИИ
+                        // Используем time (секунды) для синусоиды
+                        let time = ctx.input(|i| i.time);
+                        // Синус от -1 до 1, переводим в 0..1
+                        let factor = (time.sin() + 1.0) / 2.0;
+
+                        // Интерполируем между Желтым и Оранжевым
+                        // Yellow: (255, 235, 59)
+                        // Orange: (255, 152, 0)
+
+                        let r = 255; // Red всегда 255
+                        let g = (235.0 + (152.0 - 235.0) * factor) as u8; // Green меняется
+                        let b = (59.0 + (0.0 - 59.0) * factor) as u8; // Blue меняется
+
+                        // Запрашиваем перерисовку постоянно, чтобы анимация была плавной
+                        ctx.request_repaint();
+
+                        (
+                            "Подключение...",
+                            egui::Color32::from_rgb(r, g, b)
+                        )
+                    },
+                    ConnectionState::Connected => (
+                        "Отключить VPN",
+                        egui::Color32::from_rgb(244, 67, 54) // Красный
+                    ),
                 };
 
                 let btn = egui::Button::new(
@@ -256,66 +300,40 @@ impl eframe::App for ANetApp {
                     .fill(btn_color);
 
                 if ui.add(btn).clicked() {
-                    if self.client.is_none() {
-                        self.log("Error: No config loaded! Press ⚙ or drag file.");
-                        self.open_file_dialog();
-                    } else {
-                        if is_running {
+                    match self.state {
+                        ConnectionState::Disconnected => {
+                            if self.client.is_none() {
+                                self.log("Error: No config loaded! Press ⚙ or drag file.");
+                                self.open_file_dialog();
+                            } else {
+                                self.start_vpn();
+                            }
+                        },
+                        ConnectionState::Connecting => {
+                            // Если нажали во время подключения - отменяем
                             self.stop_vpn();
-                        } else {
-                            self.start_vpn();
+                        },
+                        ConnectionState::Connected => {
+                            self.stop_vpn();
                         }
                     }
                 }
 
                 ui.add_space(20.0);
-                let status_text = if is_running {
-                    "VPN соединение установлено!"
-                } else {
-                    "VPN соединение не установлено."
-                };
-                let status_color = if is_running {
-                    btn_color
-                } else {
-                    egui::Color32::from_rgb(255, 82, 82)
-                };
-                ui.label(
-                    egui::RichText::new(status_text)
-                        .size(16.0)
-                        .strong()
-                        .color(status_color),
-                );
+
+                // СТАТУС ТЕКСТ
+                match self.state {
+                    ConnectionState::Connected => {
+                        ui.label(egui::RichText::new("VPN соединение установлено!").size(16.0).strong().color(egui::Color32::GREEN));
+                    },
+                    ConnectionState::Disconnected => {
+                        ui.label(egui::RichText::new("VPN соединение не установлено.").size(16.0).strong().color(egui::Color32::RED));
+                    },
+                    ConnectionState::Connecting => {
+                        ui.label(egui::RichText::new("Установка соединения...").size(16.0).strong().color(egui::Color32::YELLOW));
+                    }
+                }
             });
-
-            // --- ЛОГИ (Прижаты к низу) ---
-            // let bottom_height = 120.0;
-            // ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-            //     ui.add_space(0.0);
-            //
-            //     egui::ScrollArea::vertical()
-            //         .max_height(bottom_height)
-            //         .auto_shrink([false, true])
-            //         .stick_to_bottom(true)
-            //         .show(ui, |ui| {
-            //             let logs = self.logs.lock().unwrap();
-            //             for line in logs.iter().rev() {
-            //                 ui.horizontal(|ui| {
-            //                     ui.label(egui::RichText::new(">").color(egui::Color32::DARK_GRAY));
-            //                     ui.label(
-            //                         egui::RichText::new(line)
-            //                             .family(egui::FontFamily::Monospace)
-            //                             .size(12.0)
-            //                             .color(egui::Color32::GREEN),
-            //                     );
-            //                 });
-            //             }
-            //         });
-            //
-            //     ui.separator();
-            //     ui.label("System Logs:");
-            // });
-
-            ctx.request_repaint_after(std::time::Duration::from_millis(200));
         });
     }
 }

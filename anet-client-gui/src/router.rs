@@ -6,12 +6,40 @@ use std::net::Ipv4Addr;
 use std::process::Command;
 use std::sync::Mutex;
 
-/// Внутреннее состояние для хранения оригинальных маршрутов
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
+// Флаг создания процесса без окна консоли
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+/// Вспомогательная функция для тихого запуска команд на Windows
+fn run_silent_cmd(cmd: &str, args: &[&str]) -> Result<()> {
+    // Собираем команду в строку для cmd
+    // Например: "route add ..."
+    let mut cmd_line = format!("{} ", cmd);
+    cmd_line.push_str(&args.join(" "));
+
+    debug!("Running silent via cmd /c: {}", cmd_line);
+
+    let mut command = Command::new("cmd");
+
+    // /C - выполнить и закрыть
+    command.args(&["/C", &cmd_line]);
+
+    command.stdout(std::process::Stdio::null());
+    command.stderr(std::process::Stdio::null());
+    command.stdin(std::process::Stdio::null());
+
+    // Скрываем окно САМОГО cmd.exe
+    command.creation_flags(CREATE_NO_WINDOW).spawn().expect("failed to run silent cmd");;;
+
+
+    Ok(())
+}
+
 #[derive(Default)]
 struct RouteState {
     original_gateway: Option<String>,
-    original_interface: Option<String>,
-    #[cfg(windows)]
     original_interface_index: Option<u32>,
     server_ip_cache: Option<String>,
 }
@@ -27,7 +55,7 @@ impl DesktopRouteManager {
         }
     }
 
-    fn find_default_interface_and_gateway(&self) -> Result<(String, String, u32)> {
+    fn find_default_interface_and_gateway(&self) -> Result<(String, u32)> {
         let default_gateway = get_default_gateway()
             .map_err(|e| anyhow::anyhow!("Failed to get default gateway: {}", e))?;
 
@@ -55,11 +83,7 @@ impl DesktopRouteManager {
             default_interface.index
         );
 
-        Ok((
-            gateway_ip.to_string(),
-            default_interface.name.clone(),
-            default_interface.index,
-        ))
+        Ok((gateway_ip.to_string(), default_interface.index))
     }
 
     fn find_interface_for_gateway<'a>(
@@ -122,6 +146,7 @@ impl DesktopRouteManager {
             "vbox",
             "host-only",
             "outline",
+            "hyper-v",
         ];
 
         virtual_keywords
@@ -132,18 +157,11 @@ impl DesktopRouteManager {
 
 impl RouteManager for DesktopRouteManager {
     fn backup_routes(&self) -> Result<()> {
-        let (gateway, interface, index) = self.find_default_interface_and_gateway()?;
+        let (gateway, index) = self.find_default_interface_and_gateway()?;
 
         let mut state = self.state.lock().unwrap();
         state.original_gateway = Some(gateway);
-        state.original_interface = Some(interface);
-
-        #[cfg(windows)]
-        {
-            state.original_interface_index = Some(index);
-        }
-        // Чтобы подавить warning unused variable на linux
-        let _ = index;
+        state.original_interface_index = Some(index);
 
         info!("Routes backed up.");
         Ok(())
@@ -156,95 +174,41 @@ impl RouteManager for DesktopRouteManager {
 
         info!("Setting exclusion route to VPN server: {}", server_ip);
 
-        #[cfg(unix)]
-        {
-            let gateway = state
-                .original_gateway
-                .as_ref()
-                .context("Gateway not backed up")?;
-            let interface = state
-                .original_interface
-                .as_ref()
-                .context("Interface not backed up")?;
+        let gateway = state
+            .original_gateway
+            .as_ref()
+            .context("Gateway not backed up")?;
+        let index = state
+            .original_interface_index
+            .context("Interface index not backed up")?;
+        let index_str = index.to_string();
 
-            let status = Command::new("ip")
-                .args([
-                    "route", "replace", server_ip, "via", gateway, "dev", interface,
-                ])
-                .status()?;
+        // 1. Сначала удаляем старый (на всякий случай, игнорируем ошибку)
+        let _ = run_silent_cmd("route", &["delete", server_ip]);
 
-            if !status.success() {
-                return Err(anyhow::anyhow!("Failed to set exclusion route"));
-            }
-        }
-
-        #[cfg(windows)]
-        {
-            let gateway = state
-                .original_gateway
-                .as_ref()
-                .context("Gateway not backed up")?;
-            let index = state
-                .original_interface_index
-                .context("Interface index not backed up")?;
-
-            // Сначала удаляем старый (на всякий случай)
-            let _ = Command::new("route").args(["delete", server_ip]).output();
-
-            let output = Command::new("route")
-                .args([
-                    "add",
-                    server_ip,
-                    "mask",
-                    "255.255.255.255",
-                    gateway,
-                    "if",
-                    &index.to_string(),
-                    "metric",
-                    "5",
-                ])
-                .output()?;
-
-            if !output.status.success() {
-                let err = String::from_utf8_lossy(&output.stderr);
-                return Err(anyhow::anyhow!("Failed to add route (Win): {}", err.trim()));
-            }
-        }
+        // 2. Добавляем маршрут
+        // route add <IP> mask 255.255.255.255 <Gateway> if <Index> metric 5
+        run_silent_cmd(
+            "route",
+            &[
+                "add",
+                server_ip,
+                "mask",
+                "255.255.255.255",
+                gateway,
+                "if",
+                &index_str,
+                "metric",
+                "5",
+            ],
+        ).context("Failed to add exclusion route via route.exe")?;
 
         Ok(())
     }
 
-    fn set_default_route(&self, gateway: &str, interface_name: &str) -> Result<()> {
-        #[cfg(unix)]
-        {
-            info!("Replacing default route via VPN ({})", interface_name);
-            let status = Command::new("ip")
-                .args([
-                    "route",
-                    "replace",
-                    "default",
-                    "via",
-                    gateway,
-                    "dev",
-                    interface_name,
-                ])
-                .status()?;
-
-            if !status.success() {
-                return Err(anyhow::anyhow!("Failed to replace default route"));
-            }
-        }
-
-        #[cfg(windows)]
-        {
-            // На Windows маршрутизация обычно работает сама, если у TUN метрика ниже.
-            // Но если нужно форсировать - тут сложнее (надо менять метрики).
-            // Пока оставим warning, так как в старом коде для Win этого метода не было.
-            warn!(
-                "set_default_route is not strictly implemented for Windows in this CLI yet (relying on interface metrics)."
-            );
-        }
-
+    fn set_default_route(&self, _gateway: &str, _interface_name: &str) -> Result<()> {
+        // На Windows при поднятии TUN-интерфейса (Wintun) он сам получает метрику.
+        debug!("Windows routing: relying on interface metrics for default route.");
         Ok(())
     }
 
@@ -252,28 +216,12 @@ impl RouteManager for DesktopRouteManager {
         let state = self.state.lock().unwrap();
         info!("Restoring original routing...");
 
-        #[cfg(unix)]
-        {
-            if let (Some(gw), Some(iface)) = (&state.original_gateway, &state.original_interface) {
-                let _ = Command::new("ip")
-                    .args(["route", "replace", "default", "via", gw, "dev", iface])
-                    .status();
-            }
-
-            if let Some(server_ip) = &state.server_ip_cache {
-                let _ = Command::new("ip")
-                    .args(["route", "del", server_ip])
-                    .status();
-            }
+        if let Some(server_ip) = &state.server_ip_cache {
+            // Тихо удаляем маршрут
+            let _ = run_silent_cmd("route", &["delete", server_ip]);
         }
 
-        #[cfg(windows)]
-        {
-            if let Some(server_ip) = &state.server_ip_cache {
-                let _ = Command::new("route").args(["delete", server_ip]).output();
-            }
-            // Дефолтный маршрут на винде обычно восстанавливается сам при падении интерфейса
-        }
+        // Дефолтный маршрут на винде восстанавливается сам при удалении TUN.
 
         info!("Routing restored.");
         Ok(())
