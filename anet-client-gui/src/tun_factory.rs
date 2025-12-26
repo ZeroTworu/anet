@@ -69,7 +69,7 @@ impl TunFactory for DesktopTunFactory {
             .context("Failed to load wintun.dll")? };
 
         info!("Step 2: Creating adapter '{}'...", self.tun_name);
-        let adapter = match wintun::Adapter::create(&wintun, "Wintun", &self.tun_name, None) {
+        let adapter = match wintun::Adapter::create(&wintun, &self.tun_name, &self.tun_name, None) {
             Ok(a) => a,
             Err(e) => {
                 error!("Create failed: {}. Trying open...", e);
@@ -101,9 +101,9 @@ impl TunFactory for DesktopTunFactory {
                     // 2. Совпадение с суффиксом " Tunnel" (стандарт Wintun)
                     name == format!("{} Tunnel", target) || friendly == format!("{} Tunnel", target) ||
                     // 3. Просто начинается с имени
-                    friendly.starts_with(&target) || name.starts_with(&target) ||
-                    // 4. Самый край
-                    friendly.starts_with("wintun")
+                    friendly.starts_with(&target) || name.starts_with(&target)
+
+
             }) {
                 target_name = iface.friendly_name.clone().unwrap_or(iface.name.clone());
 
@@ -132,7 +132,7 @@ impl TunFactory for DesktopTunFactory {
 
         let set_ip_args = [
             "interface", "ip", "set", "address",
-            &self.tun_name,
+            target_name.as_str(),
             "static",
             ip,
             mask,
@@ -148,7 +148,7 @@ impl TunFactory for DesktopTunFactory {
         info!("Step 6: Setting DNS...");
         let _ = Self::run_silent_cmd("netsh", &[
             "interface", "ip", "set", "dns",
-            &self.tun_name, "static", "1.1.1.1"
+            target_name.as_str(), "static", "1.1.1.1"
         ]);
 
         if mtu > 0 {
@@ -156,7 +156,7 @@ impl TunFactory for DesktopTunFactory {
             let mtu_str = mtu.to_string();
             let _ = Self::run_silent_cmd("netsh", &[
                 "interface", "ipv4", "set", "subinterface",
-                &self.tun_name,
+                target_name.as_str(),
                 &format!("mtu={}", mtu_str),
                 "store=active"
             ]);

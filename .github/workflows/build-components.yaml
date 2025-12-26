@@ -27,6 +27,18 @@ jobs:
           target: "x86_64-unknown-linux-musl"
           override: "true"
 
+      - name: "Cache Rust dependencies"
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-musl-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-musl-
+            ${{ runner.os }}-cargo-
+
       - name: "Build Server"
         run: "RUSTFLAGS=\"-C target-feature=+crt-static\" cargo build --release --package anet-server --target x86_64-unknown-linux-musl"
 
@@ -51,6 +63,18 @@ jobs:
           target: "x86_64-unknown-linux-musl"
           override: "true"
 
+      - name: "Cache Rust dependencies"
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-musl-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-musl-
+            ${{ runner.os }}-cargo-
+
       - name: "Build Client (Linux)"
         run: "RUSTFLAGS=\"-C target-feature=+crt-static\" cargo build --release --package anet-client-cli --target x86_64-unknown-linux-musl"
 
@@ -74,8 +98,20 @@ jobs:
           toolchain: "stable"
           override: "true"
 
+      - name: "Cache Rust dependencies"
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
       - name: "Build Client (CLI) (Windows)"
         run: "cargo build --release --package anet-client-cli"
+
       - uses: "actions/upload-artifact@v4"
         with:
           name: "anet-client-windows-cli"
@@ -83,6 +119,7 @@ jobs:
 
       - name: "Build Client (GUI) (Windows)"
         run: "cargo build --release --package anet-client-gui"
+
       - uses: "actions/upload-artifact@v4"
         with:
           name: "anet-client-windows-gui"
@@ -95,19 +132,23 @@ jobs:
     steps:
       - name: "Checkout repository"
         uses: "actions/checkout@v4"
+
       - name: "Download Client Artifact (CLI)"
         uses: "actions/download-artifact@v4"
         with:
           name: "anet-client-windows-cli"
           path: "installer_source/"
+
       - name: "Download Client Artifact (GUI)"
         uses: "actions/download-artifact@v4"
         with:
           name: "anet-client-windows-gui"
           path: "installer_source/"
+
       - name: "Install Inno Setup"
         shell: "powershell"
         run: "choco install -y innosetup"
+
       - name: "Prepare Source Files"
         shell: "powershell"
         run: |
@@ -132,6 +173,7 @@ jobs:
 
           # Удаление временного каталога
           Remove-Item wintun, wintun.zip -Recurse
+
       - name: Set Release Version (for ISCC Define)
         shell: bash
         run: |
@@ -151,12 +193,14 @@ jobs:
         shell: "cmd"
         run: |
           "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "%GITHUB_WORKSPACE%\installer_source\install.iss" /O"%GITHUB_WORKSPACE%\installer_source\Output" ${{ env.VERSION_ARG }}
+
       - name: "Upload Installer Artifact"
         uses: "actions/upload-artifact@v4"
         with:
           path: installer_source\Output\*.exe
           name: anet-client-setup-windows
           if-no-files-found: error
+
   build-android-libs:
     name: "Build Rust for Android"
     runs-on: "ubuntu-latest"
@@ -167,12 +211,24 @@ jobs:
       - name: "Setup Android NDK"
         uses: nttld/setup-ndk@v1
         with:
-          ndk-version: r26d # Или какая у тебя локально
+          ndk-version: r26d
 
       - name: "Install Rust Targets"
         run: |
           rustup target add aarch64-linux-android
           rustup target add x86_64-linux-android
+
+      - name: "Cache Rust dependencies"
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-android-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-android-
+            ${{ runner.os }}-cargo-
 
       - name: "Install cargo-ndk"
         run: "cargo install cargo-ndk"
@@ -185,35 +241,45 @@ jobs:
         with:
           name: "anet-mobile-libs"
           path: "jniLibs/"
+
   package-android-apk:
     name: "Package Android APK"
     runs-on: "ubuntu-latest"
-    needs: "build-android-libs" # Ждем Rust библиотеки
+    needs: "build-android-libs"
     steps:
-      # 1. Скачиваем исходники Android UI (из второй репы)
       - name: "Checkout Android UI Repo"
         uses: actions/checkout@v4
         with:
           repository: "ZeroTworu/anet-android"
           path: "android-ui"
-          # Если репа приватная, нужен token:
-          # token: ${{ secrets.MY_PAT }}
 
-      # 2. Скачиваем собранные Rust библиотеки
       - name: "Download Rust Libs"
         uses: actions/download-artifact@v4
         with:
           name: "anet-mobile-libs"
           path: "android-ui/app/src/main/jniLibs"
+
       - uses: actions/setup-java@v3
         with:
           distribution: 'temurin'
           java-version: '17'
+
+      - name: "Cache Gradle"
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
       - name: "Build APK"
         run: |
           cd android-ui
           chmod +x gradlew
           ./gradlew assembleDebug
+
       - uses: "actions/upload-artifact@v4"
         with:
           name: "anet-android-apk"
