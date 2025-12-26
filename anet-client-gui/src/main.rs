@@ -4,7 +4,18 @@ use anet_client_gui::app::ANetApp;
 use eframe::egui;
 
 fn main() -> Result<(), eframe::Error> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    #[cfg(windows)]
+    {
+        use winapi::um::wincon::GetConsoleWindow;
+        use winapi::um::winuser::{ShowWindow, SW_HIDE};
+
+        let window = unsafe { GetConsoleWindow() };
+        if window != std::ptr::null_mut() {
+            unsafe { ShowWindow(window, SW_HIDE) };
+        }
+    }
+
+    // env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

@@ -1,0 +1,13 @@
+[target.x86_64-pc-windows-msvc]
+rustflags = [
+    "-C", "link-args=/SUBSYSTEM:WINDOWS",
+    "-C", "link-args=/ENTRY:mainCRTStartup",
+    "-C", "link-args=/MANIFEST:EMBED"
+]
+
+[target.i686-pc-windows-msvc]
+rustflags = [
+    "-C", "link-args=/SUBSYSTEM:WINDOWS",
+    "-C", "link-args=/ENTRY:mainCRTStartup",
+    "-C", "link-args=/MANIFEST:EMBED"
+]

@@ -10,7 +10,6 @@ egui = "0.33.2"
 tokio = { workspace = true }
 netdev = { workspace = true }
 anyhow = { workspace = true }
-env_logger = { workspace = true }
 log = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 bytes = {workspace = true}
@@ -23,6 +22,18 @@ serde_json = "1.0.147"
 anet-client-core = { path = "../anet-client-core" }
 anet-common = { path = "../anet-common" }
 rfd = "0.16.0"
+
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["winuser", "wincon"] }
+
+
+[package.metadata.winres]
+Manifest = "app.manifest"
+ProductVersion = "1.0.0.0"
+FileVersion = "1.0.0.0"
+
+[build-dependencies]
+winres = "0.1"
 
 [[bin]]
 name = "anet-gui"

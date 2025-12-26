@@ -252,7 +252,7 @@ dependencies = [
  "rustls",
  "serde",
  "tokio",
- "toml",
+ "toml 0.9.8",
 ]
 
 [[package]]
@@ -287,7 +287,6 @@ dependencies = [
  "bytes",
  "eframe",
  "egui",
- "env_logger",
  "log",
  "net-route",
  "netdev",
@@ -295,7 +294,9 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
- "toml",
+ "toml 0.9.8",
+ "winapi",
+ "winres",
 ]
 
 [[package]]
@@ -345,7 +346,7 @@ dependencies = [
  "jni",
  "log",
  "tokio",
- "toml",
+ "toml 0.9.8",
  "tun",
 ]
 
@@ -371,7 +372,7 @@ dependencies = [
  "rustls-pemfile",
  "serde",
  "tokio",
- "toml",
+ "toml 0.9.8",
  "x25519-dalek",
 ]
 
@@ -4518,6 +4519,15 @@ dependencies = [
 
 [[package]]
 name = "toml"
+version = "0.5.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f4f7f0dd8d50a853a531c426359045b1998f04219d88799810762cd4ad314234"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "toml"
 version = "0.9.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f0dc8b1fb61449e27716ec0e1bdf0f6b8f3e8f6b05391e8497b8b6d7804ea6d8"
@@ -5679,6 +5689,15 @@ checksum = "cb5a765337c50e9ec252c2069be9bf91c7df47afb103b642ba3a53bf8101be97"
 dependencies = [
  "cfg-if",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "winres"
+version = "0.1.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b68db261ef59e9e52806f688020631e987592bd83619edccda9c47d42cde4f6c"
+dependencies = [
+ "toml 0.5.11",
 ]
 
 [[package]]

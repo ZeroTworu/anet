@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use log::{info, warn, debug};
 use net_route::{Handle, Route};
 use std::net::{IpAddr, Ipv4Addr};
-use tokio::sync::Mutex; // <-- Тяжелая артиллерия
+use tokio::sync::Mutex;
 
 #[derive(Default)]
 struct RouteState {
