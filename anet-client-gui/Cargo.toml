@@ -10,6 +10,7 @@ egui = "0.33.2"
 tokio = { workspace = true }
 netdev = { workspace = true }
 anyhow = { workspace = true }
+env_logger = {workspace = true}
 log = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 bytes = {workspace = true}
@@ -24,8 +25,7 @@ anet-common = { path = "../anet-common" }
 rfd = "0.16.0"
 
 [target.'cfg(windows)'.dependencies]
-winapi = { version = "0.3", features = ["winuser", "wincon"] }
-
+wintun = "0.4"
 
 [package.metadata.winres]
 Manifest = "app.manifest"

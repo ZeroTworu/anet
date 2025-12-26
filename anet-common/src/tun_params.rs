@@ -42,26 +42,16 @@ impl TunParams {
 
     #[cfg(windows)]
     pub fn create_config(&self) -> anyhow::Result<Configuration> {
-        use tun::platform::windows::DeviceConfig;
+        let mut config = Configuration::default();
 
-        let mut config = DeviceConfig::default();
+        config.up();
+        config.tun_name(&self.name);
+        config.address(self.address);
+        config.netmask(self.netmask);
+        config.destination(self.gateway);
+        config.mtu(self.mtu);
 
-        // Базовые настройки
-        config.name(&self.name)
-            .address(self.address)
-            .netmask(self.netmask)
-            .destination(self.gateway)
-            .mtu(self.mtu as i32)
-            .up();
-
-        // КРИТИЧНО: Отключаем автоматическое обновление DNS и DHCP
-        config = config.dns_register(false);  // Отключаем регистрацию в DNS
-        config = config.dhcp_register(false); // Отключаем DHCP
-
-        // Устанавливаем метрику (низкая = приоритет выше)
-        config = config.metric(500);
-
-        Ok(Configuration::Device(config))
+        Ok(config)
     }
 
     pub fn get_info(&self) -> String {

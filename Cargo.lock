@@ -287,6 +287,7 @@ dependencies = [
  "bytes",
  "eframe",
  "egui",
+ "env_logger",
  "log",
  "net-route",
  "netdev",
@@ -295,8 +296,8 @@ dependencies = [
  "serde_json",
  "tokio",
  "toml 0.9.8",
- "winapi",
  "winres",
+ "wintun",
 ]
 
 [[package]]
@@ -910,11 +911,31 @@ checksum = "d71b6127be86fdcfddb610f7182ac57211d4b18a3e9c82eb2d17662f2227ad6a"
 
 [[package]]
 name = "c2rust-bitfields"
+version = "0.18.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b43c3f07ab0ef604fa6f595aa46ec2f8a22172c975e186f6f5bf9829a3b72c41"
+dependencies = [
+ "c2rust-bitfields-derive 0.18.0",
+]
+
+[[package]]
+name = "c2rust-bitfields"
 version = "0.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "46dc7d2bffa0d0b3d47eb2dc69973466858281446c2ac9f6d8a10e92ab1017df"
 dependencies = [
- "c2rust-bitfields-derive",
+ "c2rust-bitfields-derive 0.20.0",
+]
+
+[[package]]
+name = "c2rust-bitfields-derive"
+version = "0.18.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3cbc102e2597c9744c8bd8c15915d554300601c91a079430d309816b0912545"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 1.0.109",
 ]
 
 [[package]]
@@ -5210,6 +5231,16 @@ checksum = "712e227841d057c1ee1cd2fb22fa7e5a5461ae8e48fa2ca79ec42cfc1931183f"
 
 [[package]]
 name = "windows"
+version = "0.52.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e48a53791691ab099e5e2ad123536d0fff50652600abaf43bbf952894110d0be"
+dependencies = [
+ "windows-core 0.52.0",
+ "windows-targets 0.52.6",
+]
+
+[[package]]
+name = "windows"
 version = "0.58.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dd04d41d93c4992d421894c18c8b43496aa748dd4c081bac0dc93eb0489272b6"
@@ -5238,6 +5269,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3beeceb5e5cfd9eb1d76b381630e82c4241ccd0d27f1a39ed41b2760b255c5e8"
 dependencies = [
  "windows-core 0.61.2",
+]
+
+[[package]]
+name = "windows-core"
+version = "0.52.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33ab640c8d7e35bf8ba19b884ba838ceb4fba93a4e8c65a9059d08afcfc683d9"
+dependencies = [
+ "windows-targets 0.52.6",
 ]
 
 [[package]]
@@ -5701,13 +5741,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "wintun"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1b3c8c8876c686f8a2d6376999ac1c9a24c74d2968551c9394f7e89127783685"
+dependencies = [
+ "c2rust-bitfields 0.18.0",
+ "libloading",
+ "log",
+ "thiserror 1.0.69",
+ "windows 0.52.0",
+]
+
+[[package]]
 name = "wintun-bindings"
 version = "0.7.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b88303b411e20a1319b368dcd04db1480003ed46ac35193e139f542720b15fbf"
 dependencies = [
  "blocking",
- "c2rust-bitfields",
+ "c2rust-bitfields 0.20.0",
  "futures",
  "libloading",
  "log",
