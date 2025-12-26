@@ -6,14 +6,18 @@ use eframe::egui;
 fn main() -> Result<(), eframe::Error> {
 
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    let icon = load_icon();
 
     let options = eframe::NativeOptions {
+        // Настраиваем Viewport (само окно)
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([400.0, 600.0]) // Мобильный форм-фактор
+            .with_inner_size([400.0, 600.0]) // Твои размеры
+            .with_icon(icon)
             .with_resizable(false) // Фиксированный размер
-            .with_drag_and_drop(true), // DnD
+            .with_drag_and_drop(true), // DnD,
         ..Default::default()
     };
+
 
     eframe::run_native(
         "ANet VPN",
@@ -24,6 +28,24 @@ fn main() -> Result<(), eframe::Error> {
             Ok(Box::new(ANetApp::new()))
         }),
     )
+}
+
+fn load_icon() -> egui::IconData {
+    let (icon_rgba, icon_width, icon_height) = {
+        let image = image::load_from_memory(include_bytes!("../icon.ico"))
+            .expect("Failed to open icon path")
+            .into_rgba8();
+
+        let (width, height) = image.dimensions();
+        let rgba = image.into_raw();
+        (rgba, width, height)
+    };
+
+    egui::IconData {
+        rgba: icon_rgba,
+        width: icon_width,
+        height: icon_height,
+    }
 }
 
 fn configure_styles(ctx: &egui::Context) {

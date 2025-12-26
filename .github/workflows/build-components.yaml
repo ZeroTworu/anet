@@ -152,6 +152,11 @@ jobs:
         with:
           name: "anet-client-windows-gui"
           path: "installer_source/"
+      - name: "Download Client Artifact (GUI Debug)"
+        uses: "actions/download-artifact@v4"
+        with:
+          name: "anet-gui-debug"
+          path: "installer_source/"
 
       - name: "Install Inno Setup"
         shell: "powershell"
