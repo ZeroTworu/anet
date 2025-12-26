@@ -124,6 +124,14 @@ jobs:
         with:
           name: "anet-client-windows-gui"
           path: "target/release/anet-gui.exe"
+      - name: "Build Client (GUI - Debug Console) (Windows)"
+        run: "cargo build --release --package anet-client-gui --features console"
+      - name: "Rename Debug Build"
+        run: "mv target/release/anet-gui.exe target/release/anet-gui-debug.exe"
+      - uses: "actions/upload-artifact@v4"
+        with:
+          name: "anet-gui-debug"
+          path: "target/release/anet-gui-debug.exe"
 
   create-installer:
     name: "Create Windows Installer"
@@ -155,6 +163,7 @@ jobs:
           # 3.1. Перемещение anet-client.exe в корень, как ожидает ISS
           Get-ChildItem installer_source\anet-client.exe | Move-Item -Destination installer_source\anet-client.exe
           Get-ChildItem installer_source\anet-gui.exe | Move-Item -Destination installer_source\anet-gui.exe
+          Get-ChildItem installer_source\anet-gui-debug.exe | Move-Item -Destination installer_source\anet-gui-debug.exe
 
           # 3.2. Скачивание и размещение Wintun DLL
           $WINTUN_VERSION="0.14.1"

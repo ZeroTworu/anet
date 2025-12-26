@@ -1,4 +1,4 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![cfg_attr(not(feature = "console"), windows_subsystem = "windows")]
 
 use anet_client_gui::app::ANetApp;
 use eframe::egui;

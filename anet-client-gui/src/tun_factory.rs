@@ -1,14 +1,19 @@
-// anet-client-gui/src/tun_factory.rs
-
 use anet_client_core::traits::TunFactory;
 use anet_common::protocol::AuthResponse;
-use anyhow::{Context, Result};
+#[cfg(target_os = "windows")]
+use anyhow::{Context};
+use anyhow::{Result};
 use async_trait::async_trait;
-use bytes::{Bytes, BytesMut};
-use log::{error, info, debug}; // <--- debug!
+use bytes::{Bytes};
+#[cfg(target_os = "windows")]
+use bytes::{BytesMut};
+#[cfg(target_os = "windows")]
+use log::{error, info, debug};
+#[cfg(target_os = "windows")]
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use std::time::Duration; // <--- Для sleep
+#[cfg(target_os = "windows")]
+use std::time::Duration;
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
@@ -202,6 +207,6 @@ impl TunFactory for DesktopTunFactory {
         &self,
         _auth: &AuthResponse,
     ) -> Result<(mpsc::Sender<Bytes>, mpsc::Receiver<Bytes>, String)> {
-        anyhow::bail!("This factory supports Windows only via Wintun");
+        anyhow::bail!("This factory supports Windows only via Wintun {}", self.tun_name);
     }
 }

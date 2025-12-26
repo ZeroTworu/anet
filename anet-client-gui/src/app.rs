@@ -4,33 +4,12 @@ use anet_client_core::config::CoreConfig;
 use anet_client_core::events::{AnetEvent, EventHandler, set_handler};
 use anet_client_core::AnetClient;
 use eframe::egui;
-use serde::{Deserialize, Serialize};
+use crate::config::AppSettings;
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use tokio::runtime::Runtime;
 
-// --- Settings ---
-#[derive(Serialize, Deserialize, Default, Clone)] // Clone добавил для удобства
-struct AppSettings {
-    last_config_path: Option<String>,
-}
-
-impl AppSettings {
-    fn load() -> Self {
-        if let Ok(content) = std::fs::read_to_string("anet_settings.json") {
-            serde_json::from_str(&content).unwrap_or_default()
-        } else {
-            Self::default()
-        }
-    }
-
-    fn save(&self) {
-        if let Ok(content) = serde_json::to_string_pretty(self) {
-            let _ = std::fs::write("anet_settings.json", content);
-        }
-    }
-}
 
 // --- Event Handler ---
 pub struct GuiEventHandler {
@@ -219,7 +198,60 @@ impl eframe::App for ANetApp {
             }
         }
 
-        let main_frame = egui::Frame::none()
+        // Сосноль
+        let console_frame = egui::Frame::NONE
+            .fill(egui::Color32::from_rgb(10, 10, 10)) // ЧЕРНЫЙ ФОН
+            .inner_margin(8.0) // Отступ текста от краев
+            // Тонкая линия сверху, чтобы отделить от основного окна
+            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(40, 40, 40)));
+
+        egui::TopBottomPanel::bottom("stalker_console")
+            .resizable(true)
+            .min_height(100.0)
+            .default_height(160.0)
+            .frame(console_frame) // <--- ПРИМЕНЯЕМ СТИЛЬ СЮДА
+            .show(ctx, |ui| {
+                ui.vertical(|ui| {
+                    // Заголовок
+                    ui.label(
+                        egui::RichText::new("SYSTEM LOG")
+                            .family(egui::FontFamily::Monospace)
+                            .size(10.0)
+                            .color(egui::Color32::from_gray(100))
+                    );
+
+                    ui.add_space(4.0);
+
+                    // Область скролла
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .stick_to_bottom(true)
+                        .show(ui, |ui| {
+                            let logs = self.logs.lock().unwrap();
+                            for line in logs.iter() {
+                                let color = if line.contains("Error") || line.contains("Failed") {
+                                    egui::Color32::from_rgb(255, 80, 80) // Красный для ошибок
+                                } else if line.contains("Tunnel UP") {
+                                    egui::Color32::from_rgb(50, 255, 50) // Ярко-зеленый для успеха
+                                } else {
+                                    egui::Color32::from_rgb(0, 180, 0)   // Тускло-зеленый для спама
+                                };
+
+                                // Отрисовка текста
+                                // TextWrapping false, чтобы логи не переносились уродливо
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(line)
+                                            .family(egui::FontFamily::Monospace)
+                                            .size(11.0)
+                                            .color(color)
+                                    ).wrap()
+                                );
+                            }
+                        });
+                });
+            });
+        let main_frame = egui::Frame::NONE
             .fill(egui::Color32::from_rgb(18, 18, 18))
             .inner_margin(12.0);
 
@@ -228,7 +260,7 @@ impl eframe::App for ANetApp {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("ANet VPN").size(24.0).strong().color(egui::Color32::WHITE));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.add(egui::Button::new(egui::RichText::new("⚙").size(24.0)).frame(false)).clicked() {
+                    if ui.add(egui::Button::new(egui::RichText::new("⚙").size(24.0).strong().color(egui::Color32::WHITE)).frame(false)).clicked() {
                         self.open_file_dialog();
                     }
                 });
@@ -244,7 +276,7 @@ impl eframe::App for ANetApp {
                     ui.label(egui::RichText::new(&self.config_name).color(egui::Color32::GRAY));
                 }
                 if self.client.is_none() && self.config_err.is_none() {
-                    ui.label(egui::RichText::new("(Нажмите ⚙ и выберите файл настроек)").size(15.0).color(egui::Color32::from_gray(80)));
+                    ui.label(egui::RichText::new("(Нажмите ⚙ и выберите файл настроек)").size(15.0).strong().color(egui::Color32::from_gray(80)));
                 }
             });
 
@@ -296,7 +328,7 @@ impl eframe::App for ANetApp {
                         .color(egui::Color32::WHITE),
                 )
                     .min_size(btn_size)
-                    .rounding(90.0)
+                    .corner_radius(90.0)
                     .fill(btn_color);
 
                 if ui.add(btn).clicked() {

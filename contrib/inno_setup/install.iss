@@ -4,6 +4,7 @@
 #define MyAppPublisher "ANet Project"
 #define MyAppCliExeName "anet-client.exe"
 #define MyAppGuiExeName "anet-gui.exe"
+#define MyAppGuiDebugExeName "anet-gui-debug.exe"
 
 #ifndef MyAppVersion
   #define MyAppVersion "dev-beta" ; Fallback version if not defined by CI
@@ -40,6 +41,7 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; Flags: checkedonce
 ; 1. БИНАРНИКИ: Устанавливаются в {app} (Program Files)
 Source: "anet-client.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "anet-gui.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "anet-gui-debug.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "wintun.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "anet.ico"; DestDir: "{app}"; Flags: ignoreversion
 
@@ -51,10 +53,10 @@ Source: "client.toml"; DestDir: "{userappdata}\anet"; DestName: "default.toml"
 ; --- Icons/Shortcuts Section ---
 [Icons]
 ; 1. Ярлык запуска клиента (Меню Пуск). Клиент будет использовать UAC благодаря Реестру.
-Name: "{autoprograms}\{#MyAppCliExeName}"; Filename: "{app}\{#MyAppCliExeName}"; Parameters: "-c ""{userappdata}\anet\default.toml"""; IconFilename: "{app}\anet.ico"
+; Name: "{autoprograms}\{#MyAppCliExeName}"; Filename: "{app}\{#MyAppCliExeName}"; Parameters: "-c ""{userappdata}\anet\default.toml"""; IconFilename: "{app}\anet.ico"
 
 ; 1. Ярлык запуска клиента (Рабочий стол).
-Name: "{autodesktop}\{#MyAppCliExeName}"; Filename: "{app}\{#MyAppCliExeName}"; Parameters: "-c ""{userappdata}\anet\default.toml"""; IconFilename: "{app}\anet.ico"; Tasks: desktopicon
+; Name: "{autodesktop}\{#MyAppCliExeName}"; Filename: "{app}\{#MyAppCliExeName}"; Parameters: "-c ""{userappdata}\anet\default.toml"""; IconFilename: "{app}\anet.ico"; Tasks: desktopicon
 
 ;-------------- GUI
 ; --- Icons/Shortcuts Section ---
@@ -66,7 +68,7 @@ Name: "{autoprograms}\{#MyAppGuiExeName}"; Filename: "{app}\{#MyAppGuiExeName}";
 Name: "{autodesktop}\{#MyAppGuiExeName}"; Filename: "{app}\{#MyAppGuiExeName}"; IconFilename: "{app}\anet.ico"; Tasks: desktopicon
 
 ; 2. Ярлык для быстрого редактирования конфига (Рабочий стол). Запускает Блокнот.
-Name: "{autodesktop}\Edit ANET Config"; Filename: "notepad.exe"; Parameters: """{userappdata}\anet\default.toml"""; IconFilename: "{sys}\notepad.exe"; Tasks: desktopicon
+;Name: "{autodesktop}\Edit ANET Config"; Filename: "notepad.exe"; Parameters: """{userappdata}\anet\default.toml"""; IconFilename: "{sys}\notepad.exe"; Tasks: desktopicon
 
 ; --- Registry Section ---
 [Registry]
