@@ -37,7 +37,7 @@ jobs:
           
           # --- WINDOWS CLIENT ---
           CLIENT_WIN_DIR="release_files/client-windows"
-          cp artifacts/anet-client-windows/anet-client.exe ${CLIENT_WIN_DIR}/
+          cp artifacts/anet-client-windows ${CLIENT_WIN_DIR}/
 
           # --- CONFIGS ---
           cp contrib/config/server.toml release_files/server/
