@@ -165,6 +165,12 @@ jobs:
           name: "anet-gui-debug"
           path: "installer_source/"
 
+      - name: "List files in installer_source for debugging"
+        shell: "powershell"
+        run: |
+          Write-Host "Listing files in installer_source:"
+          Get-ChildItem -Path "installer_source" -Recurse | Format-Table Name, FullName
+
       - name: "Install Inno Setup"
         shell: "powershell"
         run: "choco install -y innosetup"
@@ -172,28 +178,32 @@ jobs:
       - name: "Prepare Source Files"
         shell: "powershell"
         run: |
-          # 3.1. Перемещение anet-client.exe в корень, как ожидает ISS
-          Get-ChildItem installer_source\anet-client.exe | Move-Item -Destination installer_source\anet-client.exe
-          Get-ChildItem installer_source\anet-gui.exe | Move-Item -Destination installer_source\anet-gui.exe
-          Get-ChildItem installer_source\anet-gui-debug.exe | Move-Item -Destination installer_source\anet-gui-debug.exe
+          # Сначала проверим, какие файлы есть на самом деле
+          Write-Host "Files in installer_source directory:"
+          Get-ChildItem "installer_source"
 
-          # 3.2. Скачивание и размещение Wintun DLL
+          # Файлы уже находятся в installer_source/ напрямую (без подпапок)
+          # Проверим, что они существуют перед копированием других файлов
+
+          # Скачивание и размещение Wintun DLL
           $WINTUN_VERSION="0.14.1"
-          Invoke-WebRequest -Uri "https://www.wintun.net/builds/wintun-$WINTUN_VERSION.zip" -OutFile "wintun.zip"
-          Expand-Archive -Path "wintun.zip" -DestinationPath "wintun"
-          Copy-Item -Path "wintun\wintun\bin\amd64\wintun.dll" -Destination "installer_source\wintun.dll"
+          Invoke-WebRequest -Uri "https://www.wintun.net/builds/wintun-$WINTUN_VERSION.zip" -OutFile "installer_source\wintun.zip"
+          Expand-Archive -Path "installer_source\wintun.zip" -DestinationPath "installer_source\wintun"
+          Copy-Item -Path "installer_source\wintun\wintun\bin\amd64\wintun.dll" -Destination "installer_source\wintun.dll" -Force
+          Remove-Item "installer_source\wintun", "installer_source\wintun.zip" -Recurse -Force
 
-          # 3.3. Копирование config и ISS скрипта в рабочую директорию
-          Copy-Item -Path "contrib\config\client.toml" -Destination "installer_source\client.toml"
+          # Копирование config и ISS скрипта в рабочую директорию
+          Copy-Item -Path "contrib\config\client.toml" -Destination "installer_source\client.toml" -Force
 
           # Для запуска ISCC скрипт должен быть в рабочем каталоге
-          Copy-Item -Path "contrib\inno_setup\install.iss" -Destination "installer_source\install.iss"
+          Copy-Item -Path "contrib\inno_setup\install.iss" -Destination "installer_source\install.iss" -Force
 
           # Иконка
-          Copy-Item -Path "contrib\inno_setup\anet.ico" -Destination "installer_source\anet.ico"
+          Copy-Item -Path "contrib\inno_setup\anet.ico" -Destination "installer_source\anet.ico" -Force
 
-          # Удаление временного каталога
-          Remove-Item wintun, wintun.zip -Recurse
+          # Проверка итоговых файлов
+          Write-Host "Final files in installer_source:"
+          Get-ChildItem "installer_source"
 
       - name: Set Release Version (for ISCC Define)
         shell: bash

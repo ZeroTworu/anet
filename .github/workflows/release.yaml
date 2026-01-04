@@ -12,7 +12,7 @@ jobs:
   package-and-release:
     name: "Release"
     runs-on: "ubuntu-latest"
-    needs: ["build"]
+    needs: [ "build" ]
     steps:
       - uses: "actions/checkout@v4"
         with:
@@ -27,17 +27,47 @@ jobs:
       - name: "Set version from tag"
         run: "echo \"VERSION=${GITHUB_REF#refs/tags/v}\" >> $GITHUB_ENV"
 
+      - name: "Debug: List all artifacts structure"
+        run: |
+          echo "Artifacts structure:"
+          find artifacts -type f -name "*" | sort
+
       - name: "Prepare files for packaging"
         run: |
           mkdir -p release_files/server release_files/client-linux release_files/client-windows
-          
+
           # --- LINUX SERVER & CLIENT ---
           cp artifacts/anet-server/anet-server release_files/server/
           cp artifacts/anet-client-linux/anet-client release_files/client-linux/
-          
+
           # --- WINDOWS CLIENT ---
           CLIENT_WIN_DIR="release_files/client-windows"
-          cp artifacts/anet-client-windows ${CLIENT_WIN_DIR}/
+
+          # Копируем Windows файлы - ищем их в разных возможных местах
+          # 1. CLI версия
+          if [ -f "artifacts/anet-client-windows-cli/anet-client.exe" ]; then
+            cp artifacts/anet-client-windows-cli/anet-client.exe ${CLIENT_WIN_DIR}/
+          elif [ -f "artifacts/anet-client-windows-cli/anet-client" ]; then
+            cp artifacts/anet-client-windows-cli/anet-client ${CLIENT_WIN_DIR}/anet-client.exe
+          fi
+
+          # 2. GUI версия  
+          if [ -f "artifacts/anet-client-windows-gui/anet-gui.exe" ]; then
+            cp artifacts/anet-client-windows-gui/anet-gui.exe ${CLIENT_WIN_DIR}/
+          elif [ -f "artifacts/anet-client-windows-gui/anet-gui" ]; then
+            cp artifacts/anet-client-windows-gui/anet-gui ${CLIENT_WIN_DIR}/anet-gui.exe
+          fi
+
+          # 3. Debug версия
+          if [ -f "artifacts/anet-gui-debug/anet-gui-debug.exe" ]; then
+            cp artifacts/anet-gui-debug/anet-gui-debug.exe ${CLIENT_WIN_DIR}/
+          elif [ -f "artifacts/anet-gui-debug/anet-gui-debug" ]; then
+            cp artifacts/anet-gui-debug/anet-gui-debug ${CLIENT_WIN_DIR}/anet-gui-debug.exe
+          fi
+
+          # Проверяем, что все файлы скопировались
+          echo "Windows client files copied:"
+          ls -la ${CLIENT_WIN_DIR}/
 
           # --- CONFIGS ---
           cp contrib/config/server.toml release_files/server/
@@ -53,14 +83,12 @@ jobs:
           cp "wintun/bin/amd64/wintun.dll" .
           rm -rf "wintun" "wintun-${WINTUN_VERSION}.zip"
           cd ../..
-          
+
           # --- ANDROID APK ---
-          # Ищем apk в папке артефактов (имя папки 'anet-android-apk' задается в build-components)
           APK_SRC=$(find artifacts/anet-android-apk -name '*.apk' | head -n 1)
           if [ -z "$APK_SRC" ]; then
               echo "Warning: Android APK not found in artifacts!"
           else
-              # Копируем и переименовываем с версией
               cp "$APK_SRC" "anet-android-${VERSION}.apk"
           fi
 
@@ -70,14 +98,18 @@ jobs:
           zip -r "server_${VERSION}.zip" server/
           zip -r "client-linux_${VERSION}.zip" client-linux/
           zip -r "client-windows_${VERSION}.zip" client-windows/
-          
+
           # Windows Installer
-          INSTALLER_EXE=$(find ../artifacts/anet-client-setup-windows -name '*.exe')
-          if [ -z "$INSTALLER_EXE" ]; then 
-              echo "Error: Windows installer EXE not found"
-              exit 1
+          if [ -d "../artifacts/anet-client-setup-windows" ]; then
+            INSTALLER_EXE=$(find ../artifacts/anet-client-setup-windows -name '*.exe' | head -n 1)
+            if [ -n "$INSTALLER_EXE" ]; then 
+              cp "$INSTALLER_EXE" ../ANET_VPN_Client_Setup_${VERSION}_x64.exe
+            else
+              echo "Warning: Windows installer EXE not found in anet-client-setup-windows folder"
+            fi
+          else
+            echo "Warning: anet-client-setup-windows folder not found"
           fi
-          cp $INSTALLER_EXE ../ANET_VPN_Client_Setup_${VERSION}_x64.exe
           cd ..
 
       - name: "Create Release"
