@@ -2,6 +2,7 @@
 name = "anet-client-cli"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 
 [dependencies]
 tokio = {workspace = true}

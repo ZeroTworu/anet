@@ -2,6 +2,7 @@
 name = "anet-client-gui"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 
 [dependencies]
 eframe = "0.33.2"

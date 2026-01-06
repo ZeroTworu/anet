@@ -2,6 +2,7 @@
 name = "anet-keygen"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 
 [dependencies]
 ed25519-dalek = { workspace = true }
