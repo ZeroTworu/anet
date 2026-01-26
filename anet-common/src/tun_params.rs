@@ -14,7 +14,6 @@ pub struct TunParams {
 }
 
 impl TunParams {
-
     pub fn from_auth_response(auth_response: &AuthResponse, adapter: &str) -> Self {
         Self {
             address: auth_response.ip.parse().unwrap(),

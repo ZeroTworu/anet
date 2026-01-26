@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod config;
 pub mod events;
+pub mod router;
 pub mod socket;
 pub mod traits;
 pub mod vpn;
@@ -11,8 +12,13 @@ use crate::events::status;
 use crate::traits::{RouteManager, TunFactory};
 use crate::vpn::VpnHandler;
 use anyhow::Result;
-use log::{error, info};
+use hickory_resolver::TokioAsyncResolver;
+use hickory_resolver::config::{NameServerConfig, Protocol, ResolverConfig, ResolverOpts};
+use ipnet::IpNet;
+use log::{error, info, warn};
 use quinn::{Connection, Endpoint};
+use std::net::{IpAddr, SocketAddr};
+use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
@@ -55,6 +61,52 @@ impl AnetClient {
         }
     }
 
+    /// Резолвинг доменов и парсинг IP из конфига
+    async fn resolve_list(&self, list: &[String]) -> Vec<IpNet> {
+        let mut result = Vec::new();
+        if list.is_empty() {
+            return result;
+        }
+
+        let dns_servers = &self.config.main.dns_server_list;
+
+        let mut resolver_config = ResolverConfig::new();
+        for dns in dns_servers {
+            if let Ok(ip) = IpAddr::from_str(dns) {
+                let socket = SocketAddr::new(ip, 53);
+                resolver_config.add_name_server(NameServerConfig::new(socket, Protocol::Udp));
+            }
+        }
+        if resolver_config.name_servers().is_empty() {
+            resolver_config = ResolverConfig::google();
+        }
+        let resolver = TokioAsyncResolver::tokio(resolver_config, ResolverOpts::default());
+
+        for target in list {
+            if let Ok(net) = IpNet::from_str(target) {
+                result.push(net);
+                continue;
+            }
+            if let Ok(ip) = IpAddr::from_str(target) {
+                result.push(IpNet::from(ip));
+                continue;
+            }
+
+            // Domain resolution
+            match resolver.lookup_ip(target).await {
+                Ok(lookup) => {
+                    for ip in lookup.iter() {
+                        if ip.is_ipv4() {
+                            result.push(IpNet::from(ip));
+                        }
+                    }
+                }
+                Err(e) => warn!("[Core] Failed to resolve {}: {}", target, e),
+            }
+        }
+        result
+    }
+
     /// Проверяет, запущен ли клиент
     pub fn is_running(&self) -> bool {
         let state = self.session.lock().unwrap();
@@ -85,7 +137,9 @@ impl AnetClient {
 
         // Добавляем маршрут до VPN-сервера
         let server_ip = self.config.main.address.split(':').next().unwrap();
-        self.route_manager.add_exclusion_route(server_ip).await?;
+        self.route_manager
+            .add_bypass_route(IpAddr::from_str(server_ip).unwrap(), 32)
+            .await?;
 
         // Поднимаем QUIC
         let vpn_handler = VpnHandler::new(self.config.clone());
@@ -128,9 +182,51 @@ impl AnetClient {
             let _ = tokio::join!(t1, t2);
         });
 
-        // 4. Меняем дефолтный шлюз
-        self.route_manager
-            .set_default_route(&auth_response.gateway, &iface_name).await?;
+        // ЛОГИКА МАРШРУТИЗАЦИИ
+        if !self.config.main.route_for.is_empty() {
+            // MODE 1: INCLUDE (Whitelist)
+            // VPN выключен по умолчанию, включаем только для списка.
+            // exclude_route_for игнорируется (логически не имеет смысла).
+
+            info!("[Core] Mode: Split Tunneling (INCLUDE).");
+            let routes = self.resolve_list(&self.config.main.route_for).await;
+
+            for net in routes {
+                self.route_manager
+                    .add_specific_route(
+                        net.addr(),
+                        net.prefix_len(),
+                        &auth_response.gateway,
+                        &iface_name,
+                    )
+                    .await?;
+            }
+        } else {
+            // MODE 2: GLOBAL VPN + EXCLUDE (Blacklist)
+            info!("[Core] Mode: Global VPN.");
+
+            // Если есть исключения - добавляем их ПЕРЕД установкой дефолтного шлюза
+            if !self.config.main.exclude_route_for.is_empty() {
+                info!(
+                    "[Core] Found {} exclusion rules.",
+                    self.config.main.exclude_route_for.len()
+                );
+                let bypass_routes = self.resolve_list(&self.config.main.exclude_route_for).await;
+
+                for net in bypass_routes {
+                    self.route_manager
+                        .add_bypass_route(net.addr(), net.prefix_len())
+                        .await?;
+                }
+            }
+
+            // Включаем перенаправление всего трафика
+            // Благодаря Longest Prefix Match, наши bypass маршруты (/32 или /24)
+            // будут приоритетнее дефолтного (/0 или /1)
+            self.route_manager
+                .set_default_route(&auth_response.gateway, &iface_name)
+                .await?;
+        }
 
         info!("[Core] VPN Tunnel UP.");
         status("[Core] VPN UP");

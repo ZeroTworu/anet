@@ -26,6 +26,7 @@ ed25519-dalek = { version = "2.1.1", features = ["std", "rand_core"] }
 sha2 = "0.10.9"
 async-trait = "0.1.89"
 netdev = { version = "0.39", features = ["gateway"] }
+ipnet = "2.11.0"
 
 [profile.release.package.anet-client-cli]
 debug = 2

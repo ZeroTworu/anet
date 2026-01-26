@@ -2,6 +2,7 @@ use anet_common::protocol::AuthResponse;
 use anyhow::Result;
 use async_trait::async_trait;
 use bytes::Bytes;
+use std::net::IpAddr;
 use tokio::sync::mpsc;
 
 /// Интерфейс для управления системной маршрутизацией.
@@ -12,11 +13,26 @@ pub trait RouteManager: Send + Sync {
     /// Сохранить текущие маршруты (если нужно)
     async fn backup_routes(&self) -> Result<()>;
 
-    /// Добавить маршрут до VPN сервера мимо туннеля
-    async fn add_exclusion_route(&self, server_ip: &str) -> Result<()>;
+    /// Добавить маршрут, который идет МИМО туннеля (через физический шлюз).
+    /// Используется для:
+    /// 1. IP самого VPN сервера (чтобы не разорвать соединение).
+    /// 2. Локальных сетей (192.168.x.x).
+    /// 3. Ресурсов, которые нужно исключить из VPN.
+    async fn add_bypass_route(&self, target: IpAddr, prefix: u8) -> Result<()>;
 
     /// Направить весь трафик в туннель
     async fn set_default_route(&self, gateway: &str, interface_name: &str) -> Result<()>;
+
+    /// Добавить точечный маршрут (Split Tunneling)
+    /// target: IP адрес или подсеть
+    /// mask: маска (u8, например 32 для одного IP)
+    async fn add_specific_route(
+        &self,
+        target: IpAddr,
+        prefix: u8,
+        gateway: &str,
+        interface_name: &str,
+    ) -> Result<()>;
 
     /// Восстановить маршрутизацию
     async fn restore_routes(&self) -> Result<()>;

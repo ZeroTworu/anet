@@ -20,7 +20,13 @@ base64 = {workspace = true}
 serde = { workspace = true, features = ["derive"] }
 async-trait = { workspace = true }
 
+ipnet = { workspace = true }
+hickory-resolver = { version = "0.24", features = ["tokio"] }
 anet-common = { path = "../anet-common" }
+
+[target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
+net-route = "0.4"
+netdev = { workspace = true }
 
 [lib]
 path = "src/lib.rs"

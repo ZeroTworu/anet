@@ -3,7 +3,7 @@ include!(concat!(env!("OUT_DIR"), "/built.rs"));
 use anet_client_cli::tun_factory::DesktopTunFactory;
 use anet_client_core::AnetClient;
 use anet_client_core::config::CoreConfig;
-use anet_client_cli::router::DesktopRouteManager;
+use anet_client_core::router::desktop::DesktopRouteManager;
 use anyhow::Result;
 use clap::Parser;
 use log::{info, warn};
@@ -59,14 +59,12 @@ fn generate_ascii_art(build_type: &str, commit_hash: &str, build_time: &str) -> 
                     ║                 ██╔══██║██║╚██╗██║██╔══╝     ██║              ║
                     ║                 ██║  ██║██║ ╚████║███████╗   ██║              ║
                     ║                 ╚═╝  ╚═╝╚═╝  ╚═══╝╚══════╝   ╚═╝              ║
-                    ║                           by Hanyuufag                        ║
                     ╠═══════════════════════════════════════════════════════════════╣
                     ║                                                               ║
                     ║                   Build Type: {:<16}                ║
                     ║                   Commit Hash: {:<16}               ║
                     ║                   Build Time:  {:<19}            ║
                     ║                                                               ║
-                    ║               >> Welcome to the digital revolution! <<        ║
                     ║                                                               ║
                     ╚═══════════════════════════════════════════════════════════════╝
 "#,

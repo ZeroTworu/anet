@@ -4,7 +4,6 @@ use anet_client_gui::app::ANetApp;
 use eframe::egui;
 
 fn main() -> Result<(), eframe::Error> {
-
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let icon = load_icon();
 
@@ -17,7 +16,6 @@ fn main() -> Result<(), eframe::Error> {
             .with_drag_and_drop(true), // DnD,
         ..Default::default()
     };
-
 
     eframe::run_native(
         "ANet VPN",
@@ -69,4 +67,3 @@ fn configure_styles(ctx: &egui::Context) {
     ctx.set_visuals(visuals);
     ctx.set_style(style);
 }
-

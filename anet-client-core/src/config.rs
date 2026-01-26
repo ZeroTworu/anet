@@ -6,6 +6,15 @@ use serde::Deserialize;
 pub struct MainConfig {
     pub address: String,
     pub tun_name: String,
+
+    #[serde(default)]
+    pub route_for: Vec<String>,
+
+    #[serde(default)]
+    pub exclude_route_for: Vec<String>,
+
+    #[serde(default)]
+    pub dns_server_list: Vec<String>,
 }
 
 impl Default for MainConfig {
@@ -13,6 +22,9 @@ impl Default for MainConfig {
         Self {
             address: "127.0.0.1:443".to_string(),
             tun_name: "anet-client".to_string(),
+            route_for: vec![],
+            exclude_route_for: vec![],
+            dns_server_list: vec!["1.1.1.1".to_string(), "8.8.8.8".to_string()],
         }
     }
 }

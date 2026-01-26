@@ -130,6 +130,7 @@ pub extern "system" fn Java_org_alco_anet_ANetVpnService_connectVpn(
         let tun_factory = Box::new(AndroidCallbackTunFactory::new(
             jvm.clone(),
             this_ref.clone(),
+            config.clone(),
         ));
         let route_manager = Box::new(AndroidRouteManager);
 

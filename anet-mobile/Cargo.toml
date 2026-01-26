@@ -17,6 +17,7 @@ anet-client-core = { path = "../anet-client-core" }
 anet-common = { path = "../anet-common" }
 bytes = { workspace = true }
 async-trait = { workspace = true }
+ipnet = { workspace = true }
 
 [lib]
 crate-type = ["cdylib"]
