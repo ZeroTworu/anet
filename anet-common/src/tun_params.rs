@@ -25,7 +25,8 @@ impl TunParams {
         }
     }
 
-    #[cfg(not(windows))]
+    /// Create TUN configuration for Linux
+    #[cfg(target_os = "linux")]
     pub fn create_config(&self) -> anyhow::Result<Configuration> {
         let mut config = Configuration::default();
 
@@ -39,6 +40,7 @@ impl TunParams {
         Ok(config)
     }
 
+    /// Create TUN configuration for Windows
     #[cfg(windows)]
     pub fn create_config(&self) -> anyhow::Result<Configuration> {
         let mut config = Configuration::default();
@@ -48,6 +50,46 @@ impl TunParams {
         config.address(self.address);
         config.netmask(self.netmask);
         config.destination(self.gateway);
+        config.mtu(self.mtu);
+
+        Ok(config)
+    }
+
+    /// Create TUN configuration for macOS
+    ///
+    /// macOS utun interfaces have specific behavior:
+    /// - Interface names are assigned dynamically (utun0, utun1, etc.)
+    /// - Custom names like "myvpn" are NOT supported - must be "utunX" with a number
+    /// - If no valid utunX name is provided, we don't set a name and let macOS auto-assign
+    /// - We configure address/netmask but skip destination (point-to-point not needed)
+    #[cfg(target_os = "macos")]
+    pub fn create_config(&self) -> anyhow::Result<Configuration> {
+        let mut config = Configuration::default();
+
+        // Bring interface up
+        config.up();
+
+        // macOS only supports utun interface names with a number (utun0, utun1, etc.)
+        // The tun crate parses the number suffix, so "utun" alone causes an error.
+        // Only set the name if it's a valid "utunX" format with a number.
+        if self.name.starts_with("utun") && self.name.len() > 4 {
+            // Check if the suffix is a valid number
+            if self.name[4..].parse::<u32>().is_ok() {
+                config.tun_name(&self.name);
+            }
+            // Otherwise, don't set name - let macOS auto-assign
+        }
+        // For non-utun names, don't set name - let macOS auto-assign
+
+        // Set IP configuration
+        config.address(self.address);
+        config.netmask(self.netmask);
+
+        // On macOS, we don't set destination for the utun interface
+        // The routing is handled separately via route commands
+        // config.destination(self.gateway);  // Skipped for macOS
+
+        // Set MTU
         config.mtu(self.mtu);
 
         Ok(config)

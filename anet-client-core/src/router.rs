@@ -1,3 +1,7 @@
+#[cfg(target_os = "macos")]
+pub mod macos {
+    pub use crate::router_macos::MacOSRouteManager;
+}
 
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 pub mod desktop {

@@ -24,8 +24,12 @@ ipnet = { workspace = true }
 hickory-resolver = { version = "0.24", features = ["tokio"] }
 anet-common = { path = "../anet-common" }
 
+# Platform-specific dependencies for route management
 [target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
 net-route = "0.4"
+
+# netdev is needed on all desktop platforms for interface discovery
+[target.'cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))'.dependencies]
 netdev = { workspace = true }
 
 [lib]

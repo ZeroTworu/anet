@@ -1,13 +1,21 @@
 pub mod auth;
 pub mod config;
+pub mod dns;
 pub mod events;
+pub mod platform;
 pub mod router;
+#[cfg(target_os = "macos")]
+mod router_macos;
 pub mod socket;
 pub mod traits;
 pub mod vpn;
 
+// Re-export commonly used items for convenience
+pub use platform::{create_route_manager, create_platform_dns_manager};
+
 use crate::auth::AuthHandler;
 use crate::config::CoreConfig;
+use crate::dns::{DnsManager, create_dns_manager};
 use crate::events::status;
 use crate::traits::{RouteManager, TunFactory};
 use crate::vpn::VpnHandler;
@@ -42,6 +50,8 @@ pub struct AnetClient {
     tun_factory: Box<dyn TunFactory>,
     /// Менеджер маршрутов (платформо-зависимый)
     route_manager: Box<dyn RouteManager>,
+    /// Менеджер DNS (платформо-зависимый)
+    dns_manager: Box<dyn DnsManager>,
     /// Состояние: Запущен или нет?
     /// Когда это поле None - VPN выключен.
     session: Mutex<Option<RunningSession>>,
@@ -57,6 +67,7 @@ impl AnetClient {
             config,
             tun_factory,
             route_manager,
+            dns_manager: create_dns_manager(),
             session: Mutex::new(None),
         }
     }
@@ -228,6 +239,14 @@ impl AnetClient {
                 .await?;
         }
 
+        // Configure DNS servers
+        if !self.config.main.dns_server_list.is_empty() {
+            if let Err(e) = self.dns_manager.set_dns(&self.config.main.dns_server_list) {
+                warn!("[Core] Failed to configure DNS: {}", e);
+                // Continue anyway - VPN can still work without custom DNS
+            }
+        }
+
         info!("[Core] VPN Tunnel UP.");
         status("[Core] VPN UP");
         status("VPN Tunnel UP"); // Типо сигнал
@@ -264,7 +283,12 @@ impl AnetClient {
             // 3. Отправляем серверу "Good bye"
             running.endpoint.close(0u32.into(), b"Disconnected by user");
 
-            // 4. Чиним маршруты (ОЧЕНЬ ВАЖНО ДЛЯ CLI)
+            // 4. Restore DNS configuration
+            if let Err(e) = self.dns_manager.restore_dns() {
+                error!("Failed to restore DNS: {}", e);
+            }
+
+            // 5. Restore routes (ОЧЕНЬ ВАЖНО ДЛЯ CLI)
             if let Err(e) = self.route_manager.restore_routes().await {
                 error!("Failed to restore routes: {}", e);
             }

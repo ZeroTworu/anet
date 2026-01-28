@@ -9,14 +9,12 @@ eframe = "0.33.2"
 egui = "0.33.2"
 
 tokio = { workspace = true }
-netdev = { workspace = true }
 anyhow = { workspace = true }
 env_logger = {workspace = true}
 log = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 bytes = {workspace = true}
 toml = { workspace = true }
-net-route = "0.4"
 
 async-trait = "0.1.89"
 serde_json = "1.0.147"
@@ -26,8 +24,17 @@ anet-client-core = { path = "../anet-client-core" }
 anet-common = { path = "../anet-common" }
 rfd = "0.16.0"
 
+# Windows-specific dependencies
 [target.'cfg(windows)'.dependencies]
 wintun = "0.4"
+
+# Platform-specific dependencies for route management
+[target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
+net-route = "0.4"
+
+# netdev is needed on all desktop platforms for interface discovery
+[target.'cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))'.dependencies]
+netdev = { workspace = true }
 
 [features]
 default = []

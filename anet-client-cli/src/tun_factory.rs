@@ -22,12 +22,14 @@ impl TunFactory for DesktopTunFactory {
         &self,
         auth: &AuthResponse,
     ) -> Result<(mpsc::Sender<Bytes>, mpsc::Receiver<Bytes>, String)> {
-        // Используем твой существующий метод from_auth_response
         let params = TunParams::from_auth_response(auth, &self.tun_name);
 
         let mut manager = TunManager::new(params)?;
-        let (tx, rx) = manager.run().await?;
 
-        Ok((tx, rx, self.tun_name.clone()))
+        // Use run_with_name to get the actual interface name
+        // This is important for macOS where utun names are assigned dynamically
+        let result = manager.run_with_name().await?;
+
+        Ok((result.tx, result.rx, result.interface_name))
     }
 }

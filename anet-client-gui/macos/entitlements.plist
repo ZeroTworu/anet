@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Allow the app to open network sockets -->
+    <key>com.apple.security.network.client</key>
+    <true/>
+
+    <!-- Allow the app to act as a network server (for listening) -->
+    <key>com.apple.security.network.server</key>
+    <true/>
+
+    <!--
+    Network Extension entitlement - Required for VPN functionality
+    Note: This requires an Apple Developer account with Network Extension capability
+    Uncomment when signing with a valid developer certificate
+    -->
+    <!--
+    <key>com.apple.developer.networking.networkextension</key>
+    <array>
+        <string>packet-tunnel-provider</string>
+    </array>
+    -->
+
+    <!-- Allow reading/writing to user-selected files (for config files) -->
+    <key>com.apple.security.files.user-selected.read-write</key>
+    <true/>
+</dict>
+</plist>

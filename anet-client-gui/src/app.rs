@@ -1,9 +1,8 @@
 use crate::config::AppSettings;
 use crate::tun_factory::DesktopTunFactory;
-use anet_client_core::AnetClient;
+use anet_client_core::{AnetClient, create_route_manager};
 use anet_client_core::config::CoreConfig;
 use anet_client_core::events::{AnetEvent, EventHandler, set_handler};
-use anet_client_core::router::desktop::DesktopRouteManager;
 use eframe::egui;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -153,7 +152,14 @@ impl ANetApp {
         match toml::from_str::<CoreConfig>(&config_content) {
             Ok(cfg) => {
                 let tun = Box::new(DesktopTunFactory::new(cfg.main.tun_name.clone()));
-                let route = Box::new(DesktopRouteManager::new().unwrap());
+                let route = match create_route_manager() {
+                    Ok(r) => r,
+                    Err(e) => {
+                        self.config_err = Some(format!("Failed to create route manager: {}", e));
+                        self.log("Failed to create route manager");
+                        return;
+                    }
+                };
 
                 self.config_err = None;
                 self.config_name = path

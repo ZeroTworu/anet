@@ -223,14 +223,22 @@ impl TunFactory for DesktopTunFactory {
         Ok((tx_to_tun, rx_from_tun, self.tun_name.clone()))
     }
 
-    #[cfg(not(target_os = "windows"))]
+    /// Linux and macOS implementation using the tun crate
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     async fn create_tun(
         &self,
-        _auth: &AuthResponse,
+        auth: &AuthResponse,
     ) -> Result<(mpsc::Sender<Bytes>, mpsc::Receiver<Bytes>, String)> {
-        anyhow::bail!(
-            "This factory supports Windows only via Wintun {}",
-            self.tun_name
-        );
+        use anet_common::atun::TunManager;
+        use anet_common::tun_params::TunParams;
+
+        let params = TunParams::from_auth_response(auth, &self.tun_name);
+        let mut manager = TunManager::new(params)?;
+
+        // Use run_with_name to get the actual interface name
+        // This is important for macOS where utun names are assigned dynamically
+        let result = manager.run_with_name().await?;
+
+        Ok((result.tx, result.rx, result.interface_name))
     }
 }

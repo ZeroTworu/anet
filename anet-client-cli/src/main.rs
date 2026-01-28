@@ -1,18 +1,34 @@
 include!(concat!(env!("OUT_DIR"), "/built.rs"));
 
 use anet_client_cli::tun_factory::DesktopTunFactory;
-use anet_client_core::AnetClient;
+use anet_client_core::{AnetClient, create_route_manager};
 use anet_client_core::config::CoreConfig;
-use anet_client_core::router::desktop::DesktopRouteManager;
+use anet_client_core::platform::requires_elevated_privileges;
 use anyhow::Result;
 use clap::Parser;
-use log::{info, warn};
+use log::{error, info, warn};
 use quinn::Connection;
 use std::process::exit;
 use std::time::Duration;
 use tokio::fs::read_to_string;
 use tokio::signal;
 use tokio::time::sleep;
+
+/// Check if the current process has elevated privileges (root/admin)
+fn check_privileges() -> bool {
+    #[cfg(unix)]
+    {
+        // On Unix systems, check if running as root (UID 0)
+        unsafe { libc::geteuid() == 0 }
+    }
+
+    #[cfg(windows)]
+    {
+        // On Windows, we don't require elevation for wintun
+        // The driver handles privilege escalation
+        true
+    }
+}
 
 const KIB: f64 = 1024.0;
 const MIB: f64 = 1024.0 * 1024.0;
@@ -75,6 +91,18 @@ fn generate_ascii_art(build_type: &str, commit_hash: &str, build_time: &str) -> 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
+    // Check for elevated privileges on platforms that require it
+    if requires_elevated_privileges() && !check_privileges() {
+        error!("This program requires elevated privileges (root/sudo).");
+        error!("Please run with: sudo ./anet-client -c <config.toml>");
+        #[cfg(target_os = "macos")]
+        error!("On macOS, you need root access to create TUN interfaces and modify routes.");
+        #[cfg(target_os = "linux")]
+        error!("On Linux, you need root access to create TUN interfaces and modify routes.");
+        exit(1);
+    }
+
     if let Err(e) = rustls::crypto::ring::default_provider().install_default() {
         warn!("Failed to install default crypto provider: {:?}", e);
         // Продолжаем, так как Quinn может использовать свой
@@ -84,7 +112,7 @@ async fn main() -> Result<()> {
     let ascii_art = generate_ascii_art(BUILD_TYPE, COMMIT_HASH, BUILD_TIME);
     println!("{}", ascii_art);
 
-    let route_mgr = Box::new(DesktopRouteManager::new()?);
+    let route_mgr = create_route_manager()?;
     let cfg = config.clone();
     let tun_fac = Box::new(DesktopTunFactory::new(config.main.tun_name));
     let client = AnetClient::new(cfg, tun_fac, route_mgr);
