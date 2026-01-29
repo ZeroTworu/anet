@@ -26,22 +26,7 @@ impl TunParams {
     }
 
     /// Create TUN configuration for Linux
-    #[cfg(target_os = "linux")]
-    pub fn create_config(&self) -> anyhow::Result<Configuration> {
-        let mut config = Configuration::default();
-
-        config.up();
-        config.tun_name(&self.name);
-        config.address(self.address);
-        config.netmask(self.netmask);
-        config.destination(self.gateway);
-        config.mtu(self.mtu);
-
-        Ok(config)
-    }
-
-    /// Create TUN configuration for Windows
-    #[cfg(windows)]
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "windows"))]
     pub fn create_config(&self) -> anyhow::Result<Configuration> {
         let mut config = Configuration::default();
 
