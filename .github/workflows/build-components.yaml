@@ -9,6 +9,12 @@ on:
         required: false
       KEYCHAIN_PASSWORD:
         required: false
+      APPLE_ID:
+        required: false
+      APPLE_ID_PASSWORD:
+        required: false
+      APPLE_TEAM_ID:
+        required: false
     outputs:
       server-artifact:
         value: ${{ jobs.build-linux-server.outputs.artifact }}
@@ -288,6 +294,72 @@ jobs:
             "target/universal-release/anet-client"
           
           echo "Binaries signed with Developer ID"
+
+      - name: "Check Notarization Credentials"
+        id: check_notarize
+        if: steps.check_cert.outputs.has_cert == 'true'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          if [ -n "$APPLE_ID" ] && [ -n "$APPLE_TEAM_ID" ]; then
+            echo "can_notarize=true" >> $GITHUB_OUTPUT
+            echo "Notarization credentials detected."
+          else
+            echo "can_notarize=false" >> $GITHUB_OUTPUT
+            echo "Notarization credentials NOT detected, skipping notarization."
+          fi
+
+      - name: "Notarize App Bundle"
+        if: steps.check_notarize.outputs.can_notarize == 'true'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          # Create a zip for notarization
+          ditto -c -k --keepParent "target/universal-release/ANet VPN.app" "target/universal-release/ANet_VPN_notarize.zip"
+
+          # Submit for notarization
+          echo "Submitting app for notarization..."
+          xcrun notarytool submit "target/universal-release/ANet_VPN_notarize.zip" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_ID_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait
+
+          # Staple the notarization ticket to the app
+          echo "Stapling notarization ticket..."
+          xcrun stapler staple "target/universal-release/ANet VPN.app"
+
+          # Clean up
+          rm "target/universal-release/ANet_VPN_notarize.zip"
+
+          echo "App notarized and stapled successfully"
+
+      - name: "Notarize CLI Binary"
+        if: steps.check_notarize.outputs.can_notarize == 'true'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          # Create a zip for CLI notarization (notarytool requires zip/dmg/pkg)
+          ditto -c -k "target/universal-release/anet-client" "target/universal-release/anet-client-notarize.zip"
+
+          # Submit for notarization
+          echo "Submitting CLI for notarization..."
+          xcrun notarytool submit "target/universal-release/anet-client-notarize.zip" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_ID_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait
+
+          # Note: Cannot staple standalone binaries, only .app, .pkg, .dmg
+          # Clean up
+          rm "target/universal-release/anet-client-notarize.zip"
+
+          echo "CLI notarized successfully"
 
       - name: "Ad-hoc Sign (fallback for PRs without certificate)"
         # Используем output предыдущего шага (инверсия)
