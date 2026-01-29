@@ -67,7 +67,7 @@ macos-universal:
 
 # Build macOS app bundle (GUI)
 macos-app:
-	./scripts/build-macos-app.sh
+	./contrib/scripts/build-macos-app.sh
 	@echo ""
 	@echo "To sign the app, run:"
 	@echo "  ./scripts/build-macos-app.sh --sign 'Developer ID Application: Your Name'"

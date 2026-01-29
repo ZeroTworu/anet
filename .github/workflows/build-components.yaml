@@ -9,6 +9,8 @@ on:
         value: ${{ jobs.build-linux-client.outputs.artifact }}
       windows-client-artifact:
         value: ${{ jobs.build-windows-client.outputs.artifact }}
+      macos-client-artifact:
+        value: ${{ jobs.build-macos-client.outputs.artifact }}
 
 jobs:
   build-linux-server:
@@ -138,6 +140,107 @@ jobs:
         with:
           name: "anet-gui-debug"
           path: "target/release/anet-gui-debug.exe"
+
+  build-macos-client:
+    name: "Build macOS Client (Universal)"
+    runs-on: "macos-latest"
+    steps:
+      - uses: "actions/checkout@v4"
+
+      # На macOS-latest protobuf обычно есть, но для гарантии
+      - name: "Install Protobuf"
+        run: brew install protobuf
+
+      - name: "Install Rust Targets (Apple Silicon & Intel)"
+        run: |
+          rustup target add aarch64-apple-darwin
+          rustup target add x86_64-apple-darwin
+
+      - name: "Cache Rust dependencies"
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-universal-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-universal-
+            ${{ runner.os }}-cargo-
+
+      # Сборка CLI (Intel + ARM)
+      - name: "Build CLI (x86_64)"
+        run: cargo build --release --package anet-client-cli --target x86_64-apple-darwin
+
+      - name: "Build CLI (aarch64)"
+        run: cargo build --release --package anet-client-cli --target aarch64-apple-darwin
+
+      # Сборка GUI (Intel + ARM)
+      - name: "Build GUI (x86_64)"
+        run: cargo build --release --package anet-client-gui --target x86_64-apple-darwin
+
+      - name: "Build GUI (aarch64)"
+        run: cargo build --release --package anet-client-gui --target aarch64-apple-darwin
+
+      # Создание Universal Binaries с помощью lipo
+      - name: "Create Universal Binaries"
+        run: |
+          mkdir -p target/universal-release
+          
+          # CLI
+          lipo -create -output target/universal-release/anet-client \
+            target/x86_64-apple-darwin/release/anet-client \
+            target/aarch64-apple-darwin/release/anet-client
+          
+          # GUI
+          lipo -create -output target/universal-release/anet-gui \
+            target/x86_64-apple-darwin/release/anet-gui \
+            target/aarch64-apple-darwin/release/anet-gui
+          
+          echo "Universal binaries created."
+          file target/universal-release/anet-client
+          file target/universal-release/anet-gui
+
+      # Упаковка в .app бандл (без подписи, т.к. нет Developer ID)
+      - name: "Package macOS App Bundle"
+        run: |
+          APP_NAME="ANet VPN"
+          APP_DIR="target/universal-release/$APP_NAME.app"
+          CONTENTS="$APP_DIR/Contents"
+          MACOS="$CONTENTS/MacOS"
+          RESOURCES="$CONTENTS/Resources"
+          
+          mkdir -p "$MACOS"
+          mkdir -p "$RESOURCES"
+          
+          # Копируем Universal GUI бинарник
+          cp "target/universal-release/anet-gui" "$MACOS/anet-gui"
+          chmod +x "$MACOS/anet-gui"
+          
+          # Копируем Info.plist
+          cp "anet-client-gui/macos/Info.plist" "$CONTENTS/Info.plist"
+          
+          # Создаем PkgInfo
+          echo -n "APPL????" > "$CONTENTS/PkgInfo"
+          
+          echo "App bundle created at $APP_DIR"
+
+      # Загружаем CLI отдельно (для тех, кто хочет через терминал)
+      - uses: "actions/upload-artifact@v4"
+        with:
+          name: "anet-client-macos-cli"
+          path: "target/universal-release/anet-client"
+
+      # Загружаем .app (внутри zip, т.к. actions могут ломать права в папках)
+      - name: "Zip App Bundle"
+        run: |
+          cd target/universal-release
+          zip -r "ANet_VPN_macOS.app.zip" "ANet VPN.app"
+
+      - uses: "actions/upload-artifact@v4"
+        with:
+          name: "anet-client-macos-app"
+          path: "target/universal-release/ANet_VPN_macOS.app.zip"
 
   create-installer:
     name: "Create Windows Installer"

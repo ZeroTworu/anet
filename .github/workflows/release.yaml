@@ -34,15 +34,15 @@ jobs:
 
       - name: "Prepare files for packaging"
         run: |
-          mkdir -p release_files/server release_files/client-linux release_files/client-windows
-
+          mkdir -p release_files/server release_files/client-linux release_files/client-windows release_files/client-macos
+          
           # --- LINUX SERVER & CLIENT ---
           cp artifacts/anet-server/anet-server release_files/server/
           cp artifacts/anet-client-linux/anet-client release_files/client-linux/
-
+          
           # --- WINDOWS CLIENT ---
           CLIENT_WIN_DIR="release_files/client-windows"
-
+          
           # Копируем Windows файлы - ищем их в разных возможных местах
           # 1. CLI версия
           if [ -f "artifacts/anet-client-windows-cli/anet-client.exe" ]; then
@@ -50,30 +50,43 @@ jobs:
           elif [ -f "artifacts/anet-client-windows-cli/anet-client" ]; then
             cp artifacts/anet-client-windows-cli/anet-client ${CLIENT_WIN_DIR}/anet-client.exe
           fi
-
+          
           # 2. GUI версия  
           if [ -f "artifacts/anet-client-windows-gui/anet-gui.exe" ]; then
             cp artifacts/anet-client-windows-gui/anet-gui.exe ${CLIENT_WIN_DIR}/
           elif [ -f "artifacts/anet-client-windows-gui/anet-gui" ]; then
             cp artifacts/anet-client-windows-gui/anet-gui ${CLIENT_WIN_DIR}/anet-gui.exe
           fi
-
+          
           # 3. Debug версия
           if [ -f "artifacts/anet-gui-debug/anet-gui-debug.exe" ]; then
             cp artifacts/anet-gui-debug/anet-gui-debug.exe ${CLIENT_WIN_DIR}/
           elif [ -f "artifacts/anet-gui-debug/anet-gui-debug" ]; then
             cp artifacts/anet-gui-debug/anet-gui-debug ${CLIENT_WIN_DIR}/anet-gui-debug.exe
           fi
-
-          # Проверяем, что все файлы скопировались
-          echo "Windows client files copied:"
-          ls -la ${CLIENT_WIN_DIR}/
-
+          
+          # --- MACOS CLIENT ---
+          CLIENT_MAC_DIR="release_files/client-macos"
+          
+          # 1. Распаковываем .app (он был зазипован в build job для сохранения прав)
+          if [ -f "artifacts/anet-client-macos-app/ANet_VPN_macOS.app.zip" ]; then
+            unzip "artifacts/anet-client-macos-app/ANet_VPN_macOS.app.zip" -d ${CLIENT_MAC_DIR}/
+          else
+            echo "Warning: macOS App Bundle artifact not found"
+          fi
+          
+          # 2. Копируем CLI binary
+          if [ -f "artifacts/anet-client-macos-cli/anet-client" ]; then
+            cp artifacts/anet-client-macos-cli/anet-client ${CLIENT_MAC_DIR}/
+            chmod +x ${CLIENT_MAC_DIR}/anet-client
+          fi
+          
           # --- CONFIGS ---
           cp contrib/config/server.toml release_files/server/
           cp contrib/config/client.toml release_files/client-linux/
           cp contrib/config/client.toml ${CLIENT_WIN_DIR}/
-
+          cp contrib/config/client.toml ${CLIENT_MAC_DIR}/
+          
           # --- WINTUN (Windows) ---
           cd ${CLIENT_WIN_DIR}
           WINTUN_VERSION="0.14.1"
@@ -83,7 +96,7 @@ jobs:
           cp "wintun/bin/amd64/wintun.dll" .
           rm -rf "wintun" "wintun-${WINTUN_VERSION}.zip"
           cd ../..
-
+          
           # --- ANDROID APK ---
           APK_SRC=$(find artifacts/anet-android-apk -name '*.apk' | head -n 1)
           if [ -z "$APK_SRC" ]; then
@@ -98,7 +111,10 @@ jobs:
           zip -r "server_${VERSION}.zip" server/
           zip -r "client-linux_${VERSION}.zip" client-linux/
           zip -r "client-windows_${VERSION}.zip" client-windows/
-
+          
+          # MacOS zip (сохраняет симлинки внутри .app, если они есть)
+          zip -r -y "client-macos_${VERSION}.zip" client-macos/
+          
           # Windows Installer
           if [ -d "../artifacts/anet-client-setup-windows" ]; then
             INSTALLER_EXE=$(find ../artifacts/anet-client-setup-windows -name '*.exe' | head -n 1)
@@ -121,6 +137,7 @@ jobs:
             release_files/server_${{ env.VERSION }}.zip
             release_files/client-linux_${{ env.VERSION }}.zip
             release_files/client-windows_${{ env.VERSION }}.zip
+            release_files/client-macos_${{ env.VERSION }}.zip
             ANET_VPN_Client_Setup_${{ env.VERSION }}_x64.exe
             anet-android-${{ env.VERSION }}.apk
         env:
