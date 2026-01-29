@@ -201,7 +201,7 @@ jobs:
           file target/universal-release/anet-client
           file target/universal-release/anet-gui
 
-      # Упаковка в .app бандл (без подписи, т.к. нет Developer ID)
+      # Упаковка в .app бандл
       - name: "Package macOS App Bundle"
         run: |
           APP_NAME="ANet VPN"
@@ -224,6 +224,65 @@ jobs:
           echo -n "APPL????" > "$CONTENTS/PkgInfo"
           
           echo "App bundle created at $APP_DIR"
+
+      - name: "Import Code Signing Certificate"
+        if: ${{ secrets.MACOS_CERTIFICATE != '' }}
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          # Create temporary keychain
+          security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+
+          # Import certificate
+          echo "$MACOS_CERTIFICATE" | base64 --decode > certificate.p12
+          security import certificate.p12 -k build.keychain -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" build.keychain
+
+          rm certificate.p12
+
+      - name: "Sign App Bundle with Entitlements"
+        if: ${{ secrets.MACOS_CERTIFICATE != '' }}
+        run: |
+          # Find the Developer ID certificate identity
+          IDENTITY=$(security find-identity -v -p codesigning build.keychain | grep "Developer ID Application" | head -1 | awk -F'"' '{print $2}')
+
+          echo "Signing with identity: $IDENTITY"
+
+          # Sign the app bundle
+          codesign --force --deep --sign "$IDENTITY" \
+            --entitlements "anet-client-gui/macos/entitlements.plist" \
+            --options runtime \
+            "target/universal-release/ANet VPN.app"
+
+          # Sign the CLI binary
+          codesign --force --sign "$IDENTITY" \
+            --entitlements "anet-client-gui/macos/entitlements.plist" \
+            --options runtime \
+            "target/universal-release/anet-client"
+
+          echo "Binaries signed with Developer ID"
+
+      - name: "Ad-hoc Sign (fallback for PRs without certificate)"
+        if: ${{ secrets.MACOS_CERTIFICATE == '' }}
+        run: |
+          echo "No certificate available, using ad-hoc signing"
+          echo "Note: Ad-hoc signed binaries require sudo for TUN device access"
+
+          # Sign the app bundle
+          codesign --force --deep --sign - \
+            --entitlements "anet-client-gui/macos/entitlements.plist" \
+            "target/universal-release/ANet VPN.app"
+
+          # Sign the CLI binary
+          codesign --force --sign - \
+            --entitlements "anet-client-gui/macos/entitlements.plist" \
+            "target/universal-release/anet-client"
+
+          echo "Binaries signed with ad-hoc signature"
 
       # Загружаем CLI отдельно (для тех, кто хочет через терминал)
       - uses: "actions/upload-artifact@v4"
