@@ -8,3 +8,4 @@ on:
 jobs:
   build:
     uses: "./.github/workflows/build-components.yaml"
+    secrets: inherit

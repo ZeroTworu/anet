@@ -2,6 +2,13 @@ name: "Build Components"
 
 on:
   workflow_call:
+    secrets:
+      MACOS_CERTIFICATE:
+        required: false
+      MACOS_CERTIFICATE_PASSWORD:
+        required: false
+      KEYCHAIN_PASSWORD:
+        required: false
     outputs:
       server-artifact:
         value: ${{ jobs.build-linux-server.outputs.artifact }}
@@ -225,8 +232,23 @@ jobs:
           
           echo "App bundle created at $APP_DIR"
 
+      - name: "Check Certificate Availability"
+        id: check_cert
+        env:
+          # Безопасно передаем секрет в env, не используя его в if
+          CERT: ${{ secrets.MACOS_CERTIFICATE }}
+        run: |
+          if [ -n "$CERT" ]; then
+            echo "has_cert=true" >> $GITHUB_OUTPUT
+            echo "Certificate detected."
+          else
+            echo "has_cert=false" >> $GITHUB_OUTPUT
+            echo "Certificate NOT detected."
+          fi
+
       - name: "Import Code Signing Certificate"
-        if: ${{ secrets.MACOS_CERTIFICATE != '' }}
+        # Используем output предыдущего шага вместо прямого доступа к secrets
+        if: steps.check_cert.outputs.has_cert == 'true'
         env:
           MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
           MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
@@ -236,52 +258,54 @@ jobs:
           security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
           security default-keychain -s build.keychain
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
-
+          
           # Import certificate
           echo "$MACOS_CERTIFICATE" | base64 --decode > certificate.p12
           security import certificate.p12 -k build.keychain -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" build.keychain
-
+          
           rm certificate.p12
 
       - name: "Sign App Bundle with Entitlements"
-        if: ${{ secrets.MACOS_CERTIFICATE != '' }}
+        # Используем output предыдущего шага
+        if: steps.check_cert.outputs.has_cert == 'true'
         run: |
           # Find the Developer ID certificate identity
           IDENTITY=$(security find-identity -v -p codesigning build.keychain | grep "Developer ID Application" | head -1 | awk -F'"' '{print $2}')
-
+          
           echo "Signing with identity: $IDENTITY"
-
+          
           # Sign the app bundle
           codesign --force --deep --sign "$IDENTITY" \
             --entitlements "anet-client-gui/macos/entitlements.plist" \
             --options runtime \
             "target/universal-release/ANet VPN.app"
-
+          
           # Sign the CLI binary
           codesign --force --sign "$IDENTITY" \
             --entitlements "anet-client-gui/macos/entitlements.plist" \
             --options runtime \
             "target/universal-release/anet-client"
-
+          
           echo "Binaries signed with Developer ID"
 
       - name: "Ad-hoc Sign (fallback for PRs without certificate)"
-        if: ${{ secrets.MACOS_CERTIFICATE == '' }}
+        # Используем output предыдущего шага (инверсия)
+        if: steps.check_cert.outputs.has_cert != 'true'
         run: |
           echo "No certificate available, using ad-hoc signing"
           echo "Note: Ad-hoc signed binaries require sudo for TUN device access"
-
+          
           # Sign the app bundle
           codesign --force --deep --sign - \
             --entitlements "anet-client-gui/macos/entitlements.plist" \
             "target/universal-release/ANet VPN.app"
-
+          
           # Sign the CLI binary
           codesign --force --sign - \
             --entitlements "anet-client-gui/macos/entitlements.plist" \
             "target/universal-release/anet-client"
-
+          
           echo "Binaries signed with ad-hoc signature"
 
       # Загружаем CLI отдельно (для тех, кто хочет через терминал)
@@ -343,26 +367,26 @@ jobs:
           # Сначала проверим, какие файлы есть на самом деле
           Write-Host "Files in installer_source directory:"
           Get-ChildItem "installer_source"
-
+          
           # Файлы уже находятся в installer_source/ напрямую (без подпапок)
           # Проверим, что они существуют перед копированием других файлов
-
+          
           # Скачивание и размещение Wintun DLL
           $WINTUN_VERSION="0.14.1"
           Invoke-WebRequest -Uri "https://www.wintun.net/builds/wintun-$WINTUN_VERSION.zip" -OutFile "installer_source\wintun.zip"
           Expand-Archive -Path "installer_source\wintun.zip" -DestinationPath "installer_source\wintun"
           Copy-Item -Path "installer_source\wintun\wintun\bin\amd64\wintun.dll" -Destination "installer_source\wintun.dll" -Force
           Remove-Item "installer_source\wintun", "installer_source\wintun.zip" -Recurse -Force
-
+          
           # Копирование config и ISS скрипта в рабочую директорию
           Copy-Item -Path "contrib\config\client.toml" -Destination "installer_source\client.toml" -Force
-
+          
           # Для запуска ISCC скрипт должен быть в рабочем каталоге
           Copy-Item -Path "contrib\inno_setup\install.iss" -Destination "installer_source\install.iss" -Force
-
+          
           # Иконка
           Copy-Item -Path "contrib\inno_setup\anet.ico" -Destination "installer_source\anet.ico" -Force
-
+          
           # Проверка итоговых файлов
           Write-Host "Final files in installer_source:"
           Get-ChildItem "installer_source"
