@@ -4,6 +4,37 @@ use anet_client_gui::app::ANetApp;
 use eframe::egui;
 
 fn main() -> Result<(), eframe::Error> {
+    // On macOS, check if we need to escalate privileges for utun access
+    #[cfg(target_os = "macos")]
+    {
+        if !is_root() {
+            let exe = std::env::current_exe()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|_| "anet-gui".to_string());
+
+            // Ask user if they want to open Terminal with sudo command
+            let script = format!(
+                r#"
+                set theResult to display dialog "ANet VPN requires administrator privileges to create network tunnels.\n\nWould you like to open Terminal with the sudo command?" with title "ANet VPN" buttons {{"Cancel", "Open Terminal"}} default button "Open Terminal" with icon caution
+                if button returned of theResult is "Open Terminal" then
+                    tell application "Terminal"
+                        activate
+                        do script "sudo '{}' ; exit"
+                    end tell
+                end if
+                "#,
+                exe.replace("'", "'\\''")
+            );
+
+            let _ = std::process::Command::new("osascript")
+                .arg("-e")
+                .arg(&script)
+                .output();
+
+            std::process::exit(0);
+        }
+    }
+
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let icon = load_icon();
 
@@ -66,4 +97,10 @@ fn configure_styles(ctx: &egui::Context) {
 
     ctx.set_visuals(visuals);
     ctx.set_style(style);
+}
+
+/// Check if running as root (UID 0)
+#[cfg(target_os = "macos")]
+fn is_root() -> bool {
+    unsafe { libc::geteuid() == 0 }
 }

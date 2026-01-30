@@ -36,6 +36,10 @@ net-route = "0.4"
 [target.'cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))'.dependencies]
 netdev = { workspace = true }
 
+# macOS-specific dependencies for privilege escalation
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
 [features]
 default = []
 console = []

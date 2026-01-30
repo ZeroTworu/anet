@@ -294,6 +294,7 @@ dependencies = [
  "egui",
  "env_logger",
  "image 0.24.9",
+ "libc",
  "log",
  "net-route",
  "netdev",
