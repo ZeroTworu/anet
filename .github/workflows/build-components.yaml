@@ -235,7 +235,10 @@ jobs:
           
           # Создаем PkgInfo
           echo -n "APPL????" > "$CONTENTS/PkgInfo"
-          
+
+          # Копируем иконку
+          cp "anet-client-gui/macos/AppIcon.icns" "$RESOURCES/AppIcon.icns"
+
           echo "App bundle created at $APP_DIR"
 
       - name: "Check Certificate Availability"
@@ -390,7 +393,10 @@ jobs:
       - name: "Zip App Bundle"
         run: |
           cd target/universal-release
-          zip -r "ANet_VPN_macOS.app.zip" "ANet VPN.app"
+          # Remove any extended attributes before zipping
+          xattr -cr "ANet VPN.app"
+          # Use ditto to preserve code signature and resource forks
+          ditto -c -k --keepParent --sequesterRsrc "ANet VPN.app" "ANet_VPN_macOS.app.zip"
 
       - uses: "actions/upload-artifact@v4"
         with:

@@ -10,7 +10,7 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 APP_NAME="ANet VPN"
 BUNDLE_ID="com.anet.vpn.gui"
 VERSION="0.1.0"
@@ -61,10 +61,16 @@ cp "$PROJECT_ROOT/anet-client-gui/macos/Info.plist" "$CONTENTS/Info.plist"
 echo "Step 5: Creating PkgInfo..."
 echo -n "APPL????" > "$CONTENTS/PkgInfo"
 
-# Create a simple icon (placeholder - replace with actual icon)
-echo "Step 6: Creating placeholder icon..."
-# Note: For a real app, you should create a proper .icns file
-# This creates a minimal placeholder
+# Copy app icon if it exists
+echo "Step 6: Copying app icon..."
+ICON_FILE="$PROJECT_ROOT/anet-client-gui/macos/AppIcon.icns"
+if [ -f "$ICON_FILE" ]; then
+    cp "$ICON_FILE" "$RESOURCES/AppIcon.icns"
+    echo "  Copied AppIcon.icns"
+else
+    echo "  Warning: AppIcon.icns not found at $ICON_FILE"
+    echo "  Run: ./contrib/scripts/generate-macos-icon.sh to generate it"
+fi
 
 # Sign the app if identity provided
 if [ -n "$SIGN_IDENTITY" ]; then

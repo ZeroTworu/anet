@@ -20,6 +20,9 @@
     <key>CFBundleDisplayName</key>
     <string>ANet VPN</string>
 
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+
     <key>CFBundlePackageType</key>
     <string>APPL</string>
 
