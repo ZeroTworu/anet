@@ -1,7 +1,6 @@
 use crate::client_registry::ClientRegistry;
 use anet_common::config::StealthConfig;
-use anet_common::consts::{AUTH_PREFIX_LEN, MAX_PACKET_SIZE, NONCE_LEN, PADDING_MTU};
-use anet_common::crypto_utils::check_auth_prefix;
+use anet_common::consts::{MAX_PACKET_SIZE, MIN_HANDSHAKE_LEN, NONCE_LEN, PADDING_MTU};
 use anet_common::padding_utils::calculate_padding_needed;
 use anet_common::transport;
 use anet_common::udp_poller::TokioUdpPoller;
@@ -133,9 +132,46 @@ impl AsyncUdpSocket for MultiKeyAnetUdpSocket {
                 }
                 let raw_packet = &recv_buf[..filled_len];
 
-                if filled_len >= AUTH_PREFIX_LEN
-                    && check_auth_prefix(&raw_packet[..AUTH_PREFIX_LEN])
-                {
+                // 1. Проверяем, похоже ли это на пакет сессии (мин длина)
+                if filled_len >= NONCE_LEN + 1 {
+                    let nonce_prefix: [u8; 4] = raw_packet[..4].try_into().unwrap();
+
+                    // Если есть в реестре - это сессия
+                    if let Some(client_info) = self.registry.get_by_prefix(&nonce_prefix) {
+                        self.registry.update_client_addr(&client_info, remote_addr);
+
+                        match transport::unwrap_packet(&client_info.cipher, raw_packet) {
+                            Ok(quic_payload) => {
+                                if bufs.is_empty() {
+                                    return Poll::Ready(Ok(0));
+                                }
+                                let copy_len = quic_payload.len().min(bufs[0].len());
+                                bufs[0][..copy_len].copy_from_slice(&quic_payload[..copy_len]);
+                                meta[0] = RecvMeta {
+                                    addr: remote_addr,
+                                    len: copy_len,
+                                    stride: copy_len,
+                                    dst_ip: None,
+                                    ecn: None,
+                                };
+                                return Poll::Ready(Ok(1));
+                            }
+                            Err(e) => {
+                                // Ошибка дешифровки сессии. Возможно коллизия префикса или атака.
+                                // Но раз префикс совпал, мы не передаем это в AuthHandler,
+                                // так как AuthHandler ожидает случайный Nonce, а не наш Sequence.
+                                warn!("Session decryption failed for {}: {}", remote_addr, e);
+                                cx.waker().wake_by_ref();
+                                return Poll::Pending;
+                            }
+                        }
+                    }
+                }
+
+                // 2. Если не сессия - возможно это Handshake.
+                // Отправляем в AuthHandler, если длина проходит минимальный порог
+                if filled_len >= MIN_HANDSHAKE_LEN {
+                    // Try_send, чтобы не блокировать IO поток
                     if self
                         .auth_tx
                         .try_send((Bytes::copy_from_slice(raw_packet), remote_addr))
@@ -146,56 +182,16 @@ impl AsyncUdpSocket for MultiKeyAnetUdpSocket {
                             remote_addr
                         );
                     }
-                    cx.waker().wake_by_ref();
-                    return Poll::Pending;
-                }
-
-                if filled_len < NONCE_LEN + 1 {
-                    debug!(
-                        "[Socket] Dropping short non-auth packet from {}",
-                        remote_addr
-                    );
-                    cx.waker().wake_by_ref();
-                    return Poll::Pending;
-                }
-
-                let nonce_prefix: [u8; 4] = raw_packet[..4].try_into().unwrap();
-                if let Some(client_info) = self.registry.get_by_prefix(&nonce_prefix) {
-                    self.registry.update_client_addr(&client_info, remote_addr);
-
-                    match transport::unwrap_packet(&client_info.cipher, raw_packet) {
-                        Ok(quic_payload) => {
-                            if bufs.is_empty() {
-                                return Poll::Ready(Ok(0));
-                            }
-                            let copy_len = quic_payload.len().min(bufs[0].len());
-                            bufs[0][..copy_len].copy_from_slice(&quic_payload[..copy_len]);
-                            meta[0] = RecvMeta {
-                                addr: remote_addr,
-                                len: copy_len,
-                                stride: copy_len,
-                                dst_ip: None,
-                                ecn: None,
-                            };
-                            Poll::Ready(Ok(1))
-                        }
-                        Err(e) => {
-                            warn!(
-                                "[Socket] Decryption failed for known client {} from {}: {}.",
-                                client_info.assigned_ip, remote_addr, e
-                            );
-                            cx.waker().wake_by_ref();
-                            Poll::Pending
-                        }
-                    }
                 } else {
                     debug!(
-                        "[Socket] Dropping packet with unknown nonce prefix from {}.",
+                        "[Socket] Dropping short unknown packet from {}",
                         remote_addr
                     );
-                    cx.waker().wake_by_ref();
-                    Poll::Pending
                 }
+
+                // В любом случае (Handshake или мусор) для QUIC сокета это "ничего"
+                cx.waker().wake_by_ref();
+                Poll::Pending
             }
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
             Poll::Pending => Poll::Pending,

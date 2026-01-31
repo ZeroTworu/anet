@@ -1,80 +1,17 @@
-use crate::consts::{AUTH_MAGIC_ID_BASE, AUTH_PREFIX_LEN, AUTH_SALT_LEN};
+use crate::encryption::Cipher;
 use base64::prelude::*;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
-use rand::{Rng, rngs::OsRng};
 use sha2::{Digest, Sha256};
 use x25519_dalek::SharedSecret;
 
-pub struct AuthPrefixWithSalt {
-    pub prefix: [u8; AUTH_PREFIX_LEN],
-    pub salt: [u8; AUTH_SALT_LEN],
-}
-
-/// Вспомогательная функция для XOR-обфускации
-pub fn xor_bytes(data: &mut [u8], key: &[u8]) {
-    if key.is_empty() {
-        return;
-    }
-    for (i, byte) in data.iter_mut().enumerate() {
-        *byte ^= key[i % key.len()];
-    }
-}
-
-/// Выполняет XOR [a] ^ [b]
-fn xor_arrays(a: &[u8; 4], b: &[u8; 4]) -> [u8; 4] {
-    let mut result = [0u8; 4];
-    for i in 0..4 {
-        result[i] = a[i] ^ b[i];
-    }
-    result
-}
-
-/// Клиент: генерирует 8-байтный обфусцированный префикс Auth (Salt + MAGIC^Salt)
-pub fn generate_auth_prefix() -> [u8; AUTH_PREFIX_LEN] {
-    generate_prefix_with_salt().prefix
-}
-
-/// функция, возвращающая и префикс, и соль
-pub fn generate_prefix_with_salt() -> AuthPrefixWithSalt {
-    let mut rng = OsRng;
-    let mut salt = [0u8; AUTH_SALT_LEN];
-    rng.fill(&mut salt);
-
-    let obfuscated_magic = xor_arrays(&AUTH_MAGIC_ID_BASE, &salt);
-
-    let mut prefix = [0u8; AUTH_PREFIX_LEN];
-    prefix[0..AUTH_SALT_LEN].copy_from_slice(&salt);
-    prefix[AUTH_SALT_LEN..AUTH_PREFIX_LEN].copy_from_slice(&obfuscated_magic);
-
-    AuthPrefixWithSalt { prefix, salt }
-}
-
-///  Функция для извлечения соли из префикса
-pub fn extract_salt_from_prefix(prefix: &[u8]) -> Option<[u8; AUTH_SALT_LEN]> {
-    if prefix.len() < AUTH_SALT_LEN {
-        return None;
-    }
-    prefix[0..AUTH_SALT_LEN].try_into().ok()
-}
-
-/// Сервер: проверяет, соответствует ли полученный префикс (8 байт) ожидаемому Magic ID
-pub fn check_auth_prefix(prefix: &[u8]) -> bool {
-    if prefix.len() < AUTH_PREFIX_LEN {
-        return false;
-    }
-    let salt: &[u8; AUTH_SALT_LEN] = match prefix[0..AUTH_SALT_LEN].try_into() {
-        Ok(s) => s,
-        Err(_) => return false,
-    };
-
-    let received_obf: &[u8; AUTH_SALT_LEN] = match prefix[AUTH_SALT_LEN..AUTH_PREFIX_LEN].try_into()
-    {
-        Ok(r) => r,
-        Err(_) => return false,
-    };
-
-    let derived_base = xor_arrays(salt, received_obf);
-    derived_base == AUTH_MAGIC_ID_BASE
+/// Создает Cipher для шифрования/дешифрования ПЕРВОГО пакета (Handshake).
+/// В качестве ключа используется SHA256 от публичного ключа сервера (Ed25519).
+/// Обеспечивает обфускацию: пакет выглядит как шум для любого, кто не знает PubKey сервера.
+pub fn create_handshake_cipher(server_pub_key_bytes: &[u8]) -> Cipher {
+    let mut hasher = Sha256::new();
+    hasher.update(server_pub_key_bytes);
+    let key: [u8; 32] = hasher.finalize().into();
+    Cipher::new(&key)
 }
 
 /// Выведение симметричного ключа из DH Shared Secret

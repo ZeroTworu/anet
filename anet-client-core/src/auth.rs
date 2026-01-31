@@ -1,6 +1,6 @@
 use crate::config::CoreConfig;
 use crate::events::{status, warn};
-use anet_common::consts::{AUTH_PREFIX_LEN, MAX_PACKET_SIZE, NONCE_LEN, PROTO_PAD_FIELD_OVERHEAD};
+use anet_common::consts::{MAX_PACKET_SIZE, NONCE_LEN, PROTO_PAD_FIELD_OVERHEAD};
 use anet_common::crypto_utils::{self, derive_shared_key, generate_key_fingerprint, sign_data};
 use anet_common::encryption::Cipher;
 use anet_common::padding_utils::{calculate_padding_needed, generate_random_padding};
@@ -30,6 +30,7 @@ const MAX_DELAY: u64 = 60;
 pub struct AuthHandler {
     server_addr: SocketAddr,
     server_public_key: VerifyingKey,
+    server_pub_key_bytes: Vec<u8>,
     ephemeral_secret: StaticSecret,
     signing_key: SigningKey,
     client_public_key: VerifyingKey,
@@ -58,6 +59,7 @@ impl AuthHandler {
             .context("Failed to decode server public key")?;
         let server_public_key = VerifyingKey::from_bytes(
             &server_pub_bytes
+                .as_slice()
                 .try_into()
                 .map_err(|_| anyhow::anyhow!("Invalid server public key length"))?,
         )?;
@@ -65,6 +67,7 @@ impl AuthHandler {
         Ok(Self {
             server_addr: cfg.main.address.parse()?,
             server_public_key,
+            server_pub_key_bytes: server_pub_bytes,
             ephemeral_secret,
             signing_key,
             client_public_key,
@@ -117,19 +120,15 @@ impl AuthHandler {
             padding: vec![],
         };
 
-        // 1. Считаем размер на проводе: Protobuf + AuthPrefix(8) + ProtobufOverhead(approx 3)
-        // (ProtobufOverhead учтем грубо, добавив к encoded_len)
-        let current_wire_len =
-            dh_init_msg.encoded_len() + AUTH_PREFIX_LEN + PROTO_PAD_FIELD_OVERHEAD;
-
-        // 2. Считаем сколько надо добавить
+        // Паддинг
+        let current_wire_len = dh_init_msg.encoded_len() + NONCE_LEN + PROTO_PAD_FIELD_OVERHEAD;
         let needed = calculate_padding_needed(current_wire_len, self.padding_step);
-
-        // 3. Генерируем и вставляем
         dh_init_msg.padding = generate_random_padding(needed);
 
-        let request_packet = self.create_obf_packet(&dh_init_msg)?;
-        info!("[AUTH] Phase I: Sending DH exchange request.");
+        // Шифруем пакет ключом сервера (обфускация)
+        let request_packet = self.create_handshake_packet(&dh_init_msg)?;
+
+        info!("[AUTH] Phase I: Sending DH exchange request (Obfuscated).");
         status("[AUTH] Phase I: Sending DH exchange request.");
 
         socket
@@ -145,8 +144,39 @@ impl AuthHandler {
         self.perform_phase_iii_iv(socket, shared_key, delay).await
     }
 
+    fn create_handshake_packet(&self, message: &AnetMessage) -> Result<Bytes> {
+        let mut request_data = Vec::new();
+        message.encode(&mut request_data)?;
+
+        // Шифратор на основе публичного ключа сервера
+        let cipher = crypto_utils::create_handshake_cipher(&self.server_pub_key_bytes);
+
+        let mut nonce = [0u8; NONCE_LEN];
+        OsRng.fill_bytes(&mut nonce);
+
+        let ciphertext = cipher.encrypt(&nonce, Bytes::from(request_data))?;
+
+        let mut packet = BytesMut::with_capacity(NONCE_LEN + ciphertext.len());
+        packet.put_slice(&nonce);
+        packet.put(ciphertext);
+
+        Ok(packet.freeze())
+    }
+
     fn handle_phase_ii_response(&self, response_buf: &[u8], len: usize) -> Result<[u8; 32]> {
-        let response_message = self.decode_obf_response(response_buf, len)?;
+        let cipher = crypto_utils::create_handshake_cipher(&self.server_pub_key_bytes);
+
+        if len < NONCE_LEN + 16 {
+            return Err(anyhow::anyhow!("Response too short"));
+        }
+
+        let (nonce, ciphertext) = response_buf[..len].split_at(NONCE_LEN);
+        let plaintext = cipher
+            .decrypt(nonce, Bytes::copy_from_slice(ciphertext))
+            .context("Failed to decrypt Phase II response")?;
+
+        let response_message: AnetMessage = Message::decode(plaintext)?;
+
         let (server_pub_key_bytes, server_signature) = match response_message.content {
             Some(Content::DhServerExchange(dh)) if dh.public_key.len() == 32 => {
                 (dh.public_key, dh.server_signed_dh_key)
@@ -163,14 +193,12 @@ impl AuthHandler {
             &server_pub_key_bytes,
             &server_signature,
         )
-        .context("Server signature verification failed")?;
-        info!("[AUTH] Server signature verified successfully.");
-        status("[AUTH] Server signature verified successfully.");
+            .context("Server signature verification failed")?;
 
         let server_key_array: [u8; 32] = server_pub_key_bytes
             .as_slice()
             .try_into()
-            .context("Failed to convert server public key bytes to a fixed-size array")?;
+            .context("Failed to convert server DH key")?;
 
         let server_pub_key = PublicKey::from(server_key_array);
         let shared_secret = self.ephemeral_secret.diffie_hellman(&server_pub_key);
@@ -188,10 +216,6 @@ impl AuthHandler {
             "[AUTH] Phase III: Sending Encrypted Auth Request ({} bytes).",
             request_packet.len()
         );
-        status(format!(
-            "[AUTH] Phase III: Sending Encrypted Auth Request ({} bytes).",
-            request_packet.len()
-        ));
 
         socket
             .send_to(&request_packet, self.server_addr)
@@ -199,16 +223,28 @@ impl AuthHandler {
             .context("Failed Phase III send")?;
 
         let (response_buf, len) = self.wait_for_response(socket, delay).await?;
-        let response_message = self.decode_obf_response(&response_buf, len)?;
 
-        if let Some(Content::EncryptedAuthResponse(enc_res)) = response_message.content {
+        // Ответ Phase IV также обернут в Handshake Cipher
+        let handshake_cipher = crypto_utils::create_handshake_cipher(&self.server_pub_key_bytes);
+
+        if len < NONCE_LEN {
+            return Err(anyhow::anyhow!("Short response"));
+        }
+        let (nonce, ciphertext) = response_buf[..len].split_at(NONCE_LEN);
+
+        let plaintext_outer = handshake_cipher
+            .decrypt(nonce, Bytes::copy_from_slice(ciphertext))
+            .context("Failed to de-obfuscate Phase IV")?;
+
+        let outer_msg: AnetMessage = Message::decode(plaintext_outer)?;
+
+        if let Some(Content::EncryptedAuthResponse(enc_res)) = outer_msg.content {
             let auth_response = self.decrypt_auth_response(enc_res, &cipher)?;
-            info!("[AUTH] Phase IV complete: Auth Response decrypted successfully.");
-            status("[AUTH] Phase IV complete: Auth Response decrypted successfully.");
-
+            info!("[AUTH] Phase IV complete.");
+            status("[AUTH] Phase IV complete.");
             Ok((auth_response, shared_key))
         } else {
-            Err(anyhow::anyhow!("Unexpected Phase IV response content"))
+            Err(anyhow::anyhow!("Unexpected Phase IV content"))
         }
     }
 
@@ -220,13 +256,8 @@ impl AuthHandler {
             padding: vec![],
         };
 
-        let current_wire_len =
-            auth_payload.encoded_len() + AUTH_PREFIX_LEN + PROTO_PAD_FIELD_OVERHEAD;
-
-        // 2. Считаем сколько надо добавить
+        let current_wire_len = auth_payload.encoded_len() + PROTO_PAD_FIELD_OVERHEAD;
         let needed = calculate_padding_needed(current_wire_len, self.padding_step);
-
-        // 3. Генерируем и вставляем
         auth_payload.padding = generate_random_padding(needed);
 
         let mut raw_auth_request = Vec::new();
@@ -246,35 +277,26 @@ impl AuthHandler {
             padding: vec![],
         };
 
-        let current_wire_len =
-            wrapped_msg.encoded_len() + AUTH_PREFIX_LEN + PROTO_PAD_FIELD_OVERHEAD;
-        // 2. Считаем сколько надо добавить
-        let needed = calculate_padding_needed(current_wire_len, self.padding_step);
-
-        // 3. Генерируем и вставляем
+        let outer_len = wrapped_msg.encoded_len() + NONCE_LEN + PROTO_PAD_FIELD_OVERHEAD;
+        let needed = calculate_padding_needed(outer_len, self.padding_step);
         wrapped_msg.padding = generate_random_padding(needed);
 
-        let mut final_data = Vec::new();
-        wrapped_msg.encode(&mut final_data)?;
+        // Внешнее шифрование (Handshake Cipher)
+        let handshake_cipher = crypto_utils::create_handshake_cipher(&self.server_pub_key_bytes);
 
-        let prefix_info = crypto_utils::generate_prefix_with_salt();
-        crypto_utils::xor_bytes(&mut final_data, &prefix_info.salt);
+        let mut raw_wrapped = Vec::new();
+        wrapped_msg.encode(&mut raw_wrapped)?;
 
-        let mut final_packet_obf = BytesMut::new();
-        final_packet_obf.put_slice(&prefix_info.prefix);
-        final_packet_obf.put_slice(&final_data);
-        Ok((final_packet_obf.freeze(), req_cipher))
-    }
+        let mut obf_nonce = [0u8; NONCE_LEN];
+        OsRng.fill_bytes(&mut obf_nonce);
 
-    fn create_obf_packet(&self, message: &AnetMessage) -> Result<Bytes> {
-        let mut request_data = Vec::new();
-        message.encode(&mut request_data)?;
-        let prefix_info = crypto_utils::generate_prefix_with_salt();
-        crypto_utils::xor_bytes(&mut request_data, &prefix_info.salt);
-        let mut packet = BytesMut::new();
-        packet.put_slice(&prefix_info.prefix);
-        packet.put_slice(&request_data);
-        Ok(packet.freeze())
+        let obf_ciphertext = handshake_cipher.encrypt(&obf_nonce, Bytes::from(raw_wrapped))?;
+
+        let mut final_packet = BytesMut::with_capacity(NONCE_LEN + obf_ciphertext.len());
+        final_packet.put_slice(&obf_nonce);
+        final_packet.put(obf_ciphertext);
+
+        Ok((final_packet.freeze(), req_cipher))
     }
 
     async fn wait_for_response(
@@ -283,39 +305,12 @@ impl AuthHandler {
         delay: u64,
     ) -> Result<(Box<[u8]>, usize)> {
         let mut buf = vec![0u8; MAX_PACKET_SIZE].into_boxed_slice();
-
-        info!("[AUTH] Waiting for response for {} seconds...", delay);
-        status(format!(
-            "[AUTH] Waiting for response for {} seconds...",
-            delay
-        ));
-
         let (len, recv_addr) =
             tokio::time::timeout(Duration::from_secs(delay), socket.recv_from(&mut buf)).await??;
         if recv_addr != self.server_addr {
-            return Err(anyhow::anyhow!(
-                "Received packet from unexpected address {}",
-                recv_addr
-            ));
+            return Err(anyhow::anyhow!("Unexpected source"));
         }
         Ok((buf, len))
-    }
-
-    fn decode_obf_response(&self, response_buf: &[u8], len: usize) -> Result<AnetMessage> {
-        if len <= AUTH_PREFIX_LEN {
-            return Err(anyhow::anyhow!("Auth response too short"));
-        }
-        let prefix = &response_buf[..AUTH_PREFIX_LEN];
-        if !crypto_utils::check_auth_prefix(prefix) {
-            return Err(anyhow::anyhow!("Auth response prefix check failed"));
-        }
-
-        let salt =
-            crypto_utils::extract_salt_from_prefix(prefix).context("Failed to extract salt")?;
-        let mut payload = response_buf[AUTH_PREFIX_LEN..len].to_vec();
-        crypto_utils::xor_bytes(&mut payload, &salt);
-
-        Message::decode(Bytes::from(payload)).context("Failed to decode Protobuf message")
     }
 
     fn decrypt_auth_response(

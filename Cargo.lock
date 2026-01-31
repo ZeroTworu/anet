@@ -261,7 +261,6 @@ name = "anet-auth"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "chrono",
  "dotenvy",
  "env_logger",
  "log",
