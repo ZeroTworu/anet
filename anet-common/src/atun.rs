@@ -2,7 +2,10 @@ use crate::consts::{CHANNEL_BUFFER_SIZE, MAX_PACKET_SIZE};
 use crate::tun_params::TunParams;
 use anyhow::Result;
 use bytes::Bytes;
-use log::{error, info, warn};
+use log::{error, info};
+#[cfg(target_os = "macos")]
+use log::warn;
+
 use std::net::Ipv4Addr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;

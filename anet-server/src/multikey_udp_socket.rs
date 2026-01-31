@@ -130,17 +130,17 @@ impl AsyncUdpSocket for MultiKeyAnetUdpSocket {
                 if filled_len == 0 {
                     return Poll::Pending;
                 }
-                let raw_packet = &recv_buf[..filled_len];
+                let raw_packet_mut = &mut recv_buf[..filled_len];
 
                 // 1. Проверяем, похоже ли это на пакет сессии (мин длина)
                 if filled_len >= NONCE_LEN + 1 {
-                    let nonce_prefix: [u8; 4] = raw_packet[..4].try_into().unwrap();
+                    let nonce_prefix: [u8; 4] = raw_packet_mut[..4].try_into().unwrap();
 
                     // Если есть в реестре - это сессия
                     if let Some(client_info) = self.registry.get_by_prefix(&nonce_prefix) {
                         self.registry.update_client_addr(&client_info, remote_addr);
 
-                        match transport::unwrap_packet(&client_info.cipher, raw_packet) {
+                        match transport::unwrap_packet_in_place(&client_info.cipher, raw_packet_mut) {
                             Ok(quic_payload) => {
                                 if bufs.is_empty() {
                                     return Poll::Ready(Ok(0));
@@ -174,7 +174,7 @@ impl AsyncUdpSocket for MultiKeyAnetUdpSocket {
                     // Try_send, чтобы не блокировать IO поток
                     if self
                         .auth_tx
-                        .try_send((Bytes::copy_from_slice(raw_packet), remote_addr))
+                        .try_send((Bytes::copy_from_slice(raw_packet_mut), remote_addr))
                         .is_err()
                     {
                         warn!(

@@ -15,7 +15,7 @@ use arc_swap::ArcSwap;
 use bytes::{BufMut, Bytes, BytesMut};
 use dashmap::DashMap;
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use log::{debug, error, info};
+use log::{debug, info};
 use prost::Message;
 use rand::RngCore;
 use rand::rngs::OsRng;

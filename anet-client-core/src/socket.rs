@@ -121,10 +121,10 @@ impl AsyncUdpSocket for AnetUdpSocket {
                     return Poll::Pending;
                 }
 
-                let raw_packet = &recv_buf[..filled_len];
+                let raw_packet_mut = &mut recv_buf[..filled_len];
 
                 // Пытаемся расшифровать
-                match transport::unwrap_packet(&self.cipher, raw_packet) {
+                match transport::unwrap_packet_in_place(&self.cipher, raw_packet_mut) {
                     Ok(quic_payload) => {
                         if bufs.is_empty() {
                             return Poll::Ready(Ok(0));

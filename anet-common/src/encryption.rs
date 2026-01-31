@@ -1,4 +1,4 @@
-use aead::{Aead, KeyInit, Nonce};
+use aead::{Aead, AeadInPlace, KeyInit, Nonce, Tag}; // <--- Добавили AeadInPlace
 use aes_gcm::Key;
 // use aes_gcm::Aes256Gcm;
 use bytes::Bytes;
@@ -49,6 +49,32 @@ impl Cipher {
 
         Ok(Bytes::from(plaintext))
     }
+
+    /// Расшифровывает данные прямо в переданном буфере.
+    /// Буфер должен содержать [Ciphertext + Tag].
+    /// После успеха буфер будет содержать [Plaintext], а "хвост" (где был тег) станет мусором.
+    #[inline]
+    pub fn decrypt_in_place(&self, nonce_bytes: &[u8], buffer: &mut [u8]) -> Result<(), EncryptionError> {
+        let nonce = Nonce::<CryptoAlgorithm>::from_slice(nonce_bytes);
+        let len = buffer.len();
+
+        // 16 байт - размер тега Poly1305 для ChaCha20Poly1305
+        if len < 16 {
+            return Err(EncryptionError::DecryptionFailed);
+        }
+
+        // Разделяем буфер на сообщение и тег
+        let (msg, tag_bytes) = buffer.split_at_mut(len - 16);
+        let tag = Tag::<CryptoAlgorithm>::from_slice(tag_bytes);
+
+        // Используем detached версию, которая работает с сырыми слайсами
+        self.cipher
+            .decrypt_in_place_detached(nonce, &[], msg, tag)
+            .map_err(|_| EncryptionError::DecryptionFailed)?;
+
+        Ok(())
+    }
+
     pub fn generate_nonce(sequence: u64) -> [u8; 12] {
         let mut nonce = [0u8; 12];
         nonce[4..].copy_from_slice(&sequence.to_be_bytes());
