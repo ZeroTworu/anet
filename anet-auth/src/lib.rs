@@ -1,4 +1,5 @@
 pub mod api;
-pub(crate) mod entities;
+pub mod entities;
 pub mod middleware;
 pub mod migration;
+pub mod keygen;

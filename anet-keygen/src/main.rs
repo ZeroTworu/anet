@@ -43,23 +43,11 @@ fn print_client_keys(private_key: &str, public_key: &str, fingerprint: &str) {
     println!("[keys]");
     println!("private_key = \"{}\"", private_key);
     println!();
-    println!("Public Key (optional, for server verification):");
-    println!("{}", public_key);
-    println!();
     println!("Fingerprint (add to server.toml allowed_clients):");
     println!("{}", fingerprint);
     println!();
-    println!("Example client.toml configuration:");
-    println!("[keys]");
-    println!("private_key = \"{}\"", private_key);
-    println!();
-    println!("[main]");
-    println!("address = \"127.0.0.1:443\"");
-    println!("tun_name = \"anet-client\"");
-    println!(
-        "# server_pub_key = \"{}\"  # Optional: for server verification",
-        public_key
-    );
+    println!("Public Key (for client verification, optional):");
+    println!("{}", public_key);
 }
 
 fn print_server_key(private_key: &str, public_key: &str) {
@@ -71,12 +59,6 @@ fn print_server_key(private_key: &str, public_key: &str) {
     println!();
     println!("Public Key (for client verification, optional):");
     println!("{}", public_key);
-    println!();
-    println!("Example server.toml configuration:");
-    println!("[crypto]");
-    println!("quic_cert = \"QUIC_CERT_PEM\"");
-    println!("quic_key = \"QUIC_KEY_PEM\"");
-    println!("server_signing_key = \"{}\"", private_key);
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

@@ -3,7 +3,6 @@ use log::error;
 use poem::Result;
 use poem_openapi::{Object, OpenApi, payload::Json};
 use sea_orm::*;
-use uuid::Uuid;
 
 // DTO
 
