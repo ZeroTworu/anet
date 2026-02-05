@@ -34,17 +34,35 @@
 
 ```bash
 # Сборка всех компонентов
-cargo build --release
+make all
+
+# Сборка статичных бинарников с musl
+make musl
+
+# Сборка библиотеки для Android
+make mob
+
+# Сборка под macOS
+# Build macOS CLI client
+make macos
+
+# Build macOS GUI client
+make macos-gui
+
+# Build universal macOS binaries (Intel + Apple Silicon)
+make macos-universal
+
+# Генерация сертификата для QUIC
+make cert
 ```
+[Android src](https://github.com/ZeroTworu/anet-android)
 
-Support the Chaos / Поддержать Хаос
+Support the Chaos
 
-Разработка ведется в условиях повышенной радиации (Черниковка), под пристальным взглядом Ханюши и с использованием альтернативных источников энергии (C2H5OH).
+Если ANet помог тебе — налей автору.
 
-Если ANet помог тебе пробить стену цензуры — налей автору.
+На водку разрабу: [Donate](https://dalink.to/rventomarika)
 
-    На водку разрабу (чтобы код компилился): https://dalink.to/rventomarika
+На булочки для Ханю: [Donate](https://dalink.to/rventomarika)
 
-    На булочки для Ханю (чтобы не кусалась): https://dalink.to/rventomarika
-
-    На J7 (для выхода из штопора): https://dalink.to/rventomarika
+На J7: [Donate](https://dalink.to/rventomarika)
