@@ -30,7 +30,7 @@ jobs:
     name: "Build Linux Server"
     runs-on: "ubuntu-latest"
     steps:
-      - uses: "actions/checkout@v4"
+      - uses: "actions/checkout@v6"
 
       - name: "Install musl tools"
         run: "sudo apt-get install -y musl-tools protobuf-compiler"
@@ -43,7 +43,7 @@ jobs:
           override: "true"
 
       - name: "Cache Rust dependencies"
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
@@ -57,7 +57,7 @@ jobs:
       - name: "Build Server"
         run: "RUSTFLAGS=\"-C target-feature=+crt-static\" cargo build --release --package anet-server --target x86_64-unknown-linux-musl"
 
-      - uses: "actions/upload-artifact@v4"
+      - uses: "actions/upload-artifact@v6"
         with:
           name: "anet-server"
           path: "target/x86_64-unknown-linux-musl/release/anet-server"
@@ -66,7 +66,7 @@ jobs:
     name: "Build Linux Client"
     runs-on: "ubuntu-latest"
     steps:
-      - uses: "actions/checkout@v4"
+      - uses: "actions/checkout@v6"
 
       - name: "Install musl tools"
         run: "sudo apt-get install -y musl-tools protobuf-compiler"
@@ -79,7 +79,7 @@ jobs:
           override: "true"
 
       - name: "Cache Rust dependencies"
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
@@ -93,7 +93,7 @@ jobs:
       - name: "Build Client (Linux)"
         run: "RUSTFLAGS=\"-C target-feature=+crt-static\" cargo build --release --package anet-client-cli --target x86_64-unknown-linux-musl"
 
-      - uses: "actions/upload-artifact@v4"
+      - uses: "actions/upload-artifact@v6"
         with:
           name: "anet-client-linux"
           path: "target/x86_64-unknown-linux-musl/release/anet-client"
@@ -102,7 +102,7 @@ jobs:
     name: "Build Windows Client"
     runs-on: "windows-latest"
     steps:
-      - uses: "actions/checkout@v4"
+      - uses: "actions/checkout@v6"
 
       - name: "Install protoc (Windows)"
         run: "choco install protoc"
@@ -114,7 +114,7 @@ jobs:
           override: "true"
 
       - name: "Cache Rust dependencies"
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
@@ -127,7 +127,7 @@ jobs:
       - name: "Build Client (CLI) (Windows)"
         run: "cargo build --release --package anet-client-cli"
 
-      - uses: "actions/upload-artifact@v4"
+      - uses: "actions/upload-artifact@v6"
         with:
           name: "anet-client-windows-cli"
           path: "target/release/anet-client.exe"
@@ -135,7 +135,7 @@ jobs:
       - name: "Build Client (GUI) (Windows)"
         run: "cargo build --release --package anet-client-gui"
 
-      - uses: "actions/upload-artifact@v4"
+      - uses: "actions/upload-artifact@v6"
         with:
           name: "anet-client-windows-gui"
           path: "target/release/anet-gui.exe"
@@ -149,7 +149,7 @@ jobs:
       - name: "Rename Debug Build"
         run: "mv target/release/anet-gui.exe target/release/anet-gui-debug.exe"
 
-      - uses: "actions/upload-artifact@v4"
+      - uses: "actions/upload-artifact@v6"
         with:
           name: "anet-gui-debug"
           path: "target/release/anet-gui-debug.exe"
@@ -158,7 +158,7 @@ jobs:
     name: "Build macOS Client (Universal)"
     runs-on: "macos-latest"
     steps:
-      - uses: "actions/checkout@v4"
+      - uses: "actions/checkout@v6"
 
       # На macOS-latest protobuf обычно есть, но для гарантии
       - name: "Install Protobuf"
@@ -170,7 +170,7 @@ jobs:
           rustup target add x86_64-apple-darwin
 
       - name: "Cache Rust dependencies"
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
@@ -384,7 +384,7 @@ jobs:
           echo "Binaries signed with ad-hoc signature"
 
       # Загружаем CLI отдельно (для тех, кто хочет через терминал)
-      - uses: "actions/upload-artifact@v4"
+      - uses: "actions/upload-artifact@v6"
         with:
           name: "anet-client-macos-cli"
           path: "target/universal-release/anet-client"
@@ -398,7 +398,7 @@ jobs:
           # Use ditto to preserve code signature and resource forks
           ditto -c -k --keepParent --sequesterRsrc "ANet VPN.app" "ANet_VPN_macOS.app.zip"
 
-      - uses: "actions/upload-artifact@v4"
+      - uses: "actions/upload-artifact@v6"
         with:
           name: "anet-client-macos-app"
           path: "target/universal-release/ANet_VPN_macOS.app.zip"
@@ -409,22 +409,22 @@ jobs:
     needs: "build-windows-client"
     steps:
       - name: "Checkout repository"
-        uses: "actions/checkout@v4"
+        uses: "actions/checkout@v6"
 
       - name: "Download Client Artifact (CLI)"
-        uses: "actions/download-artifact@v4"
+        uses: "actions/download-artifact@v7"
         with:
           name: "anet-client-windows-cli"
           path: "installer_source/"
 
       - name: "Download Client Artifact (GUI)"
-        uses: "actions/download-artifact@v4"
+        uses: "actions/download-artifact@v7"
         with:
           name: "anet-client-windows-gui"
           path: "installer_source/"
 
       - name: "Download Client Artifact (GUI Debug)"
-        uses: "actions/download-artifact@v4"
+        uses: "actions/download-artifact@v7"
         with:
           name: "anet-gui-debug"
           path: "installer_source/"
@@ -490,7 +490,7 @@ jobs:
           "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "%GITHUB_WORKSPACE%\installer_source\install.iss" /O"%GITHUB_WORKSPACE%\installer_source\Output" ${{ env.VERSION_ARG }}
 
       - name: "Upload Installer Artifact"
-        uses: "actions/upload-artifact@v4"
+        uses: "actions/upload-artifact@v6"
         with:
           path: installer_source\Output\*.exe
           name: anet-client-setup-windows
@@ -500,7 +500,7 @@ jobs:
     name: "Build Rust for Android"
     runs-on: "ubuntu-latest"
     steps:
-      - uses: "actions/checkout@v4"
+      - uses: "actions/checkout@v6"
 
       # Установка Android NDK и Rust таргетов
       - name: "Setup Android NDK"
@@ -514,7 +514,7 @@ jobs:
           rustup target add x86_64-linux-android
 
       - name: "Cache Rust dependencies"
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
@@ -532,7 +532,7 @@ jobs:
         run: |
           cargo ndk -t aarch64-linux-android -o ./jniLibs build --release -p anet-mobile
 
-      - uses: "actions/upload-artifact@v4"
+      - uses: "actions/upload-artifact@v6"
         with:
           name: "anet-mobile-libs"
           path: "jniLibs/"
@@ -543,24 +543,24 @@ jobs:
     needs: "build-android-libs"
     steps:
       - name: "Checkout Android UI Repo"
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: "ZeroTworu/anet-android"
           path: "android-ui"
 
       - name: "Download Rust Libs"
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: "anet-mobile-libs"
           path: "android-ui/app/src/main/jniLibs"
 
-      - uses: actions/setup-java@v3
+      - uses: actions/setup-java@v5
         with:
           distribution: 'temurin'
           java-version: '17'
 
       - name: "Cache Gradle"
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.gradle/caches
@@ -575,7 +575,7 @@ jobs:
           chmod +x gradlew
           ./gradlew assembleDebug
 
-      - uses: "actions/upload-artifact@v4"
+      - uses: "actions/upload-artifact@v6"
         with:
           name: "anet-android-apk"
           path: "android-ui/app/build/outputs/apk/debug/app-debug.apk"
