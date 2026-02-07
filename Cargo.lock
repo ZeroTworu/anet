@@ -323,6 +323,7 @@ dependencies = [
  "rustls",
  "rustls-pemfile",
  "serde",
+ "sha2",
  "tokio",
  "x25519-dalek",
 ]
@@ -364,6 +365,7 @@ dependencies = [
  "bytes",
  "chacha20poly1305",
  "ed25519-dalek",
+ "hkdf",
  "log",
  "prost",
  "prost-build",
@@ -427,6 +429,7 @@ dependencies = [
  "rustls",
  "rustls-pemfile",
  "serde",
+ "sha2",
  "tokio",
  "toml 0.9.8",
  "x25519-dalek",

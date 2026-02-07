@@ -1,4 +1,5 @@
 use crate::AuthResponse;
+use anyhow::Context;
 use std::net::Ipv4Addr;
 use tun::Configuration;
 
@@ -14,15 +15,15 @@ pub struct TunParams {
 }
 
 impl TunParams {
-    pub fn from_auth_response(auth_response: &AuthResponse, adapter: &str) -> Self {
-        Self {
-            address: auth_response.ip.parse().unwrap(),
-            netmask: auth_response.netmask.parse().unwrap(),
-            gateway: auth_response.gateway.parse().unwrap(),
+    pub fn from_auth_response(auth_response: &AuthResponse, adapter: &str) -> anyhow::Result<Self> {
+        Ok(Self {
+            address: auth_response.ip.parse().context("invalid assigned IP")?,
+            netmask: auth_response.netmask.parse().context("invalid netmask")?,
+            gateway: auth_response.gateway.parse().context("invalid gateway")?,
             name: adapter.to_string(),
             mtu: auth_response.mtu as u16,
             network: None,
-        }
+        })
     }
 
     /// Create TUN configuration for Linux

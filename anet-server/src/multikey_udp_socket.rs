@@ -26,7 +26,8 @@ pub type StreamSender = mpsc::Sender<Bytes>;
 
 #[derive(Clone)]
 pub struct TempDHInfo {
-    pub shared_key: [u8; 32],
+    pub auth_key: [u8; 32],
+    pub transport_key: [u8; 32],
     pub created_at: Instant,
     pub client_fingerprint: String,
 }

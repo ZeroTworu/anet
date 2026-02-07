@@ -19,7 +19,6 @@ use quinn::{Endpoint, EndpointConfig, ServerConfig as QuinnServerConfig, TokioRu
 use rustls::ServerConfig as RustlsServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::io::BufReader;
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
@@ -32,7 +31,7 @@ const TEMP_DH_CLEANUP_INTERVAL: Duration = Duration::from_secs(10);
 pub struct ANetServer {
     cfg: Config,
     registry: Arc<ClientRegistry>,
-    temp_dh_map: Arc<DashMap<SocketAddr, TempDHInfo>>,
+    temp_dh_map: Arc<DashMap<[u8; 32], TempDHInfo>>,
     tun_manager: TunManager,
     server_signing_key: SigningKey,
 }
@@ -158,7 +157,7 @@ impl ANetServer {
     }
 }
 
-async fn clear_expired_dh_sessions(temp_dh_map: Arc<DashMap<SocketAddr, TempDHInfo>>) {
+async fn clear_expired_dh_sessions(temp_dh_map: Arc<DashMap<[u8; 32], TempDHInfo>>) {
     info!("Temporary DH state cleanup task started.");
     loop {
         tokio::time::sleep(TEMP_DH_CLEANUP_INTERVAL).await;

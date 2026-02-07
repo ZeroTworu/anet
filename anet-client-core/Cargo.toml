@@ -16,6 +16,7 @@ rustls-pemfile = {workspace = true}
 rand = { workspace = true }
 x25519-dalek = {workspace = true}
 ed25519-dalek = {workspace = true}
+sha2 = {workspace = true}
 base64 = {workspace = true}
 serde = { workspace = true, features = ["derive"] }
 async-trait = { workspace = true }
