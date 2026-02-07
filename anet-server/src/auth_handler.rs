@@ -19,6 +19,7 @@ use log::{debug, info};
 use prost::Message;
 use rand::RngCore;
 use rand::rngs::OsRng;
+use sha2::{Digest, Sha256};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
@@ -31,7 +32,7 @@ use x25519_dalek::{PublicKey, StaticSecret};
 pub struct ServerAuthHandler {
     socket: Arc<UdpSocket>,
     registry: Arc<ClientRegistry>,
-    temp_dh_map: Arc<DashMap<SocketAddr, TempDHInfo>>,
+    temp_dh_map: Arc<DashMap<[u8; 32], TempDHInfo>>,
     auth_provider: Arc<AuthProvider>,
     server_signing_key: SigningKey,
     handshake_cipher: Arc<Cipher>,
@@ -43,7 +44,7 @@ impl ServerAuthHandler {
     pub fn new(
         socket: Arc<UdpSocket>,
         registry: Arc<ClientRegistry>,
-        temp_dh_map: Arc<DashMap<SocketAddr, TempDHInfo>>,
+        temp_dh_map: Arc<DashMap<[u8; 32], TempDHInfo>>,
         auth_provider: Arc<AuthProvider>,
         server_signing_key: SigningKey,
         quic_cert_pem: String,
@@ -149,10 +150,12 @@ impl ServerAuthHandler {
             .context("Failed to convert client DH public key")?;
         let client_dh_pub = PublicKey::from(client_dh_pub_array);
 
+        let dh_pubkey_hash: [u8; 32] = Sha256::digest(&req.public_key).into();
+
         let shared_secret = server_ephemeral_secret.diffie_hellman(&client_dh_pub);
 
         self.temp_dh_map.insert(
-            remote_addr,
+            dh_pubkey_hash,
             TempDHInfo {
                 auth_key: crypto_utils::derive_shared_key(&shared_secret, b"anet-auth-encrypt"),
                 transport_key: crypto_utils::derive_shared_key(&shared_secret, b"anet-transport"),
@@ -186,9 +189,14 @@ impl ServerAuthHandler {
         enc_req: EncryptedAuthRequest,
         remote_addr: SocketAddr,
     ) -> Result<()> {
+        let dh_key: [u8; 32] = enc_req
+            .dh_pubkey_hash
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("Invalid dh_pubkey_hash length"))?;
+
         let temp_info = self
             .temp_dh_map
-            .remove(&remote_addr)
+            .remove(&dh_key)
             .map(|(_, v)| v)
             .context("DH session expired or not found")?;
 

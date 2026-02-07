@@ -23,6 +23,9 @@ pub struct EncryptedAuthRequest {
     pub ciphertext: ::prost::alloc::vec::Vec<u8>,
     #[prost(bytes = "vec", tag = "2")]
     pub nonce: ::prost::alloc::vec::Vec<u8>,
+    /// SHA-256 of client's ephemeral DH pubkey
+    #[prost(bytes = "vec", tag = "3")]
+    pub dh_pubkey_hash: ::prost::alloc::vec::Vec<u8>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct EncryptedAuthResponse {

@@ -16,6 +16,7 @@ message DHServerExchange {
 message EncryptedAuthRequest {
     bytes ciphertext = 1;
     bytes nonce = 2;
+    bytes dh_pubkey_hash = 3;  // SHA-256 of client's ephemeral DH pubkey
 }
 
 message EncryptedAuthResponse {

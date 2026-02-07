@@ -16,6 +16,7 @@ use log::{info, warn};
 use prost::Message;
 use rand::RngCore;
 use rand::rngs::OsRng;
+use sha2::{Digest, Sha256};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -106,6 +107,7 @@ impl AuthHandler {
     ) -> Result<(AuthResponse, [u8; 32])> {
         let ephemeral_secret = StaticSecret::random_from_rng(OsRng);
         let client_pub_key = PublicKey::from(&ephemeral_secret);
+        let dh_pubkey_hash: [u8; 32] = Sha256::digest(client_pub_key.as_bytes()).into();
         let client_signed_dh_key = sign_data(&self.signing_key, client_pub_key.as_bytes());
 
         let mut dh_init_msg = AnetMessage {
@@ -139,7 +141,7 @@ impl AuthHandler {
         info!("[AUTH] Phase II complete. Shared secret derived.");
         status("[AUTH] Phase II complete. Shared secret derived.");
 
-        self.perform_phase_iii_iv(socket, auth_key, transport_key, delay)
+        self.perform_phase_iii_iv(socket, auth_key, transport_key, dh_pubkey_hash, delay)
             .await
     }
 
@@ -216,9 +218,11 @@ impl AuthHandler {
         socket: &Arc<UdpSocket>,
         auth_key: [u8; 32],
         transport_key: [u8; 32],
+        dh_pubkey_hash: [u8; 32],
         delay: u64,
     ) -> Result<(AuthResponse, [u8; 32])> {
-        let (request_packet, cipher) = self.create_encrypted_auth_request(&auth_key)?;
+        let (request_packet, cipher) =
+            self.create_encrypted_auth_request(&auth_key, &dh_pubkey_hash)?;
         info!(
             "[AUTH] Phase III: Sending Encrypted Auth Request ({} bytes).",
             request_packet.len()
@@ -255,7 +259,11 @@ impl AuthHandler {
         }
     }
 
-    fn create_encrypted_auth_request(&self, auth_key: &[u8; 32]) -> Result<(Bytes, Cipher)> {
+    fn create_encrypted_auth_request(
+        &self,
+        auth_key: &[u8; 32],
+        dh_pubkey_hash: &[u8; 32],
+    ) -> Result<(Bytes, Cipher)> {
         let mut auth_payload = AnetMessage {
             content: Some(Content::AuthRequest(AuthRequest {
                 client_id: self.client_id.clone(),
@@ -278,6 +286,7 @@ impl AuthHandler {
         let encrypted_req = EncryptedAuthRequest {
             ciphertext: ciphertext.to_vec(),
             nonce: nonce_bytes.to_vec(),
+            dh_pubkey_hash: dh_pubkey_hash.to_vec(),
         };
         let mut wrapped_msg = AnetMessage {
             content: Some(Content::EncryptedAuthRequest(encrypted_req)),
