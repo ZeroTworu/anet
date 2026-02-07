@@ -232,7 +232,7 @@ impl TunFactory for DesktopTunFactory {
         use anet_common::atun::TunManager;
         use anet_common::tun_params::TunParams;
 
-        let params = TunParams::from_auth_response(auth, &self.tun_name);
+        let params = TunParams::from_auth_response(auth, &self.tun_name)?;
         let mut manager = TunManager::new(params)?;
 
         // Use run_with_name to get the actual interface name

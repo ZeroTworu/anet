@@ -22,7 +22,7 @@ impl TunFactory for DesktopTunFactory {
         &self,
         auth: &AuthResponse,
     ) -> Result<(mpsc::Sender<Bytes>, mpsc::Receiver<Bytes>, String)> {
-        let params = TunParams::from_auth_response(auth, &self.tun_name);
+        let params = TunParams::from_auth_response(auth, &self.tun_name)?;
 
         let mut manager = TunManager::new(params)?;
 
