@@ -1,6 +1,7 @@
 use crate::encryption::Cipher;
 use base64::prelude::*;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use hkdf::Hkdf;
 use sha2::{Digest, Sha256};
 use x25519_dalek::SharedSecret;
 
@@ -14,12 +15,13 @@ pub fn create_handshake_cipher(server_pub_key_bytes: &[u8]) -> Cipher {
     Cipher::new(&key)
 }
 
-/// Выведение симметричного ключа из DH Shared Secret
-pub fn derive_shared_key(shared_secret: &SharedSecret) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(shared_secret.as_bytes());
-    let output: [u8; 32] = hasher.finalize().into();
-    output
+/// Выведение симметричного ключа из DH Shared Secret через HKDF-SHA256 с domain separation
+pub fn derive_shared_key(shared_secret: &SharedSecret, info: &[u8]) -> [u8; 32] {
+    let hkdf = Hkdf::<Sha256>::new(Some(b"anet-v1"), shared_secret.as_bytes());
+    let mut key = [0u8; 32];
+    hkdf.expand(info, &mut key)
+        .expect("32 bytes is valid for HKDF-SHA256");
+    key
 }
 
 /// Подписывает данные личным ключом клиента

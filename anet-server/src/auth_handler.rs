@@ -154,7 +154,8 @@ impl ServerAuthHandler {
         self.temp_dh_map.insert(
             remote_addr,
             TempDHInfo {
-                shared_key: crypto_utils::derive_shared_key(&shared_secret),
+                auth_key: crypto_utils::derive_shared_key(&shared_secret, b"anet-auth-encrypt"),
+                transport_key: crypto_utils::derive_shared_key(&shared_secret, b"anet-transport"),
                 client_fingerprint,
                 created_at: Instant::now(),
             },
@@ -191,7 +192,7 @@ impl ServerAuthHandler {
             .map(|(_, v)| v)
             .context("DH session expired or not found")?;
 
-        let cipher = Cipher::new(&temp_info.shared_key);
+        let cipher = Cipher::new(&temp_info.auth_key);
 
         let plaintext =
             cipher.decrypt(enc_req.nonce.as_slice(), Bytes::from(enc_req.ciphertext))?;
@@ -215,7 +216,7 @@ impl ServerAuthHandler {
         let session_id = generate_seid();
 
         let client_info = Arc::new(ClientTransportInfo {
-            cipher: Arc::new(Cipher::new(&temp_info.shared_key)),
+            cipher: Arc::new(Cipher::new(&temp_info.transport_key)),
             sequence: Arc::new(AtomicU64::new(0)),
             assigned_ip: client_ip_str.clone(),
             session_id: session_id.clone(),

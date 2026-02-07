@@ -31,7 +31,6 @@ pub struct AuthHandler {
     server_addr: SocketAddr,
     server_public_key: VerifyingKey,
     server_pub_key_bytes: Vec<u8>,
-    ephemeral_secret: StaticSecret,
     signing_key: SigningKey,
     client_public_key: VerifyingKey,
     client_id: String,
@@ -40,8 +39,6 @@ pub struct AuthHandler {
 
 impl AuthHandler {
     pub fn new(cfg: &CoreConfig) -> Result<Self> {
-        let ephemeral_secret = StaticSecret::random_from_rng(OsRng);
-
         let private_key_bytes = BASE64_STANDARD
             .decode(&cfg.keys.private_key)
             .context("Failed to decode client private key")?;
@@ -68,7 +65,6 @@ impl AuthHandler {
             server_addr: cfg.main.address.parse()?,
             server_public_key,
             server_pub_key_bytes: server_pub_bytes,
-            ephemeral_secret,
             signing_key,
             client_public_key,
             client_id,
@@ -108,7 +104,8 @@ impl AuthHandler {
         socket: &Arc<UdpSocket>,
         delay: u64,
     ) -> Result<(AuthResponse, [u8; 32])> {
-        let client_pub_key = PublicKey::from(&self.ephemeral_secret);
+        let ephemeral_secret = StaticSecret::random_from_rng(OsRng);
+        let client_pub_key = PublicKey::from(&ephemeral_secret);
         let client_signed_dh_key = sign_data(&self.signing_key, client_pub_key.as_bytes());
 
         let mut dh_init_msg = AnetMessage {
@@ -137,11 +134,13 @@ impl AuthHandler {
             .context("Failed Phase I send")?;
 
         let (response_buf, len) = self.wait_for_response(socket, delay).await?;
-        let shared_key = self.handle_phase_ii_response(&response_buf, len)?;
+        let (auth_key, transport_key) =
+            self.handle_phase_ii_response(&response_buf, len, &ephemeral_secret)?;
         info!("[AUTH] Phase II complete. Shared secret derived.");
         status("[AUTH] Phase II complete. Shared secret derived.");
 
-        self.perform_phase_iii_iv(socket, shared_key, delay).await
+        self.perform_phase_iii_iv(socket, auth_key, transport_key, delay)
+            .await
     }
 
     fn create_handshake_packet(&self, message: &AnetMessage) -> Result<Bytes> {
@@ -163,7 +162,12 @@ impl AuthHandler {
         Ok(packet.freeze())
     }
 
-    fn handle_phase_ii_response(&self, response_buf: &[u8], len: usize) -> Result<[u8; 32]> {
+    fn handle_phase_ii_response(
+        &self,
+        response_buf: &[u8],
+        len: usize,
+        ephemeral_secret: &StaticSecret,
+    ) -> Result<([u8; 32], [u8; 32])> {
         let cipher = crypto_utils::create_handshake_cipher(&self.server_pub_key_bytes);
 
         if len < NONCE_LEN + 16 {
@@ -201,17 +205,20 @@ impl AuthHandler {
             .context("Failed to convert server DH key")?;
 
         let server_pub_key = PublicKey::from(server_key_array);
-        let shared_secret = self.ephemeral_secret.diffie_hellman(&server_pub_key);
-        Ok(derive_shared_key(&shared_secret))
+        let shared_secret = ephemeral_secret.diffie_hellman(&server_pub_key);
+        let auth_key = derive_shared_key(&shared_secret, b"anet-auth-encrypt");
+        let transport_key = derive_shared_key(&shared_secret, b"anet-transport");
+        Ok((auth_key, transport_key))
     }
 
     async fn perform_phase_iii_iv(
         &self,
         socket: &Arc<UdpSocket>,
-        shared_key: [u8; 32],
+        auth_key: [u8; 32],
+        transport_key: [u8; 32],
         delay: u64,
     ) -> Result<(AuthResponse, [u8; 32])> {
-        let (request_packet, cipher) = self.create_encrypted_auth_request(&shared_key)?;
+        let (request_packet, cipher) = self.create_encrypted_auth_request(&auth_key)?;
         info!(
             "[AUTH] Phase III: Sending Encrypted Auth Request ({} bytes).",
             request_packet.len()
@@ -242,13 +249,13 @@ impl AuthHandler {
             let auth_response = self.decrypt_auth_response(enc_res, &cipher)?;
             info!("[AUTH] Phase IV complete.");
             status("[AUTH] Phase IV complete.");
-            Ok((auth_response, shared_key))
+            Ok((auth_response, transport_key))
         } else {
             Err(anyhow::anyhow!("Unexpected Phase IV content"))
         }
     }
 
-    fn create_encrypted_auth_request(&self, shared_key: &[u8; 32]) -> Result<(Bytes, Cipher)> {
+    fn create_encrypted_auth_request(&self, auth_key: &[u8; 32]) -> Result<(Bytes, Cipher)> {
         let mut auth_payload = AnetMessage {
             content: Some(Content::AuthRequest(AuthRequest {
                 client_id: self.client_id.clone(),
@@ -263,7 +270,7 @@ impl AuthHandler {
         let mut raw_auth_request = Vec::new();
         auth_payload.encode(&mut raw_auth_request)?;
 
-        let req_cipher = Cipher::new(shared_key);
+        let req_cipher = Cipher::new(auth_key);
         let mut nonce_bytes = [0u8; NONCE_LEN];
         OsRng.fill_bytes(&mut nonce_bytes);
         let ciphertext = req_cipher.encrypt(&nonce_bytes, Bytes::from(raw_auth_request))?;

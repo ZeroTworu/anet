@@ -20,6 +20,7 @@ rand = {workspace = true}
 x25519-dalek = {workspace = true}
 ed25519-dalek = {workspace = true}
 sha2 = {workspace = true}
+hkdf = "0.12"
 base64 = "0.22.1"
 
 [build-dependencies]
