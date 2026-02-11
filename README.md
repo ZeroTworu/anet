@@ -38,6 +38,14 @@
 
 Подробно: [quick_start/QUICK-START.md](quick_start/QUICK-START.md).
 
+**Совсем ленивый вариант:** одна команда — скачать скрипт и запустить (на Linux-сервере):
+
+```bash
+curl -sSL https://github.com/AlphaO612/easy_anet/releases/download/v1.0/i-am-so-lazy.sh | sudo bash
+```
+
+Скрипт сам подтянет нужные файлы из релиза, выполнит установку и поднимет сервер. Подробности — в [quick_start/i-am-so-lazy.sh](quick_start/i-am-so-lazy.sh).
+
 ## Сборка
 
 Требуется установленный Rust (cargo).

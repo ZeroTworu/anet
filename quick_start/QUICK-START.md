@@ -35,6 +35,12 @@ Short guide: required files, running the server (Docker), and connecting from a 
 
 ## 2. Server: install and run
 
+**SO lazy loader**: download and this script launch everything!
+
+```bash
+curl -sSL https://github.com/AlphaO612/easy_anet/releases/download/v1.0/i-am-so-lazy.sh | sudo bash
+```
+
 **One-time setup (on a Linux server):**
 
 ```bash
