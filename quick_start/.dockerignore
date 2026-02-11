@@ -12,9 +12,7 @@ server/anet-server
 # Client / unrelated
 client-windows
 wg0*.conf
-wireguard-log*.txt
 *.txt
-!README-quic-cert.txt
 
 # Misc
 *.log
