@@ -1,0 +1,22 @@
+# Git and IDE
+.git
+.gitignore
+.cursor
+.vscode
+*.md
+
+# Build artifacts (we build inside container)
+**/target/
+server/anet-server
+
+# Client / unrelated
+client-windows
+wg0*.conf
+wireguard-log*.txt
+*.txt
+!README-quic-cert.txt
+
+# Misc
+*.log
+.DS_Store
+Thumbs.db

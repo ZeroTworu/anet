@@ -1,0 +1,21 @@
+# ANet VPN Server — Docker Compose
+# Requires: Linux host, network_mode: host, NET_ADMIN capability
+
+services:
+  anet-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: anet-server:latest
+    container_name: anet-server
+    # Host network so server can bind 0.0.0.0:8443 and use host's external_if for NAT
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    volumes:
+      # Mount config dir: put server.toml here (with quic_cert, quic_key, server_signing_key, allowed_clients)
+      - ./server:/config:ro
+    command: ["-c", "/config/server.toml"]
+    restart: unless-stopped

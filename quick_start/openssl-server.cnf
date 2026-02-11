@@ -1,0 +1,20 @@
+# Конфигурация OpenSSL для генерации серверного (leaf) сертификата.
+# Использование: см. README-quic-cert.txt
+# Без этих расширений сертификат может получиться как CA, и клиент выдаст:
+#   CaUsedAsEndEntity
+
+[req]
+distinguished_name = req_distinguished_name
+req_extensions = v3_req
+prompt = no
+
+[req_distinguished_name]
+CN = anet-server
+
+[v3_req]
+basicConstraints = critical, CA:FALSE
+keyUsage = critical, digitalSignature, keyEncipherment
+extendedKeyUsage = serverAuth
+subjectKeyIdentifier = hash
+# Имя "alco" захардкожено в клиенте для проверки сертификата (anet-client-core).
+subjectAltName = DNS:alco
