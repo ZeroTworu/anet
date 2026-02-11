@@ -1,6 +1,5 @@
 /target
 .idea
 *.pem
-*.sh
 android-build/*
 .env
