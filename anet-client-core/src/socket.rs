@@ -1,5 +1,5 @@
 use anet_common::config::StealthConfig;
-use anet_common::consts::{NONCE_PREFIX_LEN, PADDING_MTU};
+use anet_common::consts::{MAX_PACKET_SIZE, NONCE_PREFIX_LEN, PADDING_MTU};
 use anet_common::encryption::Cipher;
 use anet_common::padding_utils::calculate_padding_needed;
 use anet_common::transport;
@@ -111,7 +111,7 @@ impl AsyncUdpSocket for AnetUdpSocket {
         bufs: &mut [io::IoSliceMut<'_>],
         meta: &mut [RecvMeta],
     ) -> Poll<io::Result<usize>> {
-        let mut recv_buf = vec![0u8; 65535];
+        let mut recv_buf = vec![0u8; MAX_PACKET_SIZE];
         let mut read_buf = tokio::io::ReadBuf::new(&mut recv_buf);
 
         match self.io.poll_recv_from(cx, &mut read_buf) {
