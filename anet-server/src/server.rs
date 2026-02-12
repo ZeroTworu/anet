@@ -82,9 +82,6 @@ impl ANetServer {
         info!("Unified UDP listener started on {}", listen_addr);
 
         let (tx_to_tun, rx_from_tun) = self.tun_manager.run().await?;
-        self.tun_manager
-            .setup_server_tun_routing(&self.cfg.server.external_if)
-            .await?;
 
         let (tx_to_auth, rx_from_auth) = mpsc::channel::<HandshakeData>(CHANNEL_BUFFER_SIZE);
 

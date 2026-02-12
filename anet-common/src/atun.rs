@@ -6,9 +6,7 @@ use log::{error, info};
 #[cfg(target_os = "macos")]
 use log::warn;
 
-use std::net::Ipv4Addr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::process::Command;
 use tokio::sync::mpsc;
 use tun::AbstractDevice;
 
@@ -220,100 +218,4 @@ impl TunManager {
         Ok(())
     }
 
-    pub async fn setup_server_tun_routing(&self, external: &str) -> Result<()> {
-        if self.params.network.is_none() {
-            // Мы - не сервер.
-            return Ok(());
-        }
-        Command::new("sysctl")
-            .arg("-w")
-            .arg("net.ipv4.ip_forward=1")
-            .status()
-            .await?;
-        Command::new("iptables").args(&["-F"]).status().await?;
-        Command::new("iptables")
-            .args(&["-t", "nat", "-F"])
-            .status()
-            .await?;
-        Command::new("iptables")
-            .args(&["-P", "INPUT", "ACCEPT"])
-            .status()
-            .await?;
-        Command::new("iptables")
-            .args(&["-P", "FORWARD", "ACCEPT"])
-            .status()
-            .await?;
-        Command::new("iptables")
-            .args(&["-P", "OUTPUT", "ACCEPT"])
-            .status()
-            .await?;
-        Command::new("iptables")
-            .args(&[
-                "-t",
-                "nat",
-                "-A",
-                "POSTROUTING",
-                "-o",
-                external,
-                "-j",
-                "MASQUERADE",
-            ])
-            .status()
-            .await?;
-        Command::new("iptables")
-            .args(&[
-                "-A",
-                "FORWARD",
-                "-i",
-                &self.params.name,
-                "-o",
-                external,
-                "-j",
-                "ACCEPT",
-            ])
-            .status()
-            .await?;
-        Command::new("iptables")
-            .args(&[
-                "-A",
-                "FORWARD",
-                "-i",
-                external,
-                "-o",
-                &self.params.name,
-                "-j",
-                "ACCEPT",
-            ])
-            .status()
-            .await?;
-        let prefix = Self::netmask_to_prefix(self.params.netmask)?;
-        let net = format!("{}/{}", self.params.network.unwrap(), prefix);
-        Command::new("ip")
-            .args(&["route", "replace", &net, "dev", &self.params.name])
-            .status()
-            .await?;
-        info!("IP routing configured successfully");
-        Ok(())
-    }
-
-    /// Преобразует маску в формате Ipv4Addr в префикс CIDR
-    fn netmask_to_prefix(netmask: Ipv4Addr) -> Result<u8, anyhow::Error> {
-        let octets = netmask.octets();
-        let mask = u32::from_be_bytes(octets);
-
-        // Проверяем что маска валидна (последовательность единиц followed by нулей)
-        if !Self::is_valid_netmask(mask) {
-            return Err(anyhow::anyhow!("Invalid netmask: {}", netmask));
-        }
-
-        // Считаем количество установленных битов
-        Ok(mask.count_ones() as u8)
-    }
-
-    /// Проверяет что маска является валидной сетевой маской
-    fn is_valid_netmask(mask: u32) -> bool {
-        // Маска должна быть последовательностью единиц followed by нулей
-        let inverted = !mask;
-        inverted & (inverted + 1) == 0
-    }
 }

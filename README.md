@@ -57,6 +57,23 @@ make cert
 ```
 [Android src](https://github.com/ZeroTworu/anet-android)
 
+### Запуск сервера, внимание!
+
+После запуска сервера, настройте двухсторонние перенаправление траффика между `TUN` интерфейсом и вашим внешним интерфейсом.
+
+*обычно* это так, но зависит от OS где запущен сервер и чего *именно* вы хотите.
+
+```
+iptables -I INPUT --dport <Server port> -j ACCEPT
+
+iptables -I FORWARD -i <External Interface> -o <if_name from server config> -j ACCEPT
+
+iptables -I FORWARD -i <if_name from server config> -o <External Interface> -j ACCEPT
+
+iptables -t nat -A POSTROUTING -o <External Interface> -j MASQUERADE
+
+```
+
 Support the Chaos
 
 Если ANet помог тебе — налей автору.
