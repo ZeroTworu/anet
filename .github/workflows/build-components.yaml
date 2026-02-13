@@ -27,20 +27,24 @@ on:
 
 jobs:
   build-linux-server:
-    name: "Build Linux Server"
+    name: "Build Linux Server & Tools"
     runs-on: "ubuntu-latest"
     steps:
       - uses: "actions/checkout@v6"
 
-      - name: "Install musl tools"
-        run: "sudo apt-get install -y musl-tools protobuf-compiler"
+      # Ставим musl для статики и mingw для кросс-компиляции винды
+      - name: "Install dependencies"
+        run: "sudo apt-get install -y musl-tools protobuf-compiler mingw-w64"
 
       - name: "Install Rust"
         uses: "actions-rs/toolchain@v1"
         with:
           toolchain: "stable"
-          target: "x86_64-unknown-linux-musl"
           override: "true"
+      - name: "Add Rust Targets"
+        run: |
+          rustup target add x86_64-unknown-linux-musl
+          rustup target add x86_64-pc-windows-gnu  
 
       - name: "Cache Rust dependencies"
         uses: actions/cache@v5
@@ -49,18 +53,39 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-musl-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-server-full-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-musl-
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-cargo-server-full-
 
-      - name: "Build Server"
-        run: "RUSTFLAGS=\"-C target-feature=+crt-static\" cargo build --release --package anet-server --target x86_64-unknown-linux-musl"
+      # 1. Сборка Linux бинарников (Static MUSL)
+      - name: "Build Linux Binaries (Musl)"
+        run: |
+          RUSTFLAGS="-C target-feature=+crt-static" cargo build --release --package anet-server --target x86_64-unknown-linux-musl
+          RUSTFLAGS="-C target-feature=+crt-static" cargo build --release --package anet-auth --target x86_64-unknown-linux-musl
+          RUSTFLAGS="-C target-feature=+crt-static" cargo build --release --package anet-keygen --target x86_64-unknown-linux-musl
+
+      # 2. Сборка Windows Keygen (Cross-compile)
+      - name: "Build Windows Keygen"
+        run: |
+          cargo build --release --package anet-keygen --target x86_64-pc-windows-gnu
+
+      # 3. Подготовка папки для артефакта
+      - name: "Prepare Artifact Folder"
+        run: |
+          mkdir -p server_bin
+          
+          # Linux
+          cp target/x86_64-unknown-linux-musl/release/anet-server server_bin/
+          cp target/x86_64-unknown-linux-musl/release/anet-auth server_bin/
+          cp target/x86_64-unknown-linux-musl/release/anet-keygen server_bin/
+          
+          # Windows
+          cp target/x86_64-pc-windows-gnu/release/anet-keygen.exe server_bin/
 
       - uses: "actions/upload-artifact@v6"
         with:
-          name: "anet-server"
-          path: "target/x86_64-unknown-linux-musl/release/anet-server"
+          name: "anet-server-full"
+          path: "server_bin/"
 
   build-linux-client:
     name: "Build Linux Client"

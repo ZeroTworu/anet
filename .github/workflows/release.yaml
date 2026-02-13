@@ -36,9 +36,24 @@ jobs:
       - name: "Prepare files for packaging"
         run: |
           mkdir -p release_files/server release_files/client-linux release_files/client-windows release_files/client-macos
+          # --- SERVER (LINUX) ---
+          # 1. Основные бинарники
+          cp artifacts/anet-server-full/anet-server release_files/server/
+          cp artifacts/anet-server-full/anet-auth release_files/server/
           
-          # --- LINUX SERVER & CLIENT ---
-          cp artifacts/anet-server/anet-server release_files/server/
+          # 2. Конфиги
+          cp contrib/config/server.toml release_files/server/
+          # Копируем .env.example.auth (если он есть в репо)
+          if [ -f "contrib/config/.env.example.auth" ]; then
+             cp contrib/config/.env.example.auth release_files/server/
+          fi
+          
+          # 3. Keygens (в отдельной папке)
+          mkdir -p release_files/server/keygen
+          cp artifacts/anet-server-full/anet-keygen release_files/server/keygen/
+          cp artifacts/anet-server-full/anet-keygen.exe release_files/server/keygen/
+          
+          # --- LINUX CLIENT ---
           cp artifacts/anet-client-linux/anet-client release_files/client-linux/
           
           # --- WINDOWS CLIENT ---
@@ -83,7 +98,6 @@ jobs:
           fi
           
           # --- CONFIGS ---
-          cp contrib/config/server.toml release_files/server/
           cp contrib/config/client.toml release_files/client-linux/
           cp contrib/config/client.toml ${CLIENT_WIN_DIR}/
           cp contrib/config/client.toml ${CLIENT_MAC_DIR}/
