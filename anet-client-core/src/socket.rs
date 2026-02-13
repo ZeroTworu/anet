@@ -111,50 +111,71 @@ impl AsyncUdpSocket for AnetUdpSocket {
         bufs: &mut [io::IoSliceMut<'_>],
         meta: &mut [RecvMeta],
     ) -> Poll<io::Result<usize>> {
+        let mut count = 0;
+        // Используем один буфер для чтения из сокета
         let mut recv_buf = vec![0u8; MAX_PACKET_SIZE];
-        let mut read_buf = tokio::io::ReadBuf::new(&mut recv_buf);
 
-        match self.io.poll_recv_from(cx, &mut read_buf) {
-            Poll::Ready(Ok(remote_addr)) => {
-                let filled_len = read_buf.filled().len();
-                if filled_len == 0 {
-                    return Poll::Pending;
-                }
+        // Пытаемся заполнить столько буферов, сколько дал Quinn
+        for (buf, meta_item) in bufs.iter_mut().zip(meta.iter_mut()) {
+            let mut read_buf = tokio::io::ReadBuf::new(&mut recv_buf);
 
-                let raw_packet_mut = &mut recv_buf[..filled_len];
+            match self.io.poll_recv_from(cx, &mut read_buf) {
+                Poll::Ready(Ok(remote_addr)) => {
+                    let filled_len = read_buf.filled().len();
+                    if filled_len == 0 {
+                        break;
+                    }
 
-                // Пытаемся расшифровать
-                match transport::unwrap_packet_in_place(&self.cipher, raw_packet_mut) {
-                    Ok(quic_payload) => {
-                        if bufs.is_empty() {
-                            return Poll::Ready(Ok(0));
+                    let raw_packet_mut = &mut recv_buf[..filled_len];
+
+                    // Пытаемся расшифровать
+                    match transport::unwrap_packet_in_place(&self.cipher, raw_packet_mut) {
+                        Ok(quic_payload) => {
+                            let copy_len = std::cmp::min(quic_payload.len(), buf.len());
+                            buf[..copy_len].copy_from_slice(&quic_payload[..copy_len]);
+
+                            *meta_item = RecvMeta {
+                                addr: remote_addr,
+                                len: copy_len,
+                                stride: copy_len,
+                                dst_ip: None,
+                                ecn: None,
+                            };
+                            count += 1;
                         }
-
-                        let copy_len = std::cmp::min(quic_payload.len(), bufs[0].len());
-                        bufs[0][..copy_len].copy_from_slice(&quic_payload[..copy_len]);
-
-                        meta[0] = RecvMeta {
-                            addr: remote_addr,
-                            len: copy_len,
-                            stride: copy_len,
-                            dst_ip: None,
-                            ecn: None,
-                        };
-                        Poll::Ready(Ok(1)) // Успешно обработали 1 пакет
+                        Err(e) => {
+                            debug!("[ANet] Drop bad packet from {}: {}", remote_addr, e);
+                            // Если пакет битый, мы не инкрементируем count,
+                            // но продолжаем цикл, чтобы попытаться вычитать следующий нормальный пакет.
+                            // Однако, буфер `buf` мы не заполнили. Quinn ожидает непрерывный заполненный слайс.
+                            // Поэтому при ошибке проще прервать батч (или нужно хитро сдвигать итераторы, но break безопаснее).
+                            // В реальной сети ошибки редки, break не сильно ударит.
+                            if count == 0 {
+                                // Если это был первый пакет и он битый - нужно перерегистрировать waker
+                                cx.waker().wake_by_ref();
+                                return Poll::Pending;
+                            }
+                            break;
+                        }
                     }
-                    Err(e) => {
-                        // Это может быть просто "левый" пакет в сети. Логируем на уровне debug.
-                        debug!(
-                            "[ANet] Failed to unwrap packet from {}: {}. Dropping.",
-                            remote_addr, e
-                        );
-                        cx.waker().wake_by_ref();
-                        Poll::Pending // Сообщаем Tokio, что нужно попробовать снова
+                }
+                Poll::Ready(Err(e)) => {
+                    if count > 0 {
+                        // Если мы уже что-то прочитали, возвращаем успех. Ошибку вернем в след. раз.
+                        break;
                     }
+                    return Poll::Ready(Err(e));
+                }
+                Poll::Pending => {
+                    break; // Больше пакетов нет
                 }
             }
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            Poll::Pending => Poll::Pending,
+        }
+
+        if count > 0 {
+            Poll::Ready(Ok(count))
+        } else {
+            Poll::Pending
         }
     }
 

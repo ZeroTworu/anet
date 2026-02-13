@@ -5,7 +5,7 @@ use anet_common::padding_utils::calculate_padding_needed;
 use anet_common::transport;
 use anet_common::udp_poller::TokioUdpPoller;
 use bytes::Bytes;
-use log::{debug, error, warn};
+use log::{error, warn};
 use quinn::{
     AsyncUdpSocket, UdpPoller,
     udp::{RecvMeta, Transmit},
@@ -121,80 +121,110 @@ impl AsyncUdpSocket for MultiKeyAnetUdpSocket {
         bufs: &mut [IoSliceMut<'_>],
         meta: &mut [RecvMeta],
     ) -> Poll<io::Result<usize>> {
+        let mut count = 0;
+        // Индекс текущего буфера Quinn, который мы хотим заполнить
+        let mut i = 0;
+
         let mut recv_buf = vec![0u8; MAX_PACKET_SIZE];
-        let mut read_buf = tokio::io::ReadBuf::new(&mut recv_buf);
 
-        match self.io.poll_recv_from(cx, &mut read_buf) {
-            Poll::Ready(Ok(remote_addr)) => {
-                let filled_len = read_buf.filled().len();
-                if filled_len == 0 {
-                    return Poll::Pending;
-                }
-                let raw_packet_mut = &mut recv_buf[..filled_len];
+        // Читаем, пока есть свободные буферы у Quinn
+        while i < bufs.len() {
+            let mut read_buf = tokio::io::ReadBuf::new(&mut recv_buf);
 
-                // 1. Проверяем, похоже ли это на пакет сессии (мин длина)
-                if filled_len >= NONCE_LEN + 1 {
-                    let nonce_prefix: [u8; 4] = raw_packet_mut[..4].try_into().unwrap();
+            match self.io.poll_recv_from(cx, &mut read_buf) {
+                Poll::Ready(Ok(remote_addr)) => {
+                    let filled_len = read_buf.filled().len();
+                    if filled_len == 0 {
+                        break;
+                    }
 
-                    // Если есть в реестре - это сессия
-                    if let Some(client_info) = self.registry.get_by_prefix(&nonce_prefix) {
-                        self.registry.update_client_addr(&client_info, remote_addr);
+                    let raw_packet_mut = &mut recv_buf[..filled_len];
+                    let mut packet_for_quinn = false;
 
-                        match transport::unwrap_packet_in_place(&client_info.cipher, raw_packet_mut) {
-                            Ok(quic_payload) => {
-                                if bufs.is_empty() {
-                                    return Poll::Ready(Ok(0));
+                    // 1. Попытка распознать сессию (Session Data)
+                    if filled_len >= NONCE_LEN + 1 {
+                        // Пробуем взять префикс
+                        if let Ok(nonce_prefix) = raw_packet_mut[..4].try_into() {
+                            if let Some(client_info) = self.registry.get_by_prefix(&nonce_prefix) {
+                                self.registry.update_client_addr(&client_info, remote_addr);
+
+                                match transport::unwrap_packet_in_place(
+                                    &client_info.cipher,
+                                    raw_packet_mut,
+                                ) {
+                                    Ok(quic_payload) => {
+                                        // УРА! Это пакет для Quinn (данные туннеля)
+                                        let buf = &mut bufs[i];
+                                        let copy_len = quic_payload.len().min(buf.len());
+                                        buf[..copy_len].copy_from_slice(&quic_payload[..copy_len]);
+
+                                        meta[i] = RecvMeta {
+                                            addr: remote_addr,
+                                            len: copy_len,
+                                            stride: copy_len,
+                                            dst_ip: None,
+                                            ecn: None,
+                                        };
+
+                                        count += 1;
+                                        i += 1; // Переходим к следующему слоту Quinn
+                                        packet_for_quinn = true;
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "Session decryption failed for {}: {}",
+                                            remote_addr, e
+                                        );
+                                        // Пакет битый, Quinn его не получит.
+                                        // Но цикл не прерываем, читаем дальше.
+                                    }
                                 }
-                                let copy_len = quic_payload.len().min(bufs[0].len());
-                                bufs[0][..copy_len].copy_from_slice(&quic_payload[..copy_len]);
-                                meta[0] = RecvMeta {
-                                    addr: remote_addr,
-                                    len: copy_len,
-                                    stride: copy_len,
-                                    dst_ip: None,
-                                    ecn: None,
-                                };
-                                return Poll::Ready(Ok(1));
-                            }
-                            Err(e) => {
-                                // Ошибка дешифровки сессии. Возможно коллизия префикса или атака.
-                                // Но раз префикс совпал, мы не передаем это в AuthHandler,
-                                // так как AuthHandler ожидает случайный Nonce, а не наш Sequence.
-                                warn!("Session decryption failed for {}: {}", remote_addr, e);
-                                cx.waker().wake_by_ref();
-                                return Poll::Pending;
                             }
                         }
                     }
-                }
 
-                // 2. Если не сессия - возможно это Handshake.
-                // Отправляем в AuthHandler, если длина проходит минимальный порог
-                if filled_len >= MIN_HANDSHAKE_LEN {
-                    // Try_send, чтобы не блокировать IO поток
-                    if self
-                        .auth_tx
-                        .try_send((Bytes::copy_from_slice(raw_packet_mut), remote_addr))
-                        .is_err()
-                    {
-                        warn!(
-                            "[Socket] Auth channel full, dropping handshake from {}.",
-                            remote_addr
-                        );
+                    // 2. Если это не пакет сессии - проверяем Хендшейк
+                    if !packet_for_quinn {
+                        if filled_len >= MIN_HANDSHAKE_LEN {
+                            // Копируем, т.к. raw_packet_mut живет только в цикле
+                            let packet_copy = Bytes::copy_from_slice(raw_packet_mut);
+
+                            // Отправляем в Auth. Не блокируем поток.
+                            if self.auth_tx.try_send((packet_copy, remote_addr)).is_err() {
+                                warn!("[Socket] Auth channel full, dropping packet");
+                            }
+                            // Пакет обработан (ушел в Auth).
+                            // Quinn его не видит.
+                            // МЫ ПРОДОЛЖАЕМ ЦИКЛ (не делаем break), чтобы найти данные для Quinn
+                        } else {
+                            warn!(
+                                "[Socket] Dropping unknown/short packet from {}",
+                                remote_addr
+                            );
+                        }
                     }
-                } else {
-                    debug!(
-                        "[Socket] Dropping short unknown packet from {}",
-                        remote_addr
-                    );
                 }
-
-                // В любом случае (Handshake или мусор) для QUIC сокета это "ничего"
-                cx.waker().wake_by_ref();
-                Poll::Pending
+                Poll::Ready(Err(_)) => {
+                    // Ошибка сокета. Если уже что-то набрали - вернем успех.
+                    if count > 0 {
+                        return Poll::Ready(Ok(count));
+                    }
+                    // Иначе просто выходим, в след раз вернет ошибку или Pending
+                    break;
+                }
+                Poll::Pending => {
+                    // Сокет пуст. Больше читать нечего.
+                    break;
+                }
             }
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            Poll::Pending => Poll::Pending,
+        }
+
+        if count > 0 {
+            Poll::Ready(Ok(count))
+        } else {
+            // Если count == 0, но мы вернули Pending - это корректно.
+            // Waker был зарегистрирован последним вызовом poll_recv_from.
+            Poll::Pending
         }
     }
 
