@@ -152,7 +152,8 @@ impl ANetApp {
         match toml::from_str::<CoreConfig>(&config_content) {
             Ok(cfg) => {
                 let tun = Box::new(DesktopTunFactory::new(cfg.main.tun_name.clone()));
-                let route = match create_route_manager() {
+                // Для гуя нет смысла в ручном роутенге.
+                let route = match create_route_manager(false) {
                     Ok(r) => r,
                     Err(e) => {
                         self.config_err = Some(format!("Failed to create route manager: {}", e));

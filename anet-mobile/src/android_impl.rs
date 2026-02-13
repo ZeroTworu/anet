@@ -1,5 +1,5 @@
 use anet_client_core::config::CoreConfig;
-use anet_client_core::traits::{RouteManager, TunFactory};
+use anet_client_core::traits::TunFactory;
 use anet_common::consts::{CHANNEL_BUFFER_SIZE, MAX_PACKET_SIZE};
 use anet_common::protocol::AuthResponse;
 use anyhow::Result;
@@ -269,24 +269,4 @@ impl TunFactory for AndroidCallbackTunFactory {
 fn ip_mask_to_prefix(mask_str: &str) -> Result<u8> {
     let mask: Ipv4Addr = mask_str.parse()?;
     Ok(u32::from(mask).count_ones() as u8)
-}
-
-pub struct AndroidRouteManager;
-#[async_trait::async_trait]
-impl RouteManager for AndroidRouteManager {
-    async fn backup_routes(&self) -> Result<()> {
-        Ok(())
-    }
-    async fn add_bypass_route(&self, _t: IpAddr, _p: u8) -> Result<()> {
-        Ok(())
-    }
-    async fn set_default_route(&self, _g: &str, _i: &str) -> Result<()> {
-        Ok(())
-    }
-    async fn add_specific_route(&self, _t: IpAddr, _p: u8, _g: &str, _i: &str) -> Result<()> {
-        Ok(())
-    }
-    async fn restore_routes(&self) -> Result<()> {
-        Ok(())
-    }
 }

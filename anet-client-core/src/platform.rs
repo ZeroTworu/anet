@@ -6,54 +6,14 @@
 use crate::dns::{DnsManager, create_dns_manager};
 use crate::traits::RouteManager;
 use anyhow::Result;
-
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 use crate::router::desktop::DesktopRouteManager;
-
 #[cfg(target_os = "macos")]
 use crate::router::macos::MacOSRouteManager;
 
-/// Create a platform-appropriate route manager
-///
-/// # Platform behavior
-/// - **Linux/Windows**: Uses `net-route` crate via `DesktopRouteManager`
-/// - **macOS**: Uses shell commands (`route`) via `MacOSRouteManager`
-///
-/// # Errors
-/// Returns an error if the route manager fails to initialize
-/// (e.g., insufficient permissions, missing dependencies)
-#[cfg(any(target_os = "linux", target_os = "windows"))]
-pub fn create_route_manager() -> Result<Box<dyn RouteManager>> {
-    Ok(Box::new(DesktopRouteManager::new()?))
-}
+pub struct NoOpRouteManager;
 
-#[cfg(target_os = "macos")]
-pub fn create_route_manager() -> Result<Box<dyn RouteManager>> {
-    Ok(Box::new(MacOSRouteManager::new()?))
-}
 
-#[cfg(target_os = "android")]
-pub fn create_route_manager() -> Result<Box<dyn RouteManager>> {
-    // Android uses VpnService for routing - return a no-op manager
-    Ok(Box::new(NoOpRouteManager))
-}
-
-/// Create a platform-appropriate DNS manager
-///
-/// # Platform behavior
-/// - **Linux**: Modifies `/etc/resolv.conf`
-/// - **Windows**: Uses `netsh` (typically handled in TUN factory)
-/// - **macOS**: Uses `scutil` for System Configuration
-/// - **Android**: No-op (VpnService handles DNS)
-pub fn create_platform_dns_manager() -> Box<dyn DnsManager> {
-    create_dns_manager()
-}
-
-/// No-op route manager for platforms that handle routing internally
-#[cfg(target_os = "android")]
-struct NoOpRouteManager;
-
-#[cfg(target_os = "android")]
 #[async_trait::async_trait]
 impl RouteManager for NoOpRouteManager {
     async fn backup_routes(&self) -> Result<()> {
@@ -82,6 +42,51 @@ impl RouteManager for NoOpRouteManager {
         Ok(())
     }
 }
+
+/// Create a platform-appropriate route manager
+///
+/// # Platform behavior
+/// - **Linux/Windows**: Uses `net-route` crate via `DesktopRouteManager`
+/// - **macOS**: Uses shell commands (`route`) via `MacOSRouteManager`
+///
+/// # Errors
+/// Returns an error if the route manager fails to initialize
+/// (e.g., insufficient permissions, missing dependencies)
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+pub fn create_route_manager(manual_routing: bool) -> Result<Box<dyn RouteManager>> {
+    use log::info;
+    if manual_routing {
+        info!("Manual routing enabled");
+        return Ok(Box::new(NoOpRouteManager))
+    }
+    info!("Enabled auto routing");
+    Ok(Box::new(DesktopRouteManager::new()?))
+}
+
+#[cfg(target_os = "macos")]
+pub fn create_route_manager(manual_routing: bool) -> Result<Box<dyn RouteManager>> {
+    Ok(Box::new(MacOSRouteManager::new()?))
+}
+
+#[cfg(target_os = "android")]
+pub fn create_route_manager(manual_routing: bool) -> Result<Box<dyn RouteManager>> {
+    // Android uses VpnService for routing - return a no-op manager
+    Ok(Box::new(NoOpRouteManager))
+}
+
+/// Create a platform-appropriate DNS manager
+///
+/// # Platform behavior
+/// - **Linux**: Modifies `/etc/resolv.conf`
+/// - **Windows**: Uses `netsh` (typically handled in TUN factory)
+/// - **macOS**: Uses `scutil` for System Configuration
+/// - **Android**: No-op (VpnService handles DNS)
+pub fn create_platform_dns_manager() -> Box<dyn DnsManager> {
+    create_dns_manager()
+}
+
+/// No-op route manager for platforms that handle routing internally
+
 
 /// Check if the current platform requires root/admin privileges for VPN
 pub fn requires_elevated_privileges() -> bool {

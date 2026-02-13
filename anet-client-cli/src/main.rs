@@ -112,7 +112,7 @@ async fn main() -> Result<()> {
     let ascii_art = generate_ascii_art(BUILD_TYPE, COMMIT_HASH, BUILD_TIME);
     println!("{}", ascii_art);
 
-    let route_mgr = create_route_manager()?;
+    let route_mgr = create_route_manager(config.main.manual_routing)?;
     let cfg = config.clone();
     let tun_fac = Box::new(DesktopTunFactory::new(config.main.tun_name));
     let client = AnetClient::new(cfg, tun_fac, route_mgr);
