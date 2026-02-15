@@ -64,8 +64,8 @@ impl DnsManager for LinuxDnsManager {
         info!("Configuring DNS servers: {:?}", servers);
 
         // Read and backup original content
-        let original = fs::read_to_string(RESOLV_CONF_PATH)
-            .context("Failed to read /etc/resolv.conf")?;
+        let original =
+            fs::read_to_string(RESOLV_CONF_PATH).context("Failed to read /etc/resolv.conf")?;
 
         // Store original content
         {
@@ -80,8 +80,7 @@ impl DnsManager for LinuxDnsManager {
 
         // Write new resolv.conf
         let new_content = Self::build_resolv_conf(servers);
-        fs::write(RESOLV_CONF_PATH, &new_content)
-            .context("Failed to write /etc/resolv.conf")?;
+        fs::write(RESOLV_CONF_PATH, &new_content).context("Failed to write /etc/resolv.conf")?;
 
         debug!("Wrote new resolv.conf:\n{}", new_content);
         info!("DNS configured successfully");
@@ -110,8 +109,8 @@ impl DnsManager for LinuxDnsManager {
                 // Try to restore from backup file if in-memory backup is missing
                 if Path::new(BACKUP_PATH).exists() {
                     info!("Restoring DNS from backup file...");
-                    let backup = fs::read_to_string(BACKUP_PATH)
-                        .context("Failed to read backup file")?;
+                    let backup =
+                        fs::read_to_string(BACKUP_PATH).context("Failed to read backup file")?;
                     fs::write(RESOLV_CONF_PATH, &backup)
                         .context("Failed to restore /etc/resolv.conf from backup")?;
                     let _ = fs::remove_file(BACKUP_PATH);

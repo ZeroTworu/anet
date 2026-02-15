@@ -1,4 +1,3 @@
-
 use base64::prelude::*;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::rngs::OsRng;

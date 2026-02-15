@@ -2,10 +2,10 @@ mod android_impl;
 
 use crate::android_impl::AndroidCallbackTunFactory;
 use android_logger::Config;
-use anet_client_core::AnetClient;
-use anet_client_core::platform::NoOpRouteManager;
+use anet_client_core::client::AnetClient;
 use anet_client_core::config::CoreConfig;
 use anet_client_core::events::{self, AnetEvent, EventHandler, status};
+use anet_client_core::platform::NoOpRouteManager;
 use jni::objects::{GlobalRef, JClass, JString, JValue};
 use jni::{JNIEnv, JavaVM};
 use log::{LevelFilter, error, info};

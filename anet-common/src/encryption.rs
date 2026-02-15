@@ -54,7 +54,11 @@ impl Cipher {
     /// Буфер должен содержать [Ciphertext + Tag].
     /// После успеха буфер будет содержать [Plaintext], а "хвост" (где был тег) станет мусором.
     #[inline]
-    pub fn decrypt_in_place(&self, nonce_bytes: &[u8], buffer: &mut [u8]) -> Result<(), EncryptionError> {
+    pub fn decrypt_in_place(
+        &self,
+        nonce_bytes: &[u8],
+        buffer: &mut [u8],
+    ) -> Result<(), EncryptionError> {
         let nonce = Nonce::<CryptoAlgorithm>::from_slice(nonce_bytes);
         let len = buffer.len();
 

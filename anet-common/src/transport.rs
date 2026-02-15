@@ -68,10 +68,7 @@ pub fn unwrap_packet(cipher: &Cipher, raw_packet: &[u8]) -> Result<Bytes> {
 /// Расшифровывает пакет на месте (без выделения памяти).
 /// buffer: полный пакет (Nonce + Ciphertext + Tag).
 /// Возвращает срез с полезной нагрузкой (Quic Payload).
-pub fn unwrap_packet_in_place<'a>(
-    cipher: &Cipher,
-    buffer: &'a mut [u8]
-) -> Result<&'a [u8]> {
+pub fn unwrap_packet_in_place<'a>(cipher: &Cipher, buffer: &'a mut [u8]) -> Result<&'a [u8]> {
     // 16 байт - размер тега Poly1305
     if buffer.len() < NONCE_LEN + 16 {
         return Err(anyhow!("Packet too short"));

@@ -1,8 +1,9 @@
 use crate::config::AppSettings;
 use crate::tun_factory::DesktopTunFactory;
-use anet_client_core::{AnetClient, create_route_manager};
+use anet_client_core::client::AnetClient;
 use anet_client_core::config::CoreConfig;
 use anet_client_core::events::{AnetEvent, EventHandler, set_handler};
+use anet_client_core::platform::create_route_manager;
 use eframe::egui;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender, channel};

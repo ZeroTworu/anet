@@ -105,7 +105,9 @@ async fn run_server(db: DatabaseConnection) -> Result<(), anyhow::Error> {
         .with(middleware::ApiKeyMiddleware { key: api_key });
 
     info!("ANet Auth started on {}", bind_to);
-    Server::new(TcpListener::bind(format!("{}", bind_to))).run(app).await?;
+    Server::new(TcpListener::bind(format!("{}", bind_to)))
+        .run(app)
+        .await?;
 
     Ok(())
 }

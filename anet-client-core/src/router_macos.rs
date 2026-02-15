@@ -61,10 +61,7 @@ impl MacOSRouteManager {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(anyhow::anyhow!(
-                "route command failed: {}",
-                stderr.trim()
-            ));
+            return Err(anyhow::anyhow!("route command failed: {}", stderr.trim()));
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -92,9 +89,7 @@ impl MacOSRouteManager {
 
         match (gateway, interface) {
             (Some(gw), Some(iface)) => Ok((gw, iface)),
-            (None, Some(_)) => Err(anyhow::anyhow!(
-                "Could not parse gateway from route output"
-            )),
+            (None, Some(_)) => Err(anyhow::anyhow!("Could not parse gateway from route output")),
             (Some(_), None) => Err(anyhow::anyhow!(
                 "Could not parse interface from route output"
             )),
@@ -154,13 +149,7 @@ impl MacOSRouteManager {
 
     /// Add a host route (/32) via gateway
     async fn add_host_route_via_gateway(target: IpAddr, gateway: IpAddr) -> Result<()> {
-        Self::run_route_cmd(&[
-            "add",
-            "-host",
-            &target.to_string(),
-            &gateway.to_string(),
-        ])
-        .await?;
+        Self::run_route_cmd(&["add", "-host", &target.to_string(), &gateway.to_string()]).await?;
         Ok(())
     }
 
@@ -173,19 +162,17 @@ impl MacOSRouteManager {
 
     /// Add a host route (/32) via interface
     async fn add_host_route_via_interface(target: IpAddr, interface: &str) -> Result<()> {
-        Self::run_route_cmd(&[
-            "add",
-            "-host",
-            &target.to_string(),
-            "-interface",
-            interface,
-        ])
-        .await?;
+        Self::run_route_cmd(&["add", "-host", &target.to_string(), "-interface", interface])
+            .await?;
         Ok(())
     }
 
     /// Add a network route via interface
-    async fn add_net_route_via_interface(target: IpAddr, prefix: u8, interface: &str) -> Result<()> {
+    async fn add_net_route_via_interface(
+        target: IpAddr,
+        prefix: u8,
+        interface: &str,
+    ) -> Result<()> {
         let cidr = format!("{}/{}", target, prefix);
         Self::run_route_cmd(&["add", "-net", &cidr, "-interface", interface]).await?;
         Ok(())
@@ -268,8 +255,8 @@ impl RouteManager for MacOSRouteManager {
         // 3. If VPN crashes, the original default route still works
 
         let routes_to_add = [
-            (IpAddr::from([0, 0, 0, 0]), 1u8),      // 0.0.0.0/1 - covers 0.0.0.0 - 127.255.255.255
-            (IpAddr::from([128, 0, 0, 0]), 1u8),   // 128.0.0.0/1 - covers 128.0.0.0 - 255.255.255.255
+            (IpAddr::from([0, 0, 0, 0]), 1u8), // 0.0.0.0/1 - covers 0.0.0.0 - 127.255.255.255
+            (IpAddr::from([128, 0, 0, 0]), 1u8), // 128.0.0.0/1 - covers 128.0.0.0 - 255.255.255.255
         ];
 
         for (dest, prefix) in routes_to_add {

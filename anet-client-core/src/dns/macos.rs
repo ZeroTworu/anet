@@ -42,7 +42,9 @@ impl MacOSDnsManager {
                 .context("Failed to write to scutil stdin")?;
         }
 
-        let output = child.wait_with_output().context("Failed to wait for scutil")?;
+        let output = child
+            .wait_with_output()
+            .context("Failed to wait for scutil")?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -76,10 +78,7 @@ set State:/Network/Service/{service}/DNS
 
     /// Build the scutil command to remove DNS configuration
     fn build_dns_remove_command() -> String {
-        format!(
-            "remove State:/Network/Service/{}/DNS\n",
-            DNS_SERVICE_NAME
-        )
+        format!("remove State:/Network/Service/{}/DNS\n", DNS_SERVICE_NAME)
     }
 }
 

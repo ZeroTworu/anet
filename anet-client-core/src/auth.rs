@@ -193,7 +193,7 @@ impl AuthHandler {
             &server_pub_key_bytes,
             &server_signature,
         )
-            .context("Server signature verification failed")?;
+        .context("Server signature verification failed")?;
 
         let server_key_array: [u8; 32] = server_pub_key_bytes
             .as_slice()
