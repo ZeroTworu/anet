@@ -35,125 +35,105 @@ jobs:
 
       - name: "Prepare files for packaging"
         run: |
-          mkdir -p release_files/server release_files/client-linux release_files/client-windows release_files/client-macos
-          # --- SERVER (LINUX) ---
-          # 1. Основные бинарники
+          mkdir -p release_files/server
+          mkdir -p release_files/client-linux-amd64
+          mkdir -p release_files/client-linux-arm64
+          mkdir -p release_files/client-windows
+          mkdir -p release_files/client-macos
+          
+          # SERVER
           cp artifacts/anet-server-full/anet-server release_files/server/
           cp artifacts/anet-server-full/anet-auth release_files/server/
-          
-          # 2. Конфиги
           cp contrib/config/server.toml release_files/server/
-          # Копируем .env.example.auth (если он есть в репо)
           if [ -f "contrib/config/.env.example.auth" ]; then
              cp contrib/config/.env.example.auth release_files/server/
           fi
-          
-          # 3. Keygens (в отдельной папке)
           mkdir -p release_files/server/keygen
           cp artifacts/anet-server-full/anet-keygen release_files/server/keygen/
           cp artifacts/anet-server-full/anet-keygen.exe release_files/server/keygen/
           
-          # --- LINUX CLIENT ---
-          cp artifacts/anet-client-linux/anet-client release_files/client-linux/
+          # LINUX CLIENT AMD64
+          cp artifacts/anet-client-linux-amd64/anet-client release_files/client-linux-amd64/
+          cp contrib/config/client.toml release_files/client-linux-amd64/
           
-          # --- WINDOWS CLIENT ---
+          # LINUX CLIENT ARM64
+          cp artifacts/anet-client-linux-arm64/anet-client release_files/client-linux-arm64/
+          cp contrib/config/client.toml release_files/client-linux-arm64/
+          
+          # WINDOWS CLIENT
           CLIENT_WIN_DIR="release_files/client-windows"
-          
-          # Копируем Windows файлы - ищем их в разных возможных местах
-          # 1. CLI версия
           if [ -f "artifacts/anet-client-windows-cli/anet-client.exe" ]; then
             cp artifacts/anet-client-windows-cli/anet-client.exe ${CLIENT_WIN_DIR}/
-          elif [ -f "artifacts/anet-client-windows-cli/anet-client" ]; then
-            cp artifacts/anet-client-windows-cli/anet-client ${CLIENT_WIN_DIR}/anet-client.exe
           fi
-          
-          # 2. GUI версия  
           if [ -f "artifacts/anet-client-windows-gui/anet-gui.exe" ]; then
             cp artifacts/anet-client-windows-gui/anet-gui.exe ${CLIENT_WIN_DIR}/
-          elif [ -f "artifacts/anet-client-windows-gui/anet-gui" ]; then
-            cp artifacts/anet-client-windows-gui/anet-gui ${CLIENT_WIN_DIR}/anet-gui.exe
           fi
+          cp contrib/config/client.toml ${CLIENT_WIN_DIR}/
           
-          # 3. Debug версия
-          if [ -f "artifacts/anet-gui-debug/anet-gui-debug.exe" ]; then
-            cp artifacts/anet-gui-debug/anet-gui-debug.exe ${CLIENT_WIN_DIR}/
-          elif [ -f "artifacts/anet-gui-debug/anet-gui-debug" ]; then
-            cp artifacts/anet-gui-debug/anet-gui-debug ${CLIENT_WIN_DIR}/anet-gui-debug.exe
-          fi
-          
-          # --- MACOS CLIENT ---
+          # MACOS CLIENT
           CLIENT_MAC_DIR="release_files/client-macos"
-          
-          # 1. Распаковываем .app (он был зазипован в build job для сохранения прав)
           if [ -f "artifacts/anet-client-macos-app/ANet_VPN_macOS.app.zip" ]; then
             unzip "artifacts/anet-client-macos-app/ANet_VPN_macOS.app.zip" -d ${CLIENT_MAC_DIR}/
-          else
-            echo "Warning: macOS App Bundle artifact not found"
           fi
-          
-          # 2. Копируем CLI binary
           if [ -f "artifacts/anet-client-macos-cli/anet-client" ]; then
             cp artifacts/anet-client-macos-cli/anet-client ${CLIENT_MAC_DIR}/
             chmod +x ${CLIENT_MAC_DIR}/anet-client
           fi
-          
-          # --- CONFIGS ---
-          cp contrib/config/client.toml release_files/client-linux/
-          cp contrib/config/client.toml ${CLIENT_WIN_DIR}/
           cp contrib/config/client.toml ${CLIENT_MAC_DIR}/
           
-          # --- WINTUN (Windows) ---
+          # WINTUN DOWNLOAD
           cd ${CLIENT_WIN_DIR}
-          WINTUN_VERSION="0.14.1"
-          WINTUN_URL="https://www.wintun.net/builds/wintun-${WINTUN_VERSION}.zip"
-          curl -sLO "$WINTUN_URL"
-          unzip "wintun-${WINTUN_VERSION}.zip"
+          curl -sLO "https://www.wintun.net/builds/wintun-0.14.1.zip"
+          unzip "wintun-0.14.1.zip"
           cp "wintun/bin/amd64/wintun.dll" .
-          rm -rf "wintun" "wintun-${WINTUN_VERSION}.zip"
+          rm -rf "wintun" "wintun-0.14.1.zip"
           cd ../..
           
-          # --- ANDROID APK ---
+          # ANDROID APK
           APK_SRC=$(find artifacts/anet-android-apk -name '*.apk' | head -n 1)
-          if [ -z "$APK_SRC" ]; then
-              echo "Warning: Android APK not found in artifacts!"
-          else
+          if [ -n "$APK_SRC" ]; then
               cp "$APK_SRC" "anet-android-${VERSION}.apk"
           fi
-
       - name: "Create zip archives"
         run: |
           cd release_files
+          
+          # Server
           zip -r "server_${VERSION}.zip" server/
-          zip -r "client-linux_${VERSION}.zip" client-linux/
+          
+          # Linux Clients (Теперь две разные архитектуры)
+          zip -r "client-linux-amd64_${VERSION}.zip" client-linux-amd64/
+          zip -r "client-linux-arm64_${VERSION}.zip" client-linux-arm64/
+          
+          # Windows Client
           zip -r "client-windows_${VERSION}.zip" client-windows/
           
           # MacOS zip (сохраняет симлинки внутри .app, если они есть)
           zip -r -y "client-macos_${VERSION}.zip" client-macos/
           
-          # Windows Installer
-          if [ -d "../artifacts/anet-client-setup-windows" ]; then
-            INSTALLER_EXE=$(find ../artifacts/anet-client-setup-windows -name '*.exe' | head -n 1)
-            if [ -n "$INSTALLER_EXE" ]; then 
-              cp "$INSTALLER_EXE" ../ANET_VPN_Client_Setup_${VERSION}_x64.exe
-            else
-              echo "Warning: Windows installer EXE not found in anet-client-setup-windows folder"
-            fi
-          else
-            echo "Warning: anet-client-setup-windows folder not found"
-          fi
           cd ..
-
+          
+          # Windows Installer (Копируем в корень для загрузки)
+          if [ -d "artifacts/anet-client-setup-windows" ]; then
+            INSTALLER_EXE=$(find artifacts/anet-client-setup-windows -name '*.exe' | head -n 1)
+            if [ -n "$INSTALLER_EXE" ]; then 
+              cp "$INSTALLER_EXE" "ANET_VPN_Client_Setup_${VERSION}_x64.exe"
+            else
+              echo "Warning: Windows installer EXE not found"
+            fi
+          fi
       - name: "Create Release"
         uses: "softprops/action-gh-release@v2"
         with:
-          tag_name: ${{ github.ref }}
-          name: Release ${{ github.ref }}
-          files: |
-            release_files/server_${{ env.VERSION }}.zip
-            release_files/client-linux_${{ env.VERSION }}.zip
-            release_files/client-windows_${{ env.VERSION }}.zip
-            release_files/client-macos_${{ env.VERSION }}.zip
-            ANET_VPN_Client_Setup_${{ env.VERSION }}_x64.exe
-            anet-android-${{ env.VERSION }}.apk
+            tag_name: ${{ github.ref }}
+            name: Release ${{ github.ref }}
+            files: |
+              release_files/server_${{ env.VERSION }}.zip
+              release_files/client-linux-amd64_${{ env.VERSION }}.zip
+              release_files/client-linux-arm64_${{ env.VERSION }}.zip
+              release_files/client-windows_${{ env.VERSION }}.zip
+              release_files/client-macos_${{ env.VERSION }}.zip
+              ANET_VPN_Client_Setup_${{ env.VERSION }}_x64.exe
+              anet-android-${{ env.VERSION }}.apk
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+            GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

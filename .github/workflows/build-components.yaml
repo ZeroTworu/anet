@@ -88,20 +88,27 @@ jobs:
           path: "server_bin/"
 
   build-linux-client:
-    name: "Build Linux Client"
+    name: "Build Linux Client (AMD64 & ARM64)"
     runs-on: "ubuntu-latest"
     steps:
       - uses: "actions/checkout@v6"
 
-      - name: "Install musl tools"
-        run: "sudo apt-get install -y musl-tools protobuf-compiler"
+      # Нам нужен компилятор C для aarch64 (для Ring/BoringSSL)
+      - name: "Install dependencies"
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools protobuf-compiler gcc-aarch64-linux-gnu
 
       - name: "Install Rust"
         uses: "actions-rs/toolchain@v1"
         with:
           toolchain: "stable"
-          target: "x86_64-unknown-linux-musl"
           override: "true"
+
+      - name: "Add Rust Targets"
+        run: |
+          rustup target add x86_64-unknown-linux-musl
+          rustup target add aarch64-unknown-linux-musl
 
       - name: "Cache Rust dependencies"
         uses: actions/cache@v5
@@ -110,18 +117,35 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-musl-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-linux-client-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-musl-
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-cargo-linux-client-
 
-      - name: "Build Client (Linux)"
-        run: "RUSTFLAGS=\"-C target-feature=+crt-static\" cargo build --release --package anet-client-cli --target x86_64-unknown-linux-musl"
+      # Сборка AMD64 (x86_64)
+      - name: "Build Client (AMD64)"
+        run: |
+          RUSTFLAGS="-C target-feature=+crt-static" cargo build --release --package anet-client-cli --target x86_64-unknown-linux-musl
 
+      # Сборка ARM64 (aarch64)
+      # Важно: указываем линковщик для aarch64
+      - name: "Build Client (ARM64)"
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_musl: aarch64-linux-gnu-gcc
+        run: |
+          RUSTFLAGS="-C target-feature=+crt-static" cargo build --release --package anet-client-cli --target aarch64-unknown-linux-musl
+
+      # Загрузка артефакта AMD64
       - uses: "actions/upload-artifact@v6"
         with:
-          name: "anet-client-linux"
+          name: "anet-client-linux-amd64"
           path: "target/x86_64-unknown-linux-musl/release/anet-client"
+
+      # Загрузка артефакта ARM64
+      - uses: "actions/upload-artifact@v6"
+        with:
+          name: "anet-client-linux-arm64"
+          path: "target/aarch64-unknown-linux-musl/release/anet-client"
 
   build-windows-client:
     name: "Build Windows Client"
