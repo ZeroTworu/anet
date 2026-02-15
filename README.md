@@ -2,7 +2,7 @@
 
 ![Build Status](https://img.shields.io/badge/build-passing-brightgreen)
 ![Language](https://img.shields.io/badge/rust-1.84%2B-orange)
-![Protocol](https://img.shields.io/badge/protocol-ASTP_v1.0-blue)
+![Protocol](https://img.shields.io/badge/protocol-ASTP_v0.5-blue)
 
 **ANet** — это инструмент для организации приватного, защищенного информационного пространства между близкими людьми. Мы строим цифровые мосты там, где обычные пути недоступны.
 
@@ -59,15 +59,5 @@ make cert
 ```
 [Android src](https://github.com/ZeroTworu/anet-android)
 
-
-
-
-Support the Chaos
-
-Если ANet помог тебе — налей автору.
-
-На водку разрабу: [Donate](https://dalink.to/rventomarika)
-
-На булочки для Ханю: [Donate](https://dalink.to/rventomarika)
 
 На J7: [Donate](https://dalink.to/rventomarika)

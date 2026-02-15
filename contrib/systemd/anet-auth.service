@@ -9,9 +9,6 @@ Type=simple
 DynamicUser=yes
 NoNewPrivileges=yes
 
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_IPC_LOCK
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_IPC_LOCK
-
 Environment=RUST_LOG=info
 
 WorkingDirectory=/opt/anet
