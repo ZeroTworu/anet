@@ -43,6 +43,58 @@ pub mod desktop {
                 .context(format!("Interface '{}' not found", name))?;
             Ok(iface.index)
         }
+
+        /// Fallback: parse /proc/net/route to get default gateway
+        /// Used when net_route crate returns None for gateway (OpenWRT compatibility)
+        #[cfg(target_os = "linux")]
+        fn parse_proc_route_gateway() -> Option<(IpAddr, u32)> {
+            use std::fs::File;
+            use std::io::{BufRead, BufReader};
+
+            let file = File::open("/proc/net/route").ok()?;
+            let reader = BufReader::new(file);
+
+            for line in reader.lines().skip(1) {
+                let line = line.ok()?;
+                let fields: Vec<&str> = line.split_whitespace().collect();
+                if fields.len() < 8 {
+                    continue;
+                }
+
+                let dest = fields[1];
+                let gateway_hex = fields[2];
+                let iface_name = fields[0];
+
+                // Match default route (dest=00000000) with non-zero gateway
+                if dest == "00000000" && gateway_hex != "00000000" {
+                    if let Ok(gw_u32) = u32::from_str_radix(gateway_hex, 16) {
+                        // Convert from little-endian hex to IP address
+                        let gw_bytes = gw_u32.to_le_bytes();
+                        let gateway = IpAddr::V4(Ipv4Addr::new(
+                            gw_bytes[0],
+                            gw_bytes[1],
+                            gw_bytes[2],
+                            gw_bytes[3],
+                        ));
+
+                        // Try to get interface index
+                        let ifindex = Self::get_iface_index(iface_name).ok();
+
+                        info!(
+                            "Fallback: parsed gateway {} from /proc/net/route (iface: {})",
+                            gateway, iface_name
+                        );
+                        return Some((gateway, ifindex.unwrap_or(0)));
+                    }
+                }
+            }
+            None
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        fn parse_proc_route_gateway() -> Option<(IpAddr, u32)> {
+            None
+        }
     }
 
     #[async_trait]
@@ -54,10 +106,20 @@ pub mod desktop {
                 .await?
                 .context("No default route found in system table")?;
 
-            let gateway = default_route
-                .gateway
-                .context("Default route has no gateway")?;
-            let ifindex = default_route.ifindex;
+            // Try to get gateway from net_route crate first
+            // If it returns None (OpenWRT issue), fall back to /proc/net/route parsing
+            let (gateway, ifindex) = if let Some(gw) = default_route.gateway {
+                (gw, default_route.ifindex)
+            } else {
+                warn!("net_route returned None for gateway, trying /proc/net/route fallback...");
+                if let Some((gw, idx)) = Self::parse_proc_route_gateway() {
+                    (gw, Some(idx))
+                } else {
+                    return Err(anyhow::anyhow!(
+                        "Default route has no gateway (net_route and /proc/net/route both failed)"
+                    ));
+                }
+            };
 
             info!("Backup: Gateway {} on iface {:?}", gateway, ifindex);
 
