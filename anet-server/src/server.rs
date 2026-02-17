@@ -47,6 +47,7 @@ impl ANetServer {
             name: cfg.network.if_name.clone(),
             mtu: cfg.network.mtu,
             network: Some(cfg.network.net.parse()?),
+            dns_servers: vec![],
         };
         let tun_manager = TunManager::new(tun_params)?;
 

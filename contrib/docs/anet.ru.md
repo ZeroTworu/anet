@@ -54,7 +54,7 @@ iqo4UuQlbWN35Pyp5vQedTEt1FeKA+6wxYTVS/XzHww=
 
 ```
 # Разрешаем входящие на порт сервера
-iptables -I INPUT --dport <Server port> -j ACCEPT 
+iptables -I INPUT -p udp --dport <Server port> -j ACCEPT 
 
 # Перенаправлям трафик из внешнего мира в VPN
 iptables -I FORWARD -i <External Interface> -o <if_name from server config> -j ACCEPT

@@ -1,9 +1,8 @@
 use crate::config::CoreConfig;
-//use crate::dns::{DnsManager, get_dns_manager};
+use crate::dns::{DnsManager, get_dns_manager};
 use crate::events::status;
 use crate::traits::{RouteManager, TunFactory};
 use crate::transport::factory::create_transport;
-// ВАЖНО: Импортируем функции для фрейминга
 use anet_common::stream_framing::{frame_packet, read_next_packet};
 use hickory_resolver::TokioAsyncResolver;
 use hickory_resolver::config::{NameServerConfig, Protocol, ResolverConfig, ResolverOpts};
@@ -39,7 +38,7 @@ pub struct AnetClient {
     /// Менеджер маршрутов (платформо-зависимый)
     route_manager: Box<dyn RouteManager>,
     /// Менеджер DNS (платформо-зависимый)
-    //dns_manager: Box<dyn DnsManager>,
+    dns_manager: Box<dyn DnsManager>,
     /// Состояние: Запущен или нет?
     /// Когда это поле None - VPN выключен.
     session: Mutex<Option<RunningSession>>,
@@ -51,10 +50,12 @@ impl AnetClient {
         tun_factory: Box<dyn TunFactory>,
         route_manager: Box<dyn RouteManager>,
     ) -> Self {
+        let dns_manager = get_dns_manager();
         Self {
             config,
             tun_factory,
             route_manager,
+            dns_manager,
             session: Mutex::new(None),
         }
     }
@@ -281,11 +282,11 @@ impl AnetClient {
                 })
                 .collect();
 
-            // if !dns_ipv4.is_empty() {
-            //     if let Err(e) = self.dns_manager.set_dns(&iface_name, &dns_ipv4) {
-            //         warn!("[Core] Failed to configure DNS: {}", e);
-            //     }
-            // }
+            if !dns_ipv4.is_empty() {
+                if let Err(e) = self.dns_manager.set_dns(&iface_name, &dns_ipv4) {
+                    warn!("[Core] Failed to configure DNS: {}", e);
+                }
+            }
         }
 
         info!("[Core] VPN Tunnel UP.");
@@ -327,12 +328,11 @@ impl AnetClient {
             if let Some(endpoint) = running.endpoint {
                 endpoint.close(0u32.into(), b"Disconnected by user");
             }
-            // Для SSH/TCP закрытие стрима (Drop) произойдет автоматически при завершении задач
 
             // 4. Restore DNS
-            // if let Err(e) = self.dns_manager.restore_dns(&running.iface_name) {
-            //     error!("Failed to restore DNS: {}", e);
-            // }
+            if let Err(e) = self.dns_manager.restore_dns(&running.iface_name) {
+                error!("Failed to restore DNS: {}", e);
+            }
 
             // 5. Restore routes
             if let Err(e) = self.route_manager.restore_routes().await {
