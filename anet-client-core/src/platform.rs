@@ -3,7 +3,7 @@
 //! This module provides convenient factory functions for creating
 //! platform-specific managers (routing, DNS, etc.)
 
-use crate::dns::{DnsManager, create_dns_manager};
+use crate::dns::{DnsManager, get_dns_manager};
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 use crate::router::desktop::DesktopRouteManager;
 #[cfg(target_os = "macos")]
@@ -67,11 +67,6 @@ pub fn create_route_manager(_manual_routing: bool) -> Result<Box<dyn RouteManage
     Ok(Box::new(MacOSRouteManager::new()?))
 }
 
-#[cfg(target_os = "android")]
-pub fn create_route_manager(_manual_routing: bool) -> Result<Box<dyn RouteManager>> {
-    // Android uses VpnService for routing - return a no-op manager
-    Ok(Box::new(NoOpRouteManager))
-}
 
 /// Create a platform-appropriate DNS manager
 ///
@@ -81,7 +76,7 @@ pub fn create_route_manager(_manual_routing: bool) -> Result<Box<dyn RouteManage
 /// - **macOS**: Uses `scutil` for System Configuration
 /// - **Android**: No-op (VpnService handles DNS)
 pub fn create_platform_dns_manager() -> Box<dyn DnsManager> {
-    create_dns_manager()
+    get_dns_manager()
 }
 
 /// No-op route manager for platforms that handle routing internally
