@@ -65,6 +65,13 @@ iptables -I FORWARD -i <if_name from server config> -o <External Interface> -j A
 # Включаем NAT
 iptables -t nat -A POSTROUTING -o <External Interface> -j MASQUERADE
 ```
+Также для Ubunutu нужно включить IPv4 forwarding, если команда `sysctl net.ipv4.ip_forward` выводит 0:
+```
+sudo sysctl -w net.ipv4.ip_forward=1
+echo 'net.ipv4.ip_forward=1' | sudo tee /etc/sysctl.d/99-anet.conf
+sudo sysctl --system
+```
+
 Если у вас иные задачи, другая OS (как показал опыт - в Ubunta 24.04 они **ДРУГИЕ**), то вы и так знаете что вы делаете и "куда жать что бы было весело".
 
 Что бы узнать что у вас вообще стоит - выполните `cat /etc/os-release`.
