@@ -20,7 +20,23 @@ rand = {workspace = true}
 x25519-dalek = {workspace = true}
 ed25519-dalek = {workspace = true}
 sha2 = {workspace = true}
+async-trait = { workspace = true }
 base64 = "0.22.1"
+
+tokio-rustls = { version = "0.26" }
+russh = { version = "0.49" }
+russh-keys = { version = "0.49" }
+async-ssh = "0.1.2"
+pin-project-lite = "0.2.16"
+rustls = "0.23.31"
+rustls-pemfile = "2.2.0"
+rustls-native-certs = "0.8.2"
+
+
+#[features]
+#tcp-tls = ["tokio-rustls"]
+#tcp-ssh = ["russh", "russh-keys"]
+#all-transports = ["tcp-tls", "tcp-ssh"]
 
 [build-dependencies]
 prost-build = "0.14.1"

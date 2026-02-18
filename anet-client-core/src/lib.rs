@@ -10,3 +10,4 @@ mod router_macos;
 pub mod socket;
 pub mod traits;
 pub mod vpn;
+mod transport_client;
