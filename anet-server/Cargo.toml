@@ -23,11 +23,16 @@ toml = {workspace = true}
 x25519-dalek = {workspace = true}
 ed25519-dalek = {workspace = true}
 
+async-trait = "0.1.89"
+thrussh = "0.40.1"
+thrussh-config = "0.4.1"
+futures = "0.3"
 dashmap = "7.0.0-rc2"
 arc-swap = "1.6"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 anet-common = { path = "../anet-common"}
+tokio-util = "0.7.16"
 
 [[bin]]
 name = "anet-server"
