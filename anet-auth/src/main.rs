@@ -89,7 +89,7 @@ async fn handle_add_user(db: &DatabaseConnection, username: String) -> Result<()
 
 /// Режим сервера (Daemon)
 async fn run_server(db: DatabaseConnection) -> Result<(), anyhow::Error> {
-    let bind_to = env::var("BIND_TOT").unwrap_or_else(|_| "127.0.0.1:3000".to_string());
+    let bind_to = env::var("BIND_TO").unwrap_or_else(|_| "127.0.0.1:3000".to_string());
     let api_key = env::var("AUTH_BACKEND_KEY").expect("AUTH_BACKEND_KEY must be set");
 
     let api_service = OpenApiService::new(api::VpnApi { db }, "ANet Auth API", "1.0")
