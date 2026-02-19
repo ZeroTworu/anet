@@ -120,7 +120,11 @@ async fn main() -> Result<()> {
     client.start().await?;
 
     if config.stats.enabled {
-        start_stats_monitor(client.get_stats().unwrap(), config.stats.interval_minutes);
+        if let Some(conn) = client.get_stats() {
+            start_stats_monitor(conn, config.stats.interval_minutes);
+        } else {
+            info!("Stats are not available for this transport mode.");
+        }
     }
 
     info!("VPN Running. Press Ctrl+C to stop.");

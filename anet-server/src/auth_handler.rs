@@ -10,7 +10,7 @@ use anet_common::protocol::{
     AuthResponse, DhClientExchange, DhServerExchange, EncryptedAuthRequest, EncryptedAuthResponse,
     Message as AnetMessage, message::Content,
 };
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use arc_swap::ArcSwap;
 use bytes::{BufMut, Bytes, BytesMut};
 use dashmap::DashMap;
@@ -49,7 +49,6 @@ impl ServerAuthHandler {
         quic_cert_pem: String,
         padding_step: u16,
     ) -> Self {
-        // Генерируем Cipher из своего же публичного ключа
         let pub_key_bytes = server_signing_key.verifying_key().to_bytes();
         let handshake_cipher = Arc::new(crypto_utils::create_handshake_cipher(&pub_key_bytes));
 
@@ -70,11 +69,46 @@ impl ServerAuthHandler {
         while let Some((packet, remote_addr)) = rx_from_auth.recv().await {
             let handler = self.clone();
             tokio::spawn(async move {
-                if let Err(e) = handler.handle_packet(packet, remote_addr).await {
-                    // Ошибки дешифровки здесь - это норма (сканнеры портов, мусор)
-                    debug!("[AUTH] Handshake dropped from {}: {}", remote_addr, e);
+                match handler.process_handshake_packet(packet, remote_addr).await {
+                    Ok((resp_bytes, _)) => {
+                        if let Some(resp) = resp_bytes {
+                            println!("Will send {:?}", resp);
+                            if let Err(e) = handler.socket.send_to(&resp, remote_addr).await {
+                                debug!("Failed to send auth response to {}: {}", remote_addr, e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        debug!("[AUTH] Handshake dropped from {}: {}", remote_addr, e);
+                    }
                 }
             });
+        }
+    }
+
+    pub async fn process_handshake_packet(
+        &self,
+        packet: Bytes,
+        remote_addr: SocketAddr,
+    ) -> Result<(
+        Option<Bytes>,
+        Option<(Arc<ClientTransportInfo>, AuthResponse)>,
+    )> {
+        let message = self.decode_obfuscated_packet(packet)?;
+
+        match message.content {
+            Some(Content::DhClientExchange(req)) => {
+                let resp_msg = self.handle_dh_exchange(req, remote_addr).await?;
+                let resp_bytes = self.encode_obfuscated_packet(resp_msg)?;
+                Ok((Some(resp_bytes), None))
+            }
+            Some(Content::EncryptedAuthRequest(enc_req)) => {
+                let (resp_msg, client_info, auth_resp) =
+                    self.handle_encrypted_auth(enc_req, remote_addr).await?;
+                let resp_bytes = self.encode_obfuscated_packet(resp_msg)?;
+                Ok((Some(resp_bytes), Some((client_info, auth_resp))))
+            }
+            _ => Err(anyhow!("Invalid msg")),
         }
     }
 
@@ -91,23 +125,27 @@ impl ServerAuthHandler {
         Message::decode(plaintext).context("Failed to decode Protobuf")
     }
 
-    async fn handle_packet(&self, full_packet: Bytes, remote_addr: SocketAddr) -> Result<()> {
-        let message = self.decode_obfuscated_packet(full_packet)?;
+    fn encode_obfuscated_packet(&self, message: AnetMessage) -> Result<Bytes> {
+        let mut data = Vec::new();
+        message.encode(&mut data)?;
 
-        match message.content {
-            Some(Content::DhClientExchange(req)) => self.handle_dh_exchange(req, remote_addr).await,
-            Some(Content::EncryptedAuthRequest(enc_req)) => {
-                self.handle_encrypted_auth(enc_req, remote_addr).await
-            }
-            _ => Err(anyhow::anyhow!("Unexpected message type in handshake")),
-        }
+        let mut nonce = [0u8; NONCE_LEN];
+        OsRng.fill_bytes(&mut nonce);
+
+        let ciphertext = self.handshake_cipher.encrypt(&nonce, Bytes::from(data))?;
+
+        let mut packet = BytesMut::with_capacity(NONCE_LEN + ciphertext.len());
+        packet.put_slice(&nonce);
+        packet.put(ciphertext);
+
+        Ok(packet.freeze())
     }
 
     async fn handle_dh_exchange(
         &self,
         req: DhClientExchange,
         remote_addr: SocketAddr,
-    ) -> Result<()> {
+    ) -> Result<AnetMessage> {
         let client_public_key = VerifyingKey::from_bytes(
             &req.client_public_key
                 .try_into()
@@ -116,7 +154,6 @@ impl ServerAuthHandler {
 
         let client_fingerprint = crypto_utils::generate_key_fingerprint(&client_public_key);
 
-        // --- ВНЕШНЯЯ АВТОРИЗАЦИЯ ---
         if !self
             .auth_provider
             .is_client_allowed(&client_fingerprint)
@@ -177,14 +214,14 @@ impl ServerAuthHandler {
         response_message.padding =
             generate_random_padding(calculate_padding_needed(wire_len, self.padding_step));
 
-        self.send_obfuscated(response_message, remote_addr).await
+        Ok(response_message)
     }
 
     async fn handle_encrypted_auth(
         &self,
         enc_req: EncryptedAuthRequest,
         remote_addr: SocketAddr,
-    ) -> Result<()> {
+    ) -> Result<(AnetMessage, Arc<ClientTransportInfo>, AuthResponse)> {
         let temp_info = self
             .temp_dh_map
             .remove(&remote_addr)
@@ -223,7 +260,7 @@ impl ServerAuthHandler {
             remote_addr: ArcSwap::new(Arc::new(remote_addr)),
         });
 
-        self.registry.pre_register_client(client_info);
+        self.registry.pre_register_client(client_info.clone());
 
         let (netmask, gateway, mtu) = self.registry.get_network_params();
         let response_payload = AuthResponse {
@@ -237,7 +274,7 @@ impl ServerAuthHandler {
         };
 
         let mut inner_msg = AnetMessage {
-            content: Some(Content::AuthResponse(response_payload)),
+            content: Some(Content::AuthResponse(response_payload.clone())),
             padding: vec![],
         };
         let inner_len = inner_msg.encoded_len() + PROTO_PAD_FIELD_OVERHEAD;
@@ -247,6 +284,7 @@ impl ServerAuthHandler {
         let mut raw_resp = Vec::new();
         inner_msg.encode(&mut raw_resp)?;
 
+        let cipher = Cipher::new(&temp_info.shared_key);
         let mut nonce_bytes = [0u8; NONCE_LEN];
         OsRng.fill_bytes(&mut nonce_bytes);
         let ciphertext = cipher.encrypt(&nonce_bytes, Bytes::from(raw_resp))?;
@@ -263,24 +301,6 @@ impl ServerAuthHandler {
         outer_msg.padding =
             generate_random_padding(calculate_padding_needed(outer_len, self.padding_step));
 
-        self.send_obfuscated(outer_msg, remote_addr).await
-    }
-
-    async fn send_obfuscated(&self, message: AnetMessage, addr: SocketAddr) -> Result<()> {
-        let mut data = Vec::new();
-        message.encode(&mut data)?;
-
-        let mut nonce = [0u8; NONCE_LEN];
-        OsRng.fill_bytes(&mut nonce);
-
-        // Шифруем нашим Handshake Cipher
-        let ciphertext = self.handshake_cipher.encrypt(&nonce, Bytes::from(data))?;
-
-        let mut packet = BytesMut::with_capacity(NONCE_LEN + ciphertext.len());
-        packet.put_slice(&nonce);
-        packet.put(ciphertext);
-
-        self.socket.send_to(&packet, addr).await?;
-        Ok(())
+        Ok((outer_msg, client_info, response_payload))
     }
 }

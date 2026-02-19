@@ -19,10 +19,14 @@ ed25519-dalek = {workspace = true}
 base64 = {workspace = true}
 serde = { workspace = true, features = ["derive"] }
 async-trait = { workspace = true }
-
 ipnet = { workspace = true }
+
+russh = "0.49.2"
+russh-keys = "0.49.2"
+
 hickory-resolver = { version = "0.24", features = ["tokio"] }
 anet-common = { path = "../anet-common" }
+futures = "0.3.31"
 
 # Platform-specific dependencies for route management
 [target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
@@ -31,6 +35,8 @@ net-route = "0.4"
 # netdev is needed on all desktop platforms for interface discovery
 [target.'cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))'.dependencies]
 netdev = { workspace = true }
+
+
 
 [lib]
 path = "src/lib.rs"

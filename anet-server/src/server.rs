@@ -4,6 +4,7 @@ use crate::client_registry::ClientRegistry;
 use crate::config::Config;
 use crate::ip_pool::IpPool;
 use crate::multikey_udp_socket::{HandshakeData, MultiKeyAnetUdpSocket, TempDHInfo};
+use crate::ssh_server;
 use crate::vpn_handler::ServerVpnHandler;
 use anet_common::atun::TunManager;
 use anet_common::consts::CHANNEL_BUFFER_SIZE;
@@ -76,7 +77,7 @@ impl ANetServer {
     }
 
     pub async fn run(&mut self) -> Result<()> {
-        let listen_addr = &self.cfg.server.bind_to;
+        let listen_addr = &self.cfg.server.quic_bind_to;
         let real_socket = Arc::new(UdpSocket::bind(listen_addr).await?);
         let server_config = self.build_quinn_server_config()?;
         info!("Unified UDP listener started on {}", listen_addr);
@@ -104,9 +105,9 @@ impl ANetServer {
         // --- VPN HANDLER ---
         let vpn_handler =
             ServerVpnHandler::new(endpoint.clone(), self.registry.clone(), cfg_arc.clone());
-
+        let quic_tx_to_tun = tx_to_tun.clone();
         let vpn_handler_task = tokio::spawn(async move {
-            if let Err(e) = vpn_handler.run(tx_to_tun, rx_from_tun).await {
+            if let Err(e) = vpn_handler.run(quic_tx_to_tun, rx_from_tun).await {
                 error!("VPN Handler critical error: {}", e);
             }
         });
@@ -128,6 +129,8 @@ impl ANetServer {
             self.cfg.stealth.padding_step,
         );
 
+        let ssh_auth_handler = auth_handler.clone();
+
         // Запускаем цикл в таске
         let auth_handler_task = tokio::spawn(async move {
             auth_handler.run(rx_from_auth).await;
@@ -136,7 +139,21 @@ impl ANetServer {
         let cleanup_temp_dh_task =
             tokio::spawn(clear_expired_dh_sessions(self.temp_dh_map.clone()));
 
-        let _ = tokio::try_join!(vpn_handler_task, auth_handler_task, cleanup_temp_dh_task)?;
+        // SSH Fallback
+        let ssh_config = Arc::new(self.cfg.clone());
+        let ssh_registry = self.registry.clone();
+        let ssh_tun_tx = tx_to_tun.clone();
+
+        let ssh_task = tokio::spawn(async move {
+            if let Err(e) =
+                ssh_server::run_ssh_server(ssh_config, ssh_registry, ssh_tun_tx, ssh_auth_handler)
+                    .await
+            {
+                error!("SSH Server failed: {}", e);
+            }
+        });
+
+        let _ = tokio::try_join!(vpn_handler_task, auth_handler_task, cleanup_temp_dh_task, ssh_task)?;
         Ok(())
     }
 

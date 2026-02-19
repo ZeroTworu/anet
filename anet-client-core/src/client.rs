@@ -1,9 +1,10 @@
-use crate::auth::AuthHandler;
 use crate::config::CoreConfig;
-use crate::dns::{DnsManager, create_dns_manager};
+//use crate::dns::{DnsManager, get_dns_manager};
 use crate::events::status;
 use crate::traits::{RouteManager, TunFactory};
-use crate::vpn::VpnHandler;
+use crate::transport::factory::create_transport;
+// ВАЖНО: Импортируем функции для фрейминга
+use anet_common::stream_framing::{frame_packet, read_next_packet};
 use hickory_resolver::TokioAsyncResolver;
 use hickory_resolver::config::{NameServerConfig, Protocol, ResolverConfig, ResolverOpts};
 use ipnet::IpNet;
@@ -12,19 +13,22 @@ use quinn::{Connection, Endpoint};
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
+use tokio::io::AsyncWriteExt; // Для write_all
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
 /// Хранит "живые" объекты запущенной сессии.
 struct RunningSession {
-    /// QUIC Endpoint
-    endpoint: Endpoint,
+    /// QUIC Endpoint (только для QUIC, нужно для отправки close frame)
+    endpoint: Option<Endpoint>,
+    /// QUIC Connection (для статистики)
+    connection: Option<Connection>,
     /// Сигнал для остановки фоновых задач пересылки байт
     shutdown_notify: Arc<Notify>,
     /// Хендл главной задачи, чтобы подождать её завершения
     main_task: JoinHandle<()>,
-    /// Имя интерфейса (нужно для очистки маршрутов)
-    connection: Connection,
+    /// Имя интерфейса (нужно для очистки DNS/маршрутов)
+    iface_name: String,
 }
 
 /// Thread-safe, можно шарить между потоками GUI.
@@ -35,7 +39,7 @@ pub struct AnetClient {
     /// Менеджер маршрутов (платформо-зависимый)
     route_manager: Box<dyn RouteManager>,
     /// Менеджер DNS (платформо-зависимый)
-    dns_manager: Box<dyn DnsManager>,
+    //dns_manager: Box<dyn DnsManager>,
     /// Состояние: Запущен или нет?
     /// Когда это поле None - VPN выключен.
     session: Mutex<Option<RunningSession>>,
@@ -51,7 +55,6 @@ impl AnetClient {
             config,
             tun_factory,
             route_manager,
-            dns_manager: create_dns_manager(),
             session: Mutex::new(None),
         }
     }
@@ -117,56 +120,94 @@ impl AnetClient {
 
         info!("[Core] Starting...");
         status("[Core] Starting...");
+
+        // --- НОВАЯ ЛОГИКА ТРАНСПОРТА ---
         status("Connecting");
+        let transport = create_transport(&self.config);
 
-        // 2. Логика подключения (Auth -> QUIC -> TUN)
-        let auth_handler = AuthHandler::new(&self.config)?;
-        // Стучимся на сервер
-        let (auth_response, shared_key) = auth_handler.authenticate().await?;
+        info!("[Core] Transport mode: {:?}", self.config.transport.mode);
 
-        info!("[Core] Authenticated. Assigned IP: {}", auth_response.ip);
-        status(format!("[Core] IP: {}", auth_response.ip));
+        // Connect возвращает AuthResponse (настройки сети) и VpnStream (трубу данных)
+        // Если это QUIC - stream это обертка над QUIC стримами.
+        // Если это SSH - stream это обертка над SSH каналом.
+        let (auth_response, vpn_stream) = transport.connect().await?;
+
+        info!("[Core] Authenticated. VPN IP: {}", auth_response.ip);
+        status(format!("[Core] Authenticated. IP: {}", auth_response.ip));
+
+        // --- НАСТРОЙКА СЕТИ ---
 
         // Бэкапим маршруты
         self.route_manager.backup_routes().await?;
 
-        // Добавляем маршрут до VPN-сервера
-        let server_ip = self.config.main.address.split(':').next().unwrap();
-        self.route_manager
-            .add_bypass_route(IpAddr::from_str(server_ip).unwrap(), 32)
-            .await?;
+        // Добавляем маршрут до VPN-сервера (Bypass), чтобы не зациклить трафик
+        let server_host = self.config.main.address.split(':').next().unwrap();
 
-        // Поднимаем QUIC
-        let vpn_handler = VpnHandler::new(self.config.clone());
-        let (endpoint, connection, tx_to_quic, mut rx_from_quic) =
-            vpn_handler.connect(&auth_response, shared_key).await?;
+        // Пытаемся распарсить как IP, если не выйдет - надо резолвить (но пока считаем что там IP)
+        if let Ok(server_ip) = IpAddr::from_str(server_host) {
+            self.route_manager.add_bypass_route(server_ip, 32).await?;
+        } else {
+            warn!(
+                "[Core] Server address is domain, skipping bypass route (TODO: implement resolve)"
+            );
+        }
 
+        // Поднимаем TUN интерфейс
         let (tx_to_tun, mut rx_from_tun, iface_name) =
             self.tun_factory.create_tun(&auth_response).await?;
 
-        // 3. Запуск пересылки данных
+        // --- ЗАПУСК МОСТА (BRIDGE) ---
+
         let shutdown_notify = Arc::new(Notify::new());
         let notify_tx = shutdown_notify.clone();
         let notify_rx = shutdown_notify.clone();
 
-        // TUN -> QUIC
+        // Разделяем VpnStream на Reader и Writer
+        let (mut stream_reader, mut stream_writer) = tokio::io::split(vpn_stream);
+
+        // Task 1: TUN -> NETWORK (Пишем в транспорт)
         let t1 = tokio::spawn(async move {
             loop {
                 tokio::select! {
                     pkt = rx_from_tun.recv() => {
-                        if let Some(p) = pkt { let _ = tx_to_quic.send(p).await; } else { break; }
+                        if let Some(packet) = pkt {
+                            // ВАЖНО: Всегда используем frame_packet (u16 length prefix).
+                            // Это нужно для SSH (TCP) и не вредит QUIC (просто overhead 2 байта).
+                            let framed = frame_packet(packet);
+                            if stream_writer.write_all(&framed).await.is_err() {
+                                error!("[Bridge] Write to transport failed");
+                                break;
+                            }
+                            // Flush может быть дорогим, но для SSH/TCP он нужен, чтобы протолкнуть буфер
+                            let _ = stream_writer.flush().await;
+                        } else {
+                            break;
+                        }
                     }
                     _ = notify_tx.notified() => { break; }
                 }
             }
         });
 
-        // QUIC -> TUN
+        // Task 2: NETWORK -> TUN (Читаем из транспорта)
         let t2 = tokio::spawn(async move {
             loop {
                 tokio::select! {
-                    pkt = rx_from_quic.recv() => {
-                        if let Some(p) = pkt { let _ = tx_to_tun.send(p).await; } else { break; }
+                    // read_next_packet читает u16 length, потом данные
+                    res = read_next_packet(&mut stream_reader) => {
+                        match res {
+                            Ok(Some(packet)) => {
+                                if tx_to_tun.send(packet).await.is_err() { break; }
+                            }
+                            Ok(None) => {
+                                info!("[Bridge] Transport closed (EOF)");
+                                break;
+                            }
+                            Err(e) => {
+                                error!("[Bridge] Read from transport error: {}", e);
+                                break;
+                            }
+                        }
                     }
                     _ = notify_rx.notified() => { break; }
                 }
@@ -175,14 +216,13 @@ impl AnetClient {
 
         let main_task = tokio::spawn(async move {
             let _ = tokio::join!(t1, t2);
+            info!("[Core] Bridge tasks finished");
         });
 
-        // ЛОГИКА МАРШРУТИЗАЦИИ
+        // --- ЛОГИКА МАРШРУТИЗАЦИИ (Split / Global) ---
+
         if !self.config.main.route_for.is_empty() {
             // MODE 1: INCLUDE (Whitelist)
-            // VPN выключен по умолчанию, включаем только для списка.
-            // exclude_route_for игнорируется (логически не имеет смысла).
-
             info!("[Core] Mode: Split Tunneling (INCLUDE).");
             let routes = self.resolve_list(&self.config.main.route_for).await;
 
@@ -197,10 +237,10 @@ impl AnetClient {
                     .await?;
             }
         } else {
-            // MODE 2: GLOBAL VPN + EXCLUDE (Blacklist)
+            // MODE 2: GLOBAL VPN
             info!("[Core] Mode: Global VPN.");
 
-            // Если есть исключения - добавляем их ПЕРЕД установкой дефолтного шлюза
+            // Исключения
             if !self.config.main.exclude_route_for.is_empty() {
                 info!(
                     "[Core] Found {} exclusion rules.",
@@ -215,33 +255,53 @@ impl AnetClient {
                 }
             }
 
-            // Включаем перенаправление всего трафика
-            // Благодаря Longest Prefix Match, наши bypass маршруты (/32 или /24)
-            // будут приоритетнее дефолтного (/0 или /1)
+            // Весь трафик в туннель
             self.route_manager
                 .set_default_route(&auth_response.gateway, &iface_name)
                 .await?;
         }
 
-        // Configure DNS servers
+        // --- DNS ---
         if !self.config.main.dns_server_list.is_empty() {
-            if let Err(e) = self.dns_manager.set_dns(&self.config.main.dns_server_list) {
-                warn!("[Core] Failed to configure DNS: {}", e);
-                // Continue anyway - VPN can still work without custom DNS
-            }
+            // Преобразуем строки в IP
+            let dns_ips: Vec<IpAddr> = self
+                .config
+                .main
+                .dns_server_list
+                .iter()
+                .filter_map(|s| IpAddr::from_str(s).ok())
+                .collect();
+
+            // Фильтруем IPv4 (для текущего менеджера)
+            let dns_ipv4: Vec<std::net::Ipv4Addr> = dns_ips
+                .iter()
+                .filter_map(|ip| match ip {
+                    IpAddr::V4(addr) => Some(*addr),
+                    _ => None,
+                })
+                .collect();
+
+            // if !dns_ipv4.is_empty() {
+            //     if let Err(e) = self.dns_manager.set_dns(&iface_name, &dns_ipv4) {
+            //         warn!("[Core] Failed to configure DNS: {}", e);
+            //     }
+            // }
         }
 
         info!("[Core] VPN Tunnel UP.");
         status("[Core] VPN UP");
-        status("VPN Tunnel UP"); // Типо сигнал
+        status("VPN Tunnel UP");
 
         // 5. Сохраняем сессию
+        // ВНИМАНИЕ: Для SSH у нас нет endpoint/connection, пишем None
+        // В будущем можно прокинуть их из Transport, если транспорт QUIC
         let mut state = self.session.lock().unwrap();
         *state = Some(RunningSession {
-            endpoint,
+            endpoint: None,   // TODO: Получить из транспорта если есть
+            connection: None, // TODO: Получить из транспорта если есть
             shutdown_notify,
             main_task,
-            connection,
+            iface_name: iface_name.clone(),
         });
 
         Ok(())
@@ -249,7 +309,6 @@ impl AnetClient {
 
     /// Остановка VPN
     pub async fn stop(&self) -> anyhow::Result<()> {
-        // Забираем сессию (Option::take), освобождая Mutex
         let session = {
             let mut state = self.session.lock().unwrap();
             state.take()
@@ -264,15 +323,18 @@ impl AnetClient {
             // 2. Ждем пока байты перестанут летать
             let _ = running.main_task.await;
 
-            // 3. Отправляем серверу "Good bye"
-            running.endpoint.close(0u32.into(), b"Disconnected by user");
-
-            // 4. Restore DNS configuration
-            if let Err(e) = self.dns_manager.restore_dns() {
-                error!("Failed to restore DNS: {}", e);
+            // 3. Если есть QUIC Endpoint - закрываем
+            if let Some(endpoint) = running.endpoint {
+                endpoint.close(0u32.into(), b"Disconnected by user");
             }
+            // Для SSH/TCP закрытие стрима (Drop) произойдет автоматически при завершении задач
 
-            // 5. Restore routes (ОЧЕНЬ ВАЖНО ДЛЯ CLI)
+            // 4. Restore DNS
+            // if let Err(e) = self.dns_manager.restore_dns(&running.iface_name) {
+            //     error!("Failed to restore DNS: {}", e);
+            // }
+
+            // 5. Restore routes
             if let Err(e) = self.route_manager.restore_routes().await {
                 error!("Failed to restore routes: {}", e);
             }
@@ -283,13 +345,9 @@ impl AnetClient {
     }
 
     /// Получение статистики
+    /// Возвращает Option, так как для SSH статистики Quinn не существует
     pub fn get_stats(&self) -> Option<Connection> {
         let state = self.session.lock().unwrap();
-        if let Some(s) = &*state {
-            // Переделать на структуру
-            Some(s.connection.clone())
-        } else {
-            None
-        }
+        state.as_ref().and_then(|s| s.connection.clone())
     }
 }

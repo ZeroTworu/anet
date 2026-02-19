@@ -63,6 +63,36 @@ impl Default for StatsConfig {
     }
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq, Copy)]
+#[serde(rename_all = "snake_case")]
+pub enum TransportMode {
+    Quic,
+    Ssh,
+    Auto, // Задел на будущее
+}
+
+impl Default for TransportMode {
+    fn default() -> Self {
+        TransportMode::Quic
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TransportConfig {
+    #[serde(default)]
+    pub mode: TransportMode,
+    pub ssh_user: Option<String>,
+}
+
+impl Default for TransportConfig {
+    fn default() -> Self {
+        Self {
+            mode: TransportMode::Quic,
+            ssh_user: Some("hanyuu".to_string()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct CoreConfig {
     #[serde(default)]
@@ -79,4 +109,7 @@ pub struct CoreConfig {
 
     #[serde(default)]
     pub stealth: StealthConfig,
+
+    #[serde(default)]
+    pub transport: TransportConfig,
 }
