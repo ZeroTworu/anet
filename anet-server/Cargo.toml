@@ -22,6 +22,10 @@ serde = { workspace = true, features = ["derive"] }
 toml = {workspace = true}
 x25519-dalek = {workspace = true}
 ed25519-dalek = {workspace = true}
+async-trait = { workspace = true }
+
+russh = "0.45"
+russh-keys = "0.45"
 
 dashmap = "7.0.0-rc2"
 arc-swap = "1.6"

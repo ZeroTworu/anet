@@ -94,16 +94,22 @@ impl Default for NetworkConfig {
 #[serde(default)]
 pub struct ServerCoreConfig {
     pub auth_phrase: String,
-    pub bind_to: String,
+    pub quic_bind_to: String,
     pub external_if: String,
+
+    pub ssh_bind_to: String,
+    pub ssh_host_key: String,
 }
 
 impl Default for ServerCoreConfig {
     fn default() -> Self {
         Self {
             auth_phrase: "default_secret".to_string(),
-            bind_to: "0.0.0.0:8443".to_string(),
+            quic_bind_to: "0.0.0.0:8443".to_string(),
             external_if: "eth0".to_string(),
+
+            ssh_bind_to: "0.0.0.0:822".to_string(),
+            ssh_host_key: "/etc/ssh/ssh_host_rsa_key".to_string(),
         }
     }
 }

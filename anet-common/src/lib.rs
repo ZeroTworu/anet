@@ -9,6 +9,7 @@ pub mod padding_utils;
 pub mod quic_settings;
 pub mod stream_framing;
 pub mod transport;
+pub mod transport_trait;
 pub mod tun_params;
 pub mod udp_poller;
 
