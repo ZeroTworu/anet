@@ -32,9 +32,10 @@ jobs:
     steps:
       - uses: "actions/checkout@v6"
 
-      # Ставим musl для статики и mingw для кросс-компиляции винды
       - name: "Install dependencies"
-        run: "sudo apt-get install -y musl-tools protobuf-compiler mingw-w64"
+        run: |
+            sudo apt-get update
+            sudo apt-get install -y musl-tools protobuf-compiler gcc-aarch64-linux-gnu mingw-w64
 
       - name: "Install Rust"
         uses: "actions-rs/toolchain@v1"
