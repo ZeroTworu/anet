@@ -64,6 +64,9 @@ iptables -I FORWARD -i <if_name from server config> -o <External Interface> -j A
 
 # Включаем NAT
 iptables -t nat -A POSTROUTING -o <External Interface> -j MASQUERADE
+
+# Проверка
+iptables -L -v -n
 ```
 Также для Ubunutu нужно включить IPv4 forwarding, если команда `sysctl net.ipv4.ip_forward` выводит 0:
 ```

@@ -68,7 +68,6 @@ impl Default for StatsConfig {
 pub enum TransportMode {
     Quic,
     Ssh,
-    Auto, // Задел на будущее
 }
 
 impl Default for TransportMode {

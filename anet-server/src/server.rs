@@ -80,7 +80,7 @@ impl ANetServer {
         let listen_addr = &self.cfg.server.quic_bind_to;
         let real_socket = Arc::new(UdpSocket::bind(listen_addr).await?);
         let server_config = self.build_quinn_server_config()?;
-        info!("Unified UDP listener started on {}", listen_addr);
+        info!("Unified UDP Listener Started On: {}", listen_addr);
 
         let (tx_to_tun, rx_from_tun) = self.tun_manager.run().await?;
 

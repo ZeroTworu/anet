@@ -125,7 +125,7 @@ impl AnetClient {
         status("Connecting");
         let transport = create_transport(&self.config);
 
-        info!("[Core] Transport mode: {:?}", self.config.transport.mode);
+        info!("[Core] Transport mode: [{:?}]", self.config.transport.mode);
 
         // Connect возвращает AuthResponse (настройки сети) и VpnStream (трубу данных)
         // Если это QUIC - stream это обертка над QUIC стримами.
