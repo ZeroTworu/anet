@@ -113,7 +113,7 @@ impl AsyncUdpSocket for AnetUdpSocket {
     ) -> Poll<io::Result<usize>> {
         let mut count = 0;
         // Используем один буфер для чтения из сокета
-        let mut recv_buf = vec![0u8; MAX_PACKET_SIZE];
+        let mut recv_buf = [0u8; MAX_PACKET_SIZE];
 
         // Пытаемся заполнить столько буферов, сколько дал Quinn
         for (buf, meta_item) in bufs.iter_mut().zip(meta.iter_mut()) {

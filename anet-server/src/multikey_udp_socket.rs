@@ -125,7 +125,7 @@ impl AsyncUdpSocket for MultiKeyAnetUdpSocket {
         // Индекс текущего буфера Quinn, который мы хотим заполнить
         let mut i = 0;
 
-        let mut recv_buf = vec![0u8; MAX_PACKET_SIZE];
+        let mut recv_buf = [0u8; MAX_PACKET_SIZE];
 
         // Читаем, пока есть свободные буферы у Quinn
         while i < bufs.len() {

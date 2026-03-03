@@ -128,7 +128,7 @@ impl TunManager {
 
         // Task for reading from TUN
         tokio::spawn(async move {
-            let mut buffer = vec![0u8; MAX_PACKET_SIZE];
+            let mut buffer = [0u8; MAX_PACKET_SIZE];
             loop {
                 match reader.read(&mut buffer).await {
                     Ok(0) => {
