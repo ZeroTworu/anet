@@ -80,6 +80,26 @@ struct AnetSshHandler {
     auth_handler: ServerAuthHandler,
 }
 
+impl AnetSshHandler {
+    fn new(
+        remote_addr: SocketAddr,
+        config: Arc<Config>,
+        registry: Arc<ClientRegistry>,
+        tun_tx: mpsc::Sender<Bytes>,
+        session_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
+        auth_handler: ServerAuthHandler,
+    ) -> Self {
+        Self {
+            remote_addr,
+            config,
+            registry,
+            tun_tx,
+            session_tx,
+            auth_handler,
+        }
+    }
+}
+
 #[async_trait]
 impl server::Handler for AnetSshHandler {
     type Error = anyhow::Error;
@@ -116,7 +136,7 @@ impl server::Handler for AnetSshHandler {
         Ok(())
     }
 
-    async fn shell_request(&mut self, channel: ChannelId, session: &mut server::Session ) -> Result<(), Self::Error> {
+    async fn shell_request(&mut self, channel: ChannelId, session: &mut server::Session) -> Result<(), Self::Error> {
         session.data(channel, CryptoVec::from_slice(b"Welcome to Simple SSH Server.\r\n"));
         session.close(channel);
         Ok(())
@@ -131,7 +151,8 @@ async fn handle_ssh_vpn_session<S>(
     remote_addr: SocketAddr,
     auth_handler: ServerAuthHandler,
 ) -> Result<()>
-where S: AsyncRead + AsyncWrite + Unpin + Send + 'static
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     info!("SSH VPN: Handshake sequence engaging with {:?}", remote_addr);
     loop {
@@ -229,12 +250,7 @@ pub async fn run_ssh_server(
     tun_tx: mpsc::Sender<Bytes>,
     auth_handler: ServerAuthHandler,
 ) -> Result<()> {
-
     let mut sh_config = server::Config::default();
-
-    // ОТКРЫВАЕМ ХАЙВЕИ ПО ПРЯМОЙ ЧТОБЫ TCP НЕ ДОХ СТОЯ
-    // sh_config.window_size = 2_000_000_000;
-    // sh_config.maximum_packet_size = 200_000_000;
 
     let key = russh_keys::load_secret_key(&config.server.ssh_host_key, None)?;
     sh_config.keys.push(key);
@@ -253,7 +269,7 @@ pub async fn run_ssh_server(
         let a_handler = auth_handler.clone();
 
         tokio::spawn(async move {
-            let h = AnetSshHandler { remote_addr: addr, config: c_config, registry, tun_tx, session_tx: None, auth_handler: a_handler };
+            let h = AnetSshHandler::new(addr, c_config, registry, tun_tx, None, a_handler);
             let _ = server::run_stream(s_conf, tcp, h).await;
         });
     }

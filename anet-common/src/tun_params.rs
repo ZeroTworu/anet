@@ -1,7 +1,6 @@
 use crate::AuthResponse;
 use std::net::Ipv4Addr;
 use tun::Configuration;
-use std::str::FromStr;
 
 #[derive(Clone)]
 pub struct TunParams {
@@ -13,15 +12,10 @@ pub struct TunParams {
 
     pub network: Option<Ipv4Addr>,
 
-    pub dns_servers: Vec<Ipv4Addr>,
 }
 
 impl TunParams {
-    pub fn from_auth_response(auth_response: &AuthResponse, adapter: &str, dns_list: &[String]) -> Self {
-        let dns_servers: Vec<Ipv4Addr> = dns_list
-            .iter()
-            .filter_map(|s| Ipv4Addr::from_str(s).ok())
-            .collect();
+    pub fn from_auth_response(auth_response: &AuthResponse, adapter: &str) -> Self {
         Self {
             address: auth_response.ip.parse().unwrap(),
             netmask: auth_response.netmask.parse().unwrap(),
@@ -29,7 +23,6 @@ impl TunParams {
             name: adapter.to_string(),
             mtu: auth_response.mtu as u16,
             network: None,
-            dns_servers,
         }
     }
 

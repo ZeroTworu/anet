@@ -24,12 +24,11 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 pub struct DesktopTunFactory {
     tun_name: String,
-    dns_servers: Vec<String>,
 }
 
 impl DesktopTunFactory {
-    pub fn new(tun_name: String, dns_servers: Vec<String>) -> Self {
-        Self { tun_name, dns_servers }
+    pub fn new(tun_name: String) -> Self {
+        Self { tun_name }
     }
 
     #[cfg(target_os = "windows")]
@@ -220,7 +219,7 @@ impl TunFactory for DesktopTunFactory {
         use anet_common::atun::TunManager;
         use anet_common::tun_params::TunParams;
 
-        let params = TunParams::from_auth_response(auth, &self.tun_name, &self.dns_servers);
+        let params = TunParams::from_auth_response(auth, &self.tun_name);
 
         let mut manager = TunManager::new(params.clone())?;
         let result = manager.run_with_name().await?;

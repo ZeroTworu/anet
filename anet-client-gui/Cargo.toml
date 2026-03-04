@@ -5,8 +5,8 @@ edition = "2024"
 license = "MIT"
 
 [dependencies]
-eframe = "0.33.2"
-egui = "0.33.2"
+eframe = "0.33.3"
+egui = "0.33.3"
 
 tokio = { workspace = true }
 anyhow = { workspace = true }
@@ -24,9 +24,12 @@ anet-client-core = { path = "../anet-client-core" }
 anet-common = { path = "../anet-common" }
 rfd = "0.17.2"
 
+notify-rust = "4.11.3"
+tray-icon = "0.21.3"
 # Windows-specific dependencies
 [target.'cfg(windows)'.dependencies]
 wintun = "0.5.1"
+windows-sys = { version = "0.59", features = ["Win32_UI_WindowsAndMessaging", "Win32_Foundation"] }
 
 # Platform-specific dependencies for route management
 [target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]

@@ -8,12 +8,11 @@ use tokio::sync::mpsc;
 
 pub struct DesktopTunFactory {
     tun_name: String,
-    dns_servers: Vec<String>,
 }
 
 impl DesktopTunFactory {
-    pub fn new(tun_name: String, dns_servers: Vec<String>) -> Self {
-        Self { tun_name, dns_servers }
+    pub fn new(tun_name: String) -> Self {
+        Self { tun_name}
     }
 }
 
@@ -23,7 +22,7 @@ impl TunFactory for DesktopTunFactory {
         &self,
         auth: &AuthResponse,
     ) -> Result<(mpsc::Sender<Bytes>, mpsc::Receiver<Bytes>, String)> {
-        let params = TunParams::from_auth_response(auth, &self.tun_name, &self.dns_servers);
+        let params = TunParams::from_auth_response(auth, &self.tun_name);
 
         let mut manager = TunManager::new(params)?;
 

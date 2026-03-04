@@ -98,7 +98,6 @@ async fn main() -> Result<()> {
     let cfg = config.clone();
     let tun_fac = Box::new(DesktopTunFactory::new(
         config.main.tun_name,
-        config.main.dns_server_list.clone(),
     ));
     let client = AnetClient::new(cfg, tun_fac, route_mgr);
 

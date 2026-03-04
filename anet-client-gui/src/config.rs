@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Serialize, Deserialize, Default, Clone)]
 pub struct AppSettings {
     pub last_config_path: Option<String>,
+    #[serde(default)]
+    pub disable_notifications: bool,
 }
 
 impl AppSettings {

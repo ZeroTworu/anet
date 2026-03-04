@@ -2,6 +2,7 @@
 
 use anet_client_gui::app::ANetApp;
 use eframe::egui;
+use anet_client_gui::icons;
 
 fn main() -> Result<(), eframe::Error> {
     // On macOS, check if we need to escalate privileges for utun access
@@ -36,7 +37,7 @@ fn main() -> Result<(), eframe::Error> {
     }
 
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-    let icon = load_icon();
+    let icon = icons::load_icon();
 
     let options = eframe::NativeOptions {
         // Настраиваем Viewport (само окно)
@@ -54,27 +55,9 @@ fn main() -> Result<(), eframe::Error> {
         Box::new(|cc| {
             // Настройка стилей при старте
             configure_styles(&cc.egui_ctx);
-            Ok(Box::new(ANetApp::new()))
+            Ok(Box::new(ANetApp::new(cc)))
         }),
     )
-}
-
-fn load_icon() -> egui::IconData {
-    let (icon_rgba, icon_width, icon_height) = {
-        let image = image::load_from_memory(include_bytes!("../icon.ico"))
-            .expect("Failed to open icon path")
-            .into_rgba8();
-
-        let (width, height) = image.dimensions();
-        let rgba = image.into_raw();
-        (rgba, width, height)
-    };
-
-    egui::IconData {
-        rgba: icon_rgba,
-        width: icon_width,
-        height: icon_height,
-    }
 }
 
 fn configure_styles(ctx: &egui::Context) {
