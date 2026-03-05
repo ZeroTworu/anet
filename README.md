@@ -59,5 +59,7 @@ make cert
 ```
 [Android src](https://github.com/ZeroTworu/anet-android)
 
+[TG Channel](https://t.me/anet_org) могу ту писать не трезвым и с ошибками
+
 
 На J7: [Donate](https://dalink.to/rventomarika)
