@@ -61,5 +61,7 @@ make cert
 
 [TG Channel](https://t.me/anet_org) могу ту писать не трезвым и с ошибками
 
+https://t.me/+HHe-dlAKZkA1NTc6
+
 
 На J7: [Donate](https://dalink.to/rventomarika)
