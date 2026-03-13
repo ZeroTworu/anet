@@ -24,6 +24,9 @@ anet-client-core = { path = "../anet-client-core" }
 anet-common = { path = "../anet-common" }
 rfd = "0.17.2"
 
+dirs = "6"
+uuid = { version = "1", features = ["v4"] }
+
 # Windows-specific dependencies
 [target.'cfg(windows)'.dependencies]
 wintun = "0.5.1"
