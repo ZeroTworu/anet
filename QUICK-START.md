@@ -21,7 +21,7 @@ Short guide: required files, running the server (Docker), and connecting from a 
 | `openssl-server.cnf` | Used for QUIC certificate (SAN: alco) |
 | `client-windows/client.toml` | Template for client config (will be overwritten by generate-client-config.sh) |
 
-**Optional:** `anet/` — ANet source. If missing, `install.sh` will clone it from GitHub.
+**Optional:** `anet/` — ANet source code (only needed if using `--build-from-source` flag). Default mode downloads prebuilt binaries from GitHub releases.
 
 **Optional (tests):** `test-client-keys.sh`, `test-keys-from-keys-file.sh` — validate keys on Linux.
 
@@ -34,6 +34,10 @@ Short guide: required files, running the server (Docker), and connecting from a 
 ---
 
 ## 2. Server: install and run
+
+### 🚀 Quick Mode (Prebuilt Binaries — Recommended)
+
+**Default mode**: Downloads prebuilt binaries from GitHub releases. **No Rust compilation, no anet/ source needed!**
 
 **SO lazy loader**: download and this script launch everything!
 
@@ -49,25 +53,55 @@ sed -i 's/\r$//' install.sh generate-config.sh generate-client-config.sh diagnos
 
 chmod +x install.sh generate-config.sh generate-client-config.sh diagnose.sh
 
-# Full install: clone anet (if needed), build image, generate config, start
+# Quick install: download prebuilt binaries, generate config, start (2-3 min)
 sudo ./install.sh
 ```
 
 This will:
 
 - Check Docker, Docker Compose, TUN, ip_forward
-- Clone `anet/` from GitHub if missing
-- Build the Docker image
+- **Download prebuilt binaries** from GitHub releases (fast!)
+- Build lightweight Docker image (~2-3 minutes)
 - Generate `server/server.toml` and `server/client-keys.txt` (if not already valid)
 - Start the container (host network, port 8443/UDP)
+
+### 🔨 Build from Source (Alternative)
+
+If you want to compile from Rust source code instead:
+
+```bash
+# Full install: clone anet (if needed), compile from source (10-15 min)
+sudo ./install.sh --build-from-source
+```
+
+This will:
+
+- Clone `anet/` from GitHub if missing
+- Compile Rust code (slower, requires more resources)
+- Generate config and start server
 
 **Manual steps (if you prefer):**
 
 ```bash
+# With custom options
+./install.sh --clients 3 --bind 51820              # 3 clients, port 51820
+./install.sh --build-from-source --external-if eth0  # Build from source, specify interface
+
+# Or generate config separately
 ./generate-config.sh --clients 2              # 2 client key pairs
 ./generate-client-config.sh --server-address YOUR_SERVER_IP:8443
-docker compose up -d
+docker compose up -d                          # Uses prebuilt binaries by default
+# docker compose -f docker-compose.build.yml up -d  # Or force build from source
 ```
+
+**Available flags for install.sh:**
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--build-from-source` | Compile from Rust source instead of downloading binaries | Disabled (uses prebuilt) |
+| `--clients N` | Number of client keys to generate | 1 |
+| `--external-if IFACE` | Network interface for NAT (e.g., eth0, ens3) | Auto-detect |
+| `--bind PORT` | UDP port to bind | 8443 |
 
 **Useful commands:**
 

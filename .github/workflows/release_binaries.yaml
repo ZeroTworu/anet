@@ -1,0 +1,75 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+jobs:
+  build:
+    uses: "./.github/workflows/build_binaries.yaml"
+    secrets: inherit
+
+  package-and-release:
+    name: "Release"
+    runs-on: "ubuntu-latest"
+    needs: [ "build" ]
+    steps:
+      - uses: "actions/checkout@v6"
+        with:
+          fetch-depth: "0"
+
+      # Скачиваем ВСЕ артефакты
+      - name: "Download all binaries and installer artifacts"
+        uses: "actions/download-artifact@v7"
+        with:
+          path: "artifacts/*"
+
+      - name: "Set version from tag"
+        run: "echo \"VERSION=${GITHUB_REF#refs/tags/v}\" >> $GITHUB_ENV"
+
+      - name: "Debug: List all artifacts structure"
+        run: |
+          echo "Artifacts structure:"
+          find artifacts/* -type f -name "*" | sort
+
+      - name: "Prepare files for packaging"
+        run: |
+          mkdir -p release_files/server release_files/client-linux release_files/client-windows release_files/client-macos
+          
+          # --- LINUX SERVER & CLIENT ---
+          cp artifacts/anet-auth-linux/anet-auth-linux release_files/auth/
+          cp artifacts/anet-server-linux/anet-server-linux release_files/server/
+          cp artifacts/anet-keygen-linux/anet-keygen-linux release_files/keygen/
+          cp artifacts/anet-client-cli-linux/anet-client-cli release_files/client-linux/
+          
+          
+          
+          # --- CONFIGS ---
+          cp contrib/config/server.toml release_files/server/
+          cp contrib/config/client.toml release_files/client-linux/
+          
+          
+
+      - name: "Create zip archives"
+        run: |
+          cd release_files
+          zip -r "auth_${VERSION}.zip" auth/
+          zip -r "server_${VERSION}.zip" server/
+          zip -r "keygen_${VERSION}.zip" keygen/
+          zip -r "client-cli-linux_${VERSION}.zip" client-cli-linux/
+          
+          cd ..
+
+      - name: "Create Release"
+        uses: "softprops/action-gh-release@v2"
+        with:
+          tag_name: ${{ github.ref }}
+          name: Release ${{ github.ref }}
+          files: |
+            release_files/server_${{ env.VERSION }}.zip
+            release_files/auth_${{ env.VERSION }}.zip
+            release_files/keygen_${{ env.VERSION }}.zip
+            release_files/client-cli-linux_${{ env.VERSION }}.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

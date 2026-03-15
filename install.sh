@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # ============================================================================
 # ANet VPN Server — Docker Installer
-# Checks prerequisites, builds the image, generates config if needed, starts
-# Usage: ./install.sh [--clients N] [--external-if IFACE] [--bind PORT]
-# All flags are passed through to generate-config.sh
+# Default: Uses prebuilt binaries from GitHub releases (fast, no compilation)
+# To build from source: ./install.sh --build-from-source
+# Usage: ./install.sh [--build-from-source] [--clients N] [--external-if IFACE] [--bind PORT]
+# Config flags (--clients, --external-if, etc.) are passed to generate-config.sh
 # ============================================================================
 set -euo pipefail
 
@@ -66,22 +67,45 @@ if [[ $MISSING -eq 1 ]]; then
   exit 1
 fi
 
-# ── 2. Check anet source directory ────────────────────────────────────────
-header "Checking ANet source"
-ANET_REPO="https://github.com/ZeroTworu/anet.git"
+# ── 2. Choose build mode ──────────────────────────────────────────────────
+header "Checking build mode"
 
-if [[ -d ./anet && -f ./anet/Cargo.toml ]]; then
-  ok "anet/ directory exists"
-else
-  warn "anet/ directory not found — cloning from $ANET_REPO"
-  if command -v git &>/dev/null; then
-    git clone "$ANET_REPO" ./anet
-    ok "Cloned anet repository"
+# Check if --build-from-source flag is passed
+BUILD_FROM_SOURCE=0
+CONFIG_ARGS=()
+for arg in "$@"; do
+  if [[ "$arg" == "--build-from-source" ]]; then
+    BUILD_FROM_SOURCE=1
   else
-    fail "git not found — install git or manually clone:"
-    echo "      git clone $ANET_REPO ./anet"
-    exit 1
+    # Collect other args for generate-config.sh
+    CONFIG_ARGS+=("$arg")
   fi
+done
+
+if [[ $BUILD_FROM_SOURCE -eq 1 ]]; then
+  info "Build mode: FROM SOURCE (--build-from-source flag detected)"
+  info "This will compile anet from Rust source code (slower, ~5-10 min)"
+  ANET_REPO="https://github.com/ZeroTworu/anet.git"
+
+  if [[ -d ./anet && -f ./anet/Cargo.toml ]]; then
+    ok "anet/ directory exists"
+  else
+    warn "anet/ directory not found — cloning from $ANET_REPO"
+    if command -v git &>/dev/null; then
+      git clone "$ANET_REPO" ./anet
+      ok "Cloned anet repository"
+    else
+      fail "git not found — install git or manually clone:"
+      echo "      git clone $ANET_REPO ./anet"
+      exit 1
+    fi
+  fi
+  COMPOSE_FILE="docker-compose.build.yml"
+else
+  info "Build mode: PREBUILT BINARIES (default)"
+  info "Docker will download latest release from GitHub (fast, ~1-2 min)"
+  info "To build from source: ./install.sh --build-from-source"
+  COMPOSE_FILE="docker-compose.yml"
 fi
 
 header "Checking TUN device"
@@ -101,7 +125,7 @@ fi
 
 # ── 3. Build Docker image ─────────────────────────────────────────────────
 header "Building Docker image"
-docker compose build
+docker compose -f "$COMPOSE_FILE" build
 info "Image built successfully"
 
 # ── 4. Generate config if not present ─────────────────────────────────────
@@ -111,23 +135,23 @@ if [[ -f ./server/server.toml ]]; then
   if grep -q 'Содержимое cert.pem' ./server/server.toml 2>/dev/null || \
      grep -q 'server_signing_key = ""' ./server/server.toml 2>/dev/null; then
     warn "server.toml has placeholder values — regenerating"
-    bash ./generate-config.sh "$@"
+    bash ./generate-config.sh "${CONFIG_ARGS[@]}"
   else
     ok "server.toml exists with configured keys"
-    info "To regenerate: ./generate-config.sh $*"
+    info "To regenerate: ./generate-config.sh ${CONFIG_ARGS[*]}"
   fi
 else
   info "No server.toml found — generating new config"
-  bash ./generate-config.sh "$@"
+  bash ./generate-config.sh "${CONFIG_ARGS[@]}"
 fi
 
 # ── 5. Start container ────────────────────────────────────────────────────
 header "Starting ANet server"
-docker compose up -d
+docker compose -f "$COMPOSE_FILE" up -d
 sleep 2
 
 # Quick health check
-if docker compose ps --format '{{.State}}' 2>/dev/null | grep -q running; then
+if docker compose -f "$COMPOSE_FILE" ps --format '{{.State}}' 2>/dev/null | grep -q running; then
   ok "Container is running"
 else
   # Fallback check for older docker compose
@@ -137,7 +161,7 @@ else
     fail "Container failed to start"
     echo ""
     warn "Last 20 log lines:"
-    docker compose logs --tail 20 anet-server
+    docker compose -f "$COMPOSE_FILE" logs --tail 20 anet-server
     exit 1
   fi
 fi
@@ -158,8 +182,13 @@ info "Config:      ./server/server.toml"
 info "Client keys: ./server/client-keys.txt"
 echo ""
 info "Useful commands:"
-echo "  docker compose logs -f anet-server    # live logs"
-echo "  docker compose restart anet-server    # restart"
-echo "  docker compose down                   # stop"
+if [[ "$COMPOSE_FILE" == "docker-compose.build.yml" ]]; then
+  COMPOSE_CMD="docker compose -f docker-compose.build.yml"
+else
+  COMPOSE_CMD="docker compose"
+fi
+echo "  $COMPOSE_CMD logs -f anet-server    # live logs"
+echo "  $COMPOSE_CMD restart anet-server    # restart"
+echo "  $COMPOSE_CMD down                   # stop"
 echo "  ./diagnose.sh                         # diagnostics"
 echo "  ./generate-config.sh --clients 2      # regenerate with 2 clients"

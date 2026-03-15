@@ -28,56 +28,93 @@
 *   `anet-common` — Реализация протокола ASTP и криптографии.
 *   `anet-keygen` — Утилита для генерации ключей доступа.
 
-## Быстрый старт
+## 🚀 Быстрый старт
 
 Запуск сервера в Docker и подключение клиента за несколько шагов:
 
-1. **Сервер (Linux):** скопируйте папку `quick_start/` на сервер, выполните `sudo ./install.sh` — скрипт соберёт образ, сгенерирует конфиг и ключи, поднимет контейнер (порт 8443/UDP).
-2. **Клиент:** на сервере выполните `./generate-client-config.sh --server-address IP:8443`, скопируйте `client-windows/client.toml` на ПК с клиентом (рядом с exe и `wintun.dll` на Windows).
+### Простой режим (рекомендуется)
+
+**Использует готовые бинарники — без компиляции Rust!**
+
+1. **Сервер (Linux):** клонируйте репозиторий и запустите `sudo ./install.sh` — скрипт скачает готовые бинарники, сгенерирует конфиг и ключи, поднимет контейнер (порт 8443/UDP).
+2. **Клиент:** на сервере выполните `./generate-client-config.sh --server-address IP:8443`, скопируйте `client-windows/client.toml` на ПК с клиентом.
 3. **Подключение:** запустите клиент ANet в папке с `client.toml`.
 
-Подробно: [quick_start/QUICK-START.md](quick_start/QUICK-START.md).
+```bash
+# Быстрая установка
+git clone https://github.com/AlphaO612/easy_anet.git
+cd easy_anet
+chmod +x install.sh
+sudo ./install.sh --clients 2
+```
 
-**Совсем ленивый вариант:** одна команда — скачать скрипт и запустить (на Linux-сервере):
+**Время установки:** ~2-3 минуты (только загрузка бинарников)
+
+### Сборка из исходников (опционально)
+
+Если хотите собрать из Rust кода:
+
+```bash
+sudo ./install.sh --build-from-source --clients 2
+```
+
+**Время установки:** ~10-15 минут (компиляция Rust)
+
+Подробно: [QUICK-START.md](QUICK-START.md)
+
+---
+
+### ⚡ Совсем ленивый вариант
+
+Одна команда — скачать скрипт и запустить (на Linux-сервере):
 
 ```bash
 curl -sSL https://github.com/AlphaO612/easy_anet/releases/download/v1.0/i-am-so-lazy.sh | sudo bash
 ```
 
-Скрипт сам подтянет нужные файлы из релиза, выполнит установку и поднимет сервер. Подробности — в [quick_start/i-am-so-lazy.sh](quick_start/i-am-so-lazy.sh).
+Скрипт сам подтянет нужные файлы из релиза, выполнит установку и поднимет сервер. Подробности — в [i-am-so-lazy.sh](i-am-so-lazy.sh).
 
-## Сборка
+---
 
-Требуется установленный Rust (cargo).
+### Makefile команды
+
+Для еще более простого управления используйте `make` (префикс `docker-`):
 
 ```bash
-# Сборка всех компонентов
-make all
+# Docker Server Deployment
+make docker-help              # Показать команды
+make docker-install           # Установка с бинарниками
+make docker-install-source    # Установка со сборкой
+make docker-start             # Запуск
+make docker-stop              # Остановка
+make docker-logs              # Логи
+make docker-diagnose          # Диагностика
+make docker-client IP=1.2.3.4 # client.toml
 
-# Сборка статичных бинарников с musl
-make musl
-
-# Сборка библиотеки для Android
-make mob
-
-# Сборка под macOS
-# Build macOS CLI client
-make macos
-
-# Build macOS GUI client
-make macos-gui
-
-# Build universal macOS binaries (Intel + Apple Silicon)
-make macos-universal
-
-# Генерация сертификата для QUIC
-make cert
+# Development (для разработчиков)
+make all              # Сборка компонентов
+make test             # Тесты
+make musl             # Статичный бинарник
 ```
-[Android src](https://github.com/ZeroTworu/anet-android)
+
+## 🔨 Сборка из исходников (для разработчиков)
+
+Этот репозиторий (easy_anet) — обертка для упрощенного деплоя. Для самостоятельной сборки компонентов ANet:
+
+1. Клонируйте основной репозиторий: `git clone https://github.com/ZeroTworu/anet.git`
+2. Установите Rust (cargo)
+3. Следуйте инструкциям в [ZeroTworu/anet](https://github.com/ZeroTworu/anet)
+
+Готовые бинарники для всех платформ доступны в [Releases](https://github.com/ZeroTworu/anet/releases):
+- **Linux Server** — `server_linux.zip`
+- **Windows Client** — `client-windows_X.X.X.zip` (CLI + GUI + wintun.dll)
+- **Linux Client** — `client-linux_X.X.X.zip`
+- **macOS Client** — `client-macos_X.X.X.zip` (Universal binary)
+- **Android Client** — [anet-android.apk](https://github.com/ZeroTworu/anet/releases)
 
 Support the Chaos
 
-Если ANet помог тебе — налей автору.
+Если ANet помог тебе — налей автору оригинала!
 
 На водку разрабу: [Donate](https://dalink.to/rventomarika)
 

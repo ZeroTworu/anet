@@ -1,5 +1,7 @@
-# ANet VPN Server — multi-stage build from anet source
-# Use rust:bookworm (Rust 1.85+ required for anet edition 2024)
+# ANet VPN Server — Build from source (alternative mode)
+# Use this if you want to build from anet source code instead of downloading binaries
+# To use: docker compose -f docker-compose.build.yml build
+
 FROM rust:bookworm AS builder
 RUN apt-get update \
   && apt-get install -y --no-install-recommends protobuf-compiler \

@@ -1,4 +1,5 @@
 .PHONY: all check test clean musl cert mob macos macos-gui macos-all macos-universal macos-app infra
+.PHONY: docker-help docker-install docker-install-source docker-start docker-stop docker-restart docker-logs docker-diagnose docker-config docker-client docker-clean
 
 # Default target
 all:
@@ -27,6 +28,7 @@ mob:
 # run infrastructure
 infra:
 	docker-compose -f contrib/docker/docker-compose.infra.yaml up --remove-orphans
+
 # Build macOS CLI client
 macos:
 	cargo build --release -p anet-client-cli
@@ -70,3 +72,74 @@ macos-universal:
 
 cert:
 	openssl req -x509 -newkey ed25519 -keyout key.pem -out cert.pem -days 365 -nodes -subj "/CN=alco" -addext "subjectAltName = DNS:alco" -addext "basicConstraints=critical,CA:FALSE" -addext "keyUsage=digitalSignature,keyEncipherment"
+
+# ============================================================================
+# Docker Server Deployment
+# ============================================================================
+
+docker-help:
+	@echo "ANet VPN Server — Docker Deployment"
+	@echo "===================================="
+	@echo ""
+	@echo "Setup:"
+	@echo "  make docker-install         Install with prebuilt binaries (fast)"
+	@echo "  make docker-install-source  Install by building from source (slower)"
+	@echo ""
+	@echo "Management:"
+	@echo "  make docker-start           Start server"
+	@echo "  make docker-stop            Stop server"
+	@echo "  make docker-restart         Restart server"
+	@echo "  make docker-logs            View logs"
+	@echo "  make docker-diagnose        Run diagnostics"
+	@echo ""
+	@echo "Configuration:"
+	@echo "  make docker-config          Generate server config"
+	@echo "  make docker-client IP=x.x.x.x  Generate client.toml"
+	@echo ""
+	@echo "Cleanup:"
+	@echo "  make docker-clean           Stop and remove containers"
+
+docker-install:
+	@echo "Installing ANet VPN server (prebuilt binaries)..."
+	chmod +x install.sh generate-config.sh generate-client-config.sh diagnose.sh
+	sudo ./install.sh --clients 2
+
+docker-install-source:
+	@echo "Installing ANet VPN server (build from source)..."
+	chmod +x install.sh generate-config.sh generate-client-config.sh diagnose.sh
+	sudo ./install.sh --build-from-source --clients 2
+
+docker-start:
+	docker compose up -d
+
+docker-stop:
+	docker compose down
+
+docker-restart:
+	docker compose restart anet-server
+
+docker-logs:
+	docker compose logs -f anet-server
+
+docker-diagnose:
+	@chmod +x diagnose.sh
+	@./diagnose.sh
+
+docker-config:
+	@chmod +x generate-config.sh
+	@./generate-config.sh --clients 2 --bind 8443
+
+docker-client:
+ifndef IP
+	@echo "Error: Please specify server IP"
+	@echo "Usage: make docker-client IP=194.41.113.15"
+	@exit 1
+endif
+	@chmod +x generate-client-config.sh
+	@./generate-client-config.sh --server-address $(IP):8443
+	@echo ""
+	@echo "Client config: client-windows/client.toml"
+
+docker-clean:
+	docker compose down
+	@echo "Containers stopped and removed."

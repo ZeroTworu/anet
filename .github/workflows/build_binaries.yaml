@@ -1,0 +1,158 @@
+name: "Build Components"
+
+on:
+  workflow_call:
+    outputs:
+      auth-artifact:
+        value: ${{ jobs.build-auth.outputs.artifact }}
+      server-artifact:
+        value: ${{ jobs.build-server.outputs.artifact }}
+      keygen-artifact:
+        value: ${{ jobs.build-keygen.outputs.artifact }}
+      client-cli-artifact:
+        value: ${{ jobs.build-client-cli.outputs.artifact }}
+
+jobs:
+  build-auth:
+    name: "Build Linux Auth"
+    runs-on: "ubuntu-latest"
+    steps:
+      - uses: "actions/checkout@v6"
+
+      - name: "Install musl tools"
+        run: "sudo apt-get install -y musl-tools protobuf-compiler"
+
+      - name: "Install Rust"
+        uses: "actions-rs/toolchain@v1"
+        with:
+          toolchain: "stable"
+          target: "x86_64-unknown-linux-musl"
+          override: "true"
+      
+      - name: "Cache Rust dependencies"
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-musl-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-musl-
+            ${{ runner.os }}-cargo-
+
+      - name: "Build Auth"
+        run: "RUSTFLAGS=\"-C target-feature=+crt-static\" cargo build --release -p anet-auth --target x86_64-unknown-linux-musl"
+
+      - uses: "actions/upload-artifact@v6"
+        with:
+          name: "anet-auth-linux"
+          path: "target/x86_64-unknown-linux-musl/release/anet-auth-linux"
+
+  build-server:
+    name: "Build Linux Server"
+    runs-on: "ubuntu-latest"
+    steps:
+      - uses: "actions/checkout@v6"
+
+      - name: "Install musl tools"
+        run: "sudo apt-get install -y musl-tools protobuf-compiler"
+
+      - name: "Install Rust"
+        uses: "actions-rs/toolchain@v1"
+        with:
+          toolchain: "stable"
+          target: "x86_64-unknown-linux-musl" 
+          override: "true"
+      
+      - name: "Cache Rust dependencies"
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-musl-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-musl-
+            ${{ runner.os }}-cargo-
+
+      - name: "Build Server"
+        run: "RUSTFLAGS=\"-C target-feature=+crt-static\" cargo build --release --package anet-server --target x86_64-unknown-linux-musl"
+
+      - uses: "actions/upload-artifact@v6"
+        with:
+          name: "anet-server-linux"
+          path: "target/x86_64-unknown-linux-musl/release/anet-server"
+
+  build-keygen:
+    name: "Build Linux Keygen"
+    runs-on: "ubuntu-latest"
+    steps:
+      - uses: "actions/checkout@v6"
+
+      - name: "Install musl tools"
+        run: "sudo apt-get install -y musl-tools protobuf-compiler"
+
+      - name: "Install Rust"
+        uses: "actions-rs/toolchain@v1"
+        with:
+          toolchain: "stable"
+          target: "x86_64-unknown-linux-musl"
+          override: "true"
+      
+      - name: "Cache Rust dependencies"
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-musl-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-musl-
+            ${{ runner.os }}-cargo-
+
+      - name: "Build Keygen"  
+        run: "RUSTFLAGS=\"-C target-feature=+crt-static\" cargo build --release -p anet-keygen --target x86_64-unknown-linux-musl"
+
+      - uses: "actions/upload-artifact@v6"
+        with:
+          name: "anet-keygen-linux"
+          path: "target/x86_64-unknown-linux-musl/release/anet-keygen"
+
+  build-client-cli:
+    name: "Build Linux Client CLI"
+    runs-on: "ubuntu-latest"
+    steps:  
+      - uses: "actions/checkout@v6"
+
+      - name: "Install musl tools"
+        run: "sudo apt-get install -y musl-tools protobuf-compiler"
+
+      - name: "Install Rust"
+        uses: "actions-rs/toolchain@v1"
+        with:
+          toolchain: "stable"
+          target: "x86_64-unknown-linux-musl"
+          override: "true"
+
+      - name: "Cache Rust dependencies"
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-musl-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-musl-
+            ${{ runner.os }}-cargo-
+
+      - name: "Build Linux Client CLI"    
+        run: "RUSTFLAGS=\"-C target-feature=+crt-static\" cargo build --release -p anet-client-cli --target x86_64-unknown-linux-musl"
+
+      - uses: "actions/upload-artifact@v6"
+        with:
+          name: "anet-client-cli-linux"
+          path: "target/x86_64-unknown-linux-musl/release/anet-client-cli"

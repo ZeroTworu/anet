@@ -1,5 +1,42 @@
+# Build artifacts (if building from source)
 /target
+/anet/target
+
+# IDE
 .idea
+.vscode
+*.swp
+*.swo
+*~
+
+# Generated configs and keys
+/server/
+/client-windows/client.toml
 *.pem
-android-build/*
+*.key
+*.crt
+
+# Temporary files
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
+
+# Environment
 .env
+
+# Android build artifacts (if building mobile)
+android-build/*
+/jniLibs
+
+# anet source (optional dependency)
+/anet/
+
+# Docker volumes (if any)
+.docker/
+
+# Artifacts
+artifacts/
+release_files/
+
+.ignore-git
