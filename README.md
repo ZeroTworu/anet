@@ -21,7 +21,8 @@
 
 Проект написан на Rust и разделен на модули:
 
-*   `anet-server` — Узел координации.
+*   `anet-auth` — Узел координации.
+*   `anet-server` — Сам сервер (может работать без `anet-auth`).
 *   `anet-client-cli` — Консольный клиент для Linux/Headless систем.
 *   `anet-client-gui` — Графический клиент (Windows/Linux) с минималистичным интерфейсом.
 *   `anet-mobile` — Библиотека и JNI-биндинги для Android.
@@ -59,9 +60,7 @@ make cert
 ```
 [Android src](https://github.com/ZeroTworu/anet-android)
 
-[TG Channel](https://t.me/anet_org) могу ту писать не трезвым и с ошибками
-
-https://t.me/+HHe-dlAKZkA1NTc6
+[TG Channel](https://t.me/anet_org) могу тут писать не трезвым и с ошибками
 
 
 На J7: [Donate](https://dalink.to/rventomarika)
