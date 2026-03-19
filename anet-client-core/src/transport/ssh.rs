@@ -1,7 +1,6 @@
-use super::ClientTransport;
+use super::{ClientTransport, ConnectionResult};
 use crate::config::CoreConfig;
 use crate::auth::{AuthHandler, StreamAuthChannel};
-use anet_common::transport_trait::VpnStream;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -38,12 +37,10 @@ impl SshTransport {
 
 #[async_trait]
 impl ClientTransport for SshTransport {
-    async fn connect(&self) -> Result<(anet_common::protocol::AuthResponse, Box<dyn VpnStream>)> {
+    async fn connect(&self) -> Result<ConnectionResult> {
         let addr_str = &self.config.main.address;
         let addr: SocketAddr = addr_str.parse().context("Invalid server address")?;
         let user = self.config.transport.ssh_user.as_deref().unwrap_or("root");
-
-        info!("[SSH] Connecting to {} as {}", addr, user);
 
         // Хак лимита (на максимум возможный в протоколе, спасает от затыков).
         let mut config_base = russh::client::Config::default();
@@ -157,7 +154,12 @@ impl ClientTransport for SshTransport {
         });
 
         // Теперь отдаем сам client_stream ядру - а оно уже обмазано "дуплексным шлюзом". Оно идентично старому `Box VpnStream`
-        Ok((auth_response, Box::new(MutexVpnStream(Arc::new(Mutex::new(client_stream))))))
+        Ok(ConnectionResult{
+            auth_response,
+            vpn_stream: Box::new(MutexVpnStream(Arc::new(Mutex::new(client_stream)))),
+            endpoint: None,
+            connection: None
+        })
     }
 }
 

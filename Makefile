@@ -1,4 +1,8 @@
-.PHONY: all check test clean musl cert mob macos macos-gui macos-all macos-universal macos-app infra
+.PHONY: all check test clean musl cert mob macos macos-gui macos-all macos-universal macos-app infra win-gui
+
+
+win-gui:
+	 cargo build --release --target x86_64-pc-windows-gnu --package anet-client-gui
 
 # Default target
 all:

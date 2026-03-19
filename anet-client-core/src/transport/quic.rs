@@ -1,11 +1,9 @@
-use super::ClientTransport;
-use crate::auth::{AuthHandler, UdpAuthChannel}; // Импорт
+use super::{ClientTransport, ConnectionResult};
+use crate::auth::{AuthHandler, UdpAuthChannel};
 use crate::config::CoreConfig;
 use crate::socket::AnetUdpSocket;
 use anet_common::encryption::Cipher;
-use anet_common::protocol::AuthResponse;
 use anet_common::quic_settings::build_transport_config;
-use anet_common::transport_trait::VpnStream;
 use anyhow::Result;
 use async_trait::async_trait;
 use log::info;
@@ -78,7 +76,7 @@ impl QuicTransport {
 
 #[async_trait]
 impl ClientTransport for QuicTransport {
-    async fn connect(&self) -> Result<(AuthResponse, Box<dyn VpnStream>)> {
+    async fn connect(&self) -> Result<ConnectionResult> {
         // 1. Создаем канал
         let server_addr: SocketAddr = self.config.main.address.parse()?;
         let udp_socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
@@ -139,6 +137,11 @@ impl ClientTransport for QuicTransport {
         let (send, recv) = connection.open_bi().await?;
         let stream = QuicDuplexStream { send, recv };
 
-        Ok((auth_response, Box::new(stream)))
+        Ok(ConnectionResult{
+            auth_response,
+            vpn_stream: Box::new(stream),
+            endpoint: Some(endpoint),
+            connection: Some(connection),
+        })
     }
 }

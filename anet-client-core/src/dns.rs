@@ -17,8 +17,11 @@ use log::debug;
 use std::os::windows::process::CommandExt;
 use std::process::Stdio;
 use std::string::ToString;
+#[cfg(target_os = "linux")]
 use std::fs;
+#[cfg(target_os = "linux")]
 use std::path::Path;
+#[cfg(target_os = "linux")]
 use std::sync::Mutex;
 
 /// Трейт для управления DNS

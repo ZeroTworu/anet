@@ -2,13 +2,14 @@ use crate::config::CoreConfig;
 use crate::dns::{DnsManager, get_dns_manager};
 use crate::events::status;
 use crate::traits::{RouteManager, TunFactory};
+use crate::statistic;
 use crate::transport::factory::create_transport;
 use anet_common::stream_framing::{frame_packet, read_next_packet};
 use hickory_resolver::TokioAsyncResolver;
 use hickory_resolver::config::{NameServerConfig, Protocol, ResolverConfig, ResolverOpts};
 use ipnet::IpNet;
 use log::{error, info, warn};
-use quinn::{Connection, Endpoint};
+use quinn::Endpoint;
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
@@ -20,8 +21,6 @@ use tokio::task::JoinHandle;
 struct RunningSession {
     /// QUIC Endpoint (только для QUIC, нужно для отправки close frame)
     endpoint: Option<Endpoint>,
-    /// QUIC Connection (для статистики)
-    connection: Option<Connection>,
     /// Сигнал для остановки фоновых задач пересылки байт
     shutdown_notify: Arc<Notify>,
     /// Хендл главной задачи, чтобы подождать её завершения
@@ -123,18 +122,20 @@ impl AnetClient {
         status("[Core] Starting...");
 
         // --- НОВАЯ ЛОГИКА ТРАНСПОРТА ---
-        status("Connecting");
+        status(format!("[CORE] Connecting to {}", self.config.main.address));
+        info!("[CORE] Connecting to {}", self.config.main.address);
         let transport = create_transport(&self.config);
 
         info!("[Core] Transport mode: [{:?}]", self.config.transport.mode);
+        status(format!("[Core] Transport mode: [{:?}]", self.config.transport.mode));
 
         // Connect возвращает AuthResponse (настройки сети) и VpnStream (трубу данных)
         // Если это QUIC - stream это обертка над QUIC стримами.
         // Если это SSH - stream это обертка над SSH каналом.
-        let (auth_response, vpn_stream) = transport.connect().await?;
+        let result  = transport.connect().await?;
 
-        info!("[Core] Authenticated. VPN IP: {}", auth_response.ip);
-        status(format!("[Core] Authenticated. IP: {}", auth_response.ip));
+        info!("[Core] Authenticated. VPN IP: {}", result.auth_response.ip);
+        status(format!("[Core] Authenticated. VPN IP: {}", result.auth_response.ip));
 
         // --- НАСТРОЙКА СЕТИ ---
 
@@ -155,7 +156,7 @@ impl AnetClient {
 
         // Поднимаем TUN интерфейс
         let (tx_to_tun, mut rx_from_tun, iface_name) =
-            self.tun_factory.create_tun(&auth_response).await?;
+            self.tun_factory.create_tun(&result.auth_response).await?;
 
         // --- ЗАПУСК МОСТА (BRIDGE) ---
 
@@ -164,7 +165,7 @@ impl AnetClient {
         let notify_rx = shutdown_notify.clone();
 
         // Разделяем VpnStream на Reader и Writer
-        let (mut stream_reader, mut stream_writer) = tokio::io::split(vpn_stream);
+        let (mut stream_reader, mut stream_writer) = tokio::io::split(result.vpn_stream);
 
         // Task 1: TUN -> NETWORK (Пишем в транспорт)
         let t1 = tokio::spawn(async move {
@@ -232,7 +233,7 @@ impl AnetClient {
                     .add_specific_route(
                         net.addr(),
                         net.prefix_len(),
-                        &auth_response.gateway,
+                        &result.auth_response.gateway,
                         &iface_name,
                     )
                     .await?;
@@ -258,7 +259,7 @@ impl AnetClient {
 
             // Весь трафик в туннель
             self.route_manager
-                .set_default_route(&auth_response.gateway, &iface_name)
+                .set_default_route(&result.auth_response.gateway, &iface_name)
                 .await?;
         }
 
@@ -293,13 +294,19 @@ impl AnetClient {
         status("[Core] VPN UP");
         status("VPN Tunnel UP");
 
+        if self.config.stats.enabled {
+            if let Some(conn) = result.connection {
+                statistic::start_stats_monitor(conn, self.config.stats.interval_minutes);
+            } else {
+                info!("Stats are not available for this transport mode.");
+            }
+        }
+
+
         // 5. Сохраняем сессию
-        // ВНИМАНИЕ: Для SSH у нас нет endpoint/connection, пишем None
-        // В будущем можно прокинуть их из Transport, если транспорт QUIC
         let mut state = self.session.lock().unwrap();
         *state = Some(RunningSession {
-            endpoint: None,   // TODO: Получить из транспорта если есть
-            connection: None, // TODO: Получить из транспорта если есть
+            endpoint: result.endpoint,
             shutdown_notify,
             main_task,
             iface_name: iface_name.clone(),
@@ -344,10 +351,4 @@ impl AnetClient {
         Ok(())
     }
 
-    /// Получение статистики
-    /// Возвращает Option, так как для SSH статистики Quinn не существует
-    pub fn get_stats(&self) -> Option<Connection> {
-        let state = self.session.lock().unwrap();
-        state.as_ref().and_then(|s| s.connection.clone())
-    }
 }
