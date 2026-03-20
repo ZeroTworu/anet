@@ -26,6 +26,11 @@ impl<E: Endpoint> Endpoint for ApiKeyEndpoint<E> {
     type Output = E::Output;
 
     async fn call(&self, req: Request) -> Result<Self::Output> {
+        // Если не точка сервера - пускать всех
+        if !req.uri().path().contains("/check_access") {
+            return self.ep.call(req).await;
+        }
+
         // Проверяем заголовок X-Auth-Key
         if let Some(auth_header) = req.headers().get("X-Auth-Key") {
             if let Ok(value) = auth_header.to_str() {
@@ -33,11 +38,6 @@ impl<E: Endpoint> Endpoint for ApiKeyEndpoint<E> {
                     return self.ep.call(req).await;
                 }
             }
-        }
-
-        // Swagger UI пускаем без пароля, чтобы видеть доку (но запросы работать не будут)
-        if req.uri().path().contains("/swagger") || req.uri().path().contains("/spec") {
-            return self.ep.call(req).await;
         }
         warn!("invalid auth header");
         Err(Error::from_string(

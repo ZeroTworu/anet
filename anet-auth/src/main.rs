@@ -1,8 +1,9 @@
 use anet_auth::api;
-use anet_auth::entities::users;
+use anet_auth::entities::{admins, users};
 use anet_auth::keygen;
 use anet_auth::middleware;
 use anet_auth::migration;
+use bcrypt::{DEFAULT_COST, hash};
 use clap::Parser;
 use log::{error, info};
 use poem::{EndpointExt, Route, Server, listener::TcpListener};
@@ -10,6 +11,7 @@ use poem_openapi::OpenApiService;
 use sea_orm::{ActiveModelTrait, Database, DatabaseConnection, Set};
 use sea_orm_migration::MigratorTrait;
 use std::env;
+use std::io::Write;
 use uuid::Uuid;
 
 #[derive(Parser, Debug)]
@@ -18,6 +20,10 @@ struct Args {
     /// Add a new user with the specified Name (UID) and generate keys
     #[arg(short = 'a', long = "add", value_name = "NAME")]
     add_user: Option<String>,
+
+    /// Добавление Администратора Системы (interactive pass entry)
+    #[arg(long = "add-su", value_name = "LOGIN")]
+    add_su: Option<String>,
 }
 
 #[tokio::main]
@@ -42,6 +48,8 @@ async fn main() -> Result<(), anyhow::Error> {
     // 5. ЛОГИКА ВЕТВЛЕНИЯ
     if let Some(username) = args.add_user {
         handle_add_user(&db, username).await?;
+    } else if let Some(admin_login) = args.add_su {
+        handle_add_admin(&db, admin_login).await?;
     } else {
         run_server(db).await?;
     }
@@ -80,6 +88,50 @@ async fn handle_add_user(db: &DatabaseConnection, username: String) -> Result<()
         }
         Err(e) => {
             error!("Failed to insert user into database: {}", e);
+            return Err(e.into());
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_add_admin(db: &DatabaseConnection, login: String) -> Result<(), anyhow::Error> {
+    info!("Initialize SuperUser terminal builder for: '{}'", login);
+
+    // Магически-Слепое приглашение для пароля
+    print!("🔑 Password for [{}]: ", login);
+    std::io::stdout().flush()?;
+
+    // Перехват символов терминалом
+    let password = rpassword::read_password()?;
+
+    if password.len() < 1 {
+        error!("Пароль слишком короткий");
+        return Ok(());
+    }
+
+    // Хешируем Bcrypt'ом солью
+    let hashed = match hash(&password, DEFAULT_COST) {
+        Ok(h) => h,
+        Err(e) => {
+            error!("CryptoHash Error: {}", e);
+            return Err(e.into());
+        }
+    };
+
+    let new_admin = admins::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        login: Set(login.clone()),
+        pass_hash: Set(hashed),
+        created_at: Set(chrono::Utc::now().naive_utc()),
+    };
+
+    match new_admin.insert(db).await {
+        Ok(_) => {
+            println!("  LOGIN :  {} created", login);
+        }
+        Err(e) => {
+            error!("БД отказала в записи: {}", e);
             return Err(e.into());
         }
     }
