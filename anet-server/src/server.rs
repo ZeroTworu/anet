@@ -4,7 +4,7 @@ use crate::client_registry::ClientRegistry;
 use crate::config::Config;
 use crate::ip_pool::IpPool;
 use crate::multikey_udp_socket::TempDHInfo;
-use crate::servers::{quic, ssh};
+use crate::servers::{quic, ssh, vnc};
 
 use anet_common::atun::TunManager;
 use anet_common::tun_params::TunParams;
@@ -104,6 +104,19 @@ impl ANetServer {
             handle_collection.push(tokio::spawn(async move {
                 if let Err(e) = ssh::run_ssh_server(c, rg, t_tx, auth).await {
                     error!("SSH Interface execution halted: {}", e);
+                }
+            }));
+        }
+
+        let bnd_vnc = self.cfg.server.vnc_bind_to.trim();
+        if !bnd_vnc.is_empty() {
+            let v_cfg = self.cfg.clone();
+            let v_reg = self.registry.clone();
+            let v_tx = tx_tun.clone();
+            let v_auth = self.auth_handler_core.clone();
+            handle_collection.push(tokio::spawn(async move {
+                if let Err(e) = vnc::run_vnc_server(v_cfg, v_reg, v_tx, v_auth).await {
+                    error!("Fatal VNC Failure: {}", e);
                 }
             }));
         }

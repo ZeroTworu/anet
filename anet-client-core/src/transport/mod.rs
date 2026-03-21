@@ -1,6 +1,7 @@
 pub(crate) mod factory;
 pub(crate) mod quic;
 pub(crate) mod ssh;
+mod vnc;
 
 use anet_common::protocol::AuthResponse;
 use anet_common::transport_trait::VpnStream;

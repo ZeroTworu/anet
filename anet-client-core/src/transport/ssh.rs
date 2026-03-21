@@ -164,7 +164,7 @@ impl ClientTransport for SshTransport {
 }
 
 
-struct SshStreamAdapter {
+pub struct SshStreamAdapter {
     read_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     write_tx: mpsc::UnboundedSender<Vec<u8>>,
     read_buffer: std::io::Cursor<Bytes>,
@@ -242,7 +242,7 @@ impl AsyncWrite for SshStreamAdapter {
     }
 }
 
-struct MutexVpnStream<S>(Arc<Mutex<S>>);
+pub struct MutexVpnStream<S>(Arc<Mutex<S>>);
 impl<S: AsyncRead + Unpin + Send> AsyncRead for MutexVpnStream<S> {
     fn poll_read(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &mut ReadBuf<'_>) -> std::task::Poll<std::io::Result<()>> {
         let mut guard = futures::ready!(Box::pin(self.0.lock()).as_mut().poll(cx));

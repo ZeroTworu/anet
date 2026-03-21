@@ -8,6 +8,7 @@ use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
+use crate::consts::CHANNEL_BUFFER_SIZE;
 
 /// Читает пакеты из канала `rx`, добавляет случайную задержку (parallel jitter),
 /// и пишет их в QUIC стрим `stream`.
@@ -25,7 +26,7 @@ where
     S: AsyncWriteExt + Unpin + Send + 'static,
 {
     // Промежуточный канал для пакетов, которые "проснулись" после джиттера
-    let (tx_ready, mut rx_ready) = mpsc::channel::<Bytes>(1024);
+    let (tx_ready, mut rx_ready) = mpsc::channel::<Bytes>(CHANNEL_BUFFER_SIZE);
 
     // Задача 1: Диспетчер (Прием -> Sleep -> ReadyChannel)
     let dispatch_task = tokio::spawn(async move {
