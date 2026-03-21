@@ -1,6 +1,5 @@
 use crate::config::AppSettings;
 use crate::tun_factory::DesktopTunFactory;
-use crate::icons;
 use crate::tray::TrayManager;
 use anet_client_core::client::AnetClient;
 use anet_client_core::config::CoreConfig;
@@ -59,6 +58,11 @@ pub struct ANetApp {
     tray_mgr: TrayManager,
     last_known_state: ConnectionState,
     window_hidden_notified: bool,
+
+    // Our new fields for sidebar
+    sidebar_open: bool,
+    editing_config_id: Option<String>,
+    edit_name_buffer: String,
 }
 
 fn send_notification(title: &str, body: &str) {
@@ -169,7 +173,6 @@ impl ANetApp {
         });
 
         // Формирование финала:
-        let last_config_path = settings_arc.lock().unwrap().last_config_path.clone();
         let mut app = Self {
             rt, logs, config_err: None, config_name: "Файл не выбран".to_string(),
             event_rx: rx,
@@ -178,15 +181,15 @@ impl ANetApp {
             tray_mgr,
             last_known_state: ConnectionState::Disconnected,
             window_hidden_notified: false,
+            sidebar_open: true,
+            editing_config_id: None,
+            edit_name_buffer: String::new(),
         };
 
-
-        // Автозагрузка конфига
-        if let Some(path_str) = &last_config_path {
-            let path = PathBuf::from(path_str);
-            if path.exists() {
-                app.load_config_from_path(path);
-            }
+        // Автозагрузка активного конфига
+        let config_to_load = app.settings.lock().unwrap().get_active_config().map(|c| (c.content.clone(), c.name.clone()));
+        if let Some((content, name)) = config_to_load {
+            app.load_config_from_content(&content, &name);
         }
 
         app
@@ -229,28 +232,114 @@ impl ANetApp {
         }
     }
 
-    fn load_config_from_path(&mut self, path: PathBuf) {
-        if let Some(ext) = path.extension() {
-            if ext != "toml" {
-                self.config_err = Some("Пожалуйста выберите файл с расширением .toml ".to_string());
-                return;
-            }
+    fn open_file_dialog(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("TOML Config", &["toml"])
+            .pick_file()
+        {
+            self.add_config_from_path(path);
+        }
+    }
+
+    fn add_config_from_path(&mut self, path: PathBuf) {
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        if ext != "toml" {
+            self.log("Please select a .toml file");
+            return;
         }
 
-        let config_content = match std::fs::read_to_string(&path) {
-            Ok(content) => content,
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
             Err(e) => {
-                self.config_err = Some(format!("Ошибка чтения: {}", e));
+                self.log(&format!("Failed to read file: {}", e));
                 return;
             }
         };
 
-        match toml::from_str::<CoreConfig>(&config_content) {
+        let clean_content = Self::strip_toml_comments(&content);
+
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("Unnamed")
+            .trim_end_matches(".toml")
+            .to_string();
+
+        let id = {
+            let mut settings = self.settings.lock().unwrap();
+            settings.add_config(name, clean_content)
+        };
+        
+        self.select_config(&id);
+    }
+
+    fn strip_toml_comments(content: &str) -> String {
+        let mut result = String::new();
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('#') {
+                continue;
+            }
+            if let Some(pos) = line.find('#') {
+                let before_comment = line[..pos].trim_end();
+                if !before_comment.is_empty() {
+                    result.push_str(before_comment);
+                    result.push('\n');
+                }
+            } else {
+                result.push_str(line);
+                result.push('\n');
+            }
+        }
+        result
+    }
+
+    fn delete_config(&mut self, id: &str) {
+        {
+            let mut settings = self.settings.lock().unwrap();
+            settings.remove_config(id);
+        }
+        
+        if self.shared.lock().unwrap().client.is_none() {
+            self.config_name = "Config deleted".to_string();
+        }
+    }
+
+    fn start_edit_name(&mut self, id: &str, current_name: &str) {
+        self.editing_config_id = Some(id.to_string());
+        self.edit_name_buffer = current_name.to_string();
+    }
+
+    fn finish_edit_name(&mut self) {
+        if let Some(id) = &self.editing_config_id {
+            let new_name = self.edit_name_buffer.trim().to_string();
+            if !new_name.is_empty() {
+                let mut settings = self.settings.lock().unwrap();
+                settings.rename_config(id, new_name);
+            }
+        }
+        self.editing_config_id = None;
+        self.edit_name_buffer.clear();
+    }
+
+    fn select_config(&mut self, id: &str) {
+        let config = {
+            let mut settings = self.settings.lock().unwrap();
+            settings.set_active(id);
+            settings.get_active_config()
+        };
+        
+        if let Some(config) = config {
+            self.load_config_from_content(&config.content, &config.name);
+        }
+    }
+
+    fn load_config_from_content(&mut self, content: &str, name: &str) {
+        match toml::from_str::<CoreConfig>(content) {
             Ok(cfg) => {
                 let tun = Box::new(DesktopTunFactory::new(
                     cfg.main.tun_name.clone(),
                 ));
-                // Для гуя нет смысла в ручном роутенге.
                 let route = match create_route_manager(false) {
                     Ok(r) => r,
                     Err(e) => {
@@ -261,18 +350,7 @@ impl ANetApp {
                 };
 
                 self.config_err = None;
-                self.config_name = path
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string();
-
-                // Сохраняем путь
-                {
-                    let mut stg = self.settings.lock().unwrap();
-                    stg.last_config_path = Some(path.to_string_lossy().to_string());
-                    stg.save();
-                }
+                self.config_name = name.to_string();
 
                 self.shared.lock().unwrap().client = Some(Arc::new(AnetClient::new(cfg, tun, route)));
                 self.log(&format!("Config loaded: {}", self.config_name));
@@ -281,15 +359,6 @@ impl ANetApp {
                 self.config_err = Some(e.to_string());
                 self.log("Failed to parse config TOML");
             }
-        }
-    }
-
-    fn open_file_dialog(&mut self) {
-        if let Some(path) = rfd::FileDialog::new()
-            .add_filter("TOML Config", &["toml"])
-            .pick_file()
-        {
-            self.load_config_from_path(path);
         }
     }
 }
@@ -453,6 +522,103 @@ impl eframe::App for ANetApp {
                         });
                 });
             });
+        // SidePanel - Список конфигов
+        let settings_guard = self.settings.lock().unwrap();
+        let configs = settings_guard.configs.clone();
+        let active_id = settings_guard.active_config_id.clone();
+        let editing_id = self.editing_config_id.clone();
+        drop(settings_guard);
+
+        egui::SidePanel::left("config_sidebar")
+            .resizable(true)
+            .default_width(250.0)
+            .frame(egui::Frame::NONE.fill(egui::Color32::from_rgb(25, 25, 25)))
+            .show_animated(ctx, self.sidebar_open, |ui: &mut egui::Ui| {
+                ui.add_space(8.0);
+
+                ui.label(
+                    egui::RichText::new("КОНФИГИ")
+                        .size(12.0)
+                        .color(egui::Color32::from_gray(100)),
+                );
+
+                ui.add_space(8.0);
+
+                // Список конфигов
+                for config in configs {
+                    let is_active = active_id.as_deref() == Some(&config.id);
+                    let is_editing = editing_id.as_deref() == Some(&config.id);
+
+                    let bg_color = if is_active {
+                        egui::Color32::from_rgb(40, 80, 60)
+                    } else {
+                        egui::Color32::from_rgb(35, 35, 35)
+                    };
+
+                    let text_color = egui::Color32::from_gray(220);
+
+                    egui::Frame::NONE
+                        .fill(bg_color)
+                        .inner_margin(4.0)
+                        .show(ui, |ui: &mut egui::Ui| {
+                            ui.horizontal(|ui: &mut egui::Ui| {
+                                if is_editing {
+                                    let response = ui.add(
+                                        egui::TextEdit::singleline(&mut self.edit_name_buffer)
+                                            .desired_width(120.0),
+                                    );
+                                    if response.lost_focus() {
+                                        self.finish_edit_name();
+                                    }
+                                    if ui.button("✓").clicked() {
+                                        self.finish_edit_name();
+                                    }
+                                } else {
+                                    if ui
+                                        .add(egui::Label::new(
+                                            egui::RichText::new(&config.name).color(text_color)
+                                        ).sense(egui::Sense::click()))
+                                        .clicked()
+                                    {
+                                        self.select_config(&config.id);
+                                    }
+
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui: &mut egui::Ui| {
+                                        if ui
+                                            .add(egui::Button::new("✏").frame(false).small())
+                                            .clicked()
+                                        {
+                                            self.start_edit_name(&config.id, &config.name);
+                                        }
+                                        if ui
+                                            .add(egui::Button::new("🗑").frame(false).small())
+                                            .clicked()
+                                        {
+                                            self.delete_config(&config.id);
+                                        }
+                                    });
+                                }
+                            });
+                        });
+                }
+
+                ui.add_space(16.0);
+
+                // Кнопка добавления
+                if ui
+                    .add(
+                        egui::Button::new(
+                            egui::RichText::new("➕ Добавить конфиг")
+                                .color(egui::Color32::WHITE)
+                        )
+                        .fill(egui::Color32::from_rgb(60, 60, 60))
+                    )
+                    .clicked()
+                {
+                    self.open_file_dialog();
+                }
+            });
+
         let main_frame = egui::Frame::NONE
             .fill(egui::Color32::from_rgb(18, 18, 18))
             .inner_margin(12.0);
@@ -462,28 +628,29 @@ impl eframe::App for ANetApp {
             .show(ctx, |ui| {
                 // Header
                 ui.horizontal(|ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new("☰")
+                                    .size(24.0)
+                                    .strong()
+                                    .color(egui::Color32::WHITE),
+                            )
+                            .frame(false),
+                        )
+                        .clicked()
+                    {
+                        self.sidebar_open = !self.sidebar_open;
+                    }
+
+                    ui.add_space(8.0);
+
                     ui.label(
                         egui::RichText::new("ANet VPN")
                             .size(24.0)
                             .strong()
                             .color(egui::Color32::WHITE),
                     );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    egui::RichText::new("⚙")
-                                        .size(24.0)
-                                        .strong()
-                                        .color(egui::Color32::WHITE),
-                                )
-                                .frame(false),
-                            )
-                            .clicked()
-                        {
-                            self.open_file_dialog();
-                        }
-                    });
                 });
 
                 ui.add_space(20.0);
@@ -497,7 +664,7 @@ impl eframe::App for ANetApp {
                     }
                     if self.shared.lock().unwrap().client.is_none() && self.config_err.is_none() {
                         ui.label(
-                            egui::RichText::new("(Нажмите ⚙ и выберите файл настроек)")
+                            egui::RichText::new("(Выберите конфиг слева или добавьте новый)")
                                 .size(15.0)
                                 .strong()
                                 .color(egui::Color32::from_gray(80)),

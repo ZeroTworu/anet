@@ -26,6 +26,9 @@ rfd = "0.17.2"
 
 notify-rust = "4.11.3"
 tray-icon = "0.21.3"
+
+dirs = "6"
+uuid = { version = "1", features = ["v4"] }
 # Windows-specific dependencies
 [target.'cfg(windows)'.dependencies]
 wintun = "0.5.1"
