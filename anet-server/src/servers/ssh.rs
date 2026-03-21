@@ -195,44 +195,17 @@ where
 
             // OUTBOUND. Туннель ОС скидывает IPшник для этого клиета -> зажевать -> чача20 -> отправить в рушх.
             let stealth_config = config.stealth.clone();
-            let padding_step = stealth_config.padding_step;
             let tx_client_info = client_info.clone();
 
             let t2 = tokio::spawn(async move {
-                let (tx_ready, mut rx_ready) = mpsc::channel::<Bytes>(1024);
-
-                let dispatch_task = tokio::spawn(async move {
-                    use rand::Rng;
-                    let mut rng = rand::rngs::OsRng;
-                    while let Some(packet) = rx_router.recv().await {
-                        if packet.len() < 20 { continue; }
-
-                        let tx = tx_ready.clone();
-                        let delay = if stealth_config.max_jitter_ns > stealth_config.min_jitter_ns {
-                            rng.gen_range(stealth_config.min_jitter_ns..=stealth_config.max_jitter_ns)
-                        } else { 0 };
-
-                        tokio::spawn(async move {
-                            if delay > 0 { tokio::time::sleep(std::time::Duration::from_nanos(delay)).await; }
-                            let _ = tx.send(packet).await;
-                        });
-                    }
-                });
-
-                while let Some(packet) = rx_ready.recv().await {
-                    let seq = tx_client_info.sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let t_len = packet.len() + 38;
-                    let pdd = calculate_padding_needed(t_len, padding_step);
-                    let spdd = if t_len + (pdd as usize) > anet_common::consts::PADDING_MTU { 0 } else { pdd };
-
-                    match anet_common::transport::wrap_packet(&tx_client_info.cipher, &tx_client_info.nonce_prefix, seq, packet, spdd) {
-                        Ok(crypted) => {
-                            if writer.write_all(&frame_packet(crypted)).await.is_err() || writer.flush().await.is_err() { break; }
-                        }
-                        Err(_) => break,
-                    }
-                }
-                dispatch_task.abort();
+                let _ = anet_common::jitter::bridge_crypto_stream_with_jitter(
+                    rx_router,
+                    writer,
+                    stealth_config,
+                    tx_client_info.cipher.clone(),
+                    tx_client_info.sequence.clone(),
+                    tx_client_info.nonce_prefix,
+                ).await;
             });
 
             let _ = tokio::join!(t1, t2);

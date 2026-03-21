@@ -10,11 +10,11 @@ use russh::{Channel, ChannelMsg};
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{mpsc, Mutex};
 use anet_common::stream_framing::{frame_packet, read_next_packet};
-use anet_common::padding_utils::calculate_padding_needed;
-use rand::Rng;
+use anet_common::consts::CHANNEL_BUFFER_SIZE;
+
 
 struct ClientHandler;
 #[async_trait]
@@ -77,86 +77,71 @@ impl ClientTransport for SshTransport {
         let (client_stream, internal_router) = tokio::io::duplex(65535 * 10);
         let (mut tunnel_read, mut tunnel_write) = tokio::io::split(internal_router);
 
-        // Инструменты Зла
         let sequence_tx = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let cipher_tx = Arc::new(anet_common::encryption::Cipher::new(&shared_key));
         let cipher_rx = Arc::new(anet_common::encryption::Cipher::new(&shared_key));
         let nonce_prefix: [u8; 4] = auth_response.nonce_prefix.as_slice().try_into().unwrap_or([0,0,0,0]);
         let stealth_cfg = self.config.stealth.clone();
-        let p_step = stealth_cfg.padding_step;
 
-        // ---------- ТАСК TX: ИСХОДЯЩИЙ ПОТОК (С КЛИЕНТА НА СЕРВЕР). -----------
-        // 1. Из туннеля-Core выходит чисто [ДЛИНА 2б | Истинный IP]. Дешифровка идет от read_next_packet!
-        // 2. Включается задержка, потом Чача-Джигл и запаковка нового [ДЛИНА ОБФ | БЛОК ШИФРА].
-        let _t_tx = tokio::spawn(async move {
-            let (tx_ready, mut rx_ready) = mpsc::channel::<Bytes>(1024);
+        let (tx_bridge, rx_bridge) = mpsc::channel(CHANNEL_BUFFER_SIZE);
 
-            let dt_stealth = stealth_cfg.clone();
-            let dispatch = tokio::spawn(async move {
-                let mut rng = rand::rngs::OsRng;
-                loop {
-                    // Парсит голый внутренний трафик от CORE.
-                    match read_next_packet(&mut tunnel_read).await {
-                        Ok(Some(raw_ip_pkg)) => {
-                            if raw_ip_pkg.len() < 20 { continue; }
-
-                            let tx = tx_ready.clone();
-                            let delay = if dt_stealth.max_jitter_ns > dt_stealth.min_jitter_ns {
-                                rng.gen_range(dt_stealth.min_jitter_ns..=dt_stealth.max_jitter_ns)
-                            } else { 0 };
-
-                            tokio::spawn(async move {
-                                if delay > 0 { tokio::time::sleep(std::time::Duration::from_nanos(delay)).await; }
-                                let _ = tx.send(raw_ip_pkg).await;
-                            });
-                        },
-                        _ => break // core detached.
-                    }
-                }
-            });
-
-            while let Some(pure_data) = rx_ready.recv().await {
-                let seq = sequence_tx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let total_len = pure_data.len() + 38;
-                let padding = calculate_padding_needed(total_len, p_step);
-                let safe_padd = if total_len + (padding as usize) > anet_common::consts::PADDING_MTU { 0 } else { padding };
-
-                match anet_common::transport::wrap_packet(&cipher_tx, &nonce_prefix, seq, pure_data, safe_padd) {
-                    Ok(crypted) => {
-                        let outgoing_frame = frame_packet(crypted); // Приматываем новый размер к обфусцированному.
-                        if tcp_writer.write_all(&outgoing_frame).await.is_err() || tcp_writer.flush().await.is_err() { break; }
-                    }
-                    Err(e) => error!("SSH wrap payload crashed: {}", e),
-                }
+        // Воркер-адаптер: Читает из виртуального DuplexStream ядра и перекладывает в канал
+        tokio::spawn(async move {
+            while let Ok(Some(packet)) = read_next_packet(&mut tunnel_read).await {
+                if tx_bridge.send(packet).await.is_err() { break; }
             }
-            dispatch.abort();
-            info!("[SSH proxy] Inner Jitter&TX channel stopped.");
         });
 
-        // ----------- ТАСК RX: ВХОДЯЩИЙ (С СЕРВЕРА К НАМ НА КЛИЕНТ) ---------------
-        let _t_rx = tokio::spawn(async move {
-            loop {
-                // Из интернета падает Frame -> Из него достаётся блок шума.
-                match read_next_packet(&mut tcp_reader).await {
-                    Ok(Some(cipher_packet)) => {
-                        // Чистится, чекается тэг от Поли1305.
-                        if let Ok(raw_decrypted) = anet_common::transport::unwrap_packet(&cipher_rx, &cipher_packet) {
-                            // Форматируется для "чистой трубы" Корa и скидывается.
-                            let frame_in_tun = frame_packet(raw_decrypted);
-                            if tunnel_write.write_all(&frame_in_tun).await.is_err() { break; }
-                        }
-                    },
-                    Ok(None) => break, // штатное закрытие.
-                    Err(_) => break // обрыв.
-                }
-            }
-            info!("[SSH proxy] Outer crypto loop terminated");
+        let stealth_clone = stealth_cfg.clone();
+        let cipher_tx_worker = cipher_tx.clone();
+        let seq_worker = sequence_tx.clone();
+        let np = nonce_prefix;
+
+        // Запускаем универсальный крипто-джиттер из anet-common
+        tokio::spawn(async move {
+            let _ = anet_common::jitter::bridge_crypto_stream_with_jitter(
+                rx_bridge,
+                tcp_writer,
+                stealth_clone,
+                cipher_tx_worker,
+                seq_worker,
+                np,
+            ).await;
         });
 
-        // Теперь отдаем сам client_stream ядру - а оно уже обмазано "дуплексным шлюзом". Оно идентично старому `Box VpnStream`
-        Ok(ConnectionResult{
-            auth_response,
-            vpn_stream: Box::new(MutexVpnStream(Arc::new(Mutex::new(client_stream)))),
+        // -------------------------------------------------------------
+        // ВХОДЯЩИЙ ТРАФИК (RX): receive_crypto_stream -> mpsc -> Duplex
+        // -------------------------------------------------------------
+        let (tx_in, mut rx_in) = mpsc::channel(CHANNEL_BUFFER_SIZE);
+        let cipher_rx_worker = cipher_rx.clone();
+
+        // Запускаем универсальный дешифратор из anet-common
+        tokio::spawn(async move {
+            let _ = anet_common::jitter::receive_crypto_stream(
+                tcp_reader,
+                tx_in,
+                cipher_rx_worker
+            ).await;
+        });
+
+        // Воркер-адаптер: Читает расшифрованные пакеты из канала и пишет в виртуальный DuplexStream ядра
+        tokio::spawn(async move {
+            while let Some(packet) = rx_in.recv().await {
+                let framed = frame_packet(packet);
+                if tokio::io::AsyncWriteExt::write_all(&mut tunnel_write, &framed).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        // -------------------------------------------------------------
+        // ВОЗВРАТ РЕЗУЛЬТАТА ЯДРУ
+        // -------------------------------------------------------------
+        let output_stream = Arc::new(Mutex::new(client_stream));
+
+        Ok(ConnectionResult {
+            auth_response: auth_response,
+            vpn_stream: Box::new(MutexVpnStream(output_stream)),
             endpoint: None,
             connection: None
         })

@@ -23,7 +23,7 @@ const RFB_SRV_INIT: &[u8; 28] = &[
     0x20, 0x18, 0x00, 0x01, // BPP
     0x00, 0xff, 0x00, 0xff, 0x00, 0xff, 0x10, 0x08, 0x00, 0x00, 0x00, 0x00, // Pix Mask/Pad
     0x00, 0x00, 0x00, 0x04, // Str Length
-    b'A', b'N', b'E', b'T'  // Desk Name "ANET" (Total 28b)
+    b'X', b'v', b'n', b'c'  // Desk Name "Xvnc" (Легитимная сигнатура стандартного VNC сервера)
 ];
 
 async fn emulate_rfb_server_handshake(stream: &mut TcpStream) -> Result<()> {
@@ -93,38 +93,19 @@ async fn handle_vnc_session(
                 }
             });
 
-            let t_stealth = config.stealth.clone();
-            let tc = client_info.clone();
-            let pad_st = t_stealth.padding_step;
 
-            // ВЕРТИМ ТX СТРИМ (ИЗ СИСТЕМЫ -> НАРУЖУ ЧЕРЕЗ TCP с JITTER'ами!)
+            let stealth_config = config.stealth.clone();
+            let tx_client_info = client_info.clone();
+
             let t2 = tokio::spawn(async move {
-                let (tx_rdy, mut rx_rdy) = mpsc::channel::<Bytes>(1024);
-
-                let dispatch = tokio::spawn(async move {
-                    use rand::Rng; let mut r = rand::rngs::OsRng;
-                    while let Some(ip) = rx_router.recv().await {
-                        if ip.len() < 20 { continue; }
-                        let dly = if t_stealth.max_jitter_ns > t_stealth.min_jitter_ns { r.gen_range(t_stealth.min_jitter_ns..=t_stealth.max_jitter_ns) } else { 0 };
-                        let st = tx_rdy.clone();
-                        tokio::spawn(async move {
-                            if dly > 0 { tokio::time::sleep(std::time::Duration::from_nanos(dly)).await; }
-                            let _ = st.send(ip).await;
-                        });
-                    }
-                });
-
-                while let Some(raw) = rx_rdy.recv().await {
-                    let seq = tc.sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let sz = raw.len() + 38;
-                    let pad = calculate_padding_needed(sz, pad_st);
-                    let sf_p = if sz + (pad as usize) > anet_common::consts::PADDING_MTU { 0 } else { pad };
-
-                    if let Ok(crypt_arr) = anet_common::transport::wrap_packet(&tc.cipher, &tc.nonce_prefix, seq, raw, sf_p) {
-                        if writer.write_all(&frame_packet(crypt_arr)).await.is_err() || writer.flush().await.is_err() { break; }
-                    }
-                }
-                dispatch.abort();
+                let _ = anet_common::jitter::bridge_crypto_stream_with_jitter(
+                    rx_router,
+                    writer,
+                    stealth_config,
+                    tx_client_info.cipher.clone(),
+                    tx_client_info.sequence.clone(),
+                    tx_client_info.nonce_prefix,
+                ).await;
             });
 
             let _ = tokio::join!(t1, t2);

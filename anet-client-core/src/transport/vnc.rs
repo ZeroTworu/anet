@@ -74,7 +74,6 @@ impl ClientTransport for VncTransport {
         let live_stream = Arc::try_unwrap(raw_stream_mutex).map_err(|_| anyhow::anyhow!("Internal reference block issue"))?.into_inner();
         let (mut tcp_rd, mut tcp_wr) = tokio::io::split(live_stream);
 
-        // ... Дальнейший механизм ИДЕНТИЧЕН 1-В-1 тому, как написан Вами ТрафикКонтроллер (SSH),
         // Мы возвращаем виртуальный Duplex-Stream ядру через обертки
 
         let (core_in, route_inner) = tokio::io::duplex(65535 * 10);
@@ -85,35 +84,55 @@ impl ClientTransport for VncTransport {
         let np = auth_pack.nonce_prefix.clone().as_slice().try_into().unwrap_or([0,0,0,0]);
         let seq_tk = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
-        let worker_tx = cipher_tx.clone(); let np_x = np.clone(); let dls = st_c.clone();
+        let (tx_bridge, rx_bridge) = mpsc::channel(1024);
 
+        // Воркер-адаптер: Читает из виртуального DuplexStream ядра и перекладывает в канал
         tokio::spawn(async move {
-            let (tr_y, mut r_yr) = mpsc::channel::<Bytes>(1024);
-            let ds = tokio::spawn(async move {
-                let mut rng = rand::rngs::OsRng;
-                while let Ok(Some(bts)) = read_next_packet(&mut v_r).await {
-                    let st = tr_y.clone();
-                    let dx = if dls.max_jitter_ns > dls.min_jitter_ns { rand::Rng::gen_range(&mut rng, dls.min_jitter_ns..=dls.max_jitter_ns) } else { 0 };
-                    tokio::spawn(async move { if dx > 0 { tokio::time::sleep(std::time::Duration::from_nanos(dx)).await; } let _ = st.send(bts).await; });
-                }
-            });
-            while let Some(dpkg) = r_yr.recv().await {
-                let q_sq = seq_tk.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let pz = dpkg.len() + 38;
-                let pa = calculate_padding_needed(pz, st_c.padding_step); let sa_pa = if pz+(pa as usize) > anet_common::consts::PADDING_MTU {0} else {pa};
-
-                if let Ok(cph) = anet_common::transport::wrap_packet(&worker_tx, &np_x, q_sq, dpkg, sa_pa) {
-                    if tcp_wr.write_all(&frame_packet(cph)).await.is_err() { break; }
-                }
+            while let Ok(Some(packet)) = read_next_packet(&mut v_r).await {
+                if tx_bridge.send(packet).await.is_err() { break; }
             }
-            ds.abort(); debug!("[VNC Proxier Output Layer Severed]");
         });
 
-        let worker_rx = cipher_rx.clone();
+        let stealth_clone = st_c.clone();
+        let cipher_tx_worker = cipher_tx.clone();
+        let seq_worker = seq_tk.clone();
+        let np_x = np;
+
+        // Запускаем универсальный крипто-джиттер из anet-common
         tokio::spawn(async move {
-            while let Ok(Some(net_dt)) = read_next_packet(&mut tcp_rd).await {
-                if let Ok(dc_sck) = anet_common::transport::unwrap_packet(&worker_rx, &net_dt) {
-                    if v_w.write_all(&frame_packet(dc_sck)).await.is_err() { break; }
+            let _ = anet_common::jitter::bridge_crypto_stream_with_jitter(
+                rx_bridge,
+                tcp_wr,
+                stealth_clone,
+                cipher_tx_worker,
+                seq_worker,
+                np_x,
+            ).await;
+            debug!("[VNC proxy] Inner Jitter&TX channel stopped.");
+        });
+
+        // -------------------------------------------------------------
+        // ВХОДЯЩИЙ ТРАФИК (RX): receive_crypto_stream -> mpsc -> Duplex
+        // -------------------------------------------------------------
+        let (tx_in, mut rx_in) = mpsc::channel(1024);
+        let cipher_rx_worker = cipher_rx.clone();
+
+        // Запускаем универсальный дешифратор из anet-common
+        tokio::spawn(async move {
+            let _ = anet_common::jitter::receive_crypto_stream(
+                tcp_rd,
+                tx_in,
+                cipher_rx_worker
+            ).await;
+            debug!("[VNC proxy] Outer crypto loop terminated");
+        });
+
+        // Воркер-адаптер: Читает расшифрованные пакеты из канала и пишет в виртуальный DuplexStream ядра
+        tokio::spawn(async move {
+            while let Some(packet) = rx_in.recv().await {
+                let framed = frame_packet(packet);
+                if tokio::io::AsyncWriteExt::write_all(&mut v_w, &framed).await.is_err() {
+                    break;
                 }
             }
         });
