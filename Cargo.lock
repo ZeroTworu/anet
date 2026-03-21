@@ -450,6 +450,7 @@ dependencies = [
  "dashmap",
  "ed25519-dalek",
  "env_logger",
+ "futures",
  "log",
  "prost",
  "quinn",
