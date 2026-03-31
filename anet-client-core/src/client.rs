@@ -137,6 +137,13 @@ impl AnetClient {
         info!("[Core] Authenticated. VPN IP: {}", result.auth_response.ip);
         status(format!("[Core] Authenticated. VPN IP: {}", result.auth_response.ip));
 
+        // =========================================================================
+        // ПРЕ-РЕЗОЛВИНГ: Собираем IP-адреса ДО того, как сломаем сеть адаптерами
+        // =========================================================================
+        status("Resolving domain routes...");
+        let include_routes = self.resolve_list(&self.config.main.route_for).await;
+        let exclude_routes = self.resolve_list(&self.config.main.exclude_route_for).await;
+
         // --- НАСТРОЙКА СЕТИ ---
 
         // Бэкапим маршруты
@@ -226,9 +233,8 @@ impl AnetClient {
         if !self.config.main.route_for.is_empty() {
             // MODE 1: INCLUDE (Whitelist)
             info!("[Core] Mode: Split Tunneling (INCLUDE).");
-            let routes = self.resolve_list(&self.config.main.route_for).await;
 
-            for net in routes {
+            for net in include_routes.iter() {
                 self.route_manager
                     .add_specific_route(
                         net.addr(),
@@ -248,9 +254,8 @@ impl AnetClient {
                     "[Core] Found {} exclusion rules.",
                     self.config.main.exclude_route_for.len()
                 );
-                let bypass_routes = self.resolve_list(&self.config.main.exclude_route_for).await;
 
-                for net in bypass_routes {
+                for net in exclude_routes.iter() {
                     self.route_manager
                         .add_bypass_route(net.addr(), net.prefix_len())
                         .await?;
