@@ -1,4 +1,4 @@
-use super::{ClientTransport, ConnectionResult};
+use super::{ClientTransport, ConnectionResult, MutexVpnStream};
 use crate::config::CoreConfig;
 use crate::auth::{AuthHandler, StreamAuthChannel};
 use anyhow::{Context, Result};
@@ -71,7 +71,7 @@ impl ClientTransport for SshTransport {
         // 3. Высвобождаем Адаптер и делаем Проксификатор: Теневой туннель через локальную Дюплекс-Трубу.
         drop(auth_channel);
         let active_tcp_stream = Arc::try_unwrap(stream_arc).map_err(|_| anyhow::anyhow!("Internal ref dropped"))?.into_inner();
-        let (mut tcp_reader, mut tcp_writer) = tokio::io::split(active_tcp_stream);
+        let (tcp_reader,  tcp_writer) = tokio::io::split(active_tcp_stream);
 
         // Дуплекс пайп. Левую сторону (client_stream) мы тупо возвращаем Кору для чтения/отправки чистых пакетов!
         let (client_stream, internal_router) = tokio::io::duplex(65535 * 10);
@@ -224,27 +224,5 @@ impl AsyncWrite for SshStreamAdapter {
     }
     fn poll_shutdown(self: Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
         std::task::Poll::Ready(Ok(()))
-    }
-}
-
-pub struct MutexVpnStream<S>(Arc<Mutex<S>>);
-impl<S: AsyncRead + Unpin + Send> AsyncRead for MutexVpnStream<S> {
-    fn poll_read(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &mut ReadBuf<'_>) -> std::task::Poll<std::io::Result<()>> {
-        let mut guard = futures::ready!(Box::pin(self.0.lock()).as_mut().poll(cx));
-        Pin::new(&mut *guard).poll_read(cx, buf)
-    }
-}
-impl<S: AsyncWrite + Unpin + Send> AsyncWrite for MutexVpnStream<S> {
-    fn poll_write(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &[u8]) -> std::task::Poll<std::io::Result<usize>> {
-        let mut guard = futures::ready!(Box::pin(self.0.lock()).as_mut().poll(cx));
-        Pin::new(&mut *guard).poll_write(cx, buf)
-    }
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
-        let mut guard = futures::ready!(Box::pin(self.0.lock()).as_mut().poll(cx));
-        Pin::new(&mut *guard).poll_flush(cx)
-    }
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
-        let mut guard = futures::ready!(Box::pin(self.0.lock()).as_mut().poll(cx));
-        Pin::new(&mut *guard).poll_shutdown(cx)
     }
 }

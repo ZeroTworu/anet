@@ -20,13 +20,14 @@ base64 = {workspace = true}
 serde = { workspace = true, features = ["derive"] }
 async-trait = { workspace = true }
 ipnet = { workspace = true }
+futures = { workspace = true }
 
 russh = "0.49.2"
 russh-keys = "0.49.2"
 
 hickory-resolver = { version = "0.24", features = ["tokio"] }
 anet-common = { path = "../anet-common" }
-futures = "0.3.31"
+
 
 # Platform-specific dependencies for route management
 [target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]

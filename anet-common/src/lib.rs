@@ -12,7 +12,6 @@ pub mod transport;
 pub mod transport_trait;
 pub mod tun_params;
 pub mod udp_poller;
-
 pub use generated::*;
 pub mod protocol {
     pub use super::*;

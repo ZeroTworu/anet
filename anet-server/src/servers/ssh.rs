@@ -2,7 +2,6 @@ use crate::client_registry::ClientRegistry;
 use crate::config::Config;
 use crate::auth_handler::ServerAuthHandler;
 use anet_common::stream_framing::{frame_packet, read_next_packet};
-use anet_common::padding_utils::calculate_padding_needed;
 use anet_common::consts::CHANNEL_BUFFER_SIZE;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -171,10 +170,10 @@ where
         if let Some((client_info, _auth_resp)) = result {
             info!("SSH VPN:  IP Route {} Assigned", client_info.assigned_ip);
 
-            let (tx_router, mut rx_router) = mpsc::channel::<Bytes>(CHANNEL_BUFFER_SIZE);
+            let (tx_router, rx_router) = mpsc::channel::<Bytes>(CHANNEL_BUFFER_SIZE);
             registry.finalize_client(&client_info.assigned_ip, tx_router);
 
-            let (mut reader, mut writer) = tokio::io::split(stream);
+            let (mut reader, writer) = tokio::io::split(stream);
 
             // ВЕРТИМ КРИПТУ ПРЯМ ТУТ В ВОРКЕРАХ
 

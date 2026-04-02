@@ -20,7 +20,10 @@ rand = {workspace = true}
 x25519-dalek = {workspace = true}
 ed25519-dalek = {workspace = true}
 sha2 = {workspace = true}
+futures = { workspace = true }
+
 base64 = "0.22.1"
+
 
 [build-dependencies]
 prost-build = "0.14.1"

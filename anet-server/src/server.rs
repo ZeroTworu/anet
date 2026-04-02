@@ -12,7 +12,7 @@ use anyhow::Result;
 use base64::prelude::*;
 use dashmap::DashMap;
 use ed25519_dalek::SigningKey;
-use log::{error, info};
+use log::error;
 use std::sync::Arc;
 use std::time::Duration;
 

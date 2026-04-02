@@ -1,7 +1,7 @@
 use crate::config::StealthConfig;
 use crate::stream_framing::frame_packet;
 use bytes::Bytes;
-use log::error;
+use log::{error, info, warn};
 use rand::Rng;
 use rand::rngs::OsRng;
 use std::time::Duration;
@@ -13,8 +13,6 @@ use crate::encryption::Cipher;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use crate::padding_utils::calculate_padding_needed;
-use crate::transport::unwrap_packet;
-use crate::stream_framing::read_next_packet;
 
 
 
@@ -135,6 +133,7 @@ where
     Ok(())
 }
 
+
 pub async fn receive_crypto_stream<R>(
     mut reader: R,
     tx: mpsc::Sender<Bytes>,
@@ -143,9 +142,28 @@ pub async fn receive_crypto_stream<R>(
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
-    while let Ok(Some(framed_packet)) = read_next_packet(&mut reader).await {
-        if let Ok(tun_data) = unwrap_packet(&cipher, &framed_packet) {
-            if tx.send(tun_data).await.is_err() {
+    loop {
+        match crate::stream_framing::read_next_packet(&mut reader).await {
+            Ok(Some(framed_packet)) => {
+                match crate::transport::unwrap_packet(&cipher, &framed_packet) {
+                    Ok(tun_data) => {
+                        if tx.send(tun_data).await.is_err() {
+                            error!("[Crypto Stream RX] Failed to send to TUN queue. Inner router channel closed!");
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        warn!("[Crypto Stream RX] Packet Decryption Failed (Dropped): {}", e);
+                        // Продолжаем читать, не убиваем туннель из-за одного битого пакета
+                    }
+                }
+            }
+            Ok(None) => {
+                info!("[Crypto Stream RX] Clean EOF received. Remote peer closed connection.");
+                break;
+            }
+            Err(e) => {
+                error!("[Crypto Stream RX] Frame Reader Fault: {}", e);
                 break;
             }
         }
