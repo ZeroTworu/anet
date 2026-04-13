@@ -1,7 +1,7 @@
 pub(crate) mod factory;
 pub(crate) mod quic;
 pub(crate) mod ssh;
-pub(crate) mod vnc; // Не забудьте, что VNC тоже должен быть тут зарегистрирован
+pub(crate) mod vnc;
 
 use anet_common::protocol::AuthResponse;
 use anet_common::transport_trait::VpnStream;
@@ -27,7 +27,7 @@ pub trait ClientTransport: Send + Sync {
 }
 
 // ------------------------------------------------------------------
-// УНИВЕРСАЛЬНАЯ ОБЕРТКА (Shared Stream Adapter)
+// Shared Stream Adapter
 // ------------------------------------------------------------------
 pub struct MutexVpnStream<S>(pub Arc<Mutex<S>>);
 
