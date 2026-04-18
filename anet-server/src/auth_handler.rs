@@ -3,7 +3,7 @@ use crate::client_registry::{ClientRegistry, ClientTransportInfo};
 use crate::multikey_udp_socket::{TempDHInfo};
 use crate::utils::{generate_seid, generate_unique_nonce_prefix};
 use anet_common::consts::{NONCE_LEN, PROTO_PAD_FIELD_OVERHEAD};
-use anet_common::crypto_utils;
+use anet_common::{crypto_utils, AuthDenyNotification};
 use anet_common::encryption::Cipher;
 use anet_common::padding_utils::{calculate_padding_needed, generate_random_padding};
 use anet_common::protocol::{
@@ -15,7 +15,7 @@ use arc_swap::ArcSwap;
 use bytes::{BufMut, Bytes, BytesMut};
 use dashmap::DashMap;
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use log::info;
+use log::{info, warn};
 use prost::Message;
 use rand::RngCore;
 use rand::rngs::OsRng;
@@ -71,7 +71,7 @@ impl ServerAuthHandler {
 
         match message.content {
             Some(Content::DhClientExchange(req)) => {
-                let resp_msg = self.handle_dh_exchange(req, remote_addr).await?;
+                let resp_msg = self.handle_dh_exchange(req, remote_addr).await.unwrap();
                 let resp_bytes = self.encode_obfuscated_packet(resp_msg)?;
                 Ok((Some(resp_bytes), None))
             }
@@ -111,42 +111,65 @@ impl ServerAuthHandler {
     async fn handle_dh_exchange(&self, req: DhClientExchange, remote_addr: SocketAddr) -> Result<AnetMessage> {
         let client_public_key = VerifyingKey::from_bytes(
             &req.client_public_key.try_into().map_err(|_| anyhow::anyhow!("Invalid key length"))?,
-        )?;
+        ).map_err(|_| anyhow::anyhow!("Invalid verifying key"))?;
+
         let client_fingerprint = crypto_utils::generate_key_fingerprint(&client_public_key);
 
-        if !self.auth_provider.is_client_allowed(&client_fingerprint).await {
-            return Err(anyhow::anyhow!("Client access denied: {}", client_fingerprint));
+        match self.auth_provider.is_client_allowed(&client_fingerprint).await {
+            Ok(_) => {
+                // --- ЛОГИКА УСПЕХА (DH Phase 1) ---
+                crypto_utils::verify_signature(&client_public_key, &req.public_key, &req.client_signed_dh_key)?;
+
+                info!("[AUTH] Auth Phase 1 success: {}", remote_addr);
+
+                let server_ephemeral_secret = StaticSecret::random_from_rng(OsRng);
+                let server_pub_key = PublicKey::from(&server_ephemeral_secret);
+
+                let client_dh_pub_array: [u8; 32] = req.public_key.as_slice().try_into().unwrap();
+                let client_dh_pub = PublicKey::from(client_dh_pub_array);
+
+                let shared_secret = server_ephemeral_secret.diffie_hellman(&client_dh_pub);
+                self.temp_dh_map.insert(remote_addr, TempDHInfo {
+                    shared_key: crypto_utils::derive_shared_key(&shared_secret),
+                    client_fingerprint,
+                    created_at: Instant::now(),
+                });
+
+                let response_payload = DhServerExchange {
+                    public_key: server_pub_key.as_bytes().to_vec(),
+                    server_signed_dh_key: crypto_utils::sign_data(&self.server_signing_key, server_pub_key.as_bytes()),
+                };
+
+                let mut response_message = AnetMessage {
+                    content: Some(Content::DhServerExchange(response_payload)),
+                    padding: vec![],
+                };
+
+                // Расчет паддинга
+                let wire_len = response_message.encoded_len() + 16; // Примерный оверхед
+                response_message.padding = generate_random_padding(calculate_padding_needed(wire_len, self.padding_step));
+
+                Ok(response_message)
+            }
+            Err(reason) => {
+                // --- ЛОГИКА ОТКАЗА ---
+                warn!("[AUTH] DH Exchange Phase 1 failed: {}, Reason: {}, Fingerprint: {}", remote_addr, reason, client_fingerprint);
+
+                // Вместо DhServerExchange пихаем AuthError (вариант 7 в oneof)
+                let mut response_message = AnetMessage {
+                    content: Some(Content::AuthError(AuthDenyNotification {
+                        message: reason, // Тот самый текст из anet-auth
+                    })),
+                    padding: vec![],
+                };
+
+                // Важно: наводим маскировку даже на пакет ошибки
+                let wire_len = response_message.encoded_len() + 16;
+                response_message.padding = generate_random_padding(calculate_padding_needed(wire_len, self.padding_step));
+
+                Ok(response_message)
+            }
         }
-        crypto_utils::verify_signature(&client_public_key, &req.public_key, &req.client_signed_dh_key)?;
-
-        info!("[AUTH] Auth Phase 1 success: {}", remote_addr);
-
-        let server_ephemeral_secret = StaticSecret::random_from_rng(OsRng);
-        let server_pub_key = PublicKey::from(&server_ephemeral_secret);
-
-        let client_dh_pub_array: [u8; 32] = req.public_key.as_slice().try_into().unwrap();
-        let client_dh_pub = PublicKey::from(client_dh_pub_array);
-
-        let shared_secret = server_ephemeral_secret.diffie_hellman(&client_dh_pub);
-        self.temp_dh_map.insert(remote_addr, TempDHInfo {
-            shared_key: crypto_utils::derive_shared_key(&shared_secret),
-            client_fingerprint,
-            created_at: Instant::now(),
-        });
-
-        let response_payload = DhServerExchange {
-            public_key: server_pub_key.as_bytes().to_vec(),
-            server_signed_dh_key: crypto_utils::sign_data(&self.server_signing_key, server_pub_key.as_bytes()),
-        };
-
-        let mut response_message = AnetMessage {
-            content: Some(Content::DhServerExchange(response_payload)),
-            padding: vec![],
-        };
-        let wire_len = response_message.encoded_len() + NONCE_LEN + PROTO_PAD_FIELD_OVERHEAD;
-        response_message.padding = generate_random_padding(calculate_padding_needed(wire_len, self.padding_step));
-
-        Ok(response_message)
     }
 
     async fn handle_encrypted_auth(&self, enc_req: EncryptedAuthRequest, remote_addr: SocketAddr) -> Result<(AnetMessage, Arc<ClientTransportInfo>, AuthResponse)> {
@@ -161,7 +184,7 @@ impl ServerAuthHandler {
         };
         if req.client_id != temp_info.client_fingerprint { return Err(anyhow::anyhow!("Client ID mismatch")); }
 
-        let assigned_ip = self.registry.allocate_ip().context("IP POOL DEPLETED")?.to_string();
+        let assigned_ip = self.registry.allocate_ip().context("IP POOL FOOL")?.to_string();
         let session_id = generate_seid();
         let nonce_prefix = generate_unique_nonce_prefix(self.registry.clone());
 
@@ -172,9 +195,16 @@ impl ServerAuthHandler {
             session_id: session_id.clone(),
             nonce_prefix,
             remote_addr: ArcSwap::new(Arc::new(remote_addr)),
+            fingerprint: temp_info.client_fingerprint.clone(),
         });
 
         self.registry.pre_register_client(client_info.clone());
+
+        let ap = self.auth_provider.clone();
+        let fp = temp_info.client_fingerprint.clone();
+        tokio::spawn(async move {
+            ap.report_session_start(fp).await;
+        });
 
         let (netmask, gateway, mtu) = self.registry.get_network_params();
         let response_payload = AuthResponse {

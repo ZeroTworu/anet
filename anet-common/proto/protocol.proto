@@ -45,6 +45,18 @@ message Message {
         EncryptedAuthResponse encrypted_auth_response = 4;
         AuthRequest auth_request = 5;
         AuthResponse auth_response = 6;
+        AuthDenyNotification auth_error = 7;
     }
-    bytes padding = 7;
+    bytes padding = 8;
+}
+
+enum DenyReason {
+    UNKNOWN = 0;
+    SESSIONS_LIMIT_REACHED = 1;
+    SUBSCRIPTION_EXPIRED = 2;
+    BANNED = 3;
+}
+
+message AuthDenyNotification {
+    string message = 1;
 }

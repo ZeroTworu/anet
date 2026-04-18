@@ -8,6 +8,7 @@ use log::{info, warn};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
+use crate::auth_provider::AuthProvider;
 
 pub struct ClientTransportInfo {
     pub cipher: Arc<Cipher>,
@@ -16,6 +17,7 @@ pub struct ClientTransportInfo {
     pub session_id: String,
     pub nonce_prefix: [u8; 4],
     pub remote_addr: ArcSwap<SocketAddr>,
+    pub fingerprint: String,
 }
 
 #[derive(Clone)]
@@ -23,15 +25,17 @@ pub struct ClientRegistry {
     clients_by_prefix: Arc<DashMap<[u8; 4], Arc<ClientTransportInfo>>>,
     clients_by_addr: Arc<DashMap<SocketAddr, Arc<ClientTransportInfo>>>,
     quic_router: Arc<DashMap<String, StreamSender>>,
+    auth_provider: Arc<AuthProvider>,
     ip_pool: IpPool,
 }
 
 impl ClientRegistry {
-    pub fn new(ip_pool: IpPool) -> Self {
+    pub fn new(ip_pool: IpPool, auth_provider: Arc<AuthProvider>) -> Self {
         Self {
             clients_by_prefix: Arc::new(DashMap::new()),
             clients_by_addr: Arc::new(DashMap::new()),
             quic_router: Arc::new(DashMap::new()),
+            auth_provider,
             ip_pool,
         }
     }
@@ -76,6 +80,15 @@ impl ClientRegistry {
         if let Ok(ip_addr) = client_ip.parse::<Ipv4Addr>() {
             self.ip_pool.release(ip_addr);
         }
+
+        // dec sessions
+        let ap = self.auth_provider.clone();
+        let fp = client_info.fingerprint.clone();
+
+        tokio::spawn(async move {
+            ap.report_session_stop(fp).await;
+        });
+
         info!("[Registry] Client {} removed.", client_ip);
     }
 

@@ -8,7 +8,7 @@ use clap::Parser;
 use log::{error, info};
 use poem::{EndpointExt, Route, Server, listener::TcpListener};
 use poem_openapi::OpenApiService;
-use sea_orm::{ActiveModelTrait, Database, DatabaseConnection, Set};
+use sea_orm::{ActiveModelTrait, Database, DatabaseConnection, Set, UpdateMany, EntityTrait};
 use sea_orm_migration::MigratorTrait;
 use std::env;
 use std::io::Write;
@@ -20,6 +20,14 @@ struct Args {
     /// Add a new user with the specified Name (UID) and generate keys
     #[arg(short = 'a', long = "add", value_name = "NAME")]
     add_user: Option<String>,
+
+    /// Количество разрешенных сессий (Опционально)
+    #[arg(short = 's', long = "sessions")]
+    sessions: Option<u32>,
+
+    /// Дата окончания доступа в формате YYYY-MM-DD-HH:MM (Опционально)
+    #[arg(short = 'd', long = "date-end")]
+    date_end: Option<String>,
 
     /// Добавление Администратора Системы (interactive pass entry)
     #[arg(long = "add-su", value_name = "LOGIN")]
@@ -45,9 +53,22 @@ async fn main() -> Result<(), anyhow::Error> {
     }
     migration::Migrator::up(&db, None).await?;
 
+    if args.add_user.is_none() && args.add_su.is_none() {
+        info!("Resetting all active sessions to 0...");
+        if let Err(e) = anet_auth::entities::active_sessions::Entity::update_many()
+            .col_expr(anet_auth::entities::active_sessions::Column::Sessions, sea_orm::sea_query::Expr::value(0))
+            .exec(&db).await
+        {
+            error!("Failed to reset sessions: {}", e);
+        }
+        else {
+            info!("Session counters reset successfully.");
+        }
+    }
+
     // 5. ЛОГИКА ВЕТВЛЕНИЯ
     if let Some(username) = args.add_user {
-        handle_add_user(&db, username).await?;
+        handle_add_user(&db, username, args.sessions, args.date_end).await?;
     } else if let Some(admin_login) = args.add_su {
         handle_add_admin(&db, admin_login).await?;
     } else {
@@ -58,15 +79,33 @@ async fn main() -> Result<(), anyhow::Error> {
 }
 
 /// Режим добавления пользователя (CLI Tool)
-async fn handle_add_user(db: &DatabaseConnection, username: String) -> Result<(), anyhow::Error> {
-    // 1. Генерируем ключи
+async fn handle_add_user(
+    db: &DatabaseConnection,
+    username: String,
+    sessions: Option<u32>,
+    date_end_str: Option<String>,
+) -> Result<(), anyhow::Error> {
     let identity = keygen::generate_identity();
-
     info!("Generating new identity for '{}'...", username);
+
+    let user_id = Uuid::new_v4();
+
+    // 1. Проверяем и парсим дату если переданы параметры тарифа
+    let mut parsed_date = None;
+    if let Some(d_str) = &date_end_str {
+        parsed_date = Some(
+            chrono::NaiveDateTime::parse_from_str(d_str, "%Y-%m-%d-%H:%M")
+                .map_err(|_| anyhow::anyhow!("Неверный формат даты. Ожидается: YYYY-MM-DD-HH:MM"))?,
+        );
+    }
+
+    if (sessions.is_some() && date_end_str.is_none()) || (sessions.is_none() && date_end_str.is_some()) {
+        return Err(anyhow::anyhow!("ОШИБКА: Для привязки тарифа необходимо указать И --sessions И --date-end"));
+    }
 
     // 2. Создаем модель для БД
     let new_user = users::ActiveModel {
-        id: Set(Uuid::new_v4()),
+        id: Set(user_id),
         fingerprint: Set(identity.fingerprint.clone()),
         uid: Set(Some(username.clone())),
         is_active: Set(true),
@@ -77,6 +116,24 @@ async fn handle_add_user(db: &DatabaseConnection, username: String) -> Result<()
     // 3. Сохраняем
     match new_user.insert(db).await {
         Ok(_) => {
+            // Если передан лимит (Rate) — пишем в базу
+            if let (Some(sess), Some(date)) = (sessions, parsed_date) {
+                let new_rate = anet_auth::entities::rates::ActiveModel {
+                    id: Set(Uuid::new_v4()),
+                    user_id: Set(user_id),
+                    sessions: Set(sess as i32),
+                    date_end: Set(date),
+                    created_at: Set(chrono::Utc::now().naive_utc()),
+                    updated_at: Set(chrono::Utc::now().naive_utc()),
+                };
+
+                if let Err(e) = new_rate.insert(db).await {
+                    error!("Failed to insert rate config into database: {}", e);
+                } else {
+                    println!("\n[✔] Тариф установлен: Сессий: {}, Истекает: {}", sess, date_end_str.unwrap());
+                }
+            }
+
             println!("\n=== User Created Successfully ===");
             println!("User (UID):  {}", username);
             println!("Fingerprint: {}", identity.fingerprint);

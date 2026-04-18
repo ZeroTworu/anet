@@ -1,5 +1,7 @@
 pub mod m20240101_000001_create_users;
 pub mod m20240319_000002_create_admins;
+pub mod m20240401_000003_create_rates;
+pub mod m20240501_000004_create_active_sessions;
 
 use sea_orm_migration::prelude::*;
 
@@ -11,6 +13,8 @@ impl MigratorTrait for Migrator {
         vec![
             Box::new(m20240101_000001_create_users::Migration),
             Box::new(m20240319_000002_create_admins::Migration),
+            Box::new(m20240401_000003_create_rates::Migration),
+            Box::new(m20240501_000004_create_active_sessions::Migration),
         ]
     }
 }

@@ -179,7 +179,7 @@ where
 
             let tun_tx_clone = tun_tx.clone();
             let rx_client_info = client_info.clone();
-            let t1 = tokio::spawn(async move {
+            let reader_task = tokio::spawn(async move {
                 loop {
                     match read_next_packet(&mut reader).await {
                         Ok(Some(framed_packet)) => {
@@ -196,7 +196,7 @@ where
             let stealth_config = config.stealth.clone();
             let tx_client_info = client_info.clone();
 
-            let t2 = tokio::spawn(async move {
+            let writer_task = tokio::spawn(async move {
                 let _ = anet_common::jitter::bridge_crypto_stream_with_jitter(
                     rx_router,
                     writer,
@@ -207,9 +207,13 @@ where
                 ).await;
             });
 
-            let _ = tokio::join!(t1, t2);
+            let _ = tokio::select! {
+                _ = reader_task => info!("SSH Reader task finished for {}", client_info.assigned_ip),
+                _ = writer_task => info!("SSH Writer task finished for {}", client_info.assigned_ip),
+            };
 
-            info!("VPN Stream cleanly wiped down: {:?}", client_info.assigned_ip);
+
+            info!("SSH VPN Stream cleanly wiped down: {:?}", client_info.assigned_ip);
             registry.remove_client(&client_info);
             return Ok(());
         }

@@ -1,4 +1,4 @@
-use log::{error, info, warn};
+use log::{error};
 use reqwest::Client as HttpClient;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -10,7 +10,13 @@ struct CheckAccessRequest {
 
 #[derive(Deserialize)]
 struct CheckAccessResponse {
+    message: String,
     allowed: bool,
+}
+
+#[derive(Serialize)]
+struct SessionEventRequest {
+    pub fingerprint: String,
 }
 
 #[derive(Clone)]
@@ -26,6 +32,12 @@ pub struct AuthProvider {
 
     /// HTTP клиент для запросов
     http_client: HttpClient,
+}
+
+pub enum AuthError {
+    SessionsLimit,
+    Expired,
+    NotFound,
 }
 
 impl AuthProvider {
@@ -48,73 +60,53 @@ impl AuthProvider {
     }
 
     /// Проверяет, разрешен ли доступ клиенту с данным fingerprint
-    pub async fn is_client_allowed(&self, fingerprint: &str) -> bool {
-        // 1. Сначала проверяем локальный конфиг (самое быстрое и надежное)
+    pub async fn is_client_allowed(&self, fingerprint: &str) -> Result<(), String> {
+        // 1. Локальный список (VIP)
         if self.allowed_clients.iter().any(|c| c == fingerprint) {
-            return true;
+            return Ok(());
         }
 
-        // 2. Если локально не нашли, и нет внешних серверов -> отказ
-        if self.auth_servers.is_empty() {
-            warn!(
-                "[Auth] Client {} not found in local config and no auth servers defined",
-                fingerprint
-            );
-            return false;
-        }
-
-        // 3. Стучимся во внешние сервера
-        let req_body = CheckAccessRequest {
-            fingerprint: fingerprint.to_string(),
-        };
+        // 2. Внешние сервера
+        let req_body = CheckAccessRequest { fingerprint: fingerprint.to_string() };
 
         for server_url in &self.auth_servers {
             let url = format!("{}/check_access", server_url);
-
-            let res = self
-                .http_client
-                .post(&url)
+            let res = self.http_client.post(&url)
                 .header("X-Auth-Key", &self.auth_token)
-                .json(&req_body)
-                .send()
-                .await;
+                .json(&req_body).send().await;
 
             match res {
                 Ok(resp) => {
                     if let Ok(json) = resp.json::<CheckAccessResponse>().await {
                         if json.allowed {
-                            info!(
-                                "[Auth] Client {} allowed by remote server {}",
-                                fingerprint, server_url
-                            );
-                            return true;
+                            return Ok(());
                         } else {
-                            // Если первый сервер послал на хуй - чё дальше? пока - хз.
-                            warn!(
-                                "[Auth] Client {} rejected by remote server {}",
-                                fingerprint, server_url
-                            );
-                            return false;
+                            return Err(json.message);
                         }
-                    } else {
-                        error!("[Auth] Failed to parse response from {}", server_url,);
                     }
                 }
-                Err(e) => {
-                    error!(
-                        "[Auth] Failed to contact {}: {}. Trying next...",
-                        server_url, e
-                    );
-                    // Пробуем следующий сервер
-                    continue;
-                }
+                Err(e) => { error!("[Auth] Server {} unreachable: {}", server_url, e); continue; }
             }
         }
+        Err("Все сервера авторизации недоступны".into())
+    }
 
-        warn!(
-            "[Auth] Client {} access denied (all checks failed)",
-            fingerprint
-        );
-        false
+
+    pub async fn report_session_start(&self, fingerprint: String) {
+        if self.auth_servers.is_empty() { return; }
+        let req_body = SessionEventRequest { fingerprint };
+        for server_url in &self.auth_servers {
+            let url = format!("{}/session/start", server_url);
+            let _ = self.http_client.post(&url).header("X-Auth-Key", &self.auth_token).json(&req_body).send().await;
+        }
+    }
+
+    pub async fn report_session_stop(&self, fingerprint: String) {
+        if self.auth_servers.is_empty() { return; }
+        let req_body = SessionEventRequest { fingerprint };
+        for server_url in &self.auth_servers {
+            let url = format!("{}/session/stop", server_url);
+            let _ = self.http_client.post(&url).header("X-Auth-Key", &self.auth_token).json(&req_body).send().await;
+        }
     }
 }

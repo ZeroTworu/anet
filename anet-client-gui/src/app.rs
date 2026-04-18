@@ -63,6 +63,7 @@ pub struct ANetApp {
     sidebar_open: bool,
     editing_config_id: Option<String>,
     edit_name_buffer: String,
+    error_modal: Option<String>,
 }
 
 fn send_notification(title: &str, body: &str) {
@@ -184,6 +185,7 @@ impl ANetApp {
             sidebar_open: true,
             editing_config_id: None,
             edit_name_buffer: String::new(),
+            error_modal: None,
         };
 
         // Автозагрузка активного конфига
@@ -448,6 +450,23 @@ impl eframe::App for ANetApp {
                         self.shared.lock().unwrap().state = ConnectionState::Disconnected;
                     }
                 }
+                AnetEvent::Error(msg) => {
+                    self.shared.lock().unwrap().state = ConnectionState::Disconnected;
+
+                    self.log(&format!("CRITICAL ERROR: {}", msg));
+
+                    // Сбрасываем состояние VPN
+                    let mut guard = self.shared.lock().unwrap();
+                    guard.state = ConnectionState::Disconnected;
+
+                    // Устанавливаем текст для модального окна
+                    self.error_modal = Some(msg);
+
+                    // Если приложение свернуто, мигаем уведомлением
+                    if !self.settings.lock().unwrap().disable_notifications {
+                        send_notification("Ошибка ALCO-NET", "Сервер отклонил подключение. Проверь логи.");
+                    }
+                }
                 _ => {}
             }
         }
@@ -516,7 +535,7 @@ impl eframe::App for ANetApp {
                                             .size(11.0)
                                             .color(color),
                                     )
-                                    .wrap(),
+                                        .wrap(),
                                 );
                             }
                         });
@@ -611,7 +630,7 @@ impl eframe::App for ANetApp {
                             egui::RichText::new("➕ Добавить конфиг")
                                 .color(egui::Color32::WHITE)
                         )
-                        .fill(egui::Color32::from_rgb(60, 60, 60))
+                            .fill(egui::Color32::from_rgb(60, 60, 60))
                     )
                     .clicked()
                 {
@@ -636,7 +655,7 @@ impl eframe::App for ANetApp {
                                     .strong()
                                     .color(egui::Color32::WHITE),
                             )
-                            .frame(false),
+                                .frame(false),
                         )
                         .clicked()
                     {
@@ -716,9 +735,9 @@ impl eframe::App for ANetApp {
                             .strong()
                             .color(egui::Color32::WHITE),
                     )
-                    .min_size(btn_size)
-                    .corner_radius(90.0)
-                    .fill(btn_color);
+                        .min_size(btn_size)
+                        .corner_radius(90.0)
+                        .fill(btn_color);
                     let state = self.shared.lock().unwrap().state.clone();
                     if ui.add(btn).clicked() {
                         match state {
@@ -771,5 +790,65 @@ impl eframe::App for ANetApp {
                     }
                 });
             });
+
+        // Окно ошибки
+        if let Some(err_msg) = self.error_modal.clone() {
+            // 2. Цвета
+            let neon_orange = egui::Color32::from_rgb(255, 100, 0); // Настоящий яркий оранжевый
+            let modal_bg = egui::Color32::from_rgb(32, 32, 32); // Чуть светлее фона прилы, чтобы края были видны
+
+            egui::Window::new("ERROR_SYSTEM")
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .collapsible(false)
+                .resizable(false)
+                .title_bar(false) // Без белой полосы
+                .frame(egui::Frame::NONE
+                    .fill(modal_bg) // Фон окна
+                    .stroke(egui::Stroke::new(3.0, neon_orange)) // Жирный яркий край
+                    .inner_margin(24.0)
+                    .corner_radius(4.0)
+                )
+                .show(ctx, |ui| {
+                    ui.vertical_centered(|ui| {
+                        // Заголовок модалки
+                        ui.label(
+                            egui::RichText::new("ОШИБКА ДОСТУПА")
+                                .size(22.0)
+                                .strong()
+                                .color(neon_orange),
+                        );
+
+                        ui.add_space(16.0);
+
+                        // Текст ошибки (Яркий, моноширинный)
+                        ui.label(
+                            egui::RichText::new(&err_msg)
+                                .size(16.0)
+                                .line_height(Some(20.0))
+                                .color(neon_orange)
+                                .family(egui::FontFamily::Monospace),
+                        );
+
+                        ui.add_space(24.0);
+
+                        // Кнопка [OK] (Яркая, чёрный текст)
+                        let btn_text = egui::RichText::new(" ПОНЯТНО (OK) ")
+                            .size(16.0)
+                            .strong()
+                            .color(egui::Color32::BLACK); // Черный текст внутри
+
+                        let btn = egui::Button::new(btn_text)
+                            .fill(neon_orange) // Яркая заливка кнопки
+                            .min_size(egui::vec2(140.0, 36.0));
+
+                        if ui.add(btn).clicked() {
+                            self.error_modal = None; // Закрываем модалку
+
+                            // Выгребаем остатки спама из очереди, чтобы окно не открылось снова
+                            while self.event_rx.try_recv().is_ok() {}
+                        }
+                    });
+                });
+        }
     }
 }

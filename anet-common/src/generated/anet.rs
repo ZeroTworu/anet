@@ -55,9 +55,9 @@ pub struct AuthResponse {
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Message {
-    #[prost(bytes = "vec", tag = "7")]
+    #[prost(bytes = "vec", tag = "8")]
     pub padding: ::prost::alloc::vec::Vec<u8>,
-    #[prost(oneof = "message::Content", tags = "1, 2, 3, 4, 5, 6")]
+    #[prost(oneof = "message::Content", tags = "1, 2, 3, 4, 5, 6, 7")]
     pub content: ::core::option::Option<message::Content>,
 }
 /// Nested message and enum types in `Message`.
@@ -76,5 +76,44 @@ pub mod message {
         AuthRequest(super::AuthRequest),
         #[prost(message, tag = "6")]
         AuthResponse(super::AuthResponse),
+        #[prost(message, tag = "7")]
+        AuthError(super::AuthDenyNotification),
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AuthDenyNotification {
+    #[prost(string, tag = "1")]
+    pub message: ::prost::alloc::string::String,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum DenyReason {
+    Unknown = 0,
+    SessionsLimitReached = 1,
+    SubscriptionExpired = 2,
+    Banned = 3,
+}
+impl DenyReason {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unknown => "UNKNOWN",
+            Self::SessionsLimitReached => "SESSIONS_LIMIT_REACHED",
+            Self::SubscriptionExpired => "SUBSCRIPTION_EXPIRED",
+            Self::Banned => "BANNED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "UNKNOWN" => Some(Self::Unknown),
+            "SESSIONS_LIMIT_REACHED" => Some(Self::SessionsLimitReached),
+            "SUBSCRIPTION_EXPIRED" => Some(Self::SubscriptionExpired),
+            "BANNED" => Some(Self::Banned),
+            _ => None,
+        }
     }
 }

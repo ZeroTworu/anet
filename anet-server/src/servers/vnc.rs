@@ -62,7 +62,6 @@ async fn handle_vnc_session(
     }
     info!("ASTP[VNC] Transport RFB Phase-I complete: {}", remote_addr);
 
-    // ================= ВАЖНО: ДОБАВЛЕН LOOP =================
     loop {
         // Читаем пакет (ASTP Хендшейк Phase 1 и Phase 3) внутри VNC ClientCutText
         let mut header = [0u8; 8];
@@ -99,7 +98,7 @@ async fn handle_vnc_session(
             // ВХОДЯЩИЙ ТРАФИК (RX - читаем от Клиента, Type = 6)
             let tun_tx_clone = tun_tx.clone();
             let cipher_rx = client_info.cipher.clone();
-            let t1 = tokio::spawn(async move {
+            let reader_task = tokio::spawn(async move {
                 let mut header = [0u8; 8];
                 while let Ok(_) = reader.read_exact(&mut header).await {
                     if header[0] != 6 { warn!("Invalid VNC MSG from Client: {}", header[0]); break; }
@@ -121,7 +120,7 @@ async fn handle_vnc_session(
             let sequence_tx = client_info.sequence.clone();
             let nonce_prefix = client_info.nonce_prefix;
 
-            let t2 = tokio::spawn(async move {
+            let writer_task = tokio::spawn(async move {
                 let (tx_ready, mut rx_ready) = mpsc::channel::<Bytes>(1024);
                 let dispatch = tokio::spawn(async move {
                     use rand::Rng; let mut r = rand::rngs::OsRng;
@@ -157,7 +156,10 @@ async fn handle_vnc_session(
                 dispatch.abort();
             });
 
-            let _ = tokio::join!(t1, t2);
+            let _ = tokio::select! {
+                _ = reader_task => info!("VNC Reader task finished for {}", client_info.assigned_ip),
+                _ = writer_task => info!("VNC Writer task finished for {}", client_info.assigned_ip),
+            };
 
             info!("[VNC Node] Client disconnected and wiped: {}", client_info.assigned_ip);
             registry.remove_client(&client_info);

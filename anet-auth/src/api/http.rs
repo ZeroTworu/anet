@@ -6,7 +6,7 @@ use poem::Result;
 use poem_openapi::{OpenApi, param::Query, payload::Json};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, IntoActiveModel,
-    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set,
+    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
 };
 use std::env;
 use uuid::Uuid;
@@ -26,7 +26,7 @@ impl VpnApi {
             &jsonwebtoken::DecodingKey::from_secret(secret.as_bytes()),
             &jsonwebtoken::Validation::default(),
         )
-        .map_err(|_| "Сломанный или протухший JWT")?;
+            .map_err(|_| "Сломанный или протухший JWT")?;
 
         let jti = Uuid::parse_str(&token_data.claims.jti).map_err(|_| "Invalid JTI Format")?;
 
@@ -45,40 +45,185 @@ impl VpnApi {
             None => Err("Отказ! Сессия отозвана".to_string()),
         }
     }
+    /// Настройки тарифа: Обновление количества сессий и даты окончания. (PATCH запрос по ID тарифа).
+    #[oai(path = "/rate/:id", method = "patch")]
+    async fn update_rate(
+        &self,
+        auth: AdminToken,
+        id: poem_openapi::param::Path<Uuid>,
+        req: Json<UpdateRateRequest>,
+    ) -> UpdateRateApiResult {
+        // Проверяем админа
+        if let Err(err) = self.validate_admin_session(&auth.0.token).await {
+            return UpdateRateApiResult::Unauthorized(Json(err));
+        }
+
+        // 1. Пытаемся поймать тариф с таким UUID
+        let rate_model = match crate::entities::rates::Entity::find_by_id(id.0).one(&self.db).await {
+            Ok(Some(r)) => r,
+            Ok(None) => {
+                return UpdateRateApiResult::NotFound(Json("Тариф не найден в базе!".to_string()));
+            }
+            Err(e) => {
+                error!("[DB CRASH] Searching rate by ID: {}", e);
+                return UpdateRateApiResult::Error(Json("Ошибка поиска тарифа".to_string()));
+            }
+        };
+
+        // 2. Раскручиваем модель в режим редактирования
+        let mut editable_rate = rate_model.into_active_model();
+        let mut something_changed = false;
+
+        // Если передано новое количество сессий
+        if let Some(new_sessions) = req.0.sessions {
+            editable_rate.sessions = Set(new_sessions as i32);
+            something_changed = true;
+        }
+
+        // Если передана новая дата окончания
+        if let Some(new_date_str) = &req.0.date_end {
+            let date_parsed = match chrono::NaiveDateTime::parse_from_str(new_date_str, "%Y-%m-%d-%H:%M") {
+                Ok(d) => d,
+                Err(_) => return UpdateRateApiResult::BadRequest(Json("Неверный формат даты. Ожидается YYYY-MM-DD-HH:MM".to_string())),
+            };
+            editable_rate.date_end = Set(date_parsed);
+            something_changed = true;
+        }
+
+        // 3. Сохраняем, если были изменения
+        if something_changed {
+            editable_rate.updated_at = Set(chrono::Utc::now().naive_utc());
+
+            match editable_rate.update(&self.db).await {
+                Ok(updated_data) => {
+                    return UpdateRateApiResult::Ok(Json(RateDto {
+                        id: updated_data.id,
+                        sessions: updated_data.sessions as u32,
+                        date_end: updated_data.date_end.format("%Y-%m-%d-%H:%M").to_string(),
+                    }));
+                }
+                Err(e) => {
+                    error!("[DB CRASH] Editing rate payload: {}", e);
+                    return UpdateRateApiResult::Error(Json("Ошибка обновления тарифа в БД!".to_string()));
+                }
+            }
+        }
+
+        // Если передан пустой JSON, возвращаем старые данные
+        UpdateRateApiResult::Ok(Json(RateDto {
+            id: editable_rate.id.unwrap(),
+            sessions: editable_rate.sessions.unwrap() as u32,
+            date_end: editable_rate.date_end.unwrap().format("%Y-%m-%d-%H:%M").to_string(),
+        }))
+    }
 
     /// Проверка VPN Сервера при Handshake
     #[oai(path = "/check_access", method = "post")]
-    async fn check_access(
-        &self,
-        req: Json<CheckAccessRequest>,
-    ) -> Result<Json<CheckAccessResponse>> {
+    async fn check_access(&self, req: Json<CheckAccessRequest>) -> Result<Json<CheckAccessResponse>> {
         let fingerprint = &req.0.fingerprint;
-        let user = users::Entity::find()
+
+        let result = users::Entity::find()
             .filter(users::Column::Fingerprint.eq(fingerprint))
+            .find_also_related(crate::entities::rates::Entity)
             .one(&self.db)
             .await
             .map_err(poem::error::InternalServerError)?;
 
-        if let Some(u) = user {
-            let res = if u.is_active {
-                CheckAccessResponse {
-                    allowed: true,
-                    message: "OK".into(),
+        if let Some((user, rate_opt)) = result {
+            if !user.is_active {
+                return Ok(Json(CheckAccessResponse { allowed: false, message: "Banned".into() }));
+            }
+
+            if let Some(rate) = rate_opt {
+                if chrono::Utc::now().naive_utc() > rate.date_end {
+                    return Ok(Json(CheckAccessResponse { allowed: false, message: "Время действия ключа истекло".into() }));
                 }
-            } else {
-                CheckAccessResponse {
-                    allowed: false,
-                    message: "Banned".into(),
+
+                let current_sessions = match crate::entities::active_sessions::Entity::find()
+                    .filter(crate::entities::active_sessions::Column::UserId.eq(user.id))
+                    .one(&self.db)
+                    .await
+                {
+                    Ok(Some(session_model)) => session_model.sessions,
+                    _ => 0,
+                };
+
+                if current_sessions >= (rate.sessions as i32) {
+                    return Ok(Json(CheckAccessResponse { allowed: false, message: "Кол-во сессий для ключа достигло максимума".into() }));
                 }
-            };
-            Ok(Json(res))
+            }
+            Ok(Json(CheckAccessResponse { allowed: true, message: "OK".into() }))
         } else {
-            Ok(Json(CheckAccessResponse {
-                allowed: false,
-                message: "Not found".into(),
-            }))
+            Ok(Json(CheckAccessResponse { allowed: false, message: "Not found".into() }))
         }
     }
+
+    #[oai(path = "/session/start", method = "post")]
+    async fn session_start(&self, req: Json<SessionEventRequest>) -> SessionEventResponse {
+        let txn = match self.db.begin().await {
+            Ok(t) => t,
+            Err(_) => return SessionEventResponse::Error,
+        };
+
+        let user = match users::Entity::find().filter(users::Column::Fingerprint.eq(&req.0.fingerprint)).one(&txn).await {
+            Ok(Some(u)) => u,
+            _ => { let _ = txn.rollback().await; return SessionEventResponse::NotFound; }
+        };
+
+        let existing_session = crate::entities::active_sessions::Entity::find()
+            .filter(crate::entities::active_sessions::Column::UserId.eq(user.id))
+            .one(&txn).await.unwrap_or(None);
+
+        match existing_session {
+            Some(sess) => {
+                let mut editable = sess.into_active_model();
+                editable.sessions = Set(editable.sessions.unwrap() + 1);
+                editable.updated_at = Set(chrono::Utc::now().naive_utc());
+                if editable.update(&txn).await.is_err() { let _ = txn.rollback().await; return SessionEventResponse::Error; }
+            }
+            None => {
+                let new_sess = crate::entities::active_sessions::ActiveModel {
+                    id: Set(Uuid::new_v4()),
+                    user_id: Set(user.id),
+                    sessions: Set(1),
+                    created_at: Set(chrono::Utc::now().naive_utc()),
+                    updated_at: Set(chrono::Utc::now().naive_utc()),
+                };
+                if new_sess.insert(&txn).await.is_err() { let _ = txn.rollback().await; return SessionEventResponse::Error; }
+            }
+        }
+        if txn.commit().await.is_err() { return SessionEventResponse::Error; }
+        SessionEventResponse::Ok
+    }
+
+    #[oai(path = "/session/stop", method = "post")]
+    async fn session_stop(&self, req: Json<SessionEventRequest>) -> SessionEventResponse {
+        let txn = match self.db.begin().await {
+            Ok(t) => t,
+            Err(_) => return SessionEventResponse::Error,
+        };
+
+        let user = match users::Entity::find().filter(users::Column::Fingerprint.eq(&req.0.fingerprint)).one(&txn).await {
+            Ok(Some(u)) => u,
+            _ => { let _ = txn.rollback().await; return SessionEventResponse::NotFound; }
+        };
+
+        if let Ok(Some(sess)) = crate::entities::active_sessions::Entity::find()
+            .filter(crate::entities::active_sessions::Column::UserId.eq(user.id))
+            .one(&txn).await
+        {
+            let mut editable = sess.into_active_model();
+            let current = editable.sessions.unwrap();
+            if current > 0 {
+                editable.sessions = Set(current - 1);
+                editable.updated_at = Set(chrono::Utc::now().naive_utc());
+                if editable.update(&txn).await.is_err() { let _ = txn.rollback().await; return SessionEventResponse::Error; }
+            }
+        }
+        if txn.commit().await.is_err() { return SessionEventResponse::Error; }
+        SessionEventResponse::Ok
+    }
+
 
     /// Логин в панель Админа
     #[oai(path = "/login", method = "post")]
@@ -121,7 +266,7 @@ impl VpnApi {
             &claims,
             &EncodingKey::from_secret(secret.as_bytes()),
         )
-        .unwrap_or_default();
+            .unwrap_or_default();
 
         LoginResponse::Ok(Json(AuthTokens {
             access_token: token,
@@ -144,6 +289,7 @@ impl VpnApi {
         let page_size = limit.0.unwrap_or(50);
 
         let users = users::Entity::find()
+            .find_also_related(crate::entities::rates::Entity)
             .order_by_desc(users::Column::CreatedAt)
             .offset(offset)
             .limit(page_size)
@@ -158,12 +304,17 @@ impl VpnApi {
         let dto_list = users
             .unwrap()
             .into_iter()
-            .map(|m| VpnUserDto {
+            .map(|(m, r)| VpnUserDto {
                 id: m.id,
                 fingerprint: m.fingerprint,
                 uid: m.uid,
                 is_active: m.is_active,
                 created_at: m.created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+                rate: r.map(|rate_model| RateDto {
+                    id: rate_model.id,
+                    sessions: rate_model.sessions as u32,
+                    date_end: rate_model.date_end.format("%Y-%m-%d-%H:%M").to_string(),
+                }),
             })
             .collect();
 
@@ -173,6 +324,51 @@ impl VpnApi {
         }))
     }
 
+    /// Получение профиля пользователя по ID (Вместе с тарифом Rate)
+    #[oai(path = "/user/:id", method = "get")]
+    async fn get_user(
+        &self,
+        auth: AdminToken,
+        id: poem_openapi::param::Path<Uuid>,
+    ) -> GetUserApiResult {
+        if let Err(err) = self.validate_admin_session(&auth.0.token).await {
+            return GetUserApiResult::Unauthorized(Json(err));
+        }
+
+        let result = match users::Entity::find_by_id(id.0)
+            .find_also_related(crate::entities::rates::Entity)
+            .one(&self.db)
+            .await
+        {
+            Ok(Some((u, r))) => {
+                let rate_dto = r.map(|rate_model| RateDto {
+                    id: rate_model.id,
+                    sessions: rate_model.sessions as u32,
+                    date_end: rate_model.date_end.format("%Y-%m-%d-%H:%M").to_string(),
+                });
+
+                VpnUserDto {
+                    id: u.id,
+                    fingerprint: u.fingerprint,
+                    uid: u.uid,
+                    is_active: u.is_active,
+                    created_at: u.created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+                    rate: rate_dto,
+                }
+            }
+            Ok(None) => return GetUserApiResult::NotFound(Json("VPN клиент не найден".to_string())),
+            Err(e) => {
+                error!("[DB ERROR] Get User By ID: {}", e);
+                return GetUserApiResult::Error(Json("Ошибка поиска".to_string()));
+            }
+        };
+
+        GetUserApiResult::Ok(Json(result))
+    }
+
+    /// Создание нового VPN-Клиента (API-альтернатива команде -a)
+    ///
+    /// Генерирует новую крипто-пару и добавляет слепок в Белый Список БД.
     /// Создание нового VPN-Клиента (API-альтернатива команде -a)
     ///
     /// Генерирует новую крипто-пару и добавляет слепок в Белый Список БД.
@@ -183,9 +379,10 @@ impl VpnApi {
         }
 
         let identity = crate::keygen::generate_identity();
+        let user_id = Uuid::new_v4();
 
         let new_user = users::ActiveModel {
-            id: Set(Uuid::new_v4()),
+            id: Set(user_id),
             fingerprint: Set(identity.fingerprint.clone()),
             uid: Set(Some(req.0.uid.clone())),
             is_active: Set(true),
@@ -198,11 +395,47 @@ impl VpnApi {
             return AddUserApiResult::Error(Json("Ошибка записи в БД".to_string()));
         }
 
+        // --- ЛОГИКА СОЗДАНИЯ ТАРИФА (RATE) ---
+        let mut saved_rate_dto = None;
+
+        if let Some(rate_req) = &req.0.rate {
+            let date_parsed = match chrono::NaiveDateTime::parse_from_str(&rate_req.date_end, "%Y-%m-%d-%H:%M") {
+                Ok(d) => d,
+                Err(_) => return AddUserApiResult::Error(Json("Неверный формат даты. Ожидается YYYY-MM-DD-HH:MM".to_string())),
+            };
+
+            let rate_id = Uuid::new_v4(); // Генерируем UUID тарифа
+
+            let new_rate = crate::entities::rates::ActiveModel {
+                id: Set(rate_id),
+                user_id: Set(user_id),
+                sessions: Set(rate_req.sessions as i32),
+                date_end: Set(date_parsed),
+                created_at: Set(chrono::Utc::now().naive_utc()),
+                updated_at: Set(chrono::Utc::now().naive_utc()),
+            };
+
+            if let Err(e) = new_rate.insert(&self.db).await {
+                error!("Failed to insert rate: {}", e);
+                return AddUserApiResult::Error(Json("Ошибка записи тарифа в БД".to_string()));
+            }
+
+            // Собираем DTO для ответа (включая только что созданный ID тарифа)
+            saved_rate_dto = Some(RateDto {
+                id: rate_id,
+                sessions: rate_req.sessions,
+                date_end: rate_req.date_end.clone(),
+            });
+        }
+
+        // Возвращаем финальный JSON, в котором есть оба ID
         AddUserApiResult::Ok(Json(AddUserResponse {
-            uid: req.0.uid,
+            id: user_id, // <--- ID созданного пользователя
+            uid: req.0.uid.clone(),
             fingerprint: identity.fingerprint,
             private_key: identity.private_key,
             public_key: identity.public_key,
+            rate: saved_rate_dto, // <--- Тариф (внутри будет свой id)
         }))
     }
 
@@ -221,9 +454,13 @@ impl VpnApi {
             return UpdateUserApiResult::Unauthorized(Json(err));
         }
 
-        // 1. Пытаемся поймать юзера с таким UUID
-        let user_model = match User::find_by_id(id.0).one(&self.db).await {
-            Ok(Some(u)) => u,
+        // 1. Пытаемся поймать юзера с таким UUID (Сразу тянем rate для ответа)
+        let (user_model, rate_model) = match User::find_by_id(id.0)
+            .find_also_related(crate::entities::rates::Entity)
+            .one(&self.db)
+            .await
+        {
+            Ok(Some((u, r))) => (u, r),
             Ok(None) => {
                 return UpdateUserApiResult::NotFound(Json(
                     "VPN клиент не найден в базе!".to_string(),
@@ -235,9 +472,15 @@ impl VpnApi {
             }
         };
 
+        // Подготавливаем Rate DTO, чтобы вернуть его в любом случае
+        let rate_dto = rate_model.map(|r_model| RateDto {
+            id: r_model.id,
+            sessions: r_model.sessions as u32,
+            date_end: r_model.date_end.format("%Y-%m-%d-%H:%M").to_string(),
+        });
+
         // 2. Раскручиваем модель из Read-Only в Режим Редактирования (ActiveModel)
         let mut editable_user = user_model.into_active_model();
-
         let mut something_changed = false;
 
         // Если нам кинули сменить имя - переименовываем
@@ -267,6 +510,7 @@ impl VpnApi {
                             .created_at
                             .format("%Y-%m-%d %H:%M:%S")
                             .to_string(),
+                        rate: rate_dto,
                     }));
                 }
                 Err(e) => {
@@ -290,6 +534,7 @@ impl VpnApi {
                 .unwrap()
                 .format("%Y-%m-%d %H:%M:%S")
                 .to_string(),
+            rate: rate_dto,
         }))
     }
 

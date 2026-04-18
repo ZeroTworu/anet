@@ -1,5 +1,5 @@
 use crate::config::CoreConfig;
-use crate::events::{status, warn};
+use crate::events::{status, warn, err as serr};
 use anet_common::consts::{MAX_PACKET_SIZE, NONCE_LEN, PROTO_PAD_FIELD_OVERHEAD};
 use anet_common::crypto_utils::{self, derive_shared_key, generate_key_fingerprint, sign_data};
 use anet_common::encryption::Cipher;
@@ -257,10 +257,15 @@ impl AuthHandler {
             Some(Content::DhServerExchange(dh)) if dh.public_key.len() == 32 => {
                 (dh.public_key, dh.server_signed_dh_key)
             }
+            // Если сервер прислал ошибку вместо ключей DH
+            Some(Content::AuthError(err)) => {
+                serr(format!("[CORE AUTH] {}", err.message));
+                return Err(anyhow::anyhow!("{}", err.message));
+            }
             _ => {
                 return Err(anyhow::anyhow!(
-                    "Unexpected or invalid response in Phase II"
-                ));
+                "Unexpected or invalid response in Phase II"
+            ));
             }
         };
 
@@ -269,7 +274,7 @@ impl AuthHandler {
             &server_pub_key_bytes,
             &server_signature,
         )
-        .context("Server signature verification failed")?;
+            .context("Server signature verification failed")?;
 
         let server_key_array: [u8; 32] = server_pub_key_bytes
             .as_slice()
@@ -289,9 +294,9 @@ impl AuthHandler {
     ) -> Result<(AuthResponse, [u8; 32])> {
         let (request_packet, cipher) = self.create_encrypted_auth_request(&shared_key)?;
         info!(
-            "[AUTH] Phase III: Sending Encrypted Auth Request ({} bytes).",
-            request_packet.len()
-        );
+        "[AUTH] Phase III: Sending Encrypted Auth Request ({} bytes).",
+        request_packet.len()
+    );
 
         channel
             .send(request_packet)
@@ -299,7 +304,6 @@ impl AuthHandler {
             .context("Failed Phase III send")?;
 
         let response_buf = channel.recv(Duration::from_secs(delay)).await?;
-
         let handshake_cipher = crypto_utils::create_handshake_cipher(&self.server_pub_key_bytes);
 
         if response_buf.len() < NONCE_LEN {
@@ -313,13 +317,19 @@ impl AuthHandler {
 
         let outer_msg: AnetMessage = Message::decode(plaintext_outer)?;
 
-        if let Some(Content::EncryptedAuthResponse(enc_res)) = outer_msg.content {
-            let auth_response = self.decrypt_auth_response(enc_res, &cipher)?;
-            info!("[AUTH] Phase IV complete.");
-            status("[AUTH] Phase IV complete.");
-            Ok((auth_response, shared_key))
-        } else {
-            Err(anyhow::anyhow!("Unexpected Phase IV content"))
+        match outer_msg.content {
+            Some(Content::EncryptedAuthResponse(enc_res)) => {
+                let auth_response = self.decrypt_auth_response(enc_res, &cipher)?;
+                info!("[AUTH] Phase IV complete.");
+                status("[AUTH] Phase IV complete.");
+                Ok((auth_response, shared_key))
+            }
+            //  ОШИБКИ В КОНЦЕ ХЕНДШЕЙКА ?
+            Some(Content::AuthError(err)) => {
+                serr(format!("[CORE AUTH] {}", err.message));
+                Err(anyhow::anyhow!("{}", err.message))
+            }
+            _ => Err(anyhow::anyhow!("Unexpected Phase IV content")),
         }
     }
 
