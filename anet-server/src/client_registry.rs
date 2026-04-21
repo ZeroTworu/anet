@@ -79,8 +79,8 @@ impl ClientRegistry {
         info!("[Registry] Client {} removed.", client_ip);
     }
 
-    pub fn allocate_ip(&self) -> Option<Ipv4Addr> {
-        self.ip_pool.allocate()
+    pub fn allocate_ip(&self, client_id: String) -> Option<Ipv4Addr> {
+        self.ip_pool.allocate(client_id)
     }
 
     pub fn get_by_addr(&self, remote_addr: &SocketAddr) -> Option<Arc<ClientTransportInfo>> {

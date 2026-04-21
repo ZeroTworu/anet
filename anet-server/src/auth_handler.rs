@@ -161,7 +161,7 @@ impl ServerAuthHandler {
         };
         if req.client_id != temp_info.client_fingerprint { return Err(anyhow::anyhow!("Client ID mismatch")); }
 
-        let assigned_ip = self.registry.allocate_ip().context("IP POOL DEPLETED")?.to_string();
+        let assigned_ip = self.registry.allocate_ip(req.client_id).context("IP POOL DEPLETED")?.to_string();
         let session_id = generate_seid();
         let nonce_prefix = generate_unique_nonce_prefix(self.registry.clone());
 
