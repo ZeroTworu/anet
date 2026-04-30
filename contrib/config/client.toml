@@ -83,6 +83,9 @@ exclude_route_for = ["192.168.1.0/32"]
 # По умолчанию: ["1.1.1.1", "8.8.8.8"]
 dns_server_list = ["1.1.1.1", "8.8.8.8"]
 
+# Откуда качать обновления
+update_url = "https://api.github.com/repos/ZeroTworu/anet/releases/latest"
+
 [transport]
 mode = "ssh" # "quic", "vnc"
 ssh_user = "hanyuu"

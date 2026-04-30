@@ -5,6 +5,9 @@ pub enum AnetEvent {
     TrafficUpdate { rx: u64, tx: u64 }, // а точно так?
     Warn(String),
     Error(String),
+    UpdateAvailable(crate::updater::GithubRelease),
+    UpdateProgress(f32), // 0.0 до 1.0
+    UpdateReady,
 }
 
 /// Трейт для подписчика
@@ -37,4 +40,8 @@ pub fn err(s: impl Into<String>) {
 
 pub fn warn(s: impl Into<String>) {
     emit(AnetEvent::Warn(s.into()));
+}
+
+pub fn update_progress(p: f32) {
+    emit(AnetEvent::UpdateProgress(p));
 }

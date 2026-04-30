@@ -17,59 +17,52 @@ fn main() {
     let dest_path = Path::new(&out_dir).join("built.rs");
     let mut f = File::create(&dest_path).unwrap();
 
-    // Получаем хэш коммита
-    let commit_hash = if let Ok(hash) = env::var("GITHUB_SHA") {
-        // CI/CD сборка - используем переменную из окружения и обрезаем до 7 символов
-        if hash.len() > 7 {
-            hash[..7].to_string()
-        } else {
-            hash
-        }
-    } else {
-        // Локальная сборка - пытаемся получить из git (уже короткий)
-        Command::new("git")
-            .args(&["rev-parse", "--short", "HEAD"])
-            .output()
-            .ok()
-            .and_then(|output| {
-                if output.status.success() {
-                    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_else(|| "unknown".to_string())
-    };
+    // 1. Получаем ТЕГ (версию)
+    let git_tag = Command::new("git")
+        .args(&["describe", "--tags", "--always"])
+        .output()
+        .ok()
+        .and_then(|output| {
+            if output.status.success() {
+                Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| "v0.0.0-dev".to_string());
 
-    // Получаем время сборки в формате UNIX timestamp
-    let build_time = SystemTime::now()
+    // 2. Получаем ХЕШ коммита
+    let commit_hash = Command::new("git")
+        .args(&["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()
+        .and_then(|output| {
+            if output.status.success() {
+                Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+
+    // 3. Время сборки
+    let build_time_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs();
+    let datetime = format_timestamp(build_time_secs);
 
-    // Форматируем время вручную без внешних зависимостей
-    let datetime = format_timestamp(build_time);
-
-    // Определяем тип сборки
     let build_type = if env::var("GITHUB_SHA").is_ok() {
         "CI/CD"
     } else {
         "Local dev"
     };
 
-    // Записываем константы в файл
+    // Записываем всё в промежуточный файл
+    writeln!(f, "pub const GIT_TAG: &str = \"{}\";", git_tag).unwrap();
     writeln!(f, "pub const COMMIT_HASH: &str = \"{}\";", commit_hash).unwrap();
     writeln!(f, "pub const BUILD_TIME: &str = \"{}\";", datetime).unwrap();
     writeln!(f, "pub const BUILD_TYPE: &str = \"{}\";", build_type).unwrap();
 
-    // Перекомпилируем при изменении build.rs
     println!("cargo:rerun-if-changed=build.rs");
-    let target = env::var("TARGET").unwrap_or_else(|_| "unknown".to_string());
-
-    println!(
-        "cargo:warning=Compiling for: {} on {} (target: {})",
-        env::var("CARGO_CFG_TARGET_OS").unwrap_or_else(|_| "unknown".to_string()),
-        env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_else(|_| "unknown".to_string()),
-        target
-    );
 }

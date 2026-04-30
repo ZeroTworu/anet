@@ -59,6 +59,10 @@ impl AnetClient {
         }
     }
 
+    pub fn get_config(&self) -> CoreConfig {
+        self.config.clone()
+    }
+
     /// Резолвинг доменов и парсинг IP из конфига
     async fn resolve_list(&self, list: &[String]) -> Vec<IpNet> {
         let mut result = Vec::new();

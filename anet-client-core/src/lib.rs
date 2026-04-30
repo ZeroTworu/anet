@@ -12,3 +12,4 @@ pub mod traits;
 mod transport;
 pub mod vpn;
 mod statistic;
+pub mod updater;
