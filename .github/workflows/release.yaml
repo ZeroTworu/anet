@@ -122,11 +122,29 @@ jobs:
               echo "Warning: Windows installer EXE not found"
             fi
           fi
+      - name: "Extract Tag Message"
+        id: get_tag_msg
+        run: |
+            # Вытаскиваем содержимое аннотированного тега
+            # Используем формат %(contents), чтобы забрать всё описание
+            TAG_MSG=$(git tag -l --format='%(contents)' ${{ github.ref_name }})
+            
+            # Если описание пустое (например, тег не аннотированный), 
+            # запишем стандартную заглушку
+            if [ -z "$TAG_MSG" ]; then
+              TAG_MSG="No release notes provided in the tag."
+            fi
+            
+            # Записываем в GITHUB_ENV с поддержкой многострочного текста
+            echo "RELEASE_BODY<<EOF" >> $GITHUB_ENV
+            echo "$TAG_MSG" >> $GITHUB_ENV
+            echo "EOF" >> $GITHUB_ENV
       - name: "Create Release"
         uses: "softprops/action-gh-release@v2"
         with:
             tag_name: ${{ github.ref }}
             name: Release ${{ github.ref }}
+            body: ${{ env.RELEASE_BODY }}
             files: |
               release_files/server_${{ env.VERSION }}.zip
               release_files/client-linux-amd64_${{ env.VERSION }}.zip
