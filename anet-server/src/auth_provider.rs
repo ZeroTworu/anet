@@ -34,12 +34,6 @@ pub struct AuthProvider {
     http_client: HttpClient,
 }
 
-pub enum AuthError {
-    SessionsLimit,
-    Expired,
-    NotFound,
-}
-
 impl AuthProvider {
     pub fn new(
         allowed_clients: Vec<String>,

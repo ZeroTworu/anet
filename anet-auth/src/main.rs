@@ -8,7 +8,7 @@ use clap::Parser;
 use log::{error, info};
 use poem::{EndpointExt, Route, Server, listener::TcpListener};
 use poem_openapi::OpenApiService;
-use sea_orm::{ActiveModelTrait, Database, DatabaseConnection, Set, UpdateMany, EntityTrait};
+use sea_orm::{ActiveModelTrait, Database, DatabaseConnection, Set, EntityTrait};
 use sea_orm_migration::MigratorTrait;
 use std::env;
 use std::io::Write;
