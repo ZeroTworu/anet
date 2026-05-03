@@ -19,8 +19,12 @@ pub struct MainConfig {
     #[serde(default)]
     pub dns_server_list: Vec<String>,
 
-    #[serde(default)]
+    #[serde(default = "default_update_url")]
     pub update_url: String,
+}
+
+fn default_update_url() -> String {
+    "https://api.github.com/repos/ZeroTworu/anet/releases/latest".to_string()
 }
 
 impl Default for MainConfig {
@@ -32,7 +36,7 @@ impl Default for MainConfig {
             exclude_route_for: vec![],
             dns_server_list: vec!["1.1.1.1".to_string(), "8.8.8.8".to_string()],
             manual_routing: false,
-            update_url: "https://api.github.com/repos/ZeroTworu/anet/releases/latest".to_string(),
+            update_url: default_update_url(),
         }
     }
 }

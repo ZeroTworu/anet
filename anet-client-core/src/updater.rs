@@ -30,25 +30,37 @@ pub struct Updater;
 impl Updater {
 
     pub async fn check_latest(url: &str, current_version: &str) -> anyhow::Result<Option<GithubRelease>> {
+        info!("[UPDATER] Checking for updates...");
+
         let client = Client::builder()
             .user_agent("ANet-Client-GUI")
             .timeout(std::time::Duration::from_secs(10))
-            .build()?;
+            .build()
+            .map_err(|e| anyhow::anyhow!("Failed to build HTTP client: {}", e))?; // Тут будет подробная ошибка
 
-        let response = client.get(url).send().await?;
+        info!("[UPDATER] Requesting URL: {}", url);
+
+        let response = client.get(url).send().await
+            .map_err(|e| anyhow::anyhow!("Network error: {}", e))?;
+
         if !response.status().is_success() {
-            return Err(anyhow::anyhow!("GitHub API Error: {}", response.status()));
+            return Err(anyhow::anyhow!("Update server returned error: {}", response.status()));
         }
 
-        let release: GithubRelease = response.json().await?;
+        let release: GithubRelease = response.json().await
+            .map_err(|e| anyhow::anyhow!("Failed to parse release JSON: {}", e))?;
+
         if release.tag_name != current_version {
+            info!("[UPDATER] New version available: {}", release.tag_name);
             Ok(Some(release))
         } else {
+            info!("[UPDATER] You are on the latest version.");
             Ok(None)
         }
     }
 
     pub async fn download_and_apply(release: GithubRelease) -> anyhow::Result<()> {
+        info!("[UPDATER] Downloading update...");
         let client = Client::builder().user_agent("ANet-Updater").build()?;
 
         let asset = release.assets.iter()

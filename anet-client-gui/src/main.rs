@@ -1,4 +1,4 @@
-#![cfg_attr(not(feature = "console"), windows_subsystem = "windows")]
+// #![cfg_attr(not(feature = "console"), windows_subsystem = "windows")]
 
 include!(concat!(env!("OUT_DIR"), "/built.rs"));
 
