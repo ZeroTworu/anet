@@ -54,24 +54,27 @@ struct AndroidEventHandler {
 
 impl EventHandler for AndroidEventHandler {
     fn on_event(&self, event: AnetEvent) {
-        // Присоединяемся к JVM (этот поток может быть любым)
+        let log_event = event.clone();
         if let Ok(mut env) = self.jvm.attach_current_thread() {
-            match event {
-                AnetEvent::Status(msg) => {
-                    // Конвертируем Rust String -> Java String
-                    if let Ok(jmsg) = env.new_string(msg) {
-                        // Вызываем void onStatusChanged(String msg)
-                        let _ = env.call_method(
-                            &self.callback_ref,
-                            "onStatusChanged",
-                            "(Ljava/lang/String;)V",
-                            &[JValue::Object(&jmsg)],
-                        );
-                    }
+            // Извлекаем строку сообщения из любого текстового события
+            let msg_to_send = match event {
+                AnetEvent::Status(s) => Some(s),
+                AnetEvent::Warn(s) => Some(format!("WARN: {}", s)),
+                AnetEvent::Error(s) => Some(format!("ERROR: {}", s)),
+                _ => None,
+            };
+
+            if let Some(msg) = msg_to_send {
+                if let Ok(jmsg) = env.new_string(msg) {
+                    let _ = env.call_method(
+                        &self.callback_ref,
+                        "onStatusChanged",
+                        "(Ljava/lang/String;)V",
+                        &[JValue::Object(&jmsg)],
+                    );
                 }
-                _ => {
-                    info!("Event called {:?}", event);
-                }
+            } else {
+                info!("Event ignored by GUI: {:?}", log_event);
             }
         }
     }

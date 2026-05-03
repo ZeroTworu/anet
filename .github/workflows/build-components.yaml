@@ -561,6 +561,7 @@ jobs:
       - name: "Install Rust Targets"
         run: |
           rustup target add aarch64-linux-android
+          rustup target add armv7-linux-androideabi
           rustup target add x86_64-linux-android
 
       - name: "Cache Rust dependencies"
@@ -580,7 +581,7 @@ jobs:
 
       - name: "Build .so libs"
         run: |
-          cargo ndk -t aarch64-linux-android -o ./jniLibs build --release -p anet-mobile
+          cargo ndk -t aarch64-linux-android -t armv7-linux-androideabi -o ./jniLibs build --release -p anet-mobile
 
       - uses: "actions/upload-artifact@v6"
         with:
