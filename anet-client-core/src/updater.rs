@@ -59,6 +59,35 @@ impl Updater {
         }
     }
 
+    pub async fn download_apk(release: GithubRelease, target_path: String) -> anyhow::Result<()> {
+        let client = Client::builder().user_agent("ANet-Updater").build()?;
+
+        // 1. Ищем APK в ассетах
+        let asset = release.assets.iter()
+            .find(|a| a.name.ends_with(".apk"))
+            .ok_or_else(|| anyhow::anyhow!("APK не найден в релизе"))?;
+
+        let total_size = asset.size as u64;
+        let mut response = client.get(&asset.browser_download_url).send().await?;
+
+        let mut downloaded: u64 = 0;
+        let mut file = std::fs::File::create(&target_path)?;
+
+        // 2. Качаем по кускам и шлем прогресс в GUI
+        while let Some(chunk) = response.chunk().await? {
+            std::io::Write::write_all(&mut file, &chunk)?;
+            downloaded += chunk.len() as u64;
+
+            let progress = downloaded as f32 / total_size as f32;
+            update_progress(progress);
+        }
+
+        info!("[UPDATER] APK downloaded to {}", target_path);
+        // Шлем событие готовности (для Android это значит "можно устанавливать")
+        emit(AnetEvent::UpdateReady);
+        Ok(())
+    }
+
     pub async fn download_and_apply(release: GithubRelease) -> anyhow::Result<()> {
         info!("[UPDATER] Downloading update...");
         let client = Client::builder().user_agent("ANet-Updater").build()?;

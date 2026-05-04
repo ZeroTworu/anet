@@ -1,8 +1,11 @@
 //! Универсальный менеджер DNS
 //! Поддерживает Linux (resolvectl, nmcli), macOS (scutil) и Windows (netsh).
 
-use anyhow::{Context, Result};
+use anyhow::Result;
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use log::{info, warn};
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+use anyhow::Context;
 use std::net::Ipv4Addr;
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
@@ -15,7 +18,9 @@ use std::io::Write;
 use log::debug;
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use std::process::Stdio;
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use std::string::ToString;
 #[cfg(target_os = "linux")]
 use std::fs;
