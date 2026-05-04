@@ -1,3 +1,4 @@
+use std::net::Ipv4Addr;
 use poem_openapi::{ApiResponse, Object, SecurityScheme, auth::Bearer, payload::Json};
 use serde::{Deserialize, Serialize};
 
@@ -66,6 +67,7 @@ pub struct VpnUserDto {
     pub is_active: bool,
     pub created_at: String,
     pub rate: Option<RateDto>,
+    pub static_ip: Option<Ipv4Addr>,
 }
 
 #[derive(Object)]

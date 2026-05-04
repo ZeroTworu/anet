@@ -4,3 +4,4 @@
 *.sh
 android-build/*
 .env
+docker-compose.yml

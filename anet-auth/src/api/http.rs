@@ -315,6 +315,7 @@ impl VpnApi {
                     sessions: rate_model.sessions as u32,
                     date_end: rate_model.date_end.format("%Y-%m-%d-%H:%M").to_string(),
                 }),
+                static_ip: m.static_ip.map(|ip| ip.parse().ok()).flatten(),
             })
             .collect();
 
@@ -354,6 +355,7 @@ impl VpnApi {
                     is_active: u.is_active,
                     created_at: u.created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
                     rate: rate_dto,
+                    static_ip: u.static_ip.map(|ip| ip.parse().ok()).flatten(),
                 }
             }
             Ok(None) => return GetUserApiResult::NotFound(Json("VPN клиент не найден".to_string())),
@@ -388,6 +390,7 @@ impl VpnApi {
             is_active: Set(true),
             created_at: Set(chrono::Utc::now().naive_utc()),
             updated_at: Set(chrono::Utc::now().naive_utc()),
+            static_ip: Set(None),
         };
 
         if let Err(e) = new_user.insert(&self.db).await {
@@ -511,6 +514,7 @@ impl VpnApi {
                             .format("%Y-%m-%d %H:%M:%S")
                             .to_string(),
                         rate: rate_dto,
+                        static_ip: updated_data.static_ip.map(|ip| ip.parse().ok()).flatten(),
                     }));
                 }
                 Err(e) => {
@@ -535,6 +539,7 @@ impl VpnApi {
                 .format("%Y-%m-%d %H:%M:%S")
                 .to_string(),
             rate: rate_dto,
+            static_ip: editable_user.static_ip.unwrap().map(|ip| ip.parse().ok()).flatten(),
         }))
     }
 

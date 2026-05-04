@@ -111,6 +111,7 @@ async fn handle_add_user(
         is_active: Set(true),
         created_at: Set(chrono::Utc::now().naive_utc()),
         updated_at: Set(chrono::Utc::now().naive_utc()),
+        static_ip: Set(None),
     };
 
     // 3. Сохраняем
