@@ -14,7 +14,7 @@ type LoginResponse = {
 export async function login(data: LoginRequest): Promise<string> {
   const res = await api<LoginResponse>('/login', {
     method: 'POST',
-    body: JSON.stringify(data)
+    body: JSON.stringify(data),
   })
 
   return res.access_token

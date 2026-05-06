@@ -5,33 +5,51 @@ import router from '@/router'
 
 const username = ref('')
 const password = ref('')
+const loading = ref(false)
 
 const submit = async () => {
-  const token = await login({
-    login: username.value,
-    password: password.value
-  })
+  loading.value = true
 
-  localStorage.setItem('token', token)
-  router.push('/users')
+  try {
+    const token = await login({
+      login: username.value,
+      password: password.value,
+    })
+
+    localStorage.setItem('token', token)
+    router.push('/users')
+  } finally {
+    loading.value = false
+  }
 }
-
 </script>
 
 <template>
-  <form @submit.prevent="submit">
-    <div>
-      <label>Email</label>
-      <input v-model="username" required />
-    </div>
+  <n-card title="Login" style="max-width: 400px; margin: 100px auto;">
+    <n-form @submit.prevent="submit">
 
-    <div>
-      <label>Password</label>
-      <input v-model="password" type="password" required />
-    </div>
+      <n-form-item label="Login">
+        <n-input v-model:value="username" placeholder="Enter login" />
+      </n-form-item>
 
-    <button type="submit">Login</button>
-  </form>
+      <n-form-item label="Password">
+        <n-input
+          v-model:value="password"
+          type="password"
+          show-password-on="click"
+          placeholder="Enter password"
+        />
+      </n-form-item>
+
+      <n-button
+        type="primary"
+        block
+        :loading="loading"
+        attr-type="submit"
+      >
+        Login
+      </n-button>
+
+    </n-form>
+  </n-card>
 </template>
-
-<style scoped></style>

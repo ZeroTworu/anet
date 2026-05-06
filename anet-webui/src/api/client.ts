@@ -2,10 +2,7 @@
 
 const API_URL = import.meta.env.ANET_API_URL || '/api/v1'
 
-export async function api<T>(
-  url: string,
-  options: RequestInit = {}
-): Promise<T> {
+export async function api<T>(url: string, options: RequestInit = {}): Promise<T> {
   const token = localStorage.getItem('token')
 
   const res = await fetch(`${API_URL}${url}`, {
@@ -13,8 +10,8 @@ export async function api<T>(
     headers: {
       'Content-Type': 'application/json',
       ...(options.headers || {}),
-      ...(token ? { Authorization: `Bearer ${token}` } : {})
-    }
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
   })
 
   if (!res.ok) {
