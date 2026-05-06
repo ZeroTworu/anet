@@ -6,11 +6,11 @@ type UsersRequest = {
 }
 
 export type UsersResponse = {
-    items: Item[]
+    items: User[]
     total: number
 }
 
-type Item = {
+export type User = {
     created_at: string
     fingerprint: string
     id: string
@@ -20,7 +20,7 @@ type Item = {
     uid: string
 }
 
-export async function getUsers(from: number = 0, limit: number = 10): Promise<UsersResponse> {
+export async function GetUsers(from: number = 0, limit: number = 10): Promise<UsersResponse> {
     const params = toQuery({
         from: from,
         limit: limit,
@@ -29,6 +29,10 @@ export async function getUsers(from: number = 0, limit: number = 10): Promise<Us
     const res = await api<UsersResponse>(`/users?${params}`)
 
     return res
+}
+
+export async function SaveUser(user: User) {
+    throw new Error("Надо доделать сохранение потому что обновление все данных идет разными запросами")
 }
 
 function toQuery(params: Record<string, string | number | null | undefined>) {
