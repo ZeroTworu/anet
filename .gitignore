@@ -4,4 +4,5 @@
 *.sh
 android-build/*
 .env
-docker-compose.yml
+/node_modules
+/.vscode
