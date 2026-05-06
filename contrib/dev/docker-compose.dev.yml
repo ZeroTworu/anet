@@ -1,0 +1,46 @@
+services:
+  anet-webui-dev:
+    container_name: anet-webui-dev
+    image: nginx:alpine
+    ports:
+      - "8080:80"
+    volumes:
+      - ../../anet-webui/dist:/usr/share/nginx/html:ro
+      - ./nginx.dev.conf:/etc/nginx/conf.d/default.conf:ro
+    restart: unless-stopped
+
+  anet-db-dev:
+    container_name: anet-db-dev
+    image: postgres:18
+    env_file:
+      - .env
+    volumes:
+      - dev_pg_data:/var/lib/postgresql
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB" ]
+      interval: 2s
+      timeout: 5s
+      retries: 5  
+
+  anet-auth-dev:
+    container_name: anet-auth-dev
+    image: debian:bookworm-slim
+    working_dir: /app
+    env_file:
+      - .env
+    volumes:
+      - ../../target/debug/anet-auth:/app/anet-auth:ro
+
+    command: ["./anet-auth"]
+
+    ports:
+      - "3000:3000"
+    depends_on:
+      - anet-db-dev
+
+    restart: unless-stopped
+
+volumes:
+  dev_pg_data:
