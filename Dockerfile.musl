@@ -1,0 +1,58 @@
+FROM ubuntu:24.04 AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# 1. Системные зависимости + инструменты сборки
+RUN apt-get update && apt-get install -y \
+    curl build-essential git clang llvm libclang-dev \
+    pkg-config protobuf-compiler m4 autoconf automake libtool \
+    wget xz-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+# 2. Ставим Zig (он поможет собрать статику без боли)
+RUN wget https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz && \
+    tar -xf zig-linux-x86_64-0.13.0.tar.xz && \
+    mv zig-linux-x86_64-0.13.0 /usr/local/zig
+ENV PATH="/usr/local/zig:${PATH}"
+
+# 3. Ставим Rust + Target Musl
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+ENV PATH="/root/.cargo/bin:${PATH}"
+RUN rustup target add x86_64-unknown-linux-musl
+RUN rustup toolchain install nightly && \
+    rustup component add rust-src --toolchain nightly
+
+# 4. Ставим вспомогательный софт
+RUN cargo install cargo-zigbuild bpf-linker --locked
+
+WORKDIR /app
+
+
+# Копируем структуру проекта
+COPY ./Cargo.toml ./Cargo.lock ./
+# Копируем все члены воркспейса (директории)
+COPY ./anet-server ./anet-server
+COPY ./anet-ebpf ./anet-ebpf
+COPY ./anet-common ./anet-common
+COPY ./anet-auth ./anet-auth
+COPY ./anet-client-core ./anet-client-core
+COPY ./anet-client-cli ./anet-client-cli
+COPY ./anet-client-gui ./anet-client-gui
+COPY ./anet-keygen ./anet-keygen
+COPY ./anet-mobile ./anet-mobile
+
+
+# 5. КРИТИЧЕСКИ ВАЖНО: Настройка для статической сборки сишных либ
+# Мы заставляем libbpf-sys собрать всё из исходников под musl
+ENV LI過BPF_SYS_EXT_VENDORED=1
+ENV OPENSSL_VENDORED=1
+
+# 6. Сборка через cargo-zigbuild
+# Флаг -C target-feature=+crt-static говорит линкеру вшить libc внутрь
+RUN RUSTFLAGS="-C target-feature=+crt-static" \
+    cargo zigbuild --release \
+    --target x86_64-unknown-linux-musl \
+    -p anet-server \
+    --features embed-ebpf
+
+# Результат будет в /app/target/x86_64-unknown-linux-musl/release/anet-server

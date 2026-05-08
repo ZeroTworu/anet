@@ -51,6 +51,7 @@ impl UdpAuthChannel {
 #[async_trait]
 impl AuthChannel for UdpAuthChannel {
     async fn send(&self, data: Bytes) -> Result<()> {
+        info!("[auth] send: TO: {}:{}, PAYLOAD: {:?}", self.target.ip(), self.target.port(), data);
         self.socket.send_to(&data, self.target).await?;
         Ok(())
     }
@@ -64,6 +65,7 @@ impl AuthChannel for UdpAuthChannel {
         if addr != self.target {
             return Err(anyhow::anyhow!("Received packet from unexpected address"));
         }
+        info!("[auth] recv: FROM:{}:{}, PAYLOAD: {:?}", addr.ip(), addr.port(), &buf[..len]);
         Ok(Bytes::copy_from_slice(&buf[..len]))
     }
 }
@@ -213,6 +215,7 @@ impl AuthHandler {
             .context("Failed Phase I send")?;
 
         let response_buf = channel.recv(Duration::from_secs(delay)).await?;
+        info!("[AUTH] Phase I: {:02x?}", response_buf);
 
         let shared_key = self.handle_phase_ii_response(&response_buf)?;
         info!("[AUTH] Phase II complete. Shared secret derived.");
@@ -245,7 +248,7 @@ impl AuthHandler {
         if response_buf.len() < NONCE_LEN + 16 {
             return Err(anyhow::anyhow!("Response too short"));
         }
-
+        info!("[AUTH] Phase II: {:02x?}", response_buf);
         let (nonce, ciphertext) = response_buf.split_at(NONCE_LEN);
         let plaintext = cipher
             .decrypt(nonce, Bytes::copy_from_slice(ciphertext))
@@ -297,7 +300,6 @@ impl AuthHandler {
         "[AUTH] Phase III: Sending Encrypted Auth Request ({} bytes).",
         request_packet.len()
     );
-
         channel
             .send(request_packet)
             .await

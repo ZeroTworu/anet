@@ -19,10 +19,10 @@ test:
 # Clean build artifacts
 clean:
 	cargo clean
-
 # Build static Linux binary (musl)
 musl:
 	RUSTFLAGS="-C target-feature=+crt-static" cargo build --release --target x86_64-unknown-linux-musl --package anet-server --package anet-client-cli --package anet-auth
+
 
 # Build Android libraries (requires cargo-ndk)
 mob:

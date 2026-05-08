@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["anet-server", "anet-client-cli", "anet-common", "anet-keygen", "anet-client-core", "anet-mobile", "anet-client-gui", "anet-auth"]
+members = ["anet-server", "anet-client-cli", "anet-common", "anet-keygen", "anet-client-core", "anet-mobile", "anet-client-gui", "anet-auth", "anet-ebpf"]
 default-members = ["anet-server", "anet-client-cli", "anet-common", "anet-auth", "anet-client-gui", "anet-keygen"]
 
 
@@ -55,6 +55,9 @@ lto = true
 codegen-units = 1
 panic = 'abort'
 incremental = false
+
+[profile.dev]
+panic = 'abort'
 
 
 [profile.release.package."*"]

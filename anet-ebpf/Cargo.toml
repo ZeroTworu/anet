@@ -1,0 +1,33 @@
+[package]
+name = "anet-ebpf"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+aya-ebpf = { version = "0.1.1", default-features = false }
+aya-log-ebpf = "0.1.0"
+network-types = "0.0.7"
+log = "0.4.29"
+
+
+[[bin]]
+name = "anet_kern"
+path = "src/main.rs"
+
+[lib]
+name = "anet_ebpf"
+path = "src/lib.rs"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+
+[build]
+target = "bpfel-unknown-none"
+
+[unstable]
+build-std = ["core"]
+[build-dependencies]
+which = "8.0.2"

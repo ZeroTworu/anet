@@ -2,6 +2,7 @@ use crate::auth_handler::ServerAuthHandler;
 use crate::client_registry::ClientRegistry;
 use crate::config::Config;
 use crate::multikey_udp_socket::{HandshakeData, MultiKeyAnetUdpSocket};
+use crate::anet_af_xdp_socket::AnetAfXdpSocket;
 use anet_common::consts::CHANNEL_BUFFER_SIZE;
 use anet_common::jitter::bridge_with_jitter;
 use anet_common::quic_settings::build_transport_config;
@@ -16,6 +17,8 @@ use std::io::BufReader;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
+use crate::ebpf::EbpfManager;
+use aya_log::EbpfLogger;
 
 fn load_cert_and_key(
     cert_pem: &str,
@@ -43,17 +46,20 @@ fn build_quinn_config(cfg: &Config) -> Result<QuinnServerConfig> {
 
 async fn serve_udp_auth_layer(
     auth_core: ServerAuthHandler,
-    socket: Arc<UdpSocket>,
+    af_xdp_socket: Arc<AnetAfXdpSocket>,
     mut rx_from_auth: mpsc::Receiver<HandshakeData>,
 ) {
-    info!("[QUIC Auth Worker] Running isolated UDP DHCP acceptor");
+    info!("[QUIC Auth Worker] Running isolated UDP DHCP acceptor via AF_XDP");
     while let Some((packet, remote_addr)) = rx_from_auth.recv().await {
         let handler = auth_core.clone();
-        let s = socket.clone();
+        let s = af_xdp_socket.clone();
         tokio::spawn(async move {
             match handler.process_handshake_packet(packet, remote_addr).await {
                 Ok((Some(resp), _)) => {
-                    let _ = s.send_to(&resp, remote_addr).await;
+                    // Отвечаем через ядерный TX-ринг
+                    if let Err(e) = s.send_raw_to(&resp, remote_addr) {
+                        error!("[QUIC Auth] Failed to send response via AF_XDP: {}", e);
+                    }
                 }
                 Err(e) => {
                     error!("[QUIC Handshake fail] {}: {}", remote_addr, e);
@@ -72,26 +78,38 @@ pub async fn run_quic_server(
 ) -> Result<()> {
     let bind_to = &config.server.quic_bind_to;
     let s_cfg = build_quinn_config(&config)?;
-    let real_socket = Arc::new(UdpSocket::bind(bind_to).await?);
 
+    let iface_name = "ens3"; // Убедись, что это имя твоего интерфейса
+
+    let bind_addr: std::net::SocketAddr = bind_to.parse()?;
+    let port = bind_addr.port();
+    let ebpf_manager = Arc::new(EbpfManager::load_and_attach(iface_name, port).await?);
     let (tx_auth, rx_auth) = mpsc::channel::<HandshakeData>(CHANNEL_BUFFER_SIZE);
 
-    // Передаем провайдера в стейт мультисокетного транспорта
-    let socket_wrapper = Arc::new(MultiKeyAnetUdpSocket::new(
-        real_socket.clone(),
+    // 1. Создаем AF_XDP сокет
+    let socket_wrapper = Arc::new(AnetAfXdpSocket::new(
+        iface_name,
+        port,
         registry.clone(),
         tx_auth,
         config.stealth.clone(),
-    ));
+    )?);
 
-    // Стартуем асинхронную ловушку DH Хендшейка UDP (Только для этого сокета)
+    // 2. Регистрируем сокет в eBPF карте!
+    // Без этого XDP_REDIRECT не будет работать
+    ebpf_manager.set_xsk(0, socket_wrapper.fd())?;
+
+    EbpfLogger::init(&mut *ebpf_manager.bpf.lock())?;
+
+    info!("[AF_XDP] Registered FD {} in XSK_MAP", socket_wrapper.fd());
+    // 3. Исправляем Auth Worker: он должен отвечать через AF_XDP
     tokio::spawn(serve_udp_auth_layer(
         auth_handler.clone(),
-        real_socket,
+        socket_wrapper.clone(),
         rx_auth,
     ));
 
-    info!("Starting ASTP[Crypted QUIC] Proxy Layer on {}", bind_to);
+    info!("Starting ASTP[Nuclear AF_XDP] Proxy Layer on {} ({})", bind_to, iface_name);
 
     let endpoint = Endpoint::new_with_abstract_socket(
         EndpointConfig::default(),
@@ -152,7 +170,7 @@ pub async fn run_quic_server(
                 _ = writer_task => info!("QUIC Writer task finished for {}", client_info.assigned_ip),
             };
 
-                info!("[VNC Node] Client disconnected and wiped: {}", client_info.assigned_ip);
+                info!("[QUIC] Client disconnected and wiped: {}", client_info.assigned_ip);
 
                 r.remove_client(&client_info);
             } else {

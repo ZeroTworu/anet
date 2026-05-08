@@ -1,0 +1,49 @@
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Устанавливаем всё из официальных реп (теперь libxdp там есть!)
+RUN apt-get update
+RUN apt-get install -y \
+    curl build-essential git clang llvm libclang-dev \
+    pkg-config libelf-dev zlib1g-dev libxdp-dev libbpf-dev \
+    protobuf-compiler m4 autoconf automake libtool \
+    gcc-multilib \
+    && rm -rf /var/lib/apt/lists/*
+
+
+RUN ln -s /usr/include/x86_64-linux-gnu/asm /usr/include/asm
+
+# Ставим Rust
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# Nightly для bpf-linker
+RUN rustup toolchain install nightly && \
+    rustup component add rust-src --toolchain nightly
+RUN cargo install bpf-linker --locked
+
+WORKDIR /app
+
+# Копируем структуру проекта
+COPY ./Cargo.toml ./Cargo.lock ./
+# Копируем все члены воркспейса (директории)
+COPY ./anet-server ./anet-server
+COPY ./anet-ebpf ./anet-ebpf
+COPY ./anet-common ./anet-common
+COPY ./anet-auth ./anet-auth
+COPY ./anet-client-core ./anet-client-core
+COPY ./anet-client-cli ./anet-client-cli
+COPY ./anet-client-gui ./anet-client-gui
+COPY ./anet-keygen ./anet-keygen
+COPY ./anet-mobile ./anet-mobile
+
+
+
+# Настройка компилятора
+ENV CC=clang
+# Даже на 24.04 флаг может пригодиться для тишины в логах
+ENV CFLAGS="-Wno-error=unused-command-line-argument"
+
+# Сборка!
+RUN cargo build --release -p anet-server --features embed-ebpf
