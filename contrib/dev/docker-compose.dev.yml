@@ -8,6 +8,8 @@ services:
       - ../../anet-webui/dist:/usr/share/nginx/html:ro
       - ./nginx.dev.conf:/etc/nginx/conf.d/default.conf:ro
     restart: unless-stopped
+    profiles:
+      - full_env
 
   anet-db-dev:
     container_name: anet-db-dev
