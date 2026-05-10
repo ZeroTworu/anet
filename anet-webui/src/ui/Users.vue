@@ -1,17 +1,18 @@
 <script setup lang="ts">
 import { onMounted, ref } from 'vue'
-import { GetUsers, SaveUser } from '@/api/users'
-import type { User, UsersResponse } from '@/api/users'
+import { GetUsers } from '@/api/users'
+import type { UsersResponse } from '@/models/user'
+
+import UserModal from '@/components/UserModal.vue'
 
 const data = ref<UsersResponse | null>(null)
 const loading = ref(false)
 
-const selectedUser = ref<User | null>(null)
+const selectedUserId = ref<string | null>(null)
 const showModal = ref(false)
 
 const loadUsers = async () => {
   loading.value = true
-
   try {
     data.value = await GetUsers(0, 10)
   } finally {
@@ -19,44 +20,24 @@ const loadUsers = async () => {
   }
 }
 
-const openEdit = (user: User) => {
-  selectedUser.value = { ...user }
+const openEdit = (id: string) => {
+  selectedUserId.value = id
   showModal.value = true
 }
 
 const closeModal = () => {
   showModal.value = false
-  selectedUser.value = null
+  selectedUserId.value = null
 }
-const saveUser = async () => {
-  if (!selectedUser.value) return
 
-  SaveUser(selectedUser.value)
-
-  await loadUsers()
-  closeModal()
-}
 onMounted(loadUsers)
 </script>
 
 <template>
   <n-spin :show="loading">
     <n-table v-if="data">
-      <thead>
-        <tr>
-          <th>UID</th>
-          <th>ID</th>
-          <th>Active</th>
-        </tr>
-      </thead>
-
       <tbody>
-        <tr
-          v-for="item in data.items"
-          :key="item.id"
-          @click="openEdit(item)"
-          style="cursor: pointer"
-        >
+        <tr v-for="item in data.items" :key="item.id" @click="openEdit(item.id)">
           <td>{{ item.uid }}</td>
           <td>{{ item.id }}</td>
           <td>
@@ -68,34 +49,11 @@ onMounted(loadUsers)
       </tbody>
     </n-table>
   </n-spin>
-  <n-modal v-model:show="showModal">
-    <n-card style="width: 600px" title="Edit user" :bordered="false">
-      <n-form v-if="selectedUser">
-        <n-form-item label="UID">
-          <n-input v-model:value="selectedUser.uid" />
-        </n-form-item>
 
-        <n-form-item label="Active">
-          <n-switch v-model:value="selectedUser.is_active" />
-        </n-form-item>
-
-        <n-form-item label="Rate">
-          <n-input-number v-model:value="selectedUser.rate" />
-        </n-form-item>
-
-        <n-form-item label="Static IP">
-          <n-input v-model:value="selectedUser.static_ip" />
-        </n-form-item>
-      </n-form>
-
-      <template #footer>
-        <n-space justify="end">
-          <n-button @click="closeModal">Cancel</n-button>
-          <n-button type="primary" @click="saveUser">Save</n-button>
-        </n-space>
-      </template>
-    </n-card>
-  </n-modal>
+  <UserModal
+    v-model:show="showModal"
+    :user-id="selectedUserId"
+    @updated="loadUsers"
+    @close="closeModal"
+  />
 </template>
-
-<style scoped></style>
