@@ -1,5 +1,6 @@
 use crate::api::dto::*;
 use crate::entities::{admins, sessions, users, users::Entity as User};
+use chrono::NaiveDateTime;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use log::error;
 use poem::Result;
@@ -115,6 +116,76 @@ impl VpnApi {
             sessions: editable_rate.sessions.unwrap() as u32,
             date_end: editable_rate.date_end.unwrap().format("%Y-%m-%d-%H:%M").to_string(),
         }))
+    }
+
+    // Добавление тарифа
+    #[oai(path = "/addrate", method = "post")]
+    async fn add_rate(&self, auth: AdminToken,
+        user_id: Query<Uuid>,
+        req: Json<AddRateRequest>,) -> AddRateApiResult {
+        // Проверяем админа
+        if let Err(err) = self.validate_admin_session(&auth.0.token).await {
+            return AddRateApiResult::Unauthorized(Json(err));
+        }
+
+       match users::Entity::find_by_id(user_id.0)
+            .one(&self.db)
+            .await
+        {
+            Ok(Some(_)) => {}
+        
+            Ok(None) => {
+                return AddRateApiResult::BadRequest(
+                    Json("Пользователь не найден".to_string())
+                );
+            }
+        
+            Err(e) => {
+                error!("[DB ERROR] Get User By ID: {}", e);
+            
+                return AddRateApiResult::Error(
+                    Json("Ошибка поиска пользователя".to_string())
+                );
+            }
+        }
+
+        let rate_id = Uuid::new_v4(); // Генерируем UUID тарифа
+
+            // --- ЛОГИКА СОЗДАНИЯ ТАРИФА (RATE) ---
+        let date_parsed: NaiveDateTime = if let Some(new_date_str) = &req.0.date_end {
+            let date_parsed = match chrono::NaiveDateTime::parse_from_str(new_date_str, "%Y-%m-%d-%H:%M") {
+                Ok(d) => d,
+                Err(_) => return AddRateApiResult::BadRequest(Json("Неверный формат даты. Ожидается YYYY-MM-DD-HH:MM".to_string())),
+            };
+            date_parsed
+        } else {
+            return AddRateApiResult::BadRequest(Json("Нету даты".to_string()))
+        };
+
+        let new_sessions = req.0.sessions.unwrap_or(0);
+
+        let new_rate= crate::entities::rates::ActiveModel  {
+            id: Set(rate_id),
+            user_id: Set(user_id.0),
+            sessions: Set(new_sessions as i32),
+            date_end: Set(date_parsed),
+            created_at: Set(chrono::Utc::now().naive_utc()),
+            updated_at: Set(chrono::Utc::now().naive_utc()),
+        };
+
+        match new_rate.insert(&self.db).await {
+            Ok(added_data) => {
+                return AddRateApiResult::Ok(Json(RateDto {
+                    id: added_data.id,
+                    sessions: added_data.sessions as u32,
+                    date_end: added_data.date_end.format("%Y-%m-%d-%H:%M").to_string(),
+                }));
+            }
+            Err(e) => {
+                error!("[DB ERROR] Add rate failed: {}", e);
+                return AddRateApiResult::Error(Json("Ошибка добавления тарифа в БД!".to_string()));
+            }
+        }
     }
 
     /// Проверка VPN Сервера при Handshake
