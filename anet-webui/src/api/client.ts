@@ -4,7 +4,7 @@ const API_URL = import.meta.env.ANET_API_URL || '/api/v1'
 
 export async function api<T>(url: string, options: RequestInit = {}): Promise<T> {
   const token = localStorage.getItem('token')
-
+  console.log('current url:', `${API_URL}${url}`)
   const res = await fetch(`${API_URL}${url}`, {
     ...options,
     headers: {
