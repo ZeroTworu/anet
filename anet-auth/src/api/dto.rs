@@ -133,6 +133,18 @@ pub enum UpdateRateApiResult {
 }
 
 #[derive(Object)]
+pub struct AddRateRequest { pub sessions: Option<u32>, pub date_end: Option<String> }
+
+#[derive(ApiResponse)]
+pub enum AddRateApiResult {
+    #[oai(status = 200)] Ok(Json<RateDto>),
+    #[oai(status = 400)] BadRequest(Json<String>),
+    #[oai(status = 401)] Unauthorized(Json<String>),
+    #[oai(status = 404)] NotFound(Json<String>),
+    #[oai(status = 500)] Error(Json<String>),
+}
+
+#[derive(Object)]
 pub struct RegenerateUserResponse {
     pub id: uuid::Uuid, pub uid: Option<String>, pub fingerprint: String,
     pub private_key: String, pub public_key: String,
