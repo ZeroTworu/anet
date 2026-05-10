@@ -5,11 +5,14 @@ import type { UsersResponse } from '@/models/user'
 
 import UserModal from '@/components/UserModal.vue'
 
+import CreateUserModal from '@/components/CreateUserModal.vue'
+
 const data = ref<UsersResponse | null>(null)
 const loading = ref(false)
 
 const selectedUserId = ref<string | null>(null)
 const showModal = ref(false)
+const showCreate = ref(false)
 
 const loadUsers = async () => {
   loading.value = true
@@ -34,6 +37,11 @@ onMounted(loadUsers)
 </script>
 
 <template>
+  <n-space justify="space-between">
+    <div style="display: flex; justify-content: end; padding: 10px">
+      <n-button type="primary" @click="showCreate = true"> Add User </n-button>
+    </div>
+  </n-space>
   <n-spin :show="loading">
     <n-table v-if="data">
       <tbody>
@@ -56,4 +64,6 @@ onMounted(loadUsers)
     @updated="loadUsers"
     @close="closeModal"
   />
+
+  <CreateUserModal v-model:show="showCreate" @created="loadUsers" />
 </template>
