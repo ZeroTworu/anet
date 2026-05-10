@@ -7,10 +7,10 @@ import Users from '@/ui/Users.vue'
 const router = createRouter({
   history: createWebHistory(),
   routes: [
-    { 
-        path: '/', 
-        component: Auth,
-        meta: {isAuth: true}
+    {
+      path: '/',
+      component: Auth,
+      meta: { isAuth: true },
     },
     { path: '/users', component: Users },
   ],

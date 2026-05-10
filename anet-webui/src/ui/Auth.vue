@@ -25,9 +25,8 @@ const submit = async () => {
 </script>
 
 <template>
-  <n-card title="Login" style="max-width: 400px; margin: 100px auto;">
+  <n-card title="Login" style="max-width: 400px; margin: 100px auto">
     <n-form @submit.prevent="submit">
-
       <n-form-item label="Login">
         <n-input v-model:value="username" placeholder="Enter login" />
       </n-form-item>
@@ -41,15 +40,7 @@ const submit = async () => {
         />
       </n-form-item>
 
-      <n-button
-        type="primary"
-        block
-        :loading="loading"
-        attr-type="submit"
-      >
-        Login
-      </n-button>
-
+      <n-button type="primary" block :loading="loading" attr-type="submit"> Login </n-button>
     </n-form>
   </n-card>
 </template>
