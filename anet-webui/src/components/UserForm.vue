@@ -8,7 +8,6 @@ const user = defineModel<User>('modelValue', {
 
 <template>
   <n-form>
-    
     <!-- UID (editable) -->
     <n-form-item label="UID">
       <n-input v-model:value="user.uid" />
