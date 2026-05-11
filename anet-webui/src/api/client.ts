@@ -1,6 +1,6 @@
 // src/api/client.ts
 
-const API_URL = import.meta.env.ANET_API_URL || '/api/v1'
+const API_URL = '/api/v1'
 
 export async function api<T>(url: string, options: RequestInit = {}): Promise<T> {
   const token = localStorage.getItem('token')
