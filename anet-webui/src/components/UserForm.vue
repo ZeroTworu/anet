@@ -18,11 +18,6 @@ const user = defineModel<User>('modelValue', {
       <n-switch v-model:value="user.is_active" />
     </n-form-item>
 
-    <!-- Static IP (editable) -->
-    <n-form-item label="Static IP">
-      <n-input v-model:value="user.static_ip" />
-    </n-form-item>
-
     <n-divider />
 
     <!-- Readonly fields -->

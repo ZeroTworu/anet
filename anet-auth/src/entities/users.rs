@@ -17,8 +17,6 @@ pub struct Model {
 
     pub created_at: DateTime,
     pub updated_at: DateTime,
-
-    pub static_ip: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

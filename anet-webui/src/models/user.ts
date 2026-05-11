@@ -12,7 +12,6 @@ export type User = {
   is_active: boolean
   created_at: string
   rate: Rate | null
-  static_ip: string | null
 }
 
 export type UpdateUserRequest = {
