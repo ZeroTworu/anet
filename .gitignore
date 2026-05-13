@@ -4,3 +4,5 @@
 *.sh
 android-build/*
 .env
+/node_modules
+/.vscode
