@@ -247,8 +247,7 @@ impl AsyncUdpSocket for AnetAfXdpSocket {
 
         if rcvd == 0 {
             // Нет данных — перепланируем задачу и сообщим Quinn, что пока ничего нет
-            cx.waker().wake_by_ref();
-            return Poll::Ready(Ok(0));
+            return self.async_fd.poll_read_ready(cx)?.map(|_| Ok(0));
         }
 
         let mut count = 0;
@@ -344,8 +343,7 @@ impl AsyncUdpSocket for AnetAfXdpSocket {
             Poll::Ready(Ok(count))
         } else {
             // Если нет пакетов для Quinn, всё равно перепланируем
-            cx.waker().wake_by_ref();
-            Poll::Ready(Ok(0))
+            self.async_fd.poll_read_ready(cx)?.map(|_| Ok(0))
         }
     }
 
@@ -440,15 +438,15 @@ impl UdpPoller for AfXdpPoller {
         // Если нет свободных, ждём событие от ядра
         match self.socket.async_fd.poll_write_ready(cx) {
             Poll::Ready(Ok(_)) => {
-                info!("[AF_XDP] poll_writable -> Ready (epoll)");
+                // info!("[AF_XDP] poll_writable -> Ready (epoll)");
                 Poll::Ready(Ok(()))
             }
             Poll::Pending => {
-                info!("[AF_XDP] poll_writable -> Pending");
+                // info!("[AF_XDP] poll_writable -> Pending");
                 Poll::Pending
             }
             Poll::Ready(Err(e)) => {
-                error!("[AF_XDP] poll_writable error: {}", e);
+                // error!("[AF_XDP] poll_writable error: {}", e);
                 Poll::Ready(Err(e))
             }
         }
