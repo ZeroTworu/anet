@@ -97,6 +97,7 @@ pub struct ServerCoreConfig {
     pub ssh_bind_to: String,
     pub vnc_bind_to: String,
     pub ssh_host_key: String,
+    pub db_url: Option<String>,
 }
 
 impl Default for ServerCoreConfig {
@@ -106,6 +107,7 @@ impl Default for ServerCoreConfig {
             ssh_bind_to: "0.0.0.0:822".to_string(),
             vnc_bind_to: "0.0.0.0:5900".to_string(),
             ssh_host_key: "/etc/ssh/ssh_host_rsa_key".to_string(),
+            db_url: None,
         }
     }
 }
@@ -129,6 +131,7 @@ pub struct Config {
 
     #[serde(default)]
     pub stealth: StealthConfig,
+
 }
 
 #[derive(Debug, Parser)]

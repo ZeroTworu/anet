@@ -13,6 +13,7 @@ use base64::prelude::*;
 use dashmap::DashMap;
 use ed25519_dalek::SigningKey;
 use log::error;
+use sea_orm::DatabaseConnection;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -25,7 +26,7 @@ pub struct ANetServer {
 }
 
 impl ANetServer {
-    pub fn new(cfg_ref: &Config) -> Result<Self> {
+    pub fn new(cfg_ref: &Config, db: DatabaseConnection) -> Result<Self> {
         let t_prm = TunParams {
             netmask: cfg_ref.network.mask.parse()?, gateway: cfg_ref.network.gateway.parse()?,
             address: cfg_ref.network.self_ip.parse()?, name: cfg_ref.network.if_name.clone(),
@@ -35,6 +36,7 @@ impl ANetServer {
         let pl = IpPool::new(
             cfg_ref.network.net.parse()?, cfg_ref.network.mask.parse()?,
             cfg_ref.network.gateway.parse()?, cfg_ref.network.self_ip.parse()?, cfg_ref.network.mtu,
+            db
         );
 
         let sk_bytes = BASE64_STANDARD.decode(&cfg_ref.crypto.server_signing_key)?;

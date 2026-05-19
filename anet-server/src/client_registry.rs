@@ -73,13 +73,8 @@ impl ClientRegistry {
         let client_ip = &client_info.assigned_ip;
         let remote_addr = **client_info.remote_addr.load();
 
-        self.quic_router.remove(client_ip);
         self.clients_by_prefix.remove(&client_info.nonce_prefix);
         self.clients_by_addr.remove(&remote_addr);
-
-        if let Ok(ip_addr) = client_ip.parse::<Ipv4Addr>() {
-            self.ip_pool.release(ip_addr);
-        }
 
         // dec sessions
         let ap = self.auth_provider.clone();
@@ -92,8 +87,8 @@ impl ClientRegistry {
         info!("[Registry] Client {} removed.", client_ip);
     }
 
-    pub fn allocate_ip(&self) -> Option<Ipv4Addr> {
-        self.ip_pool.allocate()
+    pub async fn allocate_ip(&self, fingerprint: String) -> Result<Ipv4Addr, anyhow::Error> {
+        self.ip_pool.allocate(fingerprint).await
     }
 
     pub fn get_by_addr(&self, remote_addr: &SocketAddr) -> Option<Arc<ClientTransportInfo>> {
