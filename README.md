@@ -62,5 +62,11 @@ make cert
 
 [TG Channel](https://t.me/anet_org) могу тут писать не трезвым и с ошибками
 
+Тут некто [Lisenblsh](https://github.com/Lisenblsh) завернул всё это в docker - [anet-docker](https://github.com/Lisenblsh/anet-docker)
 
-На J7: [Donate](https://dalink.to/rventomarika)
+Лично я не проверял, но с первого взгляда выглядит нормально.
+
+**WARNINING!**
+
+Это не мой друг-знакомый, так что "на свой страх и риск", обсуждение [тут](https://github.com/ZeroTworu/anet/issues/36).
+
