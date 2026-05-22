@@ -11,7 +11,7 @@ use anyhow::Result;
 use log::{error, info};
 use quinn::{ClientConfig, Connection, Endpoint, EndpointConfig, TokioRuntime};
 use rustls::RootCertStore;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
@@ -41,7 +41,8 @@ impl VpnHandler {
             build_transport_config(&self.config.quic_transport, auth_response.mtu as u16)?;
 
         // 2. Создание сокета (AnetUdpSocket)
-        let server_addr: SocketAddr = self.config.main.address.parse()?;
+        let addr_str = &self.config.main.address;
+        let server_addr: SocketAddr = addr_str.to_socket_addrs()?.next().ok_or(anyhow::anyhow!("Invalid server address"))?;
         let real_socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
         let cipher = Arc::new(Cipher::new(&shared_key));
         let nonce_prefix: [u8; 4] = auth_response.nonce_prefix.as_slice().try_into()?;

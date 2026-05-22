@@ -1,11 +1,11 @@
 use super::{ClientTransport, ConnectionResult, MutexVpnStream};
 use crate::config::CoreConfig;
 use crate::auth::{AuthHandler, AuthChannel};
-use anyhow::{Context, Result};
+use anyhow::Result;
 use async_trait::async_trait;
 use bytes::{BufMut, Bytes};
 use log::{info, warn};
-use std::net::SocketAddr;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -58,7 +58,8 @@ impl VncTransport { pub fn new(c: CoreConfig) -> Self { Self { config: c } } }
 #[async_trait]
 impl ClientTransport for VncTransport {
     async fn connect(&self) -> Result<ConnectionResult> {
-        let addr: SocketAddr = self.config.main.address.parse().context("Invalid server target")?;
+        let addr_str = &self.config.main.address;
+        let addr: SocketAddr = addr_str.to_socket_addrs()?.next().ok_or(anyhow::anyhow!("Invalid server address"))?;
         info!("[VNC Transport] Probing fake desktop target: {}", addr);
 
         let mut stream = TcpStream::connect(addr).await?;

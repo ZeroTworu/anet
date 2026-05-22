@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use log::info;
 use quinn::{ClientConfig, Endpoint, EndpointConfig, RecvStream, SendStream, TokioRuntime};
 use rustls::RootCertStore;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -78,7 +78,8 @@ impl QuicTransport {
 impl ClientTransport for QuicTransport {
     async fn connect(&self) -> Result<ConnectionResult> {
         // 1. Создаем канал
-        let server_addr: SocketAddr = self.config.main.address.parse()?;
+        let addr_str = &self.config.main.address;
+        let server_addr: SocketAddr = addr_str.to_socket_addrs()?.next().ok_or(anyhow::anyhow!("Invalid server address"))?;
         let udp_socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
         let channel = UdpAuthChannel::new(udp_socket.clone(), server_addr);
 
