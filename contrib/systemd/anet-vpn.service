@@ -7,22 +7,30 @@ Before=network-online.target
 [Service]
 Type=simple
 DynamicUser=yes
-# NoNewPrivileges=yes
+NoNewPrivileges=yes
 
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_IPC_LOCK
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_IPC_LOCK
+StateDirectory=anet
+
+AmbientCapabilities=CAP_NET_ADMIN  CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 
 Environment=RUST_LOG=info
 
 WorkingDirectory=/opt/anet
 ExecStart=/opt/anet/anet-server -c /opt/anet/server.toml
-ExecReload=/bin/kill -HUP $MAINPID
-ExecStop=/bin/kill -TERM $MAINPID
 
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=30s
 TimeoutStartSec=30s
+
+ProtectClock=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectKernelLogs=yes
+ProtectHome=yes
+ProtectSystem=strict
+ProtectProc=invisible
 
 [Install]
 WantedBy=multi-user.target

@@ -9,17 +9,31 @@ Type=simple
 DynamicUser=yes
 NoNewPrivileges=yes
 
+CapabilityBoundingSet=
+
 Environment=RUST_LOG=info
 
 WorkingDirectory=/opt/anet
 ExecStart=/opt/anet/anet-auth
-ExecReload=/bin/kill -HUP $MAINPID
-ExecStop=/bin/kill -TERM $MAINPID
 
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=30s
 TimeoutStartSec=30s
+
+ProtectClock=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectKernelLogs=yes
+ProtectHome=yes
+ProtectSystem=strict
+ProtectProc=invisible
+PrivateDevices=yes
+PrivateTmp=yes
+
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+RestrictNamespaces=yes
 
 [Install]
 WantedBy=multi-user.target

@@ -37,7 +37,9 @@ mtu = 1300
 # сетевых интерфейсах.
 quicbind_to = "0.0.0.0:8443"
 ssh_bind_to = "0.0.0.0:8222"
+vnc_bind_to = "0.0.0.0:56678"
 ssh_host_key = "/etc/ssh/ssh_host_rsa_key"
+# ssh_host_key = "/opt/anet/anet_ssh_host_key"
 
 # =========================================================================
 # ANET Server: Аутентификация и авторизация

@@ -42,6 +42,16 @@ openssl req -x509 -newkey ed25519 -keyout key.pem -out cert.pem -days 365 -nodes
 * Содержимое `cert.pem` кладём в `quic_cert = `, содержимое `key.pem` — в `quic_key = `, а приватный ключ от `anet-keygen` — в `server_signing_key = `.
 * Настраиваем транспорты (UDP/TCP), подсети и маскировку в секциях `[server]`, `[network]`, `[stealth]`.
 
+### SSH
+Если сервер стартует не от `root`, а например по присету юнита из `contrib/systemd/`, то дефолтный `ssh_host_key = "/etc/ssh/ssh_host_rsa_key"` не подойдёт, т.к. прав нету, нужно создать отдельный `ssh key`.
+
+Предположим всё лежит в `/opt/anet`.
+
+* `ssh-keygen -t rsa -b 4096 -f /opt/anet/anet_ssh_host_key -N "" -q` - генерим ключ.
+* `chmod 644 /opt/anet/anet_ssh_host_key /opt/anet/anet_ssh_host_key.pub` - меняем права
+* в конфиге сервера `ssh_host_key = "/opt/anet/anet_ssh_host_key"`
+
+PS. Внимательный Зоркий Джо, мог заметить в пресете `StateDirectory=anet` - ну, так если Зоркий Джо знает, что это, ему и другая версия инструкции не нужна.
 ### Запуск сервера и маршрутизация (ВАЖНО!)
 
 После запуска сервера необходимо на уровне ОС настроить перенаправление трафика между `TUN` интерфейсом (по умолчанию `anet-server`) и вашим внешним интерфейсом (интернетом).

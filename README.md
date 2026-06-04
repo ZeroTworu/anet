@@ -1,8 +1,7 @@
 # ANet: Сеть Друзей
 
-![Build Status](https://img.shields.io/badge/build-passing-brightgreen)
 ![Language](https://img.shields.io/badge/rust-1.84%2B-orange)
-![Protocol](https://img.shields.io/badge/protocol-ASTP_v0.5-blue)
+![Protocol](https://img.shields.io/badge/protocol-ASTP_v0.6-blue)
 
 **ANet** — это инструмент для организации приватного, защищенного информационного пространства между близкими людьми. Мы строим цифровые мосты там, где обычные пути недоступны.
 
@@ -23,6 +22,7 @@
 
 *   `anet-auth` — Узел координации.
 *   `anet-server` — Сам сервер (может работать без `anet-auth`).
+*   `anet-client-core` — Непосредственно клиент.
 *   `anet-client-cli` — Консольный клиент для Linux/Headless систем.
 *   `anet-client-gui` — Графический клиент (Windows/Linux) с минималистичным интерфейсом.
 *   `anet-mobile` — Библиотека и JNI-биндинги для Android.
@@ -60,7 +60,9 @@ make cert
 ```
 [Android src](https://github.com/ZeroTworu/anet-android)
 
-[TG Channel](https://t.me/anet_org) могу тут писать не трезвым и с ошибками
+[TG Channel](https://t.me/anet_org)
+
+[Donate](https://dalink.to/anet_project)
 
 Тут некто [Lisenblsh](https://github.com/Lisenblsh) завернул всё это в docker - [anet-docker](https://github.com/Lisenblsh/anet-docker)
 
