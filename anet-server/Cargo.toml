@@ -25,6 +25,10 @@ ed25519-dalek = {workspace = true}
 async-trait = { workspace = true }
 futures = { workspace = true }
 
+sea-orm = { version = "1", features = ["sqlx-postgres", "sqlx-sqlite", "runtime-tokio-rustls"] }
+
+directories = "5"
+
 russh = "0.45"
 russh-keys = "0.45"
 
@@ -33,6 +37,7 @@ arc-swap = "1.6"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 anet-common = { path = "../anet-common" }
+sea-orm-migration = "1.1.20"
 
 [[bin]]
 name = "anet-server"

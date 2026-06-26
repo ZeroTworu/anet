@@ -1,7 +1,9 @@
 use anet_server::config::load;
 use anet_server::server;
 use anyhow::Result;
+use sea_orm::DatabaseConnection;
 use server::ANetServer;
+use anet_server::db::AnetDB;
 
 // #[tokio::main(flavor = "current_thread")]
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
@@ -17,7 +19,10 @@ async fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let cfg = load().await?;
 
-    let mut server = ANetServer::new(&cfg)?;
+    let db: DatabaseConnection = AnetDB::connect_db(cfg.server.db_url.clone()).await?;
+    
+
+    let mut server = ANetServer::new(&cfg, db)?;
     server.run().await?;
 
     Ok(())

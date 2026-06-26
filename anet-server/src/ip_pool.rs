@@ -1,6 +1,8 @@
-use dashmap::DashSet;
+use anyhow::Error;
+use sea_orm::{ActiveValue::Set, DatabaseConnection, QuerySelect, TransactionTrait, sqlx::types::chrono};
 use std::net::Ipv4Addr;
-use std::sync::Arc;
+use crate::entities::clients;
+use sea_orm::{EntityTrait};
 
 #[derive(Clone)]
 pub struct IpPool {
@@ -9,7 +11,7 @@ pub struct IpPool {
     pub gateway: Ipv4Addr,
     pub server: Ipv4Addr,
     pub mtu: u16,
-    used: Arc<DashSet<Ipv4Addr>>,
+    db: DatabaseConnection,
 }
 
 impl IpPool {
@@ -19,6 +21,7 @@ impl IpPool {
         gateway: Ipv4Addr,
         server: Ipv4Addr,
         mtu: u16,
+        db: DatabaseConnection,
     ) -> Self {
         Self {
             network,
@@ -26,38 +29,104 @@ impl IpPool {
             gateway,
             server,
             mtu,
-            used: Arc::new(DashSet::new()),
+            db,
         }
     }
 
-    pub fn allocate(&self) -> Option<Ipv4Addr> {
+    pub async fn allocate(
+        &self,
+        fingerprint: String,
+    ) -> Result<Ipv4Addr, Error> {
+    
+        let txn = self.db.begin().await?;
+    
+        // 1. уже есть IP
+        if let Some(ip) = self.get_ip(&txn, fingerprint.clone()).await? {
+            txn.commit().await?;
+            return Ok(ip);
+        }
+    
+        // 2. ищем свободный
+        let ip = self.assign_ip(&txn).await?;
+    
+        // 3. сохраняем
+        self.set_ip(&txn, fingerprint, ip).await?;
+    
+        txn.commit().await?;
+    
+        Ok(ip)
+    }
+
+    async fn get_ip(
+        &self,
+        txn: &sea_orm::DatabaseTransaction,
+        fingerprint: String,
+    ) -> Result<Option<Ipv4Addr>, Error> {
+
+        let model = clients::Entity::find_by_id(fingerprint)
+            .one(txn)
+            .await?;
+
+        Ok(model.map(|m| Ipv4Addr::from(m.ip as u32)))
+    }
+
+    async fn assign_ip(
+        &self,
+        txn: &sea_orm::DatabaseTransaction,
+    ) -> Result<Ipv4Addr, Error> {
+
+        let used: Vec<i64> = clients::Entity::find()
+            .select_only()
+            .column(clients::Column::Ip)
+            .into_tuple()
+            .all(txn)
+            .await?;
+
+        let used: std::collections::HashSet<u32> =
+            used.into_iter().map(|v| v as u32).collect();
+
         let net = u32::from(self.network);
         let mask = u32::from(self.netmask);
-        let gw = self.gateway;
-        let srv = self.server;
 
-        for host in 1..=u32::MAX {
+        for host in 1..=254u32 {
             let candidate = net | host;
+
             if (candidate & mask) != (net & mask) {
                 break;
             }
+
             let ip = Ipv4Addr::from(candidate);
 
-            if ip == gw || ip == srv {
-                continue;
-            }
-            if self.used.contains(&ip) {
+            if ip == self.gateway || ip == self.server {
                 continue;
             }
 
-            self.used.insert(ip);
-            return Some(ip);
+            if used.contains(&candidate) {
+                continue;
+            }
+
+            return Ok(ip);
         }
-        None
+
+        Err(anyhow::anyhow!("no free IPs in pool"))
     }
 
-    pub fn release(&self, ip: Ipv4Addr) -> bool {
-        self.used.remove(&ip);
-        self.used.contains(&ip)
+    async fn set_ip(
+        &self,
+        txn: &sea_orm::DatabaseTransaction,
+        fingerprint: String,
+        ip: Ipv4Addr,
+    ) -> Result<(), Error> {
+    
+        clients::Entity::insert(clients::ActiveModel {
+            fingerprint: Set(fingerprint),
+            ip: Set(u32::from(ip) as i64),
+            created_at: Set(chrono::Utc::now().naive_utc()),
+            updated_at: Set(chrono::Utc::now().naive_utc()),
+        })
+        .exec(txn)
+        .await?;
+    
+        Ok(())
     }
 }

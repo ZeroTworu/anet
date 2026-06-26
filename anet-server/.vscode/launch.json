@@ -1,0 +1,61 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug anet-server",
+      "cargo": {
+        "args": [
+          "build",
+          "--bin",
+          "anet-server"
+        ],
+        "filter": {
+          "name": "anet-server",
+          "kind": "bin"
+        }
+      },
+      "args": [
+        "-c",
+        "/home/lis/Documents/coded/anet-fork/contrib/dev/server.toml"
+      ],
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "name": "Attach anet-server",
+      "type": "lldb",
+      "request": "attach",
+      "program": "${workspaceFolder}/target/debug/anet-server",
+      "pid": "${command:pickProcess}"
+    },
+{
+      "name": "Debug anet-server (sudo)",
+      "type": "lldb",
+      "request": "launch",
+
+      "program": "/home/lis/Documents/coded/anet-fork/target/debug/anet-server",
+
+      "args": [
+        "-c",
+        "/home/lis/Documents/coded/anet-fork/contrib/dev/server.toml"
+      ],
+
+      "cwd": "/home/lis/Documents/coded/anet-fork",
+
+      "preLaunchTask": "cargo build",
+
+      "initCommands": [
+        "platform select remote-linux"
+      ],
+
+      "pipeTransport": {
+        "pipeProgram": "sudo",
+        "pipeArgs": [
+          "-E"
+        ],
+        "debuggerPath": "/usr/bin/lldb-server"
+      }
+    }
+  ]
+}

@@ -7,3 +7,6 @@ pub(crate) mod multikey_udp_socket;
 pub mod server;
 pub(crate) mod utils;
 pub mod servers;
+pub mod db;
+pub(crate) mod migration;
+pub(crate) mod entities;
