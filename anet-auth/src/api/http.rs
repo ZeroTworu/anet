@@ -201,13 +201,18 @@ impl VpnApi {
             .map_err(poem::error::InternalServerError)?;
 
         if let Some((user, rate_opt)) = result {
+            let static_ip = user.static_ip.clone();
             if !user.is_active {
-                return Ok(Json(CheckAccessResponse { allowed: false, message: "Banned".into() }));
+                return Ok(Json(CheckAccessResponse {
+                    allowed: false,
+                    message: "Banned".into(),
+                    static_ip: None
+                }));
             }
 
             if let Some(rate) = rate_opt {
                 if chrono::Utc::now().naive_utc() > rate.date_end {
-                    return Ok(Json(CheckAccessResponse { allowed: false, message: "Время действия ключа истекло".into() }));
+                    return Ok(Json(CheckAccessResponse { allowed: false, message: "Время действия ключа истекло".into(), static_ip: None }));
                 }
 
                 let current_sessions = match crate::entities::active_sessions::Entity::find()
@@ -220,12 +225,12 @@ impl VpnApi {
                 };
 
                 if current_sessions >= (rate.sessions as i32) {
-                    return Ok(Json(CheckAccessResponse { allowed: false, message: "Кол-во сессий для ключа достигло максимума".into() }));
+                    return Ok(Json(CheckAccessResponse { allowed: false, message: "Кол-во сессий для ключа достигло максимума".into(), static_ip: None }));
                 }
             }
-            Ok(Json(CheckAccessResponse { allowed: true, message: "OK".into() }))
+            Ok(Json(CheckAccessResponse { allowed: true, message: "OK".into(), static_ip }))
         } else {
-            Ok(Json(CheckAccessResponse { allowed: false, message: "Not found".into() }))
+            Ok(Json(CheckAccessResponse { allowed: false, message: "Not found".into(), static_ip: None }))
         }
     }
 
@@ -386,6 +391,7 @@ impl VpnApi {
                     sessions: rate_model.sessions as u32,
                     date_end: rate_model.date_end.format("%Y-%m-%d-%H:%M").to_string(),
                 }),
+                static_ip: m.static_ip.map(|ip| ip.parse().ok()).flatten(),
             })
             .collect();
 
@@ -425,6 +431,7 @@ impl VpnApi {
                     is_active: u.is_active,
                     created_at: u.created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
                     rate: rate_dto,
+                    static_ip: u.static_ip.map(|ip| ip.parse().ok()).flatten(),
                 }
             }
             Ok(None) => return GetUserApiResult::NotFound(Json("VPN клиент не найден".to_string())),
@@ -459,6 +466,7 @@ impl VpnApi {
             is_active: Set(true),
             created_at: Set(chrono::Utc::now().naive_utc()),
             updated_at: Set(chrono::Utc::now().naive_utc()),
+            static_ip: Set(None),
         };
 
         if let Err(e) = new_user.insert(&self.db).await {
@@ -566,6 +574,12 @@ impl VpnApi {
             something_changed = true;
         }
 
+        // static_ip changed?
+        if let Some(static_ip) = req.0.static_ip {
+            editable_user.static_ip = Set(Some(static_ip));
+            something_changed = true;
+        }
+
         // 3. Завершаем работу!
         if something_changed {
             editable_user.updated_at = Set(chrono::Utc::now().naive_utc());
@@ -582,6 +596,7 @@ impl VpnApi {
                             .format("%Y-%m-%d %H:%M:%S")
                             .to_string(),
                         rate: rate_dto,
+                        static_ip: updated_data.static_ip.map(|ip| ip.parse().ok()).flatten(),
                     }));
                 }
                 Err(e) => {
@@ -606,6 +621,7 @@ impl VpnApi {
                 .format("%Y-%m-%d %H:%M:%S")
                 .to_string(),
             rate: rate_dto,
+            static_ip: editable_user.static_ip.unwrap().map(|ip| ip.parse().ok()).flatten(),
         }))
     }
 

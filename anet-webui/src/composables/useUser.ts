@@ -22,6 +22,7 @@ export function useUser() {
     await UpdateUser(user.value.id, {
       uid: user.value.uid,
       is_active: user.value.is_active,
+      static_ip: user.value.static_ip,
     })
   }
 
