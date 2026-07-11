@@ -27,6 +27,8 @@ rpassword = "7.4.0"
 jsonwebtoken = { version = "10.3.0", features = ["rust_crypto"] }
 bcrypt = "0.19.0"
 
+anet-common = { path = "../anet-common", features = ["poem"] }
+
 [[bin]]
 name = "anet-auth"
 path = "src/main.rs"

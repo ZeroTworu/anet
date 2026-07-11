@@ -290,6 +290,7 @@ dependencies = [
 name = "anet-auth"
 version = "0.1.0"
 dependencies = [
+ "anet-common",
  "anyhow",
  "base64",
  "bcrypt",
@@ -407,8 +408,8 @@ dependencies = [
  "bytes",
  "chacha20poly1305",
  "ed25519-dalek",
- "futures",
  "log",
+ "poem-openapi",
  "prost",
  "prost-build",
  "quinn",

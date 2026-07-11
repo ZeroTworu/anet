@@ -29,6 +29,7 @@ pub struct TempDHInfo {
     pub shared_key: [u8; 32],
     pub created_at: Instant,
     pub client_fingerprint: String,
+    pub static_ip: Option<String>,
 }
 
 pub type HandshakeData = (Bytes, SocketAddr);

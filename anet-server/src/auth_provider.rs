@@ -1,23 +1,8 @@
 use log::{error};
 use reqwest::Client as HttpClient;
-use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-#[derive(Serialize)]
-struct CheckAccessRequest {
-    fingerprint: String,
-}
-
-#[derive(Deserialize)]
-struct CheckAccessResponse {
-    message: String,
-    allowed: bool,
-}
-
-#[derive(Serialize)]
-struct SessionEventRequest {
-    pub fingerprint: String,
-}
+use anet_common::dto::{CheckAccessRequest, CheckAccessResponse, SessionEventRequest};
 
 #[derive(Clone)]
 pub struct AuthProvider {
@@ -54,10 +39,10 @@ impl AuthProvider {
     }
 
     /// Проверяет, разрешен ли доступ клиенту с данным fingerprint
-    pub async fn is_client_allowed(&self, fingerprint: &str) -> Result<(), String> {
+    pub async fn is_client_allowed(&self, fingerprint: &str) -> Result<Option<String>, String> {
         // 1. Локальный список (VIP)
         if self.allowed_clients.iter().any(|c| c == fingerprint) {
-            return Ok(());
+            return Ok(None);
         }
 
         // 2. Внешние сервера
@@ -73,7 +58,7 @@ impl AuthProvider {
                 Ok(resp) => {
                     if let Ok(json) = resp.json::<CheckAccessResponse>().await {
                         if json.allowed {
-                            return Ok(());
+                            return Ok(json.static_ip);
                         } else {
                             return Err(json.message);
                         }

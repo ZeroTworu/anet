@@ -1,12 +1,13 @@
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 import { AddRate, UpdateRate } from '@/api/rate'
+import type { User } from '@/models/user'
 
 export function useRate(user: any) {
   const saving = ref(false)
 
   const saveRate = async () => {
     if (!user.value?.rate) {
-      console.log('no rate')
+      console.error('no rate')
       return
     }
     saving.value = true

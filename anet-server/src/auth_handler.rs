@@ -116,7 +116,7 @@ impl ServerAuthHandler {
         let client_fingerprint = crypto_utils::generate_key_fingerprint(&client_public_key);
 
         match self.auth_provider.is_client_allowed(&client_fingerprint).await {
-            Ok(_) => {
+            Ok(static_ip) => {
                 // --- ЛОГИКА УСПЕХА (DH Phase 1) ---
                 crypto_utils::verify_signature(&client_public_key, &req.public_key, &req.client_signed_dh_key)?;
 
@@ -132,6 +132,7 @@ impl ServerAuthHandler {
                 self.temp_dh_map.insert(remote_addr, TempDHInfo {
                     shared_key: crypto_utils::derive_shared_key(&shared_secret),
                     client_fingerprint,
+                    static_ip,
                     created_at: Instant::now(),
                 });
 
@@ -184,7 +185,14 @@ impl ServerAuthHandler {
         };
         if req.client_id != temp_info.client_fingerprint { return Err(anyhow::anyhow!("Client ID mismatch")); }
 
-        let assigned_ip = self.registry.allocate_ip().context("IP POOL FOOL")?.to_string();
+        // Если в TempDHInfo от бэкенда прилетел статический IP, используем его, иначе динамически берем из пула
+        let assigned_ip = if let Some(static_ip) = temp_info.static_ip {
+            info!("[AUTH] Assigned static IP {} to client {}", static_ip, req.client_id);
+            static_ip
+        } else {
+            self.registry.allocate_ip().context("IP POOL FOOL")?.to_string()
+        };
+        
         let session_id = generate_seid();
         let nonce_prefix = generate_unique_nonce_prefix(self.registry.clone());
 

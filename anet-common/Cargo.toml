@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 
+[features]
+default = []
+poem = ["dep:poem-openapi"]
+
 [dependencies]
 tun = {workspace = true}
 bytes = {workspace = true}
@@ -20,7 +24,7 @@ rand = {workspace = true}
 x25519-dalek = {workspace = true}
 ed25519-dalek = {workspace = true}
 sha2 = {workspace = true}
-futures = { workspace = true }
+poem-openapi = { version = "5.1.12", features = ["uuid"], optional = true }
 
 base64 = "0.22.1"
 
