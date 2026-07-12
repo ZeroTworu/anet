@@ -1,0 +1,34 @@
+name: "Manual Deploy to VPS"
+
+# Включаем мануальный запуск по клику в UI
+on:
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: 'Причина деплоя (Необязательно)'
+        required: false
+        default: 'Ручной запуск'
+
+jobs:
+  deploy:
+    name: "Deploy to Production"
+    runs-on: "ubuntu-latest"
+    steps:
+      - name: "Execute remote SSH commands"
+        uses: "appleboy/ssh-action@v1.0.3"
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ secrets.SSH_PORT || 22 }}
+          script: |
+            echo "🚀 Starting deployment. Reason: ${{ github.event.inputs.reason }}"
+            cd /opt/anet
+            
+            docker-compose pull
+            
+            docker-compose up -d
+
+            docker image prune -f
+            
+            echo "✅ Deployment completed successfully! ANet WebUI is live."
