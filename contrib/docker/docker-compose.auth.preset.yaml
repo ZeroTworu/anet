@@ -1,0 +1,45 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: anet-db
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: db
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    ports:
+      - "5557:5432"
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB" ]
+      interval: 2s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  anet-auth:
+    image: ghcr.io/zerotworu/anet-auth:latest
+    container_name: anet-auth
+    environment:
+      - DATABASE_URL=postgres://postgres:password@postgres:5432/db
+      - BIND_TO=0.0.0.0:3000
+      - AUTH_BACKEND_KEY=test_key
+      - JWT_SECRET=secret_na_chushpana
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
+
+  anet-webui:
+    image: ghcr.io/zerotworu/anet-webui:latest
+    container_name: anet-webui
+    ports:
+      - "80:80"
+    depends_on:
+      - anet-auth
+    restart: unless-stopped
+
+volumes:
+  pg_data:
