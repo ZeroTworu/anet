@@ -40,7 +40,7 @@ const submit = async () => {
         />
       </n-form-item>
 
-      <n-button type="primary" block :loading="loading" attr-type="submit"> Login </n-button>
+      <n-button type="primary" block :loading="loading" attr-type="submit"> Войти </n-button>
     </n-form>
   </n-card>
 </template>
