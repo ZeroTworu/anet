@@ -116,7 +116,7 @@ pub struct AuthHandler {
 }
 
 impl AuthHandler {
-    pub fn new(cfg: &CoreConfig) -> Result<Self> {
+    pub fn new(cfg: &CoreConfig, server_pub_key_override: Option<&str>) -> Result<Self> {
         let ephemeral_secret = StaticSecret::random_from_rng(OsRng);
 
         let private_key_bytes = BASE64_STANDARD
@@ -131,9 +131,16 @@ impl AuthHandler {
         let client_public_key = signing_key.verifying_key();
         let client_id = generate_key_fingerprint(&client_public_key);
 
+        // Если есть переопределенный ключ для сервера — берем его, иначе глобальный
+        let key_str = server_pub_key_override.unwrap_or(&cfg.keys.server_pub_key);
+        if key_str.is_empty() {
+            anyhow::bail!("Публичный ключ сервера (server_pub_key) не настроен!");
+        }
+
         let server_pub_bytes = BASE64_STANDARD
-            .decode(&cfg.keys.server_pub_key)
+            .decode(key_str)
             .context("Failed to decode server public key")?;
+
         let server_public_key = VerifyingKey::from_bytes(
             &server_pub_bytes
                 .as_slice()

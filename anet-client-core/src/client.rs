@@ -1,6 +1,6 @@
-use crate::config::CoreConfig;
+use crate::config::{CoreConfig, ServerConfig};
 use crate::dns::{DnsManager, get_dns_manager};
-use crate::events::status;
+use crate::events::{status, warn, err};
 use crate::traits::{RouteManager, TunFactory};
 use crate::statistic;
 use crate::transport::factory::create_transport;
@@ -13,35 +13,28 @@ use quinn::Endpoint;
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
-use tokio::io::AsyncWriteExt; // Для write_all
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
-/// Хранит "живые" объекты запущенной сессии.
 struct RunningSession {
-    /// QUIC Endpoint (только для QUIC, нужно для отправки close frame)
     endpoint: Option<Endpoint>,
-    /// Сигнал для остановки фоновых задач пересылки байт
     shutdown_notify: Arc<Notify>,
-    /// Хендл главной задачи, чтобы подождать её завершения
     main_task: JoinHandle<()>,
-    /// Имя интерфейса (нужно для очистки DNS/маршрутов)
+    stats_task: Option<JoinHandle<()>>, // Сохраняем таску статистики для сброса
     iface_name: String,
 }
 
-/// Thread-safe, можно шарить между потоками GUI.
 pub struct AnetClient {
     config: CoreConfig,
-    /// Фабрика TUN (платформо-зависимая)
     tun_factory: Box<dyn TunFactory>,
-    /// Менеджер маршрутов (платформо-зависимый)
     route_manager: Box<dyn RouteManager>,
-    /// Менеджер DNS (платформо-зависимый)
     dns_manager: Box<dyn DnsManager>,
-    /// Состояние: Запущен или нет?
-    /// Когда это поле None - VPN выключен.
     session: Mutex<Option<RunningSession>>,
 }
+
 
 impl AnetClient {
     pub fn new(
@@ -63,7 +56,6 @@ impl AnetClient {
         self.config.clone()
     }
 
-    /// Резолвинг доменов и парсинг IP из конфига
     async fn resolve_list(&self, list: &[String]) -> Vec<IpNet> {
         let mut result = Vec::new();
         if list.is_empty() {
@@ -71,7 +63,6 @@ impl AnetClient {
         }
 
         let dns_servers = &self.config.main.dns_server_list;
-
         let mut resolver_config = ResolverConfig::new();
         for dns in dns_servers {
             if let Ok(ip) = IpAddr::from_str(dns) {
@@ -93,8 +84,6 @@ impl AnetClient {
                 result.push(IpNet::from(ip));
                 continue;
             }
-
-            // Domain resolution
             match resolver.lookup_ip(target).await {
                 Ok(lookup) => {
                     for ip in lookup.iter() {
@@ -109,117 +98,143 @@ impl AnetClient {
         result
     }
 
-    /// Проверяет, запущен ли клиент
     pub fn is_running(&self) -> bool {
         let state = self.session.lock().unwrap();
         state.is_some()
     }
 
-    /// Запуск VPN
+    /// Главный метод запуска VPN. Управляет циклом каскадного переподключения серверов.
     pub async fn start(&self) -> anyhow::Result<()> {
-        // 1. Защита от двойного запуска
         if self.is_running() {
-            return Err(anyhow::anyhow!("VPN is already running"));
+            return Err(anyhow::anyhow!("VPN tunnel is already active"));
         }
 
-        info!("[Core] Starting...");
-        status("[Core] Starting...");
+        // Санитаризируем конфиг (если массив серверов пуст — соберем его из старых полей)
+        let mut config_clone = self.config.clone();
+        config_clone.sanitize()?;
 
-        // --- НОВАЯ ЛОГИКА ТРАНСПОРТА ---
-        status(format!("[CORE] Connecting to {}", self.config.main.address));
-        info!("[CORE] Connecting to {}", self.config.main.address);
-        let transport = create_transport(&self.config);
+        info!("[Core] Starting failover connection loop...");
+        warn("[Core] Starting connection loop...");
 
-        info!("[Core] Transport mode: [{:?}]", self.config.transport.mode);
-        status(format!("[Core] Transport mode: [{:?}]", self.config.transport.mode));
+        let reconnect_signal = Arc::new(Notify::new());
+        let mut current_server_index = 0;
 
-        // Connect возвращает AuthResponse (настройки сети) и VpnStream (трубу данных)
-        // Если это QUIC - stream это обертка над QUIC стримами.
-        // Если это SSH - stream это обертка над SSH каналом.
-        let result  = transport.connect().await?;
+        loop {
+            let server = &config_clone.servers[current_server_index];
+            info!("[Core] Connecting to {} via {:?}", server.address, server.mode);
+            status(format!("Connecting to {}...", server.address));
 
-        info!("[Core] Authenticated. VPN IP: {}", result.auth_response.ip);
-        status(format!("[Core] Authenticated. VPN IP: {}", result.auth_response.ip));
+            // Запускаем сессию для конкретной ноды
+            match self.connect_and_run(server, reconnect_signal.clone()).await {
+                Ok(()) => {
+                    // Сессия успешно работала, но мы получили сигнал реконнекта (Case 2)
+                    warn!("[Core] Connection with {} lost. Switching to the next node...", server.address);
+                    warn("Connection lost. Reconnecting...");
 
-        // =========================================================================
-        // ПРЕ-РЕЗОЛВИНГ: Собираем IP-адреса ДО того, как сломаем сеть адаптерами
-        // =========================================================================
-        status("Resolving domain routes...");
-        let include_routes = self.resolve_list(&self.config.main.route_for).await;
-        let exclude_routes = self.resolve_list(&self.config.main.exclude_route_for).await;
+                    // Переходим к следующей ноде в списке
+                    current_server_index = (current_server_index + 1) % config_clone.servers.len();
 
-        // --- НАСТРОЙКА СЕТИ ---
+                    // ВАЖНО: Даем ОС время на асинхронное закрытие дескрипторов старого TUN устройства
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+                Err(e) => {
+                    // Ошибка на этапе рукопожатия или Case 1 (нет начального трафика)
+                    error!("[Core] Connection failed or timed out for {}: {}", server.address, e);
+                    err(format!("Node error: {}", e));
 
-        // Бэкапим маршруты
+                    // Немедленно переходим к следующему серверу
+                    current_server_index = (current_server_index + 1) % config_clone.servers.len();
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+            }
+        }
+    }
+
+    /// Внутренний метод, который держит активную сессию и мониторит её здоровье
+    async fn connect_and_run(&self, server: &ServerConfig, reconnect_signal: Arc<Notify>) -> anyhow::Result<()> {
+        let mut config_clone = self.config.clone();
+        config_clone.sanitize()?;
+
+        let transport = create_transport(&config_clone, server);
+        let conn_timeout = Duration::from_secs(server.timeout_secs);
+
+        // Хендшейк и авторизация с ограничением по времени
+        let result = tokio::time::timeout(conn_timeout, transport.connect())
+            .await
+            .map_err(|_| anyhow::anyhow!("Connection handshake timed out"))??;
+
+        info!("[Core] Authentication successful. Configuring tunnel interface...");
+        status("[Core] Authentication successful. Configuring tunnel interface...");
+
         self.route_manager.backup_routes().await?;
 
-        // Добавляем маршрут до VPN-сервера (Bypass), чтобы не зациклить трафик
-        let server_host = self.config.main.address.split(':').next().unwrap();
-
-        // Пытаемся распарсить как IP, если не выйдет - надо резолвить (но пока считаем что там IP)
+        let server_host = server.address.split(':').next().unwrap();
         if let Ok(server_ip) = IpAddr::from_str(server_host) {
             self.route_manager.add_bypass_route(server_ip, 32).await?;
-        } else {
-            warn!(
-                "[Core] Server address is domain, skipping bypass route (TODO: implement resolve)"
-            );
         }
 
-        // Поднимаем TUN интерфейс
+        // Создаем TUN-интерфейс
         let (tx_to_tun, mut rx_from_tun, iface_name) =
             self.tun_factory.create_tun(&result.auth_response).await?;
 
-        // --- ЗАПУСК МОСТА (BRIDGE) ---
+        // Временные метки для мониторинга активности трафика
+        let last_rx_time = Arc::new(Mutex::new(Instant::now()));
+        let last_tx_time = Arc::new(Mutex::new(Instant::now()));
+
+        // Счетчики байт для универсальной статистики (работает для QUIC, SSH и VNC)
+        let total_rx_bytes = Arc::new(AtomicU64::new(0));
+        let total_tx_bytes = Arc::new(AtomicU64::new(0));
+        let total_rx_packets = Arc::new(AtomicU64::new(0));
+        let total_tx_packets = Arc::new(AtomicU64::new(0));
 
         let shutdown_notify = Arc::new(Notify::new());
         let notify_tx = shutdown_notify.clone();
         let notify_rx = shutdown_notify.clone();
 
-        // Разделяем VpnStream на Reader и Writer
         let (mut stream_reader, mut stream_writer) = tokio::io::split(result.vpn_stream);
 
-        // Task 1: TUN -> NETWORK (Пишем в транспорт)
+        // Задача TUN -> NETWORK (Отправка пакетов)
+        let tx_time = last_tx_time.clone();
+        let tx_bytes = total_tx_bytes.clone();
+        let tx_packets = total_tx_packets.clone();
         let t1 = tokio::spawn(async move {
             loop {
                 tokio::select! {
                     pkt = rx_from_tun.recv() => {
                         if let Some(packet) = pkt {
-                            // ВАЖНО: Всегда используем frame_packet (u16 length prefix).
-                            // Это нужно для SSH (TCP) и не вредит QUIC (просто overhead 2 байта).
+                            *tx_time.lock().unwrap() = Instant::now(); // Засекаем время отправки
+                            let len = packet.len() as u64;
+                            tx_bytes.fetch_add(len, Ordering::Relaxed);
+                            tx_packets.fetch_add(1, Ordering::Relaxed);
+
                             let framed = frame_packet(packet);
-                            if stream_writer.write_all(&framed).await.is_err() {
-                                error!("[Bridge] Write to transport failed");
-                                break;
-                            }
-                            // Flush может быть дорогим, но для SSH/TCP он нужен, чтобы протолкнуть буфер
+                            if stream_writer.write_all(&framed).await.is_err() { break; }
                             let _ = stream_writer.flush().await;
-                        } else {
-                            break;
-                        }
+                        } else { break; }
                     }
                     _ = notify_tx.notified() => { break; }
                 }
             }
         });
 
-        // Task 2: NETWORK -> TUN (Читаем из транспорта)
+        // Задача NETWORK -> TUN (Прием пакетов)
+        let rx_time = last_rx_time.clone();
+        let rx_bytes = total_rx_bytes.clone();
+        let rx_packets = total_rx_packets.clone();
         let t2 = tokio::spawn(async move {
             loop {
                 tokio::select! {
-                    // read_next_packet читает u16 length, потом данные
                     res = read_next_packet(&mut stream_reader) => {
                         match res {
                             Ok(Some(packet)) => {
+                                *rx_time.lock().unwrap() = Instant::now(); // Засекаем время приема
+                                let len = packet.len() as u64;
+                                rx_bytes.fetch_add(len, Ordering::Relaxed);
+                                rx_packets.fetch_add(1, Ordering::Relaxed);
+
                                 if tx_to_tun.send(packet).await.is_err() { break; }
                             }
-                            Ok(None) => {
-                                info!("[Bridge] Transport closed (EOF)");
-                                break;
-                            }
-                            Err(e) => {
-                                error!("[Bridge] Read from transport error: {}", e);
-                                break;
-                            }
+                            _ => break,
                         }
                     }
                     _ = notify_rx.notified() => { break; }
@@ -227,104 +242,161 @@ impl AnetClient {
             }
         });
 
-        let main_task = tokio::spawn(async move {
-            let _ = tokio::join!(t1, t2);
-            info!("[Core] Bridge tasks finished");
-        });
-
-        // --- ЛОГИКА МАРШРУТИЗАЦИИ (Split / Global) ---
-
-        if !self.config.main.route_for.is_empty() {
-            // MODE 1: INCLUDE (Whitelist)
-            info!("[Core] Mode: Split Tunneling (INCLUDE).");
-
+        // Настройка таблиц маршрутизации (Split Tunneling или Global)
+        if !config_clone.main.route_for.is_empty() {
+            let include_routes = self.resolve_list(&config_clone.main.route_for).await;
             for net in include_routes.iter() {
-                self.route_manager
-                    .add_specific_route(
-                        net.addr(),
-                        net.prefix_len(),
-                        &result.auth_response.gateway,
-                        &iface_name,
-                    )
-                    .await?;
+                self.route_manager.add_specific_route(
+                    net.addr(),
+                    net.prefix_len(),
+                    &result.auth_response.gateway,
+                    &iface_name,
+                ).await?;
             }
         } else {
-            // MODE 2: GLOBAL VPN
-            info!("[Core] Mode: Global VPN.");
-
-            // Исключения
-            if !self.config.main.exclude_route_for.is_empty() {
-                info!(
-                    "[Core] Found {} exclusion rules.",
-                    self.config.main.exclude_route_for.len()
-                );
-
+            if !config_clone.main.exclude_route_for.is_empty() {
+                let exclude_routes = self.resolve_list(&config_clone.main.exclude_route_for).await;
                 for net in exclude_routes.iter() {
-                    self.route_manager
-                        .add_bypass_route(net.addr(), net.prefix_len())
-                        .await?;
+                    self.route_manager.add_bypass_route(net.addr(), net.prefix_len()).await?;
                 }
             }
-
-            // Весь трафик в туннель
-            self.route_manager
-                .set_default_route(&result.auth_response.gateway, &iface_name)
-                .await?;
+            self.route_manager.set_default_route(&result.auth_response.gateway, &iface_name).await?;
         }
 
-        // --- DNS ---
-        if !self.config.main.dns_server_list.is_empty() {
-            // Преобразуем строки в IP
-            let dns_ips: Vec<IpAddr> = self
-                .config
-                .main
-                .dns_server_list
-                .iter()
-                .filter_map(|s| IpAddr::from_str(s).ok())
-                .collect();
-
-            // Фильтруем IPv4 (для текущего менеджера)
-            let dns_ipv4: Vec<std::net::Ipv4Addr> = dns_ips
-                .iter()
-                .filter_map(|ip| match ip {
-                    IpAddr::V4(addr) => Some(*addr),
-                    _ => None,
-                })
-                .collect();
+        // Настройка DNS-резолвера
+        if !config_clone.main.dns_server_list.is_empty() {
+            let dns_ips: Vec<IpAddr> = config_clone.main.dns_server_list.iter()
+                .filter_map(|s| IpAddr::from_str(s).ok()).collect();
+            let dns_ipv4: Vec<std::net::Ipv4Addr> = dns_ips.iter().filter_map(|ip| match ip {
+                IpAddr::V4(addr) => Some(*addr),
+                _ => None,
+            }).collect();
 
             if !dns_ipv4.is_empty() {
-                if let Err(e) = self.dns_manager.set_dns(&iface_name, &dns_ipv4) {
-                    warn!("[Core] Failed to configure DNS: {}", e);
+                let _ = self.dns_manager.set_dns(&iface_name, &dns_ipv4);
+            }
+        }
+
+        // =========================================================================
+        // АКТИВНЫЙ ВОРКЕР КОНТРОЛЯ ЗДОРОВЬЯ (HEALTH MONITOR)
+        // =========================================================================
+        let monitor_shutdown = shutdown_notify.clone();
+        let monitor_reconnect = reconnect_signal.clone();
+        let rx_check = last_rx_time.clone();
+
+        let health_task = tokio::spawn(async move {
+            let check_interval = Duration::from_secs(4);
+            let mut is_initial_phase = true;
+
+            loop {
+                // Асинхронно ждем либо таймер проверки, либо сигнал закрытия сессии
+                tokio::select! {
+                    _ = tokio::time::sleep(check_interval) => {
+                        // Таймер сработал, продолжаем проверку трафика
+                    }
+                    _ = monitor_shutdown.notified() => {
+                        // Получен сигнал завершения сессии, тихо выходим
+                        break;
+                    }
+                }
+
+                let elapsed_rx = rx_check.lock().unwrap().elapsed();
+
+                if is_initial_phase {
+                    // CASE 1: Соединение установлено, но полезный трафик не идет вообще (блэкхол на старте)
+                    if elapsed_rx > Duration::from_secs(8) {
+                        warn!("[Health] CASE 1 Detected: Connection established, but payload traffic is blocked!");
+                        warn("[Health] CASE 1 Detected: Connection established, but payload traffic is blocked!");
+                        monitor_reconnect.notify_one();
+                        break;
+                    }
+                    is_initial_phase = false;
+                } else {
+                    // CASE 2: Активное соединение внезапно перестало получать байты (тайм-аут 15 сек)
+                    if elapsed_rx > Duration::from_secs(15) {
+                        warn!("[Health] CASE 2 Detected: Active tunnel lost traffic flow (15s inactivity timeout)!");
+                        warn("[Health] CASE 2 Detected: Active tunnel lost traffic flow (15s inactivity timeout)!");
+                        monitor_reconnect.notify_one();
+                        break;
+                    }
                 }
             }
+        });
+
+        // =========================================================================
+        // УНИВЕРСАЛЬНЫЙ СБОРЩИК СТАТИСТИКИ (РАБОТАЕТ ДЛЯ ВСЕХ ТРАНСПОРТОВ)
+        // =========================================================================
+        let stats_shutdown = shutdown_notify.clone();
+        let stats_task = if config_clone.stats.enabled {
+            let provider: Arc<dyn statistic::StatsProvider> = if let Some(ref conn) = result.connection {
+                // Если у нас QUIC — используем низкоуровневые метрики
+                Arc::new(statistic::QuicStatsProvider::new(conn.clone()))
+            } else {
+                // Если SSH или VNC — собираем статистику по мосту TUN
+                Arc::new(statistic::StreamStatsProvider::new(
+                    total_rx_bytes.clone(),
+                    total_tx_bytes.clone(),
+                    total_rx_packets.clone(),
+                    total_tx_packets.clone(),
+                ))
+            };
+            Some(statistic::start_stats_monitor(
+                provider,
+                config_clone.stats.interval_minutes,
+                stats_shutdown,
+            ))
+        } else {
+            None
+        };
+
+        // Сохраняем запущенную сессию локально
+        // ОГРАНИЧИВАЕМ ЛЕКСИЧЕСКУЮ ОБЛАСТЬ ВИДИМОСТИ MutexGuard ФИГУРНЫМИ СКОБКАМИ
+        // Это предотвращает удержание сторожа мьютекса (state) во время .await точек
+        {
+            let mut state = self.session.lock().unwrap();
+            *state = Some(RunningSession {
+                endpoint: result.endpoint,
+                shutdown_notify: shutdown_notify.clone(),
+                main_task: tokio::spawn(async move {
+                    let _ = tokio::join!(t1, t2);
+                }),
+                stats_task, // Сохраняем таску статистики в сессии для сброса
+                iface_name: iface_name.clone(),
+            });
         }
 
-        info!("[Core] VPN Tunnel UP.");
+        info!("[Core] VPN interface configured. Tunnel UP.");
+        status(format!("Connected. Local IP: {}", result.auth_response.ip));
         status("[Core] VPN UP");
         status("VPN Tunnel UP");
+        // Засыпаем и ждем сигнала о необходимости реконнекта от воркера здоровья
+        reconnect_signal.notified().await;
 
-        if self.config.stats.enabled {
-            if let Some(conn) = result.connection {
-                statistic::start_stats_monitor(conn, self.config.stats.interval_minutes);
-            } else {
-                info!("Stats are not available for this transport mode.");
+        // Очистка текущей нерабочей сессии
+        info!("[Core] Cleaning up dead session...");
+        status("[Core] Cleaning up dead session...");
+        shutdown_notify.notify_waiters();
+        health_task.abort();
+
+        // Принудительно забираем сессию и ЖДЕМ завершения ее фоновых задач (t1 и t2 и статистики).
+        // Это закроет все отправители и приемники каналов, гарантируя освобождение TUN.
+        let session_to_clean = {
+            let mut state = self.session.lock().unwrap();
+            state.take()
+        };
+        if let Some(sess) = session_to_clean {
+            if let Some(task) = sess.stats_task {
+                task.abort(); // Принудительно глушим старую задачу статистики
             }
+            let _ = sess.main_task.await;
         }
 
-
-        // 5. Сохраняем сессию
-        let mut state = self.session.lock().unwrap();
-        *state = Some(RunningSession {
-            endpoint: result.endpoint,
-            shutdown_notify,
-            main_task,
-            iface_name: iface_name.clone(),
-        });
+        let _ = self.dns_manager.restore_dns(&iface_name);
+        let _ = self.route_manager.restore_routes().await;
 
         Ok(())
     }
 
-    /// Остановка VPN
     pub async fn stop(&self) -> anyhow::Result<()> {
         let session = {
             let mut state = self.session.lock().unwrap();
@@ -333,31 +405,24 @@ impl AnetClient {
 
         if let Some(running) = session {
             info!("[Core] Stopping VPN...");
-
-            // 1. Говорим задачам остановиться
+            status("[Core] Stopping VPN...");
             running.shutdown_notify.notify_waiters();
 
-            // 2. Ждем пока байты перестанут летать
+            if let Some(task) = running.stats_task {
+                task.abort(); // Глушим статистику при ручной остановке
+            }
+
             let _ = running.main_task.await;
 
-            // 3. Если есть QUIC Endpoint - закрываем
             if let Some(endpoint) = running.endpoint {
                 endpoint.close(0u32.into(), b"Disconnected by user");
             }
 
-            // 4. Restore DNS
-            if let Err(e) = self.dns_manager.restore_dns(&running.iface_name) {
-                error!("Failed to restore DNS: {}", e);
-            }
-
-            // 5. Restore routes
-            if let Err(e) = self.route_manager.restore_routes().await {
-                error!("Failed to restore routes: {}", e);
-            }
-
+            let _ = self.dns_manager.restore_dns(&running.iface_name);
+            let _ = self.route_manager.restore_routes().await;
             info!("[Core] VPN Stopped.");
+            status("[Core] VPN Stopped.");
         }
         Ok(())
     }
-
 }

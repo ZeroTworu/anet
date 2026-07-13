@@ -4,8 +4,10 @@ use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct MainConfig {
-    pub address: String,
     pub tun_name: String,
+
+    #[serde(default)]
+    pub address: String,
 
     #[serde(default)]
     pub manual_routing: bool,
@@ -30,7 +32,7 @@ fn default_update_url() -> String {
 impl Default for MainConfig {
     fn default() -> Self {
         Self {
-            address: "127.0.0.1:443".to_string(),
+            address: "".to_string(),
             tun_name: "anet-client".to_string(),
             route_for: vec![],
             exclude_route_for: vec![],
@@ -101,6 +103,29 @@ impl Default for TransportConfig {
     }
 }
 
+// Новая структура для точечного описания серверов в массиве [[servers]]
+#[derive(Debug, Clone, Deserialize)]
+pub struct ServerConfig {
+    // IP-адрес или доменное имя сервера и порт для подключения
+    pub address: String,
+    // Режим транспорта (quic, ssh, vnc)
+    pub mode: TransportMode,
+
+    // Индивидуальный тайм-аут подключения (в секундах)
+    #[serde(default = "default_timeout_secs")]
+    pub timeout_secs: u64,
+
+    // Опциональное переопределение публичного ключа сервера
+    pub server_pub_key: Option<String>,
+
+    // Опциональное переопределение пользователя SSH
+    pub ssh_user: Option<String>,
+}
+
+fn default_timeout_secs() -> u64 {
+    10
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct CoreConfig {
     #[serde(default)]
@@ -120,4 +145,28 @@ pub struct CoreConfig {
 
     #[serde(default)]
     pub transport: TransportConfig,
+
+    // Наш новый массив серверов [[servers]] для переключения при сбоях
+    #[serde(default)]
+    pub servers: Vec<ServerConfig>,
+}
+
+impl CoreConfig {
+    /// Санитайзер для плавной обратной совместимости.
+    /// Если массив серверов пуст — мы прозрачно собираем его из старых полей конфига.
+    pub fn sanitize(&mut self) -> anyhow::Result<()> {
+        if self.servers.is_empty() {
+            if self.main.address.is_empty() {
+                anyhow::bail!("No servers defined in [[servers]] and legacy address is empty");
+            }
+            self.servers.push(ServerConfig {
+                address: self.main.address.clone(),
+                mode: self.transport.mode,
+                timeout_secs: 10,
+                server_pub_key: None,
+                ssh_user: self.transport.ssh_user.clone(),
+            });
+        }
+        Ok(())
+    }
 }

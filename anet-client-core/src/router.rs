@@ -6,6 +6,7 @@ pub mod macos {
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 pub mod desktop {
     use crate::traits::RouteManager;
+    use crate::events::{status, warn, err};
     use anyhow::Context;
     use anyhow::Result;
     use async_trait::async_trait;
@@ -122,6 +123,7 @@ pub mod desktop {
             };
 
             info!("Backup: Gateway {} on iface {:?}", gateway, ifindex);
+            status(format!("Gateway: {}", gateway));
 
             let mut state = self.state.lock().await;
             state.original_gateway = Some(gateway);
@@ -143,6 +145,9 @@ pub mod desktop {
                 target, prefix, gateway
             );
 
+            status(format!("Adding BYPASS route for {}/{} via physical gateway {}",
+                           target, prefix, gateway));
+
             let route = Route::new(target, prefix)
                 .with_gateway(gateway)
                 .with_ifindex(ifindex)
@@ -152,10 +157,17 @@ pub mod desktop {
             let _ = self.handle.delete(&route).await;
 
             // Добавляем
-            self.handle
+            match self.handle
                 .add(&route)
                 .await
-                .context("Failed to add bypass route")?;
+                .context("Failed to add bypass route") {
+                Ok(_) => {},
+                Err(e) => {
+                    error!("Failed to add bypass route: {}", e);
+                    err(format!("Failed to add bypass route: {}", e));
+                    return Err(anyhow::anyhow!("Failed to add bypass route: {}", e));
+                }
+            }
 
             // Сохраняем в список, чтобы потом удалить при выключении VPN
             // (хотя для server_ip мы раньше использовали отдельное поле,
@@ -168,6 +180,7 @@ pub mod desktop {
         async fn set_default_route(&self, _gateway: &str, interface_name: &str) -> Result<()> {
             let tun_index = Self::get_iface_index(interface_name)?;
             info!("Redirecting ALL traffic to TUN (index: {})", tun_index);
+            status(format!("Redirecting ALL traffic to TUN (index: {})", tun_index));
 
             let routes_to_add = vec![
                 Route::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 1)
@@ -183,6 +196,7 @@ pub mod desktop {
                 let _ = self.handle.delete(&route).await;
                 if let Err(e) = self.handle.add(&route).await {
                     warn!("Failed to add redirect route {:?}: {}", route, e);
+                    warn(format!("Failed to add redirect route {:?}: {}", route, e));
                 } else {
                     state.added_routes.push(route);
                 }
@@ -211,11 +225,13 @@ pub mod desktop {
             match self.handle.add(&route).await {
                 Ok(_) => {
                     info!("Added split-tunnel route: {}/{} via TUN", target, prefix);
+                    status(format!("Added split-tunnel route: {}/{} via TUN", target, prefix));
                     state.added_routes.push(route);
                     Ok(())
                 }
                 Err(e) => {
                     error!("Failed to add route {}/{}: {}", target, prefix, e);
+                    err(format!("Failed to add route {}/{}: {}", target, prefix, e));
                     Err(anyhow::anyhow!(e))
                 }
             }
@@ -223,6 +239,7 @@ pub mod desktop {
 
         async fn restore_routes(&self) -> Result<()> {
             info!("Restoring original routing...");
+            status("Restoring original routing...");
             let mut state = self.state.lock().await;
 
             // Удаляем все маршруты (Global, Specific, Bypass) в обратном порядке
@@ -232,6 +249,7 @@ pub mod desktop {
             }
 
             info!("Routing restored.");
+            status("Routing restored.");
             Ok(())
         }
     }

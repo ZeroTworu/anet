@@ -1,5 +1,5 @@
 use super::{ClientTransport, ConnectionResult, MutexVpnStream};
-use crate::config::CoreConfig;
+use crate::config::{CoreConfig, ServerConfig}; // Импортируем новую структуру ноды
 use crate::auth::{AuthHandler, AuthChannel};
 use anyhow::Result;
 use async_trait::async_trait;
@@ -12,11 +12,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, Mutex};
 use std::time::Duration;
 use anet_common::stream_framing::{frame_packet, read_next_packet};
-use anet_common::padding_utils::calculate_padding_needed;
 use anet_common::consts::{MAX_PACKET_SIZE, CHANNEL_BUFFER_SIZE};
 
 const RFB_VER: &[u8; 12] = b"RFB 003.008\n";
-const RFB_SEC_TYPES: &[u8; 2] = &[1, 1]; // Security Count = 1, Auth = None
+const RFB_SEC_TYPES: &[u8; 2] = &[1, 1];
 const RFB_SEC_RESULT: &[u8; 4] = &[0, 0, 0, 0];
 
 struct VncAuthChannel {
@@ -29,7 +28,7 @@ impl AuthChannel for VncAuthChannel {
         let mut stream = self.stream.lock().await;
         let mut framed = bytes::BytesMut::with_capacity(8 + data.len());
         framed.put_u8(6); // ClientCutText
-        framed.put_slice(&[0, 0, 0]); // Padding
+        framed.put_slice(&[0, 0, 0]);
         framed.put_u32(data.len() as u32);
         framed.put(data);
         stream.write_all(&framed).await?;
@@ -52,13 +51,22 @@ impl AuthChannel for VncAuthChannel {
     }
 }
 
-pub struct VncTransport { config: CoreConfig }
-impl VncTransport { pub fn new(c: CoreConfig) -> Self { Self { config: c } } }
+pub struct VncTransport {
+    config: CoreConfig,
+    server: ServerConfig, // Сохраняем индивидуальные параметры ноды
+}
+
+impl VncTransport {
+    pub fn new(config: CoreConfig, server: ServerConfig) -> Self {
+        Self { config, server }
+    }
+}
 
 #[async_trait]
 impl ClientTransport for VncTransport {
     async fn connect(&self) -> Result<ConnectionResult> {
-        let addr_str = &self.config.main.address;
+        // Вытаскиваем адрес конкретной ноды
+        let addr_str = &self.server.address;
         let addr: SocketAddr = addr_str.to_socket_addrs()?.next().ok_or(anyhow::anyhow!("Invalid server address"))?;
         info!("[VNC Transport] Probing fake desktop target: {}", addr);
 
@@ -86,18 +94,16 @@ impl ClientTransport for VncTransport {
 
         info!("[VNC Tunnel Ready]. Securing envelope (Entering ASTP Domain)...");
 
-        // ЯДРО СВЯЗИ VPN ЧЕРЕЗ VNC-AUTH-CHANNEL (БЕЗ ARC)
         let auth_ch = VncAuthChannel { stream: Mutex::new(stream) };
 
-        let ath_ctrl = AuthHandler::new(&self.config)?;
+        // Передаем опциональный ключ сервера для переопределения
+        let ath_ctrl = AuthHandler::new(&self.config, self.server.server_pub_key.as_deref())?;
         let (auth_pack, key) = ath_ctrl.authenticate(&auth_ch).await?;
         info!("[ASTP over VNC] Encapsulated Layer successful! Bound Local VPN IPv4: {}", auth_pack.ip);
 
-        // Вытаскиваем чистый TCP-сокет обратно из Mutex'а
         let live_stream = auth_ch.stream.into_inner();
         let (mut tcp_reader, mut tcp_writer) = tokio::io::split(live_stream);
 
-        // Мост для Core
         let (client_stream, internal_router) = tokio::io::duplex(MAX_PACKET_SIZE * 10);
         let (mut tunnel_read, mut tunnel_write) = tokio::io::split(internal_router);
 
@@ -107,9 +113,6 @@ impl ClientTransport for VncTransport {
         let nonce_prefix: [u8; 4] = auth_pack.nonce_prefix.clone().as_slice().try_into().unwrap_or([0,0,0,0]);
         let stealth_cfg = self.config.stealth.clone();
 
-        // -------------------------------------------------------------
-        // ИСХОДЯЩИЙ ТРАФИК (TX - Пишем серверу, Type = 6)
-        // -------------------------------------------------------------
         let (tx_bridge, mut rx_bridge) = mpsc::channel(CHANNEL_BUFFER_SIZE);
         tokio::spawn(async move {
             while let Ok(Some(packet)) = read_next_packet(&mut tunnel_read).await {
@@ -135,13 +138,13 @@ impl ClientTransport for VncTransport {
             while let Some(raw) = rx_ready.recv().await {
                 let seq = sequence_tx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let sz = raw.len() + 38;
-                let pad = calculate_padding_needed(sz, p_step);
+                let pad = anet_common::padding_utils::calculate_padding_needed(sz, p_step);
                 let sa_pa = if sz+(pad as usize) > anet_common::consts::PADDING_MTU {0} else {pad};
 
                 if let Ok(crypted) = anet_common::transport::wrap_packet(&cipher_tx, &nonce_prefix, seq, raw, sa_pa) {
                     let mut framed = bytes::BytesMut::with_capacity(8 + crypted.len());
-                    framed.put_u8(6); // ClientCutText
-                    framed.put_slice(&[0, 0, 0]); // Padding
+                    framed.put_u8(6);
+                    framed.put_slice(&[0, 0, 0]);
                     framed.put_u32(crypted.len() as u32);
                     framed.put(crypted);
 
@@ -151,9 +154,6 @@ impl ClientTransport for VncTransport {
             dispatch.abort(); warn!("[VNC proxy] Inner TX channel stopped.");
         });
 
-        // -------------------------------------------------------------
-        // ВХОДЯЩИЙ ТРАФИК (RX - Читаем от сервера, Type = 3)
-        // -------------------------------------------------------------
         let (tx_in, mut rx_in) = mpsc::channel(CHANNEL_BUFFER_SIZE);
 
         tokio::spawn(async move {

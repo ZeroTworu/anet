@@ -1,6 +1,6 @@
 use super::{ClientTransport, ConnectionResult};
 use crate::auth::{AuthHandler, UdpAuthChannel};
-use crate::config::CoreConfig;
+use crate::config::{CoreConfig, ServerConfig};
 use crate::socket::AnetUdpSocket;
 use anet_common::encryption::Cipher;
 use anet_common::quic_settings::build_transport_config;
@@ -20,7 +20,7 @@ pub struct QuicDuplexStream {
     send: SendStream,
     recv: RecvStream,
 }
-// ... (impl AsyncRead/Write те же) ...
+
 impl AsyncRead for QuicDuplexStream {
     fn poll_read(
         mut self: Pin<&mut Self>,
@@ -30,6 +30,7 @@ impl AsyncRead for QuicDuplexStream {
         Pin::new(&mut self.recv).poll_read(cx, buf)
     }
 }
+
 impl AsyncWrite for QuicDuplexStream {
     fn poll_write(
         mut self: Pin<&mut Self>,
@@ -66,28 +67,28 @@ impl AsyncWrite for QuicDuplexStream {
 
 pub struct QuicTransport {
     config: CoreConfig,
+    server: ServerConfig, // Сохраняем индивидуальные параметры ноды
 }
 
 impl QuicTransport {
-    pub fn new(config: CoreConfig) -> Self {
-        Self { config }
+    pub fn new(config: CoreConfig, server: ServerConfig) -> Self {
+        Self { config, server }
     }
 }
 
 #[async_trait]
 impl ClientTransport for QuicTransport {
     async fn connect(&self) -> Result<ConnectionResult> {
-        // 1. Создаем канал
-        let addr_str = &self.config.main.address;
+        // Вытаскиваем адрес конкретной ноды
+        let addr_str = &self.server.address;
         let server_addr: SocketAddr = addr_str.to_socket_addrs()?.next().ok_or(anyhow::anyhow!("Invalid server address"))?;
         let udp_socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
         let channel = UdpAuthChannel::new(udp_socket.clone(), server_addr);
 
-        // 2. Аутентификация
-        let auth_handler = AuthHandler::new(&self.config)?;
+        // Передаем опциональный ключ сервера для переопределения
+        let auth_handler = AuthHandler::new(&self.config, self.server.server_pub_key.as_deref())?;
         let (auth_response, shared_key) = auth_handler.authenticate(&channel).await?;
 
-        // 3. QUIC
         let transport_config =
             build_transport_config(&self.config.quic_transport, auth_response.mtu as u16)?;
 
@@ -99,7 +100,7 @@ impl ClientTransport for QuicTransport {
             .map_err(|_| anyhow::anyhow!("Invalid nonce prefix len"))?;
 
         let anet_socket = Arc::new(AnetUdpSocket::new(
-            udp_socket, // Используем тот же сокет
+            udp_socket,
             cipher,
             nonce_prefix,
             self.config.stealth.clone(),

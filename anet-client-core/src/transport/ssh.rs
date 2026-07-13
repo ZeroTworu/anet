@@ -1,5 +1,5 @@
 use super::{ClientTransport, ConnectionResult, MutexVpnStream};
-use crate::config::CoreConfig;
+use crate::config::{CoreConfig, ServerConfig}; // Импортируем новую структуру ноды
 use crate::auth::{AuthHandler, StreamAuthChannel};
 use anyhow::Result;
 use async_trait::async_trait;
@@ -15,7 +15,6 @@ use tokio::sync::{mpsc, Mutex};
 use anet_common::stream_framing::{frame_packet, read_next_packet};
 use anet_common::consts::CHANNEL_BUFFER_SIZE;
 
-
 struct ClientHandler;
 #[async_trait]
 impl Handler for ClientHandler {
@@ -27,22 +26,27 @@ impl Handler for ClientHandler {
 
 pub struct SshTransport {
     config: CoreConfig,
+    server: ServerConfig, // Сохраняем индивидуальные параметры ноды
 }
 
 impl SshTransport {
-    pub fn new(config: CoreConfig) -> Self {
-        Self { config }
+    pub fn new(config: CoreConfig, server: ServerConfig) -> Self {
+        Self { config, server }
     }
 }
 
 #[async_trait]
 impl ClientTransport for SshTransport {
     async fn connect(&self) -> Result<ConnectionResult> {
-        let addr_str = &self.config.main.address;
+        // Вытаскиваем адрес конкретной ноды
+        let addr_str = &self.server.address;
         let addr: SocketAddr = addr_str.to_socket_addrs()?.next().ok_or(anyhow::anyhow!("Invalid server address"))?;
-        let user = self.config.transport.ssh_user.as_deref().unwrap_or("root");
 
-        // Хак лимита (на максимум возможный в протоколе, спасает от затыков).
+        // Разрешаем приоритет переопределения SSH юзера для ноды
+        let user = self.server.ssh_user.as_deref()
+            .or(self.config.transport.ssh_user.as_deref())
+            .unwrap_or("root");
+
         let mut config_base = russh::client::Config::default();
         config_base.window_size = 10_000_000;
         config_base.maximum_packet_size = 65535;
@@ -58,22 +62,19 @@ impl ClientTransport for SshTransport {
         let channel = session.channel_open_session().await?;
         channel.exec(true, "anet-vpn").await?;
 
-        // 1. Адаптер (Абсолютно честный родной адаптер для SSH).
         let raw_stream = SshStreamAdapter::new(channel);
         let stream_arc = Arc::new(Mutex::new(raw_stream));
         let auth_channel = StreamAuthChannel::new(stream_arc.clone());
 
-        // 2. Аутентификация
-        let auth_handler = AuthHandler::new(&self.config)?;
+        // Передаем опциональный ключ сервера для переопределения
+        let auth_handler = AuthHandler::new(&self.config, self.server.server_pub_key.as_deref())?;
         let (auth_response, shared_key) = auth_handler.authenticate(&auth_channel).await?;
         info!("[SSH] Handshake complete. Assigned IP: {}", auth_response.ip);
 
-        // 3. Высвобождаем Адаптер и делаем Проксификатор: Теневой туннель через локальную Дюплекс-Трубу.
         drop(auth_channel);
         let active_tcp_stream = Arc::try_unwrap(stream_arc).map_err(|_| anyhow::anyhow!("Internal ref dropped"))?.into_inner();
         let (tcp_reader,  tcp_writer) = tokio::io::split(active_tcp_stream);
 
-        // Дуплекс пайп. Левую сторону (client_stream) мы тупо возвращаем Кору для чтения/отправки чистых пакетов!
         let (client_stream, internal_router) = tokio::io::duplex(65535 * 10);
         let (mut tunnel_read, mut tunnel_write) = tokio::io::split(internal_router);
 
@@ -85,7 +86,6 @@ impl ClientTransport for SshTransport {
 
         let (tx_bridge, rx_bridge) = mpsc::channel(CHANNEL_BUFFER_SIZE);
 
-        // Воркер-адаптер: Читает из виртуального DuplexStream ядра и перекладывает в канал
         tokio::spawn(async move {
             while let Ok(Some(packet)) = read_next_packet(&mut tunnel_read).await {
                 if tx_bridge.send(packet).await.is_err() { break; }
@@ -97,7 +97,6 @@ impl ClientTransport for SshTransport {
         let seq_worker = sequence_tx.clone();
         let np = nonce_prefix;
 
-        // Запускаем универсальный крипто-джиттер из anet-common
         tokio::spawn(async move {
             let _ = anet_common::jitter::bridge_crypto_stream_with_jitter(
                 rx_bridge,
@@ -109,13 +108,9 @@ impl ClientTransport for SshTransport {
             ).await;
         });
 
-        // -------------------------------------------------------------
-        // ВХОДЯЩИЙ ТРАФИК (RX): receive_crypto_stream -> mpsc -> Duplex
-        // -------------------------------------------------------------
         let (tx_in, mut rx_in) = mpsc::channel(CHANNEL_BUFFER_SIZE);
         let cipher_rx_worker = cipher_rx.clone();
 
-        // Запускаем универсальный дешифратор из anet-common
         tokio::spawn(async move {
             let _ = anet_common::jitter::receive_crypto_stream(
                 tcp_reader,
@@ -124,7 +119,6 @@ impl ClientTransport for SshTransport {
             ).await;
         });
 
-        // Воркер-адаптер: Читает расшифрованные пакеты из канала и пишет в виртуальный DuplexStream ядра
         tokio::spawn(async move {
             while let Some(packet) = rx_in.recv().await {
                 let framed = frame_packet(packet);
@@ -134,9 +128,6 @@ impl ClientTransport for SshTransport {
             }
         });
 
-        // -------------------------------------------------------------
-        // ВОЗВРАТ РЕЗУЛЬТАТА ЯДРУ
-        // -------------------------------------------------------------
         let output_stream = Arc::new(Mutex::new(client_stream));
 
         Ok(ConnectionResult {
@@ -147,7 +138,6 @@ impl ClientTransport for SshTransport {
         })
     }
 }
-
 
 pub struct SshStreamAdapter {
     read_rx: mpsc::UnboundedReceiver<Vec<u8>>,
@@ -188,7 +178,6 @@ impl SshStreamAdapter {
         Self { read_rx, write_tx, read_buffer: std::io::Cursor::new(Bytes::new()) }
     }
 }
-
 
 impl AsyncRead for SshStreamAdapter {
     fn poll_read(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &mut ReadBuf<'_>) -> std::task::Poll<std::io::Result<()>> {
