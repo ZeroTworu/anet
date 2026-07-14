@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -15,6 +16,8 @@ pub struct AppSettings {
     pub active_config_id: Option<String>,
     #[serde(default)]
     pub disable_notifications: bool,
+    #[serde(default)]
+    pub selected_servers: HashMap<String, String>,
 }
 
 impl AppSettings {
@@ -80,6 +83,7 @@ impl AppSettings {
         if self.active_config_id.as_deref() == Some(id) {
             self.active_config_id = None;
         }
+        self.selected_servers.remove(id);
         self.save();
     }
 

@@ -108,7 +108,7 @@ pub fn toggle_vpn(shared: &Arc<Mutex<SharedState>>, rt_handle: &Handle, logs: &A
     if guard.state == ConnectionState::Disconnected {
         if let Some(client_clone) = guard.client.clone() {
             guard.state = ConnectionState::Connecting;
-            drop(guard); // освобождаем мьютекс перед await
+            drop(guard);
 
             let logs_clone = logs.clone();
             let shared_clone = shared.clone();
@@ -117,7 +117,6 @@ pub fn toggle_vpn(shared: &Arc<Mutex<SharedState>>, rt_handle: &Handle, logs: &A
                 match client_clone.start().await {
                     Ok(_) => {
                         logs_clone.lock().unwrap().push("> VPN Stopped (Ok)".into());
-                        // Connected установит GuiEventHandler при "Tunnel UP"
                     }
                     Err(e) => {
                         logs_clone.lock().unwrap().push(format!("> Error: {}", e));
@@ -143,8 +142,6 @@ pub fn toggle_vpn(shared: &Arc<Mutex<SharedState>>, rt_handle: &Handle, logs: &A
 
 impl ANetApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        // Чистим старые .old файлы при запуске
-        // crate::updater::cleanup_old_version();
         let rt = Runtime::new().unwrap();
 
         let settings = AppSettings::load();
@@ -160,7 +157,6 @@ impl ANetApp {
         let (event_tx, event_rx) = channel::<AnetEvent>();
         let (tray_cmd_tx, tray_cmd_rx) = channel::<TrayCommand>();
 
-        // Обработчик событий ядра — обновляет shared.state
         let shared_for_handler = shared.clone();
         set_handler(Box::new(GuiEventHandler {
             tx: event_tx,
@@ -168,17 +164,14 @@ impl ANetApp {
             shared: shared_for_handler,
         }));
 
-        // Замыкания для трея
         let show_ctx = cc.egui_ctx.clone();
         let on_show = move || { force_wake_up_window(&show_ctx); };
 
-        // Замыкание "Toggle VPN" — захватывает shared, runtime и logs
         let toggle_shared = shared.clone();
         let toggle_rt = rt.handle().clone();
         let toggle_logs = logs.clone();
         let on_toggle = move || { toggle_vpn(&toggle_shared, &toggle_rt, &toggle_logs); };
 
-        // Запускаем фоновый поток трея
         TrayBackground::spawn(
             tray_cmd_rx,
             shared.clone(),
@@ -187,14 +180,13 @@ impl ANetApp {
             on_toggle,
         );
 
-
         let mut app = Self {
             rt, logs, config_err: None,
             config_name: "Файл не выбран".to_string(),
             event_rx,
             settings: settings_arc,
             shared,
-            tray_cmd_tx, // <-- сохраняем
+            tray_cmd_tx,
             last_known_state: ConnectionState::Disconnected,
             is_in_tray: false,
             sidebar_open: false,
@@ -204,20 +196,18 @@ impl ANetApp {
             update_status: UpdateStatus::Idle,
         };
 
-        let config_to_load = app.settings.lock().unwrap().get_active_config().map(|c| (c.content.clone(), c.name.clone()));
-        if let Some((content, name)) = config_to_load {
-            app.load_config_from_content(&content, &name);
+        let config_to_load = app.settings.lock().unwrap().get_active_config();
+        if let Some(config) = config_to_load {
+            app.load_config_from_content(&config.id, &config.content, &config.name);
         }
 
         app
     }
 
     fn check_for_updates(&mut self) {
-        // Достаем URL из текущего загруженного конфига клиента
         let update_url = if let Some(client) = self.shared.lock().unwrap().client.as_ref() {
             client.get_config().main.update_url.clone()
         } else {
-            // Если конфиг не загружен, берем дефолтный
             "https://api.github.com/repos/ZeroTworu/anet/releases/latest".to_string()
         };
 
@@ -228,7 +218,6 @@ impl ANetApp {
         self.log(&format!("Проверка обновлений (текущая: {})...", current_ver));
 
         rt_handle.spawn(async move {
-            // Передаем URL в апдейтер
             match Updater::check_latest(&update_url, &current_ver).await {
                 Ok(Some(release)) => {
                     anet_client_core::events::emit(AnetEvent::UpdateAvailable(release));
@@ -348,12 +337,29 @@ impl ANetApp {
             settings.set_active(id);
             settings.get_active_config()
         };
-        if let Some(config) = config { self.load_config_from_content(&config.content, &config.name); }
+        if let Some(config) = config {
+            self.load_config_from_content(&config.id, &config.content, &config.name);
+        }
     }
 
-    fn load_config_from_content(&mut self, content: &str, name: &str) {
+    fn load_config_from_content(&mut self, id: &str, content: &str, name: &str) {
         match toml::from_str::<CoreConfig>(content) {
-            Ok(cfg) => {
+            Ok(mut cfg) => {
+                let _ = cfg.sanitize();
+
+                // Инициируем выравнивание и сдвиг приоритетной ноды
+                let selected_name_opt = {
+                    let settings = self.settings.lock().unwrap();
+                    settings.selected_servers.get(id).cloned()
+                };
+
+                if let Some(selected_name) = selected_name_opt {
+                    if let Some(idx) = cfg.servers.iter().position(|s| s.get_name() == selected_name) {
+                        // Сдвигаем массив так, чтобы выбранный пользователем сервер встал на позицию 0
+                        cfg.servers.rotate_left(idx);
+                    }
+                }
+
                 let tun = Box::new(DesktopTunFactory::new(cfg.main.tun_name.clone()));
                 let route = match create_route_manager(false) {
                     Ok(r) => r,
@@ -406,9 +412,29 @@ pub fn force_wake_up_window(ctx: &egui::Context) {
 
 impl eframe::App for ANetApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let mut visuals = egui::Visuals::dark();
+
+        // Цвет фона для выпадающих меню (ComboBox) и всплывающих окон
+        visuals.window_fill = egui::Color32::from_rgb(25, 25, 25);
+
+        // Граница выпадающего меню
+        visuals.window_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(50, 50, 50));
+
+        // Цвета кнопок и интерактивных элементов внутри выпадающего списка
+        visuals.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(20, 20, 20);
+        visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(30, 30, 30);
+
+        // Цвет элемента при наведении мыши (Hover)
+        visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(45, 45, 45);
+
+        // Цвет выбранного/активного элемента
+        visuals.widgets.active.bg_fill = egui::Color32::from_rgb(40, 80, 60);
+
+        // Применяем тему ко всему графическому контексту
+        ctx.set_visuals(visuals);
+
         ctx.request_repaint_after(std::time::Duration::from_millis(500));
 
-        // 1. Прятки в трей
         let is_minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
         if is_minimized {
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
@@ -420,7 +446,6 @@ impl eframe::App for ANetApp {
             }
         }
 
-        // 2. Читаем события ядра (логи, модалки, обновления)
         while let Ok(event) = self.event_rx.try_recv() {
             match event {
                 AnetEvent::Status(msg) => {
@@ -433,7 +458,6 @@ impl eframe::App for ANetApp {
                     if !self.settings.lock().unwrap().disable_notifications {
                         send_notification("Ошибка ANeT", &err);
                     }
-                    // НЕ обновляем shared.state здесь!
                 }
                 AnetEvent::UpdateProgress(p) => {
                     self.update_status = UpdateStatus::Downloading(p);
@@ -449,7 +473,6 @@ impl eframe::App for ANetApp {
             }
         }
 
-        // 3. Синхронизируем UI с единым состоянием
         self.last_known_state = self.shared.lock().unwrap().state;
 
         let console_frame = egui::Frame::NONE.fill(egui::Color32::from_rgb(10, 10, 10)).inner_margin(8.0).stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(40, 40, 40)));
@@ -472,7 +495,6 @@ impl eframe::App for ANetApp {
         let active_id = settings_guard.active_config_id.clone();
         let editing_id = self.editing_config_id.clone();
         drop(settings_guard);
-
 
         egui::SidePanel::left("config_sidebar").resizable(true).default_width(250.0).frame(egui::Frame::NONE.fill(egui::Color32::from_rgb(25, 25, 25))).show_animated(ctx, self.sidebar_open, |ui| {
             ui.add_space(8.0);
@@ -507,13 +529,9 @@ impl eframe::App for ANetApp {
                 self.open_file_dialog();
             }
 
-            // КНОПКА ОБНОВЛЕНИЯ ВНИЗУ САЙДБАРА
             ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
                 ui.add_space(10.0);
-
-                // Проверяем, не занят ли апдейтер
                 let is_busy = matches!(self.update_status, UpdateStatus::Checking | UpdateStatus::Downloading(_));
-
                 ui.add_enabled_ui(!is_busy, |ui| {
                     let label = if is_busy { "⏳ ЖДИТЕ..." } else { "🔄 ПРОВЕРИТЬ ОБНОВЛЕНИЯ" };
                     if ui.add(egui::Button::new(egui::RichText::new(label).size(11.0))).clicked() {
@@ -522,6 +540,27 @@ impl eframe::App for ANetApp {
                 });
             });
         });
+
+        // Считываем список серверов оригинального TOML для активного профиля
+        let mut server_names = Vec::new();
+        let mut selected_server_name = String::new();
+        let mut active_id_opt = None;
+
+        {
+            let settings = self.settings.lock().unwrap();
+            if let Some(active_cfg) = settings.get_active_config() {
+                active_id_opt = Some(active_cfg.id.clone());
+                if let Ok(mut raw_cfg) = toml::from_str::<CoreConfig>(&active_cfg.content) {
+                    let _ = raw_cfg.sanitize();
+                    server_names = raw_cfg.servers.iter().map(|s| s.get_name()).collect();
+                }
+                selected_server_name = settings.selected_servers.get(&active_cfg.id)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        server_names.first().cloned().unwrap_or_default()
+                    });
+            }
+        }
 
         let main_frame = egui::Frame::NONE.fill(egui::Color32::from_rgb(18, 18, 18)).inner_margin(12.0);
         egui::CentralPanel::default().frame(main_frame).show(ctx, |ui| {
@@ -541,29 +580,59 @@ impl eframe::App for ANetApp {
                     ui.label(egui::RichText::new("(Выберите конфиг слева или добавьте новый)").size(15.0).strong().color(egui::Color32::from_gray(80)));
                 }
             });
+
+            // Выпадающий список выбора ноды подключения
+            if !server_names.is_empty() {
+                ui.add_space(10.0);
+                ui.vertical_centered(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.add_space(ui.available_width() * 0.1);
+                        ui.label(egui::RichText::new("Подключение к:").color(egui::Color32::GRAY));
+
+                        let mut changed = false;
+                        let mut selected_name = String::new();
+
+                        egui::ComboBox::from_id_salt("first_server_select")
+                            .selected_text(&selected_server_name)
+                            .show_ui(ui, |ui| {
+                                for name in &server_names {
+                                    if ui.selectable_label(name == &selected_server_name, name).clicked() {
+                                        selected_name = name.clone();
+                                        changed = true;
+                                    }
+                                }
+                            });
+
+                        if changed {
+                            if let Some(ref active_id) = active_id_opt {
+                                let active_cfg_opt = {
+                                    let mut settings = self.settings.lock().unwrap();
+                                    settings.selected_servers.insert(active_id.clone(), selected_name);
+                                    settings.save();
+                                    settings.get_active_config()
+                                };
+                                if let Some(active_cfg) = active_cfg_opt {
+                                    // Перезагружаем конфиг, чтобы мгновенно применить изменения
+                                    self.load_config_from_content(&active_cfg.id, &active_cfg.content, &active_cfg.name);
+                                }
+                            }
+                        }
+                    });
+                });
+            }
+
             ui.add_space(ui.available_height() * 0.15);
             ui.vertical_centered(|ui| {
                 let btn_size = egui::vec2(180.0, 180.0);
                 let (btn_text, btn_color) = match self.shared.lock().unwrap().state {
                     ConnectionState::Disconnected => ("Подключить VPN", egui::Color32::from_rgb(76, 175, 80)),
                     ConnectionState::Connecting => {
-                        // АНИМАЦИЯ ПУЛЬСАЦИИ
-                        // Используем time (секунды) для синусоиды
                         let time = ctx.input(|i| i.time);
-                        // Синус от -1 до 1, переводим в 0..1
                         let factor = (time.sin() + 1.0) / 2.0;
-
-                        // Интерполируем между Желтым и Оранжевым
-                        // Yellow: (255, 235, 59)
-                        // Orange: (255, 152, 0)
-
-                        let r = 255; // Red всегда 255
-                        let g = (235.0 + (152.0 - 235.0) * factor) as u8; // Green меняется
-                        let b = (59.0 + (0.0 - 59.0) * factor) as u8; // Blue меняется
-
-                        // Запрашиваем перерисовку постоянно, чтобы анимация была плавной
+                        let r = 255;
+                        let g = (235.0 + (152.0 - 235.0) * factor) as u8;
+                        let b = (59.0 + (0.0 - 59.0) * factor) as u8;
                         ctx.request_repaint();
-
                         ("Подключение...", egui::Color32::from_rgb(r, g, b))
                     }
                     ConnectionState::Connected => ("Отключить VPN", egui::Color32::from_rgb(244, 67, 54)),
@@ -585,7 +654,6 @@ impl eframe::App for ANetApp {
             });
         });
 
-        // МОДАЛКА ОШИБКИ
         if let Some(err_msg) = self.error_modal.clone() {
             let neon_orange = egui::Color32::from_rgb(255, 100, 0);
             let modal_bg = egui::Color32::from_rgb(32, 32, 32);
@@ -602,7 +670,7 @@ impl eframe::App for ANetApp {
                 });
             });
         }
-        // --- МОДАЛКА ГОТОВНОСТИ ОБНОВЛЕНИЯ ---
+
         if matches!(self.update_status, UpdateStatus::ReadyToRestart) {
             let neon_orange = egui::Color32::from_rgb(255, 100, 0);
             let modal_bg = egui::Color32::from_rgb(32, 32, 32);
@@ -635,7 +703,7 @@ impl eframe::App for ANetApp {
                     });
                 });
         }
-        // МОДАЛКА ОБНОВЛЕНИЯ
+
         let (show_upd, release_data, progress) = match &self.update_status {
             UpdateStatus::Available(r) => (true, Some(r.clone()), None),
             UpdateStatus::Downloading(p) => (true, None, Some(*p)),
@@ -655,7 +723,6 @@ impl eframe::App for ANetApp {
                         ui.label(egui::RichText::new("SYSTEM UPDATE").size(22.0).strong().color(neon_orange));
 
                         if let Some(rel) = release_data {
-                            // --- ФАЗА 1: ВЫБОР (Текст + Кнопки) ---
                             ui.label(egui::RichText::new(format!("Доступна версия: {}", rel.tag_name)).size(16.0).color(neon_orange));
                             ui.add_space(16.0);
                             ui.add_space(16.0);
@@ -663,12 +730,10 @@ impl eframe::App for ANetApp {
                             ui.add_space(4.0);
 
                             egui::ScrollArea::vertical()
-                                .max_height(180.0) // Можно чуть увеличить высоту
-                                .auto_shrink([false, true]) // Чтобы область подстраивалась под текст
+                                .max_height(180.0)
+                                .auto_shrink([false, true])
                                 .show(ui, |ui| {
                                     let changelog = rel.body.as_deref().unwrap_or("Описание изменений отсутствует.");
-
-                                    // Используем ui.add с явным включением переноса строк (.wrap())
                                     ui.add(
                                         egui::Label::new(
                                             egui::RichText::new(changelog)
@@ -680,10 +745,8 @@ impl eframe::App for ANetApp {
                                 });
                             ui.add_space(24.0);
                             ui.horizontal(|ui| {
-                                // Расположим кнопки симметрично
                                 ui.add_space(ui.available_width() / 6.0);
 
-                                // --- Кнопка ОБНОВИТЬ ---
                                 let btn_update = egui::Button::new(
                                     egui::RichText::new("ОБНОВИТЬ")
                                         .size(16.0)
@@ -704,7 +767,7 @@ impl eframe::App for ANetApp {
                                     });
                                 }
 
-                                ui.add_space(20.0); // Промежуток между кнопками
+                                ui.add_space(20.0);
 
                                 let btn_cancel = egui::Button::new(
                                     egui::RichText::new("ПОЗДНЕЕ")
@@ -720,7 +783,6 @@ impl eframe::App for ANetApp {
                                 }
                             });
                         } else if let Some(p) = progress {
-                            // --- ФАЗА 2: ЗАГРУЗКА (Прогресс-бар) ---
                             ui.add_space(20.0);
                             ui.label(egui::RichText::new("СКАЧИВАНИЕ НОВЫХ БИНАРНИКОВ...").color(neon_orange).strong());
                             ui.add_space(12.0);

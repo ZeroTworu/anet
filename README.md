@@ -28,8 +28,11 @@
 *   `anet-mobile` — Библиотека и JNI-биндинги для Android.
 *   `anet-common` — Реализация протокола ASTP и криптографии.
 *   `anet-keygen` — Утилита для генерации ключей доступа.
+*   `anet-webui` — Админ панель.
 
-Как мог накидал [Документацию](./contrib/docs/anet.ru.md)
+Как мог накидал: [Документацию](./contrib/docs/anet.ru.md)
+
+А это уже полностью нейронка: [AUTH HTTP API](./contrib/docs/http.api.ru.md)
 
 ## Сборка
 
@@ -72,3 +75,10 @@ make cert
 
 Это не мой друг-знакомый, так что "на свой страх и риск", обсуждение [тут](https://github.com/ZeroTworu/anet/issues/36).
 
+## Скриншоты интерфейса (anet-client-gui)
+
+<p align="center">
+<img src=".assets/win-gui-1.png" height="380" alt="Интерфейс отключен" />
+<img src=".assets/win-gui-2.png" height="380" alt="Процесс подключения" />
+<img src=".assets/win-gui-3.png" height="380" alt="Успешное соединение" />
+</p>
