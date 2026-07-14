@@ -9,6 +9,18 @@ import CreateUserModal from '@/components/CreateUserModal.vue'
 const data = ref<UsersResponse | null>(null)
 const loading = ref(false)
 
+// Состояние пагинации
+const page = ref(1)
+const pageSize = ref(10)
+
+// Опции для выбора количества элементов на странице
+const pageSizeOptions = [
+  { label: '10 / стр', value: 10 },
+  { label: '20 / стр', value: 20 },
+  { label: '50 / стр', value: 50 },
+  { label: '100 / стр', value: 100 }
+]
+
 const selectedUserId = ref<string | null>(null)
 const showModal = ref(false)
 const showCreate = ref(false)
@@ -16,10 +28,29 @@ const showCreate = ref(false)
 const loadUsers = async () => {
   loading.value = true
   try {
-    data.value = await GetUsers(0, 10)
+    const offset = (page.value - 1) * pageSize.value
+    data.value = await GetUsers(offset, pageSize.value)
   } finally {
     loading.value = false
   }
+}
+
+// Переключение страниц
+const handlePageChange = (direction: 'prev' | 'next') => {
+  if (direction === 'prev' && page.value > 1) {
+    page.value--
+    loadUsers()
+  } else if (direction === 'next' && data.value && page.value * pageSize.value < data.value.total) {
+    page.value++
+    loadUsers()
+  }
+}
+
+// Изменение размера страницы
+const handlePageSizeChange = (value: number) => {
+  pageSize.value = value
+  page.value = 1 // Сброс на первую страницу
+  loadUsers()
 }
 
 const openEdit = (id: string) => {
@@ -36,7 +67,6 @@ onMounted(loadUsers)
 </script>
 
 <template>
-  <!-- ЕДИНЫЙ КОРНЕВОЙ ЭЛЕМЕНТ ( divs ) ДЛЯ ВСЕЙ СТРАНИЦЫ -->
   <div style="padding: 24px; max-width: 1200px; margin: 0 auto;">
     <n-space justify="space-between" align="center" style="margin-bottom: 20px;">
       <h2 style="margin: 0; font-weight: 600; font-size: 20px;">ANet VPN Clients</h2>
@@ -71,6 +101,41 @@ onMounted(loadUsers)
           </tbody>
         </n-table>
       </div>
+
+      <!-- Кастомная панель пагинации -->
+      <n-space justify="space-between" align="center" style="margin-top: 20px;" v-if="data">
+        <!-- Выбор количества записей -->
+        <n-space align="center">
+          <span style="color: #94a3b8; size: 13px;">Показано {{ data.items.length }} из {{ data.total }}</span>
+          <n-select
+              v-model:value="pageSize"
+              :options="pageSizeOptions"
+              style="width: 120px"
+              @update:value="handlePageSizeChange"
+          />
+        </n-space>
+
+        <!-- Кнопки управления страницами -->
+        <n-space align="center">
+          <n-button
+              :disabled="page === 1"
+              @click="handlePageChange('prev')"
+          >
+            ← СЮДА
+          </n-button>
+
+          <span style="font-family: monospace; min-width: 40px; text-align: center;">
+            {{ page }}
+          </span>
+
+          <n-button
+              :disabled="page * pageSize >= data.total"
+              @click="handlePageChange('next')"
+          >
+            ТУДА →
+          </n-button>
+        </n-space>
+      </n-space>
     </n-spin>
 
     <UserModal
