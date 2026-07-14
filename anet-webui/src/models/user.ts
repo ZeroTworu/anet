@@ -13,12 +13,14 @@ export type User = {
   created_at: string
   rate: Rate | null
   static_ip: string | null
+  server_ids: string[]
 }
 
 export type UpdateUserRequest = {
   uid: string
   is_active: boolean
   static_ip: string | null
+  server_ids: string[]
 }
 
 export type RegenerateUserRequest = {
@@ -32,4 +34,5 @@ export type RegenerateUserRequest = {
 export type CreateUserRequest = {
   uid: string
   rate: RateReqRequest | null
+  server_ids: string[]
 }

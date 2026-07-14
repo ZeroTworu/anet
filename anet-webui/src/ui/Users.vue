@@ -36,13 +36,11 @@ onMounted(loadUsers)
 </script>
 
 <template>
-  <!-- Обертка панели -->
+  <!-- ЕДИНЫЙ КОРНЕВОЙ ЭЛЕМЕНТ ( divs ) ДЛЯ ВСЕЙ СТРАНИЦЫ -->
   <div style="padding: 24px; max-width: 1200px; margin: 0 auto;">
     <n-space justify="space-between" align="center" style="margin-bottom: 20px;">
       <h2 style="margin: 0; font-weight: 600; font-size: 20px;">ANet VPN Clients</h2>
-      <n-button type="primary" @click="showCreate = true">
-        Add User
-      </n-button>
+      <n-button type="primary" @click="showCreate = true"> Add User </n-button>
     </n-space>
 
     <n-spin :show="loading">
@@ -87,7 +85,6 @@ onMounted(loadUsers)
 </template>
 
 <style scoped>
-/* Контейнер таблицы */
 .table-container {
   background: #ffffff !important;
   border-radius: 8px;
@@ -96,14 +93,12 @@ onMounted(loadUsers)
   overflow: hidden;
 }
 
-/* 1. ЗАСТАВЛЯЕМ ЯЧЕЙКИ БЫТЬ ПРОЗРАЧНЫМИ, чтобы они не маскировали строки */
 .interactive-table :deep(td) {
   background-color: transparent !important;
   border-bottom: 1px solid #e2e8f0 !important;
   padding: 16px 20px !important;
 }
 
-/* Шапка таблицы (Светлая тема) */
 .interactive-table :deep(th) {
   background-color: #f1f5f9 !important;
   color: #0f172a !important;
@@ -111,7 +106,6 @@ onMounted(loadUsers)
   border-bottom: 2px solid #cbd5e1 !important;
 }
 
-/* 2. ЖЕСТКО ДЕКЛАРИРУЕМ ЦВЕТА СТРОК ДЛЯ СВЕТЛОЙ ТЕМЫ */
 .clickable-row {
   background-color: #ffffff !important;
   cursor: pointer;
@@ -120,68 +114,54 @@ onMounted(loadUsers)
 }
 
 .clickable-row:nth-child(even) {
-  background-color: #f8fafc !important; /* Легкий серо-синий тон для зебры */
+  background-color: #f8fafc !important;
 }
 
-/* Hover-эффект (Светлая тема) */
 .clickable-row:hover {
   border-left: 4px solid #18a058 !important;
-  background-color: #f0fdf4 !important; /* Мягкий зеленый подтон */
+  background-color: #f0fdf4 !important;
 }
 
-/* Контрастные цвета шрифтов (Светлая тема) */
 .uid-col {
   font-weight: 600 !important;
-  color: #0f172a !important; /* Глубокий темный сланец (виден идеально) */
+  color: #0f172a !important;
   font-size: 15px !important;
 }
 
 .uuid-col {
   font-family: 'Fira Code', 'Courier New', Courier, monospace !important;
-  color: #475569 !important; /* Четкий темно-серый шрифт */
+  color: #475569 !important;
   font-size: 13.5px !important;
 }
 
-
-/* =========================================================================
-   3. КОРРЕКТНЫЙ И КОНТРАСТНЫЙ ТЕМНЫЙ РЕЖИМ (Если ОС/Браузер в Dark Mode)
-   ========================================================================= */
 @media (prefers-color-scheme: dark) {
   .table-container {
     background: #18181c !important;
     border: 1px solid #2d3748 !important;
   }
-
   .interactive-table :deep(th) {
     background-color: #2d3748 !important;
     color: #ffffff !important;
     border-bottom: 2px solid #4a5568 !important;
   }
-
   .interactive-table :deep(td) {
     border-bottom: 1px solid #2d3748 !important;
   }
-
   .clickable-row {
     background-color: #18181c !important;
   }
-
   .clickable-row:nth-child(even) {
     background-color: #1f1f23 !important;
   }
-
-  /* Зеленый ховер в темной теме */
   .clickable-row:hover {
     background-color: #1a3a2a !important;
     border-left: 4px solid #18a058 !important;
   }
-
   .uid-col {
-    color: #ffffff !important; /* Белый на темном фоне */
+    color: #ffffff !important;
   }
-
   .uuid-col {
-    color: #94a3b8 !important; /* Светло-серый моноширинный на темном */
+    color: #94a3b8 !important;
   }
 }
 </style>

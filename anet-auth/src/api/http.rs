@@ -1,10 +1,11 @@
 use crate::api::dto::*;
-use crate::entities::{admins, sessions, users, users::Entity as User};
+use crate::entities::{admins, sessions, users, servers, user_servers, users::Entity as User};
+use crate::crypto::DbEncryptor;
 use chrono::NaiveDateTime;
 use jsonwebtoken::{EncodingKey, Header, encode};
-use log::error;
+use log::{error, info, warn};
 use poem::Result;
-use poem_openapi::{OpenApi, param::Query, payload::Json};
+use poem_openapi::{OpenApi, param::Query, payload::Json, payload::PlainText};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, IntoActiveModel,
     PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
@@ -14,11 +15,12 @@ use uuid::Uuid;
 
 pub struct VpnApi {
     pub db: DatabaseConnection,
+    pub client_template_path: String,
 }
 
 #[OpenApi]
 impl VpnApi {
-    /// Внутренний механизм верификации
+    /// Внутренний механизм верификации токена администратора
     async fn validate_admin_session(&self, token_str: &str) -> std::result::Result<Uuid, String> {
         let secret = env::var("JWT_SECRET").unwrap_or_else(|_| "secret_na_chushpana".to_string());
 
@@ -46,6 +48,68 @@ impl VpnApi {
             None => Err("Отказ! Сессия отозвана".to_string()),
         }
     }
+
+    /// Регистрация нового физического VPN-сервера (ноды) в системе
+    #[oai(path = "/servers", method = "post")]
+    async fn create_server(&self, auth: AdminToken, req: Json<CreateServerRequest>) -> Result<Json<ServerDto>, poem::Error> {
+        if let Err(err) = self.validate_admin_session(&auth.0.token).await {
+            return Err(poem::Error::from_string(err, poem::http::StatusCode::UNAUTHORIZED));
+        }
+
+        let server_id = Uuid::new_v4();
+        let new_server = servers::ActiveModel {
+            id: Set(server_id),
+            name: Set(req.0.name.clone()),
+            address: Set(req.0.address.clone()),
+            public_key: Set(req.0.public_key.clone()),
+            quic_port: Set(req.0.quic_port),
+            ssh_port: Set(req.0.ssh_port),
+            vnc_port: Set(req.0.vnc_port),
+            ssh_user: Set(req.0.ssh_user.clone()),
+            created_at: Set(chrono::Utc::now().naive_utc()),
+            updated_at: Set(chrono::Utc::now().naive_utc()),
+        };
+
+        match new_server.insert(&self.db).await {
+            Ok(saved) => Ok(Json(ServerDto {
+                id: saved.id,
+                name: saved.name,
+                address: saved.address,
+                public_key: saved.public_key,
+                quic_port: saved.quic_port,
+                ssh_port: saved.ssh_port,
+                vnc_port: saved.vnc_port,
+                ssh_user: saved.ssh_user,
+            })),
+            Err(e) => Err(poem::error::InternalServerError(e)),
+        }
+    }
+
+    /// Получить список всех зарегистрированных VPN-нод
+    #[oai(path = "/servers", method = "get")]
+    async fn get_servers(&self, auth: AdminToken) -> GetServersResponse {
+        if let Err(err) = self.validate_admin_session(&auth.0.token).await {
+            return GetServersResponse::Unauthorized(Json(err));
+        }
+
+        match servers::Entity::find().all(&self.db).await {
+            Ok(list) => {
+                let dtos = list.into_iter().map(|s| ServerDto {
+                    id: s.id,
+                    name: s.name,
+                    address: s.address,
+                    public_key: s.public_key,
+                    quic_port: s.quic_port,
+                    ssh_port: s.ssh_port,
+                    vnc_port: s.vnc_port,
+                    ssh_user: s.ssh_user,
+                }).collect();
+                GetServersResponse::Ok(Json(dtos))
+            }
+            Err(e) => GetServersResponse::Error(Json(e.to_string())),
+        }
+    }
+
     /// Настройки тарифа: Обновление количества сессий и даты окончания. (PATCH запрос по ID тарифа).
     #[oai(path = "/rate/:id", method = "patch")]
     async fn update_rate(
@@ -54,12 +118,10 @@ impl VpnApi {
         id: poem_openapi::param::Path<Uuid>,
         req: Json<UpdateRateRequest>,
     ) -> UpdateRateApiResult {
-        // Проверяем админа
         if let Err(err) = self.validate_admin_session(&auth.0.token).await {
             return UpdateRateApiResult::Unauthorized(Json(err));
         }
 
-        // 1. Пытаемся поймать тариф с таким UUID
         let rate_model = match crate::entities::rates::Entity::find_by_id(id.0).one(&self.db).await {
             Ok(Some(r)) => r,
             Ok(None) => {
@@ -71,17 +133,14 @@ impl VpnApi {
             }
         };
 
-        // 2. Раскручиваем модель в режим редактирования
         let mut editable_rate = rate_model.into_active_model();
         let mut something_changed = false;
 
-        // Если передано новое количество сессий
         if let Some(new_sessions) = req.0.sessions {
             editable_rate.sessions = Set(new_sessions as i32);
             something_changed = true;
         }
 
-        // Если передана новая дата окончания
         if let Some(new_date_str) = &req.0.date_end {
             let date_parsed = match chrono::NaiveDateTime::parse_from_str(new_date_str, "%Y-%m-%d-%H:%M") {
                 Ok(d) => d,
@@ -91,7 +150,6 @@ impl VpnApi {
             something_changed = true;
         }
 
-        // 3. Сохраняем, если были изменения
         if something_changed {
             editable_rate.updated_at = Set(chrono::Utc::now().naive_utc());
 
@@ -110,7 +168,6 @@ impl VpnApi {
             }
         }
 
-        // Если передан пустой JSON, возвращаем старые данные
         UpdateRateApiResult::Ok(Json(RateDto {
             id: editable_rate.id.unwrap(),
             sessions: editable_rate.sessions.unwrap() as u32,
@@ -118,40 +175,38 @@ impl VpnApi {
         }))
     }
 
-    // Добавление тарифа
+    /// Добавление тарифа
     #[oai(path = "/addrate", method = "post")]
     async fn add_rate(&self, auth: AdminToken,
-        user_id: Query<Uuid>,
-        req: Json<AddRateRequest>,) -> AddRateApiResult {
-        // Проверяем админа
+                      user_id: Query<Uuid>,
+                      req: Json<AddRateRequest>,) -> AddRateApiResult {
         if let Err(err) = self.validate_admin_session(&auth.0.token).await {
             return AddRateApiResult::Unauthorized(Json(err));
         }
 
-       match users::Entity::find_by_id(user_id.0)
+        match users::Entity::find_by_id(user_id.0)
             .one(&self.db)
             .await
         {
             Ok(Some(_)) => {}
-        
+
             Ok(None) => {
                 return AddRateApiResult::BadRequest(
                     Json("Пользователь не найден".to_string())
                 );
             }
-        
+
             Err(e) => {
                 error!("[DB ERROR] Get User By ID: {}", e);
-            
+
                 return AddRateApiResult::Error(
                     Json("Ошибка поиска пользователя".to_string())
                 );
             }
         }
 
-        let rate_id = Uuid::new_v4(); // Генерируем UUID тарифа
+        let rate_id = Uuid::new_v4();
 
-            // --- ЛОГИКА СОЗДАНИЯ ТАРИФА (RATE) ---
         let date_parsed: NaiveDateTime = if let Some(new_date_str) = &req.0.date_end {
             let date_parsed = match chrono::NaiveDateTime::parse_from_str(new_date_str, "%Y-%m-%d-%H:%M") {
                 Ok(d) => d,
@@ -201,13 +256,8 @@ impl VpnApi {
             .map_err(poem::error::InternalServerError)?;
 
         if let Some((user, rate_opt)) = result {
-            let static_ip = user.static_ip.clone();
             if !user.is_active {
-                return Ok(Json(CheckAccessResponse {
-                    allowed: false,
-                    message: "Banned".into(),
-                    static_ip: None
-                }));
+                return Ok(Json(CheckAccessResponse { allowed: false, message: "Banned".into(), static_ip: None }));
             }
 
             if let Some(rate) = rate_opt {
@@ -228,6 +278,10 @@ impl VpnApi {
                     return Ok(Json(CheckAccessResponse { allowed: false, message: "Кол-во сессий для ключа достигло максимума".into(), static_ip: None }));
                 }
             }
+
+            // Отдаем привязанный статический IP обратно серверу для аллокации
+            let static_ip = user.static_ip.clone();
+
             Ok(Json(CheckAccessResponse { allowed: true, message: "OK".into(), static_ip }))
         } else {
             Ok(Json(CheckAccessResponse { allowed: false, message: "Not found".into(), static_ip: None }))
@@ -349,7 +403,7 @@ impl VpnApi {
         }))
     }
 
-    /// Список юзеров в Панели (С ЗАМКОМ JWT)
+    /// Список юзеров в Панели (Заполняем массивы server_ids для каждого)
     #[oai(path = "/users", method = "get")]
     async fn get_users(
         &self,
@@ -364,23 +418,36 @@ impl VpnApi {
         let offset = from.0.unwrap_or(0);
         let page_size = limit.0.unwrap_or(50);
 
-        let users = users::Entity::find()
+        let users = match users::Entity::find()
             .find_also_related(crate::entities::rates::Entity)
             .order_by_desc(users::Column::CreatedAt)
             .offset(offset)
             .limit(page_size)
             .all(&self.db)
-            .await;
-        let count = users::Entity::find().count(&self.db).await;
+            .await
+        {
+            Ok(list) => list,
+            Err(e) => return GetUsersResponse::Error(Json(e.to_string())),
+        };
 
-        if users.is_err() || count.is_err() {
-            return GetUsersResponse::Error(Json("DB Fetch Error".into()));
-        }
+        let count = match users::Entity::find().count(&self.db).await {
+            Ok(c) => c,
+            Err(e) => return GetUsersResponse::Error(Json(e.to_string())),
+        };
 
-        let dto_list = users
-            .unwrap()
-            .into_iter()
-            .map(|(m, r)| VpnUserDto {
+        let mut dto_list = Vec::new();
+        for (m, r) in users {
+            // Забираем связи многие-ко-многим для каждого пользователя
+            let s_ids = user_servers::Entity::find()
+                .filter(user_servers::Column::UserId.eq(m.id))
+                .all(&self.db)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|us| us.server_id)
+                .collect();
+
+            dto_list.push(VpnUserDto {
                 id: m.id,
                 fingerprint: m.fingerprint,
                 uid: m.uid,
@@ -392,16 +459,17 @@ impl VpnApi {
                     date_end: rate_model.date_end.format("%Y-%m-%d-%H:%M").to_string(),
                 }),
                 static_ip: m.static_ip.map(|ip| ip.parse().ok()).flatten(),
-            })
-            .collect();
+                server_ids: s_ids,
+            });
+        }
 
         GetUsersResponse::Ok(Json(PaginatedUsers {
-            total: count.unwrap(),
+            total: count,
             items: dto_list,
         }))
     }
 
-    /// Получение профиля пользователя по ID (Вместе с тарифом Rate)
+    /// Получение профиля пользователя по ID
     #[oai(path = "/user/:id", method = "get")]
     async fn get_user(
         &self,
@@ -417,39 +485,42 @@ impl VpnApi {
             .one(&self.db)
             .await
         {
-            Ok(Some((u, r))) => {
-                let rate_dto = r.map(|rate_model| RateDto {
-                    id: rate_model.id,
-                    sessions: rate_model.sessions as u32,
-                    date_end: rate_model.date_end.format("%Y-%m-%d-%H:%M").to_string(),
-                });
-
-                VpnUserDto {
-                    id: u.id,
-                    fingerprint: u.fingerprint,
-                    uid: u.uid,
-                    is_active: u.is_active,
-                    created_at: u.created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
-                    rate: rate_dto,
-                    static_ip: u.static_ip.map(|ip| ip.parse().ok()).flatten(),
-                }
-            }
+            Ok(Some((u, r))) => (u, r),
             Ok(None) => return GetUserApiResult::NotFound(Json("VPN клиент не найден".to_string())),
-            Err(e) => {
-                error!("[DB ERROR] Get User By ID: {}", e);
-                return GetUserApiResult::Error(Json("Ошибка поиска".to_string()));
-            }
+            Err(e) => return GetUserApiResult::Error(Json(e.to_string())),
         };
 
-        GetUserApiResult::Ok(Json(result))
+        let s_ids = user_servers::Entity::find()
+            .filter(user_servers::Column::UserId.eq(result.0.id))
+            .all(&self.db)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|us| us.server_id)
+            .collect();
+
+        let rate_dto = result.1.map(|rate_model| RateDto {
+            id: rate_model.id,
+            sessions: rate_model.sessions as u32,
+            date_end: rate_model.date_end.format("%Y-%m-%d-%H:%M").to_string(),
+        });
+
+        GetUserApiResult::Ok(Json(VpnUserDto {
+            id: result.0.id,
+            fingerprint: result.0.fingerprint,
+            uid: result.0.uid,
+            is_active: result.0.is_active,
+            created_at: result.0.created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+            rate: rate_dto,
+            static_ip: result.0.static_ip.map(|ip| ip.parse().ok()).flatten(),
+            server_ids: s_ids,
+        }))
     }
 
     /// Создание нового VPN-Клиента (API-альтернатива команде -a)
     ///
     /// Генерирует новую крипто-пару и добавляет слепок в Белый Список БД.
-    /// Создание нового VPN-Клиента (API-альтернатива команде -a)
-    ///
-    /// Генерирует новую крипто-пару и добавляет слепок в Белый Список БД.
+    /// Создание нового VPN-Клиента (запись связей в user_servers)
     #[oai(path = "/add", method = "post")]
     async fn add_user(&self, auth: AdminToken, req: Json<AddUserRequest>) -> AddUserApiResult {
         if let Err(err) = self.validate_admin_session(&auth.0.token).await {
@@ -458,6 +529,16 @@ impl VpnApi {
 
         let identity = crate::keygen::generate_identity();
         let user_id = Uuid::new_v4();
+        let encryptor = DbEncryptor::new();
+
+        let encrypted_private_key = match encryptor.encrypt(&identity.private_key) {
+            Ok(k) => k,
+            Err(e) => return AddUserApiResult::Error(Json(e.to_string())),
+        };
+        let encrypted_public_key = match encryptor.encrypt(&identity.public_key) {
+            Ok(k) => k,
+            Err(e) => return AddUserApiResult::Error(Json(e.to_string())),
+        };
 
         let new_user = users::ActiveModel {
             id: Set(user_id),
@@ -467,6 +548,8 @@ impl VpnApi {
             created_at: Set(chrono::Utc::now().naive_utc()),
             updated_at: Set(chrono::Utc::now().naive_utc()),
             static_ip: Set(None),
+            private_key: Set(Some(encrypted_private_key)),
+            public_key: Set(Some(encrypted_public_key)),
         };
 
         if let Err(e) = new_user.insert(&self.db).await {
@@ -474,53 +557,30 @@ impl VpnApi {
             return AddUserApiResult::Error(Json("Ошибка записи в БД".to_string()));
         }
 
-        // --- ЛОГИКА СОЗДАНИЯ ТАРИФА (RATE) ---
-        let mut saved_rate_dto = None;
-
-        if let Some(rate_req) = &req.0.rate {
-            let date_parsed = match chrono::NaiveDateTime::parse_from_str(&rate_req.date_end, "%Y-%m-%d-%H:%M") {
-                Ok(d) => d,
-                Err(_) => return AddUserApiResult::Error(Json("Неверный формат даты. Ожидается YYYY-MM-DD-HH:MM".to_string())),
-            };
-
-            let rate_id = Uuid::new_v4(); // Генерируем UUID тарифа
-
-            let new_rate = crate::entities::rates::ActiveModel {
-                id: Set(rate_id),
-                user_id: Set(user_id),
-                sessions: Set(rate_req.sessions as i32),
-                date_end: Set(date_parsed),
-                created_at: Set(chrono::Utc::now().naive_utc()),
-                updated_at: Set(chrono::Utc::now().naive_utc()),
-            };
-
-            if let Err(e) = new_rate.insert(&self.db).await {
-                error!("Failed to insert rate: {}", e);
-                return AddUserApiResult::Error(Json("Ошибка записи тарифа в БД".to_string()));
+        // Записываем привязку ко всем выбранным серверам (нодам)
+        if let Some(ids) = &req.0.server_ids {
+            for sid in ids {
+                let link = user_servers::ActiveModel {
+                    user_id: Set(user_id),
+                    server_id: Set(*sid),
+                };
+                if let Err(e) = link.insert(&self.db).await {
+                    error!("Failed to bind server to user: {}", e);
+                }
             }
-
-            // Собираем DTO для ответа (включая только что созданный ID тарифа)
-            saved_rate_dto = Some(RateDto {
-                id: rate_id,
-                sessions: rate_req.sessions,
-                date_end: rate_req.date_end.clone(),
-            });
         }
 
-        // Возвращаем финальный JSON, в котором есть оба ID
         AddUserApiResult::Ok(Json(AddUserResponse {
-            id: user_id, // <--- ID созданного пользователя
+            id: user_id,
             uid: req.0.uid.clone(),
             fingerprint: identity.fingerprint,
             private_key: identity.private_key,
             public_key: identity.public_key,
-            rate: saved_rate_dto, // <--- Тариф (внутри будет свой id)
+            rate: None,
         }))
     }
 
-    /// Настройки профиля: Ренейминг и Бан. (PATCH запрос по ID клиента).
-    ///
-    /// Полное отключение узла (`is_active: false`) перекрывает доступ для `CheckAccess`.
+    /// Настройки профиля: Ренейминг, Бан и обновление списка серверов
     #[oai(path = "/user/:id", method = "patch")]
     async fn update_user(
         &self,
@@ -528,102 +588,110 @@ impl VpnApi {
         id: poem_openapi::param::Path<Uuid>,
         req: Json<UpdateUserRequest>,
     ) -> UpdateUserApiResult {
-        // Проверяем админа
         if let Err(err) = self.validate_admin_session(&auth.0.token).await {
             return UpdateUserApiResult::Unauthorized(Json(err));
         }
 
-        // 1. Пытаемся поймать юзера с таким UUID (Сразу тянем rate для ответа)
-        let (user_model, rate_model) = match User::find_by_id(id.0)
-            .find_also_related(crate::entities::rates::Entity)
-            .one(&self.db)
-            .await
-        {
+        let (user_model, rate_model) = match User::find_by_id(id.0).find_also_related(crate::entities::rates::Entity).one(&self.db).await {
             Ok(Some((u, r))) => (u, r),
-            Ok(None) => {
-                return UpdateUserApiResult::NotFound(Json(
-                    "VPN клиент не найден в базе!".to_string(),
-                ));
-            }
-            Err(e) => {
-                error!("[DB CRASH] Searching user by ID: {}", e);
-                return UpdateUserApiResult::Error(Json("Ошибка поиска (DB Fallback)".to_string()));
-            }
+            Ok(None) => return UpdateUserApiResult::NotFound(Json("VPN клиент не найден".to_string())),
+            Err(e) => return UpdateUserApiResult::Error(Json(e.to_string())),
         };
 
-        // Подготавливаем Rate DTO, чтобы вернуть его в любом случае
         let rate_dto = rate_model.map(|r_model| RateDto {
             id: r_model.id,
             sessions: r_model.sessions as u32,
             date_end: r_model.date_end.format("%Y-%m-%d-%H:%M").to_string(),
         });
 
-        // 2. Раскручиваем модель из Read-Only в Режим Редактирования (ActiveModel)
         let mut editable_user = user_model.into_active_model();
         let mut something_changed = false;
 
-        // Если нам кинули сменить имя - переименовываем
         if let Some(new_uid) = req.0.uid {
-            editable_user.uid = Set(Some(new_uid.clone()));
+            editable_user.uid = Set(Some(new_uid));
             something_changed = true;
         }
-
-        // Если дёргают рубильник доступа:
         if let Some(activation_flag) = req.0.is_active {
             editable_user.is_active = Set(activation_flag);
             something_changed = true;
         }
-
-        // static_ip changed?
         if let Some(static_ip) = req.0.static_ip {
             editable_user.static_ip = Set(Some(static_ip));
             something_changed = true;
         }
 
-        // 3. Завершаем работу!
+        // Обновляем связи со списком серверов в СУБД
+        if let Some(ref ids) = req.0.server_ids {
+            // Удаляем старые связи
+            let _ = user_servers::Entity::delete_many()
+                .filter(user_servers::Column::UserId.eq(id.0))
+                .exec(&self.db)
+                .await;
+
+            // Записываем новые связи
+            for sid in ids {
+                let link = user_servers::ActiveModel {
+                    user_id: Set(id.0),
+                    server_id: Set(*sid),
+                };
+                let _ = link.insert(&self.db).await;
+            }
+            something_changed = true;
+        }
+
         if something_changed {
             editable_user.updated_at = Set(chrono::Utc::now().naive_utc());
 
             match editable_user.update(&self.db).await {
                 Ok(updated_data) => {
+                    let s_ids = user_servers::Entity::find()
+                        .filter(user_servers::Column::UserId.eq(updated_data.id))
+                        .all(&self.db)
+                        .await
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|us| us.server_id)
+                        .collect();
+
                     return UpdateUserApiResult::Ok(Json(VpnUserDto {
                         id: updated_data.id,
                         fingerprint: updated_data.fingerprint,
                         uid: updated_data.uid,
                         is_active: updated_data.is_active,
-                        created_at: updated_data
-                            .created_at
-                            .format("%Y-%m-%d %H:%M:%S")
-                            .to_string(),
+                        created_at: updated_data.created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
                         rate: rate_dto,
                         static_ip: updated_data.static_ip.map(|ip| ip.parse().ok()).flatten(),
+                        server_ids: s_ids,
                     }));
                 }
                 Err(e) => {
                     error!("[DB CRASH] Editing user payload: {}", e);
-                    return UpdateUserApiResult::Error(Json(
-                        "Обновление сорвано на фазе базы данных!".to_string(),
-                    ));
+                    return UpdateUserApiResult::Error(Json("DB Update failed".to_string()));
                 }
             }
         }
 
-        // Если передали абсолютно пустой JSON (Не меняли ни Имя ни Статус) — отдадим старое.
-        // Дабы Сваггер или ВебМорда не ругались и не висли
+        let s_ids = user_servers::Entity::find()
+            .filter(user_servers::Column::UserId.eq(editable_user.id.clone().unwrap()))
+            .all(&self.db)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|us| us.server_id)
+            .collect();
+
         UpdateUserApiResult::Ok(Json(VpnUserDto {
             id: editable_user.id.unwrap(),
             fingerprint: editable_user.fingerprint.unwrap(),
             uid: editable_user.uid.unwrap(),
             is_active: editable_user.is_active.unwrap(),
-            created_at: editable_user
-                .created_at
-                .unwrap()
-                .format("%Y-%m-%d %H:%M:%S")
-                .to_string(),
+            created_at: editable_user.created_at.unwrap().format("%Y-%m-%d %H:%M:%S").to_string(),
             rate: rate_dto,
             static_ip: editable_user.static_ip.unwrap().map(|ip| ip.parse().ok()).flatten(),
+            server_ids: s_ids,
         }))
     }
+
 
     /// Обнулить конфиг: (Удаление старых ключей) по ID клиента.
     ///
@@ -653,12 +721,25 @@ impl VpnApi {
         };
 
         let new_crypto_core = crate::keygen::generate_identity();
+        let encryptor = DbEncryptor::new();
+
+        // Шифруем новые ключи перед перезаписью
+        let encrypted_private_key = match encryptor.encrypt(&new_crypto_core.private_key) {
+            Ok(k) => k,
+            Err(_) => return RegenerateUserApiResult::Error(Json("Encryption error".to_string())),
+        };
+        let encrypted_public_key = match encryptor.encrypt(&new_crypto_core.public_key) {
+            Ok(k) => k,
+            Err(_) => return RegenerateUserApiResult::Error(Json("Encryption error".to_string())),
+        };
 
         // 3. ПЕРЕСБОРКА В ТИПЕ ActiveModel (Разбираем-Собираем)
         let mut updated_usr = user_model.into_active_model();
 
         // ВАЖНО: Мы перебиваем ему в базе только `fingerprint`, и ставим дату
         updated_usr.fingerprint = Set(new_crypto_core.fingerprint.clone());
+        updated_usr.private_key = Set(Some(encrypted_private_key));
+        updated_usr.public_key = Set(Some(encrypted_public_key));
         updated_usr.updated_at = Set(chrono::Utc::now().naive_utc());
 
         let final_model = match updated_usr.update(&self.db).await {
@@ -679,4 +760,304 @@ impl VpnApi {
             public_key: new_crypto_core.public_key,
         }))
     }
+
+    /// ПУБЛИЧНЫЙ ЭНДПОИНТ: Скачать готовый client.toml для конкретного пользователя по его UUID
+    /// ПУБЛИЧНЫЙ ЭНДПОИНТ: Скачать готовый файл конфигурации client.toml для конкретного пользователя по его UUID
+    #[oai(path = "/config/:id", method = "get")]
+    async fn download_config(&self, id: poem_openapi::param::Path<Uuid>) -> DownloadConfigResponse {
+        // 1. ЗА ОДИН ЗАПРОС тянем пользователя и ВСЕ связанные с ним ноды (Many-to-Many) из базы данных
+        let (user_opt, assigned_servers) = match User::find_by_id(id.0)
+            .find_with_related(servers::Entity)
+            .all(&self.db)
+            .await
+        {
+            Ok(mut list) => {
+                if list.is_empty() {
+                    warn!("[CONFIG] Client download failed: ID {} not found", id.0);
+                    return DownloadConfigResponse::NotFound(Json("Client not found".to_string()));
+                }
+                list.remove(0) // Забираем единственный кортеж (users::Model, Vec<servers::Model>)
+            }
+            Err(e) => {
+                error!("[DB ERROR] Failed to fetch user and assigned servers: {}", e);
+                return DownloadConfigResponse::Error(Json("Database error".to_string()));
+            }
+        };
+
+        // 2. Если пользователь забанен или неактивен — прерываем операцию
+        if !user_opt.is_active {
+            warn!("[CONFIG] Blocked download attempt for inactive/banned client: {}", id.0);
+            return DownloadConfigResponse::NotFound(Json("Client is inactive or banned".to_string()));
+        }
+
+        // 3. Если у пользователя нет привязанных серверов — ругаемся
+        if assigned_servers.is_empty() {
+            warn!("[CONFIG] Download cancelled: No servers assigned to user {}", id.0);
+            return DownloadConfigResponse::Error(Json("No servers assigned to this user".to_string()));
+        }
+
+        // 4. Инициализируем дешифратор базы данных
+        let encryptor = DbEncryptor::new();
+
+        // 5. Расшифровываем приватный ключ пользователя на лету
+        let decrypted_private_key = match user_opt.private_key {
+            Some(ref enc_pk) => match encryptor.decrypt(enc_pk) {
+                Ok(pk) => pk,
+                Err(e) => {
+                    error!("[DECRYPTION ERROR] Failed to decrypt user private key for {}: {}", id.0, e);
+                    return DownloadConfigResponse::Error(Json("Failed to decrypt user credentials".to_string()));
+                }
+            },
+            None => {
+                error!("[CONFIG ERROR] Private key is missing in database for user {}", id.0);
+                return DownloadConfigResponse::Error(Json("Private key is missing in DB".to_string()));
+            }
+        };
+
+        // 6. Динамически генерируем каскадный массив [[servers]]
+        let mut servers_toml = String::new();
+        servers_toml.push_str("\n# =========================================================================\n");
+        servers_toml.push_str("# ANET Client: Dynamic Failover Servers (Multi-Node)\n");
+        servers_toml.push_str("# =========================================================================\n");
+
+        let mut fallback_pub_key = String::new();
+
+        // Пробегаемся по уже загруженному в память массиву серверов без единого запроса к СУБД!
+        for server in assigned_servers {
+            if fallback_pub_key.is_empty() {
+                fallback_pub_key = server.public_key.clone();
+            }
+
+            if let Some(port) = server.quic_port {
+                servers_toml.push_str(&format!(
+                    "[[servers]]\nname = \"{}\"\naddress = \"{}:{}\"\nmode = \"quic\"\ntimeout_secs = 5\nserver_pub_key = \"{}\"\n\n",
+                    format!("{} [QUIC]", server.name), server.address, port, server.public_key
+                ));
+            }
+
+            if let Some(port) = server.ssh_port {
+                let user_name = server.ssh_user.as_deref().unwrap_or("hanyuu");
+                servers_toml.push_str(&format!(
+                    "[[servers]]\nname = \"{}\"\naddress = \"{}:{}\"\nmode = \"ssh\"\nssh_user = \"{}\"\ntimeout_secs = 6\nserver_pub_key = \"{}\"\n\n",
+                    format!("{} [SSH]", server.name), server.address, port, user_name, server.public_key
+                ));
+            }
+
+            if let Some(port) = server.vnc_port {
+                servers_toml.push_str(&format!(
+                    "[[servers]]\nname = \"{}\"\naddress = \"{}:{}\"\nmode = \"vnc\"\ntimeout_secs = 8\nserver_pub_key = \"{}\"\n\n",
+                    format!("{} [VNC]", server.name), server.address, port, server.public_key
+                ));
+            }
+        }
+
+        // 7. Читаем базовый шаблон client_template.toml с диска сервера
+        let template_content = match tokio::fs::read_to_string(&self.client_template_path).await {
+            Ok(content) => content,
+            Err(e) => {
+                error!("[CONFIG TEMPLATE ERROR] Failed to read {}: {}", self.client_template_path, e);
+                return DownloadConfigResponse::Error(Json("Base configuration template is missing on server".to_string()));
+            }
+        };
+
+        // 8. Сливаем базовый конфиг и сгенерированный блок серверов в один контент
+        let mut config_output = template_content;
+        config_output.push_str(&servers_toml);
+
+        // 9. Заменяем плейсхолдеры на расшифрованный приватный ключ юзера и ключ сервера
+        let final_output = config_output
+            .replace("{{PRIVATE_KEY}}", &decrypted_private_key)
+            .replace("{{SERVER_PUB_KEY}}", &fallback_pub_key);
+
+        // 10. Настраиваем заголовки скачивания
+        let client_name = user_opt.uid.unwrap_or_else(|| "client".to_string());
+        let filename_header = format!("attachment; filename=\"{}.toml\"", client_name);
+
+        info!("[CONFIG] Successfully generated and served client.toml for user: {}", client_name);
+
+        DownloadConfigResponse::Ok(PlainText(final_output), filename_header)
+    }
+
+    /// ПУБЛИЧНЫЙ ЭНДПОИНТ: Получить HTML-страницу с QR-кодом и прямой ссылкой на скачивание конфига
+    #[oai(path = "/config/qr/:id", method = "get")]
+    async fn download_config_qr(
+        &self,
+        id: poem_openapi::param::Path<Uuid>,
+        #[oai(name = "Host")] host: poem_openapi::param::Header<Option<String>>,
+    ) -> QrPageResponse {
+        let user_opt = match User::find_by_id(id.0).one(&self.db).await {
+            Ok(Some(u)) => u,
+            Ok(None) => {
+                warn!("[QR] Download failed: ID {} not found", id.0);
+                return QrPageResponse::NotFound(Json("Client not found".to_string()));
+            }
+            Err(e) => {
+                error!("[DB ERROR] Failed to fetch user for QR config: {}", e);
+                return QrPageResponse::Error(Json("Database error".to_string()));
+            }
+        };
+
+        if !user_opt.is_active {
+            warn!("[QR] Blocked download attempt for inactive/banned client: {}", id.0);
+            return QrPageResponse::NotFound(Json("Client is inactive or banned".to_string()));
+        }
+
+        // Автоматически строим абсолютную ссылку на скачивание на основе хоста запроса
+        let host_str = host.0.unwrap_or_else(|| "127.0.0.1:3000".to_string());
+        let config_url = format!("http://{}/api/v1/config/{}", host_str, id.0);
+
+        // Рендерим наш стильный OLED-Black HTML-шаблон на лету
+        let html_page = get_qr_html_page(&config_url);
+
+        info!("[QR] Successfully served QR setup page for user ID: {}", id.0);
+
+        QrPageResponse::Ok(PlainText(html_page))
+    }
+}
+
+
+/// Генератор стильной консольной OLED-Black HTML страницы для скачивания конфига клиентом
+fn get_qr_html_page(config_url: &str) -> String {
+    format!(r#"<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ANet VPN Connection</title>
+    <style>
+        body {{
+            background-color: #050505;
+            color: #e2e8f0;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+            margin: 0;
+            padding: 16px;
+            box-sizing: border-box;
+        }}
+        .card {{
+            background: #0a0a0a;
+            border: 1px solid #1f1f23;
+            border-radius: 12px;
+            padding: 32px;
+            text-align: center;
+            max-width: 420px;
+            width: 100%;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+        }}
+        h1 {{
+            color: #18a058;
+            font-size: 24px;
+            margin-top: 0;
+            margin-bottom: 8px;
+            font-family: monospace;
+            letter-spacing: 0.5px;
+        }}
+        p {{
+            color: #94a3b8;
+            font-size: 14px;
+            line-height: 1.5;
+            margin-bottom: 24px;
+        }}
+        .qr-container {{
+            background: white;
+            padding: 16px;
+            border-radius: 8px;
+            display: inline-block;
+            margin-bottom: 24px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+        }}
+        .qr-container img {{
+            display: block;
+            width: 200px;
+            height: 200px;
+        }}
+        .btn {{
+            display: block;
+            background-color: #18a058;
+            color: white;
+            text-decoration: none;
+            padding: 12px 24px;
+            border-radius: 6px;
+            font-weight: 600;
+            font-size: 15px;
+            transition: background-color 0.15s ease-in-out;
+            margin-bottom: 16px;
+            border: none;
+            cursor: pointer;
+            width: 100%;
+            box-sizing: border-box;
+        }}
+        .btn:hover {{
+            background-color: #148043;
+        }}
+        .input-group {{
+            display: flex;
+            background: #121214;
+            border: 1px solid #1f1f23;
+            border-radius: 6px;
+            padding: 4px;
+            margin-top: 16px;
+        }}
+        .input-group input {{
+            flex: 1;
+            background: transparent;
+            border: none;
+            color: #cbd5e1;
+            font-family: monospace;
+            font-size: 12px;
+            padding: 8px;
+            outline: none;
+            width: 100%;
+        }}
+        .btn-copy {{
+            background: #222;
+            border: 1px solid #333;
+            color: #cbd5e1;
+            padding: 6px 12px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 12px;
+            transition: all 0.1s;
+        }}
+        .btn-copy:hover {{
+            background: #333;
+            color: white;
+        }}
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h1>ANet VPN</h1>
+        <p>Отсканируй QR-код, или скачай файл конфигурации прямо на свой компьютер.</p>
+
+        <div class="qr-container">
+            <img src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&data={config_url}" alt="Config QR" />
+        </div>
+
+        <a href="{config_url}" class="btn">Download client.toml</a>
+
+        <div class="input-group">
+            <input type="text" readonly id="link-input" value="{config_url}" />
+            <button class="btn-copy" onclick="copyLink()">Copy</button>
+        </div>
+    </div>
+    <script>
+        function copyLink() {{
+            var copyText = document.getElementById("link-input");
+            copyText.select();
+            copyText.setSelectionRange(0, 99999);
+            navigator.clipboard.writeText(copyText.value);
+
+            var btn = document.querySelector(".btn-copy");
+            btn.textContent = "Copied!";
+            setTimeout(function() {{
+                btn.textContent = "Copy";
+            }}, 2000);
+        }}
+    </script>
+</body>
+</html>"#, config_url = config_url)
 }

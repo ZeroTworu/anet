@@ -1,4 +1,4 @@
-use log::{error};
+use log::error;
 use reqwest::Client as HttpClient;
 use std::time::Duration;
 
@@ -47,7 +47,6 @@ impl AuthProvider {
 
         // 2. Внешние сервера
         let req_body = CheckAccessRequest { fingerprint: fingerprint.to_string() };
-
         for server_url in &self.auth_servers {
             let url = format!("{}/check_access", server_url);
             let res = self.http_client.post(&url)
@@ -56,13 +55,21 @@ impl AuthProvider {
 
             match res {
                 Ok(resp) => {
-                    if let Ok(json) = resp.json::<CheckAccessResponse>().await {
-                        if json.allowed {
-                            return Ok(json.static_ip);
-                        } else {
-                            return Err(json.message);
+                    match resp.status() {
+                        reqwest::StatusCode::OK => {
+                            if let Ok(json) = resp.json::<CheckAccessResponse>().await {
+                                return if json.allowed {
+                                    Ok(json.static_ip)
+                                } else {
+                                    Err(json.message)
+                                }
+                            }
+                        }
+                        _ => {
+                            return Err(resp.text().await.unwrap());
                         }
                     }
+
                 }
                 Err(e) => { error!("[Auth] Server {} unreachable: {}", server_url, e); continue; }
             }

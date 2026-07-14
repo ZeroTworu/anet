@@ -103,11 +103,15 @@ impl Default for TransportConfig {
     }
 }
 
-// Новая структура для точечного описания серверов в массиве [[servers]]
+// структура для точечного описания серверов в массиве [[servers]]
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServerConfig {
+    // Опциональное человекочитаемое имя сервера (например, "Germany-1")
+    pub name: Option<String>,
+
     // IP-адрес или доменное имя сервера и порт для подключения
     pub address: String,
+
     // Режим транспорта (quic, ssh, vnc)
     pub mode: TransportMode,
 
@@ -121,6 +125,27 @@ pub struct ServerConfig {
     // Опциональное переопределение пользователя SSH
     pub ssh_user: Option<String>,
 }
+
+impl ServerConfig {
+    /// Получить имя сервера.
+    /// Если имя не указано в TOML — генерируем его на лету в формате IP:MODE (например, 127.0.0.1:SSH)
+    pub fn get_name(&self) -> String {
+        self.name.clone().unwrap_or_else(|| {
+            // Извлекаем чистый IP без порта
+            let ip = self.address.split(':').next().unwrap_or(&self.address);
+
+            // Мапим режим транспорта в строгий верхний регистр (UPPERCASE)
+            let mode_str = match self.mode {
+                TransportMode::Quic => "QUIC",
+                TransportMode::Ssh => "SSH",
+                TransportMode::Vnc => "VNC",
+            };
+
+            format!("{}:{}", ip, mode_str)
+        })
+    }
+}
+
 
 fn default_timeout_secs() -> u64 {
     10
@@ -159,7 +184,13 @@ impl CoreConfig {
             if self.main.address.is_empty() {
                 anyhow::bail!("No servers defined in [[servers]] and legacy address is empty");
             }
+            let mode_str = match self.transport.mode {
+                TransportMode::Quic => "QUIC",
+                TransportMode::Ssh => "SSH",
+                TransportMode::Vnc => "VNC",
+            };
             self.servers.push(ServerConfig {
+                name: Some(format!("{}:{}", self.main.address.clone(), mode_str)),
                 address: self.main.address.clone(),
                 mode: self.transport.mode,
                 timeout_secs: 10,

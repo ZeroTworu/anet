@@ -1,10 +1,52 @@
-use poem_openapi::{ApiResponse, Object, SecurityScheme, auth::Bearer, payload::Json};
+use poem_openapi::{ApiResponse, Object, SecurityScheme, auth::Bearer, payload::Json, payload::PlainText};
 use serde::{Deserialize, Serialize};
 use std::net::Ipv4Addr;
 
-pub use anet_common::dto::{CheckAccessRequest, CheckAccessResponse, SessionEventRequest};
-/// [ VPN Core Communication ]
+// Реэкспортируем общие DTO-структуры из anet-common
+pub use anet_common::dto::{
+    CheckAccessRequest, CheckAccessResponse, SessionEventRequest
+};
 
+/// [ VPN Server Management Area ]
+#[derive(Object, Debug, Clone, Serialize, Deserialize)]
+pub struct ServerDto {
+    pub id: uuid::Uuid,
+    pub name: String,
+    pub address: String,
+    pub public_key: String,
+    pub quic_port: Option<i32>,
+    pub ssh_port: Option<i32>,
+    pub vnc_port: Option<i32>,
+    pub ssh_user: Option<String>,
+}
+
+#[derive(Object, Debug, Clone, Serialize, Deserialize)]
+pub struct CreateServerRequest {
+    pub name: String,
+    pub address: String,
+    pub public_key: String,
+    pub quic_port: Option<i32>,
+    pub ssh_port: Option<i32>,
+    pub vnc_port: Option<i32>,
+    pub ssh_user: Option<String>,
+}
+
+#[derive(ApiResponse)]
+pub enum GetServersResponse {
+    #[oai(status = 200, content_type = "application/json")]
+    Ok(Json<Vec<ServerDto>>),
+    #[oai(status = 401, content_type = "application/json")]
+    Unauthorized(Json<String>),
+    #[oai(status = 500, content_type = "application/json")]
+    Error(Json<String>),
+}
+
+
+/// [ VPN Core Communication: Session Lifecycle ]
+#[derive(Object)]
+pub struct SessionEventRequestLocal {
+    pub fingerprint: String,
+}
 
 #[derive(ApiResponse)]
 pub enum SessionEventResponse {
@@ -73,6 +115,7 @@ pub struct VpnUserDto {
     pub created_at: String,
     pub rate: Option<RateDto>,
     pub static_ip: Option<Ipv4Addr>,
+    pub server_ids: Vec<uuid::Uuid>,
 }
 
 #[derive(Object)]
@@ -107,6 +150,7 @@ pub enum GetUserApiResult {
 pub struct AddUserRequest {
     pub uid: String,
     pub rate: Option<RateReqDto>,
+    pub server_ids: Option<Vec<uuid::Uuid>>,
 }
 
 #[derive(Object)]
@@ -134,6 +178,7 @@ pub struct UpdateUserRequest {
     pub uid: Option<String>,
     pub is_active: Option<bool>,
     pub static_ip: Option<String>,
+    pub server_ids: Option<Vec<uuid::Uuid>>,
 }
 
 #[derive(ApiResponse)]
@@ -208,5 +253,31 @@ pub enum RegenerateUserApiResult {
     #[oai(status = 404)]
     NotFound(Json<String>),
     #[oai(status = 500)]
+    Error(Json<String>),
+}
+
+
+#[derive(ApiResponse)]
+pub enum DownloadConfigResponse {
+    /// Возвращает сгенерированный файл конфигурации в виде вложения
+    #[oai(status = 200, content_type = "text/plain")]
+    Ok(
+        PlainText<String>, // <--- ПЕРВЫЙ АРГУМЕНТ: ТЕЛО ФАЙЛА (Payload)
+        #[oai(header = "Content-Disposition")] String,
+    ),
+    #[oai(status = 404, content_type = "application/json")]
+    NotFound(Json<String>),
+    #[oai(status = 500, content_type = "application/json")]
+    Error(Json<String>),
+}
+
+#[derive(ApiResponse)]
+pub enum QrPageResponse {
+    /// Возвращает готовую HTML-страницу с QR-кодом и кнопкой скачивания
+    #[oai(status = 200, content_type = "text/html")]
+    Ok(PlainText<String>),
+    #[oai(status = 404, content_type = "application/json")]
+    NotFound(Json<String>),
+    #[oai(status = 500, content_type = "application/json")]
     Error(Json<String>),
 }

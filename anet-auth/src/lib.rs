@@ -3,3 +3,4 @@ pub mod entities;
 pub mod keygen;
 pub mod middleware;
 pub mod migration;
+pub mod crypto;

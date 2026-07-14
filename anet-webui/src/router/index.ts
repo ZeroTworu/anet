@@ -1,8 +1,8 @@
-// src/router/index.ts
 import { createRouter, createWebHistory } from 'vue-router'
 
 import Auth from '@/ui/Auth.vue'
 import Users from '@/ui/Users.vue'
+import Servers from '@/ui/Servers.vue'
 
 const router = createRouter({
   history: createWebHistory(),
@@ -13,6 +13,7 @@ const router = createRouter({
       meta: { isAuth: true },
     },
     { path: '/users', component: Users },
+    { path: '/servers', component: Servers },
   ],
 })
 

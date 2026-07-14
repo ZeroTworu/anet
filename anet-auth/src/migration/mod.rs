@@ -3,6 +3,9 @@ pub mod m20240319_000002_create_admins;
 pub mod m20240401_000003_create_rates;
 pub mod m20240501_000004_create_active_sessions;
 pub mod m20260504_152844_add_ipv4_to_user;
+pub mod m20260714_000007_create_servers;
+pub mod m20260714_000006_add_keys_to_user;
+pub mod m20260714_000008_create_user_servers;
 
 use sea_orm_migration::prelude::*;
 
@@ -17,6 +20,9 @@ impl MigratorTrait for Migrator {
             Box::new(m20240401_000003_create_rates::Migration),
             Box::new(m20240501_000004_create_active_sessions::Migration),
             Box::new(m20260504_152844_add_ipv4_to_user::Migration),
+            Box::new(m20260714_000007_create_servers::Migration),
+            Box::new(m20260714_000008_create_user_servers::Migration),
+            Box::new(m20260714_000006_add_keys_to_user::Migration),
         ]
     }
 }

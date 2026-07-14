@@ -1,6 +1,6 @@
 use crate::config::{CoreConfig, ServerConfig};
 use crate::dns::{DnsManager, get_dns_manager};
-use crate::events::{status, warn, err};
+use crate::events::{status, warn};
 use crate::traits::{RouteManager, TunFactory};
 use crate::statistic;
 use crate::transport::factory::create_transport;
@@ -23,7 +23,7 @@ struct RunningSession {
     endpoint: Option<Endpoint>,
     shutdown_notify: Arc<Notify>,
     main_task: JoinHandle<()>,
-    stats_task: Option<JoinHandle<()>>, // Сохраняем таску статистики для сброса
+    stats_task: Option<JoinHandle<()>>,
     iface_name: String,
 }
 
@@ -109,7 +109,6 @@ impl AnetClient {
             return Err(anyhow::anyhow!("VPN tunnel is already active"));
         }
 
-        // Санитаризируем конфиг (если массив серверов пуст — соберем его из старых полей)
         let mut config_clone = self.config.clone();
         config_clone.sanitize()?;
 
@@ -121,28 +120,24 @@ impl AnetClient {
 
         loop {
             let server = &config_clone.servers[current_server_index];
-            info!("[Core] Connecting to {} via {:?}", server.address, server.mode);
-            status(format!("Connecting to {}...", server.address));
 
-            // Запускаем сессию для конкретной ноды
+            // Используем наш хелпер get_name() для вывода имени
+            let server_name = server.get_name();
+            info!("[Core] Connecting to server '{}' ({}) via {:?}", server_name, server.address, server.mode);
+            status(format!("Connecting to '{}'...", server_name));
+
             match self.connect_and_run(server, reconnect_signal.clone()).await {
                 Ok(()) => {
-                    // Сессия успешно работала, но мы получили сигнал реконнекта (Case 2)
-                    warn!("[Core] Connection with {} lost. Switching to the next node...", server.address);
-                    warn("Connection lost. Reconnecting...");
+                    warn!("[Core] Connection with server '{}' lost. Switching to the next node...", server_name);
+                    status("Connection lost. Reconnecting...");
 
-                    // Переходим к следующей ноде в списке
                     current_server_index = (current_server_index + 1) % config_clone.servers.len();
-
-                    // ВАЖНО: Даем ОС время на асинхронное закрытие дескрипторов старого TUN устройства
                     tokio::time::sleep(Duration::from_secs(2)).await;
                 }
                 Err(e) => {
-                    // Ошибка на этапе рукопожатия или Case 1 (нет начального трафика)
-                    error!("[Core] Connection failed or timed out for {}: {}", server.address, e);
-                    err(format!("Node error: {}", e));
+                    error!("[Core] Connection failed or timed out for server '{}': {}", server_name, e);
+                    status(format!("Node error: {}", e));
 
-                    // Немедленно переходим к следующему серверу
                     current_server_index = (current_server_index + 1) % config_clone.servers.len();
                     tokio::time::sleep(Duration::from_secs(2)).await;
                 }

@@ -294,6 +294,7 @@ dependencies = [
  "anyhow",
  "base64",
  "bcrypt",
+ "bytes",
  "chrono",
  "clap",
  "dotenvy",

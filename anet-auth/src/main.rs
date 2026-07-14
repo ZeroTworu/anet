@@ -3,6 +3,7 @@ use anet_auth::entities::{admins, users};
 use anet_auth::keygen;
 use anet_auth::middleware;
 use anet_auth::migration;
+use anet_auth::crypto::DbEncryptor; // Подключаем наш шифратор базы данных
 use bcrypt::{DEFAULT_COST, hash};
 use clap::Parser;
 use log::{error, info};
@@ -103,7 +104,16 @@ async fn handle_add_user(
         return Err(anyhow::anyhow!("ОШИБКА: Для привязки тарифа необходимо указать И --sessions И --date-end"));
     }
 
-    // 2. Создаем модель для БД
+    // Инициализируем шифратор БД
+    let encryptor = DbEncryptor::new();
+
+    // Зашифровываем сгенерированные ключи перед записью в Postgres
+    let encrypted_private_key = encryptor.encrypt(&identity.private_key)
+        .map_err(|e| anyhow::anyhow!("Failed to encrypt user private key: {}", e))?;
+    let encrypted_public_key = encryptor.encrypt(&identity.public_key)
+        .map_err(|e| anyhow::anyhow!("Failed to encrypt user public key: {}", e))?;
+
+    // 2. Создаем модель для БД с поддержкой новых зашифрованных полей
     let new_user = users::ActiveModel {
         id: Set(user_id),
         fingerprint: Set(identity.fingerprint.clone()),
@@ -112,6 +122,8 @@ async fn handle_add_user(
         created_at: Set(chrono::Utc::now().naive_utc()),
         updated_at: Set(chrono::Utc::now().naive_utc()),
         static_ip: Set(None),
+        private_key: Set(Some(encrypted_private_key)),
+        public_key: Set(Some(encrypted_public_key)),
     };
 
     // 3. Сохраняем
@@ -201,8 +213,10 @@ async fn handle_add_admin(db: &DatabaseConnection, login: String) -> Result<(), 
 async fn run_server(db: DatabaseConnection) -> Result<(), anyhow::Error> {
     let bind_to = env::var("BIND_TO").unwrap_or_else(|_| "127.0.0.1:3000".to_string());
     let api_key = env::var("AUTH_BACKEND_KEY").expect("AUTH_BACKEND_KEY must be set");
+    let client_template_path = env::var("CLIENT_TEMPLATE_PATH")
+        .unwrap_or_else(|_| "/opt/anet/client_template.toml".to_string());
 
-    let api_service = OpenApiService::new(api::VpnApi { db }, "ANet Auth API", "1.0")
+    let api_service = OpenApiService::new(api::VpnApi { db, client_template_path }, "ANet Auth API", "1.0")
         .server(format!("http://{}/api/v1", bind_to));
 
     let ui = api_service.swagger_ui();

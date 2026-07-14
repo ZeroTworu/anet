@@ -1,0 +1,47 @@
+# =========================================================================
+# ANET Client: Base Configuration Template (Dynamic)
+# =========================================================================
+[main]
+# Название виртуального адаптера
+tun_name = "anet-client"
+
+# Включает ручное управление роутингом на клиенте
+manual_routing = false
+
+# Настройки Маршрутизации (Split Tunneling)
+# Пустой список route_for означает "Режим Global VPN" (весь трафик в туннель)
+route_for = []
+
+exclude_route_for = ["192.168.1.0/24"]
+
+# Список DNS-серверов, используемых при запуске для резолва доменов
+dns_server_list = ["1.1.1.1", "8.8.8.8"]
+
+# Ссылка для скачивания авто-обновлений клиента
+update_url = "https://api.github.com/repos/ZeroTworu/anet/releases/latest"
+
+[keys]
+# Эти параметры бэкенд дешифрует и заполнит автоматически при скачивании
+private_key = "{{PRIVATE_KEY}}"
+server_pub_key = "{{SERVER_PUB_KEY}}"
+
+[stats]
+enabled = true
+interval_minutes = 1
+
+[stealth]
+min_jitter_ns = 1000000
+max_jitter_ns = 5000000
+padding_step = 64
+
+[quic_transport]
+algorithm = "bbr"
+expected_rtt_ms = 75
+bandwidth_down_mbps = 200
+bandwidth_up_mbps = 200
+receive_window = 16777216
+stream_receive_window = 8388608
+send_window = 33554432
+enable_gso = true
+idle_timeout_seconds = 21600
+max_mtu = 1500

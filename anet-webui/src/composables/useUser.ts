@@ -23,6 +23,7 @@ export function useUser() {
       uid: user.value.uid,
       is_active: user.value.is_active,
       static_ip: user.value.static_ip,
+      server_ids: user.value.server_ids || [],
     })
   }
 
