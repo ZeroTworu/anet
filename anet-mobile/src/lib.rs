@@ -173,8 +173,9 @@ impl EventHandler for AndroidEventHandler {
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_org_alco_anet_ANetVpnService_connectVpn(
     mut env: JNIEnv,
-    this: jni::objects::JObject,
+    this: JObject,
     config_jstr: JString,
+    selected_server_jstr: JString,
 ) {
     info!("JNI: connectVpn called");
 
@@ -203,7 +204,12 @@ pub extern "system" fn Java_org_alco_anet_ANetVpnService_connectVpn(
         }
     };
 
-    let config: CoreConfig = match toml::from_str(&config_toml) {
+    let selected_server: String = match env.get_string(&selected_server_jstr) {
+        Ok(java_str) => java_str.into(),
+        Err(_) => String::new(),
+    };
+
+    let mut config: CoreConfig = match toml::from_str(&config_toml) {
         Ok(c) => c,
         Err(e) => {
             error!("Failed to parse TOML config: {}", e);
@@ -213,7 +219,6 @@ pub extern "system" fn Java_org_alco_anet_ANetVpnService_connectVpn(
     };
 
     rt.spawn(async move {
-        // Очищаем и останавливаем старый инстанс клиента перед созданием нового
         let old_client = {
             let mut client_guard = CLIENT.lock().unwrap();
             client_guard.take()
@@ -221,6 +226,17 @@ pub extern "system" fn Java_org_alco_anet_ANetVpnService_connectVpn(
         if let Some(client) = old_client {
             info!("Rust JNI: Stopping old active client task...");
             let _ = client.stop().await;
+        }
+
+        // Применяем санитайзер
+        let _ = config.sanitize();
+
+        // Ротация серверов
+        if !selected_server.is_empty() {
+            if let Some(idx) = config.servers.iter().position(|s| s.get_name() == selected_server) {
+                config.servers.rotate_left(idx);
+                info!("Rust: Reordered server list. Starting node: {}", selected_server);
+            }
         }
 
         let tun_factory = Box::new(AndroidCallbackTunFactory::new(
@@ -232,7 +248,6 @@ pub extern "system" fn Java_org_alco_anet_ANetVpnService_connectVpn(
 
         let client = Arc::new(AnetClient::new(config, tun_factory, route_manager));
 
-        // Сразу сохраняем дескриптор в глобальный мьютекс
         {
             *CLIENT.lock().unwrap() = Some(client.clone());
         }
