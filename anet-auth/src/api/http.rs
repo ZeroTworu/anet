@@ -1000,7 +1000,7 @@ impl VpnApi {
         let config_url = format!("http://{}/api/v1/config/{}", host_str, id.0);
 
         // Рендерим наш стильный OLED-Black HTML-шаблон на лету
-        let html_page = get_qr_html_page(&config_url);
+        let html_page = get_qr_html_page(&config_url, user_opt.uid.unwrap_or_else(|| "client".to_string()).as_str());
 
         info!("[QR] Successfully served QR setup page for user ID: {}", id.0);
 
@@ -1010,7 +1010,7 @@ impl VpnApi {
 
 
 /// Генератор стильной консольной OLED-Black HTML страницы для скачивания конфига клиентом
-fn get_qr_html_page(config_url: &str) -> String {
+fn get_qr_html_page(config_url: &str, user_name: &str) -> String {
     format!(r#"<!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -1123,8 +1123,8 @@ fn get_qr_html_page(config_url: &str) -> String {
 </head>
 <body>
     <div class="card">
-        <h1>ANet VPN</h1>
-        <p>Отсканируй QR-код, или скачай файл конфигурации прямо на свой компьютер.</p>
+        <h1>ANet VPN for {user_name}</h1>
+        <p>Отсканируй QR-код приложением ANet, или скачай файл конфигурации прямо на свой компьютер.</p>
 
         <div class="qr-container">
             <img src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&data={config_url}" alt="Config QR" />
