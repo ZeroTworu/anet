@@ -1,6 +1,6 @@
 use crate::config::StealthConfig;
-use crate::stream_framing::frame_packet;
-use bytes::Bytes;
+use crate::stream_framing::frame_packet_into;
+use bytes::{Bytes, BytesMut};
 use log::{error, info, warn};
 use rand::Rng;
 use rand::rngs::OsRng;
@@ -23,6 +23,55 @@ use crate::padding_utils::calculate_padding_needed;
 /// * `stream`: QUIC SendStream.
 /// * `min_jitter`: Минимальная задержка (ns).
 /// * `max_jitter`: Максимальная задержка (ns).
+/// Максимальный размер буфера коалесценции (байт) перед сбросом в стрим.
+/// ~44 пакета по 1450 байт. Держим заметно меньше stream receive window,
+/// чтобы не вносить лишнюю задержку.
+const COALESCE_BUDGET_BYTES: usize = 64 * 1024;
+
+/// Цикл отправки с коалесценцией: берём первый пакет блокирующе,
+/// затем выгребаем всё, что уже накопилось в канале, через `try_recv()`,
+/// и пишем одним `write_all` с одним `flush`.
+///
+/// На высоких PPS это уменьшает число операций записи в стрим (и, как следствие,
+/// syscalls/QUIC-пакетов на выходе) на порядок, сохраняя порядок пакетов.
+async fn coalesced_sender_loop<S>(
+    rx_ready: &mut mpsc::Receiver<Bytes>,
+    stream: &mut S,
+) -> anyhow::Result<()>
+where
+    S: AsyncWriteExt + Unpin + Send,
+{
+    let mut buf = BytesMut::with_capacity(COALESCE_BUDGET_BYTES);
+
+    while let Some(packet) = rx_ready.recv().await {
+        buf.clear();
+
+        // Фильтр мусора: минимальный IPv4-заголовок — 20 байт
+        if packet.len() >= 20 {
+            frame_packet_into(&mut buf, &packet);
+        }
+
+        // Выгребаем всё, что уже готово, без ожидания
+        while buf.len() < COALESCE_BUDGET_BYTES {
+            match rx_ready.try_recv() {
+                Ok(p) if p.len() >= 20 => frame_packet_into(&mut buf, &p),
+                Ok(_) => continue,
+                Err(_) => break,
+            }
+        }
+
+        if buf.is_empty() {
+            continue;
+        }
+
+        if stream.write_all(&buf).await.is_err() || stream.flush().await.is_err() {
+            error!("Stream write failed");
+            break;
+        }
+    }
+    Ok(())
+}
+
 pub async fn bridge_with_jitter<S>(
     mut rx: mpsc::Receiver<Bytes>,
     mut stream: S,
@@ -31,6 +80,18 @@ pub async fn bridge_with_jitter<S>(
 where
     S: AsyncWriteExt + Unpin + Send + 'static,
 {
+    let jitter_enabled = config.max_jitter_ns > config.min_jitter_ns;
+
+    // --- Быстрый путь: джиттер выключен (дефолт) ---
+    // Без диспетчера, без spawn на каждый пакет, без второго канала.
+    // Пакеты идут напрямую: rx -> коалесценция -> стрим. Порядок сохраняется.
+    if !jitter_enabled {
+        let result = coalesced_sender_loop(&mut rx, &mut stream).await;
+        let _ = stream.shutdown().await;
+        return result;
+    }
+
+    // --- Путь с джиттером ---
     // Промежуточный канал для пакетов, которые "проснулись" после джиттера
     let (tx_ready, mut rx_ready) = mpsc::channel::<Bytes>(CHANNEL_BUFFER_SIZE);
 
@@ -43,11 +104,7 @@ where
             } // Фильтр мусора (опционально)
 
             let tx = tx_ready.clone();
-            let delay = if config.max_jitter_ns > config.min_jitter_ns {
-                rng.gen_range(config.min_jitter_ns..=config.max_jitter_ns)
-            } else {
-                0
-            };
+            let delay = rng.gen_range(config.min_jitter_ns..=config.max_jitter_ns);
 
             // Спавним микро-задачу на каждый пакет
             tokio::spawn(async move {
@@ -62,13 +119,7 @@ where
 
     // Задача 2: Отправщик (ReadyChannel -> QUIC Stream)
     // Этот цикл работает в текущем таске и ждет завершения
-    while let Some(packet) = rx_ready.recv().await {
-        let framed = frame_packet(packet);
-        if stream.write_all(&framed).await.is_err() || stream.flush().await.is_err() {
-            error!("Stream write failed");
-            break;
-        }
-    }
+    let result = coalesced_sender_loop(&mut rx_ready, &mut stream).await;
 
     // Закрываем стрим корректно
     let _ = stream.shutdown().await;
@@ -76,7 +127,7 @@ where
     // Ждем завершения диспетчера (хотя он скорее всего уже умер из-за закрытия канала)
     dispatch_task.abort();
 
-    Ok(())
+    result
 }
 
 
@@ -114,17 +165,38 @@ where
     });
 
     let padding_step = config.padding_step;
-    while let Some(packet) = rx_ready.recv().await {
+    let mut buf = BytesMut::with_capacity(COALESCE_BUDGET_BYTES);
+
+    // Шифруем пакет и дописываем его фрейм в буфер коалесценции
+    let encrypt_into = |packet: Bytes, buf: &mut BytesMut| {
         let seq = sequence.fetch_add(1, Ordering::Relaxed);
         let total_len = packet.len() + 38;
         let pad = calculate_padding_needed(total_len, padding_step);
         let safe_pad = if total_len + (pad as usize) > crate::consts::PADDING_MTU { 0 } else { pad };
 
         if let Ok(crypted) = crate::transport::wrap_packet(&cipher, &nonce_prefix, seq, packet, safe_pad) {
-            let framed = frame_packet(crypted);
-            if stream.write_all(&framed).await.is_err() || stream.flush().await.is_err() {
-                break;
+            frame_packet_into(buf, &crypted);
+        }
+    };
+
+    while let Some(packet) = rx_ready.recv().await {
+        buf.clear();
+        encrypt_into(packet, &mut buf);
+
+        // Выгребаем всё, что уже готово, и пишем одним вызовом
+        while buf.len() < COALESCE_BUDGET_BYTES {
+            match rx_ready.try_recv() {
+                Ok(p) => encrypt_into(p, &mut buf),
+                Err(_) => break,
             }
+        }
+
+        if buf.is_empty() {
+            continue;
+        }
+
+        if stream.write_all(&buf).await.is_err() || stream.flush().await.is_err() {
+            break;
         }
     }
 
@@ -169,4 +241,75 @@ where
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+
+    /// Быстрый путь (джиттер выключен): все пакеты доходят, порядок сохранён,
+    /// фрейминг корректен.
+    #[tokio::test]
+    async fn test_fast_path_preserves_order_and_framing() {
+        let (tx, rx) = mpsc::channel::<Bytes>(64);
+        let (writer, mut read_half) = tokio::io::duplex(1 << 20);
+
+        for i in 0..50u8 {
+            tx.send(Bytes::from(vec![i; 24])).await.unwrap();
+        }
+        drop(tx);
+
+        let bridge = tokio::spawn(bridge_with_jitter(rx, writer, StealthConfig::default()));
+
+        let mut data = Vec::new();
+        read_half.read_to_end(&mut data).await.unwrap();
+        bridge.await.unwrap().unwrap();
+
+        let mut reader = std::io::Cursor::new(data);
+        for i in 0..50u8 {
+            let pkt = crate::stream_framing::read_next_packet(&mut reader)
+                .await
+                .unwrap()
+                .expect("packet missing");
+            assert_eq!(pkt.len(), 24);
+            assert_eq!(pkt[0], i, "packet order violated");
+        }
+        assert!(
+            crate::stream_framing::read_next_packet(&mut reader)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// Мусор (<20 байт) отфильтровывается и в быстром пути.
+    #[tokio::test]
+    async fn test_fast_path_filters_garbage() {
+        let (tx, rx) = mpsc::channel::<Bytes>(8);
+        let (writer, mut read_half) = tokio::io::duplex(1 << 16);
+
+        tx.send(Bytes::from_static(&[1, 2, 3])).await.unwrap(); // мусор
+        tx.send(Bytes::from(vec![7u8; 32])).await.unwrap(); // нормальный
+        drop(tx);
+
+        let bridge = tokio::spawn(bridge_with_jitter(rx, writer, StealthConfig::default()));
+
+        let mut data = Vec::new();
+        read_half.read_to_end(&mut data).await.unwrap();
+        bridge.await.unwrap().unwrap();
+
+        let mut reader = std::io::Cursor::new(data);
+        let pkt = crate::stream_framing::read_next_packet(&mut reader)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pkt.len(), 32);
+        assert!(
+            crate::stream_framing::read_next_packet(&mut reader)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
 }
