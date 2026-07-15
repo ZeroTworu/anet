@@ -18,6 +18,7 @@ pub struct ServerDto {
     pub ssh_port: Option<i32>,
     pub vnc_port: Option<i32>,
     pub ssh_user: Option<String>,
+    pub is_active: bool,
 }
 
 #[derive(Object, Debug, Clone, Serialize, Deserialize)]
@@ -29,6 +30,7 @@ pub struct CreateServerRequest {
     pub ssh_port: Option<i32>,
     pub vnc_port: Option<i32>,
     pub ssh_user: Option<String>,
+    pub is_active: Option<bool>,
 }
 
 #[derive(ApiResponse)]
@@ -38,6 +40,31 @@ pub enum GetServersResponse {
     #[oai(status = 401, content_type = "application/json")]
     Unauthorized(Json<String>),
     #[oai(status = 500, content_type = "application/json")]
+    Error(Json<String>),
+}
+
+//  DTO для PATCH-запросов обновления сервера
+#[derive(Object, Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateServerRequest {
+    pub name: Option<String>,
+    pub address: Option<String>,
+    pub public_key: Option<String>,
+    pub quic_port: Option<Option<i32>>,
+    pub ssh_port: Option<Option<i32>>,
+    pub vnc_port: Option<Option<i32>>,
+    pub ssh_user: Option<Option<String>>,
+    pub is_active: Option<bool>,
+}
+
+#[derive(ApiResponse)]
+pub enum UpdateServerApiResult {
+    #[oai(status = 200)]
+    Ok(Json<ServerDto>),
+    #[oai(status = 401)]
+    Unauthorized(Json<String>),
+    #[oai(status = 404)]
+    NotFound(Json<String>),
+    #[oai(status = 500)]
     Error(Json<String>),
 }
 

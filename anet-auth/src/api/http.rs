@@ -66,6 +66,7 @@ impl VpnApi {
             ssh_port: Set(req.0.ssh_port),
             vnc_port: Set(req.0.vnc_port),
             ssh_user: Set(req.0.ssh_user.clone()),
+            is_active: Set(req.0.is_active.unwrap_or(true)),
             created_at: Set(chrono::Utc::now().naive_utc()),
             updated_at: Set(chrono::Utc::now().naive_utc()),
         };
@@ -80,8 +81,94 @@ impl VpnApi {
                 ssh_port: saved.ssh_port,
                 vnc_port: saved.vnc_port,
                 ssh_user: saved.ssh_user,
+                is_active: saved.is_active,
             })),
             Err(e) => Err(poem::error::InternalServerError(e)),
+        }
+    }
+
+    /// Настройки сервера: Обновление параметров, портов и статуса активности (PATCH)
+    #[oai(path = "/servers/:id", method = "patch")]
+    async fn update_server(
+        &self,
+        auth: AdminToken,
+        id: poem_openapi::param::Path<Uuid>,
+        req: Json<UpdateServerRequest>,
+    ) -> UpdateServerApiResult {
+        if let Err(err) = self.validate_admin_session(&auth.0.token).await {
+            return UpdateServerApiResult::Unauthorized(Json(err));
+        }
+
+        let server_model = match servers::Entity::find_by_id(id.0).one(&self.db).await {
+            Ok(Some(s)) => s,
+            Ok(None) => return UpdateServerApiResult::NotFound(Json("Сервер не найден".to_string())),
+            Err(e) => return UpdateServerApiResult::Error(Json(e.to_string())),
+        };
+
+        let mut active_model = server_model.clone().into_active_model();
+        let mut changed = false;
+
+        if let Some(name) = req.0.name {
+            active_model.name = Set(name);
+            changed = true;
+        }
+        if let Some(address) = req.0.address {
+            active_model.address = Set(address);
+            changed = true;
+        }
+        if let Some(pub_key) = req.0.public_key {
+            active_model.public_key = Set(pub_key);
+            changed = true;
+        }
+        if let Some(port) = req.0.quic_port {
+            active_model.quic_port = Set(port);
+            changed = true;
+        }
+        if let Some(port) = req.0.ssh_port {
+            active_model.ssh_port = Set(port);
+            changed = true;
+        }
+        if let Some(port) = req.0.vnc_port {
+            active_model.vnc_port = Set(port);
+            changed = true;
+        }
+        if let Some(user) = req.0.ssh_user {
+            active_model.ssh_user = Set(user);
+            changed = true;
+        }
+        if let Some(is_active) = req.0.is_active {
+            active_model.is_active = Set(is_active);
+            changed = true;
+        }
+
+        if changed {
+            active_model.updated_at = Set(chrono::Utc::now().naive_utc());
+            match active_model.update(&self.db).await {
+                Ok(saved) => UpdateServerApiResult::Ok(Json(ServerDto {
+                    id: saved.id,
+                    name: saved.name,
+                    address: saved.address,
+                    public_key: saved.public_key,
+                    quic_port: saved.quic_port,
+                    ssh_port: saved.ssh_port,
+                    vnc_port: saved.vnc_port,
+                    ssh_user: saved.ssh_user,
+                    is_active: saved.is_active,
+                })),
+                Err(e) => UpdateServerApiResult::Error(Json(e.to_string())),
+            }
+        } else {
+            UpdateServerApiResult::Ok(Json(ServerDto {
+                id: server_model.id,
+                name: server_model.name,
+                address: server_model.address,
+                public_key: server_model.public_key,
+                quic_port: server_model.quic_port,
+                ssh_port: server_model.ssh_port,
+                vnc_port: server_model.vnc_port,
+                ssh_user: server_model.ssh_user,
+                is_active: server_model.is_active,
+            }))
         }
     }
 
@@ -103,6 +190,7 @@ impl VpnApi {
                     ssh_port: s.ssh_port,
                     vnc_port: s.vnc_port,
                     ssh_user: s.ssh_user,
+                    is_active: s.is_active,
                 }).collect();
                 GetServersResponse::Ok(Json(dtos))
             }
@@ -824,6 +912,11 @@ impl VpnApi {
 
         // Пробегаемся по уже загруженному в память массиву серверов без единого запроса к СУБД!
         for server in assigned_servers {
+
+            if !server.is_active {
+                continue;
+            }
+
             if fallback_pub_key.is_empty() {
                 fallback_pub_key = server.public_key.clone();
             }

@@ -2,11 +2,15 @@
 import { onMounted, ref } from 'vue'
 import { GetServers, CreateServer } from '@/api/servers'
 import type { Server, CreateServerRequest } from '@/models/server'
+import ServerModal from '@/components/ServerModal.vue'
 
 const data = ref<Server[]>([])
 const loading = ref(false)
 const showCreate = ref(false)
 const createLoading = ref(false)
+
+const selectedServer = ref<Server | null>(null)
+const showEditModal = ref(false)
 
 const form = ref<CreateServerRequest>({
   name: '',
@@ -16,6 +20,7 @@ const form = ref<CreateServerRequest>({
   ssh_port: 822,
   vnc_port: 56678,
   ssh_user: 'hanyuu',
+  is_active: true,
 })
 
 const loadServers = async () => {
@@ -40,6 +45,7 @@ const handleCreate = async () => {
       ssh_port: 822,
       vnc_port: 56678,
       ssh_user: 'hanyuu',
+      is_active: true,
     }
     await loadServers()
   } finally {
@@ -47,11 +53,20 @@ const handleCreate = async () => {
   }
 }
 
+const openEdit = (server: Server) => {
+  selectedServer.value = server
+  showEditModal.value = true
+}
+
+const closeEditModal = () => {
+  showEditModal.value = false
+  selectedServer.value = null
+}
+
 onMounted(loadServers)
 </script>
 
 <template>
-  <!-- ЕДИНЫЙ КОРНЕВОЙ ЭЛЕМЕНТ ( divs ) ДЛЯ СТРАНИЦЫ СЕРВЕРОВ -->
   <div style="padding: 24px; max-width: 1200px; margin: 0 auto;">
     <n-space justify="space-between" align="center" style="margin-bottom: 20px;">
       <h2 style="margin: 0; font-weight: 600; font-size: 20px;">VPN Nodes (Servers)</h2>
@@ -65,18 +80,24 @@ onMounted(loadServers)
           <tr>
             <th>Название</th>
             <th>IP / Домен</th>
+            <th>Status</th>
             <th>QUIC Port</th>
             <th>SSH Port</th>
             <th>VNC Port</th>
           </tr>
           </thead>
           <tbody>
-          <tr v-for="item in data" :key="item.id" class="static-row">
+          <tr v-for="item in data" :key="item.id" @click="openEdit(item)" class="clickable-row">
             <td class="name-col">{{ item.name }}</td>
             <td class="addr-col">{{ item.address }}</td>
-            <td><n-tag type="success" size="small">{{ item.quic_port || 'Closed' }}</n-tag></td>
-            <td><n-tag type="warning" size="small">{{ item.ssh_port || 'Closed' }}</n-tag></td>
-            <td><n-tag type="info" size="small">{{ item.vnc_port || 'Closed' }}</n-tag></td>
+            <td>
+              <n-tag :type="item.is_active ? 'success' : 'error'" round size="small">
+                {{ item.is_active ? 'ВКЛ' : 'ВЫКЛ' }}
+              </n-tag>
+            </td>
+            <td><n-tag :type="item.is_active && item.quic_port ? 'success' : 'default'" size="small">{{ item.quic_port || 'Closed' }}</n-tag></td>
+            <td><n-tag :type="item.is_active && item.ssh_port ? 'warning' : 'default'" size="small">{{ item.ssh_port || 'Closed' }}</n-tag></td>
+            <td><n-tag :type="item.is_active && item.vnc_port ? 'info' : 'default'" size="small">{{ item.vnc_port || 'Closed' }}</n-tag></td>
           </tr>
           </tbody>
         </n-table>
@@ -84,6 +105,7 @@ onMounted(loadServers)
       <n-empty v-else description="Серверов пока нет. Добавьте первую ноду!" style="margin-top: 40px;" />
     </n-spin>
 
+    <!-- Модалка создания нового сервера -->
     <n-modal v-model:show="showCreate" preset="card" style="width: 650px;" title="Добавить физический сервер">
       <n-form>
         <n-form-item label="Название локации">
@@ -115,6 +137,10 @@ onMounted(loadServers)
         <n-form-item label="Пользователь SSH (ssh_user)">
           <n-input v-model:value="form.ssh_user" placeholder="hanyuu" />
         </n-form-item>
+
+        <n-form-item label="Активен (ВКЛ)">
+          <n-switch v-model:value="form.is_active" />
+        </n-form-item>
       </n-form>
       <template #footer>
         <n-space justify="end">
@@ -123,6 +149,14 @@ onMounted(loadServers)
         </n-space>
       </template>
     </n-modal>
+
+    <!-- Модалка редактирования существующего сервера -->
+    <ServerModal
+        v-model:show="showEditModal"
+        :server="selectedServer"
+        @updated="loadServers"
+        @close="closeEditModal"
+    />
   </div>
 </template>
 
@@ -147,8 +181,20 @@ onMounted(loadServers)
   padding: 16px 20px !important;
 }
 
-.static-row:nth-child(even) {
+.clickable-row {
+  background-color: #ffffff !important;
+  cursor: pointer;
+  border-left: 4px solid transparent;
+  transition: all 0.15s ease-in-out;
+}
+
+.clickable-row:nth-child(even) {
   background-color: #fcfcfc !important;
+}
+
+.clickable-row:hover {
+  border-left: 4px solid #18a058 !important;
+  background-color: #f0fdf4 !important;
 }
 
 .name-col {
@@ -175,8 +221,15 @@ onMounted(loadServers)
   .interactive-table :deep(td) {
     border-bottom: 1px solid #333 !important;
   }
-  .static-row:nth-child(even) {
+  .clickable-row {
+    background-color: #18181c !important;
+  }
+  .clickable-row:nth-child(even) {
     background-color: #1c1c20 !important;
+  }
+  .clickable-row:hover {
+    background-color: #1a3a2a !important;
+    border-left: 4px solid #18a058 !important;
   }
   .name-col {
     color: #ffffff !important;

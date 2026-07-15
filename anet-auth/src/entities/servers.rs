@@ -15,6 +15,7 @@ pub struct Model {
     pub ssh_user: Option<String>,
     pub created_at: DateTime,
     pub updated_at: DateTime,
+    pub is_active: bool,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

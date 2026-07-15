@@ -15,3 +15,12 @@ export async function CreateServer(data: CreateServerRequest): Promise<Server> {
         body: JSON.stringify(data),
     })
 }
+
+/// Обновить параметры существующего сервера
+export async function UpdateServer(id: string, data: Partial<CreateServerRequest>): Promise<Server> {
+    return api<Server>(`/servers/${id}`, {
+        method: 'PATCH',
+        body: JSON.stringify(data),
+    })
+}
+

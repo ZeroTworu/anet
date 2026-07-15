@@ -7,6 +7,7 @@ export type Server = {
     ssh_port: number | null
     vnc_port: number | null
     ssh_user: string | null
+    is_active: boolean
 }
 
 export type CreateServerRequest = {
@@ -17,4 +18,5 @@ export type CreateServerRequest = {
     ssh_port: number | null
     vnc_port: number | null
     ssh_user: string | null
+    is_active?: boolean
 }
