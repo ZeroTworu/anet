@@ -15,19 +15,18 @@ use log::{LevelFilter, error, info};
 use std::sync::{Arc, Mutex};
 use tokio::runtime::Runtime;
 
-// Глобальный стейт, чтобы хранить клиента между вызовами
+/// Глобальный стейт, чтобы хранить клиента между вызовами
 static CLIENT: Mutex<Option<Arc<AnetClient>>> = Mutex::new(None);
-// Рантайм тоже нужно хранить глобально
+/// Рантайм тоже нужно хранить глобально
 static RUNTIME: Mutex<Option<Runtime>> = Mutex::new(None);
 
 static PENDING_RELEASE: Mutex<Option<GithubRelease>> = Mutex::new(None);
-
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_org_alco_anet_MainActivity_checkUpdates(
     mut env: JNIEnv,
     this: JObject,
-    config_jstr: JString, // <--- Новый параметр
+    config_jstr: JString,
 ) {
     info!("JNI: checkUpdates called");
 
@@ -39,7 +38,6 @@ pub extern "system" fn Java_org_alco_anet_MainActivity_checkUpdates(
         callback_ref: this_ref,
     }));
 
-    // 1. Извлекаем URL из переданного Котлином конфига
     let config_toml: String = match env.get_string(&config_jstr) {
         Ok(s) => s.into(),
         Err(_) => String::new(),
@@ -49,8 +47,6 @@ pub extern "system" fn Java_org_alco_anet_MainActivity_checkUpdates(
         match toml::from_str::<CoreConfig>(&config_toml) {
             Ok(c) => {
                 let url = c.main.update_url.clone();
-                // Если в TOML поле было пустым, Serde подставил дефолт (пустую строку),
-                // проверяем это:
                 if url.is_empty() {
                     "https://api.github.com/repos/ZeroTworu/anet/releases/latest".to_string()
                 } else {
@@ -60,11 +56,9 @@ pub extern "system" fn Java_org_alco_anet_MainActivity_checkUpdates(
             Err(_) => "https://api.github.com/repos/ZeroTworu/anet/releases/latest".to_string(),
         }
     } else {
-        // Если конфига нет вообще (первый запуск)
         "https://api.github.com/repos/ZeroTworu/anet/releases/latest".to_string()
     };
 
-    // 2. Рантайм
     let rt = {
         let mut rt_guard = RUNTIME.lock().unwrap();
         if rt_guard.is_none() {
@@ -73,7 +67,6 @@ pub extern "system" fn Java_org_alco_anet_MainActivity_checkUpdates(
         rt_guard.as_ref().unwrap().handle().clone()
     };
 
-    // 3. Запуск
     rt.spawn(async move {
         info!("[UPDATER] Checking URL: {}", update_url);
         let current_ver = GIT_TAG;
@@ -94,7 +87,6 @@ pub extern "system" fn Java_org_alco_anet_MainActivity_checkUpdates(
     });
 }
 
-
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_org_alco_anet_MainActivity_startDownload(mut env: JNIEnv, _this: JObject, j_path: JString) {
     let path: String = env.get_string(&j_path).unwrap().into();
@@ -113,7 +105,6 @@ pub extern "system" fn Java_org_alco_anet_MainActivity_startDownload(mut env: JN
     }
 }
 
-/// Инициализация логгера (вызывается из Java onCreate)
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_org_alco_anet_ANetVpnService_initLogger(_env: JNIEnv, _class: JClass) {
     android_logger::init_once(
@@ -146,24 +137,14 @@ pub extern "system" fn Java_org_alco_anet_MainActivity_initLogger(_env: JNIEnv, 
     info!("Rust Logger Initialized");
 }
 
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_org_alco_anet_ANetVpnService_stopVpn(_env: JNIEnv, _class: JClass) {
-    info!("Nop Stop");
-    status("VPN Stopped");
-    // А оно точно надо?
-}
-
 struct AndroidEventHandler {
     jvm: Arc<JavaVM>,
-    // Нам нужен глобальный реф на объект, который умеет принимать события.
-    // В нашем случае это VpnService (this).
     callback_ref: GlobalRef,
 }
 
 impl EventHandler for AndroidEventHandler {
     fn on_event(&self, event: AnetEvent) {
         if let Ok(mut env) = self.jvm.attach_current_thread() {
-            // 1. Превращаем любое событие в Option<String>
             let msg_to_send: Option<String> = match event {
                 AnetEvent::Status(s) => Some(s),
                 AnetEvent::Warn(s) => Some(format!("WARN: {}", s)),
@@ -174,7 +155,6 @@ impl EventHandler for AndroidEventHandler {
                 _ => None,
             };
 
-            // 2. Если есть что отправлять - отправляем в Котлин ОДИН РАЗ
             if let Some(msg) = msg_to_send {
                 if let Ok(jmsg) = env.new_string(msg) {
                     let _ = env.call_method(
@@ -189,7 +169,7 @@ impl EventHandler for AndroidEventHandler {
     }
 }
 
-/// Кнопка Connect
+/// Кнопка Connect (Остановка старого клиента включена для предотвращения утечек памяти)
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_org_alco_anet_ANetVpnService_connectVpn(
     mut env: JNIEnv,
@@ -199,10 +179,9 @@ pub extern "system" fn Java_org_alco_anet_ANetVpnService_connectVpn(
     info!("JNI: connectVpn called");
 
     let jvm = env.get_java_vm().unwrap();
-    let jvm = Arc::new(jvm); // Arc<JavaVM> - Send
+    let jvm = Arc::new(jvm);
 
-    let this_ref = env.new_global_ref(this).unwrap(); // GlobalRef - Send
-    // 1. Поднимаем Runtime (если нет)
+    let this_ref = env.new_global_ref(this).unwrap();
     let mut rt_guard = RUNTIME.lock().unwrap();
     if rt_guard.is_none() {
         *rt_guard = Some(Runtime::new().unwrap());
@@ -227,18 +206,22 @@ pub extern "system" fn Java_org_alco_anet_ANetVpnService_connectVpn(
     let config: CoreConfig = match toml::from_str(&config_toml) {
         Ok(c) => c,
         Err(e) => {
-            // Если конфиг битый - шлем ошибку в UI через EventBus (если успели) или просто лог
             error!("Failed to parse TOML config: {}", e);
             status(format!("Failed to parse TOML config: {}", e));
             return;
         }
     };
 
-    // 3. Запускаем
     rt.spawn(async move {
-        info!("Rust: Creating client...");
-
-        // env здесь уже НЕДОСТУПЕН и не нужен
+        // Очищаем и останавливаем старый инстанс клиента перед созданием нового
+        let old_client = {
+            let mut client_guard = CLIENT.lock().unwrap();
+            client_guard.take()
+        };
+        if let Some(client) = old_client {
+            info!("Rust JNI: Stopping old active client task...");
+            let _ = client.stop().await;
+        }
 
         let tun_factory = Box::new(AndroidCallbackTunFactory::new(
             jvm.clone(),
@@ -249,14 +232,39 @@ pub extern "system" fn Java_org_alco_anet_ANetVpnService_connectVpn(
 
         let client = Arc::new(AnetClient::new(config, tun_factory, route_manager));
 
-        info!("Rust: Calling start()...");
-        match client.start().await {
-            Ok(_) => info!("Rust: VPN Started!"),
-            Err(e) => error!("Rust: VPN Start Failed: {}", e),
+        // Сразу сохраняем дескриптор в глобальный мьютекс
+        {
+            *CLIENT.lock().unwrap() = Some(client.clone());
         }
 
-        *CLIENT.lock().unwrap() = Some(client);
+        info!("Rust: Calling start()...");
+        match client.start().await {
+            Ok(_) => info!("Rust: VPN Loop exited cleanly"),
+            Err(e) => error!("Rust: VPN Start Failed: {}", e),
+        }
     });
+}
+
+/// Кнопка Stop (Принудительно тушит клиентскую задачу в рантайме)
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_alco_anet_ANetVpnService_stopVpn(_env: JNIEnv, _class: JClass) {
+    info!("Rust: stopVpn JNI trigger received");
+
+    let rt_guard = RUNTIME.lock().unwrap();
+    if let Some(rt) = rt_guard.as_ref() {
+        let client_opt = {
+            let mut client_guard = CLIENT.lock().unwrap();
+            client_guard.take()
+        };
+        if let Some(client) = client_opt {
+            // Асинхронно останавливаем клиент в контексте нашего рантайма
+            rt.spawn(async move {
+                info!("Rust JNI: Sending stop signal to active client loop...");
+                let _ = client.stop().await;
+            });
+        }
+    }
+    status("VPN Stopped");
 }
 
 #[unsafe(no_mangle)]
@@ -270,7 +278,7 @@ pub extern "system" fn Java_org_alco_anet_MainActivity_getPendingTag(env: JNIEnv
 pub extern "system" fn Java_org_alco_anet_MainActivity_getPendingBody(env: JNIEnv, _this: JObject) -> jni::sys::jstring {
     let guard = PENDING_RELEASE.lock().unwrap();
     let body = guard.as_ref()
-        .and_then(|r| r.body.clone()) // r.body теперь Option<String>
+        .and_then(|r| r.body.clone())
         .unwrap_or_else(|| "Описание изменений отсутствует.".to_string());
     env.new_string(body).unwrap().into_raw()
 }
