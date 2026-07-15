@@ -287,7 +287,7 @@ pub enum RegenerateUserApiResult {
 #[derive(ApiResponse)]
 pub enum DownloadConfigResponse {
     /// Возвращает сгенерированный файл конфигурации в виде вложения
-    #[oai(status = 200, content_type = "text/plain")]
+    #[oai(status = 200, content_type = "application/octet-stream")]
     Ok(
         PlainText<String>, // <--- ПЕРВЫЙ АРГУМЕНТ: ТЕЛО ФАЙЛА (Payload)
         #[oai(header = "Content-Disposition")] String,
