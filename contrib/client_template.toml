@@ -9,9 +9,7 @@ tun_name = "anet-client"
 manual_routing = false
 
 # Настройки Маршрутизации (Split Tunneling)
-# Пустой список route_for означает "Режим Global VPN" (весь трафик в туннель)
 route_for = []
-
 exclude_route_for = ["192.168.1.0/24"]
 
 # Список DNS-серверов, используемых при запуске для резолва доменов
@@ -30,8 +28,8 @@ enabled = true
 interval_minutes = 1
 
 [stealth]
-min_jitter_ns = 1000000
-max_jitter_ns = 5000000
+min_jitter_ns = 1000000   # 1 ms
+max_jitter_ns = 5000000   # 5 ms
 padding_step = 64
 
 [quic_transport]
@@ -39,9 +37,14 @@ algorithm = "bbr"
 expected_rtt_ms = 75
 bandwidth_down_mbps = 200
 bandwidth_up_mbps = 200
-receive_window = 16777216
-stream_receive_window = 8388608
+
+# Буферы увеличены до 32 MB для снятия любых ограничений на скачивание
+receive_window = 33554432
+stream_receive_window = 33554432
 send_window = 33554432
+
 enable_gso = true
 idle_timeout_seconds = 21600
-max_mtu = 1500
+
+# Ограничение физического размера кадра для удаления IP-фрагментации
+max_mtu = 1400

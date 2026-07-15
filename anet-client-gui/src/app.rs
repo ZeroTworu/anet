@@ -564,6 +564,9 @@ impl eframe::App for ANetApp {
 
         let main_frame = egui::Frame::NONE.fill(egui::Color32::from_rgb(18, 18, 18)).inner_margin(12.0);
         egui::CentralPanel::default().frame(main_frame).show(ctx, |ui| {
+            // --- ОБЪЯВЛЯЕМ STATE В САМОМ НАЧАЛЕ ОБЛАСТИ ВИДИМОСТИ ЦЕНТРАЛЬНОЙ ПАНЕЛИ ---
+            let state = self.shared.lock().unwrap().state.clone();
+
             ui.horizontal(|ui| {
                 if ui.add(egui::Button::new(egui::RichText::new("☰").size(24.0).strong().color(egui::Color32::WHITE)).frame(false)).clicked() { self.sidebar_open = !self.sidebar_open; }
                 ui.add_space(8.0);
@@ -581,42 +584,43 @@ impl eframe::App for ANetApp {
                 }
             });
 
-            // Выпадающий список выбора ноды подключения
             if !server_names.is_empty() {
                 ui.add_space(10.0);
                 ui.vertical_centered(|ui| {
-                    ui.horizontal(|ui| {
-                        ui.add_space(ui.available_width() * 0.1);
-                        ui.label(egui::RichText::new("Подключение к:").color(egui::Color32::GRAY));
+                    let is_disconnected = state == ConnectionState::Disconnected;
+                    ui.add_enabled_ui(is_disconnected, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.add_space(ui.available_width() * 0.1);
+                            ui.label(egui::RichText::new("Первое подключение к:").color(egui::Color32::GRAY));
 
-                        let mut changed = false;
-                        let mut selected_name = String::new();
+                            let mut changed = false;
+                            let mut selected_name = String::new();
 
-                        egui::ComboBox::from_id_salt("first_server_select")
-                            .selected_text(&selected_server_name)
-                            .show_ui(ui, |ui| {
-                                for name in &server_names {
-                                    if ui.selectable_label(name == &selected_server_name, name).clicked() {
-                                        selected_name = name.clone();
-                                        changed = true;
+                            egui::ComboBox::from_id_salt("first_server_select")
+                                .selected_text(&selected_server_name)
+                                .show_ui(ui, |ui| {
+                                    for name in &server_names {
+                                        if ui.selectable_label(name == &selected_server_name, name).clicked() {
+                                            selected_name = name.clone();
+                                            changed = true;
+                                        }
+                                    }
+                                });
+
+                            if changed {
+                                if let Some(ref active_id) = active_id_opt {
+                                    let active_cfg_opt = {
+                                        let mut settings = self.settings.lock().unwrap();
+                                        settings.selected_servers.insert(active_id.clone(), selected_name);
+                                        settings.save();
+                                        settings.get_active_config()
+                                    };
+                                    if let Some(active_cfg) = active_cfg_opt {
+                                        self.load_config_from_content(&active_cfg.id, &active_cfg.content, &active_cfg.name);
                                     }
                                 }
-                            });
-
-                        if changed {
-                            if let Some(ref active_id) = active_id_opt {
-                                let active_cfg_opt = {
-                                    let mut settings = self.settings.lock().unwrap();
-                                    settings.selected_servers.insert(active_id.clone(), selected_name);
-                                    settings.save();
-                                    settings.get_active_config()
-                                };
-                                if let Some(active_cfg) = active_cfg_opt {
-                                    // Перезагружаем конфиг, чтобы мгновенно применить изменения
-                                    self.load_config_from_content(&active_cfg.id, &active_cfg.content, &active_cfg.name);
-                                }
                             }
-                        }
+                        });
                     });
                 });
             }
@@ -624,7 +628,7 @@ impl eframe::App for ANetApp {
             ui.add_space(ui.available_height() * 0.15);
             ui.vertical_centered(|ui| {
                 let btn_size = egui::vec2(180.0, 180.0);
-                let (btn_text, btn_color) = match self.shared.lock().unwrap().state {
+                let (btn_text, btn_color) = match state { // <-- Используем уже объявленный выше state
                     ConnectionState::Disconnected => ("Подключить VPN", egui::Color32::from_rgb(76, 175, 80)),
                     ConnectionState::Connecting => {
                         let time = ctx.input(|i| i.time);
@@ -638,7 +642,7 @@ impl eframe::App for ANetApp {
                     ConnectionState::Connected => ("Отключить VPN", egui::Color32::from_rgb(244, 67, 54)),
                 };
                 let btn = egui::Button::new(egui::RichText::new(btn_text).size(24.0).strong().color(egui::Color32::WHITE)).min_size(btn_size).corner_radius(90.0).fill(btn_color);
-                let state = self.shared.lock().unwrap().state.clone();
+
                 if ui.add(btn).clicked() {
                     match state {
                         ConnectionState::Disconnected => { if self.shared.lock().unwrap().client.is_none() { self.open_file_dialog(); } else { self.start_vpn(); } }
@@ -646,7 +650,7 @@ impl eframe::App for ANetApp {
                     }
                 }
                 ui.add_space(20.0);
-                match self.shared.lock().unwrap().state {
+                match state {
                     ConnectionState::Connected => { ui.label(egui::RichText::new("VPN соединение установлено!").size(16.0).strong().color(egui::Color32::GREEN)); }
                     ConnectionState::Disconnected => { ui.label(egui::RichText::new("VPN соединение не установлено.").size(16.0).strong().color(egui::Color32::RED)); }
                     ConnectionState::Connecting => { ui.label(egui::RichText::new("Установка соединения...").size(16.0).strong().color(egui::Color32::YELLOW)); }
