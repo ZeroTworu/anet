@@ -33,6 +33,7 @@ pub struct QuicConfig {
 
     pub enable_gso: bool,
     pub idle_timeout_seconds: Option<u64>,
+    pub keep_alive_interval_seconds: Option<u64>,
 }
 
 impl Default for QuicConfig {
@@ -48,6 +49,7 @@ impl Default for QuicConfig {
             enable_gso: true,
             idle_timeout_seconds: Some(3600),
             max_mtu: 1500,
+            keep_alive_interval_seconds: Some(20),
         }
     }
 }
@@ -119,14 +121,14 @@ pub fn build_transport_config(cfg: &QuicConfig, mtu: u16) -> Result<TransportCon
         .stream_receive_window(VarInt::from_u64(final_stream_receive_window)?)
         .send_window(final_send_window);
 
-    // Настройка MTU Discovery (без изменений)
+    // Настройка MTU Discovery
     let mut mtu_config = MtuDiscoveryConfig::default();
     mtu_config.upper_bound(cfg.max_mtu);
     config
         .initial_mtu(mtu.into())
         .mtu_discovery_config(Some(mtu_config));
 
-    // Таймаут (без изменений)
+    // Таймаут
     if let Some(timeout_secs) = cfg.idle_timeout_seconds {
         if timeout_secs > 0 {
             let timeout = IdleTimeout::try_from(Duration::from_secs(timeout_secs))?;
@@ -137,5 +139,17 @@ pub fn build_transport_config(cfg: &QuicConfig, mtu: u16) -> Result<TransportCon
             );
         }
     }
+
+    // Настройка Keep-Alive (Пингов) во избежание протухания NAT-таблиц провайдеров
+    if let Some(interval_secs) = cfg.keep_alive_interval_seconds {
+        if interval_secs > 0 {
+            config.keep_alive_interval(Some(Duration::from_secs(interval_secs)));
+            info!(
+                "QUIC Transport: Keep-Alive Interval set to {} seconds.",
+                interval_secs
+            );
+        }
+    }
+
     Ok(config)
 }

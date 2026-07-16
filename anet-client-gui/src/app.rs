@@ -450,6 +450,19 @@ impl eframe::App for ANetApp {
             match event {
                 AnetEvent::Status(msg) => {
                     self.log(&msg);
+
+                    if msg.contains("Active node:") {
+                        if let Some(active_part) = msg.split("Active node:").last() {
+                            let active_name = active_part.trim().to_string();
+
+                            // Захватываем Mutex настроек ровно ОДИН раз
+                            let mut settings = self.settings.lock().unwrap();
+                            if let Some(active_cfg) = settings.get_active_config() {
+                                settings.selected_servers.insert(active_cfg.id.clone(), active_name);
+                                settings.save();
+                            }
+                        }
+                    }
                 }
                 AnetEvent::Error(msg) => {
                     let err = format!("CRITICAL ERROR: {}", msg);
@@ -496,60 +509,85 @@ impl eframe::App for ANetApp {
         let editing_id = self.editing_config_id.clone();
         drop(settings_guard);
 
-        egui::SidePanel::left("config_sidebar").resizable(true).default_width(250.0).frame(egui::Frame::NONE.fill(egui::Color32::from_rgb(25, 25, 25))).show_animated(ctx, self.sidebar_open, |ui| {
-            ui.add_space(8.0);
-            ui.label(egui::RichText::new("КОНФИГИ").size(12.0).color(egui::Color32::from_gray(100)));
-            ui.add_space(8.0);
-            for config in configs {
-                let is_active = active_id.as_deref() == Some(&config.id);
-                let is_editing = editing_id.as_deref() == Some(&config.id);
-                let bg_color = if is_active { egui::Color32::from_rgb(40, 80, 60) } else { egui::Color32::from_rgb(35, 35, 35) };
-                egui::Frame::NONE.fill(bg_color).inner_margin(4.0).show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        if is_editing {
-                            let response = ui.add(egui::TextEdit::singleline(&mut self.edit_name_buffer).desired_width(120.0));
-                            if response.lost_focus() { self.finish_edit_name(); }
-                            if ui.button("✓").clicked() { self.finish_edit_name(); }
-                        } else {
-                            if ui.add(egui::Label::new(egui::RichText::new(&config.name).color(egui::Color32::from_gray(220))).sense(egui::Sense::click())).clicked() {
-                                self.select_config(&config.id);
+        egui::SidePanel::left("config_sidebar")
+            .resizable(true)
+            .default_width(250.0)
+            .frame(egui::Frame::NONE.fill(egui::Color32::from_rgb(25, 25, 25)))
+            .show_animated(ctx, self.sidebar_open, |ui| {
+                ui.add_space(8.0);
+
+                // Фирменный неоново-оранжевый цвет
+                let neon_orange = egui::Color32::from_rgb(255, 100, 0);
+
+                // ТРЕБОВАНИЕ: Сделали заголовок "КОНФИГИ" оранжевым
+                ui.label(egui::RichText::new("КОНФИГИ").size(12.0).strong().color(neon_orange));
+                ui.add_space(8.0);
+
+                for config in configs {
+                    let is_active = active_id.as_deref() == Some(&config.id);
+                    let is_editing = editing_id.as_deref() == Some(&config.id);
+
+                    // Темная подложка для неактивных и выделенная рамка/фон для активного конфига
+                    let bg_color = if is_active {
+                        egui::Color32::from_rgb(40, 50, 45) // Приглушенный темно-зеленый
+                    } else {
+                        egui::Color32::from_rgb(30, 30, 30)
+                    };
+
+                    egui::Frame::NONE.fill(bg_color).inner_margin(4.0).show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            if is_editing {
+                                let response = ui.add(egui::TextEdit::singleline(&mut self.edit_name_buffer).desired_width(120.0));
+                                if response.lost_focus() { self.finish_edit_name(); }
+                                if ui.button("✓").clicked() { self.finish_edit_name(); }
+                            } else {
+                                // ТРЕБОВАНИЕ: Сделали имена конфигов в списке оранжевыми
+                                let text_color = if is_active { egui::Color32::WHITE } else { neon_orange };
+                                if ui.add(egui::Label::new(egui::RichText::new(&config.name).color(text_color)).sense(egui::Sense::click())).clicked() {
+                                    self.select_config(&config.id);
+                                }
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if ui.add(egui::Button::new("✏").frame(false).small()).clicked() { self.start_edit_name(&config.id, &config.name); }
+                                    if ui.add(egui::Button::new("🗑").frame(false).small()).clicked() { self.delete_config(&config.id); }
+                                });
                             }
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.add(egui::Button::new("✏").frame(false).small()).clicked() { self.start_edit_name(&config.id, &config.name); }
-                                if ui.add(egui::Button::new("🗑").frame(false).small()).clicked() { self.delete_config(&config.id); }
-                            });
+                        });
+                    });
+                }
+                ui.add_space(16.0);
+
+                // Сделали надпись на кнопке добавления конфига оранжевой
+                if ui.add(egui::Button::new(egui::RichText::new("➕ Добавить конфиг")
+                    .color(neon_orange))
+                    .fill(egui::Color32::from_rgb(45, 45, 45))).clicked() {
+                    self.open_file_dialog();
+                }
+
+                // КНОПКА ОБНОВЛЕНИЯ ВНИЗУ САЙДБАРА
+                ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
+                    ui.add_space(10.0);
+
+                    // Проверяем, не занят ли апдейтер
+                    let is_busy = matches!(self.update_status, UpdateStatus::Checking | UpdateStatus::Downloading(_));
+
+                    ui.add_enabled_ui(!is_busy, |ui| {
+                        let label = if is_busy { "⏳ ЖДИТЕ..." } else { "🔄 ПРОВЕРИТЬ ОБНОВЛЕНИЯ" };
+
+                        // ТРЕБОВАНИЕ: Сделали текст кнопки обновления оранжевым
+                        let btn_text = egui::RichText::new(label).size(11.0).strong().color(neon_orange);
+                        if ui.add(egui::Button::new(btn_text).fill(egui::Color32::from_rgb(45, 45, 45))).clicked() {
+                            self.check_for_updates();
                         }
                     });
                 });
-            }
-            ui.add_space(16.0);
-            if ui.add(egui::Button::new(egui::RichText::new("➕ Добавить конфиг")
-                .color(egui::Color32::WHITE))
-                .fill(egui::Color32::from_rgb(60, 60, 60))).clicked() {
-                self.open_file_dialog();
-            }
-
-            ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
-                ui.add_space(10.0);
-                let is_busy = matches!(self.update_status, UpdateStatus::Checking | UpdateStatus::Downloading(_));
-                ui.add_enabled_ui(!is_busy, |ui| {
-                    let label = if is_busy { "⏳ ЖДИТЕ..." } else { "🔄 ПРОВЕРИТЬ ОБНОВЛЕНИЯ" };
-                    if ui.add(egui::Button::new(egui::RichText::new(label).size(11.0))).clicked() {
-                        self.check_for_updates();
-                    }
-                });
             });
-        });
 
         // Считываем список серверов оригинального TOML для активного профиля
         let mut server_names = Vec::new();
         let mut selected_server_name = String::new();
-        let mut active_id_opt = None;
-
         {
             let settings = self.settings.lock().unwrap();
             if let Some(active_cfg) = settings.get_active_config() {
-                active_id_opt = Some(active_cfg.id.clone());
                 if let Ok(mut raw_cfg) = toml::from_str::<CoreConfig>(&active_cfg.content) {
                     let _ = raw_cfg.sanitize();
                     server_names = raw_cfg.servers.iter().map(|s| s.get_name()).collect();
@@ -564,43 +602,51 @@ impl eframe::App for ANetApp {
 
         let main_frame = egui::Frame::NONE.fill(egui::Color32::from_rgb(18, 18, 18)).inner_margin(12.0);
         egui::CentralPanel::default().frame(main_frame).show(ctx, |ui| {
-            // --- ОБЪЯВЛЯЕМ STATE В САМОМ НАЧАЛЕ ОБЛАСТИ ВИДИМОСТИ ЦЕНТРАЛЬНОЙ ПАНЕЛИ ---
             let state = self.shared.lock().unwrap().state.clone();
+
+            // Фирменный неоново-оранжевый цвет
+            let neon_orange = egui::Color32::from_rgb(255, 100, 0);
 
             ui.horizontal(|ui| {
                 if ui.add(egui::Button::new(egui::RichText::new("☰").size(24.0).strong().color(egui::Color32::WHITE)).frame(false)).clicked() { self.sidebar_open = !self.sidebar_open; }
                 ui.add_space(8.0);
-                ui.label(egui::RichText::new("ANet VPN").size(24.0).strong().color(egui::Color32::WHITE));
+                // ТРЕБОВАНИЕ: Сделали надпись ANet VPN фирменной оранжевой
+                ui.label(egui::RichText::new("ANet VPN").size(24.0).strong().color(neon_orange));
             });
             ui.add_space(20.0);
             ui.vertical_centered(|ui| {
                 if let Some(err) = &self.config_err {
                     ui.label(egui::RichText::new(err).color(egui::Color32::RED));
                 } else {
-                    ui.label(egui::RichText::new(&self.config_name).color(egui::Color32::GRAY));
+                    // ТРЕБОВАНИЕ: Сделали имя загруженного TOML-файла фирменным оранжевым
+                    ui.label(egui::RichText::new(&self.config_name).color(neon_orange));
                 }
                 if self.shared.lock().unwrap().client.is_none() && self.config_err.is_none() {
                     ui.label(egui::RichText::new("(Выберите конфиг слева или добавьте новый)").size(15.0).strong().color(egui::Color32::from_gray(80)));
                 }
             });
 
+            // Выпадающий список выбора ноды подключения
             if !server_names.is_empty() {
                 ui.add_space(10.0);
                 ui.vertical_centered(|ui| {
-                    let is_disconnected = state == ConnectionState::Disconnected;
-                    ui.add_enabled_ui(is_disconnected, |ui| {
+                    if state == ConnectionState::Disconnected {
+                        // Режим "Отключено": Показываем красивый интерактивный ComboBox с оранжевым текстом
                         ui.horizontal(|ui| {
                             ui.add_space(ui.available_width() * 0.1);
-                            ui.label(egui::RichText::new("Первое подключение к:").color(egui::Color32::GRAY));
+                            ui.label(egui::RichText::new("Подключение к:").color(neon_orange));
 
                             let mut changed = false;
                             let mut selected_name = String::new();
 
                             egui::ComboBox::from_id_salt("first_server_select")
-                                .selected_text(&selected_server_name)
+                                .selected_text(egui::RichText::new(&selected_server_name).color(neon_orange))
                                 .show_ui(ui, |ui| {
                                     for name in &server_names {
-                                        if ui.selectable_label(name == &selected_server_name, name).clicked() {
+                                        // Оборачиваем имя в RichText и окрашиваем его в оранжевый цвет
+                                        let option_text = egui::RichText::new(name).color(neon_orange);
+
+                                        if ui.selectable_label(name == &selected_server_name, option_text).clicked() {
                                             selected_name = name.clone();
                                             changed = true;
                                         }
@@ -608,27 +654,43 @@ impl eframe::App for ANetApp {
                                 });
 
                             if changed {
-                                if let Some(ref active_id) = active_id_opt {
-                                    let active_cfg_opt = {
-                                        let mut settings = self.settings.lock().unwrap();
-                                        settings.selected_servers.insert(active_id.clone(), selected_name);
+                                // Используем идиоматичный лексический блок для сужения области видимости MutexGuard.
+                                // Lock settings будет автоматически уничтожен компилятором на выходе из этого блока.
+                                let active_cfg_data = {
+                                    let mut settings = self.settings.lock().unwrap();
+                                    if let Some(active_cfg) = settings.get_active_config() {
+                                        settings.selected_servers.insert(active_cfg.id.clone(), selected_name);
                                         settings.save();
-                                        settings.get_active_config()
-                                    };
-                                    if let Some(active_cfg) = active_cfg_opt {
-                                        self.load_config_from_content(&active_cfg.id, &active_cfg.content, &active_cfg.name);
+
+                                        // Копируем данные по значению, чтобы полностью отвязаться от заимствования settings
+                                        Some((active_cfg.id.clone(), active_cfg.content.clone(), active_cfg.name.clone()))
+                                    } else {
+                                        None
                                     }
+                                };
+
+                                // Теперь мы можем безопасно заимствовать `self` как mutable,
+                                // так как все ссылки на MutexGuard были уничтожены выше
+                                if let Some((id, content, name)) = active_cfg_data {
+                                    self.load_config_from_content(&id, &content, &name);
                                 }
                             }
                         });
-                    });
+                    } else {
+                        // Вместо нечитаемой серой кнопки выводим яркую статичную оранжевую надпись
+                        ui.horizontal(|ui| {
+                            ui.add_space(ui.available_width() * 0.1);
+                            ui.label(egui::RichText::new("Активная нода:").color(neon_orange));
+                            ui.label(egui::RichText::new(&selected_server_name).strong().color(neon_orange));
+                        });
+                    }
                 });
             }
 
             ui.add_space(ui.available_height() * 0.15);
             ui.vertical_centered(|ui| {
                 let btn_size = egui::vec2(180.0, 180.0);
-                let (btn_text, btn_color) = match state { // <-- Используем уже объявленный выше state
+                let (btn_text, btn_color) = match state {
                     ConnectionState::Disconnected => ("Подключить VPN", egui::Color32::from_rgb(76, 175, 80)),
                     ConnectionState::Connecting => {
                         let time = ctx.input(|i| i.time);

@@ -81,4 +81,5 @@ make cert
 <img src=".assets/win-gui-1.png" height="380" alt="Интерфейс отключен" />
 <img src=".assets/win-gui-2.png" height="380" alt="Процесс подключения" />
 <img src=".assets/win-gui-3.png" height="380" alt="Успешное соединение" />
+<img src=".assets/win-gui-4.png" height="380" alt="Управление настройками" />
 </p>

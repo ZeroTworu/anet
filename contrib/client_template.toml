@@ -48,3 +48,5 @@ idle_timeout_seconds = 21600
 
 # Ограничение физического размера кадра для удаления IP-фрагментации
 max_mtu = 1400
+
+keep_alive_interval_seconds = 20

@@ -1,7 +1,7 @@
 use crate::consts::{CHANNEL_BUFFER_SIZE, MAX_PACKET_SIZE};
 use crate::tun_params::TunParams;
 use anyhow::Result;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 #[cfg(target_os = "macos")]
 use log::warn;
 use log::{error, info};
@@ -111,7 +111,11 @@ impl TunManager {
         #[cfg(target_os = "macos")]
         self.configure_macos_interface(&actual_name).await?;
 
-        let (mut reader, mut writer) = tokio::io::split(device);
+        // Нативный split устройства: reader и writer получают независимые
+        // регистрации AsyncFd. Раньше здесь был tokio::io::split(), который
+        // оборачивает устройство в BiLock — чтение и запись конкурировали
+        // за один лок на каждом пакете (а VPN-трафик всегда двунаправленный).
+        let (mut writer, mut reader) = device.split()?;
 
         info!(
             "Created TUN with: [{}] (actual name: {})",
@@ -122,18 +126,28 @@ impl TunManager {
         // Задача чтения из TUN устройства (TUN -> NETWORK)
         let tx_clone = tx_from_tun.clone();
         tokio::spawn(async move {
-            let mut buffer = [0u8; MAX_PACKET_SIZE];
+            // Читаем в переиспользуемый BytesMut: одно выделение памяти
+            // амортизируется на ~64 пакета, а split().freeze() отдает пакет
+            // без дополнительного memcpy (раньше было: ядро -> стек-буфер,
+            // затем стек -> Bytes::copy_from_slice, т.е. лишняя копия на пакет).
+            const READ_CHUNK: usize = 64 * MAX_PACKET_SIZE;
+            let mut buf = BytesMut::with_capacity(READ_CHUNK);
             loop {
+                // Гарантируем, что в буфере всегда есть место под целый пакет,
+                // иначе read() на TUN обрежет пакет.
+                if buf.capacity() < MAX_PACKET_SIZE {
+                    buf = BytesMut::with_capacity(READ_CHUNK);
+                }
                 tokio::select! {
                     // Читаем входящие пакеты от операционной системы
-                    res = reader.read(&mut buffer) => {
+                    res = reader.read_buf(&mut buf) => {
                         match res {
                             Ok(0) => {
                                 info!("TUN reader stream ended.");
                                 break;
                             }
-                            Ok(n) => {
-                                let packet = Bytes::copy_from_slice(&buffer[..n]);
+                            Ok(_) => {
+                                let packet = buf.split().freeze();
                                 if tx_clone.send(packet).await.is_err() {
                                     break;
                                 }
@@ -157,10 +171,21 @@ impl TunManager {
 
         // Задача записи в TUN устройство (NETWORK -> TUN)
         tokio::spawn(async move {
-            while let Some(packet) = rx_to_tun.recv().await {
-                if let Err(e) = writer.write_all(&packet).await {
-                    error!("Failed to write to TUN: {}, bytes: {:?}", e, packet);
-                    break;
+            'outer: while let Some(mut packet) = rx_to_tun.recv().await {
+                // Пишем бурст целиком: после первого пакета выгребаем всё,
+                // что уже накопилось в канале, через try_recv(), не отдавая
+                // управление планировщику между пакетами одного бурста.
+                // (Каждый write в TUN обязан оставаться отдельным вызовом —
+                // это один пакет на write() без IFF_VNET_HDR.)
+                loop {
+                    if let Err(e) = writer.write_all(&packet).await {
+                        error!("Failed to write to TUN: {}, bytes: {:?}", e, packet);
+                        break 'outer;
+                    }
+                    match rx_to_tun.try_recv() {
+                        Ok(next) => packet = next,
+                        Err(_) => break,
+                    }
                 }
             }
         });

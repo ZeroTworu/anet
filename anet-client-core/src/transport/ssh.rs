@@ -1,5 +1,5 @@
 use super::{ClientTransport, ConnectionResult, MutexVpnStream};
-use crate::config::{CoreConfig, ServerConfig}; // Импортируем новую структуру ноды
+use crate::config::{CoreConfig, ServerConfig};
 use crate::auth::{AuthHandler, StreamAuthChannel};
 use anyhow::Result;
 use async_trait::async_trait;
@@ -13,20 +13,23 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{mpsc, Mutex};
 use anet_common::stream_framing::{frame_packet, read_next_packet};
-use anet_common::consts::CHANNEL_BUFFER_SIZE;
-
+use anet_common::consts::{CHANNEL_BUFFER_SIZE, MAX_PACKET_SIZE};
+use std::future::ready;
 struct ClientHandler;
 #[async_trait]
 impl Handler for ClientHandler {
     type Error = russh::Error;
-    async fn check_server_key(&mut self, _server_public_key: &russh_keys::PublicKey) -> Result<bool, Self::Error> {
-        Ok(true)
+    fn check_server_key(
+        &mut self,
+        _server_public_key: &russh::keys::PublicKey,
+    ) -> impl Future<Output = Result<bool, Self::Error>> + Send {
+        ready(Ok(true))
     }
 }
 
 pub struct SshTransport {
     config: CoreConfig,
-    server: ServerConfig, // Сохраняем индивидуальные параметры ноды
+    server: ServerConfig,
 }
 
 impl SshTransport {
@@ -38,23 +41,21 @@ impl SshTransport {
 #[async_trait]
 impl ClientTransport for SshTransport {
     async fn connect(&self) -> Result<ConnectionResult> {
-        // Вытаскиваем адрес конкретной ноды
         let addr_str = &self.server.address;
         let addr: SocketAddr = addr_str.to_socket_addrs()?.next().ok_or(anyhow::anyhow!("Invalid server address"))?;
 
-        // Разрешаем приоритет переопределения SSH юзера для ноды
         let user = self.server.ssh_user.as_deref()
             .or(self.config.transport.ssh_user.as_deref())
             .unwrap_or("root");
 
         let mut config_base = russh::client::Config::default();
-        config_base.window_size = 10_000_000;
-        config_base.maximum_packet_size = 65535;
+        config_base.window_size = 2_000_000;
+        config_base.maximum_packet_size = MAX_PACKET_SIZE as u32;
 
         let config = Arc::new(config_base);
         let mut session = russh::client::connect(config, addr, ClientHandler).await?;
 
-        if !session.authenticate_none(user).await? {
+        if !session.authenticate_none(user).await?.success() {
             anyhow::bail!("SSH Authentication failed (auth_none rejected)");
         }
         info!("[SSH] Authenticated. Opening VPN channel...");
@@ -62,11 +63,11 @@ impl ClientTransport for SshTransport {
         let channel = session.channel_open_session().await?;
         channel.exec(true, "anet-vpn").await?;
 
-        let raw_stream = SshStreamAdapter::new(channel);
+        // Передаем сессию по значению с конкретным типом Handle<ClientHandler>
+        let raw_stream = SshStreamAdapter::new(channel, session);
         let stream_arc = Arc::new(Mutex::new(raw_stream));
         let auth_channel = StreamAuthChannel::new(stream_arc.clone());
 
-        // Передаем опциональный ключ сервера для переопределения
         let auth_handler = AuthHandler::new(&self.config, self.server.server_pub_key.as_deref())?;
         let (auth_response, shared_key) = auth_handler.authenticate(&auth_channel).await?;
         info!("[SSH] Handshake complete. Assigned IP: {}", auth_response.ip);
@@ -143,14 +144,17 @@ pub struct SshStreamAdapter {
     read_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     write_tx: mpsc::UnboundedSender<Vec<u8>>,
     read_buffer: std::io::Cursor<Bytes>,
+    task_handle: tokio::task::JoinHandle<()>,
+    // Используем конкретный тип Handle<ClientHandler>
+    session: Option<russh::client::Handle<ClientHandler>>,
 }
 
 impl SshStreamAdapter {
-    fn new(mut channel: Channel<russh::client::Msg>) -> Self {
+    fn new(mut channel: Channel<russh::client::Msg>, session: russh::client::Handle<ClientHandler>) -> Self {
         let (read_tx, read_rx) = mpsc::unbounded_channel();
         let (write_tx, mut write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
-        tokio::spawn(async move {
+        let task_handle = tokio::spawn(async move {
             loop {
                 tokio::select! {
                     msg = channel.wait() => {
@@ -172,10 +176,24 @@ impl SshStreamAdapter {
                     }
                 }
             }
-            let _ = channel.close().await;
         });
 
-        Self { read_rx, write_tx, read_buffer: std::io::Cursor::new(Bytes::new()) }
+        Self { read_rx, write_tx, read_buffer: std::io::Cursor::new(Bytes::new()), task_handle, session: Some(session) }
+    }
+}
+
+impl Drop for SshStreamAdapter {
+    fn drop(&mut self) {
+        log::info!("SshStreamAdapter: Dropping adapter, aborting task.");
+        self.task_handle.abort();
+
+        // Забираем и закрываем физическую сессию Handle<ClientHandler>
+        if let Some(session) = self.session.take() {
+            tokio::spawn(async move {
+                info!("SshStreamAdapter: Sending disconnect packet...");
+                let _ = session.disconnect(russh::Disconnect::ByApplication, "Closed by ANet", "en");
+            });
+        }
     }
 }
 
@@ -201,6 +219,7 @@ impl AsyncRead for SshStreamAdapter {
         }
     }
 }
+
 impl AsyncWrite for SshStreamAdapter {
     fn poll_write(self: Pin<&mut Self>, _cx: &mut std::task::Context<'_>, buf: &[u8]) -> std::task::Poll<std::io::Result<usize>> {
         match self.write_tx.send(buf.to_vec()) {

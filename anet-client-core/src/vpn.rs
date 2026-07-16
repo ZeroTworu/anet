@@ -1,7 +1,7 @@
 use crate::config::CoreConfig;
 use crate::events::status;
 use crate::socket::AnetUdpSocket;
-use anet_common::consts::MAX_PACKET_SIZE;
+use anet_common::consts::CHANNEL_BUFFER_SIZE;
 use anet_common::encryption::Cipher;
 use anet_common::jitter::bridge_with_jitter;
 use anet_common::protocol::AuthResponse;
@@ -96,8 +96,11 @@ impl VpnHandler {
         let (send_stream, mut recv_stream) = connection.open_bi().await?;
 
         // Каналы для связи с TUN (Logic <-> TUN)
-        let (tx_to_quic, rx_to_quic) = mpsc::channel(MAX_PACKET_SIZE); // TUN -> QUIC
-        let (tx_from_quic, rx_from_quic) = mpsc::channel(MAX_PACKET_SIZE); // QUIC -> TUN
+        // ИСПРАВЛЕНО: раньше здесь по опечатке стоял MAX_PACKET_SIZE (2048) —
+        // это размер пакета в байтах, а не глубина очереди. Очередь на 2048
+        // пакетов = ~3 MB / ~140 ms bufferbloat'а на 170 Mbit/s.
+        let (tx_to_quic, rx_to_quic) = mpsc::channel(CHANNEL_BUFFER_SIZE); // TUN -> QUIC
+        let (tx_from_quic, rx_from_quic) = mpsc::channel(CHANNEL_BUFFER_SIZE); // QUIC -> TUN
 
         let stealth_config = self.config.stealth.clone();
 
