@@ -34,6 +34,14 @@ impl TrayBackground {
         G: Fn() + Send + 'static,
     {
         std::thread::spawn(move || {
+
+            #[cfg(target_os = "linux")]
+            {
+                if let Err(e) = gtk::init() {
+                    log::error!("Failed to initialize GTK on background tray thread: {:?}", e);
+                }
+            }
+
             let show_item = MenuItem::new("👁 Развернуть ANet", false, None);
             let toggle_vpn_item = MenuItem::new("⚪ Подключить VPN", true, None);
             let disable_notifs_item = CheckMenuItem::new("🔕 Без уведомлений", true, false, None);
@@ -74,6 +82,19 @@ impl TrayBackground {
                         DispatchMessageW(&msg as *const _);
                     }
                 }
+
+                // Вручную прокручиваем цикл событий GLib/GTK на Linux.
+                // Это позволяет GTK отправить сигналы регистрации StatusNotifierItem по DBus,
+                // после чего иконка мгновенно появится в системном трее KDE Plasma.
+                #[cfg(target_os = "linux")]
+                {
+                    let context = gtk::glib::MainContext::default();
+                    // Выгребаем все накопившиеся системные сообщения неблокирующим образом
+                    while context.pending() {
+                        context.iteration(false);
+                    }
+                }
+
 
                 // --- Команды от GUI
                 while let Ok(cmd) = cmd_rx.try_recv() {

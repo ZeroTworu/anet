@@ -343,11 +343,21 @@ impl ANetApp {
     }
 
     fn load_config_from_content(&mut self, id: &str, content: &str, name: &str) {
+
+        let _ = self.rt.enter();
+
+        // Принудительно запускаем создание менеджера маршрутов в контексте рантайма.
+        // Метод block_on физически входит в цикл Tokio и гарантирует, что lld/LTO оптимизации
+        // в релизной сборке не смогут вырезать контекст реактора до инициализации Netlink-сокетов.
+        let route_result = self.rt.block_on(async {
+            create_route_manager(false)
+        });
+
         match toml::from_str::<CoreConfig>(content) {
             Ok(mut cfg) => {
                 let _ = cfg.sanitize();
 
-                // Инициируем выравнивание и сдвиг приоритетной ноды
+                // Поворачиваем список серверов так, чтобы выбранный был нулевым
                 let selected_name_opt = {
                     let settings = self.settings.lock().unwrap();
                     settings.selected_servers.get(id).cloned()
@@ -355,13 +365,14 @@ impl ANetApp {
 
                 if let Some(selected_name) = selected_name_opt {
                     if let Some(idx) = cfg.servers.iter().position(|s| s.get_name() == selected_name) {
-                        // Сдвигаем массив так, чтобы выбранный пользователем сервер встал на позицию 0
                         cfg.servers.rotate_left(idx);
                     }
                 }
 
                 let tun = Box::new(DesktopTunFactory::new(cfg.main.tun_name.clone()));
-                let route = match create_route_manager(false) {
+
+                // Используем результат, полученный внутри block_on
+                let route = match route_result {
                     Ok(r) => r,
                     Err(e) => {
                         self.config_err = Some(format!("Failed to create route manager: {}", e));

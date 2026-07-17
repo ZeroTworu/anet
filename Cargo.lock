@@ -378,6 +378,7 @@ dependencies = [
  "eframe",
  "egui",
  "env_logger",
+ "gtk",
  "image",
  "libc",
  "log",

@@ -94,6 +94,19 @@ jobs:
           if [ -n "$APK_SRC" ]; then
               cp "$APK_SRC" "anet-android-${VERSION}.apk"
           fi
+          
+          # Arch zst pkg
+          cp artifacts/anet-client-macos-cli/anet-client ${CLIENT_MAC_DIR}/
+          chmod +x ${CLIENT_MAC_DIR}/anet-client
+          cp contrib/config/client.toml ${CLIENT_MAC_DIR}/
+
+          # ТРЕБОВАНИЕ: Копируем созданный Arch Linux .zst пакет в корень релиза
+          if [ -d "artifacts/anet-client-linux-gui-zst" ]; then
+            ZST_PKG=$(find artifacts/anet-client-linux-gui-zst -name '*.pkg.tar.zst' | head -n 1)
+            if [ -n "$ZST_PKG" ]; then
+              cp "$ZST_PKG" .
+            fi
+          fi
       - name: "Create zip archives"
         run: |
           cd release_files
@@ -153,5 +166,6 @@ jobs:
               release_files/client-macos_${{ env.VERSION }}.zip
               ANET_VPN_Client_Setup_${{ env.VERSION }}_x64.exe
               anet-android-${{ env.VERSION }}.apk
+              anet-vpn-gui-*.pkg.tar.zst
         env:
             GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

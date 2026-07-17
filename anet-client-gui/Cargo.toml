@@ -40,6 +40,9 @@ windows-sys = { version = "0.59", features = ["Win32_UI_WindowsAndMessaging", "W
 [target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
 net-route = "0.4"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = "0.18"
+
 # netdev is needed on all desktop platforms for interface discovery
 [target.'cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))'.dependencies]
 netdev = { workspace = true }
