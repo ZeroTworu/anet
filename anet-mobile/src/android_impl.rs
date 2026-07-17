@@ -4,7 +4,7 @@ use anet_common::consts::{CHANNEL_BUFFER_SIZE, MAX_PACKET_SIZE};
 use anet_common::protocol::AuthResponse;
 use anyhow::Result;
 use async_trait::async_trait;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use ipnet::{IpNet, Ipv4Net};
 use jni::JavaVM;
 use jni::objects::{GlobalRef, JValue};
@@ -214,9 +214,14 @@ impl TunFactory for AndroidCallbackTunFactory {
         }
 
         // --- 3. Tun Creation ---
-        // (Код создания tun устройства тот же самый)
         let mut config = Configuration::default();
         config.raw_fd(fd);
+        // КРИТИЧНО: fd принадлежит Java-стороне (ParcelFileDescriptor в VpnService).
+        // По умолчанию tun-крейт закрывает fd при drop устройства — при реконнекте
+        // это приводит к двойному close() одного номера fd с двух сторон. Если между
+        // ними номер успел переиспользоваться (сокет, файл) — закрывается ЧУЖОЙ
+        // дескриптор, и приложение ловит случайные, невоспроизводимые глюки.
+        config.close_fd_on_drop(false);
         if let Ok(ipv4) = auth.ip.parse::<Ipv4Addr>() {
             config.address(ipv4);
         }
@@ -229,24 +234,31 @@ impl TunFactory for AndroidCallbackTunFactory {
         let device = tun::create_as_async(&config)
             .map_err(|e| anyhow::anyhow!("Failed to create async TUN: {}", e))?;
 
-        let (mut reader, mut writer) = tokio::io::split(device);
+        // Нативный split: независимые регистрации AsyncFd для чтения и записи.
+        // tokio::io::split() оборачивал устройство в BiLock — RX и TX конкурировали
+        // за один лок на каждом пакете (как было в atun.rs на десктопе).
+        let (mut writer, mut reader) = device.split()?;
         let (tx_to_core, rx_from_tun) = mpsc::channel::<Bytes>(CHANNEL_BUFFER_SIZE);
         let (tx_to_tun, mut rx_from_core) = mpsc::channel::<Bytes>(CHANNEL_BUFFER_SIZE);
 
         tokio::spawn(async move {
-            let mut buf = vec![0u8; MAX_PACKET_SIZE];
+            // Переиспользуемый буфер: аллокация амортизируется на ~64 пакета,
+            // split().freeze() отдает пакет без дополнительного memcpy.
+            const READ_CHUNK: usize = 64 * MAX_PACKET_SIZE;
+            let mut buf = BytesMut::with_capacity(READ_CHUNK);
             loop {
-                match reader.read(&mut buf).await {
+                if buf.capacity() < MAX_PACKET_SIZE {
+                    buf = BytesMut::with_capacity(READ_CHUNK);
+                }
+                match reader.read_buf(&mut buf).await {
                     Ok(n) if n > 0 => {
-                        if tx_to_core
-                            .send(Bytes::copy_from_slice(&buf[..n]))
-                            .await
-                            .is_err()
-                        {
+                        if tx_to_core.send(buf.split().freeze()).await.is_err() {
                             break;
                         }
                     }
-                    Ok(_) => {}
+                    // Ok(0) = fd закрыт. Раньше здесь было `Ok(_) => {}` —
+                    // потенциальный busy-loop на закрытом дескрипторе.
+                    Ok(_) => break,
                     Err(_) => {
                         break;
                     }
@@ -255,9 +267,17 @@ impl TunFactory for AndroidCallbackTunFactory {
         });
 
         tokio::spawn(async move {
-            while let Some(pkt) = rx_from_core.recv().await {
-                if writer.write_all(&pkt).await.is_err() {
-                    break;
+            'outer: while let Some(mut pkt) = rx_from_core.recv().await {
+                // Пишем бурст целиком, не отдавая планировщику управление
+                // между пакетами (write в TUN — строго один пакет за вызов).
+                loop {
+                    if writer.write_all(&pkt).await.is_err() {
+                        break 'outer;
+                    }
+                    match rx_from_core.try_recv() {
+                        Ok(next) => pkt = next,
+                        Err(_) => break,
+                    }
                 }
             }
         });
