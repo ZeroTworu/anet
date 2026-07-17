@@ -788,7 +788,7 @@ jobs:
           pkgver=${{ github.ref_name }}
           pkgver=${pkgver#v} # убираем 'v' в начале
           pkgrel=1
-          pkgdesc="ANet VPN GUI client with ASTP obfuscation"
+          pkgdesc="ANet VPN GUI client"
           arch=('x86_64')
           url="https://github.com/ZeroTworu/anet"
           license=('MIT')
