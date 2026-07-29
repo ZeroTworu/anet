@@ -5,6 +5,7 @@ use crate::traits::{RouteManager, TunFactory};
 use crate::statistic;
 use crate::transport::factory::create_transport;
 use anet_common::stream_framing::{frame_packet_into, read_next_packet};
+use anet_common::consts::COALESCE_BUDGET_BYTES;
 use hickory_resolver::TokioAsyncResolver;
 use hickory_resolver::config::{NameServerConfig, Protocol, ResolverConfig, ResolverOpts};
 use ipnet::IpNet;
@@ -20,8 +21,6 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use anyhow::Context;
 
-/// Бюджет коалесценции для группировки мелких IP-пакетов перед записью в сокет.
-const COALESCE_BUDGET_BYTES: usize = 64 * 1024;
 
 struct RunningSession {
     endpoint: Option<Endpoint>,
@@ -215,7 +214,7 @@ impl AnetClient {
                 filter.add_bypass(sa.ip()).await;
             }
         }
-        
+
         let apps_names = self.config.main.per_app.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ");
         let mode_str = match mode {
             crate::config::PerAppMode::All => "all",
@@ -459,13 +458,13 @@ impl AnetClient {
                 }
 
                 let elapsed_rx = rx_check.lock().unwrap().elapsed();
-                let elapsed_tx = tx_check.lock().unwrap().elapsed(); // Читаем tx
+                let elapsed_tx = tx_check.lock().unwrap().elapsed();
 
                 if is_initial_phase {
                     // Если мы отправляли данные в последние 4 сек, но ответа нет 8 сек -> Блокировка
                     if elapsed_rx > Duration::from_secs(8) && elapsed_tx < Duration::from_secs(4) {
                         warn!("[Health] CASE 1 Detected: Connection established, but payload traffic is blocked!");
-                        warn!("[Health] CASE 1 Detected: Connection established, but payload traffic is blocked!");
+                        warn("[Health] CASE 1 Detected: Connection established, but payload traffic is blocked!");
                         monitor_reconnect.notify_one();
                         break;
                     }
@@ -475,7 +474,7 @@ impl AnetClient {
                     // но ответа нет 15с. Если elapsed_tx тоже большое — значит юзер просто отошел попить чай (AFK).
                     if elapsed_rx > Duration::from_secs(15) && elapsed_tx < Duration::from_secs(10) {
                         warn!("[Health] CASE 2 Detected: Active tunnel lost traffic flow (15s inactivity timeout)!");
-                        warn!("[Health] CASE 2 Detected: Active tunnel lost traffic flow (15s inactivity timeout)!");
+                        warn("[Health] CASE 2 Detected: Active tunnel lost traffic flow (15s inactivity timeout)!");
                         monitor_reconnect.notify_one();
                         break;
                     }
