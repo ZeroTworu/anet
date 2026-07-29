@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["anet-server", "anet-client-cli", "anet-common", "anet-keygen", "anet-client-core", "anet-mobile", "anet-client-gui", "anet-auth"]
+members = ["anet-server", "anet-client-cli", "anet-common", "anet-keygen", "anet-client-core", "anet-mobile", "anet-client-gui", "anet-auth", "anet-appfilter"]
 default-members = ["anet-server", "anet-client-cli", "anet-common", "anet-auth", "anet-client-gui", "anet-keygen"]
 
 
@@ -28,6 +28,9 @@ async-trait = "0.1.89"
 netdev = { version = "0.39", features = ["gateway"] }
 ipnet = "2.11.0"
 futures = "0.3.31"
+windows-sys = { version = "0.59" }
+dashmap = { version = "7.0.0-rc2" }
+reqwest = { version = "0.12.28", default-features = false }
 
 [profile.release.package.anet-client-cli]
 debug = 2

@@ -8,11 +8,12 @@ use tokio::sync::mpsc;
 
 pub struct DesktopTunFactory {
     tun_name: String,
+    _per_app_mode: bool,
 }
 
 impl DesktopTunFactory {
-    pub fn new(tun_name: String) -> Self {
-        Self { tun_name}
+    pub fn new(tun_name: String, per_app_mode: bool) -> Self {
+        Self { tun_name, _per_app_mode: per_app_mode }
     }
 }
 
@@ -23,13 +24,8 @@ impl TunFactory for DesktopTunFactory {
         auth: &AuthResponse,
     ) -> Result<(mpsc::Sender<Bytes>, mpsc::Receiver<Bytes>, String)> {
         let params = TunParams::from_auth_response(auth, &self.tun_name);
-
         let mut manager = TunManager::new(params)?;
-
-        // Use run_with_name to get the actual interface name
-        // This is important for macOS where utun names are assigned dynamically
         let result = manager.run_with_name().await?;
-
         Ok((result.tx, result.rx, result.interface_name))
     }
 }

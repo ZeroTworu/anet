@@ -21,6 +21,16 @@ pub struct MainConfig {
     #[serde(default)]
     pub dns_server_list: Vec<String>,
 
+    /// Windows per-app split tunneling: список имён процессов ("firefox.exe").
+    /// Пусто — обычный полный туннель через TUN (поведение по умолчанию).
+    #[serde(default)]
+    pub per_app: Vec<String>,
+
+    /// true  — процессы из `per_app` ИСКЛЮЧАЮТСЯ из туннеля (exclude-режим);
+    /// false — в туннель идут ТОЛЬКО процессы из `per_app` (include-режим).
+    #[serde(default)]
+    pub per_app_exclude: bool,
+
     #[serde(default = "default_update_url")]
     pub update_url: String,
 }
@@ -38,6 +48,8 @@ impl Default for MainConfig {
             exclude_route_for: vec![],
             dns_server_list: vec!["1.1.1.1".to_string(), "8.8.8.8".to_string()],
             manual_routing: false,
+            per_app: vec![],
+            per_app_exclude: false,
             update_url: default_update_url(),
         }
     }

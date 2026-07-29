@@ -369,7 +369,10 @@ impl ANetApp {
                     }
                 }
 
-                let tun = Box::new(DesktopTunFactory::new(cfg.main.tun_name.clone()));
+                let tun = Box::new(DesktopTunFactory::new(
+                    cfg.main.tun_name.clone(),
+                    !cfg.main.per_app.is_empty(),
+                ));
 
                 // Используем результат, полученный внутри block_on
                 let route = match route_result {

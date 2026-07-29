@@ -34,7 +34,7 @@ libc = "0.2.175"
 # Windows-specific dependencies
 [target.'cfg(windows)'.dependencies]
 wintun = "0.5.1"
-windows-sys = { version = "0.59", features = ["Win32_UI_WindowsAndMessaging", "Win32_Foundation"] }
+windows-sys = {  workspace = true, features = ["Win32_UI_WindowsAndMessaging", "Win32_Foundation"] }
 
 # Platform-specific dependencies for route management
 [target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
@@ -54,6 +54,8 @@ libc = "0.2"
 [features]
 default = []
 console = []
+# Включить per-app split tunneling (Windows + WinDivert SDK при сборке).
+per-app = ["anet-client-core/per-app"]
 
 [package.metadata.winres]
 Manifest = "app.manifest"

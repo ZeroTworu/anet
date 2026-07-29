@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 
+[features]
+default = []
+# Включить per-app split tunneling (Windows + WinDivert SDK при сборке).
+per-app = ["anet-client-core/per-app"]
+
 [dependencies]
 tokio = {workspace = true}
 log = {workspace = true}

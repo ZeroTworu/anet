@@ -4,6 +4,13 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 
+[features]
+default = []
+# Включает реальный per-app split tunneling через WinDivert (только Windows).
+# Без этой фичи per-app-конфиг игнорируется и клиент работает через TUN.
+# Требует наличия WinDivert SDK при сборке (см. anet-appfilter).
+per-app = ["anet-appfilter/windivert"]
+
 [dependencies]
 tokio = {workspace = true}
 rustls = {workspace = true }
@@ -22,14 +29,13 @@ async-trait = { workspace = true }
 ipnet = { workspace = true }
 futures = { workspace = true }
 
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots"] }
+reqwest = { workspace = true, features = ["json", "rustls-tls-webpki-roots"] }
 
 russh = "0.51.1"
-
+zip = "8.6.0"
 
 hickory-resolver = { version = "0.24", features = ["tokio"] }
 anet-common = { path = "../anet-common" }
-zip = "8.6.0"
 
 
 # Platform-specific dependencies for route management
@@ -39,6 +45,11 @@ net-route = "0.4"
 # netdev is needed on all desktop platforms for interface discovery
 [target.'cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))'.dependencies]
 netdev = { workspace = true }
+
+# Per-app split tunneling — только Windows (WinDivert).
+# Заглушка по умолчанию; реальный WinDivert включается фичей `per-app`.
+[target.'cfg(windows)'.dependencies]
+anet-appfilter = { path = "../anet-appfilter" }
 
 
 

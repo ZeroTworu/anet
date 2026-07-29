@@ -2,7 +2,9 @@
 
 
 win-gui:
-	 cargo build --release --target x86_64-pc-windows-gnu --package anet-client-gui
+	 cargo build --release --target x86_64-pc-windows-gnu --package anet-client-guiwin-gui:
+win-gui-d:
+	 cargo build --release --target x86_64-pc-windows-gnu --package anet-client-gui --features per-app --features console
 
 # Default target
 all:
