@@ -174,8 +174,32 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
+      # Per-app split tunneling (anet-appfilter/windivert) требует на этапе
+      # линковки WinDivert.lib/.dll/.sys — по аналогии с wintun.dll ниже, но
+      # эти файлы нужны уже сейчас, для сборки, а не только для установщика.
+      - name: "Download WinDivert SDK (for per-app build)"
+        shell: pwsh
+        run: |
+          $WINDIVERT_VERSION = "2.2.2"
+          Invoke-WebRequest -Uri "https://github.com/basil00/WinDivert/releases/download/v$WINDIVERT_VERSION/WinDivert-$WINDIVERT_VERSION-A.zip" -OutFile "windivert.zip"
+          Expand-Archive -Path "windivert.zip" -DestinationPath "windivert_sdk_raw" -Force
+
+          New-Item -ItemType Directory -Force -Path "windivert_sdk" | Out-Null
+          $dll = Get-ChildItem -Path "windivert_sdk_raw" -Recurse -Filter "WinDivert.dll" | Where-Object { $_.DirectoryName -like "*x64*" } | Select-Object -First 1
+          $lib = Get-ChildItem -Path "windivert_sdk_raw" -Recurse -Filter "WinDivert.lib" | Where-Object { $_.DirectoryName -like "*x64*" } | Select-Object -First 1
+          $sys = Get-ChildItem -Path "windivert_sdk_raw" -Recurse -Filter "WinDivert64.sys" | Select-Object -First 1
+
+          Copy-Item $dll.FullName "windivert_sdk\WinDivert.dll"
+          Copy-Item $lib.FullName "windivert_sdk\WinDivert.lib"
+          Copy-Item $sys.FullName "windivert_sdk\WinDivert64.sys"
+
+          $sdkPath = (Resolve-Path "windivert_sdk").Path
+          echo "WINDIVERT_PATH=$sdkPath" >> $env:GITHUB_ENV
+
+          Remove-Item "windivert_sdk_raw", "windivert.zip" -Recurse -Force
+
       - name: "Build Client (CLI) (Windows)"
-        run: "cargo build --release --package anet-client-cli"
+        run: "cargo build --release --package anet-client-cli --features per-app"
 
       - uses: "actions/upload-artifact@v6"
         with:
@@ -183,7 +207,7 @@ jobs:
           path: "target/release/anet-client.exe"
 
       - name: "Build Client (GUI) (Windows)"
-        run: "cargo build --release --package anet-client-gui"
+        run: "cargo build --release --package anet-client-gui --features per-app"
 
       - uses: "actions/upload-artifact@v6"
         with:
@@ -191,7 +215,7 @@ jobs:
           path: "target/release/anet-gui.exe"
 
       - name: "Build Client (GUI - Debug Console) (Windows)"
-        run: "cargo build --release --package anet-client-gui --features console"
+        run: "cargo build --release --package anet-client-gui --features console,per-app"
 
       - name: "Remove existing debug build if exists"
         run: "if (Test-Path target/release/anet-gui-debug.exe) { Remove-Item target/release/anet-gui-debug.exe }"
@@ -505,6 +529,16 @@ jobs:
           Expand-Archive -Path "installer_source\wintun.zip" -DestinationPath "installer_source\wintun"
           Copy-Item -Path "installer_source\wintun\wintun\bin\amd64\wintun.dll" -Destination "installer_source\wintun.dll" -Force
           Remove-Item "installer_source\wintun", "installer_source\wintun.zip" -Recurse -Force
+
+          # Скачивание и размещение WinDivert (per-app split tunneling, anet-appfilter)
+          $WINDIVERT_VERSION="2.2.2"
+          Invoke-WebRequest -Uri "https://github.com/basil00/WinDivert/releases/download/v$WINDIVERT_VERSION/WinDivert-$WINDIVERT_VERSION-A.zip" -OutFile "installer_source\windivert.zip"
+          Expand-Archive -Path "installer_source\windivert.zip" -DestinationPath "installer_source\windivert_raw" -Force
+          $wdDll = Get-ChildItem -Path "installer_source\windivert_raw" -Recurse -Filter "WinDivert.dll" | Where-Object { $_.DirectoryName -like "*x64*" } | Select-Object -First 1
+          $wdSys = Get-ChildItem -Path "installer_source\windivert_raw" -Recurse -Filter "WinDivert64.sys" | Select-Object -First 1
+          Copy-Item -Path $wdDll.FullName -Destination "installer_source\WinDivert.dll" -Force
+          Copy-Item -Path $wdSys.FullName -Destination "installer_source\WinDivert64.sys" -Force
+          Remove-Item "installer_source\windivert_raw", "installer_source\windivert.zip" -Recurse -Force
           
           # Копирование config и ISS скрипта в рабочую директорию
           Copy-Item -Path "contrib\config\client.toml" -Destination "installer_source\client.toml" -Force

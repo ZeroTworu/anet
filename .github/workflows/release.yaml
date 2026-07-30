@@ -87,6 +87,14 @@ jobs:
           unzip "wintun-0.14.1.zip"
           cp "wintun/bin/amd64/wintun.dll" .
           rm -rf "wintun" "wintun-0.14.1.zip"
+
+          # WINDIVERT DOWNLOAD (per-app split tunneling, anet-appfilter)
+          WINDIVERT_VERSION="2.2.2"
+          curl -sLO "https://github.com/basil00/WinDivert/releases/download/v${WINDIVERT_VERSION}/WinDivert-${WINDIVERT_VERSION}-A.zip"
+          unzip -q "WinDivert-${WINDIVERT_VERSION}-A.zip" -d windivert_raw
+          cp "$(find windivert_raw -path '*x64/WinDivert.dll' | head -n1)" .
+          cp "$(find windivert_raw -path '*x64/WinDivert64.sys' | head -n1)" .
+          rm -rf windivert_raw "WinDivert-${WINDIVERT_VERSION}-A.zip"
           cd ../..
           
           # ANDROID APK
