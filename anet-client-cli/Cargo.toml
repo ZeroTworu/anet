@@ -38,6 +38,9 @@ netdev = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[target.'cfg(windows)'.dependencies]
+wintun = "0.5.1"
+
 [build-dependencies]
 chrono = "0.4.42"
 
