@@ -11,3 +11,11 @@ pub const PROTO_PAD_FIELD_OVERHEAD: usize = 3;
 // Минимальный размер пакета рукопожатия для фильтрации мусора на сервере
 // Nonce (12) + Tag (16) + Min Protobuf (~50)
 pub const MIN_HANDSHAKE_LEN: usize = 78;
+
+/// Бюджет коалесценции для группировки мелких IP-пакетов перед записью в сокет.
+pub const COALESCE_BUDGET_BYTES: usize = 64 * 1024;
+
+/// Безопасный бюджет коалесценции для SSH/VNC (16 KB)
+/// Гарантирует, что размер пакета никогда не превысит стандартное окно SSH-канала (32 KB),
+/// предотвращая переполнение буферов и панику CryptoVec::resize.
+pub const CRYPTO_COALESCE_BUDGET_BYTES: usize = 16 * 1024;

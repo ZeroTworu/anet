@@ -4,6 +4,7 @@ pub mod consts;
 pub mod crypto_utils;
 pub mod encryption;
 pub mod generated;
+pub mod handshake_fragmentation;
 pub mod jitter;
 pub mod padding_utils;
 pub mod quic_settings;

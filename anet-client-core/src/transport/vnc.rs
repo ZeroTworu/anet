@@ -1,5 +1,5 @@
 use super::{ClientTransport, ConnectionResult, MutexVpnStream};
-use crate::config::{CoreConfig, ServerConfig}; // Импортируем новую структуру ноды
+use crate::config::{CoreConfig, ServerConfig};
 use crate::auth::{AuthHandler, AuthChannel};
 use anyhow::Result;
 use async_trait::async_trait;
@@ -13,6 +13,7 @@ use tokio::sync::{mpsc, Mutex};
 use std::time::Duration;
 use anet_common::stream_framing::{frame_packet, read_next_packet};
 use anet_common::consts::{MAX_PACKET_SIZE, CHANNEL_BUFFER_SIZE};
+use anet_common::handshake_fragmentation::{FragmentConfig, write_fragmented};
 
 const RFB_VER: &[u8; 12] = b"RFB 003.008\n";
 const RFB_SEC_TYPES: &[u8; 2] = &[1, 1];
@@ -24,15 +25,16 @@ struct VncAuthChannel {
 
 #[async_trait]
 impl AuthChannel for VncAuthChannel {
-    async fn send(&self, data: Bytes) -> Result<()> {
+    async fn send(&self, data: Bytes, frag: &FragmentConfig) -> Result<()> {
         let mut stream = self.stream.lock().await;
         let mut framed = bytes::BytesMut::with_capacity(8 + data.len());
         framed.put_u8(6); // ClientCutText
         framed.put_slice(&[0, 0, 0]);
         framed.put_u32(data.len() as u32);
         framed.put(data);
-        stream.write_all(&framed).await?;
-        stream.flush().await?;
+        // Получателю не важно, сколькими TCP-сегментами это придёт — он читает
+        // строго по RFB-заголовку (8 байт) + указанной в нём длине.
+        write_fragmented(&mut *stream, &framed, frag).await?;
         Ok(())
     }
 
@@ -43,7 +45,7 @@ impl AuthChannel for VncAuthChannel {
         if header[0] != 3 { anyhow::bail!("Invalid VNC Auth msg type from server: {}", header[0]); }
 
         let len = u32::from_be_bytes(header[4..8].try_into().unwrap()) as usize;
-        if len > anet_common::consts::MAX_PACKET_SIZE * 2 { anyhow::bail!("VNC Auth packet too large"); }
+        if len > MAX_PACKET_SIZE * 2 { anyhow::bail!("VNC Auth packet too large"); }
 
         let mut payload = vec![0u8; len];
         tokio::time::timeout(timeout, stream.read_exact(&mut payload)).await??;
@@ -70,31 +72,31 @@ impl ClientTransport for VncTransport {
         let addr: SocketAddr = addr_str.to_socket_addrs()?.next().ok_or(anyhow::anyhow!("Invalid server address"))?;
         info!("[VNC Transport] Probing fake desktop target: {}", addr);
 
-        let mut stream = TcpStream::connect(addr).await?;
-        let _ = stream.set_nodelay(true);
+        let mut tcp_stream = TcpStream::connect(addr).await?;
+        tcp_stream.set_nodelay(true)?;
 
-        let mut ver = [0u8; 12]; stream.read_exact(&mut ver).await?;
+        let mut ver = [0u8; 12]; tcp_stream.read_exact(&mut ver).await?;
         info!("-> Read Srv Ban: {:?}", std::str::from_utf8(&ver).unwrap_or(""));
         if &ver != RFB_VER { anyhow::bail!("Target Server returned unknown protocol (Not RFB3.8)."); }
-        stream.write_all(RFB_VER).await?;
-        stream.flush().await?;
+        tcp_stream.write_all(RFB_VER).await?;
+        tcp_stream.flush().await?;
 
-        let mut sc_types = [0u8; 2]; stream.read_exact(&mut sc_types).await?;
+        let mut sc_types = [0u8; 2]; tcp_stream.read_exact(&mut sc_types).await?;
         if &sc_types != RFB_SEC_TYPES { anyhow::bail!("VNC Security handshake rejection.")}
-        stream.write_all(&[1]).await?;
-        stream.flush().await?;
+        tcp_stream.write_all(&[1]).await?;
+        tcp_stream.flush().await?;
 
-        let mut sc_rs = [0u8; 4]; stream.read_exact(&mut sc_rs).await?;
+        let mut sc_rs = [0u8; 4]; tcp_stream.read_exact(&mut sc_rs).await?;
         if &sc_rs != RFB_SEC_RESULT { anyhow::bail!("VNC Server banned logic.")}
-        stream.write_all(&[1]).await?;
-        stream.flush().await?;
+        tcp_stream.write_all(&[1]).await?;
+        tcp_stream.flush().await?;
 
         let mut rfb_desktop = vec![0u8; 28];
-        stream.read_exact(&mut rfb_desktop).await?;
+        tcp_stream.read_exact(&mut rfb_desktop).await?;
 
         info!("[VNC Tunnel Ready]. Securing envelope (Entering ASTP Domain)...");
 
-        let auth_ch = VncAuthChannel { stream: Mutex::new(stream) };
+        let auth_ch = VncAuthChannel { stream: Mutex::new(tcp_stream) };
 
         // Передаем опциональный ключ сервера для переопределения
         let ath_ctrl = AuthHandler::new(&self.config, self.server.server_pub_key.as_deref())?;

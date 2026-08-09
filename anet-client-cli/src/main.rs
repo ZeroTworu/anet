@@ -55,7 +55,6 @@ async fn main() -> Result<()> {
     let tun_fac = Box::new(
         DesktopTunFactory::new(
             config.main.tun_name.clone(),
-            !config.main.per_app.is_empty(),
         ));
     let client = AnetClient::new(config, tun_fac, route_mgr);
 

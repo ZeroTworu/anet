@@ -18,6 +18,9 @@ manual_routing = false
 # per_app = ["firefox.exe", "telegram.exe"]
 # per_app_exclude = false
 
+per_app = []
+per_app_exclude = false
+
 # exclude-режим (в туннель всё, КРОМЕ этих):
 # per_app = ["steam.exe"]
 # per_app_exclude = true
@@ -233,6 +236,11 @@ min_jitter_ns = 1000000
 # По умолчанию: 5000000 (5 ms)
 max_jitter_ns = 5000000
 
+# Включить фрагментацию первого пакета, заимствованно из GoodbyDPI
+# Может помочь, против примитивных DPI на стороне провайдера
+frag_enabled = true
+frag_min_chunks = 2
+frag_max_chunks = 3
 
 # =========================================================================
 # Настройки транспорта QUIC (Quinn Transport Configuration)

@@ -5,6 +5,7 @@ use crate::traits::{RouteManager, TunFactory};
 use crate::statistic;
 use crate::transport::factory::create_transport;
 use anet_common::stream_framing::{frame_packet_into, read_next_packet};
+use anet_common::consts::{COALESCE_BUDGET_BYTES};
 use hickory_resolver::TokioAsyncResolver;
 use hickory_resolver::config::{NameServerConfig, Protocol, ResolverConfig, ResolverOpts};
 use ipnet::IpNet;
@@ -18,10 +19,7 @@ use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
-use anyhow::Context;
 
-/// Бюджет коалесценции для группировки мелких IP-пакетов перед записью в сокет.
-const COALESCE_BUDGET_BYTES: usize = 64 * 1024;
 
 struct RunningSession {
     endpoint: Option<Endpoint>,

@@ -11,6 +11,7 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Mutex};
 use anet_common::stream_framing::{frame_packet, read_next_packet};
 use anet_common::consts::{CHANNEL_BUFFER_SIZE, MAX_PACKET_SIZE};
@@ -53,7 +54,12 @@ impl ClientTransport for SshTransport {
         config_base.maximum_packet_size = MAX_PACKET_SIZE as u32;
 
         let config = Arc::new(config_base);
-        let mut session = russh::client::connect(config, addr, ClientHandler).await?;
+
+        // используем connect_stream() вместо connect(), чтобы успеть
+        // выставить TCP_NODELAY до начала SSH-хендшейка.
+        let tcp_stream = TcpStream::connect(addr).await?;
+        tcp_stream.set_nodelay(true)?;
+        let mut session = russh::client::connect_stream(config, tcp_stream, ClientHandler).await?;
 
         if !session.authenticate_none(user).await?.success() {
             anyhow::bail!("SSH Authentication failed (auth_none rejected)");
