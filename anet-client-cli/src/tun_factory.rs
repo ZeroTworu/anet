@@ -8,12 +8,11 @@ use tokio::sync::mpsc;
 
 pub struct DesktopTunFactory {
     tun_name: String,
-    per_app_mode: bool,
 }
 
 impl DesktopTunFactory {
-    pub fn new(tun_name: String, per_app_mode: bool) -> Self {
-        Self { tun_name, per_app_mode }
+    pub fn new(tun_name: String) -> Self {
+        Self { tun_name }
     }
 }
 

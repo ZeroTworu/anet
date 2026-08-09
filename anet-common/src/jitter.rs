@@ -8,19 +8,12 @@ use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
-use crate::consts::CHANNEL_BUFFER_SIZE;
+use crate::consts::{CHANNEL_BUFFER_SIZE, COALESCE_BUDGET_BYTES, CRYPTO_COALESCE_BUDGET_BYTES};
 use crate::encryption::Cipher;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use crate::padding_utils::calculate_padding_needed;
 
-/// Максимальный размер буфера коалесценции для QUIC (64 KB)
-const COALESCE_BUDGET_BYTES: usize = 64 * 1024;
-
-/// Безопасный бюджет коалесценции для SSH/VNC (16 KB)
-/// Гарантирует, что размер пакета никогда не превысит стандартное окно SSH-канала (32 KB),
-/// предотвращая переполнение буферов и панику CryptoVec::resize.
-const CRYPTO_COALESCE_BUDGET_BYTES: usize = 16 * 1024;
 
 async fn coalesced_sender_loop<S>(
     rx_ready: &mut mpsc::Receiver<Bytes>,

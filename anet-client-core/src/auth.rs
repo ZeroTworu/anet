@@ -3,6 +3,7 @@ use crate::events::{status, warn, err as serr};
 use anet_common::consts::{MAX_PACKET_SIZE, NONCE_LEN, PROTO_PAD_FIELD_OVERHEAD};
 use anet_common::crypto_utils::{self, derive_shared_key, generate_key_fingerprint, sign_data};
 use anet_common::encryption::Cipher;
+use anet_common::handshake_fragmentation::{FragmentConfig, write_fragmented};
 use anet_common::padding_utils::{calculate_padding_needed, generate_random_padding};
 use anet_common::protocol::{
     AuthRequest, AuthResponse, DhClientExchange, EncryptedAuthRequest, EncryptedAuthResponse,
@@ -21,7 +22,7 @@ use rand::rngs::OsRng;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 use tokio::time::sleep;
@@ -33,7 +34,7 @@ const MAX_DELAY: u64 = 60;
 
 #[async_trait]
 pub trait AuthChannel: Send + Sync {
-    async fn send(&self, data: Bytes) -> Result<()>;
+    async fn send(&self, data: Bytes, frag: &FragmentConfig) -> Result<()>;
     async fn recv(&self, timeout: Duration) -> Result<Bytes>;
 }
 
@@ -50,7 +51,8 @@ impl UdpAuthChannel {
 
 #[async_trait]
 impl AuthChannel for UdpAuthChannel {
-    async fn send(&self, data: Bytes) -> Result<()> {
+    async fn send(&self, data: Bytes, frag: &FragmentConfig) -> Result<()> {
+        let _ = frag;
         self.socket.send_to(&data, self.target).await?;
         Ok(())
     }
@@ -80,11 +82,13 @@ impl<S> StreamAuthChannel<S> {
 
 #[async_trait]
 impl<S: AsyncRead + AsyncWrite + Unpin + Send> AuthChannel for StreamAuthChannel<S> {
-    async fn send(&self, data: Bytes) -> Result<()> {
+    async fn send(&self, data: Bytes, frag: &FragmentConfig) -> Result<()> {
         let mut stream = self.stream.lock().await;
         let framed = frame_packet(data);
-        stream.write_all(&framed).await?;
-        stream.flush().await?;
+        // Получателю не нужны никакие изменения: поток (TCP/SSH/VNC, в
+        // гарантирует доставку байт по порядку независимо от
+        // того, сколькими сегментами это было разбито на передаче.
+        write_fragmented(&mut *stream, &framed, frag).await?;
         Ok(())
     }
 
@@ -113,6 +117,7 @@ pub struct AuthHandler {
     client_public_key: VerifyingKey,
     client_id: String,
     padding_step: u16,
+    frag_cfg: FragmentConfig,
 }
 
 impl AuthHandler {
@@ -156,6 +161,7 @@ impl AuthHandler {
             client_public_key,
             client_id,
             padding_step: cfg.stealth.padding_step,
+            frag_cfg: FragmentConfig::from_stealth(&cfg.stealth),
         })
     }
 
@@ -215,7 +221,7 @@ impl AuthHandler {
         status("[AUTH] Phase I: Sending DH exchange request.");
 
         channel
-            .send(request_packet)
+            .send(request_packet, &self.frag_cfg)
             .await
             .context("Failed Phase I send")?;
 
@@ -306,7 +312,7 @@ impl AuthHandler {
     );
 
         channel
-            .send(request_packet)
+            .send(request_packet, &self.frag_cfg)
             .await
             .context("Failed Phase III send")?;
 
