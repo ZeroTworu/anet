@@ -19,6 +19,8 @@ use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
+#[cfg(all(windows, feature = "per-app"))]
+use anyhow::Context;
 
 
 struct RunningSession {
