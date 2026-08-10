@@ -1,11 +1,13 @@
 use crate::client_registry::ClientRegistry;
 use anet_common::config::StealthConfig;
 use anet_common::consts::{MAX_PACKET_SIZE, MIN_HANDSHAKE_LEN, NONCE_LEN, PADDING_MTU};
+use anet_common::handshake_fragmentation::DatagramReassembler;
 use anet_common::padding_utils::calculate_padding_needed;
 use anet_common::transport;
 use anet_common::udp_poller::TokioUdpPoller;
 use bytes::Bytes;
-use log::{error, warn};
+use dashmap::DashMap;
+use log::{debug, error, warn};
 use quinn::{
     AsyncUdpSocket, UdpPoller,
     udp::{RecvMeta, Transmit},
@@ -39,7 +41,15 @@ pub struct MultiKeyAnetUdpSocket {
     registry: Arc<ClientRegistry>,
     auth_tx: mpsc::Sender<HandshakeData>,
     stealth_config: StealthConfig,
+    // Реассемблер фрагментированных UDP-хендшейков, по адресу источника.
+    // Храним вместе с меткой времени первого фрагмента — если сборка не
+    // завершилась в разумное время (клиент оборвался/потерял датаграмму),
+    // запись самоочищается при следующем обращении с того же адреса, без
+    // отдельной фоновой GC-задачи.
+    reassemblers: Arc<DashMap<SocketAddr, (Instant, DatagramReassembler)>>,
 }
+
+const REASSEMBLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl MultiKeyAnetUdpSocket {
     pub fn new(
@@ -53,6 +63,7 @@ impl MultiKeyAnetUdpSocket {
             registry,
             auth_tx,
             stealth_config,
+            reassemblers: Arc::new(DashMap::new()),
         }
     }
 }
@@ -186,23 +197,44 @@ impl AsyncUdpSocket for MultiKeyAnetUdpSocket {
 
                     // 2. Если это не пакет сессии - проверяем Хендшейк
                     if !packet_for_quinn {
-                        if filled_len >= MIN_HANDSHAKE_LEN {
-                            // Копируем, т.к. raw_packet_mut живет только в цикле
-                            let packet_copy = Bytes::copy_from_slice(raw_packet_mut);
+                        // Собираем через реассемблер ДО проверки MIN_HANDSHAKE_LEN:
+                        // отдельные фрагменты хендшейка (при включённой
+                        // фрагментации на клиенте)
+                        let complete: Option<Vec<u8>> = {
+                            let mut entry = self
+                                .reassemblers
+                                .entry(remote_addr)
+                                .and_modify(|(ts, reassembler)| {
+                                    if ts.elapsed() > REASSEMBLY_TIMEOUT {
+                                        *reassembler = DatagramReassembler::new();
+                                    }
+                                    *ts = Instant::now();
+                                })
+                                .or_insert_with(|| (Instant::now(), DatagramReassembler::new()));
 
-                            // Отправляем в Auth. Не блокируем поток.
-                            if self.auth_tx.try_send((packet_copy, remote_addr)).is_err() {
-                                warn!("[Socket] Auth channel full, dropping packet");
+                            entry.1.feed(raw_packet_mut)
+                        };
+
+                        debug!("[Socket] Start reassembling handshake from {}:", remote_addr);
+                        if let Some(complete) = complete {
+                            self.reassemblers.remove(&remote_addr);
+
+                            if complete.len() >= MIN_HANDSHAKE_LEN {
+                                let packet_copy = Bytes::from(complete);
+                                if self.auth_tx.try_send((packet_copy, remote_addr)).is_err() {
+                                    warn!("[Socket] Auth channel full, dropping packet");
+                                }
+                            } else {
+                                warn!(
+                                    "[Socket] Reassembled handshake too short from {} ({} bytes), dropping",
+                                    remote_addr,
+                                    complete.len()
+                                );
                             }
-                            // Пакет обработан (ушел в Auth).
-                            // Quinn его не видит.
-                            // МЫ ПРОДОЛЖАЕМ ЦИКЛ (не делаем break), чтобы найти данные для Quinn
                         } else {
-                            warn!(
-                                "[Socket] Dropping unknown/short packet from {}",
-                                remote_addr
-                            );
+                            warn!("[Socket] Reassembled handshake from {} is None", remote_addr);
                         }
+
                     }
                 }
                 Poll::Ready(Err(_)) => {

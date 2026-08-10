@@ -3,7 +3,7 @@ use crate::events::{status, warn, err as serr};
 use anet_common::consts::{MAX_PACKET_SIZE, NONCE_LEN, PROTO_PAD_FIELD_OVERHEAD};
 use anet_common::crypto_utils::{self, derive_shared_key, generate_key_fingerprint, sign_data};
 use anet_common::encryption::Cipher;
-use anet_common::handshake_fragmentation::{FragmentConfig, write_fragmented};
+use anet_common::handshake_fragmentation::{FragmentConfig, send_fragmented_datagrams, write_fragmented};
 use anet_common::padding_utils::{calculate_padding_needed, generate_random_padding};
 use anet_common::protocol::{
     AuthRequest, AuthResponse, DhClientExchange, EncryptedAuthRequest, EncryptedAuthResponse,
@@ -52,8 +52,10 @@ impl UdpAuthChannel {
 #[async_trait]
 impl AuthChannel for UdpAuthChannel {
     async fn send(&self, data: Bytes, frag: &FragmentConfig) -> Result<()> {
-        let _ = frag;
-        self.socket.send_to(&data, self.target).await?;
+        send_fragmented_datagrams(&data, frag, |chunk| async move {
+            self.socket.send_to(&chunk, self.target).await.map(|_| ())
+        })
+            .await?;
         Ok(())
     }
 
