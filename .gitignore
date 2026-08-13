@@ -2,6 +2,7 @@
 .idea
 *.pem
 *.sh
+*.ps*
 android-build/*
 .env
 /node_modules
