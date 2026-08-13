@@ -8,6 +8,7 @@ use anyhow::Result;
 use clap::Parser;
 use log::{error, info};
 use std::process::exit;
+use std::sync::Arc;
 use tokio::fs::read_to_string;
 use tokio::signal;
 
@@ -57,16 +58,35 @@ async fn main() -> Result<()> {
             config.main.tun_name.clone(),
             !config.main.per_app.is_empty(),
         ));
-    let client = AnetClient::new(config, tun_fac, route_mgr);
+    let client = Arc::new(AnetClient::new(config, tun_fac, route_mgr));
 
-    if let Err(e) = client.start().await {
-        error!("Handshake Failed: {}", e);
-        exit(1);
-    }
+
+    let client_for_task = client.clone();
+    let mut run_task = tokio::spawn(async move {
+        if let Err(e) = client_for_task.start().await {
+            error!("VPN connection loop exited with error: {}", e);
+        }
+    });
 
     info!("VPN Running. Press Ctrl+C to stop.");
-    signal::ctrl_c().await?;
-    client.stop().await?;
+
+    tokio::select! {
+        res = &mut run_task => {
+            // Цикл подключения завершился сам по себе (например, ошибка
+            // конфигурации ещё до первого коннекта) — ждать Ctrl+C уже нечего.
+            if let Err(e) = res {
+                error!("VPN task panicked: {}", e);
+            }
+            exit(1);
+        }
+        ctrlc_result = signal::ctrl_c() => {
+            ctrlc_result?;
+            info!("Ctrl+C received. Stopping VPN and restoring system state...");
+            client.stop().await?;
+            let _ = run_task.await;
+        }
+    }
+
     Ok(())
 }
 
