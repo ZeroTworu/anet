@@ -14,7 +14,7 @@ use quinn::Endpoint;
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Notify;
@@ -38,6 +38,12 @@ pub struct AnetClient {
     route_manager: Box<dyn RouteManager>,
     dns_manager: Box<dyn DnsManager>,
     session: Mutex<Option<RunningSession>>,
+    // Взводится в stop(): цикл переподключения в start() использует этот
+    // флаг, чтобы отличить "пользователь нажал disconnect" от "сессия
+    // умерла сама" — оба случая возвращаются из connect_and_run() одним и
+    // тем же путём (через reconnect_signal), поэтому раньше stop() всегда
+    // трактовался как обрыв связи и немедленно вызывал реконнект.
+    stop_requested: AtomicBool,
 }
 
 impl AnetClient {
@@ -53,6 +59,7 @@ impl AnetClient {
             route_manager,
             dns_manager,
             session: Mutex::new(None),
+            stop_requested: AtomicBool::new(false),
         }
     }
 
@@ -113,6 +120,10 @@ impl AnetClient {
             return Err(anyhow::anyhow!("VPN tunnel is already active"));
         }
 
+        // Свежий цикл подключения — сбрасываем флаг от возможного
+        // предыдущего stop().
+        self.stop_requested.store(false, Ordering::SeqCst);
+
         let mut config_clone = self.config.clone();
         config_clone.sanitize()?;
 
@@ -131,6 +142,16 @@ impl AnetClient {
 
             match self.connect_and_run(server, reconnect_signal.clone()).await {
                 Ok(()) => {
+                    // connect_and_run() возвращается через reconnect_signal и
+                    // при обрыве сессии, и при вызове stop() — различаем эти
+                    // случаи флагом, иначе disconnect всегда трактовался как
+                    // "связь потеряна" и тут же запускал реконнект.
+                    if self.stop_requested.load(Ordering::SeqCst) {
+                        info!("[Core] Stop requested by user. Exiting connection loop.");
+                        status("VPN Stopped");
+                        break;
+                    }
+
                     warn!("[Core] Connection with server '{}' lost. Switching to the next node...", server_name);
                     status("Connection lost. Reconnecting...");
 
@@ -138,6 +159,12 @@ impl AnetClient {
                     tokio::time::sleep(Duration::from_secs(2)).await;
                 }
                 Err(e) => {
+                    if self.stop_requested.load(Ordering::SeqCst) {
+                        info!("[Core] Stop requested by user. Exiting connection loop.");
+                        status("VPN Stopped");
+                        break;
+                    }
+
                     error!("[Core] Connection failed or timed out for server '{}': {}", server_name, e);
                     status(format!("Node error: {}", e));
 
@@ -146,6 +173,8 @@ impl AnetClient {
                 }
             }
         }
+
+        Ok(())
     }
 
     /// Получает источник IP-пакетов для сессии.
@@ -554,6 +583,10 @@ impl AnetClient {
     }
 
     pub async fn stop(&self) -> anyhow::Result<()> {
+        // Взводим ДО notify_one() ниже — start() должен увидеть флаг сразу,
+        // как только проснётся от сигнала reconnect_signal.
+        self.stop_requested.store(true, Ordering::SeqCst);
+
         let session = {
             let mut state = self.session.lock().unwrap();
             state.take()
