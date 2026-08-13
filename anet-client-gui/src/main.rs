@@ -48,15 +48,16 @@ fn main() -> Result<(), eframe::Error> {
     // Формируем заголовок окна: "ANet VPN v0.5.2 (5313b9e)"
     let window_title = format!("ANet VPN {} ({})", GIT_TAG, COMMIT_HASH);
 
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title(window_title) // Устанавливаем заголовок с версией
-            .with_inner_size([400.0, 600.0])
-            .with_icon(icon)
-            .with_resizable(false)
-            .with_drag_and_drop(true),
-        ..Default::default()
-    };
+let options = eframe::NativeOptions {
+    viewport: egui::ViewportBuilder::default()
+        .with_title(window_title)
+        .with_inner_size([400.0, 600.0])
+        .with_icon(icon)
+        .with_resizable(false)
+        .with_decorations(false) // <--- Отключаем стандартную рамку и шапку ОС
+        .with_transparent(true),  // Опционально: если нужны скругленные углы окна
+    ..Default::default()
+};
 
     eframe::run_native(
         "ANet VPN", // Это внутренний ID приложения

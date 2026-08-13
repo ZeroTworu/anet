@@ -1,48 +1,37 @@
+use std::os::windows::process::CommandExt;
+use std::process::Command;
 use anet_client_core::traits::TunFactory;
 use anet_common::protocol::AuthResponse;
-#[cfg(target_os = "windows")]
 use anyhow::Context;
 use anyhow::Result;
 use async_trait::async_trait;
 use bytes::Bytes;
-#[cfg(target_os = "windows")]
 use log::{debug, error, info};
-#[cfg(target_os = "windows")]
 use std::sync::Arc;
-#[cfg(target_os = "windows")]
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-#[cfg(target_os = "windows")]
-use std::os::windows::process::CommandExt;
-#[cfg(target_os = "windows")]
-use std::process::Command;
-
-
-#[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 pub struct DesktopTunFactory {
     tun_name: String,
+    per_app_mode: bool, // <-- Добавлено поле
 }
 
 impl DesktopTunFactory {
-    pub fn new(tun_name: String) -> Self {
-        Self { tun_name }
+    pub fn new(tun_name: String, per_app_mode: bool) -> Self {
+        Self { tun_name, per_app_mode }
     }
 
-    #[cfg(target_os = "windows")]
     fn run_silent_cmd(prog: &str, args: &[&str]) -> Result<()> {
         let mut command = Command::new(prog);
         command.args(args);
         command.creation_flags(CREATE_NO_WINDOW);
-
-        // ВРЕМЕННО: Включаем stderr, чтобы видеть ошибки в логах программы!
         command.stdout(std::process::Stdio::null());
-        command.stderr(std::process::Stdio::piped()); // <--- Piped вместо Null
+        command.stderr(std::process::Stdio::piped());
         command.stdin(std::process::Stdio::null());
 
-        debug!("Exec: {} {:?}", prog, args); // Логируем команду
+        debug!("Exec: {} {:?}", prog, args);
 
         let output = command
             .output()
@@ -59,75 +48,54 @@ impl DesktopTunFactory {
 
 #[async_trait]
 impl TunFactory for DesktopTunFactory {
-    #[cfg(target_os = "windows")]
     async fn create_tun(
         &self,
         auth: &AuthResponse,
     ) -> Result<(mpsc::Sender<Bytes>, mpsc::Receiver<Bytes>, String)> {
         info!("Step 1: Loading wintun.dll...");
-        // Проверяем наличие файла для диагностики
         if !std::path::Path::new("wintun.dll").exists() {
             anyhow::bail!("CRITICAL: wintun.dll not found in current directory!");
         }
 
-        let wintun =
-            unsafe { wintun::load_from_path("wintun.dll").context("Failed to load wintun.dll")? };
+        let wintun = unsafe { wintun::load_from_path("wintun.dll").context("Failed to load wintun.dll")? };
 
         info!("Step 2: Creating adapter '{}'...", self.tun_name);
         let adapter = match wintun::Adapter::create(&wintun, &self.tun_name, &self.tun_name, None) {
             Ok(a) => a,
             Err(e) => {
                 error!("Create failed: {}. Trying open...", e);
-                wintun::Adapter::open(&wintun, &self.tun_name)
-                    .context("Failed to open existing Wintun adapter")?
+                wintun::Adapter::open(&wintun, &self.tun_name).context("Failed to open existing Wintun adapter")?
             }
         };
 
         info!("Step 3: Starting session...");
         let session = Arc::new(adapter.start_session(wintun::MAX_RING_CAPACITY)?);
 
-        // ВАЖНО: Даем винде время одуплиться, что интерфейс появился
         info!("Step 4: Waiting for Windows to register interface...");
         let start = std::time::Instant::now();
         let mut target_name = String::new();
         let mut found = false;
 
-        // Ждем до 15 секунд (в виртуалках бывает туго)
         while start.elapsed() < Duration::from_secs(15) {
             let interfaces = netdev::get_interfaces();
-
-            // Ищем интерфейс, который ПОХОЖ на наш
             if let Some(iface) = interfaces.iter().find(|i| {
                 let name = i.name.to_lowercase();
                 let friendly = i.friendly_name.as_deref().unwrap_or("").to_lowercase();
                 let target = self.tun_name.to_lowercase();
-                // 1. Точное совпадение
                 name == target || friendly == target ||
-                    // 2. Совпадение с суффиксом " Tunnel" (стандарт Wintun)
                     name == format!("{} Tunnel", target) || friendly == format!("{} Tunnel", target) ||
-                    // 3. Просто начинается с имени
                     friendly.starts_with(&target) || name.starts_with(&target)
-
-
             }) {
                 target_name = iface.friendly_name.clone().unwrap_or(iface.name.clone());
-
-                info!(">> TUN FOUND: '{}' (Real system name: '{}', Index: {})",
-                      self.tun_name, target_name, iface.index);
+                info!(">> TUN FOUND: '{}' (Real system name: '{}', Index: {})", self.tun_name, target_name, iface.index);
                 found = true;
                 break;
             }
-
-            // Ждем перед следующей попыткой
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
 
         if !found {
-            error!(
-                "TIMEOUT: Adapter '{}' did not appear in netdev list after 15s.",
-                self.tun_name
-            );
-            // Можно попробовать продолжить с дефолтным именем, но скорее всего netsh упадет
+            error!("TIMEOUT: Adapter '{}' did not appear in netdev list after 15s.", self.tun_name);
             target_name = self.tun_name.clone();
         }
 
@@ -136,20 +104,35 @@ impl TunFactory for DesktopTunFactory {
         let gateway = &auth.gateway;
         let mtu = auth.mtu;
 
-        info!("Step 5: Configuring IP {}/{} via netsh...", ip, mask);
-
-        let set_ip_args = [
-            "interface",
-            "ip",
-            "set",
-            "address",
-            target_name.as_str(),
-            "static",
-            ip,
-            mask,
-            gateway,
-            "1",
-        ];
+        // Если активен раздельный туннель (per-app), мы НЕ настраиваем шлюз на адаптере Wintun.
+        // Это предотвратит перехват дефолтного маршрута операционной системы.
+        let set_ip_args = if self.per_app_mode {
+            info!("Step 5: Configuring IP {}/{} via netsh (Per-App wildcard mode, no gateway)...", ip, mask);
+            vec![
+                "interface",
+                "ip",
+                "set",
+                "address",
+                target_name.as_str(),
+                "static",
+                ip,
+                mask,
+            ]
+        } else {
+            info!("Step 5: Configuring IP {}/{} via netsh (Full tunnel mode with gateway {})...", ip, mask, gateway);
+            vec![
+                "interface",
+                "ip",
+                "set",
+                "address",
+                target_name.as_str(),
+                "static",
+                ip,
+                mask,
+                gateway,
+                "1",
+            ]
+        };
 
         if let Err(e) = Self::run_silent_cmd("netsh", &set_ip_args) {
             error!("IP Config failed! Check interface name or permissions.");
@@ -181,18 +164,22 @@ impl TunFactory for DesktopTunFactory {
         let reader_session = session.clone();
         let writer_session = session.clone();
 
+        // Клонируем канал отправки, чтобы основной не был закрыт преждевременно
+        let tx_from_tun_clone = tx_from_tun.clone();
+
         std::thread::spawn(move || {
             loop {
                 match reader_session.receive_blocking() {
                     Ok(packet) => {
                         let bytes = Bytes::copy_from_slice(packet.bytes());
-                        if tx_from_tun.blocking_send(bytes).is_err() {
+                        if tx_from_tun_clone.blocking_send(bytes).is_err() {
                             break;
                         }
                     }
-                    Err(_) => break,
+                    Err(_) => break, // Выход при закрытии адаптера
                 }
             }
+            info!("Wintun reader thread exited normally.");
         });
 
         tokio::spawn(async move {
@@ -207,23 +194,16 @@ impl TunFactory for DesktopTunFactory {
             }
         });
 
-        Ok((tx_to_tun, rx_from_tun, self.tun_name.clone()))
-    }
+        // Асинхронный монитор жизни адаптера.
+        // Ждет закрытия канала tx_from_tun (когда клиент завершает сессию)
+        // и принудительно уничтожает Wintun-адаптер.
+        let tx_monitor = tx_from_tun.clone();
+        tokio::spawn(async move {
+            tx_monitor.closed().await;
+            drop(adapter);
+            info!("Wintun adapter dropped cleanly via channel monitor.");
+        });
 
-    /// Linux and macOS implementation using the tun crate
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    async fn create_tun(
-        &self,
-        auth: &AuthResponse,
-    ) -> Result<(mpsc::Sender<Bytes>, mpsc::Receiver<Bytes>, String)> {
-        use anet_common::atun::TunManager;
-        use anet_common::tun_params::TunParams;
-
-        let params = TunParams::from_auth_response(auth, &self.tun_name);
-
-        let mut manager = TunManager::new(params.clone())?;
-        let result = manager.run_with_name().await?;
-
-        Ok((result.tx, result.rx, result.interface_name))
+        Ok((tx_to_tun, rx_from_tun, target_name))
     }
 }

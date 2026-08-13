@@ -13,6 +13,15 @@ tun_name = "anet-client"
 # By request in https://github.com/ZeroTworu/anet/issues/13
 manual_routing = false
 
+# Windows per-app split tunneling.
+# include-режим: в туннель идут ТОЛЬКО эти процессы.
+# per_app = ["firefox.exe", "telegram.exe"]
+# per_app_exclude = false
+
+# exclude-режим (в туннель всё, КРОМЕ этих):
+# per_app = ["steam.exe"]
+# per_app_exclude = true
+
 # =========================================================================
 # Настройки Маршрутизации (Split Tunneling)
 # =========================================================================

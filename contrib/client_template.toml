@@ -8,6 +8,15 @@ tun_name = "anet-client"
 # Включает ручное управление роутингом на клиенте
 manual_routing = false
 
+# Windows per-app split tunneling.
+# include-режим: в туннель идут ТОЛЬКО эти процессы.
+# per_app = ["firefox.exe", "telegram.exe"]
+# per_app_exclude = false
+
+# exclude-режим (в туннель всё, КРОМЕ этих):
+# per_app = ["steam.exe"]
+# per_app_exclude = true
+
 # Настройки Маршрутизации (Split Tunneling)
 route_for = []
 exclude_route_for = ["192.168.1.0/24"]

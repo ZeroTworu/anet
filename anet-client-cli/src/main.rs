@@ -52,7 +52,11 @@ async fn main() -> Result<()> {
     println!("{}", generate_ascii_art(GIT_TAG, BUILD_TYPE, COMMIT_HASH, BUILD_TIME));
 
     let route_mgr = create_route_manager(config.main.manual_routing)?;
-    let tun_fac = Box::new(DesktopTunFactory::new(config.main.tun_name.clone()));
+    let tun_fac = Box::new(
+        DesktopTunFactory::new(
+            config.main.tun_name.clone(),
+            !config.main.per_app.is_empty(),
+        ));
     let client = AnetClient::new(config, tun_fac, route_mgr);
 
     if let Err(e) = client.start().await {
