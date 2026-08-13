@@ -65,7 +65,7 @@ impl Default for MainConfig {
             dns_server_list: vec!["1.1.1.1".to_string(), "8.8.8.8".to_string()],
             manual_routing: false,
             per_app: vec![],
-            per_app_mode: PerAppMode::All, // <-- изменен дефолт
+            per_app_mode: PerAppMode::All,
             update_url: default_update_url(),
         }
     }

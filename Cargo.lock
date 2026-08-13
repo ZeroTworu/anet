@@ -350,7 +350,6 @@ dependencies = [
  "serde",
  "tokio",
  "toml 0.9.8",
- "wintun",
 ]
 
 [[package]]
