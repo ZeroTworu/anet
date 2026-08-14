@@ -1,7 +1,7 @@
-use super::{ClientTransport, ConnectionResult, MutexVpnStream};
+use super::{ClientTransport, ConnectionResult};
 use crate::auth::{AuthChannel, AuthHandler};
 use crate::config::{CoreConfig, ServerConfig};
-use anet_common::consts::{CHANNEL_BUFFER_SIZE, MAX_PACKET_SIZE};
+use anet_common::consts::{CHANNEL_BUFFER_SIZE, COALESCE_BUDGET_BYTES, MAX_PACKET_SIZE};
 use anet_common::handshake_fragmentation::FragmentConfig;
 use anet_common::stream_framing::{frame_packet, read_next_packet};
 use anyhow::{Context, Result};
@@ -10,7 +10,7 @@ use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
 use http::HeaderValue;
 use http::header::{ACCEPT_LANGUAGE, CACHE_CONTROL, ORIGIN, PRAGMA, USER_AGENT};
-use log::{info, warn};
+use log::{debug, info, warn};
 use rand::{Rng, seq::SliceRandom};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,25 +27,25 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async_with_conf
 type ClientSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 const CHROME_USER_AGENTS: &[&str] = &[
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
 ];
 const FIREFOX_USER_AGENTS: &[&str] = &[
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0",
-    "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:132.0) Gecko/20100101 Firefox/132.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:131.0) Gecko/20100101 Firefox/131.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:153.0) Gecko/20100101 Firefox/153.0",
+    "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:152.0) Gecko/20100101 Firefox/152.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:151.0) Gecko/20100101 Firefox/151.0",
 ];
 const CHROME_BRANDS: &[&str] = &[
-    "\"Chromium\";v=\"131\", \"Not_A Brand\";v=\"24\", \"Google Chrome\";v=\"131\"",
-    "\"Chromium\";v=\"130\", \"Not_A Brand\";v=\"24\", \"Google Chrome\";v=\"130\"",
-    "\"Chromium\";v=\"129\", \"Not_A Brand\";v=\"24\", \"Google Chrome\";v=\"129\"",
+    "\"Google Chrome\";v=\"151\", \"Chromium\";v=\"151\", \"Not_A Brand\";v=\"24\"",
+    "\"Chromium\";v=\"150\", \"Not_A Brand\";v=\"24\", \"Google Chrome\";v=\"150\"",
+    "\"Not_A Brand\";v=\"24\", \"Google Chrome\";v=\"149\", \"Chromium\";v=\"149\"",
 ];
 const CHROME_PLATFORMS: &[&str] = &["\"Windows\"", "\"Linux\"", "\"macOS\""];
 const SAFARI_USER_AGENTS: &[&str] = &[
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Safari/605.1.15",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_6) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.15",
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.5 Safari/605.1.15",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.4 Safari/605.1.15",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.5 Mobile/15E148 Safari/604.1",
 ];
 const ACCEPT_LANGUAGES: &[&str] = &[
     "en-US,en;q=0.9",
@@ -263,14 +263,9 @@ impl ClientTransport for WebSocketTransport {
         // AsyncRead operations are not generally cancellation-safe: cancelling
         // after a partial length prefix would desynchronise all later frames.
         let tunnel_reader_task = tokio::spawn(async move {
-            loop {
-                match read_next_packet(&mut tunnel_read).await {
-                    Ok(Some(packet)) => {
-                        if tunnel_packet_tx.send(packet).await.is_err() {
-                            break;
-                        }
-                    }
-                    _ => break,
+            while let Ok(Some(packet)) = read_next_packet(&mut tunnel_read).await {
+                if tunnel_packet_tx.send(packet).await.is_err() {
+                    break;
                 }
             }
         });
@@ -293,24 +288,48 @@ impl ClientTransport for WebSocketTransport {
                 loop {
                     tokio::select! {
                         packet = tunnel_packet_rx.recv() => {
-                            let Some(raw) = packet else { break 'sessions; };
-                            let size = raw.len() + 38;
-                            let padding = anet_common::padding_utils::calculate_padding_needed(size, config.stealth.padding_step);
-                            let padding = if size + padding as usize > anet_common::consts::PADDING_MTU { 0 } else { padding };
-                            match anet_common::transport::wrap_packet(&cipher, &nonce_prefix, sequence, raw, padding) {
-                                Ok(encrypted) => {
-                                    sequence = sequence.wrapping_add(1);
-                                    if socket.send(Message::Binary(encrypted)).await.is_err() { break 'sessions; }
+                            let Some(mut raw) = packet else { break 'sessions; };
+                            let mut batch_bytes = 0usize;
+                            loop {
+                                let encrypted = match anet_common::transport::wrap_packet_padded(
+                                    &cipher,
+                                    &nonce_prefix,
+                                    sequence,
+                                    raw,
+                                    config.stealth.padding_step,
+                                ) {
+                                    Ok(encrypted) => encrypted,
+                                    Err(error) => {
+                                        warn!("[WebSocket] Failed to encrypt outbound packet: {error}");
+                                        break 'sessions;
+                                    }
+                                };
+                                sequence = sequence.wrapping_add(1);
+                                batch_bytes += encrypted.len();
+                                if socket.feed(Message::Binary(encrypted)).await.is_err() {
+                                    break 'sessions;
                                 }
-                                Err(_) => break 'sessions,
+                                if batch_bytes >= COALESCE_BUDGET_BYTES {
+                                    break;
+                                }
+                                raw = match tunnel_packet_rx.try_recv() {
+                                    Ok(packet) => packet,
+                                    Err(_) => break,
+                                };
+                            }
+                            if socket.flush().await.is_err() {
+                                break 'sessions;
                             }
                         }
                         incoming = socket.next() => {
                             match incoming {
                                 Some(Ok(Message::Binary(data))) => {
-                                    if let Ok(packet) = anet_common::transport::unwrap_packet(&cipher, &data) {
-                                        let framed = frame_packet(packet);
-                                        if tunnel_write.write_all(&framed).await.is_err() { break 'sessions; }
+                                    match anet_common::transport::unwrap_packet_bytes(&cipher, data) {
+                                        Ok(packet) => {
+                                            let framed = frame_packet(packet);
+                                            if tunnel_write.write_all(&framed).await.is_err() { break 'sessions; }
+                                        }
+                                        Err(error) => debug!("[WebSocket] Dropped invalid inbound message: {error}"),
                                     }
                                 }
                                 Some(Ok(Message::Ping(data))) => {
@@ -393,7 +412,7 @@ impl ClientTransport for WebSocketTransport {
 
         Ok(ConnectionResult {
             auth_response,
-            vpn_stream: Box::new(MutexVpnStream(Arc::new(Mutex::new(client_stream)))),
+            vpn_stream: Box::new(client_stream),
             endpoint: None,
             connection: None,
             health_pause: Some(health_pause),
@@ -457,5 +476,39 @@ mod tests {
             first.headers().get("sec-ch-ua"),
             second.headers().get("sec-ch-ua")
         );
+    }
+
+    #[test]
+    fn chrome_user_agent_matches_client_hints_and_platform() {
+        for index in 0..CHROME_USER_AGENTS.len() {
+            let profile = BrowserProfile {
+                user_agent: CHROME_USER_AGENTS[index],
+                accept_language: ACCEPT_LANGUAGES[0],
+                chrome_profile: Some(index),
+            };
+            let request = browser_request(&server("wss://example.com/socket"), &profile).unwrap();
+            let major = profile
+                .user_agent
+                .split("Chrome/")
+                .nth(1)
+                .unwrap()
+                .split('.')
+                .next()
+                .unwrap();
+
+            assert!(
+                request
+                    .headers()
+                    .get("sec-ch-ua")
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .contains(&format!("v=\"{major}\""))
+            );
+            assert_eq!(
+                request.headers().get("sec-ch-ua-platform").unwrap(),
+                CHROME_PLATFORMS[index]
+            );
+        }
     }
 }

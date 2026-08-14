@@ -1,11 +1,11 @@
 use crate::auth_handler::ServerAuthHandler;
 use crate::client_registry::ClientRegistry;
 use crate::config::Config;
-use anet_common::consts::CHANNEL_BUFFER_SIZE;
+use anet_common::consts::{CHANNEL_BUFFER_SIZE, COALESCE_BUDGET_BYTES};
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
-use log::{info, warn};
+use log::{debug, info, warn};
 use rand::Rng;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -95,8 +95,11 @@ async fn handle_session(
                     incoming = socket.next() => {
                         match incoming {
                             Some(Ok(Message::Binary(data))) => {
-                                if let Ok(packet) = anet_common::transport::unwrap_packet(&cipher, &data) {
-                                    if tun_tx.send(packet).await.is_err() { break; }
+                                match anet_common::transport::unwrap_packet_bytes(&cipher, data) {
+                                    Ok(packet) => {
+                                        if tun_tx.send(packet).await.is_err() { break; }
+                                    }
+                                    Err(error) => debug!("[WebSocket] Dropped invalid message from {remote_addr}: {error}"),
                                 }
                             }
                             Some(Ok(Message::Ping(data))) => {
@@ -115,14 +118,39 @@ async fn handle_session(
                         }
                     }
                     packet = rx_router.recv() => {
-                        let Some(raw) = packet else { break; };
-                        if raw.len() < 20 { continue; }
-                        let seq = sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let size = raw.len() + 38;
-                        let padding = anet_common::padding_utils::calculate_padding_needed(size, padding_step);
-                        let padding = if size + padding as usize > anet_common::consts::PADDING_MTU { 0 } else { padding };
-                        if let Ok(encrypted) = anet_common::transport::wrap_packet(&cipher, &nonce_prefix, seq, raw, padding) {
-                            if socket.send(Message::Binary(encrypted)).await.is_err() { break; }
+                        let Some(mut raw) = packet else { break; };
+                        let mut batch_bytes = 0usize;
+                        loop {
+                            if raw.len() >= 20 {
+                                let seq = sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                let encrypted = match anet_common::transport::wrap_packet_padded(
+                                    &cipher,
+                                    &nonce_prefix,
+                                    seq,
+                                    raw,
+                                    padding_step,
+                                ) {
+                                    Ok(encrypted) => encrypted,
+                                    Err(error) => {
+                                        warn!("[WebSocket] Failed to encrypt packet for {remote_addr}: {error}");
+                                        return Err(error.into());
+                                    }
+                                };
+                                batch_bytes += encrypted.len();
+                                if socket.feed(Message::Binary(encrypted)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            if batch_bytes >= COALESCE_BUDGET_BYTES {
+                                break;
+                            }
+                            raw = match rx_router.try_recv() {
+                                Ok(packet) => packet,
+                                Err(_) => break,
+                            };
+                        }
+                        if socket.flush().await.is_err() {
+                            break;
                         }
                     }
                     _ = &mut ping_timer => {
