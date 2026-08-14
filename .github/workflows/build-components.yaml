@@ -94,11 +94,10 @@ jobs:
     steps:
       - uses: "actions/checkout@v6"
 
-      # Нам нужен компилятор C для aarch64 (для Ring/BoringSSL)
       - name: "Install dependencies"
         run: |
           sudo apt-get update
-          sudo apt-get install -y musl-tools protobuf-compiler gcc-aarch64-linux-gnu
+          sudo apt-get install -y musl-tools protobuf-compiler
 
       - name: "Install Rust"
         uses: "actions-rs/toolchain@v1"
@@ -110,6 +109,11 @@ jobs:
         run: |
           rustup target add x86_64-unknown-linux-musl
           rustup target add aarch64-unknown-linux-musl
+
+      # ARM64 содержит C-зависимости (aws-lc, ring и zstd). Для musl им нужен
+      # настоящий musl cross-toolchain, а не glibc linker aarch64-linux-gnu-gcc.
+      - name: "Install cross"
+        run: cargo install cross --git https://github.com/cross-rs/cross --locked
 
       - name: "Cache Rust dependencies"
         uses: actions/cache@v5
@@ -127,14 +131,15 @@ jobs:
         run: |
           RUSTFLAGS="-C target-feature=+crt-static" cargo build --release --package anet-client-cli --target x86_64-unknown-linux-musl
 
-      # Сборка ARM64 (aarch64)
-      # Важно: указываем линковщик для aarch64
+      # Сборка ARM64 (aarch64) в готовом musl cross-окружении.
       - name: "Build Client (ARM64)"
         env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
-          CC_aarch64_unknown_linux_musl: aarch64-linux-gnu-gcc
+          # cross не передаёт CI в контейнер автоматически. Этот флаг нужен,
+          # чтобы anet-common использовал закоммиченный generated protobuf-код
+          # и не пытался запускать отсутствующий внутри контейнера protoc.
+          CROSS_CONTAINER_OPTS: "-e CI=true"
         run: |
-          RUSTFLAGS="-C target-feature=+crt-static" cargo build --release --package anet-client-cli --target aarch64-unknown-linux-musl
+          cross build --locked --release --package anet-client-cli --target aarch64-unknown-linux-musl
 
       # Загрузка артефакта AMD64
       - uses: "actions/upload-artifact@v6"
