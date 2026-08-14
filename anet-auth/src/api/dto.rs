@@ -17,6 +17,7 @@ pub struct ServerDto {
     pub quic_port: Option<i32>,
     pub ssh_port: Option<i32>,
     pub vnc_port: Option<i32>,
+    pub websocket_url: Option<String>,
     pub ssh_user: Option<String>,
     pub is_active: bool,
 }
@@ -29,6 +30,7 @@ pub struct CreateServerRequest {
     pub quic_port: Option<i32>,
     pub ssh_port: Option<i32>,
     pub vnc_port: Option<i32>,
+    pub websocket_url: Option<String>,
     pub ssh_user: Option<String>,
     pub is_active: Option<bool>,
 }
@@ -52,6 +54,7 @@ pub struct UpdateServerRequest {
     pub quic_port: Option<Option<i32>>,
     pub ssh_port: Option<Option<i32>>,
     pub vnc_port: Option<Option<i32>>,
+    pub websocket_url: Option<Option<String>>,
     pub ssh_user: Option<Option<String>>,
     pub is_active: Option<bool>,
 }

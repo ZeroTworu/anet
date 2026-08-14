@@ -37,6 +37,8 @@ mtu = 1400
 quic_bind_to = "0.0.0.0:4519"
 ssh_bind_to = "0.0.0.0:822"
 vnc_bind_to = "0.0.0.0:56678"
+websocket_bind_to = "0.0.0.0:8080"
+websocket_path = "/socket"
 ssh_host_key = "/opt/anet/anet_ssh_host_key"
 
 # =========================================================================
@@ -260,4 +262,3 @@ max_mtu = 1400
 #
 # По умолчанию: 20
 keep_alive_interval_seconds = 20
-

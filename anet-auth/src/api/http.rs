@@ -65,6 +65,7 @@ impl VpnApi {
             quic_port: Set(req.0.quic_port),
             ssh_port: Set(req.0.ssh_port),
             vnc_port: Set(req.0.vnc_port),
+            websocket_url: Set(req.0.websocket_url),
             ssh_user: Set(req.0.ssh_user.clone()),
             is_active: Set(req.0.is_active.unwrap_or(true)),
             created_at: Set(chrono::Utc::now().naive_utc()),
@@ -80,6 +81,7 @@ impl VpnApi {
                 quic_port: saved.quic_port,
                 ssh_port: saved.ssh_port,
                 vnc_port: saved.vnc_port,
+                websocket_url: saved.websocket_url,
                 ssh_user: saved.ssh_user,
                 is_active: saved.is_active,
             })),
@@ -132,6 +134,10 @@ impl VpnApi {
             active_model.vnc_port = Set(port);
             changed = true;
         }
+        if let Some(url) = req.0.websocket_url {
+            active_model.websocket_url = Set(url);
+            changed = true;
+        }
         if let Some(user) = req.0.ssh_user {
             active_model.ssh_user = Set(user);
             changed = true;
@@ -152,6 +158,7 @@ impl VpnApi {
                     quic_port: saved.quic_port,
                     ssh_port: saved.ssh_port,
                     vnc_port: saved.vnc_port,
+                    websocket_url: saved.websocket_url,
                     ssh_user: saved.ssh_user,
                     is_active: saved.is_active,
                 })),
@@ -166,6 +173,7 @@ impl VpnApi {
                 quic_port: server_model.quic_port,
                 ssh_port: server_model.ssh_port,
                 vnc_port: server_model.vnc_port,
+                websocket_url: server_model.websocket_url,
                 ssh_user: server_model.ssh_user,
                 is_active: server_model.is_active,
             }))
@@ -189,6 +197,7 @@ impl VpnApi {
                     quic_port: s.quic_port,
                     ssh_port: s.ssh_port,
                     vnc_port: s.vnc_port,
+                    websocket_url: s.websocket_url,
                     ssh_user: s.ssh_user,
                     is_active: s.is_active,
                 }).collect();
@@ -940,6 +949,13 @@ impl VpnApi {
                 servers_toml.push_str(&format!(
                     "[[servers]]\nname = \"{}\"\naddress = \"{}:{}\"\nmode = \"vnc\"\ntimeout_secs = 8\nserver_pub_key = \"{}\"\n\n",
                     format!("{} [VNC]", server.name), server.address, port, server.public_key
+                ));
+            }
+
+            if let Some(url) = server.websocket_url {
+                servers_toml.push_str(&format!(
+                    "[[servers]]\nname = \"{}\"\naddress = \"{}\"\nmode = \"websocket\"\nwebsocket_url = \"{}\"\ntimeout_secs = 8\nserver_pub_key = \"{}\"\n\n",
+                    format!("{} [WS]", server.name), server.address, url, server.public_key
                 ));
             }
         }

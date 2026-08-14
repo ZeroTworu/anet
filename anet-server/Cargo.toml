@@ -24,6 +24,7 @@ x25519-dalek = {workspace = true}
 ed25519-dalek = {workspace = true}
 async-trait = { workspace = true }
 futures = { workspace = true }
+tokio-tungstenite = { workspace = true }
 dashmap = { workspace = true }
 reqwest = { workspace = true, default-features = false, features = ["json", "rustls-tls"] }
 
@@ -35,6 +36,9 @@ arc-swap = "1.6"
 
 
 anet-common = { path = "../anet-common", features = ["poem"] }
+
+[dev-dependencies]
+anet-client-core = { path = "../anet-client-core" }
 
 [[bin]]
 name = "anet-server"

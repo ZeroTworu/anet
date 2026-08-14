@@ -1,7 +1,9 @@
 pub(crate) mod factory;
 pub(crate) mod quic;
 pub(crate) mod ssh;
-pub(crate) mod vnc; // Не забудьте, что VNC тоже должен быть тут зарегистрирован
+pub(crate) mod vnc;
+pub (crate) mod websocket;
+
 
 use anet_common::protocol::AuthResponse;
 use anet_common::transport_trait::VpnStream;
@@ -11,6 +13,7 @@ use quinn::{Endpoint, Connection};
 
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::Mutex;
 
@@ -19,6 +22,8 @@ pub struct ConnectionResult {
     pub vpn_stream: Box<dyn VpnStream>,
     pub endpoint: Option<Endpoint>,
     pub connection: Option<Connection>,
+    /// Set only while a transport performs a planned internal reconnect.
+    pub health_pause: Option<Arc<AtomicBool>>,
 }
 
 #[async_trait]

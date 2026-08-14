@@ -307,9 +307,26 @@ impl AnetClient {
 
         self.route_manager.backup_routes().await?;
 
-        let server_host = server.address.split(':').next().unwrap();
-        if let Ok(server_ip) = IpAddr::from_str(server_host) {
-            self.route_manager.add_bypass_route(server_ip, 32).await?;
+        let (server_host, server_port) = if server.mode == crate::config::TransportMode::Websocket {
+            let uri: http::Uri = server.websocket_url.parse()?;
+            let host = uri.host().ok_or_else(|| anyhow::anyhow!("websocket_url has no host"))?;
+            let port = uri.port_u16().unwrap_or(if uri.scheme_str() == Some("wss") { 443 } else { 80 });
+            (host.to_string(), port)
+        } else {
+            let address = server.address.rsplit_once(':').unwrap_or((&server.address, "0"));
+            (address.0.trim_matches(['[', ']']).to_string(), address.1.parse().unwrap_or(0))
+        };
+        let mut bypass_ips = Vec::new();
+        if let Ok(server_ip) = IpAddr::from_str(&server_host) {
+            bypass_ips.push(server_ip);
+        } else if let Ok(resolved) = tokio::net::lookup_host((server_host.as_str(), server_port)).await {
+            bypass_ips.extend(resolved.map(|addr| addr.ip()));
+            bypass_ips.sort_unstable();
+            bypass_ips.dedup();
+        }
+        for server_ip in bypass_ips {
+            let prefix = if server_ip.is_ipv4() { 32 } else { 128 };
+            self.route_manager.add_bypass_route(server_ip, prefix).await?;
         }
 
         // Источник/приёмник IP-пакетов. Обычно это TUN. На Windows, если задан
@@ -475,6 +492,7 @@ impl AnetClient {
         //  Забираем время последней отправки пакета!
         let tx_check = last_tx_time.clone();
 
+        let health_pause = result.health_pause.clone();
         let health_task = tokio::spawn(async move {
             let check_interval = Duration::from_secs(4);
             let mut is_initial_phase = true;
@@ -489,6 +507,12 @@ impl AnetClient {
 
                 let elapsed_rx = rx_check.lock().unwrap().elapsed();
                 let elapsed_tx = tx_check.lock().unwrap().elapsed();
+
+                if health_pause.as_ref().is_some_and(|pause| pause.load(Ordering::Acquire)) {
+                    *rx_check.lock().unwrap() = Instant::now();
+                    *tx_check.lock().unwrap() = Instant::now();
+                    continue;
+                }
 
                 if is_initial_phase {
                     // Если мы отправляли данные в последние 4 сек, но ответа нет 8 сек -> Блокировка

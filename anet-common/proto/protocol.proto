@@ -6,6 +6,7 @@ message DHClientExchange {
     bytes public_key = 1;
     bytes client_signed_dh_key = 2;  // Подпись клиентом своего DH ключа
     bytes client_public_key = 3;     // Публичный ключ клиента для верификации
+    string resume_session_id = 4;
 }
 
 message DHServerExchange {
@@ -25,6 +26,8 @@ message EncryptedAuthResponse {
 
 message AuthRequest {
     string client_id = 1;
+    // Existing logical VPN session requested after a transport rotation.
+    string resume_session_id = 2;
 }
 
 message AuthResponse {

@@ -19,6 +19,7 @@ const form = ref<CreateServerRequest>({
   quic_port: 4519,
   ssh_port: 822,
   vnc_port: 56678,
+  websocket_url: 'ws://127.0.0.1:8080/socket',
   ssh_user: 'hanyuu',
   is_active: true,
 })
@@ -44,6 +45,7 @@ const handleCreate = async () => {
       quic_port: 4519,
       ssh_port: 822,
       vnc_port: 56678,
+      websocket_url: 'ws://127.0.0.1:8080/socket',
       ssh_user: 'hanyuu',
       is_active: true,
     }
@@ -84,6 +86,7 @@ onMounted(loadServers)
             <th>QUIC Port</th>
             <th>SSH Port</th>
             <th>VNC Port</th>
+            <th>WebSocket URL</th>
           </tr>
           </thead>
           <tbody>
@@ -98,6 +101,7 @@ onMounted(loadServers)
             <td><n-tag :type="item.is_active && item.quic_port ? 'success' : 'default'" size="small">{{ item.quic_port || 'Closed' }}</n-tag></td>
             <td><n-tag :type="item.is_active && item.ssh_port ? 'warning' : 'default'" size="small">{{ item.ssh_port || 'Closed' }}</n-tag></td>
             <td><n-tag :type="item.is_active && item.vnc_port ? 'info' : 'default'" size="small">{{ item.vnc_port || 'Closed' }}</n-tag></td>
+            <td><n-tag :type="item.is_active && item.websocket_url ? 'primary' : 'default'" size="small">{{ item.websocket_url || 'Closed' }}</n-tag></td>
           </tr>
           </tbody>
         </n-table>
@@ -131,6 +135,10 @@ onMounted(loadServers)
 
           <n-form-item label="VNC Port (TCP)">
             <n-input-number v-model:value="form.vnc_port" clearable />
+          </n-form-item>
+
+          <n-form-item label="WebSocket URL">
+            <n-input v-model:value="form.websocket_url" placeholder="wss://example.com/socket" clearable />
           </n-form-item>
         </n-space>
 

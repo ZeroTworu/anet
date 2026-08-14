@@ -144,6 +144,7 @@ impl ClientTransport for QuicTransport {
             vpn_stream: Box::new(stream),
             endpoint: Some(endpoint),
             connection: Some(connection),
+            health_pause: None,
         })
     }
 }
