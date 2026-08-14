@@ -6,12 +6,13 @@ use crate::android_impl::AndroidCallbackTunFactory;
 use android_logger::Config;
 use anet_client_core::client::AnetClient;
 use anet_client_core::config::CoreConfig;
-use anet_client_core::events::{self, AnetEvent, EventHandler, status};
+use anet_client_core::events::{self, AnetEvent, ClientState, EventHandler, client_state, status};
 use anet_client_core::updater::{GithubRelease, Updater};
 use anet_client_core::platform::NoOpRouteManager;
 use jni::objects::{GlobalRef, JClass, JObject, JString, JValue};
 use jni::{JNIEnv, JavaVM};
 use log::{LevelFilter, error, info};
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::sync::mpsc::{self, Sender};
 use tokio::runtime::Runtime;
@@ -20,10 +21,15 @@ use tokio::runtime::Runtime;
 static CLIENT: Mutex<Option<Arc<AnetClient>>> = Mutex::new(None);
 static RUNTIME: Mutex<Option<Runtime>> = Mutex::new(None);
 static PENDING_RELEASE: Mutex<Option<GithubRelease>> = Mutex::new(None);
+static CLIENT_LIFECYCLE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+static CLIENT_GENERATION: AtomicU64 = AtomicU64::new(0);
+static CURRENT_CLIENT_STATE: AtomicI32 = AtomicI32::new(0);
+static CURRENT_SERVER_NAME: Mutex<Option<String>> = Mutex::new(None);
 
 // --- ГЛОБАЛЬНЫЙ МНОГОПОТОЧНЫЙ JNI-МОСТ (Защита от утечек и дедлоков) ---
 static JNI_SENDER: OnceLock<Sender<AnetEvent>> = OnceLock::new();
-static JNI_CALLBACK_REF: Mutex<Option<GlobalRef>> = Mutex::new(None);
+static VPN_CALLBACK_REF: Mutex<Option<GlobalRef>> = Mutex::new(None);
+static UI_CALLBACK_REF: Mutex<Option<GlobalRef>> = Mutex::new(None);
 
 // Наш асинхронный обработчик событий ядра.
 // Теперь он просто мгновенно отправляет события в канал, не блокируя Tokio-потоки вызовами JNI.
@@ -31,9 +37,159 @@ struct AndroidEventHandler;
 
 impl EventHandler for AndroidEventHandler {
     fn on_event(&self, event: AnetEvent) {
+        if let AnetEvent::ClientStateChanged {
+            state, server_name, ..
+        } = &event
+        {
+            CURRENT_CLIENT_STATE.store(client_state_code(*state), Ordering::SeqCst);
+            if let Some(server_name) = server_name {
+                *CURRENT_SERVER_NAME.lock().unwrap() = Some(server_name.clone());
+            } else if matches!(state, ClientState::Disconnected | ClientState::Stopped) {
+                *CURRENT_SERVER_NAME.lock().unwrap() = None;
+            }
+        }
         if let Some(sender) = JNI_SENDER.get() {
             let _ = sender.send(event);
         }
+    }
+}
+
+fn inspect_config(config_toml: &str) -> String {
+    let mut config: CoreConfig = match toml::from_str(config_toml) {
+        Ok(config) => config,
+        Err(error) => return format!("ERROR\n{error}"),
+    };
+    if let Err(error) = config.sanitize() {
+        return format!("ERROR\n{error}");
+    }
+
+    let mut result = String::from("OK");
+    for server in config.servers {
+        result.push('\n');
+        result.push_str(&server.get_name().replace(['\r', '\n'], " "));
+    }
+    result
+}
+
+fn client_state_code(state: ClientState) -> i32 {
+    match state {
+        ClientState::Disconnected => 0,
+        ClientState::Connecting => 1,
+        ClientState::Connected => 2,
+        ClientState::Reconnecting => 3,
+        ClientState::Stopping => 4,
+        ClientState::Stopped => 5,
+        ClientState::Failed => 6,
+    }
+}
+
+fn event_message(event: AnetEvent) -> Option<String> {
+    match event {
+        AnetEvent::Status(s) | AnetEvent::UpdateStatus(s) => Some(s),
+        AnetEvent::Warn(s) => Some(format!("WARN: {s}")),
+        AnetEvent::Error(s) => Some(format!("ERROR: {s}")),
+        AnetEvent::UpdateProgress(p) => Some(format!("PROGRESS:{p:.2}")),
+        AnetEvent::UpdateAvailable(rel) => Some(format!("Найдено обновление: {}", rel.tag_name)),
+        AnetEvent::UpdateReady => Some("Update downloaded to cache".to_string()),
+        AnetEvent::TrafficUpdate { .. } | AnetEvent::ClientStateChanged { .. } => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn client_state_codes_match_android_contract() {
+        assert_eq!(client_state_code(ClientState::Disconnected), 0);
+        assert_eq!(client_state_code(ClientState::Connecting), 1);
+        assert_eq!(client_state_code(ClientState::Connected), 2);
+        assert_eq!(client_state_code(ClientState::Reconnecting), 3);
+        assert_eq!(client_state_code(ClientState::Stopping), 4);
+        assert_eq!(client_state_code(ClientState::Stopped), 5);
+        assert_eq!(client_state_code(ClientState::Failed), 6);
+    }
+
+    #[test]
+    fn config_inspection_returns_sanitized_server_names() {
+        let result = inspect_config(
+            r#"
+                [main]
+                tun_name = "anet"
+                [[servers]]
+                name = "Primary"
+                address = "127.0.0.1:443"
+                mode = "quic"
+            "#,
+        );
+        assert_eq!(result, "OK\nPrimary");
+    }
+
+    #[test]
+    fn config_inspection_reports_invalid_toml() {
+        assert!(inspect_config("not toml").starts_with("ERROR\n"));
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_alco_anet_MainActivity_inspectConfig(
+    mut env: JNIEnv,
+    _this: JObject,
+    config_jstr: JString,
+) -> jni::sys::jstring {
+    let result = env
+        .get_string(&config_jstr)
+        .map(|value| inspect_config(&String::from(value)))
+        .unwrap_or_else(|error| format!("ERROR\n{error}"));
+    env.new_string(result).unwrap().into_raw()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_alco_anet_MainActivity_getVpnStateCode(
+    _env: JNIEnv,
+    _this: JObject,
+) -> i32 {
+    CURRENT_CLIENT_STATE.load(Ordering::SeqCst)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_alco_anet_MainActivity_getVpnServerName(
+    env: JNIEnv,
+    _this: JObject,
+) -> jni::sys::jstring {
+    let server_name = CURRENT_SERVER_NAME
+        .lock()
+        .unwrap()
+        .clone()
+        .unwrap_or_default();
+    env.new_string(server_name).unwrap().into_raw()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_alco_anet_MainActivity_clearUiCallback(
+    env: JNIEnv,
+    this: JObject,
+) {
+    let mut callback = UI_CALLBACK_REF.lock().unwrap();
+    if callback
+        .as_ref()
+        .is_some_and(|current| env.is_same_object(current.as_obj(), &this).unwrap_or(false))
+    {
+        *callback = None;
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_alco_anet_ANetVpnService_clearVpnCallback(
+    env: JNIEnv,
+    this: JObject,
+) {
+    let mut callback = VPN_CALLBACK_REF.lock().unwrap();
+    if callback
+        .as_ref()
+        .is_some_and(|current| env.is_same_object(current.as_obj(), &this).unwrap_or(false))
+    {
+        *callback = None;
     }
 }
 
@@ -59,23 +215,25 @@ fn init_jni_bridge_thread(jvm: Arc<JavaVM>) {
             // Прикрепляем выделенный системный поток к JVM один раз
             if let Ok(mut env) = jvm.attach_current_thread() {
                 while let Ok(event) = rx.recv() {
-                    let callback_ref_opt = {
-                        let guard = JNI_CALLBACK_REF.lock().unwrap();
-                        guard.clone()
+                    let is_update_event = matches!(event, AnetEvent::UpdateAvailable(_) | AnetEvent::UpdateProgress(_) | AnetEvent::UpdateStatus(_) | AnetEvent::UpdateReady);
+                    let callback_ref_opt = if is_update_event {
+                        UI_CALLBACK_REF.lock().unwrap().clone()
+                    } else {
+                        VPN_CALLBACK_REF.lock().unwrap().clone()
                     };
 
                     if let Some(callback_ref) = callback_ref_opt {
-                        let msg_to_send: Option<String> = match event {
-                            AnetEvent::Status(s) => Some(s),
-                            AnetEvent::Warn(s) => Some(format!("WARN: {}", s)),
-                            AnetEvent::Error(s) => Some(format!("ERROR: {}", s)),
-                            AnetEvent::UpdateProgress(p) => Some(format!("PROGRESS:{:.2}", p)),
-                            AnetEvent::UpdateAvailable(rel) => Some(format!("Найдено обновление: {}", rel.tag_name)),
-                            AnetEvent::UpdateReady => Some("Update downloaded to cache".to_string()),
-                            _ => None,
-                        };
-
-                        if let Some(msg) = msg_to_send {
+                        if let AnetEvent::ClientStateChanged { state, message, server_name } = event {
+                            let jmsg = env.new_string(message);
+                            let jserver = env.new_string(server_name.unwrap_or_default());
+                            if let (Ok(jmsg), Ok(jserver)) = (jmsg, jserver) {
+                                let _ = env.call_method(&callback_ref, "onVpnStateChanged", "(ILjava/lang/String;Ljava/lang/String;)V", &[
+                                    JValue::Int(client_state_code(state)),
+                                    JValue::Object(&jmsg),
+                                    JValue::Object(&jserver),
+                                ]);
+                            }
+                        } else if let Some(msg) = event_message(event) {
                             if let Ok(jmsg) = env.new_string(msg) {
                                 let _ = env.call_method(
                                     &callback_ref,
@@ -110,7 +268,7 @@ pub extern "system" fn Java_org_alco_anet_MainActivity_checkUpdates(
 
     // Настраиваем глобальную ссылку для вызовов JNI-моста
     {
-        *JNI_CALLBACK_REF.lock().unwrap() = Some(this_ref);
+        *UI_CALLBACK_REF.lock().unwrap() = Some(this_ref);
     }
 
     init_jni_bridge_thread(jvm_arc);
@@ -154,11 +312,11 @@ pub extern "system" fn Java_org_alco_anet_MainActivity_checkUpdates(
                 events::emit(AnetEvent::UpdateAvailable(release));
             }
             Ok(None) => {
-                status("У вас установлена актуальная версия.");
+                events::emit(AnetEvent::UpdateStatus("У вас установлена актуальная версия.".into()));
             }
             Err(e) => {
                 error!("[UPDATER] Error: {}", e);
-                status(format!("Ошибка обновления: {}", e));
+                events::emit(AnetEvent::UpdateStatus(format!("Ошибка обновления: {}", e)));
             }
         }
     });
@@ -222,7 +380,7 @@ pub extern "system" fn Java_org_alco_anet_ANetVpnService_connectVpn(
 
     // Обновляем глобальную ссылку для JNI-моста
     {
-        *JNI_CALLBACK_REF.lock().unwrap() = Some(this_ref.clone());
+        *VPN_CALLBACK_REF.lock().unwrap() = Some(this_ref.clone());
     }
 
     init_jni_bridge_thread(jvm_for_bridge);
@@ -253,21 +411,26 @@ pub extern "system" fn Java_org_alco_anet_ANetVpnService_connectVpn(
         Err(e) => {
             error!("Failed to parse TOML config: {}", e);
             status(format!("Failed to parse TOML config: {}", e));
+            client_state(ClientState::Failed, format!("Invalid configuration: {e}"), None);
             return;
         }
     };
 
+    let generation = CLIENT_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
     rt.spawn(async move {
-        let old_client = {
-            let mut client_guard = CLIENT.lock().unwrap();
-            client_guard.take()
-        };
-        if let Some(client) = old_client {
-            info!("Rust JNI: Stopping old active client task...");
-            let _ = client.stop().await;
-        }
-
-        let _ = config.sanitize();
+        let client = {
+            let _lifecycle = CLIENT_LIFECYCLE.lock().await;
+            if CLIENT_GENERATION.load(Ordering::SeqCst) != generation { return; }
+            let old_client = CLIENT.lock().unwrap().take();
+            if let Some(client) = old_client {
+                info!("Rust JNI: Stopping old active client task...");
+                let _ = client.stop().await;
+            }
+            if CLIENT_GENERATION.load(Ordering::SeqCst) != generation { return; }
+            if let Err(error) = config.sanitize() {
+                client_state(ClientState::Failed, format!("Invalid configuration: {error}"), None);
+                return;
+            }
 
         if !selected_server.is_empty() {
             if let Some(idx) = config.servers.iter().position(|s| s.get_name() == selected_server) {
@@ -276,23 +439,20 @@ pub extern "system" fn Java_org_alco_anet_ANetVpnService_connectVpn(
             }
         }
 
-        let tun_factory = Box::new(AndroidCallbackTunFactory::new(
-            jvm_for_factory,
-            this_ref.clone(),
-            config.clone(),
-        ));
-        let route_manager = Box::new(NoOpRouteManager);
-
-        let client = Arc::new(AnetClient::new(config, tun_factory, route_manager));
-
-        {
+            let tun_factory = Box::new(AndroidCallbackTunFactory::new(jvm_for_factory, this_ref.clone(), config.clone()));
+            let route_manager = Box::new(NoOpRouteManager);
+            let client = Arc::new(AnetClient::new(config, tun_factory, route_manager));
             *CLIENT.lock().unwrap() = Some(client.clone());
-        }
+            client
+        };
 
         info!("Rust: Calling start()...");
         match client.start().await {
             Ok(_) => info!("Rust: VPN Loop exited cleanly"),
-            Err(e) => error!("Rust: VPN Start Failed: {}", e),
+            Err(e) => {
+                error!("Rust: VPN Start Failed: {}", e);
+                client_state(ClientState::Failed, format!("VPN start failed: {e}"), None);
+            }
         }
     });
 }
@@ -300,7 +460,9 @@ pub extern "system" fn Java_org_alco_anet_ANetVpnService_connectVpn(
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_org_alco_anet_ANetVpnService_stopVpn(_env: JNIEnv, _class: JClass) {
     info!("Rust: stopVpn JNI trigger received");
+    client_state(ClientState::Stopping, "Stopping VPN", None);
 
+    CLIENT_GENERATION.fetch_add(1, Ordering::SeqCst);
     let rt_guard = RUNTIME.lock().unwrap();
     if let Some(rt) = rt_guard.as_ref() {
         let client_opt = {
@@ -308,12 +470,14 @@ pub extern "system" fn Java_org_alco_anet_ANetVpnService_stopVpn(_env: JNIEnv, _
             client_guard.take()
         };
         if let Some(client) = client_opt {
-            rt.spawn(async move {
+            rt.block_on(async move {
+                let _lifecycle = CLIENT_LIFECYCLE.lock().await;
                 info!("Rust JNI: Sending stop signal to active client loop...");
                 let _ = client.stop().await;
             });
         }
     }
+    client_state(ClientState::Stopped, "VPN stopped", None);
     status("VPN Stopped");
 }
 

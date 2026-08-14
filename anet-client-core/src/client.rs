@@ -1,6 +1,6 @@
 use crate::config::{CoreConfig, ServerConfig};
 use crate::dns::{DnsManager, get_dns_manager};
-use crate::events::{status, warn};
+use crate::events::{ClientState, client_state, status, warn};
 use crate::traits::{RouteManager, TunFactory};
 use crate::statistic;
 use crate::transport::factory::create_transport;
@@ -129,6 +129,7 @@ impl AnetClient {
 
         info!("[Core] Starting failover connection loop...");
         warn("[Core] Starting connection loop...");
+        client_state(ClientState::Connecting, "Starting connection loop", None);
 
         let reconnect_signal = Arc::new(Notify::new());
         let mut current_server_index = 0;
@@ -139,6 +140,7 @@ impl AnetClient {
             let server_name = server.get_name();
             info!("[Core] Connecting to server '{}' ({}) via {:?}", server_name, server.address, server.mode);
             status(format!("Connecting to '{}'...", server_name));
+            client_state(ClientState::Connecting, format!("Connecting to '{}'", server_name), Some(server_name.clone()));
 
             match self.connect_and_run(server, reconnect_signal.clone()).await {
                 Ok(()) => {
@@ -149,11 +151,13 @@ impl AnetClient {
                     if self.stop_requested.load(Ordering::SeqCst) {
                         info!("[Core] Stop requested by user. Exiting connection loop.");
                         status("VPN Stopped");
+                        client_state(ClientState::Stopped, "VPN stopped", None);
                         break;
                     }
 
                     warn!("[Core] Connection with server '{}' lost. Switching to the next node...", server_name);
                     status("Connection lost. Reconnecting...");
+                    client_state(ClientState::Reconnecting, "Connection lost; reconnecting", Some(server_name.clone()));
 
                     current_server_index = (current_server_index + 1) % config_clone.servers.len();
                     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -162,11 +166,13 @@ impl AnetClient {
                     if self.stop_requested.load(Ordering::SeqCst) {
                         info!("[Core] Stop requested by user. Exiting connection loop.");
                         status("VPN Stopped");
+                        client_state(ClientState::Stopped, "VPN stopped", None);
                         break;
                     }
 
                     error!("[Core] Connection failed or timed out for server '{}': {}", server_name, e);
                     status(format!("Node error: {}", e));
+                    client_state(ClientState::Reconnecting, format!("Node error: {e}"), Some(server_name.clone()));
 
                     current_server_index = (current_server_index + 1) % config_clone.servers.len();
                     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -578,6 +584,7 @@ impl AnetClient {
         status(format!("[Core] VPN interface configured. Tunnel UP. Active node: {}", server.get_name()));
         status(format!("Connected. Local IP: {}", result.auth_response.ip));
         status("VPN Tunnel UP");
+        client_state(ClientState::Connected, format!("Connected. Local IP: {}", result.auth_response.ip), Some(server.get_name()));
 
         // Засыпаем и ждем сигнала о необходимости реконнекта от воркера здоровья или задач t1/t2
         reconnect_signal.notified().await;
@@ -619,6 +626,7 @@ impl AnetClient {
         if let Some(running) = session {
             info!("[Core] Stopping VPN...");
             status("[Core] Stopping VPN...");
+            client_state(ClientState::Stopping, "Stopping VPN", None);
             running.shutdown_notify.notify_waiters();
             running.reconnect_signal.notify_one(); // <-- Сигнализируем выходу из connect_and_run!
 
@@ -636,6 +644,7 @@ impl AnetClient {
             let _ = self.route_manager.restore_routes().await;
             info!("[Core] VPN Stopped.");
             status("[Core] VPN Stopped.");
+            client_state(ClientState::Stopped, "VPN stopped", None);
         }
         Ok(())
     }

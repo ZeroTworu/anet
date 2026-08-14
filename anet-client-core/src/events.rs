@@ -1,12 +1,29 @@
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClientState {
+    Disconnected,
+    Connecting,
+    Connected,
+    Reconnecting,
+    Stopping,
+    Stopped,
+    Failed,
+}
+
 /// Типы событий
 #[derive(Clone, Debug)]
 pub enum AnetEvent {
     Status(String),
+    ClientStateChanged {
+        state: ClientState,
+        message: String,
+        server_name: Option<String>,
+    },
     TrafficUpdate { rx: u64, tx: u64 }, // а точно так?
     Warn(String),
     Error(String),
     UpdateAvailable(crate::updater::GithubRelease),
     UpdateProgress(f32), // 0.0 до 1.0
+    UpdateStatus(String),
     UpdateReady,
 }
 
@@ -32,6 +49,14 @@ pub fn emit(event: AnetEvent) {
 // Хелперы для удобства
 pub fn status(s: impl Into<String>) {
     emit(AnetEvent::Status(s.into()));
+}
+
+pub fn client_state(state: ClientState, message: impl Into<String>, server_name: Option<String>) {
+    emit(AnetEvent::ClientStateChanged {
+        state,
+        message: message.into(),
+        server_name,
+    });
 }
 
 pub fn err(s: impl Into<String>) {
