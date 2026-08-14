@@ -8,7 +8,7 @@ use crate::tray::TrayCommand;
 use anet_client_core::updater::{ Updater, GithubRelease };
 use anet_client_core::client::AnetClient;
 use anet_client_core::config::CoreConfig;
-use anet_client_core::events::{ AnetEvent, EventHandler, set_handler };
+use anet_client_core::events::{ AnetEvent, ClientState, EventHandler, set_handler };
 use anet_client_core::platform::create_route_manager;
 use eframe::egui;
 use std::path::PathBuf;
@@ -115,17 +115,13 @@ impl EventHandler for GuiEventHandler {
         let _ = self.tx.send(event.clone());
 
         match &event {
-            AnetEvent::Status(msg) => {
+            AnetEvent::ClientStateChanged { state, .. } => {
                 let mut guard = self.shared.lock().unwrap();
-                // Только чёткие финальные статусы от ядра!
-                if msg.contains("Tunnel UP") {
-                    guard.state = ConnectionState::Connected;
-                } else if msg.contains("Stopped") || msg.contains("Error") {
-                    guard.state = ConnectionState::Disconnected;
-                }
-            }
-            AnetEvent::Error(_) => {
-                self.shared.lock().unwrap().state = ConnectionState::Disconnected;
+                guard.state = match state {
+                    ClientState::Connected => ConnectionState::Connected,
+                    ClientState::Connecting | ClientState::Reconnecting | ClientState::Stopping => ConnectionState::Connecting,
+                    ClientState::Disconnected | ClientState::Stopped | ClientState::Failed => ConnectionState::Disconnected,
+                };
             }
             _ => {}
         }
@@ -1232,19 +1228,14 @@ impl eframe::App for ANetApp {
             match event {
                 AnetEvent::Status(msg) => {
                     self.log(&msg);
-
-                    if msg.contains("Active node:") {
-                        if let Some(active_part) = msg.split("Active node:").last() {
-                            let active_name = active_part.trim().to_string();
-
-                            let mut settings = self.settings.lock().unwrap();
-                            if let Some(active_cfg) = settings.get_active_config() {
-                                settings.selected_servers.insert(
-                                    active_cfg.id.clone(),
-                                    active_name
-                                );
-                                settings.save();
-                            }
+                }
+                AnetEvent::ClientStateChanged { message, server_name, .. } => {
+                    self.log(&message);
+                    if let Some(active_name) = server_name {
+                        let mut settings = self.settings.lock().unwrap();
+                        if let Some(active_cfg) = settings.get_active_config() {
+                            settings.selected_servers.insert(active_cfg.id.clone(), active_name);
+                            settings.save();
                         }
                     }
                 }
@@ -1259,6 +1250,7 @@ impl eframe::App for ANetApp {
                 AnetEvent::UpdateProgress(p) => {
                     self.update_status = UpdateStatus::Downloading(p);
                 }
+                AnetEvent::UpdateStatus(msg) => self.log(&msg),
                 AnetEvent::UpdateAvailable(release) => {
                     self.log(&format!("Найдено обновление: {}", release.tag_name));
                     self.update_status = UpdateStatus::Available(release);

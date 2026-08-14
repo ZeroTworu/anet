@@ -1,6 +1,7 @@
 use anet_common::config::StealthConfig;
 use anet_common::quic_settings::QuicConfig;
 use serde::Deserialize;
+use std::net::{IpAddr, SocketAddr};
 
 // Добавьте этот enum рядом с другими (например, над MainConfig или под TransportMode)
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -170,8 +171,7 @@ impl ServerConfig {
     /// Если имя не указано в TOML — генерируем его на лету в формате IP:MODE (например, 127.0.0.1:SSH)
     pub fn get_name(&self) -> String {
         self.name.clone().unwrap_or_else(|| {
-            // Извлекаем чистый IP без порта
-            let ip = self.address.split(':').next().unwrap_or(&self.address);
+            let host = display_host(&self.address);
 
             // Мапим режим транспорта в строгий верхний регистр (UPPERCASE)
             let mode_str = match self.mode {
@@ -181,9 +181,24 @@ impl ServerConfig {
                 TransportMode::Websocket => "WS",
             };
 
-            format!("{}:{}", ip, mode_str)
+            format!("{}:{}", host, mode_str)
         })
     }
+}
+
+fn display_host(address: &str) -> String {
+    if let Ok(socket) = address.parse::<SocketAddr>() {
+        return socket.ip().to_string();
+    }
+    if let Ok(ip) = address.parse::<IpAddr>() {
+        return ip.to_string();
+    }
+    if let Some((host, port)) = address.rsplit_once(':') {
+        if port.parse::<u16>().is_ok() {
+            return host.trim_matches(['[', ']']).to_string();
+        }
+    }
+    address.trim_matches(['[', ']']).to_string()
 }
 
 fn default_timeout_secs() -> u64 {
@@ -265,5 +280,18 @@ impl CoreConfig {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::display_host;
+
+    #[test]
+    fn display_host_handles_dns_ipv4_and_ipv6() {
+        assert_eq!(display_host("vpn.example.com:443"), "vpn.example.com");
+        assert_eq!(display_host("127.0.0.1:443"), "127.0.0.1");
+        assert_eq!(display_host("[2001:db8::1]:443"), "2001:db8::1");
+        assert_eq!(display_host("2001:db8::1"), "2001:db8::1");
     }
 }
