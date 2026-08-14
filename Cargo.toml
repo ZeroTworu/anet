@@ -63,4 +63,4 @@ incremental = false
 
 
 [profile.release.package."*"]
-opt-level = 0
+opt-level = 3

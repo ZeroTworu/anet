@@ -104,3 +104,39 @@ pub fn unwrap_packet_in_place<'a>(cipher: &Cipher, buffer: &'a mut [u8]) -> Resu
     // Возвращаем срез чистого пейлоуда
     Ok(&plaintext[10..10 + data_len])
 }
+
+/// Decrypts an owned packet in place and returns a zero-copy view of its IP payload.
+///
+/// Unlike [`unwrap_packet`], this reuses the receive buffer for both ciphertext and
+/// plaintext. `Bytes` produced directly from a freshly read `Vec` is normally unique;
+/// a shared buffer is rejected rather than silently copied.
+pub fn unwrap_packet_bytes_in_place(cipher: &Cipher, raw_packet: Bytes) -> Result<Bytes> {
+    let mut buffer = raw_packet
+        .try_into_mut()
+        .map_err(|_| anyhow!("Encrypted packet buffer is unexpectedly shared"))?;
+
+    let payload = unwrap_packet_in_place(cipher, &mut buffer)?;
+    let payload_len = payload.len();
+    let payload_start = NONCE_LEN + 10;
+    let payload_end = payload_start + payload_len;
+    buffer.truncate(payload_end);
+    Ok(buffer.freeze().slice(payload_start..payload_end))
+}
+
+#[cfg(test)]
+mod in_place_tests {
+    use super::*;
+
+    #[test]
+    fn owned_in_place_unwrap_matches_allocating_path() {
+        let cipher = Cipher::new(&[9; 32]);
+        let payload = Bytes::from_static(b"test IP packet payload");
+        let encrypted = wrap_packet(&cipher, &[1, 2, 3, 4], 7, payload.clone(), 13).unwrap();
+
+        let allocating = unwrap_packet(&cipher, &encrypted).unwrap();
+        let in_place = unwrap_packet_bytes_in_place(&cipher, encrypted).unwrap();
+
+        assert_eq!(allocating, payload);
+        assert_eq!(in_place, payload);
+    }
+}
