@@ -13,6 +13,7 @@ pub mod transport;
 pub mod transport_trait;
 pub mod tun_params;
 pub mod udp_poller;
+pub mod vnc;
 pub mod dto;
 
 pub use generated::*;
