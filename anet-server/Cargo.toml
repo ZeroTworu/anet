@@ -28,8 +28,7 @@ tokio-tungstenite = { workspace = true }
 dashmap = { workspace = true }
 reqwest = { workspace = true, default-features = false, features = ["json", "rustls-tls"] }
 
-russh = "0.45.0"
-russh-keys = "0.45.0"
+russh = { workspace = true }
 
 
 arc-swap = "1.6"
