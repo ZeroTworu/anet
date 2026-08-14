@@ -129,7 +129,7 @@ pub async fn run_quic_server(
                 let stealth_c = c.stealth.clone();
 
                 let ci_tx = client_info.clone();
-                let writer_task = tokio::spawn(async move {
+                let mut writer_task = tokio::spawn(async move {
                     if bridge_with_jitter(rx_router, send, stealth_c)
                         .await
                         .is_err()
@@ -139,7 +139,7 @@ pub async fn run_quic_server(
                 });
 
                 let ci_rx = client_info.clone();
-                let reader_task  = tokio::spawn(async move {
+                let mut reader_task = tokio::spawn(async move {
                     while let Ok(Some(pkt)) = read_next_packet(&mut recv).await {
                         if t_tx.send(pkt).await.is_err() {
                             break;
@@ -147,12 +147,21 @@ pub async fn run_quic_server(
                     }
                     warn!("Client {} rx abort", ci_rx.assigned_ip);
                 });
-                let _ = tokio::select! {
-                _ = reader_task => info!("QUIC Reader task finished for {}", client_info.assigned_ip),
-                _ = writer_task => info!("QUIC Writer task finished for {}", client_info.assigned_ip),
-            };
+                tokio::select! {
+                    _ = &mut reader_task => {
+                        writer_task.abort();
+                        info!("QUIC reader task finished for {}", client_info.assigned_ip);
+                    }
+                    _ = &mut writer_task => {
+                        reader_task.abort();
+                        info!("QUIC writer task finished for {}", client_info.assigned_ip);
+                    }
+                }
 
-                info!("[VNC Node] Client disconnected and wiped: {}", client_info.assigned_ip);
+                info!(
+                    "[QUIC Node] Client disconnected and wiped: {}",
+                    client_info.assigned_ip
+                );
 
                 r.remove_client(&client_info);
             } else {

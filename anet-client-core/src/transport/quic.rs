@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use log::info;
 use quinn::{ClientConfig, Endpoint, EndpointConfig, RecvStream, SendStream, TokioRuntime};
 use rustls::RootCertStore;
+use std::io;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -37,31 +38,19 @@ impl AsyncWrite for QuicDuplexStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        match Pin::new(&mut self.send).poll_write(cx, buf) {
-            Poll::Ready(Ok(n)) => Poll::Ready(Ok(n)),
-            Poll::Ready(Err(e)) => {
-                Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::Other, e)))
-            }
-            Poll::Pending => Poll::Pending,
-        }
+        Pin::new(&mut self.send)
+            .poll_write(cx, buf)
+            .map(|result| result.map_err(io::Error::other))
     }
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        match Pin::new(&mut self.send).poll_flush(cx) {
-            Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
-            Poll::Ready(Err(e)) => {
-                Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::Other, e)))
-            }
-            Poll::Pending => Poll::Pending,
-        }
+        Pin::new(&mut self.send)
+            .poll_flush(cx)
+            .map(|result| result.map_err(io::Error::other))
     }
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        match Pin::new(&mut self.send).poll_shutdown(cx) {
-            Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
-            Poll::Ready(Err(e)) => {
-                Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::Other, e)))
-            }
-            Poll::Pending => Poll::Pending,
-        }
+        Pin::new(&mut self.send)
+            .poll_shutdown(cx)
+            .map(|result| result.map_err(io::Error::other))
     }
 }
 
@@ -81,7 +70,10 @@ impl ClientTransport for QuicTransport {
     async fn connect(&self) -> Result<ConnectionResult> {
         // Вытаскиваем адрес конкретной ноды
         let addr_str = &self.server.address;
-        let server_addr: SocketAddr = addr_str.to_socket_addrs()?.next().ok_or(anyhow::anyhow!("Invalid server address"))?;
+        let server_addr: SocketAddr = addr_str
+            .to_socket_addrs()?
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("Invalid server address"))?;
         let udp_socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
         let channel = UdpAuthChannel::new(udp_socket.clone(), server_addr);
 
@@ -139,7 +131,7 @@ impl ClientTransport for QuicTransport {
         let (send, recv) = connection.open_bi().await?;
         let stream = QuicDuplexStream { send, recv };
 
-        Ok(ConnectionResult{
+        Ok(ConnectionResult {
             auth_response,
             vpn_stream: Box::new(stream),
             endpoint: Some(endpoint),

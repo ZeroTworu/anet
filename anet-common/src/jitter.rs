@@ -1,5 +1,5 @@
 use crate::config::StealthConfig;
-use crate::consts::{CHANNEL_BUFFER_SIZE, COALESCE_BUDGET_BYTES, CRYPTO_COALESCE_BUDGET_BYTES};
+use crate::consts::{COALESCE_BUDGET_BYTES, CRYPTO_COALESCE_BUDGET_BYTES};
 use crate::encryption::Cipher;
 use crate::padding_utils::calculate_padding_needed;
 use crate::stream_framing::frame_packet_into;
@@ -7,10 +7,8 @@ use bytes::{Bytes, BytesMut};
 use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt, StreamExt};
-use log::error;
 use rand::Rng;
 use rand::SeedableRng;
-use rand::rngs::OsRng;
 use rand::rngs::StdRng;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -21,42 +19,6 @@ use tokio::time::sleep;
 
 const MAX_PENDING_JITTER_PACKETS: usize = 256;
 
-async fn coalesced_sender_loop<S>(
-    rx_ready: &mut mpsc::Receiver<Bytes>,
-    stream: &mut S,
-) -> anyhow::Result<()>
-where
-    S: AsyncWriteExt + Unpin + Send,
-{
-    let mut buf = BytesMut::with_capacity(COALESCE_BUDGET_BYTES);
-
-    while let Some(packet) = rx_ready.recv().await {
-        buf.clear();
-
-        if packet.len() >= 20 {
-            frame_packet_into(&mut buf, &packet);
-        }
-
-        while buf.len() < COALESCE_BUDGET_BYTES {
-            match rx_ready.try_recv() {
-                Ok(p) if p.len() >= 20 => frame_packet_into(&mut buf, &p),
-                Ok(_) => continue,
-                Err(_) => break,
-            }
-        }
-
-        if buf.is_empty() {
-            continue;
-        }
-
-        if stream.write_all(&buf).await.is_err() || stream.flush().await.is_err() {
-            error!("Stream write failed");
-            break;
-        }
-    }
-    Ok(())
-}
-
 pub async fn bridge_with_jitter<S>(
     mut rx: mpsc::Receiver<Bytes>,
     mut stream: S,
@@ -66,39 +28,71 @@ where
     S: AsyncWriteExt + Unpin + Send + 'static,
 {
     let jitter_enabled = config.max_jitter_ns > config.min_jitter_ns;
+    let mut rng = StdRng::from_entropy();
+    let mut pending = FuturesUnordered::<BoxFuture<'static, Bytes>>::new();
+    let mut input_open = true;
+    let mut buf = BytesMut::with_capacity(COALESCE_BUDGET_BYTES);
 
-    if !jitter_enabled {
-        let result = coalesced_sender_loop(&mut rx, &mut stream).await;
-        let _ = stream.shutdown().await;
-        return result;
+    while input_open || !pending.is_empty() {
+        let packet = if !jitter_enabled {
+            match rx.recv().await {
+                Some(packet) => packet,
+                None => break,
+            }
+        } else if pending.is_empty() {
+            match rx.recv().await {
+                Some(packet) => {
+                    schedule_with_jitter(&mut pending, packet, &config, &mut rng);
+                    continue;
+                }
+                None => {
+                    input_open = false;
+                    continue;
+                }
+            }
+        } else if !input_open || pending.len() >= MAX_PENDING_JITTER_PACKETS {
+            pending.next().await.expect("jitter queue is not empty")
+        } else {
+            tokio::select! {
+                packet = rx.recv() => {
+                    match packet {
+                        Some(packet) => {
+                            schedule_with_jitter(&mut pending, packet, &config, &mut rng);
+                            continue;
+                        }
+                        None => {
+                            input_open = false;
+                            continue;
+                        }
+                    }
+                }
+                packet = pending.next() => packet.expect("jitter queue is not empty"),
+            }
+        };
+
+        if packet.len() < 20 {
+            continue;
+        }
+
+        buf.clear();
+        frame_packet_into(&mut buf, &packet);
+
+        // On the fast path, drain ready packets into one stream write. With jitter enabled,
+        // completion order is intentionally retained and each timer stays independently delayed.
+        while !jitter_enabled && buf.len() < COALESCE_BUDGET_BYTES {
+            match rx.try_recv() {
+                Ok(packet) if packet.len() >= 20 => frame_packet_into(&mut buf, &packet),
+                Ok(_) => continue,
+                Err(_) => break,
+            }
+        }
+
+        stream.write_all(&buf).await?;
+        stream.flush().await?;
     }
 
-    let (tx_ready, mut rx_ready) = mpsc::channel::<Bytes>(CHANNEL_BUFFER_SIZE);
-
-    let dispatch_task = tokio::spawn(async move {
-        let mut rng = OsRng;
-        while let Some(packet) = rx.recv().await {
-            if packet.len() < 20 {
-                continue;
-            }
-
-            let tx = tx_ready.clone();
-            let delay = rng.gen_range(config.min_jitter_ns..=config.max_jitter_ns);
-
-            tokio::spawn(async move {
-                if delay > 0 {
-                    sleep(Duration::from_nanos(delay)).await;
-                }
-                let _ = tx.send(packet).await;
-            });
-        }
-    });
-
-    let result = coalesced_sender_loop(&mut rx_ready, &mut stream).await;
-    let _ = stream.shutdown().await;
-    dispatch_task.abort();
-
-    result
+    stream.shutdown().await?;
+    Ok(())
 }
 
 /// Шифрует и объединяет пакеты потокового SSH-транспорта с ограниченным джиттером.

@@ -1,13 +1,15 @@
 use crate::client_registry::ClientRegistry;
 use anet_common::config::StealthConfig;
-use anet_common::consts::{MAX_PACKET_SIZE, MIN_HANDSHAKE_LEN, NONCE_LEN, PADDING_MTU};
+use anet_common::consts::{
+    MAX_PACKET_SIZE, MIN_HANDSHAKE_LEN, NONCE_LEN, PADDING_MTU, TRANSPORT_ENVELOPE_OVERHEAD,
+};
 use anet_common::handshake_fragmentation::DatagramReassembler;
 use anet_common::padding_utils::calculate_padding_needed;
 use anet_common::transport;
 use anet_common::udp_poller::TokioUdpPoller;
 use bytes::Bytes;
 use dashmap::DashMap;
-use log::{debug, error, warn};
+use log::{debug, warn};
 use quinn::{
     AsyncUdpSocket, UdpPoller,
     udp::{RecvMeta, Transmit},
@@ -89,7 +91,7 @@ impl AsyncUdpSocket for MultiKeyAnetUdpSocket {
         if let Some(info) = self.registry.get_by_addr(&transmit.destination) {
             let seq = info.sequence.fetch_add(1, Ordering::Relaxed);
 
-            let total_len = transmit.contents.len() + 38;
+            let total_len = transmit.contents.len() + TRANSPORT_ENVELOPE_OVERHEAD;
             let padding = calculate_padding_needed(total_len, self.stealth_config.padding_step);
             let safe_padding = if total_len + (padding as usize) > PADDING_MTU {
                 0
@@ -97,34 +99,22 @@ impl AsyncUdpSocket for MultiKeyAnetUdpSocket {
                 padding
             };
 
-            match transport::wrap_packet(
+            let wrapped = transport::wrap_packet_slice(
                 &info.cipher,
                 &info.nonce_prefix,
                 seq,
-                Bytes::copy_from_slice(transmit.contents),
+                transmit.contents,
                 safe_padding,
-            ) {
-                Ok(wrapped) => match self.io.try_send_to(&wrapped, transmit.destination) {
-                    Ok(_) => Ok(()),
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => Err(e),
-                    Err(e) => {
-                        warn!(
-                            "[Socket] UDP send failed for {}: {}. QUIC will retransmit.",
-                            transmit.destination, e
-                        );
-                        Ok(())
-                    }
-                },
-                Err(e) => {
-                    error!(
-                        "[Socket] Failed to wrap outgoing packet for {}: {}",
-                        transmit.destination, e
-                    );
-                    Ok(())
-                }
-            }
+            )
+            .map_err(io::Error::other)?;
+            self.io
+                .try_send_to(&wrapped, transmit.destination)
+                .map(|_| ())
         } else {
-            Ok(())
+            Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                format!("no session for {}", transmit.destination),
+            ))
         }
     }
 
@@ -216,7 +206,10 @@ impl AsyncUdpSocket for MultiKeyAnetUdpSocket {
                             entry.1.feed(raw_packet_mut)
                         };
 
-                        debug!("[Socket] Start reassembling handshake from {}:", remote_addr);
+                        debug!(
+                            "[Socket] Start reassembling handshake from {}:",
+                            remote_addr
+                        );
                         if let Some(complete) = complete {
                             self.reassemblers.remove(&remote_addr);
 
@@ -232,19 +225,14 @@ impl AsyncUdpSocket for MultiKeyAnetUdpSocket {
                                     complete.len()
                                 );
                             }
-                        } else {
-                            warn!("[Socket] Reassembled handshake from {} is None", remote_addr);
                         }
-
                     }
                 }
-                Poll::Ready(Err(_)) => {
-                    // Ошибка сокета. Если уже что-то набрали - вернем успех.
+                Poll::Ready(Err(error)) => {
                     if count > 0 {
                         return Poll::Ready(Ok(count));
                     }
-                    // Иначе просто выходим, в след раз вернет ошибку или Pending
-                    break;
+                    return Poll::Ready(Err(error));
                 }
                 Poll::Pending => {
                     // Сокет пуст. Больше читать нечего.
@@ -264,5 +252,9 @@ impl AsyncUdpSocket for MultiKeyAnetUdpSocket {
 
     fn local_addr(&self) -> io::Result<SocketAddr> {
         self.io.local_addr()
+    }
+
+    fn may_fragment(&self) -> bool {
+        true
     }
 }

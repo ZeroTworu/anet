@@ -79,6 +79,21 @@ impl Cipher {
         Ok(())
     }
 
+    /// Encrypts a mutable buffer without allocating and returns its detached tag.
+    #[inline]
+    pub fn encrypt_in_place_detached(
+        &self,
+        nonce_bytes: &[u8],
+        buffer: &mut [u8],
+    ) -> Result<[u8; 16], EncryptionError> {
+        let nonce = Nonce::<CryptoAlgorithm>::from_slice(nonce_bytes);
+        let tag = self
+            .cipher
+            .encrypt_in_place_detached(nonce, &[], buffer)
+            .map_err(|_| EncryptionError::EncryptionFailed)?;
+        Ok(tag.into())
+    }
+
     pub fn generate_nonce(sequence: u64) -> [u8; 12] {
         let mut nonce = [0u8; 12];
         nonce[4..].copy_from_slice(&sequence.to_be_bytes());

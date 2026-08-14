@@ -6,6 +6,8 @@ pub const CHANNEL_BUFFER_SIZE: usize = 1024;
 pub const NONCE_PREFIX_LEN: usize = 4;
 pub const NONCE_LEN: usize = 12;
 pub const PADDING_MTU: usize = 1450;
+/// Nonce (12) + Poly1305 tag (16) + sequence (8) + payload length (2).
+pub const TRANSPORT_ENVELOPE_OVERHEAD: usize = 38;
 pub const PROTO_PAD_FIELD_OVERHEAD: usize = 3;
 
 // Минимальный размер пакета рукопожатия для фильтрации мусора на сервере
