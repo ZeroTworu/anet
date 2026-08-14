@@ -80,10 +80,12 @@ make cert
 
 ### Desktop Windows Application
 <p align="center">
-<img src=".assets/win-gui-1.png" height="380" alt="Интерфейс отключен" />
-<img src=".assets/win-gui-2.png" height="380" alt="Процесс подключения" />
-<img src=".assets/win-gui-3.png" height="380" alt="Успешное соединение" />
-<img src=".assets/win-gui-4.png" height="380" alt="Управление настройками" />
+<img src=".assets/desktop-1.png" height="380" alt="Интерфейс отключен" />
+<img src=".assets/desktop-2.png" height="380" alt="Процесс подключения" />
+<img src=".assets/desktop-3.png" height="380" alt="Успешное соединение" />
+<img src=".assets/desktop-4.png" height="380" alt="Управление приложениями" />
+<img src=".assets/desktop-5.png" height="380" alt="Обновления" />
+<img src=".assets/desktop-6.png" height="380" alt="Управление настройками" />
 </p>
 
 
