@@ -11,6 +11,7 @@ poem = ["dep:poem-openapi"]
 [dependencies]
 tun = {workspace = true}
 bytes = {workspace = true}
+futures = {workspace = true}
 prost = {workspace = true}
 tokio = {workspace = true}
 log = {workspace = true}

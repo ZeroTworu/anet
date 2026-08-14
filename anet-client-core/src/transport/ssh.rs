@@ -1,29 +1,36 @@
 use super::{ClientTransport, ConnectionResult, MutexVpnStream};
-use crate::config::{CoreConfig, ServerConfig};
 use crate::auth::{AuthHandler, StreamAuthChannel};
-use anyhow::Result;
+use crate::config::{CoreConfig, ServerConfig};
+use anet_common::consts::{CHANNEL_BUFFER_SIZE, MAX_PACKET_SIZE};
+use anet_common::stream_framing::{frame_packet, read_next_packet};
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
-use log::{info, error};
+use log::{info, warn};
 use russh::client::Handler;
-use russh::{Channel, ChannelMsg};
-use std::net::{SocketAddr, ToSocketAddrs};
-use std::pin::Pin;
-use std::sync::Arc;
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::net::TcpStream;
-use tokio::sync::{mpsc, Mutex};
-use anet_common::stream_framing::{frame_packet, read_next_packet};
-use anet_common::consts::{CHANNEL_BUFFER_SIZE, MAX_PACKET_SIZE};
 use std::future::ready;
+use std::net::{SocketAddr, ToSocketAddrs};
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::time::Duration;
+use tokio::io::AsyncWriteExt;
+use tokio::net::TcpStream;
+use tokio::sync::{Mutex, mpsc};
+
+const SSH_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const SSH_CHANNEL_WINDOW_SIZE: u32 = 4 * 1024 * 1024;
+const SSH_MAX_PACKET_SIZE: u32 = 32 * 1024;
+
 struct ClientHandler;
-#[async_trait]
+
 impl Handler for ClientHandler {
     type Error = russh::Error;
+
     fn check_server_key(
         &mut self,
         _server_public_key: &russh::keys::PublicKey,
     ) -> impl Future<Output = Result<bool, Self::Error>> + Send {
+        // Подлинность конечного узла дополнительно проверяется подписанным ASTP DH-обменом.
         ready(Ok(true))
     }
 }
@@ -42,104 +49,111 @@ impl SshTransport {
 #[async_trait]
 impl ClientTransport for SshTransport {
     async fn connect(&self) -> Result<ConnectionResult> {
-        let addr_str = &self.server.address;
-        let addr: SocketAddr = addr_str.to_socket_addrs()?.next().ok_or(anyhow::anyhow!("Invalid server address"))?;
-
-        let user = self.server.ssh_user.as_deref()
+        let address = resolve_address(&self.server.address)?;
+        let user = self
+            .server
+            .ssh_user
+            .as_deref()
             .or(self.config.transport.ssh_user.as_deref())
             .unwrap_or("root");
 
-        let mut config_base = russh::client::Config::default();
-        config_base.window_size = 2_000_000;
-        config_base.maximum_packet_size = MAX_PACKET_SIZE as u32;
+        let ssh_config = Arc::new(russh::client::Config {
+            window_size: SSH_CHANNEL_WINDOW_SIZE,
+            maximum_packet_size: SSH_MAX_PACKET_SIZE,
+            channel_buffer_size: CHANNEL_BUFFER_SIZE,
+            nodelay: true,
+            ..Default::default()
+        });
 
-        let config = Arc::new(config_base);
+        let stream = tokio::time::timeout(SSH_CONNECT_TIMEOUT, TcpStream::connect(address))
+            .await
+            .context("timed out connecting to the SSH endpoint")??;
+        stream.set_nodelay(true)?;
+        let mut session = russh::client::connect_stream(ssh_config, stream, ClientHandler).await?;
 
-        // используем connect_stream() вместо connect(), чтобы успеть
-        // выставить TCP_NODELAY до начала SSH-хендшейка.
-        let tcp_stream = TcpStream::connect(addr).await?;
-        tcp_stream.set_nodelay(true)?;
-        let mut session = russh::client::connect_stream(config, tcp_stream, ClientHandler).await?;
-
-        if !session.authenticate_none(user).await?.success() {
-            anyhow::bail!("SSH Authentication failed (auth_none rejected)");
-        }
-        info!("[SSH] Authenticated. Opening VPN channel...");
+        anyhow::ensure!(
+            session.authenticate_none(user).await?.success(),
+            "SSH none authentication was rejected"
+        );
+        info!("[SSH] Authenticated; opening the VPN channel");
 
         let channel = session.channel_open_session().await?;
         channel.exec(true, "anet-vpn").await?;
+        let channel_stream = channel.into_stream();
+        let stream = Arc::new(Mutex::new(channel_stream));
 
-        // Передаем сессию по значению с конкретным типом Handle<ClientHandler>
-        let raw_stream = SshStreamAdapter::new(channel, session);
-        let stream_arc = Arc::new(Mutex::new(raw_stream));
-        let auth_channel = StreamAuthChannel::new(stream_arc.clone());
+        let (auth_response, shared_key) = {
+            let auth_channel = StreamAuthChannel::new(stream.clone());
+            let auth_handler =
+                AuthHandler::new(&self.config, self.server.server_pub_key.as_deref())?;
+            auth_handler.authenticate(&auth_channel).await?
+        };
+        info!("[SSH] ASTP authenticated; assigned IP {}", auth_response.ip);
 
-        let auth_handler = AuthHandler::new(&self.config, self.server.server_pub_key.as_deref())?;
-        let (auth_response, shared_key) = auth_handler.authenticate(&auth_channel).await?;
-        info!("[SSH] Handshake complete. Assigned IP: {}", auth_response.ip);
+        let stream = Arc::try_unwrap(stream)
+            .map_err(|_| anyhow::anyhow!("SSH authentication stream is still shared"))?
+            .into_inner();
+        let (reader, writer) = tokio::io::split(stream);
+        let (client_stream, internal_stream) = tokio::io::duplex(MAX_PACKET_SIZE * 10);
+        let (tunnel_reader, tunnel_writer) = tokio::io::split(internal_stream);
 
-        drop(auth_channel);
-        let active_tcp_stream = Arc::try_unwrap(stream_arc).map_err(|_| anyhow::anyhow!("Internal ref dropped"))?.into_inner();
-        let (tcp_reader,  tcp_writer) = tokio::io::split(active_tcp_stream);
-
-        let (client_stream, internal_router) = tokio::io::duplex(65535 * 10);
-        let (mut tunnel_read, mut tunnel_write) = tokio::io::split(internal_router);
-
-        let sequence_tx = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let cipher_tx = Arc::new(anet_common::encryption::Cipher::new(&shared_key));
-        let cipher_rx = Arc::new(anet_common::encryption::Cipher::new(&shared_key));
-        let nonce_prefix: [u8; 4] = auth_response.nonce_prefix.as_slice().try_into().unwrap_or([0,0,0,0]);
-        let stealth_cfg = self.config.stealth.clone();
-
-        let (tx_bridge, rx_bridge) = mpsc::channel(CHANNEL_BUFFER_SIZE);
-
-        tokio::spawn(async move {
-            while let Ok(Some(packet)) = read_next_packet(&mut tunnel_read).await {
-                if tx_bridge.send(packet).await.is_err() { break; }
-            }
-        });
-
-        let stealth_clone = stealth_cfg.clone();
-        let cipher_tx_worker = cipher_tx.clone();
-        let seq_worker = sequence_tx.clone();
-        let np = nonce_prefix;
+        let cipher = Arc::new(anet_common::encryption::Cipher::new(&shared_key));
+        let nonce_prefix = auth_response
+            .nonce_prefix
+            .as_slice()
+            .try_into()
+            .context("server returned an invalid nonce prefix")?;
+        let sequence = Arc::new(AtomicU64::new(0));
+        let stealth = self.config.stealth.clone();
 
         tokio::spawn(async move {
-            let _ = anet_common::jitter::bridge_crypto_stream_with_jitter(
-                rx_bridge,
-                tcp_writer,
-                stealth_clone,
-                cipher_tx_worker,
-                seq_worker,
-                np,
-            ).await;
-        });
-
-        let (tx_in, mut rx_in) = mpsc::channel(CHANNEL_BUFFER_SIZE);
-        let cipher_rx_worker = cipher_rx.clone();
-
-        tokio::spawn(async move {
-            let _ = anet_common::jitter::receive_crypto_stream(
-                tcp_reader,
-                tx_in,
-                cipher_rx_worker
-            ).await;
-        });
-
-        tokio::spawn(async move {
-            while let Some(packet) = rx_in.recv().await {
-                let framed = frame_packet(packet);
-                if tokio::io::AsyncWriteExt::write_all(&mut tunnel_write, &framed).await.is_err() {
-                    break;
+            let (packet_tx, packet_rx) = mpsc::channel(CHANNEL_BUFFER_SIZE);
+            let (network_tx, mut network_rx) = mpsc::channel(CHANNEL_BUFFER_SIZE);
+            let mut tunnel_input = tokio::spawn(read_tunnel_packets(tunnel_reader, packet_tx));
+            let mut outbound = tokio::spawn(anet_common::jitter::bridge_crypto_stream_with_jitter(
+                packet_rx,
+                writer,
+                stealth,
+                cipher.clone(),
+                sequence,
+                nonce_prefix,
+            ));
+            let mut inbound = tokio::spawn(anet_common::jitter::receive_crypto_stream(
+                reader, network_tx, cipher,
+            ));
+            let mut tunnel_output = tokio::spawn(async move {
+                let mut tunnel_writer = tunnel_writer;
+                while let Some(packet) = network_rx.recv().await {
+                    tunnel_writer.write_all(&frame_packet(packet)).await?;
                 }
+                tunnel_writer.shutdown().await?;
+                Result::<()>::Ok(())
+            });
+
+            let result = tokio::select! {
+                result = &mut tunnel_input => flatten_worker_result("TUN reader", result),
+                result = &mut outbound => flatten_worker_result("network writer", result),
+                result = &mut inbound => flatten_worker_result("network reader", result),
+                result = &mut tunnel_output => flatten_worker_result("TUN writer", result),
+            };
+            tunnel_input.abort();
+            outbound.abort();
+            inbound.abort();
+            tunnel_output.abort();
+            let _ = tunnel_input.await;
+            let _ = outbound.await;
+            let _ = inbound.await;
+            let _ = tunnel_output.await;
+
+            match result {
+                Ok(()) => info!("[SSH] Tunnel closed"),
+                Err(error) => warn!("[SSH] Tunnel stopped: {error:#}"),
             }
         });
-
-        let output_stream = Arc::new(Mutex::new(client_stream));
 
         Ok(ConnectionResult {
-            auth_response: auth_response,
-            vpn_stream: Box::new(MutexVpnStream(output_stream)),
+            auth_response,
+            vpn_stream: Box::new(MutexVpnStream(Arc::new(Mutex::new(client_stream)))),
             endpoint: None,
             connection: None,
             health_pause: None,
@@ -147,97 +161,30 @@ impl ClientTransport for SshTransport {
     }
 }
 
-pub struct SshStreamAdapter {
-    read_rx: mpsc::UnboundedReceiver<Vec<u8>>,
-    write_tx: mpsc::UnboundedSender<Vec<u8>>,
-    read_buffer: std::io::Cursor<Bytes>,
-    task_handle: tokio::task::JoinHandle<()>,
-    // Используем конкретный тип Handle<ClientHandler>
-    session: Option<russh::client::Handle<ClientHandler>>,
+fn resolve_address(address: &str) -> Result<SocketAddr> {
+    address
+        .to_socket_addrs()
+        .with_context(|| format!("failed to resolve SSH endpoint {address}"))?
+        .next()
+        .with_context(|| format!("SSH endpoint {address} resolved to no addresses"))
 }
 
-impl SshStreamAdapter {
-    fn new(mut channel: Channel<russh::client::Msg>, session: russh::client::Handle<ClientHandler>) -> Self {
-        let (read_tx, read_rx) = mpsc::unbounded_channel();
-        let (write_tx, mut write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-
-        let task_handle = tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    msg = channel.wait() => {
-                        match msg {
-                            Some(ChannelMsg::Data { data }) => { let _ = read_tx.send(data.to_vec()); }
-                            Some(ChannelMsg::WindowAdjusted { .. }) => {}
-                            Some(ChannelMsg::ExtendedData { .. }) => {}
-                            Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => break,
-                            _ => {}
-                        }
-                    }
-                    data_to_send = write_rx.recv() => {
-                        if let Some(data) = data_to_send {
-                            if let Err(e) = channel.data(&data[..]).await {
-                                error!("Underground tcp loop failure to deliver byte bounds: {}", e);
-                                break;
-                            }
-                        } else { break; }
-                    }
-                }
-            }
-        });
-
-        Self { read_rx, write_tx, read_buffer: std::io::Cursor::new(Bytes::new()), task_handle, session: Some(session) }
-    }
+fn flatten_worker_result(
+    worker: &'static str,
+    result: std::result::Result<Result<()>, tokio::task::JoinError>,
+) -> Result<()> {
+    result.with_context(|| format!("SSH {worker} task failed"))?
 }
 
-impl Drop for SshStreamAdapter {
-    fn drop(&mut self) {
-        log::info!("SshStreamAdapter: Dropping adapter, aborting task.");
-        self.task_handle.abort();
-
-        // Забираем и закрываем физическую сессию Handle<ClientHandler>
-        if let Some(session) = self.session.take() {
-            tokio::spawn(async move {
-                info!("SshStreamAdapter: Sending disconnect packet...");
-                let _ = session.disconnect(russh::Disconnect::ByApplication, "Closed by ANet", "en");
-            });
-        }
+async fn read_tunnel_packets(
+    mut tunnel_reader: tokio::io::ReadHalf<tokio::io::DuplexStream>,
+    packet_tx: mpsc::Sender<Bytes>,
+) -> Result<()> {
+    while let Some(packet) = read_next_packet(&mut tunnel_reader).await? {
+        packet_tx
+            .send(packet)
+            .await
+            .context("SSH packet queue closed")?;
     }
-}
-
-impl AsyncRead for SshStreamAdapter {
-    fn poll_read(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &mut ReadBuf<'_>) -> std::task::Poll<std::io::Result<()>> {
-        use std::task::Poll;
-        if self.read_buffer.position() < self.read_buffer.get_ref().len() as u64 {
-            let n = std::io::Read::read(&mut self.read_buffer, buf.initialize_unfilled())?;
-            buf.advance(n);
-            return Poll::Ready(Ok(()));
-        }
-        match self.read_rx.poll_recv(cx) {
-            Poll::Ready(Some(data)) => {
-                let len = std::cmp::min(data.len(), buf.remaining());
-                buf.put_slice(&data[..len]);
-                if len < data.len() {
-                    self.read_buffer = std::io::Cursor::new(Bytes::copy_from_slice(&data[len..]));
-                }
-                Poll::Ready(Ok(()))
-            }
-            Poll::Ready(None) => Poll::Ready(Ok(())),
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
-impl AsyncWrite for SshStreamAdapter {
-    fn poll_write(self: Pin<&mut Self>, _cx: &mut std::task::Context<'_>, buf: &[u8]) -> std::task::Poll<std::io::Result<usize>> {
-        match self.write_tx.send(buf.to_vec()) {
-            Ok(_) => std::task::Poll::Ready(Ok(buf.len())),
-            Err(_) => std::task::Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Ssh Write Link Snapped"))),
-        }
-    }
-    fn poll_flush(self: Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
-        std::task::Poll::Ready(Ok(()))
-    }
-    fn poll_shutdown(self: Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
-        std::task::Poll::Ready(Ok(()))
-    }
+    Ok(())
 }
