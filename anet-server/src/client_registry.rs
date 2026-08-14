@@ -252,8 +252,13 @@ impl ClientRegistry {
     }
 
     pub fn update_client_addr(&self, client_info: &Arc<ClientTransportInfo>, new_addr: SocketAddr) {
+        // NAT rebinding is rare. Keep the common path read-only and allocation-free instead of
+        // swapping a new Arc for every received QUIC datagram.
+        if **client_info.remote_addr.load() == new_addr {
+            return;
+        }
+
         let old_addr_arc = client_info.remote_addr.swap(Arc::new(new_addr));
-        // ИСПРАВЛЕНИЕ: Разыменовываем Arc<SocketAddr>
         let old_addr = *old_addr_arc;
 
         if old_addr == new_addr {

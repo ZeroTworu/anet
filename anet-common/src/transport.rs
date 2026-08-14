@@ -11,14 +11,18 @@ pub fn wrap_packet(
     quic_payload: Bytes,
     padding_size: u16,
 ) -> Result<Bytes, EncryptionError> {
-    let payload_len = quic_payload.len();
-    let total_capacity = 8 + 2 + payload_len + padding_size as usize;
+    wrap_packet_slice(cipher, nonce_prefix, sequence, &quic_payload, padding_size)
+}
 
-    let mut plaintext = BytesMut::with_capacity(total_capacity);
-    plaintext.put_u64(sequence);
-    plaintext.put_u16(payload_len as u16); // Записываем длину данных
-    plaintext.put(quic_payload);
-    plaintext.put_bytes(0u8, padding_size as usize); // Добиваем нулями (станут шумом)
+/// Packs and encrypts a packet using a single output allocation.
+pub fn wrap_packet_slice(
+    cipher: &Cipher,
+    nonce_prefix: &[u8; NONCE_PREFIX_LEN],
+    sequence: u64,
+    payload: &[u8],
+    padding_size: u16,
+) -> Result<Bytes, EncryptionError> {
+    let payload_len = payload.len();
 
     // Nonce = [prefix][sequence]
     let mut nonce = [0u8; NONCE_LEN];
@@ -26,14 +30,20 @@ pub fn wrap_packet(
     // Последние 8 байт nonce - это сам sequence, для уникальности
     nonce[NONCE_PREFIX_LEN..].copy_from_slice(&sequence.to_be_bytes());
 
-    // Шифруем
-    let ciphertext = cipher.encrypt(&nonce, plaintext.freeze())?;
-
-    // Финальный пакет = [полный nonce][зашифрованные данные]
-    // Nonce теперь идет в открытом виде для O(1) поиска на сервере
-    let mut final_packet = BytesMut::with_capacity(NONCE_LEN + ciphertext.len());
+    // Reserve the final wire buffer once: nonce + plaintext + authentication tag.
+    let mut final_packet =
+        BytesMut::with_capacity(NONCE_LEN + 10 + payload_len + padding_size as usize + 16);
     final_packet.put_slice(&nonce);
-    final_packet.put(ciphertext);
+    final_packet.put_u64(sequence);
+    final_packet.put_u16(payload_len as u16);
+    final_packet.put_slice(payload);
+    final_packet.put_bytes(0, padding_size as usize);
+
+    let tag = {
+        let plaintext = &mut final_packet[NONCE_LEN..];
+        cipher.encrypt_in_place_detached(&nonce, plaintext)?
+    };
+    final_packet.put_slice(&tag);
 
     Ok(final_packet.freeze())
 }

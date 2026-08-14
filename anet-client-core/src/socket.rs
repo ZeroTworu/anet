@@ -1,11 +1,12 @@
 use anet_common::config::StealthConfig;
-use anet_common::consts::{MAX_PACKET_SIZE, NONCE_PREFIX_LEN, PADDING_MTU};
+use anet_common::consts::{
+    MAX_PACKET_SIZE, NONCE_PREFIX_LEN, PADDING_MTU, TRANSPORT_ENVELOPE_OVERHEAD,
+};
 use anet_common::encryption::Cipher;
 use anet_common::padding_utils::calculate_padding_needed;
 use anet_common::transport;
 use anet_common::udp_poller::TokioUdpPoller;
-use bytes::Bytes;
-use log::{debug, error, warn};
+use log::debug;
 use quinn::{
     AsyncUdpSocket, UdpPoller,
     udp::{RecvMeta, Transmit},
@@ -65,7 +66,7 @@ impl AsyncUdpSocket for AnetUdpSocket {
         let seq = self.sequence.fetch_add(1, Ordering::Relaxed);
         // 1. Считаем полный размер пакета на проводе
         // Overhead = 38 байт (12 Nonce + 16 Tag + 8 Seq + 2 Len)
-        let total_len = transmit.contents.len() + 38;
+        let total_len = transmit.contents.len() + TRANSPORT_ENVELOPE_OVERHEAD;
 
         // 2. Считаем сколько нулей добавить
         let padding = calculate_padding_needed(total_len, self.stealth_config.padding_step);
@@ -77,31 +78,18 @@ impl AsyncUdpSocket for AnetUdpSocket {
             padding
         };
 
-        match transport::wrap_packet(
+        let wrapped_packet = transport::wrap_packet_slice(
             &self.cipher,
             &self.nonce_prefix,
             seq,
-            Bytes::copy_from_slice(transmit.contents),
+            transmit.contents,
             safe_padding,
-        ) {
-            Ok(wrapped_packet) => {
-                match self.io.try_send_to(&wrapped_packet, transmit.destination) {
-                    Ok(_) => Ok(()),
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => Err(e),
-                    Err(e) => {
-                        // Логируем, но не паникуем. QUIC обработает потерю.
-                        warn!("[ANet] Socket send failed: {}. QUIC will retransmit.", e);
-                        Ok(())
-                    }
-                }
-            }
-            Err(e) => {
-                // Это серьезная ошибка в логике, логируем как error.
-                error!("[ANet] Failed to wrap QUIC packet for seq {}: {}", seq, e);
-                // Все равно возвращаем Ok, чтобы не обрушить Quinn
-                Ok(())
-            }
-        }
+        )
+        .map_err(io::Error::other)?;
+
+        self.io
+            .try_send_to(&wrapped_packet, transmit.destination)
+            .map(|_| ())
     }
 
     #[inline]
@@ -181,5 +169,9 @@ impl AsyncUdpSocket for AnetUdpSocket {
 
     fn local_addr(&self) -> io::Result<SocketAddr> {
         self.io.local_addr()
+    }
+
+    fn may_fragment(&self) -> bool {
+        true
     }
 }
