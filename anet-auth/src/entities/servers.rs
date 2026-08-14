@@ -12,6 +12,7 @@ pub struct Model {
     pub quic_port: Option<i32>,
     pub ssh_port: Option<i32>,
     pub vnc_port: Option<i32>,
+    pub websocket_url: Option<String>,
     pub ssh_user: Option<String>,
     pub created_at: DateTime,
     pub updated_at: DateTime,

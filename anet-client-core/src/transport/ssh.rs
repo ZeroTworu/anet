@@ -141,7 +141,8 @@ impl ClientTransport for SshTransport {
             auth_response: auth_response,
             vpn_stream: Box::new(MutexVpnStream(output_stream)),
             endpoint: None,
-            connection: None
+            connection: None,
+            health_pause: None,
         })
     }
 }

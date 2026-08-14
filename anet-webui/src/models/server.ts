@@ -6,6 +6,7 @@ export type Server = {
     quic_port: number | null
     ssh_port: number | null
     vnc_port: number | null
+    websocket_url: string | null
     ssh_user: string | null
     is_active: boolean
 }
@@ -17,6 +18,7 @@ export type CreateServerRequest = {
     quic_port: number | null
     ssh_port: number | null
     vnc_port: number | null
+    websocket_url: string | null
     ssh_user: string | null
     is_active?: boolean
 }

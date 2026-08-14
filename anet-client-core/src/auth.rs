@@ -120,10 +120,19 @@ pub struct AuthHandler {
     client_id: String,
     padding_step: u16,
     frag_cfg: FragmentConfig,
+    resume_session_id: Option<String>,
 }
 
 impl AuthHandler {
     pub fn new(cfg: &CoreConfig, server_pub_key_override: Option<&str>) -> Result<Self> {
+        Self::new_with_resume(cfg, server_pub_key_override, None)
+    }
+
+    pub fn new_with_resume(
+        cfg: &CoreConfig,
+        server_pub_key_override: Option<&str>,
+        resume_session_id: Option<String>,
+    ) -> Result<Self> {
         let ephemeral_secret = StaticSecret::random_from_rng(OsRng);
 
         let private_key_bytes = BASE64_STANDARD
@@ -164,6 +173,7 @@ impl AuthHandler {
             client_id,
             padding_step: cfg.stealth.padding_step,
             frag_cfg: FragmentConfig::from_stealth(&cfg.stealth),
+            resume_session_id,
         })
     }
 
@@ -202,13 +212,18 @@ impl AuthHandler {
         delay: u64,
     ) -> Result<(AuthResponse, [u8; 32])> {
         let client_pub_key = PublicKey::from(&self.ephemeral_secret);
-        let client_signed_dh_key = sign_data(&self.signing_key, client_pub_key.as_bytes());
+        let mut signed_handshake = client_pub_key.as_bytes().to_vec();
+        if let Some(session_id) = &self.resume_session_id {
+            signed_handshake.extend_from_slice(session_id.as_bytes());
+        }
+        let client_signed_dh_key = sign_data(&self.signing_key, &signed_handshake);
 
         let mut dh_init_msg = AnetMessage {
             content: Some(Content::DhClientExchange(DhClientExchange {
                 public_key: client_pub_key.as_bytes().to_vec(),
                 client_signed_dh_key,
                 client_public_key: self.client_public_key.to_bytes().to_vec(),
+                resume_session_id: self.resume_session_id.clone().unwrap_or_default(),
             })),
             padding: vec![],
         };
@@ -352,6 +367,7 @@ impl AuthHandler {
         let mut auth_payload = AnetMessage {
             content: Some(Content::AuthRequest(AuthRequest {
                 client_id: self.client_id.clone(),
+                resume_session_id: self.resume_session_id.clone().unwrap_or_default(),
             })),
             padding: vec![],
         };

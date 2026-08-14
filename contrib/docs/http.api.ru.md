@@ -47,6 +47,7 @@
       "quic_port": 4519,
       "ssh_port": 822,
       "vnc_port": 56678,
+      "websocket_url": "wss://tunnel.example.com/socket",
       "ssh_user": "hanyuu"
     }
   ]
@@ -62,6 +63,7 @@
     "quic_port": 4519,
     "ssh_port": 822,
     "vnc_port": 56678,
+    "websocket_url": "wss://tunnel.example.com/socket",
     "ssh_user": "hanyuu"
   }
   ```

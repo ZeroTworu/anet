@@ -4,7 +4,7 @@ use crate::client_registry::ClientRegistry;
 use crate::config::Config;
 use crate::ip_pool::IpPool;
 use crate::multikey_udp_socket::TempDHInfo;
-use crate::servers::{quic, ssh, vnc};
+use crate::servers::{quic, ssh, vnc, websocket};
 
 use anet_common::atun::TunManager;
 use anet_common::tun_params::TunParams;
@@ -80,10 +80,12 @@ impl ANetServer {
 
         // 2. Демон очистки State (Очистка незаконченных DH транзакций по истечении тайминга)
         let gcx = self.temp_dh_map.clone();
+        let gc_registry = self.registry.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(10)).await;
                 gcx.retain(|_, v| v.created_at.elapsed() <= Duration::from_secs(30));
+                gc_registry.cleanup_suspended();
             }
         });
 
@@ -124,6 +126,18 @@ impl ANetServer {
             handle_collection.push(tokio::spawn(async move {
                 if let Err(e) = vnc::run_vnc_server(v_cfg, v_reg, v_tx, v_auth).await {
                     error!("Fatal VNC Failure: {}", e);
+                }
+            }));
+        }
+
+        if !self.cfg.server.websocket_bind_to.trim().is_empty() {
+            let c = self.cfg.clone();
+            let rg = self.registry.clone();
+            let tx = tx_tun.clone();
+            let auth = self.auth_handler_core.clone();
+            handle_collection.push(tokio::spawn(async move {
+                if let Err(e) = websocket::run_websocket_server(c, rg, tx, auth).await {
+                    error!("WebSocket interface execution halted: {}", e);
                 }
             }));
         }

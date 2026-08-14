@@ -109,12 +109,13 @@ update_url = "https://api.github.com/repos/ZeroTworu/anet/releases/latest"
 #
 # Возможные параметры каждого сервера:
 # 1. address: "IP:порт" или "домен:порт" для подключения.
-# 2. mode: тип транспорта. Допустимые значения: "quic" (UDP), "ssh" (TCP), "vnc" (TCP).
+# 2. mode: тип транспорта. Допустимые значения: "quic", "ssh", "vnc", "websocket".
 # 3. timeout_secs: (Опционально) Время ожидания подключения в секундах, после которого
 #    нода считается упавшей и клиент переходит к следующей. По умолчанию: 10 секунд.
 # 4. server_pub_key: (Опционально) Переопределение публичного ключа для этого конкретного
 #    сервера (если он отличается от глобального в секции [keys]).
 # 5. ssh_user: (Опционально) Переопределение имени пользователя для SSH-транспорта.
+# 6. websocket_url: полный URL вида ws://host/path или wss://host/path.
 # =========================================================================
 
 # 1. Первая попытка: Сверхбыстрый и плавный UDP-транспорт (QUIC)
@@ -137,6 +138,16 @@ timeout_secs = 6
 name = "GM Primary [VNC]"
 address = "127.0.0.1:56678"
 mode = "vnc"
+timeout_secs = 8
+
+# 4. WebSocket: browser-like HTTP Upgrade и плановая ротация сессий.
+[[servers]]
+name = "GM Primary [WS]"
+address = "127.0.0.1:8080" # Имя ноды; подключение выполняется по websocket_url.
+mode = "websocket"
+websocket_url = "ws://127.0.0.1:8080/socket"
+websocket_min_session_secs = 480
+websocket_max_session_secs = 1500
 timeout_secs = 8
 
 

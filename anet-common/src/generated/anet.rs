@@ -9,6 +9,8 @@ pub struct DhClientExchange {
     /// Публичный ключ клиента для верификации
     #[prost(bytes = "vec", tag = "3")]
     pub client_public_key: ::prost::alloc::vec::Vec<u8>,
+    #[prost(string, tag = "4")]
+    pub resume_session_id: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DhServerExchange {
@@ -35,6 +37,9 @@ pub struct EncryptedAuthResponse {
 pub struct AuthRequest {
     #[prost(string, tag = "1")]
     pub client_id: ::prost::alloc::string::String,
+    /// Existing logical VPN session requested after a transport rotation.
+    #[prost(string, tag = "2")]
+    pub resume_session_id: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct AuthResponse {

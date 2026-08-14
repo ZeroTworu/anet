@@ -7,6 +7,7 @@ pub mod m20260714_000007_create_servers;
 pub mod m20260714_000006_add_keys_to_user;
 pub mod m20260714_000008_create_user_servers;
 pub mod m20260714_000009_add_is_active_to_servers;
+pub mod m20260814_000010_add_websocket_url_to_servers;
 
 use sea_orm_migration::prelude::*;
 
@@ -25,6 +26,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260714_000008_create_user_servers::Migration),
             Box::new(m20260714_000006_add_keys_to_user::Migration),
             Box::new(m20260714_000009_add_is_active_to_servers::Migration),
+            Box::new(m20260814_000010_add_websocket_url_to_servers::Migration),
         ]
     }
 }

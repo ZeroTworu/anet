@@ -28,6 +28,8 @@ serde = { workspace = true, features = ["derive"] }
 async-trait = { workspace = true }
 ipnet = { workspace = true }
 futures = { workspace = true }
+tokio-tungstenite = { workspace = true }
+http = { workspace = true }
 
 reqwest = { workspace = true, features = ["json", "rustls-tls-webpki-roots"] }
 

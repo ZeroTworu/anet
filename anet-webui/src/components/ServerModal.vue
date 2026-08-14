@@ -21,6 +21,7 @@ const form = ref({
   quic_port: null as number | null,
   ssh_port: null as number | null,
   vnc_port: null as number | null,
+  websocket_url: null as string | null,
   ssh_user: '',
   is_active: true
 })
@@ -38,6 +39,7 @@ watch(
           quic_port: val.quic_port,
           ssh_port: val.ssh_port,
           vnc_port: val.vnc_port,
+          websocket_url: val.websocket_url,
           ssh_user: val.ssh_user || '',
           is_active: val.is_active
         }
@@ -92,6 +94,10 @@ const close = () => {
 
         <n-form-item label="VNC Port (TCP)">
           <n-input-number v-model:value="form.vnc_port" clearable />
+        </n-form-item>
+
+        <n-form-item label="WebSocket URL">
+          <n-input v-model:value="form.websocket_url" placeholder="wss://example.com/socket" clearable />
         </n-form-item>
       </n-space>
 

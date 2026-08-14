@@ -107,6 +107,7 @@ pub enum TransportMode {
     Quic,
     Ssh,
     Vnc,
+    Websocket,
 }
 
 impl Default for TransportMode {
@@ -140,7 +141,7 @@ pub struct ServerConfig {
     // IP-адрес или доменное имя сервера и порт для подключения
     pub address: String,
 
-    // Режим транспорта (quic, ssh, vnc)
+    // Режим транспорта (quic, ssh, vnc, websocket)
     pub mode: TransportMode,
 
     // Индивидуальный тайм-аут подключения (в секундах)
@@ -152,6 +153,16 @@ pub struct ServerConfig {
 
     // Опциональное переопределение пользователя SSH
     pub ssh_user: Option<String>,
+
+    /// Complete ws:// or wss:// endpoint. Used only in websocket mode.
+    #[serde(default)]
+    pub websocket_url: String,
+
+    /// Bounds for a browser-like WebSocket session rotation.
+    #[serde(default = "default_websocket_min_session_secs")]
+    pub websocket_min_session_secs: u64,
+    #[serde(default = "default_websocket_max_session_secs")]
+    pub websocket_max_session_secs: u64,
 }
 
 impl ServerConfig {
@@ -167,6 +178,7 @@ impl ServerConfig {
                 TransportMode::Quic => "QUIC",
                 TransportMode::Ssh => "SSH",
                 TransportMode::Vnc => "VNC",
+                TransportMode::Websocket => "WS",
             };
 
             format!("{}:{}", ip, mode_str)
@@ -177,6 +189,9 @@ impl ServerConfig {
 fn default_timeout_secs() -> u64 {
     10
 }
+
+fn default_websocket_min_session_secs() -> u64 { 8 * 60 }
+fn default_websocket_max_session_secs() -> u64 { 25 * 60 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct CoreConfig {
@@ -215,6 +230,7 @@ impl CoreConfig {
                 TransportMode::Quic => "QUIC",
                 TransportMode::Ssh => "SSH",
                 TransportMode::Vnc => "VNC",
+                TransportMode::Websocket => "WS",
             };
             self.servers.push(ServerConfig {
                 name: Some(format!("{}:{}", self.main.address.clone(), mode_str)),
@@ -223,6 +239,9 @@ impl CoreConfig {
                 timeout_secs: 10,
                 server_pub_key: None,
                 ssh_user: self.transport.ssh_user.clone(),
+                websocket_url: String::new(),
+                websocket_min_session_secs: default_websocket_min_session_secs(),
+                websocket_max_session_secs: default_websocket_max_session_secs(),
             });
         }
 
@@ -231,6 +250,18 @@ impl CoreConfig {
                 "[Config] Per-app 'include' mode selected, but 'per_app' list is empty. Falling back to 'all' traffic mode."
             );
             self.main.per_app_mode = PerAppMode::All;
+        }
+
+        for server in &self.servers {
+            if server.mode == TransportMode::Websocket
+                && !(server.websocket_url.starts_with("ws://")
+                    || server.websocket_url.starts_with("wss://"))
+            {
+                anyhow::bail!(
+                    "WebSocket server '{}' requires websocket_url starting with ws:// or wss://",
+                    server.get_name()
+                );
+            }
         }
 
         Ok(())
