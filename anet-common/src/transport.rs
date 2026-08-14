@@ -1,5 +1,6 @@
-use crate::consts::{NONCE_LEN, NONCE_PREFIX_LEN};
+use crate::consts::{NONCE_LEN, NONCE_PREFIX_LEN, PADDING_MTU, TRANSPORT_ENVELOPE_OVERHEAD};
 use crate::encryption::{Cipher, EncryptionError};
+use crate::padding_utils::calculate_padding_needed;
 use anyhow::{Result, anyhow};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
@@ -46,6 +47,25 @@ pub fn wrap_packet_slice(
     final_packet.put_slice(&tag);
 
     Ok(final_packet.freeze())
+}
+
+/// Applies the configured transport padding and encrypts an owned packet.
+#[inline]
+pub fn wrap_packet_padded(
+    cipher: &Cipher,
+    nonce_prefix: &[u8; NONCE_PREFIX_LEN],
+    sequence: u64,
+    payload: Bytes,
+    padding_step: u16,
+) -> Result<Bytes, EncryptionError> {
+    let wire_len_without_padding = payload.len() + TRANSPORT_ENVELOPE_OVERHEAD;
+    let requested_padding = calculate_padding_needed(wire_len_without_padding, padding_step);
+    let padding = if wire_len_without_padding + usize::from(requested_padding) <= PADDING_MTU {
+        requested_padding
+    } else {
+        0
+    };
+    wrap_packet_slice(cipher, nonce_prefix, sequence, &payload, padding)
 }
 
 /// Расшифровывает пакет, полученный от сервера
@@ -133,6 +153,22 @@ pub fn unwrap_packet_bytes_in_place(cipher: &Cipher, raw_packet: Bytes) -> Resul
     Ok(buffer.freeze().slice(payload_start..payload_end))
 }
 
+/// Decrypts an owned packet in place when its buffer is unique and falls back to the
+/// allocating path for shared buffers such as slices owned by a WebSocket frame parser.
+pub fn unwrap_packet_bytes(cipher: &Cipher, raw_packet: Bytes) -> Result<Bytes> {
+    let mut buffer = match raw_packet.try_into_mut() {
+        Ok(buffer) => buffer,
+        Err(shared) => return unwrap_packet(cipher, &shared),
+    };
+
+    let payload = unwrap_packet_in_place(cipher, &mut buffer)?;
+    let payload_len = payload.len();
+    let payload_start = NONCE_LEN + 10;
+    let payload_end = payload_start + payload_len;
+    buffer.truncate(payload_end);
+    Ok(buffer.freeze().slice(payload_start..payload_end))
+}
+
 #[cfg(test)]
 mod in_place_tests {
     use super::*;
@@ -148,5 +184,27 @@ mod in_place_tests {
 
         assert_eq!(allocating, payload);
         assert_eq!(in_place, payload);
+    }
+
+    #[test]
+    fn padded_wrap_round_trips_without_changing_payload() {
+        let cipher = Cipher::new(&[3; 32]);
+        let payload = Bytes::from(vec![7; 1400]);
+        let encrypted = wrap_packet_padded(&cipher, &[4, 3, 2, 1], 9, payload.clone(), 64)
+            .expect("packet must encrypt");
+
+        assert!(encrypted.len() <= PADDING_MTU);
+        assert_eq!(unwrap_packet(&cipher, &encrypted).unwrap(), payload);
+    }
+
+    #[test]
+    fn owned_unwrap_falls_back_for_shared_buffers() {
+        let cipher = Cipher::new(&[8; 32]);
+        let payload = Bytes::from_static(b"shared WebSocket frame payload");
+        let encrypted = wrap_packet(&cipher, &[9, 8, 7, 6], 11, payload.clone(), 0).unwrap();
+        let shared = encrypted.clone();
+
+        assert_eq!(unwrap_packet_bytes(&cipher, encrypted).unwrap(), payload);
+        assert!(!shared.is_empty());
     }
 }
