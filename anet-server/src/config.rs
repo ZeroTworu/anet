@@ -68,6 +68,30 @@ impl Default for AuthenticationConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
+pub struct ControlPlaneConfig {
+    /// UUID узла из панели управления. Пустое значение отключает heartbeat.
+    pub node_id: String,
+    /// Базовый URL API, например http://127.0.0.1:3000/api/v1.
+    pub url: String,
+    /// Одноразово выданный в WebUI секрет этой ноды. Передаётся в X-Node-Token.
+    pub token: String,
+    /// Период исходящего heartbeat, отчёта трафика и polling команд.
+    pub heartbeat_interval_seconds: u64,
+}
+
+impl Default for ControlPlaneConfig {
+    fn default() -> Self {
+        Self {
+            node_id: String::new(),
+            url: String::new(),
+            token: String::new(),
+            heartbeat_interval_seconds: 15,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct NetworkConfig {
     pub mask: String,
     pub net: String,
@@ -130,6 +154,9 @@ pub struct Config {
 
     #[serde(default)]
     pub authentication: AuthenticationConfig,
+
+    #[serde(default)]
+    pub control_plane: ControlPlaneConfig,
 
     #[serde(default)]
     pub stealth: StealthConfig,

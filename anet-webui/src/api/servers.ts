@@ -1,5 +1,8 @@
 import { api } from './client'
-import type { Server, CreateServerRequest } from '@/models/server'
+import type { Server, CreateServerRequest, NodeCommand, NodeCommandStatus, NodeCredential } from '@/models/server'
+
+// API панели управления нодами. Команды admission возвращаются с ID,
+// по которому UI затем отслеживает фактическое выполнение на ноде.
 
 /// Получить список всех зарегистрированных нод
 export async function GetServers(): Promise<Server[]> {
@@ -24,3 +27,21 @@ export async function UpdateServer(id: string, data: Partial<CreateServerRequest
     })
 }
 
+export async function SetNodeAdmission(id: string, acceptingConnections: boolean): Promise<NodeCommand> {
+    return api<NodeCommand>(`/servers/${id}/commands/admission`, {
+        method: 'POST',
+        body: JSON.stringify({ accepting_connections: acceptingConnections }),
+    })
+}
+
+export async function GetNodeCommandStatus(serverId: string, commandId: string): Promise<NodeCommandStatus> {
+    return api<NodeCommandStatus>(`/servers/${serverId}/commands/${commandId}`, {
+        method: 'GET',
+    })
+}
+
+export async function RotateNodeCredential(serverId: string): Promise<NodeCredential> {
+    return api<NodeCredential>(`/servers/${serverId}/credentials`, {
+        method: 'POST',
+    })
+}

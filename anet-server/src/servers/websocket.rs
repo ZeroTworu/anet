@@ -97,7 +97,9 @@ async fn handle_session(
                             Some(Ok(Message::Binary(data))) => {
                                 match anet_common::transport::unwrap_packet_bytes(&cipher, data) {
                                     Ok(packet) => {
+                                        let packet_len = packet.len();
                                         if tun_tx.send(packet).await.is_err() { break; }
+                                        registry.record_rx(&client_info, packet_len);
                                     }
                                     Err(error) => debug!("[WebSocket] Dropped invalid message from {remote_addr}: {error}"),
                                 }

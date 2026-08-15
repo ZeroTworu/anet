@@ -2,13 +2,14 @@ use crate::auth_provider::AuthProvider;
 use crate::ip_pool::IpPool;
 use crate::multikey_udp_socket::StreamSender;
 use anet_common::encryption::Cipher;
+use anet_common::dto::TrafficUsageSample;
 use arc_swap::ArcSwap;
 use bytes::Bytes;
 use dashmap::DashMap;
 use log::{info, warn};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 pub struct ClientTransportInfo {
@@ -19,6 +20,14 @@ pub struct ClientTransportInfo {
     pub nonce_prefix: [u8; 4],
     pub remote_addr: ArcSwap<SocketAddr>,
     pub fingerprint: String,
+    pub user_id: Option<String>,
+}
+
+struct TrafficCounters {
+    user_id: Option<String>,
+    fingerprint: String,
+    rx_bytes: AtomicU64,
+    tx_bytes: AtomicU64,
 }
 
 #[cfg(test)]
@@ -49,6 +58,7 @@ mod tests {
             nonce_prefix: [1, 2, 3, 4],
             remote_addr: ArcSwap::new(Arc::new("127.0.0.1:12345".parse().unwrap())),
             fingerprint: fingerprint.to_string(),
+            user_id: None,
         })
     }
 
@@ -74,6 +84,36 @@ mod tests {
         assert_eq!(resumed.assigned_ip, "10.0.0.3");
         assert!(!registry.can_resume("session-1", "fingerprint-1"));
     }
+
+    #[test]
+    fn admission_state_can_be_changed_by_control_plane() {
+        let registry = registry();
+        assert!(registry.is_accepting_connections());
+        registry.set_accepting_connections(false);
+        assert!(!registry.is_accepting_connections());
+        registry.set_accepting_connections(true);
+        assert!(registry.is_accepting_connections());
+    }
+
+    #[tokio::test]
+    async fn traffic_snapshot_counts_decrypted_payload_bytes() {
+        let registry = registry();
+        let client = client("session-traffic", "fingerprint-traffic");
+        let (router, mut receiver) = mpsc::channel(1);
+        registry.pre_register_client(client.clone());
+        registry.finalize_client(&client.assigned_ip, router);
+
+        registry.record_rx(&client, 120);
+        registry
+            .route_packet_to_client(&client.assigned_ip, Bytes::from(vec![0; 80]))
+            .await;
+        assert_eq!(receiver.recv().await.unwrap().len(), 80);
+
+        let snapshot = registry.traffic_snapshot();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].rx_bytes, 120);
+        assert_eq!(snapshot[0].tx_bytes, 80);
+    }
 }
 
 struct SuspendedSession {
@@ -87,10 +127,13 @@ const RESUME_WINDOW: Duration = Duration::from_secs(45);
 pub struct ClientRegistry {
     clients_by_prefix: Arc<DashMap<[u8; 4], Arc<ClientTransportInfo>>>,
     clients_by_addr: Arc<DashMap<SocketAddr, Arc<ClientTransportInfo>>>,
+    clients_by_ip: Arc<DashMap<String, Arc<ClientTransportInfo>>>,
     quic_router: Arc<DashMap<String, StreamSender>>,
     suspended_sessions: Arc<DashMap<String, SuspendedSession>>,
     auth_provider: Arc<AuthProvider>,
     ip_pool: IpPool,
+    accepting_connections: Arc<AtomicBool>,
+    traffic_totals: Arc<DashMap<String, Arc<TrafficCounters>>>,
 }
 
 impl ClientRegistry {
@@ -98,10 +141,13 @@ impl ClientRegistry {
         Self {
             clients_by_prefix: Arc::new(DashMap::new()),
             clients_by_addr: Arc::new(DashMap::new()),
+            clients_by_ip: Arc::new(DashMap::new()),
             quic_router: Arc::new(DashMap::new()),
             suspended_sessions: Arc::new(DashMap::new()),
             auth_provider,
             ip_pool,
+            accepting_connections: Arc::new(AtomicBool::new(true)),
+            traffic_totals: Arc::new(DashMap::new()),
         }
     }
 
@@ -113,6 +159,57 @@ impl ClientRegistry {
         )
     }
 
+    pub fn active_connection_count(&self) -> usize {
+        // quic_router содержит только завершённые и реально обслуживаемые
+        // подключения, поэтому это значение подходит для least-connections.
+        self.quic_router.len()
+    }
+
+    pub fn is_accepting_connections(&self) -> bool {
+        self.accepting_connections.load(Ordering::Acquire)
+    }
+
+    pub fn set_accepting_connections(&self, accepting: bool) {
+        // Admission влияет только на новые handshake; уже установленные
+        // логические сессии продолжают работать и могут быть resumed.
+        self.accepting_connections.store(accepting, Ordering::Release);
+        info!("[ControlPlane] accepting_connections={accepting}");
+    }
+
+    pub fn record_rx(&self, client: &ClientTransportInfo, bytes: usize) {
+        // Счётчик увеличивается на границе расшифрованной полезной нагрузки,
+        // а не на размере зашифрованного транспорта.
+        self.traffic_counters(client)
+            .rx_bytes
+            .fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    pub fn traffic_snapshot(&self) -> Vec<TrafficUsageSample> {
+        // Нода отправляет cumulative snapshot; панель сама считает дельты
+        // и поэтому безопасно переживает повторы heartbeat/report.
+        self.traffic_totals
+            .iter()
+            .map(|entry| TrafficUsageSample {
+                user_id: entry.user_id.clone(),
+                fingerprint: entry.fingerprint.clone(),
+                rx_bytes: entry.rx_bytes.load(Ordering::Relaxed),
+                tx_bytes: entry.tx_bytes.load(Ordering::Relaxed),
+            })
+            .collect()
+    }
+
+    fn traffic_counters(&self, client: &ClientTransportInfo) -> Arc<TrafficCounters> {
+        self.traffic_totals
+            .entry(client.fingerprint.clone())
+            .or_insert_with(|| Arc::new(TrafficCounters {
+                user_id: client.user_id.clone(),
+                fingerprint: client.fingerprint.clone(),
+                rx_bytes: AtomicU64::new(0),
+                tx_bytes: AtomicU64::new(0),
+            }))
+            .clone()
+    }
+
     pub fn pre_register_client(&self, client_info: Arc<ClientTransportInfo>) {
         let remote_addr = **client_info.remote_addr.load();
         info!(
@@ -121,7 +218,9 @@ impl ClientRegistry {
         );
         self.clients_by_prefix
             .insert(client_info.nonce_prefix, client_info.clone());
-        self.clients_by_addr.insert(remote_addr, client_info);
+        self.clients_by_addr.insert(remote_addr, client_info.clone());
+        self.clients_by_ip
+            .insert(client_info.assigned_ip.clone(), client_info.clone());
     }
 
     pub fn finalize_client(&self, client_ip: &str, router_sender: StreamSender) {
@@ -141,6 +240,7 @@ impl ClientRegistry {
         self.quic_router.remove(client_ip);
         self.clients_by_prefix.remove(&client_info.nonce_prefix);
         self.clients_by_addr.remove(&remote_addr);
+        self.clients_by_ip.remove(client_ip);
 
         if let Ok(ip_addr) = client_ip.parse::<Ipv4Addr>() {
             self.ip_pool.release(ip_addr);
@@ -163,6 +263,7 @@ impl ClientRegistry {
         self.quic_router.remove(&client_ip);
         self.clients_by_prefix.remove(&client_info.nonce_prefix);
         self.clients_by_addr.remove(&remote_addr);
+        self.clients_by_ip.remove(&client_ip);
         self.suspended_sessions.insert(
             client_info.session_id.clone(),
             SuspendedSession {
@@ -276,8 +377,13 @@ impl ClientRegistry {
 
     pub async fn route_packet_to_client(&self, dst_ip: &str, packet: Bytes) {
         if let Some(sender) = self.quic_router.get(dst_ip) {
+            let packet_len = packet.len();
             if sender.send(packet).await.is_err() {
                 warn!("[Registry] Failed to route to {}: channel closed.", dst_ip);
+            } else if let Some(client) = self.clients_by_ip.get(dst_ip) {
+                self.traffic_counters(&client)
+                    .tx_bytes
+                    .fetch_add(packet_len as u64, Ordering::Relaxed);
             }
         }
     }

@@ -24,6 +24,9 @@ export function useUser() {
       is_active: user.value.is_active,
       static_ip: user.value.static_ip,
       server_ids: user.value.server_ids || [],
+      pool_ids: user.value.pool_ids || [],
+      route_map_id: user.value.route_map_id || undefined,
+      clear_route_map: !user.value.route_map_id,
     })
   }
 

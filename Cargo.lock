@@ -341,6 +341,7 @@ dependencies = [
  "dotenvy",
  "ed25519-dalek 2.2.0",
  "env_logger",
+ "ipnet",
  "jsonwebtoken",
  "log",
  "poem",
@@ -352,6 +353,7 @@ dependencies = [
  "serde",
  "sha2 0.10.9",
  "tokio",
+ "toml 0.9.8",
  "uuid",
 ]
 

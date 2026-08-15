@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { onBeforeUnmount, onMounted, ref } from 'vue'
 import { GetServers, CreateServer } from '@/api/servers'
 import type { Server, CreateServerRequest } from '@/models/server'
 import ServerModal from '@/components/ServerModal.vue'
@@ -11,6 +11,15 @@ const createLoading = ref(false)
 
 const selectedServer = ref<Server | null>(null)
 const showEditModal = ref(false)
+let refreshTimer: number | undefined
+
+const formatUptime = (seconds?: number) => {
+  if (seconds === undefined) return '—'
+  const days = Math.floor(seconds / 86400)
+  const hours = Math.floor((seconds % 86400) / 3600)
+  const minutes = Math.floor((seconds % 3600) / 60)
+  return days > 0 ? `${days}d ${hours}h` : `${hours}h ${minutes}m`
+}
 
 const form = ref<CreateServerRequest>({
   name: '',
@@ -65,7 +74,14 @@ const closeEditModal = () => {
   selectedServer.value = null
 }
 
-onMounted(loadServers)
+onMounted(() => {
+  loadServers()
+  refreshTimer = window.setInterval(loadServers, 15_000)
+})
+
+onBeforeUnmount(() => {
+  if (refreshTimer !== undefined) window.clearInterval(refreshTimer)
+})
 </script>
 
 <template>
@@ -82,7 +98,12 @@ onMounted(loadServers)
           <tr>
             <th>Название</th>
             <th>IP / Домен</th>
-            <th>Status</th>
+            <th>Configured</th>
+            <th>Actual state</th>
+            <th>Control plane</th>
+            <th>Connections</th>
+            <th>Admission</th>
+            <th>Uptime</th>
             <th>QUIC Port</th>
             <th>SSH Port</th>
             <th>VNC Port</th>
@@ -98,6 +119,28 @@ onMounted(loadServers)
                 {{ item.is_active ? 'ВКЛ' : 'ВЫКЛ' }}
               </n-tag>
             </td>
+            <td>
+              <n-tag
+                  :type="item.runtime?.status === 'online' ? 'success' : 'error'"
+                  round
+                  size="small"
+              >
+                {{ item.runtime?.status === 'online' ? 'ONLINE' : 'OFFLINE' }}
+              </n-tag>
+              <div v-if="item.runtime" class="runtime-version">v{{ item.runtime.version }}</div>
+            </td>
+            <td>
+              <n-tag :type="item.has_control_credential ? 'success' : 'warning'" size="small">
+                {{ item.has_control_credential ? 'READY' : 'SETUP REQUIRED' }}
+              </n-tag>
+            </td>
+            <td class="metric-col">{{ item.runtime?.active_connections ?? 0 }}</td>
+            <td>
+              <n-tag :type="item.runtime ? (item.runtime.accepting_connections ? 'success' : 'warning') : 'default'" size="small">
+                {{ !item.runtime ? 'UNKNOWN' : item.runtime.accepting_connections ? 'OPEN' : 'CLOSED' }}
+              </n-tag>
+            </td>
+            <td class="metric-col">{{ formatUptime(item.runtime?.uptime_seconds) }}</td>
             <td><n-tag :type="item.is_active && item.quic_port ? 'success' : 'default'" size="small">{{ item.quic_port || 'Closed' }}</n-tag></td>
             <td><n-tag :type="item.is_active && item.ssh_port ? 'warning' : 'default'" size="small">{{ item.ssh_port || 'Closed' }}</n-tag></td>
             <td><n-tag :type="item.is_active && item.vnc_port ? 'info' : 'default'" size="small">{{ item.vnc_port || 'Closed' }}</n-tag></td>
@@ -214,6 +257,18 @@ onMounted(loadServers)
 .addr-col {
   font-family: 'Fira Code', 'Courier New', Courier, monospace !important;
   color: #4a5568 !important;
+}
+
+.metric-col {
+  font-family: 'Fira Code', 'Courier New', Courier, monospace;
+  white-space: nowrap;
+}
+
+.runtime-version {
+  margin-top: 4px;
+  color: #64748b;
+  font-family: monospace;
+  font-size: 11px;
 }
 
 @media (prefers-color-scheme: dark) {

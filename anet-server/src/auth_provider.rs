@@ -4,6 +4,12 @@ use std::time::Duration;
 
 use anet_common::dto::{CheckAccessRequest, CheckAccessResponse, SessionEventRequest};
 
+#[derive(Debug, Clone)]
+pub struct AccessGrant {
+    pub static_ip: Option<String>,
+    pub user_id: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct AuthProvider {
     /// Локальный "белый список" (VIP, админы, резерв)
@@ -39,10 +45,10 @@ impl AuthProvider {
     }
 
     /// Проверяет, разрешен ли доступ клиенту с данным fingerprint
-    pub async fn is_client_allowed(&self, fingerprint: &str) -> Result<Option<String>, String> {
+    pub async fn is_client_allowed(&self, fingerprint: &str) -> Result<AccessGrant, String> {
         // 1. Локальный список (VIP)
         if self.allowed_clients.iter().any(|c| c == fingerprint) {
-            return Ok(None);
+            return Ok(AccessGrant { static_ip: None, user_id: None });
         }
 
         // 2. Внешние сервера
@@ -59,7 +65,7 @@ impl AuthProvider {
                         reqwest::StatusCode::OK => {
                             if let Ok(json) = resp.json::<CheckAccessResponse>().await {
                                 return if json.allowed {
-                                    Ok(json.static_ip)
+                                    Ok(AccessGrant { static_ip: json.static_ip, user_id: json.user_id })
                                 } else {
                                     Err(json.message)
                                 }

@@ -26,8 +26,10 @@ impl<E: Endpoint> Endpoint for ApiKeyEndpoint<E> {
     type Output = E::Output;
 
     async fn call(&self, req: Request) -> Result<Self::Output> {
-        // Если не точка сервера - пускать всех
-        if !req.uri().path().contains("/check_access") {
+        // Служебные точки доступны только доверенным VPN-нодам.
+        let protected_node_endpoint =
+            req.uri().path().contains("/check_access") || req.uri().path().contains("/session/");
+        if !protected_node_endpoint {
             return self.ep.call(req).await;
         }
 

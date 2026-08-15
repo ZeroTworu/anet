@@ -17,7 +17,7 @@ const submit = async () => {
     })
 
     localStorage.setItem('token', token)
-    router.push('/users')
+    router.push('/overview')
   } finally {
     loading.value = false
   }

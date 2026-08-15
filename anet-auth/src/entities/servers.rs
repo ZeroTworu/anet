@@ -1,3 +1,8 @@
+//! Зарегистрированная VPN-нода и её параметры подключения.
+//!
+//! `control_token_hash` используется только для исходящих heartbeat/command/
+//! traffic запросов и никогда не возвращается обычному списку нод.
+
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -17,6 +22,7 @@ pub struct Model {
     pub created_at: DateTime,
     pub updated_at: DateTime,
     pub is_active: bool,
+    pub control_token_hash: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

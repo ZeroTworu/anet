@@ -86,7 +86,12 @@ async fn handle_vnc_session(
     registry.finalize_client(&client_info.assigned_ip, router_tx);
 
     let (reader, writer) = tokio::io::split(stream);
-    let mut inbound = tokio::spawn(receive_from_client(reader, tun_tx, client_info.clone()));
+    let mut inbound = tokio::spawn(receive_from_client(
+        reader,
+        tun_tx,
+        client_info.clone(),
+        registry.clone(),
+    ));
     let mut outbound = tokio::spawn(send_to_client(
         writer,
         router_rx,
@@ -148,14 +153,17 @@ async fn receive_from_client(
     mut reader: tokio::io::ReadHalf<TcpStream>,
     tun_tx: mpsc::Sender<Bytes>,
     client_info: Arc<ClientTransportInfo>,
+    registry: Arc<ClientRegistry>,
 ) -> Result<()> {
     while let Some(encrypted) = read_cut_text(&mut reader, CLIENT_CUT_TEXT).await? {
         let packet =
             anet_common::transport::unwrap_packet_bytes_in_place(&client_info.cipher, encrypted)?;
+        let packet_len = packet.len();
         tun_tx
             .send(packet)
             .await
             .context("TUN input queue closed")?;
+        registry.record_rx(&client_info, packet_len);
     }
     Ok(())
 }

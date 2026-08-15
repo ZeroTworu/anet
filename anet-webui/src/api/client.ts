@@ -18,5 +18,9 @@ export async function api<T>(url: string, options: RequestInit = {}): Promise<T>
     throw new Error(`HTTP ${res.status}`)
   }
 
+  if (res.status === 204) {
+    return undefined as T
+  }
+
   return res.json() as Promise<T>
 }

@@ -139,11 +139,14 @@ pub async fn run_quic_server(
                 });
 
                 let ci_rx = client_info.clone();
+                let rx_registry = r.clone();
                 let mut reader_task = tokio::spawn(async move {
                     while let Ok(Some(pkt)) = read_next_packet(&mut recv).await {
+                        let packet_len = pkt.len();
                         if t_tx.send(pkt).await.is_err() {
                             break;
                         }
+                        rx_registry.record_rx(&ci_rx, packet_len);
                     }
                     warn!("Client {} rx abort", ci_rx.assigned_ip);
                 });

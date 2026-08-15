@@ -34,6 +34,7 @@ pub struct TempDHInfo {
     pub created_at: Instant,
     pub client_fingerprint: String,
     pub static_ip: Option<String>,
+    pub user_id: Option<String>,
     pub resume_session_id: String,
 }
 

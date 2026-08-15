@@ -67,6 +67,12 @@ impl ANetServer {
     pub async fn run(&mut self) -> Result<()> {
         let (tx_tun, mut rx_tun) = self.tun_manager.run().await?;
 
+        let control_config = self.cfg.control_plane.clone();
+        let control_registry = self.registry.clone();
+        tokio::spawn(async move {
+            crate::control_plane::run_heartbeat(control_config, control_registry).await;
+        });
+
         // 1. Дешифратор маршрутов: от ядра ОС к внутренним регистрам UDP/TCP транспорта
         let rx_reg = self.registry.clone();
         tokio::spawn(async move {

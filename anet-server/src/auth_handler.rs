@@ -262,13 +262,15 @@ impl ServerAuthHandler {
             .registry
             .can_resume(&req.resume_session_id, &client_fingerprint);
         let access = if resume_allowed {
-            Ok(None)
+            Ok(crate::auth_provider::AccessGrant { static_ip: None, user_id: None })
+        } else if !self.registry.is_accepting_connections() {
+            Err("Node is not accepting new connections".to_string())
         } else {
             self.auth_provider.is_client_allowed(&client_fingerprint).await
         };
 
         match access {
-            Ok(static_ip) => {
+            Ok(grant) => {
                 // --- ЛОГИКА УСПЕХА (DH Phase 1) ---
                 let mut signed_handshake = req.public_key.clone();
                 if !req.resume_session_id.is_empty() {
@@ -294,7 +296,8 @@ impl ServerAuthHandler {
                     TempDHInfo {
                         shared_key: crypto_utils::derive_shared_key(&shared_secret),
                         client_fingerprint,
-                        static_ip,
+                        static_ip: grant.static_ip,
+                        user_id: grant.user_id,
                         resume_session_id: req.resume_session_id,
                         created_at: Instant::now(),
                     },
@@ -378,12 +381,17 @@ impl ServerAuthHandler {
         if !req.resume_session_id.is_empty() && resumed.is_none() {
             anyhow::bail!("Requested VPN session is not available for resume");
         }
-        let (assigned_ip, session_id, is_resume) = if let Some(previous) = resumed {
+        let (assigned_ip, session_id, is_resume, user_id) = if let Some(previous) = resumed {
             info!(
                 "[AUTH] Resuming logical session {} on a new transport",
                 previous.session_id
             );
-            (previous.assigned_ip.clone(), previous.session_id.clone(), true)
+            (
+                previous.assigned_ip.clone(),
+                previous.session_id.clone(),
+                true,
+                previous.user_id.clone(),
+            )
         } else {
             let assigned_ip = if let Some(static_ip) = temp_info.static_ip {
                 info!(
@@ -397,7 +405,7 @@ impl ServerAuthHandler {
                     .context("IP POOL FOOL")?
                     .to_string()
             };
-            (assigned_ip, generate_seid(), false)
+            (assigned_ip, generate_seid(), false, temp_info.user_id.clone())
         };
 
         let nonce_prefix = generate_unique_nonce_prefix(self.registry.clone());
@@ -410,6 +418,7 @@ impl ServerAuthHandler {
             nonce_prefix,
             remote_addr: ArcSwap::new(Arc::new(remote_addr)),
             fingerprint: temp_info.client_fingerprint.clone(),
+            user_id,
         });
 
         self.registry.pre_register_client(client_info.clone());

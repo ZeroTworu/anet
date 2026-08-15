@@ -4,3 +4,5 @@ pub mod keygen;
 pub mod middleware;
 pub mod migration;
 pub mod crypto;
+pub mod balancer;
+pub mod route_compiler;

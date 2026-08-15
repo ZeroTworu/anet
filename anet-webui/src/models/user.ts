@@ -14,6 +14,8 @@ export type User = {
   rate: Rate | null
   static_ip: string | null
   server_ids: string[]
+  pool_ids: string[]
+  route_map_id: string | null
 }
 
 export type UpdateUserRequest = {
@@ -21,6 +23,9 @@ export type UpdateUserRequest = {
   is_active: boolean
   static_ip: string | null
   server_ids: string[]
+  pool_ids: string[]
+  route_map_id?: string
+  clear_route_map?: boolean
 }
 
 export type RegenerateUserRequest = {
@@ -35,4 +40,6 @@ export type CreateUserRequest = {
   uid: string
   rate: RateReqRequest | null
   server_ids: string[]
+  pool_ids: string[]
+  route_map_id: string | null
 }

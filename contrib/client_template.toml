@@ -1,5 +1,5 @@
 # =========================================================================
-# ANET Client: Base Configuration Template (Dynamic)
+# ANET Client: базовый шаблон конфигурации, который панель заполняет динамически
 # =========================================================================
 [main]
 # Название виртуального адаптера
@@ -11,18 +11,18 @@ manual_routing = false
 # Windows per-app split tunneling.
 # include-режим: в туннель идут ТОЛЬКО эти процессы.
 # per_app = ["firefox.exe", "telegram.exe"]
-# per_app_exclude = false
+# per_app_mode = "include"
 
-per_app = []
-per_app_exclude = false
+per_app = {{PER_APP}}
+per_app_mode = "{{PER_APP_MODE}}"
 
 # exclude-режим (в туннель всё, КРОМЕ этих):
 # per_app = ["steam.exe"]
-# per_app_exclude = true
+# per_app_mode = "exclude"
 
 # Настройки Маршрутизации (Split Tunneling)
-route_for = []
-exclude_route_for = ["192.168.1.0/24"]
+route_for = {{ROUTE_FOR}}
+exclude_route_for = {{EXCLUDE_ROUTE_FOR}}
 
 # Список DNS-серверов, используемых при запуске для резолва доменов
 dns_server_list = ["1.1.1.1", "8.8.8.8"]
