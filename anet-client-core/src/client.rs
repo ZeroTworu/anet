@@ -530,14 +530,12 @@ impl AnetClient {
                     }
                     is_initial_phase = false;
                 } else {
-                    // Ошибка Блэкхолинга (CASE 2) срабатывает ТОЛЬКО если мы пытаемся что-то отправить (в последние 10с),
-                    // но ответа нет 15с. Если elapsed_tx тоже большое — значит юзер просто отошел попить чай (AFK).
-                    if elapsed_rx > Duration::from_secs(15) && elapsed_tx < Duration::from_secs(10) {
-                        warn!("[Health] CASE 2 Detected: Active tunnel lost traffic flow (15s inactivity timeout)!");
-                        warn("[Health] CASE 2 Detected: Active tunnel lost traffic flow (15s inactivity timeout)!");
-                        monitor_reconnect.notify_one();
-                        break;
-                    }
+                    // После успешного старта отсутствие входящих IP-пакетов не
+                    // доказывает разрыв туннеля: трафик может быть асимметричным,
+                    // идти пакетами, не попадающими в TUN, или временно не иметь
+                    // обратного направления. Реальный обрыв определяется
+                    // сетевыми worker-ами по EOF/ошибке чтения или записи.
+                    // Поэтому payload inactivity больше не вызывает реконнект.
                 }
             }
         });

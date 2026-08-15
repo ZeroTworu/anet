@@ -94,14 +94,23 @@ async fn handle_vnc_session(
         config.stealth.clone(),
     ));
 
-    let result = tokio::select! {
-        result = &mut inbound => flatten_worker_result("reader", result),
-        result = &mut outbound => flatten_worker_result("writer", result),
+    enum FinishedWorker {
+        Inbound,
+        Outbound,
+    }
+
+    let (finished_worker, result) = tokio::select! {
+        result = &mut inbound => (FinishedWorker::Inbound, flatten_worker_result("reader", result)),
+        result = &mut outbound => (FinishedWorker::Outbound, flatten_worker_result("writer", result)),
     };
-    inbound.abort();
-    outbound.abort();
-    let _ = inbound.await;
-    let _ = outbound.await;
+    if !matches!(finished_worker, FinishedWorker::Inbound) {
+        inbound.abort();
+        let _ = inbound.await;
+    }
+    if !matches!(finished_worker, FinishedWorker::Outbound) {
+        outbound.abort();
+        let _ = outbound.await;
+    }
     registry.remove_client(&client_info);
     result
 }

@@ -113,17 +113,39 @@ impl ClientTransport for VncTransport {
                 stealth,
             ));
 
-            let result = tokio::select! {
-                result = &mut tunnel_input => flatten_worker_result("TUN reader", result),
-                result = &mut inbound => flatten_worker_result("network reader", result),
-                result = &mut outbound => flatten_worker_result("network writer", result),
+            enum FinishedWorker {
+                TunnelInput,
+                Inbound,
+                Outbound,
+            }
+
+            let (finished_worker, result) = tokio::select! {
+                result = &mut tunnel_input => (
+                    FinishedWorker::TunnelInput,
+                    flatten_worker_result("TUN reader", result),
+                ),
+                result = &mut inbound => (
+                    FinishedWorker::Inbound,
+                    flatten_worker_result("network reader", result),
+                ),
+                result = &mut outbound => (
+                    FinishedWorker::Outbound,
+                    flatten_worker_result("network writer", result),
+                ),
             };
-            tunnel_input.abort();
-            inbound.abort();
-            outbound.abort();
-            let _ = tunnel_input.await;
-            let _ = inbound.await;
-            let _ = outbound.await;
+
+            if !matches!(finished_worker, FinishedWorker::TunnelInput) {
+                tunnel_input.abort();
+                let _ = tunnel_input.await;
+            }
+            if !matches!(finished_worker, FinishedWorker::Inbound) {
+                inbound.abort();
+                let _ = inbound.await;
+            }
+            if !matches!(finished_worker, FinishedWorker::Outbound) {
+                outbound.abort();
+                let _ = outbound.await;
+            }
             match result {
                 Ok(()) => info!("[VNC] Tunnel closed"),
                 Err(error) => warn!("[VNC] Tunnel stopped: {error:#}"),
