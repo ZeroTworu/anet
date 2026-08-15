@@ -43,6 +43,10 @@ Source: "anet-client.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "anet-gui.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "anet-gui-debug.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "wintun.dll"; DestDir: "{app}"; Flags: ignoreversion
+; WinDivert is required by the per-app split-tunneling backend.  The driver
+; must be installed next to the executable so WinDivert can load it at runtime.
+Source: "WinDivert.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "WinDivert64.sys"; DestDir: "{app}"; Flags: ignoreversion
 Source: "anet.ico"; DestDir: "{app}"; Flags: ignoreversion
 
 ; 2. КОНФИГ: Устанавливается в {userappdata}\anet\. Флаг onlyifdoesntexist гарантирует, что пользовательский конфиг не будет затерт при обновлении.

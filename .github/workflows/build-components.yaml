@@ -557,6 +557,12 @@ jobs:
           # Проверка итоговых файлов
           Write-Host "Final files in installer_source:"
           Get-ChildItem "installer_source"
+          $required = @("anet-client.exe", "anet-gui.exe", "anet-gui-debug.exe", "wintun.dll", "WinDivert.dll", "WinDivert64.sys", "client.toml", "install.iss", "anet.ico")
+          foreach ($file in $required) {
+            if (-not (Test-Path "installer_source\$file")) {
+              throw "Required installer file is missing: $file"
+            }
+          }
 
       - name: Set Release Version (for ISCC Define)
         shell: bash
