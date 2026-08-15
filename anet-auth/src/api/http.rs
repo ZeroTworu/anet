@@ -930,14 +930,14 @@ impl VpnApi {
                 fallback_pub_key = server.public_key.clone();
             }
 
-            if let Some(port) = server.quic_port {
+            if let Some(port) = server.quic_port.filter(|port| *port > 0) {
                 servers_toml.push_str(&format!(
                     "[[servers]]\nname = \"{}\"\naddress = \"{}:{}\"\nmode = \"quic\"\ntimeout_secs = 5\nserver_pub_key = \"{}\"\n\n",
                     format!("{} [QUIC]", server.name), server.address, port, server.public_key
                 ));
             }
 
-            if let Some(port) = server.ssh_port {
+            if let Some(port) = server.ssh_port.filter(|port| *port > 0) {
                 let user_name = server.ssh_user.as_deref().unwrap_or("hanyuu");
                 servers_toml.push_str(&format!(
                     "[[servers]]\nname = \"{}\"\naddress = \"{}:{}\"\nmode = \"ssh\"\nssh_user = \"{}\"\ntimeout_secs = 6\nserver_pub_key = \"{}\"\n\n",
@@ -945,14 +945,14 @@ impl VpnApi {
                 ));
             }
 
-            if let Some(port) = server.vnc_port {
+            if let Some(port) = server.vnc_port.filter(|port| *port > 0) {
                 servers_toml.push_str(&format!(
                     "[[servers]]\nname = \"{}\"\naddress = \"{}:{}\"\nmode = \"vnc\"\ntimeout_secs = 8\nserver_pub_key = \"{}\"\n\n",
                     format!("{} [VNC]", server.name), server.address, port, server.public_key
                 ));
             }
 
-            if let Some(url) = server.websocket_url {
+            if let Some(url) = server.websocket_url.filter(|url| !url.trim().is_empty()) {
                 servers_toml.push_str(&format!(
                     "[[servers]]\nname = \"{}\"\naddress = \"{}\"\nmode = \"websocket\"\nwebsocket_url = \"{}\"\ntimeout_secs = 8\nserver_pub_key = \"{}\"\n\n",
                     format!("{} [WS]", server.name), server.address, url, server.public_key
