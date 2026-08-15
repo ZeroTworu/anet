@@ -78,73 +78,73 @@ onMounted(load)
 
 <template>
   <main class="pools-page">
-    <n-space justify="space-between" align="center" class="page-title">
+    <div justify="space-between" align="center" class="page-title">
       <div><h2>Node Pools</h2><span>Группы узлов и стратегия выбора entry point</span></div>
-      <n-button type="primary" @click="openCreate">Создать pool</n-button>
-    </n-space>
+      <v-btn color="primary" @click="openCreate">Создать pool</v-btn>
+    </div>
 
-    <n-spin :show="loading">
-      <n-grid :cols="1" :x-gap="16" :y-gap="16" responsive="screen" item-responsive>
-        <n-grid-item v-for="pool in pools" :key="pool.id">
-          <n-card hoverable @click="openEdit(pool)">
-            <n-space justify="space-between" align="start">
+    <div class="position-relative">
+      <v-row :cols="1" :x-gap="16" :y-gap="16" responsive="screen" item-responsive>
+        <v-col v-for="pool in pools" :key="pool.id">
+          <v-card hoverable @click="openEdit(pool)">
+            <div justify="space-between" align="start">
               <div>
-                <n-space align="center">
+                <div align="center">
                   <strong>{{ pool.name }}</strong>
-                  <n-tag :type="pool.is_active ? 'success' : 'default'" size="small">{{ pool.is_active ? 'ACTIVE' : 'DISABLED' }}</n-tag>
-                </n-space>
+                  <v-chip  :color="pool.is_active ? 'success' : 'default'" size="small">{{ pool.is_active ? 'ACTIVE' : 'DISABLED' }}</v-chip>
+                </div>
                 <div class="strategy">{{ pool.strategy === 'weighted' ? 'Weighted rendezvous' : 'Least connections' }}</div>
               </div>
-              <n-space align="center">
-                <n-statistic label="Nodes" :value="pool.members.length" />
-                <n-popconfirm @positive-click="removePool(pool.id)">
-                  <template #trigger><n-button type="error" text @click.stop>Удалить</n-button></template>
+              <div align="center">
+                <div label="Nodes" :modelValue="pool.members.length" />
+                <div>
+                  <v-btn color="error" text @click.stop>Удалить</v-btn>
                   Удалить pool и назначения пользователей?
-                </n-popconfirm>
-              </n-space>
-            </n-space>
-            <n-space class="members">
-              <n-tag v-for="member in pool.members" :key="member.server_id" size="small">
+                </div>
+              </div>
+            </div>
+            <div class="members">
+              <v-chip v-for="member in pool.members" :key="member.server_id" size="small">
                 {{ serverById.get(member.server_id)?.name || member.server_id }} · w{{ member.weight }}
-              </n-tag>
-            </n-space>
-          </n-card>
-        </n-grid-item>
-      </n-grid>
-      <n-empty v-if="pools.length === 0" description="Pools ещё не созданы" />
-    </n-spin>
+              </v-chip>
+            </div>
+          </v-card>
+        </v-col>
+      </v-row>
+      <v-empty-state v-if="pools.length === 0" description="Pools ещё не созданы" />
+    </div>
 
-    <n-modal v-model:show="showEditor" preset="card" style="width: 720px" :title="editingId ? 'Редактировать pool' : 'Создать pool'">
-      <n-form>
-        <n-form-item label="Название"><n-input v-model:value="form.name" /></n-form-item>
-        <n-form-item label="Стратегия"><n-select v-model:value="form.strategy" :options="strategyOptions" /></n-form-item>
-        <n-form-item label="Активен"><n-switch v-model:value="form.is_active" /></n-form-item>
-        <n-divider>Узлы</n-divider>
-        <n-space vertical style="width: 100%">
-          <n-space v-for="(member, index) in form.members" :key="member.server_id" align="center" justify="space-between">
+    <v-dialog v-model="showEditor" style="width: 720px" :title="editingId ? 'Редактировать pool' : 'Создать pool'">
+      <v-form>
+        <div label="Название"><v-text-field v-model="form.name" /></div>
+        <div label="Стратегия"><v-select v-model="form.strategy" :items="strategyOptions" /></div>
+        <div label="Активен"><v-switch v-model="form.is_active" /></div>
+        <v-divider>Узлы</v-divider>
+        <div vertical style="width: 100%">
+          <div v-for="(member, index) in form.members" :key="member.server_id" align="center" justify="space-between">
             <span>{{ serverById.get(member.server_id)?.name || member.server_id }}</span>
-            <n-space align="center">
+            <div align="center">
               <span class="weight-label">Вес</span>
-              <n-input-number v-model:value="member.weight" :min="1" :max="10000" style="width: 110px" />
-              <n-button text type="error" @click="form.members.splice(index, 1)">Убрать</n-button>
-            </n-space>
-          </n-space>
-          <n-select
+              <v-number-input v-model="member.weight" :min="1" :max="10000" style="width: 110px" />
+              <v-btn text color="error" @click="form.members.splice(index, 1)">Убрать</v-btn>
+            </div>
+          </div>
+          <v-select
               v-if="availableServers.length"
-              :value="null"
-              :options="availableServers.map(server => ({ label: `${server.name} (${server.address})`, value: server.id }))"
+              :modelValue="null"
+              :items="availableServers.map(server => ({ title: `${server.name} (${server.dsn})`, value: server.id }))"
               placeholder="Добавить узел"
-              @update:value="addNode"
+              @update:modelValue="value => value && addNode(String(value))"
           />
-        </n-space>
-      </n-form>
-      <template #footer>
-        <n-space justify="end">
-          <n-button @click="showEditor = false">Отмена</n-button>
-          <n-button type="primary" :loading="saving" :disabled="!form.name.trim()" @click="save">Сохранить</n-button>
-        </n-space>
-      </template>
-    </n-modal>
+        </div>
+      </v-form>
+      <div class="d-flex justify-end ga-4">
+        <div justify="end">
+          <v-btn @click="showEditor = false">Отмена</v-btn>
+          <v-btn color="primary" :loading="saving" :disabled="!form.name.trim()" @click="save">Сохранить</v-btn>
+        </div>
+      </div>
+    </v-dialog>
   </main>
 </template>
 

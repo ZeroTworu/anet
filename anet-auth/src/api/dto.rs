@@ -15,12 +15,8 @@ pub use anet_common::dto::{
 pub struct ServerDto {
     pub id: uuid::Uuid,
     pub name: String,
-    pub address: String,
+    pub dsn: String,
     pub public_key: String,
-    pub quic_port: Option<i32>,
-    pub ssh_port: Option<i32>,
-    pub vnc_port: Option<i32>,
-    pub websocket_url: Option<String>,
     pub ssh_user: Option<String>,
     pub is_active: bool,
     pub has_control_credential: bool,
@@ -212,12 +208,8 @@ pub enum GetTrafficHistoryResponse {
 #[derive(Object, Debug, Clone, Serialize, Deserialize)]
 pub struct CreateServerRequest {
     pub name: String,
-    pub address: String,
+    pub dsn: String,
     pub public_key: String,
-    pub quic_port: Option<i32>,
-    pub ssh_port: Option<i32>,
-    pub vnc_port: Option<i32>,
-    pub websocket_url: Option<String>,
     pub ssh_user: Option<String>,
     pub is_active: Option<bool>,
 }
@@ -236,12 +228,8 @@ pub enum GetServersResponse {
 #[derive(Object, Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateServerRequest {
     pub name: Option<String>,
-    pub address: Option<String>,
+    pub dsn: Option<String>,
     pub public_key: Option<String>,
-    pub quic_port: Option<Option<i32>>,
-    pub ssh_port: Option<Option<i32>>,
-    pub vnc_port: Option<Option<i32>>,
-    pub websocket_url: Option<Option<String>>,
     pub ssh_user: Option<Option<String>>,
     pub is_active: Option<bool>,
 }

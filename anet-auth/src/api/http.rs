@@ -379,12 +379,13 @@ impl VpnApi {
         let new_server = servers::ActiveModel {
             id: Set(server_id),
             name: Set(req.0.name.clone()),
-            address: Set(req.0.address.clone()),
+            address: Set(String::new()),
+            dsn: Set(req.0.dsn.clone()),
             public_key: Set(req.0.public_key.clone()),
-            quic_port: Set(req.0.quic_port),
-            ssh_port: Set(req.0.ssh_port),
-            vnc_port: Set(req.0.vnc_port),
-            websocket_url: Set(req.0.websocket_url),
+            quic_port: Set(None),
+            ssh_port: Set(None),
+            vnc_port: Set(None),
+            websocket_url: Set(None),
             ssh_user: Set(req.0.ssh_user.clone()),
             is_active: Set(req.0.is_active.unwrap_or(true)),
             control_token_hash: Set(None),
@@ -396,12 +397,8 @@ impl VpnApi {
             Ok(saved) => Ok(Json(ServerDto {
                 id: saved.id,
                 name: saved.name,
-                address: saved.address,
+                dsn: saved.dsn,
                 public_key: saved.public_key,
-                quic_port: saved.quic_port,
-                ssh_port: saved.ssh_port,
-                vnc_port: saved.vnc_port,
-                websocket_url: saved.websocket_url,
                 ssh_user: saved.ssh_user,
                 is_active: saved.is_active,
                 has_control_credential: saved.control_token_hash.is_some(),
@@ -438,28 +435,12 @@ impl VpnApi {
             active_model.name = Set(name);
             changed = true;
         }
-        if let Some(address) = req.0.address {
-            active_model.address = Set(address);
+        if let Some(dsn) = req.0.dsn {
+            active_model.dsn = Set(dsn);
             changed = true;
         }
         if let Some(pub_key) = req.0.public_key {
             active_model.public_key = Set(pub_key);
-            changed = true;
-        }
-        if let Some(port) = req.0.quic_port {
-            active_model.quic_port = Set(port);
-            changed = true;
-        }
-        if let Some(port) = req.0.ssh_port {
-            active_model.ssh_port = Set(port);
-            changed = true;
-        }
-        if let Some(port) = req.0.vnc_port {
-            active_model.vnc_port = Set(port);
-            changed = true;
-        }
-        if let Some(url) = req.0.websocket_url {
-            active_model.websocket_url = Set(url);
             changed = true;
         }
         if let Some(user) = req.0.ssh_user {
@@ -477,12 +458,8 @@ impl VpnApi {
                 Ok(saved) => UpdateServerApiResult::Ok(Json(ServerDto {
                     id: saved.id,
                     name: saved.name,
-                    address: saved.address,
+                    dsn: saved.dsn,
                     public_key: saved.public_key,
-                    quic_port: saved.quic_port,
-                    ssh_port: saved.ssh_port,
-                    vnc_port: saved.vnc_port,
-                    websocket_url: saved.websocket_url,
                     ssh_user: saved.ssh_user,
                     is_active: saved.is_active,
                     has_control_credential: saved.control_token_hash.is_some(),
@@ -494,12 +471,8 @@ impl VpnApi {
             UpdateServerApiResult::Ok(Json(ServerDto {
                 id: server_model.id,
                 name: server_model.name,
-                address: server_model.address,
+                dsn: server_model.dsn,
                 public_key: server_model.public_key,
-                quic_port: server_model.quic_port,
-                ssh_port: server_model.ssh_port,
-                vnc_port: server_model.vnc_port,
-                websocket_url: server_model.websocket_url,
                 ssh_user: server_model.ssh_user,
                 is_active: server_model.is_active,
                 has_control_credential: server_model.control_token_hash.is_some(),
@@ -545,12 +518,8 @@ impl VpnApi {
                         }),
                         id: s.id,
                         name: s.name,
-                        address: s.address,
+                        dsn: s.dsn,
                         public_key: s.public_key,
-                        quic_port: s.quic_port,
-                        ssh_port: s.ssh_port,
-                        vnc_port: s.vnc_port,
-                        websocket_url: s.websocket_url,
                         ssh_user: s.ssh_user,
                         is_active: s.is_active,
                         has_control_credential: s.control_token_hash.is_some(),
@@ -2379,34 +2348,19 @@ impl VpnApi {
                 fallback_pub_key = server.public_key.clone();
             }
 
-            if let Some(port) = server.quic_port.filter(|port| *port > 0) {
-                servers_toml.push_str(&format!(
-                    "[[servers]]\nname = \"{}\"\naddress = \"{}:{}\"\nmode = \"quic\"\ntimeout_secs = 5\nserver_pub_key = \"{}\"\n\n",
-                    format!("{} [QUIC]", server.name), server.address, port, server.public_key
-                ));
+            if server.dsn.trim().is_empty() {
+                continue;
             }
 
-            if let Some(port) = server.ssh_port.filter(|port| *port > 0) {
-                let user_name = server.ssh_user.as_deref().unwrap_or("hanyuu");
-                servers_toml.push_str(&format!(
-                    "[[servers]]\nname = \"{}\"\naddress = \"{}:{}\"\nmode = \"ssh\"\nssh_user = \"{}\"\ntimeout_secs = 6\nserver_pub_key = \"{}\"\n\n",
-                    format!("{} [SSH]", server.name), server.address, port, user_name, server.public_key
-                ));
-            }
-
-            if let Some(port) = server.vnc_port.filter(|port| *port > 0) {
-                servers_toml.push_str(&format!(
-                    "[[servers]]\nname = \"{}\"\naddress = \"{}:{}\"\nmode = \"vnc\"\ntimeout_secs = 8\nserver_pub_key = \"{}\"\n\n",
-                    format!("{} [VNC]", server.name), server.address, port, server.public_key
-                ));
-            }
-
-            if let Some(url) = server.websocket_url.filter(|url| !url.trim().is_empty()) {
-                servers_toml.push_str(&format!(
-                    "[[servers]]\nname = \"{}\"\naddress = \"{}\"\nmode = \"websocket\"\nwebsocket_url = \"{}\"\ntimeout_secs = 8\nserver_pub_key = \"{}\"\n\n",
-                    format!("{} [WS]", server.name), server.address, url, server.public_key
-                ));
-            }
+            let ssh_user = server
+                .ssh_user
+                .as_deref()
+                .map(|user| format!("ssh_user = \"{}\"\n", user))
+                .unwrap_or_default();
+            servers_toml.push_str(&format!(
+                "[[servers]]\nname = \"{}\"\ndsn = \"{}\"\n{}timeout_secs = 8\nserver_pub_key = \"{}\"\n\n",
+                server.name, server.dsn, ssh_user, server.public_key
+            ));
         }
 
         // 7. Читаем базовый шаблон client_template.toml с диска сервера

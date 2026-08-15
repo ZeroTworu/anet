@@ -3,10 +3,9 @@ import { api } from './client'
 import { toQuery } from '@/utils'
 
 export async function UpdateRate(id: string, data: RateReqRequest): Promise<Rate> {
-  console.log(data.date_end)
   return api<Rate>(`/rate/${id}`, {
     method: 'PATCH',
-    body: JSON.stringify(data),
+    data,
   })
 }
 
@@ -16,6 +15,6 @@ export async function AddRate(user_id: string, data: RateReqRequest): Promise<Ra
   })
   return api<Rate>(`/addrate?${params}`, {
     method: 'POST',
-    body: JSON.stringify(data),
+    data,
   })
 }

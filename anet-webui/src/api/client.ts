@@ -1,26 +1,31 @@
-// src/api/client.ts
+import axios, { type AxiosRequestConfig } from 'axios'
+import router from '@/router'
 
-const API_URL = '/api/v1'
+const client = axios.create({
+  baseURL: '/api/v1',
+  headers: { 'Content-Type': 'application/json' },
+})
 
-export async function api<T>(url: string, options: RequestInit = {}): Promise<T> {
+client.interceptors.request.use((config) => {
   const token = localStorage.getItem('token')
-  console.log('current url:', `${API_URL}${url}`)
-  const res = await fetch(`${API_URL}${url}`, {
-    ...options,
-    headers: {
-      'Content-Type': 'application/json',
-      ...(options.headers || {}),
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
-    },
-  })
+  if (token) config.headers.Authorization = `Bearer ${token}`
+  return config
+})
 
-  if (!res.ok) {
-    throw new Error(`HTTP ${res.status}`)
-  }
+client.interceptors.response.use(
+  (response) => response,
+  async (error) => {
+    if (error.response?.status === 401) {
+      localStorage.removeItem('token')
+      if (router.currentRoute.value.path !== '/') {
+        window.location.assign('/')
+      }
+    }
+    return Promise.reject(error)
+  },
+)
 
-  if (res.status === 204) {
-    return undefined as T
-  }
-
-  return res.json() as Promise<T>
+export async function api<T>(url: string, config: AxiosRequestConfig = {}): Promise<T> {
+  const response = await client.request<T>({ url, ...config })
+  return response.data
 }

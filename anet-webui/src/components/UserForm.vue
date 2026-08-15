@@ -19,7 +19,7 @@ const availableRouteMaps = ref<RouteMap[]>([])
 // Форматируем список серверов под опции n-select
 const serverOptions = computed(() => {
   return availableServers.value.map(s => ({
-    label: `${s.name} (${s.address})`,
+    label: `${s.name} (${s.dsn})`,
     value: s.id,
   }))
 })
@@ -51,59 +51,59 @@ onMounted(async () => {
 </script>
 
 <template>
-  <n-form>
+  <v-form>
     <!-- UID (editable) -->
-    <n-form-item label="UID">
-      <n-input v-model:value="user.uid" />
-    </n-form-item>
+    <div label="UID">
+      <v-text-field v-model="user.uid" />
+    </div>
 
-    <n-form-item label="Балансируемые pools">
-      <n-select
-          v-model:value="user.pool_ids"
+    <div label="Балансируемые pools">
+      <v-select
+          v-model="user.pool_ids"
           multiple
-          :options="poolOptions"
+          :items="poolOptions"
           placeholder="Выберите pools для этого пользователя"
       />
-    </n-form-item>
+    </div>
 
-    <n-form-item label="Route map">
-      <n-select
-          v-model:value="user.route_map_id"
+    <div label="Route map">
+      <v-select
+          v-model="user.route_map_id"
           clearable
-          :options="routeMapOptions"
+          :items="routeMapOptions"
           placeholder="Политика маршрутизации"
       />
-    </n-form-item>
+    </div>
 
     <!-- Active (editable) -->
-    <n-form-item label="Active">
-      <n-switch v-model:value="user.is_active" />
-    </n-form-item>
+    <div label="Active">
+      <v-switch v-model="user.is_active" />
+    </div>
 
     <!-- Static IP (editable) -->
-    <n-form-item label="Static IP">
-      <n-input v-model:value="user.static_ip" placeholder="e.g. 10.0.0.10" />
-    </n-form-item>
+    <div label="Static IP">
+      <v-text-field v-model="user.static_ip" placeholder="e.g. 10.0.0.10" />
+    </div>
 
     <!-- ВЫБОР СЕРВЕРОВ (Many-to-Many) -->
-    <n-form-item label="Привязанные сервера (Локации)">
-      <n-select
-          v-model:value="user.server_ids"
+    <div label="Привязанные сервера (Локации)">
+      <v-select
+          v-model="user.server_ids"
           multiple
-          :options="serverOptions"
+          :items="serverOptions"
           placeholder="Выберите сервера для этого пользователя"
       />
-    </n-form-item>
+    </div>
 
-    <n-divider />
+    <v-divider />
 
     <!-- Readonly fields -->
-    <n-form-item label="Fingerprint">
-      <n-input :value="user.fingerprint" disabled />
-    </n-form-item>
+    <div label="Fingerprint">
+      <v-text-field :modelValue="user.fingerprint" disabled />
+    </div>
 
-    <n-form-item label="Created At">
-      <n-input :value="user.created_at" disabled />
-    </n-form-item>
-  </n-form>
+    <div label="Created At">
+      <v-text-field :modelValue="user.created_at" disabled />
+    </div>
+  </v-form>
 </template>

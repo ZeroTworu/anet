@@ -41,7 +41,12 @@ impl VpnHandler {
             build_transport_config(&self.config.quic_transport, auth_response.mtu as u16)?;
 
         // 2. Создание сокета (AnetUdpSocket)
-        let addr_str = &self.config.main.address;
+        let addr_str = self
+            .config
+            .servers
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("No servers defined in [[servers]]"))?
+            .endpoint()?;
         let server_addr: SocketAddr = addr_str.to_socket_addrs()?.next().ok_or(anyhow::anyhow!("Invalid server address"))?;
         let real_socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
         let cipher = Arc::new(Cipher::new(&shared_key));

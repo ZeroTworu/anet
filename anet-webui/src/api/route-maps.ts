@@ -5,9 +5,9 @@ import type { RouteMap, SaveRouteMapRequest } from '@/models/route-map'
 
 export const GetRouteMaps = () => api<RouteMap[]>('/route-maps')
 export const CreateRouteMap = (routeMap: SaveRouteMapRequest) => api<RouteMap>('/route-maps', {
-  method: 'POST', body: JSON.stringify(routeMap),
+  method: 'POST', data: routeMap,
 })
 export const UpdateRouteMap = (id: string, routeMap: SaveRouteMapRequest) => api<RouteMap>(`/route-maps/${id}`, {
-  method: 'PATCH', body: JSON.stringify(routeMap),
+  method: 'PATCH', data: routeMap,
 })
 export const DeleteRouteMap = (id: string) => api<void>(`/route-maps/${id}`, { method: 'DELETE' })

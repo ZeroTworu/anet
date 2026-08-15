@@ -69,7 +69,7 @@ impl QuicTransport {
 impl ClientTransport for QuicTransport {
     async fn connect(&self) -> Result<ConnectionResult> {
         // Вытаскиваем адрес конкретной ноды
-        let addr_str = &self.server.address;
+        let addr_str = self.server.endpoint()?;
         let server_addr: SocketAddr = addr_str
             .to_socket_addrs()?
             .next()

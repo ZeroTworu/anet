@@ -88,78 +88,78 @@ onMounted(load)
 
 <template>
   <main class="route-page">
-    <n-space justify="space-between" align="center" class="page-title">
+    <div justify="space-between" align="center" class="page-title">
       <div><h2>Route Maps</h2><span>Политики split tunneling для клиентских конфигураций</span></div>
-      <n-button type="primary" @click="openCreate">Создать карту</n-button>
-    </n-space>
-    <n-alert type="info" :bordered="false" class="scope-alert">
+      <v-btn color="primary" @click="openCreate">Создать карту</v-btn>
+    </div>
+    <v-alert type="info" :bordered="false" class="scope-alert">
       CIDR-карты работают на desktop и mobile. Application rules используют Windows per-app filtering.
       Domain/Geo и межузловые hops появятся вместе с соответствующим data plane.
-    </n-alert>
+    </v-alert>
 
-    <n-spin :show="loading">
-      <n-grid :cols="1" :y-gap="14">
-        <n-grid-item v-for="map in maps" :key="map.id">
-          <n-card hoverable @click="openEdit(map)">
-            <n-space justify="space-between" align="start">
+    <div class="position-relative">
+      <v-row :cols="1" :y-gap="14">
+        <v-col v-for="map in maps" :key="map.id">
+          <v-card hoverable @click="openEdit(map)">
+            <div justify="space-between" align="start">
               <div>
-                <n-space align="center">
+                <div align="center">
                   <strong>{{ map.name }}</strong>
-                  <n-tag :type="map.is_active ? 'success' : 'default'" size="small">{{ map.is_active ? 'ACTIVE' : 'DISABLED' }}</n-tag>
-                  <n-tag size="small">rev {{ map.revision }}</n-tag>
-                </n-space>
+                  <v-chip  :color="map.is_active ? 'success' : 'default'" size="small">{{ map.is_active ? 'ACTIVE' : 'DISABLED' }}</v-chip>
+                  <v-chip size="small">rev {{ map.revision }}</v-chip>
+                </div>
                 <p>{{ map.description || 'Без описания' }}</p>
               </div>
-              <n-space align="center">
-                <n-statistic label="Rules" :value="map.rules.length" />
-                <n-tag :type="map.default_action === 'tunnel' ? 'success' : 'warning'">default: {{ map.default_action }}</n-tag>
-                <n-popconfirm @positive-click="remove(map.id)">
-                  <template #trigger><n-button text type="error" @click.stop>Удалить</n-button></template>
+              <div align="center">
+                <div label="Rules" :modelValue="map.rules.length" />
+                <v-chip  :color="map.default_action === 'tunnel' ? 'success' : 'warning'">default: {{ map.default_action }}</v-chip>
+                <div>
+                  <v-btn text color="error" @click.stop>Удалить</v-btn>
                   Удалить карту? Назначения пользователей также будут удалены.
-                </n-popconfirm>
-              </n-space>
-            </n-space>
-          </n-card>
-        </n-grid-item>
-      </n-grid>
-      <n-empty v-if="maps.length === 0" description="Маршрутных карт ещё нет" />
-    </n-spin>
+                </div>
+              </div>
+            </div>
+          </v-card>
+        </v-col>
+      </v-row>
+      <v-empty-state v-if="maps.length === 0" description="Маршрутных карт ещё нет" />
+    </div>
 
-    <n-modal v-model:show="showEditor" preset="card" style="width: min(900px, calc(100vw - 40px))" :title="editingId ? 'Редактировать карту' : 'Создать карту'">
-      <n-form>
-        <n-grid :cols="2" :x-gap="16">
-          <n-form-item-gi label="Название"><n-input v-model:value="form.name" /></n-form-item-gi>
-          <n-form-item-gi label="Default action"><n-select v-model:value="form.default_action" :options="actionOptions" /></n-form-item-gi>
-        </n-grid>
-        <n-form-item label="Описание"><n-input v-model:value="form.description" type="textarea" /></n-form-item>
-        <n-form-item label="Активна"><n-switch v-model:value="form.is_active" /></n-form-item>
-        <n-form-item label="Тип новых правил">
-          <n-select :value="ruleKind" :options="kindOptions" @update:value="changeKind" />
-        </n-form-item>
-        <n-divider>Rules · CIDR и application можно смешивать; совпадения отправляются {{ oppositeAction }}</n-divider>
+    <v-dialog v-model="showEditor" style="width: min(900px, calc(100vw - 40px))" :title="editingId ? 'Редактировать карту' : 'Создать карту'">
+      <v-form>
+        <v-row :cols="2" :x-gap="16">
+          <div label="Название"><v-text-field v-model="form.name" /></div>
+          <div label="Default action"><v-select v-model="form.default_action" :items="actionOptions" /></div>
+        </v-row>
+        <div label="Описание"><v-text-field v-model="form.description" type="textarea" /></div>
+        <div label="Активна"><v-switch v-model="form.is_active" /></div>
+        <div label="Тип новых правил">
+          <v-select :modelValue="ruleKind" :items="kindOptions" @update:modelValue="changeKind" />
+        </div>
+        <v-divider>Rules · CIDR и application можно смешивать; совпадения отправляются {{ oppositeAction }}</v-divider>
 
-        <n-space vertical style="width: 100%">
-          <n-input-group v-for="(rule, index) in form.rules" :key="rule.id || index">
-            <n-input-group-label style="width: 46px">{{ index + 1 }}</n-input-group-label>
-            <n-select v-model:value="rule.match_type" :options="kindOptions" style="width: 175px" />
-            <n-input
-                v-model:value="rule.match_value"
+        <div vertical style="width: 100%">
+          <div v-for="(rule, index) in form.rules" :key="rule.id || index">
+            <span style="width: 46px">{{ index + 1 }}</span>
+            <v-select v-model="rule.match_type" :items="kindOptions" style="width: 175px" />
+            <v-text-field
+                v-model="rule.match_value"
                 :placeholder="rule.match_type === 'cidr' ? '10.0.0.0/8' : 'steam.exe'"
             />
-            <n-button :disabled="index === 0" @click="moveRule(index, -1)">↑</n-button>
-            <n-button :disabled="index === form.rules.length - 1" @click="moveRule(index, 1)">↓</n-button>
-            <n-button type="error" ghost @click="form.rules.splice(index, 1)">×</n-button>
-          </n-input-group>
-          <n-button dashed block @click="addRule">Добавить правило</n-button>
-        </n-space>
-      </n-form>
-      <template #footer>
-        <n-space justify="end">
-          <n-button @click="showEditor = false">Отмена</n-button>
-          <n-button type="primary" :loading="saving" :disabled="!form.name.trim() || form.rules.some(rule => !rule.match_value.trim())" @click="save">Сохранить</n-button>
-        </n-space>
-      </template>
-    </n-modal>
+            <v-btn :disabled="index === 0" @click="moveRule(index, -1)">↑</v-btn>
+            <v-btn :disabled="index === form.rules.length - 1" @click="moveRule(index, 1)">↓</v-btn>
+            <v-btn color="error" ghost @click="form.rules.splice(index, 1)">×</v-btn>
+          </div>
+          <v-btn dashed block @click="addRule">Добавить правило</v-btn>
+        </div>
+      </v-form>
+      <div class="d-flex justify-end ga-4">
+        <div justify="end">
+          <v-btn @click="showEditor = false">Отмена</v-btn>
+          <v-btn color="primary" :loading="saving" :disabled="!form.name.trim() || form.rules.some(rule => !rule.match_value.trim())" @click="save">Сохранить</v-btn>
+        </div>
+      </div>
+    </v-dialog>
   </main>
 </template>
 

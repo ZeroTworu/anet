@@ -25,22 +25,22 @@ const submit = async () => {
 </script>
 
 <template>
-  <n-card title="Login" style="max-width: 400px; margin: 100px auto">
-    <n-form @submit.prevent="submit">
-      <n-form-item label="Login">
-        <n-input v-model:value="username" placeholder="Enter login" />
-      </n-form-item>
+  <v-card title="Login" style="max-width: 400px; margin: 100px auto">
+    <v-form @submit.prevent="submit">
+      <div label="Login">
+        <v-text-field v-model="username" placeholder="Enter login" />
+      </div>
 
-      <n-form-item label="Password">
-        <n-input
-          v-model:value="password"
+      <div label="Password">
+        <v-text-field
+          v-model="password"
           type="password"
-          show-password-on="click"
+          append-inner-icon="mdi-eye"
           placeholder="Enter password"
         />
-      </n-form-item>
+      </div>
 
-      <n-button type="primary" block :loading="loading" attr-type="submit"> Войти  </n-button>
-    </n-form>
-  </n-card>
+      <v-btn color="primary" block :loading="loading" type="submit"> Войти  </v-btn>
+    </v-form>
+  </v-card>
 </template>

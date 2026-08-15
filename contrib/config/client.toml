@@ -108,44 +108,39 @@ update_url = "https://api.github.com/repos/ZeroTworu/anet/releases/latest"
 # Каждый сервер описывается отдельным независимым блоком [[servers]].
 #
 # Возможные параметры каждого сервера:
-# 1. address: "IP:порт" или "домен:порт" для подключения.
-# 2. mode: тип транспорта. Допустимые значения: "quic", "ssh", "vnc", "websocket".
-# 3. timeout_secs: (Опционально) Время ожидания подключения в секундах, после которого
+# 1. dsn: единый адрес с типом транспорта, например
+#    quic://host:4519, ssh://host:822, vnc://host:56678 или
+#    ws://host:8080/socket или wss://host:8080/socket.
+# 2. timeout_secs: (Опционально) Время ожидания подключения в секундах, после которого
 #    нода считается упавшей и клиент переходит к следующей. По умолчанию: 10 секунд.
 # 4. server_pub_key: (Опционально) Переопределение публичного ключа для этого конкретного
 #    сервера (если он отличается от глобального в секции [keys]).
 # 5. ssh_user: (Опционально) Переопределение имени пользователя для SSH-транспорта.
-# 6. websocket_url: полный URL вида ws://host/path или wss://host/path.
 # =========================================================================
 
 # 1. Первая попытка: Сверхбыстрый и плавный UDP-транспорт (QUIC)
 [[servers]]
 name = "GM Primary [QUIC]"
-address = "127.0.0.1:4519"
-mode = "quic"
+dsn = "quic://127.0.0.1:4519"
 timeout_secs = 5 # Ждем максимум 5 секунд, если ТСПУ глушит UDP на старте — идем дальше
 
 # 2. Вторая попытка: Резервный TCP-транспорт (SSH) — пробиваем стандартные блокировки
 [[servers]]
 name = "GM Primary [SSH]"
-address = "127.0.0.1:822"
-mode = "ssh"
+dsn = "ssh://127.0.0.1:822"
 ssh_user = "hanyuu"
 timeout_secs = 6
 
 # 3. Третья попытка: Маскировка под удаленный рабочий стол (VNC) — для самых жестких условий
 [[servers]]
 name = "GM Primary [VNC]"
-address = "127.0.0.1:56678"
-mode = "vnc"
+dsn = "vnc://127.0.0.1:56678"
 timeout_secs = 8
 
 # 4. WebSocket: browser-like HTTP Upgrade и плановая ротация сессий.
 [[servers]]
 name = "GM Primary [WS]"
-address = "127.0.0.1:8080" # Имя ноды; подключение выполняется по websocket_url.
-mode = "websocket"
-websocket_url = "ws://127.0.0.1:8080/socket"
+dsn = "ws://127.0.0.1:8080/socket"
 websocket_min_session_secs = 480
 websocket_max_session_secs = 1500
 timeout_secs = 8

@@ -49,7 +49,7 @@ impl SshTransport {
 #[async_trait]
 impl ClientTransport for SshTransport {
     async fn connect(&self) -> Result<ConnectionResult> {
-        let address = resolve_address(&self.server.address)?;
+        let address = resolve_address(&self.server.endpoint()?)?;
         let user = self
             .server
             .ssh_user

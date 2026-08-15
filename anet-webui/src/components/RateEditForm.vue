@@ -11,21 +11,21 @@ const emit = defineEmits<{
 </script>
 
 <template>
-  <n-divider title-placement="left"> Rate (Edit) </n-divider>
+  <v-divider title-placement="left"> Rate (Edit) </v-divider>
 
-  <n-form v-if="user.rate">
-    <n-form-item label="Sessions">
-      <n-input-number v-model:value="user.rate.sessions" />
-    </n-form-item>
+  <v-form v-if="user.rate">
+    <div label="Sessions">
+      <v-number-input v-model="user.rate.sessions" />
+    </div>
 
-    <n-form-item label="Date End">
-      <n-date-picker
-        v-model:formatted-value="user.rate.date_end"
-        type="datetime"
+    <div label="Date End">
+      <v-text-field
+        v-model="user.rate.date_end"
+        type="datetime-local"
         value-format="yyyy-MM-dd-HH:mm"
       />
-    </n-form-item>
-  </n-form>
+    </div>
+  </v-form>
 
-  <n-button type="primary" @click="emit('save')"> Update Rate </n-button>
+  <v-btn color="primary" @click="emit('save')"> Update Rate </v-btn>
 </template>

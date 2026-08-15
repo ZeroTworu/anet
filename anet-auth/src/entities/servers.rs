@@ -13,6 +13,7 @@ pub struct Model {
     pub id: Uuid,
     pub name: String,
     pub address: String,
+    pub dsn: String,
     pub public_key: String,
     pub quic_port: Option<i32>,
     pub ssh_port: Option<i32>,

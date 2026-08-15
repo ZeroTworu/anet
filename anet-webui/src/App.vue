@@ -1,11 +1,11 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { NConfigProvider, NDialogProvider, NMessageProvider, NNotificationProvider, darkTheme } from 'naive-ui'
 
 const route = useRoute()
 const router = useRouter()
 const mobileOpen = ref(false)
+const snackbar = ref({ open: false, message: '', color: 'info' })
 const pageTitle = computed(() => String(route.meta.title || 'ANet'))
 const navigation = [
   { label: 'Overview', path: '/overview', icon: '◫', group: 'Overview' },
@@ -19,6 +19,14 @@ const groups = computed(() => [...new Set(navigation.map(item => item.group))])
 
 watch(() => route.path, () => { mobileOpen.value = false })
 
+const onMessage = (event: Event) => {
+  const detail = (event as CustomEvent<{ kind: string; message: string }>).detail
+  snackbar.value = { open: true, message: detail.message, color: detail.kind }
+}
+
+onMounted(() => window.addEventListener('anet:message', onMessage))
+onBeforeUnmount(() => window.removeEventListener('anet:message', onMessage))
+
 const logout = () => {
   localStorage.removeItem('token')
   router.push('/')
@@ -26,10 +34,8 @@ const logout = () => {
 </script>
 
 <template>
-  <n-config-provider :theme="darkTheme">
-    <n-message-provider>
-      <n-dialog-provider>
-        <n-notification-provider>
+  <v-app>
+    <v-main>
           <router-view v-if="route.meta.isAuth" class="auth-surface" />
 
           <div v-else class="admin-shell">
@@ -70,10 +76,11 @@ const logout = () => {
               <div class="workspace-content"><router-view /></div>
             </section>
           </div>
-        </n-notification-provider>
-      </n-dialog-provider>
-    </n-message-provider>
-  </n-config-provider>
+    </v-main>
+    <v-snackbar v-model="snackbar.open" :color="snackbar.color" :timeout="4000">
+      {{ snackbar.message }}
+    </v-snackbar>
+  </v-app>
 </template>
 
 <style>

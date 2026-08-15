@@ -31,7 +31,7 @@ export async function GetUser(id: string): Promise<User> {
 export async function UpdateUser(id: string, data: UpdateUserRequest) {
   return api<RegenerateUserRequest>(`/user/${id}`, {
     method: 'PATCH',
-    body: JSON.stringify(data),
+    data,
   })
 }
 
@@ -44,6 +44,6 @@ export async function Regenerate(id: string): Promise<RegenerateUserRequest> {
 export async function CreateUser(data: CreateUserRequest): Promise<User> {
   return api<User>(`/add`, {
     method: 'POST',
-    body: JSON.stringify(data),
+    data,
   })
 }

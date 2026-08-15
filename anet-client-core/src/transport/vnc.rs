@@ -63,7 +63,7 @@ impl VncTransport {
 #[async_trait]
 impl ClientTransport for VncTransport {
     async fn connect(&self) -> Result<ConnectionResult> {
-        let addr = resolve_address(&self.server.address)?;
+        let addr = resolve_address(&self.server.endpoint()?)?;
         info!("[VNC] Connecting to RFB endpoint {addr}");
 
         let mut stream = tokio::time::timeout(RFB_HANDSHAKE_TIMEOUT, TcpStream::connect(addr))

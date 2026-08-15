@@ -140,7 +140,7 @@ impl WebSocketTransport {
 }
 
 fn browser_request(server: &ServerConfig, profile: &BrowserProfile) -> Result<http::Request<()>> {
-    let url = &server.websocket_url;
+    let url = server.websocket_url()?;
     let mut request = url.as_str().into_client_request()?;
 
     request
@@ -423,17 +423,13 @@ impl ClientTransport for WebSocketTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::TransportMode;
-
     fn server(url: &str) -> ServerConfig {
         ServerConfig {
             name: None,
-            address: "example.com:443".to_string(),
-            mode: TransportMode::Websocket,
+            dsn: url.to_string(),
             timeout_secs: 8,
             server_pub_key: None,
             ssh_user: None,
-            websocket_url: url.to_string(),
             websocket_min_session_secs: 480,
             websocket_max_session_secs: 1500,
         }

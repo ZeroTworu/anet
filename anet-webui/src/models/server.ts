@@ -2,12 +2,8 @@
 export type Server = {
     id: string
     name: string
-    address: string
+    dsn: string
     public_key: string
-    quic_port: number | null
-    ssh_port: number | null
-    vnc_port: number | null
-    websocket_url: string | null
     ssh_user: string | null
     is_active: boolean
     has_control_credential: boolean
@@ -48,12 +44,8 @@ export type NodeCredential = {
 
 export type CreateServerRequest = {
     name: string
-    address: string
+    dsn: string
     public_key: string
-    quic_port: number | null
-    ssh_port: number | null
-    vnc_port: number | null
-    websocket_url: string | null
     ssh_user: string | null
     is_active?: boolean
 }

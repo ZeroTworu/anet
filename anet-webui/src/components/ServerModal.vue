@@ -2,7 +2,7 @@
 // Карточка ноды: настройки endpoint, admission-команды и одноразовая выдача
 // credential для исходящего control plane соединения.
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
-import { useMessage } from 'naive-ui'
+import { useAppMessage } from '@/composables/useAppMessage'
 import { GetNodeCommandStatus, RotateNodeCredential, SetNodeAdmission, UpdateServer } from '@/api/servers'
 import type { Server } from '@/models/server'
 
@@ -19,12 +19,8 @@ const emit = defineEmits<{
 
 const form = ref({
   name: '',
-  address: '',
+  dsn: '',
   public_key: '',
-  quic_port: null as number | null,
-  ssh_port: null as number | null,
-  vnc_port: null as number | null,
-  websocket_url: null as string | null,
   ssh_user: '',
   is_active: true
 })
@@ -37,7 +33,7 @@ const issuedCredential = ref<{ node_id: string; token: string } | null>(null)
 const credentialConfig = computed(() => issuedCredential.value
   ? `[control_plane]\nnode_id = "${issuedCredential.value.node_id}"\ntoken = "${issuedCredential.value.token}"`
   : '')
-const message = useMessage()
+const message = useAppMessage()
 let commandAbort = false
 
 const wait = (milliseconds: number) => new Promise(resolve => window.setTimeout(resolve, milliseconds))
@@ -102,12 +98,8 @@ watch(
       if (val) {
         form.value = {
           name: val.name,
-          address: val.address,
+          dsn: val.dsn,
           public_key: val.public_key,
-          quic_port: val.quic_port,
-          ssh_port: val.ssh_port,
-          vnc_port: val.vnc_port,
-          websocket_url: val.websocket_url,
           ssh_user: val.ssh_user || '',
           is_active: val.is_active
         }
@@ -138,59 +130,41 @@ const close = () => {
 </script>
 
 <template>
-  <n-modal v-model:show="show" @update:show="close" preset="card" style="width: 650px;" title="Редактировать физический сервер">
-    <n-form>
-      <n-form-item label="Название локации">
-        <n-input v-model:value="form.name" />
-      </n-form-item>
+  <v-dialog v-model="show" @update:modelValue="close" style="width: 650px;" title="Редактировать физический сервер">
+    <v-form>
+      <div label="Название локации">
+        <v-text-field v-model="form.name" />
+      </div>
 
-      <n-form-item label="IP Адрес или Домен">
-        <n-input v-model:value="form.address" />
-      </n-form-item>
+      <div label="DSN">
+        <v-text-field v-model="form.dsn" placeholder="quic://host:4519 или wss://host:8080/socket" />
+      </div>
 
-      <n-form-item label="Публичный ключ сервера">
-        <n-input v-model:value="form.public_key" />
-      </n-form-item>
+      <div label="Публичный ключ сервера">
+        <v-text-field v-model="form.public_key" />
+      </div>
 
-      <n-space item-style="width: 175px;">
-        <n-form-item label="QUIC Port (UDP)">
-          <n-input-number v-model:value="form.quic_port" clearable />
-        </n-form-item>
+      <div label="Пользователь SSH">
+        <v-text-field v-model="form.ssh_user" />
+      </div>
 
-        <n-form-item label="SSH Port (TCP)">
-          <n-input-number v-model:value="form.ssh_port" clearable />
-        </n-form-item>
+      <div label="Статус (ВКЛ / ВЫКЛ)">
+        <v-switch v-model="form.is_active" />
+      </div>
 
-        <n-form-item label="VNC Port (TCP)">
-          <n-input-number v-model:value="form.vnc_port" clearable />
-        </n-form-item>
-
-        <n-form-item label="WebSocket URL">
-          <n-input v-model:value="form.websocket_url" placeholder="wss://example.com/socket" clearable />
-        </n-form-item>
-      </n-space>
-
-      <n-form-item label="Пользователь SSH">
-        <n-input v-model:value="form.ssh_user" />
-      </n-form-item>
-
-      <n-form-item label="Статус (ВКЛ / ВЫКЛ)">
-        <n-switch v-model:value="form.is_active" />
-      </n-form-item>
-
-      <n-card v-if="server" size="small" title="Управление подключениями">
-        <n-space vertical>
+      <v-card v-if="server" size="small" title="Управление подключениями">
+        <div vertical>
           <span>
             Фактическое состояние:
-            <n-tag
-                :type="server.runtime ? (server.runtime.accepting_connections ? 'success' : 'warning') : 'default'"
+            <v-chip
+                 :color="server.runtime ? (server.runtime.accepting_connections ? 'success' : 'warning') : 'default'"
                 size="small"
             >
               {{ !server.runtime ? 'нет данных' : server.runtime.accepting_connections ? 'принимает новые подключения' : 'новые подключения запрещены' }}
-            </n-tag>
+            </v-chip>
           </span>
-          <n-space>
-            <n-button
+          <div>
+            <v-btn
                 type="success"
                 ghost
                 :loading="commandLoading"
@@ -198,83 +172,79 @@ const close = () => {
                 @click="setAdmission(true)"
             >
               Разрешить подключения
-            </n-button>
-            <n-button
-                type="warning"
+            </v-btn>
+            <v-btn
+                color="warning"
                 ghost
                 :loading="commandLoading"
                 :disabled="server.runtime?.status !== 'online' || server.runtime?.accepting_connections === false"
                 @click="setAdmission(false)"
             >
               Запретить новые
-            </n-button>
-          </n-space>
-          <n-text v-if="commandStatus" depth="3">
+            </v-btn>
+          </div>
+          <span v-if="commandStatus" depth="3">
             Команда: {{ commandStatus === 'pending' ? 'ожидает ноду' : commandStatus === 'running' ? 'выполняется' : commandStatus }}
-          </n-text>
-        </n-space>
-      </n-card>
-
-      <n-card v-if="server" size="small" title="Control plane credential" style="margin-top: 12px">
-        <n-space vertical>
-          <span>Состояние:
-            <n-tag :type="server.has_control_credential ? 'success' : 'warning'" size="small">
-              {{ server.has_control_credential ? 'PROVISIONED' : 'NOT PROVISIONED' }}
-            </n-tag>
           </span>
-          <n-text depth="3">
+        </div>
+      </v-card>
+
+      <v-card v-if="server" size="small" title="Control plane credential" style="margin-top: 12px">
+        <div vertical>
+          <span>Состояние:
+            <v-chip  :color="server.has_control_credential ? 'success' : 'warning'" size="small">
+              {{ server.has_control_credential ? 'PROVISIONED' : 'NOT PROVISIONED' }}
+            </v-chip>
+          </span>
+          <span depth="3">
             Credential хранится на панели только в виде SHA-256 хэша. После перевыпуска текущая нода потеряет доступ,
             пока новый token не будет записан в её server.toml.
-          </n-text>
-          <n-popconfirm
-              positive-text="Перевыпустить"
-              negative-text="Отмена"
-              @positive-click="rotateCredential"
-          >
-            <template #trigger>
-              <n-button tertiary :loading="credentialLoading">Перевыпустить credential</n-button>
-            </template>
-            Текущий credential немедленно перестанет работать. Продолжить?
-          </n-popconfirm>
-        </n-space>
-      </n-card>
-    </n-form>
-    <template #footer>
-      <n-space justify="end">
-        <n-button @click="close">Cancel</n-button>
-        <n-button type="primary" :loading="loading" @click="save"> Save </n-button>
-      </n-space>
-    </template>
-  </n-modal>
+          </span>
+          <div>
 
-  <n-modal
-      :show="issuedCredential !== null"
-      preset="card"
+              <v-btn tertiary :loading="credentialLoading">Перевыпустить credential</v-btn>
+
+            Текущий credential немедленно перестанет работать. Продолжить?
+          </div>
+        </div>
+      </v-card>
+    </v-form>
+    <div class="d-flex justify-end ga-4">
+      <div justify="end">
+        <v-btn @click="close">Cancel</v-btn>
+        <v-btn color="primary" :loading="loading" @click="save"> Save </v-btn>
+      </div>
+    </div>
+  </v-dialog>
+
+  <v-dialog
+      :model-value="issuedCredential !== null"
+
       style="width: min(620px, calc(100vw - 32px))"
       title="Новый credential ноды"
       :mask-closable="false"
-      @update:show="handleCredentialVisibility"
+      @update:modelValue="handleCredentialVisibility"
   >
-    <n-alert type="warning" :show-icon="true" style="margin-bottom: 14px">
+    <v-alert type="warning" :show-icon="true" style="margin-bottom: 14px">
       Сохраните token сейчас: повторно панель его не покажет.
-    </n-alert>
-    <n-form-item label="node_id">
-      <n-input :value="issuedCredential?.node_id" readonly />
-    </n-form-item>
-    <n-form-item label="control_plane.token">
-      <n-input :value="issuedCredential?.token" type="password" show-password-on="click" readonly />
-    </n-form-item>
-    <n-code
+    </v-alert>
+    <div label="node_id">
+      <v-text-field :modelValue="issuedCredential?.node_id" readonly />
+    </div>
+    <div label="control_plane.token">
+      <v-text-field :modelValue="issuedCredential?.token" type="password" append-inner-icon="mdi-eye" readonly />
+    </div>
+    <pre
         v-if="issuedCredential"
         language="toml"
         :code="credentialConfig"
         word-wrap
     />
-    <template #footer>
-      <n-space justify="end">
-        <n-button @click="copyCredential">Скопировать token</n-button>
-        <n-button type="primary" @click="issuedCredential = null">Я сохранил</n-button>
-      </n-space>
-    </template>
-  </n-modal>
+    <div class="d-flex justify-end ga-4">
+      <div justify="end">
+        <v-btn @click="copyCredential">Скопировать token</v-btn>
+        <v-btn color="primary" @click="issuedCredential = null">Я сохранил</v-btn>
+      </div>
+    </div>
+  </v-dialog>
 </template>

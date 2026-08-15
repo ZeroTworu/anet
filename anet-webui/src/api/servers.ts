@@ -15,7 +15,7 @@ export async function GetServers(): Promise<Server[]> {
 export async function CreateServer(data: CreateServerRequest): Promise<Server> {
     return api<Server>('/servers', {
         method: 'POST',
-        body: JSON.stringify(data),
+        data,
     })
 }
 
@@ -23,14 +23,14 @@ export async function CreateServer(data: CreateServerRequest): Promise<Server> {
 export async function UpdateServer(id: string, data: Partial<CreateServerRequest>): Promise<Server> {
     return api<Server>(`/servers/${id}`, {
         method: 'PATCH',
-        body: JSON.stringify(data),
+        data,
     })
 }
 
 export async function SetNodeAdmission(id: string, acceptingConnections: boolean): Promise<NodeCommand> {
     return api<NodeCommand>(`/servers/${id}/commands/admission`, {
         method: 'POST',
-        body: JSON.stringify({ accepting_connections: acceptingConnections }),
+        data: { accepting_connections: acceptingConnections },
     })
 }
 

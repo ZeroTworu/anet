@@ -23,12 +23,8 @@ const formatUptime = (seconds?: number) => {
 
 const form = ref<CreateServerRequest>({
   name: '',
-  address: '',
+  dsn: 'quic://127.0.0.1:4519',
   public_key: '',
-  quic_port: 4519,
-  ssh_port: 822,
-  vnc_port: 56678,
-  websocket_url: 'ws://127.0.0.1:8080/socket',
   ssh_user: 'hanyuu',
   is_active: true,
 })
@@ -49,12 +45,8 @@ const handleCreate = async () => {
     showCreate.value = false
     form.value = {
       name: '',
-      address: '',
+      dsn: 'quic://127.0.0.1:4519',
       public_key: '',
-      quic_port: 4519,
-      ssh_port: 822,
-      vnc_port: 56678,
-      websocket_url: 'ws://127.0.0.1:8080/socket',
       ssh_user: 'hanyuu',
       is_active: true,
     }
@@ -86,124 +78,98 @@ onBeforeUnmount(() => {
 
 <template>
   <div style="padding: 24px; max-width: 1200px; margin: 0 auto;">
-    <n-space justify="space-between" align="center" style="margin-bottom: 20px;">
+    <div justify="space-between" align="center" style="margin-bottom: 20px;">
       <h2 style="margin: 0; font-weight: 600; font-size: 20px;">VPN Nodes (Servers)</h2>
-      <n-button type="primary" @click="showCreate = true"> Add Server </n-button>
-    </n-space>
+      <v-btn color="primary" @click="showCreate = true"> Add Server </v-btn>
+    </div>
 
-    <n-spin :show="loading">
+    <div class="position-relative">
       <div class="table-container" v-if="data.length">
-        <n-table :bordered="true" :single-line="false" class="interactive-table">
+        <v-table :bordered="true" :single-line="false" class="interactive-table">
           <thead>
           <tr>
             <th>Название</th>
-            <th>IP / Домен</th>
+            <th>DSN</th>
             <th>Configured</th>
             <th>Actual state</th>
             <th>Control plane</th>
             <th>Connections</th>
             <th>Admission</th>
             <th>Uptime</th>
-            <th>QUIC Port</th>
-            <th>SSH Port</th>
-            <th>VNC Port</th>
-            <th>WebSocket URL</th>
           </tr>
           </thead>
           <tbody>
           <tr v-for="item in data" :key="item.id" @click="openEdit(item)" class="clickable-row">
             <td class="name-col">{{ item.name }}</td>
-            <td class="addr-col">{{ item.address }}</td>
+            <td class="addr-col">{{ item.dsn }}</td>
             <td>
-              <n-tag :type="item.is_active ? 'success' : 'error'" round size="small">
+              <v-chip  :color="item.is_active ? 'success' : 'error'" round size="small">
                 {{ item.is_active ? 'ВКЛ' : 'ВЫКЛ' }}
-              </n-tag>
+              </v-chip>
             </td>
             <td>
-              <n-tag
-                  :type="item.runtime?.status === 'online' ? 'success' : 'error'"
+              <v-chip
+                   :color="item.runtime?.status === 'online' ? 'success' : 'error'"
                   round
                   size="small"
               >
                 {{ item.runtime?.status === 'online' ? 'ONLINE' : 'OFFLINE' }}
-              </n-tag>
+              </v-chip>
               <div v-if="item.runtime" class="runtime-version">v{{ item.runtime.version }}</div>
             </td>
             <td>
-              <n-tag :type="item.has_control_credential ? 'success' : 'warning'" size="small">
+              <v-chip  :color="item.has_control_credential ? 'success' : 'warning'" size="small">
                 {{ item.has_control_credential ? 'READY' : 'SETUP REQUIRED' }}
-              </n-tag>
+              </v-chip>
             </td>
             <td class="metric-col">{{ item.runtime?.active_connections ?? 0 }}</td>
             <td>
-              <n-tag :type="item.runtime ? (item.runtime.accepting_connections ? 'success' : 'warning') : 'default'" size="small">
+              <v-chip  :color="item.runtime ? (item.runtime.accepting_connections ? 'success' : 'warning') : 'default'" size="small">
                 {{ !item.runtime ? 'UNKNOWN' : item.runtime.accepting_connections ? 'OPEN' : 'CLOSED' }}
-              </n-tag>
+              </v-chip>
             </td>
             <td class="metric-col">{{ formatUptime(item.runtime?.uptime_seconds) }}</td>
-            <td><n-tag :type="item.is_active && item.quic_port ? 'success' : 'default'" size="small">{{ item.quic_port || 'Closed' }}</n-tag></td>
-            <td><n-tag :type="item.is_active && item.ssh_port ? 'warning' : 'default'" size="small">{{ item.ssh_port || 'Closed' }}</n-tag></td>
-            <td><n-tag :type="item.is_active && item.vnc_port ? 'info' : 'default'" size="small">{{ item.vnc_port || 'Closed' }}</n-tag></td>
-            <td><n-tag :type="item.is_active && item.websocket_url ? 'primary' : 'default'" size="small">{{ item.websocket_url || 'Closed' }}</n-tag></td>
           </tr>
           </tbody>
-        </n-table>
+        </v-table>
       </div>
-      <n-empty v-else description="Серверов пока нет. Добавьте первую ноду!" style="margin-top: 40px;" />
-    </n-spin>
+      <v-empty-state v-else description="Серверов пока нет. Добавьте первую ноду!" style="margin-top: 40px;" />
+    </div>
 
     <!-- Модалка создания нового сервера -->
-    <n-modal v-model:show="showCreate" preset="card" style="width: 650px;" title="Добавить физический сервер">
-      <n-form>
-        <n-form-item label="Название локации">
-          <n-input v-model:value="form.name" placeholder="e.g. Germany VPS 1" />
-        </n-form-item>
+    <v-dialog v-model="showCreate" style="width: 650px;" title="Добавить физический сервер">
+      <v-form>
+        <div label="Название локации">
+          <v-text-field v-model="form.name" placeholder="e.g. Germany VPS 1" />
+        </div>
 
-        <n-form-item label="IP Адрес или Домен">
-          <n-input v-model:value="form.address" placeholder="e.g. 127.0.0.1 or vps.example.com" />
-        </n-form-item>
+        <div label="DSN">
+          <v-text-field v-model="form.dsn" placeholder="quic://host:4519 или wss://host:8080/socket" />
+        </div>
 
-        <n-form-item label="Публичный ключ сервера (server_pub_key)">
-          <n-input v-model:value="form.public_key" placeholder="Из утилиты anet-keygen" />
-        </n-form-item>
+        <div label="Публичный ключ сервера (server_pub_key)">
+          <v-text-field v-model="form.public_key" placeholder="Из утилиты anet-keygen" />
+        </div>
 
-        <n-space item-style="width: 175px;">
-          <n-form-item label="QUIC Port (UDP)">
-            <n-input-number v-model:value="form.quic_port" clearable />
-          </n-form-item>
+        <div label="Пользователь SSH (ssh_user)">
+          <v-text-field v-model="form.ssh_user" placeholder="hanyuu" />
+        </div>
 
-          <n-form-item label="SSH Port (TCP)">
-            <n-input-number v-model:value="form.ssh_port" clearable />
-          </n-form-item>
-
-          <n-form-item label="VNC Port (TCP)">
-            <n-input-number v-model:value="form.vnc_port" clearable />
-          </n-form-item>
-
-          <n-form-item label="WebSocket URL">
-            <n-input v-model:value="form.websocket_url" placeholder="wss://example.com/socket" clearable />
-          </n-form-item>
-        </n-space>
-
-        <n-form-item label="Пользователь SSH (ssh_user)">
-          <n-input v-model:value="form.ssh_user" placeholder="hanyuu" />
-        </n-form-item>
-
-        <n-form-item label="Активен (ВКЛ)">
-          <n-switch v-model:value="form.is_active" />
-        </n-form-item>
-      </n-form>
-      <template #footer>
-        <n-space justify="end">
-          <n-button @click="showCreate = false">Cancel</n-button>
-          <n-button type="primary" :loading="createLoading" @click="handleCreate"> Add Node </n-button>
-        </n-space>
-      </template>
-    </n-modal>
+        <div label="Активен (ВКЛ)">
+          <v-switch v-model="form.is_active" />
+        </div>
+      </v-form>
+      <div class="d-flex justify-end ga-4">
+        <div justify="end">
+          <v-btn @click="showCreate = false">Cancel</v-btn>
+          <v-btn color="primary" :loading="createLoading" @click="handleCreate"> Add Node </v-btn>
+        </div>
+      </div>
+    </v-dialog>
 
     <!-- Модалка редактирования существующего сервера -->
     <ServerModal
-        v-model:show="showEditModal"
+        v-model="showEditModal"
         :server="selectedServer"
         @updated="loadServers"
         @close="closeEditModal"

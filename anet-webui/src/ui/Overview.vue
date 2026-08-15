@@ -60,70 +60,70 @@ onBeforeUnmount(() => { if (refreshTimer !== undefined) clearInterval(refreshTim
 
 <template>
   <main class="overview-page">
-    <n-space justify="space-between" align="center" class="hero">
+    <div justify="space-between" align="center" class="hero">
       <div><h1>Infrastructure overview</h1><p>Состояние control plane и VPN-узлов в реальном времени</p></div>
-      <n-button :loading="loading" @click="load">Обновить</n-button>
-    </n-space>
-    <n-alert v-if="error" type="error" closable class="error-alert" @close="error = null">{{ error }}</n-alert>
+      <v-btn :loading="loading" @click="load">Обновить</v-btn>
+    </div>
+    <v-alert v-if="error" type="error" closable class="error-alert" @close="error = null">{{ error }}</v-alert>
 
-    <n-grid cols="1 s:2 l:4" responsive="screen" :x-gap="16" :y-gap="16">
-      <n-grid-item>
-        <n-card class="metric-card" @click="router.push('/servers')">
+    <v-row cols="1 s:2 l:4" responsive="screen" :x-gap="16" :y-gap="16">
+      <v-col>
+        <v-card class="metric-card" @click="router.push('/servers')">
           <span class="metric-label">Nodes online</span>
           <strong>{{ onlineNodes.length }}<small>/ {{ servers.length }}</small></strong>
           <span :class="offlineNodes.length ? 'metric-warning' : 'metric-ok'">{{ offlineNodes.length ? `${offlineNodes.length} требуют внимания` : 'Все узлы доступны' }}</span>
-        </n-card>
-      </n-grid-item>
-      <n-grid-item>
-        <n-card class="metric-card" @click="router.push('/users')">
+        </v-card>
+      </v-col>
+      <v-col>
+        <v-card class="metric-card" @click="router.push('/users')">
           <span class="metric-label">Users</span><strong>{{ userCount }}</strong>
           <span>{{ activeConnections }} активных соединений</span>
-        </n-card>
-      </n-grid-item>
-      <n-grid-item>
-        <n-card class="metric-card" @click="router.push('/statistics')">
+        </v-card>
+      </v-col>
+      <v-col>
+        <v-card class="metric-card" @click="router.push('/statistics')">
           <span class="metric-label">Lifetime traffic</span><strong>{{ formatBytes(totalTraffic) }}</strong>
           <span>Полезные данные туннеля</span>
-        </n-card>
-      </n-grid-item>
-      <n-grid-item>
-        <n-card class="metric-card" @click="router.push('/pools')">
+        </v-card>
+      </v-col>
+      <v-col>
+        <v-card class="metric-card" @click="router.push('/pools')">
           <span class="metric-label">Control policies</span><strong>{{ poolCount + routeMapCount }}</strong>
           <span>{{ poolCount }} pools · {{ routeMapCount }} route maps</span>
-        </n-card>
-      </n-grid-item>
-    </n-grid>
+        </v-card>
+      </v-col>
+    </v-row>
 
-    <n-grid cols="1 l:3" responsive="screen" :x-gap="18" :y-gap="18" class="details-grid">
-      <n-grid-item span="1 l:2">
-        <n-card title="Node health">
-          <template #header-extra><span class="subtle">{{ acceptingNodes }} принимают подключения</span></template>
+    <v-row cols="1 l:3" responsive="screen" :x-gap="18" :y-gap="18" class="details-grid">
+      <v-col span="1 l:2">
+        <v-card title="Node health">
+          <span class="subtle">{{ acceptingNodes }} принимают подключения</span>
           <div class="node-list">
             <button v-for="node in servers" :key="node.id" class="node-row" @click="router.push('/servers')">
               <span :class="['health-dot', node.runtime?.status === 'online' ? 'online' : 'offline']" />
-              <span class="node-identity"><strong>{{ node.name }}</strong><small>{{ node.address }}</small></span>
+              <span class="node-identity"><strong>{{ node.name }}</strong><small>{{ node.dsn }}</small></span>
               <span class="node-state">
                 <b>{{ node.runtime?.active_connections || 0 }}</b><small>connections</small>
               </span>
-              <n-tag :type="node.runtime?.accepting_connections ? 'success' : 'warning'" size="small">
+              <v-chip  :color="node.runtime?.accepting_connections ? 'success' : 'warning'" size="small">
                 {{ !node.runtime ? 'NO DATA' : node.runtime.accepting_connections ? 'OPEN' : 'CLOSED' }}
-              </n-tag>
+              </v-chip>
             </button>
-            <n-empty v-if="servers.length === 0" description="Узлы не зарегистрированы" />
+            <v-empty-state v-if="servers.length === 0" description="Узлы не зарегистрированы" />
           </div>
-        </n-card>
-      </n-grid-item>
-      <n-grid-item>
-        <n-card title="Quick actions">
-          <n-space vertical class="quick-actions">
-            <n-button block secondary @click="router.push('/servers')">Добавить или настроить узел</n-button>
-            <n-button block secondary @click="router.push('/users')">Создать пользователя</n-button>
-            <n-button block secondary @click="router.push('/pools')">Настроить балансировку</n-button>
-            <n-button block secondary @click="router.push('/route-maps')">Создать route map</n-button>
-          </n-space>
-        </n-card>
-      </n-grid-item>
-    </n-grid>
+        </v-card>
+      </v-col>
+      <v-col>
+        <v-card title="Quick actions">
+          <div vertical class="quick-actions">
+            <v-btn block secondary @click="router.push('/servers')">Добавить или настроить узел</v-btn>
+            <v-btn block secondary @click="router.push('/users')">Создать пользователя</v-btn>
+            <v-btn block secondary @click="router.push('/pools')">Настроить балансировку</v-btn>
+            <v-btn block secondary @click="router.push('/route-maps')">Создать route map</v-btn>
+          </div>
+        </v-card>
+      </v-col>
+    </v-row>
   </main>
 </template>
 

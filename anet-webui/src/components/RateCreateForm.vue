@@ -14,21 +14,21 @@ const form = ref<RateReqRequest>({
 </script>
 
 <template>
-  <n-divider title-placement="left"> Rate (Create) </n-divider>
+  <v-divider title-placement="left"> Rate (Create) </v-divider>
 
-  <n-form>
-    <n-form-item label="Sessions">
-      <n-input-number v-model:value="form.sessions" />
-    </n-form-item>
+  <v-form>
+    <div label="Sessions">
+      <v-number-input v-model="form.sessions" />
+    </div>
 
-    <n-form-item label="Date End">
-      <n-date-picker
-        v-model:formatted-value="form.date_end"
-        type="datetime"
+    <div label="Date End">
+      <v-text-field
+        v-model="form.date_end"
+        type="datetime-local"
         value-format="yyyy-MM-dd-HH:mm"
       />
-    </n-form-item>
-  </n-form>
+    </div>
+  </v-form>
 
-  <n-button type="primary" @click="emit('create', form)"> Create Rate </n-button>
+  <v-btn color="primary" @click="emit('create', form)"> Create Rate </v-btn>
 </template>

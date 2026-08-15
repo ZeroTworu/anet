@@ -45,7 +45,7 @@ const loadServers = async () => {
 
 const serverOptions = computed(() => {
   return availableServers.value.map(s => ({
-    label: `${s.name} (${s.address})`,
+    label: `${s.name} (${s.dsn})`,
     value: s.id,
   }))
 })
@@ -95,63 +95,63 @@ const create = async () => {
 </script>
 
 <template>
-  <n-modal v-model:show="show" preset="card" style="width: 600px">
-    <n-form>
-      <n-form-item label="UID">
-        <n-input v-model:value="form.uid" placeholder="e.g. Koshka_Vasya" />
-      </n-form-item>
+  <v-dialog v-model="show" style="width: 600px">
+    <v-form>
+      <div label="UID">
+        <v-text-field v-model="form.uid" placeholder="e.g. Koshka_Vasya" />
+      </div>
 
-      <n-form-item label="Привязать к pools">
-        <n-select
-            v-model:value="form.pool_ids"
+      <div label="Привязать к pools">
+        <v-select
+            v-model="form.pool_ids"
             multiple
-            :options="poolOptions"
+            :items="poolOptions"
             placeholder="Выберите балансируемые группы"
         />
-      </n-form-item>
+      </div>
 
-      <n-form-item label="Route map">
-        <n-select
-            v-model:value="form.route_map_id"
+      <div label="Route map">
+        <v-select
+            v-model="form.route_map_id"
             clearable
-            :options="routeMapOptions"
+            :items="routeMapOptions"
             placeholder="Политика маршрутизации"
         />
-      </n-form-item>
+      </div>
 
       <!-- ПРИВЯЗКА К СЕРВЕРАМ НА СТАРТЕ -->
-      <n-form-item label="Привязать к серверам">
-        <n-select
-            v-model:value="form.server_ids"
+      <div label="Привязать к серверам">
+        <v-select
+            v-model="form.server_ids"
             multiple
-            :options="serverOptions"
+            :items="serverOptions"
             placeholder="Выберите локации"
         />
-      </n-form-item>
+      </div>
 
-      <n-form-item>
-        <n-checkbox v-model:checked="rateEnabled"> Create rate </n-checkbox>
-      </n-form-item>
+      <div>
+        <v-checkbox v-model="rateEnabled"> Create rate </v-checkbox>
+      </div>
 
       <div v-if="rateEnabled">
-        <n-form-item label="Sessions">
-          <n-input-number v-model:value="rateForm.sessions" />
-        </n-form-item>
+        <div label="Sessions">
+          <v-number-input v-model="rateForm.sessions" />
+        </div>
 
-        <n-form-item label="Date End">
-          <n-date-picker
-              v-model:formatted-value="rateForm.date_end"
-              type="datetime"
+        <div label="Date End">
+          <v-text-field
+              v-model="rateForm.date_end"
+              type="datetime-local"
               value-format="yyyy-MM-dd-HH:mm"
           />
-        </n-form-item>
+        </div>
       </div>
-    </n-form>
-    <template #footer>
-      <n-space justify="end">
-        <n-button @click="show = false">Cancel</n-button>
-        <n-button type="primary" :loading="loading" @click="create"> Create </n-button>
-      </n-space>
-    </template>
-  </n-modal>
+    </v-form>
+    <div class="d-flex justify-end ga-4">
+      <div justify="end">
+        <v-btn @click="show = false">Cancel</v-btn>
+        <v-btn color="primary" :loading="loading" @click="create"> Create </v-btn>
+      </div>
+    </div>
+  </v-dialog>
 </template>

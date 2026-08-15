@@ -15,6 +15,7 @@ pub mod m20260815_000014_create_traffic_hourly;
 pub mod m20260815_000015_create_node_pools;
 pub mod m20260815_000016_create_route_maps;
 pub mod m20260815_000017_add_control_token_to_servers;
+pub mod m20260815_000018_add_dsn_to_servers;
 
 use sea_orm_migration::prelude::*;
 
@@ -41,6 +42,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260815_000015_create_node_pools::Migration),
             Box::new(m20260815_000016_create_route_maps::Migration),
             Box::new(m20260815_000017_add_control_token_to_servers::Migration),
+            Box::new(m20260815_000018_add_dsn_to_servers::Migration),
         ]
     }
 }

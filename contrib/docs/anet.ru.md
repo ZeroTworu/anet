@@ -113,7 +113,7 @@ f+f9KfEh/kuAZUzLMT4z7A==
 
 * Качаем клиент **той же версии**, что и сервер.
 * Открываем `client.toml` (шаблон в `contrib/config/client.toml`).
-* Вместо старых одиночных полей `address` и `mode`, настраиваем **каскадный список серверов `[[servers]]`** (Failover).
+* Для каждой ноды задаём единый DSN в каскадном списке `[[servers]]` (Failover).
 
 ### Как работает каскадный Failover:
 Вы можете задать список из разных портов и типов транспорта (даже для одного и того же физического сервера). Клиент будет пытаться подключиться к ним по очереди.
@@ -126,28 +126,23 @@ f+f9KfEh/kuAZUzLMT4z7A==
 ```toml
 # 1. Первая попытка: Сверхбыстрый UDP-транспорт (QUIC)
 [[servers]]
-address = "127.0.0.1:4519"
-mode = "quic"
+dsn = "quic://127.0.0.1:4519"
 timeout_secs = 5 # Время ожидания хендшейка в секундах
 
 # 2. Вторая попытка: Резервный TCP-транспорт (SSH)
 [[servers]]
-address = "127.0.0.1:822"
-mode = "ssh"
+dsn = "ssh://127.0.0.1:822"
 ssh_user = "hanyuu"
 timeout_secs = 6
 
 # 3. Третья попытка: Маскировка под удаленный рабочий стол (VNC)
 [[servers]]
-address = "127.0.0.1:56678"
-mode = "vnc"
+dsn = "vnc://127.0.0.1:56678"
 timeout_secs = 8
 
 # 4. WebSocket с browser-like HTTP Upgrade и внутренней ротацией сессии
 [[servers]]
-address = "127.0.0.1:8080"
-mode = "websocket"
-websocket_url = "ws://127.0.0.1:8080/socket"
+dsn = "wss://127.0.0.1:8080/socket"
 websocket_min_session_secs = 480
 websocket_max_session_secs = 1500
 timeout_secs = 8

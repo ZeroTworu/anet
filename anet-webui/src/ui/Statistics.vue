@@ -56,27 +56,27 @@ onBeforeUnmount(() => {
 
 <template>
   <main class="statistics-page">
-    <n-space justify="space-between" align="center" class="page-title">
+    <div justify="space-between" align="center" class="page-title">
       <div>
         <h2>Traffic</h2>
         <span>Полезный трафик внутри VPN-туннеля</span>
       </div>
-      <n-button :loading="loading" @click="load">Обновить</n-button>
-    </n-space>
+      <v-btn :loading="loading" @click="load">Обновить</v-btn>
+    </div>
 
-    <n-grid :cols="3" :x-gap="16" responsive="screen" item-responsive>
-      <n-grid-item span="3 m:1"><n-statistic label="Получено узлами" :value="formatBytes(totalRx)" /></n-grid-item>
-      <n-grid-item span="3 m:1"><n-statistic label="Отправлено клиентам" :value="formatBytes(totalTx)" /></n-grid-item>
-      <n-grid-item span="3 m:1"><n-statistic label="Всего" :value="formatBytes(totalRx + totalTx)" /></n-grid-item>
-    </n-grid>
+    <v-row :cols="3" :x-gap="16" responsive="screen" item-responsive>
+      <v-col span="3 m:1"><div label="Получено узлами" :modelValue="formatBytes(totalRx)" /></v-col>
+      <v-col span="3 m:1"><div label="Отправлено клиентам" :modelValue="formatBytes(totalTx)" /></v-col>
+      <v-col span="3 m:1"><div label="Всего" :modelValue="formatBytes(totalRx + totalTx)" /></v-col>
+    </v-row>
 
-    <n-card title="Последние 24 часа" class="history-card">
-      <template #header-extra>
-        <n-space>
+    <v-card title="Последние 24 часа" class="history-card">
+
+        <div>
           <span class="legend rx">RX</span>
           <span class="legend tx">TX</span>
-        </n-space>
-      </template>
+        </div>
+
       <div class="chart-wrap">
         <svg viewBox="0 0 1000 260" role="img" aria-label="График трафика за 24 часа">
           <line v-for="y in [40, 100, 160, 220]" :key="y" x1="40" :y1="y" x2="960" :y2="y" class="grid-line" />
@@ -92,12 +92,12 @@ onBeforeUnmount(() => {
           >{{ new Date(point.bucket_start).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) }}</text>
         </svg>
       </div>
-    </n-card>
+    </v-card>
 
-    <n-spin :show="loading">
-      <n-tabs type="line" animated class="traffic-tabs">
-        <n-tab-pane name="nodes" tab="По узлам">
-          <n-table :single-line="false" striped>
+    <div class="position-relative">
+      <div type="line" animated class="traffic-tabs">
+        <div name="nodes" tab="По узлам">
+          <v-table :single-line="false" striped="odd">
             <thead><tr><th>Узел</th><th>RX</th><th>TX</th><th>Всего</th></tr></thead>
             <tbody>
               <tr v-for="node in nodes" :key="node.node_id">
@@ -107,12 +107,12 @@ onBeforeUnmount(() => {
                 <td class="metric total">{{ formatBytes(node.rx_bytes + node.tx_bytes) }}</td>
               </tr>
             </tbody>
-          </n-table>
-          <n-empty v-if="nodes.length === 0" description="Нет данных по узлам" />
-        </n-tab-pane>
+          </v-table>
+          <v-empty-state v-if="nodes.length === 0" description="Нет данных по узлам" />
+        </div>
 
-        <n-tab-pane name="users" tab="По пользователям">
-          <n-table :single-line="false" striped>
+        <div name="users" tab="По пользователям">
+          <v-table :single-line="false" striped="odd">
             <thead><tr><th>Пользователь</th><th>Fingerprint</th><th>RX</th><th>TX</th><th>Всего</th></tr></thead>
             <tbody>
               <tr v-for="user in users" :key="user.fingerprint">
@@ -123,11 +123,11 @@ onBeforeUnmount(() => {
                 <td class="metric total">{{ formatBytes(user.rx_bytes + user.tx_bytes) }}</td>
               </tr>
             </tbody>
-          </n-table>
-          <n-empty v-if="users.length === 0" description="Нет данных по пользователям" />
-        </n-tab-pane>
-      </n-tabs>
-    </n-spin>
+          </v-table>
+          <v-empty-state v-if="users.length === 0" description="Нет данных по пользователям" />
+        </div>
+      </div>
+    </div>
   </main>
 </template>
 

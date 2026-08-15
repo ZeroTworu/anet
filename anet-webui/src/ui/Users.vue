@@ -68,14 +68,14 @@ onMounted(loadUsers)
 
 <template>
   <div style="padding: 24px; max-width: 1200px; margin: 0 auto;">
-    <n-space justify="space-between" align="center" style="margin-bottom: 20px;">
+    <div justify="space-between" align="center" style="margin-bottom: 20px;">
       <h2 style="margin: 0; font-weight: 600; font-size: 20px;">ANet VPN Clients</h2>
-      <n-button type="primary" @click="showCreate = true"> Add User </n-button>
-    </n-space>
+      <v-btn color="primary" @click="showCreate = true"> Add User </v-btn>
+    </div>
 
-    <n-spin :show="loading">
+    <div class="position-relative">
       <div class="table-container" v-if="data">
-        <n-table :bordered="true" :single-line="false" class="interactive-table">
+        <v-table :bordered="true" :single-line="false" class="interactive-table">
           <thead>
           <tr>
             <th style="width: 25%">UID (User Name)</th>
@@ -93,59 +93,59 @@ onMounted(loadUsers)
             <td class="uid-col">{{ item.uid || 'No Name' }}</td>
             <td class="uuid-col">{{ item.id }}</td>
             <td>
-              <n-tag :type="item.is_active ? 'success' : 'error'" round>
+              <v-chip  :color="item.is_active ? 'success' : 'error'" round>
                 {{ item.is_active ? 'Active' : 'Banned' }}
-              </n-tag>
+              </v-chip>
             </td>
           </tr>
           </tbody>
-        </n-table>
+        </v-table>
       </div>
 
       <!-- Кастомная панель пагинации -->
-      <n-space justify="space-between" align="center" style="margin-top: 20px;" v-if="data">
+      <div justify="space-between" align="center" style="margin-top: 20px;" v-if="data">
         <!-- Выбор количества записей -->
-        <n-space align="center">
+        <div align="center">
           <span style="color: #94a3b8; size: 13px;">Показано {{ data.items.length }} из {{ data.total }}</span>
-          <n-select
-              v-model:value="pageSize"
-              :options="pageSizeOptions"
+          <v-select
+              v-model="pageSize"
+              :items="pageSizeOptions"
               style="width: 120px"
-              @update:value="handlePageSizeChange"
+              @update:modelValue="handlePageSizeChange"
           />
-        </n-space>
+        </div>
 
         <!-- Кнопки управления страницами -->
-        <n-space align="center">
-          <n-button
+        <div align="center">
+          <v-btn
               :disabled="page === 1"
               @click="handlePageChange('prev')"
           >
             ← СЮДА
-          </n-button>
+          </v-btn>
 
           <span style="font-family: monospace; min-width: 40px; text-align: center;">
             {{ page }}
           </span>
 
-          <n-button
+          <v-btn
               :disabled="page * pageSize >= data.total"
               @click="handlePageChange('next')"
           >
             ТУДА →
-          </n-button>
-        </n-space>
-      </n-space>
-    </n-spin>
+          </v-btn>
+        </div>
+      </div>
+    </div>
 
     <UserModal
-        v-model:show="showModal"
+        v-model="showModal"
         :user-id="selectedUserId"
         @updated="loadUsers"
         @close="closeModal"
     />
 
-    <CreateUserModal v-model:show="showCreate" @created="loadUsers" />
+    <CreateUserModal v-model="showCreate" @created="loadUsers" />
   </div>
 </template>
 

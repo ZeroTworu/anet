@@ -138,7 +138,7 @@ impl AnetClient {
             let server = &config_clone.servers[current_server_index];
 
             let server_name = server.get_name();
-            info!("[Core] Connecting to server '{}' ({}) via {:?}", server_name, server.address, server.mode);
+            info!("[Core] Connecting to server '{}' ({})", server_name, server.dsn);
             status(format!("Connecting to '{}'...", server_name));
             client_state(ClientState::Connecting, format!("Connecting to '{}'", server_name), Some(server_name.clone()));
 
@@ -217,8 +217,8 @@ impl AnetClient {
             .config
             .servers
             .iter()
-            .filter_map(|s| s.address.split(':').next())
-            .filter_map(|host| IpAddr::from_str(host).ok())
+            .filter_map(|s| s.host_port().ok())
+            .filter_map(|(host, _)| IpAddr::from_str(&host).ok())
             .collect();
 
         // Формируем политику на основе enum с явным указанием типов для пустых векторов
@@ -240,12 +240,10 @@ impl AnetClient {
         let (filter, tx, rx) = anet_appfilter::AppFilter::start(policy, initial_bypass, vpn_ip)?;
 
         // Динамический bypass: фактический адрес текущего сервера.
-        let server_host = _server.address.split(':').next().unwrap_or_default();
-        if let Ok(ip) = IpAddr::from_str(server_host) {
+        let (server_host, server_port) = _server.host_port()?;
+        if let Ok(ip) = IpAddr::from_str(&server_host) {
             filter.add_bypass(ip).await;
-        } else if let Ok(mut addrs) =
-            tokio::net::lookup_host(_server.address.as_str()).await
-        {
+        } else if let Ok(mut addrs) = tokio::net::lookup_host((server_host.as_str(), server_port)).await {
             if let Some(sa) = addrs.next() {
                 filter.add_bypass(sa.ip()).await;
             }
@@ -301,7 +299,7 @@ impl AnetClient {
         let mut config_clone = self.config.clone();
         config_clone.sanitize()?;
 
-        let transport = create_transport(&config_clone, server);
+        let transport = create_transport(&config_clone, server)?;
         let conn_timeout = Duration::from_secs(server.timeout_secs);
 
         let result = tokio::time::timeout(conn_timeout, transport.connect())
@@ -313,15 +311,7 @@ impl AnetClient {
 
         self.route_manager.backup_routes().await?;
 
-        let (server_host, server_port) = if server.mode == crate::config::TransportMode::Websocket {
-            let uri: http::Uri = server.websocket_url.parse()?;
-            let host = uri.host().ok_or_else(|| anyhow::anyhow!("websocket_url has no host"))?;
-            let port = uri.port_u16().unwrap_or(if uri.scheme_str() == Some("wss") { 443 } else { 80 });
-            (host.to_string(), port)
-        } else {
-            let address = server.address.rsplit_once(':').unwrap_or((&server.address, "0"));
-            (address.0.trim_matches(['[', ']']).to_string(), address.1.parse().unwrap_or(0))
-        };
+        let (server_host, server_port) = server.host_port()?;
         let mut bypass_ips = Vec::new();
         if let Ok(server_ip) = IpAddr::from_str(&server_host) {
             bypass_ips.push(server_ip);
