@@ -130,20 +130,52 @@ impl ClientTransport for SshTransport {
                 Result::<()>::Ok(())
             });
 
-            let result = tokio::select! {
-                result = &mut tunnel_input => flatten_worker_result("TUN reader", result),
-                result = &mut outbound => flatten_worker_result("network writer", result),
-                result = &mut inbound => flatten_worker_result("network reader", result),
-                result = &mut tunnel_output => flatten_worker_result("TUN writer", result),
+            // `select!` уже забирает результат одной из задач. Её JoinHandle
+            // нельзя повторно poll-ить через `.await`: Tokio завершает процесс
+            // с "JoinHandle polled after completion". Запоминаем победителя,
+            // отменяем только остальные задачи и ждём только их.
+            enum FinishedWorker {
+                TunnelInput,
+                Outbound,
+                Inbound,
+                TunnelOutput,
+            }
+
+            let (finished_worker, result) = tokio::select! {
+                result = &mut tunnel_input => (
+                    FinishedWorker::TunnelInput,
+                    flatten_worker_result("TUN reader", result),
+                ),
+                result = &mut outbound => (
+                    FinishedWorker::Outbound,
+                    flatten_worker_result("network writer", result),
+                ),
+                result = &mut inbound => (
+                    FinishedWorker::Inbound,
+                    flatten_worker_result("network reader", result),
+                ),
+                result = &mut tunnel_output => (
+                    FinishedWorker::TunnelOutput,
+                    flatten_worker_result("TUN writer", result),
+                ),
             };
-            tunnel_input.abort();
-            outbound.abort();
-            inbound.abort();
-            tunnel_output.abort();
-            let _ = tunnel_input.await;
-            let _ = outbound.await;
-            let _ = inbound.await;
-            let _ = tunnel_output.await;
+
+            if !matches!(finished_worker, FinishedWorker::TunnelInput) {
+                tunnel_input.abort();
+                let _ = tunnel_input.await;
+            }
+            if !matches!(finished_worker, FinishedWorker::Outbound) {
+                outbound.abort();
+                let _ = outbound.await;
+            }
+            if !matches!(finished_worker, FinishedWorker::Inbound) {
+                inbound.abort();
+                let _ = inbound.await;
+            }
+            if !matches!(finished_worker, FinishedWorker::TunnelOutput) {
+                tunnel_output.abort();
+                let _ = tunnel_output.await;
+            }
 
             match result {
                 Ok(()) => info!("[SSH] Tunnel closed"),
