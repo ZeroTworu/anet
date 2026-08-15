@@ -28,7 +28,7 @@ musl:
 
 # Build Android libraries (requires cargo-ndk)
 mob:
-	cargo ndk -t x86_64-linux-android -t aarch64-linux-android -o ./android-build/jniLibs build --release -p anet-mobile
+	cargo ndk -t x86_64-linux-android -t aarch64-linux-android -t armv7-linux-androideabi -o ./android-build/jniLibs build --release -p anet-mobile
 
 # run infrastructure
 infra:
