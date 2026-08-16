@@ -86,7 +86,7 @@ impl ClientTransport for SshTransport {
             let auth_channel = StreamAuthChannel::new(stream.clone());
             let auth_handler =
                 AuthHandler::new(&self.config, self.server.server_pub_key.as_deref())?;
-            auth_handler.authenticate(&auth_channel).await?
+            auth_handler.authenticate_once(&auth_channel).await?
         };
         info!("[SSH] ASTP authenticated; assigned IP {}", auth_response.ip);
 

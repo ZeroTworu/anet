@@ -82,7 +82,7 @@ impl ClientTransport for VncTransport {
             stream: Mutex::new(stream),
         };
         let auth_handler = AuthHandler::new(&self.config, self.server.server_pub_key.as_deref())?;
-        let (auth_response, shared_key) = auth_handler.authenticate(&auth_channel).await?;
+        let (auth_response, shared_key) = auth_handler.authenticate_once(&auth_channel).await?;
         info!("[VNC] ASTP authenticated; assigned IP {}", auth_response.ip);
 
         let stream = auth_channel.stream.into_inner();

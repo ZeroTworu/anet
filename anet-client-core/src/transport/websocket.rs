@@ -206,7 +206,7 @@ async fn connect_authenticated(
     };
     let auth =
         AuthHandler::new_with_resume(config, server.server_pub_key.as_deref(), resume_session_id)?;
-    let (response, key) = auth.authenticate(&channel).await?;
+    let (response, key) = auth.authenticate_once(&channel).await?;
     Ok((channel.socket.into_inner(), response, key))
 }
 
