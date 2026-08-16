@@ -206,6 +206,18 @@ impl AuthHandler {
         ))
     }
 
+    /// Performs one handshake attempt on a stream transport.
+    ///
+    /// TCP/SSH/WebSocket/VNC cannot recover after the peer closes the stream:
+    /// retrying on the same channel only delays failover and can turn the real
+    /// connection error into an outer handshake timeout.
+    pub async fn authenticate_once(
+        &self,
+        channel: &dyn AuthChannel,
+    ) -> Result<(AuthResponse, [u8; 32])> {
+        self.attempt_handshake(channel, INITIAL_DELAY).await
+    }
+
     async fn attempt_handshake(
         &self,
         channel: &dyn AuthChannel,

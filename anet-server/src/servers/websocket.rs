@@ -195,7 +195,7 @@ pub async fn run_websocket_server(
         );
         tokio::spawn(async move {
             if let Err(error) = handle_session(stream, remote_addr, reg, cfg, tx, auth).await {
-                warn!("[WebSocket] Session {} stopped: {}", remote_addr, error);
+                warn!("[WebSocket] Session {} stopped: {error:#}", remote_addr);
             }
         });
     }
