@@ -1780,7 +1780,7 @@ impl eframe::App for ANetApp {
                     }
 
                     // 📌 РИСУЕМ ОСНОВНОЙ КОНТУР КРУГА С ГРАДИЕНТОМ
-                    let stroke_width = 2.5;
+                    let stroke_width = 5.0;
                     let segments = 128;
 
                     for i in 0..segments {
