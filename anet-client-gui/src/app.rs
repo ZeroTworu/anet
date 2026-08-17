@@ -1021,7 +1021,7 @@ impl eframe::App for ANetApp {
 
         let grey_color = egui::Color32::from_rgb(128, 128, 128);
 
-
+        
         let connected_text_color = egui::Color32::from_rgb(84, 210, 87);
 
 
@@ -1375,7 +1375,6 @@ impl eframe::App for ANetApp {
         let active_id = settings_guard.active_config_id.clone();
         let editing_id = self.editing_config_id.clone();
         drop(settings_guard);
-      
 
         let mut server_names = Vec::new();
         let mut selected_server_name = String::new();
@@ -1629,199 +1628,94 @@ impl eframe::App for ANetApp {
                 if !server_names.is_empty() {
                     ui.add_space(10.0);
                     ui.vertical_centered(|ui| {
-                        let header_text = if state == ConnectionState::Disconnected {
-                            "Подключение к:"
-                        } else {
-                            "Активная нода:"
-                        };
-
-                        ui.label(
-                            egui::RichText::new(header_text)
-                                .size(13.0)
-                                .color(ivory_color)
-                                .family(egui::FontFamily::Name("Inter-V".into()))
-                        );
-                        ui.add_space(7.0);
-
-                        const NODE_WIDTH: f32 = 266.0;
-                        const NODE_HEIGHT: f32 = 36.0;
-                        const NODE_RADIUS: u8 = 18;
-                        const ITEM_HEIGHT: f32 = 34.0;
-
-                        let orange = egui::Color32::from_rgb(235, 140, 52);
-                        let indicator = match state {
-                            ConnectionState::Connected => orange,
-                            ConnectionState::Disconnected | ConnectionState::Connecting => {
-                                egui::Color32::from_rgb(120, 124, 132)
-                            }
-                        };
-                        let bg = egui::Color32::from_rgb(25, 28, 36);
-                        let hover_bg = egui::Color32::from_rgb(31, 35, 44);
-                        let border = egui::Color32::from_rgb(50, 54, 66);
-                        let text = egui::Color32::from_rgb(242, 243, 246);
-                        let muted = egui::Color32::from_rgb(160, 164, 172);
-
-                        let (rect, response) = ui.allocate_exact_size(
-                            egui::vec2(NODE_WIDTH, NODE_HEIGHT),
-                            if state == ConnectionState::Disconnected {
-                                egui::Sense::click()
-                            } else {
-                                egui::Sense::hover()
-                            }
-                        );
-
-                        if state != ConnectionState::Disconnected {
-                            self.node_popup_open = false;
-                        }
-
-                        if state == ConnectionState::Disconnected && response.clicked() {
-                            self.node_popup_open = !self.node_popup_open;
-                        }
-
-                        let popup_open = self.node_popup_open;
-
-                        let field_fill = if response.hovered() && state == ConnectionState::Disconnected {
-                            hover_bg
-                        } else {
-                            bg
-                        };
-                        ui.painter().rect_filled(
-                            rect,
-                            egui::CornerRadius::same(NODE_RADIUS),
-                            field_fill
-                        );
-                        ui.painter().rect_stroke(
-                            rect,
-                            egui::CornerRadius::same(NODE_RADIUS),
-                            egui::Stroke::new(1.0, border),
-                            egui::StrokeKind::Inside
-                        );
-
-                        let center_y = rect.center().y;
-                        let dot_center = egui::pos2(rect.left() + 18.0, center_y);
-                        ui.painter().circle_filled(dot_center, 5.0, indicator);
-
-                        ui.painter().text(
-                            egui::pos2(rect.left() + 32.0, center_y),
-                            egui::Align2::LEFT_CENTER,
-                            &selected_server_name,
-                            egui::FontId::new(13.0, egui::FontFamily::Name("Inter-V".into())),
-                            text
-                        );
-
                         if state == ConnectionState::Disconnected {
-                            let cx = rect.right() - 17.0;
-                            let cy = center_y;
-                            ui.painter().add(
-                                egui::Shape::convex_polygon(
-                                    vec![
-                                        egui::pos2(cx - 5.0, cy - 2.0),
-                                        egui::pos2(cx + 5.0, cy - 2.0),
-                                        egui::pos2(cx, cy + 4.0)
-                                    ],
-                                    muted,
-                                    egui::Stroke::NONE
-                                )
-                            );
-                        }
+                            ui.horizontal(|ui| {
+                                ui.add_space(ui.available_width() * 0.1);
+                                ui.label(egui::RichText::new("Подключение к:").color(ivory_color));
 
-                        if state == ConnectionState::Disconnected && popup_open {
-                            let popup_height = 12.0 + (server_names.len() as f32) * ITEM_HEIGHT;
-                            let popup_pos = egui::pos2(rect.left(), rect.bottom() + 6.0);
-                            let popup_area_id = egui::Id::new("node_selection_popup");
+                                let mut changed = false;
+                                let mut selected_name = String::new();
 
-                            egui::Area::new(popup_area_id)
-                                .order(egui::Order::Foreground)
-                                .fixed_pos(popup_pos)
-                                .interactable(true)
-                                .show(ui.ctx(), |popup_ui| {
-                                    popup_ui.set_min_size(egui::vec2(NODE_WIDTH, popup_height));
-                                    popup_ui.set_max_size(egui::vec2(NODE_WIDTH, popup_height));
+                                egui::ComboBox
+                                    ::from_id_salt("first_server_select")
+                                    .selected_text(
+                                        egui::RichText::new(&selected_server_name).color(gold_color)
+                                    )
+                                    .show_ui(ui, |ui| {
+                                        for name in &server_names {
+                                            let option_text = egui::RichText
+                                                ::new(name)
+                                                .color(gold_color);
 
-                                    egui::Frame::NONE
-                                        .fill(bg)
-                                        .stroke(egui::Stroke::new(1.0, border))
-                                        .corner_radius(egui::CornerRadius::same(14))
-                                        .inner_margin(egui::Margin::symmetric(6, 6))
-                                        .show(popup_ui, |popup_ui| {
-                                            for name in &server_names {
-                                                let selected = name == &selected_server_name;
-                                                let (item_rect, item_response) = popup_ui.allocate_exact_size(
-                                                    egui::vec2(NODE_WIDTH - 12.0, ITEM_HEIGHT),
-                                                    egui::Sense::click()
-                                                );
-
-                                                if item_response.hovered() {
-                                                    popup_ui.painter().rect_filled(
-                                                        item_rect,
-                                                        egui::CornerRadius::same(9),
-                                                        hover_bg
-                                                    );
-                                                }
-
-                                                if selected {
-                                                    popup_ui.painter().circle_filled(
-                                                        egui::pos2(item_rect.left() + 13.0, item_rect.center().y),
-                                                        4.0,
-                                                        orange
-                                                    );
-                                                }
-
-                                                popup_ui.painter().text(
-                                                    egui::pos2(item_rect.left() + 25.0, item_rect.center().y),
-                                                    egui::Align2::LEFT_CENTER,
-                                                    name,
-                                                    egui::FontId::new(13.0, egui::FontFamily::Name("Inter-V".into())),
-                                                    if selected { text } else { muted }
-                                                );
-
-                                                if item_response.clicked() {
-                                                    self.node_popup_open = false;
-
-                                                    let selected_name = name.clone();
-                                                    {
-                                                        let mut settings = lock_ignore_poison(&self.settings);
-                                                        if let Some(active_cfg) = settings.get_active_config() {
-                                                            settings.selected_servers.insert(
-                                                                active_cfg.id.clone(),
-                                                                selected_name.clone()
-                                                            );
-                                                            settings.save();
-                                                        }
-                                                    }
-
-                                                    let active_cfg_data = {
-                                                        let settings = lock_ignore_poison(&self.settings);
-                                                        settings.get_active_config().map(|cfg| {
-                                                            (cfg.id.clone(), cfg.content.clone(), cfg.name.clone())
-                                                        })
-                                                    };
-
-                                                    if let Some((id, content, name)) = active_cfg_data {
-                                                        self.load_config_from_content(&id, &content, &name, false);
-                                                    }
-                                                }
+                                            if
+                                                ui
+                                                    .selectable_label(
+                                                        name == &selected_server_name,
+                                                        option_text
+                                                    )
+                                                    .clicked()
+                                            {
+                                                selected_name = name.clone();
+                                                changed = true;
                                             }
-                                        });
+                                        }
+                                    });
 
-                                    let pointer_pos = popup_ui.input(|i| i.pointer.interact_pos());
-                                    let outside_click = popup_ui.input(|i| i.pointer.any_pressed())
-                                        && pointer_pos.map_or(false, |p| !popup_ui.max_rect().contains(p));
-                                    if outside_click {
-                                        self.node_popup_open = false;
+                                if changed {
+                                    let active_cfg_data = {
+                                        let mut settings = self.settings.lock().unwrap();
+                                        if let Some(active_cfg) = settings.get_active_config() {
+                                            settings.selected_servers.insert(
+                                                active_cfg.id.clone(),
+                                                selected_name
+                                            );
+                                            settings.save();
+
+                                            Some((
+                                                active_cfg.id.clone(),
+                                                active_cfg.content.clone(),
+                                                active_cfg.name.clone(),
+                                            ))
+                                        } else {
+                                            None
+                                        }
+                                    };
+
+                                    if let Some((id, content, name)) = active_cfg_data {
+                                        self.load_config_from_content(&id, &content, &name);
                                     }
-                                });
+                                }
+                            });
+                        } else {
+                            ui.horizontal(|ui| {
+                                ui.add_space(ui.available_width() * 0.1);
+                                ui.label(egui::RichText::new("Активная нода:").color(gold_color));
+                                ui.label(
+                                    egui::RichText
+                                        ::new(&selected_server_name)
+                                        .strong()
+                                        .color(gold_color)
+                                );
+                            });
                         }
                     });
                 }
 
                 ui.add_space(ui.available_height() * 0.15);
 
+                //кнопка CONNECT
+
                 ui.vertical_centered(|ui| {
                     let btn_size = egui::vec2(180.0, 180.0);
 
+                    // Определяем текст и цвета градиента (верх и низ)
                     let (btn_text, color_top, color_bottom) = match state {
-                        ConnectionState::Disconnected => ("CONNECT", gold_color, light_blue_color),
+                        ConnectionState::Disconnected =>
+                            (
+                                "CONNECT",
+                                gold_color, // Светло-зеленый
+                                light_blue_color, // Темно-зеленый
+                            ),
                         ConnectionState::Connecting => {
                             let time = ctx.input(|i| i.time);
                             let factor = (time.sin() + 1.0) / 2.0;
@@ -1832,17 +1726,17 @@ impl eframe::App for ANetApp {
                             let top = egui::Color32::from_rgb(r, g, 0);
                             let bottom = egui::Color32::from_rgb(200, 60, 0);
 
-                            ("CONNECTING",
-                            egui::Color32::from_rgb(247, 137, 46),
+                            ("CONNECTING", 
+                            egui::Color32::from_rgb(247, 137, 46), 
                             egui::Color32::from_rgb(244, 46, 82)
                         )
                         }
                         ConnectionState::Connected =>
                             (
                                 "DISCONNECT",
-                                 egui::Color32::from_rgb(248, 61, 170), // Темно-красный
-                                egui::Color32::from_rgb(243, 208, 120), // Светло-красный
-
+                                egui::Color32::from_rgb(255, 43, 68),
+                            egui::Color32::from_rgb(131, 140, 251)
+                               
                             ),
                     };
 
