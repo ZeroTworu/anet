@@ -119,8 +119,10 @@ impl EventHandler for GuiEventHandler {
                 let mut guard = self.shared.lock().unwrap();
                 guard.state = match state {
                     ClientState::Connected => ConnectionState::Connected,
-                    ClientState::Connecting | ClientState::Reconnecting | ClientState::Stopping => ConnectionState::Connecting,
-                    ClientState::Disconnected | ClientState::Stopped | ClientState::Failed => ConnectionState::Disconnected,
+                    ClientState::Connecting | ClientState::Reconnecting | ClientState::Stopping =>
+                        ConnectionState::Connecting,
+                    ClientState::Disconnected | ClientState::Stopped | ClientState::Failed =>
+                        ConnectionState::Disconnected,
                 };
             }
             _ => {}
@@ -1015,8 +1017,13 @@ impl eframe::App for ANetApp {
 
         let title_bg = egui::Color32::from_rgb(23, 25, 31);
         let dark_color = egui::Color32::from_rgb(22, 24, 31);
+        let console_bg = egui::Color32::from_rgb(32, 34, 41);
 
         let grey_color = egui::Color32::from_rgb(128, 128, 128);
+
+        
+        let connected_text_color = egui::Color32::from_rgb(84, 210, 87);
+
 
         let text_button_color = egui::Color32::from_rgb(0, 0, 0);
         let green_button_color = egui::Color32::from_rgb(65, 180, 65); // Зеленый
@@ -1264,61 +1271,103 @@ impl eframe::App for ANetApp {
 
         self.last_known_state = self.shared.lock().unwrap().state;
 
-        let console_frame = egui::Frame::NONE
-            .fill(dark_color)
-            .inner_margin(8.0)
-            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(40, 40, 40)))
-            .corner_radius(egui::CornerRadius { nw: 0, ne: 0, sw: 14, se: 14 });
+        // 1. Конфигурируем внутренний блок (карточку) для логов
+        let console_inner_frame = egui::Frame::NONE
+            .fill(console_bg) // Фон внутреннего контейнера
+            .inner_margin(egui::Margin::same(10)) // Внутренние отступы для текста
+            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(50, 50, 50))) // (Опционально) Тонкая рамка
+            .corner_radius(egui::CornerRadius { nw: 0, ne: 0, sw: 14, se: 14 }); // Скругление углов
+
+        // 2. Внешняя панель консоли
         egui::TopBottomPanel
             ::bottom("stalker_console")
-            .resizable(true)
-            .min_height(100.0)
-            //.default_height(100.0)
-            .frame(console_frame)
+            .resizable(false)
+            .min_height(150.0)
+            .default_height(150.0)
+            .show_separator_line(false)
+            .frame(egui::Frame::NONE)
             .show(ctx, |ui| {
-                ui.vertical(|ui| {
-                    ui.label(
-                        egui::RichText
-                            ::new("SYSTEM LOG")
-                            .family(egui::FontFamily::Name("Inter-V".into()))
-                            .size(10.0)
-                            .color(white_color)
-                    );
-                    ui.add_space(4.0);
-                    egui::ScrollArea
-                        ::vertical()
-                        .auto_shrink([false, false])
-                        .stick_to_bottom(true)
-                        .show(ui, |ui| {
-                            let logs = self.logs.lock().unwrap();
+                // Внешняя обертка для создания отступов от краев главного окна
+                egui::Frame::NONE
+                    .outer_margin(egui::Margin {
+                        left: 0,
+                        right: 0,
+                        top: 0,
+                        bottom: 0,
+                    })
+                    .inner_margin(egui::Margin {
+                        left: 20,
+                        right: 20,
+                        top: 10,
+                        bottom: 20,
+                    })
+                    .fill(dark_color) // Фон внутреннего контейнера
+                    .corner_radius(egui::CornerRadius { nw: 0, ne: 0, sw: 14, se: 14 })
+                    .show(ui, |ui| {
+                        ui.vertical(|ui| {
+                            // Конфигурируем стили для контейнера заголовка
+                            let header_frame = egui::Frame::NONE
+                                .fill(console_bg) // Цвет фона плашки
+                                .inner_margin(egui::Margin::symmetric(8, 4)) // Внутренние отступы (слева/справа: 8px, сверху/снизу: 4px)
+                                .corner_radius(egui::CornerRadius { nw: 14, ne: 14, sw: 0, se: 0 }) // Скругление углов
+                                .stroke(
+                                    egui::Stroke::new(1.0, egui::Color32::from_rgb(50, 50, 50))
+                                ); // (Опционально) Тонкая рамка
 
-                            for line in logs.iter() {
-                                let color = if line.contains("Error") || line.contains("Failed") {
-                                    red_button_color
-                                } else if line.contains("Tunnel UP") {
-                                    green_button_color
-                                } else if line.contains("Config loaded") {
-                                    gold_color
-                                } else {
-                                    grey_color
-                                };
-                                ui.horizontal(|ui| {
-                                    ui.add(
-                                        egui::Label
-                                            ::new(
-                                                egui::RichText
-                                                    ::new(line)
-                                                    .family(egui::FontFamily::Monospace)
-                                                    .size(11.0)
-                                                    .color(color)
-                                            )
-                                            .selectable(true)
-                                            .wrap()
-                                    );
-                                });
-                            }
+                            // Оборачиваем заголовок
+                            header_frame.show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                ui.label(
+                                    egui::RichText
+                                        ::new("SYSTEM LOG")
+                                        .family(egui::FontFamily::Name("Inter-V".into()))
+                                        .size(10.0)
+                                        .color(white_color)
+                                );
+                            });
+
+                            // Вложенный блок со своим фоном, рамкой и скруглением
+                            console_inner_frame.show(ui, |ui| {
+                                egui::ScrollArea
+                                    ::vertical()
+                                    .auto_shrink([false, false])
+                                    .stick_to_bottom(true)
+                                    .show(ui, |ui| {
+                                        let logs = self.logs.lock().unwrap();
+
+                                        for line in logs.iter() {
+                                            let color = if
+                                                line.contains("Error") ||
+                                                line.contains("Failed")
+                                            {
+                                                red_button_color
+                                            } else if line.contains("Tunnel UP") {
+                                                green_button_color
+                                            } else if line.contains("Config loaded") {
+                                                gold_color
+                                            } else {
+                                                grey_color
+                                            };
+
+                                            ui.horizontal(|ui| {
+                                                ui.add(
+                                                    egui::Label
+                                                        ::new(
+                                                            egui::RichText
+                                                                ::new(line)
+                                                                .family(egui::FontFamily::Monospace)
+                                                                .size(11.0)
+                                                                .color(color)
+                                                        )
+                                                        .selectable(true)
+                                                        .wrap()
+                                                );
+                                            });
+                                        }
+                                    });
+                            });
                         });
-                });
+                    });
             });
 
         let settings_guard = self.settings.lock().unwrap();
@@ -1326,7 +1375,6 @@ impl eframe::App for ANetApp {
         let active_id = settings_guard.active_config_id.clone();
         let editing_id = self.editing_config_id.clone();
         drop(settings_guard);
-      
 
         let mut server_names = Vec::new();
         let mut selected_server_name = String::new();
@@ -1678,13 +1726,17 @@ impl eframe::App for ANetApp {
                             let top = egui::Color32::from_rgb(r, g, 0);
                             let bottom = egui::Color32::from_rgb(200, 60, 0);
 
-                            ("CONNECTING", top, bottom)
+                            ("CONNECTING", 
+                            egui::Color32::from_rgb(247, 137, 46), 
+                            egui::Color32::from_rgb(244, 46, 82)
+                        )
                         }
                         ConnectionState::Connected =>
                             (
                                 "DISCONNECT",
-                                egui::Color32::from_rgb(229, 57, 53), // Светло-красный
-                                egui::Color32::from_rgb(183, 28, 28), // Темно-красный
+                                 egui::Color32::from_rgb(248, 61, 170), // Темно-красный
+                                egui::Color32::from_rgb(243, 208, 120), // Светло-красный
+                               
                             ),
                     };
 
@@ -1795,7 +1847,7 @@ impl eframe::App for ANetApp {
                                     ::new("CONNECTED")
                                     .size(16.0)
                                     .strong()
-                                    .color(egui::Color32::GREEN)
+                                    .color(connected_text_color)
                             );
                         }
                         ConnectionState::Disconnected => {
@@ -1822,22 +1874,24 @@ impl eframe::App for ANetApp {
                 ui.add_space(20.0);
             });
 
-if self.sidebar_open {
-            egui::Area::new(egui::Id::new("config_appbar"))
-        .order(egui::Order::Foreground)
-        .fixed_pos(egui::pos2(0.0, 0.0))                
-        .show(ctx, |ui| {
-            let screen_rect = ui.ctx().screen_rect();
-            
-            let border_color = egui::Color32::from_rgb(100, 100, 100);
-            let corner_radius = 14.0; // Укажите ваш радиус скругления
+        if self.sidebar_open {
+            egui::Area
+                ::new(egui::Id::new("config_appbar"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(egui::pos2(0.0, 0.0))
+                .show(ctx, |ui| {
+                    let screen_rect = ui.ctx().screen_rect();
 
-            egui::Frame::none()
-                .fill(ui.visuals().window_fill())
-                .inner_margin(margin)
-                .corner_radius(corner_radius) // Скругление углов для appbar
-                .stroke(egui::Stroke::new(1.0, border_color)) // Обводка в 1 пиксель
-                .show(ui, |ui| {
+                    let border_color = egui::Color32::from_rgb(100, 100, 100);
+                    let corner_radius = 14.0; // Укажите ваш радиус скругления
+
+                    egui::Frame
+                        ::none()
+                        .fill(ui.visuals().window_fill())
+                        .inner_margin(margin)
+                        .corner_radius(corner_radius) // Скругление углов для appbar
+                        .stroke(egui::Stroke::new(1.0, border_color)) // Обводка в 1 пиксель
+                        .show(ui, |ui| {
                             ui.set_width(screen_rect.width() - margin * 2.0);
                             ui.set_height(screen_rect.height() - margin * 2.0);
 
@@ -2185,23 +2239,25 @@ if self.sidebar_open {
                 });
         }
 
-    #[cfg(target_os = "windows")]
-if self.appbar_open {
-    egui::Area::new(egui::Id::new("config_appbar"))
-        .order(egui::Order::Foreground)
-        .fixed_pos(egui::pos2(0.0, 0.0))                
-        .show(ctx, |ui| {
-            let screen_rect = ui.ctx().screen_rect();
-            
-            let border_color = egui::Color32::from_rgb(100, 100, 100);
-            let corner_radius = 14.0; // Укажите ваш радиус скругления
+        #[cfg(target_os = "windows")]
+        if self.appbar_open {
+            egui::Area
+                ::new(egui::Id::new("config_appbar"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(egui::pos2(0.0, 0.0))
+                .show(ctx, |ui| {
+                    let screen_rect = ui.ctx().screen_rect();
 
-            egui::Frame::none()
-                .fill(ui.visuals().window_fill())
-                .inner_margin(margin)
-                .corner_radius(corner_radius) // Скругление углов для appbar
-                .stroke(egui::Stroke::new(1.0, border_color)) // Обводка в 1 пиксель
-                .show(ui, |ui| {
+                    let border_color = egui::Color32::from_rgb(100, 100, 100);
+                    let corner_radius = 14.0; // Укажите ваш радиус скругления
+
+                    egui::Frame
+                        ::none()
+                        .fill(ui.visuals().window_fill())
+                        .inner_margin(margin)
+                        .corner_radius(corner_radius) // Скругление углов для appbar
+                        .stroke(egui::Stroke::new(1.0, border_color)) // Обводка в 1 пиксель
+                        .show(ui, |ui| {
                             ui.set_width(screen_rect.width() - margin * 2.0);
                             ui.set_height(screen_rect.height() - margin * 2.0);
 
@@ -2233,8 +2289,6 @@ if self.appbar_open {
                         });
                 });
         }
-
-
 
         if let Some(err_msg) = self.error_modal.clone() {
             let modal_bg = egui::Color32::from_rgb(32, 32, 32);

@@ -63,7 +63,7 @@ debug = 2
 codegen-units = 1
 
 [profile.release]
-opt-level = 3
+opt-level = 0
 lto = true
 codegen-units = 1
 panic = 'abort'
@@ -71,4 +71,5 @@ incremental = false
 
 
 [profile.release.package."*"]
-opt-level = 3
+opt-level = 0
+
