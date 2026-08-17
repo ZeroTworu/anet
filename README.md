@@ -91,10 +91,10 @@ make cert
 
 ### Mobile Android Application
 <p align="center">
-<img src=".assets/mobile-1.png" height="380" alt="Базовое окно" />
-<img src=".assets/mobile-2.png" height="380" alt="Окно обновления" />
-<img src=".assets/mobile-3.png" height="380" alt="Окно выбора приложений для туннелирования" />
-<img src=".assets/mobile-4.png" height="380" alt="Процесс соединения" />
-<img src=".assets/mobile-5.png" height="380" alt="Успешное соединение" />
+<img src=".assets/mobile_1.png" height="380" alt="Базовое окно" />
+<img src=".assets/mobile_2.png" height="380" alt="Окно обновления" />
+<img src=".assets/mobile_3.png" height="380" alt="Окно выбора приложений для туннелирования" />
+<img src=".assets/mobile_4.png" height="380" alt="Процесс соединения" />
+<img src=".assets/mobile_5.png" height="380" alt="Успешное соединение" />
 
 </p>
