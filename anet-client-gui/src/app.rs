@@ -1734,8 +1734,8 @@ impl eframe::App for ANetApp {
                         ConnectionState::Connected =>
                             (
                                 "DISCONNECT",
-                                 egui::Color32::from_rgb(248, 61, 170), // Темно-красный
-                                egui::Color32::from_rgb(243, 208, 120), // Светло-красный
+                                egui::Color32::from_rgb(255, 43, 68), 
+                            egui::Color32::from_rgb(131, 140, 251)
                                
                             ),
                     };
