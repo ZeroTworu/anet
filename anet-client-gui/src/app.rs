@@ -1,32 +1,46 @@
 #![allow(warnings)]
 include!(concat!(env!("OUT_DIR"), "/built.rs"));
 
-use crate::config::AppSettings;
-use crate::tun_factory::DesktopTunFactory;
-use crate::tray::TrayBackground;
-use crate::tray::TrayCommand;
-use anet_client_core::updater::{ Updater, GithubRelease };
-use anet_client_core::client::AnetClient;
-use anet_client_core::config::CoreConfig;
-use anet_client_core::events::{ AnetEvent, ClientState, EventHandler, set_handler };
-use anet_client_core::platform::create_route_manager;
-use eframe::egui;
-use std::path::PathBuf;
-use std::sync::mpsc::{ Receiver, Sender, channel };
-use std::sync::{ Arc, Mutex };
-use tokio::runtime::Runtime;
-use tokio::runtime::Handle;
-use notify_rust::Notification;
-use egui::{ RichText, FontId, FontDefinitions, FontData, FontFamily, Stroke, Visuals };
-use egui::widgets::Spinner;
-use egui::text::{ LayoutJob, TextFormat };
-use std::fs;
-use std::io;
-use std::fs::OpenOptions;
-use std::io::Write;
-use std::collections::BTreeMap;
-use sysinfo::System;
 use chrono::Local;
+use notify_rust::Notification;
+use sysinfo::System;
+use tokio::runtime::{ Handle, Runtime };
+
+use eframe::egui;
+use egui::{
+    containers::Sides,
+    text::{ LayoutJob, TextFormat },
+    widgets::Spinner,
+    FontData,
+    FontDefinitions,
+    FontId,
+    FontFamily,
+    RichText,
+    Stroke,
+    Visuals,
+};
+
+use anet_client_core::{
+    client::AnetClient,
+    config::CoreConfig,
+    events::{ set_handler, AnetEvent, ClientState, EventHandler },
+    platform::create_route_manager,
+    updater::{ GithubRelease, Updater },
+};
+
+use crate::{
+    config::AppSettings,
+    tun_factory::DesktopTunFactory,
+    tray::{ TrayBackground, TrayCommand },
+};
+
+use std::{
+    collections::BTreeMap,
+    fs::{ self, OpenOptions },
+    io::{ self, Write },
+    path::PathBuf,
+    sync::{ mpsc::{ channel, Receiver, Sender }, Arc, Mutex },
+};
 
 // Состояния для апдейтера
 #[derive(Clone)]
@@ -58,7 +72,6 @@ pub struct ProcessItem {
     pub pid: u32,
     pub name: String,
     pub is_selected: bool,
-    // В будущем сюда можно добавить egui::TextureHandle для иконки
 }
 
 pub struct AppState {
@@ -161,6 +174,7 @@ pub struct ANetApp {
     is_in_tray: bool,
     sidebar_open: bool,
     appbar_open: bool,
+    logbar_open: bool,
     editing_config_id: Option<String>,
     edit_name_buffer: String,
     error_modal: Option<String>,
@@ -671,6 +685,7 @@ impl ANetApp {
             is_in_tray: false,
             sidebar_open: false,
             appbar_open: false,
+            logbar_open: false,
             editing_config_id: None,
             edit_name_buffer: String::new(),
             error_modal: None,
@@ -980,7 +995,7 @@ fn load_fonts(ctx: &egui::Context) {
         std::sync::Arc::new(egui::FontData::from_static(inter_font_data))
     );
 
-    // 3. 📌 ВАЖНО: Регистрируем кастомное имя в семействе FontFamilies,
+    // 3. Регистрируем кастомное имя в семействе FontFamilies,
     // чтобы egui разрешил использовать FontFamily::Name("Inter-V".into())
     fonts.families
         .entry(egui::FontFamily::Name("Inter-V".into()))
@@ -1017,13 +1032,11 @@ impl eframe::App for ANetApp {
 
         let title_bg = egui::Color32::from_rgb(23, 25, 31);
         let dark_color = egui::Color32::from_rgb(22, 24, 31);
-        let console_bg = egui::Color32::from_rgb(32, 34, 41);
+        let console_bg = egui::Color32::from_rgb(21, 26, 35);
 
         let grey_color = egui::Color32::from_rgb(128, 128, 128);
 
-        
         let connected_text_color = egui::Color32::from_rgb(84, 210, 87);
-
 
         let text_button_color = egui::Color32::from_rgb(0, 0, 0);
         let green_button_color = egui::Color32::from_rgb(65, 180, 65); // Зеленый
@@ -1075,7 +1088,6 @@ impl eframe::App for ANetApp {
                 rect.max.y = rect.min.y + 38.0;
 
                 // 1. Рисуем сплошной фон на всю высоту и ширину
-                // let bg_color = egui::Color32::from_rgb(40, 40, 40);
                 ui.painter().rect_filled(
                     rect,
                     egui::CornerRadius { nw: 14, ne: 14, sw: 0, se: 0 },
@@ -1273,10 +1285,11 @@ impl eframe::App for ANetApp {
 
         // 1. Конфигурируем внутренний блок (карточку) для логов
         let console_inner_frame = egui::Frame::NONE
-            .fill(console_bg) // Фон внутреннего контейнера
-            .inner_margin(egui::Margin::same(10)) // Внутренние отступы для текста
-            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(50, 50, 50))) // (Опционально) Тонкая рамка
-            .corner_radius(egui::CornerRadius { nw: 0, ne: 0, sw: 14, se: 14 }); // Скругление углов
+            .fill(console_bg)
+            .inner_margin(egui::Margin::same(10))
+            .outer_margin(egui::Margin::same(0))
+            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(38, 41, 50)))
+            .corner_radius(egui::CornerRadius { nw: 0, ne: 0, sw: 14, se: 14 });
 
         // 2. Внешняя панель консоли
         egui::TopBottomPanel
@@ -1308,8 +1321,9 @@ impl eframe::App for ANetApp {
                             // Конфигурируем стили для контейнера заголовка
                             let header_frame = egui::Frame::NONE
                                 .fill(console_bg) // Цвет фона плашки
-                                .inner_margin(egui::Margin::symmetric(8, 4)) // Внутренние отступы (слева/справа: 8px, сверху/снизу: 4px)
-                                .corner_radius(egui::CornerRadius { nw: 14, ne: 14, sw: 0, se: 0 }) // Скругление углов
+                                .inner_margin(egui::Margin::symmetric(8, 4))
+                                .outer_margin(egui::Margin::symmetric(0, 0))
+                                .corner_radius(egui::CornerRadius { nw: 14, ne: 14, sw: 0, se: 0 })
                                 .stroke(
                                     egui::Stroke::new(1.0, egui::Color32::from_rgb(50, 50, 50))
                                 ); // (Опционально) Тонкая рамка
@@ -1317,15 +1331,79 @@ impl eframe::App for ANetApp {
                             // Оборачиваем заголовок
                             header_frame.show(ui, |ui| {
                                 ui.set_width(ui.available_width());
-                                ui.label(
-                                    egui::RichText
-                                        ::new("SYSTEM LOG")
-                                        .family(egui::FontFamily::Name("Inter-V".into()))
-                                        .size(10.0)
-                                        .color(white_color)
-                                );
-                            });
 
+                                Sides::new()
+                                    .height(24.0)
+                                    .show(
+                                        ui,
+                                        |ui| {
+                                            ui.label(
+                                                egui::RichText
+                                                    ::new("SYSTEM LOG")
+                                                    .family(
+                                                        egui::FontFamily::Name("Inter-V".into())
+                                                    )
+                                                    .size(10.0)
+                                                    .color(white_color)
+                                            );
+                                        },
+                                        |ui| {
+                                            let mut response = ui
+                                                .horizontal(|ui| {
+                                                    ui.spacing_mut().item_spacing.x = 6.0; // Отступ между текстом и иконкой
+
+                                                    // 1. Текст
+                                                    ui.label(
+                                                        egui::RichText
+                                                            ::new("open full log")
+                                                            .family(
+                                                                egui::FontFamily::Name(
+                                                                    "Inter-V".into()
+                                                                )
+                                                            )
+                                                            .size(11.0)
+                                                            .color(white_color)
+                                                    );
+
+                                                    // 2. Иконка с возможностью пиксельного смещения
+                                                    let image_size = egui::vec2(14.0, 14.0);
+                                                    let (rect, _) = ui.allocate_exact_size(
+                                                        image_size,
+                                                        egui::Sense::hover()
+                                                    );
+
+                                                    let offset_x = 4.0;
+                                                    let offset_y = 2.0;
+                                                    // -------------------------------------
+
+                                                    // Смещаем прямоугольник отрисовки
+                                                    let shifted_rect = rect.translate(
+                                                        egui::vec2(offset_x, offset_y)
+                                                    );
+
+                                                    // Отрисовываем SVG в смещенной области
+                                                    egui::Image
+                                                        ::new(
+                                                            egui::include_image!(
+                                                                "./assets/list.svg"
+                                                            )
+                                                        )
+                                                        .max_size(image_size)
+                                                        .paint_at(ui, shifted_rect);
+                                                })
+                                                .response.interact(egui::Sense::click());
+
+                                            response = response.on_hover_cursor(
+                                                egui::CursorIcon::PointingHand
+                                            );
+
+                                            if response.clicked() {
+                                                self.logbar_open = !self.logbar_open;
+                                            }
+                                        }
+                                    );
+                            });
+                            ui.add_space(-ui.spacing().item_spacing.y);
                             // Вложенный блок со своим фоном, рамкой и скруглением
                             console_inner_frame.show(ui, |ui| {
                                 egui::ScrollArea
@@ -1396,7 +1474,6 @@ impl eframe::App for ANetApp {
         }
 
         let main_frame = egui::Frame::NONE.fill(dark_color).inner_margin(margin);
-        //.corner_radius(egui::CornerRadius { nw: 0, ne: 0, sw: 14, se: 14 });
 
         egui::CentralPanel
             ::default()
@@ -1416,7 +1493,7 @@ impl eframe::App for ANetApp {
                             // Получаем значение анимации с ПРЕДЫДУЩЕГО кадра (от 0.0 до 1.0)
                             let hover_t: f32 = ui.data(|d| d.get_temp(anim_id)).unwrap_or(0.0);
 
-                            // 🌟 2. ПЛАВНЫЙ ПЕРЕХОД ЦВЕТА (Обычный цвет -> Цвет при наведении)
+                            // 2. ПЛАВНЫЙ ПЕРЕХОД ЦВЕТА (Обычный цвет -> Цвет при наведении)
                             let normal_color = white_color;
                             let hover_color = gold_color;
 
@@ -1579,30 +1656,6 @@ impl eframe::App for ANetApp {
                                 ui.add_space(2.0);
                                 ui.label(RichText::new("APPS").size(label_size).color(grey_color));
                             }
-                            // |ui| {
-                            //     let icon = egui::Image
-                            //         ::new(egui::include_image!("./assets/apps_white.svg"))
-                            //         .fit_to_exact_size(button_icon_size);
-
-                            //     let menu_button = egui::Button
-                            //         ::image(icon)
-                            //         .min_size(button_size)
-                            //         .stroke(egui::Stroke::NONE)
-                            //         .frame(false)
-                            //         .rounding(button_size.y / 2.0);
-
-                            //     // Добавляем кнопку один раз, сразу настраиваем курсор и получаем response
-                            //     let response = ui
-                            //         .add(menu_button)
-                            //         .on_hover_cursor(egui::CursorIcon::PointingHand);
-
-                            //     // Проверяем клик через полученный response
-                            //     if response.clicked() {
-                            //         self.appbar_open = !self.appbar_open; // Или sidebar_open, в зависимости от нужной кнопки
-                            //     }
-                            //     ui.add_space(2.0);
-                            //     ui.label(RichText::new("APPS").size(label_size).color(grey_color));
-                            // }
                         );
                     }
                 });
@@ -1726,17 +1779,17 @@ impl eframe::App for ANetApp {
                             let top = egui::Color32::from_rgb(r, g, 0);
                             let bottom = egui::Color32::from_rgb(200, 60, 0);
 
-                            ("CONNECTING", 
-                            egui::Color32::from_rgb(247, 137, 46), 
-                            egui::Color32::from_rgb(244, 46, 82)
-                        )
+                            (
+                                "CONNECTING",
+                                egui::Color32::from_rgb(247, 137, 46),
+                                egui::Color32::from_rgb(244, 46, 82),
+                            )
                         }
                         ConnectionState::Connected =>
                             (
                                 "DISCONNECT",
-                                egui::Color32::from_rgb(255, 43, 68), 
-                            egui::Color32::from_rgb(131, 140, 251)
-                               
+                                egui::Color32::from_rgb(255, 43, 68),
+                                egui::Color32::from_rgb(131, 140, 251),
                             ),
                     };
 
@@ -1882,15 +1935,13 @@ impl eframe::App for ANetApp {
                 .show(ctx, |ui| {
                     let screen_rect = ui.ctx().screen_rect();
 
-                    let border_color = egui::Color32::from_rgb(100, 100, 100);
                     let corner_radius = 14.0; // Укажите ваш радиус скругления
 
                     egui::Frame
                         ::none()
                         .fill(ui.visuals().window_fill())
                         .inner_margin(margin)
-                        .corner_radius(corner_radius) // Скругление углов для appbar
-                        .stroke(egui::Stroke::new(1.0, border_color)) // Обводка в 1 пиксель
+                        .corner_radius(corner_radius)
                         .show(ui, |ui| {
                             ui.set_width(screen_rect.width() - margin * 2.0);
                             ui.set_height(screen_rect.height() - margin * 2.0);
@@ -1918,8 +1969,6 @@ impl eframe::App for ANetApp {
                                 ui.heading("Настройки профиля");
                             });
                             ui.separator();
-
-                            //let gold_color = egui::Color32::from_rgb(255, 100, 0);
 
                             ui.label(
                                 egui::RichText::new("КОНФИГИ").size(12.0).strong().color(gold_color)
@@ -2247,16 +2296,12 @@ impl eframe::App for ANetApp {
                 .fixed_pos(egui::pos2(0.0, 0.0))
                 .show(ctx, |ui| {
                     let screen_rect = ui.ctx().screen_rect();
-
-                    let border_color = egui::Color32::from_rgb(100, 100, 100);
-                    let corner_radius = 14.0; // Укажите ваш радиус скругления
-
+                    let corner_radius = 14.0;
                     egui::Frame
                         ::none()
                         .fill(ui.visuals().window_fill())
                         .inner_margin(margin)
-                        .corner_radius(corner_radius) // Скругление углов для appbar
-                        .stroke(egui::Stroke::new(1.0, border_color)) // Обводка в 1 пиксель
+                        .corner_radius(corner_radius)
                         .show(ui, |ui| {
                             ui.set_width(screen_rect.width() - margin * 2.0);
                             ui.set_height(screen_rect.height() - margin * 2.0);
@@ -2272,7 +2317,6 @@ impl eframe::App for ANetApp {
                                     .stroke(Stroke::NONE)
                                     .rounding(button_size.y / 2.0);
 
-                                // Добавляем кнопку, сразу настраиваем курсор и сохраняем результат
                                 let response = ui
                                     .add(circle_button)
                                     .on_hover_cursor(egui::CursorIcon::PointingHand);
@@ -2290,6 +2334,97 @@ impl eframe::App for ANetApp {
                 });
         }
 
+        /////
+
+        if self.logbar_open {
+            egui::Area
+                ::new(egui::Id::new("config_logbar"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(egui::pos2(0.0, 0.0))
+                .show(ctx, |ui| {
+                    let screen_rect = ui.ctx().screen_rect();
+
+                    let corner_radius = 14.0;
+
+                    egui::Frame
+                        ::none()
+                        .fill(ui.visuals().window_fill())
+                        .inner_margin(margin)
+                        .corner_radius(corner_radius)
+
+                        .show(ui, |ui| {
+                            ui.set_width(screen_rect.width() - margin * 2.0);
+                            ui.set_height(screen_rect.height() - margin * 2.0);
+
+                            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                                self.logbar_open = false;
+                            }
+
+                            ui.horizontal(|ui| {
+                                let circle_button = egui::Button
+                                    ::new("⏴")
+                                    .min_size(button_size)
+                                    .stroke(Stroke::NONE)
+                                    .rounding(button_size.y / 2.0);
+
+                                // Добавляем кнопку, сразу настраиваем курсор и сохраняем результат
+                                let response = ui
+                                    .add(circle_button)
+                                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+
+                                if response.clicked() {
+                                    self.logbar_open = false;
+                                }
+
+                                ui.heading("Log");
+                            });
+                            ui.separator();
+
+                            let console_inner_frame = egui::Frame::NONE;
+                            console_inner_frame.show(ui, |ui| {
+                                egui::ScrollArea
+                                    ::vertical()
+                                    .auto_shrink([false, false])
+                                    .stick_to_bottom(true)
+                                    .show(ui, |ui| {
+                                        let logs = self.logs.lock().unwrap();
+
+                                        for line in logs.iter() {
+                                            let color = if
+                                                line.contains("Error") ||
+                                                line.contains("Failed")
+                                            {
+                                                red_button_color
+                                            } else if line.contains("Tunnel UP") {
+                                                green_button_color
+                                            } else if line.contains("Config loaded") {
+                                                gold_color
+                                            } else {
+                                                grey_color
+                                            };
+
+                                            ui.horizontal(|ui| {
+                                                ui.add(
+                                                    egui::Label
+                                                        ::new(
+                                                            egui::RichText
+                                                                ::new(line)
+                                                                .family(egui::FontFamily::Monospace)
+                                                                .size(11.0)
+                                                                .color(color)
+                                                        )
+                                                        .selectable(true)
+                                                        .wrap()
+                                                );
+                                            });
+                                        }
+                                    });
+                            });
+                        });
+                });
+        }
+
+        //////
         if let Some(err_msg) = self.error_modal.clone() {
             let modal_bg = egui::Color32::from_rgb(32, 32, 32);
             egui::Window
@@ -2303,7 +2438,7 @@ impl eframe::App for ANetApp {
                         .fill(modal_bg)
                         .stroke(egui::Stroke::new(3.0, gold_color))
                         .inner_margin(24.0)
-                        .corner_radius(4.0)
+                        .corner_radius(14.0)
                 )
                 .show(ctx, |ui| {
                     ui.vertical_centered(|ui| {
@@ -2348,7 +2483,6 @@ impl eframe::App for ANetApp {
         }
 
         if matches!(self.update_status, UpdateStatus::ReadyToRestart) {
-            // let gold_color = egui::Color32::from_rgb(255, 100, 0);
             let modal_bg = egui::Color32::from_rgb(32, 32, 32);
 
             egui::Window
@@ -2362,7 +2496,7 @@ impl eframe::App for ANetApp {
                         .fill(modal_bg)
                         .stroke(egui::Stroke::new(3.0, gold_color))
                         .inner_margin(24.0)
-                        .corner_radius(4.0)
+                        .corner_radius(14.0)
                 )
                 .show(ctx, |ui| {
                     ui.vertical_centered(|ui| {
@@ -2443,7 +2577,7 @@ impl eframe::App for ANetApp {
         painter.rect_stroke(
             screen_rect,
             corner_radius,
-            egui::Stroke::new(1.0, egui::Color32::from_rgb(100, 100, 100)),
+            egui::Stroke::new(1.0, egui::Color32::from_rgb(38, 41, 46)),
             egui::StrokeKind::Inside // Прижимаем обводку внутрь, чтобы она не обрезалась границами экрана
         );
     }
