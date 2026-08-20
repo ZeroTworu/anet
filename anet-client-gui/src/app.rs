@@ -9,6 +9,7 @@ use tokio::runtime::{ Handle, Runtime };
 use eframe::egui;
 use egui::{
     containers::Sides,
+    scroll_area::ScrollBarVisibility,
     text::{ LayoutJob, TextFormat },
     widgets::Spinner,
     FontData,
@@ -454,9 +455,17 @@ impl ANetApp {
 
         ui.separator();
 
+        // Настраиваем цвета бегунка для разных состояний
+        // ЗАСТАВЛЯЕМ скроллбар брать цвет из настроек фона (bg_fill), а не текста
+        ui.style_mut().spacing.scroll.foreground_color = false;
+        ui.style_mut().visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(80, 80, 80); // Обычный цвет
+        ui.style_mut().visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(120, 120, 120); // Цвет при наведении мыши
+        ui.style_mut().visuals.widgets.active.bg_fill = egui::Color32::from_rgb(160, 160, 160); // Цвет при зажатии/перетаскивании
+
         egui::ScrollArea
             ::vertical()
             .auto_shrink([false, false])
+            .scroll_bar_visibility(ScrollBarVisibility::AlwaysVisible)
             .show(ui, |ui| {
                 egui::Grid
                     ::new("process_grid")
@@ -1027,27 +1036,32 @@ impl eframe::App for ANetApp {
         let ivory_color = egui::Color32::from_rgb(234, 233, 235);
         let gold_color = egui::Color32::from_rgb(238, 188, 122);
         let light_blue_color = egui::Color32::from_rgb(128, 172, 202);
-
         let white_color = egui::Color32::from_rgb(255, 255, 255);
-
         let title_bg = egui::Color32::from_rgb(23, 25, 31);
         let dark_color = egui::Color32::from_rgb(22, 24, 31);
         let console_bg = egui::Color32::from_rgb(21, 26, 35);
-
-        let grey_color = egui::Color32::from_rgb(128, 128, 128);
-
-        let connected_text_color = egui::Color32::from_rgb(84, 210, 87);
-
-        let text_button_color = egui::Color32::from_rgb(0, 0, 0);
-        let green_button_color = egui::Color32::from_rgb(65, 180, 65); // Зеленый
-        let orange_button_color = egui::Color32::from_rgb(218, 130, 0); // Оранжевый
-        let red_button_color = egui::Color32::from_rgb(220, 60, 60); // Красный
+        let grey_color = egui::Color32::from_rgb(128, 128, 128);        
+        let green_color = egui::Color32::from_rgb(65, 180, 65); 
+        let orange_color = egui::Color32::from_rgb(218, 130, 0); 
+        let red_color = egui::Color32::from_rgb(220, 60, 60); 
 
         let button_size = egui::vec2(32.0, 32.0);
         let button_icon_size = egui::vec2(26.0, 26.0);
 
         let margin = 20.0;
         let label_size = 10.0;
+
+        // scrollbar
+        let track_width = 2.0;
+        let track_margin = -2.0; // Отступ от правого края
+
+        // подложка
+        let track_corner = egui::CornerRadius::same(3);
+        let track_color = egui::Color32::from_black_alpha(40);
+
+        // бегунок
+        let tracker_corner = egui::CornerRadius::same(3);
+        let tracker_color = egui::Color32::from_rgb(60, 112, 222);
 
         let mut visuals = egui::Visuals::dark();
 
@@ -1309,10 +1323,10 @@ impl eframe::App for ANetApp {
                         bottom: 0,
                     })
                     .inner_margin(egui::Margin {
-                        left: 20,
-                        right: 20,
+                        left: 10,
+                        right: 10,
                         top: 10,
-                        bottom: 20,
+                        bottom: 10,
                     })
                     .fill(dark_color) // Фон внутреннего контейнера
                     .corner_radius(egui::CornerRadius { nw: 0, ne: 0, sw: 14, se: 14 })
@@ -1406,9 +1420,13 @@ impl eframe::App for ANetApp {
                             ui.add_space(-ui.spacing().item_spacing.y);
                             // Вложенный блок со своим фоном, рамкой и скруглением
                             console_inner_frame.show(ui, |ui| {
-                                egui::ScrollArea
+                                // 1. Создаем ScrollArea, отключая стандартный скроллбар
+                                let output1 = egui::ScrollArea
                                     ::vertical()
                                     .auto_shrink([false, false])
+                                    .scroll_bar_visibility(
+                                        egui::scroll_area::ScrollBarVisibility::AlwaysHidden
+                                    ) // Прячем дефолтный
                                     .stick_to_bottom(true)
                                     .show(ui, |ui| {
                                         let logs = self.logs.lock().unwrap();
@@ -1416,13 +1434,18 @@ impl eframe::App for ANetApp {
                                         for line in logs.iter() {
                                             let color = if
                                                 line.contains("Error") ||
-                                                line.contains("Failed")
+                                                line.contains("Failed") ||
+                                                line.contains("error")
                                             {
-                                                red_button_color
+                                                red_color
                                             } else if line.contains("Tunnel UP") {
-                                                green_button_color
+                                                green_color
                                             } else if line.contains("Config loaded") {
                                                 gold_color
+                                            } else if line.contains("Connection lost") {
+                                                red_color
+                                            } else if line.contains("Cleaning up dead session") {
+                                                orange_color
                                             } else {
                                                 grey_color
                                             };
@@ -1443,6 +1466,63 @@ impl eframe::App for ANetApp {
                                             });
                                         }
                                     });
+
+                                // 2. Получаем метрики для расчета кастомного скроллбара
+                                let viewport_height1 = output1.inner_rect.height(); // Размер видимой области (окна)
+                                let content_height1 = output1.content_size.y; // Полная высота всех логов
+
+                                // Скроллбар нужен только если контент не влезает в окно
+                                if content_height1 > viewport_height1 {
+                                    let offset_y1 = output1.state.offset.y; // Текущее смещение скролла по Y
+
+                                    // Вычисляем координаты "дорожки" (прижимаем к правому краю видимой области)
+                                    let track_rect1 = egui::Rect::from_min_size(
+                                        egui::pos2(
+                                            output1.inner_rect.right() - track_width - track_margin,
+                                            output1.inner_rect.top()
+                                        ),
+                                        egui::vec2(track_width, viewport_height1)
+                                    );
+
+                                    // Вычисляем высоту бегунка (пропорционально контенту)
+                                    let thumb_proportion1 = viewport_height1 / content_height1;
+                                    let thumb_height1 = (viewport_height1 * thumb_proportion1).max(
+                                        20.0
+                                    ); // Не меньше 20 пикселей
+
+                                    // Вычисляем смещение бегунка сверху
+                                    let max_scroll1 = content_height1 - viewport_height1;
+                                    let scroll_ratio1 = if max_scroll1 > 0.0 {
+                                        offset_y1 / max_scroll1
+                                    } else {
+                                        0.0
+                                    };
+                                    let thumb_start_y1 =
+                                        track_rect1.top() +
+                                        scroll_ratio1 * (viewport_height1 - thumb_height1);
+
+                                    let thumb_rect1 = egui::Rect::from_min_size(
+                                        egui::pos2(track_rect1.left(), thumb_start_y1),
+                                        egui::vec2(track_width, thumb_height1)
+                                    );
+
+                                    // 3. ОТРИСОВКА СОБСТВЕННЫХ ЦВЕТОВ
+                                    let painter1 = ui.painter();
+
+                                    // Рисуем подложку (дорожку)
+                                    painter1.rect_filled(
+                                        track_rect1,
+                                        track_corner, // Скругление
+                                        track_color
+                                    );
+
+                                    // Рисуем сам бегунок
+                                    painter1.rect_filled(
+                                        thumb_rect1,
+                                        tracker_corner,
+                                        tracker_color
+                                    );
+                                }
                             });
                         });
                     });
@@ -1683,6 +1763,7 @@ impl eframe::App for ANetApp {
                     ui.vertical_centered(|ui| {
                         if state == ConnectionState::Disconnected {
                             ui.horizontal(|ui| {
+                                ui.set_width(ui.available_width());
                                 ui.add_space(ui.available_width() * 0.1);
                                 ui.label(egui::RichText::new("Подключение к:").color(ivory_color));
 
@@ -1741,6 +1822,7 @@ impl eframe::App for ANetApp {
                             });
                         } else {
                             ui.horizontal(|ui| {
+                                ui.set_width(ui.available_width());
                                 ui.add_space(ui.available_width() * 0.1);
                                 ui.label(egui::RichText::new("Активная нода:").color(gold_color));
                                 ui.label(
@@ -1895,31 +1977,213 @@ impl eframe::App for ANetApp {
                     // Статусный текст снизу
                     match state {
                         ConnectionState::Connected => {
-                            ui.label(
-                                egui::RichText
-                                    ::new("CONNECTED")
-                                    .size(16.0)
-                                    .strong()
-                                    .color(connected_text_color)
-                            );
+                           
+                            let text_str = "CONNECTED";
+let font_size = 16.0;
+
+// 1. Измеряем точную ширину текста
+let font_id = egui::FontId::new(
+    font_size,
+    egui::FontFamily::Proportional
+);
+let galley = ui
+    .painter()
+    .layout_no_wrap(text_str.to_string(), font_id, grey_color);
+let text_width = galley.rect.width();
+
+// 2. Параметры иконки и отступа
+let icon_size = egui::vec2(16.0, 16.0);
+
+let spacing = 2.0; // Желаемый отступ между иконкой и текстом
+
+// 3. Вычисляем позицию X, где должен НАЧИНАТЬСЯ текст, чтобы он был строго по центру
+let available_width = ui.available_width();
+let text_start_x = (available_width - text_width) / 2.0;
+
+// 4. Отступаем слева так, чтобы с учетом ширины иконки и отступа
+// текст начался ровно в позиции text_start_x
+let left_padding = (text_start_x - icon_size.x  + spacing).max(0.0);
+
+ui.horizontal(|ui| {
+    // 1. Отключаем автоматический межэлементный отступ egui
+    ui.spacing_mut().item_spacing.x = spacing;
+
+    // 2. Добавляем точный расчетный отступ
+    ui.add_space(left_padding);
+
+    let indicator_color = egui::Color32::from_rgb(76, 175, 80);
+
+    // Выделяем место под SVG
+    let (rect, _) = ui.allocate_exact_size(
+        icon_size,
+        egui::Sense::hover()
+    );
+
+    let offset_x = 0.0;
+    let offset_y = 0.0;
+    let shifted_rect = rect.translate(egui::vec2(offset_x, offset_y));
+
+    // --- ОТРИСОВКА СВЕЧЕНИЯ И ИКОНКИ ---
+    egui::Image::new(egui::include_image!("./assets/dot.svg"))
+                                    .tint(indicator_color.linear_multiply(0.15))
+                                    .paint_at(ui, shifted_rect.expand(4.0));
+
+                                // 2. Средний слой свечения
+                egui::Image
+                                    ::new(egui::include_image!("./assets/dot.svg"))
+                                    .tint(indicator_color.linear_multiply(0.35))
+                                    .paint_at(ui, shifted_rect.expand(2.0));
+
+                                // 3. Основная SVG-иконка
+                                egui::Image
+                                    ::new(egui::include_image!("./assets/dot.svg"))
+                                    .max_size(icon_size)
+                                    .paint_at(ui, shifted_rect); 
+
+    // Текст встанет вплотную к SVG (или на расстояние `spacing`, если зададите значение больше 0)
+    ui.label(
+        egui::RichText::new(text_str)
+            .size(font_size)
+            .strong()
+            .color(green_color)
+    );
+});
                         }
                         ConnectionState::Disconnected => {
-                            ui.label(
-                                egui::RichText
-                                    ::new("DISCONNECTED")
-                                    .size(16.0)
-                                    .strong()
-                                    .color(grey_color)
-                            );
+                            let text_str = "DISCONNECTED";
+let font_size = 16.0;
+
+// 1. Измеряем точную ширину текста
+let font_id = egui::FontId::new(
+    font_size,
+    egui::FontFamily::Proportional
+);
+let galley = ui
+    .painter()
+    .layout_no_wrap(text_str.to_string(), font_id, grey_color);
+let text_width = galley.rect.width();
+
+// 2. Параметры иконки и отступа
+let icon_size = egui::vec2(16.0, 16.0);
+
+let spacing = 2.0; // Желаемый отступ между иконкой и текстом
+
+// 3. Вычисляем позицию X, где должен НАЧИНАТЬСЯ текст, чтобы он был строго по центру
+let available_width = ui.available_width();
+let text_start_x = (available_width - text_width) / 2.0;
+
+// 4. Отступаем слева так, чтобы с учетом ширины иконки и отступа
+// текст начался ровно в позиции text_start_x
+let left_padding = (text_start_x - icon_size.x  + spacing).max(0.0);
+
+ui.horizontal(|ui| {
+    // 1. Отключаем автоматический межэлементный отступ egui
+    ui.spacing_mut().item_spacing.x = spacing;
+
+    // 2. Добавляем точный расчетный отступ
+    ui.add_space(left_padding);
+
+    let indicator_color = grey_color;
+
+    // Выделяем место под SVG
+    let (rect, _) = ui.allocate_exact_size(
+        icon_size,
+        egui::Sense::hover()
+    );
+
+    let offset_x = 0.0;
+    let offset_y = 0.0;
+    let shifted_rect = rect.translate(egui::vec2(offset_x, offset_y));
+
+    // --- ОТРИСОВКА СВЕЧЕНИЯ И ИКОНКИ ---
+    egui::Image::new(egui::include_image!("./assets/block.svg"))
+        .tint(indicator_color.linear_multiply(0.15))
+        .paint_at(ui, shifted_rect.expand(4.0));
+
+    egui::Image::new(egui::include_image!("./assets/block.svg"))
+        .tint(indicator_color.linear_multiply(0.35))
+        .paint_at(ui, shifted_rect.expand(2.0));
+
+    egui::Image::new(egui::include_image!("./assets/block.svg"))
+        .max_size(icon_size)
+        .paint_at(ui, shifted_rect);   
+
+    // Текст встанет вплотную к SVG (или на расстояние `spacing`, если зададите значение больше 0)
+    ui.label(
+        egui::RichText::new(text_str)
+            .size(font_size)
+            .strong()
+            .color(grey_color)
+    );
+});
                         }
                         ConnectionState::Connecting => {
-                            ui.label(
-                                egui::RichText
-                                    ::new("CONNECTING")
-                                    .size(16.0)
-                                    .strong()
-                                    .color(egui::Color32::YELLOW)
-                            );
+                            
+                            let text_str = "CONNECTING";
+let font_size = 16.0;
+
+// 1. Измеряем точную ширину текста
+let font_id = egui::FontId::new(
+    font_size,
+    egui::FontFamily::Proportional
+);
+let galley = ui
+    .painter()
+    .layout_no_wrap(text_str.to_string(), font_id, grey_color);
+let text_width = galley.rect.width();
+
+// 2. Параметры иконки и отступа
+let icon_size = egui::vec2(16.0, 16.0);
+
+let spacing = 2.0; // Желаемый отступ между иконкой и текстом
+
+// 3. Вычисляем позицию X, где должен НАЧИНАТЬСЯ текст, чтобы он был строго по центру
+let available_width = ui.available_width();
+let text_start_x = (available_width - text_width) / 2.0;
+
+// 4. Отступаем слева так, чтобы с учетом ширины иконки и отступа
+// текст начался ровно в позиции text_start_x
+let left_padding = (text_start_x - icon_size.x  + spacing).max(0.0);
+
+ui.horizontal(|ui| {
+    // 1. Отключаем автоматический межэлементный отступ egui
+    ui.spacing_mut().item_spacing.x = spacing;
+
+    // 2. Добавляем точный расчетный отступ
+    ui.add_space(left_padding);
+
+    let indicator_color = orange_color;
+
+    // Выделяем место под SVG
+    let (rect, _) = ui.allocate_exact_size(
+        icon_size,
+        egui::Sense::hover()
+    );
+
+    let offset_x = 0.0;
+    let offset_y = 0.0;
+    let shifted_rect = rect.translate(egui::vec2(offset_x, offset_y));
+
+    // --- ОТРИСОВКА СВЕЧЕНИЯ И ИКОНКИ ---
+egui::Image
+                                    ::new(egui::include_image!("./assets/connecting.svg"))
+                                    .tint(indicator_color.linear_multiply(0.35))
+                                    .paint_at(ui, shifted_rect.expand(2.0));
+
+                                // 3. Основная SVG-иконка
+                                egui::Image
+                                    ::new(egui::include_image!("./assets/connecting.svg"))
+                                    .max_size(icon_size)
+                                    .paint_at(ui, shifted_rect);
+
+    // Текст встанет вплотную к SVG (или на расстояние `spacing`, если зададите значение больше 0)
+    ui.label(
+        egui::RichText::new(text_str)
+            .size(font_size)
+            .strong()
+            .color(orange_color)
+    );
+});
                         }
                     }
                 });
@@ -2168,11 +2432,22 @@ impl eframe::App for ANetApp {
                                                         .strong()
                                                 );
                                                 ui.add_space(4.0);
-
+                                                // Настраиваем цвета бегунка для разных состояний
+                                                // ЗАСТАВЛЯЕМ скроллбар брать цвет из настроек фона (bg_fill), а не текста
+                                                ui.style_mut().spacing.scroll.foreground_color = false;
+                                                ui.style_mut().visuals.widgets.inactive.bg_fill =
+                                                    egui::Color32::from_rgb(80, 80, 80); // Обычный цвет
+                                                ui.style_mut().visuals.widgets.hovered.bg_fill =
+                                                    egui::Color32::from_rgb(120, 120, 120); // Цвет при наведении мыши
+                                                ui.style_mut().visuals.widgets.active.bg_fill =
+                                                    egui::Color32::from_rgb(160, 160, 160); // Цвет при зажатии/перетаскивании
                                                 egui::ScrollArea
                                                     ::vertical()
                                                     .max_height(180.0)
                                                     .auto_shrink([false, true])
+                                                    .scroll_bar_visibility(
+                                                        ScrollBarVisibility::AlwaysVisible
+                                                    )
                                                     .show(ui, |ui| {
                                                         let changelog = rel.body
                                                             .as_deref()
@@ -2382,9 +2657,13 @@ impl eframe::App for ANetApp {
 
                             let console_inner_frame = egui::Frame::NONE;
                             console_inner_frame.show(ui, |ui| {
-                                egui::ScrollArea
+                                // 1. Создаем ScrollArea, отключая стандартный скроллбар
+                                let output2 = egui::ScrollArea
                                     ::vertical()
                                     .auto_shrink([false, false])
+                                    .scroll_bar_visibility(
+                                        egui::scroll_area::ScrollBarVisibility::AlwaysHidden
+                                    ) // Прячем дефолтный
                                     .stick_to_bottom(true)
                                     .show(ui, |ui| {
                                         let logs = self.logs.lock().unwrap();
@@ -2392,13 +2671,18 @@ impl eframe::App for ANetApp {
                                         for line in logs.iter() {
                                             let color = if
                                                 line.contains("Error") ||
-                                                line.contains("Failed")
+                                                line.contains("Failed") ||
+                                                line.contains("error")
                                             {
-                                                red_button_color
+                                                red_color
                                             } else if line.contains("Tunnel UP") {
-                                                green_button_color
+                                                green_color
                                             } else if line.contains("Config loaded") {
                                                 gold_color
+                                            } else if line.contains("Connection lost") {
+                                                red_color
+                                            } else if line.contains("Cleaning up dead session") {
+                                                orange_color
                                             } else {
                                                 grey_color
                                             };
@@ -2419,6 +2703,65 @@ impl eframe::App for ANetApp {
                                             });
                                         }
                                     });
+
+                                // 2. Получаем метрики для расчета кастомного скроллбара
+                                let viewport_height2 = output2.inner_rect.height(); // Размер видимой области (окна)
+                                let content_height2 = output2.content_size.y; // Полная высота всех логов
+
+                                // Скроллбар нужен только если контент не влезает в окно
+                                if content_height2 > viewport_height2 {
+                                    let offset_y2 = output2.state.offset.y; // Текущее смещение скролла по Y
+
+                                    // Настройки размеров
+
+                                    // Вычисляем координаты "дорожки" (прижимаем к правому краю видимой области)
+                                    let track_rect2 = egui::Rect::from_min_size(
+                                        egui::pos2(
+                                            output2.inner_rect.right() - track_width - track_margin,
+                                            output2.inner_rect.top()
+                                        ),
+                                        egui::vec2(track_width, viewport_height2)
+                                    );
+
+                                    // Вычисляем высоту бегунка (пропорционально контенту)
+                                    let thumb_proportion2 = viewport_height2 / content_height2;
+                                    let thumb_height2 = (viewport_height2 * thumb_proportion2).max(
+                                        20.0
+                                    ); // Не меньше 20 пикселей
+
+                                    // Вычисляем смещение бегунка сверху
+                                    let max_scroll2 = content_height2 - viewport_height2;
+                                    let scroll_ratio2 = if max_scroll2 > 0.0 {
+                                        offset_y2 / max_scroll2
+                                    } else {
+                                        0.0
+                                    };
+                                    let thumb_start_y2 =
+                                        track_rect2.top() +
+                                        scroll_ratio2 * (viewport_height2 - thumb_height2);
+
+                                    let thumb_rect2 = egui::Rect::from_min_size(
+                                        egui::pos2(track_rect2.left(), thumb_start_y2),
+                                        egui::vec2(track_width, thumb_height2)
+                                    );
+
+                                    // 3. ОТРИСОВКА СОБСТВЕННЫХ ЦВЕТОВ
+                                    let painter2 = ui.painter();
+
+                                    // Рисуем подложку (дорожку)
+                                    painter2.rect_filled(
+                                        track_rect2,
+                                        track_corner, // Скругление
+                                        track_color
+                                    );
+
+                                    // Рисуем сам бегунок
+                                    painter2.rect_filled(
+                                        thumb_rect2,
+                                        tracker_corner,
+                                        tracker_color
+                                    );
+                                }
                             });
                         });
                 });
