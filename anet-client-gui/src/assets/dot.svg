@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<svg
+   xmlns:dc="http://purl.org/dc/elements/1.1/"
+   xmlns:cc="http://creativecommons.org/ns#"
+   xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+   xmlns:svg="http://www.w3.org/2000/svg"
+   xmlns="http://www.w3.org/2000/svg"
+   xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd"
+   xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape"
+   inkscape:version="1.0 (4035a4fb49, 2020-05-01)"
+   sodipodi:docname="dot.svg"
+   id="svg4"
+   version="1.1"
+   fill="#75FB4C"
+   width="24px"
+   viewBox="0 -960 960 960"
+   height="24px">
+  <metadata
+     id="metadata10">
+    <rdf:RDF>
+      <cc:Work
+         rdf:about="">
+        <dc:format>image/svg+xml</dc:format>
+        <dc:type
+           rdf:resource="http://purl.org/dc/dcmitype/StillImage" />
+        <dc:title></dc:title>
+      </cc:Work>
+    </rdf:RDF>
+  </metadata>
+  <defs
+     id="defs8" />
+  <sodipodi:namedview
+     inkscape:current-layer="svg4"
+     inkscape:window-maximized="1"
+     inkscape:window-y="-8"
+     inkscape:window-x="54"
+     inkscape:cy="12"
+     inkscape:cx="12"
+     inkscape:zoom="37.833333"
+     showgrid="false"
+     id="namedview6"
+     inkscape:window-height="1057"
+     inkscape:window-width="2498"
+     inkscape:pageshadow="2"
+     inkscape:pageopacity="0"
+     guidetolerance="10"
+     gridtolerance="10"
+     objecttolerance="10"
+     borderopacity="1"
+     bordercolor="#666666"
+     pagecolor="#ffffff" />
+  <path
+     d="m 813.03967,-493.74448 a 331.45374,347.8414 0 0 1 -331.45373,347.8414 331.45374,347.8414 0 0 1 -331.45374,-347.8414 331.45374,347.8414 0 0 1 331.45374,-347.8414 331.45374,347.8414 0 0 1 331.45373,347.8414 z M 480,-80 Q 397,-80 324,-111.5 251,-143 197,-197 143,-251 111.5,-324 80,-397 80,-480 q 0,-83 31.5,-156 31.5,-73 85.5,-127 54,-54 127,-85.5 73,-31.5 156,-31.5 83,0 156,31.5 73,31.5 127,85.5 54,54 85.5,127 31.5,73 31.5,156 0,83 -31.5,156 -31.5,73 -85.5,127 -54,54 -127,85.5 Q 563,-80 480,-80 Z m 0,-80 q 134,0 227,-93 93,-93 93,-227 0,-134 -93,-227 -93,-93 -227,-93 -134,0 -227,93 -93,93 -93,227 0,134 93,227 93,93 227,93 z m 0,-320 z"
+     style="fill:#4caf50;fill-opacity:1;stroke:none;stroke-width:3472.23"
+     id="path837" />
+</svg>
