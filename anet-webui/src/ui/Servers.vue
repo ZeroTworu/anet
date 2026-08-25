@@ -1,16 +1,18 @@
 <script setup lang="ts">
 import { onBeforeUnmount, onMounted, ref } from 'vue'
-import { GetServers, CreateServer } from '@/api/servers'
-import type { Server, CreateServerRequest } from '@/models/server'
+import { GetServers } from '@/api/servers'
+import type { Server } from '@/models/server'
 import ServerModal from '@/components/ServerModal.vue'
+import CreateServerModal from '@/components/CreateServerModal.vue'
 
 const data = ref<Server[]>([])
 const loading = ref(false)
-const showCreate = ref(false)
-const createLoading = ref(false)
 
-const selectedServer = ref<Server | null>(null)
+// Управление модалками
+const showCreateModal = ref(false)
 const showEditModal = ref(false)
+const selectedServer = ref<Server | null>(null)
+
 let refreshTimer: number | undefined
 
 const formatUptime = (seconds?: number) => {
@@ -21,38 +23,12 @@ const formatUptime = (seconds?: number) => {
   return days > 0 ? `${days}d ${hours}h` : `${hours}h ${minutes}m`
 }
 
-const form = ref<CreateServerRequest>({
-  name: '',
-  dsn: 'quic://127.0.0.1:4519',
-  public_key: '',
-  ssh_user: 'hanyuu',
-  is_active: true,
-})
-
 const loadServers = async () => {
   loading.value = true
   try {
     data.value = await GetServers()
   } finally {
     loading.value = false
-  }
-}
-
-const handleCreate = async () => {
-  createLoading.value = true
-  try {
-    await CreateServer(form.value)
-    showCreate.value = false
-    form.value = {
-      name: '',
-      dsn: 'quic://127.0.0.1:4519',
-      public_key: '',
-      ssh_user: 'hanyuu',
-      is_active: true,
-    }
-    await loadServers()
-  } finally {
-    createLoading.value = false
   }
 }
 
@@ -78,14 +54,14 @@ onBeforeUnmount(() => {
 
 <template>
   <div style="padding: 24px; max-width: 1200px; margin: 0 auto;">
-    <div justify="space-between" align="center" style="margin-bottom: 20px;">
+    <div class="d-flex justify-space-between align-center mb-5">
       <h2 style="margin: 0; font-weight: 600; font-size: 20px;">VPN Nodes (Servers)</h2>
-      <v-btn color="primary" @click="showCreate = true"> Add Server </v-btn>
+      <v-btn color="primary" @click="showCreateModal = true"> Add Server </v-btn>
     </div>
 
     <div class="position-relative">
       <div class="table-container" v-if="data.length">
-        <v-table :bordered="true" :single-line="false" class="interactive-table">
+        <v-table :bordered="true" class="interactive-table">
           <thead>
           <tr>
             <th>Название</th>
@@ -103,14 +79,13 @@ onBeforeUnmount(() => {
             <td class="name-col">{{ item.name }}</td>
             <td class="addr-col">{{ item.dsn }}</td>
             <td>
-              <v-chip  :color="item.is_active ? 'success' : 'error'" round size="small">
+              <v-chip :color="item.is_active ? 'success' : 'error'" size="small">
                 {{ item.is_active ? 'ВКЛ' : 'ВЫКЛ' }}
               </v-chip>
             </td>
             <td>
               <v-chip
-                   :color="item.runtime?.status === 'online' ? 'success' : 'error'"
-                  round
+                  :color="item.runtime?.status === 'online' ? 'success' : 'error'"
                   size="small"
               >
                 {{ item.runtime?.status === 'online' ? 'ONLINE' : 'OFFLINE' }}
@@ -118,13 +93,13 @@ onBeforeUnmount(() => {
               <div v-if="item.runtime" class="runtime-version">v{{ item.runtime.version }}</div>
             </td>
             <td>
-              <v-chip  :color="item.has_control_credential ? 'success' : 'warning'" size="small">
+              <v-chip :color="item.has_control_credential ? 'success' : 'warning'" size="small">
                 {{ item.has_control_credential ? 'READY' : 'SETUP REQUIRED' }}
               </v-chip>
             </td>
             <td class="metric-col">{{ item.runtime?.active_connections ?? 0 }}</td>
             <td>
-              <v-chip  :color="item.runtime ? (item.runtime.accepting_connections ? 'success' : 'warning') : 'default'" size="small">
+              <v-chip :color="item.runtime ? (item.runtime.accepting_connections ? 'success' : 'warning') : 'default'" size="small">
                 {{ !item.runtime ? 'UNKNOWN' : item.runtime.accepting_connections ? 'OPEN' : 'CLOSED' }}
               </v-chip>
             </td>
@@ -133,39 +108,14 @@ onBeforeUnmount(() => {
           </tbody>
         </v-table>
       </div>
-      <v-empty-state v-else description="Серверов пока нет. Добавьте первую ноду!" style="margin-top: 40px;" />
+      <v-empty-state v-else title="Серверов пока нет" text="Добавьте первую ноду!" class="mt-10" />
     </div>
 
-    <!-- Модалка создания нового сервера -->
-    <v-dialog v-model="showCreate" style="width: 650px;" title="Добавить физический сервер">
-      <v-form>
-        <div label="Название локации">
-          <v-text-field v-model="form.name" placeholder="e.g. Germany VPS 1" />
-        </div>
-
-        <div label="DSN">
-          <v-text-field v-model="form.dsn" placeholder="quic://host:4519 или wss://host:8080/socket" />
-        </div>
-
-        <div label="Публичный ключ сервера (server_pub_key)">
-          <v-text-field v-model="form.public_key" placeholder="Из утилиты anet-keygen" />
-        </div>
-
-        <div label="Пользователь SSH (ssh_user)">
-          <v-text-field v-model="form.ssh_user" placeholder="hanyuu" />
-        </div>
-
-        <div label="Активен (ВКЛ)">
-          <v-switch v-model="form.is_active" />
-        </div>
-      </v-form>
-      <div class="d-flex justify-end ga-4">
-        <div justify="end">
-          <v-btn @click="showCreate = false">Cancel</v-btn>
-          <v-btn color="primary" :loading="createLoading" @click="handleCreate"> Add Node </v-btn>
-        </div>
-      </div>
-    </v-dialog>
+    <!-- Новая модалка создания сервера -->
+    <CreateServerModal
+        v-model="showCreateModal"
+        @created="loadServers"
+    />
 
     <!-- Модалка редактирования существующего сервера -->
     <ServerModal
@@ -178,6 +128,7 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
+/* Стили оставляем без изменений, они отличные */
 .table-container {
   background: #ffffff;
   border-radius: 8px;

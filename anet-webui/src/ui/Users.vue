@@ -13,12 +13,12 @@ const loading = ref(false)
 const page = ref(1)
 const pageSize = ref(10)
 
-// Опции для выбора количества элементов на странице
+// Опции для выбора количества элементов на странице (используем title/value для Vuetify)
 const pageSizeOptions = [
-  { label: '10 / стр', value: 10 },
-  { label: '20 / стр', value: 20 },
-  { label: '50 / стр', value: 50 },
-  { label: '100 / стр', value: 100 }
+  { title: '10 / стр', value: 10 },
+  { title: '20 / стр', value: 20 },
+  { title: '50 / стр', value: 50 },
+  { title: '100 / стр', value: 100 }
 ]
 
 const selectedUserId = ref<string | null>(null)
@@ -68,14 +68,14 @@ onMounted(loadUsers)
 
 <template>
   <div style="padding: 24px; max-width: 1200px; margin: 0 auto;">
-    <div justify="space-between" align="center" style="margin-bottom: 20px;">
+    <div class="d-flex justify-space-between align-center" style="margin-bottom: 20px;">
       <h2 style="margin: 0; font-weight: 600; font-size: 20px;">ANet VPN Clients</h2>
       <v-btn color="primary" @click="showCreate = true"> Add User </v-btn>
     </div>
 
     <div class="position-relative">
       <div class="table-container" v-if="data">
-        <v-table :bordered="true" :single-line="false" class="interactive-table">
+        <v-table class="interactive-table">
           <thead>
           <tr>
             <th style="width: 25%">UID (User Name)</th>
@@ -93,7 +93,7 @@ onMounted(loadUsers)
             <td class="uid-col">{{ item.uid || 'No Name' }}</td>
             <td class="uuid-col">{{ item.id }}</td>
             <td>
-              <v-chip  :color="item.is_active ? 'success' : 'error'" round>
+              <v-chip :color="item.is_active ? 'success' : 'error'" size="small">
                 {{ item.is_active ? 'Active' : 'Banned' }}
               </v-chip>
             </td>
@@ -102,33 +102,40 @@ onMounted(loadUsers)
         </v-table>
       </div>
 
-      <!-- Кастомная панель пагинации -->
-      <div justify="space-between" align="center" style="margin-top: 20px;" v-if="data">
-        <!-- Выбор количества записей -->
-        <div align="center">
-          <span style="color: #94a3b8; size: 13px;">Показано {{ data.items.length }} из {{ data.total }}</span>
+      <!-- Пагинация с правильным select -->
+      <div class="d-flex justify-space-between align-center mt-4" v-if="data">
+        <div class="d-flex align-center gap-3">
+          <span class="text-caption text-medium-emphasis">Показано {{ data.items.length }} из {{ data.total }}</span>
           <v-select
               v-model="pageSize"
               :items="pageSizeOptions"
-              style="width: 120px"
+              item-title="title"
+              item-value="value"
+              variant="outlined"
+              density="compact"
+              hide-details
+              style="width: 130px"
               @update:modelValue="handlePageSizeChange"
           />
         </div>
 
-        <!-- Кнопки управления страницами -->
-        <div align="center">
+        <div class="d-flex align-center gap-2">
           <v-btn
+              variant="tonal"
+              size="small"
               :disabled="page === 1"
               @click="handlePageChange('prev')"
           >
             ← СЮДА
           </v-btn>
 
-          <span style="font-family: monospace; min-width: 40px; text-align: center;">
+          <span style="font-family: monospace; min-width: 30px; text-align: center;">
             {{ page }}
           </span>
 
           <v-btn
+              variant="tonal"
+              size="small"
               :disabled="page * pageSize >= data.total"
               @click="handlePageChange('next')"
           >
@@ -150,6 +157,9 @@ onMounted(loadUsers)
 </template>
 
 <style scoped>
+.gap-2 { gap: 8px; }
+.gap-3 { gap: 12px; }
+
 .table-container {
   background: #ffffff !important;
   border-radius: 8px;

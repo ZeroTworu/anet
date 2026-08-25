@@ -53,57 +53,57 @@ onMounted(async () => {
 <template>
   <v-form>
     <!-- UID (editable) -->
-    <div label="UID">
-      <v-text-field v-model="user.uid" />
-    </div>
+    <v-text-field v-model="user.uid" label="UID" variant="outlined" class="mb-3" />
 
-    <div label="Балансируемые pools">
-      <v-select
-          v-model="user.pool_ids"
-          multiple
-          :items="poolOptions"
-          placeholder="Выберите pools для этого пользователя"
-      />
-    </div>
+    <!-- Балансируемые pools -->
+    <v-select
+        v-model="user.pool_ids"
+        multiple
+        item-title="label"
+        item-value="value"
+        :items="poolOptions"
+        label="Балансируемые pools"
+        placeholder="Выберите pools для этого пользователя"
+        variant="outlined"
+        class="mb-3"
+    />
 
-    <div label="Route map">
-      <v-select
-          v-model="user.route_map_id"
-          clearable
-          :items="routeMapOptions"
-          placeholder="Политика маршрутизации"
-      />
-    </div>
+    <!-- Route map -->
+    <v-select
+        v-model="user.route_map_id"
+        clearable
+        item-title="label"
+        item-value="value"
+        :items="routeMapOptions"
+        label="Route map"
+        placeholder="Политика маршрутизации"
+        variant="outlined"
+        class="mb-3"
+    />
 
     <!-- Active (editable) -->
-    <div label="Active">
-      <v-switch v-model="user.is_active" />
-    </div>
+    <v-switch v-model="user.is_active" label="Active" color="success" class="mb-2" />
 
     <!-- Static IP (editable) -->
-    <div label="Static IP">
-      <v-text-field v-model="user.static_ip" placeholder="e.g. 10.0.0.10" />
-    </div>
+    <v-text-field v-model="user.static_ip" label="Static IP" placeholder="e.g. 10.0.0.10" variant="outlined" class="mb-3" />
 
     <!-- ВЫБОР СЕРВЕРОВ (Many-to-Many) -->
-    <div label="Привязанные сервера (Локации)">
-      <v-select
-          v-model="user.server_ids"
-          multiple
-          :items="serverOptions"
-          placeholder="Выберите сервера для этого пользователя"
-      />
-    </div>
+    <v-select
+        v-model="user.server_ids"
+        multiple
+        item-title="label"
+        item-value="value"
+        :items="serverOptions"
+        label="Привязанные сервера (Локации)"
+        placeholder="Выберите сервера для этого пользователя"
+        variant="outlined"
+        class="mb-3"
+    />
 
-    <v-divider />
+    <v-divider class="my-4" />
 
     <!-- Readonly fields -->
-    <div label="Fingerprint">
-      <v-text-field :modelValue="user.fingerprint" disabled />
-    </div>
-
-    <div label="Created At">
-      <v-text-field :modelValue="user.created_at" disabled />
-    </div>
+    <v-text-field :modelValue="user.fingerprint" label="Fingerprint" disabled variant="outlined" class="mb-3" />
+    <v-text-field :modelValue="user.created_at" label="Created At" disabled variant="outlined" class="mb-3" />
   </v-form>
 </template>

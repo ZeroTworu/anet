@@ -11,9 +11,9 @@ impl MigrationTrait for Migration {
         manager
             .alter_table(
                 Table::alter()
-                    .table(Server::Table)
+                    .table(Servers::Table)
                     .add_column(
-                        ColumnDef::new(Server::Dsn)
+                        ColumnDef::new(Servers::Dsn)
                             .text()
                             .not_null()
                             .default("quic://127.0.0.1:0"),
@@ -51,8 +51,8 @@ impl MigrationTrait for Migration {
         manager
             .alter_table(
                 Table::alter()
-                    .table(Server::Table)
-                    .drop_column(Server::Dsn)
+                    .table(Servers::Table)
+                    .drop_column(Servers::Dsn)
                     .to_owned(),
             )
             .await
@@ -60,7 +60,7 @@ impl MigrationTrait for Migration {
 }
 
 #[derive(Iden)]
-enum Server {
+enum Servers {
     Table,
     Dsn,
 }

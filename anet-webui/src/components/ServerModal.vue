@@ -1,12 +1,11 @@
 <script setup lang="ts">
-// Карточка ноды: настройки endpoint, admission-команды и одноразовая выдача
-// credential для исходящего control plane соединения.
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { useAppMessage } from '@/composables/useAppMessage'
 import { GetNodeCommandStatus, RotateNodeCredential, SetNodeAdmission, UpdateServer } from '@/api/servers'
 import type { Server } from '@/models/server'
 
-const show = defineModel<boolean>('show')
+// ИСПРАВЛЕНО: Убрано 'show', теперь ловит дефолтный v-model из родителя
+const show = defineModel<boolean>()
 
 const props = defineProps<{
   server: Server | null
@@ -31,8 +30,8 @@ const commandStatus = ref<string | null>(null)
 const credentialLoading = ref(false)
 const issuedCredential = ref<{ node_id: string; token: string } | null>(null)
 const credentialConfig = computed(() => issuedCredential.value
-  ? `[control_plane]\nnode_id = "${issuedCredential.value.node_id}"\ntoken = "${issuedCredential.value.token}"`
-  : '')
+    ? `[control_plane]\nnode_id = "${issuedCredential.value.node_id}"\ntoken = "${issuedCredential.value.token}"`
+    : '')
 const message = useAppMessage()
 let commandAbort = false
 
@@ -130,121 +129,128 @@ const close = () => {
 </script>
 
 <template>
-  <v-dialog v-model="show" @update:modelValue="close" style="width: 650px;" title="Редактировать физический сервер">
-    <v-form>
-      <div label="Название локации">
-        <v-text-field v-model="form.name" />
-      </div>
+  <!-- Основная модалка редактирования -->
+  <v-dialog v-model="show" @update:model-value="close" max-width="650px">
+    <v-card>
+      <v-card-title class="text-h6 pb-4">Редактировать физический сервер</v-card-title>
 
-      <div label="DSN">
-        <v-text-field v-model="form.dsn" placeholder="quic://host:4519 или wss://host:8080/socket" />
-      </div>
+      <v-card-text>
+        <v-form>
+          <v-text-field v-model="form.name" label="Название локации" variant="outlined" class="mb-3" />
+          <v-text-field v-model="form.dsn" label="DSN" placeholder="quic://host:4519 или wss://host:8080/socket" variant="outlined" class="mb-3" />
+          <v-text-field v-model="form.public_key" label="Публичный ключ сервера" variant="outlined" class="mb-3" />
+          <v-text-field v-model="form.ssh_user" label="Пользователь SSH" variant="outlined" class="mb-3" />
 
-      <div label="Публичный ключ сервера">
-        <v-text-field v-model="form.public_key" />
-      </div>
+          <v-switch v-model="form.is_active" label="Статус (ВКЛ / ВЫКЛ)" color="success" class="mb-4" />
 
-      <div label="Пользователь SSH">
-        <v-text-field v-model="form.ssh_user" />
-      </div>
+          <!-- Блок управления подключениями -->
+          <v-card v-if="server" variant="outlined" class="mb-4 pa-4">
+            <div class="text-subtitle-1 font-weight-bold mb-2">Управление подключениями</div>
+            <div class="mb-4">
+              Фактическое состояние:
+              <v-chip
+                  :color="server.runtime ? (server.runtime.accepting_connections ? 'success' : 'warning') : 'default'"
+                  size="small"
+                  class="ml-2"
+              >
+                {{ !server.runtime ? 'нет данных' : server.runtime.accepting_connections ? 'принимает новые подключения' : 'новые подключения запрещены' }}
+              </v-chip>
+            </div>
 
-      <div label="Статус (ВКЛ / ВЫКЛ)">
-        <v-switch v-model="form.is_active" />
-      </div>
+            <div class="d-flex gap-2 mb-2">
+              <v-btn
+                  color="success"
+                  variant="outlined"
+                  :loading="commandLoading"
+                  :disabled="server.runtime?.status !== 'online' || server.runtime?.accepting_connections === true"
+                  @click="setAdmission(true)"
+                  class="mr-2"
+              >
+                Разрешить
+              </v-btn>
+              <v-btn
+                  color="warning"
+                  variant="outlined"
+                  :loading="commandLoading"
+                  :disabled="server.runtime?.status !== 'online' || server.runtime?.accepting_connections === false"
+                  @click="setAdmission(false)"
+              >
+                Запретить
+              </v-btn>
+            </div>
+            <div v-if="commandStatus" class="text-caption text-medium-emphasis mt-2">
+              Команда: {{ commandStatus === 'pending' ? 'ожидает ноду' : commandStatus === 'running' ? 'выполняется' : commandStatus }}
+            </div>
+          </v-card>
 
-      <v-card v-if="server" size="small" title="Управление подключениями">
-        <div vertical>
-          <span>
-            Фактическое состояние:
-            <v-chip
-                 :color="server.runtime ? (server.runtime.accepting_connections ? 'success' : 'warning') : 'default'"
-                size="small"
-            >
-              {{ !server.runtime ? 'нет данных' : server.runtime.accepting_connections ? 'принимает новые подключения' : 'новые подключения запрещены' }}
-            </v-chip>
-          </span>
-          <div>
-            <v-btn
-                type="success"
-                ghost
-                :loading="commandLoading"
-                :disabled="server.runtime?.status !== 'online' || server.runtime?.accepting_connections === true"
-                @click="setAdmission(true)"
-            >
-              Разрешить подключения
-            </v-btn>
-            <v-btn
-                color="warning"
-                ghost
-                :loading="commandLoading"
-                :disabled="server.runtime?.status !== 'online' || server.runtime?.accepting_connections === false"
-                @click="setAdmission(false)"
-            >
-              Запретить новые
-            </v-btn>
-          </div>
-          <span v-if="commandStatus" depth="3">
-            Команда: {{ commandStatus === 'pending' ? 'ожидает ноду' : commandStatus === 'running' ? 'выполняется' : commandStatus }}
-          </span>
-        </div>
-      </v-card>
+          <!-- Блок Control plane credential -->
+          <v-card v-if="server" variant="outlined" class="pa-4">
+            <div class="text-subtitle-1 font-weight-bold mb-2">Control plane credential</div>
+            <div class="mb-2">
+              Состояние:
+              <v-chip :color="server.has_control_credential ? 'success' : 'warning'" size="small" class="ml-2">
+                {{ server.has_control_credential ? 'PROVISIONED' : 'NOT PROVISIONED' }}
+              </v-chip>
+            </div>
+            <div class="text-caption text-medium-emphasis mb-4">
+              Credential хранится на панели только в виде SHA-256 хэша. После перевыпуска текущая нода потеряет доступ, пока новый token не будет записан в её config.
+            </div>
 
-      <v-card v-if="server" size="small" title="Control plane credential" style="margin-top: 12px">
-        <div vertical>
-          <span>Состояние:
-            <v-chip  :color="server.has_control_credential ? 'success' : 'warning'" size="small">
-              {{ server.has_control_credential ? 'PROVISIONED' : 'NOT PROVISIONED' }}
-            </v-chip>
-          </span>
-          <span depth="3">
-            Credential хранится на панели только в виде SHA-256 хэша. После перевыпуска текущая нода потеряет доступ,
-            пока новый token не будет записан в её server.toml.
-          </span>
-          <div>
+            <div class="d-flex align-center">
+              <!-- ИСПРАВЛЕНО: Добавлен @click -->
+              <v-btn variant="tonal" color="error" :loading="credentialLoading" @click="rotateCredential" class="mr-4">
+                Перевыпустить credential
+              </v-btn>
+              <span class="text-caption text-error">Текущий токен сразу сбросится!</span>
+            </div>
+          </v-card>
+        </v-form>
+      </v-card-text>
 
-              <v-btn tertiary :loading="credentialLoading">Перевыпустить credential</v-btn>
-
-            Текущий credential немедленно перестанет работать. Продолжить?
-          </div>
-        </div>
-      </v-card>
-    </v-form>
-    <div class="d-flex justify-end ga-4">
-      <div justify="end">
-        <v-btn @click="close">Cancel</v-btn>
-        <v-btn color="primary" :loading="loading" @click="save"> Save </v-btn>
-      </div>
-    </div>
+      <v-card-actions class="px-6 pb-4">
+        <v-spacer></v-spacer>
+        <v-btn variant="text" @click="close">Отмена</v-btn>
+        <v-btn color="primary" variant="flat" :loading="loading" @click="save">Сохранить</v-btn>
+      </v-card-actions>
+    </v-card>
   </v-dialog>
 
+  <!-- Модалка выдачи нового Credential -->
   <v-dialog
       :model-value="issuedCredential !== null"
-
-      style="width: min(620px, calc(100vw - 32px))"
-      title="Новый credential ноды"
-      :mask-closable="false"
-      @update:modelValue="handleCredentialVisibility"
+      max-width="620px"
+      persistent
+      @update:model-value="handleCredentialVisibility"
   >
-    <v-alert type="warning" :show-icon="true" style="margin-bottom: 14px">
-      Сохраните token сейчас: повторно панель его не покажет.
-    </v-alert>
-    <div label="node_id">
-      <v-text-field :modelValue="issuedCredential?.node_id" readonly />
-    </div>
-    <div label="control_plane.token">
-      <v-text-field :modelValue="issuedCredential?.token" type="password" append-inner-icon="mdi-eye" readonly />
-    </div>
-    <pre
-        v-if="issuedCredential"
-        language="toml"
-        :code="credentialConfig"
-        word-wrap
-    />
-    <div class="d-flex justify-end ga-4">
-      <div justify="end">
-        <v-btn @click="copyCredential">Скопировать token</v-btn>
-        <v-btn color="primary" @click="issuedCredential = null">Я сохранил</v-btn>
-      </div>
-    </div>
+    <v-card>
+      <v-card-title class="text-h6 pb-4">Новый credential ноды</v-card-title>
+
+      <v-card-text>
+        <v-alert type="warning" variant="tonal" class="mb-4">
+          Сохраните token сейчас: повторно панель его не покажет.
+        </v-alert>
+
+        <v-text-field :model-value="issuedCredential?.node_id" label="node_id" readonly variant="outlined" class="mb-3" />
+
+        <v-text-field
+            :model-value="issuedCredential?.token"
+            label="control_plane.token"
+            type="text"
+            readonly
+            variant="outlined"
+            class="mb-3"
+        />
+
+        <v-sheet color="grey-darken-4" class="pa-4 rounded bg-black" v-if="issuedCredential">
+          <pre style="margin: 0; white-space: pre-wrap; font-family: monospace;">{{ credentialConfig }}</pre>
+        </v-sheet>
+      </v-card-text>
+
+      <v-card-actions class="px-6 pb-4">
+        <v-spacer></v-spacer>
+        <v-btn variant="outlined" @click="copyCredential">Скопировать токен</v-btn>
+        <v-btn color="primary" variant="flat" @click="issuedCredential = null">Я сохранил</v-btn>
+      </v-card-actions>
+    </v-card>
   </v-dialog>
 </template>

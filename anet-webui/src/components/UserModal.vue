@@ -1,4 +1,3 @@
-<!-- anet-webui/src/components/UserModal.vue -->
 <script setup lang="ts">
 import { watch, computed } from 'vue'
 import { useAppMessage } from '@/composables/useAppMessage'
@@ -26,65 +25,50 @@ const { saving, saveRate, createRate } = useRate(user)
 
 const message = useAppMessage()
 
-// 1. Вычисляем прямую ссылку на скачивание client.toml
+// Прямая ссылка на скачивание client.toml
 const directConfigLink = computed(() => {
   if (!user.value) return ''
   return `${window.location.origin}/api/v1/config/${user.value.id}`
 })
 
-// 2. Вычисляем ссылку на веб-страницу со стильным QR-кодом
+// Ссылка на веб-страницу со стильным QR-кодом
 const qrPageLink = computed(() => {
   if (!user.value) return ''
   return `${window.location.origin}/api/v1/config/qr/${user.value.id}`
 })
 
-// Универсальная функция копирования, устойчивая к блокировкам HTTP со стороны браузеров
 const copyToClipboard = (text: string, successMessage: string) => {
-  // Если браузер работает по HTTPS/localhost и современный API доступен
   if (navigator.clipboard && window.isSecureContext) {
     navigator.clipboard.writeText(text)
-        .then(() => {
-          message.success(successMessage)
-        })
-        .catch(() => {
-          message.error('Failed to copy link.')
-        })
+        .then(() => message.success(successMessage))
+        .catch(() => message.error('Failed to copy link.'))
   } else {
-    // Надежный фолбек для обычного HTTP и IP-адресов
     const textArea = document.createElement('textarea')
     textArea.value = text
-    // Прячем элемент вне экрана, чтобы интерфейс не дергался
     textArea.style.position = 'fixed'
     textArea.style.left = '-9999px'
     textArea.style.top = '-9999px'
     document.body.appendChild(textArea)
-
     textArea.focus()
     textArea.select()
-
     try {
-      const successful = document.execCommand('copy')
-      if (successful) {
+      if (document.execCommand('copy')) {
         message.success(successMessage)
       } else {
         message.error('Failed to copy link.')
       }
     } catch (err) {
-      console.error('Fallback copy failed:', err)
       message.error('Failed to copy link.')
     }
-
     document.body.removeChild(textArea)
   }
 }
 
-// Копирование прямой ссылки на конфиг
 const copyDirectLink = () => {
   if (!directConfigLink.value) return
   copyToClipboard(directConfigLink.value, 'Прямая ссылка на client.toml скопирована!')
 }
 
-// Копирование ссылки на страницу с QR-кодом
 const copyQrPageLink = () => {
   if (!qrPageLink.value) return
   copyToClipboard(qrPageLink.value, 'Ссылка на страницу с QR-кодом скопирована!')
@@ -93,9 +77,7 @@ const copyQrPageLink = () => {
 watch(
     () => props.userId,
     (id) => {
-      if (id) {
-        loadUser(id)
-      }
+      if (id) loadUser(id)
     },
     { immediate: true },
 )
@@ -116,57 +98,70 @@ const handleSaveUser = async () => {
 <template>
   <v-dialog
       v-model="show"
-      @update:modelValue="close()"
-
-      style="width: min(900px, calc(100vw - 48px)); max-height: calc(100vh - 120px); overflow-y: auto"
+      @update:modelValue="close"
+      max-width="900px"
   >
-    <v-card :bordered="false" size="huge" role="dialog" aria-modal="true">
-      <div class="position-relative">
+    <v-card class="pa-6">
+      <v-card-title class="text-h6 px-0 pb-4">
+        {{ userId ? 'Редактировать пользователя' : 'Создать пользователя' }}
+      </v-card-title>
+
+      <v-card-text class="px-0">
+        <!-- Форма юзера -->
         <UserForm v-if="user" v-model="user" />
 
-        <v-btn color="primary" @click="handleSaveUser"> Save User </v-btn>
-
-        <RateEditForm v-if="user?.rate" v-model="user" @save="saveRate" />
-        <RateCreateForm v-else @create="createRate" />
+        <div v-if="user" class="mt-4">
+          <RateEditForm v-if="user?.rate" v-model="user" @save="saveRate" />
+          <RateCreateForm v-else @create="createRate" />
+        </div>
 
         <!-- КОМПАКТНЫЙ БЛОК ДЛЯ ССЫЛОК И ШЕРИНГА -->
-        <div v-if="user" style="margin-top: 24px;">
-          <div title="🔗 Поделиться конфигурацией" name="config-sharing">
-            <v-form label-placement="top">
+        <div v-if="user" class="mt-6">
+          <div class="text-subtitle-2 mb-3">🔗 Поделиться конфигурацией</div>
 
-              <!-- Поле 1: Прямое скачивание TOML-файла -->
-              <div label="Прямая ссылка на скачивание client.toml">
-                <div>
-                  <v-text-field readonly :modelValue="directConfigLink" style="font-family: monospace;" />
-                  <v-btn color="primary" @click="copyDirectLink">
-                    Copy
-                  </v-btn>
-                </div>
+          <v-form>
+            <!-- Поле 1: Прямое скачивание TOML-файла -->
+            <div class="mb-3">
+              <div class="text-caption text-medium-emphasis mb-1">Прямая ссылка на скачивание client.toml</div>
+              <div class="d-flex gap-2">
+                <v-text-field readonly :modelValue="directConfigLink" variant="outlined" density="compact" hide-details class="font-monospace" />
+                <v-btn color="primary" variant="tonal" @click="copyDirectLink">
+                  Copy
+                </v-btn>
               </div>
+            </div>
 
-              <!-- Поле 2: Ссылка на страницу с QR-кодом -->
-              <div label="Ссылка на веб-страницу с QR-кодом">
-                <div>
-                  <v-text-field readonly :modelValue="qrPageLink" style="font-family: monospace;" />
-                  <v-btn color="info" @click="copyQrPageLink">
-                    Copy
-                  </v-btn>
-                </div>
+            <!-- Поле 2: Ссылка на страницу с QR-кодом -->
+            <div class="mb-3">
+              <div class="text-caption text-medium-emphasis mb-1">Ссылка на веб-страницу с QR-кодом</div>
+              <div class="d-flex gap-2">
+                <v-text-field readonly :modelValue="qrPageLink" variant="outlined" density="compact" hide-details class="font-monospace" />
+                <v-btn color="info" variant="tonal" @click="copyQrPageLink">
+                  Copy
+                </v-btn>
               </div>
-
-            </v-form>
-          </div>
+            </div>
+          </v-form>
         </div>
+      </v-card-text>
 
-        <v-divider />
+      <v-divider class="my-4"></v-divider>
 
-        <div justify="space-between" align="center" style="margin-top: 16px;">
-          <v-btn color="warning" :loading="regenerating" @click="regenerate">
-            Regenerate Keys
-          </v-btn>
-          <v-btn @click="close"> Close </v-btn>
+      <v-card-actions class="px-0 pb-0 justify-space-between">
+        <v-btn color="warning" variant="text" :loading="regenerating" @click="regenerate">
+          Regenerate Keys
+        </v-btn>
+
+        <div class="d-flex gap-2">
+          <v-btn variant="text" @click="close">Close</v-btn>
+            <v-btn color="primary" variant="flat" @click="handleSaveUser">Save User</v-btn>
         </div>
-      </div>
+      </v-card-actions>
     </v-card>
   </v-dialog>
 </template>
+
+<style scoped>
+.gap-2 { gap: 8px; }
+.font-monospace :deep(input) { font-family: monospace; font-size: 13px; }
+</style>
