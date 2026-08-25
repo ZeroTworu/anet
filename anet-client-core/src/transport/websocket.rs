@@ -15,6 +15,9 @@ use rand::{Rng, seq::SliceRandom};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{DigitallySignedStruct, SignatureScheme};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
@@ -22,7 +25,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, frame::coding::CloseCode};
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async_with_config};
+use tokio_tungstenite::{Connector, MaybeTlsStream, WebSocketStream, connect_async_tls_with_config};
 
 type ClientSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -98,6 +101,88 @@ impl BrowserProfile {
 
 struct WebSocketAuthChannel {
     socket: Mutex<ClientSocket>,
+}
+
+/// Принимает любой серверный сертификат: и CA-подписанный, и самоподписанный.
+///
+/// TLS на этом транспорте — камуфляж под обычный браузерный HTTPS, а не граница
+/// доверия: узел аутентифицируется ASTP-слоем (X25519 + подпись Ed25519,
+/// ключ можно запинить в client.toml), и трафик шифруется ChaCha20Poly1305
+/// поверх TLS. Это та же модель доверия, что у QUIC-транспорта, который
+/// принимает самоподписанный сертификат, доставленный внутри ASTP-канала.
+#[derive(Debug)]
+struct AcceptAnyServerCert;
+
+impl ServerCertVerifier for AcceptAnyServerCert {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> std::result::Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        vec![
+            SignatureScheme::RSA_PSS_SHA256,
+            SignatureScheme::RSA_PSS_SHA384,
+            SignatureScheme::RSA_PSS_SHA512,
+            SignatureScheme::RSA_PKCS1_SHA256,
+            SignatureScheme::RSA_PKCS1_SHA384,
+            SignatureScheme::RSA_PKCS1_SHA512,
+            SignatureScheme::ECDSA_NISTP256_SHA256,
+            SignatureScheme::ECDSA_NISTP384_SHA384,
+            SignatureScheme::ED25519,
+        ]
+    }
+}
+
+fn wss_connector() -> Result<Connector> {
+    let tls = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert))
+        .with_no_client_auth();
+    // Настоящий браузер в ClientHello почти всегда предлагает оба протокола
+    // (h2 приоритетнее http/1.1); список из одного http/1.1 — заметная
+    // аномалия для пассивного DPI ещё до WebSocket-апгрейда.
+    let mut tls = tls;
+    tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Ok(Connector::Rustls(Arc::new(tls)))
+}
+
+fn connector_for(server: &ServerConfig) -> Result<Connector> {
+    let scheme = server
+        .dsn
+        .parse::<http::Uri>()?
+        .scheme_str()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if scheme == "wss" {
+        wss_connector()
+    } else {
+        Ok(Connector::Plain)
+    }
 }
 
 #[async_trait]
@@ -200,7 +285,13 @@ async fn connect_authenticated(
         .max_write_buffer_size(128 * 1024)
         .max_message_size(Some(MAX_WS_MESSAGE_SIZE))
         .max_frame_size(Some(MAX_WS_MESSAGE_SIZE));
-    let (socket, _) = connect_async_with_config(request, Some(ws_config), true).await?;
+    let (socket, _) = connect_async_tls_with_config(
+        request,
+        Some(ws_config),
+        true,
+        Some(connector_for(server)?),
+    )
+    .await?;
     let channel = WebSocketAuthChannel {
         socket: Mutex::new(socket),
     };
@@ -433,6 +524,18 @@ mod tests {
             websocket_min_session_secs: 480,
             websocket_max_session_secs: 1500,
         }
+    }
+
+    #[test]
+    fn wss_dsn_selects_tls_connector_and_ws_stays_plain() {
+        assert!(matches!(
+            connector_for(&server("wss://example.com/socket")).unwrap(),
+            Connector::Rustls(_)
+        ));
+        assert!(matches!(
+            connector_for(&server("ws://example.com:8080/socket")).unwrap(),
+            Connector::Plain
+        ));
     }
 
     #[test]
