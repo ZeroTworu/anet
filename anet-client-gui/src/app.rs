@@ -170,6 +170,7 @@ pub struct ANetApp {
     sidebar_open: bool,
     appbar_open: bool,
     logbar_open: bool,
+    node_popup_open: bool,
     editing_config_id: Option<String>,
     edit_name_buffer: String,
     error_modal: Option<String>,
@@ -182,6 +183,9 @@ pub struct ANetApp {
 
     pub total_rx: String,
     pub total_tx: String,
+    pub total_rtt: String,
+    pub total_rxm: String,
+    pub total_txm: String,
 }
 
 fn send_notification(title: &str, body: &str) {
@@ -192,7 +196,6 @@ fn send_notification(title: &str, body: &str) {
         .icon("dialog-information")
         .show();
 }
-
 
 pub fn toggle_vpn(
     shared: &Arc<Mutex<SharedState>>,
@@ -367,10 +370,11 @@ impl ANetApp {
 
                     if let Some(path) = target_path {
                         match std::fs::write(&path, &content) {
-                            Ok(_) =>
+                            Ok(_) => {
                                 self.log(
                                     &format!("Конфиг успешно перезаписан на диске: {:?}", path)
-                                ),
+                                );
+                            }
                             Err(e) => self.log(&format!(" Ошибка записи в {:?}: {}", path, e)),
                         }
                     } else {
@@ -665,6 +669,7 @@ impl ANetApp {
             sidebar_open: false,
             appbar_open: false,
             logbar_open: false,
+            node_popup_open: false,
             editing_config_id: None,
             edit_name_buffer: String::new(),
             error_modal: None,
@@ -675,6 +680,9 @@ impl ANetApp {
 
             total_rx: "0 B".to_string(),
             total_tx: "0 B".to_string(),
+            total_rtt: "0".to_string(),
+            total_rxm: "0 B".to_string(),
+            total_txm: "0 B".to_string(),
         };
 
         #[cfg(target_os = "windows")]
@@ -1215,27 +1223,33 @@ impl eframe::App for ANetApp {
 
         while let Ok(event) = self.event_rx.try_recv() {
             match event {
-
                 // 1. Каждую секунду обновляем переменные интерфейса (без записи в лог)
-        AnetEvent::Stats { rx, tx } => {
-            self.total_rx = rx;
-            self.total_tx = tx;
-        }
+                AnetEvent::Stats { rx, tx, rtt, rxm, txm } => {
+                    self.total_rx = rx;
+                    self.total_tx = tx;
+                    self.total_rtt = rtt;
+                    self.total_rxm = rxm;
+                    self.total_txm = txm;
+                }
 
                 AnetEvent::Status(msg) => {
-                    self.log(&msg);                
+                    self.log(&msg);
                 }
-    AnetEvent::ClientStateChanged { state, message, server_name } => {
-    self.log(&message);
+                AnetEvent::ClientStateChanged { state, message, server_name } => {
+                    self.log(&message);
 
-    if matches!(
-        state,
-        ClientState::Disconnected | ClientState::Stopped | ClientState::Failed
-    ) {
-        self.total_rx = "0 B".to_string();
-        self.total_tx = "0 B".to_string();
-    }
-
+                    if
+                        matches!(
+                            state,
+                            ClientState::Disconnected | ClientState::Stopped | ClientState::Failed
+                        )
+                    {
+                        self.total_rx = "0 B".to_string();
+                        self.total_tx = "0 B".to_string();
+                        self.total_rtt = "0".to_string();
+                        self.total_rxm = "0 B".to_string();
+                        self.total_txm = "0 B".to_string();
+                    }
 
                     if let Some(active_name) = server_name {
                         let mut settings = self.settings.lock().unwrap();
@@ -1270,6 +1284,13 @@ impl eframe::App for ANetApp {
 
         self.last_known_state = self.shared.lock().unwrap().state;
 
+        let panel_frame = egui::Frame::NONE.fill(console_bg).corner_radius(egui::CornerRadius {
+            nw: 0,
+            ne: 0,
+            sw: 14,
+            se: 14,
+        });
+
         let console_inner_frame = egui::Frame::NONE
             .fill(console_bg)
             .inner_margin(egui::Margin::same(10))
@@ -1282,170 +1303,198 @@ impl eframe::App for ANetApp {
                 se: 14,
             });
 
+        let border_color = egui::Color32::from_rgb(38, 41, 50);
+        let text_muted = egui::Color32::from_rgb(140, 145, 155);
+        let text_white = egui::Color32::WHITE;
+
         egui::TopBottomPanel
             ::bottom("stalker_console")
             .resizable(false)
-            .min_height(150.0)
-            .default_height(150.0)
+            .min_height(170.0)
+            .default_height(170.0)
             .show_separator_line(false)
-            .frame(egui::Frame::NONE)
+            .frame(panel_frame)
             .show(ctx, |ui| {
+                // Внутренняя карточка со внешними отступами от границ окна
                 egui::Frame::NONE
-                    .outer_margin(egui::Margin {
-                        left: 0,
-                        right: 0,
-                        top: 0,
-                        bottom: 0,
-                    })
-                    .inner_margin(egui::Margin {
-                        left: 10,
-                        right: 10,
-                        top: 10,
-                        bottom: 10,
-                    })
                     .fill(dark_color)
+                    .stroke(egui::Stroke::new(1.0, border_color))
                     .corner_radius(egui::CornerRadius {
-                        nw: 0,
-                        ne: 0,
+                        nw: 14,
+                        ne: 14,
                         sw: 14,
                         se: 14,
                     })
+                    .outer_margin(egui::Margin::same(10)) // Внешний отступ, отделяющий карточку от краев
+                    .inner_margin(egui::Margin::same(12)) // Внутренние отступы контента
                     .show(ui, |ui| {
                         ui.vertical(|ui| {
-                            let header_frame = egui::Frame::NONE
-                                .fill(console_bg)
-                                .inner_margin(egui::Margin::symmetric(8, 4))
-                                .outer_margin(egui::Margin::symmetric(0, 0))
-                                .corner_radius(egui::CornerRadius {
-                                    nw: 14,
-                                    ne: 14,
-                                    sw: 0,
-                                    se: 0,
-                                })
-                                .stroke(
-                                    egui::Stroke::new(1.0, egui::Color32::from_rgb(50, 50, 50))
+                            // --- HEADER ---
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText
+                                        ::new("CONNECTION")
+                                        .family(egui::FontFamily::Name("Inter-V".into()))
+                                        .size(11.0)
+                                        .color(text_muted)
+                                        .strong()
                                 );
 
-                            header_frame.show(ui, |ui| {
-                                ui.set_width(ui.available_width());
-
-                                Sides::new()
-                                    .height(24.0)
-                                    .show(
-                                        ui,
-                                        |ui| {
-                                            ui.label(
-                                                egui::RichText
-                                                    ::new("SYSTEM LOG")
-                                                    .family(
-                                                        egui::FontFamily::Name("Inter-V".into())
-                                                    )
-                                                    .size(10.0)
-                                                    .color(white_color)
-                                            );
-                                        },
-                                        |ui| {
-                                            let mut response = ui
-                                                .horizontal(|ui| {
-                                                    ui.spacing_mut().item_spacing.x = 6.0;
-
-                                                    ui.label(
-                                                        egui::RichText
-                                                            ::new("open full log")
-                                                            .family(
-                                                                egui::FontFamily::Name(
-                                                                    "Inter-V".into()
-                                                                )
-                                                            )
-                                                            .size(11.0)
-                                                            .color(white_color)
-                                                    );
-
-                                                    let image_size = egui::vec2(14.0, 14.0);
-                                                    let (rect, _) = ui.allocate_exact_size(
-                                                        image_size,
-                                                        egui::Sense::hover()
-                                                    );
-
-                                                    let shifted_rect = rect.translate(
-                                                        egui::vec2(4.0, 2.0)
-                                                    );
-
-                                                    egui::Image
-                                                        ::new(
-                                                            egui::include_image!(
-                                                                "./assets/list.svg"
-                                                            )
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        let btn = ui.add(
+                                            egui::Label
+                                                ::new(
+                                                    egui::RichText
+                                                        ::new("VIEW LOG →")
+                                                        .family(
+                                                            egui::FontFamily::Name("Inter-V".into())
                                                         )
-                                                        .max_size(image_size)
-                                                        .paint_at(ui, shifted_rect);
-                                                })
-                                                .response.interact(egui::Sense::click());
+                                                        .size(11.0)
+                                                        .color(text_muted)
+                                                )
+                                                .sense(egui::Sense::click())
+                                        );
 
-                                            response = response.on_hover_cursor(
+                                        if btn.hovered() {
+                                            ui.ctx().set_cursor_icon(
                                                 egui::CursorIcon::PointingHand
                                             );
-
-                                            if response.clicked() {
-                                                self.logbar_open = !self.logbar_open;
-                                            }
                                         }
-                                    );
+                                        if btn.clicked() {
+                                            self.logbar_open = !self.logbar_open;
+                                        }
+                                    }
+                                );
                             });
-                            ui.add_space(-ui.spacing().item_spacing.y);
 
-                            console_inner_frame.show(ui, |ui| {
-                                egui::ScrollArea
-                                    ::vertical()
-                                    .auto_shrink([false, false])
-                                    .scroll_bar_visibility(
-                                        egui::scroll_area::ScrollBarVisibility::AlwaysHidden
-                                    )
-                                    .stick_to_bottom(true)
-                                    .show(ui, |ui| {
-                                        ui.horizontal(|ui| {
-                                            ui.spacing_mut().item_spacing.x = 12.0;
+                            ui.add_space(6.0);
+                            let (rect, _) = ui.allocate_exact_size(
+                                egui::vec2(ui.available_width(), 1.0),
+                                egui::Sense::hover()
+                            );
+                            ui.painter().line_segment(
+                                [rect.left_center(), rect.right_center()],
+                                egui::Stroke::new(1.0, border_color)
+                            );
+                            ui.add_space(6.0);
 
-                                            let stats_str = format!(
-                                                "↓ {}  ↑ {}",
-                                                self.total_rx,
-                                                self.total_tx
-                                            );
+                            // --- TOP ROW: RTT | DOWNLOAD | UPLOAD ---
+                            ui.columns(3, |cols| {
+                                // 1. RTT
+                                cols[0].vertical(|ui| {
+                                    ui.label(
+                                        egui::RichText
+                                            ::new("RTT")
+                                            .size(10.0)
+                                            .color(text_muted)
+                                            .family(egui::FontFamily::Name("Inter-V".into()))
+                                    );
+                                    ui.add_space(2.0);
+                                    ui.label(
+                                        egui::RichText
+                                            ::new(format!("{}", self.total_rtt))
+                                            .size(15.0)
+                                            .color(text_white)
+                                            .strong()
+                                            .family(egui::FontFamily::Name("Inter-V".into()))
+                                    );
+                                });
 
-                                            let font_id = egui::FontId::new(
-                                                13.0,
-                                                egui::FontFamily::Name("Inter-V".into())
-                                            );
+                                // 2. DOWNLOAD
+                                cols[1].vertical(|ui| {
+                                    ui.label(
+                                        egui::RichText
+                                            ::new("↓ DOWNLOAD")
+                                            .size(10.0)
+                                            .color(text_muted)
+                                            .family(egui::FontFamily::Name("Inter-V".into()))
+                                    );
+                                    ui.add_space(2.0);
+                                    ui.label(
+                                        egui::RichText
+                                            ::new(format!("{:.2} Mbps", self.total_rxm))
+                                            .size(15.0)
+                                            .color(text_white)
+                                            .strong()
+                                            .family(egui::FontFamily::Name("Inter-V".into()))
+                                    );
+                                });
 
-                                            let galley = ui
-                                                .painter()
-                                                .layout_no_wrap(stats_str, font_id, grey_color);
-                                            let left_padding_stats = (
-                                                (ui.available_width() - galley.rect.width()) /
-                                                2.0
-                                            ).max(0.0);
+                                // 3. UPLOAD
+                                cols[2].vertical(|ui| {
+                                    ui.label(
+                                        egui::RichText
+                                            ::new("↑ UPLOAD")
+                                            .size(10.0)
+                                            .color(text_muted)
+                                            .family(egui::FontFamily::Name("Inter-V".into()))
+                                    );
+                                    ui.add_space(2.0);
+                                    ui.label(
+                                        egui::RichText
+                                            ::new(format!("{:.2} Mbps", self.total_txm))
+                                            .size(15.0)
+                                            .color(text_white)
+                                            .strong()
+                                            .family(egui::FontFamily::Name("Inter-V".into()))
+                                    );
+                                });
+                            });
 
-                                            ui.add_space(left_padding_stats);
-                                            ui.label(
-                                                egui::RichText
-                                                    ::new(format!("↓ {}", self.total_rx))
-                                                    .size(13.0)
-                                                    .family(
-                                                        egui::FontFamily::Name("Inter-V".into())
-                                                    )
-                                                    .color(light_blue_color)
-                                            );
-                                            ui.label(
-                                                egui::RichText
-                                                    ::new(format!("↑ {}", self.total_tx))
-                                                    .size(13.0)
-                                                    .family(
-                                                        egui::FontFamily::Name("Inter-V".into())
-                                                    )
-                                                    .color(gold_color)
-                                            );
-                                        });
-                                    });
+                            ui.add_space(6.0);
+                            let (rect, _) = ui.allocate_exact_size(
+                                egui::vec2(ui.available_width(), 1.0),
+                                egui::Sense::hover()
+                            );
+                            ui.painter().line_segment(
+                                [rect.left_center(), rect.right_center()],
+                                egui::Stroke::new(1.0, border_color)
+                            );
+                            ui.add_space(6.0);
+
+                            // --- BOTTOM ROW: TOTAL RX | TOTAL TX ---
+                            ui.columns(2, |cols| {
+                                // 1. TOTAL RX
+                                cols[0].vertical(|ui| {
+                                    ui.label(
+                                        egui::RichText
+                                            ::new("↓ TOTAL RX")
+                                            .size(10.0)
+                                            .color(text_muted)
+                                            .family(egui::FontFamily::Name("Inter-V".into()))
+                                    );
+                                    ui.add_space(2.0);
+                                    ui.label(
+                                        egui::RichText
+                                            ::new(format!("{}", self.total_rx))
+                                            .size(15.0)
+                                            .color(text_white)
+                                            .strong()
+                                            .family(egui::FontFamily::Name("Inter-V".into()))
+                                    );
+                                });
+
+                                // 2. TOTAL TX
+                                cols[1].vertical(|ui| {
+                                    ui.label(
+                                        egui::RichText
+                                            ::new("↑ TOTAL TX")
+                                            .size(10.0)
+                                            .color(text_muted)
+                                            .family(egui::FontFamily::Name("Inter-V".into()))
+                                    );
+                                    ui.add_space(2.0);
+                                    ui.label(
+                                        egui::RichText
+                                            ::new(format!("{}", self.total_tx))
+                                            .size(15.0)
+                                            .color(text_white)
+                                            .strong()
+                                            .family(egui::FontFamily::Name("Inter-V".into()))
+                                    );
+                                });
                             });
                         });
                     });
@@ -1657,77 +1706,252 @@ impl eframe::App for ANetApp {
                 if !server_names.is_empty() {
                     ui.add_space(10.0);
                     ui.vertical_centered(|ui| {
-                        if state == ConnectionState::Disconnected {
-                            ui.horizontal(|ui| {
-                                ui.set_width(ui.available_width());
-                                ui.add_space(ui.available_width() * 0.1);
-                                ui.label(egui::RichText::new("Подключение к:").color(ivory_color));
-
-                                let mut changed = false;
-                                let mut selected_name = String::new();
-
-                                egui::ComboBox
-                                    ::from_id_salt("first_server_select")
-                                    .selected_text(
-                                        egui::RichText::new(&selected_server_name).color(gold_color)
-                                    )
-                                    .show_ui(ui, |ui| {
-                                        for name in &server_names {
-                                            let option_text = egui::RichText
-                                                ::new(name)
-                                                .color(gold_color);
-
-                                            if
-                                                ui
-                                                    .selectable_label(
-                                                        name == &selected_server_name,
-                                                        option_text
-                                                    )
-                                                    .clicked()
-                                            {
-                                                selected_name = name.clone();
-                                                changed = true;
-                                            }
-                                        }
-                                    });
-
-                                if changed {
-                                    let active_cfg_data = {
-                                        let mut settings = self.settings.lock().unwrap();
-                                        if let Some(active_cfg) = settings.get_active_config() {
-                                            settings.selected_servers.insert(
-                                                active_cfg.id.clone(),
-                                                selected_name
-                                            );
-                                            settings.save();
-
-                                            Some((
-                                                active_cfg.id.clone(),
-                                                active_cfg.content.clone(),
-                                                active_cfg.name.clone(),
-                                            ))
-                                        } else {
-                                            None
-                                        }
-                                    };
-
-                                    if let Some((id, content, name)) = active_cfg_data {
-                                        self.load_config_from_content(&id, &content, &name);
-                                    }
-                                }
-                            });
+                        let header_text = if state == ConnectionState::Disconnected {
+                            "Подключение к:"
                         } else {
-                            ui.horizontal(|ui| {
-                                ui.set_width(ui.available_width());
-                                ui.add_space(ui.available_width() * 0.1);
-                                ui.label(egui::RichText::new("Активная нода:").color(gold_color));
-                                ui.label(
-                                    egui::RichText
-                                        ::new(&selected_server_name)
-                                        .strong()
-                                        .color(gold_color)
-                                );
-                            });
+                            "Активная нода:"
+                        };
+
+                        ui.label(
+                            egui::RichText
+                                ::new(header_text)
+                                .size(13.0)
+                                .color(ivory_color)
+                                .family(egui::FontFamily::Name("Inter-V".into()))
+                        );
+                        ui.add_space(7.0);
+
+                        // Один и тот же геометрический компонент в обоих состояниях.
+                        // Важно: здесь НЕТ Frame с inner_margin — он больше не может
+                        // увеличивать фактическую высоту активной ноды.
+                        const NODE_WIDTH: f32 = 266.0;
+                        const NODE_HEIGHT: f32 = 36.0;
+                        const NODE_RADIUS: u8 = 18;
+                        const ITEM_HEIGHT: f32 = 34.0;
+
+                        // Node status indicator: gray until the client is REALLY connected.
+                        // Selecting a node/config must not make the indicator orange.
+                        let orange = egui::Color32::from_rgb(235, 140, 52);
+                        let indicator = match state {
+                            ConnectionState::Connected => orange,
+                            ConnectionState::Disconnected | ConnectionState::Connecting => {
+                                egui::Color32::from_rgb(120, 124, 132)
+                            }
+                        };
+                        let bg = egui::Color32::from_rgb(25, 28, 36);
+                        let hover_bg = egui::Color32::from_rgb(31, 35, 44);
+                        let border = egui::Color32::from_rgb(50, 54, 66);
+                        let text = egui::Color32::from_rgb(242, 243, 246);
+                        let muted = egui::Color32::from_rgb(160, 164, 172);
+
+                        let (rect, response) = ui.allocate_exact_size(
+                            egui::vec2(NODE_WIDTH, NODE_HEIGHT),
+                            if state == ConnectionState::Disconnected {
+                                egui::Sense::click()
+                            } else {
+                                egui::Sense::hover()
+                            }
+                        );
+
+                        // Popup state belongs to the app, not egui temporary data.
+                        // This makes closing on item click deterministic.
+                        if state != ConnectionState::Disconnected {
+                            self.node_popup_open = false;
+                        }
+
+                        if state == ConnectionState::Disconnected && response.clicked() {
+                            self.node_popup_open = !self.node_popup_open;
+                        }
+
+                        let popup_open = self.node_popup_open;
+
+                        // The field itself is painted manually, so active and inactive
+                        // states are pixel-identical in size and shape.
+                        let field_fill = if
+                            response.hovered() &&
+                            state == ConnectionState::Disconnected
+                        {
+                            hover_bg
+                        } else {
+                            bg
+                        };
+                        ui.painter().rect_filled(
+                            rect,
+                            egui::CornerRadius::same(NODE_RADIUS),
+                            field_fill
+                        );
+                        ui.painter().rect_stroke(
+                            rect,
+                            egui::CornerRadius::same(NODE_RADIUS),
+                            egui::Stroke::new(1.0, border),
+                            egui::StrokeKind::Inside
+                        );
+
+                        let center_y = rect.center().y;
+                        let dot_center = egui::pos2(rect.left() + 18.0, center_y);
+                        ui.painter().circle_filled(dot_center, 5.0, indicator);
+
+                        ui.painter().text(
+                            egui::pos2(rect.left() + 32.0, center_y),
+                            egui::Align2::LEFT_CENTER,
+                            &selected_server_name,
+                            egui::FontId::new(13.0, egui::FontFamily::Name("Inter-V".into())),
+                            text
+                        );
+
+                        // Only the disconnected state gets the small dropdown chevron.
+                        if state == ConnectionState::Disconnected {
+                            let cx = rect.right() - 17.0;
+                            let cy = center_y;
+                            ui.painter().add(
+                                egui::Shape::convex_polygon(
+                                    vec![
+                                        egui::pos2(cx - 5.0, cy - 2.0),
+                                        egui::pos2(cx + 5.0, cy - 2.0),
+                                        egui::pos2(cx, cy + 4.0)
+                                    ],
+                                    muted,
+                                    egui::Stroke::NONE
+                                )
+                            );
+                        }
+
+                        // Custom popup: no ScrollArea and no ComboBox-internal scrolling.
+                        // Its height is exactly the number of nodes that must be shown.
+                        if state == ConnectionState::Disconnected && popup_open {
+                            let popup_height = 12.0 + (server_names.len() as f32) * ITEM_HEIGHT;
+                            let popup_pos = egui::pos2(rect.left(), rect.bottom() + 6.0);
+                            let popup_area_id = egui::Id::new("node_selection_popup");
+
+                            egui::Area
+                                ::new(popup_area_id)
+                                .order(egui::Order::Foreground)
+                                .fixed_pos(popup_pos)
+                                .interactable(true)
+                                .show(ui.ctx(), |popup_ui| {
+                                    popup_ui.set_min_size(egui::vec2(NODE_WIDTH, popup_height));
+                                    popup_ui.set_max_size(egui::vec2(NODE_WIDTH, popup_height));
+
+                                    egui::Frame::NONE
+                                        .fill(bg)
+                                        .stroke(egui::Stroke::new(1.0, border))
+                                        .corner_radius(egui::CornerRadius::same(14))
+                                        .inner_margin(egui::Margin::symmetric(6, 6))
+                                        .show(popup_ui, |popup_ui| {
+                                            for name in &server_names {
+                                                let selected = name == &selected_server_name;
+                                                let (item_rect, item_response) =
+                                                    popup_ui.allocate_exact_size(
+                                                        egui::vec2(NODE_WIDTH - 12.0, ITEM_HEIGHT),
+                                                        egui::Sense::click()
+                                                    );
+
+                                                if item_response.hovered() {
+                                                    popup_ui
+                                                        .painter()
+                                                        .rect_filled(
+                                                            item_rect,
+                                                            egui::CornerRadius::same(9),
+                                                            hover_bg
+                                                        );
+                                                }
+
+                                                if selected {
+                                                    popup_ui
+                                                        .painter()
+                                                        .circle_filled(
+                                                            egui::pos2(
+                                                                item_rect.left() + 13.0,
+                                                                item_rect.center().y
+                                                            ),
+                                                            4.0,
+                                                            orange
+                                                        );
+                                                }
+
+                                                popup_ui
+                                                    .painter()
+                                                    .text(
+                                                        egui::pos2(
+                                                            item_rect.left() + 25.0,
+                                                            item_rect.center().y
+                                                        ),
+                                                        egui::Align2::LEFT_CENTER,
+                                                        name,
+                                                        egui::FontId::new(
+                                                            13.0,
+                                                            egui::FontFamily::Name("Inter-V".into())
+                                                        ),
+                                                        if selected {
+                                                            text
+                                                        } else {
+                                                            muted
+                                                        }
+                                                    );
+
+                                                if item_response.clicked() {
+                                                    // Select the node and immediately collapse the popup.
+                                                    // This is the authoritative popup state.
+                                                    self.node_popup_open = false;
+
+                                                    let selected_name = name.clone();
+                                                    {
+                                                        let mut settings = self.settings
+                                                            .lock()
+                                                            .unwrap();
+                                                        if
+                                                            let Some(active_cfg) =
+                                                                settings.get_active_config()
+                                                        {
+                                                            settings.selected_servers.insert(
+                                                                active_cfg.id.clone(),
+                                                                selected_name.clone()
+                                                            );
+                                                            settings.save();
+                                                        }
+                                                    }
+
+                                                    let active_cfg_data = {
+                                                        let settings = self.settings
+                                                            .lock()
+                                                            .unwrap();
+                                                        settings
+                                                            .get_active_config()
+                                                            .map(|cfg| {
+                                                                (
+                                                                    cfg.id.clone(),
+                                                                    cfg.content.clone(),
+                                                                    cfg.name.clone(),
+                                                                )
+                                                            })
+                                                    };
+
+                                                    if
+                                                        let Some((id, content, name)) =
+                                                            active_cfg_data
+                                                    {
+                                                        self.load_config_from_content(
+                                                            &id,
+                                                            &content,
+                                                            &name
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        });
+
+                                    // Close the popup when clicking outside it.
+                                    let pointer_pos = popup_ui.input(|i| i.pointer.interact_pos());
+                                    let outside_click =
+                                        popup_ui.input(|i| i.pointer.any_pressed()) &&
+                                        pointer_pos.map_or(
+                                            false,
+                                            |p| !popup_ui.max_rect().contains(p)
+                                        );
+                                    if outside_click {
+                                        self.node_popup_open = false;
+                                    }
+                                });
                         }
                     });
                 }

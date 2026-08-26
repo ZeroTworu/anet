@@ -16,6 +16,9 @@ pub enum AnetEvent {
     Stats {
         rx: String,
         tx: String,
+        rtt: String,
+        rxm: String,
+        txm: String,
     },
     Status(String),
     ClientStateChanged {
@@ -23,7 +26,13 @@ pub enum AnetEvent {
         message: String,
         server_name: Option<String>,
     },
-    TrafficUpdate { rx: u64, tx: u64 }, // а точно так?
+    TrafficUpdate {
+        rx: u64,
+        tx: u64,
+        rtt: u64,
+        rxm: u64,
+        txm: u64,
+    }, // а точно так?
     Warn(String),
     Error(String),
     UpdateAvailable(crate::updater::GithubRelease),
