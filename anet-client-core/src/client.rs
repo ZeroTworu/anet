@@ -3,7 +3,7 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-
+use crate::statistic;
 use anyhow::{anyhow, Result};
 #[cfg(all(windows, feature = "per-app"))]
 use anyhow::Context;
@@ -33,7 +33,7 @@ use crate::config::PerAppMode;
 
 use crate::config::{CoreConfig, ServerConfig};
 use crate::dns::{get_dns_manager, DnsManager};
-use crate::events::{client_state, status, warn, ClientState};
+use crate::events::{client_state, status, warn, ClientState, err};
 use crate::statistic::{
     start_stats_monitor, QuicStatsProvider, StatsProvider, StreamStatsProvider,
 };
@@ -55,6 +55,11 @@ pub struct AnetClient {
     route_manager: Box<dyn RouteManager>,
     dns_manager: Box<dyn DnsManager>,
     session: Mutex<Option<RunningSession>>,
+    // Взводится в stop(): цикл переподключения в start() использует этот
+    // флаг, чтобы отличить "пользователь нажал disconnect" от "сессия
+    // умерла сама" — оба случая возвращаются из connect_and_run() одним и
+    // тем же путём (через reconnect_signal), поэтому раньше stop() всегда
+    // трактовался как обрыв связи и немедленно вызывал реконнект.
     stop_requested: AtomicBool,
 }
 
@@ -132,6 +137,8 @@ impl AnetClient {
             return Err(anyhow!("VPN tunnel is already active"));
         }
 
+        // Свежий цикл подключения — сбрасываем флаг от возможного
+        // предыдущего stop().
         self.stop_requested.store(false, Ordering::SeqCst);
 
         let mut config_clone = self.config.clone();
@@ -158,6 +165,10 @@ impl AnetClient {
 
             match self.connect_and_run(server, reconnect_signal.clone()).await {
                 Ok(()) => {
+                    // connect_and_run() возвращается через reconnect_signal и
+                    // при обрыве сессии, и при вызове stop() — различаем эти
+                    // случаи флагом, иначе disconnect всегда трактовался как
+                    // "связь потеряна" и тут же запускал реконнект.
                     if self.stop_requested.load(Ordering::SeqCst) {
                         info!("[Core] Stop requested by user. Exiting connection loop.");
                         status("VPN Stopped");
@@ -169,12 +180,8 @@ impl AnetClient {
                         "[Core] Connection with server '{}' lost. Switching to the next node...",
                         server_name
                     );
-                    status("Connection lost. Reconnecting...");
-                    client_state(
-                        ClientState::Reconnecting,
-                        "Connection lost; reconnecting",
-                        Some(server_name.clone()),
-                    );
+                    warn("Connection lost. Reconnecting...");
+                    client_state(ClientState::Reconnecting, "Connection lost; reconnecting", Some(server_name.clone()));
 
                     current_server_index = (current_server_index + 1) % config_clone.servers.len();
                     sleep(Duration::from_secs(2)).await;
@@ -191,7 +198,7 @@ impl AnetClient {
                         "[Core] Connection failed or timed out for server '{}': {}",
                         server_name, e
                     );
-                    status(format!("Node error: {}", e));
+                    err(format!("Node error: {}", e));
                     client_state(
                         ClientState::Reconnecting,
                         format!("Node error: {e}"),
@@ -207,13 +214,26 @@ impl AnetClient {
         Ok(())
     }
 
+    /// Получает источник IP-пакетов для сессии.
+    ///
+    /// Возвращает `(tx_to_source, rx_from_source, iface_name, filter_handle)`,
+    /// где `filter_handle` держит WinDivert-фильтр живым (None для TUN-режима).
     #[cfg(all(windows, feature = "per-app"))]
     async fn acquire_packet_source(
         &self,
         _server: &ServerConfig,
-        auth: &AuthResponse,
-    ) -> Result<(Sender<Bytes>, Receiver<Bytes>, String, Option<AppFilter>)> {
+        auth: &anet_common::protocol::AuthResponse,
+    ) -> anyhow::Result<(
+        tokio::sync::mpsc::Sender<bytes::Bytes>,
+        tokio::sync::mpsc::Receiver<bytes::Bytes>,
+        String,
+        Option<anet_appfilter::AppFilter>,
+    )> {
+        // МЫ ВСЕГДА создаем TUN-интерфейс (Wintun), чтобы операционная система зарегистрировала
+        // выделенный виртуальный IP-адрес на хосте.
         let (tun_tx, tun_rx, iface_name) = self.tun_factory.create_tun(auth).await?;
+
+        // Проверяем режим работы через обновленный enum
         let mode = self.config.main.per_app_mode;
 
         if mode == PerAppMode::All
@@ -221,9 +241,11 @@ impl AnetClient {
         {
             info!("[Core] Per-app mode is disabled (All applications)");
             status("[Core] Per-app mode is disabled (All applications)");
+            // Обычный полнотуннельный режим через TUN для всех приложений
             return Ok((tun_tx, tun_rx, iface_name, None));
         }
 
+        // Статический bypass: IP-литералы всех серверов из конфига.
         let initial_bypass: Vec<IpAddr> = self
             .config
             .servers
@@ -232,19 +254,29 @@ impl AnetClient {
             .filter_map(|(host, _)| IpAddr::from_str(&host).ok())
             .collect();
 
+        // Формируем политику на основе enum с явным указанием типов для пустых векторов
         let policy = match mode {
-            PerAppMode::Exclude => AppPolicy::exclude(self.config.main.per_app.clone()),
-            PerAppMode::Include => AppPolicy::include(self.config.main.per_app.clone()),
-            PerAppMode::All => AppPolicy::exclude(Vec::<String>::new()),
+            crate::config::PerAppMode::Exclude => {
+                anet_appfilter::AppPolicy::exclude(self.config.main.per_app.clone())
+            }
+            crate::config::PerAppMode::Include => {
+                anet_appfilter::AppPolicy::include(self.config.main.per_app.clone())
+            }
+            crate::config::PerAppMode::All => {
+                anet_appfilter::AppPolicy::exclude(Vec::<String>::new())
+            }
         };
 
+        // Парсим выданный VPN IP
         let vpn_ip = IpAddr::from_str(&auth.ip).context("Failed to parse assigned VPN IP")?;
-        let (filter, tx, rx) = AppFilter::start(policy, initial_bypass, vpn_ip)?;
 
+        let (filter, tx, rx) = anet_appfilter::AppFilter::start(policy, initial_bypass, vpn_ip)?;
+
+        // Динамический bypass: фактический адрес текущего сервера.
         let (server_host, server_port) = _server.host_port()?;
         if let Ok(ip) = IpAddr::from_str(&server_host) {
             filter.add_bypass(ip).await;
-        } else if let Ok(mut addrs) = lookup_host((server_host.as_str(), server_port)).await {
+        } else if let Ok(mut addrs) = tokio::net::lookup_host((server_host.as_str(), server_port)).await {
             if let Some(sa) = addrs.next() {
                 filter.add_bypass(sa.ip()).await;
             }
@@ -259,14 +291,17 @@ impl AnetClient {
 
         info!(
             "[Core] Per-app mode active, apps: [{}], mode: [{}]",
-            apps_names, mode_str
+            apps_names,
+            mode_str,
         );
         status(format!(
             "[Core] Per-app mode active, apps: [{}], mode: [{}]",
-            apps_names, mode_str
+            apps_names,
+            mode_str,
         ));
 
-        spawn(async move {
+        // Утилизируем входящий канал TUN (tun_rx) в фоновом режиме
+        tokio::spawn(async move {
             let mut rx = tun_rx;
             while rx.recv().await.is_some() {}
         });
@@ -274,6 +309,9 @@ impl AnetClient {
         Ok((tx, rx, iface_name, Some(filter)))
     }
 
+    /// Fallback: per-app недоступен (не Windows, либо фича `per-app`
+    /// выключена) — всегда обычный TUN. Тип хэндла — (), чтобы сигнатура
+    /// вызова совпадала на всех платформах.
     #[cfg(not(all(windows, feature = "per-app")))]
     async fn acquire_packet_source(
         &self,
@@ -319,6 +357,13 @@ impl AnetClient {
             self.route_manager.add_bypass_route(server_ip, prefix).await?;
         }
 
+        // Источник/приёмник IP-пакетов. Обычно это TUN. На Windows, если задан
+        // per-app список, вместо TUN поднимаем WinDivert-фильтр, который отдаёт
+        // ту же пару каналов (Sender/Receiver<Bytes>) — транспорт не меняется.
+        //
+        // `_app_filter` держит хэндл фильтра живым на всё время сессии; при
+        // выходе из функции он дропается и рабочие потоки WinDivert
+        // останавливаются вместе с закрытием каналов.
         let (tx_to_tun, mut rx_from_tun, iface_name, _app_filter) =
             self.acquire_packet_source(server, &result.auth_response).await?;
 
@@ -336,7 +381,9 @@ impl AnetClient {
 
         let (mut stream_reader, mut stream_writer) = io_split(result.vpn_stream);
 
-        // Задача TUN -> NETWORK (Отправка пакетов)
+        // =========================================================================
+        // Задача TUN -> NETWORK (Отправка пакетов) с КOАЛЕСЦЕНЦИЕЙ и СИГНАЛОМ ОТМЕНЫ
+        // =========================================================================
         let tx_time = last_tx_time.clone();
         let tx_bytes = total_tx_bytes.clone();
         let tx_packets = total_tx_packets.clone();
@@ -349,10 +396,11 @@ impl AnetClient {
                     pkt = rx_from_tun.recv() => {
                         match pkt {
                             Some(p) => p,
-                            None => break,
+                            None => break, // Канал закрылся
                         }
                     }
                     _ = notify_tx.notified() => {
+                        // Получен сигнал отмены сессии при очистке — немедленно выходим!
                         break;
                     }
                 };
@@ -366,6 +414,7 @@ impl AnetClient {
 
                 frame_packet_into(&mut write_buf, &packet);
 
+                // Пакетная выгрузка без ожидания (выгребаем готовое)
                 while write_buf.len() < COALESCE_BUDGET_BYTES {
                     match rx_from_tun.try_recv() {
                         Ok(p) => {
@@ -423,6 +472,9 @@ impl AnetClient {
             }
         });
 
+        // В per-app режиме (Windows/WinDivert) маршрутизацией управляет сам
+        // фильтр на уровне пакетов: нет реального интерфейса, дефолтный маршрут
+        // и системный DNS трогать нельзя. `_app_filter.is_some()` == per-app.
         let per_app_active = _app_filter.is_some();
 
         if !per_app_active {
@@ -474,10 +526,13 @@ impl AnetClient {
             }
         }
 
-        // Монитор активности и блокировок
+        // АКТИВНЫЙ ВОРКЕР КОНТРОЛЯ ЗДОРОВЬЯ (HEALTH MONITOR)
+        // =========================================================================
         let monitor_shutdown = shutdown_notify.clone();
         let monitor_reconnect = reconnect_signal.clone();
         let rx_check = last_rx_time.clone();
+
+        //  Забираем время последней отправки пакета!
         let tx_check = last_tx_time.clone();
 
         let health_pause = result.health_pause.clone();
@@ -503,6 +558,7 @@ impl AnetClient {
                 }
 
                 if is_initial_phase {
+                    // Если мы отправляли данные в последние 4 сек, но ответа нет 8 сек -> Блокировка
                     if elapsed_rx > Duration::from_secs(8) && elapsed_tx < Duration::from_secs(4) {
                         warn!("[Health] CASE 1 Detected: Connection established, but payload traffic is blocked!");
                         warn("[Health] CASE 1 Detected: Connection established, but payload traffic is blocked!");
@@ -514,20 +570,32 @@ impl AnetClient {
             }
         });
 
-        // Сборщик статистики сессии
+        // =========================================================================
+        // УНИВЕРСАЛЬНЫЙ СБОРЩИК СТАТИСТИКИ
+        // =========================================================================
+
         let stats_shutdown = shutdown_notify.clone();
-        let stats_task = if config_clone.stats.enabled {
-            let provider: Arc<dyn StatsProvider> = if let Some(ref conn) = result.connection {
-                Arc::new(QuicStatsProvider::new(conn.clone()))
-            } else {
-                Arc::new(StreamStatsProvider::new(
-                    total_rx_bytes.clone(),
-                    total_tx_bytes.clone(),
-                    total_rx_packets.clone(),
-                    total_tx_packets.clone(),
-                ))
-            };
-            Some(start_stats_monitor(
+        let stats_task = {
+        let provider: Arc<dyn statistic::StatsProvider> = if let Some(ref conn) = result.connection {
+            Arc::new(statistic::QuicStatsProvider::new(conn.clone()))
+        } else {
+            Arc::new(statistic::StreamStatsProvider::new(
+                total_rx_bytes.clone(),
+                total_tx_bytes.clone(),
+                total_rx_packets.clone(),
+                total_tx_packets.clone(),
+            ))
+        };
+
+        // 1. Быстрый монитор для обновления UI-меток (каждую секунду)
+        let fast_handle = statistic::start_fast_stats_monitor(
+            provider.clone(),
+            stats_shutdown.clone(),
+        );
+
+        // 2. Медленный монитор для записи детальной статистики в лог (по интервалу)
+        let slow_handle = if config_clone.stats.enabled {
+            Some(statistic::start_stats_monitor(
                 provider,
                 config_clone.stats.interval_minutes,
                 stats_shutdown,
@@ -536,13 +604,23 @@ impl AnetClient {
             None
         };
 
+        // Объединяем выполнение обоих мониторов в единый JoinHandle
+            Some(spawn(async move {
+                if let Some(slow) = slow_handle {
+                    let _ = tokio::join!(fast_handle, slow);
+                } else {
+                    let _ = fast_handle.await;
+                }
+            }))
+        };
+
         {
             let mut state = self.session.lock().unwrap();
             *state = Some(RunningSession {
                 endpoint: result.endpoint,
                 shutdown_notify: shutdown_notify.clone(),
                 reconnect_signal: reconnect_signal.clone(),
-                main_task: spawn(async move {
+                main_task: tokio::spawn(async move {
                     let _ = tokio::join!(t1, t2);
                 }),
                 stats_task,
@@ -641,9 +719,10 @@ impl AnetClient {
             Some(server.get_name()),
         );
 
-        // Ожидание сигнала перезапуска сессии
+        // Засыпаем и ждем сигнала о необходимости реконнекта от воркера здоровья или задач t1/t2
         reconnect_signal.notified().await;
 
+        // Очистка текущей нерабочей сессии
         info!("[Core] Cleaning up dead session...");
         status("[Core] Cleaning up dead session...");
         shutdown_notify.notify_waiters();
@@ -657,6 +736,7 @@ impl AnetClient {
             if let Some(task) = sess.stats_task {
                 task.abort();
             }
+            // Теперь main_task разрешится за доли миллисекунды без зависания!
             let _ = sess.main_task.await;
         }
 
@@ -666,7 +746,9 @@ impl AnetClient {
         Ok(())
     }
 
-    pub async fn stop(&self) -> Result<()> {
+    pub async fn stop(&self) -> anyhow::Result<()> {
+        // Взводим ДО notify_one() ниже — start() должен увидеть флаг сразу,
+        // как только проснётся от сигнала reconnect_signal.
         self.stop_requested.store(true, Ordering::SeqCst);
 
         let session = {
@@ -679,7 +761,7 @@ impl AnetClient {
             status("[Core] Stopping VPN...");
             client_state(ClientState::Stopping, "Stopping VPN", None);
             running.shutdown_notify.notify_waiters();
-            running.reconnect_signal.notify_one();
+            running.reconnect_signal.notify_one(); // <-- Сигнализируем выходу из connect_and_run!
 
             if let Some(task) = running.stats_task {
                 task.abort();
