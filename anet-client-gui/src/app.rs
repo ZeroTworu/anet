@@ -2246,7 +2246,7 @@ impl eframe::App for ANetApp {
 
         if self.sidebar_open {
             egui::Area
-                ::new(egui::Id::new("config_appbar"))
+                ::new(egui::Id::new("config_sidebar"))
                 .order(egui::Order::Foreground)
                 .fixed_pos(egui::pos2(0.0, 0.0))
                 .show(ctx, |ui| {
@@ -2851,5 +2851,22 @@ impl eframe::App for ANetApp {
                     });
                 });
         }
+
+
+       let painter = ctx.layer_painter(
+            egui::LayerId::new(egui::Order::Foreground, egui::Id::new("window_border"))
+        );
+        let screen_rect = ctx.screen_rect();
+
+        // Укажите реальный радиус скругления ваших углов вместо 8.0
+        let corner_radius = 14.0;
+
+        painter.rect_stroke(
+            screen_rect,
+            corner_radius,
+            egui::Stroke::new(1.0, egui::Color32::from_rgb(100, 100, 100)),
+            egui::StrokeKind::Inside // Прижимаем обводку внутрь, чтобы она не обрезалась границами экрана
+        );
+
     }
 }
