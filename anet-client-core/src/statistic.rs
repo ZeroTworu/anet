@@ -4,9 +4,9 @@ use quinn::Connection;
 use std::sync::Arc;
 use tokio::time::sleep;
 use tokio::sync::Notify;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{ AtomicU64, Ordering };
 use crate::events::status;
-use crate::events::{emit, AnetEvent};
+use crate::events::{ emit, AnetEvent };
 
 const KIB: f64 = 1024.0;
 const MIB: f64 = 1024.0 * 1024.0;
@@ -89,7 +89,7 @@ impl StreamStatsProvider {
         total_rx_bytes: Arc<AtomicU64>,
         total_tx_bytes: Arc<AtomicU64>,
         total_rx_packets: Arc<AtomicU64>,
-        total_tx_packets: Arc<AtomicU64>,
+        total_tx_packets: Arc<AtomicU64>
     ) -> Self {
         Self {
             total_rx_bytes,
@@ -123,16 +123,10 @@ impl StatsProvider for StreamStatsProvider {
 pub fn start_stats_monitor(
     provider: Arc<dyn StatsProvider>,
     interval_minutes: u64,
-    shutdown_notify: Arc<Notify>,
+    shutdown_notify: Arc<Notify>
 ) -> tokio::task::JoinHandle<()> {
-    info!(
-        "[STATS] Monitor enabled. Interval: {} minute(s).",
-        interval_minutes
-    );
-    status(format!(
-        "[STATS] Monitor enabled. Interval: {} minute(s).",
-        interval_minutes
-    ));
+    info!("[STATS] Monitor enabled. Interval: {} minute(s).", interval_minutes);
+    status(format!("[STATS] Monitor enabled. Interval: {} minute(s).", interval_minutes));
 
     tokio::spawn(async move {
         let interval = Duration::from_secs(interval_minutes * 60);
@@ -225,17 +219,15 @@ pub fn start_stats_monitor(
     })
 }
 
-
-
-
-
 /// Запуск секундного мониторинга трафика для обновления UI
 pub fn start_fast_stats_monitor(
     provider: Arc<dyn StatsProvider>,
-    shutdown_notify: Arc<Notify>,
+    shutdown_notify: Arc<Notify>
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let interval = Duration::from_secs(1);
+        let mut last_stats = provider.get_stats();
+        let start_time = std::time::Instant::now();
 
         loop {
             tokio::select! {
@@ -247,14 +239,44 @@ pub fn start_fast_stats_monitor(
                     // 1. Получаем актуальный снимок метрик
                     let current_stats = provider.get_stats();
 
+                    let interval_secs = interval.as_secs_f64();
+
                     // 2. Форматируем байты в строки
                     let rx_str = format_bytes(current_stats.total_rx_bytes);
                     let tx_str = format_bytes(current_stats.total_tx_bytes);
+                   let rtt_str = current_stats.rtt_ms
+    .map(|rtt| format!("{:>4.0}ms", rtt))
+    .unwrap_or_else(|| "N/A".to_string());
+
+                    // Считаем разницу переданных данных за интервал
+                    let rx_bytes_delta = current_stats
+                        .total_rx_bytes
+                        .saturating_sub(last_stats.total_rx_bytes);
+                    let tx_bytes_delta = current_stats
+                        .total_tx_bytes
+                        .saturating_sub(last_stats.total_tx_bytes);
+
+                    // Расчет скорости передачи в мегабитах
+                    let rx_mbps = if interval_secs > 0.0 {
+                        (rx_bytes_delta * 8) as f64 / (1000.0 * 1000.0 * interval_secs)
+                    } else {
+                        0.0
+                    };
+                    let tx_mbps = if interval_secs > 0.0 {
+                        (tx_bytes_delta * 8) as f64 / (1000.0 * 1000.0 * interval_secs)
+                    } else {
+                        0.0
+                    };    
+
+
 
                     // 3. Излучаем событие через глобальный emit
                     emit(AnetEvent::Stats {
                         rx: rx_str,
                         tx: tx_str,
+                        rtt: rtt_str.to_string(),
+                        rxm: rx_mbps.to_string(),
+                        txm: tx_mbps.to_string()
                     });
                 }
                 _ = shutdown_notify.notified() => {
