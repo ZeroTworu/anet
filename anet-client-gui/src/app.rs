@@ -1,8 +1,6 @@
 #![allow(warnings)]
 include!(concat!(env!("OUT_DIR"), "/built.rs"));
 
-use chrono::Local;
-use notify_rust::Notification;
 use sysinfo::System;
 use tokio::runtime::{ Handle, Runtime };
 
@@ -11,15 +9,16 @@ use egui::{
     containers::Sides,
     scroll_area::ScrollBarVisibility,
     text::{ LayoutJob, TextFormat },
-    widgets::Spinner,
     FontData,
     FontDefinitions,
-    FontId,
     FontFamily,
+    FontId,
     RichText,
     Stroke,
     Visuals,
 };
+
+use notify_rust::Notification;
 
 use anet_client_core::{
     client::AnetClient,
@@ -31,14 +30,12 @@ use anet_client_core::{
 
 use crate::{
     config::AppSettings,
-    tun_factory::DesktopTunFactory,
     tray::{ TrayBackground, TrayCommand },
+    tun_factory::DesktopTunFactory,
 };
 
 use std::{
     collections::BTreeMap,
-    fs::{ self, OpenOptions },
-    io::{ self, Write },
     path::PathBuf,
     sync::{ mpsc::{ channel, Receiver, Sender }, Arc, Mutex },
 };
@@ -94,7 +91,6 @@ impl AppState {
     // Обновление списка .exe процессов
     #[cfg(target_os = "windows")]
     pub fn refresh_processes(&mut self) {
-        // 1. Сохраняем имена уже выбранных приложений перед обновлением
         let selected_apps: std::collections::HashSet<String> = self.processes
             .iter()
             .filter(|p| p.is_selected)
@@ -109,7 +105,6 @@ impl AppState {
             let name = process.name().to_string();
 
             if name.ends_with(".exe") || cfg!(windows) {
-                // 2. Восстанавливаем состояние is_selected, если процесс был выбран ранее
                 let is_selected = selected_apps.contains(&name);
 
                 map.entry(name.clone()).or_insert(ProcessItem {
@@ -128,18 +123,17 @@ impl EventHandler for GuiEventHandler {
     fn on_event(&self, event: AnetEvent) {
         let _ = self.tx.send(event.clone());
 
-        match &event {
-            AnetEvent::ClientStateChanged { state, .. } => {
-                let mut guard = self.shared.lock().unwrap();
-                guard.state = match state {
-                    ClientState::Connected => ConnectionState::Connected,
-                    ClientState::Connecting | ClientState::Reconnecting | ClientState::Stopping =>
-                        ConnectionState::Connecting,
-                    ClientState::Disconnected | ClientState::Stopped | ClientState::Failed =>
-                        ConnectionState::Disconnected,
-                };
-            }
-            _ => {}
+        if let AnetEvent::ClientStateChanged { state, .. } = &event {
+            let mut guard = self.shared.lock().unwrap();
+            guard.state = match state {
+                ClientState::Connected => ConnectionState::Connected,
+                ClientState::Connecting | ClientState::Reconnecting | ClientState::Stopping => {
+                    ConnectionState::Connecting
+                }
+                ClientState::Disconnected | ClientState::Stopped | ClientState::Failed => {
+                    ConnectionState::Disconnected
+                }
+            };
         }
 
         self.ctx.request_repaint();
@@ -185,6 +179,9 @@ pub struct ANetApp {
     pub sys: System,
 
     pub filter_mode: FilterMode,
+
+    pub total_rx: String,
+    pub total_tx: String,
 }
 
 fn send_notification(title: &str, body: &str) {
@@ -195,6 +192,7 @@ fn send_notification(title: &str, body: &str) {
         .icon("dialog-information")
         .show();
 }
+
 
 pub fn toggle_vpn(
     shared: &Arc<Mutex<SharedState>>,
@@ -224,25 +222,21 @@ pub fn toggle_vpn(
                 }
             });
         }
-    } else {
-        if let Some(client_clone) = guard.client.clone() {
-            guard.state = ConnectionState::Disconnected;
-            drop(guard);
+    } else if let Some(client_clone) = guard.client.clone() {
+        guard.state = ConnectionState::Disconnected;
+        drop(guard);
 
-            let logs_clone = logs.clone();
-            rt_handle.spawn(async move {
-                logs_clone.lock().unwrap().push("> Stopping service...".into());
-                let _ = client_clone.stop().await;
-            });
-        }
+        let logs_clone = logs.clone();
+        rt_handle.spawn(async move {
+            logs_clone.lock().unwrap().push("> Stopping service...".into());
+            let _ = client_clone.stop().await;
+        });
     }
 }
 
 impl ANetApp {
-    // Функция сканирования запущенных .exe процессов
     #[cfg(target_os = "windows")]
     pub fn refresh_processes(&mut self) {
-        // 1. Сохраняем имена уже выбранных приложений перед обновлением
         let selected_apps: std::collections::HashSet<String> = self.processes
             .iter()
             .filter(|p| p.is_selected)
@@ -257,7 +251,6 @@ impl ANetApp {
             let name = process.name().to_string();
 
             if name.ends_with(".exe") || cfg!(windows) {
-                // 2. Восстанавливаем состояние is_selected
                 let is_selected = selected_apps.contains(&name);
 
                 map.entry(name.clone()).or_insert(ProcessItem {
@@ -271,7 +264,6 @@ impl ANetApp {
         self.processes = map.into_values().collect();
     }
 
-    // Метод отрисовки таблицы процессов
     #[cfg(target_os = "windows")]
     fn render_process_list(&mut self, ui: &mut egui::Ui) {
         ui.vertical(|ui| {
@@ -315,19 +307,15 @@ impl ANetApp {
                 self.refresh_processes();
             }
             if ui.button(" Применить").clicked() {
-                // 1. Собираем выбранные .exe
                 let selected_apps: Vec<String> = self.processes
                     .iter()
                     .filter(|p| p.is_selected)
                     .map(|p| p.name.clone())
                     .collect();
 
-                // 2. Определяем режим фильтрации
                 let filter_mode = self.filter_mode;
-
                 let mut updated_config_data: Option<(String, String, String)> = None;
 
-                // 3. Обновляем конфигурацию в памяти
                 {
                     let mut settings = self.settings.lock().unwrap();
                     let active_id = settings.active_config_id.clone();
@@ -335,7 +323,6 @@ impl ANetApp {
                     if let Some(id) = active_id {
                         let updated_info = {
                             if let Some(cfg) = settings.configs.iter_mut().find(|c| c.id == id) {
-                                // Модифицируем TOML текст с учетом per_app_mode
                                 cfg.content = Self::inject_per_app_to_toml(
                                     &cfg.content,
                                     &selected_apps,
@@ -354,7 +341,6 @@ impl ANetApp {
                     }
                 }
 
-                // 4. Записываем файл на диск и перезагружаем ядро
                 if let Some((id, content, name)) = updated_config_data {
                     let path_by_id = std::path::PathBuf
                         ::from("configs")
@@ -397,39 +383,30 @@ impl ANetApp {
                         );
                     }
 
-                    // Перезагружаем ядро
                     self.load_config_from_content(&id, &content, &name);
                     self.log("Настройки приложений применены.");
 
-                    // === БЕЗОПАСНЫЙ РЕКОМНЕКТ ДЛЯ TOKIO ===
                     let current_state = self.shared.lock().unwrap().state;
                     if current_state == ConnectionState::Connected {
                         self.log("Переподключение VPN из-за изменения настроек...");
-
-                        // 1. Останавливаем VPN
                         self.stop_vpn();
 
-                        // 2. Подготавливаем данные для фоновой задачи вне async блока
                         let shared_clone = self.shared.clone();
                         let logs_clone = self.logs.clone();
                         let rt_handle = self.rt.handle().clone();
 
                         rt_handle.spawn(async move {
-                            // Небольшая пауза
                             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-                            // Получаем клиента и сразу отпускаем мьютекс через drop,
-                            // чтобы не держать его во время .await вызовов!
                             let client_opt = {
                                 let mut guard = shared_clone.lock().unwrap();
                                 guard.state = ConnectionState::Connecting;
                                 guard.client.clone()
-                            }; // <--- Здесь guard гарантированно уничтожается (dropped)
+                            };
 
                             if let Some(client_clone) = client_opt {
                                 logs_clone.lock().unwrap().push("> Re-starting service...".into());
 
-                                // Вызов .await происходит БЕЗ удерживающегося мьютекса в контексте задачи
                                 match client_clone.start().await {
                                     Ok(_) => {
                                         logs_clone
@@ -455,12 +432,10 @@ impl ANetApp {
 
         ui.separator();
 
-        // Настраиваем цвета бегунка для разных состояний
-        // ЗАСТАВЛЯЕМ скроллбар брать цвет из настроек фона (bg_fill), а не текста
         ui.style_mut().spacing.scroll.foreground_color = false;
-        ui.style_mut().visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(80, 80, 80); // Обычный цвет
-        ui.style_mut().visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(120, 120, 120); // Цвет при наведении мыши
-        ui.style_mut().visuals.widgets.active.bg_fill = egui::Color32::from_rgb(160, 160, 160); // Цвет при зажатии/перетаскивании
+        ui.style_mut().visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(80, 80, 80);
+        ui.style_mut().visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(120, 120, 120);
+        ui.style_mut().visuals.widgets.active.bg_fill = egui::Color32::from_rgb(160, 160, 160);
 
         egui::ScrollArea
             ::vertical()
@@ -509,7 +484,6 @@ impl ANetApp {
                                 ui.style_mut().visuals.widgets.hovered.bg_stroke = checkbox_stroke;
 
                                 if ui.checkbox(&mut proc.is_selected, "").changed() {
-                                    // Реакция на переключение чекбокса
                                 }
                             });
                             ui.label("⚙");
@@ -528,7 +502,6 @@ impl ANetApp {
             });
     }
 
-    /// Функция для обновления per_app и per_app_mode в TOML
     #[cfg(target_os = "windows")]
     fn inject_per_app_to_toml(content: &str, apps: &[String], mode: FilterMode) -> String {
         let normalized = content.replace("\r\n", "\n");
@@ -556,7 +529,7 @@ impl ANetApp {
         let mut main_end_idx = None;
         let mut per_app_idx = None;
         let mut mode_idx = None;
-        let mut old_exclude_idx = None; // на случай старого параметра в файле
+        let mut old_exclude_idx = None;
 
         for (i, line) in lines.iter().enumerate() {
             let trimmed = line.trim();
@@ -588,43 +561,42 @@ impl ANetApp {
             }
         }
 
-        let default_insert_pos = main_end_idx.unwrap_or(lines.len());
+        if let Some(idx) = old_exclude_idx {
+            lines.remove(idx);
+            if let Some(ref mut p) = per_app_idx {
+                if *p > idx {
+                    *p -= 1;
+                }
+            }
+            if let Some(ref mut m) = mode_idx {
+                if *m > idx {
+                    *m -= 1;
+                }
+            }
+            if let Some(ref mut e) = main_end_idx {
+                if *e > idx {
+                    *e -= 1;
+                }
+            }
+        }
 
-        // 1. Обновляем или добавляем per_app
         match per_app_idx {
             Some(idx) => {
                 lines[idx] = per_app_line.clone();
             }
             None => {
+                let default_insert_pos = main_end_idx.unwrap_or(lines.len());
                 lines.insert(default_insert_pos, per_app_line.clone());
                 main_end_idx = Some(default_insert_pos + 1);
             }
         }
 
-        let current_insert_pos = main_end_idx.unwrap_or(lines.len());
-
-        // 2. Если в старом конфиге остался per_app_exclude, удалим его, чтобы не плодить мусор
-        if let Some(idx) = old_exclude_idx {
-            lines.remove(idx);
-            // сдвигаем индексы если нужно, либо просто заменим на новый ниже
-        }
-
-        // 3. Обновляем или добавляем per_app_mode
         match mode_idx {
             Some(idx) => {
                 lines[idx] = mode_line.clone();
             }
             None => {
-                // Если старый exclude был удален до idx, можно безопасно вставлять
-                let insert_pos = if let Some(old_idx) = old_exclude_idx {
-                    if old_idx < current_insert_pos {
-                        current_insert_pos.saturating_sub(1)
-                    } else {
-                        current_insert_pos
-                    }
-                } else {
-                    current_insert_pos
-                };
+                let insert_pos = main_end_idx.unwrap_or(lines.len());
                 lines.insert(insert_pos.min(lines.len()), mode_line.clone());
             }
         }
@@ -636,10 +608,8 @@ impl ANetApp {
         load_fonts(&cc.egui_ctx);
 
         let rt = Runtime::new().unwrap();
-
         let settings = AppSettings::load();
         let settings_arc = Arc::new(Mutex::new(settings));
-
         let logs = Arc::new(Mutex::new(vec!["> System Ready...".to_string()]));
 
         let shared = Arc::new(
@@ -701,16 +671,18 @@ impl ANetApp {
             update_status: UpdateStatus::Idle,
             processes: Vec::new(),
             sys: System::new_all(),
-
             filter_mode: FilterMode::Include,
+
+            total_rx: "0 B".to_string(),
+            total_tx: "0 B".to_string(),
         };
 
         #[cfg(target_os = "windows")]
-        app.refresh_processes(); // <--- Сначала сканируем процессы
+        app.refresh_processes();
 
         let config_to_load = app.settings.lock().unwrap().get_active_config();
         if let Some(config) = config_to_load {
-            app.load_config_from_content(&config.id, &config.content, &config.name); // <--- Потом грузим конфиг (тут применятся галочки)
+            app.load_config_from_content(&config.id, &config.content, &config.name);
         }
 
         app
@@ -822,27 +794,6 @@ impl ANetApp {
         self.select_config(&id);
     }
 
-    fn strip_toml_comments(content: &str) -> String {
-        let mut result = String::new();
-        for line in content.lines() {
-            let trimmed = line.trim();
-            if trimmed.starts_with('#') {
-                continue;
-            }
-            if let Some(pos) = line.find('#') {
-                let before_comment = line[..pos].trim_end();
-                if !before_comment.is_empty() {
-                    result.push_str(before_comment);
-                    result.push('\n');
-                }
-            } else {
-                result.push_str(line);
-                result.push('\n');
-            }
-        }
-        result
-    }
-
     fn delete_config(&mut self, id: &str) {
         self.settings.lock().unwrap().remove_config(id);
         if self.shared.lock().unwrap().client.is_none() {
@@ -880,20 +831,17 @@ impl ANetApp {
 
     fn load_config_from_content(&mut self, id: &str, content: &str, name: &str) {
         let _ = self.rt.enter();
-
         let route_result = self.rt.block_on(async { create_route_manager(false) });
 
         match toml::from_str::<CoreConfig>(content) {
             Ok(mut cfg) => {
                 let _ = cfg.sanitize();
-                // Синхронизируем режимы фильтрации из конфига в UI состояние
                 self.filter_mode = match cfg.main.per_app_mode {
                     anet_client_core::config::PerAppMode::All => FilterMode::All,
                     anet_client_core::config::PerAppMode::Include => FilterMode::Include,
                     anet_client_core::config::PerAppMode::Exclude => FilterMode::Exclude,
                 };
 
-                // Отмечаем галочками те процессы, которые прописаны в cfg.main.per_app
                 for proc in &mut self.processes {
                     proc.is_selected = cfg.main.per_app.contains(&proc.name);
                 }
@@ -982,6 +930,8 @@ pub fn force_wake_up_window(ctx: &egui::Context) {
             EnumWindows(Some(enum_window_callback), pid as LPARAM);
         }
     }
+    // Сбрасываем состояние минимизации и делаем окно видимым
+    ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Minimized(false));
     ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Visible(true));
     ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Focus);
     ctx.request_repaint_of(egui::ViewportId::ROOT);
@@ -990,11 +940,9 @@ pub fn force_wake_up_window(ctx: &egui::Context) {
 fn load_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
 
-    // 1. Внедряем файлы шрифтов
     let jetbrains_font_data = include_bytes!("./assets/fonts/JetBrainsMono.ttf");
     let inter_font_data = include_bytes!("./assets/fonts/Inter/Inter-Light.otf");
 
-    // 2. Добавляем в коллекцию под вашими именами
     fonts.font_data.insert(
         "JetBrainsMono".to_owned(),
         std::sync::Arc::new(egui::FontData::from_static(jetbrains_font_data))
@@ -1004,14 +952,11 @@ fn load_fonts(ctx: &egui::Context) {
         std::sync::Arc::new(egui::FontData::from_static(inter_font_data))
     );
 
-    // 3. Регистрируем кастомное имя в семействе FontFamilies,
-    // чтобы egui разрешил использовать FontFamily::Name("Inter-V".into())
     fonts.families
         .entry(egui::FontFamily::Name("Inter-V".into()))
         .or_default()
         .push("Inter-V".to_owned());
 
-    // Также можно сделать Inter-V основным пропорциональным шрифтом (по желанию):
     fonts.families
         .entry(egui::FontFamily::Proportional)
         .or_default()
@@ -1040,10 +985,10 @@ impl eframe::App for ANetApp {
         let title_bg = egui::Color32::from_rgb(23, 25, 31);
         let dark_color = egui::Color32::from_rgb(22, 24, 31);
         let console_bg = egui::Color32::from_rgb(21, 26, 35);
-        let grey_color = egui::Color32::from_rgb(128, 128, 128);        
-        let green_color = egui::Color32::from_rgb(65, 180, 65); 
-        let orange_color = egui::Color32::from_rgb(218, 130, 0); 
-        let red_color = egui::Color32::from_rgb(220, 60, 60); 
+        let grey_color = egui::Color32::from_rgb(128, 128, 128);
+        let green_color = egui::Color32::from_rgb(65, 180, 65);
+        let orange_color = egui::Color32::from_rgb(218, 130, 0);
+        let red_color = egui::Color32::from_rgb(220, 60, 60);
 
         let button_size = egui::vec2(32.0, 32.0);
         let button_icon_size = egui::vec2(26.0, 26.0);
@@ -1051,15 +996,12 @@ impl eframe::App for ANetApp {
         let margin = 20.0;
         let label_size = 10.0;
 
-        // scrollbar
         let track_width = 2.0;
-        let track_margin = -2.0; // Отступ от правого края
+        let track_margin = -2.0;
 
-        // подложка
         let track_corner = egui::CornerRadius::same(3);
         let track_color = egui::Color32::from_black_alpha(40);
 
-        // бегунок
         let tracker_corner = egui::CornerRadius::same(3);
         let tracker_color = egui::Color32::from_rgb(60, 112, 222);
 
@@ -1073,23 +1015,25 @@ impl eframe::App for ANetApp {
         visuals.widgets.active.bg_fill = egui::Color32::from_rgb(40, 80, 60);
 
         ctx.set_visuals(visuals);
-
         ctx.request_repaint_after(std::time::Duration::from_millis(500));
 
+        // --- БЕЗОПАСНАЯ ОБРАБОТКА СВОРАЧИВАНИЯ И СБРОС СТАТУСА ТРЕЯ ---
         let is_minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
+
         if is_minimized {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
             if !self.is_in_tray {
                 self.is_in_tray = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
                 let _ = self.tray_cmd_tx.send(TrayCommand::WindowVisible(false));
                 let _ = self.tray_cmd_tx.send(TrayCommand::NotifyHidden);
             }
+            return;
+        } else if self.is_in_tray {
+            self.is_in_tray = false;
+            let _ = self.tray_cmd_tx.send(TrayCommand::WindowVisible(true));
         }
 
-        let titlebar_height = 38.0;
         let titlebar_button = egui::vec2(42.0, 38.0);
-        let titlebar_button_d2 = 19.0;
 
         egui::TopBottomPanel
             ::top("custom_titlebar")
@@ -1104,7 +1048,12 @@ impl eframe::App for ANetApp {
                 // 1. Рисуем сплошной фон на всю высоту и ширину
                 ui.painter().rect_filled(
                     rect,
-                    egui::CornerRadius { nw: 14, ne: 14, sw: 0, se: 0 },
+                    egui::CornerRadius {
+                        nw: 14,
+                        ne: 14,
+                        sw: 0,
+                        se: 0,
+                    },
                     title_bg
                 );
 
@@ -1114,7 +1063,10 @@ impl eframe::App for ANetApp {
                     ui.id().with("title_bar"),
                     egui::Sense::click_and_drag()
                 );
-                if response.dragged_by(egui::PointerButton::Primary) {
+                if
+                    response.dragged_by(egui::PointerButton::Primary) ||
+                    response.drag_started_by(egui::PointerButton::Primary)
+                {
                     ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
                 }
 
@@ -1139,7 +1091,6 @@ impl eframe::App for ANetApp {
                                     style.interaction.selectable_labels = false;
                                 });
 
-                                // Зеленый индикатор
                                 let indicator_color = egui::Color32::from_rgb(76, 175, 80);
                                 let (dot_rect, _) = ui.allocate_exact_size(
                                     egui::vec2(8.0, 8.0),
@@ -1149,38 +1100,32 @@ impl eframe::App for ANetApp {
 
                                 ui.add_space(8.0);
 
-                                // Название приложения и версии через LayoutJob
-                                use egui::text::{ LayoutJob, TextFormat };
-
                                 let mut job = LayoutJob::default();
                                 let font_id = egui::FontId::new(
                                     12.0,
                                     egui::FontFamily::Name("Inter-V".into())
                                 );
 
-                                // 1. Часть "ANet VPN" (белый цвет)
                                 job.append("ANet VPN ", 0.0, TextFormat {
                                     font_id: font_id.clone(),
-                                    color: white_color, // Белый
+                                    color: white_color,
                                     ..Default::default()
                                 });
 
-                                // 2. Часть с версией и хэшем (серый цвет)
                                 let version_str = format!("{} ({})", GIT_TAG, COMMIT_HASH);
                                 job.append(&version_str, 0.0, TextFormat {
                                     font_id,
-                                    color: grey_color, // Серый
+                                    color: grey_color,
                                     ..Default::default()
                                 });
 
-                                // Выводим скомпонованный текст как единый элемент интерфейса
                                 ui.add(egui::Label::new(job));
                             });
                         });
 
                         // ПРАВАЯ ЧАСТЬ (Кнопки управления)
                         let right_rect = egui::Rect::from_min_size(
-                            rect.right_top() - egui::vec2(80.0, 0.0), // Исправлено на right_top()
+                            rect.right_top() - egui::vec2(80.0, 0.0),
                             egui::vec2(80.0, available_height)
                         );
 
@@ -1200,7 +1145,12 @@ impl eframe::App for ANetApp {
                                 if close_response.hovered() {
                                     ui.painter().rect_filled(
                                         close_rect,
-                                        egui::CornerRadius { nw: 0, ne: 14, sw: 0, se: 0 },
+                                        egui::CornerRadius {
+                                            nw: 0,
+                                            ne: 14,
+                                            sw: 0,
+                                            se: 0,
+                                        },
                                         egui::Color32::from_rgb(205, 39, 39)
                                     );
                                 }
@@ -1241,15 +1191,21 @@ impl eframe::App for ANetApp {
                                 );
                                 minimize_img.paint_at(ui, min_img_rect);
 
+                                // Прямое скрытие окна в трей
                                 if min_response.clicked() {
-                                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                                    self.is_in_tray = true;
+                                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                                    let _ = self.tray_cmd_tx.send(
+                                        TrayCommand::WindowVisible(false)
+                                    );
+                                    let _ = self.tray_cmd_tx.send(TrayCommand::NotifyHidden);
                                 }
                             });
                         });
                     });
                 });
 
-                // 4. Аккуратная разделительная линия строго по нижней границе шапки
+                // 4. Разделительная линия
                 let painter = ui.painter();
                 painter.line_segment(
                     [rect.left_bottom(), rect.right_bottom()],
@@ -1259,11 +1215,28 @@ impl eframe::App for ANetApp {
 
         while let Ok(event) = self.event_rx.try_recv() {
             match event {
+
+                // 1. Каждую секунду обновляем переменные интерфейса (без записи в лог)
+        AnetEvent::Stats { rx, tx } => {
+            self.total_rx = rx;
+            self.total_tx = tx;
+        }
+
                 AnetEvent::Status(msg) => {
-                    self.log(&msg);
+                    self.log(&msg);                
                 }
-                AnetEvent::ClientStateChanged { message, server_name, .. } => {
-                    self.log(&message);
+    AnetEvent::ClientStateChanged { state, message, server_name } => {
+    self.log(&message);
+
+    if matches!(
+        state,
+        ClientState::Disconnected | ClientState::Stopped | ClientState::Failed
+    ) {
+        self.total_rx = "0 B".to_string();
+        self.total_tx = "0 B".to_string();
+    }
+
+
                     if let Some(active_name) = server_name {
                         let mut settings = self.settings.lock().unwrap();
                         if let Some(active_cfg) = settings.get_active_config() {
@@ -1297,15 +1270,18 @@ impl eframe::App for ANetApp {
 
         self.last_known_state = self.shared.lock().unwrap().state;
 
-        // 1. Конфигурируем внутренний блок (карточку) для логов
         let console_inner_frame = egui::Frame::NONE
             .fill(console_bg)
             .inner_margin(egui::Margin::same(10))
             .outer_margin(egui::Margin::same(0))
             .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(38, 41, 50)))
-            .corner_radius(egui::CornerRadius { nw: 0, ne: 0, sw: 14, se: 14 });
+            .corner_radius(egui::CornerRadius {
+                nw: 0,
+                ne: 0,
+                sw: 14,
+                se: 14,
+            });
 
-        // 2. Внешняя панель консоли
         egui::TopBottomPanel
             ::bottom("stalker_console")
             .resizable(false)
@@ -1314,7 +1290,6 @@ impl eframe::App for ANetApp {
             .show_separator_line(false)
             .frame(egui::Frame::NONE)
             .show(ctx, |ui| {
-                // Внешняя обертка для создания отступов от краев главного окна
                 egui::Frame::NONE
                     .outer_margin(egui::Margin {
                         left: 0,
@@ -1328,21 +1303,29 @@ impl eframe::App for ANetApp {
                         top: 10,
                         bottom: 10,
                     })
-                    .fill(dark_color) // Фон внутреннего контейнера
-                    .corner_radius(egui::CornerRadius { nw: 0, ne: 0, sw: 14, se: 14 })
+                    .fill(dark_color)
+                    .corner_radius(egui::CornerRadius {
+                        nw: 0,
+                        ne: 0,
+                        sw: 14,
+                        se: 14,
+                    })
                     .show(ui, |ui| {
                         ui.vertical(|ui| {
-                            // Конфигурируем стили для контейнера заголовка
                             let header_frame = egui::Frame::NONE
-                                .fill(console_bg) // Цвет фона плашки
+                                .fill(console_bg)
                                 .inner_margin(egui::Margin::symmetric(8, 4))
                                 .outer_margin(egui::Margin::symmetric(0, 0))
-                                .corner_radius(egui::CornerRadius { nw: 14, ne: 14, sw: 0, se: 0 })
+                                .corner_radius(egui::CornerRadius {
+                                    nw: 14,
+                                    ne: 14,
+                                    sw: 0,
+                                    se: 0,
+                                })
                                 .stroke(
                                     egui::Stroke::new(1.0, egui::Color32::from_rgb(50, 50, 50))
-                                ); // (Опционально) Тонкая рамка
+                                );
 
-                            // Оборачиваем заголовок
                             header_frame.show(ui, |ui| {
                                 ui.set_width(ui.available_width());
 
@@ -1364,9 +1347,8 @@ impl eframe::App for ANetApp {
                                         |ui| {
                                             let mut response = ui
                                                 .horizontal(|ui| {
-                                                    ui.spacing_mut().item_spacing.x = 6.0; // Отступ между текстом и иконкой
+                                                    ui.spacing_mut().item_spacing.x = 6.0;
 
-                                                    // 1. Текст
                                                     ui.label(
                                                         egui::RichText
                                                             ::new("open full log")
@@ -1379,23 +1361,16 @@ impl eframe::App for ANetApp {
                                                             .color(white_color)
                                                     );
 
-                                                    // 2. Иконка с возможностью пиксельного смещения
                                                     let image_size = egui::vec2(14.0, 14.0);
                                                     let (rect, _) = ui.allocate_exact_size(
                                                         image_size,
                                                         egui::Sense::hover()
                                                     );
 
-                                                    let offset_x = 4.0;
-                                                    let offset_y = 2.0;
-                                                    // -------------------------------------
-
-                                                    // Смещаем прямоугольник отрисовки
                                                     let shifted_rect = rect.translate(
-                                                        egui::vec2(offset_x, offset_y)
+                                                        egui::vec2(4.0, 2.0)
                                                     );
 
-                                                    // Отрисовываем SVG в смещенной области
                                                     egui::Image
                                                         ::new(
                                                             egui::include_image!(
@@ -1418,111 +1393,59 @@ impl eframe::App for ANetApp {
                                     );
                             });
                             ui.add_space(-ui.spacing().item_spacing.y);
-                            // Вложенный блок со своим фоном, рамкой и скруглением
+
                             console_inner_frame.show(ui, |ui| {
-                                // 1. Создаем ScrollArea, отключая стандартный скроллбар
-                                let output1 = egui::ScrollArea
+                                egui::ScrollArea
                                     ::vertical()
                                     .auto_shrink([false, false])
                                     .scroll_bar_visibility(
                                         egui::scroll_area::ScrollBarVisibility::AlwaysHidden
-                                    ) // Прячем дефолтный
+                                    )
                                     .stick_to_bottom(true)
                                     .show(ui, |ui| {
-                                        let logs = self.logs.lock().unwrap();
+                                        ui.horizontal(|ui| {
+                                            ui.spacing_mut().item_spacing.x = 12.0;
 
-                                        for line in logs.iter() {
-                                            let color = if
-                                                line.contains("Error") ||
-                                                line.contains("Failed") ||
-                                                line.contains("error")
-                                            {
-                                                red_color
-                                            } else if line.contains("Tunnel UP") {
-                                                green_color
-                                            } else if line.contains("Config loaded") {
-                                                gold_color
-                                            } else if line.contains("Connection lost") {
-                                                red_color
-                                            } else if line.contains("Cleaning up dead session") {
-                                                orange_color
-                                            } else {
-                                                grey_color
-                                            };
+                                            let stats_str = format!(
+                                                "↓ {}  ↑ {}",
+                                                self.total_rx,
+                                                self.total_tx
+                                            );
 
-                                            ui.horizontal(|ui| {
-                                                ui.add(
-                                                    egui::Label
-                                                        ::new(
-                                                            egui::RichText
-                                                                ::new(line)
-                                                                .family(egui::FontFamily::Monospace)
-                                                                .size(11.0)
-                                                                .color(color)
-                                                        )
-                                                        .selectable(true)
-                                                        .wrap()
-                                                );
-                                            });
-                                        }
+                                            let font_id = egui::FontId::new(
+                                                13.0,
+                                                egui::FontFamily::Name("Inter-V".into())
+                                            );
+
+                                            let galley = ui
+                                                .painter()
+                                                .layout_no_wrap(stats_str, font_id, grey_color);
+                                            let left_padding_stats = (
+                                                (ui.available_width() - galley.rect.width()) /
+                                                2.0
+                                            ).max(0.0);
+
+                                            ui.add_space(left_padding_stats);
+                                            ui.label(
+                                                egui::RichText
+                                                    ::new(format!("↓ {}", self.total_rx))
+                                                    .size(13.0)
+                                                    .family(
+                                                        egui::FontFamily::Name("Inter-V".into())
+                                                    )
+                                                    .color(light_blue_color)
+                                            );
+                                            ui.label(
+                                                egui::RichText
+                                                    ::new(format!("↑ {}", self.total_tx))
+                                                    .size(13.0)
+                                                    .family(
+                                                        egui::FontFamily::Name("Inter-V".into())
+                                                    )
+                                                    .color(gold_color)
+                                            );
+                                        });
                                     });
-
-                                // 2. Получаем метрики для расчета кастомного скроллбара
-                                let viewport_height1 = output1.inner_rect.height(); // Размер видимой области (окна)
-                                let content_height1 = output1.content_size.y; // Полная высота всех логов
-
-                                // Скроллбар нужен только если контент не влезает в окно
-                                if content_height1 > viewport_height1 {
-                                    let offset_y1 = output1.state.offset.y; // Текущее смещение скролла по Y
-
-                                    // Вычисляем координаты "дорожки" (прижимаем к правому краю видимой области)
-                                    let track_rect1 = egui::Rect::from_min_size(
-                                        egui::pos2(
-                                            output1.inner_rect.right() - track_width - track_margin,
-                                            output1.inner_rect.top()
-                                        ),
-                                        egui::vec2(track_width, viewport_height1)
-                                    );
-
-                                    // Вычисляем высоту бегунка (пропорционально контенту)
-                                    let thumb_proportion1 = viewport_height1 / content_height1;
-                                    let thumb_height1 = (viewport_height1 * thumb_proportion1).max(
-                                        20.0
-                                    ); // Не меньше 20 пикселей
-
-                                    // Вычисляем смещение бегунка сверху
-                                    let max_scroll1 = content_height1 - viewport_height1;
-                                    let scroll_ratio1 = if max_scroll1 > 0.0 {
-                                        offset_y1 / max_scroll1
-                                    } else {
-                                        0.0
-                                    };
-                                    let thumb_start_y1 =
-                                        track_rect1.top() +
-                                        scroll_ratio1 * (viewport_height1 - thumb_height1);
-
-                                    let thumb_rect1 = egui::Rect::from_min_size(
-                                        egui::pos2(track_rect1.left(), thumb_start_y1),
-                                        egui::vec2(track_width, thumb_height1)
-                                    );
-
-                                    // 3. ОТРИСОВКА СОБСТВЕННЫХ ЦВЕТОВ
-                                    let painter1 = ui.painter();
-
-                                    // Рисуем подложку (дорожку)
-                                    painter1.rect_filled(
-                                        track_rect1,
-                                        track_corner, // Скругление
-                                        track_color
-                                    );
-
-                                    // Рисуем сам бегунок
-                                    painter1.rect_filled(
-                                        thumb_rect1,
-                                        tracker_corner,
-                                        tracker_color
-                                    );
-                                }
                             });
                         });
                     });
@@ -1549,7 +1472,7 @@ impl eframe::App for ANetApp {
                 selected_server_name = settings.selected_servers
                     .get(&active_cfg.id)
                     .cloned()
-                    .unwrap_or_else(|| { server_names.first().cloned().unwrap_or_default() });
+                    .unwrap_or_else(|| server_names.first().cloned().unwrap_or_default());
             }
         }
 
@@ -1562,22 +1485,16 @@ impl eframe::App for ANetApp {
                 let state = self.shared.lock().unwrap().state.clone();
 
                 ui.horizontal(|ui| {
-                    // 1. Левая кнопка (MENU) занимает минимальное пространство
                     ui.allocate_ui_with_layout(
-                        egui::vec2(60.0, ui.available_height()), // фиксированная минимальная ширина под кнопку
+                        egui::vec2(60.0, ui.available_height()),
                         egui::Layout::top_down(egui::Align::Center),
                         |ui| {
-                            // 1. Уникальный ID для сохранения состояния анимации между кадрами
                             let anim_id = ui.id().with("gear_btn_color");
-
-                            // Получаем значение анимации с ПРЕДЫДУЩЕГО кадра (от 0.0 до 1.0)
                             let hover_t: f32 = ui.data(|d| d.get_temp(anim_id)).unwrap_or(0.0);
 
-                            // 2. ПЛАВНЫЙ ПЕРЕХОД ЦВЕТА (Обычный цвет -> Цвет при наведении)
                             let normal_color = white_color;
                             let hover_color = gold_color;
 
-                            // Интерполируем каналы R, G, B в зависимости от hover_t
                             let r = ((normal_color.r() as f32) * (1.0 - hover_t) +
                                 (hover_color.r() as f32) * hover_t) as u8;
                             let g = ((normal_color.g() as f32) * (1.0 - hover_t) +
@@ -1586,10 +1503,9 @@ impl eframe::App for ANetApp {
                                 (hover_color.b() as f32) * hover_t) as u8;
                             let current_color = egui::Color32::from_rgb(r, g, b);
 
-                            // 3. Создаем иконку фиксированного размера с плавно меняющимся цветом
                             let icon = egui::Image
                                 ::new(egui::include_image!("./assets/gear_3.svg"))
-                                .fit_to_exact_size(button_icon_size) // Используем исходный размер
+                                .fit_to_exact_size(button_icon_size)
                                 .tint(current_color);
 
                             let menu_button = egui::Button
@@ -1603,10 +1519,7 @@ impl eframe::App for ANetApp {
                                 .add(menu_button)
                                 .on_hover_cursor(egui::CursorIcon::PointingHand);
 
-                            // 4. Вычисляем целевое значение анимации для следующего кадра
                             let target_t = if response.hovered() { 1.0 } else { 0.0 };
-
-                            // Плавная интерполяция за ~0.2 секунды
                             let dt = ui.input(|i| i.stable_dt);
                             let speed = 1.0 / 0.2;
                             let new_t = if hover_t < target_t {
@@ -1615,15 +1528,12 @@ impl eframe::App for ANetApp {
                                 (hover_t - speed * dt).max(target_t)
                             };
 
-                            // Сохраняем состояние в память egui
                             ui.data_mut(|d| d.insert_temp(anim_id, new_t));
 
-                            // Запрос перерисовки пока идет анимация
                             if new_t != target_t {
                                 ui.ctx().request_repaint();
                             }
 
-                            // Обработка клика
                             if response.clicked() {
                                 self.sidebar_open = !self.sidebar_open;
                             }
@@ -1633,14 +1543,13 @@ impl eframe::App for ANetApp {
                         }
                     );
 
-                    // 2. Центральная область (ANET VPN) забирает всю оставшуюся ширину
-                    let available_width = ui.available_width() - 60.0; // вычитаем ширину правой панели (если Windows)
-
                     #[cfg(target_os = "windows")]
-                    let available_width = ui.available_width() - 60.0; // отнимаем правую кнопку тоже
+                    let center_width = (ui.available_width() - 60.0).max(0.0);
+                    #[cfg(not(target_os = "windows"))]
+                    let center_width = ui.available_width();
 
                     ui.allocate_ui_with_layout(
-                        egui::vec2(available_width, ui.available_height()),
+                        egui::vec2(center_width, ui.available_height()),
                         egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
                         |ui| {
                             let mut job = LayoutJob::default();
@@ -1665,24 +1574,18 @@ impl eframe::App for ANetApp {
                         }
                     );
 
-                    // 3. Правая кнопка (APPS) занимает минимальное пространство (только для Windows)
                     #[cfg(target_os = "windows")]
                     {
                         ui.allocate_ui_with_layout(
                             egui::vec2(60.0, ui.available_height()),
                             egui::Layout::top_down(egui::Align::Center),
                             |ui| {
-                                // 1. Уникальный ID для сохранения состояния анимации между кадрами
                                 let anim_id = ui.id().with("apps_btn_color");
-
-                                // Получаем значение анимации с ПРЕДЫДУЩЕГО кадра (от 0.0 до 1.0)
                                 let hover_t: f32 = ui.data(|d| d.get_temp(anim_id)).unwrap_or(0.0);
 
-                                // 🌟 2. ПЛАВНЫЙ ПЕРЕХОД ЦВЕТА (Обычный цвет -> Цвет при наведении)
                                 let normal_color = white_color;
                                 let hover_color = gold_color;
 
-                                // Интерполируем каналы R, G, B в зависимости от hover_t
                                 let r = ((normal_color.r() as f32) * (1.0 - hover_t) +
                                     (hover_color.r() as f32) * hover_t) as u8;
                                 let g = ((normal_color.g() as f32) * (1.0 - hover_t) +
@@ -1691,10 +1594,9 @@ impl eframe::App for ANetApp {
                                     (hover_color.b() as f32) * hover_t) as u8;
                                 let current_color = egui::Color32::from_rgb(r, g, b);
 
-                                // 3. Создаем иконку фиксированного размера с плавно меняющимся цветом
                                 let icon = egui::Image
                                     ::new(egui::include_image!("./assets/apps_white.svg"))
-                                    .fit_to_exact_size(button_icon_size) // Используем исходный размер
+                                    .fit_to_exact_size(button_icon_size)
                                     .tint(current_color);
 
                                 let menu_button = egui::Button
@@ -1708,10 +1610,7 @@ impl eframe::App for ANetApp {
                                     .add(menu_button)
                                     .on_hover_cursor(egui::CursorIcon::PointingHand);
 
-                                // 4. Вычисляем целевое значение анимации для следующего кадра
                                 let target_t = if response.hovered() { 1.0 } else { 0.0 };
-
-                                // Плавная интерполяция за ~0.2 секунды
                                 let dt = ui.input(|i| i.stable_dt);
                                 let speed = 1.0 / 0.2;
                                 let new_t = if hover_t < target_t {
@@ -1720,15 +1619,12 @@ impl eframe::App for ANetApp {
                                     (hover_t - speed * dt).max(target_t)
                                 };
 
-                                // Сохраняем состояние в память egui
                                 ui.data_mut(|d| d.insert_temp(anim_id, new_t));
 
-                                // Запрос перерисовки пока идет анимация
                                 if new_t != target_t {
                                     ui.ctx().request_repaint();
                                 }
 
-                                // Обработка клика
                                 if response.clicked() {
                                     self.appbar_open = !self.appbar_open;
                                 }
@@ -1838,32 +1734,21 @@ impl eframe::App for ANetApp {
 
                 ui.add_space(ui.available_height() * 0.15);
 
-                //кнопка CONNECT
-
                 ui.vertical_centered(|ui| {
                     let btn_size = egui::vec2(180.0, 180.0);
 
-                    // Определяем текст и цвета градиента (верх и низ)
                     let (btn_text, color_top, color_bottom) = match state {
-                        ConnectionState::Disconnected =>
-                            (
-                                "CONNECT",
-                                gold_color, // Светло-зеленый
-                                light_blue_color, // Темно-зеленый
-                            ),
+                        ConnectionState::Disconnected => ("CONNECT", gold_color, light_blue_color),
                         ConnectionState::Connecting => {
                             let time = ctx.input(|i| i.time);
                             let factor = (time.sin() + 1.0) / 2.0;
                             ctx.request_repaint();
 
-                            let r = 255;
                             let g = (140.0 + (80.0 - 140.0) * factor) as u8;
-                            let top = egui::Color32::from_rgb(r, g, 0);
-                            let bottom = egui::Color32::from_rgb(200, 60, 0);
 
                             (
                                 "CONNECTING",
-                                egui::Color32::from_rgb(247, 137, 46),
+                                egui::Color32::from_rgb(247, g, 46),
                                 egui::Color32::from_rgb(244, 46, 82),
                             )
                         }
@@ -1880,15 +1765,11 @@ impl eframe::App for ANetApp {
                     let center = rect.center();
                     let radius = btn_size.x / 2.0;
 
-                    // АНИМАЦИЯ СВЕЧЕНИЯ
                     let hover_animation_id = response.id.with("hover_glow");
-                    let hover_t = ui.ctx().animate_bool_with_time(
-                        hover_animation_id,
-                        response.hovered(),
-                        0.5 // Длительность анимации в секундах
-                    );
+                    let hover_t = ui
+                        .ctx()
+                        .animate_bool_with_time(hover_animation_id, response.hovered(), 0.5);
 
-                    //  РИСУЕМ СВЕЧЕНИЕ (интенсивность зависит от hover_t)
                     if hover_t > 0.0 {
                         for glow_i in (1..=6).rev() {
                             let glow_radius = radius + (glow_i as f32) * 2.5;
@@ -1910,11 +1791,9 @@ impl eframe::App for ANetApp {
                                 );
                             }
                         }
-                        // Запрашиваем перерисовку, пока идет анимация
                         ui.ctx().request_repaint();
                     }
 
-                    // 📌 РИСУЕМ ОСНОВНОЙ КОНТУР КРУГА С ГРАДИЕНТОМ
                     let stroke_width = 5.0;
                     let segments = 128;
 
@@ -1926,8 +1805,7 @@ impl eframe::App for ANetApp {
                         let p1 = center + radius * egui::vec2(a1.cos(), a1.sin());
 
                         let y_mid = (p0.y + p1.y) / 2.0;
-                        let t = (y_mid - center.y + radius) / (radius * 2.0);
-                        let t = t.clamp(0.0, 1.0);
+                        let t = ((y_mid - center.y + radius) / (radius * 2.0)).clamp(0.0, 1.0);
 
                         let r_col = ((color_top.r() as f32) * (1.0 - t) +
                             (color_bottom.r() as f32) * t) as u8;
@@ -1945,7 +1823,6 @@ impl eframe::App for ANetApp {
                         );
                     }
 
-                    // Поверх рисуем текст кнопки по центру
                     let galley = ui
                         .painter()
                         .layout_no_wrap(
@@ -1956,7 +1833,6 @@ impl eframe::App for ANetApp {
                     let text_pos = center - galley.size() / 2.0;
                     ui.painter().galley(text_pos, galley, egui::Color32::WHITE);
 
-                    // Обработка клика
                     if response.clicked() {
                         match state {
                             ConnectionState::Disconnected => {
@@ -1974,216 +1850,169 @@ impl eframe::App for ANetApp {
 
                     ui.add_space(20.0);
 
-                    // Статусный текст снизу
                     match state {
                         ConnectionState::Connected => {
-                           
                             let text_str = "CONNECTED";
-let font_size = 16.0;
+                            let font_size = 16.0;
 
-// 1. Измеряем точную ширину текста
-let font_id = egui::FontId::new(
-    font_size,
-    egui::FontFamily::Proportional
-);
-let galley = ui
-    .painter()
-    .layout_no_wrap(text_str.to_string(), font_id, grey_color);
-let text_width = galley.rect.width();
+                            let font_id = egui::FontId::new(
+                                font_size,
+                                egui::FontFamily::Proportional
+                            );
+                            let galley = ui
+                                .painter()
+                                .layout_no_wrap(text_str.to_string(), font_id, grey_color);
+                            let text_width = galley.rect.width();
 
-// 2. Параметры иконки и отступа
-let icon_size = egui::vec2(16.0, 16.0);
+                            let icon_size = egui::vec2(16.0, 16.0);
+                            let spacing = 2.0;
 
-let spacing = 2.0; // Желаемый отступ между иконкой и текстом
+                            let available_width = ui.available_width();
+                            let text_start_x = (available_width - text_width) / 2.0;
+                            let left_padding = (text_start_x - icon_size.x + spacing).max(0.0);
 
-// 3. Вычисляем позицию X, где должен НАЧИНАТЬСЯ текст, чтобы он был строго по центру
-let available_width = ui.available_width();
-let text_start_x = (available_width - text_width) / 2.0;
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = spacing;
+                                ui.add_space(left_padding);
 
-// 4. Отступаем слева так, чтобы с учетом ширины иконки и отступа
-// текст начался ровно в позиции text_start_x
-let left_padding = (text_start_x - icon_size.x  + spacing).max(0.0);
+                                let indicator_color = egui::Color32::from_rgb(76, 175, 80);
+                                let (rect, _) = ui.allocate_exact_size(
+                                    icon_size,
+                                    egui::Sense::hover()
+                                );
 
-ui.horizontal(|ui| {
-    // 1. Отключаем автоматический межэлементный отступ egui
-    ui.spacing_mut().item_spacing.x = spacing;
+                                let shifted_rect = rect.translate(egui::vec2(0.0, 0.0));
 
-    // 2. Добавляем точный расчетный отступ
-    ui.add_space(left_padding);
-
-    let indicator_color = egui::Color32::from_rgb(76, 175, 80);
-
-    // Выделяем место под SVG
-    let (rect, _) = ui.allocate_exact_size(
-        icon_size,
-        egui::Sense::hover()
-    );
-
-    let offset_x = 0.0;
-    let offset_y = 0.0;
-    let shifted_rect = rect.translate(egui::vec2(offset_x, offset_y));
-
-    // --- ОТРИСОВКА СВЕЧЕНИЯ И ИКОНКИ ---
-    egui::Image::new(egui::include_image!("./assets/dot.svg"))
+                                egui::Image
+                                    ::new(egui::include_image!("./assets/dot.svg"))
                                     .tint(indicator_color.linear_multiply(0.15))
                                     .paint_at(ui, shifted_rect.expand(4.0));
 
-                                // 2. Средний слой свечения
-                egui::Image
+                                egui::Image
                                     ::new(egui::include_image!("./assets/dot.svg"))
                                     .tint(indicator_color.linear_multiply(0.35))
                                     .paint_at(ui, shifted_rect.expand(2.0));
 
-                                // 3. Основная SVG-иконка
                                 egui::Image
                                     ::new(egui::include_image!("./assets/dot.svg"))
                                     .max_size(icon_size)
-                                    .paint_at(ui, shifted_rect); 
+                                    .paint_at(ui, shifted_rect);
 
-    // Текст встанет вплотную к SVG (или на расстояние `spacing`, если зададите значение больше 0)
-    ui.label(
-        egui::RichText::new(text_str)
-            .size(font_size)
-            .strong()
-            .color(green_color)
-    );
-});
+                                ui.label(
+                                    egui::RichText
+                                        ::new(text_str)
+                                        .size(font_size)
+                                        .strong()
+                                        .color(green_color)
+                                );
+                            });
                         }
                         ConnectionState::Disconnected => {
                             let text_str = "DISCONNECTED";
-let font_size = 16.0;
+                            let font_size = 16.0;
 
-// 1. Измеряем точную ширину текста
-let font_id = egui::FontId::new(
-    font_size,
-    egui::FontFamily::Proportional
-);
-let galley = ui
-    .painter()
-    .layout_no_wrap(text_str.to_string(), font_id, grey_color);
-let text_width = galley.rect.width();
+                            let font_id = egui::FontId::new(
+                                font_size,
+                                egui::FontFamily::Proportional
+                            );
+                            let galley = ui
+                                .painter()
+                                .layout_no_wrap(text_str.to_string(), font_id, grey_color);
+                            let text_width = galley.rect.width();
 
-// 2. Параметры иконки и отступа
-let icon_size = egui::vec2(16.0, 16.0);
+                            let icon_size = egui::vec2(16.0, 16.0);
+                            let spacing = 2.0;
 
-let spacing = 2.0; // Желаемый отступ между иконкой и текстом
+                            let available_width = ui.available_width();
+                            let text_start_x = (available_width - text_width) / 2.0;
+                            let left_padding = (text_start_x - icon_size.x + spacing).max(0.0);
 
-// 3. Вычисляем позицию X, где должен НАЧИНАТЬСЯ текст, чтобы он был строго по центру
-let available_width = ui.available_width();
-let text_start_x = (available_width - text_width) / 2.0;
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = spacing;
+                                ui.add_space(left_padding);
 
-// 4. Отступаем слева так, чтобы с учетом ширины иконки и отступа
-// текст начался ровно в позиции text_start_x
-let left_padding = (text_start_x - icon_size.x  + spacing).max(0.0);
+                                let indicator_color = grey_color;
+                                let (rect, _) = ui.allocate_exact_size(
+                                    icon_size,
+                                    egui::Sense::hover()
+                                );
 
-ui.horizontal(|ui| {
-    // 1. Отключаем автоматический межэлементный отступ egui
-    ui.spacing_mut().item_spacing.x = spacing;
+                                let shifted_rect = rect.translate(egui::vec2(0.0, 0.0));
 
-    // 2. Добавляем точный расчетный отступ
-    ui.add_space(left_padding);
+                                egui::Image
+                                    ::new(egui::include_image!("./assets/block.svg"))
+                                    .tint(indicator_color.linear_multiply(0.15))
+                                    .paint_at(ui, shifted_rect.expand(4.0));
 
-    let indicator_color = grey_color;
+                                egui::Image
+                                    ::new(egui::include_image!("./assets/block.svg"))
+                                    .tint(indicator_color.linear_multiply(0.35))
+                                    .paint_at(ui, shifted_rect.expand(2.0));
 
-    // Выделяем место под SVG
-    let (rect, _) = ui.allocate_exact_size(
-        icon_size,
-        egui::Sense::hover()
-    );
+                                egui::Image
+                                    ::new(egui::include_image!("./assets/block.svg"))
+                                    .max_size(icon_size)
+                                    .paint_at(ui, shifted_rect);
 
-    let offset_x = 0.0;
-    let offset_y = 0.0;
-    let shifted_rect = rect.translate(egui::vec2(offset_x, offset_y));
-
-    // --- ОТРИСОВКА СВЕЧЕНИЯ И ИКОНКИ ---
-    egui::Image::new(egui::include_image!("./assets/block.svg"))
-        .tint(indicator_color.linear_multiply(0.15))
-        .paint_at(ui, shifted_rect.expand(4.0));
-
-    egui::Image::new(egui::include_image!("./assets/block.svg"))
-        .tint(indicator_color.linear_multiply(0.35))
-        .paint_at(ui, shifted_rect.expand(2.0));
-
-    egui::Image::new(egui::include_image!("./assets/block.svg"))
-        .max_size(icon_size)
-        .paint_at(ui, shifted_rect);   
-
-    // Текст встанет вплотную к SVG (или на расстояние `spacing`, если зададите значение больше 0)
-    ui.label(
-        egui::RichText::new(text_str)
-            .size(font_size)
-            .strong()
-            .color(grey_color)
-    );
-});
+                                ui.label(
+                                    egui::RichText
+                                        ::new(text_str)
+                                        .size(font_size)
+                                        .strong()
+                                        .color(grey_color)
+                                );
+                            });
                         }
                         ConnectionState::Connecting => {
-                            
                             let text_str = "CONNECTING";
-let font_size = 16.0;
+                            let font_size = 16.0;
 
-// 1. Измеряем точную ширину текста
-let font_id = egui::FontId::new(
-    font_size,
-    egui::FontFamily::Proportional
-);
-let galley = ui
-    .painter()
-    .layout_no_wrap(text_str.to_string(), font_id, grey_color);
-let text_width = galley.rect.width();
+                            let font_id = egui::FontId::new(
+                                font_size,
+                                egui::FontFamily::Proportional
+                            );
+                            let galley = ui
+                                .painter()
+                                .layout_no_wrap(text_str.to_string(), font_id, grey_color);
+                            let text_width = galley.rect.width();
 
-// 2. Параметры иконки и отступа
-let icon_size = egui::vec2(16.0, 16.0);
+                            let icon_size = egui::vec2(16.0, 16.0);
+                            let spacing = 2.0;
 
-let spacing = 2.0; // Желаемый отступ между иконкой и текстом
+                            let available_width = ui.available_width();
+                            let text_start_x = (available_width - text_width) / 2.0;
+                            let left_padding = (text_start_x - icon_size.x + spacing).max(0.0);
 
-// 3. Вычисляем позицию X, где должен НАЧИНАТЬСЯ текст, чтобы он был строго по центру
-let available_width = ui.available_width();
-let text_start_x = (available_width - text_width) / 2.0;
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = spacing;
+                                ui.add_space(left_padding);
 
-// 4. Отступаем слева так, чтобы с учетом ширины иконки и отступа
-// текст начался ровно в позиции text_start_x
-let left_padding = (text_start_x - icon_size.x  + spacing).max(0.0);
+                                let indicator_color = orange_color;
+                                let (rect, _) = ui.allocate_exact_size(
+                                    icon_size,
+                                    egui::Sense::hover()
+                                );
 
-ui.horizontal(|ui| {
-    // 1. Отключаем автоматический межэлементный отступ egui
-    ui.spacing_mut().item_spacing.x = spacing;
+                                let shifted_rect = rect.translate(egui::vec2(0.0, 0.0));
 
-    // 2. Добавляем точный расчетный отступ
-    ui.add_space(left_padding);
-
-    let indicator_color = orange_color;
-
-    // Выделяем место под SVG
-    let (rect, _) = ui.allocate_exact_size(
-        icon_size,
-        egui::Sense::hover()
-    );
-
-    let offset_x = 0.0;
-    let offset_y = 0.0;
-    let shifted_rect = rect.translate(egui::vec2(offset_x, offset_y));
-
-    // --- ОТРИСОВКА СВЕЧЕНИЯ И ИКОНКИ ---
-egui::Image
+                                egui::Image
                                     ::new(egui::include_image!("./assets/connecting.svg"))
                                     .tint(indicator_color.linear_multiply(0.35))
                                     .paint_at(ui, shifted_rect.expand(2.0));
 
-                                // 3. Основная SVG-иконка
                                 egui::Image
                                     ::new(egui::include_image!("./assets/connecting.svg"))
                                     .max_size(icon_size)
                                     .paint_at(ui, shifted_rect);
 
-    // Текст встанет вплотную к SVG (или на расстояние `spacing`, если зададите значение больше 0)
-    ui.label(
-        egui::RichText::new(text_str)
-            .size(font_size)
-            .strong()
-            .color(orange_color)
-    );
-});
+                                ui.label(
+                                    egui::RichText
+                                        ::new(text_str)
+                                        .size(font_size)
+                                        .strong()
+                                        .color(orange_color)
+                                );
+                            });
                         }
                     }
                 });
@@ -2198,8 +2027,7 @@ egui::Image
                 .fixed_pos(egui::pos2(0.0, 0.0))
                 .show(ctx, |ui| {
                     let screen_rect = ui.ctx().screen_rect();
-
-                    let corner_radius = 14.0; // Укажите ваш радиус скругления
+                    let corner_radius = 14.0;
 
                     egui::Frame
                         ::none()
@@ -2221,7 +2049,6 @@ egui::Image
                                     .stroke(Stroke::NONE)
                                     .rounding(button_size.y / 2.0);
 
-                                // Добавляем кнопку, сразу настраиваем курсор и сохраняем результат
                                 let response = ui
                                     .add(circle_button)
                                     .on_hover_cursor(egui::CursorIcon::PointingHand);
@@ -2432,15 +2259,15 @@ egui::Image
                                                         .strong()
                                                 );
                                                 ui.add_space(4.0);
-                                                // Настраиваем цвета бегунка для разных состояний
-                                                // ЗАСТАВЛЯЕМ скроллбар брать цвет из настроек фона (bg_fill), а не текста
+
                                                 ui.style_mut().spacing.scroll.foreground_color = false;
                                                 ui.style_mut().visuals.widgets.inactive.bg_fill =
-                                                    egui::Color32::from_rgb(80, 80, 80); // Обычный цвет
+                                                    egui::Color32::from_rgb(80, 80, 80);
                                                 ui.style_mut().visuals.widgets.hovered.bg_fill =
-                                                    egui::Color32::from_rgb(120, 120, 120); // Цвет при наведении мыши
+                                                    egui::Color32::from_rgb(120, 120, 120);
                                                 ui.style_mut().visuals.widgets.active.bg_fill =
-                                                    egui::Color32::from_rgb(160, 160, 160); // Цвет при зажатии/перетаскивании
+                                                    egui::Color32::from_rgb(160, 160, 160);
+
                                                 egui::ScrollArea
                                                     ::vertical()
                                                     .max_height(180.0)
@@ -2609,8 +2436,6 @@ egui::Image
                 });
         }
 
-        /////
-
         if self.logbar_open {
             egui::Area
                 ::new(egui::Id::new("config_logbar"))
@@ -2618,7 +2443,6 @@ egui::Image
                 .fixed_pos(egui::pos2(0.0, 0.0))
                 .show(ctx, |ui| {
                     let screen_rect = ui.ctx().screen_rect();
-
                     let corner_radius = 14.0;
 
                     egui::Frame
@@ -2626,7 +2450,6 @@ egui::Image
                         .fill(ui.visuals().window_fill())
                         .inner_margin(margin)
                         .corner_radius(corner_radius)
-
                         .show(ui, |ui| {
                             ui.set_width(screen_rect.width() - margin * 2.0);
                             ui.set_height(screen_rect.height() - margin * 2.0);
@@ -2642,7 +2465,6 @@ egui::Image
                                     .stroke(Stroke::NONE)
                                     .rounding(button_size.y / 2.0);
 
-                                // Добавляем кнопку, сразу настраиваем курсор и сохраняем результат
                                 let response = ui
                                     .add(circle_button)
                                     .on_hover_cursor(egui::CursorIcon::PointingHand);
@@ -2657,13 +2479,12 @@ egui::Image
 
                             let console_inner_frame = egui::Frame::NONE;
                             console_inner_frame.show(ui, |ui| {
-                                // 1. Создаем ScrollArea, отключая стандартный скроллбар
                                 let output2 = egui::ScrollArea
                                     ::vertical()
                                     .auto_shrink([false, false])
                                     .scroll_bar_visibility(
                                         egui::scroll_area::ScrollBarVisibility::AlwaysHidden
-                                    ) // Прячем дефолтный
+                                    )
                                     .stick_to_bottom(true)
                                     .show(ui, |ui| {
                                         let logs = self.logs.lock().unwrap();
@@ -2704,17 +2525,12 @@ egui::Image
                                         }
                                     });
 
-                                // 2. Получаем метрики для расчета кастомного скроллбара
-                                let viewport_height2 = output2.inner_rect.height(); // Размер видимой области (окна)
-                                let content_height2 = output2.content_size.y; // Полная высота всех логов
+                                let viewport_height2 = output2.inner_rect.height();
+                                let content_height2 = output2.content_size.y;
 
-                                // Скроллбар нужен только если контент не влезает в окно
                                 if content_height2 > viewport_height2 {
-                                    let offset_y2 = output2.state.offset.y; // Текущее смещение скролла по Y
+                                    let offset_y2 = output2.state.offset.y;
 
-                                    // Настройки размеров
-
-                                    // Вычисляем координаты "дорожки" (прижимаем к правому краю видимой области)
                                     let track_rect2 = egui::Rect::from_min_size(
                                         egui::pos2(
                                             output2.inner_rect.right() - track_width - track_margin,
@@ -2723,13 +2539,11 @@ egui::Image
                                         egui::vec2(track_width, viewport_height2)
                                     );
 
-                                    // Вычисляем высоту бегунка (пропорционально контенту)
                                     let thumb_proportion2 = viewport_height2 / content_height2;
                                     let thumb_height2 = (viewport_height2 * thumb_proportion2).max(
                                         20.0
-                                    ); // Не меньше 20 пикселей
+                                    );
 
-                                    // Вычисляем смещение бегунка сверху
                                     let max_scroll2 = content_height2 - viewport_height2;
                                     let scroll_ratio2 = if max_scroll2 > 0.0 {
                                         offset_y2 / max_scroll2
@@ -2745,17 +2559,8 @@ egui::Image
                                         egui::vec2(track_width, thumb_height2)
                                     );
 
-                                    // 3. ОТРИСОВКА СОБСТВЕННЫХ ЦВЕТОВ
                                     let painter2 = ui.painter();
-
-                                    // Рисуем подложку (дорожку)
-                                    painter2.rect_filled(
-                                        track_rect2,
-                                        track_corner, // Скругление
-                                        track_color
-                                    );
-
-                                    // Рисуем сам бегунок
+                                    painter2.rect_filled(track_rect2, track_corner, track_color);
                                     painter2.rect_filled(
                                         thumb_rect2,
                                         tracker_corner,
@@ -2767,7 +2572,6 @@ egui::Image
                 });
         }
 
-        //////
         if let Some(err_msg) = self.error_modal.clone() {
             let modal_bg = egui::Color32::from_rgb(32, 32, 32);
             egui::Window
@@ -2808,120 +2612,20 @@ egui::Image
                                     egui::Button
                                         ::new(
                                             egui::RichText
-                                                ::new(" ПОНЯТНО (OK) ")
+                                                ::new("ЗАКРЫТЬ")
                                                 .size(16.0)
                                                 .strong()
                                                 .color(egui::Color32::BLACK)
                                         )
                                         .fill(gold_color)
-                                        .min_size(egui::vec2(140.0, 36.0))
+                                        .min_size(egui::vec2(120.0, 36.0))
                                 )
                                 .clicked()
                         {
                             self.error_modal = None;
-                            while self.event_rx.try_recv().is_ok() {}
                         }
                     });
                 });
         }
-
-        if matches!(self.update_status, UpdateStatus::ReadyToRestart) {
-            let modal_bg = egui::Color32::from_rgb(32, 32, 32);
-
-            egui::Window
-                ::new("RESTART_REQUIRED")
-                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-                .collapsible(false)
-                .resizable(false)
-                .title_bar(false)
-                .frame(
-                    egui::Frame::NONE
-                        .fill(modal_bg)
-                        .stroke(egui::Stroke::new(3.0, gold_color))
-                        .inner_margin(24.0)
-                        .corner_radius(14.0)
-                )
-                .show(ctx, |ui| {
-                    ui.vertical_centered(|ui| {
-                        ui.label(
-                            egui::RichText
-                                ::new("ОБНОВЛЕНИЕ ЗАГРУЖЕНО")
-                                .size(22.0)
-                                .strong()
-                                .color(gold_color)
-                        );
-                        ui.add_space(16.0);
-                        ui.label(
-                            egui::RichText
-                                ::new(
-                                    "Все компоненты системы заменены на новые.\nПерезапустить приложение сейчас?"
-                                )
-                                .size(16.0)
-                                .color(gold_color)
-                                .family(egui::FontFamily::Monospace)
-                        );
-                        ui.add_space(24.0);
-
-                        ui.horizontal(|ui| {
-                            ui.add_space(ui.available_width() / 6.0);
-
-                            if
-                                ui
-                                    .add(
-                                        egui::Button
-                                            ::new(
-                                                egui::RichText
-                                                    ::new(" ПЕРЕЗАПУСК ")
-                                                    .size(16.0)
-                                                    .strong()
-                                                    .color(egui::Color32::BLACK)
-                                            )
-                                            .fill(gold_color)
-                                            .min_size(egui::vec2(120.0, 36.0))
-                                    )
-                                    .clicked()
-                            {
-                                Updater::final_restart();
-                            }
-
-                            ui.add_space(20.0);
-
-                            if
-                                ui
-                                    .add(
-                                        egui::Button
-                                            ::new(
-                                                egui::RichText
-                                                    ::new(" ПОЗЖЕ ")
-                                                    .size(16.0)
-                                                    .strong()
-                                                    .color(gold_color)
-                                            )
-                                            .frame(false)
-                                    )
-                                    .clicked()
-                            {
-                                self.update_status = UpdateStatus::Idle;
-                                self.log("Обновление будет применено при следующем запуске.");
-                            }
-                        });
-                    });
-                });
-        }
-
-        let painter = ctx.layer_painter(
-            egui::LayerId::new(egui::Order::Foreground, egui::Id::new("window_border"))
-        );
-        let screen_rect = ctx.screen_rect();
-
-        // Укажите реальный радиус скругления ваших углов вместо 8.0
-        let corner_radius = 14.0;
-
-        painter.rect_stroke(
-            screen_rect,
-            corner_radius,
-            egui::Stroke::new(1.0, egui::Color32::from_rgb(38, 41, 46)),
-            egui::StrokeKind::Inside // Прижимаем обводку внутрь, чтобы она не обрезалась границами экрана
-        );
     }
 }

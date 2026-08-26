@@ -6,6 +6,7 @@ use tokio::time::sleep;
 use tokio::sync::Notify;
 use std::sync::atomic::{AtomicU64, Ordering};
 use crate::events::status;
+use crate::events::{emit, AnetEvent};
 
 const KIB: f64 = 1024.0;
 const MIB: f64 = 1024.0 * 1024.0;
@@ -221,5 +222,45 @@ pub fn start_stats_monitor(
             }
         }
         info!("[STATS] Connection closed, stopping stats monitor.");
+    })
+}
+
+
+
+
+
+/// Запуск секундного мониторинга трафика для обновления UI
+pub fn start_fast_stats_monitor(
+    provider: Arc<dyn StatsProvider>,
+    shutdown_notify: Arc<Notify>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let interval = Duration::from_secs(1);
+
+        loop {
+            tokio::select! {
+                _ = sleep(interval) => {
+                    if provider.is_closed() {
+                        break;
+                    }
+
+                    // 1. Получаем актуальный снимок метрик
+                    let current_stats = provider.get_stats();
+
+                    // 2. Форматируем байты в строки
+                    let rx_str = format_bytes(current_stats.total_rx_bytes);
+                    let tx_str = format_bytes(current_stats.total_tx_bytes);
+
+                    // 3. Излучаем событие через глобальный emit
+                    emit(AnetEvent::Stats {
+                        rx: rx_str,
+                        tx: tx_str,
+                    });
+                }
+                _ = shutdown_notify.notified() => {
+                    break;
+                }
+            }
+        }
     })
 }

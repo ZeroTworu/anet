@@ -533,26 +533,48 @@ impl AnetClient {
         // =========================================================================
         // УНИВЕРСАЛЬНЫЙ СБОРЩИК СТАТИСТИКИ
         // =========================================================================
-        let stats_shutdown = shutdown_notify.clone();
-        let stats_task = if config_clone.stats.enabled {
-            let provider: Arc<dyn statistic::StatsProvider> = if let Some(ref conn) = result.connection {
-                Arc::new(statistic::QuicStatsProvider::new(conn.clone()))
-            } else {
-                Arc::new(statistic::StreamStatsProvider::new(
-                    total_rx_bytes.clone(),
-                    total_tx_bytes.clone(),
-                    total_rx_packets.clone(),
-                    total_tx_packets.clone(),
-                ))
-            };
-            Some(statistic::start_stats_monitor(
-                provider,
-                config_clone.stats.interval_minutes,
-                stats_shutdown,
-            ))
+     // =========================================================================
+// УНИВЕРСАЛЬНЫЙ СБОРЩИК СТАТИСТИКИ
+// =========================================================================
+let stats_shutdown = shutdown_notify.clone();
+let stats_task = {
+    let provider: Arc<dyn statistic::StatsProvider> = if let Some(ref conn) = result.connection {
+        Arc::new(statistic::QuicStatsProvider::new(conn.clone()))
+    } else {
+        Arc::new(statistic::StreamStatsProvider::new(
+            total_rx_bytes.clone(),
+            total_tx_bytes.clone(),
+            total_rx_packets.clone(),
+            total_tx_packets.clone(),
+        ))
+    };
+
+    // 1. Быстрый монитор для обновления UI-меток (каждую секунду)
+    let fast_handle = statistic::start_fast_stats_monitor(
+        provider.clone(),
+        stats_shutdown.clone(),
+    );
+
+    // 2. Медленный монитор для записи детальной статистики в лог (по интервалу)
+    let slow_handle = if config_clone.stats.enabled {
+        Some(statistic::start_stats_monitor(
+            provider,
+            config_clone.stats.interval_minutes,
+            stats_shutdown,
+        ))
+    } else {
+        None
+    };
+
+    // Объединяем выполнение обоих мониторов в единый JoinHandle
+    Some(tokio::spawn(async move {
+        if let Some(slow) = slow_handle {
+            let _ = tokio::join!(fast_handle, slow);
         } else {
-            None
-        };
+            let _ = fast_handle.await;
+        }
+    }))
+};
 
         {
             let mut state = self.session.lock().unwrap();

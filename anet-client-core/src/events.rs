@@ -12,6 +12,11 @@ pub enum ClientState {
 /// Типы событий
 #[derive(Clone, Debug)]
 pub enum AnetEvent {
+    // Новый вариант специально для передачи метрик трафика
+    Stats {
+        rx: String,
+        tx: String,
+    },
     Status(String),
     ClientStateChanged {
         state: ClientState,
