@@ -9,7 +9,6 @@ use eframe::egui;
 use std::process::Command;
 
 fn main() -> Result<(), eframe::Error> {
-    rustls::crypto::ring::default_provider().install_default().ok();
     #[cfg(target_os = "macos")]
     {
         if !is_root() {
@@ -52,7 +51,7 @@ fn main() -> Result<(), eframe::Error> {
 let options = eframe::NativeOptions {
     viewport: egui::ViewportBuilder::default()
         .with_title(window_title)
-        .with_inner_size([400.0, 720.0])
+        .with_inner_size([400.0, 620.0])
         .with_icon(icon)
         .with_resizable(false)
         .with_decorations(false) // <--- Отключаем стандартную рамку и шапку ОС
