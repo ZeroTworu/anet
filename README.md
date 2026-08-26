@@ -86,6 +86,7 @@ make cert
 <img src=".assets/desktop-4.png" height="380" alt="Управление приложениями" />
 <img src=".assets/desktop-5.png" height="380" alt="Обновления" />
 <img src=".assets/desktop-6.png" height="380" alt="Управление настройками" />
+<img src=".assets/desktop-7.png" height="380" alt="Выбор ноды" />
 </p>
 
 
