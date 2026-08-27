@@ -186,6 +186,8 @@ pub struct ANetApp {
     pub total_rtt: String,
     pub total_rxm: String,
     pub total_txm: String,
+
+    tray_value: bool,
 }
 
 fn send_notification(title: &str, body: &str) {
@@ -608,6 +610,57 @@ impl ANetApp {
         lines.join("\n")
     }
 
+    #[cfg(target_os = "windows")]
+    fn inject_tray_mode_to_toml(content: &str, tray_mode: bool) -> String {
+    let normalized = content.replace("\r\n", "\n");
+    let mut lines: Vec<String> = normalized
+        .lines()
+        .map(|s| s.to_string())
+        .collect();
+
+    let tray_line = format!("tray_mode = {}", tray_mode);
+
+    let mut in_main = false;
+    let mut main_end_idx = None;
+    let mut tray_mode_idx = None;
+
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            if trimmed == "[main]" {
+                in_main = true;
+            } else if in_main {
+                main_end_idx = Some(i);
+                in_main = false;
+            }
+        } else if in_main {
+            let clean_line: String = trimmed
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect();
+
+            if clean_line.starts_with("tray_mode=") {
+                tray_mode_idx = Some(i);
+            }
+        }
+    }
+
+    match tray_mode_idx {
+        Some(idx) => {
+            lines[idx] = tray_line;
+        }
+        None => {
+            let insert_pos = main_end_idx.unwrap_or(lines.len());
+            lines.insert(insert_pos, tray_line);
+        }
+    }
+
+    lines.join("\n")
+}
+
+
+
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         load_fonts(&cc.egui_ctx);
 
@@ -683,6 +736,8 @@ impl ANetApp {
             total_rtt: "0".to_string(),
             total_rxm: "0 B".to_string(),
             total_txm: "0 B".to_string(),
+
+            tray_value: true,
         };
 
         #[cfg(target_os = "windows")]
@@ -849,6 +904,15 @@ impl ANetApp {
                     anet_client_core::config::PerAppMode::Include => FilterMode::Include,
                     anet_client_core::config::PerAppMode::Exclude => FilterMode::Exclude,
                 };
+
+                // Загружаем настройку сворачивания в трей из [main]
+if let Ok(raw_toml) = toml::from_str::<toml::Value>(content) {
+    self.tray_value = raw_toml
+        .get("main")
+        .and_then(|main| main.get("tray_mode"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(true);
+}
 
                 for proc in &mut self.processes {
                     proc.is_selected = cfg.main.per_app.contains(&proc.name);
@@ -1025,21 +1089,43 @@ impl eframe::App for ANetApp {
         ctx.set_visuals(visuals);
         ctx.request_repaint_after(std::time::Duration::from_millis(500));
 
-        // --- БЕЗОПАСНАЯ ОБРАБОТКА СВОРАЧИВАНИЯ И СБРОС СТАТУСА ТРЕЯ ---
-        let is_minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
 
-        if is_minimized {
-            if !self.is_in_tray {
-                self.is_in_tray = true;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-                let _ = self.tray_cmd_tx.send(TrayCommand::WindowVisible(false));
-                let _ = self.tray_cmd_tx.send(TrayCommand::NotifyHidden);
-            }
-            return;
-        } else if self.is_in_tray {
-            self.is_in_tray = false;
-            let _ = self.tray_cmd_tx.send(TrayCommand::WindowVisible(true));
+        // --- ОБРАБОТКА СВОРАЧИВАНИЯ ---
+let is_minimized = ctx.input(|i| {
+    i.viewport().minimized.unwrap_or(false)
+});
+
+if self.tray_value {
+    // Режим "Сворачивать приложение в трей"
+    if is_minimized {
+        if !self.is_in_tray {
+            self.is_in_tray = true;
+
+            ctx.send_viewport_cmd(
+                egui::ViewportCommand::Visible(false)
+            );
+
+            let _ = self.tray_cmd_tx.send(
+                TrayCommand::WindowVisible(false)
+            );
+
+            let _ = self.tray_cmd_tx.send(
+                TrayCommand::NotifyHidden
+            );
         }
+
+        return;
+    } else if self.is_in_tray {
+        self.is_in_tray = false;
+
+        let _ = self.tray_cmd_tx.send(
+            TrayCommand::WindowVisible(true)
+        );
+    }
+}
+
+// Если tray_value == false —
+// обычная минимизация окна никак не перехватывается.
 
         let titlebar_button = egui::vec2(42.0, 38.0);
 
@@ -1200,14 +1286,34 @@ impl eframe::App for ANetApp {
                                 minimize_img.paint_at(ui, min_img_rect);
 
                                 // Прямое скрытие окна в трей
-                                if min_response.clicked() {
-                                    self.is_in_tray = true;
-                                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-                                    let _ = self.tray_cmd_tx.send(
-                                        TrayCommand::WindowVisible(false)
-                                    );
-                                    let _ = self.tray_cmd_tx.send(TrayCommand::NotifyHidden);
-                                }
+                                // Кнопка "Свернуть"
+if min_response.clicked() {
+    if self.tray_value {
+        // ==========================================
+        // РЕЖИМ: СВОРАЧИВАНИЕ В ТРЕЙ
+        // ==========================================
+        self.is_in_tray = true;
+
+        ctx.send_viewport_cmd(
+            egui::ViewportCommand::Visible(false)
+        );
+
+        let _ = self.tray_cmd_tx.send(
+            TrayCommand::WindowVisible(false)
+        );
+
+        let _ = self.tray_cmd_tx.send(
+            TrayCommand::NotifyHidden
+        );
+    } else {
+        // ==========================================
+        // ОБЫЧНЫЙ РЕЖИМ: МИНИМИЗАЦИЯ ОКНА
+        // ==========================================
+        ctx.send_viewport_cmd(
+            egui::ViewportCommand::Minimized(true)
+        );
+    }
+}
                             });
                         });
                     });
@@ -2285,6 +2391,87 @@ impl eframe::App for ANetApp {
                             });
                             ui.separator();
 
+                            if ui
+    .checkbox(&mut self.tray_value, "Сворачивать приложение в трэй")
+    .changed()
+{
+    let tray_mode = self.tray_value;
+
+    let mut updated_config_data: Option<(String, String, String)> = None;
+
+    {
+        let mut settings = self.settings.lock().unwrap();
+
+        if let Some(active_id) = settings.active_config_id.clone() {
+            if let Some(cfg) = settings
+                .configs
+                .iter_mut()
+                .find(|c| c.id == active_id)
+            {
+                cfg.content = Self::inject_tray_mode_to_toml(
+                    &cfg.content,
+                    tray_mode,
+                );
+
+                updated_config_data = Some((
+                    cfg.id.clone(),
+                    cfg.content.clone(),
+                    cfg.name.clone(),
+                ));
+            }
+
+            settings.save();
+        }
+    }
+
+    // Записываем изменения непосредственно в .toml
+    if let Some((id, content, name)) = updated_config_data {
+        let path_by_id = std::path::PathBuf::from("configs")
+            .join(format!("{}.toml", id));
+
+        let path_by_name = std::path::PathBuf::from("configs")
+            .join(format!("{}.toml", name));
+
+        let target_path = if path_by_id.exists() {
+            Some(path_by_id)
+        } else if path_by_name.exists() {
+            Some(path_by_name)
+        } else {
+            let root_id =
+                std::path::PathBuf::from(format!("{}.toml", id));
+
+            let root_name =
+                std::path::PathBuf::from(format!("{}.toml", name));
+
+            if root_id.exists() {
+                Some(root_id)
+            } else if root_name.exists() {
+                Some(root_name)
+            } else {
+                None
+            }
+        };
+
+        if let Some(path) = target_path {
+            match std::fs::write(&path, &content) {
+                Ok(_) => {
+                    self.log(&format!(
+                        "Настройка tray_mode сохранена: {}",
+                        tray_mode
+                    ));
+                }
+
+                Err(e) => {
+                    self.log(&format!(
+                        "Ошибка записи tray_mode в {:?}: {}",
+                        path, e
+                    ));
+                }
+            }
+        }
+    }
+}
+                            ui.separator();
                             ui.label(
                                 egui::RichText::new("КОНФИГИ").size(12.0).strong().color(gold_color)
                             );
@@ -2852,8 +3039,7 @@ impl eframe::App for ANetApp {
                 });
         }
 
-
-       let painter = ctx.layer_painter(
+        let painter = ctx.layer_painter(
             egui::LayerId::new(egui::Order::Foreground, egui::Id::new("window_border"))
         );
         let screen_rect = ctx.screen_rect();
@@ -2867,6 +3053,5 @@ impl eframe::App for ANetApp {
             egui::Stroke::new(1.0, egui::Color32::from_rgb(100, 100, 100)),
             egui::StrokeKind::Inside // Прижимаем обводку внутрь, чтобы она не обрезалась границами экрана
         );
-
     }
 }
