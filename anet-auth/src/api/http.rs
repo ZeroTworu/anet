@@ -2495,6 +2495,7 @@ impl VpnApi {
     }
 
     /// Получить подробный список активных подключений в реальном времени
+    /// Получить подробный список активных подключений в реальном времени
     #[oai(path = "/statistics/active-connections", method = "get")]
     async fn get_active_connections(
         &self,
@@ -2507,56 +2508,61 @@ impl VpnApi {
             ));
         }
 
-        // Выбираем только тех, у кого количество сессий больше нуля
-        let active_sess_list = crate::entities::active_sessions::Entity::find()
-            .filter(crate::entities::active_sessions::Column::Sessions.gt(0))
+        let now = chrono::Utc::now().naive_utc();
+        // Ноды отправляют отчеты каждые 15 секунд.
+        // Порог в 90 секунд надежно отсечет оффлайн-сессии и защитит от задержек сети.
+        let threshold = now - chrono::Duration::seconds(90);
+
+        // Запрашиваем записи трафика, обновленные за последние 90 секунд
+        let active_totals = crate::entities::traffic_totals::Entity::find()
+            .filter(crate::entities::traffic_totals::Column::UpdatedAt.gte(threshold))
             .all(&self.db)
             .await
             .map_err(poem::error::InternalServerError)?;
 
         let mut dtos = Vec::new();
-        let now = chrono::Utc::now().naive_utc();
 
-        for sess in active_sess_list {
-            let Some(user) = users::Entity::find_by_id(sess.user_id)
-                .one(&self.db)
-                .await
-                .map_err(poem::error::InternalServerError)?
-            else {
-                continue;
-            };
-
-            // Ищем записи трафика для этого пользователя
-            let totals = traffic_totals::Entity::find()
-                .filter(traffic_totals::Column::UserId.eq(sess.user_id))
-                .all(&self.db)
-                .await
-                .map_err(poem::error::InternalServerError)?;
-
-            for total in totals {
-                // Если запись трафика не обновлялась более 5 минут,
-                // значит это устаревшие данные от предыдущих сессий
-                if now.signed_duration_since(total.updated_at).num_seconds() > 300 {
-                    continue;
-                }
-
-                let server_name = servers::Entity::find_by_id(total.server_id)
+        for total in active_totals {
+            let username = if let Some(user_id) = total.user_id {
+                crate::entities::users::Entity::find_by_id(user_id)
                     .one(&self.db)
                     .await
                     .map_err(poem::error::InternalServerError)?
-                    .map(|s| s.name)
-                    .unwrap_or_else(|| "Unknown Server".to_string());
-                let uid = user.uid.clone();
-                dtos.push(ActiveConnectionDto {
-                    user_id: sess.user_id,
-                    username: uid.unwrap_or_else(|| "Unknown".to_string()),
-                    server_id: total.server_id,
-                    server_name,
-                    rx_bytes: total.rx_bytes.max(0) as u64,
-                    tx_bytes: total.tx_bytes.max(0) as u64,
-                    connection_count: sess.sessions,
-                });
-            }
+                    .and_then(|u| u.uid)
+                    .unwrap_or_else(|| "Unknown".to_string())
+            } else {
+                "Unknown".to_string()
+            };
+
+            let server_name = crate::entities::servers::Entity::find_by_id(total.server_id)
+                .one(&self.db)
+                .await
+                .map_err(poem::error::InternalServerError)?
+                .map(|s| s.name)
+                .unwrap_or_else(|| "Unknown Server".to_string());
+
+            // Ищем количество сессий в таблице active_sessions для вывода счетчика
+            let connection_count = if let Some(user_id) = total.user_id {
+                crate::entities::active_sessions::Entity::find()
+                    .filter(crate::entities::active_sessions::Column::UserId.eq(user_id))
+                    .one(&self.db)
+                    .await
+                    .map_err(poem::error::InternalServerError)?
+                    .map(|s| s.sessions)
+                    .unwrap_or(1)
+            } else {
+                1
+            };
+
+            dtos.push(ActiveConnectionDto {
+                user_id: total.user_id.unwrap_or_else(uuid::Uuid::nil),
+                username,
+                server_id: total.server_id,
+                server_name,
+                rx_bytes: total.rx_bytes.max(0) as u64,
+                tx_bytes: total.tx_bytes.max(0) as u64,
+                connection_count: connection_count.max(1), // Гарантируем минимум 1 при рассинхронизации БД
+            });
         }
 
         Ok(Json(dtos))

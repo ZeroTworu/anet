@@ -185,10 +185,16 @@ impl ClientRegistry {
     }
 
     pub fn traffic_snapshot(&self) -> Vec<TrafficUsageSample> {
-        // Нода отправляет cumulative snapshot; панель сама считает дельты
-        // и поэтому безопасно переживает повторы heartbeat/report.
+        // Собираем отпечатки (fingerprints) только действительно активных сессий
+        let active_fps: std::collections::HashSet<String> = self.clients_by_prefix
+            .iter()
+            .map(|entry| entry.value().fingerprint.clone())
+            .collect();
+
+        // Отправляем отчеты только по активным клиентам
         self.traffic_totals
             .iter()
+            .filter(|entry| active_fps.contains(entry.key()))
             .map(|entry| TrafficUsageSample {
                 user_id: entry.user_id.clone(),
                 fingerprint: entry.fingerprint.clone(),
