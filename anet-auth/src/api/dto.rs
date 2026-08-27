@@ -17,6 +17,12 @@ pub struct ServerDto {
     pub name: String,
     pub dsn: String,
     pub public_key: String,
+    /// Legacy per-transport fields, kept alongside `dsn` for manual migration
+    /// of endpoints that were registered before the unified DSN column.
+    pub quic_port: Option<i32>,
+    pub ssh_port: Option<i32>,
+    pub vnc_port: Option<i32>,
+    pub websocket_url: Option<String>,
     pub ssh_user: Option<String>,
     pub is_active: bool,
     pub has_control_credential: bool,
@@ -210,6 +216,12 @@ pub struct CreateServerRequest {
     pub name: String,
     pub dsn: String,
     pub public_key: String,
+    /// Legacy per-transport fields, optional. Set these to register a node
+    /// under its old-style addressing alongside the unified `dsn`.
+    pub quic_port: Option<i32>,
+    pub ssh_port: Option<i32>,
+    pub vnc_port: Option<i32>,
+    pub websocket_url: Option<String>,
     pub ssh_user: Option<String>,
     pub is_active: Option<bool>,
 }
@@ -230,6 +242,13 @@ pub struct UpdateServerRequest {
     pub name: Option<String>,
     pub dsn: Option<String>,
     pub public_key: Option<String>,
+    /// Outer `Option` = "field present in request"; inner `Option` = the new
+    /// value, where `null` explicitly clears the column (same convention as
+    /// `ssh_user` below).
+    pub quic_port: Option<Option<i32>>,
+    pub ssh_port: Option<Option<i32>>,
+    pub vnc_port: Option<Option<i32>>,
+    pub websocket_url: Option<Option<String>>,
     pub ssh_user: Option<Option<String>>,
     pub is_active: Option<bool>,
 }

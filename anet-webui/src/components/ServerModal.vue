@@ -4,7 +4,6 @@ import { useAppMessage } from '@/composables/useAppMessage'
 import { GetNodeCommandStatus, RotateNodeCredential, SetNodeAdmission, UpdateServer } from '@/api/servers'
 import type { Server } from '@/models/server'
 
-// ИСПРАВЛЕНО: Убрано 'show', теперь ловит дефолтный v-model из родителя
 const show = defineModel<boolean>()
 
 const props = defineProps<{
@@ -21,7 +20,11 @@ const form = ref({
   dsn: '',
   public_key: '',
   ssh_user: '',
-  is_active: true
+  is_active: true,
+  quic_port: null as number | null,
+  ssh_port: null as number | null,
+  vnc_port: null as number | null,
+  websocket_url: ''
 })
 
 const loading = ref(false)
@@ -100,7 +103,11 @@ watch(
           dsn: val.dsn,
           public_key: val.public_key,
           ssh_user: val.ssh_user || '',
-          is_active: val.is_active
+          is_active: val.is_active,
+          quic_port: val.quic_port !== undefined ? val.quic_port : null,
+          ssh_port: val.ssh_port !== undefined ? val.ssh_port : null,
+          vnc_port: val.vnc_port !== undefined ? val.vnc_port : null,
+          websocket_url: val.websocket_url || ''
         }
       }
     },
@@ -139,6 +146,46 @@ const close = () => {
           <v-text-field v-model="form.name" label="Название локации" variant="filled" class="mb-3" />
           <v-text-field v-model="form.dsn" label="DSN" placeholder="quic://host:4519 или wss://host:8080/socket" variant="filled" class="mb-3" />
           <v-text-field v-model="form.public_key" label="Публичный ключ сервера" variant="filled" class="mb-3" />
+
+          <!-- Размещаем порты side-by-side -->
+          <v-row class="mb-1">
+            <v-col cols="12" sm="4">
+              <v-text-field
+                  v-model.number="form.quic_port"
+                  type="number"
+                  label="QUIC Port (UDP)"
+                  variant="filled"
+                  hide-details
+              />
+            </v-col>
+            <v-col cols="12" sm="4">
+              <v-text-field
+                  v-model.number="form.ssh_port"
+                  type="number"
+                  label="SSH Port (TCP)"
+                  variant="filled"
+                  hide-details
+              />
+            </v-col>
+            <v-col cols="12" sm="4">
+              <v-text-field
+                  v-model.number="form.vnc_port"
+                  type="number"
+                  label="VNC Port (TCP)"
+                  variant="filled"
+                  hide-details
+              />
+            </v-col>
+          </v-row>
+
+          <v-text-field
+              v-model="form.websocket_url"
+              label="WebSocket URL"
+              placeholder="ws://127.0.0.1:8080/s"
+              variant="filled"
+              class="mb-3"
+          />
+
           <v-text-field v-model="form.ssh_user" label="Пользователь SSH" variant="filled" class="mb-3" />
 
           <v-switch v-model="form.is_active" label="Статус (ВКЛ / ВЫКЛ)" color="success" class="mb-4" />
@@ -188,7 +235,7 @@ const close = () => {
             <div class="mb-2">
               Состояние:
               <v-chip :color="server.has_control_credential ? 'success' : 'warning'" size="small" class="ml-2">
-                {{ server.has_control_credential ? 'PROVISIONED' : 'NOT PROVISIONED' }}
+                {{ server.has_control_credential ? 'READY' : 'SETUP REQUIRED' }}
               </v-chip>
             </div>
             <div class="text-caption text-medium-emphasis mb-4">

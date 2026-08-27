@@ -13,13 +13,17 @@ const emit = defineEmits<{
 
 const loading = ref(false)
 
-// Функция для сброса формы к значениям по умолчанию
+// Функция для сброса формы к значениям по умолчанию (с учетом портов)
 const defaultForm = (): CreateServerRequest => ({
   name: '',
   dsn: 'quic://127.0.0.1:4519',
   public_key: '',
   ssh_user: 'hanyuu',
   is_active: true,
+  quic_port: 4519,
+  ssh_port: 822,
+  vnc_port: 56678,
+  websocket_url: 'ws://127.0.0.1:8080/s',
 })
 
 const form = ref<CreateServerRequest>(defaultForm())
@@ -74,6 +78,45 @@ const close = () => {
               v-model="form.public_key"
               label="Публичный ключ сервера (server_pub_key)"
               placeholder="Из утилиты anet-keygen"
+              variant="filled"
+              class="mb-3"
+          />
+
+          <!-- Размещаем порты side-by-side с числовой валидацией -->
+          <v-row class="mb-1">
+            <v-col cols="12" sm="4">
+              <v-text-field
+                  v-model.number="form.quic_port"
+                  type="number"
+                  label="QUIC Port (UDP)"
+                  variant="filled"
+                  hide-details
+              />
+            </v-col>
+            <v-col cols="12" sm="4">
+              <v-text-field
+                  v-model.number="form.ssh_port"
+                  type="number"
+                  label="SSH Port (TCP)"
+                  variant="filled"
+                  hide-details
+              />
+            </v-col>
+            <v-col cols="12" sm="4">
+              <v-text-field
+                  v-model.number="form.vnc_port"
+                  type="number"
+                  label="VNC Port (TCP)"
+                  variant="filled"
+                  hide-details
+              />
+            </v-col>
+          </v-row>
+
+          <v-text-field
+              v-model="form.websocket_url"
+              label="WebSocket URL"
+              placeholder="ws://127.0.0.1:8080/s"
               variant="filled"
               class="mb-3"
           />

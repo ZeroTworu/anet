@@ -382,10 +382,10 @@ impl VpnApi {
             address: Set(String::new()),
             dsn: Set(req.0.dsn.clone()),
             public_key: Set(req.0.public_key.clone()),
-            quic_port: Set(None),
-            ssh_port: Set(None),
-            vnc_port: Set(None),
-            websocket_url: Set(None),
+            quic_port: Set(req.0.quic_port),
+            ssh_port: Set(req.0.ssh_port),
+            vnc_port: Set(req.0.vnc_port),
+            websocket_url: Set(req.0.websocket_url.clone()),
             ssh_user: Set(req.0.ssh_user.clone()),
             is_active: Set(req.0.is_active.unwrap_or(true)),
             control_token_hash: Set(None),
@@ -399,6 +399,10 @@ impl VpnApi {
                 name: saved.name,
                 dsn: saved.dsn,
                 public_key: saved.public_key,
+                quic_port: saved.quic_port,
+                ssh_port: saved.ssh_port,
+                vnc_port: saved.vnc_port,
+                websocket_url: saved.websocket_url,
                 ssh_user: saved.ssh_user,
                 is_active: saved.is_active,
                 has_control_credential: saved.control_token_hash.is_some(),
@@ -443,6 +447,22 @@ impl VpnApi {
             active_model.public_key = Set(pub_key);
             changed = true;
         }
+        if let Some(quic_port) = req.0.quic_port {
+            active_model.quic_port = Set(quic_port);
+            changed = true;
+        }
+        if let Some(ssh_port) = req.0.ssh_port {
+            active_model.ssh_port = Set(ssh_port);
+            changed = true;
+        }
+        if let Some(vnc_port) = req.0.vnc_port {
+            active_model.vnc_port = Set(vnc_port);
+            changed = true;
+        }
+        if let Some(websocket_url) = req.0.websocket_url {
+            active_model.websocket_url = Set(websocket_url);
+            changed = true;
+        }
         if let Some(user) = req.0.ssh_user {
             active_model.ssh_user = Set(user);
             changed = true;
@@ -460,6 +480,10 @@ impl VpnApi {
                     name: saved.name,
                     dsn: saved.dsn,
                     public_key: saved.public_key,
+                    quic_port: saved.quic_port,
+                    ssh_port: saved.ssh_port,
+                    vnc_port: saved.vnc_port,
+                    websocket_url: saved.websocket_url,
                     ssh_user: saved.ssh_user,
                     is_active: saved.is_active,
                     has_control_credential: saved.control_token_hash.is_some(),
@@ -473,6 +497,10 @@ impl VpnApi {
                 name: server_model.name,
                 dsn: server_model.dsn,
                 public_key: server_model.public_key,
+                quic_port: server_model.quic_port,
+                ssh_port: server_model.ssh_port,
+                vnc_port: server_model.vnc_port,
+                websocket_url: server_model.websocket_url,
                 ssh_user: server_model.ssh_user,
                 is_active: server_model.is_active,
                 has_control_credential: server_model.control_token_hash.is_some(),
@@ -520,6 +548,10 @@ impl VpnApi {
                         name: s.name,
                         dsn: s.dsn,
                         public_key: s.public_key,
+                        quic_port: s.quic_port,
+                        ssh_port: s.ssh_port,
+                        vnc_port: s.vnc_port,
+                        websocket_url: s.websocket_url,
                         ssh_user: s.ssh_user,
                         is_active: s.is_active,
                         has_control_credential: s.control_token_hash.is_some(),

@@ -8,6 +8,10 @@ export type Server = {
     is_active: boolean
     has_control_credential: boolean
     runtime: NodeRuntime | null
+    quic_port: number | null
+    ssh_port: number | null
+    vnc_port: number | null
+    websocket_url: string | null
 }
 
 export type NodeRuntime = {
@@ -48,4 +52,8 @@ export type CreateServerRequest = {
     public_key: string
     ssh_user: string | null
     is_active?: boolean
+    quic_port?: number | null
+    ssh_port?: number | null
+    vnc_port?: number | null
+    websocket_url?: string | null
 }
