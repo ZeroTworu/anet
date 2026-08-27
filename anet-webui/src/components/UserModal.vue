@@ -9,10 +9,10 @@ import RateCreateForm from './RateCreateForm.vue'
 import { useUser } from '@/composables/useUser'
 import { useRate } from '@/composables/useRate'
 
-const show = defineModel<boolean>('show')
+const show = defineModel<boolean>()
 
 const props = defineProps<{
-  userId: string | null
+  userId: string
 }>()
 
 const emit = defineEmits<{
@@ -77,6 +77,7 @@ const copyQrPageLink = () => {
 watch(
     () => props.userId,
     (id) => {
+      // Пустая строка — модалка закрыта, пользователя не загружаем
       if (id) loadUser(id)
     },
     { immediate: true },
@@ -103,7 +104,7 @@ const handleSaveUser = async () => {
   >
     <v-card class="pa-6">
       <v-card-title class="text-h6 px-0 pb-4">
-        {{ userId ? 'Редактировать пользователя' : 'Создать пользователя' }}
+        Редактировать пользователя
       </v-card-title>
 
       <v-card-text class="px-0">
@@ -116,45 +117,49 @@ const handleSaveUser = async () => {
         </div>
 
         <!-- КОМПАКТНЫЙ БЛОК ДЛЯ ССЫЛОК И ШЕРИНГА -->
-        <div v-if="user" class="mt-6">
+        <v-card v-if="user" variant="outlined" class="mt-6 pa-4">
           <div class="text-subtitle-2 mb-3">🔗 Поделиться конфигурацией</div>
 
-          <v-form>
-            <!-- Поле 1: Прямое скачивание TOML-файла -->
-            <div class="mb-3">
-              <div class="text-caption text-medium-emphasis mb-1">Прямая ссылка на скачивание client.toml</div>
-              <div class="d-flex gap-2">
-                <v-text-field readonly :modelValue="directConfigLink" variant="outlined" density="compact" hide-details class="font-monospace" />
-                <v-btn color="primary" variant="tonal" @click="copyDirectLink">
-                  Copy
-                </v-btn>
-              </div>
-            </div>
+          <v-text-field
+              readonly
+              :model-value="directConfigLink"
+              label="Прямая ссылка на скачивание client.toml"
+              variant="filled"
+              density="compact"
+              hide-details
+              class="link-field mb-3"
+          >
+            <template #append>
+              <v-btn color="primary" variant="tonal" @click="copyDirectLink">Copy</v-btn>
+            </template>
+          </v-text-field>
 
-            <!-- Поле 2: Ссылка на страницу с QR-кодом -->
-            <div class="mb-3">
-              <div class="text-caption text-medium-emphasis mb-1">Ссылка на веб-страницу с QR-кодом</div>
-              <div class="d-flex gap-2">
-                <v-text-field readonly :modelValue="qrPageLink" variant="outlined" density="compact" hide-details class="font-monospace" />
-                <v-btn color="info" variant="tonal" @click="copyQrPageLink">
-                  Copy
-                </v-btn>
-              </div>
-            </div>
-          </v-form>
-        </div>
+          <v-text-field
+              readonly
+              :model-value="qrPageLink"
+              label="Ссылка на веб-страницу с QR-кодом"
+              variant="filled"
+              density="compact"
+              hide-details
+              class="link-field"
+          >
+            <template #append>
+              <v-btn color="info" variant="tonal" @click="copyQrPageLink">Copy</v-btn>
+            </template>
+          </v-text-field>
+        </v-card>
       </v-card-text>
 
-      <v-divider class="my-4"></v-divider>
+      <v-divider class="my-4" />
 
       <v-card-actions class="px-0 pb-0 justify-space-between">
         <v-btn color="warning" variant="text" :loading="regenerating" @click="regenerate">
           Regenerate Keys
         </v-btn>
 
-        <div class="d-flex gap-2">
+        <div class="d-flex ga-2">
           <v-btn variant="text" @click="close">Close</v-btn>
-            <v-btn color="primary" variant="flat" @click="handleSaveUser">Save User</v-btn>
+          <v-btn color="primary" variant="flat" @click="handleSaveUser">Save User</v-btn>
         </div>
       </v-card-actions>
     </v-card>
@@ -162,6 +167,5 @@ const handleSaveUser = async () => {
 </template>
 
 <style scoped>
-.gap-2 { gap: 8px; }
-.font-monospace :deep(input) { font-family: monospace; font-size: 13px; }
+.link-field :deep(input) { font-family: 'Fira Code', monospace; font-size: 13px; }
 </style>

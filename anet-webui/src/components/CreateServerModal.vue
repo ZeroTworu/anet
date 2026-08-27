@@ -58,7 +58,7 @@ const close = () => {
               v-model="form.name"
               label="Название локации"
               placeholder="e.g. Germany VPS 1"
-              variant="outlined"
+              variant="filled"
               class="mb-3"
           />
 
@@ -66,7 +66,7 @@ const close = () => {
               v-model="form.dsn"
               label="DSN"
               placeholder="quic://host:4519 или wss://host:8080/socket"
-              variant="outlined"
+              variant="filled"
               class="mb-3"
           />
 
@@ -74,7 +74,7 @@ const close = () => {
               v-model="form.public_key"
               label="Публичный ключ сервера (server_pub_key)"
               placeholder="Из утилиты anet-keygen"
-              variant="outlined"
+              variant="filled"
               class="mb-3"
           />
 
@@ -82,7 +82,7 @@ const close = () => {
               v-model="form.ssh_user"
               label="Пользователь SSH (ssh_user)"
               placeholder="hanyuu"
-              variant="outlined"
+              variant="filled"
               class="mb-3"
           />
 
@@ -96,7 +96,7 @@ const close = () => {
       </v-card-text>
 
       <v-card-actions class="px-6 pb-4">
-        <v-spacer></v-spacer>
+        <v-spacer />
         <v-btn variant="text" @click="close">Cancel</v-btn>
         <v-btn color="primary" variant="flat" :loading="loading" @click="handleCreate">
           Add Node

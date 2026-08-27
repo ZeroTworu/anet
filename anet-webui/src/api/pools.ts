@@ -1,8 +1,6 @@
 import { api } from './client'
 import type { NodePool, SaveNodePoolRequest } from '@/models/pool'
 
-// CRUD pools: resolver панели сам исключает offline и admission-closed ноды.
-
 export const GetPools = () => api<NodePool[]>('/pools')
 export const CreatePool = (pool: SaveNodePoolRequest) => api<NodePool>('/pools', {
   method: 'POST', data: pool,

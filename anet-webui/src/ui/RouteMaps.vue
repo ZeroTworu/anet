@@ -3,6 +3,7 @@ import { onMounted, ref } from 'vue'
 import { DeleteRouteMap, GetRouteMaps } from '@/api/route-maps'
 import type { RouteMap } from '@/models/route-map'
 import RouteMapModal from '@/components/RouteMapModal.vue'
+import EntityCard from '@/components/EntityCard.vue'
 
 const maps = ref<RouteMap[]>([])
 const loading = ref(false)
@@ -39,11 +40,11 @@ onMounted(load)
 </script>
 
 <template>
-  <main class="route-page">
-    <div class="d-flex justify-space-between align-center page-title">
+  <v-container max-width="1200" class="route-maps-page">
+    <div class="d-flex justify-space-between align-center mb-5">
       <div>
-        <h2>Route Maps</h2>
-        <span>Политики split tunneling для клиентских конфигураций</span>
+        <h2 class="text-h6 font-weight-bold ma-0">Route Maps</h2>
+        <span class="text-caption text-medium-emphasis">Политики split tunneling для клиентских конфигураций</span>
       </div>
       <v-btn color="primary" @click="openCreate">Создать карту</v-btn>
     </div>
@@ -56,33 +57,28 @@ onMounted(load)
     <div class="position-relative">
       <v-row v-if="maps.length > 0">
         <v-col v-for="map in maps" :key="map.id" cols="12" md="6">
-          <v-card hover class="pa-4 h-100 cursor-pointer d-flex flex-column" @click="openEdit(map)">
-            <div class="d-flex justify-space-between align-start mb-3">
-              <div>
-                <div class="d-flex align-center gap-2 mb-1">
-                  <strong class="text-h6">{{ map.name }}</strong>
-                  <v-chip :color="map.is_active ? 'success' : 'default'" size="small">
-                    {{ map.is_active ? 'ACTIVE' : 'DISABLED' }}
-                  </v-chip>
-                  <v-chip size="small" variant="outlined">rev {{ map.revision }}</v-chip>
-                </div>
-                <div class="text-medium-emphasis text-body-2 mt-1">
-                  {{ map.description || 'Без описания' }}
-                </div>
-              </div>
-              <div class="d-flex flex-column align-end gap-2">
-                <span class="text-caption text-medium-emphasis">
-                  Rules: {{ map.rules.length }}
-                </span>
-                <v-chip :color="map.default_action === 'tunnel' ? 'success' : 'warning'" size="small">
-                  default: {{ map.default_action }}
-                </v-chip>
-                <v-btn color="error" variant="text" size="small" class="mt-2" @click.stop="remove(map.id)">
-                  Удалить
-                </v-btn>
-              </div>
-            </div>
-          </v-card>
+          <EntityCard
+              :title="map.name"
+              :subtitle="map.description || 'Без описания'"
+              @click="openEdit(map)"
+          >
+            <template #badges>
+              <v-chip :color="map.is_active ? 'success' : 'default'" size="small">
+                {{ map.is_active ? 'ACTIVE' : 'DISABLED' }}
+              </v-chip>
+              <v-chip size="small" variant="outlined">rev {{ map.revision }}</v-chip>
+            </template>
+
+            <template #meta>
+              <span class="text-caption text-medium-emphasis">Rules: {{ map.rules.length }}</span>
+              <v-chip :color="map.default_action === 'tunnel' ? 'success' : 'warning'" size="small">
+                default: {{ map.default_action }}
+              </v-chip>
+              <v-btn color="error" variant="text" size="small" @click.stop="remove(map.id)">
+                Удалить
+              </v-btn>
+            </template>
+          </EntityCard>
         </v-col>
       </v-row>
 
@@ -94,19 +90,14 @@ onMounted(load)
       />
     </div>
 
-    <!-- Модалка редактирования -->
     <RouteMapModal
         v-model="showEditor"
         :route-map="selectedMap"
         @saved="load"
     />
-  </main>
+  </v-container>
 </template>
 
 <style scoped>
-.route-page { max-width: 1200px; margin: 0 auto; padding: 24px; }
-.page-title { margin-bottom: 24px; }
-.page-title h2 { margin: 0 0 4px; font-weight: 600; font-size: 22px; }
-.page-title span { color: #94a3b8; font-size: 13px; }
-.gap-2 { gap: 8px; }
+.route-maps-page { padding: 24px; }
 </style>

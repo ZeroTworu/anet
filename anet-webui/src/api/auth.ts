@@ -1,5 +1,3 @@
-// src/api/auth.ts
-
 import { api } from './client'
 
 type LoginRequest = {

@@ -1,17 +1,13 @@
 import { api } from './client'
 import type { Server, CreateServerRequest, NodeCommand, NodeCommandStatus, NodeCredential } from '@/models/server'
 
-// API панели управления нодами. Команды admission возвращаются с ID,
-// по которому UI затем отслеживает фактическое выполнение на ноде.
 
-/// Получить список всех зарегистрированных нод
 export async function GetServers(): Promise<Server[]> {
     return api<Server[]>('/servers', {
         method: 'GET',
     })
 }
 
-/// Добавить новый физический сервер в базу данных
 export async function CreateServer(data: CreateServerRequest): Promise<Server> {
     return api<Server>('/servers', {
         method: 'POST',
@@ -19,7 +15,6 @@ export async function CreateServer(data: CreateServerRequest): Promise<Server> {
     })
 }
 
-/// Обновить параметры существующего сервера
 export async function UpdateServer(id: string, data: Partial<CreateServerRequest>): Promise<Server> {
     return api<Server>(`/servers/${id}`, {
         method: 'PATCH',

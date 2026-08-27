@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { computed, ref } from 'vue'
 import { GetUsers } from '@/api/users'
 import type { UsersResponse } from '@/models/user'
 
@@ -9,49 +9,43 @@ import CreateUserModal from '@/components/CreateUserModal.vue'
 const data = ref<UsersResponse | null>(null)
 const loading = ref(false)
 
-// Состояние пагинации
-const page = ref(1)
-const pageSize = ref(10)
+// Пагинация серверная (offset/limit в API), v-data-table лишь сообщает опции
+const options = ref({ page: 1, itemsPerPage: 10 })
+let optionsInitialized = false
 
-// Опции для выбора количества элементов на странице (используем title/value для Vuetify)
-const pageSizeOptions = [
-  { title: '10 / стр', value: 10 },
-  { title: '20 / стр', value: 20 },
-  { title: '50 / стр', value: 50 },
-  { title: '100 / стр', value: 100 }
+const headers = [
+  { title: 'UID (User Name)', key: 'uid' },
+  { title: 'UUID (ID)', key: 'id' },
+  { title: 'Status', key: 'is_active', align: 'center' as const },
 ]
 
-const selectedUserId = ref<string | null>(null)
-const showModal = ref(false)
-const showCreate = ref(false)
+const items = computed(() => data.value?.items ?? [])
+const total = computed(() => data.value?.total ?? 0)
 
 const loadUsers = async () => {
   loading.value = true
   try {
-    const offset = (page.value - 1) * pageSize.value
-    data.value = await GetUsers(offset, pageSize.value)
+    const offset = (options.value.page - 1) * options.value.itemsPerPage
+    data.value = await GetUsers(offset, options.value.itemsPerPage)
   } finally {
     loading.value = false
   }
 }
 
-// Переключение страниц
-const handlePageChange = (direction: 'prev' | 'next') => {
-  if (direction === 'prev' && page.value > 1) {
-    page.value--
-    loadUsers()
-  } else if (direction === 'next' && data.value && page.value * pageSize.value < data.value.total) {
-    page.value++
+// Единственная точка смены страницы/размера: встроенный футер таблицы
+const handleOptions = (opts: { page: number; itemsPerPage: number }) => {
+  const changed = opts.page !== options.value.page || opts.itemsPerPage !== options.value.itemsPerPage
+  options.value = { page: opts.page, itemsPerPage: opts.itemsPerPage }
+  if (changed || !optionsInitialized) {
+    optionsInitialized = true
     loadUsers()
   }
 }
 
-// Изменение размера страницы
-const handlePageSizeChange = (value: number) => {
-  pageSize.value = value
-  page.value = 1 // Сброс на первую страницу
-  loadUsers()
-}
+// Пустая строка = модалка закрыта, ничего не выбрано
+const selectedUserId = ref('')
+const showModal = ref(false)
+const showCreate = ref(false)
 
 const openEdit = (id: string) => {
   selectedUserId.value = id
@@ -60,90 +54,47 @@ const openEdit = (id: string) => {
 
 const closeModal = () => {
   showModal.value = false
-  selectedUserId.value = null
+  selectedUserId.value = ''
 }
-
-onMounted(loadUsers)
 </script>
 
 <template>
-  <div style="padding: 24px; max-width: 1200px; margin: 0 auto;">
-    <div class="d-flex justify-space-between align-center" style="margin-bottom: 20px;">
-      <h2 style="margin: 0; font-weight: 600; font-size: 20px;">ANet VPN Clients</h2>
+  <v-container max-width="1200" class="users-page">
+    <div class="d-flex justify-space-between align-center mb-5">
+      <h2 class="text-h6 font-weight-bold ma-0">ANet VPN Clients</h2>
       <v-btn color="primary" @click="showCreate = true"> Add User </v-btn>
     </div>
 
-    <div class="position-relative">
-      <div class="table-container" v-if="data">
-        <v-table class="interactive-table">
-          <thead>
-          <tr>
-            <th style="width: 25%">UID (User Name)</th>
-            <th style="width: 50%">UUID (ID)</th>
-            <th style="width: 15%">Status</th>
-          </tr>
-          </thead>
-          <tbody>
-          <tr
-              v-for="item in data.items"
-              :key="item.id"
-              @click="openEdit(item.id)"
-              class="clickable-row"
-          >
-            <td class="uid-col">{{ item.uid || 'No Name' }}</td>
-            <td class="uuid-col">{{ item.id }}</td>
-            <td>
-              <v-chip :color="item.is_active ? 'success' : 'error'" size="small">
-                {{ item.is_active ? 'Active' : 'Banned' }}
-              </v-chip>
-            </td>
-          </tr>
-          </tbody>
-        </v-table>
-      </div>
+    <v-data-table
+        :headers="headers"
+        :items="items"
+        :items-length="total"
+        :loading="loading"
+        :items-per-page="options.itemsPerPage"
+        :items-per-page-options="[10, 20, 50, 100]"
+        items-per-page-text="Строк на странице"
+        loading-text="Загрузка пользователей…"
+        no-data-text="Пользователи не найдены"
+        density="comfortable"
+        class="users-table"
+        hover
+        @update:options="handleOptions"
+        @click:row="(_: unknown, data: { item: { id: string } }) => openEdit(data.item.id)"
+    >
+      <template #item.uid="{ item }">
+        <span class="uid-col">{{ item.uid || 'No Name' }}</span>
+      </template>
 
-      <!-- Пагинация с правильным select -->
-      <div class="d-flex justify-space-between align-center mt-4" v-if="data">
-        <div class="d-flex align-center gap-3">
-          <span class="text-caption text-medium-emphasis">Показано {{ data.items.length }} из {{ data.total }}</span>
-          <v-select
-              v-model="pageSize"
-              :items="pageSizeOptions"
-              item-title="title"
-              item-value="value"
-              variant="outlined"
-              density="compact"
-              hide-details
-              style="width: 130px"
-              @update:modelValue="handlePageSizeChange"
-          />
-        </div>
+      <template #item.id="{ item }">
+        <span class="uuid-col">{{ item.id }}</span>
+      </template>
 
-        <div class="d-flex align-center gap-2">
-          <v-btn
-              variant="tonal"
-              size="small"
-              :disabled="page === 1"
-              @click="handlePageChange('prev')"
-          >
-            ← СЮДА
-          </v-btn>
-
-          <span style="font-family: monospace; min-width: 30px; text-align: center;">
-            {{ page }}
-          </span>
-
-          <v-btn
-              variant="tonal"
-              size="small"
-              :disabled="page * pageSize >= data.total"
-              @click="handlePageChange('next')"
-          >
-            ТУДА →
-          </v-btn>
-        </div>
-      </div>
-    </div>
+      <template #item.is_active="{ item }">
+        <v-chip :color="item.is_active ? 'success' : 'error'" size="small">
+          {{ item.is_active ? 'Active' : 'Banned' }}
+        </v-chip>
+      </template>
+    </v-data-table>
 
     <UserModal
         v-model="showModal"
@@ -153,90 +104,17 @@ onMounted(loadUsers)
     />
 
     <CreateUserModal v-model="showCreate" @created="loadUsers" />
-  </div>
+  </v-container>
 </template>
 
 <style scoped>
-.gap-2 { gap: 8px; }
-.gap-3 { gap: 12px; }
+.users-page { padding: 24px; }
 
-.table-container {
-  background: #ffffff !important;
-  border-radius: 8px;
-  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.08);
-  border: 1px solid #dcdcdc !important;
-  overflow: hidden;
-}
+.users-table { border-radius: 10px; }
 
-.interactive-table :deep(td) {
-  background-color: transparent !important;
-  border-bottom: 1px solid #e2e8f0 !important;
-  padding: 16px 20px !important;
-}
+.users-table :deep(tbody tr) { cursor: pointer; }
+.users-table :deep(tbody tr:hover) { background: rgba(43, 184, 148, .07) !important; }
 
-.interactive-table :deep(th) {
-  background-color: #f1f5f9 !important;
-  color: #0f172a !important;
-  font-weight: 700 !important;
-  border-bottom: 2px solid #cbd5e1 !important;
-}
-
-.clickable-row {
-  background-color: #ffffff !important;
-  cursor: pointer;
-  border-left: 4px solid transparent;
-  transition: all 0.15s ease-in-out;
-}
-
-.clickable-row:nth-child(even) {
-  background-color: #f8fafc !important;
-}
-
-.clickable-row:hover {
-  border-left: 4px solid #18a058 !important;
-  background-color: #f0fdf4 !important;
-}
-
-.uid-col {
-  font-weight: 600 !important;
-  color: #0f172a !important;
-  font-size: 15px !important;
-}
-
-.uuid-col {
-  font-family: 'Fira Code', 'Courier New', Courier, monospace !important;
-  color: #475569 !important;
-  font-size: 13.5px !important;
-}
-
-@media (prefers-color-scheme: dark) {
-  .table-container {
-    background: #18181c !important;
-    border: 1px solid #2d3748 !important;
-  }
-  .interactive-table :deep(th) {
-    background-color: #2d3748 !important;
-    color: #ffffff !important;
-    border-bottom: 2px solid #4a5568 !important;
-  }
-  .interactive-table :deep(td) {
-    border-bottom: 1px solid #2d3748 !important;
-  }
-  .clickable-row {
-    background-color: #18181c !important;
-  }
-  .clickable-row:nth-child(even) {
-    background-color: #1f1f23 !important;
-  }
-  .clickable-row:hover {
-    background-color: #1a3a2a !important;
-    border-left: 4px solid #18a058 !important;
-  }
-  .uid-col {
-    color: #ffffff !important;
-  }
-  .uuid-col {
-    color: #94a3b8 !important;
-  }
-}
+.uid-col { font-weight: 600; font-size: 15px; }
+.uuid-col { font-family: 'Fira Code', 'Courier New', Courier, monospace; color: #9aa5a0; font-size: 13.5px; }
 </style>

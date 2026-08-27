@@ -12,59 +12,66 @@ const user = defineModel<User>('modelValue', {
   required: true,
 })
 
+// Валидность формы наружу (кнопка Create/Save в родительской модалке)
+const valid = defineModel<boolean>('valid', { default: false })
+
+// Режим создания: показываем только поля, входящие в CreateUserRequest
+const props = defineProps<{
+  creating?: boolean
+}>()
+
 const availableServers = ref<Server[]>([])
 const availablePools = ref<NodePool[]>([])
 const availableRouteMaps = ref<RouteMap[]>([])
 
-// Форматируем список серверов под опции n-select
-const serverOptions = computed(() => {
-  return availableServers.value.map(s => ({
-    label: `${s.name} (${s.dsn})`,
-    value: s.id,
-  }))
-})
+// Опции v-select в стандартном формате { title, value } — без item-title,
+// иначе в списке вместо названий будет [object Object]
+const serverOptions = computed(() => availableServers.value.map(s => ({
+  title: `${s.name} (${s.dsn})`,
+  value: s.id,
+})))
 const poolOptions = computed(() => availablePools.value.map(pool => ({
-  label: `${pool.name} · ${pool.strategy}`,
+  title: `${pool.name} · ${pool.strategy}`,
   value: pool.id,
 })))
 const routeMapOptions = computed(() => availableRouteMaps.value.map(map => ({
-  label: `${map.name} · rev ${map.revision}`,
+  title: `${map.name} · rev ${map.revision}`,
   value: map.id,
 })))
 
+const uidRules = [
+  (v: string) => !!v?.trim() || 'UID обязателен',
+  (v: string) => /^[A-Za-z0-9_.-]{2,64}$/.test(v) || '2–64 символа: латиница, цифры, . _ -',
+]
+
 onMounted(async () => {
   try {
-    // Загружаем список серверов строго в момент монтирования формы
+    // Загружаем справочники строго в момент монтирования формы
     ;[availableServers.value, availablePools.value, availableRouteMaps.value] = await Promise.all([
       GetServers(), GetPools(), GetRouteMaps(),
     ])
 
-    // Защита: гарантируем, что server_ids инициализирован как массив
-    if (!user.value.server_ids) {
-      user.value.server_ids = []
-    }
+    // Защита: гарантируем, что массивы инициализированы
+    if (!user.value.server_ids) user.value.server_ids = []
     if (!user.value.pool_ids) user.value.pool_ids = []
   } catch (e) {
-    console.error("Failed to fetch servers inside form:", e)
+    console.error('Failed to fetch dictionaries inside form:', e)
   }
 })
 </script>
 
 <template>
-  <v-form>
+  <v-form v-model="valid" @submit.prevent>
     <!-- UID (editable) -->
-    <v-text-field v-model="user.uid" label="UID" variant="outlined" class="mb-3" />
+    <v-text-field v-model="user.uid" label="UID" :rules="uidRules" counter="64" class="mb-3" />
 
     <!-- Балансируемые pools -->
     <v-select
         v-model="user.pool_ids"
         multiple
-        item-title="label"
-        item-value="value"
         :items="poolOptions"
         label="Балансируемые pools"
         placeholder="Выберите pools для этого пользователя"
-        variant="outlined"
         class="mb-3"
     />
 
@@ -72,38 +79,35 @@ onMounted(async () => {
     <v-select
         v-model="user.route_map_id"
         clearable
-        item-title="label"
-        item-value="value"
         :items="routeMapOptions"
         label="Route map"
         placeholder="Политика маршрутизации"
-        variant="outlined"
         class="mb-3"
     />
 
-    <!-- Active (editable) -->
-    <v-switch v-model="user.is_active" label="Active" color="success" class="mb-2" />
+    <template v-if="!props.creating">
+      <!-- Active (editable) -->
+      <v-switch v-model="user.is_active" label="Active" color="success" class="mb-2" />
 
-    <!-- Static IP (editable) -->
-    <v-text-field v-model="user.static_ip" label="Static IP" placeholder="e.g. 10.0.0.10" variant="outlined" class="mb-3" />
+      <!-- Static IP (editable) -->
+      <v-text-field v-model="user.static_ip" label="Static IP" placeholder="e.g. 10.0.0.10" class="mb-3" />
+    </template>
 
     <!-- ВЫБОР СЕРВЕРОВ (Many-to-Many) -->
     <v-select
         v-model="user.server_ids"
         multiple
-        item-title="label"
-        item-value="value"
         :items="serverOptions"
         label="Привязанные сервера (Локации)"
         placeholder="Выберите сервера для этого пользователя"
-        variant="outlined"
-        class="mb-3"
-    />
+      />
 
-    <v-divider class="my-4" />
+    <template v-if="!props.creating">
+      <v-divider class="my-4" />
 
-    <!-- Readonly fields -->
-    <v-text-field :modelValue="user.fingerprint" label="Fingerprint" disabled variant="outlined" class="mb-3" />
-    <v-text-field :modelValue="user.created_at" label="Created At" disabled variant="outlined" class="mb-3" />
+      <!-- Readonly fields -->
+      <v-text-field :model-value="user.fingerprint" label="Fingerprint" disabled class="mb-3" />
+      <v-text-field :model-value="user.created_at" label="Created At" disabled />
+    </template>
   </v-form>
 </template>

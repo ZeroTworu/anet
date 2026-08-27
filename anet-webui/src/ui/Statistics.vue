@@ -8,6 +8,7 @@ import type { NodeTrafficStat, TrafficHistoryPoint, UserTrafficStat } from '@/mo
 const nodes = ref<NodeTrafficStat[]>([])
 const users = ref<UserTrafficStat[]>([])
 const history = ref<TrafficHistoryPoint[]>([])
+const activeTab = ref('nodes')
 const loading = ref(false)
 let refreshTimer: number | undefined
 
@@ -56,7 +57,7 @@ onBeforeUnmount(() => {
 
 <template>
   <main class="statistics-page">
-    <div justify="space-between" align="center" class="page-title">
+    <div class="d-flex align-center justify-space-between page-title">
       <div>
         <h2>Traffic</h2>
         <span>Полезный трафик внутри VPN-туннеля</span>
@@ -64,40 +65,63 @@ onBeforeUnmount(() => {
       <v-btn :loading="loading" @click="load">Обновить</v-btn>
     </div>
 
-    <v-row :cols="3" :x-gap="16" responsive="screen" item-responsive>
-      <v-col span="3 m:1"><div label="Получено узлами" :modelValue="formatBytes(totalRx)" /></v-col>
-      <v-col span="3 m:1"><div label="Отправлено клиентам" :modelValue="formatBytes(totalTx)" /></v-col>
-      <v-col span="3 m:1"><div label="Всего" :modelValue="formatBytes(totalRx + totalTx)" /></v-col>
+    <v-row class="mt-2">
+      <v-col cols="12" md="4">
+        <v-card class="pa-4">
+          <div class="text-caption text-medium-emphasis">Получено узлами</div>
+          <div class="text-h6 font-weight-bold">{{ formatBytes(totalRx) }}</div>
+        </v-card>
+      </v-col>
+      <v-col cols="12" md="4">
+        <v-card class="pa-4">
+          <div class="text-caption text-medium-emphasis">Отправлено клиентам</div>
+          <div class="text-h6 font-weight-bold">{{ formatBytes(totalTx) }}</div>
+        </v-card>
+      </v-col>
+      <v-col cols="12" md="4">
+        <v-card class="pa-4">
+          <div class="text-caption text-medium-emphasis">Всего</div>
+          <div class="text-h6 font-weight-bold">{{ formatBytes(totalRx + totalTx) }}</div>
+        </v-card>
+      </v-col>
     </v-row>
 
-    <v-card title="Последние 24 часа" class="history-card">
-
-        <div>
+    <v-card class="history-card">
+      <template #title>
+        <div class="d-flex align-center ga-4">
+          <span>Последние 24 часа</span>
           <span class="legend rx">RX</span>
           <span class="legend tx">TX</span>
         </div>
-
-      <div class="chart-wrap">
-        <svg viewBox="0 0 1000 260" role="img" aria-label="График трафика за 24 часа">
-          <line v-for="y in [40, 100, 160, 220]" :key="y" x1="40" :y1="y" x2="960" :y2="y" class="grid-line" />
-          <polyline :points="chartPoints('rx_bytes')" class="traffic-line rx-line" />
-          <polyline :points="chartPoints('tx_bytes')" class="traffic-line tx-line" />
-          <text
-              v-for="(point, index) in chartLabels"
-              :key="point.bucket_start"
-              :x="40 + history.indexOf(point) * (920 / Math.max(1, history.length - 1))"
-              y="248"
-              :text-anchor="index === 0 ? 'start' : index === chartLabels.length - 1 ? 'end' : 'middle'"
-              class="axis-label"
-          >{{ new Date(point.bucket_start).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) }}</text>
-        </svg>
-      </div>
+      </template>
+      <v-card-text>
+        <div class="chart-wrap">
+          <svg viewBox="0 0 1000 260" role="img" aria-label="График трафика за 24 часа">
+            <line v-for="y in [40, 100, 160, 220]" :key="y" x1="40" :y1="y" x2="960" :y2="y" class="grid-line" />
+            <polyline :points="chartPoints('rx_bytes')" class="traffic-line rx-line" />
+            <polyline :points="chartPoints('tx_bytes')" class="traffic-line tx-line" />
+            <text
+                v-for="(point, index) in chartLabels"
+                :key="point.bucket_start"
+                :x="40 + history.indexOf(point) * (920 / Math.max(1, history.length - 1))"
+                y="248"
+                :text-anchor="index === 0 ? 'start' : index === chartLabels.length - 1 ? 'end' : 'middle'"
+                class="axis-label"
+            >{{ new Date(point.bucket_start).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) }}</text>
+          </svg>
+        </div>
+      </v-card-text>
     </v-card>
 
-    <div class="position-relative">
-      <div type="line" animated class="traffic-tabs">
-        <div name="nodes" tab="По узлам">
-          <v-table :single-line="false" striped="odd">
+    <v-card class="traffic-tabs">
+      <v-tabs v-model="activeTab" color="primary">
+        <v-tab value="nodes">По узлам</v-tab>
+        <v-tab value="users">По пользователям</v-tab>
+      </v-tabs>
+
+      <v-tabs-window v-model="activeTab">
+        <v-tabs-window-item value="nodes">
+          <v-table>
             <thead><tr><th>Узел</th><th>RX</th><th>TX</th><th>Всего</th></tr></thead>
             <tbody>
               <tr v-for="node in nodes" :key="node.node_id">
@@ -108,11 +132,11 @@ onBeforeUnmount(() => {
               </tr>
             </tbody>
           </v-table>
-          <v-empty-state v-if="nodes.length === 0" description="Нет данных по узлам" />
-        </div>
+          <v-empty-state v-if="nodes.length === 0" text="Нет данных по узлам" />
+        </v-tabs-window-item>
 
-        <div name="users" tab="По пользователям">
-          <v-table :single-line="false" striped="odd">
+        <v-tabs-window-item value="users">
+          <v-table>
             <thead><tr><th>Пользователь</th><th>Fingerprint</th><th>RX</th><th>TX</th><th>Всего</th></tr></thead>
             <tbody>
               <tr v-for="user in users" :key="user.fingerprint">
@@ -124,31 +148,31 @@ onBeforeUnmount(() => {
               </tr>
             </tbody>
           </v-table>
-          <v-empty-state v-if="users.length === 0" description="Нет данных по пользователям" />
-        </div>
-      </div>
-    </div>
+          <v-empty-state v-if="users.length === 0" text="Нет данных по пользователям" />
+        </v-tabs-window-item>
+      </v-tabs-window>
+    </v-card>
   </main>
 </template>
 
 <style scoped>
 .statistics-page { max-width: 1200px; margin: 0 auto; padding: 24px; }
-.page-title { margin-bottom: 24px; }
+.page-title { margin-bottom: 16px; }
 .page-title h2 { margin: 0 0 4px; font-size: 22px; }
-.page-title span { color: #94a3b8; font-size: 13px; }
-.traffic-tabs { margin-top: 28px; }
+.page-title span { color: #9aa5a0; font-size: 13px; }
+.traffic-tabs { margin-top: 24px; }
 .history-card { margin-top: 20px; }
 .chart-wrap { width: 100%; min-height: 220px; }
 .chart-wrap svg { display: block; width: 100%; height: auto; }
-.grid-line { stroke: rgba(148, 163, 184, 0.15); stroke-width: 1; }
+.grid-line { stroke: rgba(154, 165, 160, 0.15); stroke-width: 1; }
 .traffic-line { fill: none; stroke-width: 3; stroke-linecap: round; stroke-linejoin: round; }
-.rx-line { stroke: #18a058; }
-.tx-line { stroke: #f0a020; }
-.axis-label { fill: #94a3b8; font-size: 12px; }
+.rx-line { stroke: #2bb894; }
+.tx-line { stroke: #d9a441; }
+.axis-label { fill: #9aa5a0; font-size: 12px; }
 .legend { font-size: 12px; font-weight: 700; }
-.legend.rx { color: #18a058; }
-.legend.tx { color: #f0a020; }
+.legend.rx { color: #2bb894; }
+.legend.tx { color: #d9a441; }
 .metric, .fingerprint { font-family: 'Fira Code', monospace; }
-.fingerprint { color: #94a3b8; font-size: 12px; }
+.fingerprint { color: #9aa5a0; font-size: 12px; }
 .total { font-weight: 700; }
 </style>

@@ -136,10 +136,10 @@ const close = () => {
 
       <v-card-text>
         <v-form>
-          <v-text-field v-model="form.name" label="Название локации" variant="outlined" class="mb-3" />
-          <v-text-field v-model="form.dsn" label="DSN" placeholder="quic://host:4519 или wss://host:8080/socket" variant="outlined" class="mb-3" />
-          <v-text-field v-model="form.public_key" label="Публичный ключ сервера" variant="outlined" class="mb-3" />
-          <v-text-field v-model="form.ssh_user" label="Пользователь SSH" variant="outlined" class="mb-3" />
+          <v-text-field v-model="form.name" label="Название локации" variant="filled" class="mb-3" />
+          <v-text-field v-model="form.dsn" label="DSN" placeholder="quic://host:4519 или wss://host:8080/socket" variant="filled" class="mb-3" />
+          <v-text-field v-model="form.public_key" label="Публичный ключ сервера" variant="filled" class="mb-3" />
+          <v-text-field v-model="form.ssh_user" label="Пользователь SSH" variant="filled" class="mb-3" />
 
           <v-switch v-model="form.is_active" label="Статус (ВКЛ / ВЫКЛ)" color="success" class="mb-4" />
 
@@ -157,14 +157,13 @@ const close = () => {
               </v-chip>
             </div>
 
-            <div class="d-flex gap-2 mb-2">
+            <div class="d-flex ga-2 mb-2">
               <v-btn
                   color="success"
                   variant="outlined"
                   :loading="commandLoading"
                   :disabled="server.runtime?.status !== 'online' || server.runtime?.accepting_connections === true"
                   @click="setAdmission(true)"
-                  class="mr-2"
               >
                 Разрешить
               </v-btn>
@@ -197,7 +196,6 @@ const close = () => {
             </div>
 
             <div class="d-flex align-center">
-              <!-- ИСПРАВЛЕНО: Добавлен @click -->
               <v-btn variant="tonal" color="error" :loading="credentialLoading" @click="rotateCredential" class="mr-4">
                 Перевыпустить credential
               </v-btn>
@@ -208,7 +206,7 @@ const close = () => {
       </v-card-text>
 
       <v-card-actions class="px-6 pb-4">
-        <v-spacer></v-spacer>
+        <v-spacer />
         <v-btn variant="text" @click="close">Отмена</v-btn>
         <v-btn color="primary" variant="flat" :loading="loading" @click="save">Сохранить</v-btn>
       </v-card-actions>
@@ -230,27 +228,36 @@ const close = () => {
           Сохраните token сейчас: повторно панель его не покажет.
         </v-alert>
 
-        <v-text-field :model-value="issuedCredential?.node_id" label="node_id" readonly variant="outlined" class="mb-3" />
+        <v-text-field :model-value="issuedCredential?.node_id" label="node_id" readonly variant="filled" class="mb-3" />
 
         <v-text-field
             :model-value="issuedCredential?.token"
             label="control_plane.token"
             type="text"
             readonly
-            variant="outlined"
+            variant="filled"
             class="mb-3"
         />
 
-        <v-sheet color="grey-darken-4" class="pa-4 rounded bg-black" v-if="issuedCredential">
-          <pre style="margin: 0; white-space: pre-wrap; font-family: monospace;">{{ credentialConfig }}</pre>
+        <v-sheet v-if="issuedCredential" color="surface-variant" rounded="lg" border class="pa-4">
+          <pre class="credential-pre">{{ credentialConfig }}</pre>
         </v-sheet>
       </v-card-text>
 
       <v-card-actions class="px-6 pb-4">
-        <v-spacer></v-spacer>
+        <v-spacer />
         <v-btn variant="outlined" @click="copyCredential">Скопировать токен</v-btn>
         <v-btn color="primary" variant="flat" @click="issuedCredential = null">Я сохранил</v-btn>
       </v-card-actions>
     </v-card>
   </v-dialog>
 </template>
+
+<style scoped>
+.credential-pre {
+  margin: 0;
+  white-space: pre-wrap;
+  font-family: 'Fira Code', monospace;
+  font-size: 13px;
+}
+</style>

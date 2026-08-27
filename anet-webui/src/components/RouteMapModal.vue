@@ -121,7 +121,7 @@ const close = () => {
         <v-form>
           <v-row>
             <v-col cols="12" sm="6">
-              <v-text-field v-model="form.name" label="Название" variant="outlined" hide-details class="mb-3" />
+              <v-text-field v-model="form.name" label="Название" variant="filled" hide-details class="mb-3" />
             </v-col>
             <v-col cols="12" sm="6">
               <v-select
@@ -130,14 +130,14 @@ const close = () => {
                   item-title="title"
                   item-value="value"
                   label="Default action"
-                  variant="outlined"
+                  variant="filled"
                   hide-details
                   class="mb-3"
               />
             </v-col>
           </v-row>
 
-          <v-textarea v-model="form.description" label="Описание" variant="outlined" rows="2" class="mb-3" />
+          <v-textarea v-model="form.description" label="Описание" variant="filled" rows="2" class="mb-3" />
 
           <v-switch v-model="form.is_active" label="Активна (ВКЛ)" color="success" class="mb-1" />
 
@@ -147,34 +147,37 @@ const close = () => {
               item-title="title"
               item-value="value"
               label="Тип новых правил по умолчанию"
-              variant="outlined"
+              variant="filled"
               hide-details
               class="mb-4"
           />
 
           <div class="d-flex align-center mt-4 mb-4">
-            <v-divider class="flex-grow-1"></v-divider>
+            <v-divider class="flex-grow-1" />
             <span class="mx-4 text-caption text-medium-emphasis text-center">
               Rules · CIDR и application можно смешивать; совпадения отправляются <strong>{{ oppositeAction }}</strong>
             </span>
-            <v-divider class="flex-grow-1"></v-divider>
+            <v-divider class="flex-grow-1" />
           </div>
 
-          <div class="d-flex flex-column gap-2 mb-4">
-            <div
+          <div class="d-flex flex-column ga-2 mb-4">
+            <v-sheet
                 v-for="(rule, index) in form.rules"
                 :key="rule.id || index"
-                class="d-flex align-center gap-3 pa-2 rounded bg-grey-darken-4 border"
+                color="surface-variant"
+                rounded="lg"
+                border
+                class="d-flex align-center ga-3 pa-2"
             >
-              <div class="text-caption text-medium-emphasis text-center" style="min-width: 24px">
+              <span class="text-caption text-medium-emphasis text-center" style="min-width: 24px">
                 {{ index + 1 }}
-              </div>
+              </span>
               <v-select
                   v-model="rule.match_type"
                   :items="kindOptions"
                   item-title="title"
                   item-value="value"
-                  variant="outlined"
+                  variant="filled"
                   density="compact"
                   hide-details
                   style="max-width: 200px"
@@ -182,17 +185,23 @@ const close = () => {
               <v-text-field
                   v-model="rule.match_value"
                   :placeholder="rule.match_type === 'cidr' ? '10.0.0.0/8' : 'steam.exe'"
-                  variant="outlined"
+                  variant="filled"
                   density="compact"
                   hide-details
                   class="flex-grow-1"
               />
-              <div class="d-flex gap-1">
-                <v-btn variant="text" size="small" :disabled="index === 0" @click="moveRule(index, -1)">↑</v-btn>
-                <v-btn variant="text" size="small" :disabled="index === form.rules.length - 1" @click="moveRule(index, 1)">↓</v-btn>
-                <v-btn color="error" variant="text" size="small" @click="form.rules.splice(index, 1)">×</v-btn>
+              <div class="d-flex ga-1">
+                <v-btn variant="text" size="small" :disabled="index === 0" @click="moveRule(index, -1)">
+                  <v-icon icon="mdi-arrow-up" />
+                </v-btn>
+                <v-btn variant="text" size="small" :disabled="index === form.rules.length - 1" @click="moveRule(index, 1)">
+                  <v-icon icon="mdi-arrow-down" />
+                </v-btn>
+                <v-btn color="error" variant="text" size="small" @click="form.rules.splice(index, 1)">
+                  <v-icon icon="mdi-close" />
+                </v-btn>
               </div>
-            </div>
+            </v-sheet>
 
             <v-btn variant="tonal" class="mt-2" block @click="addRule">
               Добавить правило
@@ -202,7 +211,7 @@ const close = () => {
       </v-card-text>
 
       <v-card-actions class="px-6 pb-4">
-        <v-spacer></v-spacer>
+        <v-spacer />
         <v-btn variant="text" @click="close">Отмена</v-btn>
         <v-btn
             color="primary"
@@ -217,10 +226,3 @@ const close = () => {
     </v-card>
   </v-dialog>
 </template>
-
-<style scoped>
-.gap-1 { gap: 4px; }
-.gap-2 { gap: 8px; }
-.gap-3 { gap: 12px; }
-.border { border: 1px solid rgba(255, 255, 255, 0.12); }
-</style>

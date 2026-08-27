@@ -93,7 +93,7 @@ const close = () => {
           <v-text-field
               v-model="form.name"
               label="Название"
-              variant="outlined"
+              variant="filled"
               class="mb-3"
           />
 
@@ -103,7 +103,7 @@ const close = () => {
               item-title="title"
               item-value="value"
               label="Стратегия"
-              variant="outlined"
+              variant="filled"
               class="mb-3"
           />
 
@@ -115,21 +115,24 @@ const close = () => {
           />
 
           <div class="d-flex align-center mt-2 mb-4">
-            <v-divider class="flex-grow-1"></v-divider>
+            <v-divider class="flex-grow-1" />
             <span class="mx-4 text-medium-emphasis">Узлы</span>
-            <v-divider class="flex-grow-1"></v-divider>
+            <v-divider class="flex-grow-1" />
           </div>
 
-          <div class="d-flex flex-column gap-3 mb-4">
-            <div
+          <div class="d-flex flex-column ga-3 mb-4">
+            <v-sheet
                 v-for="(member, index) in form.members"
                 :key="member.server_id"
-                class="d-flex align-center justify-space-between pa-3 rounded bg-grey-darken-4 border"
+                color="surface-variant"
+                rounded="lg"
+                border
+                class="d-flex align-center justify-space-between pa-3"
             >
-              <div class="font-weight-medium">
+              <span class="font-weight-medium">
                 {{ serverById.get(member.server_id)?.name || member.server_id }}
-              </div>
-              <div class="d-flex align-center gap-3">
+              </span>
+              <div class="d-flex align-center ga-3">
                 <!-- Используем обычный v-text-field type="number", так как v-number-input в Vuetify 3 пока экспериментальный -->
                 <v-text-field
                     v-model.number="member.weight"
@@ -143,7 +146,7 @@ const close = () => {
                 />
                 <v-btn color="error" variant="text" size="small" @click="removeNode(index)">Убрать</v-btn>
               </div>
-            </div>
+            </v-sheet>
           </div>
 
           <v-select
@@ -154,17 +157,17 @@ const close = () => {
               item-value="value"
               label="Добавить узел"
               placeholder="Выберите сервер из списка"
-              variant="outlined"
+              variant="filled"
               @update:model-value="val => val && addNode(String(val))"
           />
-          <div v-else class="text-center text-medium-emphasis py-2">
+          <v-alert v-else type="info" variant="tonal" density="compact">
             Нет доступных серверов для добавления
-          </div>
+          </v-alert>
         </v-form>
       </v-card-text>
 
       <v-card-actions class="px-6 pb-4">
-        <v-spacer></v-spacer>
+        <v-spacer />
         <v-btn variant="text" @click="close">Отмена</v-btn>
         <v-btn color="primary" variant="flat" :loading="loading" :disabled="!form.name.trim()" @click="save">
           Сохранить
@@ -173,8 +176,3 @@ const close = () => {
     </v-card>
   </v-dialog>
 </template>
-
-<style scoped>
-.gap-3 { gap: 12px; }
-.border { border: 1px solid rgba(255, 255, 255, 0.12); }
-</style>
