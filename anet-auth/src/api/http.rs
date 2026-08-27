@@ -2493,7 +2493,77 @@ impl VpnApi {
 
         QrPageResponse::Ok(PlainText(html_page))
     }
+
+    /// Получить подробный список активных подключений в реальном времени
+    #[oai(path = "/statistics/active-connections", method = "get")]
+    async fn get_active_connections(
+        &self,
+        auth: AdminToken,
+    ) -> Result<Json<Vec<ActiveConnectionDto>>, poem::Error> {
+        if let Err(err) = self.validate_admin_session(&auth.0.token).await {
+            return Err(poem::Error::from_string(
+                err,
+                poem::http::StatusCode::UNAUTHORIZED,
+            ));
+        }
+
+        // Выбираем только тех, у кого количество сессий больше нуля
+        let active_sess_list = crate::entities::active_sessions::Entity::find()
+            .filter(crate::entities::active_sessions::Column::Sessions.gt(0))
+            .all(&self.db)
+            .await
+            .map_err(poem::error::InternalServerError)?;
+
+        let mut dtos = Vec::new();
+        let now = chrono::Utc::now().naive_utc();
+
+        for sess in active_sess_list {
+            let Some(user) = users::Entity::find_by_id(sess.user_id)
+                .one(&self.db)
+                .await
+                .map_err(poem::error::InternalServerError)?
+            else {
+                continue;
+            };
+
+            // Ищем записи трафика для этого пользователя
+            let totals = traffic_totals::Entity::find()
+                .filter(traffic_totals::Column::UserId.eq(sess.user_id))
+                .all(&self.db)
+                .await
+                .map_err(poem::error::InternalServerError)?;
+
+            for total in totals {
+                // Если запись трафика не обновлялась более 5 минут,
+                // значит это устаревшие данные от предыдущих сессий
+                if now.signed_duration_since(total.updated_at).num_seconds() > 300 {
+                    continue;
+                }
+
+                let server_name = servers::Entity::find_by_id(total.server_id)
+                    .one(&self.db)
+                    .await
+                    .map_err(poem::error::InternalServerError)?
+                    .map(|s| s.name)
+                    .unwrap_or_else(|| "Unknown Server".to_string());
+                let uid = user.uid.clone();
+                dtos.push(ActiveConnectionDto {
+                    user_id: sess.user_id,
+                    username: uid.unwrap_or_else(|| "Unknown".to_string()),
+                    server_id: total.server_id,
+                    server_name,
+                    rx_bytes: total.rx_bytes.max(0) as u64,
+                    tx_bytes: total.tx_bytes.max(0) as u64,
+                    connection_count: sess.sessions,
+                });
+            }
+        }
+
+        Ok(Json(dtos))
+    }
 }
+
+
 
 /// Генератор стильной консольной OLED-Black HTML страницы для скачивания конфига клиентом
 fn get_qr_html_page(config_url: &str, user_name: &str) -> String {

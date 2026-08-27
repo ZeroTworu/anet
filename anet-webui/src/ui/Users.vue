@@ -9,7 +9,7 @@ import CreateUserModal from '@/components/CreateUserModal.vue'
 const data = ref<UsersResponse | null>(null)
 const loading = ref(false)
 
-// Пагинация серверная (offset/limit в API), v-data-table лишь сообщает опции
+// Пагинация серверная (offset/limit в API), v-data-table-server сообщает опции
 const options = ref({ page: 1, itemsPerPage: 10 })
 let optionsInitialized = false
 
@@ -65,12 +65,14 @@ const closeModal = () => {
       <v-btn color="primary" @click="showCreate = true"> Add User </v-btn>
     </div>
 
-    <v-data-table
+    <!-- Заменено на v-data-table-server с двусторонним связыванием v-model -->
+    <v-data-table-server
+        v-model:items-per-page="options.itemsPerPage"
+        v-model:page="options.page"
         :headers="headers"
         :items="items"
         :items-length="total"
         :loading="loading"
-        :items-per-page="options.itemsPerPage"
         :items-per-page-options="[10, 20, 50, 100]"
         items-per-page-text="Строк на странице"
         loading-text="Загрузка пользователей…"
@@ -94,7 +96,9 @@ const closeModal = () => {
           {{ item.is_active ? 'Active' : 'Banned' }}
         </v-chip>
       </template>
-    </v-data-table>
+    </v-data-table-server>
+
+    <v-sidebar />
 
     <UserModal
         v-model="showModal"

@@ -634,3 +634,14 @@ pub enum QrPageResponse {
     #[oai(status = 500, content_type = "application/json")]
     Error(Json<String>),
 }
+
+#[derive(Object, Debug, Clone, Serialize, Deserialize)]
+pub struct ActiveConnectionDto {
+    pub user_id: uuid::Uuid,
+    pub username: String,
+    pub server_id: uuid::Uuid,
+    pub server_name: String,
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
+    pub connection_count: i32,
+}

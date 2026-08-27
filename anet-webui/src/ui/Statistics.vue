@@ -1,12 +1,11 @@
 <script setup lang="ts">
-// Экран наблюдаемости получает независимые срезы по нодам, пользователям
-// и почасовую историю, которую control plane собирает из cumulative counters.
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
-import { GetNodeTrafficStats, GetTrafficHistory, GetUserTrafficStats } from '@/api/statistics'
-import type { NodeTrafficStat, TrafficHistoryPoint, UserTrafficStat } from '@/models/statistics'
+import { GetNodeTrafficStats, GetTrafficHistory, GetUserTrafficStats, GetActiveConnections } from '@/api/statistics'
+import type { NodeTrafficStat, TrafficHistoryPoint, UserTrafficStat, ActiveConnection } from '@/models/statistics'
 
 const nodes = ref<NodeTrafficStat[]>([])
 const users = ref<UserTrafficStat[]>([])
+const activeConnections = ref<ActiveConnection[]>([])
 const history = ref<TrafficHistoryPoint[]>([])
 const activeTab = ref('nodes')
 const loading = ref(false)
@@ -32,13 +31,15 @@ const formatBytes = (bytes: number) => {
 const load = async () => {
   loading.value = true
   try {
-    const [nodeStats, userStats, trafficHistory] = await Promise.all([
+    const [nodeStats, userStats, connStats, trafficHistory] = await Promise.all([
       GetNodeTrafficStats(),
       GetUserTrafficStats(),
+      GetActiveConnections(),
       GetTrafficHistory(24),
     ])
     nodes.value = nodeStats.sort((a, b) => b.rx_bytes + b.tx_bytes - a.rx_bytes - a.tx_bytes)
     users.value = userStats
+    activeConnections.value = connStats
     history.value = trafficHistory
   } finally {
     loading.value = false
@@ -56,7 +57,7 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <main class="statistics-page">
+  <v-main class="statistics-page">
     <div class="d-flex align-center justify-space-between page-title">
       <div>
         <h2>Traffic</h2>
@@ -117,6 +118,7 @@ onBeforeUnmount(() => {
       <v-tabs v-model="activeTab" color="primary">
         <v-tab value="nodes">По узлам</v-tab>
         <v-tab value="users">По пользователям</v-tab>
+        <v-tab value="connections">Активные подключения</v-tab>
       </v-tabs>
 
       <v-tabs-window v-model="activeTab">
@@ -124,35 +126,65 @@ onBeforeUnmount(() => {
           <v-table>
             <thead><tr><th>Узел</th><th>RX</th><th>TX</th><th>Всего</th></tr></thead>
             <tbody>
-              <tr v-for="node in nodes" :key="node.node_id">
-                <td>{{ node.name }}</td>
-                <td class="metric">{{ formatBytes(node.rx_bytes) }}</td>
-                <td class="metric">{{ formatBytes(node.tx_bytes) }}</td>
-                <td class="metric total">{{ formatBytes(node.rx_bytes + node.tx_bytes) }}</td>
-              </tr>
+            <tr v-for="node in nodes" :key="node.node_id">
+              <td>{{ node.name }}</td>
+              <td class="metric">{{ formatBytes(node.rx_bytes) }}</td>
+              <td class="metric">{{ formatBytes(node.tx_bytes) }}</td>
+              <td class="metric total">{{ formatBytes(node.rx_bytes + node.tx_bytes) }}</td>
+            </tr>
             </tbody>
           </v-table>
           <v-empty-state v-if="nodes.length === 0" text="Нет данных по узлам" />
         </v-tabs-window-item>
 
         <v-tabs-window-item value="users">
+          <div class="px-4 pt-3 text-caption text-medium-emphasis">
+            Показаны все пользователи с зафиксированной сетевой активностью (всего: {{ users.length }})
+          </div>
           <v-table>
-            <thead><tr><th>Пользователь</th><th>Fingerprint</th><th>RX</th><th>TX</th><th>Всего</th></tr></thead>
+            <thead><tr><th>Пользователь</th><th>RX</th><th>TX</th><th>Всего</th></tr></thead>
             <tbody>
-              <tr v-for="user in users" :key="user.fingerprint">
-                <td>{{ user.uid || 'Локальный клиент' }}</td>
-                <td class="fingerprint">{{ user.fingerprint }}</td>
-                <td class="metric">{{ formatBytes(user.rx_bytes) }}</td>
-                <td class="metric">{{ formatBytes(user.tx_bytes) }}</td>
-                <td class="metric total">{{ formatBytes(user.rx_bytes + user.tx_bytes) }}</td>
-              </tr>
+            <tr v-for="user in users" :key="user.fingerprint">
+              <td>{{ user.uid || 'Локальный клиент' }}</td>
+              <td class="metric">{{ formatBytes(user.rx_bytes) }}</td>
+              <td class="metric">{{ formatBytes(user.tx_bytes) }}</td>
+              <td class="metric total">{{ formatBytes(user.rx_bytes + user.tx_bytes) }}</td>
+            </tr>
             </tbody>
           </v-table>
           <v-empty-state v-if="users.length === 0" text="Нет данных по пользователям" />
         </v-tabs-window-item>
+
+        <!-- Новая вкладка детальных активных сессий -->
+        <v-tabs-window-item value="connections">
+          <div class="px-4 pt-3 text-caption text-medium-emphasis">
+            Список установленных сессий (всего: {{ activeConnections.length }})
+          </div>
+          <v-table>
+            <thead>
+            <tr>
+              <th>Пользователь</th>
+              <th>Сервер</th>
+              <th>RX (Сессия)</th>
+              <th>TX (Сессия)</th>
+              <th>Количество сессий</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr v-for="conn in activeConnections" :key="`${conn.user_id}-${conn.server_id}`">
+              <td>{{ conn.username }}</td>
+              <td>{{ conn.server_name }}</td>
+              <td class="metric">{{ formatBytes(conn.rx_bytes) }}</td>
+              <td class="metric">{{ formatBytes(conn.tx_bytes) }}</td>
+              <td class="metric total">{{ conn.connection_count }}</td>
+            </tr>
+            </tbody>
+          </v-table>
+          <v-empty-state v-if="activeConnections.length === 0" text="Нет активных подключений" />
+        </v-tabs-window-item>
       </v-tabs-window>
     </v-card>
-  </main>
+  </v-main>
 </template>
 
 <style scoped>
@@ -172,7 +204,6 @@ onBeforeUnmount(() => {
 .legend { font-size: 12px; font-weight: 700; }
 .legend.rx { color: #2bb894; }
 .legend.tx { color: #d9a441; }
-.metric, .fingerprint { font-family: 'Fira Code', monospace; }
-.fingerprint { color: #9aa5a0; font-size: 12px; }
+.metric { font-family: 'Fira Code', monospace; }
 .total { font-weight: 700; }
 </style>

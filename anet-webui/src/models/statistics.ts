@@ -19,3 +19,13 @@ export type TrafficHistoryPoint = {
   rx_bytes: number
   tx_bytes: number
 }
+
+export type ActiveConnection = {
+  user_id: string
+  username: string
+  server_id: string
+  server_name: string
+  rx_bytes: number
+  tx_bytes: number
+  connection_count: number
+}

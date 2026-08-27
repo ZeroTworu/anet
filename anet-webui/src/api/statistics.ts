@@ -1,5 +1,5 @@
 import { api } from './client'
-import type { NodeTrafficStat, TrafficHistoryPoint, UserTrafficStat } from '@/models/statistics'
+import type { NodeTrafficStat, TrafficHistoryPoint, UserTrafficStat, ActiveConnection } from '@/models/statistics'
 
 // Эти данные строятся из cumulative отчётов нод и не требуют входящего API.
 
@@ -9,3 +9,5 @@ export const GetUserTrafficStats = () => api<UserTrafficStat[]>('/statistics/use
 
 export const GetTrafficHistory = (hours = 24) =>
   api<TrafficHistoryPoint[]>(`/statistics/traffic/history?hours=${hours}`)
+
+export const GetActiveConnections = () => api<ActiveConnection[]>('/statistics/active-connections')
