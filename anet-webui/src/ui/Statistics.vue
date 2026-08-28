@@ -5,6 +5,9 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { GetNodeTrafficStats, GetTrafficHistory, GetUserTrafficStats, GetActiveConnections } from '@/api/statistics'
 import type { NodeTrafficStat, TrafficHistoryPoint, UserTrafficStat, ActiveConnection } from '@/models/statistics'
 
+// Инициализируем таймер пустым значением для предотвращения ReferenceError в строгом режиме
+let refreshTimer: any = null
+
 const nodes = ref<NodeTrafficStat[]>([])
 const users = ref<UserTrafficStat[]>([])
 const activeConnections = ref<ActiveConnection[]>([])
@@ -12,14 +15,27 @@ const history = ref<TrafficHistoryPoint[]>([])
 const activeTab = ref('nodes')
 const loading = ref(false)
 const searchQuery = ref('')
-let refreshTimer: number | undefined
-
-// Выбранный временной диапазон (в часах): 6, 12, 24 или 72 (3 дня)
-const selectedRange = ref(24)
 
 // Контейнер графика и состояние наведения
 const containerRef = ref<HTMLElement | null>(null)
 const hoveredIdx = ref<number | null>(null)
+
+// Выбранный временной диапазон (в часах): 6, 12, 24 или 72 (3 дня)
+const selectedRange = ref(24)
+
+// Активный фильтр трафика (что выведено на графике)
+const selectedFilter = ref<{
+  type: 'node' | 'user' | 'connection' | null
+  id: string | null
+  serverId?: string
+  userId?: string
+  fingerprint?: string
+  name: string | null
+}>({
+  type: null,
+  id: null,
+  name: null
+})
 
 const totalRx = computed(() => nodes.value.reduce((sum, item) => sum + item.rx_bytes, 0))
 const totalTx = computed(() => nodes.value.reduce((sum, item) => sum + item.tx_bytes, 0))
@@ -111,7 +127,7 @@ const hoveredData = computed(() => {
   if (hoveredIdx.value === null) return null
 
   const item = history.value[hoveredIdx.value]
-  if (!item) return null // Сужение типа (Type Guard) — гарантирует наличие объекта
+  if (!item) return null // Сужение типа (Type Guard) — убирает ошибку TS18048
 
   const date = new Date(item.bucket_start)
 
@@ -145,9 +161,130 @@ const formatBytes = (bytes: number) => {
   return `${(bytes / 1024 ** unit).toFixed(unit === 0 ? 0 : 2)} ${units[unit]}`
 }
 
+// Подгрузка исключительно истории трафика (чтобы не перезагружать таблицы)
+const loadHistoryOnly = async () => {
+  try {
+    history.value = await GetTrafficHistory(
+        selectedRange.value,
+        selectedFilter.value.serverId,
+        selectedFilter.value.userId,
+        selectedFilter.value.fingerprint
+    )
+  } catch (e) {
+    console.error('Failed to load traffic history:', e)
+  }
+}
+
+const load = async () => {
+  loading.value = true
+  try {
+    const [nodeStats, userStats, connStats] = await Promise.all([
+      GetNodeTrafficStats(),
+      GetUserTrafficStats(),
+      GetActiveConnections(),
+    ])
+    nodes.value = nodeStats.sort((a, b) => b.rx_bytes + b.tx_bytes - a.rx_bytes - a.tx_bytes)
+    users.value = userStats
+    activeConnections.value = connStats
+
+    await loadHistoryOnly()
+  } finally {
+    loading.value = false
+  }
+}
+
+// Сброс активного фильтра в исходное состояние (Общий трафик)
+const resetFilter = () => {
+  selectedFilter.value = { type: null, id: null, name: null }
+}
+
+// Логика выбора элементов из таблиц
+const selectNode = (item: NodeTrafficStat) => {
+  if (selectedFilter.value.type === 'node' && selectedFilter.value.id === item.node_id) {
+    resetFilter()
+  } else {
+    selectedFilter.value = {
+      type: 'node',
+      id: item.node_id,
+      serverId: item.node_id,
+      name: item.name
+    }
+  }
+}
+
+const selectUser = (item: UserTrafficStat) => {
+  const id = item.user_id || item.fingerprint
+  if (selectedFilter.value.type === 'user' && selectedFilter.value.id === id) {
+    resetFilter()
+  } else {
+    selectedFilter.value = {
+      type: 'user',
+      id,
+      userId: item.user_id || undefined,
+      fingerprint: !item.user_id ? item.fingerprint : undefined,
+      name: item.uid || 'Локальный клиент'
+    }
+  }
+}
+
+const selectConnection = (item: ActiveConnection) => {
+  const id = `${item.user_id}-${item.server_id}`
+  if (selectedFilter.value.type === 'connection' && selectedFilter.value.id === id) {
+    resetFilter()
+  } else {
+    selectedFilter.value = {
+      type: 'connection',
+      id,
+      serverId: item.server_id,
+      userId: item.user_id,
+      name: `${item.username} на ${item.server_name}`
+    }
+  }
+}
+
+// Хелперы кликов по строкам таблиц для устранения ошибки компилятора Vue "Cannot find name row"
+const onNodeRowClick = (_event: any, row: { item: NodeTrafficStat }) => {
+  selectNode(row.item)
+}
+
+const onUserRowClick = (_event: any, row: { item: UserTrafficStat }) => {
+  selectUser(row.item)
+}
+
+const onConnectionRowClick = (_event: any, row: { item: ActiveConnection }) => {
+  selectConnection(row.item)
+}
+
+// Определение CSS-класса для подсветки выбранной строки таблицы
+const getRowProps = (data: { item: any }) => {
+  const item = data.item
+  const isSelected =
+      (selectedFilter.value.type === 'node' && selectedFilter.value.id === item.node_id) ||
+      (selectedFilter.value.type === 'user' && selectedFilter.value.id === (item.user_id || item.fingerprint)) ||
+      (selectedFilter.value.type === 'connection' && selectedFilter.value.id === `${item.user_id}-${item.server_id}`);
+
+  return isSelected ? { class: 'selected-row' } : {}
+}
+
+// Наблюдаем за изменением зума или фильтра для обновления только графика
+watch([selectedRange, selectedFilter], () => {
+  loadHistoryOnly()
+})
+
+onMounted(() => {
+  load()
+  refreshTimer = window.setInterval(load, 15_000)
+})
+
+onBeforeUnmount(() => {
+  if (refreshTimer !== null) {
+    window.clearInterval(refreshTimer)
+  }
+})
+
 // Конфигурация колонок и вычисляемые данные для таблицы узлов
 const nodeHeaders = [
-  { title: 'Узел', key: 'name', align: 'start' as const },
+  { title: 'Узел', key: 'name', sortable: true },
   { title: 'RX', key: 'rx_bytes', align: 'end' as const },
   { title: 'TX', key: 'tx_bytes', align: 'end' as const },
   { title: 'Всего', key: 'total_bytes', align: 'end' as const },
@@ -161,7 +298,7 @@ const mappedNodes = computed(() => {
 
 // Конфигурация колонок и вычисляемые данные для таблицы пользователей
 const userHeaders = [
-  { title: 'Пользователь', key: 'username_display', align: 'start' as const },
+  { title: 'Пользователь', key: 'username_display', sortable: true },
   { title: 'RX', key: 'rx_bytes', align: 'end' as const },
   { title: 'TX', key: 'tx_bytes', align: 'end' as const },
   { title: 'Всего', key: 'total_bytes', align: 'end' as const },
@@ -176,44 +313,12 @@ const mappedUsers = computed(() => {
 
 // Конфигурация колонок для таблицы активных подключений
 const connectionHeaders = [
-  { title: 'Пользователь', key: 'username', align: 'start' as const },
-  { title: 'Сервер', key: 'server_name', align: 'start' as const },
+  { title: 'Пользователь', key: 'username', sortable: true },
+  { title: 'Сервер', key: 'server_name', sortable: true },
   { title: 'RX (Сессия)', key: 'rx_bytes', align: 'end' as const },
   { title: 'TX (Сессия)', key: 'tx_bytes', align: 'end' as const },
   { title: 'Количество сессий', key: 'connection_count', align: 'end' as const },
 ]
-
-const load = async () => {
-  loading.value = true
-  try {
-    const [nodeStats, userStats, connStats, trafficHistory] = await Promise.all([
-      GetNodeTrafficStats(),
-      GetUserTrafficStats(),
-      GetActiveConnections(),
-      GetTrafficHistory(selectedRange.value), // Запрос истории с выбранным диапазоном
-    ])
-    nodes.value = nodeStats.sort((a, b) => b.rx_bytes + b.tx_bytes - a.rx_bytes - a.tx_bytes)
-    users.value = userStats
-    activeConnections.value = connStats
-    history.value = trafficHistory
-  } finally {
-    loading.value = false
-  }
-}
-
-// Наблюдатель за изменением выбранного диапазона (зума) для перезагрузки графиков
-watch(selectedRange, () => {
-  load()
-})
-
-onMounted(() => {
-  load()
-  refreshTimer = window.setInterval(load, 15_000)
-})
-
-onBeforeUnmount(() => {
-  if (refreshTimer !== undefined) window.clearInterval(refreshTimer)
-})
 </script>
 
 <template>
@@ -251,9 +356,21 @@ onBeforeUnmount(() => {
       <template #title>
         <div class="d-flex align-center justify-space-between flex-wrap ga-4">
           <div class="d-flex align-center ga-4">
-            <span>График трафика</span>
+            <!-- Динамическое название графика с выводом активного фильтра и кнопкой сброса -->
+            <span>{{ selectedFilter.type ? `Трафик: ${selectedFilter.name}` : 'Общий трафик' }}</span>
             <span class="legend rx">RX</span>
             <span class="legend tx">TX</span>
+            <v-chip
+                v-if="selectedFilter.type"
+                size="small"
+                color="error"
+                variant="tonal"
+                closable
+                @click:close="resetFilter"
+                class="ml-2"
+            >
+              Сбросить фильтр
+            </v-chip>
           </div>
 
           <!-- Переключатель масштаба временной шкалы (Зум) -->
@@ -288,8 +405,8 @@ onBeforeUnmount(() => {
                 @mousemove="onMouseMove"
                 @mouseleave="hoveredIdx = null"
             >
-              <v-sheet color="transparent" style="height: 180px;">
-                <!-- Основной график RX (smooth = 0 для острых углов) -->
+              <v-sheet v-if="history.length > 0" color="transparent" style="height: 180px;">
+                <!-- Основной график RX -->
                 <v-sparkline
                     :model-value="rxValues"
                     :min="0"
@@ -380,6 +497,9 @@ onBeforeUnmount(() => {
                   </v-card>
                 </template>
               </v-sheet>
+              <v-sheet v-else color="transparent" class="d-flex align-center justify-center" style="height: 180px;">
+                <span class="text-caption text-medium-emphasis">Загрузка данных графика...</span>
+              </v-sheet>
 
               <!-- Нижняя шкала X (Адаптивные временные метки с учетом TZ) -->
               <div class="d-flex justify-space-between px-2 pt-2 text-caption text-medium-emphasis font-mono">
@@ -420,12 +540,14 @@ onBeforeUnmount(() => {
               :items="mappedNodes"
               :search="searchQuery"
               :loading="loading"
+              :row-props="getRowProps"
               :items-per-page="10"
               :items-per-page-options="[10, 20, 50]"
               items-per-page-text="Строк на странице"
               loading-text="Загрузка статистики узлов…"
               no-data-text="Нет данных"
               hover
+              @click:row="onNodeRowClick"
           >
             <template #item.rx_bytes="{ value }">
               <span class="metric">{{ formatBytes(value) }}</span>
@@ -445,12 +567,14 @@ onBeforeUnmount(() => {
               :items="mappedUsers"
               :search="searchQuery"
               :loading="loading"
+              :row-props="getRowProps"
               :items-per-page="10"
               :items-per-page-options="[10, 20, 50]"
               items-per-page-text="Строк на странице"
               loading-text="Загрузка статистики пользователей…"
               no-data-text="Нет данных"
               hover
+              @click:row="onUserRowClick"
           >
             <template #item.rx_bytes="{ value }">
               <span class="metric">{{ formatBytes(value) }}</span>
@@ -470,12 +594,14 @@ onBeforeUnmount(() => {
               :items="activeConnections"
               :search="searchQuery"
               :loading="loading"
+              :row-props="getRowProps"
               :items-per-page="10"
               :items-per-page-options="[10, 20, 50]"
               items-per-page-text="Строк на странице"
               loading-text="Загрузка списка активных сессий…"
               no-data-text="Нет активных подключений"
               hover
+              @click:row="onConnectionRowClick"
           >
             <template #item.rx_bytes="{ value }">
               <span class="metric">{{ formatBytes(value) }}</span>
@@ -570,5 +696,10 @@ onBeforeUnmount(() => {
   height: 8px;
   border-radius: 50%;
   background-color: #d9a441;
+}
+
+/* Стилизация выбранных строк в таблицах */
+:deep(.selected-row) {
+  background-color: rgba(43, 184, 148, 0.15) !important;
 }
 </style>

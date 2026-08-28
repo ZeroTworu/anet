@@ -1399,24 +1399,50 @@ impl VpnApi {
         GetUserTrafficStatsResponse::Ok(Json(stats))
     }
 
+    /// Получить историю трафика за указанный период с опциональной фильтрацией
     #[oai(path = "/statistics/traffic/history", method = "get")]
     async fn get_traffic_history(
         &self,
         auth: AdminToken,
         hours: Query<Option<u32>>,
+        server_id: Query<Option<uuid::Uuid>>,
+        user_id: Query<Option<uuid::Uuid>>,
+        fingerprint: Query<Option<String>>,
     ) -> GetTrafficHistoryResponse {
         if let Err(err) = self.validate_admin_session(&auth.0.token).await {
             return GetTrafficHistoryResponse::Unauthorized(Json(err));
         }
         let hours = hours.0.unwrap_or(24).clamp(1, 24 * 90);
         let now = chrono::Utc::now().naive_utc();
+
+        let step_minutes = 15; // 15-минутный шаг детализации
+        let total_steps = (hours * 60) / step_minutes;
+
+        let current_minute = (now.minute() / step_minutes) * step_minutes;
         let current_bucket = now
             .date()
-            .and_hms_opt(now.hour(), 0, 0)
+            .and_hms_opt(now.hour(), current_minute, 0)
             .expect("valid hour");
-        let first_bucket = current_bucket - chrono::Duration::hours((hours - 1) as i64);
-        let rows = match traffic_hourly::Entity::find()
-            .filter(traffic_hourly::Column::BucketStart.gte(first_bucket))
+
+        let first_bucket = current_bucket - chrono::Duration::minutes((total_steps - 1) as i64 * step_minutes as i64);
+
+        // Строим динамический запрос к БД с учетом фильтров
+        let mut query = traffic_hourly::Entity::find()
+            .filter(traffic_hourly::Column::BucketStart.gte(first_bucket));
+
+        if let Some(srv_id) = server_id.0 {
+            query = query.filter(traffic_hourly::Column::ServerId.eq(srv_id));
+        }
+        if let Some(usr_id) = user_id.0 {
+            query = query.filter(traffic_hourly::Column::UserId.eq(usr_id));
+        }
+        if let Some(ref fp) = fingerprint.0 {
+            if !fp.trim().is_empty() {
+                query = query.filter(traffic_hourly::Column::Fingerprint.eq(fp));
+            }
+        }
+
+        let rows = match query
             .order_by_asc(traffic_hourly::Column::BucketStart)
             .all(&self.db)
             .await
@@ -1424,15 +1450,17 @@ impl VpnApi {
             Ok(rows) => rows,
             Err(e) => return GetTrafficHistoryResponse::Error(Json(e.to_string())),
         };
+
         let mut aggregate: HashMap<NaiveDateTime, (u64, u64)> = HashMap::new();
         for row in rows {
             let entry = aggregate.entry(row.bucket_start).or_default();
             entry.0 = entry.0.saturating_add(row.rx_bytes.max(0) as u64);
             entry.1 = entry.1.saturating_add(row.tx_bytes.max(0) as u64);
         }
-        let points = (0..hours)
+
+        let points = (0..total_steps)
             .map(|offset| {
-                let bucket = first_bucket + chrono::Duration::hours(offset as i64);
+                let bucket = first_bucket + chrono::Duration::minutes(offset as i64 * step_minutes as i64);
                 let (rx_bytes, tx_bytes) = aggregate.get(&bucket).copied().unwrap_or_default();
                 TrafficHistoryPointDto {
                     bucket_start: bucket.and_utc().to_rfc3339(),
@@ -1441,6 +1469,7 @@ impl VpnApi {
                 }
             })
             .collect();
+
         GetTrafficHistoryResponse::Ok(Json(points))
     }
 
