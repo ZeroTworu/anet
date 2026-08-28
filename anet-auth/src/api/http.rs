@@ -2376,10 +2376,51 @@ impl VpnApi {
                 .as_deref()
                 .map(|user| format!("ssh_user = \"{}\"\n", user))
                 .unwrap_or_default();
-            servers_toml.push_str(&format!(
-                "[[servers]]\nname = \"{}\"\ndsn = \"{}\"\n{}timeout_secs = 8\nserver_pub_key = \"{}\"\n\n",
-                server.name, server.address, ssh_user, server.public_key
-            ));
+
+            // Вспомогательный хелпер для формирования и записи блока [[servers]]
+            let mut write_server_block = |protocol: &str, port_or_url: &str| {
+                let dsn = if port_or_url.contains("://") {
+                    port_or_url.to_string()
+                } else {
+                    format!("{}://{}:{}", protocol, server.address, port_or_url)
+                };
+
+                let display_name = format!("{} [{}]", server.name.trim(), protocol.to_uppercase());
+
+                servers_toml.push_str(&format!(
+                    "[[servers]]\nname = \"{}\"\ndsn = \"{}\"\n{}timeout_secs = 8\nserver_pub_key = \"{}\"\n\n",
+                    display_name, dsn, ssh_user, server.public_key
+                ));
+            };
+
+            // 1. Попытка: QUIC (UDP)
+            if let Some(quic) = server.quic_port {
+                if quic > 0 {
+                    write_server_block("quic", &quic.to_string());
+                }
+            }
+
+            // 2. Попытка: WebSocket (TCP)
+            if let Some(ref ws) = server.websocket_url {
+                if !ws.trim().is_empty() {
+                    let proto = if ws.starts_with("ws://") { "ws" } else { "wss" };
+                    write_server_block(proto, ws);
+                }
+            }
+
+            // 3. Попытка: SSH (TCP)
+            if let Some(ssh) = server.ssh_port {
+                if ssh > 0 {
+                    write_server_block("ssh", &ssh.to_string());
+                }
+            }
+
+            // 4. Попытка: VNC (TCP)
+            if let Some(vnc) = server.vnc_port {
+                if vnc > 0 {
+                    write_server_block("vnc", &vnc.to_string());
+                }
+            }
         }
 
         // 7. Читаем базовый шаблон client_template.toml с диска сервера
@@ -2482,7 +2523,6 @@ impl VpnApi {
     }
 
     /// Получить подробный список активных подключений в реальном времени
-    /// Получить подробный список активных подключений в реальном времени
     #[oai(path = "/statistics/active-connections", method = "get")]
     async fn get_active_connections(
         &self,
@@ -2497,29 +2537,63 @@ impl VpnApi {
 
         let now = chrono::Utc::now().naive_utc();
         // Ноды отправляют отчеты каждые 15 секунд.
-        // Порог в 90 секунд надежно отсечет оффлайн-сессии и защитит от задержек сети.
         let threshold = now - chrono::Duration::seconds(90);
 
-        // Запрашиваем записи трафика, обновленные за последние 90 секунд
-        let active_totals = crate::entities::traffic_totals::Entity::find()
-            .filter(traffic_totals::Column::UpdatedAt.gte(threshold))
+        // 1. Получаем все свежие записи трафика
+        let mut active_totals = crate::entities::traffic_totals::Entity::find()
+            .filter(crate::entities::traffic_totals::Column::UpdatedAt.gte(threshold))
             .all(&self.db)
             .await
             .map_err(poem::error::InternalServerError)?;
 
+        // 2. Сортируем все записи по времени последнего обновления (по убыванию),
+        // чтобы самые свежие и активные подключения всегда шли первыми.
+        active_totals.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+
+        // 3. Группируем по пользователю и ограничиваем количество выводов
+        // лимитом из таблицы active_sessions (Sessions).
+        let mut user_connection_counts: std::collections::HashMap<uuid::Uuid, i32> = std::collections::HashMap::new();
         let mut dtos = Vec::new();
 
         for total in active_totals {
-            let username = if let Some(user_id) = total.user_id {
-                crate::entities::users::Entity::find_by_id(user_id)
+            let Some(user_id) = total.user_id else {
+                continue; // Игнорируем записи без привязанного пользователя
+            };
+
+            // Кешируем и получаем лимит сессий для этого пользователя из БД
+            let max_allowed_connections = if let Some(&count) = user_connection_counts.get(&user_id) {
+                count
+            } else {
+                let sessions_in_db = crate::entities::active_sessions::Entity::find()
+                    .filter(crate::entities::active_sessions::Column::UserId.eq(user_id))
                     .one(&self.db)
                     .await
                     .map_err(poem::error::InternalServerError)?
-                    .and_then(|u| u.uid)
-                    .unwrap_or_else(|| "Unknown".to_string())
-            } else {
-                "Unknown".to_string()
+                    .map(|s| s.sessions)
+                    .unwrap_or(1);
+
+                let limit = sessions_in_db.max(1);
+                user_connection_counts.insert(user_id, limit);
+                limit
             };
+
+            // Считаем, сколько подключений для этого пользователя мы УЖЕ добавили в результат
+            let already_added = dtos.iter()
+                .filter(|dto: &&ActiveConnectionDto| dto.user_id == user_id)
+                .count() as i32;
+
+            // Если количество выведенных записей достигло лимита активных сессий пользователя —
+            // игнорируем более старые (зависшие при реконнекте) записи в пользу свежих!
+            if already_added >= max_allowed_connections {
+                continue;
+            }
+
+            let username = crate::entities::users::Entity::find_by_id(user_id)
+                .one(&self.db)
+                .await
+                .map_err(poem::error::InternalServerError)?
+                .and_then(|u| u.uid)
+                .unwrap_or_else(|| "Unknown".to_string());
 
             let server_name = crate::entities::servers::Entity::find_by_id(total.server_id)
                 .one(&self.db)
@@ -2528,27 +2602,14 @@ impl VpnApi {
                 .map(|s| s.name)
                 .unwrap_or_else(|| "Unknown Server".to_string());
 
-            // Ищем количество сессий в таблице active_sessions для вывода счетчика
-            let connection_count = if let Some(user_id) = total.user_id {
-                crate::entities::active_sessions::Entity::find()
-                    .filter(crate::entities::active_sessions::Column::UserId.eq(user_id))
-                    .one(&self.db)
-                    .await
-                    .map_err(poem::error::InternalServerError)?
-                    .map(|s| s.sessions)
-                    .unwrap_or(1)
-            } else {
-                1
-            };
-
             dtos.push(ActiveConnectionDto {
-                user_id: total.user_id.unwrap_or_else(uuid::Uuid::nil),
+                user_id,
                 username,
                 server_id: total.server_id,
                 server_name,
                 rx_bytes: total.rx_bytes.max(0) as u64,
                 tx_bytes: total.tx_bytes.max(0) as u64,
-                connection_count: connection_count.max(1), // Гарантируем минимум 1 при рассинхронизации БД
+                connection_count: max_allowed_connections,
             });
         }
 
