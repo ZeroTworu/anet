@@ -647,9 +647,6 @@ const connectionHeaders = [
   </main>
 </template>
 
-<template>
-</template>
-
 <style scoped>
 .statistics-page { max-width: 1200px; margin: 0 auto; padding: 24px; }
 .page-title { margin-bottom: 16px; }
