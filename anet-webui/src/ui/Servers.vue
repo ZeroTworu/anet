@@ -7,6 +7,7 @@ import CreateServerModal from '@/components/CreateServerModal.vue'
 
 const data = ref<Server[]>([])
 const loading = ref(false)
+const searchQuery = ref('')
 
 // Управление модалками
 const showCreateModal = ref(false)
@@ -16,14 +17,14 @@ const selectedServer = ref<Server | null>(null)
 let refreshTimer: number | undefined
 
 const headers = [
-  { title: 'Название', key: 'name', sortable: false },
-  { title: 'DSN', key: 'dsn', sortable: false },
-  { title: 'Configured', key: 'is_active', sortable: false, align: 'center' as const },
-  { title: 'Actual state', key: 'runtime.status', sortable: false, align: 'center' as const },
-  { title: 'Control plane', key: 'has_control_credential', sortable: false, align: 'center' as const },
-  { title: 'Connections', key: 'runtime.active_connections', sortable: false, align: 'end' as const },
-  { title: 'Admission', key: 'runtime.accepting_connections', sortable: false, align: 'center' as const },
-  { title: 'Uptime', key: 'runtime.uptime_seconds', sortable: false, align: 'end' as const },
+  { title: 'Название', key: 'name', sortable: true },
+  { title: 'DSN', key: 'dsn', sortable: true },
+  { title: 'Configured', key: 'is_active', sortable: true, align: 'center' as const },
+  { title: 'Actual state', key: 'runtime.status', sortable: true, align: 'center' as const },
+  { title: 'Control plane', key: 'has_control_credential', sortable: true, align: 'center' as const },
+  { title: 'Connections', key: 'runtime.active_connections', sortable: true, align: 'end' as const },
+  { title: 'Admission', key: 'runtime.accepting_connections', sortable: true, align: 'center' as const },
+  { title: 'Uptime', key: 'runtime.uptime_seconds', sortable: true, align: 'end' as const },
 ]
 
 const formatUptime = (seconds?: number) => {
@@ -65,17 +66,34 @@ onBeforeUnmount(() => {
 
 <template>
   <v-container max-width="1400" class="servers-page">
-    <div class="d-flex justify-space-between align-center mb-5">
-      <h2 class="text-h6 font-weight-bold ma-0">VPN Nodes (Servers)</h2>
-      <v-btn color="primary" @click="showCreateModal = true"> Add Server </v-btn>
+    <div class="d-flex justify-space-between align-center flex-wrap ga-4 mb-5">
+      <div>
+        <h2 class="text-h6 font-weight-bold ma-0">VPN Nodes (Servers)</h2>
+        <span class="text-caption text-medium-emphasis">Управление физическими серверами и нодами доступа</span>
+      </div>
+      <div class="d-flex align-center ga-3">
+        <v-text-field
+            v-model="searchQuery"
+            prepend-inner-icon="mdi-magnify"
+            label="Поиск по названию или DSN..."
+            variant="outlined"
+            density="compact"
+            hide-details
+            single-line
+            style="width: 280px"
+        />
+        <v-btn color="primary" @click="showCreateModal = true"> Add Server </v-btn>
+      </div>
     </div>
 
     <v-data-table
         :headers="headers"
         :items="data"
+        :search="searchQuery"
         :loading="loading"
-        :items-per-page="-1"
-        hide-default-footer
+        :items-per-page="10"
+        :items-per-page-options="[10, 20, 50]"
+        items-per-page-text="Строк на странице"
         loading-text="Загрузка нод…"
         no-data-text="Серверов пока нет — добавьте первую ноду!"
         density="comfortable"
@@ -146,12 +164,9 @@ onBeforeUnmount(() => {
 
 <style scoped>
 .servers-page { padding: 24px; }
-
 .servers-table { border-radius: 10px; }
-
 .servers-table :deep(tbody tr) { cursor: pointer; }
 .servers-table :deep(tbody tr:hover) { background: rgba(43, 184, 148, .07) !important; }
-
 .name-col { font-weight: 600; font-size: 15px; }
 .addr-col { font-family: 'Fira Code', 'Courier New', Courier, monospace; color: #9aa5a0; }
 .metric-col { font-family: 'Fira Code', 'Courier New', Courier, monospace; white-space: nowrap; }

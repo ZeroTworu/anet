@@ -1,7 +1,7 @@
 <script setup lang="ts">
 // Экран наблюдаемости получает независимые срезы по нодам, пользователям
 // и почасовую историю, которую control plane собирает из cumulative counters.
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { GetNodeTrafficStats, GetTrafficHistory, GetUserTrafficStats, GetActiveConnections } from '@/api/statistics'
 import type { NodeTrafficStat, TrafficHistoryPoint, UserTrafficStat, ActiveConnection } from '@/models/statistics'
 
@@ -13,6 +13,13 @@ const activeTab = ref('nodes')
 const loading = ref(false)
 const searchQuery = ref('')
 let refreshTimer: number | undefined
+
+// Выбранный временной диапазон (в часах): 6, 12, 24 или 72 (3 дня)
+const selectedRange = ref(24)
+
+// Контейнер графика и состояние наведения
+const containerRef = ref<HTMLElement | null>(null)
+const hoveredIdx = ref<number | null>(null)
 
 const totalRx = computed(() => nodes.value.reduce((sum, item) => sum + item.rx_bytes, 0))
 const totalTx = computed(() => nodes.value.reduce((sum, item) => sum + item.tx_bytes, 0))
@@ -28,16 +35,105 @@ const chartMax = computed(() => {
   return Math.max(maxRx, maxTx, 1) // Исключаем деление на ноль
 })
 
-// Форматируем метки по локальной таймзоне пользователя
-const chartLabelsFormatted = computed(() => {
-  return history.value.map((item, index) => {
-    // Выводим только каждую 4-ю метку и последнюю точку для избежания наложения текста
-    if (index % 4 === 0 || index === history.value.length - 1) {
-      const date = new Date(item.bucket_start)
-      return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+// Равномерно распределяем 5 временных меток по горизонтали во избежание наложений
+const chartLabelsFiltered = computed(() => {
+  if (history.value.length === 0) return []
+
+  const totalPoints = history.value.length
+  const indices = [
+    0,
+    Math.floor(totalPoints * 0.25),
+    Math.floor(totalPoints * 0.5),
+    Math.floor(totalPoints * 0.75),
+    totalPoints - 1
+  ]
+
+  return indices.map(idx => {
+    const item = history.value[idx]
+    if (!item) return { time: '' }
+    const date = new Date(item.bucket_start)
+
+    // Если выбран масштаб более суток (например, 3 дня), добавляем дату
+    if (selectedRange.value > 24) {
+      return {
+        time: date.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ' ' +
+            date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+      }
     }
-    return ''
+
+    return {
+      time: date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+    }
   })
+})
+
+// Вычисление точной вертикальной координаты (%) с учетом внутреннего padding графика
+const getVerticalPercent = (val: number) => {
+  const height = 180
+  const padding = 8
+  const availableHeight = height - (padding * 2)
+  const yPixels = height - padding - (val / chartMax.value) * availableHeight
+  return (yPixels / height) * 100
+}
+
+// Вычисление точной горизонтальной координаты (%) с учетом внутреннего padding графика
+const getHorizontalPercent = (idx: number) => {
+  if (history.value.length <= 1) return 50
+  const width = 1000
+  const padding = 8
+  const availableWidth = width - (padding * 2)
+  const xPixels = padding + (idx / (history.value.length - 1)) * availableWidth
+  return (xPixels / width) * 100
+}
+
+// Вычисление индекса точки при движении мыши по контейнеру (нативный трекинг)
+const onMouseMove = (event: MouseEvent) => {
+  if (!containerRef.value || history.value.length === 0) return
+
+  const rect = containerRef.value.getBoundingClientRect()
+  const x = event.clientX - rect.left
+  const width = rect.width
+
+  // Учитываем внутренний отступ графика (8px при ширине виртуальной сетки 1000px)
+  const paddingPx = (8 / 1000) * width
+  const usableWidth = width - (paddingPx * 2)
+
+  // Рассчитываем положение внутри полезной ширины
+  const xInside = x - paddingPx
+  const relativeX = Math.max(0, Math.min(1, xInside / usableWidth))
+
+  // Находим ближайший шаг времени
+  hoveredIdx.value = Math.round(relativeX * (history.value.length - 1))
+}
+
+// Реактивные данные для отображения в тултипе при наведении
+const hoveredData = computed(() => {
+  if (hoveredIdx.value === null || !history.value[hoveredIdx.value]) return null
+
+  const item = history.value[hoveredIdx.value]
+  const date = new Date(item.bucket_start)
+
+  const dateStr = date.toLocaleDateString('ru-RU', {
+    day: 'numeric',
+    month: 'long',
+    year: 'numeric',
+    weekday: 'short'
+  })
+  const timeStr = date.toLocaleTimeString('ru-RU', {
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit'
+  })
+
+  return {
+    timeLabel: `${dateStr} • ${timeStr}`,
+    rx: item.rx_bytes,
+    tx: item.tx_bytes,
+    total: item.rx_bytes + item.tx_bytes,
+    xPercent: getHorizontalPercent(hoveredIdx.value),
+    rxYPercent: getVerticalPercent(item.rx_bytes),
+    txYPercent: getVerticalPercent(item.tx_bytes),
+  }
 })
 
 const formatBytes = (bytes: number) => {
@@ -92,7 +188,7 @@ const load = async () => {
       GetNodeTrafficStats(),
       GetUserTrafficStats(),
       GetActiveConnections(),
-      GetTrafficHistory(24),
+      GetTrafficHistory(selectedRange.value), // Запрос истории с выбранным диапазоном
     ])
     nodes.value = nodeStats.sort((a, b) => b.rx_bytes + b.tx_bytes - a.rx_bytes - a.tx_bytes)
     users.value = userStats
@@ -102,6 +198,11 @@ const load = async () => {
     loading.value = false
   }
 }
+
+// Наблюдатель за изменением выбранного диапазона (зума) для перезагрузки графиков
+watch(selectedRange, () => {
+  load()
+})
 
 onMounted(() => {
   load()
@@ -146,44 +247,146 @@ onBeforeUnmount(() => {
 
     <v-card class="history-card">
       <template #title>
-        <div class="d-flex align-center ga-4">
-          <span>Последние 24 часа</span>
-          <span class="legend rx">RX</span>
-          <span class="legend tx">TX</span>
+        <div class="d-flex align-center justify-space-between flex-wrap ga-4">
+          <div class="d-flex align-center ga-4">
+            <span>График трафика</span>
+            <span class="legend rx">RX</span>
+            <span class="legend tx">TX</span>
+          </div>
+
+          <!-- Переключатель масштаба временной шкалы (Зум) -->
+          <v-btn-toggle
+              v-model="selectedRange"
+              mandatory
+              color="primary"
+              density="compact"
+              variant="outlined"
+          >
+            <v-btn :value="6">6ч</v-btn>
+            <v-btn :value="12">12ч</v-btn>
+            <v-btn :value="24">24ч</v-btn>
+            <v-btn :value="72">3д</v-btn>
+          </v-btn-toggle>
         </div>
       </template>
       <v-card-text>
-        <div class="chart-wrap mt-2">
-          <!-- Обертка с абсолютным позиционированием для наложения графиков -->
-          <v-sheet color="transparent" class="position-relative" style="height: 180px;">
-            <!-- График RX с временной шкалой -->
-            <v-sparkline
-                :model-value="rxValues"
-                :labels="chartLabelsFormatted"
-                :min="0"
-                :max="chartMax"
-                color="primary"
-                line-width="2"
-                padding="16"
-                smooth="8"
-                stroke-linecap="round"
-                auto-draw
-                style="height: 100%; width: 100%;"
-            />
-            <!-- График TX без подписей для избежания наложения текста -->
-            <v-sparkline
-                :model-value="txValues"
-                :min="0"
-                :max="chartMax"
-                color="warning"
-                line-width="2"
-                padding="16"
-                smooth="8"
-                stroke-linecap="round"
-                auto-draw
-                style="position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none;"
-            />
-          </v-sheet>
+        <div class="chart-wrap mt-4">
+          <div class="d-flex">
+            <!-- Левая шкала Y (Единицы измерения трафика) -->
+            <div class="d-flex flex-column justify-space-between pr-3 text-caption text-medium-emphasis text-right font-mono" style="width: 85px; height: 180px; border-right: 1px solid rgba(255,255,255,0.08); padding-bottom: 8px;">
+              <span>{{ formatBytes(chartMax) }}</span>
+              <span>{{ formatBytes(chartMax / 2) }}</span>
+              <span>0 B</span>
+            </div>
+
+            <!-- Область графиков с нативным трекингом мыши -->
+            <div
+                ref="containerRef"
+                class="flex-grow-1 position-relative"
+                @mousemove="onMouseMove"
+                @mouseleave="hoveredIdx = null"
+            >
+              <v-sheet color="transparent" style="height: 180px;">
+                <!-- Основной график RX (smooth = 0 для острых углов) -->
+                <v-sparkline
+                    :model-value="rxValues"
+                    :min="0"
+                    :max="chartMax"
+                    color="primary"
+                    line-width="2"
+                    padding="8"
+                    :smooth="0"
+                    stroke-linecap="round"
+                    auto-draw
+                    style="height: 100%; width: 100%;"
+                />
+                <!-- Наложенный график TX -->
+                <v-sparkline
+                    :model-value="txValues"
+                    :min="0"
+                    :max="chartMax"
+                    color="warning"
+                    line-width="2"
+                    padding="8"
+                    :smooth="0"
+                    stroke-linecap="round"
+                    auto-draw
+                    style="position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none;"
+                />
+
+                <!-- Тултип и маркеры наведения на сетке координат -->
+                <template v-if="hoveredData">
+                  <!-- Вертикальная розовая линия-визир -->
+                  <div
+                      class="hover-line"
+                      :style="{ left: `${hoveredData.xPercent}%` }"
+                  ></div>
+
+                  <!-- Кружок-маркер для RX (зеленый) -->
+                  <div
+                      class="hover-marker rx-marker"
+                      :style="{
+                      left: `${hoveredData.xPercent}%`,
+                      top: `${hoveredData.rxYPercent}%`
+                    }"
+                  ></div>
+
+                  <!-- Кружок-маркер для TX (желтый) -->
+                  <div
+                      class="hover-marker tx-marker"
+                      :style="{
+                      left: `${hoveredData.xPercent}%`,
+                      top: `${hoveredData.txYPercent}%`
+                    }"
+                  ></div>
+
+                  <!-- Плавающая карточка тултипа (авто-смещение влево/вправо) -->
+                  <v-card
+                      class="hover-tooltip-card pa-3 text-caption"
+                      elevation="12"
+                      border
+                      :style="{
+                      left: hoveredData.xPercent > 50 ? 'auto' : `${hoveredData.xPercent + 2}%`,
+                      right: hoveredData.xPercent > 50 ? `${100 - hoveredData.xPercent + 2}%` : 'auto',
+                      top: '15px'
+                    }"
+                  >
+                    <div class="font-weight-bold mb-2">{{ hoveredData.timeLabel }}</div>
+
+                    <div class="d-flex align-center justify-space-between mb-1" style="min-width: 240px;">
+                      <div class="d-flex align-center ga-2">
+                        <span class="legend rx-dot" />
+                        <span>RX (Получено)</span>
+                      </div>
+                      <span class="font-mono">{{ formatBytes(hoveredData.rx) }}</span>
+                    </div>
+
+                    <div class="d-flex align-center justify-space-between mb-2">
+                      <div class="d-flex align-center ga-2">
+                        <span class="legend tx-dot" />
+                        <span>TX (Отправлено)</span>
+                      </div>
+                      <span class="font-mono">{{ formatBytes(hoveredData.tx) }}</span>
+                    </div>
+
+                    <v-divider class="my-1" />
+
+                    <div class="d-flex align-center justify-space-between font-weight-bold mt-1">
+                      <span>Сумма</span>
+                      <span class="font-mono">{{ formatBytes(hoveredData.total) }}</span>
+                    </div>
+                  </v-card>
+                </template>
+              </v-sheet>
+
+              <!-- Нижняя шкала X (Адаптивные временные метки с учетом TZ) -->
+              <div class="d-flex justify-space-between px-2 pt-2 text-caption text-medium-emphasis font-mono">
+                <span v-for="(label, idx) in chartLabelsFiltered" :key="idx">
+                  {{ label.time }}
+                </span>
+              </div>
+            </div>
+          </div>
         </div>
       </v-card-text>
     </v-card>
@@ -301,11 +504,69 @@ onBeforeUnmount(() => {
 .legend.rx { color: #2bb894; }
 .legend.tx { color: #d9a441; }
 .metric { font-family: 'Fira Code', monospace; }
+.font-mono { font-family: 'Fira Code', monospace; }
 .total { font-weight: 700; }
 
 /* Кастомные стили для масштабируемых шрифтов v-sparkline */
 :deep(.v-sparkline text) {
   fill: #9aa5a0;
   font-size: 11px;
+}
+
+/* Вертикальная розовая линия-визир при наведении */
+.hover-line {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background-color: rgba(229, 117, 111, 0.45);
+  pointer-events: none;
+  z-index: 2;
+}
+
+/* Круглые маркеры на линиях графиков */
+.hover-marker {
+  position: absolute;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  border: 2px solid #1e2221;
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+  z-index: 3;
+}
+.rx-marker {
+  background-color: #2bb894;
+  box-shadow: 0 0 8px rgba(43, 184, 148, 0.85);
+}
+.tx-marker {
+  background-color: #d9a441;
+  box-shadow: 0 0 8px rgba(217, 164, 65, 0.85);
+}
+
+/* Стилизация плавающей карточки тултипа */
+.hover-tooltip-card {
+  position: absolute;
+  background-color: rgba(30, 34, 33, 0.95) !important;
+  backdrop-filter: blur(4px);
+  z-index: 10;
+  pointer-events: none;
+  border-color: rgba(255, 255, 255, 0.08) !important;
+}
+
+/* Точки легенды внутри тултипа */
+.rx-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background-color: #2bb894;
+}
+.tx-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background-color: #d9a441;
 }
 </style>

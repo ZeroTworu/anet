@@ -1,48 +1,65 @@
 <template>
-  <v-container class="d-flex align-center justify-center">
-    <v-card width="100%" max-width="400" class="pa-6" elevation="8">
-      <v-card-title class="text-h5 text-center mb-6">
-        Вход в систему
-      </v-card-title>
+  <v-container fluid class="fill-height d-flex align-center justify-center" style="min-height: 100vh; background-color: #0c0e0d;">
+    <v-card width="100%" max-width="400" class="pa-8" rounded="xl" border elevation="12">
+      <!-- Брендированная шапка входа -->
+      <div class="text-center mb-8">
+        <v-avatar color="primary" size="56" class="mb-3 text-h5 font-weight-bold" style="color: #fff !important;">
+          A
+        </v-avatar>
+        <h1 class="text-h5 font-weight-bold text-primary" style="font-family: monospace; letter-spacing: 1.5px; text-transform: uppercase;">
+          ANet VPN
+        </h1>
+        <p class="text-caption text-medium-emphasis mt-1">
+          Control Plane Management Panel
+        </p>
+      </div>
 
-      <v-form @submit.prevent="handleLogin" v-model="isFormValid">
+      <v-form v-model="isFormValid" @submit.prevent="handleLogin">
+        <!-- Поле ввода логина -->
         <v-text-field
             v-model="username"
             label="Имя пользователя"
-            variant="outlined"
-            prepend-inner-icon="mdi-account"
+            prepend-inner-icon="mdi-account-outline"
             :rules="[required]"
+            clearable
             class="mb-4"
         />
 
+        <!-- Поле ввода пароля с переключателем видимости -->
         <v-text-field
             v-model="password"
             label="Пароль"
-            type="password"
-            variant="outlined"
-            prepend-inner-icon="mdi-lock"
+            :type="showPassword ? 'text' : 'password'"
+            prepend-inner-icon="mdi-lock-outline"
+            :append-inner-icon="showPassword ? 'mdi-eye-off-outline' : 'mdi-eye-outline'"
             :rules="[required]"
+            @click:append-inner="showPassword = !showPassword"
             class="mb-6"
         />
 
+        <!-- Оповещение об ошибке -->
         <v-alert
             v-if="errorMessage"
             type="error"
             variant="tonal"
-            class="mb-6"
+            density="comfortable"
             closable
+            class="mb-6"
             @click:close="errorMessage = ''"
         >
           {{ errorMessage }}
         </v-alert>
 
+        <!-- Кнопка входа -->
         <v-btn
             type="submit"
             color="primary"
             size="large"
             block
+            flat
             :loading="isLoading"
             :disabled="!isFormValid"
+            style="text-transform: none; font-weight: 600;"
         >
           Войти
         </v-btn>
@@ -64,6 +81,7 @@ const password = ref('')
 const errorMessage = ref('')
 const isLoading = ref(false)
 const isFormValid = ref(false)
+const showPassword = ref(false)
 
 const required = (value: string) => !!value || 'Это поле обязательно'
 
