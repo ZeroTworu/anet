@@ -34,8 +34,8 @@ pub struct NodeRuntimeDto {
     pub status: String,
     pub last_seen_at: String,
     pub version: String,
-    pub uptime_seconds: u64,
-    pub active_connections: u64,
+    pub uptime_seconds: i64,
+    pub active_connections: i64,
     pub accepting_connections: bool,
 }
 
@@ -161,8 +161,8 @@ pub enum RotateNodeCredentialResponse {
 pub struct NodeTrafficStatDto {
     pub node_id: uuid::Uuid,
     pub name: String,
-    pub rx_bytes: u64,
-    pub tx_bytes: u64,
+    pub rx_bytes: i64,
+    pub tx_bytes: i64,
 }
 
 #[derive(Object, Debug, Clone, Serialize, Deserialize)]
@@ -170,8 +170,8 @@ pub struct UserTrafficStatDto {
     pub user_id: Option<uuid::Uuid>,
     pub uid: Option<String>,
     pub fingerprint: String,
-    pub rx_bytes: u64,
-    pub tx_bytes: u64,
+    pub rx_bytes: i64,
+    pub tx_bytes: i64,
 }
 
 #[derive(ApiResponse)]
@@ -197,8 +197,8 @@ pub enum GetUserTrafficStatsResponse {
 #[derive(Object, Debug, Clone, Serialize, Deserialize)]
 pub struct TrafficHistoryPointDto {
     pub bucket_start: String,
-    pub rx_bytes: u64,
-    pub tx_bytes: u64,
+    pub rx_bytes: i64,
+    pub tx_bytes: i64,
 }
 
 #[derive(ApiResponse)]
@@ -318,14 +318,14 @@ pub struct AdminToken(pub Bearer);
 
 #[derive(Object, Debug, Serialize, Deserialize, Clone)]
 pub struct RateReqDto {
-    pub sessions: u32,
+    pub sessions: i32,
     pub date_end: String,
 }
 
 #[derive(Object, Debug, Serialize, Deserialize, Clone)]
 pub struct RateDto {
     pub id: uuid::Uuid,
-    pub sessions: u32,
+    pub sessions: i32,
     pub date_end: String,
 }
 
@@ -341,11 +341,12 @@ pub struct VpnUserDto {
     pub server_ids: Vec<uuid::Uuid>,
     pub pool_ids: Vec<uuid::Uuid>,
     pub route_map_id: Option<uuid::Uuid>,
+    pub group_id: Option<uuid::Uuid>,
 }
 
 #[derive(Object)]
 pub struct PaginatedUsers {
-    pub total: u64,
+    pub total: i64,
     pub items: Vec<VpnUserDto>,
 }
 
@@ -378,6 +379,7 @@ pub struct AddUserRequest {
     pub server_ids: Option<Vec<uuid::Uuid>>,
     pub pool_ids: Option<Vec<uuid::Uuid>>,
     pub route_map_id: Option<uuid::Uuid>,
+    pub group_id: Option<uuid::Uuid>,
 }
 
 #[derive(Object)]
@@ -409,12 +411,14 @@ pub struct UpdateUserRequest {
     pub pool_ids: Option<Vec<uuid::Uuid>>,
     pub route_map_id: Option<uuid::Uuid>,
     pub clear_route_map: Option<bool>,
+    pub group_id: Option<uuid::Uuid>,
+    pub clear_group: Option<bool>,
 }
 
 #[derive(Object, Debug, Clone, Serialize, Deserialize)]
 pub struct RouteRuleDto {
     pub id: Option<uuid::Uuid>,
-    pub position: u32,
+    pub position: i32,
     pub match_type: String,
     pub match_value: String,
     pub action: String,
@@ -427,7 +431,7 @@ pub struct RouteMapDto {
     pub description: String,
     pub default_action: String,
     pub is_active: bool,
-    pub revision: u64,
+    pub revision: i64,
     pub rules: Vec<RouteRuleDto>,
 }
 
@@ -479,7 +483,7 @@ pub enum DeleteRouteMapResponse {
 #[derive(Object, Debug, Clone, Serialize, Deserialize)]
 pub struct NodePoolMemberDto {
     pub server_id: uuid::Uuid,
-    pub weight: u32,
+    pub weight: i32,
 }
 
 #[derive(Object, Debug, Clone, Serialize, Deserialize)]
@@ -551,7 +555,7 @@ pub enum UpdateUserApiResult {
 
 #[derive(Object)]
 pub struct UpdateRateRequest {
-    pub sessions: Option<u32>,
+    pub sessions: Option<i32>,
     pub date_end: Option<String>,
 }
 
@@ -571,8 +575,10 @@ pub enum UpdateRateApiResult {
 
 #[derive(Object)]
 pub struct AddRateRequest {
-    pub sessions: Option<u32>,
+    pub sessions: Option<i32>,
     pub date_end: Option<String>,
+    pub traffic_limit: Option<i64>,
+    pub speed_limit: Option<i32>,
 }
 
 #[derive(ApiResponse)]
@@ -641,8 +647,67 @@ pub struct ActiveConnectionDto {
     pub username: String,
     pub server_id: uuid::Uuid,
     pub server_name: String,
-    pub rx_bytes: u64,
-    pub tx_bytes: u64,
+    pub rx_bytes: i64,
+    pub tx_bytes: i64,
     pub connection_count: i32,
     pub protocol: String,
+}
+
+#[derive(Object, Debug, Clone, Serialize, Deserialize)]
+pub struct GroupDto {
+    pub id: uuid::Uuid,
+    pub name: String,
+    pub traffic_limit: i64,
+    pub speed_limit: i32,
+    pub sessions_limit: i32,
+    pub duration_days: i32,
+    pub user_ids: Vec<uuid::Uuid>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Object, Debug, Clone, Serialize, Deserialize)]
+pub struct SaveGroupRequest {
+    pub name: String,
+    pub traffic_limit: i64,
+    pub speed_limit: i32,
+    pub sessions_limit: i32,
+    pub duration_days: i32,
+    pub user_ids: Option<Vec<uuid::Uuid>>,
+}
+
+#[derive(ApiResponse)]
+pub enum GetGroupsResponse {
+    #[oai(status = 200)]
+    Ok(Json<Vec<GroupDto>>),
+    #[oai(status = 401)]
+    Unauthorized(Json<String>),
+    #[oai(status = 500)]
+    Error(Json<String>),
+}
+
+#[derive(ApiResponse)]
+pub enum SaveGroupResponse {
+    #[oai(status = 200)]
+    Ok(Json<GroupDto>),
+    #[oai(status = 400)]
+    BadRequest(Json<String>),
+    #[oai(status = 401)]
+    Unauthorized(Json<String>),
+    #[oai(status = 404)]
+    NotFound(Json<String>),
+    #[oai(status = 500)]
+    Error(Json<String>),
+}
+
+#[derive(ApiResponse)]
+pub enum DeleteGroupResponse {
+    #[oai(status = 204)]
+    Deleted,
+    #[oai(status = 401)]
+    Unauthorized(Json<String>),
+    #[oai(status = 404)]
+    NotFound(Json<String>),
+    #[oai(status = 500)]
+    Error(Json<String>),
 }

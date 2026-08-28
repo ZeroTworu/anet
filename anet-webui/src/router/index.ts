@@ -9,6 +9,8 @@ const Pools = () => import('@/ui/Pools.vue')
 const RouteMaps = () => import('@/ui/RouteMaps.vue')
 const Overview = () => import('@/ui/Overview.vue')
 
+const Groups = () => import('@/ui/Groups.vue')
+
 const router = createRouter({
   history: createWebHistory(),
   routes: [
@@ -23,6 +25,7 @@ const router = createRouter({
     { path: '/statistics', component: Statistics, meta: { title: 'Traffic' } },
     { path: '/pools', component: Pools, meta: { title: 'Node Pools' } },
     { path: '/route-maps', component: RouteMaps, meta: { title: 'Route Maps' } },
+    { path: '/groups', component: Groups, meta: { title: 'User Groups' } },
   ],
 })
 

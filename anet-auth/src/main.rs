@@ -125,6 +125,7 @@ async fn handle_add_user(
         private_key: Set(Some(encrypted_private_key)),
         public_key: Set(Some(encrypted_public_key)),
         route_map_id: Set(None),
+        group_id: Set(None),
     };
 
     // 3. Сохраняем
@@ -139,6 +140,8 @@ async fn handle_add_user(
                     date_end: Set(date),
                     created_at: Set(chrono::Utc::now().naive_utc()),
                     updated_at: Set(chrono::Utc::now().naive_utc()),
+                    traffic_limit: Set(0),
+                    speed_limit: Set(0),
                 };
 
                 if let Err(e) = new_rate.insert(db).await {

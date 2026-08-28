@@ -19,6 +19,7 @@ pub mod m20260815_000018_add_dsn_to_servers;
 pub mod m20260820_000019_refactor_route_maps;
 pub mod m20260828_000020_remove_dsn_from_servers;
 pub mod m20260829_000021_add_protocol_to_traffic;
+pub mod m20260830_000022_add_groups_and_update_rates;
 
 use sea_orm_migration::prelude::*;
 
@@ -49,6 +50,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260820_000019_refactor_route_maps::Migration),
             Box::new(m20260828_000020_remove_dsn_from_servers::Migration),
             Box::new(m20260829_000021_add_protocol_to_traffic::Migration),
+            Box::new(m20260830_000022_add_groups_and_update_rates::Migration),
         ]
     }
 }

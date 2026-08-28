@@ -1,4 +1,4 @@
-import type { Rate, RateReqRequest } from './rate'
+import type { Rate } from './rate'
 
 export type UsersResponse = {
   items: User[]
@@ -16,6 +16,7 @@ export type User = {
   server_ids: string[]
   pool_ids: string[]
   route_map_id: string | null
+  group_id: string | null
 }
 
 export type UpdateUserRequest = {
@@ -26,6 +27,8 @@ export type UpdateUserRequest = {
   pool_ids: string[]
   route_map_id?: string
   clear_route_map?: boolean
+  group_id?: string
+  clear_group?: boolean
 }
 
 export type RegenerateUserRequest = {
@@ -38,8 +41,8 @@ export type RegenerateUserRequest = {
 
 export type CreateUserRequest = {
   uid: string
-  rate: RateReqRequest | null
   server_ids: string[]
   pool_ids: string[]
   route_map_id: string | null
+  group_id: string | null
 }

@@ -2,7 +2,6 @@
 import { ref } from 'vue'
 import { CreateUser } from '@/api/users'
 import type { CreateUserRequest, User } from '@/models/user'
-import { formatDate } from '@/utils'
 import { useAppMessage } from '@/composables/useAppMessage'
 import UserForm from '@/components/UserForm.vue'
 
@@ -15,14 +14,8 @@ const emit = defineEmits<{
 
 const message = useAppMessage()
 
-const rateEnabled = ref(false)
 const loading = ref(false)
 const formValid = ref(false)
-
-const rateForm = ref({
-  sessions: 1,
-  date_end: formatDate(new Date(), 'yyyy-MM-dd-HH:mm'),
-})
 
 // Черновик User: общие поля редактирует UserForm, справочники грузит он же
 const defaultDraft = (): User => ({
@@ -36,20 +29,12 @@ const defaultDraft = (): User => ({
   server_ids: [],
   pool_ids: [],
   route_map_id: null,
+  group_id: null,
 })
 const draft = ref<User>(defaultDraft())
 
-const rateIsValid = () =>
-    Number.isInteger(rateForm.value.sessions)
-    && rateForm.value.sessions >= 1
-    && !!rateForm.value.date_end
-
 const create = async () => {
   if (!formValid.value) return
-  if (rateEnabled.value && !rateIsValid()) {
-    message.error('Заполните тариф: сессии — целое число от 1, и дата окончания')
-    return
-  }
   loading.value = true
   try {
     const payload: CreateUserRequest = {
@@ -57,12 +42,7 @@ const create = async () => {
       server_ids: draft.value.server_ids,
       pool_ids: draft.value.pool_ids,
       route_map_id: draft.value.route_map_id,
-      rate: rateEnabled.value
-          ? {
-            sessions: rateForm.value.sessions,
-            date_end: rateForm.value.date_end,
-          }
-          : null,
+      group_id: draft.value.group_id, // Группа передается напрямую
     }
 
     await CreateUser(payload)
@@ -71,7 +51,6 @@ const create = async () => {
     show.value = false
 
     draft.value = defaultDraft()
-    rateEnabled.value = false
   } catch (e: unknown) {
     const err = e as { response?: { data?: unknown }; message?: string }
     const detail = typeof err.response?.data === 'string'
@@ -91,30 +70,6 @@ const create = async () => {
 
       <v-card-text>
         <UserForm v-model="draft" v-model:valid="formValid" creating />
-
-        <v-checkbox
-            v-model="rateEnabled"
-            label="Create rate"
-            density="comfortable"
-            hide-details
-            class="mt-4 mb-2"
-        />
-
-        <template v-if="rateEnabled">
-          <v-number-input
-              v-model="rateForm.sessions"
-              label="Sessions"
-              :min="1"
-              class="mb-3"
-          />
-
-          <v-text-field
-              v-model="rateForm.date_end"
-              label="Date End"
-              type="datetime-local"
-              value-format="yyyy-MM-dd-HH:mm"
-          />
-        </template>
       </v-card-text>
 
       <v-card-actions class="px-6 pb-4">

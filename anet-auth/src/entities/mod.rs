@@ -16,4 +16,6 @@ pub mod route_maps;
 pub mod route_rules;
 pub mod user_servers;
 pub mod protocol_type;
+pub mod groups;
+
 pub use protocol_type::ProtocolType;

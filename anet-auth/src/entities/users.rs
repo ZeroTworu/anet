@@ -17,6 +17,7 @@ pub struct Model {
     pub private_key: Option<String>,
     pub public_key: Option<String>,
     pub route_map_id: Option<Uuid>,
+    pub group_id: Option<Uuid>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
@@ -25,7 +26,6 @@ pub enum Relation {
     Rate,
     #[sea_orm(has_one = "super::active_sessions::Entity")]
     ActiveSession,
-    // Отношение "многие пользователи к одной карте" (Many-to-One)
     #[sea_orm(
         belongs_to = "super::route_maps::Entity",
         from = "Column::RouteMapId",
@@ -34,6 +34,14 @@ pub enum Relation {
         on_delete = "SetNull"
     )]
     RouteMap,
+    #[sea_orm(
+        belongs_to = "super::groups::Entity",
+        from = "Column::GroupId",
+        to = "super::groups::Column::Id",
+        on_update = "Cascade",
+        on_delete = "SetNull"
+    )]
+    Group,
 }
 
 impl Related<super::rates::Entity> for Entity {
@@ -54,7 +62,12 @@ impl Related<super::route_maps::Entity> for Entity {
     }
 }
 
-// Связь многие-ко-многим к таблице серверов (servers) через промежуточную user_servers
+impl Related<super::groups::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::Group.def()
+    }
+}
+
 impl Related<super::servers::Entity> for Entity {
     fn to() -> RelationDef {
         super::user_servers::Relation::Server.def()

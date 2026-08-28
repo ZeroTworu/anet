@@ -7,6 +7,8 @@ import { GetPools } from '@/api/pools'
 import type { NodePool } from '@/models/pool'
 import { GetRouteMaps } from '@/api/route-maps'
 import type { RouteMap } from '@/models/route-map'
+import { GetGroups } from '@/api/groups'
+import type { UserGroup } from '@/models/group'
 
 const user = defineModel<User>('modelValue', {
   required: true,
@@ -23,9 +25,9 @@ const props = defineProps<{
 const availableServers = ref<Server[]>([])
 const availablePools = ref<NodePool[]>([])
 const availableRouteMaps = ref<RouteMap[]>([])
+const availableGroups = ref<UserGroup[]>([])
 
-// Опции v-select в стандартном формате { title, value } — без item-title,
-// иначе в списке вместо названий будет [object Object]
+// Опции v-select в стандартном формате { title, value }
 const serverOptions = computed(() => availableServers.value.map(s => ({
   title: `${s.name} (${s.address})`,
   value: s.id,
@@ -38,6 +40,10 @@ const routeMapOptions = computed(() => availableRouteMaps.value.map(map => ({
   title: `${map.name} · rev ${map.revision}`,
   value: map.id,
 })))
+const groupOptions = computed(() => availableGroups.value.map(group => ({
+  title: `${group.name} (+${group.duration_days} дн.)`,
+  value: group.id,
+})))
 
 const uidRules = [
   (v: string) => !!v?.trim() || 'UID обязателен',
@@ -46,9 +52,17 @@ const uidRules = [
 
 onMounted(async () => {
   try {
-    // Загружаем справочники строго в момент монтирования формы
-    ;[availableServers.value, availablePools.value, availableRouteMaps.value] = await Promise.all([
-      GetServers(), GetPools(), GetRouteMaps(),
+    // Загружаем справочники, включая новые Группы Пользователей
+    ;[
+      availableServers.value,
+      availablePools.value,
+      availableRouteMaps.value,
+      availableGroups.value
+    ] = await Promise.all([
+      GetServers(),
+      GetPools(),
+      GetRouteMaps(),
+      GetGroups(),
     ])
 
     // Защита: гарантируем, что массивы инициализированы
@@ -64,6 +78,16 @@ onMounted(async () => {
   <v-form v-model="valid" @submit.prevent>
     <!-- UID (editable) -->
     <v-text-field v-model="user.uid" label="UID" :rules="uidRules" counter="64" class="mb-3" />
+
+    <!-- Выбор группы (Тарифа) -->
+    <v-select
+        v-model="user.group_id"
+        clearable
+        :items="groupOptions"
+        label="Группа пользователей"
+        placeholder="Выберите группу пользователей"
+        class="mb-3"
+    />
 
     <!-- Балансируемые pools -->
     <v-select
@@ -100,7 +124,7 @@ onMounted(async () => {
         :items="serverOptions"
         label="Привязанные сервера (Локации)"
         placeholder="Выберите сервера для этого пользователя"
-      />
+    />
 
     <template v-if="!props.creating">
       <v-divider class="my-4" />

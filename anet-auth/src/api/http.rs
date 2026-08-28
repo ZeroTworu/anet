@@ -4,7 +4,7 @@ use crate::crypto::DbEncryptor;
 use crate::entities::{
     admins, node_commands, node_pool_members, node_pools, node_runtime_states, route_maps,
     route_rules, servers, sessions, traffic_hourly, traffic_totals, user_node_pools,
-    user_servers, users, users::Entity as User,
+    user_servers, users, users::Entity as User, groups,
 };
 use crate::route_compiler::{
     CompiledRouteConfig, RouteRuleSpec, compile_route_map, toml_string_array,
@@ -76,7 +76,7 @@ async fn load_pool_dto(
         .into_iter()
         .map(|member| NodePoolMemberDto {
             server_id: member.server_id,
-            weight: member.weight.max(1) as u32,
+            weight: member.weight.max(1) as i32,
         })
         .collect();
     Ok(NodePoolDto {
@@ -141,7 +141,7 @@ async fn load_route_map_dto(
         .into_iter()
         .map(|rule| RouteRuleDto {
             id: Some(rule.id),
-            position: rule.position.max(0) as u32,
+            position: rule.position.max(0) as i32,
             match_type: rule.match_type,
             match_value: rule.match_value,
             action: rule.action,
@@ -153,7 +153,7 @@ async fn load_route_map_dto(
         description: map.description,
         default_action: map.default_action,
         is_active: map.is_active,
-        revision: map.revision.max(0) as u64,
+        revision: map.revision.max(0) as i64,
         rules,
     })
 }
@@ -219,7 +219,7 @@ async fn resolve_client_servers(
             .collect();
         let weight_by_id: HashMap<_, _> = members
             .into_iter()
-            .map(|member| (member.server_id, member.weight.max(1) as u32))
+            .map(|member| (member.server_id, member.weight.max(1) as i32))
             .collect();
         let mut server_by_id: HashMap<_, _> = pool_servers
             .into_iter()
@@ -239,10 +239,10 @@ async fn resolve_client_servers(
             .keys()
             .map(|server_id| BalanceCandidate {
                 server_id: *server_id,
-                weight: weight_by_id.get(server_id).copied().unwrap_or(1),
+                weight: weight_by_id.get(server_id).copied().unwrap_or(1).max(1) as u32, // Приведение к u32
                 active_connections: runtime_by_id
                     .get(server_id)
-                    .map(|runtime| runtime.active_connections.max(0) as u64)
+                    .map(|runtime| runtime.active_connections.max(0) as u64) // Приведение к u64
                     .unwrap_or_default(),
             })
             .collect();
@@ -541,8 +541,8 @@ impl VpnApi {
                             },
                             last_seen_at: state.last_seen_at.and_utc().to_rfc3339(),
                             version: state.version.clone(),
-                            uptime_seconds: state.uptime_seconds.max(0) as u64,
-                            active_connections: state.active_connections.max(0) as u64,
+                            uptime_seconds: state.uptime_seconds.max(0) as i64,
+                            active_connections: state.active_connections.max(0) as i64,
                             accepting_connections: state.accepting_connections,
                         }),
                         id: s.id,
@@ -622,7 +622,7 @@ impl VpnApi {
             if let Err(e) = (node_pool_members::ActiveModel {
                 pool_id: Set(pool.id),
                 server_id: Set(member.server_id),
-                weight: Set(member.weight as i32),
+                weight: Set(member.weight),
             })
             .insert(&txn)
             .await
@@ -681,7 +681,7 @@ impl VpnApi {
             if let Err(e) = (node_pool_members::ActiveModel {
                 pool_id: Set(id.0),
                 server_id: Set(member.server_id),
-                weight: Set(member.weight as i32),
+                weight: Set(member.weight),
             })
             .insert(&txn)
             .await
@@ -909,8 +909,8 @@ impl VpnApi {
         }
 
         let now = chrono::Utc::now().naive_utc();
-        let uptime_seconds = req.0.uptime_seconds.min(i64::MAX as u64) as i64;
-        let active_connections = req.0.active_connections.min(i64::MAX as u64) as i64;
+        let uptime_seconds = req.0.uptime_seconds.min(u64::MAX) as i64;
+        let active_connections = req.0.active_connections.min(u64::MAX) as i64;
         let result = match node_runtime_states::Entity::find_by_id(node_id)
             .one(&self.db)
             .await
@@ -919,8 +919,8 @@ impl VpnApi {
                 let mut state = existing.into_active_model();
                 state.last_seen_at = Set(now);
                 state.version = Set(req.0.version);
-                state.uptime_seconds = Set(uptime_seconds);
-                state.active_connections = Set(active_connections);
+                state.uptime_seconds = Set(uptime_seconds as i64);
+                state.active_connections = Set(active_connections as i64);
                 state.accepting_connections = Set(req.0.accepting_connections);
                 state.update(&self.db).await.map(|_| ())
             }
@@ -928,8 +928,8 @@ impl VpnApi {
                 server_id: Set(node_id),
                 last_seen_at: Set(now),
                 version: Set(req.0.version),
-                uptime_seconds: Set(uptime_seconds),
-                active_connections: Set(active_connections),
+                uptime_seconds: Set(uptime_seconds as i64),
+                active_connections: Set(active_connections as i64),
                 accepting_connections: Set(req.0.accepting_connections),
             }
             .insert(&self.db)
@@ -1247,8 +1247,8 @@ impl VpnApi {
                 },
                 None => None,
             };
-            let rx_bytes = sample.rx_bytes.min(i64::MAX as u64) as i64;
-            let tx_bytes = sample.tx_bytes.min(i64::MAX as u64) as i64;
+            let rx_bytes = sample.rx_bytes.min(u64::MAX)  as i64;
+            let tx_bytes = sample.tx_bytes.min(u64::MAX)  as i64;
 
             let existing = match traffic_totals::Entity::find()
                 .filter(traffic_totals::Column::ServerId.eq(node_id))
@@ -1266,8 +1266,8 @@ impl VpnApi {
                 let rx_delta = cumulative_delta(existing.rx_bytes, rx_bytes);
                 let tx_delta = cumulative_delta(existing.tx_bytes, tx_bytes);
                 let mut total = existing.into_active_model();
-                total.rx_bytes = Set(rx_bytes);
-                total.tx_bytes = Set(tx_bytes);
+                total.rx_bytes = Set(rx_bytes as i64);
+                total.tx_bytes = Set(tx_bytes as i64);
                 total.user_id = Set(user_id);
                 total.updated_at = Set(now);
                 (rx_delta, tx_delta, total.update(&txn).await.map(|_| ()))
@@ -1352,11 +1352,11 @@ impl VpnApi {
             Ok(totals) => totals,
             Err(e) => return GetNodeTrafficStatsResponse::Error(Json(e.to_string())),
         };
-        let mut aggregate: HashMap<Uuid, (u64, u64)> = HashMap::new();
+        let mut aggregate: HashMap<Uuid, (i64, i64)> = HashMap::new();
         for total in totals {
             let entry = aggregate.entry(total.server_id).or_default();
-            entry.0 = entry.0.saturating_add(total.rx_bytes.max(0) as u64);
-            entry.1 = entry.1.saturating_add(total.tx_bytes.max(0) as u64);
+            entry.0 = entry.0.saturating_add(total.rx_bytes.max(0) as i64);
+            entry.1 = entry.1.saturating_add(total.tx_bytes.max(0) as i64);
         }
         GetNodeTrafficStatsResponse::Ok(Json(
             nodes
@@ -1403,8 +1403,8 @@ impl VpnApi {
                         tx_bytes: 0,
                     }
                 });
-            entry.rx_bytes = entry.rx_bytes.saturating_add(total.rx_bytes.max(0) as u64);
-            entry.tx_bytes = entry.tx_bytes.saturating_add(total.tx_bytes.max(0) as u64);
+            entry.rx_bytes = entry.rx_bytes.saturating_add(total.rx_bytes.max(0) as i64);
+            entry.tx_bytes = entry.tx_bytes.saturating_add(total.tx_bytes.max(0) as i64);
         }
         let mut stats: Vec<_> = aggregate.into_values().collect();
         stats.sort_by_key(|item| std::cmp::Reverse(item.rx_bytes.saturating_add(item.tx_bytes)));
@@ -1470,11 +1470,11 @@ impl VpnApi {
             Err(e) => return GetTrafficHistoryResponse::Error(Json(e.to_string())),
         };
 
-        let mut aggregate: HashMap<NaiveDateTime, (u64, u64)> = HashMap::new();
+        let mut aggregate: HashMap<NaiveDateTime, (i64, i64)> = HashMap::new();
         for row in rows {
             let entry = aggregate.entry(row.bucket_start).or_default();
-            entry.0 = entry.0.saturating_add(row.rx_bytes.max(0) as u64);
-            entry.1 = entry.1.saturating_add(row.tx_bytes.max(0) as u64);
+            entry.0 = entry.0.saturating_add(row.rx_bytes.max(0) as i64);
+            entry.1 = entry.1.saturating_add(row.tx_bytes.max(0) as i64);
         }
 
         let points = (0..total_steps)
@@ -1522,7 +1522,7 @@ impl VpnApi {
         let mut something_changed = false;
 
         if let Some(new_sessions) = req.0.sessions {
-            editable_rate.sessions = Set(new_sessions as i32);
+            editable_rate.sessions = Set(new_sessions);
             something_changed = true;
         }
 
@@ -1547,7 +1547,7 @@ impl VpnApi {
                 Ok(updated_data) => {
                     return UpdateRateApiResult::Ok(Json(RateDto {
                         id: updated_data.id,
-                        sessions: updated_data.sessions as u32,
+                        sessions: updated_data.sessions as i32,
                         date_end: updated_data.date_end.format("%Y-%m-%d-%H:%M").to_string(),
                     }));
                 }
@@ -1562,7 +1562,7 @@ impl VpnApi {
 
         UpdateRateApiResult::Ok(Json(RateDto {
             id: editable_rate.id.unwrap(),
-            sessions: editable_rate.sessions.unwrap() as u32,
+            sessions: editable_rate.sessions.unwrap() as i32,
             date_end: editable_rate
                 .date_end
                 .unwrap()
@@ -1619,8 +1619,10 @@ impl VpnApi {
         let new_rate = crate::entities::rates::ActiveModel {
             id: Set(rate_id),
             user_id: Set(user_id.0),
-            sessions: Set(new_sessions as i32),
+            sessions: Set(new_sessions),
             date_end: Set(date_parsed),
+            traffic_limit: Set(req.0.traffic_limit.unwrap_or(0)),
+            speed_limit: Set(req.0.speed_limit.unwrap_or(0)),
             created_at: Set(chrono::Utc::now().naive_utc()),
             updated_at: Set(chrono::Utc::now().naive_utc()),
         };
@@ -1629,7 +1631,7 @@ impl VpnApi {
             Ok(added_data) => {
                 return AddRateApiResult::Ok(Json(RateDto {
                     id: added_data.id,
-                    sessions: added_data.sessions as u32,
+                    sessions: added_data.sessions as i32,
                     date_end: added_data.date_end.format("%Y-%m-%d-%H:%M").to_string(),
                 }));
             }
@@ -1858,22 +1860,45 @@ impl VpnApi {
     }
 
     /// Список юзеров в Панели (Заполняем массивы server_ids для каждого)
+    /// Список юзеров в Панели (Заполняем массивы server_ids для каждого)
     #[oai(path = "/users", method = "get")]
     async fn get_users(
         &self,
         auth: AdminToken,
-        from: Query<Option<u64>>,
-        limit: Query<Option<u64>>,
+        from: Query<Option<i64>>,
+        limit: Query<Option<i64>>,
+        search: Query<Option<String>>, // <-- Параметр поиска
     ) -> GetUsersResponse {
         if let Err(deny_reason) = self.validate_admin_session(&auth.0.token).await {
             return GetUsersResponse::Unauthorized(Json(deny_reason));
         }
 
-        let offset = from.0.unwrap_or(0);
-        let page_size = limit.0.unwrap_or(50);
+        let offset = from.0.unwrap_or(0) as u64;
+        let page_size = limit.0.unwrap_or(50) as u64;
 
-        let users = match users::Entity::find()
-            .find_also_related(crate::entities::rates::Entity)
+        // Инициализируем базовый запрос
+        let mut query = users::Entity::find()
+            .find_also_related(crate::entities::rates::Entity);
+
+        // Применяем фильтр поиска через метод .like()
+        if let Some(ref s) = search.0 {
+            if !s.trim().is_empty() {
+                let pattern = format!("%{}%", s.trim());
+                query = query.filter(
+                    users::Column::Uid.like(&pattern)
+                        .or(users::Column::Fingerprint.like(&pattern))
+                );
+            }
+        }
+
+        // Подсчитываем количество записей с учетом наложенных фильтров
+        let count = match query.clone().count(&self.db).await {
+            Ok(c) => c as i64,
+            Err(e) => return GetUsersResponse::Error(Json(e.to_string())),
+        };
+
+        // Извлекаем страницу пользователей
+        let users = match query
             .order_by_desc(users::Column::CreatedAt)
             .offset(offset)
             .limit(page_size)
@@ -1884,16 +1909,10 @@ impl VpnApi {
             Err(e) => return GetUsersResponse::Error(Json(e.to_string())),
         };
 
-        let count = match users::Entity::find().count(&self.db).await {
-            Ok(c) => c,
-            Err(e) => return GetUsersResponse::Error(Json(e.to_string())),
-        };
-
         let mut dto_list = Vec::new();
         for (m, r) in users {
             let p_ids = user_pool_ids(&self.db, m.id).await;
             let route_map_id = user_route_map_id(&self.db, m.id).await;
-            // Забираем связи многие-ко-многим для каждого пользователя
             let s_ids = user_servers::Entity::find()
                 .filter(user_servers::Column::UserId.eq(m.id))
                 .all(&self.db)
@@ -1911,13 +1930,14 @@ impl VpnApi {
                 created_at: m.created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
                 rate: r.map(|rate_model| RateDto {
                     id: rate_model.id,
-                    sessions: rate_model.sessions as u32,
+                    sessions: rate_model.sessions as i32,
                     date_end: rate_model.date_end.format("%Y-%m-%d-%H:%M").to_string(),
                 }),
                 static_ip: m.static_ip.map(|ip| ip.parse().ok()).flatten(),
                 server_ids: s_ids,
                 pool_ids: p_ids,
                 route_map_id,
+                group_id: m.group_id,
             });
         }
 
@@ -1963,7 +1983,7 @@ impl VpnApi {
 
         let rate_dto = result.1.map(|rate_model| RateDto {
             id: rate_model.id,
-            sessions: rate_model.sessions as u32,
+            sessions: rate_model.sessions as i32,
             date_end: rate_model.date_end.format("%Y-%m-%d-%H:%M").to_string(),
         });
 
@@ -1978,6 +1998,7 @@ impl VpnApi {
             server_ids: s_ids,
             pool_ids: p_ids,
             route_map_id,
+            group_id: result.0.group_id,
         }))
     }
 
@@ -1985,6 +2006,7 @@ impl VpnApi {
     ///
     /// Генерирует новую крипто-пару и добавляет слепок в Белый Список БД.
     /// Создание нового VPN-Клиента (запись связей в user_servers)
+    /// Создание нового VPN-Клиента (API-альтернатива команде -a)
     #[oai(path = "/add", method = "post")]
     async fn add_user(&self, auth: AdminToken, req: Json<AddUserRequest>) -> AddUserApiResult {
         if let Err(err) = self.validate_admin_session(&auth.0.token).await {
@@ -2008,18 +2030,40 @@ impl VpnApi {
             id: Set(user_id),
             fingerprint: Set(identity.fingerprint.clone()),
             uid: Set(Some(req.0.uid.clone())),
-            is_active: Set(true),
+            is_active: Set(true), // Новые юзеры по дефолту активны
             created_at: Set(chrono::Utc::now().naive_utc()),
             updated_at: Set(chrono::Utc::now().naive_utc()),
             static_ip: Set(None),
             private_key: Set(Some(encrypted_private_key)),
             public_key: Set(Some(encrypted_public_key)),
-            route_map_id: Set(req.0.route_map_id), // <--- Запись напрямую
+            route_map_id: Set(req.0.route_map_id),
+            group_id: Set(req.0.group_id), // Привязываем группу
         };
 
         if let Err(e) = new_user.insert(&self.db).await {
             error!("Failed to create user: {}", e);
             return AddUserApiResult::Error(Json("Ошибка записи в БД".to_string()));
+        }
+
+        // Если пользователь создается сразу активным и у него есть группа —
+        // мгновенно рассчитываем и создаем индивидуальный тариф (rate)
+        if let Some(group_id) = req.0.group_id {
+            if let Ok(Some(group)) = groups::Entity::find_by_id(group_id).one(&self.db).await {
+                let now = chrono::Utc::now().naive_utc();
+                let date_end = now + chrono::Duration::days(group.duration_days as i64);
+
+                let new_rate = crate::entities::rates::ActiveModel {
+                    id: Set(Uuid::new_v4()),
+                    user_id: Set(user_id),
+                    sessions: Set(group.sessions_limit),
+                    traffic_limit: Set(group.traffic_limit),
+                    speed_limit: Set(group.speed_limit),
+                    date_end: Set(date_end),
+                    created_at: Set(now),
+                    updated_at: Set(now),
+                };
+                let _ = new_rate.insert(&self.db).await;
+            }
         }
 
         // Записываем привязку ко всем выбранным серверам (нодам)
@@ -2084,7 +2128,7 @@ impl VpnApi {
 
         let rate_dto = rate_model.map(|r_model| RateDto {
             id: r_model.id,
-            sessions: r_model.sessions as u32,
+            sessions: r_model.sessions as i32,
             date_end: r_model.date_end.format("%Y-%m-%d-%H:%M").to_string(),
         });
 
@@ -2179,6 +2223,7 @@ impl VpnApi {
                         server_ids: s_ids,
                         pool_ids: p_ids,
                         route_map_id,
+                        group_id: updated_data.group_id,
                     }));
                 }
                 Err(e) => {
@@ -2219,6 +2264,7 @@ impl VpnApi {
             server_ids: s_ids,
             pool_ids: p_ids,
             route_map_id,
+            group_id: editable_user.group_id.unwrap(),
         }))
     }
 
@@ -2599,8 +2645,8 @@ impl VpnApi {
         active_totals.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
 
         // 3. Быстрая O(1) дедупликация и лимитирование сессий
-        let mut user_connection_limits: std::collections::HashMap<uuid::Uuid, i32> = std::collections::HashMap::new();
-        let mut added_user_counts: std::collections::HashMap<uuid::Uuid, i32> = std::collections::HashMap::new();
+        let mut user_connection_limits: HashMap<Uuid, i32> = HashMap::new();
+        let mut added_user_counts: HashMap<Uuid, i32> = HashMap::new();
         let mut dtos = Vec::new();
 
         for total in active_totals {
@@ -2618,7 +2664,7 @@ impl VpnApi {
                     .await
                     .map_err(poem::error::InternalServerError)?
                     .map(|s| s.sessions)
-                    .unwrap_or(1);
+                    .unwrap_or(1) as i32;
 
                 let limit = sessions_in_db.max(1);
                 user_connection_limits.insert(user_id, limit);
@@ -2655,8 +2701,8 @@ impl VpnApi {
                 username,
                 server_id: total.server_id,
                 server_name,
-                rx_bytes: total.rx_bytes.max(0) as u64,
-                tx_bytes: total.tx_bytes.max(0) as u64,
+                rx_bytes: total.rx_bytes.max(0) as i64,
+                tx_bytes: total.tx_bytes.max(0) as i64,
                 connection_count: max_allowed_connections,
                 protocol: total.protocol.as_str().to_string(), // <--- Заполнили поле для отображения в таблице активных сессий
             });
@@ -2664,8 +2710,225 @@ impl VpnApi {
 
         Ok(Json(dtos))
     }
+
+    /// Получить список всех групп пользователей
+    #[oai(path = "/groups", method = "get")]
+    async fn get_user_groups(&self, auth: AdminToken) -> GetGroupsResponse {
+        if let Err(err) = self.validate_admin_session(&auth.0.token).await {
+            return GetGroupsResponse::Unauthorized(Json(err));
+        }
+        match crate::entities::groups::Entity::find()
+            .order_by_asc(crate::entities::groups::Column::Name)
+            .all(&self.db)
+            .await
+        {
+            Ok(list) => {
+                let mut dtos = Vec::new();
+                for group in list {
+                    let user_ids = group_user_ids(&self.db, group.id).await;
+                    dtos.push(map_group_model_to_dto(group, user_ids));
+                }
+                GetGroupsResponse::Ok(Json(dtos))
+            }
+            Err(e) => GetGroupsResponse::Error(Json(e.to_string())),
+        }
+    }
+
+    /// Создать новую группу пользователей
+    #[oai(path = "/groups", method = "post")]
+    async fn create_user_group(
+        &self,
+        auth: AdminToken,
+        req: Json<SaveGroupRequest>,
+    ) -> SaveGroupResponse {
+        if let Err(err) = self.validate_admin_session(&auth.0.token).await {
+            return SaveGroupResponse::Unauthorized(Json(err));
+        }
+        if let Err(error) = validate_group_request(&req.0) {
+            return SaveGroupResponse::BadRequest(Json(error));
+        }
+
+        let txn = match self.db.begin().await {
+            Ok(txn) => txn,
+            Err(e) => return SaveGroupResponse::Error(Json(e.to_string())),
+        };
+
+        let now = chrono::Utc::now().naive_utc();
+        let group_id = uuid::Uuid::new_v4();
+
+        let new_group = crate::entities::groups::ActiveModel {
+            id: Set(group_id),
+            name: Set(req.0.name.trim().to_string()),
+            traffic_limit: Set(req.0.traffic_limit as i64),
+            speed_limit: Set(req.0.speed_limit as i32),
+            sessions_limit: Set(req.0.sessions_limit as i32),
+            duration_days: Set(req.0.duration_days as i32),
+            created_at: Set(now),
+            updated_at: Set(now),
+        };
+
+        let group = match new_group.insert(&txn).await {
+            Ok(g) => g,
+            Err(e) => {
+                let _ = txn.rollback().await;
+                return SaveGroupResponse::Error(Json(e.to_string()));
+            }
+        };
+
+        // Если передан список пользователей, привязываем их к созданной группе
+        if let Some(ref user_ids) = req.0.user_ids {
+            if let Err(e) = users::Entity::update_many()
+                .col_expr(users::Column::GroupId, sea_orm::sea_query::Expr::value(Some(group_id)))
+                .filter(users::Column::Id.is_in(user_ids.clone()))
+                .exec(&txn)
+                .await
+            {
+                let _ = txn.rollback().await;
+                return SaveGroupResponse::Error(Json(e.to_string()));
+            }
+        }
+
+        if let Err(e) = txn.commit().await {
+            return SaveGroupResponse::Error(Json(e.to_string()));
+        }
+
+        let final_user_ids = group_user_ids(&self.db, group_id).await;
+        SaveGroupResponse::Ok(Json(map_group_model_to_dto(group, final_user_ids)))
+    }
+
+    /// Обновить параметры существующей группы пользователей
+    #[oai(path = "/groups/:id", method = "patch")]
+    async fn update_user_group(
+        &self,
+        auth: AdminToken,
+        id: poem_openapi::param::Path<uuid::Uuid>,
+        req: Json<SaveGroupRequest>,
+    ) -> SaveGroupResponse {
+        if let Err(err) = self.validate_admin_session(&auth.0.token).await {
+            return SaveGroupResponse::Unauthorized(Json(err));
+        }
+        if let Err(error) = validate_group_request(&req.0) {
+            return SaveGroupResponse::BadRequest(Json(error));
+        }
+
+        let txn = match self.db.begin().await {
+            Ok(txn) => txn,
+            Err(e) => return SaveGroupResponse::Error(Json(e.to_string())),
+        };
+
+        let existing = match crate::entities::groups::Entity::find_by_id(id.0).one(&txn).await {
+            Ok(Some(g)) => g,
+            Ok(None) => {
+                let _ = txn.rollback().await;
+                return SaveGroupResponse::NotFound(Json("Group not found".to_string()));
+            }
+            Err(e) => {
+                let _ = txn.rollback().await;
+                return SaveGroupResponse::Error(Json(e.to_string()));
+            }
+        };
+
+        let mut active = existing.into_active_model();
+        active.name = Set(req.0.name.trim().to_string());
+        active.traffic_limit = Set(req.0.traffic_limit as i64);
+        active.speed_limit = Set(req.0.speed_limit as i32);
+        active.sessions_limit = Set(req.0.sessions_limit as i32);
+        active.duration_days = Set(req.0.duration_days as i32);
+        active.updated_at = Set(chrono::Utc::now().naive_utc());
+
+        let group = match active.update(&txn).await {
+            Ok(g) => g,
+            Err(e) => {
+                let _ = txn.rollback().await;
+                return SaveGroupResponse::Error(Json(e.to_string()));
+            }
+        };
+
+        // Обновляем состав группы пользователей
+        if let Some(ref user_ids) = req.0.user_ids {
+            // 1. Сбрасываем группу у всех старых участников
+            if let Err(e) = users::Entity::update_many()
+                .col_expr(users::Column::GroupId, sea_orm::sea_query::Expr::value(None::<uuid::Uuid>))
+                .filter(users::Column::GroupId.eq(id.0))
+                .exec(&txn)
+                .await
+            {
+                let _ = txn.rollback().await;
+                return SaveGroupResponse::Error(Json(e.to_string()));
+            }
+
+            // 2. Назначаем группу новым участникам
+            if let Err(e) = users::Entity::update_many()
+                .col_expr(users::Column::GroupId, sea_orm::sea_query::Expr::value(Some(id.0)))
+                .filter(users::Column::Id.is_in(user_ids.clone()))
+                .exec(&txn)
+                .await
+            {
+                let _ = txn.rollback().await;
+                return SaveGroupResponse::Error(Json(e.to_string()));
+            }
+        }
+
+        if let Err(e) = txn.commit().await {
+            return SaveGroupResponse::Error(Json(e.to_string()));
+        }
+
+        let final_user_ids = group_user_ids(&self.db, id.0).await;
+        SaveGroupResponse::Ok(Json(map_group_model_to_dto(group, final_user_ids)))
+    }
+
+    /// Удалить группу пользователей
+    #[oai(path = "/groups/:id", method = "delete")]
+    async fn delete_user_group(
+        &self,
+        auth: AdminToken,
+        id: poem_openapi::param::Path<uuid::Uuid>,
+    ) -> DeleteGroupResponse {
+        if let Err(err) = self.validate_admin_session(&auth.0.token).await {
+            return DeleteGroupResponse::Unauthorized(Json(err));
+        }
+        match crate::entities::groups::Entity::delete_by_id(id.0).exec(&self.db).await {
+            Ok(res) if res.rows_affected > 0 => DeleteGroupResponse::Deleted,
+            Ok(_) => DeleteGroupResponse::NotFound(Json("Group not found".to_string())),
+            Err(e) => DeleteGroupResponse::Error(Json(e.to_string())),
+        }
+    }
 }
 
+
+fn validate_group_request(req: &SaveGroupRequest) -> std::result::Result<(), String> {
+    if req.name.trim().is_empty() {
+        return Err("Group name cannot be empty".to_string());
+    }
+    // Значения 0 разрешены и представляют собой полный безлимит
+    Ok(())
+}
+
+fn map_group_model_to_dto(group: groups::Model, user_ids: Vec<uuid::Uuid>) -> GroupDto {
+    GroupDto {
+        id: group.id,
+        name: group.name,
+        traffic_limit: group.traffic_limit,
+        speed_limit: group.speed_limit,
+        sessions_limit: group.sessions_limit,
+        duration_days: group.duration_days,
+        user_ids,
+        created_at: group.created_at.and_utc().to_rfc3339(),
+        updated_at: group.updated_at.and_utc().to_rfc3339(),
+    }
+}
+
+// Хелпер для получения списка ID пользователей группы
+async fn group_user_ids(db: &DatabaseConnection, group_id: uuid::Uuid) -> Vec<uuid::Uuid> {
+    users::Entity::find()
+        .filter(users::Column::GroupId.eq(group_id))
+        .all(db)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|u| u.id)
+        .collect()
+}
 
 
 /// Генератор стильной консольной OLED-Black HTML страницы для скачивания конфига клиентом
