@@ -4,7 +4,7 @@ use crate::crypto::DbEncryptor;
 use crate::entities::{
     admins, node_commands, node_pool_members, node_pools, node_runtime_states, route_maps,
     route_rules, servers, sessions, traffic_hourly, traffic_totals, user_node_pools,
-    user_route_maps, user_servers, users, users::Entity as User,
+    user_servers, users, users::Entity as User,
 };
 use crate::route_compiler::{
     CompiledRouteConfig, RouteRuleSpec, compile_route_map, toml_string_array,
@@ -121,12 +121,12 @@ async fn user_pool_ids(db: &DatabaseConnection, user_id: Uuid) -> Vec<Uuid> {
 }
 
 async fn user_route_map_id(db: &DatabaseConnection, user_id: Uuid) -> Option<Uuid> {
-    user_route_maps::Entity::find_by_id(user_id)
+    users::Entity::find_by_id(user_id)
         .one(db)
         .await
         .ok()
         .flatten()
-        .map(|link| link.route_map_id)
+        .and_then(|user| user.route_map_id)
 }
 
 async fn load_route_map_dto(
@@ -269,16 +269,17 @@ async fn compiled_routes_for_user(
     db: &DatabaseConnection,
     user_id: Uuid,
 ) -> std::result::Result<Option<CompiledRouteConfig>, String> {
-    // Route map компилируется в момент выдачи client.toml, чтобы сам клиент
-    // не зависел от REST-доступа к панели во время работы туннеля.
-    let Some(link) = user_route_maps::Entity::find_by_id(user_id)
+    let Some(user) = users::Entity::find_by_id(user_id)
         .one(db)
         .await
         .map_err(|e| e.to_string())?
     else {
         return Ok(None);
     };
-    let Some(map) = route_maps::Entity::find_by_id(link.route_map_id)
+    let Some(route_map_id) = user.route_map_id else {
+        return Ok(None);
+    };
+    let Some(map) = route_maps::Entity::find_by_id(route_map_id)
         .one(db)
         .await
         .map_err(|e| e.to_string())?
@@ -304,6 +305,7 @@ async fn compiled_routes_for_user(
         .collect();
     compile_route_map(&map.default_action, &specs).map(Some)
 }
+
 
 #[cfg(test)]
 mod traffic_tests {
@@ -1965,6 +1967,7 @@ impl VpnApi {
             static_ip: Set(None),
             private_key: Set(Some(encrypted_private_key)),
             public_key: Set(Some(encrypted_public_key)),
+            route_map_id: Set(req.0.route_map_id), // <--- Запись напрямую
         };
 
         if let Err(e) = new_user.insert(&self.db).await {
@@ -1990,22 +1993,11 @@ impl VpnApi {
                     user_id: Set(user_id),
                     pool_id: Set(*pool_id),
                 })
-                .insert(&self.db)
-                .await
+                    .insert(&self.db)
+                    .await
                 {
                     error!("Failed to bind pool to user: {}", e);
                 }
-            }
-        }
-        if let Some(route_map_id) = req.0.route_map_id {
-            if let Err(e) = (user_route_maps::ActiveModel {
-                user_id: Set(user_id),
-                route_map_id: Set(route_map_id),
-            })
-            .insert(&self.db)
-            .await
-            {
-                error!("Failed to bind route map to user: {}", e);
             }
         }
 
@@ -2065,7 +2057,7 @@ impl VpnApi {
             something_changed = true;
         }
 
-        // Обновляем связи со списком серверов в СУБД
+        // Обновляем связи со списком серверов в СУБД (Many-to-Many через соединительную таблицу)
         if let Some(ref ids) = req.0.server_ids {
             // Удаляем старые связи
             let _ = user_servers::Entity::delete_many()
@@ -2093,23 +2085,19 @@ impl VpnApi {
                     user_id: Set(id.0),
                     pool_id: Set(*pool_id),
                 })
-                .insert(&self.db)
-                .await;
+                    .insert(&self.db)
+                    .await;
             }
             something_changed = true;
         }
-        if req.0.clear_route_map.unwrap_or(false) || req.0.route_map_id.is_some() {
-            let _ = user_route_maps::Entity::delete_by_id(id.0)
-                .exec(&self.db)
-                .await;
-            if let Some(route_map_id) = req.0.route_map_id {
-                let _ = (user_route_maps::ActiveModel {
-                    user_id: Set(id.0),
-                    route_map_id: Set(route_map_id),
-                })
-                .insert(&self.db)
-                .await;
-            }
+
+        // Прямое изменение внешнего ключа route_map_id на самом пользователе
+        // Вместо удаления и вставки во внешнюю таблицу, изменяем свойство модели пользователя напрямую
+        if req.0.clear_route_map.unwrap_or(false) {
+            editable_user.route_map_id = Set(None);
+            something_changed = true;
+        } else if let Some(route_map_id) = req.0.route_map_id {
+            editable_user.route_map_id = Set(Some(route_map_id));
             something_changed = true;
         }
 
@@ -2127,6 +2115,7 @@ impl VpnApi {
                         .map(|us| us.server_id)
                         .collect();
                     let p_ids = user_pool_ids(&self.db, updated_data.id).await;
+                    // Данный хелпер теперь считывает route_map_id напрямую из users
                     let route_map_id = user_route_map_id(&self.db, updated_data.id).await;
 
                     return UpdateUserApiResult::Ok(Json(VpnUserDto {
@@ -2255,7 +2244,6 @@ impl VpnApi {
     }
 
     /// ПУБЛИЧНЫЙ ЭНДПОИНТ: Скачать готовый client.toml для конкретного пользователя по его UUID
-    /// ПУБЛИЧНЫЙ ЭНДПОИНТ: Скачать готовый файл конфигурации client.toml для конкретного пользователя по его UUID
     #[oai(path = "/config/:id", method = "get")]
     async fn download_config(&self, id: poem_openapi::param::Path<Uuid>) -> DownloadConfigResponse {
         // 1. ЗА ОДИН ЗАПРОС тянем пользователя и ВСЕ связанные с ним ноды (Many-to-Many) из базы данных

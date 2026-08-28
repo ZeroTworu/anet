@@ -14,5 +14,4 @@ pub mod node_pool_members;
 pub mod user_node_pools;
 pub mod route_maps;
 pub mod route_rules;
-pub mod user_route_maps;
 pub mod user_servers;

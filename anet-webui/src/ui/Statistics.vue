@@ -1,4 +1,6 @@
 <script setup lang="ts">
+// Экран наблюдаемости получает независимые срезы по нодам, пользователям
+// и почасовую историю, которую control plane собирает из cumulative counters.
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { GetNodeTrafficStats, GetTrafficHistory, GetUserTrafficStats, GetActiveConnections } from '@/api/statistics'
 import type { NodeTrafficStat, TrafficHistoryPoint, UserTrafficStat, ActiveConnection } from '@/models/statistics'
@@ -9,17 +11,34 @@ const activeConnections = ref<ActiveConnection[]>([])
 const history = ref<TrafficHistoryPoint[]>([])
 const activeTab = ref('nodes')
 const loading = ref(false)
+const searchQuery = ref('')
 let refreshTimer: number | undefined
 
 const totalRx = computed(() => nodes.value.reduce((sum, item) => sum + item.rx_bytes, 0))
 const totalTx = computed(() => nodes.value.reduce((sum, item) => sum + item.tx_bytes, 0))
-const chartMax = computed(() => Math.max(1, ...history.value.flatMap(item => [item.rx_bytes, item.tx_bytes])))
-const chartPoints = (field: 'rx_bytes' | 'tx_bytes') => history.value.map((item, index) => {
-  const x = history.value.length <= 1 ? 500 : 40 + index * (920 / (history.value.length - 1))
-  const y = 220 - item[field] / chartMax.value * 180
-  return `${x},${y}`
-}).join(' ')
-const chartLabels = computed(() => history.value.filter((_, index) => index % 6 === 0 || index === history.value.length - 1))
+
+// Извлекаем чистые массивы байт для графиков
+const rxValues = computed(() => history.value.map(item => item.rx_bytes))
+const txValues = computed(() => history.value.map(item => item.tx_bytes))
+
+// Вычисляем абсолютный пик трафика для корректного масштабирования обеих линий
+const chartMax = computed(() => {
+  const maxRx = Math.max(...rxValues.value, 0)
+  const maxTx = Math.max(...txValues.value, 0)
+  return Math.max(maxRx, maxTx, 1) // Исключаем деление на ноль
+})
+
+// Форматируем метки по локальной таймзоне пользователя
+const chartLabelsFormatted = computed(() => {
+  return history.value.map((item, index) => {
+    // Выводим только каждую 4-ю метку и последнюю точку для избежания наложения текста
+    if (index % 4 === 0 || index === history.value.length - 1) {
+      const date = new Date(item.bucket_start)
+      return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+    }
+    return ''
+  })
+})
 
 const formatBytes = (bytes: number) => {
   if (bytes === 0) return '0 B'
@@ -27,6 +46,44 @@ const formatBytes = (bytes: number) => {
   const unit = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1)
   return `${(bytes / 1024 ** unit).toFixed(unit === 0 ? 0 : 2)} ${units[unit]}`
 }
+
+// Конфигурация колонок и вычисляемые данные для таблицы узлов
+const nodeHeaders = [
+  { title: 'Узел', key: 'name', align: 'start' as const },
+  { title: 'RX', key: 'rx_bytes', align: 'end' as const },
+  { title: 'TX', key: 'tx_bytes', align: 'end' as const },
+  { title: 'Всего', key: 'total_bytes', align: 'end' as const },
+]
+const mappedNodes = computed(() => {
+  return nodes.value.map(node => ({
+    ...node,
+    total_bytes: node.rx_bytes + node.tx_bytes,
+  }))
+})
+
+// Конфигурация колонок и вычисляемые данные для таблицы пользователей
+const userHeaders = [
+  { title: 'Пользователь', key: 'username_display', align: 'start' as const },
+  { title: 'RX', key: 'rx_bytes', align: 'end' as const },
+  { title: 'TX', key: 'tx_bytes', align: 'end' as const },
+  { title: 'Всего', key: 'total_bytes', align: 'end' as const },
+]
+const mappedUsers = computed(() => {
+  return users.value.map(user => ({
+    ...user,
+    username_display: user.uid || 'Локальный клиент',
+    total_bytes: user.rx_bytes + user.tx_bytes,
+  }))
+})
+
+// Конфигурация колонок для таблицы активных подключений
+const connectionHeaders = [
+  { title: 'Пользователь', key: 'username', align: 'start' as const },
+  { title: 'Сервер', key: 'server_name', align: 'start' as const },
+  { title: 'RX (Сессия)', key: 'rx_bytes', align: 'end' as const },
+  { title: 'TX (Сессия)', key: 'tx_bytes', align: 'end' as const },
+  { title: 'Количество сессий', key: 'connection_count', align: 'end' as const },
+]
 
 const load = async () => {
   loading.value = true
@@ -57,7 +114,7 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <v-main class="statistics-page">
+  <main class="statistics-page">
     <div class="d-flex align-center justify-space-between page-title">
       <div>
         <h2>Traffic</h2>
@@ -96,95 +153,139 @@ onBeforeUnmount(() => {
         </div>
       </template>
       <v-card-text>
-        <div class="chart-wrap">
-          <svg viewBox="0 0 1000 260" role="img" aria-label="График трафика за 24 часа">
-            <line v-for="y in [40, 100, 160, 220]" :key="y" x1="40" :y1="y" x2="960" :y2="y" class="grid-line" />
-            <polyline :points="chartPoints('rx_bytes')" class="traffic-line rx-line" />
-            <polyline :points="chartPoints('tx_bytes')" class="traffic-line tx-line" />
-            <text
-                v-for="(point, index) in chartLabels"
-                :key="point.bucket_start"
-                :x="40 + history.indexOf(point) * (920 / Math.max(1, history.length - 1))"
-                y="248"
-                :text-anchor="index === 0 ? 'start' : index === chartLabels.length - 1 ? 'end' : 'middle'"
-                class="axis-label"
-            >{{ new Date(point.bucket_start).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) }}</text>
-          </svg>
+        <div class="chart-wrap mt-2">
+          <!-- Обертка с абсолютным позиционированием для наложения графиков -->
+          <v-sheet color="transparent" class="position-relative" style="height: 180px;">
+            <!-- График RX с временной шкалой -->
+            <v-sparkline
+                :model-value="rxValues"
+                :labels="chartLabelsFormatted"
+                :min="0"
+                :max="chartMax"
+                color="primary"
+                line-width="2"
+                padding="16"
+                smooth="8"
+                stroke-linecap="round"
+                auto-draw
+                style="height: 100%; width: 100%;"
+            />
+            <!-- График TX без подписей для избежания наложения текста -->
+            <v-sparkline
+                :model-value="txValues"
+                :min="0"
+                :max="chartMax"
+                color="warning"
+                line-width="2"
+                padding="16"
+                smooth="8"
+                stroke-linecap="round"
+                auto-draw
+                style="position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none;"
+            />
+          </v-sheet>
         </div>
       </v-card-text>
     </v-card>
 
     <v-card class="traffic-tabs">
-      <v-tabs v-model="activeTab" color="primary">
-        <v-tab value="nodes">По узлам</v-tab>
-        <v-tab value="users">По пользователям</v-tab>
-        <v-tab value="connections">Активные подключения</v-tab>
-      </v-tabs>
+      <div class="d-flex flex-wrap align-center justify-space-between px-4 pt-2 border-b">
+        <v-tabs v-model="activeTab" color="primary">
+          <v-tab value="nodes">По узлам</v-tab>
+          <v-tab value="users">По пользователям</v-tab>
+          <v-tab value="connections">Активные подключения</v-tab>
+        </v-tabs>
+        <v-text-field
+            v-model="searchQuery"
+            prepend-inner-icon="mdi-magnify"
+            label="Поиск по таблице..."
+            variant="outlined"
+            density="compact"
+            hide-details
+            single-line
+            style="max-width: 300px"
+            class="my-2"
+        />
+      </div>
 
       <v-tabs-window v-model="activeTab">
         <v-tabs-window-item value="nodes">
-          <v-table>
-            <thead><tr><th>Узел</th><th>RX</th><th>TX</th><th>Всего</th></tr></thead>
-            <tbody>
-            <tr v-for="node in nodes" :key="node.node_id">
-              <td>{{ node.name }}</td>
-              <td class="metric">{{ formatBytes(node.rx_bytes) }}</td>
-              <td class="metric">{{ formatBytes(node.tx_bytes) }}</td>
-              <td class="metric total">{{ formatBytes(node.rx_bytes + node.tx_bytes) }}</td>
-            </tr>
-            </tbody>
-          </v-table>
-          <v-empty-state v-if="nodes.length === 0" text="Нет данных по узлам" />
+          <v-data-table
+              :headers="nodeHeaders"
+              :items="mappedNodes"
+              :search="searchQuery"
+              :loading="loading"
+              :items-per-page="10"
+              :items-per-page-options="[10, 20, 50]"
+              items-per-page-text="Строк на странице"
+              loading-text="Загрузка статистики узлов…"
+              no-data-text="Нет данных"
+              hover
+          >
+            <template #item.rx_bytes="{ value }">
+              <span class="metric">{{ formatBytes(value) }}</span>
+            </template>
+            <template #item.tx_bytes="{ value }">
+              <span class="metric">{{ formatBytes(value) }}</span>
+            </template>
+            <template #item.total_bytes="{ value }">
+              <span class="metric total">{{ formatBytes(value) }}</span>
+            </template>
+          </v-data-table>
         </v-tabs-window-item>
 
         <v-tabs-window-item value="users">
-          <div class="px-4 pt-3 text-caption text-medium-emphasis">
-            Показаны все пользователи с зафиксированной сетевой активностью (всего: {{ users.length }})
-          </div>
-          <v-table>
-            <thead><tr><th>Пользователь</th><th>RX</th><th>TX</th><th>Всего</th></tr></thead>
-            <tbody>
-            <tr v-for="user in users" :key="user.fingerprint">
-              <td>{{ user.uid || 'Локальный клиент' }}</td>
-              <td class="metric">{{ formatBytes(user.rx_bytes) }}</td>
-              <td class="metric">{{ formatBytes(user.tx_bytes) }}</td>
-              <td class="metric total">{{ formatBytes(user.rx_bytes + user.tx_bytes) }}</td>
-            </tr>
-            </tbody>
-          </v-table>
-          <v-empty-state v-if="users.length === 0" text="Нет данных по пользователям" />
+          <v-data-table
+              :headers="userHeaders"
+              :items="mappedUsers"
+              :search="searchQuery"
+              :loading="loading"
+              :items-per-page="10"
+              :items-per-page-options="[10, 20, 50]"
+              items-per-page-text="Строк на странице"
+              loading-text="Загрузка статистики пользователей…"
+              no-data-text="Нет данных"
+              hover
+          >
+            <template #item.rx_bytes="{ value }">
+              <span class="metric">{{ formatBytes(value) }}</span>
+            </template>
+            <template #item.tx_bytes="{ value }">
+              <span class="metric">{{ formatBytes(value) }}</span>
+            </template>
+            <template #item.total_bytes="{ value }">
+              <span class="metric total">{{ formatBytes(value) }}</span>
+            </template>
+          </v-data-table>
         </v-tabs-window-item>
 
-        <!-- Новая вкладка детальных активных сессий -->
         <v-tabs-window-item value="connections">
-          <div class="px-4 pt-3 text-caption text-medium-emphasis">
-            Список установленных сессий (всего: {{ activeConnections.length }})
-          </div>
-          <v-table>
-            <thead>
-            <tr>
-              <th>Пользователь</th>
-              <th>Сервер</th>
-              <th>RX (Сессия)</th>
-              <th>TX (Сессия)</th>
-              <th>Количество сессий</th>
-            </tr>
-            </thead>
-            <tbody>
-            <tr v-for="conn in activeConnections" :key="`${conn.user_id}-${conn.server_id}`">
-              <td>{{ conn.username }}</td>
-              <td>{{ conn.server_name }}</td>
-              <td class="metric">{{ formatBytes(conn.rx_bytes) }}</td>
-              <td class="metric">{{ formatBytes(conn.tx_bytes) }}</td>
-              <td class="metric total">{{ conn.connection_count }}</td>
-            </tr>
-            </tbody>
-          </v-table>
-          <v-empty-state v-if="activeConnections.length === 0" text="Нет активных подключений" />
+          <v-data-table
+              :headers="connectionHeaders"
+              :items="activeConnections"
+              :search="searchQuery"
+              :loading="loading"
+              :items-per-page="10"
+              :items-per-page-options="[10, 20, 50]"
+              items-per-page-text="Строк на странице"
+              loading-text="Загрузка списка активных сессий…"
+              no-data-text="Нет активных подключений"
+              hover
+          >
+            <template #item.rx_bytes="{ value }">
+              <span class="metric">{{ formatBytes(value) }}</span>
+            </template>
+            <template #item.tx_bytes="{ value }">
+              <span class="metric">{{ formatBytes(value) }}</span>
+            </template>
+            <template #item.connection_count="{ value }">
+              <span class="metric total">{{ value }}</span>
+            </template>
+          </v-data-table>
         </v-tabs-window-item>
       </v-tabs-window>
     </v-card>
-  </v-main>
+  </main>
 </template>
 
 <style scoped>
@@ -195,15 +296,16 @@ onBeforeUnmount(() => {
 .traffic-tabs { margin-top: 24px; }
 .history-card { margin-top: 20px; }
 .chart-wrap { width: 100%; min-height: 220px; }
-.chart-wrap svg { display: block; width: 100%; height: auto; }
 .grid-line { stroke: rgba(154, 165, 160, 0.15); stroke-width: 1; }
-.traffic-line { fill: none; stroke-width: 3; stroke-linecap: round; stroke-linejoin: round; }
-.rx-line { stroke: #2bb894; }
-.tx-line { stroke: #d9a441; }
-.axis-label { fill: #9aa5a0; font-size: 12px; }
 .legend { font-size: 12px; font-weight: 700; }
 .legend.rx { color: #2bb894; }
 .legend.tx { color: #d9a441; }
 .metric { font-family: 'Fira Code', monospace; }
 .total { font-weight: 700; }
+
+/* Кастомные стили для масштабируемых шрифтов v-sparkline */
+:deep(.v-sparkline text) {
+  fill: #9aa5a0;
+  font-size: 11px;
+}
 </style>

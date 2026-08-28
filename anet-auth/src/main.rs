@@ -124,6 +124,7 @@ async fn handle_add_user(
         static_ip: Set(None),
         private_key: Set(Some(encrypted_private_key)),
         public_key: Set(Some(encrypted_public_key)),
+        route_map_id: Set(None),
     };
 
     // 3. Сохраняем
