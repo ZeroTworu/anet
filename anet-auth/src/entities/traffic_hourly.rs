@@ -1,13 +1,13 @@
-//! Почасовые агрегаты трафика для графиков и исторических отчётов.
+//! Почасовые агрегаты трафика для графиков и исторических отчётов по протоколам.
 
 use sea_orm::entity::prelude::*;
+use super::ProtocolType;
 
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
 #[sea_orm(table_name = "traffic_hourly")]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub id: Uuid,
-    /// Начало часового интервала в UTC.
     pub bucket_start: DateTime,
     pub server_id: Uuid,
     pub user_id: Option<Uuid>,
@@ -15,6 +15,7 @@ pub struct Model {
     pub rx_bytes: i64,
     pub tx_bytes: i64,
     pub updated_at: DateTime,
+    pub protocol: ProtocolType,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

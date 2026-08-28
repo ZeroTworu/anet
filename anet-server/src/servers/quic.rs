@@ -51,7 +51,7 @@ async fn serve_udp_auth_layer(
         let handler = auth_core.clone();
         let s = socket.clone();
         tokio::spawn(async move {
-            match handler.process_handshake_packet(packet, remote_addr).await {
+            match handler.process_handshake_packet(packet, remote_addr, "quic").await {
                 Ok((Some(resp), _)) => {
                     let _ = s.send_to(&resp, remote_addr).await;
                 }
@@ -146,7 +146,7 @@ pub async fn run_quic_server(
                         if t_tx.send(pkt).await.is_err() {
                             break;
                         }
-                        rx_registry.record_rx(&ci_rx, packet_len);
+                        rx_registry.record_rx(&ci_rx, packet_len, "quic");
                     }
                     warn!("Client {} rx abort", ci_rx.assigned_ip);
                 });

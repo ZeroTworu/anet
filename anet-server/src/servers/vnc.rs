@@ -137,7 +137,7 @@ async fn authenticate(
             .await?
             .context("client disconnected during ASTP authentication")?;
         let (response, result) = auth_handler
-            .process_handshake_packet(packet, remote_addr)
+            .process_handshake_packet(packet, remote_addr, "vnc")
             .await?;
 
         if let Some(response) = response {
@@ -163,7 +163,7 @@ async fn receive_from_client(
             .send(packet)
             .await
             .context("TUN input queue closed")?;
-        registry.record_rx(&client_info, packet_len);
+        registry.record_rx(&client_info, packet_len, "vnc");
     }
     Ok(())
 }

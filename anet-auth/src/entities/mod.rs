@@ -15,3 +15,5 @@ pub mod user_node_pools;
 pub mod route_maps;
 pub mod route_rules;
 pub mod user_servers;
+pub mod protocol_type;
+pub use protocol_type::ProtocolType;

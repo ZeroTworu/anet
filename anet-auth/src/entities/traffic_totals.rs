@@ -1,6 +1,7 @@
-//! Идемпотентные накопительные счётчики трафика по ноде и пользователю.
+//! Идемпотентные накопительные счётчики трафика по ноде, пользователю и протоколу.
 
 use sea_orm::entity::prelude::*;
+use super::ProtocolType;
 
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
 #[sea_orm(table_name = "traffic_totals")]
@@ -14,6 +15,7 @@ pub struct Model {
     pub rx_bytes: i64,
     pub tx_bytes: i64,
     pub updated_at: DateTime,
+    pub protocol: ProtocolType,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

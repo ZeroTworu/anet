@@ -63,7 +63,7 @@ mod tests {
         async fn send(&self, data: Bytes, _frag: &FragmentConfig) -> Result<()> {
             let (response, authenticated) = self
                 .server
-                .process_handshake_packet(data, self.remote_addr)
+                .process_handshake_packet(data, self.remote_addr, "quic")
                 .await?;
             *self.response.lock().unwrap() = response;
             if let Some((client, _)) = authenticated {
@@ -193,6 +193,7 @@ impl ServerAuthHandler {
         &self,
         packet: Bytes,
         remote_addr: SocketAddr,
+        protocol: &str, // <--- Добавили аргумент типа протокола
     ) -> Result<(
         Option<Bytes>,
         Option<(Arc<ClientTransportInfo>, AuthResponse)>,
@@ -209,7 +210,7 @@ impl ServerAuthHandler {
             }
             Some(Content::EncryptedAuthRequest(enc_req)) => {
                 let (resp_msg, client_info, auth_resp) = self
-                    .handle_encrypted_auth(enc_req, remote_addr)
+                    .handle_encrypted_auth(enc_req, remote_addr, protocol) // <--- Передаем дальше
                     .await
                     .context("ASTP shared-key authentication failed")?;
                 let resp_bytes = self.encode_obfuscated_packet(resp_msg)?;
@@ -352,6 +353,7 @@ impl ServerAuthHandler {
         &self,
         enc_req: EncryptedAuthRequest,
         remote_addr: SocketAddr,
+        protocol: &str,
     ) -> Result<(AnetMessage, Arc<ClientTransportInfo>, AuthResponse)> {
         let temp_info = self
             .temp_dh_map
@@ -419,6 +421,7 @@ impl ServerAuthHandler {
             remote_addr: ArcSwap::new(Arc::new(remote_addr)),
             fingerprint: temp_info.client_fingerprint.clone(),
             user_id,
+            protocol: protocol.to_string(),
         });
 
         self.registry.pre_register_client(client_info.clone());

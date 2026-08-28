@@ -23,6 +23,9 @@ const hoveredIdx = ref<number | null>(null)
 // Выбранный временной диапазон (в часах): 6, 12, 24 или 72 (3 дня)
 const selectedRange = ref(24)
 
+// Выбранный протокол (фильтр типа транспорта)
+const selectedProtocol = ref('all')
+
 // Активный фильтр трафика (что выведено на графике)
 const selectedFilter = ref<{
   type: 'node' | 'user' | 'connection' | null
@@ -168,7 +171,8 @@ const loadHistoryOnly = async () => {
         selectedRange.value,
         selectedFilter.value.serverId,
         selectedFilter.value.userId,
-        selectedFilter.value.fingerprint
+        selectedFilter.value.fingerprint,
+        selectedProtocol.value === 'all' ? undefined : selectedProtocol.value
     )
   } catch (e) {
     console.error('Failed to load traffic history:', e)
@@ -266,8 +270,8 @@ const getRowProps = (data: { item: any }) => {
   return isSelected ? { class: 'selected-row' } : {}
 }
 
-// Наблюдаем за изменением зума или фильтра для обновления только графика
-watch([selectedRange, selectedFilter], () => {
+// Наблюдаем за изменением зума, фильтра или выбранного протокола для обновления только графика
+watch([selectedRange, selectedFilter, selectedProtocol], () => {
   loadHistoryOnly()
 })
 
@@ -318,6 +322,7 @@ const connectionHeaders = [
   { title: 'RX (Сессия)', key: 'rx_bytes', align: 'end' as const },
   { title: 'TX (Сессия)', key: 'tx_bytes', align: 'end' as const },
   { title: 'Количество сессий', key: 'connection_count', align: 'end' as const },
+  { title: 'Протокол', key: 'protocol', align: 'center' as const },
 ]
 </script>
 
@@ -373,19 +378,36 @@ const connectionHeaders = [
             </v-chip>
           </div>
 
-          <!-- Переключатель масштаба временной шкалы (Зум) -->
-          <v-btn-toggle
-              v-model="selectedRange"
-              mandatory
-              color="primary"
-              density="compact"
-              variant="outlined"
-          >
-            <v-btn :value="6">6ч</v-btn>
-            <v-btn :value="12">12ч</v-btn>
-            <v-btn :value="24">24ч</v-btn>
-            <v-btn :value="72">3д</v-btn>
-          </v-btn-toggle>
+          <div class="d-flex align-center ga-3 flex-wrap">
+            <!-- Переключатель типа трафика (Протоколы) -->
+            <v-btn-toggle
+                v-model="selectedProtocol"
+                mandatory
+                color="primary"
+                density="compact"
+                variant="outlined"
+            >
+              <v-btn value="all">Все</v-btn>
+              <v-btn value="quic">QUIC</v-btn>
+              <v-btn value="ws">WS(S)</v-btn>
+              <v-btn value="ssh">SSH</v-btn>
+              <v-btn value="vnc">VNC</v-btn>
+            </v-btn-toggle>
+
+            <!-- Переключатель масштаба временной шкалы (Зум) -->
+            <v-btn-toggle
+                v-model="selectedRange"
+                mandatory
+                color="primary"
+                density="compact"
+                variant="outlined"
+            >
+              <v-btn :value="6">6ч</v-btn>
+              <v-btn :value="12">12ч</v-btn>
+              <v-btn :value="24">24ч</v-btn>
+              <v-btn :value="72">3д</v-btn>
+            </v-btn-toggle>
+          </div>
         </div>
       </template>
       <v-card-text>
@@ -417,7 +439,7 @@ const connectionHeaders = [
                     :smooth="0"
                     stroke-linecap="round"
                     auto-draw
-                    style="height: 100%; width: 100%;"
+                    style="height: 100%; width: 100%; cursor: crosshair;"
                 />
                 <!-- Наложенный график TX -->
                 <v-sparkline
@@ -612,11 +634,20 @@ const connectionHeaders = [
             <template #item.connection_count="{ value }">
               <span class="metric total">{{ value }}</span>
             </template>
+            <!-- Вывод названия протокола -->
+            <template #item.protocol="{ value }">
+              <v-chip size="small" variant="tonal" class="text-uppercase" color="info">
+                {{ value }}
+              </v-chip>
+            </template>
           </v-data-table>
         </v-tabs-window-item>
       </v-tabs-window>
     </v-card>
   </main>
+</template>
+
+<template>
 </template>
 
 <style scoped>

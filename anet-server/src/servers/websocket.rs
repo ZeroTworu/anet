@@ -72,7 +72,7 @@ async fn handle_session(
         };
 
         let (response, result) = auth_handler
-            .process_handshake_packet(payload, remote_addr)
+            .process_handshake_packet(payload, remote_addr, "ws")
             .await
             .with_context(|| format!("WebSocket ASTP handshake phase {}", handshake_phase))?;
         if let Some(response) = response {
@@ -99,7 +99,7 @@ async fn handle_session(
                                     Ok(packet) => {
                                         let packet_len = packet.len();
                                         if tun_tx.send(packet).await.is_err() { break; }
-                                        registry.record_rx(&client_info, packet_len);
+                                        registry.record_rx(&client_info, packet_len, "ws");
                                     }
                                     Err(error) => debug!("[WebSocket] Dropped invalid message from {remote_addr}: {error}"),
                                 }

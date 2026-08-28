@@ -1220,15 +1220,22 @@ impl VpnApi {
             Err(e) => return TrafficReportResponse::Error(Json(e.to_string())),
         };
         let now = chrono::Utc::now().naive_utc();
+
+        let minute = (now.minute() / 15) * 15;
         let bucket_start = now
             .date()
-            .and_hms_opt(now.hour(), 0, 0)
-            .expect("valid hour");
+            .and_hms_opt(now.hour(), minute, 0)
+            .expect("valid bucket");
 
         for sample in req.0.samples {
             if sample.fingerprint.is_empty() {
                 return TrafficReportResponse::BadRequest(Json("Empty fingerprint".to_string()));
             }
+
+            // Преобразуем входящую строку транспорта в строго типизированный Enum
+            let raw_proto = sample.protocol.clone().unwrap_or_else(|| "quic".to_string());
+            let protocol = crate::entities::ProtocolType::from_str(&raw_proto);
+
             let user_id = match sample.user_id {
                 Some(id) => match Uuid::parse_str(&id) {
                     Ok(id) => Some(id),
@@ -1242,21 +1249,23 @@ impl VpnApi {
             };
             let rx_bytes = sample.rx_bytes.min(i64::MAX as u64) as i64;
             let tx_bytes = sample.tx_bytes.min(i64::MAX as u64) as i64;
+
             let existing = match traffic_totals::Entity::find()
                 .filter(traffic_totals::Column::ServerId.eq(node_id))
                 .filter(traffic_totals::Column::BootId.eq(&req.0.boot_id))
                 .filter(traffic_totals::Column::Fingerprint.eq(&sample.fingerprint))
+                .filter(traffic_totals::Column::Protocol.eq(protocol)) // Фильтр по ENUM
                 .one(&txn)
                 .await
             {
                 Ok(existing) => existing,
                 Err(e) => return TrafficReportResponse::Error(Json(e.to_string())),
             };
+
             let (rx_delta, tx_delta, total_result) = if let Some(existing) = existing {
                 let rx_delta = cumulative_delta(existing.rx_bytes, rx_bytes);
                 let tx_delta = cumulative_delta(existing.tx_bytes, tx_bytes);
                 let mut total = existing.into_active_model();
-                // Reports are cumulative for a node boot, so retries cannot double count.
                 total.rx_bytes = Set(rx_bytes);
                 total.tx_bytes = Set(tx_bytes);
                 total.user_id = Set(user_id);
@@ -1271,11 +1280,12 @@ impl VpnApi {
                     fingerprint: Set(sample.fingerprint.clone()),
                     rx_bytes: Set(rx_bytes),
                     tx_bytes: Set(tx_bytes),
+                    protocol: Set(protocol), // Вставляем ENUM
                     updated_at: Set(now),
                 }
-                .insert(&txn)
-                .await
-                .map(|_| ());
+                    .insert(&txn)
+                    .await
+                    .map(|_| ());
                 (rx_bytes, tx_bytes, result)
             };
             if let Err(e) = total_result {
@@ -1289,6 +1299,7 @@ impl VpnApi {
                 .filter(traffic_hourly::Column::BucketStart.eq(bucket_start))
                 .filter(traffic_hourly::Column::ServerId.eq(node_id))
                 .filter(traffic_hourly::Column::Fingerprint.eq(&sample.fingerprint))
+                .filter(traffic_hourly::Column::Protocol.eq(protocol)) // Фильтр по ENUM
                 .one(&txn)
                 .await
             {
@@ -1311,11 +1322,12 @@ impl VpnApi {
                     fingerprint: Set(sample.fingerprint),
                     rx_bytes: Set(rx_delta),
                     tx_bytes: Set(tx_delta),
+                    protocol: Set(protocol),
                     updated_at: Set(now),
                 }
-                .insert(&txn)
-                .await
-                .map(|_| ())
+                    .insert(&txn)
+                    .await
+                    .map(|_| ())
             };
             if let Err(e) = hourly_result {
                 return TrafficReportResponse::Error(Json(e.to_string()));
@@ -1408,6 +1420,7 @@ impl VpnApi {
         server_id: Query<Option<uuid::Uuid>>,
         user_id: Query<Option<uuid::Uuid>>,
         fingerprint: Query<Option<String>>,
+        protocol: Query<Option<String>>, // Входящий текстовый фильтр
     ) -> GetTrafficHistoryResponse {
         if let Err(err) = self.validate_admin_session(&auth.0.token).await {
             return GetTrafficHistoryResponse::Unauthorized(Json(err));
@@ -1426,7 +1439,6 @@ impl VpnApi {
 
         let first_bucket = current_bucket - chrono::Duration::minutes((total_steps - 1) as i64 * step_minutes as i64);
 
-        // Строим динамический запрос к БД с учетом фильтров
         let mut query = traffic_hourly::Entity::find()
             .filter(traffic_hourly::Column::BucketStart.gte(first_bucket));
 
@@ -1439,6 +1451,13 @@ impl VpnApi {
         if let Some(ref fp) = fingerprint.0 {
             if !fp.trim().is_empty() {
                 query = query.filter(traffic_hourly::Column::Fingerprint.eq(fp));
+            }
+        }
+        // Мапим текстовый фильтр в PostgreSQL ENUM тип
+        if let Some(ref proto) = protocol.0 {
+            if !proto.trim().is_empty() {
+                let db_proto = crate::entities::ProtocolType::from_str(proto);
+                query = query.filter(traffic_hourly::Column::Protocol.eq(db_proto));
             }
         }
 
@@ -2575,13 +2594,13 @@ impl VpnApi {
             .await
             .map_err(poem::error::InternalServerError)?;
 
-        // 2. Сортируем все записи по времени последнего обновления (по убыванию),
-        // чтобы самые свежие и активные подключения всегда шли первыми.
+        // 2. Сортируем записи по времени последнего обновления (по убыванию).
+        // Самое свежее подключение (куда клиент только что переподключился) пойдет первым.
         active_totals.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
 
-        // 3. Группируем по пользователю и ограничиваем количество выводов
-        // лимитом из таблицы active_sessions (Sessions).
-        let mut user_connection_counts: std::collections::HashMap<uuid::Uuid, i32> = std::collections::HashMap::new();
+        // 3. Быстрая O(1) дедупликация и лимитирование сессий
+        let mut user_connection_limits: std::collections::HashMap<uuid::Uuid, i32> = std::collections::HashMap::new();
+        let mut added_user_counts: std::collections::HashMap<uuid::Uuid, i32> = std::collections::HashMap::new();
         let mut dtos = Vec::new();
 
         for total in active_totals {
@@ -2590,7 +2609,7 @@ impl VpnApi {
             };
 
             // Кешируем и получаем лимит сессий для этого пользователя из БД
-            let max_allowed_connections = if let Some(&count) = user_connection_counts.get(&user_id) {
+            let max_allowed_connections = if let Some(&count) = user_connection_limits.get(&user_id) {
                 count
             } else {
                 let sessions_in_db = crate::entities::active_sessions::Entity::find()
@@ -2602,20 +2621,20 @@ impl VpnApi {
                     .unwrap_or(1);
 
                 let limit = sessions_in_db.max(1);
-                user_connection_counts.insert(user_id, limit);
+                user_connection_limits.insert(user_id, limit);
                 limit
             };
 
-            // Считаем, сколько подключений для этого пользователя мы УЖЕ добавили в результат
-            let already_added = dtos.iter()
-                .filter(|dto: &&ActiveConnectionDto| dto.user_id == user_id)
-                .count() as i32;
+            // Получаем количество уже добавленных подключений для этого пользователя
+            let already_added = added_user_counts.entry(user_id).or_insert(0);
 
-            // Если количество выведенных записей достигло лимита активных сессий пользователя —
-            // игнорируем более старые (зависшие при реконнекте) записи в пользу свежих!
-            if already_added >= max_allowed_connections {
+            // Если лимит сессий превышен — пропускаем старую запись
+            if *already_added >= max_allowed_connections {
                 continue;
             }
+
+            // Увеличиваем счетчик добавленных подключений для пользователя
+            *already_added += 1;
 
             let username = crate::entities::users::Entity::find_by_id(user_id)
                 .one(&self.db)
@@ -2639,6 +2658,7 @@ impl VpnApi {
                 rx_bytes: total.rx_bytes.max(0) as u64,
                 tx_bytes: total.tx_bytes.max(0) as u64,
                 connection_count: max_allowed_connections,
+                protocol: total.protocol.as_str().to_string(), // <--- Заполнили поле для отображения в таблице активных сессий
             });
         }
 

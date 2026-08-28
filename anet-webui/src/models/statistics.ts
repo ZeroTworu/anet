@@ -1,4 +1,3 @@
-// DTO статистики для таблиц узлов/пользователей и почасового графика.
 export type NodeTrafficStat = {
   node_id: string
   name: string
@@ -28,4 +27,5 @@ export type ActiveConnection = {
   rx_bytes: number
   tx_bytes: number
   connection_count: number
+  protocol: string
 }

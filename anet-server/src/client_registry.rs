@@ -21,11 +21,13 @@ pub struct ClientTransportInfo {
     pub remote_addr: ArcSwap<SocketAddr>,
     pub fingerprint: String,
     pub user_id: Option<String>,
+    pub protocol: String, // "quic" | "ssh" | "vnc" | "ws"
 }
 
 struct TrafficCounters {
     user_id: Option<String>,
     fingerprint: String,
+    protocol: String,
     rx_bytes: AtomicU64,
     tx_bytes: AtomicU64,
 }
@@ -59,6 +61,7 @@ mod tests {
             remote_addr: ArcSwap::new(Arc::new("127.0.0.1:12345".parse().unwrap())),
             fingerprint: fingerprint.to_string(),
             user_id: None,
+            protocol: "quic".to_string(),
         })
     }
 
@@ -103,7 +106,7 @@ mod tests {
         registry.pre_register_client(client.clone());
         registry.finalize_client(&client.assigned_ip, router);
 
-        registry.record_rx(&client, 120);
+        registry.record_rx(&client, 120, "quic");
         registry
             .route_packet_to_client(&client.assigned_ip, Bytes::from(vec![0; 80]))
             .await;
@@ -176,40 +179,39 @@ impl ClientRegistry {
         info!("[ControlPlane] accepting_connections={accepting}");
     }
 
-    pub fn record_rx(&self, client: &ClientTransportInfo, bytes: usize) {
-        // Счётчик увеличивается на границе расшифрованной полезной нагрузки,
-        // а не на размере зашифрованного транспорта.
-        self.traffic_counters(client)
+    pub fn record_rx(&self, client: &ClientTransportInfo, bytes: usize, protocol: &str) {
+        self.traffic_counters(client, protocol)
             .rx_bytes
             .fetch_add(bytes as u64, Ordering::Relaxed);
     }
 
     pub fn traffic_snapshot(&self) -> Vec<TrafficUsageSample> {
-        // Собираем отпечатки (fingerprints) только действительно активных сессий
         let active_fps: std::collections::HashSet<String> = self.clients_by_prefix
             .iter()
             .map(|entry| entry.value().fingerprint.clone())
             .collect();
 
-        // Отправляем отчеты только по активным клиентам
         self.traffic_totals
             .iter()
-            .filter(|entry| active_fps.contains(entry.key()))
+            .filter(|entry| active_fps.contains(&entry.value().fingerprint))
             .map(|entry| TrafficUsageSample {
-                user_id: entry.user_id.clone(),
-                fingerprint: entry.fingerprint.clone(),
-                rx_bytes: entry.rx_bytes.load(Ordering::Relaxed),
-                tx_bytes: entry.tx_bytes.load(Ordering::Relaxed),
+                user_id: entry.value().user_id.clone(),
+                fingerprint: entry.value().fingerprint.clone(),
+                rx_bytes: entry.value().rx_bytes.load(Ordering::Relaxed),
+                tx_bytes: entry.value().tx_bytes.load(Ordering::Relaxed),
+                protocol: Some(entry.value().protocol.clone()), // Передаем тип транспорта
             })
             .collect()
     }
 
-    fn traffic_counters(&self, client: &ClientTransportInfo) -> Arc<TrafficCounters> {
+    fn traffic_counters(&self, client: &ClientTransportInfo, protocol: &str) -> Arc<TrafficCounters> {
+        let key = format!("{}#{}", client.fingerprint, protocol);
         self.traffic_totals
-            .entry(client.fingerprint.clone())
+            .entry(key)
             .or_insert_with(|| Arc::new(TrafficCounters {
                 user_id: client.user_id.clone(),
                 fingerprint: client.fingerprint.clone(),
+                protocol: protocol.to_string(),
                 rx_bytes: AtomicU64::new(0),
                 tx_bytes: AtomicU64::new(0),
             }))
@@ -387,7 +389,8 @@ impl ClientRegistry {
             if sender.send(packet).await.is_err() {
                 warn!("[Registry] Failed to route to {}: channel closed.", dst_ip);
             } else if let Some(client) = self.clients_by_ip.get(dst_ip) {
-                self.traffic_counters(&client)
+                // Извлекаем сохраненный протокол сессии из транспортной структуры
+                self.traffic_counters(&client, &client.protocol)
                     .tx_bytes
                     .fetch_add(packet_len as u64, Ordering::Relaxed);
             }

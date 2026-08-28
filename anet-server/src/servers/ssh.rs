@@ -199,7 +199,7 @@ where
             .await?
             .context("client disconnected during ASTP authentication")?;
         let (response, result) = auth_handler
-            .process_handshake_packet(packet, remote_addr)
+            .process_handshake_packet(packet, remote_addr, "ssh")
             .await?;
 
         if let Some(response) = response {
@@ -229,7 +229,7 @@ where
             .send(packet)
             .await
             .context("TUN input queue closed")?;
-        registry.record_rx(&client_info, packet_len);
+        registry.record_rx(&client_info, packet_len, "ssh");
     }
     Ok(())
 }

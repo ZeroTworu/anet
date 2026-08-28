@@ -68,9 +68,10 @@ pub struct TrafficUsageSample {
     pub user_id: Option<String>,
     /// Отпечаток клиента — стабильный fallback-идентификатор агрегации.
     pub fingerprint: String,
-    /// Байты от клиента к VPN-нode и от VPN-ноды к клиенту.
+    /// Байты от клиента к VPN-ноде и от VPN-ноды к клиенту.
     pub rx_bytes: u64,
     pub tx_bytes: u64,
+    pub protocol: Option<String>, // Тип транспорта: "quic", "ssh", "vnc", "ws"
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

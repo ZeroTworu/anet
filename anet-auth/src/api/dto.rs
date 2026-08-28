@@ -644,4 +644,5 @@ pub struct ActiveConnectionDto {
     pub rx_bytes: u64,
     pub tx_bytes: u64,
     pub connection_count: i32,
+    pub protocol: String,
 }
