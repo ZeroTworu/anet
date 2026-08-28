@@ -13,10 +13,10 @@ const emit = defineEmits<{
 
 const loading = ref(false)
 
-// Функция для сброса формы к значениям по умолчанию (с учетом портов)
+// Функция для сброса формы к значениям по умолчанию
 const defaultForm = (): CreateServerRequest => ({
   name: '',
-  dsn: 'quic://127.0.0.1:4519',
+  address: '127.0.0.1', // Заменили dsn на address
   public_key: '',
   ssh_user: 'hanyuu',
   is_active: true,
@@ -66,10 +66,11 @@ const close = () => {
               class="mb-3"
           />
 
+          <!-- Изменили поле DSN на "IP Адрес или Домен" -->
           <v-text-field
-              v-model="form.dsn"
-              label="DSN"
-              placeholder="quic://host:4519 или wss://host:8080/socket"
+              v-model="form.address"
+              label="IP Адрес или Домен"
+              placeholder="e.g. 64.188.118.201 или vpn.ziga.com"
               variant="filled"
               class="mb-3"
           />

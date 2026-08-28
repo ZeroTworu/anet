@@ -152,7 +152,7 @@ const close = () => {
           <v-select
               v-if="availableServers.length"
               :model-value="null"
-              :items="availableServers.map(server => ({ title: `${server.name} (${server.dsn})`, value: server.id }))"
+              :items="availableServers.map(server => ({ title: `${server.name} (${server.address})`, value: server.id }))"
               item-title="title"
               item-value="value"
               label="Добавить узел"

@@ -108,9 +108,11 @@ const onMouseMove = (event: MouseEvent) => {
 
 // Реактивные данные для отображения в тултипе при наведении
 const hoveredData = computed(() => {
-  if (hoveredIdx.value === null || !history.value[hoveredIdx.value]) return null
+  if (hoveredIdx.value === null) return null
 
   const item = history.value[hoveredIdx.value]
+  if (!item) return null // Сужение типа (Type Guard) — гарантирует наличие объекта
+
   const date = new Date(item.bucket_start)
 
   const dateStr = date.toLocaleDateString('ru-RU', {

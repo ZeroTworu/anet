@@ -4,6 +4,7 @@ import { useAppMessage } from '@/composables/useAppMessage'
 import { GetNodeCommandStatus, RotateNodeCredential, SetNodeAdmission, UpdateServer } from '@/api/servers'
 import type { Server } from '@/models/server'
 
+// ИСПРАВЛЕНО: Убрано 'show', теперь ловит дефолтный v-model из родителя
 const show = defineModel<boolean>()
 
 const props = defineProps<{
@@ -17,7 +18,7 @@ const emit = defineEmits<{
 
 const form = ref({
   name: '',
-  dsn: '',
+  address: '', // Заменили dsn на address
   public_key: '',
   ssh_user: '',
   is_active: true,
@@ -100,7 +101,7 @@ watch(
       if (val) {
         form.value = {
           name: val.name,
-          dsn: val.dsn,
+          address: val.address, // Заменили dsn на address
           public_key: val.public_key,
           ssh_user: val.ssh_user || '',
           is_active: val.is_active,
@@ -144,8 +145,12 @@ const close = () => {
       <v-card-text>
         <v-form>
           <v-text-field v-model="form.name" label="Название локации" variant="filled" class="mb-3" />
-          <v-text-field v-model="form.dsn" label="DSN" placeholder="quic://host:4519 или wss://host:8080/socket" variant="filled" class="mb-3" />
+
+          <!-- Изменили поле DSN на "IP Адрес или Домен" -->
+          <v-text-field v-model="form.address" label="IP Адрес или Домен" placeholder="e.g. 64.188.118.201 или vpn.ziga.com" variant="filled" class="mb-3" />
+
           <v-text-field v-model="form.public_key" label="Публичный ключ сервера" variant="filled" class="mb-3" />
+          <v-text-field v-model="form.ssh_user" label="Пользователь SSH" variant="filled" class="mb-3" />
 
           <!-- Размещаем порты side-by-side -->
           <v-row class="mb-1">
@@ -185,8 +190,6 @@ const close = () => {
               variant="filled"
               class="mb-3"
           />
-
-          <v-text-field v-model="form.ssh_user" label="Пользователь SSH" variant="filled" class="mb-3" />
 
           <v-switch v-model="form.is_active" label="Статус (ВКЛ / ВЫКЛ)" color="success" class="mb-4" />
 

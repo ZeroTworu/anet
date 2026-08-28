@@ -382,7 +382,6 @@ impl VpnApi {
             id: Set(server_id),
             name: Set(req.0.name.clone()),
             address: Set(String::new()),
-            dsn: Set(req.0.dsn.clone()),
             public_key: Set(req.0.public_key.clone()),
             quic_port: Set(req.0.quic_port),
             ssh_port: Set(req.0.ssh_port),
@@ -399,7 +398,7 @@ impl VpnApi {
             Ok(saved) => Ok(Json(ServerDto {
                 id: saved.id,
                 name: saved.name,
-                dsn: saved.dsn,
+                address: saved.address,
                 public_key: saved.public_key,
                 quic_port: saved.quic_port,
                 ssh_port: saved.ssh_port,
@@ -441,8 +440,8 @@ impl VpnApi {
             active_model.name = Set(name);
             changed = true;
         }
-        if let Some(dsn) = req.0.dsn {
-            active_model.dsn = Set(dsn);
+        if let Some(address ) = req.0.address {
+            active_model.address = Set(address );
             changed = true;
         }
         if let Some(pub_key) = req.0.public_key {
@@ -480,7 +479,7 @@ impl VpnApi {
                 Ok(saved) => UpdateServerApiResult::Ok(Json(ServerDto {
                     id: saved.id,
                     name: saved.name,
-                    dsn: saved.dsn,
+                    address: saved.address,
                     public_key: saved.public_key,
                     quic_port: saved.quic_port,
                     ssh_port: saved.ssh_port,
@@ -497,7 +496,7 @@ impl VpnApi {
             UpdateServerApiResult::Ok(Json(ServerDto {
                 id: server_model.id,
                 name: server_model.name,
-                dsn: server_model.dsn,
+                address: server_model.address,
                 public_key: server_model.public_key,
                 quic_port: server_model.quic_port,
                 ssh_port: server_model.ssh_port,
@@ -548,7 +547,7 @@ impl VpnApi {
                         }),
                         id: s.id,
                         name: s.name,
-                        dsn: s.dsn,
+                        address: s.address,
                         public_key: s.public_key,
                         quic_port: s.quic_port,
                         ssh_port: s.ssh_port,
@@ -2368,7 +2367,7 @@ impl VpnApi {
                 fallback_pub_key = server.public_key.clone();
             }
 
-            if server.dsn.trim().is_empty() {
+            if server.address.trim().is_empty() {
                 continue;
             }
 
@@ -2379,7 +2378,7 @@ impl VpnApi {
                 .unwrap_or_default();
             servers_toml.push_str(&format!(
                 "[[servers]]\nname = \"{}\"\ndsn = \"{}\"\n{}timeout_secs = 8\nserver_pub_key = \"{}\"\n\n",
-                server.name, server.dsn, ssh_user, server.public_key
+                server.name, server.address, ssh_user, server.public_key
             ));
         }
 
@@ -2503,7 +2502,7 @@ impl VpnApi {
 
         // Запрашиваем записи трафика, обновленные за последние 90 секунд
         let active_totals = crate::entities::traffic_totals::Entity::find()
-            .filter(crate::entities::traffic_totals::Column::UpdatedAt.gte(threshold))
+            .filter(traffic_totals::Column::UpdatedAt.gte(threshold))
             .all(&self.db)
             .await
             .map_err(poem::error::InternalServerError)?;

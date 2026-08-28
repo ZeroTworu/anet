@@ -27,7 +27,7 @@ const availableRouteMaps = ref<RouteMap[]>([])
 // Опции v-select в стандартном формате { title, value } — без item-title,
 // иначе в списке вместо названий будет [object Object]
 const serverOptions = computed(() => availableServers.value.map(s => ({
-  title: `${s.name} (${s.dsn})`,
+  title: `${s.name} (${s.address})`,
   value: s.id,
 })))
 const poolOptions = computed(() => availablePools.value.map(pool => ({

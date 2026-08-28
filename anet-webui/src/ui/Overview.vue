@@ -110,7 +110,7 @@ onBeforeUnmount(() => { if (refreshTimer !== undefined) clearInterval(refreshTim
             <div class="node-list">
               <button v-for="node in servers" :key="node.id" class="node-row" @click="router.push('/servers')">
                 <span :class="['health-dot', node.runtime?.status === 'online' ? 'online' : 'offline']" />
-                <span class="node-identity"><strong>{{ node.name }}</strong><small>{{ node.dsn }}</small></span>
+                <span class="node-identity"><strong>{{ node.name }}</strong><small>{{ node.address }}</small></span>
                 <span class="node-state">
                   <b>{{ node.runtime?.active_connections || 0 }}</b><small>connections</small>
                 </span>

@@ -15,7 +15,7 @@ pub use anet_common::dto::{
 pub struct ServerDto {
     pub id: uuid::Uuid,
     pub name: String,
-    pub dsn: String,
+    pub address: String,
     pub public_key: String,
     /// Legacy per-transport fields, kept alongside `dsn` for manual migration
     /// of endpoints that were registered before the unified DSN column.
@@ -214,7 +214,7 @@ pub enum GetTrafficHistoryResponse {
 #[derive(Object, Debug, Clone, Serialize, Deserialize)]
 pub struct CreateServerRequest {
     pub name: String,
-    pub dsn: String,
+    pub address: String,
     pub public_key: String,
     /// Legacy per-transport fields, optional. Set these to register a node
     /// under its old-style addressing alongside the unified `dsn`.
@@ -240,7 +240,7 @@ pub enum GetServersResponse {
 #[derive(Object, Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateServerRequest {
     pub name: Option<String>,
-    pub dsn: Option<String>,
+    pub address: Option<String>,
     pub public_key: Option<String>,
     /// Outer `Option` = "field present in request"; inner `Option` = the new
     /// value, where `null` explicitly clears the column (same convention as

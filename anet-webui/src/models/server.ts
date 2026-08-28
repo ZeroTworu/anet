@@ -2,7 +2,7 @@
 export type Server = {
     id: string
     name: string
-    dsn: string
+    address: string
     public_key: string
     ssh_user: string | null
     is_active: boolean
@@ -48,7 +48,7 @@ export type NodeCredential = {
 
 export type CreateServerRequest = {
     name: string
-    dsn: string
+    address: string
     public_key: string
     ssh_user: string | null
     is_active?: boolean
