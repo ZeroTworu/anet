@@ -1,17 +1,15 @@
 use std::collections::HashMap;
 use crate::api::api::{generate_node_token, hash_node_token, node_token_is_valid, validate_admin_session};
-use crate::api::dto::{
-    AdminToken, CreateAdmissionCommandRequest, CreateNodeCommandResponse, CreateServerRequest,
-    GetNodeCommandStatusResponse, GetNodeCommandsResponse, GetServersResponse, NodeCommandResultResponse,
-    NodeCommandResultRequest, NodeCommandStatusDto, NodeCredentialDto, RotateNodeCredentialResponse, ServerDto, NodeRuntimeDto, NodeCommand
-};
+use crate::api::dto::{AdminToken, CreateAdmissionCommandRequest, CreateNodeCommandResponse, CreateServerRequest, GetNodeCommandStatusResponse, GetNodeCommandsResponse, GetServersResponse, NodeCommandResultResponse, NodeCommandResultRequest, NodeCommandStatusDto, NodeCredentialDto, RotateNodeCredentialResponse, ServerDto, NodeRuntimeDto, NodeCommand, NodeHeartbeatResponse};
 use crate::entities::{node_commands, node_runtime_states, servers};
 use chrono::{NaiveDateTime, Utc};
+use log::info;
 use poem_openapi::{param::Query, payload::Json, OpenApi};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, IntoActiveModel, Set, QueryFilter, QueryOrder
 };
 use uuid::Uuid;
+use anet_common::dto::NodeHeartbeatRequest;
 
 pub struct ServersApi {
     pub db: DatabaseConnection,
@@ -332,6 +330,65 @@ impl ServersApi {
         }
     }
 
+    /// Принять периодический heartbeat от ноды и обновить её состояние в БД
+    #[oai(path = "/control/nodes/heartbeat", method = "post")]
+    async fn node_heartbeat(
+        &self,
+        #[oai(name = "X-Node-Token")] node_token: poem_openapi::param::Header<String>,
+        req: Json<NodeHeartbeatRequest>,
+    ) -> NodeHeartbeatResponse {
+        let node_id = match Uuid::parse_str(&req.0.node_id) {
+            Ok(id) => id,
+            Err(_) => {
+                return NodeHeartbeatResponse::BadRequest(Json("Invalid node_id".to_string()));
+            }
+        };
+
+        // Проверяем токен ноды
+        match node_token_is_valid(&self.db, node_id, &node_token.0).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return NodeHeartbeatResponse::Unauthorized(Json("Invalid node credential".to_string()));
+            }
+            Err(e) => return NodeHeartbeatResponse::Error(Json(e.to_string())),
+        }
+
+        let now = Utc::now().naive_utc();
+
+        // Ищем существующую запись состояния в БД
+        let existing = match node_runtime_states::Entity::find_by_id(node_id).one(&self.db).await {
+            Ok(state) => state,
+            Err(e) => return NodeHeartbeatResponse::Error(Json(e.to_string())),
+        };
+
+        let result = if let Some(state) = existing {
+            // Обновляем текущее состояние
+            let mut active = state.into_active_model();
+            active.last_seen_at = Set(now);
+            active.version = Set(req.0.version.clone());
+            active.uptime_seconds = Set(req.0.uptime_seconds as i64);
+            active.active_connections = Set(req.0.active_connections as i64);
+            active.accepting_connections = Set(req.0.accepting_connections);
+            active.update(&self.db).await
+        } else {
+            // Создаем новую запись, если нода стучится впервые
+            let new_state = node_runtime_states::ActiveModel {
+                server_id: Set(node_id),
+                last_seen_at: Set(now),
+                version: Set(req.0.version.clone()),
+                uptime_seconds: Set(req.0.uptime_seconds as i64),
+                active_connections: Set(req.0.active_connections as i64),
+                accepting_connections: Set(req.0.accepting_connections),
+            };
+            new_state.insert(&self.db).await
+        };
+
+        match result {
+            Ok(_) => NodeHeartbeatResponse::Accepted,
+            Err(e) => NodeHeartbeatResponse::Error(Json(e.to_string())),
+        }
+    }
+
     /// Забрать следующую ожидающую команду. Вызов выполняется самой нодой.
     #[oai(path = "/control/nodes/commands", method = "get")]
     async fn get_node_commands(
@@ -401,7 +458,7 @@ impl ServersApi {
         match claimed.update(&self.db).await {
             Ok(saved) => {
                 // Добавьте эту строку для диагностики:
-                log::info!(
+                info!(
                     "[ControlPlane] Sending command: ID={}, Type={}, Fingerprint={:?}",
                     saved.id,
                     saved.command_type,

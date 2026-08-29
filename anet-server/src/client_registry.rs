@@ -186,20 +186,23 @@ impl ClientRegistry {
     }
 
     pub fn traffic_snapshot(&self) -> Vec<TrafficUsageSample> {
-        let active_fps: std::collections::HashSet<String> = self.clients_by_prefix
+        let active_sessions: std::collections::HashSet<String> = self.clients_by_prefix
             .iter()
-            .map(|entry| entry.value().fingerprint.clone())
+            .map(|entry| format!("{}#{}", entry.value().fingerprint, entry.value().protocol))
             .collect();
 
         self.traffic_totals
             .iter()
-            .filter(|entry| active_fps.contains(&entry.value().fingerprint))
+            .filter(|entry| {
+                let key = format!("{}#{}", entry.value().fingerprint, entry.value().protocol);
+                active_sessions.contains(&key)
+            })
             .map(|entry| TrafficUsageSample {
                 user_id: entry.value().user_id.clone(),
                 fingerprint: entry.value().fingerprint.clone(),
                 rx_bytes: entry.value().rx_bytes.load(Ordering::Relaxed),
                 tx_bytes: entry.value().tx_bytes.load(Ordering::Relaxed),
-                protocol: Some(entry.value().protocol.clone()), // Передаем тип транспорта
+                protocol: Some(entry.value().protocol.clone()),
             })
             .collect()
     }
@@ -250,6 +253,10 @@ impl ClientRegistry {
         self.clients_by_addr.remove(&remote_addr);
         self.clients_by_ip.remove(client_ip);
 
+        // Очищаем локальные счетчики трафика отключенной сессии во избежание утечки памяти
+        let key = format!("{}#{}", client_info.fingerprint, client_info.protocol);
+        self.traffic_totals.remove(&key);
+
         if let Ok(ip_addr) = client_ip.parse::<Ipv4Addr>() {
             self.ip_pool.release(ip_addr);
         }
@@ -264,6 +271,7 @@ impl ClientRegistry {
 
         info!("[Registry] Client {} removed.", client_ip);
     }
+
 
     pub fn suspend_client(&self, client_info: Arc<ClientTransportInfo>) {
         let client_ip = client_info.assigned_ip.clone();
@@ -333,6 +341,11 @@ impl ClientRegistry {
         if let Ok(ip_addr) = client_info.assigned_ip.parse::<Ipv4Addr>() {
             self.ip_pool.release(ip_addr);
         }
+
+        // Очищаем локальные счетчики трафика истекшей сессии
+        let key = format!("{}#{}", client_info.fingerprint, client_info.protocol);
+        self.traffic_totals.remove(&key);
+
         let auth_provider = self.auth_provider.clone();
         let fingerprint = client_info.fingerprint.clone();
         tokio::spawn(async move {
