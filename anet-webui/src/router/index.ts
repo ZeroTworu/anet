@@ -11,6 +11,8 @@ const Overview = () => import('@/ui/Overview.vue')
 
 const Groups = () => import('@/ui/Groups.vue')
 
+const GroupDetail = () => import('@/ui/GroupDetail.vue')
+
 const router = createRouter({
   history: createWebHistory(),
   routes: [
@@ -26,6 +28,7 @@ const router = createRouter({
     { path: '/pools', component: Pools, meta: { title: 'Node Pools' } },
     { path: '/route-maps', component: RouteMaps, meta: { title: 'Route Maps' } },
     { path: '/groups', component: Groups, meta: { title: 'User Groups' } },
+    { path: '/groups/:id', component: GroupDetail, meta: { title: 'Параметры группы' } }
   ],
 })
 

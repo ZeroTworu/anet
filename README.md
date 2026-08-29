@@ -1,6 +1,6 @@
 # ANet: Сеть Друзей
 
-![Language](https://img.shields.io/badge/rust-1.84%2B-orange)
+![Language](https://img.shields.io/badge/rust-1.98%2B-orange)
 ![Protocol](https://img.shields.io/badge/protocol-ASTP_v0.6-blue)
 
 **ANet** — это инструмент для организации приватного, защищенного информационного пространства между близкими людьми. Мы строим цифровые мосты там, где обычные пути недоступны.

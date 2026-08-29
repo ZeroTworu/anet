@@ -1,7 +1,9 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { GetUsers } from '@/api/users'
-import type { UsersResponse } from '@/models/user'
+import { GetGroups } from '@/api/groups'
+import type { UsersResponse, User } from '@/models/user'
+import type { UserGroup } from '@/models/group'
 
 import UserModal from '@/components/UserModal.vue'
 import CreateUserModal from '@/components/CreateUserModal.vue'
@@ -9,12 +11,19 @@ import CreateUserModal from '@/components/CreateUserModal.vue'
 const data = ref<UsersResponse | null>(null)
 const loading = ref(false)
 const searchQuery = ref('')
+const selectedGroupIds = ref<string[]>([])
+const groups = ref<UserGroup[]>([])
 
-// Текущие опции пагинации
-const options = ref({ page: 1, itemsPerPage: 10 })
+// Текущие опции пагинации и сортировки
+const options = ref({
+  page: 1,
+  itemsPerPage: 10,
+  sortBy: [] as { key: string; order: string }[] // <-- Сюда Vuetify пишет активную сортировку
+})
 
 const headers = [
   { title: 'UID (User Name)', key: 'uid', sortable: true },
+  { title: 'Группа', key: 'group_name', sortable: false }, // По этой связи сортировка отключена
   { title: 'UUID (ID)', key: 'id', sortable: true },
   { title: 'Status', key: 'is_active', sortable: true, align: 'center' as const },
 ]
@@ -22,27 +31,55 @@ const headers = [
 const items = computed(() => data.value?.items ?? [])
 const total = computed(() => data.value?.total ?? 0)
 
-// Функция загрузки с безопасными параметрами по умолчанию
+const groupMap = computed(() => new Map(groups.value.map(g => [g.id, g])))
+const groupOptions = computed(() => groups.value.map(g => ({ title: g.name, value: g.id })))
+
+// Загрузка пользователей
 const loadUsers = async (
-    page: number = options.value.page,
-    itemsPerPage: number = options.value.itemsPerPage,
-    search: string = searchQuery.value
+    page = options.value.page,
+    itemsPerPage = options.value.itemsPerPage,
+    search = searchQuery.value,
+    groupIds = selectedGroupIds.value,
+    sortBy = options.value.sortBy
 ) => {
   loading.value = true
   try {
     const offset = (page - 1) * itemsPerPage
-    data.value = await GetUsers(offset, itemsPerPage, search)
+    const sortField = sortBy[0]?.key // Извлекаем поле сортировки
+    const isDesc = sortBy[0]?.order === 'desc' // Извлекаем направление
+
+    data.value = await GetUsers(offset, itemsPerPage, search, groupIds, sortField, isDesc)
   } finally {
     loading.value = false
   }
 }
 
-// Единая точка входа для любых изменений таблицы (поиск, страница, размер страницы)
-const handleOptions = (opts: { page: number; itemsPerPage: number }) => {
+const loadGroupDictionary = async () => {
+  try {
+    groups.value = await GetGroups()
+  } catch (e) {
+    console.error('Failed to load group dictionary for users list:', e)
+  }
+}
+
+// При клике на пагинацию или заголовки колонок
+const handleOptions = (opts: any) => {
   options.value.page = opts.page
   options.value.itemsPerPage = opts.itemsPerPage
-  loadUsers(opts.page, opts.itemsPerPage, searchQuery.value)
+  options.value.sortBy = opts.sortBy || []
+
+  loadUsers(opts.page, opts.itemsPerPage, searchQuery.value, selectedGroupIds.value, opts.sortBy)
 }
+
+watch(selectedGroupIds, (newIds) => {
+  options.value.page = 1
+  loadUsers(1, options.value.itemsPerPage, searchQuery.value, newIds, options.value.sortBy)
+})
+
+watch(searchQuery, (query) => {
+  options.value.page = 1
+  loadUsers(1, options.value.itemsPerPage, query, selectedGroupIds.value, options.value.sortBy)
+})
 
 const selectedUserId = ref('')
 const showModal = ref(false)
@@ -57,6 +94,11 @@ const closeModal = () => {
   showModal.value = false
   selectedUserId.value = ''
 }
+
+onMounted(() => {
+  loadGroupDictionary()
+  loadUsers()
+})
 </script>
 
 <template>
@@ -66,7 +108,24 @@ const closeModal = () => {
         <h2 class="text-h6 font-weight-bold ma-0">ANet VPN Clients</h2>
         <span class="text-caption text-medium-emphasis">Управление учетными записями пользователей</span>
       </div>
-      <div class="d-flex align-center ga-3">
+      <div class="d-flex align-center flex-wrap flex-sm-nowrap ga-3">
+        <v-select
+            v-model="selectedGroupIds"
+            multiple
+            clearable
+            chips
+            collapse-chips
+            :items="groupOptions"
+            item-title="title"
+            item-value="value"
+            label="Фильтр по группам"
+            placeholder="Выберите группы"
+            variant="outlined"
+            density="compact"
+            hide-details
+            style="width: 280px"
+        />
+
         <v-text-field
             v-model="searchQuery"
             prepend-inner-icon="mdi-magnify"
@@ -75,7 +134,7 @@ const closeModal = () => {
             density="compact"
             hide-details
             single-line
-            style="width: 260px"
+            style="width: 240px"
         />
         <v-btn color="primary" @click="showCreate = true"> Add User </v-btn>
       </div>
@@ -88,7 +147,6 @@ const closeModal = () => {
         :items="items"
         :items-length="total"
         :loading="loading"
-        :search="searchQuery"
         :items-per-page-options="[10, 20, 50, 100]"
         items-per-page-text="Строк на странице"
         loading-text="Загрузка пользователей…"
@@ -101,6 +159,18 @@ const closeModal = () => {
     >
       <template #item.uid="{ item }">
         <span class="uid-col">{{ item.uid || 'No Name' }}</span>
+      </template>
+
+      <template #item.group_name="{ item }">
+        <v-chip
+            v-if="item.group_id && groupMap.has(item.group_id)"
+            size="small"
+            variant="flat"
+            color="secondary"
+        >
+          {{ groupMap.get(item.group_id)?.name }}
+        </v-chip>
+        <span v-else class="text-caption text-medium-emphasis">—</span>
       </template>
 
       <template #item.id="{ item }">

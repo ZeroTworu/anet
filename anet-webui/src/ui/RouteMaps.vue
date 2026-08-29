@@ -49,11 +49,6 @@ onMounted(load)
       <v-btn color="primary" @click="openCreate">Создать карту</v-btn>
     </div>
 
-    <v-alert type="info" variant="tonal" class="mb-6">
-      CIDR-карты работают на desktop и mobile. Application rules используют Windows per-app filtering.
-      Domain/Geo и межузловые hops появятся вместе с соответствующим data plane.
-    </v-alert>
-
     <div class="position-relative">
       <v-row v-if="maps.length > 0">
         <v-col v-for="map in maps" :key="map.id" cols="12" md="6">

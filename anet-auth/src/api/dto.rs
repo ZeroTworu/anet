@@ -661,9 +661,14 @@ pub struct GroupDto {
     pub speed_limit: i32,
     pub sessions_limit: i32,
     pub duration_days: i32,
-    pub user_ids: Vec<uuid::Uuid>,
+    pub user_count: i64,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Object, Debug, Clone, Serialize, Deserialize)]
+pub struct AddGroupMemberRequest {
+    pub user_id: uuid::Uuid,
 }
 
 #[derive(Object, Debug, Clone, Serialize, Deserialize)]
@@ -673,7 +678,6 @@ pub struct SaveGroupRequest {
     pub speed_limit: i32,
     pub sessions_limit: i32,
     pub duration_days: i32,
-    pub user_ids: Option<Vec<uuid::Uuid>>,
 }
 
 #[derive(ApiResponse)]

@@ -1,15 +1,16 @@
 <script setup lang="ts">
 import { onMounted, ref } from 'vue'
+import { useRouter } from 'vue-router' // <-- Импортируем роутер для переходов
 import { GetGroups, DeleteGroup } from '@/api/groups'
 import type { UserGroup } from '@/models/group'
 import GroupModal from '@/components/GroupModal.vue'
 import EntityCard from '@/components/EntityCard.vue'
 import { useAppMessage } from '@/composables/useAppMessage'
 
+const router = useRouter() // <-- Инициализируем роутер
 const groups = ref<UserGroup[]>([])
 const loading = ref(false)
 const showEditor = ref(false)
-const selectedGroup = ref<UserGroup | null>(null)
 const message = useAppMessage()
 
 const formatBytes = (bytes: number | null | undefined) => {
@@ -35,32 +36,29 @@ const formatDuration = (days: number | null | undefined) => {
 }
 
 const load = async () => {
-  console.log('[Groups] Loading data from API...');
   loading.value = true
   try {
     const res = await GetGroups()
-    console.log('[Groups] API response received:', res);
     groups.value = res || []
   } catch (err) {
-    console.error('[Groups] API Error:', err);
     message.error('Не удалось загрузить группы пользователей')
   } finally {
     loading.value = false
   }
 }
 
+// Открываем облегченную модалку создания новой группы
 const openCreate = () => {
-  selectedGroup.value = null
   showEditor.value = true
 }
 
-const openEdit = (group: UserGroup) => {
-  selectedGroup.value = group
-  showEditor.value = true
+// Переход на выделенный полноэкранный интерфейс деталки
+const goToDetail = (id: string) => {
+  router.push(`/groups/${id}`)
 }
 
 const remove = async (id: string) => {
-  if (!confirm('Вы уверены, что хотите удалить эту группу пользователей?')) return
+  if (!confirm('Вы уверены, что хотите удалить эту группу пользователей? У всех ее участников сбросится группа.')) return
   try {
     await DeleteGroup(id)
     message.success('Группа удалена')
@@ -71,7 +69,6 @@ const remove = async (id: string) => {
 }
 
 onMounted(() => {
-  console.log('[Groups] Component mounted successfully!');
   load()
 })
 </script>
@@ -89,10 +86,11 @@ onMounted(() => {
     <div class="position-relative">
       <v-row v-if="groups && groups.length > 0">
         <v-col v-for="group in groups" :key="group.id" cols="12" md="6" lg="4">
+          <!-- Клик теперь вызывает переход на деталку вместо модалки редактирования -->
           <EntityCard
               :title="group.name"
               :subtitle="formatDuration(group.duration_days)"
-              @click="openEdit(group)"
+              @click="goToDetail(group.id)"
           >
             <template #badges>
               <v-chip size="small" variant="outlined" :color="!group.sessions_limit ? 'info' : 'default'">
@@ -101,6 +99,9 @@ onMounted(() => {
             </template>
 
             <template #meta>
+              <v-chip color="primary" size="small" variant="tonal">
+                Участников: {{ group.user_count }}
+              </v-chip>
               <v-btn color="error" variant="text" size="small" @click.stop="remove(group.id)">
                 Удалить
               </v-btn>
@@ -118,7 +119,6 @@ onMounted(() => {
         </v-col>
       </v-row>
 
-      <!-- Универсальное пустое состояние на базе v-sheet, работающее на любой версии Vuetify 3 -->
       <v-sheet v-else color="transparent" class="d-flex flex-column align-center justify-center pa-10 text-center mt-10">
         <v-icon icon="mdi-wallet-membership" size="64" color="medium-emphasis" class="mb-4" />
         <h3 class="text-h6 font-weight-bold mb-1">Группы пользователей ещё не созданы</h3>
@@ -126,9 +126,10 @@ onMounted(() => {
       </v-sheet>
     </div>
 
+    <!-- Модалка только для быстрого создания пустой группы -->
     <GroupModal
         v-model="showEditor"
-        :group="selectedGroup"
+        :group="null"
         @saved="load"
     />
   </v-container>
@@ -137,3 +138,4 @@ onMounted(() => {
 <style scoped>
 .groups-page { padding: 24px; }
 </style>
+

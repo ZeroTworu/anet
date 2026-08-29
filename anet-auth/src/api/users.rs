@@ -27,7 +27,8 @@ pub struct UsersApi {
 
 #[OpenApi]
 impl UsersApi {
-    /// Получить список всех пользователей (с поиском по LIKE)
+
+    /// Получить список всех пользователей (с поиском, фильтром групп и сортировкой)
     #[oai(path = "/users", method = "get")]
     async fn get_users(
         &self,
@@ -35,6 +36,9 @@ impl UsersApi {
         from: Query<Option<i64>>,
         limit: Query<Option<i64>>,
         search: Query<Option<String>>,
+        group_ids: Query<Option<String>>,
+        sort_by: Query<Option<String>>,
+        descending: Query<Option<bool>>,
     ) -> GetUsersResponse {
         if let Err(deny_reason) = validate_admin_session(&self.db, &auth.0.token).await {
             return GetUsersResponse::Unauthorized(Json(deny_reason));
@@ -50,9 +54,22 @@ impl UsersApi {
             if !s.trim().is_empty() {
                 let pattern = format!("%{}%", s.trim());
                 query = query.filter(
-                    users::Column::Uid.like(&pattern)
-                        .or(users::Column::Fingerprint.like(&pattern))
+                    sea_orm::Condition::any()
+                        .add(users::Column::Uid.ilike(&pattern))
+                        .add(users::Column::Fingerprint.ilike(&pattern))
                 );
+            }
+        }
+
+        if let Some(ref g_ids) = group_ids.0 {
+            if !g_ids.trim().is_empty() {
+                let parsed_ids: Vec<Uuid> = g_ids
+                    .split(',')
+                    .filter_map(|s| Uuid::parse_str(s).ok())
+                    .collect();
+                if !parsed_ids.is_empty() {
+                    query = query.filter(users::Column::GroupId.is_in(parsed_ids));
+                }
             }
         }
 
@@ -61,8 +78,21 @@ impl UsersApi {
             Err(e) => return GetUsersResponse::Error(Json(e.to_string())),
         };
 
+        // Логика динамической сортировки Sea-ORM
+        let order_col = match sort_by.0.as_deref() {
+            Some("uid") => users::Column::Uid,
+            Some("id") => users::Column::Id,
+            Some("is_active") => users::Column::IsActive,
+            _ => users::Column::CreatedAt, // По умолчанию
+        };
+
+        query = if descending.0.unwrap_or(false) {
+            query.order_by_desc(order_col)
+        } else {
+            query.order_by_asc(order_col)
+        };
+
         let users = match query
-            .order_by_desc(users::Column::CreatedAt)
             .offset(offset)
             .limit(page_size)
             .all(&self.db)
@@ -74,17 +104,6 @@ impl UsersApi {
 
         let mut dto_list = Vec::new();
         for (m, r) in users {
-            let p_ids = user_pool_ids(&self.db, m.id).await;
-            let route_map_id = user_route_map_id(&self.db, m.id).await;
-            let s_ids = user_servers::Entity::find()
-                .filter(user_servers::Column::UserId.eq(m.id))
-                .all(&self.db)
-                .await
-                .unwrap_or_default()
-                .into_iter()
-                .map(|us| us.server_id)
-                .collect();
-
             dto_list.push(VpnUserDto {
                 id: m.id,
                 fingerprint: m.fingerprint,
@@ -97,9 +116,9 @@ impl UsersApi {
                     date_end: rate_model.date_end.format("%Y-%m-%d-%H:%M").to_string(),
                 }),
                 static_ip: m.static_ip.map(|ip| ip.parse().ok()).flatten(),
-                server_ids: s_ids,
-                pool_ids: p_ids,
-                route_map_id,
+                server_ids: Vec::new(),
+                pool_ids: Vec::new(),
+                route_map_id: m.route_map_id,
                 group_id: m.group_id,
             });
         }

@@ -8,11 +8,21 @@ import {
 import { api } from './client'
 import { toQuery } from '@/utils'
 
-export async function GetUsers(from: number = 0, limit: number = 10, search?: string): Promise<UsersResponse> {
+export async function GetUsers(
+    from: number = 0,
+    limit: number = 10,
+    search?: string,
+    groupIds?: string[],
+    sortBy?: string,       // <-- Новое
+    descending?: boolean,  // <-- Новое
+): Promise<UsersResponse> {
   const params = toQuery({
     from: from,
     limit: limit,
-    search: search || undefined, // Параметр для будущей или текущей фильтрации на бэкенде
+    search: search || undefined,
+    group_ids: groupIds && groupIds.length ? groupIds.join(',') : undefined,
+    sort_by: sortBy || undefined,
+    descending: descending !== undefined ? String(descending) : undefined,
   })
 
   const res = await api<UsersResponse>(`/users?${params}`, {
