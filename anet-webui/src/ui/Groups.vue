@@ -1,38 +1,48 @@
 <script setup lang="ts">
 import { onMounted, ref } from 'vue'
-import { useRouter } from 'vue-router' // <-- Импортируем роутер для переходов
+import { useRouter } from 'vue-router'
 import { GetGroups, DeleteGroup } from '@/api/groups'
 import type { UserGroup } from '@/models/group'
 import GroupModal from '@/components/GroupModal.vue'
-import EntityCard from '@/components/EntityCard.vue'
 import { useAppMessage } from '@/composables/useAppMessage'
 
-const router = useRouter() // <-- Инициализируем роутер
+const router = useRouter()
 const groups = ref<UserGroup[]>([])
 const loading = ref(false)
 const showEditor = ref(false)
+const searchQuery = ref('')
 const message = useAppMessage()
 
+const headers = [
+  { title: 'Группа', key: 'name', sortable: true },
+  { title: 'Ограничение трафика', key: 'traffic_limit', sortable: true },
+  { title: 'Ограничение скорости', key: 'speed_limit', sortable: true },
+  { title: 'Сессий', key: 'sessions_limit', sortable: true, align: 'center' as const },
+  { title: 'Период подписки', key: 'duration_days', sortable: true },
+  { title: 'Участники', key: 'user_count', sortable: true, align: 'center' as const },
+  { title: 'Действия', key: 'actions', sortable: false, align: 'center' as const },
+]
+
 const formatBytes = (bytes: number | null | undefined) => {
-  if (!bytes) return 'Без лимита трафика'
+  if (!bytes) return 'Безлимит'
   const gb = bytes / (1024 * 1024 * 1024)
   return `${gb.toFixed(0)} ГБ`
 }
 
 const formatSpeed = (kbps: number | null | undefined) => {
-  if (!kbps) return 'Без лимита скорости'
+  if (!kbps) return 'Безлимит'
   const mbps = kbps / 1024
   return `${mbps.toFixed(0)} Мбит/с`
 }
 
 const formatSessions = (sessions: number | null | undefined) => {
-  if (!sessions) return 'Безлимитные сессии'
-  return `Сессий: ${sessions}`
+  if (!sessions) return 'Безлимит'
+  return `${sessions}`
 }
 
 const formatDuration = (days: number | null | undefined) => {
   if (!days) return 'Бессрочный доступ'
-  return `Доступ при активации: +${days} дней`
+  return `+${days} дней`
 }
 
 const load = async () => {
@@ -47,12 +57,10 @@ const load = async () => {
   }
 }
 
-// Открываем облегченную модалку создания новой группы
 const openCreate = () => {
   showEditor.value = true
 }
 
-// Переход на выделенный полноэкранный интерфейс деталки
 const goToDetail = (id: string) => {
   router.push(`/groups/${id}`)
 }
@@ -74,62 +82,88 @@ onMounted(() => {
 </script>
 
 <template>
-  <v-container max-width="1200" class="groups-page">
-    <div class="d-flex justify-space-between align-center mb-5">
-      <div>
-        <h2 class="text-h6 font-weight-bold ma-0">Группы пользователей</h2>
-        <span class="text-caption text-medium-emphasis">Группы пользователей и автоматические ограничения ресурсов</span>
+  <v-container max-width="1400" class="groups-page">
+      <div class="d-flex justify-space-between align-center flex-wrap ga-4 mb-6">
+        <v-list-item
+            class="px-0"
+            subtitle="Группы пользователей и автоматические ограничения ресурсов"
+        >
+          <template #title>
+            <h1 class="text-h5 font-weight-bold">Группы пользователей</h1>
+          </template>
+        </v-list-item>
+
+        <div class="d-flex align-center ga-3">
+        <v-text-field
+            v-model="searchQuery"
+            prepend-inner-icon="mdi-magnify"
+            label="Поиск по группам..."
+            variant="outlined"
+            density="compact"
+            hide-details
+            single-line
+            style="width: 280px"
+        />
+        <v-btn color="primary" @click="openCreate">Создать группу</v-btn>
       </div>
-      <v-btn color="primary" @click="openCreate">Создать группу</v-btn>
     </div>
 
-    <div class="position-relative">
-      <v-row v-if="groups && groups.length > 0">
-        <v-col v-for="group in groups" :key="group.id" cols="12" md="6" lg="4">
-          <!-- Клик теперь вызывает переход на деталку вместо модалки редактирования -->
-          <EntityCard
-              :title="group.name"
-              :subtitle="formatDuration(group.duration_days)"
-              @click="goToDetail(group.id)"
-          >
-            <template #badges>
-              <v-chip size="small" variant="outlined" :color="!group.sessions_limit ? 'info' : 'default'">
-                {{ formatSessions(group.sessions_limit) }}
-              </v-chip>
-            </template>
+    <v-data-table
+        :headers="headers"
+        :items="groups"
+        :search="searchQuery"
+        :loading="loading"
+        :items-per-page="10"
+        :items-per-page-options="[10, 20, 50]"
+        items-per-page-text="Строк на странице"
+        loading-text="Загрузка групп пользователей…"
+        no-data-text="Групп пока нет — создайте первую!"
+        density="comfortable"
+        class="groups-table border rounded-lg"
+        hover
+        @click:row="(_: unknown, data: { item: UserGroup }) => goToDetail(data.item.id)"
+    >
+      <template #item.name="{ item }">
+        <span class="group-name-col">{{ item.name }}</span>
+      </template>
 
-            <template #meta>
-              <v-chip color="primary" size="small" variant="tonal">
-                Участников: {{ group.user_count }}
-              </v-chip>
-              <v-btn color="error" variant="text" size="small" @click.stop="remove(group.id)">
-                Удалить
-              </v-btn>
-            </template>
+      <template #item.traffic_limit="{ item }">
+        <v-chip size="small" variant="tonal" :color="!item.traffic_limit ? 'info' : 'success'">
+          {{ formatBytes(item.traffic_limit) }}
+        </v-chip>
+      </template>
 
-            <template #footer>
-              <v-chip size="small" variant="tonal" :color="!group.traffic_limit ? 'info' : 'success'">
-                {{ formatBytes(group.traffic_limit) }}
-              </v-chip>
-              <v-chip size="small" variant="tonal" :color="!group.speed_limit ? 'info' : 'success'">
-                {{ formatSpeed(group.speed_limit) }}
-              </v-chip>
-            </template>
-          </EntityCard>
-        </v-col>
-      </v-row>
+      <template #item.speed_limit="{ item }">
+        <v-chip size="small" variant="tonal" :color="!item.speed_limit ? 'info' : 'success'">
+          {{ formatSpeed(item.speed_limit) }}
+        </v-chip>
+      </template>
 
-      <v-sheet v-else color="transparent" class="d-flex flex-column align-center justify-center pa-10 text-center mt-10">
-        <v-icon icon="mdi-wallet-membership" size="64" color="medium-emphasis" class="mb-4" />
-        <h3 class="text-h6 font-weight-bold mb-1">Группы пользователей ещё не созданы</h3>
-        <p class="text-caption text-medium-emphasis">Создайте первую группу для автоматического назначения ограничений.</p>
-      </v-sheet>
-    </div>
+      <template #item.sessions_limit="{ item }">
+        <v-chip size="small" variant="outlined" :color="!item.sessions_limit ? 'info' : 'default'">
+          {{ formatSessions(item.sessions_limit) }}
+        </v-chip>
+      </template>
 
-    <!-- Модалка только для быстрого создания пустой группы -->
+      <template #item.duration_days="{ item }">
+        <span>{{ formatDuration(item.duration_days) }}</span>
+      </template>
+
+      <template #item.user_count="{ item }">
+        <v-chip color="primary" size="small" variant="tonal">
+          Участников: {{ item.user_count }}
+        </v-chip>
+      </template>
+
+      <template #item.actions="{ item }">
+        <v-btn color="error" variant="text" size="small" @click.stop="remove(item.id)">
+          Удалить
+        </v-btn>
+      </template>
+    </v-data-table>
+
     <GroupModal
         v-model="showEditor"
-        :group="null"
         @saved="load"
     />
   </v-container>
@@ -137,5 +171,7 @@ onMounted(() => {
 
 <style scoped>
 .groups-page { padding: 24px; }
+.groups-table :deep(tbody tr) { cursor: pointer; }
+.groups-table :deep(tbody tr:hover) { background: rgba(43, 184, 148, .07) !important; }
+.group-name-col { font-weight: 600; font-size: 15px; }
 </style>
-

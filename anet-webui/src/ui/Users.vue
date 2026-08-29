@@ -104,10 +104,14 @@ onMounted(() => {
 <template>
   <v-container max-width="1200" class="users-page">
     <div class="d-flex justify-space-between align-center flex-wrap ga-4 mb-5">
-      <div>
-        <h2 class="text-h6 font-weight-bold ma-0">ANet VPN Clients</h2>
-        <span class="text-caption text-medium-emphasis">Управление учетными записями пользователей</span>
-      </div>
+      <v-list-item
+          class="px-0"
+          subtitle="Управление учетными записями пользователей"
+      >
+        <template #title>
+          <h1 class="text-h5 font-weight-bold">ANet VPN Clients</h1>
+        </template>
+      </v-list-item>
       <div class="d-flex align-center flex-wrap flex-sm-nowrap ga-3">
         <v-select
             v-model="selectedGroupIds"
