@@ -1,13 +1,13 @@
 export type UserGroup = {
     id: string
     name: string
-    traffic_limit: number     // в байтах (0 - безлимит)
-    speed_limit: number       // в kbps (0 - безлимит)
-    sessions_limit: number    // кол-во одновременных сессий
-    duration_days: number     // дельта дней
+    traffic_limit: number
+    speed_limit: number
+    sessions_limit: number
+    duration_days: number
     created_at: string
     updated_at: string
-    user_ids: string[]
+    user_count: number
 }
 
-export type SaveGroupRequest = Omit<UserGroup, 'id' | 'created_at' | 'updated_at'>
+export type SaveGroupRequest = Omit<UserGroup, 'id' | 'created_at' | 'updated_at' | 'user_count'>

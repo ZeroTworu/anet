@@ -250,12 +250,14 @@ impl ServersApi {
             started_at: Set(None),
             completed_at: Set(None),
             error: Set(None),
+            target_fingerprint: Set(None),
         };
         match command.insert(&self.db).await {
             Ok(saved) => CreateNodeCommandResponse::Created(Json(NodeCommand {
                 command_id: saved.id.to_string(),
                 command_type: saved.command_type,
                 accepting_connections: saved.accepting_connections,
+                target_fingerprint: saved.target_fingerprint,
             })),
             Err(e) => CreateNodeCommandResponse::Error(Json(e.to_string())),
         }
@@ -397,11 +399,22 @@ impl ServersApi {
         claimed.status = Set("running".to_string());
         claimed.started_at = Set(Some(Utc::now().naive_utc()));
         match claimed.update(&self.db).await {
-            Ok(saved) => GetNodeCommandsResponse::Ok(Json(vec![NodeCommand {
-                command_id: saved.id.to_string(),
-                command_type: saved.command_type,
-                accepting_connections: saved.accepting_connections,
-            }])),
+            Ok(saved) => {
+                // Добавьте эту строку для диагностики:
+                log::info!(
+                    "[ControlPlane] Sending command: ID={}, Type={}, Fingerprint={:?}",
+                    saved.id,
+                    saved.command_type,
+                    saved.target_fingerprint
+                );
+
+                GetNodeCommandsResponse::Ok(Json(vec![NodeCommand {
+                    command_id: saved.id.to_string(),
+                    command_type: saved.command_type,
+                    accepting_connections: saved.accepting_connections,
+                    target_fingerprint: saved.target_fingerprint,
+                }]))
+            },
             Err(e) => GetNodeCommandsResponse::Error(Json(e.to_string())),
         }
     }

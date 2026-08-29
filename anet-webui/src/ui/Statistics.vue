@@ -2,10 +2,12 @@
 // Экран наблюдаемости получает независимые срезы по нодам, пользователям
 // и почасовую историю, которую control plane собирает из cumulative counters.
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { api } from '@/api/client' // <-- Базовый клиент
+import { useAppMessage } from '@/composables/useAppMessage' // <-- Система алертов
 import { GetNodeTrafficStats, GetTrafficHistory, GetUserTrafficStats, GetActiveConnections } from '@/api/statistics'
 import type { NodeTrafficStat, TrafficHistoryPoint, UserTrafficStat, ActiveConnection } from '@/models/statistics'
 
-// Инициализируем таймер пустым значением для предотвращения ReferenceError в строгом режиме
+// Инициализируем таймер пустым значением
 let refreshTimer: any = null
 
 const nodes = ref<NodeTrafficStat[]>([])
@@ -15,6 +17,8 @@ const history = ref<TrafficHistoryPoint[]>([])
 const activeTab = ref('nodes')
 const loading = ref(false)
 const searchQuery = ref('')
+
+const message = useAppMessage()
 
 // Контейнер графика и состояние наведения
 const containerRef = ref<HTMLElement | null>(null)
@@ -89,7 +93,7 @@ const chartLabelsFiltered = computed(() => {
 // Вычисление точной вертикальной координаты (%) с учетом внутреннего padding графика
 const getVerticalPercent = (val: number) => {
   const height = 180
-  const padding = 8
+  const padding = 1
   const availableHeight = height - (padding * 2)
   const yPixels = height - padding - (val / chartMax.value) * availableHeight
   return (yPixels / height) * 100
@@ -130,7 +134,7 @@ const hoveredData = computed(() => {
   if (hoveredIdx.value === null) return null
 
   const item = history.value[hoveredIdx.value]
-  if (!item) return null // Сужение типа (Type Guard) — убирает ошибку TS18048
+  if (!item) return null // Сужение типа (Type Guard)
 
   const date = new Date(item.bucket_start)
 
@@ -246,7 +250,7 @@ const selectConnection = (item: ActiveConnection) => {
   }
 }
 
-// Хелперы кликов по строкам таблиц для устранения ошибки компилятора Vue "Cannot find name row"
+// Хелперы кликов по строкам таблиц
 const onNodeRowClick = (_event: any, row: { item: NodeTrafficStat }) => {
   selectNode(row.item)
 }
@@ -257,6 +261,25 @@ const onUserRowClick = (_event: any, row: { item: UserTrafficStat }) => {
 
 const onConnectionRowClick = (_event: any, row: { item: ActiveConnection }) => {
   selectConnection(row.item)
+}
+
+// Отключить принудительно (Disconnect)
+const disconnectConnection = async (item: ActiveConnection) => {
+  if (!confirm(`Принудительно разорвать VPN-сессию пользователя «${item.username}» на сервере «${item.server_name}»?`)) return
+  try {
+    // ВЫЗОВ POST МЕТОДА С ПЕРЕДАЧЕЙ СЕРВЕРНЫХ ID И FINGERPRINT В ТЕЛЕ ЗАПРОСА
+    await api<void>(`/statistics/active-connections/disconnect`, {
+      method: 'POST',
+      data: {
+        server_id: item.server_id,
+        fingerprint: item.fingerprint
+      }
+    })
+    message.success('Команда отключения поставлена в очередь ноды. Сессия будет сброшена в течение 15 секунд.')
+    await load()
+  } catch (e) {
+    message.error('Не удалось отправить команду отключения на сервер')
+  }
 }
 
 // Определение CSS-класса для подсветки выбранной строки таблицы
@@ -323,45 +346,49 @@ const connectionHeaders = [
   { title: 'TX (Сессия)', key: 'tx_bytes', align: 'end' as const },
   { title: 'Количество сессий', key: 'connection_count', align: 'end' as const },
   { title: 'Протокол', key: 'protocol', align: 'center' as const },
+  { title: 'Исключить', key: 'actions', sortable: false, align: 'center' as const }, // <-- Добавлена колонка действий
 ]
 </script>
 
 <template>
-  <main class="statistics-page">
-    <div class="d-flex align-center justify-space-between page-title">
-      <div>
-        <h2>Traffic</h2>
-        <span>Полезный трафик внутри VPN-туннеля</span>
-      </div>
+  <v-container max-width="1200" class="statistics-page py-6">
+    <div class="d-flex justify-space-between align-center flex-wrap ga-4 mb-6">
+      <v-list-item
+          class="px-0"
+          subtitle="Полезный трафик внутри VPN-туннеля"
+      >
+        <template #title>
+          <h1 class="text-h5 font-weight-bold">Traffic</h1>
+        </template>
+      </v-list-item>
       <v-btn :loading="loading" @click="load">Обновить</v-btn>
     </div>
 
-    <v-row class="mt-2">
+    <v-row>
       <v-col cols="12" md="4">
-        <v-card class="pa-4">
+        <v-card class="pa-4" border flat>
           <div class="text-caption text-medium-emphasis">Получено узлами</div>
           <div class="text-h6 font-weight-bold">{{ formatBytes(totalRx) }}</div>
         </v-card>
       </v-col>
       <v-col cols="12" md="4">
-        <v-card class="pa-4">
+        <v-card class="pa-4" border flat>
           <div class="text-caption text-medium-emphasis">Отправлено клиентам</div>
           <div class="text-h6 font-weight-bold">{{ formatBytes(totalTx) }}</div>
         </v-card>
       </v-col>
       <v-col cols="12" md="4">
-        <v-card class="pa-4">
+        <v-card class="pa-4" border flat>
           <div class="text-caption text-medium-emphasis">Всего</div>
           <div class="text-h6 font-weight-bold">{{ formatBytes(totalRx + totalTx) }}</div>
         </v-card>
       </v-col>
     </v-row>
 
-    <v-card class="history-card">
+    <v-card class="history-card" border flat>
       <template #title>
         <div class="d-flex align-center justify-space-between flex-wrap ga-4">
           <div class="d-flex align-center ga-4">
-            <!-- Динамическое название графика с выводом активного фильтра и кнопкой сброса -->
             <span>{{ selectedFilter.type ? `Трафик: ${selectedFilter.name}` : 'Общий трафик' }}</span>
             <span class="legend rx">RX</span>
             <span class="legend tx">TX</span>
@@ -379,7 +406,6 @@ const connectionHeaders = [
           </div>
 
           <div class="d-flex align-center ga-3 flex-wrap">
-            <!-- Переключатель типа трафика (Протоколы) -->
             <v-btn-toggle
                 v-model="selectedProtocol"
                 mandatory
@@ -394,7 +420,6 @@ const connectionHeaders = [
               <v-btn value="vnc">VNC</v-btn>
             </v-btn-toggle>
 
-            <!-- Переключатель масштаба временной шкалы (Зум) -->
             <v-btn-toggle
                 v-model="selectedRange"
                 mandatory
@@ -413,14 +438,12 @@ const connectionHeaders = [
       <v-card-text>
         <div class="chart-wrap mt-4">
           <div class="d-flex">
-            <!-- Левая шкала Y (Единицы измерения трафика) -->
             <div class="d-flex flex-column justify-space-between pr-3 text-caption text-medium-emphasis text-right font-mono" style="width: 85px; height: 180px; border-right: 1px solid rgba(255,255,255,0.08); padding-bottom: 8px;">
               <span>{{ formatBytes(chartMax) }}</span>
               <span>{{ formatBytes(chartMax / 2) }}</span>
               <span>0 B</span>
             </div>
 
-            <!-- Область графиков с нативным трекингом мыши -->
             <div
                 ref="containerRef"
                 class="flex-grow-1 position-relative"
@@ -428,7 +451,6 @@ const connectionHeaders = [
                 @mouseleave="hoveredIdx = null"
             >
               <v-sheet v-if="history.length > 0" color="transparent" style="height: 180px;">
-                <!-- Основной график RX -->
                 <v-sparkline
                     :model-value="rxValues"
                     :min="0"
@@ -441,7 +463,6 @@ const connectionHeaders = [
                     auto-draw
                     style="height: 100%; width: 100%; cursor: crosshair;"
                 />
-                <!-- Наложенный график TX -->
                 <v-sparkline
                     :model-value="txValues"
                     :min="0"
@@ -455,15 +476,12 @@ const connectionHeaders = [
                     style="position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none;"
                 />
 
-                <!-- Тултип и маркеры наведения на сетке координат -->
                 <template v-if="hoveredData">
-                  <!-- Вертикальная розовая линия-визир -->
                   <div
                       class="hover-line"
                       :style="{ left: `${hoveredData.xPercent}%` }"
                   ></div>
 
-                  <!-- Кружок-маркер для RX (зеленый) -->
                   <div
                       class="hover-marker rx-marker"
                       :style="{
@@ -472,7 +490,6 @@ const connectionHeaders = [
                     }"
                   ></div>
 
-                  <!-- Кружок-маркер для TX (желтый) -->
                   <div
                       class="hover-marker tx-marker"
                       :style="{
@@ -481,7 +498,6 @@ const connectionHeaders = [
                     }"
                   ></div>
 
-                  <!-- Плавающая карточка тултипа (авто-смещение влево/вправо) -->
                   <v-card
                       class="hover-tooltip-card pa-3 text-caption"
                       elevation="12"
@@ -523,7 +539,6 @@ const connectionHeaders = [
                 <span class="text-caption text-medium-emphasis">Загрузка данных графика...</span>
               </v-sheet>
 
-              <!-- Нижняя шкала X (Адаптивные временные метки с учетом TZ) -->
               <div class="d-flex justify-space-between px-2 pt-2 text-caption text-medium-emphasis font-mono">
                 <span v-for="(label, idx) in chartLabelsFiltered" :key="idx">
                   {{ label.time }}
@@ -535,7 +550,7 @@ const connectionHeaders = [
       </v-card-text>
     </v-card>
 
-    <v-card class="traffic-tabs">
+    <v-card class="traffic-tabs" border flat>
       <div class="d-flex flex-wrap align-center justify-space-between px-4 pt-2 border-b">
         <v-tabs v-model="activeTab" color="primary">
           <v-tab value="nodes">По узлам</v-tab>
@@ -634,28 +649,33 @@ const connectionHeaders = [
             <template #item.connection_count="{ value }">
               <span class="metric total">{{ value }}</span>
             </template>
-            <!-- Вывод названия протокола -->
             <template #item.protocol="{ value }">
               <v-chip size="small" variant="tonal" class="text-uppercase" color="info">
                 {{ value }}
               </v-chip>
             </template>
+            <!-- Слот принудительного разрыва сессии -->
+            <template #item.actions="{ item }">
+              <v-btn
+                  icon="mdi-close-circle-outline"
+                  variant="text"
+                  color="error"
+                  size="small"
+                  @click.stop="disconnectConnection(item)"
+              />
+            </template>
           </v-data-table>
         </v-tabs-window-item>
       </v-tabs-window>
     </v-card>
-  </main>
+  </v-container>
 </template>
 
 <style scoped>
-.statistics-page { max-width: 1200px; margin: 0 auto; padding: 24px; }
-.page-title { margin-bottom: 16px; }
-.page-title h2 { margin: 0 0 4px; font-size: 22px; }
-.page-title span { color: #9aa5a0; font-size: 13px; }
+.statistics-page { max-width: 1200px; margin: 0 auto; }
 .traffic-tabs { margin-top: 24px; }
 .history-card { margin-top: 20px; }
 .chart-wrap { width: 100%; min-height: 220px; }
-.grid-line { stroke: rgba(154, 165, 160, 0.15); stroke-width: 1; }
 .legend { font-size: 12px; font-weight: 700; }
 .legend.rx { color: #2bb894; }
 .legend.tx { color: #d9a441; }
@@ -663,13 +683,11 @@ const connectionHeaders = [
 .font-mono { font-family: 'Fira Code', monospace; }
 .total { font-weight: 700; }
 
-/* Кастомные стили для масштабируемых шрифтов v-sparkline */
 :deep(.v-sparkline text) {
   fill: #9aa5a0;
   font-size: 11px;
 }
 
-/* Вертикальная розовая линия-визир при наведении */
 .hover-line {
   position: absolute;
   top: 0;
@@ -680,7 +698,6 @@ const connectionHeaders = [
   z-index: 2;
 }
 
-/* Круглые маркеры на линиях графиков */
 .hover-marker {
   position: absolute;
   width: 10px;
@@ -700,7 +717,6 @@ const connectionHeaders = [
   box-shadow: 0 0 8px rgba(217, 164, 65, 0.85);
 }
 
-/* Стилизация плавающей карточки тултипа */
 .hover-tooltip-card {
   position: absolute;
   background-color: rgba(30, 34, 33, 0.95) !important;
@@ -710,7 +726,6 @@ const connectionHeaders = [
   border-color: rgba(255, 255, 255, 0.08) !important;
 }
 
-/* Точки легенды внутри тултипа */
 .rx-dot {
   display: inline-block;
   width: 8px;
@@ -726,7 +741,6 @@ const connectionHeaders = [
   background-color: #d9a441;
 }
 
-/* Стилизация выбранных строк в таблицах */
 :deep(.selected-row) {
   background-color: rgba(43, 184, 148, 0.15) !important;
 }

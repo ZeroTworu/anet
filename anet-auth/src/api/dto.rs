@@ -17,8 +17,6 @@ pub struct ServerDto {
     pub name: String,
     pub address: String,
     pub public_key: String,
-    /// Legacy per-transport fields, kept alongside `dsn` for manual migration
-    /// of endpoints that were registered before the unified DSN column.
     pub quic_port: Option<i32>,
     pub ssh_port: Option<i32>,
     pub vnc_port: Option<i32>,
@@ -216,8 +214,6 @@ pub struct CreateServerRequest {
     pub name: String,
     pub address: String,
     pub public_key: String,
-    /// Legacy per-transport fields, optional. Set these to register a node
-    /// under its old-style addressing alongside the unified `dsn`.
     pub quic_port: Option<i32>,
     pub ssh_port: Option<i32>,
     pub vnc_port: Option<i32>,
@@ -236,15 +232,11 @@ pub enum GetServersResponse {
     Error(Json<String>),
 }
 
-//  DTO для PATCH-запросов обновления сервера
 #[derive(Object, Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateServerRequest {
     pub name: Option<String>,
     pub address: Option<String>,
     pub public_key: Option<String>,
-    /// Outer `Option` = "field present in request"; inner `Option` = the new
-    /// value, where `null` explicitly clears the column (same convention as
-    /// `ssh_user` below).
     pub quic_port: Option<Option<i32>>,
     pub ssh_port: Option<Option<i32>>,
     pub vnc_port: Option<Option<i32>>,
@@ -265,7 +257,6 @@ pub enum UpdateServerApiResult {
     Error(Json<String>),
 }
 
-/// [ VPN Core Communication: Session Lifecycle ]
 #[derive(Object)]
 pub struct SessionEventRequestLocal {
     pub fingerprint: String,
@@ -281,7 +272,6 @@ pub enum SessionEventResponse {
     Error,
 }
 
-/// [ Authentication Area ]
 #[derive(Object)]
 pub struct LoginRequest {
     #[oai(validator(max_length = 100))]
@@ -311,7 +301,6 @@ pub struct Claims {
     pub exp: usize,
 }
 
-/// [ User Management Area ]
 #[derive(SecurityScheme)]
 #[oai(ty = "bearer", bearer_format = "jwt")]
 pub struct AdminToken(pub Bearer);
@@ -618,10 +607,9 @@ pub enum RegenerateUserApiResult {
 
 #[derive(ApiResponse)]
 pub enum DownloadConfigResponse {
-    /// Возвращает сгенерированный файл конфигурации в виде вложения
     #[oai(status = 200, content_type = "application/octet-stream")]
     Ok(
-        PlainText<String>, // <--- ПЕРВЫЙ АРГУМЕНТ: ТЕЛО ФАЙЛА (Payload)
+        PlainText<String>,
         #[oai(header = "Content-Disposition")] String,
     ),
     #[oai(status = 404, content_type = "application/json")]
@@ -632,7 +620,6 @@ pub enum DownloadConfigResponse {
 
 #[derive(ApiResponse)]
 pub enum QrPageResponse {
-    /// Возвращает готовую HTML-страницу с QR-кодом и кнопкой скачивания
     #[oai(status = 200, content_type = "text/html")]
     Ok(PlainText<String>),
     #[oai(status = 404, content_type = "application/json")]
@@ -651,6 +638,7 @@ pub struct ActiveConnectionDto {
     pub tx_bytes: i64,
     pub connection_count: i32,
     pub protocol: String,
+    pub fingerprint: String,
 }
 
 #[derive(Object, Debug, Clone, Serialize, Deserialize)]
@@ -714,4 +702,11 @@ pub enum DeleteGroupResponse {
     NotFound(Json<String>),
     #[oai(status = 500)]
     Error(Json<String>),
+}
+
+
+#[derive(Object, Debug, Clone, Serialize, Deserialize)]
+pub struct DisconnectMemberRequest {
+    pub server_id: uuid::Uuid,
+    pub fingerprint: String,
 }

@@ -1,5 +1,3 @@
-//! Надёжная очередь команд от панели к ноде.
-
 use sea_orm::entity::prelude::*;
 
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
@@ -10,6 +8,7 @@ pub struct Model {
     pub server_id: Uuid,
     pub command_type: String,
     pub accepting_connections: Option<bool>,
+    pub target_fingerprint: Option<String>,
     pub status: String,
     pub created_at: DateTime,
     pub started_at: Option<DateTime>,

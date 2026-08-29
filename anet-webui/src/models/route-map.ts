@@ -15,6 +15,7 @@ export type RouteMap = {
   is_active: boolean
   revision: number
   rules: RouteRule[]
+  rules_count?: number
 }
 
-export type SaveRouteMapRequest = Omit<RouteMap, 'id' | 'revision'>
+export type SaveRouteMapRequest = Omit<RouteMap, 'id' | 'revision' | 'rules_count'>

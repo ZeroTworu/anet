@@ -124,9 +124,6 @@ async fn execute_and_report_command(
     registry: &ClientRegistry,
     command: NodeCommand,
 ) {
-    // Команды выполняются локально, после чего панель получает подтверждение.
-    // Это позволяет UI показать реальное состояние, а не только факт постановки
-    // записи в очередь.
     let result = match command.command_type.as_str() {
         "set_accepting_connections" => match command.accepting_connections {
             Some(accepting) => {
@@ -134,6 +131,17 @@ async fn execute_and_report_command(
                 Ok(())
             }
             None => Err("Command is missing accepting_connections".to_string()),
+        },
+        "disconnect_user" => match command.target_fingerprint {
+            Some(ref fp) => {
+                if registry.disconnect_by_fingerprint(fp) {
+                    info!("[ControlPlane] Disconnected client with fingerprint: {}", fp);
+                    Ok(())
+                } else {
+                    Err(format!("Client with fingerprint {} not found on this node", fp))
+                }
+            }
+            None => Err("Command disconnect_user is missing target_fingerprint".to_string()),
         },
         other => Err(format!("Unsupported command type: {other}")),
     };

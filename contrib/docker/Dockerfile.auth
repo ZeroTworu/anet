@@ -1,5 +1,5 @@
 # Stage 1: Build binary
-FROM rust:1.93-slim AS builder
+FROM rust:1.94-slim AS builder
 WORKDIR /app
 RUN apt-get update && apt-get install -y pkg-config libssl-dev protobuf-compiler && rm -rf /var/lib/apt/lists/*
 

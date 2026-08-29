@@ -2,25 +2,37 @@ use crate::api::api::{cumulative_delta, validate_admin_session};
 use crate::api::dto::{
     ActiveConnectionDto, AdminToken, GetNodeTrafficStatsResponse, GetTrafficHistoryResponse,
     GetUserTrafficStatsResponse, NodeTrafficReport, TrafficHistoryPointDto, TrafficReportResponse,
-    UserTrafficStatDto, NodeTrafficStatDto,
+    UserTrafficStatDto, NodeTrafficStatDto, DisconnectMemberRequest
 };
-use crate::entities::{servers, traffic_hourly, traffic_totals, users};
-use chrono::{NaiveDateTime, Timelike};
-use poem_openapi::{param::Query, payload::Json, OpenApi};
+use crate::entities::{servers, traffic_hourly, traffic_totals, users, node_commands};
+use chrono::{NaiveDateTime, Timelike, Utc};
+use poem::Result;
+use poem_openapi::{param::Query, payload::Json, OpenApi, ApiResponse};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, IntoActiveModel, Set,
-    QueryFilter, QueryOrder, TransactionTrait,
+    QueryFilter, QueryOrder, TransactionTrait, QuerySelect
 };
 use std::collections::HashMap;
+use log::info;
 use uuid::Uuid;
 
 pub struct StatisticsApi {
     pub db: DatabaseConnection,
 }
 
+#[derive(ApiResponse)]
+pub enum DisconnectConnectionResponse {
+    #[oai(status = 200)]
+    Ok,
+    #[oai(status = 401)]
+    Unauthorized(Json<String>),
+    #[oai(status = 500)]
+    Error(Json<String>),
+}
+
 #[OpenApi]
 impl StatisticsApi {
-    /// Принять накопительные счётчики полезного VPN-трафика от ноды
+    /// Принять накопительные счётчики полезного VPN-трафика от ноды (С авто-блокировкой по лимиту)
     #[oai(path = "/control/nodes/traffic", method = "post")]
     async fn report_node_traffic(
         &self,
@@ -127,6 +139,50 @@ impl StatisticsApi {
                 return TrafficReportResponse::Error(Json(e.to_string()));
             }
 
+            if let Some(usr_id) = user_id {
+                if let Ok(Some(rate)) = crate::entities::rates::Entity::find()
+                    .filter(crate::entities::rates::Column::UserId.eq(usr_id))
+                    .one(&txn)
+                    .await
+                {
+                    if rate.traffic_limit > 0 {
+                        let sum_result = traffic_totals::Entity::find()
+                            .filter(traffic_totals::Column::UserId.eq(usr_id))
+                            .select_only()
+                            .column_as(sea_orm::sea_query::Expr::cust("SUM(rx_bytes) + SUM(tx_bytes)"), "total")
+                            .into_tuple::<Option<i64>>()
+                            .one(&txn)
+                            .await;
+
+                        if let Ok(Some(Some(total_bytes))) = sum_result {
+                            if total_bytes >= rate.traffic_limit {
+                                info!("[Billing] Client {} exceeded traffic limit. Blocking and enqueuing disconnect.", usr_id);
+
+                                let _ = users::Entity::update_many()
+                                    .col_expr(users::Column::IsActive, sea_orm::sea_query::Expr::value(false))
+                                    .filter(users::Column::Id.eq(usr_id))
+                                    .exec(&txn)
+                                    .await;
+
+                                let disconnect_cmd = node_commands::ActiveModel {
+                                    id: Set(Uuid::new_v4()),
+                                    server_id: Set(node_id),
+                                    command_type: Set("disconnect_user".to_string()),
+                                    accepting_connections: Set(None),
+                                    target_fingerprint: Set(Some(sample.fingerprint.clone())),
+                                    status: Set("pending".to_string()),
+                                    created_at: Set(Utc::now().naive_utc()),
+                                    started_at: Set(None),
+                                    completed_at: Set(None),
+                                    error: Set(None),
+                                };
+                                let _ = disconnect_cmd.insert(&txn).await;
+                            }
+                        }
+                    }
+                }
+            }
+
             if rx_delta == 0 && tx_delta == 0 {
                 continue;
             }
@@ -174,7 +230,38 @@ impl StatisticsApi {
         }
     }
 
-    /// Суммарная статистика потребления трафика нодами
+    /// Принудительный сброс сессии (Disconnect) из Админки (Через POST body)
+    #[oai(path = "/statistics/active-connections/disconnect", method = "post")]
+    async fn disconnect_active_connection(
+        &self,
+        auth: AdminToken,
+        req: Json<DisconnectMemberRequest>, // <-- Изменено: параметры принимаются в body
+    ) -> DisconnectConnectionResponse {
+        if let Err(err) = validate_admin_session(&self.db, &auth.0.token).await {
+            return DisconnectConnectionResponse::Unauthorized(Json(err));
+        }
+
+        let command_id = Uuid::new_v4();
+        let command = node_commands::ActiveModel {
+            id: Set(command_id),
+            server_id: Set(req.0.server_id),
+            command_type: Set("disconnect_user".to_string()),
+            accepting_connections: Set(None),
+            target_fingerprint: Set(Some(req.0.fingerprint)),
+            status: Set("pending".to_string()),
+            created_at: Set(Utc::now().naive_utc()),
+            started_at: Set(None),
+            completed_at: Set(None),
+            error: Set(None),
+        };
+
+        match command.insert(&self.db).await {
+            Ok(_) => DisconnectConnectionResponse::Ok,
+            Err(e) => DisconnectConnectionResponse::Error(Json(e.to_string())),
+        }
+    }
+
+    /// Статистика по нодам
     #[oai(path = "/statistics/nodes", method = "get")]
     async fn get_node_traffic_stats(&self, auth: AdminToken) -> GetNodeTrafficStatsResponse {
         if let Err(err) = validate_admin_session(&self.db, &auth.0.token).await {
@@ -198,7 +285,7 @@ impl StatisticsApi {
             nodes
                 .into_iter()
                 .map(|node| {
-                    let (rx_bytes, tx_bytes) = aggregate.get(&node.id).copied().unwrap_or_default();
+                    let (rx_bytes, tx_bytes) = aggregate.get(&node.id).copied().unwrap_or((0, 0));
                     NodeTrafficStatDto {
                         node_id: node.id,
                         name: node.name,
@@ -210,7 +297,7 @@ impl StatisticsApi {
         ))
     }
 
-    /// Суммарная статистика трафика в разрезе пользователей
+    /// Статистика по пользователям
     #[oai(path = "/statistics/users", method = "get")]
     async fn get_user_traffic_stats(&self, auth: AdminToken) -> GetUserTrafficStatsResponse {
         if let Err(err) = validate_admin_session(&self.db, &auth.0.token).await {
@@ -246,7 +333,7 @@ impl StatisticsApi {
         GetUserTrafficStatsResponse::Ok(Json(stats))
     }
 
-    /// График истории трафика по 15-минутным бакетам
+    /// График истории
     #[oai(path = "/statistics/traffic/history", method = "get")]
     async fn get_traffic_history(
         &self,
@@ -316,7 +403,7 @@ impl StatisticsApi {
             .map(|offset| {
                 let bucket = first_bucket
                     + chrono::Duration::minutes(offset as i64 * step_minutes as i64);
-                let (rx_bytes, tx_bytes) = aggregate.get(&bucket).copied().unwrap_or_default();
+                let (rx_bytes, tx_bytes) = aggregate.get(&bucket).copied().unwrap_or((0, 0));
                 TrafficHistoryPointDto {
                     bucket_start: bucket.and_utc().to_rfc3339(),
                     rx_bytes,
@@ -328,7 +415,7 @@ impl StatisticsApi {
         GetTrafficHistoryResponse::Ok(Json(points))
     }
 
-    /// Активные соединения (sessions) в реальном времени
+    /// Получить подробный список активных подключений в реальном времени
     #[oai(path = "/statistics/active-connections", method = "get")]
     async fn get_active_connections(
         &self,
@@ -409,6 +496,7 @@ impl StatisticsApi {
                 tx_bytes: total.tx_bytes.max(0) as i64,
                 connection_count: max_allowed_connections,
                 protocol: total.protocol.as_str().to_string(),
+                fingerprint: total.fingerprint, // <-- Передаем отпечаток
             });
         }
 

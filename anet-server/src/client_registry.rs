@@ -396,4 +396,21 @@ impl ClientRegistry {
             }
         }
     }
+
+    pub fn disconnect_by_fingerprint(&self, fingerprint: &str) -> bool {
+        let mut found_client = None;
+        for entry in self.clients_by_ip.iter() {
+            if entry.value().fingerprint == fingerprint {
+                found_client = Some(entry.value().clone());
+                break;
+            }
+        }
+        if let Some(client_info) = found_client {
+            // Закрывает каналы, освобождает виртуальный IP, шлет стоп-сессию в Auth
+            self.remove_client(&client_info);
+            true
+        } else {
+            false
+        }
+    }
 }

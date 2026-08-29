@@ -49,6 +49,8 @@ pub struct NodeCommand {
     pub command_type: String,
     /// Параметр команды admission: принимать ли новые подключения.
     pub accepting_connections: Option<bool>,
+    /// Отпечаток целевого пользователя для отключения.
+    pub target_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

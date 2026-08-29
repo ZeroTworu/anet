@@ -19,6 +19,7 @@ export type TrafficHistoryPoint = {
   tx_bytes: number
 }
 
+// Обновленный интерфейс активной сессии
 export type ActiveConnection = {
   user_id: string
   username: string
@@ -28,4 +29,5 @@ export type ActiveConnection = {
   tx_bytes: number
   connection_count: number
   protocol: string
+  fingerprint: string
 }
