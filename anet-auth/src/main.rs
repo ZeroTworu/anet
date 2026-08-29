@@ -220,7 +220,11 @@ async fn run_server(db: DatabaseConnection) -> Result<(), anyhow::Error> {
     let client_template_path = env::var("CLIENT_TEMPLATE_PATH")
         .unwrap_or_else(|_| "/opt/anet/client_template.toml".to_string());
 
-    let api_service = OpenApiService::new(api::VpnApi { db, client_template_path }, "ANet Auth API", "1.0")
+    let api_service = OpenApiService::new(
+        api::get_api(db, client_template_path),
+        "ANet Auth API",
+        "1.0"
+    )
         .server(format!("http://{}/api/v1", bind_to));
 
     let ui = api_service.swagger_ui();
