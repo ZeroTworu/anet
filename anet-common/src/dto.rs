@@ -17,6 +17,7 @@ pub struct CheckAccessResponse {
     pub message: String,
     pub static_ip: Option<String>,
     pub user_id: Option<String>,
+    pub speed_limit: Option<i32>,
 }
 
 /// [ VPN Core Communication: Session Events ]

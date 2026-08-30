@@ -15,6 +15,7 @@ use sea_orm::{
 use std::collections::HashMap;
 use log::info;
 use uuid::Uuid;
+use chrono::Datelike;
 
 pub struct StatisticsApi {
     pub db: DatabaseConnection,
@@ -139,45 +140,104 @@ impl StatisticsApi {
                 return TrafficReportResponse::Error(Json(e.to_string()));
             }
 
-            if let Some(usr_id) = user_id {
-                if let Ok(Some(rate)) = crate::entities::rates::Entity::find()
+            if let Ok(Some(user_model)) = users::Entity::find()
+                .filter(users::Column::Fingerprint.eq(&sample.fingerprint))
+                .one(&txn)
+                .await
+            {
+                let usr_id = user_model.id;
+
+                // Загружаем тариф и группу
+                let rate_opt = crate::entities::rates::Entity::find()
                     .filter(crate::entities::rates::Column::UserId.eq(usr_id))
                     .one(&txn)
                     .await
-                {
+                    .unwrap_or(None);
+
+                let group_opt = if let Some(group_id) = user_model.group_id {
+                    crate::entities::groups::Entity::find_by_id(group_id)
+                        .one(&txn)
+                        .await
+                        .unwrap_or(None)
+                } else {
+                    None
+                };
+
+                let now = chrono::Utc::now().naive_utc();
+
+                // Вычисляем календарные границы текущего месяца
+                let first_day_current_month = chrono::NaiveDate::from_ymd_opt(now.year(), now.month(), 1)
+                    .unwrap()
+                    .and_hms_opt(0, 0, 0)
+                    .unwrap();
+
+                let (next_year, next_month) = if now.month() == 12 {
+                    (now.year() + 1, 1)
+                } else {
+                    (now.year(), now.month() + 1)
+                };
+                let first_day_next_month = chrono::NaiveDate::from_ymd_opt(next_year, next_month, 1)
+                    .unwrap()
+                    .and_hms_opt(0, 0, 0)
+                    .unwrap();
+
+                // Определение временных границ периода
+                let mut expiration_date = first_day_next_month;
+                let mut cycle_start = first_day_current_month;
+
+                if let Some(ref rate) = rate_opt {
+                    expiration_date = rate.date_end;
+                    let duration_days = group_opt.as_ref().map(|g| g.duration_days).unwrap_or(30).max(1) as i64;
+                    cycle_start = expiration_date - chrono::Duration::days(duration_days);
+                }
+
+                // Определение лимита трафика
+                let mut limit: i64 = 0;
+                let mut has_traffic_limit = false;
+
+                let rate_has_limits = rate_opt.as_ref().is_some_and(|r| r.sessions > 0 || r.traffic_limit > 0 || r.speed_limit > 0);
+
+                if rate_has_limits {
+                    let rate = rate_opt.as_ref().unwrap();
                     if rate.traffic_limit > 0 {
-                        let sum_result = traffic_totals::Entity::find()
-                            .filter(traffic_totals::Column::UserId.eq(usr_id))
-                            .select_only()
-                            .column_as(sea_orm::sea_query::Expr::cust("SUM(rx_bytes) + SUM(tx_bytes)"), "total")
-                            .into_tuple::<Option<i64>>()
-                            .one(&txn)
-                            .await;
+                        limit = rate.traffic_limit;
+                        has_traffic_limit = true;
+                    }
+                } else if let Some(ref group) = group_opt {
+                    if group.traffic_limit > 0 {
+                        limit = group.traffic_limit;
+                        has_traffic_limit = true;
+                    }
+                }
 
-                        if let Ok(Some(Some(total_bytes))) = sum_result {
-                            if total_bytes >= rate.traffic_limit {
-                                info!("[Billing] Client {} exceeded traffic limit. Blocking and enqueuing disconnect.", usr_id);
+                // Сверяем трафик за ТЕКУЩИЙ расчетный период с лимитом
+                if has_traffic_limit {
+                    let sum_result = traffic_totals::Entity::find()
+                        .filter(traffic_totals::Column::UserId.eq(usr_id))
+                        .filter(traffic_totals::Column::UpdatedAt.gte(cycle_start)) // Считаем только с начала периода
+                        .select_only()
+                        .column_as(sea_orm::sea_query::Expr::cust("CAST(SUM(rx_bytes) + SUM(tx_bytes) AS BIGINT)"), "total")
+                        .into_tuple::<Option<i64>>()
+                        .one(&txn)
+                        .await;
 
-                                let _ = users::Entity::update_many()
-                                    .col_expr(users::Column::IsActive, sea_orm::sea_query::Expr::value(false))
-                                    .filter(users::Column::Id.eq(usr_id))
-                                    .exec(&txn)
-                                    .await;
+                    if let Ok(Some(Some(total_bytes))) = sum_result {
+                        if total_bytes >= limit {
+                            info!("[Billing] Client {} (FP: {}) exceeded traffic limit ({} >= {}). Enqueuing disconnect.", usr_id, sample.fingerprint, total_bytes, limit);
 
-                                let disconnect_cmd = node_commands::ActiveModel {
-                                    id: Set(Uuid::new_v4()),
-                                    server_id: Set(node_id),
-                                    command_type: Set("disconnect_user".to_string()),
-                                    accepting_connections: Set(None),
-                                    target_fingerprint: Set(Some(sample.fingerprint.clone())),
-                                    status: Set("pending".to_string()),
-                                    created_at: Set(Utc::now().naive_utc()),
-                                    started_at: Set(None),
-                                    completed_at: Set(None),
-                                    error: Set(None),
-                                };
-                                let _ = disconnect_cmd.insert(&txn).await;
-                            }
+                            let disconnect_cmd = node_commands::ActiveModel {
+                                id: Set(Uuid::new_v4()),
+                                server_id: Set(node_id),
+                                command_type: Set("disconnect_user".to_string()),
+                                accepting_connections: Set(None),
+                                target_fingerprint: Set(Some(sample.fingerprint.clone())),
+                                status: Set("pending".to_string()),
+                                created_at: Set(Utc::now().naive_utc()),
+                                started_at: Set(None),
+                                completed_at: Set(None),
+                                error: Set(None),
+                            };
+                            let _ = disconnect_cmd.insert(&txn).await;
                         }
                     }
                 }

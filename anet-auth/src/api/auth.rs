@@ -9,10 +9,11 @@ use poem::Result;
 use poem_openapi::{payload::Json, OpenApi};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, IntoActiveModel, Set,
-    QueryFilter, TransactionTrait,
+    QueryFilter, TransactionTrait, QuerySelect
 };
 use std::env;
 use uuid::Uuid;
+use chrono::Datelike;
 
 pub struct AuthApi {
     pub db: DatabaseConnection,
@@ -76,68 +77,173 @@ impl AuthApi {
     ) -> Result<Json<CheckAccessResponse>> {
         let fingerprint = &req.0.fingerprint;
 
-        let result = users::Entity::find()
+        let user = match users::Entity::find()
             .filter(users::Column::Fingerprint.eq(fingerprint))
-            .find_also_related(crate::entities::rates::Entity)
             .one(&self.db)
             .await
-            .map_err(poem::error::InternalServerError)?;
-
-        if let Some((user, rate_opt)) = result {
-            if !user.is_active {
+            .map_err(poem::error::InternalServerError)?
+        {
+            Some(u) => u,
+            None => {
                 return Ok(Json(CheckAccessResponse {
                     allowed: false,
-                    message: "Banned".into(),
+                    message: "Not found".into(),
                     static_ip: None,
                     user_id: None,
+                    speed_limit: None,
+                }))
+            }
+        };
+
+        if !user.is_active {
+            return Ok(Json(CheckAccessResponse {
+                allowed: false,
+                message: "Учетная запись заблокирована".into(),
+                static_ip: None,
+                user_id: None,
+                speed_limit: None,
+            }));
+        }
+
+        // Загружаем индивидуальный тариф (если есть)
+        let rate_opt = crate::entities::rates::Entity::find()
+            .filter(crate::entities::rates::Column::UserId.eq(user.id))
+            .one(&self.db)
+            .await
+            .unwrap_or(None);
+
+        // Загружаем группу (если привязана)
+        let group_opt = if let Some(group_id) = user.group_id {
+            crate::entities::groups::Entity::find_by_id(group_id)
+                .one(&self.db)
+                .await
+                .unwrap_or(None)
+        } else {
+            None
+        };
+
+        let now = chrono::Utc::now().naive_utc();
+
+        // 1. Вычисляем календарные границы текущего месяца на случай отсутствия тарифа
+        let first_day_current_month = chrono::NaiveDate::from_ymd_opt(now.year(), now.month(), 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap();
+
+        let (next_year, next_month) = if now.month() == 12 {
+            (now.year() + 1, 1)
+        } else {
+            (now.year(), now.month() + 1)
+        };
+        let first_day_next_month = chrono::NaiveDate::from_ymd_opt(next_year, next_month, 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap();
+
+        // 2. Определяем временные границы цикла
+        let mut expiration_date = first_day_next_month;
+        let mut cycle_start = first_day_current_month;
+        let mut check_expiration = false;
+
+        if let Some(ref rate) = rate_opt {
+            expiration_date = rate.date_end;
+            check_expiration = true;
+
+            let duration_days = group_opt.as_ref().map(|g| g.duration_days).unwrap_or(30).max(1) as i64;
+            cycle_start = expiration_date - chrono::Duration::days(duration_days);
+        }
+
+        // 3. Определяем значения лимитов трафика, сессий и СКОРОСТИ
+        let mut allowed_sessions = 0;
+        let mut max_traffic: i64 = 0;
+        let mut speed_limit = 0; // Скорость в Кбит/с (по умолчанию 0 — безлимит)
+        let mut has_limits = false;
+
+        let rate_has_limits = rate_opt.as_ref().is_some_and(|r| r.sessions > 0 || r.traffic_limit > 0 || r.speed_limit > 0);
+
+        if rate_has_limits {
+            // Лимиты заданы в тарифе напрямую (полный приоритет)
+            let rate = rate_opt.as_ref().unwrap();
+            max_traffic = rate.traffic_limit;
+            allowed_sessions = rate.sessions as i32;
+            speed_limit = rate.speed_limit; // Берем скорость из тарифа
+            has_limits = true;
+        } else if let Some(ref group) = group_opt {
+            // В тарифе нули (или его нет) -> откатываемся на группу
+            max_traffic = group.traffic_limit;
+            allowed_sessions = group.sessions_limit;
+            speed_limit = group.speed_limit; // Берем скорость из группы
+            has_limits = true;
+        }
+
+        // 4. Проверяем лимиты, если они активны
+        if has_limits {
+            // Проверка срока действия
+            if check_expiration && chrono::Utc::now().naive_utc() > expiration_date {
+                return Ok(Json(CheckAccessResponse {
+                    allowed: false,
+                    message: "Время действия подписки истекло".into(),
+                    static_ip: None,
+                    user_id: None,
+                    speed_limit: None,
                 }));
             }
 
-            if let Some(rate) = rate_opt {
-                if chrono::Utc::now().naive_utc() > rate.date_end {
-                    return Ok(Json(CheckAccessResponse {
-                        allowed: false,
-                        message: "Время действия ключа истекло".into(),
-                        static_ip: None,
-                        user_id: None,
-                    }));
-                }
-
-                let current_sessions = match crate::entities::active_sessions::Entity::find()
+            // Проверка активных сессий
+            if allowed_sessions > 0 {
+                let current_sessions = crate::entities::active_sessions::Entity::find()
                     .filter(crate::entities::active_sessions::Column::UserId.eq(user.id))
                     .one(&self.db)
                     .await
-                {
-                    Ok(Some(session_model)) => session_model.sessions,
-                    _ => 0,
-                };
+                    .ok()
+                    .flatten()
+                    .map(|s| s.sessions)
+                    .unwrap_or(0);
 
-                if current_sessions >= (rate.sessions as i32) {
+                if current_sessions >= allowed_sessions {
                     return Ok(Json(CheckAccessResponse {
                         allowed: false,
-                        message: "Кол-во сессий для ключа достигло максимума".into(),
+                        message: "Достигнут лимит одновременных подключений".into(),
                         static_ip: None,
                         user_id: None,
+                        speed_limit: None,
                     }));
                 }
             }
 
-            let static_ip = user.static_ip.clone();
+            // Проверка исчерпания трафика за расчетный период
+            if max_traffic > 0 {
+                let sum_result = crate::entities::traffic_totals::Entity::find()
+                    .filter(crate::entities::traffic_totals::Column::UserId.eq(user.id))
+                    .filter(crate::entities::traffic_totals::Column::UpdatedAt.gte(cycle_start))
+                    .select_only()
+                    .column_as(sea_orm::sea_query::Expr::cust("CAST(SUM(rx_bytes) + SUM(tx_bytes) AS BIGINT)"), "total")
+                    .into_tuple::<Option<i64>>()
+                    .one(&self.db)
+                    .await;
 
-            Ok(Json(CheckAccessResponse {
-                allowed: true,
-                message: "OK".into(),
-                static_ip,
-                user_id: Some(user.id.to_string()),
-            }))
-        } else {
-            Ok(Json(CheckAccessResponse {
-                allowed: false,
-                message: "Not found".into(),
-                static_ip: None,
-                user_id: None,
-            }))
+                if let Ok(Some(Some(total_bytes))) = sum_result {
+                    if total_bytes >= max_traffic {
+                        return Ok(Json(CheckAccessResponse {
+                            allowed: false,
+                            message: "Лимит трафика на этот период исчерпан".into(),
+                            static_ip: None,
+                            user_id: None,
+                            speed_limit: None,
+                        }));
+                    }
+                }
+            }
         }
+
+        // УСПЕШНЫЙ ВХОД: возвращаем разрешенную скорость для eBPF-шейпера на сервере
+        Ok(Json(CheckAccessResponse {
+            allowed: true,
+            message: "OK".into(),
+            static_ip: user.static_ip.clone(),
+            user_id: Some(user.id.to_string()),
+            speed_limit: Some(speed_limit),
+        }))
     }
 
     /// Старт сессии
