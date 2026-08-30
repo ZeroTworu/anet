@@ -24,6 +24,7 @@ const group = ref<UserGroup | null>(null)
 const members = ref<User[]>([])
 const totalMembers = ref(0)
 const showAddModal = ref(false)
+const autocompleteRef = ref<any>(null)
 
 // Фильтры и пагинация таблицы участников
 const searchQuery = ref('')
@@ -119,6 +120,15 @@ watch(searchInput, async (q) => {
 watch(searchQuery, (val) => {
   options.value.page = 1
   loadMembers(1, options.value.itemsPerPage, val)
+})
+
+// Наблюдатель за открытием модального окна добавления участника
+watch(showAddModal, (visible) => {
+  if (visible) {
+    setTimeout(() => {
+      autocompleteRef.value?.focus();
+    }, 150); // Ждем завершения анимации диалога перед фокусом
+  }
 })
 
 const saveGroupSettings = async () => {
@@ -323,13 +333,13 @@ onMounted(() => {
         <v-card-title class="text-h6 pb-4">Добавить участника в группу</v-card-title>
         <v-card-text>
           <v-autocomplete
+              ref="autocompleteRef"
               v-model:search="searchInput"
               :items="searchResults.map(u => ({ title: u.uid || 'No Name', value: u.id }))"
               item-title="title"
               item-value="value"
               :loading="searchLoading"
-              label="Поиск пользователя по UID"
-              placeholder="Начните вводить имя..."
+              label="Начните вводить имя или UID пользователя..."
               no-filter
               hide-no-data
               variant="filled"

@@ -47,7 +47,7 @@ const groupOptions = computed(() => availableGroups.value.map(group => ({
 
 const uidRules = [
   (v: string) => !!v?.trim() || 'UID обязателен',
-  (v: string) => /^[A-Za-z0-9_.-]{2,64}$/.test(v) || '2–64 символа: латиница, цифры, . _ -',
+  (v: string) => (v && v.trim().length >= 2 && v.trim().length <= 64) || 'Длина имени должна быть от 2 до 64 символов',
 ]
 
 onMounted(async () => {
