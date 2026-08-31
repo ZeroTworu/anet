@@ -167,7 +167,7 @@ fn wss_connector() -> Result<Connector> {
     // (h2 приоритетнее http/1.1); список из одного http/1.1 — заметная
     // аномалия для пассивного DPI ещё до WebSocket-апгрейда.
     let mut tls = tls;
-    tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    tls.alpn_protocols = vec![b"http/1.1".to_vec()];
     Ok(Connector::Rustls(Arc::new(tls)))
 }
 
