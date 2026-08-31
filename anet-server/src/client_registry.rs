@@ -154,6 +154,13 @@ impl ClientRegistry {
         }
     }
 
+    pub fn get_by_session(&self, session_id: &str) -> Option<Arc<ClientTransportInfo>> {
+        self.clients_by_ip
+            .iter()
+            .find(|entry| entry.value().session_id == session_id)
+            .map(|entry| entry.value().clone())
+    }
+
     pub fn get_network_params(&self) -> (String, String, i32) {
         (
             self.ip_pool.netmask.to_string(),

@@ -38,6 +38,8 @@ fn generate_ascii_art(tag: &str, build_type: &str, commit_hash: &str, build_time
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<()> {
+
+    rustls::crypto::ring::default_provider().install_default().ok();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     // Проверка прав

@@ -10,7 +10,8 @@ pub fn generate_seid() -> String {
     let mut rng = rand::thread_rng();
     let mut session_id = [0u8; 16];
     rng.fill_bytes(&mut session_id);
-    general_purpose::STANDARD.encode(session_id)
+    // Используем безопасный URL-алфавит без падинга
+    general_purpose::URL_SAFE_NO_PAD.encode(session_id)
 }
 
 #[inline]

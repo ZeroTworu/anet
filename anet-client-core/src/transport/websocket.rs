@@ -3,6 +3,7 @@ use crate::auth::{AuthChannel, AuthHandler};
 use crate::config::{CoreConfig, ServerConfig};
 use anet_common::consts::{CHANNEL_BUFFER_SIZE, COALESCE_BUDGET_BYTES, MAX_PACKET_SIZE};
 use anet_common::handshake_fragmentation::FragmentConfig;
+use anet_common::http_help::{BrowserProfile, CHROME_BRANDS, CHROME_PLATFORMS};
 use anet_common::stream_framing::{frame_packet, read_next_packet};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -11,7 +12,7 @@ use futures::{SinkExt, StreamExt};
 use http::HeaderValue;
 use http::header::{ACCEPT_LANGUAGE, CACHE_CONTROL, ORIGIN, PRAGMA, USER_AGENT};
 use log::{debug, info, warn};
-use rand::{Rng, seq::SliceRandom};
+use rand::Rng;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -28,76 +29,7 @@ use tokio_tungstenite::tungstenite::protocol::{CloseFrame, frame::coding::CloseC
 use tokio_tungstenite::{Connector, MaybeTlsStream, WebSocketStream, connect_async_tls_with_config};
 
 type ClientSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
-
-const CHROME_USER_AGENTS: &[&str] = &[
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
-];
-const FIREFOX_USER_AGENTS: &[&str] = &[
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:153.0) Gecko/20100101 Firefox/153.0",
-    "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:152.0) Gecko/20100101 Firefox/152.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:151.0) Gecko/20100101 Firefox/151.0",
-];
-const CHROME_BRANDS: &[&str] = &[
-    "\"Google Chrome\";v=\"151\", \"Chromium\";v=\"151\", \"Not_A Brand\";v=\"24\"",
-    "\"Chromium\";v=\"150\", \"Not_A Brand\";v=\"24\", \"Google Chrome\";v=\"150\"",
-    "\"Not_A Brand\";v=\"24\", \"Google Chrome\";v=\"149\", \"Chromium\";v=\"149\"",
-];
-const CHROME_PLATFORMS: &[&str] = &["\"Windows\"", "\"Linux\"", "\"macOS\""];
-const SAFARI_USER_AGENTS: &[&str] = &[
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.5 Safari/605.1.15",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.4 Safari/605.1.15",
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.5 Mobile/15E148 Safari/604.1",
-];
-const ACCEPT_LANGUAGES: &[&str] = &[
-    "en-US,en;q=0.9",
-    "en-GB,en;q=0.9,en-US;q=0.8",
-    "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-];
 const MAX_WS_MESSAGE_SIZE: usize = 64 * 1024;
-
-#[derive(Clone)]
-struct BrowserProfile {
-    user_agent: &'static str,
-    accept_language: &'static str,
-    chrome_profile: Option<usize>,
-}
-
-impl BrowserProfile {
-    fn random() -> Self {
-        let mut rng = rand::rngs::OsRng;
-        let family = rng.gen_range(0..3);
-        let (user_agent, chrome_profile) = match family {
-            0 => {
-                let index = rng.gen_range(0..CHROME_USER_AGENTS.len());
-                (CHROME_USER_AGENTS[index], Some(index))
-            }
-            1 => (
-                FIREFOX_USER_AGENTS
-                    .choose(&mut rng)
-                    .copied()
-                    .unwrap_or(FIREFOX_USER_AGENTS[0]),
-                None,
-            ),
-            _ => (
-                SAFARI_USER_AGENTS
-                    .choose(&mut rng)
-                    .copied()
-                    .unwrap_or(SAFARI_USER_AGENTS[0]),
-                None,
-            ),
-        };
-        Self {
-            user_agent,
-            accept_language: ACCEPT_LANGUAGES
-                .choose(&mut rng)
-                .copied()
-                .unwrap_or(ACCEPT_LANGUAGES[0]),
-            chrome_profile,
-        }
-    }
-}
 
 struct WebSocketAuthChannel {
     socket: Mutex<ClientSocket>,
@@ -579,6 +511,7 @@ mod tests {
 
     #[test]
     fn chrome_user_agent_matches_client_hints_and_platform() {
+        use anet_common::http_help::{CHROME_USER_AGENTS, ACCEPT_LANGUAGES};
         for index in 0..CHROME_USER_AGENTS.len() {
             let profile = BrowserProfile {
                 user_agent: CHROME_USER_AGENTS[index],

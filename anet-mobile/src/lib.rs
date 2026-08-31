@@ -371,6 +371,11 @@ pub extern "system" fn Java_org_alco_anet_ANetVpnService_connectVpn(
 ) {
     info!("JNI: connectVpn called");
 
+    // ИНИЦИАЛИЗАЦИЯ КРИПТО-ПРОВАЙДЕРА ДЛЯ ANDROID
+    // Игнорируем ошибку, так как при реконнектах (когда сервис не умирал, а просто
+    // перезапускал туннель) провайдер уже может быть установлен.
+    rustls::crypto::ring::default_provider().install_default().ok();
+
     // Подготавливаем потокобезопасные структуры за пределами Tokio-рантайма
     let jvm = env.get_java_vm().unwrap();
     let jvm_arc = Arc::new(jvm);

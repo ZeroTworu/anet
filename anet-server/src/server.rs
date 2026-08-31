@@ -4,7 +4,7 @@ use crate::client_registry::ClientRegistry;
 use crate::config::Config;
 use crate::ip_pool::IpPool;
 use crate::multikey_udp_socket::TempDHInfo;
-use crate::servers::{quic, ssh, vnc, websocket};
+use crate::servers::{http_stream, quic, ssh, vnc, websocket};
 
 use anet_common::atun::TunManager;
 use anet_common::tun_params::TunParams;
@@ -144,6 +144,18 @@ impl ANetServer {
             handle_collection.push(tokio::spawn(async move {
                 if let Err(e) = websocket::run_websocket_server(c, rg, tx, auth).await {
                     error!("WebSocket interface execution halted: {}", e);
+                }
+            }));
+        }
+
+        if !self.cfg.server.ahttp_bind_to.trim().is_empty() {
+            let c = self.cfg.clone();
+            let rg = self.registry.clone();
+            let tx = tx_tun.clone();
+            let auth = self.auth_handler_core.clone();
+            handle_collection.push(tokio::spawn(async move {
+                if let Err(e) = http_stream::run_http_stream_server(c, rg, tx, auth).await {
+                    error!("Fatal error: [AHTTP-Stream] Server halted: {}", e);
                 }
             }));
         }

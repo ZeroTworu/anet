@@ -104,6 +104,7 @@ pub enum TransportMode {
     Ssh,
     Vnc,
     Websocket,
+    Ahttp,
 }
 
 impl Default for TransportMode {
@@ -159,6 +160,7 @@ impl ServerConfig {
             Some("ssh") => Ok(TransportMode::Ssh),
             Some("vnc") => Ok(TransportMode::Vnc),
             Some("ws") | Some("wss") => Ok(TransportMode::Websocket),
+            Some("http") | Some("https") => Ok(TransportMode::Ahttp),
             Some(scheme) => anyhow::bail!("unsupported server DSN scheme '{scheme}'"),
             None => anyhow::bail!("server DSN '{}' has no scheme", self.dsn),
         }
@@ -199,6 +201,7 @@ impl ServerConfig {
                 TransportMode::Ssh => "SSH",
                 TransportMode::Vnc => "VNC",
                 TransportMode::Websocket => "WS",
+                TransportMode::Ahttp => "AHTTP",
             };
 
             format!("{}:{}", host, mode_str)

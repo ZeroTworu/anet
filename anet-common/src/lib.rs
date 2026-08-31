@@ -15,6 +15,7 @@ pub mod tun_params;
 pub mod udp_poller;
 pub mod vnc;
 pub mod dto;
+pub mod http_help;
 
 pub use generated::*;
 pub mod protocol {

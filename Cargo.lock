@@ -396,6 +396,7 @@ dependencies = [
  "futures",
  "hickory-resolver",
  "http",
+ "httparse",
  "ipnet",
  "log",
  "net-route",
@@ -409,6 +410,7 @@ dependencies = [
  "rustls-pemfile",
  "serde",
  "tokio",
+ "tokio-rustls",
  "tokio-tungstenite",
  "x25519-dalek",
  "zip",
@@ -437,6 +439,7 @@ dependencies = [
  "netdev",
  "notify-rust",
  "rfd",
+ "rustls",
  "serde",
  "serde_json",
  "sysinfo",
@@ -499,6 +502,7 @@ dependencies = [
  "ipnet",
  "jni 0.21.1",
  "log",
+ "rustls",
  "tokio",
  "toml 0.9.8",
  "tun",
@@ -521,6 +525,7 @@ dependencies = [
  "ed25519-dalek 2.2.0",
  "env_logger",
  "futures",
+ "httparse",
  "log",
  "prost",
  "quinn",
@@ -533,6 +538,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "toml 0.9.8",
+ "url",
  "x25519-dalek",
 ]
 
@@ -7649,6 +7655,8 @@ version = "0.23.31"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c0ebcbd2f03de0fc1122ad9bb24b127a5a6cd51d72604a3f3c50ac459762b6cc"
 dependencies = [
+ "aws-lc-rs",
+ "log",
  "once_cell",
  "ring",
  "rustls-pki-types",
@@ -7721,6 +7729,7 @@ version = "0.103.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0a17884ae0c1b773f1ccd2bd4a8c72f16da897310a98b0e84bf349ad5ead92fc"
 dependencies = [
+ "aws-lc-rs",
  "ring",
  "rustls-pki-types",
  "untrusted 0.9.0",

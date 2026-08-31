@@ -1,7 +1,7 @@
 // Все константы обсалютно научны, и соответствуют числу тараканов на лолу и кол-ву бычков в пепельнице.
 // Не научные - числу мух на потолке.
 
-pub const MAX_PACKET_SIZE: usize = 2048;
+pub const MAX_PACKET_SIZE: usize = 65536;
 pub const CHANNEL_BUFFER_SIZE: usize = 1024;
 pub const NONCE_PREFIX_LEN: usize = 4;
 pub const NONCE_LEN: usize = 12;

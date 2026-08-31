@@ -35,6 +35,8 @@ arc-swap = "1.6"
 
 
 anet-common = { path = "../anet-common", features = ["poem"] }
+httparse = "1.10.1"
+url = "2.5.7"
 
 [dev-dependencies]
 anet-client-core = { path = "../anet-client-core" }

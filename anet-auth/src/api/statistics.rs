@@ -176,13 +176,12 @@ impl StatisticsApi {
                 } else {
                     (now.year(), now.month() + 1)
                 };
-                let first_day_next_month = chrono::NaiveDate::from_ymd_opt(next_year, next_month, 1)
+                let mut expiration_date = chrono::NaiveDate::from_ymd_opt(next_year, next_month, 1)
                     .unwrap()
                     .and_hms_opt(0, 0, 0)
                     .unwrap();
 
                 // Определение временных границ периода
-                let mut expiration_date = first_day_next_month;
                 let mut cycle_start = first_day_current_month;
 
                 if let Some(ref rate) = rate_opt {

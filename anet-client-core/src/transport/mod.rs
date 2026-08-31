@@ -3,7 +3,7 @@ pub(crate) mod quic;
 pub(crate) mod ssh;
 pub(crate) mod vnc;
 pub (crate) mod websocket;
-
+pub(crate) mod ahttp;
 
 use anet_common::protocol::AuthResponse;
 use anet_common::transport_trait::VpnStream;

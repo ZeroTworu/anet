@@ -120,8 +120,13 @@ pub struct ServerCoreConfig {
     pub quic_bind_to: String,
     pub ssh_bind_to: String,
     pub vnc_bind_to: String,
+
     pub websocket_bind_to: String,
     pub websocket_path: String,
+
+    pub ahttp_bind_to: String,
+    pub ahttp_path: String,
+
     pub ssh_host_key: String,
 }
 
@@ -131,8 +136,13 @@ impl Default for ServerCoreConfig {
             quic_bind_to: "0.0.0.0:8443".to_string(),
             ssh_bind_to: "0.0.0.0:822".to_string(),
             vnc_bind_to: "0.0.0.0:5900".to_string(),
+
             websocket_bind_to: "0.0.0.0:8080".to_string(),
             websocket_path: "/socket".to_string(),
+
+            ahttp_bind_to: "127.0.0.1:8081".to_string(),
+            ahttp_path: "/api/v2/telemetry".to_string(),
+
             ssh_host_key: "/etc/ssh/ssh_host_rsa_key".to_string(),
         }
     }

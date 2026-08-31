@@ -9,6 +9,7 @@ use eframe::egui;
 use std::process::Command;
 
 fn main() -> Result<(), eframe::Error> {
+    rustls::crypto::ring::default_provider().install_default().ok();
     #[cfg(target_os = "macos")]
     {
         if !is_root() {

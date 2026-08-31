@@ -38,6 +38,8 @@ zip = "8.6.0"
 
 hickory-resolver = { version = "0.24", features = ["tokio"] }
 anet-common = { path = "../anet-common" }
+httparse = "1.10.1"
+tokio-rustls = "0.26.4"
 
 
 # Platform-specific dependencies for route management
