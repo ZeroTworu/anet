@@ -566,43 +566,66 @@ impl AnetClient {
                         break;
                     }
                     is_initial_phase = false;
+                } else {
+                    // После успешного старта отсутствие входящих IP-пакетов не
+                    // доказывает разрыв туннеля: трафик может быть асимметричным,
+                    // идти пакетами, не попадающими в TUN, или временно не иметь
+                    // обратного направления. Реальный обрыв определяется
+                    // сетевыми worker-ами по EOF/ошибке чтения или записи.
+                    // Поэтому payload inactivity больше не вызывает реконнект.
                 }
             }
         });
 
-        // =========================================================================
-        // УНИВЕРСАЛЬНЫЙ СБОРЩИК СТАТИСТИКИ
-        // =========================================================================
+       // =========================================================================
+// УНИВЕРСАЛЬНЫЙ СБОРЩИК СТАТИСТИКИ
+// =========================================================================
+let stats_shutdown = shutdown_notify.clone();
+let stats_task = {
+    let provider: Arc<dyn statistic::StatsProvider> = if let Some(ref conn) = result.connection {
+        Arc::new(statistic::QuicStatsProvider::new(conn.clone()))
+    } else {
+        Arc::new(statistic::StreamStatsProvider::new(
+            total_rx_bytes.clone(),
+            total_tx_bytes.clone(),
+            total_rx_packets.clone(),
+            total_tx_packets.clone(),
+        ))
+    };
 
-        let stats_shutdown = shutdown_notify.clone();
-        let stats_task = {
-        let provider: Arc<dyn statistic::StatsProvider> = if let Some(ref conn) = result.connection {
-            Arc::new(statistic::QuicStatsProvider::new(conn.clone()))
-        } else {
-            Arc::new(statistic::StreamStatsProvider::new(
-                total_rx_bytes.clone(),
-                total_tx_bytes.clone(),
-                total_rx_packets.clone(),
-                total_tx_packets.clone(),
-            ))
-        };
+    // 1. Получаем IP:Port текущего сервера
+    let (server_host, server_port) = server.host_port().unwrap_or_default();
+    let mut resolved_addr: Option<SocketAddr> = None;
 
-        // 1. Быстрый монитор для обновления UI-меток (каждую секунду)
-        let fast_handle = statistic::start_fast_stats_monitor(
-            provider.clone(),
-            stats_shutdown.clone(),
-        );
+    if let Ok(ip) = IpAddr::from_str(&server_host) {
+        resolved_addr = Some(SocketAddr::new(ip, server_port));
+    } else if let Ok(mut addrs) = tokio::net::lookup_host((server_host.as_str(), server_port)).await {
+        resolved_addr = addrs.next();
+    }
 
-        // 2. Медленный монитор для записи детальной статистики в лог (по интервалу)
-        let slow_handle = if config_clone.stats.enabled {
-            Some(statistic::start_stats_monitor(
-                provider,
-                config_clone.stats.interval_minutes,
-                stats_shutdown,
-            ))
-        } else {
-            None
-        };
+    // 2. Оборачиваем provider в PingStatsProvider (если адрес успешно определён)
+    let fast_provider: Arc<dyn statistic::StatsProvider> = if let Some(addr) = resolved_addr {
+        statistic::PingStatsProvider::new(provider.clone(), addr)
+    } else {
+        provider.clone()
+    };
+
+    // 3. Быстрый монитор для обновления UI-меток (каждую секунду)
+    let fast_handle = statistic::start_fast_stats_monitor(
+        fast_provider,
+        stats_shutdown.clone(),
+    );
+
+    // 4. Медленный монитор для записи детальной статистики в лог (по интервалу)
+    let slow_handle = if config_clone.stats.enabled {
+        Some(statistic::start_stats_monitor(
+            provider,
+            config_clone.stats.interval_minutes,
+            stats_shutdown,
+        ))
+    } else {
+        None
+    };
 
         // Объединяем выполнение обоих мониторов в единый JoinHandle
             Some(spawn(async move {
