@@ -4,9 +4,11 @@ use quinn::Connection;
 use std::sync::Arc;
 use tokio::time::sleep;
 use tokio::sync::Notify;
-use std::sync::atomic::{ AtomicU64, Ordering };
+use std::sync::atomic::{ AtomicU32, AtomicU64, Ordering };
 use crate::events::status;
 use crate::events::{ emit, AnetEvent };
+use std::net::SocketAddr;
+use std::time::Instant;
 
 const KIB: f64 = 1024.0;
 const MIB: f64 = 1024.0 * 1024.0;
@@ -50,6 +52,11 @@ pub struct QuicStatsProvider {
     connection: Connection,
 }
 
+pub struct PingStatsProvider {
+    inner: Arc<dyn StatsProvider>,
+    last_rtt_ms: Arc<AtomicU32>,
+}
+
 impl QuicStatsProvider {
     pub fn new(connection: Connection) -> Self {
         Self { connection }
@@ -73,6 +80,63 @@ impl StatsProvider for QuicStatsProvider {
 
     fn is_closed(&self) -> bool {
         self.connection.close_reason().is_some()
+    }
+}
+
+impl PingStatsProvider {
+    pub fn new(inner: Arc<dyn StatsProvider>, target_addr: SocketAddr) -> Arc<Self> {
+        let last_rtt_ms = Arc::new(AtomicU32::new(u32::MAX));
+        let rtt_clone = last_rtt_ms.clone();
+
+        tokio::spawn(async move {
+            loop {
+                let start = Instant::now();
+
+                // Пробуем установить TCP-соединение с таймаутом 1 секунда
+                let res = tokio::time::timeout(
+                    Duration::from_secs(1),
+                    tokio::net::TcpStream::connect(target_addr)
+                ).await;
+
+                match res {
+                    Ok(Ok(_stream)) => {
+                        let rtt = start.elapsed().as_secs_f64() * 1000.0;
+                        rtt_clone.store(rtt as u32, Ordering::Relaxed);
+                    }
+                    _ => {
+                        // Если порт закрыт или отброшен, но ответил RST — время все равно считаем как задержку сети
+                        let rtt = start.elapsed().as_secs_f64() * 1000.0;
+                        if rtt < 1000.0 {
+                            rtt_clone.store(rtt as u32, Ordering::Relaxed);
+                        } else {
+                            rtt_clone.store(u32::MAX, Ordering::Relaxed);
+                        }
+                    }
+                }
+
+                // Пауза перед следующим замером
+                sleep(Duration::from_secs(1)).await;
+            }
+        });
+
+        Arc::new(Self { inner, last_rtt_ms })
+    }
+}
+
+impl StatsProvider for PingStatsProvider {
+    fn get_stats(&self) -> StatsSnapshot {
+        let mut stats = self.inner.get_stats();
+        let rtt = self.last_rtt_ms.load(Ordering::Relaxed);
+
+        if rtt != u32::MAX {
+            stats.rtt_ms = Some(rtt as f64);
+        }
+
+        stats
+    }
+
+    fn is_closed(&self) -> bool {
+        self.inner.is_closed()
     }
 }
 
@@ -245,7 +309,7 @@ pub fn start_fast_stats_monitor(
                     let rx_str = format_bytes(current_stats.total_rx_bytes);
                     let tx_str = format_bytes(current_stats.total_tx_bytes);
                    let rtt_str = current_stats.rtt_ms
-    .map(|rtt| format!("{:>4.0}ms", rtt))
+    .map(|rtt| format!("{:.0}ms", rtt))
     .unwrap_or_else(|| "N/A".to_string());
 
                     // Считаем разницу переданных данных за интервал
