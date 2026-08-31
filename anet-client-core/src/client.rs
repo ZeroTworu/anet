@@ -530,10 +530,7 @@ impl AnetClient {
             }
         });
 
-        // =========================================================================
-        // УНИВЕРСАЛЬНЫЙ СБОРЩИК СТАТИСТИКИ
-        // =========================================================================
-     // =========================================================================
+       // =========================================================================
 // УНИВЕРСАЛЬНЫЙ СБОРЩИК СТАТИСТИКИ
 // =========================================================================
 let stats_shutdown = shutdown_notify.clone();
@@ -549,13 +546,30 @@ let stats_task = {
         ))
     };
 
-    // 1. Быстрый монитор для обновления UI-меток (каждую секунду)
+    // 1. Получаем IP:Port текущего сервера
+    let (server_host, server_port) = server.host_port().unwrap_or_default();
+    let mut resolved_addr: Option<SocketAddr> = None;
+
+    if let Ok(ip) = IpAddr::from_str(&server_host) {
+        resolved_addr = Some(SocketAddr::new(ip, server_port));
+    } else if let Ok(mut addrs) = tokio::net::lookup_host((server_host.as_str(), server_port)).await {
+        resolved_addr = addrs.next();
+    }
+
+    // 2. Оборачиваем provider в PingStatsProvider (если адрес успешно определён)
+    let fast_provider: Arc<dyn statistic::StatsProvider> = if let Some(addr) = resolved_addr {
+        statistic::PingStatsProvider::new(provider.clone(), addr)
+    } else {
+        provider.clone()
+    };
+
+    // 3. Быстрый монитор для обновления UI-меток (каждую секунду)
     let fast_handle = statistic::start_fast_stats_monitor(
-        provider.clone(),
+        fast_provider,
         stats_shutdown.clone(),
     );
 
-    // 2. Медленный монитор для записи детальной статистики в лог (по интервалу)
+    // 4. Медленный монитор для записи детальной статистики в лог (по интервалу)
     let slow_handle = if config_clone.stats.enabled {
         Some(statistic::start_stats_monitor(
             provider,

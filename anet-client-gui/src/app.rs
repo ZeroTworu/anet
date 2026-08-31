@@ -188,6 +188,9 @@ pub struct ANetApp {
     pub total_txm: String,
 
     tray_value: bool,
+
+    status_text: String,
+    status_color: egui::Color32,
 }
 
 fn send_notification(title: &str, body: &str) {
@@ -482,6 +485,9 @@ impl ANetApp {
                                 if proc.is_selected {
                                     ui.style_mut().visuals.widgets.inactive.bg_stroke =
                                         checkbox_active_stroke;
+                                    ui.style_mut().visuals.widgets.inactive.bg_fill = checkbox_gold;
+                                    ui.style_mut().visuals.widgets.inactive.fg_stroke =
+                                        egui::Stroke::new(2.0, checkbox_grey);
                                 } else {
                                     ui.style_mut().visuals.widgets.inactive.bg_stroke =
                                         checkbox_inactive_stroke;
@@ -612,54 +618,52 @@ impl ANetApp {
 
     #[cfg(target_os = "windows")]
     fn inject_tray_mode_to_toml(content: &str, tray_mode: bool) -> String {
-    let normalized = content.replace("\r\n", "\n");
-    let mut lines: Vec<String> = normalized
-        .lines()
-        .map(|s| s.to_string())
-        .collect();
+        let normalized = content.replace("\r\n", "\n");
+        let mut lines: Vec<String> = normalized
+            .lines()
+            .map(|s| s.to_string())
+            .collect();
 
-    let tray_line = format!("tray_mode = {}", tray_mode);
+        let tray_line = format!("tray_mode = {}", tray_mode);
 
-    let mut in_main = false;
-    let mut main_end_idx = None;
-    let mut tray_mode_idx = None;
+        let mut in_main = false;
+        let mut main_end_idx = None;
+        let mut tray_mode_idx = None;
 
-    for (i, line) in lines.iter().enumerate() {
-        let trimmed = line.trim();
+        for (i, line) in lines.iter().enumerate() {
+            let trimmed = line.trim();
 
-        if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            if trimmed == "[main]" {
-                in_main = true;
+            if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                if trimmed == "[main]" {
+                    in_main = true;
+                } else if in_main {
+                    main_end_idx = Some(i);
+                    in_main = false;
+                }
             } else if in_main {
-                main_end_idx = Some(i);
-                in_main = false;
-            }
-        } else if in_main {
-            let clean_line: String = trimmed
-                .chars()
-                .filter(|c| !c.is_whitespace())
-                .collect();
+                let clean_line: String = trimmed
+                    .chars()
+                    .filter(|c| !c.is_whitespace())
+                    .collect();
 
-            if clean_line.starts_with("tray_mode=") {
-                tray_mode_idx = Some(i);
+                if clean_line.starts_with("tray_mode=") {
+                    tray_mode_idx = Some(i);
+                }
             }
         }
-    }
 
-    match tray_mode_idx {
-        Some(idx) => {
-            lines[idx] = tray_line;
+        match tray_mode_idx {
+            Some(idx) => {
+                lines[idx] = tray_line;
+            }
+            None => {
+                let insert_pos = main_end_idx.unwrap_or(lines.len());
+                lines.insert(insert_pos, tray_line);
+            }
         }
-        None => {
-            let insert_pos = main_end_idx.unwrap_or(lines.len());
-            lines.insert(insert_pos, tray_line);
-        }
+
+        lines.join("\n")
     }
-
-    lines.join("\n")
-}
-
-
 
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         load_fonts(&cc.egui_ctx);
@@ -738,6 +742,8 @@ impl ANetApp {
             total_txm: "0 B".to_string(),
 
             tray_value: true,
+            status_text: "CONNECTION".to_string(),
+            status_color: egui::Color32::from_rgb(128, 128, 128),
         };
 
         #[cfg(target_os = "windows")]
@@ -906,13 +912,13 @@ impl ANetApp {
                 };
 
                 // Загружаем настройку сворачивания в трей из [main]
-if let Ok(raw_toml) = toml::from_str::<toml::Value>(content) {
-    self.tray_value = raw_toml
-        .get("main")
-        .and_then(|main| main.get("tray_mode"))
-        .and_then(|value| value.as_bool())
-        .unwrap_or(true);
-}
+                if let Ok(raw_toml) = toml::from_str::<toml::Value>(content) {
+                    self.tray_value = raw_toml
+                        .get("main")
+                        .and_then(|main| main.get("tray_mode"))
+                        .and_then(|value| value.as_bool())
+                        .unwrap_or(true);
+                }
 
                 for proc in &mut self.processes {
                     proc.is_selected = cfg.main.per_app.contains(&proc.name);
@@ -957,6 +963,15 @@ if let Ok(raw_toml) = toml::from_str::<toml::Value>(content) {
                 self.log("Failed to parse config TOML");
             }
         }
+    }
+
+    fn styled_label_text(&self, text: impl Into<String>, color: egui::Color32) -> egui::RichText {
+        egui::RichText
+            ::new(text)
+            .family(egui::FontFamily::Name("Inter-V".into()))
+            .size(11.0)
+            .color(color)
+            .strong()
     }
 }
 
@@ -1089,43 +1104,32 @@ impl eframe::App for ANetApp {
         ctx.set_visuals(visuals);
         ctx.request_repaint_after(std::time::Duration::from_millis(500));
 
-
         // --- ОБРАБОТКА СВОРАЧИВАНИЯ ---
-let is_minimized = ctx.input(|i| {
-    i.viewport().minimized.unwrap_or(false)
-});
+        let is_minimized = ctx.input(|i| { i.viewport().minimized.unwrap_or(false) });
 
-if self.tray_value {
-    // Режим "Сворачивать приложение в трей"
-    if is_minimized {
-        if !self.is_in_tray {
-            self.is_in_tray = true;
+        if self.tray_value {
+            // Режим "Сворачивать приложение в трей"
+            if is_minimized {
+                if !self.is_in_tray {
+                    self.is_in_tray = true;
 
-            ctx.send_viewport_cmd(
-                egui::ViewportCommand::Visible(false)
-            );
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
 
-            let _ = self.tray_cmd_tx.send(
-                TrayCommand::WindowVisible(false)
-            );
+                    let _ = self.tray_cmd_tx.send(TrayCommand::WindowVisible(false));
 
-            let _ = self.tray_cmd_tx.send(
-                TrayCommand::NotifyHidden
-            );
+                    let _ = self.tray_cmd_tx.send(TrayCommand::NotifyHidden);
+                }
+
+                return;
+            } else if self.is_in_tray {
+                self.is_in_tray = false;
+
+                let _ = self.tray_cmd_tx.send(TrayCommand::WindowVisible(true));
+            }
         }
 
-        return;
-    } else if self.is_in_tray {
-        self.is_in_tray = false;
-
-        let _ = self.tray_cmd_tx.send(
-            TrayCommand::WindowVisible(true)
-        );
-    }
-}
-
-// Если tray_value == false —
-// обычная минимизация окна никак не перехватывается.
+        // Если tray_value == false —
+        // обычная минимизация окна никак не перехватывается.
 
         let titlebar_button = egui::vec2(42.0, 38.0);
 
@@ -1287,33 +1291,31 @@ if self.tray_value {
 
                                 // Прямое скрытие окна в трей
                                 // Кнопка "Свернуть"
-if min_response.clicked() {
-    if self.tray_value {
-        // ==========================================
-        // РЕЖИМ: СВОРАЧИВАНИЕ В ТРЕЙ
-        // ==========================================
-        self.is_in_tray = true;
+                                if min_response.clicked() {
+                                    if self.tray_value {
+                                        // ==========================================
+                                        // РЕЖИМ: СВОРАЧИВАНИЕ В ТРЕЙ
+                                        // ==========================================
+                                        self.is_in_tray = true;
 
-        ctx.send_viewport_cmd(
-            egui::ViewportCommand::Visible(false)
-        );
+                                        ctx.send_viewport_cmd(
+                                            egui::ViewportCommand::Visible(false)
+                                        );
 
-        let _ = self.tray_cmd_tx.send(
-            TrayCommand::WindowVisible(false)
-        );
+                                        let _ = self.tray_cmd_tx.send(
+                                            TrayCommand::WindowVisible(false)
+                                        );
 
-        let _ = self.tray_cmd_tx.send(
-            TrayCommand::NotifyHidden
-        );
-    } else {
-        // ==========================================
-        // ОБЫЧНЫЙ РЕЖИМ: МИНИМИЗАЦИЯ ОКНА
-        // ==========================================
-        ctx.send_viewport_cmd(
-            egui::ViewportCommand::Minimized(true)
-        );
-    }
-}
+                                        let _ = self.tray_cmd_tx.send(TrayCommand::NotifyHidden);
+                                    } else {
+                                        // ==========================================
+                                        // ОБЫЧНЫЙ РЕЖИМ: МИНИМИЗАЦИЯ ОКНА
+                                        // ==========================================
+                                        ctx.send_viewport_cmd(
+                                            egui::ViewportCommand::Minimized(true)
+                                        );
+                                    }
+                                }
                             });
                         });
                     });
@@ -1437,14 +1439,32 @@ if min_response.clicked() {
                         ui.vertical(|ui| {
                             // --- HEADER ---
                             ui.horizontal(|ui| {
+                                let text_muted = egui::Color32::GRAY;
                                 ui.label(
-                                    egui::RichText
-                                        ::new("CONNECTION")
-                                        .family(egui::FontFamily::Name("Inter-V".into()))
-                                        .size(11.0)
-                                        .color(text_muted)
-                                        .strong()
+                                    self.styled_label_text(&self.status_text, self.status_color)
                                 );
+
+
+                                // Захватываем блокировку только если Mutex свободен прямо сейчас
+if let Ok(logs) = self.logs.try_lock() {
+    if let Some((text, color)) = logs.iter().rev().find_map(|line| {
+        if line.contains("Error") || line.contains("Failed") || line.contains("Connection lost") {
+            Some((line.clone(), red_color))
+        } else if line.contains("Tunnel UP") {
+            Some((line.clone(), green_color))
+        } else if line.contains("Config loaded") {
+            Some((line.clone(), gold_color))
+        } else if line.contains("Cleaning up dead session") {
+            Some((line.clone(), orange_color))
+        } else {
+            None
+        }
+    }) {
+        self.status_text = text;
+        self.status_color = color;
+    }
+}
+// Блокировка `logs` автоматически освобождается в конце блока `if let`
 
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
@@ -2391,86 +2411,106 @@ if min_response.clicked() {
                             });
                             ui.separator();
 
-                            if ui
-    .checkbox(&mut self.tray_value, "Сворачивать приложение в трэй")
-    .changed()
-{
-    let tray_mode = self.tray_value;
+                            ui.style_mut().spacing.scroll.foreground_color = false;
+                            ui.style_mut().visuals.widgets.inactive.bg_fill =
+                                egui::Color32::from_rgb(80, 80, 80);
+                            ui.style_mut().visuals.widgets.hovered.bg_fill =
+                                egui::Color32::from_rgb(120, 120, 120);
+                            ui.style_mut().visuals.widgets.active.bg_fill = egui::Color32::from_rgb(
+                                160,
+                                160,
+                                160
+                            );
 
-    let mut updated_config_data: Option<(String, String, String)> = None;
+                            if
+                                ui
+                                    .checkbox(&mut self.tray_value, "Сворачивать приложение в трэй")
+                                    .changed()
+                            {
+                                let tray_mode = self.tray_value;
 
-    {
-        let mut settings = self.settings.lock().unwrap();
+                                let mut updated_config_data: Option<
+                                    (String, String, String)
+                                > = None;
 
-        if let Some(active_id) = settings.active_config_id.clone() {
-            if let Some(cfg) = settings
-                .configs
-                .iter_mut()
-                .find(|c| c.id == active_id)
-            {
-                cfg.content = Self::inject_tray_mode_to_toml(
-                    &cfg.content,
-                    tray_mode,
-                );
+                                {
+                                    let mut settings = self.settings.lock().unwrap();
 
-                updated_config_data = Some((
-                    cfg.id.clone(),
-                    cfg.content.clone(),
-                    cfg.name.clone(),
-                ));
-            }
+                                    if let Some(active_id) = settings.active_config_id.clone() {
+                                        if
+                                            let Some(cfg) = settings.configs
+                                                .iter_mut()
+                                                .find(|c| c.id == active_id)
+                                        {
+                                            cfg.content = Self::inject_tray_mode_to_toml(
+                                                &cfg.content,
+                                                tray_mode
+                                            );
 
-            settings.save();
-        }
-    }
+                                            updated_config_data = Some((
+                                                cfg.id.clone(),
+                                                cfg.content.clone(),
+                                                cfg.name.clone(),
+                                            ));
+                                        }
 
-    // Записываем изменения непосредственно в .toml
-    if let Some((id, content, name)) = updated_config_data {
-        let path_by_id = std::path::PathBuf::from("configs")
-            .join(format!("{}.toml", id));
+                                        settings.save();
+                                    }
+                                }
 
-        let path_by_name = std::path::PathBuf::from("configs")
-            .join(format!("{}.toml", name));
+                                // Записываем изменения непосредственно в .toml
+                                if let Some((id, content, name)) = updated_config_data {
+                                    let path_by_id = std::path::PathBuf
+                                        ::from("configs")
+                                        .join(format!("{}.toml", id));
 
-        let target_path = if path_by_id.exists() {
-            Some(path_by_id)
-        } else if path_by_name.exists() {
-            Some(path_by_name)
-        } else {
-            let root_id =
-                std::path::PathBuf::from(format!("{}.toml", id));
+                                    let path_by_name = std::path::PathBuf
+                                        ::from("configs")
+                                        .join(format!("{}.toml", name));
 
-            let root_name =
-                std::path::PathBuf::from(format!("{}.toml", name));
+                                    let target_path = if path_by_id.exists() {
+                                        Some(path_by_id)
+                                    } else if path_by_name.exists() {
+                                        Some(path_by_name)
+                                    } else {
+                                        let root_id = std::path::PathBuf::from(
+                                            format!("{}.toml", id)
+                                        );
 
-            if root_id.exists() {
-                Some(root_id)
-            } else if root_name.exists() {
-                Some(root_name)
-            } else {
-                None
-            }
-        };
+                                        let root_name = std::path::PathBuf::from(
+                                            format!("{}.toml", name)
+                                        );
 
-        if let Some(path) = target_path {
-            match std::fs::write(&path, &content) {
-                Ok(_) => {
-                    self.log(&format!(
-                        "Настройка tray_mode сохранена: {}",
-                        tray_mode
-                    ));
-                }
+                                        if root_id.exists() {
+                                            Some(root_id)
+                                        } else if root_name.exists() {
+                                            Some(root_name)
+                                        } else {
+                                            None
+                                        }
+                                    };
 
-                Err(e) => {
-                    self.log(&format!(
-                        "Ошибка записи tray_mode в {:?}: {}",
-                        path, e
-                    ));
-                }
-            }
-        }
-    }
-}
+                                    if let Some(path) = target_path {
+                                        match std::fs::write(&path, &content) {
+                                            Ok(_) => {
+                                                self.log(
+                                                    &format!("Настройка tray_mode сохранена: {}", tray_mode)
+                                                );
+                                            }
+
+                                            Err(e) => {
+                                                self.log(
+                                                    &format!(
+                                                        "Ошибка записи tray_mode в {:?}: {}",
+                                                        path,
+                                                        e
+                                                    )
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             ui.separator();
                             ui.label(
                                 egui::RichText::new("КОНФИГИ").size(12.0).strong().color(gold_color)
@@ -2901,23 +2941,33 @@ if min_response.clicked() {
                                         let logs = self.logs.lock().unwrap();
 
                                         for line in logs.iter() {
-                                            let color = if
+                                            let mut color = grey_color;
+
+                                            if
                                                 line.contains("Error") ||
                                                 line.contains("Failed") ||
-                                                line.contains("error")
+                                                line.contains("Connection lost")
                                             {
-                                                red_color
+                                                color = red_color;
+                                                self.status_text = line.to_string();
+                                                self.status_color = color;
                                             } else if line.contains("Tunnel UP") {
-                                                green_color
+                                                color = green_color;
+                                                self.status_text = line.to_string();
+                                                self.status_color = color;
                                             } else if line.contains("Config loaded") {
-                                                gold_color
-                                            } else if line.contains("Connection lost") {
-                                                red_color
+                                                color = gold_color;
+                                                self.status_text = line.to_string();
+                                                self.status_color = color;
                                             } else if line.contains("Cleaning up dead session") {
-                                                orange_color
+                                                color = orange_color;
+                                                self.status_text = line.to_string();
+                                                self.status_color = color;
                                             } else {
-                                                grey_color
-                                            };
+                                                // color = grey_color;
+                                                // self.status_text = "CONNECTION".to_string();
+                                                // self.status_color = color;
+                                            }
 
                                             ui.horizontal(|ui| {
                                                 ui.add(
@@ -3053,5 +3103,6 @@ if min_response.clicked() {
             egui::Stroke::new(1.0, egui::Color32::from_rgb(100, 100, 100)),
             egui::StrokeKind::Inside // Прижимаем обводку внутрь, чтобы она не обрезалась границами экрана
         );
+        
     }
 }
