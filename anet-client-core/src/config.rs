@@ -139,6 +139,7 @@ pub struct AhttpConfig {
     pub coalesce_budget_bytes: usize,
     pub poll_timeout_ms: u64,
     pub concurrency: usize,
+    pub reassembly_queue_max_size: usize,
 
     pub http2_adaptive_window: bool,
     pub http2_max_frame_size: Option<u32>,
@@ -161,7 +162,8 @@ impl Default for AhttpConfig {
             coalesce_budget_bytes: 65536,
             poll_timeout_ms: 15,
             concurrency: 4, // 4 параллельных потока по умолчанию для обхода HOL-blocking
-
+            reassembly_queue_max_size: 1024,
+            
             http2_adaptive_window: true,
             http2_max_frame_size: None,
             http2_max_header_list_size: Some(16384),

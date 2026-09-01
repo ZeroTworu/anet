@@ -3,6 +3,7 @@ use crate::auth_handler::ServerAuthHandler;
 use crate::config::Config;
 use anet_common::consts::{CHANNEL_BUFFER_SIZE, MAX_PACKET_SIZE, COALESCE_BUDGET_BYTES};
 use anet_common::transport::wrap_packet_padded;
+use anet_common::reassembly::ReassemblyQueue;
 use anyhow::{Context, Result};
 use bytes::{Bytes, BytesMut};
 use httparse::{Request, Status};
@@ -15,7 +16,6 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex};
 use dashmap::DashMap;
 use url::Url;
-use std::collections::BTreeMap;
 use anet_common::stream_framing::read_next_packet;
 
 fn get_real_ip(req: &httparse::Request, fallback: SocketAddr) -> SocketAddr {
@@ -101,50 +101,6 @@ fn unwrap_packet_with_seq(cipher: &anet_common::encryption::Cipher, raw_packet: 
     Ok((seq, payload_bytes))
 }
 
-/// Скользящее окно реассемблирования входящих out-of-order пакетов на сервере
-struct ReassemblyQueue {
-    next_seq: u64,
-    buffer: BTreeMap<u64, Bytes>,
-}
-
-impl ReassemblyQueue {
-    fn new() -> Self {
-        Self {
-            next_seq: 0,
-            buffer: BTreeMap::new(),
-        }
-    }
-
-    async fn insert_and_drain(
-        &mut self,
-        seq: u64,
-        payload: Bytes,
-        tun_tx: &mpsc::Sender<Bytes>,
-        registry: &ClientRegistry,
-        client_info: &crate::client_registry::ClientTransportInfo,
-    ) -> Result<()> {
-        if seq < self.next_seq {
-            return Ok(());
-        }
-
-        self.buffer.insert(seq, payload);
-
-        if self.buffer.len() > 1024 {
-            if let Some(&oldest_seq) = self.buffer.keys().next() {
-                self.buffer.remove(&oldest_seq);
-                self.next_seq = oldest_seq + 1;
-            }
-        }
-
-        while let Some(packet) = self.buffer.remove(&self.next_seq) {
-            let packet_len = packet.len();
-            let _ = tun_tx.send(packet).await;
-            registry.record_rx(client_info, packet_len, "ahttp");
-            self.next_seq += 1;
-        }
-        Ok(())
-    }
-}
 
 /// Контекст сессии на сервере (Очередь вывода + Скользящее окно ввода)
 struct ServerSession {
@@ -194,7 +150,7 @@ async fn handle_http_connection(
     auth_handler: ServerAuthHandler,
     sessions: Arc<DashMap<String, Arc<ServerSession>>>,
 ) -> Result<()> {
-    let mut buffer = BytesMut::with_capacity(65536);
+    let mut buffer = BytesMut::with_capacity(MAX_PACKET_SIZE * 2);
 
     // Чтение путей из конфигурационного файла [ahttp]
     let path_handshake = format!("{}{}", config.server.ahttp_path, config.ahttp.handshake_path);
@@ -261,7 +217,7 @@ async fn handle_http_connection(
                                 registry.finalize_client(&client_info.assigned_ip, tx_router);
                                 Arc::new(ServerSession {
                                     rx_router: Arc::new(Mutex::new(rx_router)),
-                                    reassembler: Arc::new(Mutex::new(ReassemblyQueue::new())),
+                                    reassembler: Arc::new(Mutex::new(ReassemblyQueue::new(config.ahttp.reassembly_queue_max_size))),
                                 })
                             }).value().clone();
 
@@ -272,7 +228,15 @@ async fn handle_http_connection(
 
                                 while let Ok(Some(encrypted_packet)) = read_next_packet(&mut cursor).await {
                                     if let Ok((seq, decrypted)) = unwrap_packet_with_seq(&client_info.cipher, encrypted_packet) {
-                                        let _ = reassembler.insert_and_drain(seq, decrypted, &tun_tx, &registry, &client_info).await;
+
+                                        // Получаем готовые упорядоченные пакеты
+                                        let ready_packets = reassembler.insert(seq, decrypted);
+                                        for packet in ready_packets {
+                                            let packet_len = packet.len();
+                                            let _ = tun_tx.send(packet).await;
+                                            // Записываем статистику на сервере
+                                            registry.record_rx(&client_info, packet_len, "ahttp");
+                                        }
                                     }
                                 }
                             }

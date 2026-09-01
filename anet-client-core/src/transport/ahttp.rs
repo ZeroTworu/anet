@@ -4,6 +4,7 @@ use crate::config::{CoreConfig, ServerConfig};
 use anet_common::consts::{CHANNEL_BUFFER_SIZE, MAX_PACKET_SIZE};
 use anet_common::handshake_fragmentation::FragmentConfig;
 use anet_common::http_help::BrowserProfile;
+use anet_common::reassembly::ReassemblyQueue;
 use anet_common::stream_framing::{frame_packet, frame_packet_into, read_next_packet};
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
@@ -15,51 +16,9 @@ use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use reqwest::{Client, Method, Url};
 use std::net::SocketAddr;
-use std::collections::BTreeMap;
 use tokio::sync::Mutex;
 use anet_common::transport::wrap_packet_padded;
 
-/// Скользящее окно реассемблирования входящих out-of-order пакетов
-struct ReassemblyQueue {
-    next_seq: u64,
-    buffer: BTreeMap<u64, Bytes>,
-}
-
-impl ReassemblyQueue {
-    fn new() -> Self {
-        Self {
-            next_seq: 0,
-            buffer: BTreeMap::new(),
-        }
-    }
-
-    async fn insert_and_drain<W: AsyncWriteExt + Unpin>(
-        &mut self,
-        seq: u64,
-        payload: Bytes,
-        writer: &mut W,
-    ) -> Result<()> {
-        if seq < self.next_seq {
-            return Ok(()); // Дубликат — игнорируем
-        }
-
-        self.buffer.insert(seq, payload);
-
-        // Лимитируем размер буфера для предотвращения утечек памяти при потере пакетов
-        if self.buffer.len() > 1024 {
-            if let Some(&oldest_seq) = self.buffer.keys().next() {
-                self.buffer.remove(&oldest_seq);
-                self.next_seq = oldest_seq + 1;
-            }
-        }
-
-        while let Some(packet) = self.buffer.remove(&self.next_seq) {
-            writer.write_all(&frame_packet(packet)).await?;
-            self.next_seq += 1;
-        }
-        Ok(())
-    }
-}
 
 /// Дешифрует входящий пакет и извлекает из него оригинальный sequence (u64)
 fn unwrap_packet_with_seq(cipher: &anet_common::encryption::Cipher, raw_packet: Bytes) -> Result<(u64, Bytes)> {
@@ -68,7 +27,7 @@ fn unwrap_packet_with_seq(cipher: &anet_common::encryption::Cipher, raw_packet: 
         .map_err(|_| anyhow::anyhow!("Encrypted packet buffer is unexpectedly shared"))?;
 
     if buffer.len() < 12 + 16 {
-        anyhow::bail!("Packet too short");
+       bail!("Packet too short");
     }
 
     let mut nonce = [0u8; 12];
@@ -304,7 +263,7 @@ impl ClientTransport for AHttpTransport {
         let cipher_ul = cipher.clone();
 
         // Инициализируем потокобезопасную очередь реассемблирования входящих пакетов
-        let rx_reassembler = Arc::new(Mutex::new(ReassemblyQueue::new()));
+        let rx_reassembler = Arc::new(Mutex::new(ReassemblyQueue::new(config_ahttp.reassembly_queue_max_size)));
         // Семафор для ограничения числа одновременных запросов в CDN
         let concurrency_semaphore = Arc::new(tokio::sync::Semaphore::new(config_ahttp.concurrency));
         let tunnel_write_mutex = Arc::new(Mutex::new(tunnel_write));
@@ -389,15 +348,18 @@ impl ClientTransport for AHttpTransport {
                                         let mut cursor = std::io::Cursor::new(body);
                                         let mut rx_pkts_count = 0;
 
-                                        // Блокируем дерево реассемблирования перед записью
-                                        let mut reassembler = rx_reassembler_clone.lock().await;
-                                        let mut tunnel_write_guard = tunnel_write_clone.lock().await;
-
                                         while let Ok(Some(encrypted_packet)) = read_next_packet(&mut cursor).await {
                                             if let Ok((seq, decrypted)) = unwrap_packet_with_seq(&cipher_ul_clone, encrypted_packet) {
                                                 rx_pkts_count += 1;
-                                                // Пропускаем пакет через скользящее окно упорядочивания
-                                                let _ = reassembler.insert_and_drain(seq, decrypted, &mut *tunnel_write_guard).await;
+
+                                                let mut reassembler = rx_reassembler_clone.lock().await;
+                                                let mut tunnel_write_guard = tunnel_write_clone.lock().await;
+
+                                                // Просто забираем готовые пакеты из очереди и пишем их в сокет/туннель
+                                                let ready_packets = reassembler.insert(seq, decrypted);
+                                                for packet in ready_packets {
+                                                    tunnel_write_guard.write_all(&frame_packet(packet)).await.unwrap();
+                                                }
                                             }
                                         }
                                         debug!("[AHTTP Client] <<< Unpacked {} valid packets", rx_pkts_count);

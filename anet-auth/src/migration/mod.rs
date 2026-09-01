@@ -21,6 +21,7 @@ pub mod m20260828_000020_remove_dsn_from_servers;
 pub mod m20260829_000021_add_protocol_to_traffic;
 pub mod m20260830_000022_add_groups_and_update_rates;
 pub mod m20260901_000023_add_target_fingerprint_to_commands;
+pub mod m20260902_000024_add_ahttp_to_protocol_type;
 
 use sea_orm_migration::prelude::*;
 
@@ -53,6 +54,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260829_000021_add_protocol_to_traffic::Migration),
             Box::new(m20260830_000022_add_groups_and_update_rates::Migration),
             Box::new(m20260901_000023_add_target_fingerprint_to_commands::Migration),
+            Box::new(m20260902_000024_add_ahttp_to_protocol_type::Migration),
         ]
     }
 }

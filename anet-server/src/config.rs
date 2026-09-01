@@ -139,6 +139,7 @@ pub struct AhttpServerConfig {
     pub traffic_path: String,
     pub response_headers: String,
     pub max_header_bytes: usize,
+    pub reassembly_queue_max_size: usize,
 }
 
 impl Default for AhttpServerConfig {
@@ -155,6 +156,7 @@ impl Default for AhttpServerConfig {
                                X-Accel-Buffering: no\r\n\
                                Content-Length: {}\r\n\
                                Connection: keep-alive\r\n\r\n".to_string(),
+            reassembly_queue_max_size: 1024,
         }
     }
 }
