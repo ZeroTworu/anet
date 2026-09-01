@@ -1,8 +1,8 @@
 use crate::client_registry::ClientRegistry;
 use crate::auth_handler::ServerAuthHandler;
 use crate::config::Config;
-use anet_common::consts::{CHANNEL_BUFFER_SIZE, COALESCE_BUDGET_BYTES};
-use anet_common::transport::{unwrap_packet_bytes_in_place, wrap_packet_padded};
+use anet_common::consts::{CHANNEL_BUFFER_SIZE, MAX_PACKET_SIZE, COALESCE_BUDGET_BYTES};
+use anet_common::transport::wrap_packet_padded;
 use anyhow::{Context, Result};
 use bytes::{Bytes, BytesMut};
 use httparse::{Request, Status};
@@ -15,9 +15,10 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex};
 use dashmap::DashMap;
 use url::Url;
+use std::collections::BTreeMap;
 use anet_common::stream_framing::read_next_packet;
 
-fn get_real_ip(req: &Request, fallback: SocketAddr) -> SocketAddr {
+fn get_real_ip(req: &httparse::Request, fallback: SocketAddr) -> SocketAddr {
     for header in req.headers.iter() {
         if header.name.eq_ignore_ascii_case("x-real-ip") || header.name.eq_ignore_ascii_case("x-forwarded-for") {
             if let Ok(ip_str) = std::str::from_utf8(header.value) {
@@ -61,6 +62,96 @@ fn extract_query_param(path: &str, param: &str) -> Option<String> {
         .map(|(_, v)| v.into_owned())
 }
 
+/// Дешифрует входящий пакет и извлекает из него оригинальный sequence (u64)
+fn unwrap_packet_with_seq(cipher: &anet_common::encryption::Cipher, raw_packet: Bytes) -> Result<(u64, Bytes)> {
+    let mut buffer = raw_packet
+        .try_into_mut()
+        .map_err(|_| anyhow::anyhow!("Encrypted packet buffer is unexpectedly shared"))?;
+
+    if buffer.len() < 12 + 16 {
+        anyhow::bail!("Packet too short");
+    }
+
+    let mut nonce = [0u8; 12];
+    nonce.copy_from_slice(&buffer[..12]);
+
+    let payload_buffer = &mut buffer[12..];
+    cipher.decrypt_in_place(&nonce, payload_buffer)
+        .map_err(|e| anyhow::anyhow!("Decryption failed: {}", e))?;
+
+    let plaintext_len = payload_buffer.len() - 16;
+    let plaintext = &payload_buffer[..plaintext_len];
+
+    if plaintext.len() < 10 {
+        anyhow::bail!("Payload too short");
+    }
+
+    let seq = u64::from_be_bytes(plaintext[0..8].try_into().unwrap());
+    let data_len = u16::from_be_bytes([plaintext[8], plaintext[9]]) as usize;
+
+    if 10 + data_len > plaintext.len() {
+        anyhow::bail!("Malformed packet length");
+    }
+
+    let payload_start = 12 + 10;
+    let payload_end = payload_start + data_len;
+    buffer.truncate(payload_end);
+    let payload_bytes = buffer.freeze().slice(payload_start..payload_end);
+
+    Ok((seq, payload_bytes))
+}
+
+/// Скользящее окно реассемблирования входящих out-of-order пакетов на сервере
+struct ReassemblyQueue {
+    next_seq: u64,
+    buffer: BTreeMap<u64, Bytes>,
+}
+
+impl ReassemblyQueue {
+    fn new() -> Self {
+        Self {
+            next_seq: 0,
+            buffer: BTreeMap::new(),
+        }
+    }
+
+    async fn insert_and_drain(
+        &mut self,
+        seq: u64,
+        payload: Bytes,
+        tun_tx: &mpsc::Sender<Bytes>,
+        registry: &ClientRegistry,
+        client_info: &crate::client_registry::ClientTransportInfo,
+    ) -> Result<()> {
+        if seq < self.next_seq {
+            return Ok(());
+        }
+
+        self.buffer.insert(seq, payload);
+
+        if self.buffer.len() > 1024 {
+            if let Some(&oldest_seq) = self.buffer.keys().next() {
+                self.buffer.remove(&oldest_seq);
+                self.next_seq = oldest_seq + 1;
+            }
+        }
+
+        while let Some(packet) = self.buffer.remove(&self.next_seq) {
+            let packet_len = packet.len();
+            let _ = tun_tx.send(packet).await;
+            registry.record_rx(client_info, packet_len, "ahttp");
+            self.next_seq += 1;
+        }
+        Ok(())
+    }
+}
+
+/// Контекст сессии на сервере (Очередь вывода + Скользящее окно ввода)
+struct ServerSession {
+    rx_router: Arc<Mutex<mpsc::Receiver<Bytes>>>,
+    reassembler: Arc<Mutex<ReassemblyQueue>>,
+}
+
 pub async fn run_http_stream_server(
     config: Arc<Config>,
     registry: Arc<ClientRegistry>,
@@ -70,8 +161,8 @@ pub async fn run_http_stream_server(
     let bind_to = &config.server.ahttp_bind_to;
     info!("[AHTTP-Stream] Initializing XHTTP pipeline on {}", bind_to);
 
-    // Глобальная карта активных сессионных очередей
-    let active_sessions: Arc<DashMap<String, Arc<Mutex<mpsc::Receiver<Bytes>>>>> = Arc::new(DashMap::new());
+    // Глобальная карта активных сессионных контекстов
+    let active_sessions: Arc<DashMap<String, Arc<ServerSession>>> = Arc::new(DashMap::new());
 
     let listener = TcpListener::bind(bind_to).await?;
     loop {
@@ -88,7 +179,7 @@ pub async fn run_http_stream_server(
 
         tokio::spawn(async move {
             if let Err(_e) = handle_http_connection(stream, remote_addr, rg, cfg, tx, auth, sessions).await {
-                // Игнорируем штатные обрывы TCP и ошибки парсинга HTTP, чтобы не флудить в логи
+                // Игнорируем штатные обрывы TCP
             }
         });
     }
@@ -101,7 +192,7 @@ async fn handle_http_connection(
     config: Arc<Config>,
     tun_tx: mpsc::Sender<Bytes>,
     auth_handler: ServerAuthHandler,
-    sessions: Arc<DashMap<String, Arc<Mutex<mpsc::Receiver<Bytes>>>>>,
+    sessions: Arc<DashMap<String, Arc<ServerSession>>>,
 ) -> Result<()> {
     let mut buffer = BytesMut::with_capacity(65536);
 
@@ -163,43 +254,64 @@ async fn handle_http_connection(
                         let session_id = extract_query_param(&path, "session_id").context("Missing session_id in query")?;
 
                         if let Some(client_info) = registry.get_by_session(&session_id) {
-                            let receiver_lock = sessions.entry(session_id.clone()).or_insert_with(|| {
+
+                            // Получаем или инициализируем контекст сессии (Очередь + Реассемблер)
+                            let session = sessions.entry(session_id.clone()).or_insert_with(|| {
                                 let (tx_router, rx_router) = mpsc::channel::<Bytes>(CHANNEL_BUFFER_SIZE);
                                 registry.finalize_client(&client_info.assigned_ip, tx_router);
-                                Arc::new(Mutex::new(rx_router))
+                                Arc::new(ServerSession {
+                                    rx_router: Arc::new(Mutex::new(rx_router)),
+                                    reassembler: Arc::new(Mutex::new(ReassemblyQueue::new())),
+                                })
                             }).value().clone();
 
-                            // 1. Прием Uplink-трафика
+                            // 1. Прием Uplink-трафика (Распаковка через окно упорядочивания)
                             if !body.is_empty() {
                                 let mut cursor = std::io::Cursor::new(body);
+                                let mut reassembler = session.reassembler.lock().await;
+
                                 while let Ok(Some(encrypted_packet)) = read_next_packet(&mut cursor).await {
-                                    let packet_len = encrypted_packet.len();
-                                    if let Ok(decrypted) = unwrap_packet_bytes_in_place(&client_info.cipher, encrypted_packet) {
-                                        let _ = tun_tx.send(decrypted).await;
-                                        registry.record_rx(&client_info, packet_len, "ahttp");
+                                    if let Ok((seq, decrypted)) = unwrap_packet_with_seq(&client_info.cipher, encrypted_packet) {
+                                        let _ = reassembler.insert_and_drain(seq, decrypted, &tun_tx, &registry, &client_info).await;
                                     }
                                 }
                             }
 
                             // 2. Отдача Downlink-трафика (Short-Polling: ждем до 30мс)
-                            let mut rx_router = receiver_lock.lock().await;
+                            let mut rx_router = session.rx_router.lock().await;
                             let mut body_buf = BytesMut::new();
                             let padding_step = config.stealth.padding_step;
 
                             let timeout_duration = std::time::Duration::from_millis(30);
+
+                            // Инлайним шифрование пакетов и полностью убираем замыкания
                             if let Ok(Some(packet)) = tokio::time::timeout(timeout_duration, rx_router.recv()).await {
                                 if packet.len() >= 20 {
                                     let seq = client_info.sequence.fetch_add(1, Ordering::Relaxed);
-                                    if let Ok(encrypted) = wrap_packet_padded(&client_info.cipher, &client_info.nonce_prefix, seq, packet, padding_step) {
-                                        anet_common::stream_framing::frame_packet_into(&mut body_buf, &encrypted);
+                                    if let Ok(encrypted) = wrap_packet_padded(
+                                        &client_info.cipher,
+                                        &client_info.nonce_prefix,
+                                        seq,
+                                        packet,
+                                        padding_step
+                                    ) {
+                                        let framed = anet_common::stream_framing::frame_packet(encrypted);
+                                        body_buf.extend_from_slice(&framed);
                                     }
                                 }
 
                                 while let Ok(next_packet) = rx_router.try_recv() {
                                     if next_packet.len() >= 20 {
                                         let seq = client_info.sequence.fetch_add(1, Ordering::Relaxed);
-                                        if let Ok(encrypted) = wrap_packet_padded(&client_info.cipher, &client_info.nonce_prefix, seq, next_packet, padding_step) {
-                                            anet_common::stream_framing::frame_packet_into(&mut body_buf, &encrypted);
+                                        if let Ok(encrypted) = wrap_packet_padded(
+                                            &client_info.cipher,
+                                            &client_info.nonce_prefix,
+                                            seq,
+                                            next_packet,
+                                            padding_step
+                                        ) {
+                                            let framed = anet_common::stream_framing::frame_packet(encrypted);
+                                            body_buf.extend_from_slice(&framed);
                                         }
                                     }
                                     if body_buf.len() >= COALESCE_BUDGET_BYTES {
@@ -208,7 +320,7 @@ async fn handle_http_connection(
                                 }
                             }
 
-                            // 3. Отвечаем клиенту (Используем нормализацию и форсированный CRLF под разметку пользователя)
+                            // 3. Отвечаем клиенту на основе кастомных заголовков
                             let response_header = config.ahttp.response_headers
                                 .replace("\r\n", "\n")
                                 .replace('\n', "\r\n")
@@ -235,7 +347,6 @@ async fn handle_http_connection(
                 let _ = buffer.split_to(total_consumed);
             }
             Ok(Status::Partial) => {
-                // Лимит размера заголовка HTTP из конфигурационного файла [ahttp]
                 if buffer.len() > config.ahttp.max_header_bytes {
                     return Err(anyhow::anyhow!("HTTP header too large"));
                 }

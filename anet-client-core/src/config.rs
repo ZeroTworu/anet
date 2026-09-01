@@ -125,7 +125,7 @@ impl Default for TransportConfig {
     }
 }
 
-// Новая структура для настройки HTTP-транспорта на стороне клиента
+// Новая расширенная структура для настройки HTTP-транспорта на стороне клиента
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct AhttpConfig {
@@ -136,6 +136,16 @@ pub struct AhttpConfig {
     pub handshake_path: String,
     pub auth_path: String,
     pub traffic_path: String,
+    pub coalesce_budget_bytes: usize,
+    pub poll_timeout_ms: u64,
+    pub concurrency: usize,
+
+    pub http2_adaptive_window: bool,
+    pub http2_max_frame_size: Option<u32>,
+    pub http2_max_header_list_size: Option<u32>,
+    pub http2_keep_alive_interval_secs: Option<u64>,
+    pub http2_keep_alive_timeout_secs: Option<u64>,
+    pub http2_keep_alive_while_idle: bool,
 }
 
 impl Default for AhttpConfig {
@@ -148,6 +158,16 @@ impl Default for AhttpConfig {
             handshake_path: "/handshake".to_string(),
             auth_path: "/auth".to_string(),
             traffic_path: "/traffic".to_string(),
+            coalesce_budget_bytes: 65536,
+            poll_timeout_ms: 15,
+            concurrency: 4, // 4 параллельных потока по умолчанию для обхода HOL-blocking
+
+            http2_adaptive_window: true,
+            http2_max_frame_size: None,
+            http2_max_header_list_size: Some(16384),
+            http2_keep_alive_interval_secs: Some(20),
+            http2_keep_alive_timeout_secs: Some(10),
+            http2_keep_alive_while_idle: true,
         }
     }
 }

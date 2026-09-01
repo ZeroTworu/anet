@@ -47,12 +47,12 @@ ahttp_path = "/api/v2/telemetry"
 ssh_host_key = "/opt/anet/anet_ssh_host_key"
 
 [ahttp]
-# Относительные пути, которые ожидает веб-сервер
+# Пути, соответствующие путям в client.toml
 handshake_path = "/handshake"
 auth_path = "/auth"
 traffic_path = "/traffic"
 
-# Максимально допустимый размер HTTP-заголовков (в байтах) для защиты от DoS
+# Лимит буфера чтения HTTP-заголовков для защиты веб-сервера от DoS/Slowloris атак
 max_header_bytes = 16384
 
 # Маска HTTP-заголовков для ответа клиенту в фазе Traffic.
