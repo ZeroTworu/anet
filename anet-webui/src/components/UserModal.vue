@@ -99,15 +99,27 @@ const handleSaveUser = async () => {
 <template>
   <v-dialog
       v-model="show"
+      scrollable
       @update:modelValue="close"
       max-width="900px"
   >
-    <v-card class="pa-6">
-      <v-card-title class="text-h6 px-0 pb-4">
+    <v-card class="pa-6 d-flex flex-column" style="max-height: 85vh;">
+      <v-card-title class="text-h6 px-0 pb-4 flex-shrink-0">
         Редактировать пользователя
       </v-card-title>
-
-      <v-card-text class="px-0">
+      <!-- Кнопка прямого скачивания файла (Фокусируется и нажимается с пульта) -->
+      <v-btn
+          :href="directConfigLink"
+          download
+          color="success"
+          variant="flat"
+          block
+          prepend-icon="mdi-download"
+          class="mb-4"
+      >
+        Скачать client.toml на устройство
+      </v-btn>
+      <v-card-text class="px-0 flex-grow-1" style="overflow-y: auto;">
         <!-- Форма юзера -->
         <UserForm v-if="user" v-model="user" />
 
@@ -118,8 +130,9 @@ const handleSaveUser = async () => {
 
         <!-- КОМПАКТНЫЙ БЛОК ДЛЯ ССЫЛОК И ШЕРИНГА -->
         <v-card v-if="user" variant="outlined" class="mt-6 pa-4">
-          <div class="text-subtitle-2 mb-3">🔗 Поделиться конфигурацией</div>
+          <div class="text-subtitle-2 mb-3">🔗 Получить конфигурацию</div>
 
+          <!-- Ссылка для копирования (оставляем как резервный вариант) -->
           <v-text-field
               readonly
               :model-value="directConfigLink"
@@ -150,9 +163,9 @@ const handleSaveUser = async () => {
         </v-card>
       </v-card-text>
 
-      <v-divider class="my-4" />
+      <v-divider class="my-4 flex-shrink-0" />
 
-      <v-card-actions class="px-0 pb-0 justify-space-between">
+      <v-card-actions class="px-0 pb-0 justify-space-between flex-shrink-0">
         <v-btn color="warning" variant="text" :loading="regenerating" @click="regenerate">
           Regenerate Keys
         </v-btn>
