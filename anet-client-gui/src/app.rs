@@ -195,6 +195,10 @@ pub struct ANetApp {
     exclude_route_input: String,
     exclude_routes_changed: bool,
 
+    // Всплывающее уведомление
+    toast_message: Option<String>,
+    toast_until: Option<std::time::Instant>,
+
     status_text: String,
     status_color: egui::Color32,
 }
@@ -249,6 +253,11 @@ pub fn toggle_vpn(
 }
 
 impl ANetApp {
+    fn show_toast(&mut self, message: impl Into<String>) {
+        self.toast_message = Some(message.into());
+        self.toast_until = Some(std::time::Instant::now() + std::time::Duration::from_secs(1));
+    }
+
     #[cfg(target_os = "windows")]
     pub fn refresh_processes(&mut self) {
         let selected_apps: std::collections::HashSet<String> = self.processes
@@ -622,258 +631,185 @@ impl ANetApp {
         lines.join("\n")
     }
 
-    fn inject_exclude_route_to_toml(
-    content: &str,
-    routes: &[String],
-) -> String {
-    let normalized = content.replace("\r\n", "\n");
+    fn inject_exclude_route_to_toml(content: &str, routes: &[String]) -> String {
+        let normalized = content.replace("\r\n", "\n");
 
-    let mut lines: Vec<String> = normalized
-        .lines()
-        .map(|s| s.to_string())
-        .collect();
+        let mut lines: Vec<String> = normalized
+            .lines()
+            .map(|s| s.to_string())
+            .collect();
 
-    let routes_str = routes
-        .iter()
-        .map(|route| {
-            format!(
-                "\"{}\"",
-                Self::toml_escape_string(route)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
+        let routes_str = routes
+            .iter()
+            .map(|route| { format!("\"{}\"", Self::toml_escape_string(route)) })
+            .collect::<Vec<_>>()
+            .join(", ");
 
-    let exclude_line =
-        format!("exclude_route_for = [{}]", routes_str);
+        let exclude_line = format!("exclude_route_for = [{}]", routes_str);
 
-    let mut in_main = false;
-    let mut main_end_idx = None;
-    let mut exclude_idx = None;
+        let mut in_main = false;
+        let mut main_end_idx = None;
+        let mut exclude_idx = None;
 
-    for (i, line) in lines.iter().enumerate() {
-        let trimmed = line.trim();
+        for (i, line) in lines.iter().enumerate() {
+            let trimmed = line.trim();
 
-        if trimmed.starts_with('[')
-            && trimmed.ends_with(']')
-        {
-            if trimmed == "[main]" {
-                in_main = true;
+            if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                if trimmed == "[main]" {
+                    in_main = true;
+                } else if in_main {
+                    main_end_idx = Some(i);
+                    in_main = false;
+                }
             } else if in_main {
-                main_end_idx = Some(i);
-                in_main = false;
-            }
-        } else if in_main {
-            let clean_line: String = trimmed
-                .chars()
-                .filter(|c| !c.is_whitespace())
-                .collect();
+                let clean_line: String = trimmed
+                    .chars()
+                    .filter(|c| !c.is_whitespace())
+                    .collect();
 
-            if clean_line.starts_with("exclude_route_for=") {
-                exclude_idx = Some(i);
-            }
-        }
-    }
-
-    match exclude_idx {
-        Some(idx) => {
-            lines[idx] = exclude_line;
-        }
-
-        None => {
-            let insert_pos =
-                main_end_idx.unwrap_or(lines.len());
-
-            lines.insert(
-                insert_pos.min(lines.len()),
-                exclude_line,
-            );
-        }
-    }
-
-    lines.join("\n")
-}
-
-
-fn close_exclbar(&mut self) {
-    self.exclbar_open = false;
-
-    if self.exclude_routes_changed {
-        self.exclude_routes_changed = false;
-        self.save_exclude_routes();
-    }
-}
-
-
-fn save_exclude_routes(&mut self) {
-    let mut updated_config_data:
-        Option<(String, String, String)> = None;
-
-    {
-        let mut settings = self.settings.lock().unwrap();
-
-        if let Some(active_id) =
-            settings.active_config_id.clone()
-        {
-            if let Some(cfg) = settings
-                .configs
-                .iter_mut()
-                .find(|c| c.id == active_id)
-            {
-                cfg.content =
-                    Self::inject_exclude_route_to_toml(
-                        &cfg.content,
-                        &self.exclude_routes,
-                    );
-
-                updated_config_data = Some((
-                    cfg.id.clone(),
-                    cfg.content.clone(),
-                    cfg.name.clone(),
-                ));
-            }
-
-            settings.save();
-        }
-    }
-
-    let Some((id, content, name)) =
-        updated_config_data
-    else {
-        self.log(
-            "Ошибка: нет активного конфига для сохранения исключений."
-        );
-        return;
-    };
-
-    let path_by_id = std::path::PathBuf::from("configs")
-        .join(format!("{}.toml", id));
-
-    let path_by_name = std::path::PathBuf::from("configs")
-        .join(format!("{}.toml", name));
-
-    let target_path = if path_by_id.exists() {
-        Some(path_by_id)
-    } else if path_by_name.exists() {
-        Some(path_by_name)
-    } else {
-        let root_id =
-            std::path::PathBuf::from(format!("{}.toml", id));
-
-        let root_name =
-            std::path::PathBuf::from(format!("{}.toml", name));
-
-        if root_id.exists() {
-            Some(root_id)
-        } else if root_name.exists() {
-            Some(root_name)
-        } else {
-            None
-        }
-    };
-
-    if let Some(path) = target_path {
-        match std::fs::write(&path, &content) {
-            Ok(_) => {
-                self.log(
-                    "Список исключённых адресов сохранён."
-                );
-            }
-
-            Err(e) => {
-                self.log(&format!(
-                    "Ошибка записи исключений в {:?}: {}",
-                    path, e
-                ));
-                return;
-            }
-        }
-    }
-
-    // Создаём новый AnetClient с обновлённым CoreConfig.
-    self.load_config_from_content(
-        &id,
-        &content,
-        &name,
-    );
-
-    // Если VPN уже работает — применяем изменение сразу.
-    let current_state =
-        self.shared.lock().unwrap().state;
-
-    if current_state == ConnectionState::Connected {
-        self.log(
-            "Переподключение VPN из-за изменения исключений..."
-        );
-
-        self.stop_vpn();
-
-        let shared_clone = self.shared.clone();
-        let logs_clone = self.logs.clone();
-        let rt_handle = self.rt.handle().clone();
-
-        rt_handle.spawn(async move {
-            tokio::time::sleep(
-                std::time::Duration::from_millis(500)
-            )
-            .await;
-
-            let client_opt = {
-                let mut guard =
-                    shared_clone.lock().unwrap();
-
-                guard.state =
-                    ConnectionState::Connecting;
-
-                guard.client.clone()
-            };
-
-            if let Some(client_clone) = client_opt {
-                logs_clone
-                    .lock()
-                    .unwrap()
-                    .push(
-                        "> Restarting VPN with updated route exclusions..."
-                            .into()
-                    );
-
-                match client_clone.start().await {
-                    Ok(_) => {
-                        logs_clone
-                            .lock()
-                            .unwrap()
-                            .push(
-                                "> VPN restarted successfully."
-                                    .into()
-                            );
-                    }
-
-                    Err(e) => {
-                        logs_clone
-                            .lock()
-                            .unwrap()
-                            .push(format!(
-                                "> Error: {}",
-                                e
-                            ));
-
-                        shared_clone
-                            .lock()
-                            .unwrap()
-                            .state =
-                            ConnectionState::Disconnected;
-
-                        anet_client_core::events::err(
-                            e.to_string()
-                        );
-                    }
+                if clean_line.starts_with("exclude_route_for=") {
+                    exclude_idx = Some(i);
                 }
             }
-        });
+        }
+
+        match exclude_idx {
+            Some(idx) => {
+                lines[idx] = exclude_line;
+            }
+
+            None => {
+                let insert_pos = main_end_idx.unwrap_or(lines.len());
+
+                lines.insert(insert_pos.min(lines.len()), exclude_line);
+            }
+        }
+
+        lines.join("\n")
     }
-}
 
+    fn close_exclbar(&mut self) {
+        self.exclbar_open = false;
 
+        if self.exclude_routes_changed {
+            self.exclude_routes_changed = false;
+            self.save_exclude_routes();
+        }
+    }
+
+    fn save_exclude_routes(&mut self) {
+        let mut updated_config_data: Option<(String, String, String)> = None;
+
+        {
+            let mut settings = self.settings.lock().unwrap();
+
+            if let Some(active_id) = settings.active_config_id.clone() {
+                if let Some(cfg) = settings.configs.iter_mut().find(|c| c.id == active_id) {
+                    cfg.content = Self::inject_exclude_route_to_toml(
+                        &cfg.content,
+                        &self.exclude_routes
+                    );
+
+                    updated_config_data = Some((
+                        cfg.id.clone(),
+                        cfg.content.clone(),
+                        cfg.name.clone(),
+                    ));
+                }
+
+                settings.save();
+            }
+        }
+
+        let Some((id, content, name)) = updated_config_data else {
+            self.log("Ошибка: нет активного конфига для сохранения исключений.");
+            return;
+        };
+
+        let path_by_id = std::path::PathBuf::from("configs").join(format!("{}.toml", id));
+
+        let path_by_name = std::path::PathBuf::from("configs").join(format!("{}.toml", name));
+
+        let target_path = if path_by_id.exists() {
+            Some(path_by_id)
+        } else if path_by_name.exists() {
+            Some(path_by_name)
+        } else {
+            let root_id = std::path::PathBuf::from(format!("{}.toml", id));
+
+            let root_name = std::path::PathBuf::from(format!("{}.toml", name));
+
+            if root_id.exists() {
+                Some(root_id)
+            } else if root_name.exists() {
+                Some(root_name)
+            } else {
+                None
+            }
+        };
+
+        if let Some(path) = target_path {
+            match std::fs::write(&path, &content) {
+                Ok(_) => {
+                    self.log("Список исключённых адресов сохранён.");
+                }
+
+                Err(e) => {
+                    self.log(&format!("Ошибка записи исключений в {:?}: {}", path, e));
+                    return;
+                }
+            }
+        }
+
+        // Создаём новый AnetClient с обновлённым CoreConfig.
+        self.load_config_from_content(&id, &content, &name);
+
+        // Если VPN уже работает — применяем изменение сразу.
+        let current_state = self.shared.lock().unwrap().state;
+
+        if current_state == ConnectionState::Connected {
+            self.log("Переподключение VPN из-за изменения исключений...");
+
+            self.stop_vpn();
+
+            let shared_clone = self.shared.clone();
+            let logs_clone = self.logs.clone();
+            let rt_handle = self.rt.handle().clone();
+
+            rt_handle.spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+                let client_opt = {
+                    let mut guard = shared_clone.lock().unwrap();
+
+                    guard.state = ConnectionState::Connecting;
+
+                    guard.client.clone()
+                };
+
+                if let Some(client_clone) = client_opt {
+                    logs_clone
+                        .lock()
+                        .unwrap()
+                        .push("> Restarting VPN with updated route exclusions...".into());
+
+                    match client_clone.start().await {
+                        Ok(_) => {
+                            logs_clone.lock().unwrap().push("> VPN restarted successfully.".into());
+                        }
+
+                        Err(e) => {
+                            logs_clone.lock().unwrap().push(format!("> Error: {}", e));
+
+                            shared_clone.lock().unwrap().state = ConnectionState::Disconnected;
+
+                            anet_client_core::events::err(e.to_string());
+                        }
+                    }
+                }
+            });
+        }
+    }
 
     #[cfg(target_os = "windows")]
     fn inject_tray_mode_to_toml(content: &str, tray_mode: bool) -> String {
@@ -1006,6 +942,9 @@ fn save_exclude_routes(&mut self) {
             exclude_routes: Vec::new(),
             exclude_route_input: String::new(),
             exclude_routes_changed: false,
+
+            toast_message: None,
+            toast_until: None,
 
             status_text: "CONNECTION".to_string(),
             status_color: egui::Color32::from_rgb(128, 128, 128),
@@ -1178,26 +1117,24 @@ fn save_exclude_routes(&mut self) {
 
                 // Загружаем настройку сворачивания в трей из [main]
                 if let Ok(raw_toml) = toml::from_str::<toml::Value>(content) {
-    self.tray_value = raw_toml
-        .get("main")
-        .and_then(|main| main.get("tray_mode"))
-        .and_then(|value| value.as_bool())
-        .unwrap_or(true);
+                    self.tray_value = raw_toml
+                        .get("main")
+                        .and_then(|main| main.get("tray_mode"))
+                        .and_then(|value| value.as_bool())
+                        .unwrap_or(true);
 
-    self.exclude_routes = raw_toml
-        .get("main")
-        .and_then(|main| main.get("exclude_route_for"))
-        .and_then(|value| value.as_array())
-        .map(|values| {
-            values
-                .iter()
-                .filter_map(|value| {
-                    value.as_str().map(ToOwned::to_owned)
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-}
+                    self.exclude_routes = raw_toml
+                        .get("main")
+                        .and_then(|main| main.get("exclude_route_for"))
+                        .and_then(|value| value.as_array())
+                        .map(|values| {
+                            values
+                                .iter()
+                                .filter_map(|value| { value.as_str().map(ToOwned::to_owned) })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                }
 
                 for proc in &mut self.processes {
                     proc.is_selected = cfg.main.per_app.contains(&proc.name);
@@ -1245,68 +1182,66 @@ fn save_exclude_routes(&mut self) {
     }
 
     /// Проверка адреса для exclude_route_for.
-///
-/// Поддерживаются:
-/// - IPv4 / IPv6
-/// - IPv4 / IPv6 с CIDR
-/// - hostname / domain
-fn validate_exclude_route(value: &str) -> bool {
-    let value = value.trim();
+    ///
+    /// Поддерживаются:
+    /// - IPv4 / IPv6
+    /// - IPv4 / IPv6 с CIDR
+    /// - hostname / domain
+    fn validate_exclude_route(value: &str) -> bool {
+        let value = value.trim();
 
-    if value.is_empty() || value.chars().any(|c| c.is_whitespace()) {
-        return false;
-    }
-
-    // Обычный IP.
-    if value.parse::<std::net::IpAddr>().is_ok() {
-        return true;
-    }
-
-    // IP/CIDR.
-    if let Some((ip, prefix)) = value.split_once('/') {
-        if let (Ok(addr), Ok(prefix)) = (
-            ip.parse::<std::net::IpAddr>(),
-            prefix.parse::<u8>(),
-        ) {
-            let max_prefix = match addr {
-                std::net::IpAddr::V4(_) => 32,
-                std::net::IpAddr::V6(_) => 128,
-            };
-
-            return prefix <= max_prefix;
+        if value.is_empty() || value.chars().any(|c| c.is_whitespace()) {
+            return false;
         }
+
+        // Обычный IP.
+        if value.parse::<std::net::IpAddr>().is_ok() {
+            return true;
+        }
+
+        // IP/CIDR.
+        if let Some((ip, prefix)) = value.split_once('/') {
+            if let (Ok(addr), Ok(prefix)) = (ip.parse::<std::net::IpAddr>(), prefix.parse::<u8>()) {
+                let max_prefix = match addr {
+                    std::net::IpAddr::V4(_) => 32,
+                    std::net::IpAddr::V6(_) => 128,
+                };
+
+                return prefix <= max_prefix;
+            }
+        }
+
+        // URL, порт, wildcard и некорректные точки запрещены.
+        if
+            value.contains("://") ||
+            value.contains(':') ||
+            value.contains('*') ||
+            value.starts_with('.') ||
+            value.ends_with('.')
+        {
+            return false;
+        }
+
+        // Проверка hostname/domain.
+        value
+            .split('.')
+            .all(|label| {
+                !label.is_empty() &&
+                    label.len() <= 63 &&
+                    !label.starts_with('-') &&
+                    !label.ends_with('-') &&
+                    label.chars().all(|c| (c.is_ascii_alphanumeric() || c == '-'))
+            })
     }
 
-    // URL, порт, wildcard и некорректные точки запрещены.
-    if value.contains("://")
-        || value.contains(':')
-        || value.contains('*')
-        || value.starts_with('.')
-        || value.ends_with('.')
-    {
-        return false;
+    fn toml_escape_string(value: &str) -> String {
+        value
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n")
+            .replace('\r', "\\r")
+            .replace('\t', "\\t")
     }
-
-    // Проверка hostname/domain.
-    value.split('.').all(|label| {
-        !label.is_empty()
-            && label.len() <= 63
-            && !label.starts_with('-')
-            && !label.ends_with('-')
-            && label
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-')
-    })
-}
-
-fn toml_escape_string(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
-        .replace('\r', "\\r")
-        .replace('\t', "\\t")
-}
 
     fn styled_label_text(&self, text: impl Into<String>, color: egui::Color32) -> egui::RichText {
         egui::RichText
@@ -1803,14 +1738,16 @@ impl eframe::App for ANetApp {
                                                     Some((line.clone(), red_color))
                                                 } else if line.contains("Tunnel UP") {
                                                     Some((line.clone(), green_color))
-                                                } else if 
+                                                } else if
                                                     line.contains("Config loaded") ||
                                                     line.contains("Найдено обновление")
                                                 {
                                                     Some((line.clone(), gold_color))
-                                                } else if line.contains("Cleaning up dead session")||
-                                                    line.contains("добавлен")||
-                                                    line.contains("удален") {
+                                                } else if
+                                                    line.contains("Cleaning up dead session") ||
+                                                    line.contains("добавлен") ||
+                                                    line.contains("удален")
+                                                {
                                                     Some((line.clone(), orange_color))
                                                 } else {
                                                     None
@@ -2072,7 +2009,9 @@ impl eframe::App for ANetApp {
 
                             ui.add_space(2.0);
                             ui.label(RichText::new("SETTINGS").size(label_size).color(grey_color));
-                            ui.label(RichText::new("CONFIGS").size(sub_label_size).color(grey_color));
+                            ui.label(
+                                RichText::new("CONFIGS").size(sub_label_size).color(grey_color)
+                            );
                         }
                     );
 
@@ -2162,9 +2101,15 @@ impl eframe::App for ANetApp {
                                     self.appbar_open = !self.appbar_open;
                                 }
 
-                                ui.add_space(2.0);                               
-                                ui.label(RichText::new("PER APP").size(label_size).color(grey_color));
-                                ui.label(RichText::new("TUNNELING").size(sub_label_size).color(grey_color));
+                                ui.add_space(2.0);
+                                ui.label(
+                                    RichText::new("PER APP").size(label_size).color(grey_color)
+                                );
+                                ui.label(
+                                    RichText::new("TUNNELING")
+                                        .size(sub_label_size)
+                                        .color(grey_color)
+                                );
                             }
                         );
                     }
@@ -2626,196 +2571,193 @@ impl eframe::App for ANetApp {
                                 egui::RichText::new("EXCLUDED").size(label_size).color(grey_color)
                             );
                             ui.label(
-                                egui::RichText::new("ADDRESSES").size(sub_label_size).color(grey_color)
+                                egui::RichText
+                                    ::new("ADDRESSES")
+                                    .size(sub_label_size)
+                                    .color(grey_color)
                             );
                         });
                     });
 
                     // 2. ПРАВАЯ КНОПКА: APPS (x: total_width - 60 .. total_width)
                     {
-
                         let (show_upd, release_data, progress) = match &self.update_status {
-                                UpdateStatus::Available(r) => (true, Some(r.clone()), None),
-                                UpdateStatus::Downloading(p) => (true, None, Some(*p)),
-                                _ => (false, None, None),
-                            };
+                            UpdateStatus::Available(r) => (true, Some(r.clone()), None),
+                            UpdateStatus::Downloading(p) => (true, None, Some(*p)),
+                            _ => (false, None, None),
+                        };
 
-                            if show_upd {
-                                let modal_bg = egui::Color32::from_rgb(32, 32, 32);
+                        if show_upd {
+                            let modal_bg = egui::Color32::from_rgb(32, 32, 32);
 
-                                egui::Window
-                                    ::new("UPDATE_SYSTEM")
-                                    .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-                                    .collapsible(false)
-                                    .resizable(false)
-                                    .title_bar(false)
-                                    .order(egui::Order::Foreground)
-                                    .frame(
-                                        egui::Frame::NONE
-                                            .fill(modal_bg)
-                                            .stroke(egui::Stroke::new(3.0, gold_color))
-                                            .inner_margin(24.0)
-                                            .corner_radius(4.0)
-                                    )
-                                    .show(ctx, |ui| {
-                                        ui.vertical_centered(|ui| {
+                            egui::Window
+                                ::new("UPDATE_SYSTEM")
+                                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                                .collapsible(false)
+                                .resizable(false)
+                                .title_bar(false)
+                                .order(egui::Order::Foreground)
+                                .frame(
+                                    egui::Frame::NONE
+                                        .fill(modal_bg)
+                                        .stroke(egui::Stroke::new(3.0, gold_color))
+                                        .inner_margin(24.0)
+                                        .corner_radius(4.0)
+                                )
+                                .show(ctx, |ui| {
+                                    ui.vertical_centered(|ui| {
+                                        ui.label(
+                                            egui::RichText
+                                                ::new("SYSTEM UPDATE")
+                                                .size(22.0)
+                                                .strong()
+                                                .color(gold_color)
+                                        );
+
+                                        if let Some(rel) = release_data {
                                             ui.label(
                                                 egui::RichText
-                                                    ::new("SYSTEM UPDATE")
-                                                    .size(22.0)
-                                                    .strong()
+                                                    ::new(
+                                                        format!("Доступна версия: {}", rel.tag_name)
+                                                    )
+                                                    .size(16.0)
                                                     .color(gold_color)
                                             );
+                                            ui.add_space(16.0);
+                                            ui.add_space(16.0);
+                                            ui.label(
+                                                egui::RichText
+                                                    ::new("Список изменений:")
+                                                    .size(14.0)
+                                                    .color(gold_color)
+                                                    .strong()
+                                            );
+                                            ui.add_space(4.0);
 
-                                            if let Some(rel) = release_data {
-                                                ui.label(
-                                                    egui::RichText
-                                                        ::new(
+                                            ui.style_mut().spacing.scroll.foreground_color = false;
+                                            ui.style_mut().visuals.widgets.inactive.bg_fill =
+                                                egui::Color32::from_rgb(80, 80, 80);
+                                            ui.style_mut().visuals.widgets.hovered.bg_fill =
+                                                egui::Color32::from_rgb(120, 120, 120);
+                                            ui.style_mut().visuals.widgets.active.bg_fill =
+                                                egui::Color32::from_rgb(160, 160, 160);
+
+                                            egui::ScrollArea
+                                                ::vertical()
+                                                .max_height(180.0)
+                                                .auto_shrink([false, true])
+                                                .scroll_bar_visibility(
+                                                    ScrollBarVisibility::AlwaysVisible
+                                                )
+                                                .show(ui, |ui| {
+                                                    let changelog = rel.body
+                                                        .as_deref()
+                                                        .unwrap_or(
+                                                            "Описание изменений отсутствует."
+                                                        );
+                                                    ui.add(
+                                                        egui::Label
+                                                            ::new(
+                                                                egui::RichText
+                                                                    ::new(changelog)
+                                                                    .size(13.0)
+                                                                    .color(gold_color)
+                                                                    .family(
+                                                                        egui::FontFamily::Monospace
+                                                                    )
+                                                            )
+                                                            .wrap()
+                                                    );
+                                                });
+                                            ui.add_space(24.0);
+                                            ui.horizontal(|ui| {
+                                                ui.add_space(ui.available_width() / 6.0);
+
+                                                let btn_update = egui::Button
+                                                    ::new(
+                                                        egui::RichText
+                                                            ::new("ОБНОВИТЬ")
+                                                            .size(16.0)
+                                                            .strong()
+                                                            .color(egui::Color32::BLACK)
+                                                    )
+                                                    .fill(gold_color)
+                                                    .min_size(egui::vec2(120.0, 36.0));
+
+                                                if ui.add(btn_update).clicked() {
+                                                    let r_clone = rel.clone();
+                                                    self.logs
+                                                        .lock()
+                                                        .unwrap()
+                                                        .push(
                                                             format!(
-                                                                "Доступна версия: {}",
+                                                                "> Обновляемся на {}",
                                                                 rel.tag_name
                                                             )
-                                                        )
-                                                        .size(16.0)
-                                                        .color(gold_color)
-                                                );
-                                                ui.add_space(16.0);
-                                                ui.add_space(16.0);
-                                                ui.label(
-                                                    egui::RichText
-                                                        ::new("Список изменений:")
-                                                        .size(14.0)
-                                                        .color(gold_color)
-                                                        .strong()
-                                                );
-                                                ui.add_space(4.0);
-
-                                                ui.style_mut().spacing.scroll.foreground_color = false;
-                                                ui.style_mut().visuals.widgets.inactive.bg_fill =
-                                                    egui::Color32::from_rgb(80, 80, 80);
-                                                ui.style_mut().visuals.widgets.hovered.bg_fill =
-                                                    egui::Color32::from_rgb(120, 120, 120);
-                                                ui.style_mut().visuals.widgets.active.bg_fill =
-                                                    egui::Color32::from_rgb(160, 160, 160);
-
-                                                egui::ScrollArea
-                                                    ::vertical()
-                                                    .max_height(180.0)
-                                                    .auto_shrink([false, true])
-                                                    .scroll_bar_visibility(
-                                                        ScrollBarVisibility::AlwaysVisible
-                                                    )
-                                                    .show(ui, |ui| {
-                                                        let changelog = rel.body
-                                                            .as_deref()
-                                                            .unwrap_or(
-                                                                "Описание изменений отсутствует."
-                                                            );
-                                                        ui.add(
-                                                            egui::Label
-                                                                ::new(
-                                                                    egui::RichText
-                                                                        ::new(changelog)
-                                                                        .size(13.0)
-                                                                        .color(gold_color)
-                                                                        .family(
-                                                                            egui::FontFamily::Monospace
-                                                                        )
-                                                                )
-                                                                .wrap()
                                                         );
-                                                    });
-                                                ui.add_space(24.0);
-                                                ui.horizontal(|ui| {
-                                                    ui.add_space(ui.available_width() / 6.0);
-
-                                                    let btn_update = egui::Button
-                                                        ::new(
-                                                            egui::RichText
-                                                                ::new("ОБНОВИТЬ")
-                                                                .size(16.0)
-                                                                .strong()
-                                                                .color(egui::Color32::BLACK)
-                                                        )
-                                                        .fill(gold_color)
-                                                        .min_size(egui::vec2(120.0, 36.0));
-
-                                                    if ui.add(btn_update).clicked() {
-                                                        let r_clone = rel.clone();
-                                                        self.logs
-                                                            .lock()
-                                                            .unwrap()
-                                                            .push(
-                                                                format!(
-                                                                    "> Обновляемся на {}",
-                                                                    rel.tag_name
-                                                                )
+                                                    self.update_status =
+                                                        UpdateStatus::Downloading(0.0);
+                                                    self.rt.spawn(async move {
+                                                        if
+                                                            let Err(e) =
+                                                                Updater::download_and_apply(
+                                                                    r_clone
+                                                                ).await
+                                                        {
+                                                            anet_client_core::events::err(
+                                                                format!("Ошибка загрузки: {}", e)
                                                             );
-                                                        self.update_status =
-                                                            UpdateStatus::Downloading(0.0);
-                                                        self.rt.spawn(async move {
-                                                            if
-                                                                let Err(e) =
-                                                                    Updater::download_and_apply(
-                                                                        r_clone
-                                                                    ).await
-                                                            {
-                                                                anet_client_core::events::err(
-                                                                    format!("Ошибка загрузки: {}", e)
-                                                                );
-                                                            }
-                                                        });
-                                                    }
-
-                                                    ui.add_space(20.0);
-
-                                                    let btn_cancel = egui::Button
-                                                        ::new(
-                                                            egui::RichText
-                                                                ::new("ПОЗДНЕЕ")
-                                                                .size(16.0)
-                                                                .strong()
-                                                                .color(egui::Color32::BLACK)
-                                                        )
-                                                        .fill(gold_color)
-                                                        .min_size(egui::vec2(120.0, 36.0));
-
-                                                    if ui.add(btn_cancel).clicked() {
-                                                        self.update_status = UpdateStatus::Idle;
-                                                    }
-                                                });
-                                            } else if let Some(p) = progress {
-                                                ui.add_space(20.0);
-                                                ui.label(
-                                                    egui::RichText
-                                                        ::new("СКАЧИВАНИЕ НОВЫХ БИНАРНИКОВ...")
-                                                        .color(gold_color)
-                                                        .strong()
-                                                );
-                                                ui.add_space(12.0);
-
-                                                ui.add(
-                                                    egui::ProgressBar
-                                                        ::new(p)
-                                                        .text(format!("{:.1}%", p * 100.0))
-                                                        .desired_width(260.0)
-                                                        .fill(gold_color)
-                                                );
+                                                        }
+                                                    });
+                                                }
 
                                                 ui.add_space(20.0);
-                                                ui.label(
-                                                    egui::RichText
-                                                        ::new(
-                                                            "Пожалуйста, не закрывайте приложение"
-                                                        )
-                                                        .size(11.0)
-                                                        .italics()
-                                                        .color(gold_color)
-                                                );
-                                            }
-                                        });
+
+                                                let btn_cancel = egui::Button
+                                                    ::new(
+                                                        egui::RichText
+                                                            ::new("ПОЗДНЕЕ")
+                                                            .size(16.0)
+                                                            .strong()
+                                                            .color(egui::Color32::BLACK)
+                                                    )
+                                                    .fill(gold_color)
+                                                    .min_size(egui::vec2(120.0, 36.0));
+
+                                                if ui.add(btn_cancel).clicked() {
+                                                    self.update_status = UpdateStatus::Idle;
+                                                }
+                                            });
+                                        } else if let Some(p) = progress {
+                                            ui.add_space(20.0);
+                                            ui.label(
+                                                egui::RichText
+                                                    ::new("СКАЧИВАНИЕ НОВЫХ БИНАРНИКОВ...")
+                                                    .color(gold_color)
+                                                    .strong()
+                                            );
+                                            ui.add_space(12.0);
+
+                                            ui.add(
+                                                egui::ProgressBar
+                                                    ::new(p)
+                                                    .text(format!("{:.1}%", p * 100.0))
+                                                    .desired_width(260.0)
+                                                    .fill(gold_color)
+                                            );
+
+                                            ui.add_space(20.0);
+                                            ui.label(
+                                                egui::RichText
+                                                    ::new("Пожалуйста, не закрывайте приложение")
+                                                    .size(11.0)
+                                                    .italics()
+                                                    .color(gold_color)
+                                            );
+                                        }
                                     });
-                            }
+                                });
+                        }
 
                         let right_rect = egui::Rect::from_min_size(
                             egui::pos2(rect.max.x - 60.0, rect.min.y),
@@ -2869,7 +2811,7 @@ impl eframe::App for ANetApp {
                                 }
 
                                 if response.clicked() {
-                                   self.check_for_updates();
+                                    self.check_for_updates();
                                 }
 
                                 ui.add_space(2.0);
@@ -2877,7 +2819,10 @@ impl eframe::App for ANetApp {
                                     egui::RichText::new("UPDATE").size(label_size).color(grey_color)
                                 );
                                 ui.label(
-                                    egui::RichText::new("CHECK").size(sub_label_size).color(grey_color)
+                                    egui::RichText
+                                        ::new("CHECK")
+                                        .size(sub_label_size)
+                                        .color(grey_color)
                                 );
                             });
                         });
@@ -3181,6 +3126,9 @@ impl eframe::App for ANetApp {
                                                 self.log(
                                                     &format!("Настройка tray_mode сохранена: {}", tray_mode)
                                                 );
+                                                self.show_toast(
+                                                    &format!("Настройка tray_mode сохранена: {}", tray_mode)
+                                                );
                                             }
 
                                             Err(e) => {
@@ -3339,8 +3287,6 @@ impl eframe::App for ANetApp {
                             //         }
                             //     });
                             // });
-
-                            
                         });
                 });
         }
@@ -3537,291 +3483,190 @@ impl eframe::App for ANetApp {
                 });
         }
 
-
-  
-
         if self.exclbar_open {
-    egui::Area
-        ::new(egui::Id::new("config_exclbar"))
-        .order(egui::Order::Foreground)
-        .fixed_pos(egui::pos2(0.0, 0.0))
-        .show(ctx, |ui| {
-            let screen_rect = ui.ctx().screen_rect();
-            let corner_radius = 14.0;
+            egui::Area
+                ::new(egui::Id::new("config_exclbar"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(egui::pos2(0.0, 0.0))
+                .show(ctx, |ui| {
+                    let screen_rect = ui.ctx().screen_rect();
+                    let corner_radius = 14.0;
 
-            egui::Frame
-                ::none()
-                .fill(ui.visuals().window_fill())
-                .inner_margin(margin)
-                .corner_radius(corner_radius)
-                .show(ui, |ui| {
-                    ui.set_width(
-                        screen_rect.width() - margin * 2.0
-                    );
+                    egui::Frame
+                        ::none()
+                        .fill(ui.visuals().window_fill())
+                        .inner_margin(margin)
+                        .corner_radius(corner_radius)
+                        .show(ui, |ui| {
+                            ui.set_width(screen_rect.width() - margin * 2.0);
 
-                    ui.set_height(
-                        screen_rect.height() - margin * 2.0
-                    );
+                            ui.set_height(screen_rect.height() - margin * 2.0);
 
-                   if ui.input(|i| {
-    i.key_pressed(egui::Key::Escape)
-}) {
-    self.close_exclbar();
-}
+                            if ui.input(|i| { i.key_pressed(egui::Key::Escape) }) {
+                                self.close_exclbar();
+                            }
 
-                    // HEADER
-                    ui.horizontal(|ui| {
-                        let circle_button =
-                            egui::Button
-                                ::new("⏴")
-                                .min_size(button_size)
-                                .stroke(Stroke::NONE)
-                                .rounding(
-                                    button_size.y / 2.0
-                                );
+                            // HEADER
+                            ui.horizontal(|ui| {
+                                let circle_button = egui::Button
+                                    ::new("⏴")
+                                    .min_size(button_size)
+                                    .stroke(Stroke::NONE)
+                                    .rounding(button_size.y / 2.0);
 
-                        let response = ui
-                            .add(circle_button)
-                            .on_hover_cursor(
-                                egui::CursorIcon::PointingHand
+                                let response = ui
+                                    .add(circle_button)
+                                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+
+                                if response.clicked() {
+                                    self.close_exclbar();
+                                }
+
+                                ui.heading("Исключить адреса из туннеля");
+                            });
+
+                            ui.separator();
+                            ui.add_space(8.0);
+
+                            ui.label(
+                                egui::RichText
+                                    ::new("Эти адреса будут исключены из VPN-туннеля.")
+                                    .size(11.0)
+                                    .color(grey_color)
+                                    .family(egui::FontFamily::Name("Inter-V".into()))
                             );
 
-                       if response.clicked() {
-    self.close_exclbar();
-}
+                            ui.add_space(14.0);
 
-                        ui.heading(
-                            "Исключить адреса из туннеля"
-                        );
-                    });
+                            // ==============================
+                            // ADD ADDRESS
+                            // ==============================
+                            ui.horizontal(|ui| {
+                                let input_width = (ui.available_width() - 92.0).max(160.0);
 
-                    ui.separator();
-                    ui.add_space(8.0);
+                                let response = ui.add(
+                                    egui::TextEdit
+                                        ::singleline(&mut self.exclude_route_input)
+                                        .desired_width(input_width)
+                                        .hint_text("IP, CIDR или домен")
+                                );
 
-                    ui.label(
-                        egui::RichText::new(
-                            "Эти адреса будут исключены из VPN-туннеля."
-                        )
-                        .size(11.0)
-                        .color(grey_color)
-                        .family(
-                            egui::FontFamily::Name(
-                                "Inter-V".into()
-                            )
-                        )
-                    );
-
-                    ui.add_space(14.0);
-
-                    // ==============================
-                    // ADD ADDRESS
-                    // ==============================
-                    ui.horizontal(|ui| {
-                        let input_width =
-                            (ui.available_width() - 92.0)
-                                .max(160.0);
-
-                        let response = ui.add(
-                            egui::TextEdit::singleline(
-                                &mut self.exclude_route_input
-                            )
-                            .desired_width(input_width)
-                            .hint_text(
-                                "IP, CIDR или домен"
-                            )
-                        );
-
-                        let add_clicked = ui
-                            .add(
-                                egui::Button::new(
-                                    egui::RichText::new(
-                                        "ДОБАВИТЬ"
+                                let add_clicked = ui
+                                    .add(
+                                        egui::Button
+                                            ::new(
+                                                egui::RichText::new("ДОБАВИТЬ").size(11.0).strong()
+                                            )
+                                            .min_size(egui::vec2(82.0, 28.0))
                                     )
-                                    .size(11.0)
-                                    .strong()
-                                )
-                                .min_size(
-                                    egui::vec2(
-                                        82.0,
-                                        28.0
-                                    )
-                                )
-                            )
-                            .on_hover_cursor(
-                                egui::CursorIcon::PointingHand
-                            )
-                            .clicked();
+                                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                    .clicked();
 
-                        let enter_pressed =
-                            response.lost_focus()
-                                && ui.input(|i| {
-                                    i.key_pressed(
-                                        egui::Key::Enter
-                                    )
-                                });
+                                let enter_pressed =
+                                    response.lost_focus() &&
+                                    ui.input(|i| { i.key_pressed(egui::Key::Enter) });
 
-                        if add_clicked || enter_pressed {
-                            let route =
-                                self.exclude_route_input
-                                    .trim()
-                                    .to_string();
+                                if add_clicked || enter_pressed {
+                                    let route = self.exclude_route_input.trim().to_string();
 
-                            if !Self::validate_exclude_route(
-                                &route
-                            ) {
-                                self.log(&format!(
-                                    "Некорректный адрес: {}",
-                                    route
-                                ));
-                            } else if self
-                                .exclude_routes
-                                .iter()
-                                .any(|r| r == &route)
-                            {
-                                self.log(&format!(
-                                    "Адрес уже добавлен: {}",
-                                    route
-                                ));
-                            } else {
-                                self.log(&format!("Адрес добавлен: {}",route));                               
-
-                                self.exclude_routes.push(route);
-self.exclude_route_input.clear();
-self.exclude_routes_changed = true;
-
-                            }
-                        }
-                    });
-
-                    ui.add_space(18.0);
-
-                    // ==============================
-                    // LIST HEADER
-                    // ==============================
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new(
-                                "ИСКЛЮЧЁННЫЕ АДРЕСА"
-                            )
-                            .size(11.0)
-                            .strong()
-                            .color(gold_color)
-                        );
-
-                        ui.label(
-                            egui::RichText::new(
-                                self.exclude_routes
-                                    .len()
-                                    .to_string()
-                            )
-                            .size(10.0)
-                            .color(grey_color)
-                        );
-                    });
-
-                    ui.add_space(8.0);
-
-                    // ==============================
-                    // LIST
-                    // ==============================
-                    egui::Frame::NONE
-                        .fill(
-                            egui::Color32::from_rgb(
-                                25, 27, 33
-                            )
-                        )
-                        .stroke(
-                            egui::Stroke::new(
-                                1.0,
-                                egui::Color32::from_rgb(
-                                    45, 47, 54
-                                )
-                            )
-                        )
-                        .corner_radius(8.0)
-                        .inner_margin(
-                            egui::Margin::same(8)
-                        )
-                        .show(ui, |ui| {
-                            egui::ScrollArea::vertical()
-                                .auto_shrink([false, false])
-                                .show(ui, |ui| {
-                                    if self.exclude_routes.is_empty() {
-                                        ui.vertical_centered(
-                                            |ui| {
-                                                ui.add_space(
-                                                    20.0
-                                                );
-
-                                                ui.label(
-                                                    egui::RichText::new(
-                                                        "Нет исключённых адресов"
-                                                    )
-                                                    .size(11.0)
-                                                    .color(
-                                                        grey_color
-                                                    )
-                                                );
-                                            }
-                                        );
+                                    if !Self::validate_exclude_route(&route) {
+                                        self.log(&format!("Некорректный адрес: {}", route));
+                                        self.show_toast(&format!("Некорректный адрес: {}", route));
+                                    } else if self.exclude_routes.iter().any(|r| r == &route) {
+                                        self.log(&format!("Адрес уже добавлен: {}", route));
+                                        self.show_toast(&format!("Адрес уже добавлен: {}", route));
                                     } else {
-                                        let mut remove_index =
-                                            None;
+                                        self.log(&format!("Адрес добавлен: {}", route));
+                                        self.show_toast(&format!("Адрес добавлен: {}", route));
 
-                                        for (
-                                            index,
-                                            route
-                                        ) in self
-                                            .exclude_routes
-                                            .iter()
-                                            .enumerate()
-                                        {
-                                            egui::Frame::NONE
-                                                .fill(
-                                                    if index % 2 == 0 {
-                                                        egui::Color32::from_rgb(
-                                                            30, 32, 39
+                                        self.exclude_routes.push(route);
+                                        self.exclude_route_input.clear();
+                                        self.exclude_routes_changed = true;
+                                    }
+                                }
+                            });
+
+                            ui.add_space(18.0);
+
+                            // ==============================
+                            // LIST HEADER
+                            // ==============================
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText
+                                        ::new("ИСКЛЮЧЁННЫЕ АДРЕСА")
+                                        .size(11.0)
+                                        .strong()
+                                        .color(gold_color)
+                                );
+
+                                ui.label(
+                                    egui::RichText
+                                        ::new(self.exclude_routes.len().to_string())
+                                        .size(10.0)
+                                        .color(grey_color)
+                                );
+                            });
+
+                            ui.add_space(8.0);
+
+                            // ==============================
+                            // LIST
+                            // ==============================
+                            egui::Frame::NONE
+                                .fill(egui::Color32::from_rgb(25, 27, 33))
+                                .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(45, 47, 54)))
+                                .corner_radius(8.0)
+                                .inner_margin(egui::Margin::same(8))
+                                .show(ui, |ui| {
+                                    egui::ScrollArea
+                                        ::vertical()
+                                        .auto_shrink([false, false])
+                                        .show(ui, |ui| {
+                                            if self.exclude_routes.is_empty() {
+                                                ui.vertical_centered(|ui| {
+                                                    ui.add_space(20.0);
+
+                                                    ui.label(
+                                                        egui::RichText
+                                                            ::new("Нет исключённых адресов")
+                                                            .size(11.0)
+                                                            .color(grey_color)
+                                                    );
+                                                });
+                                            } else {
+                                                let mut remove_index = None;
+
+                                                for (index, route) in self.exclude_routes
+                                                    .iter()
+                                                    .enumerate() {
+                                                    egui::Frame::NONE
+                                                        .fill(
+                                                            if index % 2 == 0 {
+                                                                egui::Color32::from_rgb(30, 32, 39)
+                                                            } else {
+                                                                egui::Color32::TRANSPARENT
+                                                            }
                                                         )
-                                                    } else {
-                                                        egui::Color32::TRANSPARENT
-                                                    }
-                                                )
-                                                .corner_radius(
-                                                    6.0
-                                                )
-                                                .inner_margin(
-                                                    egui::Margin::symmetric(
-                                                        8,
-                                                        5
-                                                    )
-                                                )
-                                                .show(
-                                                    ui,
-                                                    |ui| {
-                                                        ui.horizontal(
-                                                            |ui| {
+                                                        .corner_radius(6.0)
+                                                        .inner_margin(egui::Margin::symmetric(8, 5))
+                                                        .show(ui, |ui| {
+                                                            ui.horizontal(|ui| {
                                                                 ui.label(
-                                                                    egui::RichText::new(
-                                                                        "•"
-                                                                    )
-                                                                    .color(
-                                                                        gold_color
-                                                                    )
+                                                                    egui::RichText
+                                                                        ::new("•")
+                                                                        .color(gold_color)
                                                                 );
 
                                                                 ui.label(
-                                                                    egui::RichText::new(
-                                                                        route
-                                                                    )
-                                                                    .size(
-                                                                        11.0
-                                                                    )
-                                                                    .family(
-                                                                        egui::FontFamily::Name(
-                                                                            "JetBrainsMono"
-                                                                                .into()
+                                                                    egui::RichText
+                                                                        ::new(route)
+                                                                        .size(11.0)
+                                                                        .family(
+                                                                            egui::FontFamily::Name(
+                                                                                "JetBrainsMono".into()
+                                                                            )
                                                                         )
-                                                                    )
                                                                 );
 
                                                                 ui.with_layout(
@@ -3829,48 +3674,47 @@ self.exclude_routes_changed = true;
                                                                         egui::Align::Center
                                                                     ),
                                                                     |ui| {
-                                                                        let delete =
-                                                                            ui.add(
-                                                                                egui::Button::new(
-                                                                                    egui::RichText::new(
-                                                                                        "Удалить"
+                                                                        let delete = ui
+                                                                            .add(
+                                                                                egui::Button
+                                                                                    ::new(
+                                                                                        egui::RichText
+                                                                                            ::new(
+                                                                                                "Удалить"
+                                                                                            )
+                                                                                            .size(
+                                                                                                10.0
+                                                                                            )
                                                                                     )
-                                                                                    .size(
-                                                                                        10.0
-                                                                                    )
-                                                                                )
-                                                                                .frame(false)
+                                                                                    .frame(false)
                                                                             )
                                                                             .on_hover_cursor(
                                                                                 egui::CursorIcon::PointingHand
                                                                             );
 
                                                                         if delete.clicked() {
-                                                                              
                                                                             remove_index =
                                                                                 Some(index);
-                                                                                self.log(&format!("Адрес удален")); 
                                                                         }
                                                                     }
                                                                 );
-                                                            }
-                                                        );
-                                                    }
-                                                );
-                                        }
+                                                            });
+                                                        });
+                                                }
 
-                                        if let Some(index) =
-                                            remove_index
-                                        {
-                                            self.exclude_routes.remove(index);
-    self.exclude_routes_changed = true;
-                                        }
-                                    }
+                                                if let Some(index) = remove_index {
+                                                    self.exclude_routes.remove(index);
+                                                    self.exclude_routes_changed = true;
+
+                                                    self.show_toast("Адрес удален");
+                                                    self.log("Адрес удален");
+                                                }
+                                            }
+                                        });
                                 });
                         });
                 });
-        });
-}
+        }
 
         if let Some(err_msg) = self.error_modal.clone() {
             let modal_bg = egui::Color32::from_rgb(32, 32, 32);
@@ -3942,5 +3786,39 @@ self.exclude_routes_changed = true;
             egui::Stroke::new(1.0, egui::Color32::from_rgb(100, 100, 100)),
             egui::StrokeKind::Inside // Прижимаем обводку внутрь, чтобы она не обрезалась границами экрана
         );
+
+        // ==============================
+        // TOAST NOTIFICATION
+        // ==============================
+        if let (Some(message), Some(until)) = (&self.toast_message, self.toast_until) {
+            if std::time::Instant::now() < until {
+                egui::Area
+                    ::new(egui::Id::new("toast_notification"))
+                    .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -30.0))
+                    .order(egui::Order::Foreground)
+                    .show(ctx, |ui| {
+                        egui::Frame::NONE
+                            .fill(egui::Color32::from_rgb(35, 37, 44))
+                            .corner_radius(8.0)
+                            .inner_margin(egui::Margin::symmetric(16, 10))
+                            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(60, 63, 72)))
+                            .show(ui, |ui| {
+                                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+
+                                ui.label(
+                                    egui::RichText
+                                        ::new(message)
+                                        .size(11.0)
+                                        .color(egui::Color32::WHITE)
+                                );
+                            });
+                    });
+
+                ctx.request_repaint();
+            } else {
+                self.toast_message = None;
+                self.toast_until = None;
+            }
+        }
     }
 }

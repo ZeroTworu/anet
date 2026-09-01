@@ -106,7 +106,17 @@ impl AnetClient {
                 Err(e) => warn!("[Core] Failed to resolve {}: {}", target, e),
             }
         }
-        result
+
+        // Нормализуем адреса (сбрасываем биты хоста, чтобы избежать ошибок масок вроде /24 с адресом .1) и удаляем дубликаты
+        let mut normalized_result: Vec<IpNet> = result
+            .into_iter()
+            .filter_map(|net| IpNet::new(net.network(), net.prefix_len()).ok())
+            .collect();
+            
+        normalized_result.sort();
+        normalized_result.dedup();
+        
+        normalized_result
     }
 
     pub fn is_running(&self) -> bool {
@@ -449,7 +459,7 @@ impl AnetClient {
                 let include_routes = self.resolve_list(&config_clone.main.route_for).await;
                 for net in include_routes.iter() {
                     self.route_manager.add_specific_route(
-                        net.addr(),
+                        net.network(),
                         net.prefix_len(),
                         &result.auth_response.gateway,
                         &iface_name,
@@ -459,7 +469,7 @@ impl AnetClient {
                 if !config_clone.main.exclude_route_for.is_empty() {
                     let exclude_routes = self.resolve_list(&config_clone.main.exclude_route_for).await;
                     for net in exclude_routes.iter() {
-                        self.route_manager.add_bypass_route(net.addr(), net.prefix_len()).await?;
+                        self.route_manager.add_bypass_route(net.network(), net.prefix_len()).await?;
                     }
                 }
                 self.route_manager.set_default_route(&result.auth_response.gateway, &iface_name).await?;
@@ -514,7 +524,7 @@ impl AnetClient {
                     // Если мы отправляли данные в последние 4 сек, но ответа нет 8 сек -> Блокировка
                     if elapsed_rx > Duration::from_secs(8) && elapsed_tx < Duration::from_secs(4) {
                         warn!("[Health] CASE 1 Detected: Connection established, but payload traffic is blocked!");
-                        warn("[Health] CASE 1 Detected: Connection established, but payload traffic is blocked!");
+                        warn!("[Health] CASE 1 Detected: Connection established, but payload traffic is blocked!");
                         monitor_reconnect.notify_one();
                         break;
                     }
