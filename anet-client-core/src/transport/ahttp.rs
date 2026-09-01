@@ -1,141 +1,58 @@
 use super::{ClientTransport, ConnectionResult};
 use crate::auth::{AuthChannel, AuthHandler};
 use crate::config::{CoreConfig, ServerConfig};
-use anet_common::consts::{CHANNEL_BUFFER_SIZE, MAX_PACKET_SIZE};
+use anet_common::consts::{CHANNEL_BUFFER_SIZE, COALESCE_BUDGET_BYTES, MAX_PACKET_SIZE};
 use anet_common::handshake_fragmentation::FragmentConfig;
 use anet_common::http_help::BrowserProfile;
 use anet_common::stream_framing::{frame_packet, read_next_packet};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
-use httparse::{Response, Status, parse_chunk_size};
-use log::{info, warn};
-use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::{DigitallySignedStruct, SignatureScheme};
-use std::net::{SocketAddr, ToSocketAddrs};
+use log::{info, warn, debug};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
-use tokio::sync::Mutex;
-use tokio_rustls::{TlsConnector, client::TlsStream};
+use tokio::io::AsyncWriteExt;
+use reqwest::{Client, Method, Url};
+use std::net::SocketAddr;
 
-#[derive(Debug)]
-struct AcceptAnyServerCert;
-
-impl ServerCertVerifier for AcceptAnyServerCert {
-    fn verify_server_cert(
-        &self, _end_entity: &CertificateDer<'_>, _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>, _ocsp_response: &[u8], _now: UnixTime,
-    ) -> std::result::Result<ServerCertVerified, rustls::Error> {
-        Ok(ServerCertVerified::assertion())
-    }
-    fn verify_tls12_signature(
-        &self, _message: &[u8], _cert: &CertificateDer<'_>, _dss: &DigitallySignedStruct,
-    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
-    }
-    fn verify_tls13_signature(
-        &self, _message: &[u8], _cert: &CertificateDer<'_>, _dss: &DigitallySignedStruct,
-    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
-    }
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        vec![SignatureScheme::RSA_PSS_SHA256, SignatureScheme::ECDSA_NISTP256_SHA256, SignatureScheme::ED25519]
-    }
-}
-
-/// Установка TLS-соединения с зафиксированным Anycast IP (DNS Pinning)
-async fn connect_tls_pinned(
-    resolved_addr: SocketAddr,
+/// Нативно внедряет маскировку заголовков в запрос reqwest без аллокаций и парсинга строк
+fn apply_stealth_headers(
+    builder: reqwest::RequestBuilder,
+    profile: &BrowserProfile,
     host: &str,
-    is_tls: bool,
-) -> Result<TlsStream<TcpStream>> {
-    let tcp_stream = TcpStream::connect(resolved_addr).await?;
-    tcp_stream.set_nodelay(true)?;
+) -> reqwest::RequestBuilder {
+    let mut builder = builder
+        .header("Host", host)
+        .header("User-Agent", profile.user_agent)
+        .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
+        .header("Accept-Language", profile.accept_language)
+        .header("Accept-Encoding", "gzip, deflate, br")
+        .header("Connection", "close") // Force Connection: close для CDN
+        .header("Sec-Fetch-Dest", "document")
+        .header("Sec-Fetch-Mode", "navigate")
+        .header("Sec-Fetch-Site", "none")
+        .header("Cache-Control", "no-cache")
+        .header("Pragma", "no-cache");
 
-    if is_tls {
-        let mut tls_config = rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert))
-            .with_no_client_auth();
-        tls_config.alpn_protocols = vec![b"http/1.1".to_vec()];
-
-        let connector = TlsConnector::from(Arc::new(tls_config));
-        let server_name = ServerName::try_from(host)?.to_owned();
-        let tls_stream = connector.connect(server_name, tcp_stream).await?;
-        Ok(tls_stream)
-    } else {
-        anyhow::bail!("http:// without TLS is not supported for OpSec reasons (use https://)");
+    if let Some(index) = profile.chrome_profile {
+        use anet_common::http_help::{CHROME_BRANDS, CHROME_PLATFORMS};
+        builder = builder
+            .header("sec-ch-ua", CHROME_BRANDS[index])
+            .header("sec-ch-ua-mobile", "?0")
+            .header("sec-ch-ua-platform", CHROME_PLATFORMS[index]);
     }
-}
-
-async fn read_http_response(stream: &mut TlsStream<TcpStream>) -> Result<Bytes> {
-    let mut buf = BytesMut::with_capacity(8192);
-    loop {
-        let mut temp = [0u8; 4096];
-        let n = stream.read(&mut temp).await?;
-        if n == 0 { anyhow::bail!("Connection closed by server"); }
-        buf.extend_from_slice(&temp[..n]);
-
-        let mut headers = [httparse::EMPTY_HEADER; 32];
-        let mut res = Response::new(&mut headers);
-
-        match res.parse(&buf) {
-            Ok(Status::Complete(header_len)) => {
-                if res.code != Some(200) {
-                    anyhow::bail!("Server rejected request: HTTP {}", res.code.unwrap_or(0));
-                }
-                let body = buf.split_off(header_len);
-                return Ok(body.freeze());
-            }
-            Ok(Status::Partial) => continue,
-            Err(e) => anyhow::bail!("Failed to parse HTTP response: {:?}", e),
-        }
-    }
-}
-
-/// Извлечение хоста для маскировки из query-параметров DSN
-fn extract_host_from_query(query: &str) -> Option<String> {
-    for part in query.split('&') {
-        let mut kv = part.split('=');
-        if let Some(k) = kv.next() {
-            if k == "host" {
-                if let Some(v) = kv.next() {
-                    return Some(v.to_string());
-                }
-            }
-        }
-    }
-    None
-}
-
-fn parse_next_http_chunk(buf: &mut BytesMut) -> Result<Option<Bytes>> {
-    let s = buf.as_ref();
-    match parse_chunk_size(s) {
-        Ok(Status::Complete((header_len, size))) => {
-            let size = size as usize;
-            let chunk_end = header_len + size;
-            if s.len() < chunk_end + 2 {
-                return Ok(None);
-            }
-            let packet = buf.split_to(chunk_end).freeze().slice(header_len..chunk_end);
-            let _ = buf.split_to(2);
-            Ok(Some(packet))
-        }
-        Ok(Status::Partial) => Ok(None),
-        Err(e) => Err(anyhow::anyhow!("Invalid HTTP chunk size: {:?}", e)),
-    }
+    builder
 }
 
 struct AHttpAuthChannel {
-    stream: Mutex<TlsStream<TcpStream>>,
-    host: String,
-    path: String,
+    client: Client,
+    base_url: String,
     profile: BrowserProfile,
     is_auth_phase: tokio::sync::Mutex<bool>,
+    pending_response: tokio::sync::Mutex<Option<Bytes>>,
+    handshake_path: String,
+    auth_path: String,
 }
 
 #[async_trait]
@@ -144,24 +61,36 @@ impl AuthChannel for AHttpAuthChannel {
         let mut is_auth = self.is_auth_phase.lock().await;
         let req_path = if !*is_auth {
             *is_auth = true;
-            format!("{}/handshake", self.path)
+            format!("{}{}", self.base_url, self.handshake_path)
         } else {
-            format!("{}/auth", self.path)
+            format!("{}{}", self.base_url, self.auth_path)
         };
 
-        let headers = self.profile.build_headers("POST", &self.host, &req_path, Some(data.len()), false);
-        let mut stream = self.stream.lock().await;
-        stream.write_all(headers.as_bytes()).await?;
-        stream.write_all(&data).await?;
-        stream.flush().await?;
+        // Извлекаем Host из целевого URL
+        let parsed_url = Url::parse(&req_path)?;
+        let host = parsed_url.host_str().unwrap_or("");
+
+        let mut req = self.client.post(&req_path);
+        req = apply_stealth_headers(req, &self.profile, host);
+
+        let resp = req.body(data.to_vec()).send().await?;
+
+        if !resp.status().is_success() {
+            anyhow::bail!("Server returned HTTP {}", resp.status());
+        }
+
+        let body = resp.bytes().await?;
+        *self.pending_response.lock().await = Some(body);
         Ok(())
     }
 
-    async fn recv(&self, timeout: Duration) -> Result<Bytes> {
-        let mut stream = self.stream.lock().await;
-        tokio::time::timeout(timeout, read_http_response(&mut *stream))
-            .await
-            .context("HTTP Auth timeout")?
+    async fn recv(&self, _timeout: Duration) -> Result<Bytes> {
+        let mut pending = self.pending_response.lock().await;
+        if let Some(body) = pending.take() {
+            Ok(body)
+        } else {
+            anyhow::bail!("No pending response from server");
+        }
     }
 }
 
@@ -174,6 +103,20 @@ impl AHttpTransport {
     pub fn new(config: CoreConfig, server: ServerConfig) -> Self {
         Self { config, server }
     }
+
+    /// Резолвит домен напрямую через нативный системный резолвер ОС (getaddrinfo),
+    /// гарантируя идеальное совпадение IP с BYPASS-маршрутами ядра.
+    async fn resolve_host(&self, host: &str, port: u16) -> Result<SocketAddr> {
+        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+            return Ok(SocketAddr::new(ip, port));
+        }
+
+        let addrs = tokio::net::lookup_host(format!("{}:{}", host, port)).await
+            .context(format!("Failed to resolve DNS for {}:{}", host, port))?;
+
+        let addr = addrs.into_iter().next().context("No IP addresses found")?;
+        Ok(addr)
+    }
 }
 
 #[async_trait]
@@ -181,42 +124,47 @@ impl ClientTransport for AHttpTransport {
     async fn connect(&self) -> Result<ConnectionResult> {
         let profile = BrowserProfile::random();
 
-        let uri = self.server.dsn.parse::<http::Uri>()?;
-        let query_str = uri.query().unwrap_or("");
+        // 1. Парсинг DSN (Без костылей)
+        let dsn_url = Url::parse(&self.server.dsn)?;
+        let scheme = dsn_url.scheme();
+        let target_host = dsn_url.host_str().context("No host in DSN")?.to_string();
+        let port = dsn_url.port_or_known_default().unwrap_or(if scheme == "https" { 443 } else { 80 });
+        let mut base_url = format!("{}://{}{}", scheme, target_host, dsn_url.path());
 
-        let mut host = uri.host().context("No host in DSN")?.to_string();
-        if let Some(h) = extract_host_from_query(query_str) {
-            host = h;
+        // Убираем слэш на конце, если он есть
+        if base_url.ends_with('/') {
+            base_url.pop();
         }
 
-        let is_tls = uri.scheme_str() == Some("https");
-        let port = uri.port_u16().unwrap_or(if is_tls { 443 } else { 80 });
-        let base_path = uri.path().to_string();
+        let mut uplink_method_str = "POST".to_string();
+        for (k, v) in dsn_url.query_pairs() {
+            if k == "method" { uplink_method_str = v.into_owned(); }
+        }
+        let uplink_method = Method::from_bytes(uplink_method_str.as_bytes()).unwrap_or(Method::POST);
 
-        let resolved_addr = format!("{}:{}", uri.host().unwrap_or(""), port)
-            .to_socket_addrs()?
-            .next()
-            .context("DNS resolution failed")?;
+        // 2. DNS PINNING: Резолвим физический IP
+        let resolved_addr = self.resolve_host(&target_host, port).await?;
+        info!("[AHTTP] Initializing XHTTP engine to {} (Pinned IP: {})", base_url, resolved_addr);
 
-        let uplink_method: &'static str = if query_str.contains("method=OPTIONS") {
-            "OPTIONS"
-        } else if query_str.contains("method=PUT") {
-            "PUT"
-        } else if query_str.contains("method=PATCH") {
-            "PATCH"
-        } else {
-            "POST"
-        };
+        // Настраиваем reqwest с жестким биндингом домена к IP
+        let http_client = Client::builder()
+            .resolve(&target_host, resolved_addr)
+            .danger_accept_invalid_certs(true)
+            .pool_max_idle_per_host(self.config.ahttp.pool_max_idle_per_host)
+            .pool_idle_timeout(Some(Duration::from_secs(self.config.ahttp.pool_idle_timeout_secs)))
+            .tcp_nodelay(self.config.ahttp.tcp_nodelay)
+            .timeout(Duration::from_secs(self.config.ahttp.timeout_secs))
+            .build()?;
 
-        info!("[AHTTP] Connecting primary channel to {} (resolved: {})", self.server.dsn, resolved_addr);
-        let conn_down = connect_tls_pinned(resolved_addr, &host, is_tls).await?;
-
+        // 3. Авторизация
         let auth_channel = AHttpAuthChannel {
-            stream: Mutex::new(conn_down),
-            host: host.clone(),
-            path: base_path.clone(),
+            client: http_client.clone(),
+            base_url: base_url.clone(),
             profile: profile.clone(),
             is_auth_phase: tokio::sync::Mutex::new(false),
+            pending_response: tokio::sync::Mutex::new(None),
+            handshake_path: self.config.ahttp.handshake_path.clone(),
+            auth_path: self.config.ahttp.auth_path.clone(),
         };
 
         let auth = AuthHandler::new(&self.config, self.server.server_pub_key.as_deref())?;
@@ -239,47 +187,45 @@ impl ClientTransport for AHttpTransport {
         });
 
         let padding_step = self.config.stealth.padding_step;
+        let config_ahttp = self.config.ahttp.clone();
 
-        let host_ul = host.clone();
-        let base_path_ul = base_path.clone();
-        let session_id_ul = session_id.clone();
+        // Клонируем переменные для изолированного фонового воркера
+        let host_ul = target_host.clone();
         let profile_ul = profile.clone();
         let cipher_ul = cipher.clone();
-        let sequence_ul = sequence.clone();
 
         tokio::spawn(async move {
-            info!("[AHTTP Client Debug] Started Unified XHTTP Traffic Loop using method: {}", uplink_method);
-            let traffic_path = format!("{}/traffic?session_id={}", base_path_ul, session_id_ul);
-            let mut batch_buf = BytesMut::with_capacity(16384);
-            let poll_timeout = Duration::from_millis(50);
-
-            // Инициализируем первое рабочее соединение
-            let mut conn = match connect_tls_pinned(resolved_addr, &host_ul, is_tls).await {
-                Ok(c) => c,
-                Err(e) => {
-                    warn!("[AHTTP Client Debug] Initial traffic connection failed: {}", e);
-                    return Result::<()>::Err(anyhow::anyhow!("Initial connection failed"));
-                }
-            };
+            info!("[AHTTP Client] Started Stateless Packet-Exchange Loop (Method: {})", uplink_method_str);
+            let traffic_url = format!("{}{}?session_id={}", base_url, config_ahttp.traffic_path, session_id);
+            // Коалесцируем до 64КБ данных перед отправкой
+            let mut batch_buf = BytesMut::with_capacity(65536);
+            // Ждем максимум 15мс (вместо 50мс), чтобы снизить искусственный пинг
+            let poll_timeout = Duration::from_millis(15);
 
             loop {
+                // Ждем пакет из TUN или срабатывает тайм-аут для отправки пустого полла
                 let packet_opt = tokio::select! {
                     pkt = tunnel_packet_rx.recv() => pkt,
                     _ = tokio::time::sleep(poll_timeout) => None,
                 };
 
+                let mut tx_pkts_count = 0;
+
                 if let Some(packet) = packet_opt {
-                    let seq = sequence_ul.fetch_add(1, Ordering::Relaxed);
+                    let seq = sequence.fetch_add(1, Ordering::Relaxed);
                     if let Ok(encrypted) = anet_common::transport::wrap_packet_padded(&cipher_ul, &nonce_prefix, seq, packet, padding_step) {
                         anet_common::stream_framing::frame_packet_into(&mut batch_buf, &encrypted);
+                        tx_pkts_count += 1;
                     }
 
-                    while batch_buf.len() < 16384 {
+                    // Пакетная коалесценция
+                    while batch_buf.len() < COALESCE_BUDGET_BYTES {
                         match tunnel_packet_rx.try_recv() {
                             Ok(p) => {
-                                let seq = sequence_ul.fetch_add(1, Ordering::Relaxed);
+                                let seq = sequence.fetch_add(1, Ordering::Relaxed);
                                 if let Ok(enc) = anet_common::transport::wrap_packet_padded(&cipher_ul, &nonce_prefix, seq, p, padding_step) {
                                     anet_common::stream_framing::frame_packet_into(&mut batch_buf, &enc);
+                                    tx_pkts_count += 1;
                                 }
                             }
                             Err(_) => break,
@@ -291,129 +237,63 @@ impl ClientTransport for AHttpTransport {
                 let mut success = false;
                 let mut attempts = 0;
 
+                if !payload.is_empty() {
+                    debug!("[AHTTP Client] >>> Sending {} bytes ({} packets)", payload.len(), tx_pkts_count);
+                }
+
                 while attempts < 3 {
-                    let req_headers = profile_ul.build_headers(uplink_method, &host_ul, &traffic_path, Some(payload.len()), false);
+                    // Генерируем полную HTTP-сигнатуру маскировки
+                    let mut req = http_client.request(uplink_method.clone(), &traffic_url);
+                    req = apply_stealth_headers(req, &profile_ul, &host_ul);
 
-                    let conn_ref = &mut conn;
-                    let exchange_res = async {
-                        conn_ref.write_all(req_headers.as_bytes()).await?;
-                        conn_ref.write_all(&payload).await?;
-                        conn_ref.flush().await?;
+                    let res = req.body(payload.to_vec()).send().await;
 
-                        let mut buf = BytesMut::with_capacity(16384);
-                        let mut content_length: Option<usize> = None;
-                        let mut is_chunked = false;
-                        let mut header_len = 0;
+                    match res {
+                        Ok(resp) if resp.status().is_success() => {
+                            if let Ok(body) = resp.bytes().await {
+                                if !body.is_empty() {
+                                    debug!("[AHTTP Client] <<< Received {} bytes", body.len());
+                                    let mut cursor = std::io::Cursor::new(body);
+                                    let mut rx_pkts_count = 0;
 
-                        // 1. Читаем до конца заголовков
-                        loop {
-                            let mut temp = [0u8; 4096];
-                            let n = conn_ref.read(&mut temp).await?;
-                            if n == 0 {
-                                return Err(anyhow::anyhow!("Connection closed by server before headers received"));
-                            }
-                            buf.extend_from_slice(&temp[..n]);
-
-                            let mut headers = [httparse::EMPTY_HEADER; 32];
-                            let mut res = Response::new(&mut headers);
-                            match res.parse(&buf) {
-                                Ok(Status::Complete(len)) => {
-                                    if res.code != Some(200) {
-                                        return Err(anyhow::anyhow!("Server returned status {:?}", res.code));
-                                    }
-                                    header_len = len;
-                                    for h in res.headers.iter() {
-                                        if h.name.eq_ignore_ascii_case("content-length") {
-                                            content_length = std::str::from_utf8(h.value).unwrap_or("").parse().ok();
-                                        } else if h.name.eq_ignore_ascii_case("transfer-encoding") {
-                                            if std::str::from_utf8(h.value).unwrap_or("").contains("chunked") {
-                                                is_chunked = true;
-                                            }
+                                    while let Ok(Some(encrypted_packet)) = read_next_packet(&mut cursor).await {
+                                        if let Ok(decrypted) = anet_common::transport::unwrap_packet_bytes_in_place(&cipher_ul, encrypted_packet) {
+                                            rx_pkts_count += 1;
+                                            let _ = tunnel_write.write_all(&frame_packet(decrypted)).await;
                                         }
                                     }
-                                    break;
+                                    debug!("[AHTTP Client] <<< Unpacked {} valid packets", rx_pkts_count);
                                 }
-                                Ok(Status::Partial) => continue,
-                                Err(e) => return Err(anyhow::anyhow!("Failed to parse response headers: {:?}", e)),
+                                success = true;
+                                break;
                             }
                         }
-
-                        // 2. Дочитываем тело
-                        loop {
-                            if let Some(cl) = content_length {
-                                if !is_chunked && buf.len() >= header_len + cl {
-                                    break;
-                                }
-                            }
-                            let mut temp = [0u8; 4096];
-                            let n = conn_ref.read(&mut temp).await?;
-                            if n == 0 { break; } // Connection: close или EOF
-                            buf.extend_from_slice(&temp[..n]);
-                        }
-
-                        let mut body = buf.split_off(header_len);
-
-                        // 3. Распаковываем
-                        let mut clean_body = BytesMut::new();
-                        if is_chunked {
-                            while let Ok(Some(chunk)) = parse_next_http_chunk(&mut body) {
-                                clean_body.extend_from_slice(&chunk);
-                            }
-                        } else {
-                            if let Some(cl) = content_length {
-                                body.truncate(cl);
-                            }
-                            clean_body = body;
-                        }
-
-                        // 4. Отправляем в TUN
-                        if !clean_body.is_empty() {
-                            let mut cursor = std::io::Cursor::new(clean_body.freeze());
-                            while let Ok(Some(encrypted_packet)) = read_next_packet(&mut cursor).await {
-                                if let Ok(decrypted) = anet_common::transport::unwrap_packet_bytes_in_place(&cipher_ul, encrypted_packet) {
-                                    let _ = tunnel_write.write_all(&frame_packet(decrypted)).await;
-                                }
-                            }
-                        }
-
-                        Ok(())
-                    }.await;
-
-                    if exchange_res.is_ok() {
-                        success = true;
-                        break;
+                        Ok(resp) => { warn!("[AHTTP Client] CDN returned HTTP {}", resp.status()); }
+                        Err(e) => { warn!("[AHTTP Client] Request failed: {}", e); }
                     }
 
                     attempts += 1;
-                    tokio::time::sleep(Duration::from_millis(50 * attempts)).await;
-                    match connect_tls_pinned(resolved_addr, &host_ul, is_tls).await {
-                        Ok(new_conn) => {
-                            conn = new_conn;
-                        }
-                        Err(_) => {}
-                    }
+                    tokio::time::sleep(Duration::from_millis(100 * attempts)).await;
                 }
 
                 if !success {
-                    warn!("[AHTTP Client Debug] Traffic exchange transaction failed");
-                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    warn!("[AHTTP Client] Traffic exchange transaction failed. Retrying...");
+                    tokio::time::sleep(Duration::from_millis(500)).await;
                 }
 
-                if tunnel_packet_rx.is_closed() {
-                    break;
-                }
+                if tunnel_packet_rx.is_closed() { break; }
             }
 
             tunnel_reader_task.abort();
             let _ = tunnel_reader_task.await;
             info!("[AHTTP] Traffic loop exited cleanly.");
-            Result::<()>::Ok(())
         });
 
         info!("[AHTTP] Transport session initialized.");
 
+        // КРИТИЧНО: Возвращаем оригинальный AuthResponse, не ломая шлюз виртуального туннеля!
         Ok(ConnectionResult {
-            auth_response,
+            auth_response, // Чистый и нетронутый
             vpn_stream: Box::new(client_stream),
             endpoint: None,
             connection: None,

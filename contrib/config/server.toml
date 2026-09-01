@@ -46,6 +46,28 @@ ahttp_path = "/api/v2/telemetry"
 
 ssh_host_key = "/opt/anet/anet_ssh_host_key"
 
+[ahttp]
+# Относительные пути, которые ожидает веб-сервер
+handshake_path = "/handshake"
+auth_path = "/auth"
+traffic_path = "/traffic"
+
+# Максимально допустимый размер HTTP-заголовков (в байтах) для защиты от DoS
+max_header_bytes = 16384
+
+# Маска HTTP-заголовков для ответа клиенту в фазе Traffic.
+# Вы можете менять Content-Type (например, на image/jpeg), добавлять любые фейковые куки
+# или кастомные заголовки вроде X-Cache-Status: HIT для мимикрии под кэш-промахи CDN.
+# ВАЖНО: Символы {} обязательны — в них сервер автоматически подставит размер бинарной пачки (Content-Length).
+response_headers = """
+HTTP/1.1 200 OK
+Content-Type: video/mp4
+Cache-Control: no-cache, no-transform, private, must-revalidate
+Pragma: no-cache
+X-Accel-Buffering: no
+Content-Length: {}
+Connection: keep-alive\n\n"""
+
 # =========================================================================
 # ANET Server: Аутентификация и авторизация
 # =========================================================================

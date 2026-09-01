@@ -10,7 +10,7 @@ use tokio::fs::read_to_string;
 pub struct CryptoConfig {
     pub quic_cert: String,
     pub quic_key: String,
-    pub server_signing_key: String, // Приватный ключ сервера для подписи
+    pub server_signing_key: String,
 }
 
 impl Default for CryptoConfig {
@@ -23,35 +23,27 @@ impl Default for CryptoConfig {
     }
 }
 
-// структура для настроек статистики
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct StatsConfig {
-    /// Включить или выключить периодический вывод статистики соединения.
     pub enabled: bool,
-    /// Интервал вывода статистики в минутах.
     pub interval_minutes: u64,
 }
 
 impl Default for StatsConfig {
     fn default() -> Self {
         Self {
-            enabled: false,      // По умолчанию выключено, чтобы не засорять логи
-            interval_minutes: 1, // По умолчанию - раз в минуту
+            enabled: false,
+            interval_minutes: 1,
         }
     }
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AuthenticationConfig {
-    /// Локальный список разрешенных клиентов (работает всегда)
     pub allowed_clients: Vec<String>,
-
-    /// Список URL серверов авторизации (например, ["http://127.0.0.1:3000/api/v1"])
     #[serde(default)]
     pub auth_servers: Vec<String>,
-
-    /// Токен для доступа к API авторизации (X-Auth-Key)
     #[serde(default)]
     pub auth_server_token: String,
 }
@@ -69,13 +61,9 @@ impl Default for AuthenticationConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct ControlPlaneConfig {
-    /// UUID узла из панели управления. Пустое значение отключает heartbeat.
     pub node_id: String,
-    /// Базовый URL API, например http://127.0.0.1:3000/api/v1.
     pub url: String,
-    /// Одноразово выданный в WebUI секрет этой ноды. Передаётся в X-Node-Token.
     pub token: String,
-    /// Период исходящего heartbeat, отчёта трафика и polling команд.
     pub heartbeat_interval_seconds: u64,
 }
 
@@ -120,13 +108,10 @@ pub struct ServerCoreConfig {
     pub quic_bind_to: String,
     pub ssh_bind_to: String,
     pub vnc_bind_to: String,
-
     pub websocket_bind_to: String,
     pub websocket_path: String,
-
     pub ahttp_bind_to: String,
     pub ahttp_path: String,
-
     pub ssh_host_key: String,
 }
 
@@ -136,14 +121,40 @@ impl Default for ServerCoreConfig {
             quic_bind_to: "0.0.0.0:8443".to_string(),
             ssh_bind_to: "0.0.0.0:822".to_string(),
             vnc_bind_to: "0.0.0.0:5900".to_string(),
-
             websocket_bind_to: "0.0.0.0:8080".to_string(),
             websocket_path: "/socket".to_string(),
-
             ahttp_bind_to: "127.0.0.1:8081".to_string(),
             ahttp_path: "/api/v2/telemetry".to_string(),
-
             ssh_host_key: "/etc/ssh/ssh_host_rsa_key".to_string(),
+        }
+    }
+}
+
+// Новая структура для настройки HTTP-транспорта на стороне сервера
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct AhttpServerConfig {
+    pub handshake_path: String,
+    pub auth_path: String,
+    pub traffic_path: String,
+    pub response_headers: String,
+    pub max_header_bytes: usize,
+}
+
+impl Default for AhttpServerConfig {
+    fn default() -> Self {
+        Self {
+            handshake_path: "/handshake".to_string(),
+            auth_path: "/auth".to_string(),
+            traffic_path: "/traffic".to_string(),
+            max_header_bytes: 16384,
+            response_headers: "HTTP/1.1 200 OK\r\n\
+                               Content-Type: video/mp4\r\n\
+                               Cache-Control: no-cache, no-transform, private, must-revalidate\r\n\
+                               Pragma: no-cache\r\n\
+                               X-Accel-Buffering: no\r\n\
+                               Content-Length: {}\r\n\
+                               Connection: keep-alive\r\n\r\n".to_string(),
         }
     }
 }
@@ -152,30 +163,26 @@ impl Default for ServerCoreConfig {
 pub struct Config {
     #[serde(default)]
     pub network: NetworkConfig,
-
     #[serde(default)]
     pub server: ServerCoreConfig,
-
     #[serde(default)]
     pub quic_transport: QuicConfig,
-
     #[serde(default)]
     pub crypto: CryptoConfig,
-
     #[serde(default)]
     pub authentication: AuthenticationConfig,
-
     #[serde(default)]
     pub control_plane: ControlPlaneConfig,
-
     #[serde(default)]
     pub stealth: StealthConfig,
+    #[serde(default)]
+    pub ahttp: AhttpServerConfig,
 }
 
 #[derive(Debug, Parser)]
 pub struct Opt {
     #[clap(short, long, default_value = "./server.toml")]
-    cfg: String,
+    pub cfg: String,
 }
 
 pub async fn load() -> anyhow::Result<Config> {
@@ -187,13 +194,7 @@ pub async fn load() -> anyhow::Result<Config> {
             Ok(cfg)
         }
         Err(_) => {
-            warn!(
-                "\n\
-                Cannot find server config file in {}, use '-c' or '--cfg' \n\
-                './anet-server -c /home/anet/anet/config.toml' for example,
-                ",
-                opt.cfg,
-            );
+            warn!("\nCannot find server config file in {}, use '-c' or '--cfg'\n", opt.cfg);
             exit(-1)
         }
     }

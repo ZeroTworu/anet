@@ -39,6 +39,24 @@ server_pub_key = "{{SERVER_PUB_KEY}}"
 enabled = true
 interval_minutes = 1
 
+[ahttp]
+# Максимальное количество удерживаемых idle-соединений на хост в пуле
+pool_max_idle_per_host = 8
+
+# Время жизни (в секундах) неиспользуемого Keep-Alive соединения в пуле
+pool_idle_timeout_secs = 60
+
+# Включение алгоритма Nagle на TCP-сокете (рекомендуется true)
+tcp_nodelay = true
+
+# Тайм-аут на выполнение одного HTTP-запроса (в секундах)
+timeout_secs = 10
+
+# Пути для фаз Handshake, Auth и Traffic (подставляются после базового dsn-path)
+handshake_path = "/handshake"
+auth_path = "/auth"
+traffic_path = "/traffic"
+
 [stealth]
 frag_enabled = true
 frag_min_chunks = 2
