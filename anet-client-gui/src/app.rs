@@ -169,6 +169,7 @@ pub struct ANetApp {
     is_in_tray: bool,
     sidebar_open: bool,
     appbar_open: bool,
+    exclbar_open: bool,
     logbar_open: bool,
     node_popup_open: bool,
     editing_config_id: Option<String>,
@@ -188,6 +189,11 @@ pub struct ANetApp {
     pub total_txm: String,
 
     tray_value: bool,
+
+    // Адреса, исключённые из VPN-туннеля.
+    exclude_routes: Vec<String>,
+    exclude_route_input: String,
+    exclude_routes_changed: bool,
 
     status_text: String,
     status_color: egui::Color32,
@@ -616,6 +622,259 @@ impl ANetApp {
         lines.join("\n")
     }
 
+    fn inject_exclude_route_to_toml(
+    content: &str,
+    routes: &[String],
+) -> String {
+    let normalized = content.replace("\r\n", "\n");
+
+    let mut lines: Vec<String> = normalized
+        .lines()
+        .map(|s| s.to_string())
+        .collect();
+
+    let routes_str = routes
+        .iter()
+        .map(|route| {
+            format!(
+                "\"{}\"",
+                Self::toml_escape_string(route)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let exclude_line =
+        format!("exclude_route_for = [{}]", routes_str);
+
+    let mut in_main = false;
+    let mut main_end_idx = None;
+    let mut exclude_idx = None;
+
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+
+        if trimmed.starts_with('[')
+            && trimmed.ends_with(']')
+        {
+            if trimmed == "[main]" {
+                in_main = true;
+            } else if in_main {
+                main_end_idx = Some(i);
+                in_main = false;
+            }
+        } else if in_main {
+            let clean_line: String = trimmed
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect();
+
+            if clean_line.starts_with("exclude_route_for=") {
+                exclude_idx = Some(i);
+            }
+        }
+    }
+
+    match exclude_idx {
+        Some(idx) => {
+            lines[idx] = exclude_line;
+        }
+
+        None => {
+            let insert_pos =
+                main_end_idx.unwrap_or(lines.len());
+
+            lines.insert(
+                insert_pos.min(lines.len()),
+                exclude_line,
+            );
+        }
+    }
+
+    lines.join("\n")
+}
+
+
+fn close_exclbar(&mut self) {
+    self.exclbar_open = false;
+
+    if self.exclude_routes_changed {
+        self.exclude_routes_changed = false;
+        self.save_exclude_routes();
+    }
+}
+
+
+fn save_exclude_routes(&mut self) {
+    let mut updated_config_data:
+        Option<(String, String, String)> = None;
+
+    {
+        let mut settings = self.settings.lock().unwrap();
+
+        if let Some(active_id) =
+            settings.active_config_id.clone()
+        {
+            if let Some(cfg) = settings
+                .configs
+                .iter_mut()
+                .find(|c| c.id == active_id)
+            {
+                cfg.content =
+                    Self::inject_exclude_route_to_toml(
+                        &cfg.content,
+                        &self.exclude_routes,
+                    );
+
+                updated_config_data = Some((
+                    cfg.id.clone(),
+                    cfg.content.clone(),
+                    cfg.name.clone(),
+                ));
+            }
+
+            settings.save();
+        }
+    }
+
+    let Some((id, content, name)) =
+        updated_config_data
+    else {
+        self.log(
+            "Ошибка: нет активного конфига для сохранения исключений."
+        );
+        return;
+    };
+
+    let path_by_id = std::path::PathBuf::from("configs")
+        .join(format!("{}.toml", id));
+
+    let path_by_name = std::path::PathBuf::from("configs")
+        .join(format!("{}.toml", name));
+
+    let target_path = if path_by_id.exists() {
+        Some(path_by_id)
+    } else if path_by_name.exists() {
+        Some(path_by_name)
+    } else {
+        let root_id =
+            std::path::PathBuf::from(format!("{}.toml", id));
+
+        let root_name =
+            std::path::PathBuf::from(format!("{}.toml", name));
+
+        if root_id.exists() {
+            Some(root_id)
+        } else if root_name.exists() {
+            Some(root_name)
+        } else {
+            None
+        }
+    };
+
+    if let Some(path) = target_path {
+        match std::fs::write(&path, &content) {
+            Ok(_) => {
+                self.log(
+                    "Список исключённых адресов сохранён."
+                );
+            }
+
+            Err(e) => {
+                self.log(&format!(
+                    "Ошибка записи исключений в {:?}: {}",
+                    path, e
+                ));
+                return;
+            }
+        }
+    }
+
+    // Создаём новый AnetClient с обновлённым CoreConfig.
+    self.load_config_from_content(
+        &id,
+        &content,
+        &name,
+    );
+
+    // Если VPN уже работает — применяем изменение сразу.
+    let current_state =
+        self.shared.lock().unwrap().state;
+
+    if current_state == ConnectionState::Connected {
+        self.log(
+            "Переподключение VPN из-за изменения исключений..."
+        );
+
+        self.stop_vpn();
+
+        let shared_clone = self.shared.clone();
+        let logs_clone = self.logs.clone();
+        let rt_handle = self.rt.handle().clone();
+
+        rt_handle.spawn(async move {
+            tokio::time::sleep(
+                std::time::Duration::from_millis(500)
+            )
+            .await;
+
+            let client_opt = {
+                let mut guard =
+                    shared_clone.lock().unwrap();
+
+                guard.state =
+                    ConnectionState::Connecting;
+
+                guard.client.clone()
+            };
+
+            if let Some(client_clone) = client_opt {
+                logs_clone
+                    .lock()
+                    .unwrap()
+                    .push(
+                        "> Restarting VPN with updated route exclusions..."
+                            .into()
+                    );
+
+                match client_clone.start().await {
+                    Ok(_) => {
+                        logs_clone
+                            .lock()
+                            .unwrap()
+                            .push(
+                                "> VPN restarted successfully."
+                                    .into()
+                            );
+                    }
+
+                    Err(e) => {
+                        logs_clone
+                            .lock()
+                            .unwrap()
+                            .push(format!(
+                                "> Error: {}",
+                                e
+                            ));
+
+                        shared_clone
+                            .lock()
+                            .unwrap()
+                            .state =
+                            ConnectionState::Disconnected;
+
+                        anet_client_core::events::err(
+                            e.to_string()
+                        );
+                    }
+                }
+            }
+        });
+    }
+}
+
+
+
     #[cfg(target_os = "windows")]
     fn inject_tray_mode_to_toml(content: &str, tray_mode: bool) -> String {
         let normalized = content.replace("\r\n", "\n");
@@ -725,6 +984,7 @@ impl ANetApp {
             is_in_tray: false,
             sidebar_open: false,
             appbar_open: false,
+            exclbar_open: false,
             logbar_open: false,
             node_popup_open: false,
             editing_config_id: None,
@@ -742,6 +1002,11 @@ impl ANetApp {
             total_txm: "0 B".to_string(),
 
             tray_value: true,
+
+            exclude_routes: Vec::new(),
+            exclude_route_input: String::new(),
+            exclude_routes_changed: false,
+
             status_text: "CONNECTION".to_string(),
             status_color: egui::Color32::from_rgb(128, 128, 128),
         };
@@ -913,12 +1178,26 @@ impl ANetApp {
 
                 // Загружаем настройку сворачивания в трей из [main]
                 if let Ok(raw_toml) = toml::from_str::<toml::Value>(content) {
-                    self.tray_value = raw_toml
-                        .get("main")
-                        .and_then(|main| main.get("tray_mode"))
-                        .and_then(|value| value.as_bool())
-                        .unwrap_or(true);
-                }
+    self.tray_value = raw_toml
+        .get("main")
+        .and_then(|main| main.get("tray_mode"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(true);
+
+    self.exclude_routes = raw_toml
+        .get("main")
+        .and_then(|main| main.get("exclude_route_for"))
+        .and_then(|value| value.as_array())
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|value| {
+                    value.as_str().map(ToOwned::to_owned)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+}
 
                 for proc in &mut self.processes {
                     proc.is_selected = cfg.main.per_app.contains(&proc.name);
@@ -964,6 +1243,70 @@ impl ANetApp {
             }
         }
     }
+
+    /// Проверка адреса для exclude_route_for.
+///
+/// Поддерживаются:
+/// - IPv4 / IPv6
+/// - IPv4 / IPv6 с CIDR
+/// - hostname / domain
+fn validate_exclude_route(value: &str) -> bool {
+    let value = value.trim();
+
+    if value.is_empty() || value.chars().any(|c| c.is_whitespace()) {
+        return false;
+    }
+
+    // Обычный IP.
+    if value.parse::<std::net::IpAddr>().is_ok() {
+        return true;
+    }
+
+    // IP/CIDR.
+    if let Some((ip, prefix)) = value.split_once('/') {
+        if let (Ok(addr), Ok(prefix)) = (
+            ip.parse::<std::net::IpAddr>(),
+            prefix.parse::<u8>(),
+        ) {
+            let max_prefix = match addr {
+                std::net::IpAddr::V4(_) => 32,
+                std::net::IpAddr::V6(_) => 128,
+            };
+
+            return prefix <= max_prefix;
+        }
+    }
+
+    // URL, порт, wildcard и некорректные точки запрещены.
+    if value.contains("://")
+        || value.contains(':')
+        || value.contains('*')
+        || value.starts_with('.')
+        || value.ends_with('.')
+    {
+        return false;
+    }
+
+    // Проверка hostname/domain.
+    value.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-')
+    })
+}
+
+fn toml_escape_string(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
+}
 
     fn styled_label_text(&self, text: impl Into<String>, color: egui::Color32) -> egui::RichText {
         egui::RichText
@@ -1082,6 +1425,7 @@ impl eframe::App for ANetApp {
 
         let margin = 20.0;
         let label_size = 10.0;
+        let sub_label_size = 8.0;
 
         let track_width = 2.0;
         let track_margin = -2.0;
@@ -1444,27 +1788,40 @@ impl eframe::App for ANetApp {
                                     self.styled_label_text(&self.status_text, self.status_color)
                                 );
 
-
                                 // Захватываем блокировку только если Mutex свободен прямо сейчас
-if let Ok(logs) = self.logs.try_lock() {
-    if let Some((text, color)) = logs.iter().rev().find_map(|line| {
-        if line.contains("Error") || line.contains("Failed") || line.contains("Connection lost") {
-            Some((line.clone(), red_color))
-        } else if line.contains("Tunnel UP") {
-            Some((line.clone(), green_color))
-        } else if line.contains("Config loaded") {
-            Some((line.clone(), gold_color))
-        } else if line.contains("Cleaning up dead session") {
-            Some((line.clone(), orange_color))
-        } else {
-            None
-        }
-    }) {
-        self.status_text = text;
-        self.status_color = color;
-    }
-}
-// Блокировка `logs` автоматически освобождается в конце блока `if let`
+                                if let Ok(logs) = self.logs.try_lock() {
+                                    if
+                                        let Some((text, color)) = logs
+                                            .iter()
+                                            .rev()
+                                            .find_map(|line| {
+                                                if
+                                                    line.contains("Error") ||
+                                                    line.contains("Failed") ||
+                                                    line.contains("Connection lost")
+                                                {
+                                                    Some((line.clone(), red_color))
+                                                } else if line.contains("Tunnel UP") {
+                                                    Some((line.clone(), green_color))
+                                                } else if 
+                                                    line.contains("Config loaded") ||
+                                                    line.contains("Найдено обновление")
+                                                {
+                                                    Some((line.clone(), gold_color))
+                                                } else if line.contains("Cleaning up dead session")||
+                                                    line.contains("добавлен")||
+                                                    line.contains("удален") {
+                                                    Some((line.clone(), orange_color))
+                                                } else {
+                                                    None
+                                                }
+                                            })
+                                    {
+                                        self.status_text = text;
+                                        self.status_color = color;
+                                    }
+                                }
+                                // Блокировка `logs` автоматически освобождается в конце блока `if let`
 
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
@@ -1714,7 +2071,8 @@ if let Ok(logs) = self.logs.try_lock() {
                             }
 
                             ui.add_space(2.0);
-                            ui.label(RichText::new("MENU").size(label_size).color(grey_color));
+                            ui.label(RichText::new("SETTINGS").size(label_size).color(grey_color));
+                            ui.label(RichText::new("CONFIGS").size(sub_label_size).color(grey_color));
                         }
                     );
 
@@ -1804,8 +2162,9 @@ if let Ok(logs) = self.logs.try_lock() {
                                     self.appbar_open = !self.appbar_open;
                                 }
 
-                                ui.add_space(2.0);
-                                ui.label(RichText::new("APPS").size(label_size).color(grey_color));
+                                ui.add_space(2.0);                               
+                                ui.label(RichText::new("PER APP").size(label_size).color(grey_color));
+                                ui.label(RichText::new("TUNNELING").size(sub_label_size).color(grey_color));
                             }
                         );
                     }
@@ -2200,171 +2559,497 @@ if let Ok(logs) = self.logs.try_lock() {
 
                     ui.add_space(20.0);
 
-                    match state {
-                        ConnectionState::Connected => {
-                            let text_str = "CONNECTED";
-                            let font_size = 16.0;
+                    let total_width = ui.available_width();
+                    let height = 48.0;
 
-                            let font_id = egui::FontId::new(
-                                font_size,
-                                egui::FontFamily::Proportional
+                    // Резервируем общую область
+                    let (rect, _) = ui.allocate_exact_size(
+                        egui::vec2(total_width, height),
+                        egui::Sense::hover()
+                    );
+
+                    // 1. ЛЕВАЯ КНОПКА: CONF (x: 0..60)
+                    let left_rect = egui::Rect::from_min_size(rect.min, egui::vec2(60.0, height));
+                    ui.allocate_ui_at_rect(left_rect, |ui| {
+                        ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
+                            let anim_id = ui.id().with("gear_btn_color");
+                            let hover_t: f32 = ui.data(|d| d.get_temp(anim_id)).unwrap_or(0.0);
+
+                            let normal_color = white_color;
+                            let hover_color = gold_color;
+
+                            let r = ((normal_color.r() as f32) * (1.0 - hover_t) +
+                                (hover_color.r() as f32) * hover_t) as u8;
+                            let g = ((normal_color.g() as f32) * (1.0 - hover_t) +
+                                (hover_color.g() as f32) * hover_t) as u8;
+                            let b = ((normal_color.b() as f32) * (1.0 - hover_t) +
+                                (hover_color.b() as f32) * hover_t) as u8;
+                            let current_color = egui::Color32::from_rgb(r, g, b);
+
+                            let icon = egui::Image
+                                ::new(egui::include_image!("./assets/excl.svg"))
+                                .fit_to_exact_size(button_icon_size)
+                                .tint(current_color);
+
+                            let menu_button = egui::Button
+                                ::image(icon)
+                                .min_size(button_size)
+                                .stroke(egui::Stroke::NONE)
+                                .frame(false)
+                                .rounding(button_size.y / 2.0);
+
+                            let response = ui
+                                .add(menu_button)
+                                .on_hover_cursor(egui::CursorIcon::PointingHand);
+
+                            let target_t = if response.hovered() { 1.0 } else { 0.0 };
+                            let dt = ui.input(|i| i.stable_dt);
+                            let speed = 1.0 / 0.2;
+                            let new_t = if hover_t < target_t {
+                                (hover_t + speed * dt).min(target_t)
+                            } else {
+                                (hover_t - speed * dt).max(target_t)
+                            };
+
+                            ui.data_mut(|d| d.insert_temp(anim_id, new_t));
+
+                            if new_t != target_t {
+                                ui.ctx().request_repaint();
+                            }
+
+                            if response.clicked() {
+                                self.exclbar_open = !self.exclbar_open;
+                            }
+
+                            ui.add_space(2.0);
+                            ui.label(
+                                egui::RichText::new("EXCLUDED").size(label_size).color(grey_color)
                             );
-                            let galley = ui
-                                .painter()
-                                .layout_no_wrap(text_str.to_string(), font_id, grey_color);
-                            let text_width = galley.rect.width();
+                            ui.label(
+                                egui::RichText::new("ADDRESSES").size(sub_label_size).color(grey_color)
+                            );
+                        });
+                    });
 
-                            let icon_size = egui::vec2(16.0, 16.0);
-                            let spacing = 2.0;
+                    // 2. ПРАВАЯ КНОПКА: APPS (x: total_width - 60 .. total_width)
+                    {
 
-                            let available_width = ui.available_width();
-                            let text_start_x = (available_width - text_width) / 2.0;
-                            let left_padding = (text_start_x - icon_size.x + spacing).max(0.0);
+                        let (show_upd, release_data, progress) = match &self.update_status {
+                                UpdateStatus::Available(r) => (true, Some(r.clone()), None),
+                                UpdateStatus::Downloading(p) => (true, None, Some(*p)),
+                                _ => (false, None, None),
+                            };
 
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = spacing;
-                                ui.add_space(left_padding);
+                            if show_upd {
+                                let modal_bg = egui::Color32::from_rgb(32, 32, 32);
 
-                                let indicator_color = egui::Color32::from_rgb(76, 175, 80);
-                                let (rect, _) = ui.allocate_exact_size(
-                                    icon_size,
-                                    egui::Sense::hover()
-                                );
+                                egui::Window
+                                    ::new("UPDATE_SYSTEM")
+                                    .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                                    .collapsible(false)
+                                    .resizable(false)
+                                    .title_bar(false)
+                                    .order(egui::Order::Foreground)
+                                    .frame(
+                                        egui::Frame::NONE
+                                            .fill(modal_bg)
+                                            .stroke(egui::Stroke::new(3.0, gold_color))
+                                            .inner_margin(24.0)
+                                            .corner_radius(4.0)
+                                    )
+                                    .show(ctx, |ui| {
+                                        ui.vertical_centered(|ui| {
+                                            ui.label(
+                                                egui::RichText
+                                                    ::new("SYSTEM UPDATE")
+                                                    .size(22.0)
+                                                    .strong()
+                                                    .color(gold_color)
+                                            );
 
-                                let shifted_rect = rect.translate(egui::vec2(0.0, 0.0));
+                                            if let Some(rel) = release_data {
+                                                ui.label(
+                                                    egui::RichText
+                                                        ::new(
+                                                            format!(
+                                                                "Доступна версия: {}",
+                                                                rel.tag_name
+                                                            )
+                                                        )
+                                                        .size(16.0)
+                                                        .color(gold_color)
+                                                );
+                                                ui.add_space(16.0);
+                                                ui.add_space(16.0);
+                                                ui.label(
+                                                    egui::RichText
+                                                        ::new("Список изменений:")
+                                                        .size(14.0)
+                                                        .color(gold_color)
+                                                        .strong()
+                                                );
+                                                ui.add_space(4.0);
 
-                                egui::Image
-                                    ::new(egui::include_image!("./assets/dot.svg"))
-                                    .tint(indicator_color.linear_multiply(0.15))
-                                    .paint_at(ui, shifted_rect.expand(4.0));
+                                                ui.style_mut().spacing.scroll.foreground_color = false;
+                                                ui.style_mut().visuals.widgets.inactive.bg_fill =
+                                                    egui::Color32::from_rgb(80, 80, 80);
+                                                ui.style_mut().visuals.widgets.hovered.bg_fill =
+                                                    egui::Color32::from_rgb(120, 120, 120);
+                                                ui.style_mut().visuals.widgets.active.bg_fill =
+                                                    egui::Color32::from_rgb(160, 160, 160);
 
-                                egui::Image
-                                    ::new(egui::include_image!("./assets/dot.svg"))
-                                    .tint(indicator_color.linear_multiply(0.35))
-                                    .paint_at(ui, shifted_rect.expand(2.0));
+                                                egui::ScrollArea
+                                                    ::vertical()
+                                                    .max_height(180.0)
+                                                    .auto_shrink([false, true])
+                                                    .scroll_bar_visibility(
+                                                        ScrollBarVisibility::AlwaysVisible
+                                                    )
+                                                    .show(ui, |ui| {
+                                                        let changelog = rel.body
+                                                            .as_deref()
+                                                            .unwrap_or(
+                                                                "Описание изменений отсутствует."
+                                                            );
+                                                        ui.add(
+                                                            egui::Label
+                                                                ::new(
+                                                                    egui::RichText
+                                                                        ::new(changelog)
+                                                                        .size(13.0)
+                                                                        .color(gold_color)
+                                                                        .family(
+                                                                            egui::FontFamily::Monospace
+                                                                        )
+                                                                )
+                                                                .wrap()
+                                                        );
+                                                    });
+                                                ui.add_space(24.0);
+                                                ui.horizontal(|ui| {
+                                                    ui.add_space(ui.available_width() / 6.0);
 
-                                egui::Image
-                                    ::new(egui::include_image!("./assets/dot.svg"))
-                                    .max_size(icon_size)
-                                    .paint_at(ui, shifted_rect);
+                                                    let btn_update = egui::Button
+                                                        ::new(
+                                                            egui::RichText
+                                                                ::new("ОБНОВИТЬ")
+                                                                .size(16.0)
+                                                                .strong()
+                                                                .color(egui::Color32::BLACK)
+                                                        )
+                                                        .fill(gold_color)
+                                                        .min_size(egui::vec2(120.0, 36.0));
 
+                                                    if ui.add(btn_update).clicked() {
+                                                        let r_clone = rel.clone();
+                                                        self.logs
+                                                            .lock()
+                                                            .unwrap()
+                                                            .push(
+                                                                format!(
+                                                                    "> Обновляемся на {}",
+                                                                    rel.tag_name
+                                                                )
+                                                            );
+                                                        self.update_status =
+                                                            UpdateStatus::Downloading(0.0);
+                                                        self.rt.spawn(async move {
+                                                            if
+                                                                let Err(e) =
+                                                                    Updater::download_and_apply(
+                                                                        r_clone
+                                                                    ).await
+                                                            {
+                                                                anet_client_core::events::err(
+                                                                    format!("Ошибка загрузки: {}", e)
+                                                                );
+                                                            }
+                                                        });
+                                                    }
+
+                                                    ui.add_space(20.0);
+
+                                                    let btn_cancel = egui::Button
+                                                        ::new(
+                                                            egui::RichText
+                                                                ::new("ПОЗДНЕЕ")
+                                                                .size(16.0)
+                                                                .strong()
+                                                                .color(egui::Color32::BLACK)
+                                                        )
+                                                        .fill(gold_color)
+                                                        .min_size(egui::vec2(120.0, 36.0));
+
+                                                    if ui.add(btn_cancel).clicked() {
+                                                        self.update_status = UpdateStatus::Idle;
+                                                    }
+                                                });
+                                            } else if let Some(p) = progress {
+                                                ui.add_space(20.0);
+                                                ui.label(
+                                                    egui::RichText
+                                                        ::new("СКАЧИВАНИЕ НОВЫХ БИНАРНИКОВ...")
+                                                        .color(gold_color)
+                                                        .strong()
+                                                );
+                                                ui.add_space(12.0);
+
+                                                ui.add(
+                                                    egui::ProgressBar
+                                                        ::new(p)
+                                                        .text(format!("{:.1}%", p * 100.0))
+                                                        .desired_width(260.0)
+                                                        .fill(gold_color)
+                                                );
+
+                                                ui.add_space(20.0);
+                                                ui.label(
+                                                    egui::RichText
+                                                        ::new(
+                                                            "Пожалуйста, не закрывайте приложение"
+                                                        )
+                                                        .size(11.0)
+                                                        .italics()
+                                                        .color(gold_color)
+                                                );
+                                            }
+                                        });
+                                    });
+                            }
+
+                        let right_rect = egui::Rect::from_min_size(
+                            egui::pos2(rect.max.x - 60.0, rect.min.y),
+                            egui::vec2(60.0, height)
+                        );
+                        ui.allocate_ui_at_rect(right_rect, |ui| {
+                            ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
+                                let anim_id = ui.id().with("apps_btn_color");
+                                let hover_t: f32 = ui.data(|d| d.get_temp(anim_id)).unwrap_or(0.0);
+
+                                let normal_color = white_color;
+                                let hover_color = gold_color;
+
+                                let r = ((normal_color.r() as f32) * (1.0 - hover_t) +
+                                    (hover_color.r() as f32) * hover_t) as u8;
+                                let g = ((normal_color.g() as f32) * (1.0 - hover_t) +
+                                    (hover_color.g() as f32) * hover_t) as u8;
+                                let b = ((normal_color.b() as f32) * (1.0 - hover_t) +
+                                    (hover_color.b() as f32) * hover_t) as u8;
+                                let current_color = egui::Color32::from_rgb(r, g, b);
+
+                                let icon = egui::Image
+                                    ::new(egui::include_image!("./assets/update.svg"))
+                                    .fit_to_exact_size(button_icon_size)
+                                    .tint(current_color);
+
+                                let menu_button = egui::Button
+                                    ::image(icon)
+                                    .min_size(button_size)
+                                    .stroke(egui::Stroke::NONE)
+                                    .frame(false)
+                                    .rounding(button_size.y / 2.0);
+
+                                let response = ui
+                                    .add(menu_button)
+                                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+
+                                let target_t = if response.hovered() { 1.0 } else { 0.0 };
+                                let dt = ui.input(|i| i.stable_dt);
+                                let speed = 1.0 / 0.2;
+                                let new_t = if hover_t < target_t {
+                                    (hover_t + speed * dt).min(target_t)
+                                } else {
+                                    (hover_t - speed * dt).max(target_t)
+                                };
+
+                                ui.data_mut(|d| d.insert_temp(anim_id, new_t));
+
+                                if new_t != target_t {
+                                    ui.ctx().request_repaint();
+                                }
+
+                                if response.clicked() {
+                                   self.check_for_updates();
+                                }
+
+                                ui.add_space(2.0);
                                 ui.label(
-                                    egui::RichText
-                                        ::new(text_str)
-                                        .size(font_size)
-                                        .strong()
-                                        .color(green_color)
+                                    egui::RichText::new("UPDATE").size(label_size).color(grey_color)
+                                );
+                                ui.label(
+                                    egui::RichText::new("CHECK").size(sub_label_size).color(grey_color)
                                 );
                             });
-                        }
-                        ConnectionState::Disconnected => {
-                            let text_str = "DISCONNECTED";
-                            let font_size = 16.0;
-
-                            let font_id = egui::FontId::new(
-                                font_size,
-                                egui::FontFamily::Proportional
-                            );
-                            let galley = ui
-                                .painter()
-                                .layout_no_wrap(text_str.to_string(), font_id, grey_color);
-                            let text_width = galley.rect.width();
-
-                            let icon_size = egui::vec2(16.0, 16.0);
-                            let spacing = 2.0;
-
-                            let available_width = ui.available_width();
-                            let text_start_x = (available_width - text_width) / 2.0;
-                            let left_padding = (text_start_x - icon_size.x + spacing).max(0.0);
-
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = spacing;
-                                ui.add_space(left_padding);
-
-                                let indicator_color = grey_color;
-                                let (rect, _) = ui.allocate_exact_size(
-                                    icon_size,
-                                    egui::Sense::hover()
-                                );
-
-                                let shifted_rect = rect.translate(egui::vec2(0.0, 0.0));
-
-                                egui::Image
-                                    ::new(egui::include_image!("./assets/block.svg"))
-                                    .tint(indicator_color.linear_multiply(0.15))
-                                    .paint_at(ui, shifted_rect.expand(4.0));
-
-                                egui::Image
-                                    ::new(egui::include_image!("./assets/block.svg"))
-                                    .tint(indicator_color.linear_multiply(0.35))
-                                    .paint_at(ui, shifted_rect.expand(2.0));
-
-                                egui::Image
-                                    ::new(egui::include_image!("./assets/block.svg"))
-                                    .max_size(icon_size)
-                                    .paint_at(ui, shifted_rect);
-
-                                ui.label(
-                                    egui::RichText
-                                        ::new(text_str)
-                                        .size(font_size)
-                                        .strong()
-                                        .color(grey_color)
-                                );
-                            });
-                        }
-                        ConnectionState::Connecting => {
-                            let text_str = "CONNECTING";
-                            let font_size = 16.0;
-
-                            let font_id = egui::FontId::new(
-                                font_size,
-                                egui::FontFamily::Proportional
-                            );
-                            let galley = ui
-                                .painter()
-                                .layout_no_wrap(text_str.to_string(), font_id, grey_color);
-                            let text_width = galley.rect.width();
-
-                            let icon_size = egui::vec2(16.0, 16.0);
-                            let spacing = 2.0;
-
-                            let available_width = ui.available_width();
-                            let text_start_x = (available_width - text_width) / 2.0;
-                            let left_padding = (text_start_x - icon_size.x + spacing).max(0.0);
-
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = spacing;
-                                ui.add_space(left_padding);
-
-                                let indicator_color = orange_color;
-                                let (rect, _) = ui.allocate_exact_size(
-                                    icon_size,
-                                    egui::Sense::hover()
-                                );
-
-                                let shifted_rect = rect.translate(egui::vec2(0.0, 0.0));
-
-                                egui::Image
-                                    ::new(egui::include_image!("./assets/connecting.svg"))
-                                    .tint(indicator_color.linear_multiply(0.35))
-                                    .paint_at(ui, shifted_rect.expand(2.0));
-
-                                egui::Image
-                                    ::new(egui::include_image!("./assets/connecting.svg"))
-                                    .max_size(icon_size)
-                                    .paint_at(ui, shifted_rect);
-
-                                ui.label(
-                                    egui::RichText
-                                        ::new(text_str)
-                                        .size(font_size)
-                                        .strong()
-                                        .color(orange_color)
-                                );
-                            });
-                        }
+                        });
                     }
+
+                    // 3. ЦЕНТРАЛЬНЫЙ БЛОК: СТАТУС
+                    #[cfg(target_os = "windows")]
+                    let center_rect = egui::Rect::from_min_max(
+                        egui::pos2(rect.min.x + 60.0, rect.min.y),
+                        egui::pos2(rect.max.x - 60.0, rect.max.y)
+                    );
+
+                    #[cfg(not(target_os = "windows"))]
+                    let center_rect = egui::Rect::from_min_max(
+                        egui::pos2(rect.min.x + 60.0, rect.min.y),
+                        egui::pos2(rect.max.x - 60.0, rect.max.y)
+                    );
+
+                    ui.allocate_ui_at_rect(center_rect, |ui| {
+                        match state {
+                            ConnectionState::Connected => {
+                                let text_str = "CONNECTED";
+                                let indicator_color = egui::Color32::from_rgb(76, 175, 80);
+                                let icon_size = egui::vec2(16.0, 16.0);
+                                let spacing = 6.0;
+
+                                // Запрашиваем у egui точный размер готового текста до его отрисовки
+                                let galley = egui::WidgetText
+                                    ::from(
+                                        egui::RichText
+                                            ::new(text_str)
+                                            .size(16.0)
+                                            .strong()
+                                            .color(green_color)
+                                    )
+                                    .into_galley(
+                                        ui,
+                                        Some(egui::TextWrapMode::Extend),
+                                        f32::INFINITY,
+                                        egui::FontSelection::Default
+                                    );
+
+                                // Вычисляем точную позицию x для старта всей группы (иконка + текст)
+                                let total_width = icon_size.x + spacing + galley.size().x;
+                                let center = center_rect.center();
+                                let start_x = center.x - total_width / 2.0;
+
+                                let i_rect = egui::Rect::from_min_size(
+                                    egui::pos2(start_x, center.y - icon_size.y / 2.0),
+                                    icon_size
+                                );
+
+                                egui::Image
+                                    ::new(egui::include_image!("./assets/dot.svg"))
+                                    .tint(indicator_color.linear_multiply(0.15))
+                                    .paint_at(ui, i_rect.expand(4.0));
+
+                                egui::Image
+                                    ::new(egui::include_image!("./assets/dot.svg"))
+                                    .tint(indicator_color.linear_multiply(0.35))
+                                    .paint_at(ui, i_rect.expand(2.0));
+
+                                egui::Image
+                                    ::new(egui::include_image!("./assets/dot.svg"))
+                                    .fit_to_exact_size(icon_size)
+                                    .paint_at(ui, i_rect);
+
+                                let text_pos = egui::pos2(
+                                    start_x + icon_size.x + spacing,
+                                    center.y - galley.size().y / 2.0
+                                );
+                                ui.painter().galley(text_pos, galley, green_color);
+                            }
+                            ConnectionState::Disconnected => {
+                                let text_str = "DISCONNECTED";
+                                let indicator_color = grey_color;
+                                let icon_size = egui::vec2(16.0, 16.0);
+                                let spacing = 6.0;
+
+                                let galley = egui::WidgetText
+                                    ::from(
+                                        egui::RichText
+                                            ::new(text_str)
+                                            .size(16.0)
+                                            .strong()
+                                            .color(grey_color)
+                                    )
+                                    .into_galley(
+                                        ui,
+                                        Some(egui::TextWrapMode::Extend),
+                                        f32::INFINITY,
+                                        egui::FontSelection::Default
+                                    );
+
+                                let total_width = icon_size.x + spacing + galley.size().x;
+                                let center = center_rect.center();
+                                let start_x = center.x - total_width / 2.0;
+
+                                let i_rect = egui::Rect::from_min_size(
+                                    egui::pos2(start_x, center.y - icon_size.y / 2.0),
+                                    icon_size
+                                );
+
+                                egui::Image
+                                    ::new(egui::include_image!("./assets/block.svg"))
+                                    .tint(indicator_color.linear_multiply(0.15))
+                                    .paint_at(ui, i_rect.expand(4.0));
+
+                                egui::Image
+                                    ::new(egui::include_image!("./assets/block.svg"))
+                                    .tint(indicator_color.linear_multiply(0.35))
+                                    .paint_at(ui, i_rect.expand(2.0));
+
+                                egui::Image
+                                    ::new(egui::include_image!("./assets/block.svg"))
+                                    .fit_to_exact_size(icon_size)
+                                    .paint_at(ui, i_rect);
+
+                                let text_pos = egui::pos2(
+                                    start_x + icon_size.x + spacing,
+                                    center.y - galley.size().y / 2.0
+                                );
+                                ui.painter().galley(text_pos, galley, grey_color);
+                            }
+                            ConnectionState::Connecting => {
+                                let text_str = "CONNECTING";
+                                let indicator_color = orange_color;
+                                let icon_size = egui::vec2(16.0, 16.0);
+                                let spacing = 6.0;
+
+                                let galley = egui::WidgetText
+                                    ::from(
+                                        egui::RichText
+                                            ::new(text_str)
+                                            .size(16.0)
+                                            .strong()
+                                            .color(orange_color)
+                                    )
+                                    .into_galley(
+                                        ui,
+                                        Some(egui::TextWrapMode::Extend),
+                                        f32::INFINITY,
+                                        egui::FontSelection::Default
+                                    );
+
+                                let total_width = icon_size.x + spacing + galley.size().x;
+                                let center = center_rect.center();
+                                let start_x = center.x - total_width / 2.0;
+
+                                let i_rect = egui::Rect::from_min_size(
+                                    egui::pos2(start_x, center.y - icon_size.y / 2.0),
+                                    icon_size
+                                );
+
+                                egui::Image
+                                    ::new(egui::include_image!("./assets/connecting.svg"))
+                                    .tint(indicator_color.linear_multiply(0.35))
+                                    .paint_at(ui, i_rect.expand(2.0));
+
+                                egui::Image
+                                    ::new(egui::include_image!("./assets/connecting.svg"))
+                                    .fit_to_exact_size(icon_size)
+                                    .paint_at(ui, i_rect);
+
+                                let text_pos = egui::pos2(
+                                    start_x + icon_size.x + spacing,
+                                    center.y - galley.size().y / 2.0
+                                );
+                                ui.painter().galley(text_pos, galley, orange_color);
+                            }
+                        }
+                    });
                 });
 
                 ui.add_space(20.0);
@@ -2372,7 +3057,7 @@ if let Ok(logs) = self.logs.try_lock() {
 
         if self.sidebar_open {
             egui::Area
-                ::new(egui::Id::new("config_sidebar"))
+                ::new(egui::Id::new("config_sidebara"))
                 .order(egui::Order::Foreground)
                 .fixed_pos(egui::pos2(0.0, 0.0))
                 .show(ctx, |ui| {
@@ -2407,7 +3092,7 @@ if let Ok(logs) = self.logs.try_lock() {
                                     self.sidebar_open = false;
                                 }
 
-                                ui.heading("Настройки профиля");
+                                ui.heading("Настройки");
                             });
                             ui.separator();
 
@@ -2621,222 +3306,41 @@ if let Ok(logs) = self.logs.try_lock() {
                                 self.open_file_dialog();
                             }
 
-                            ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
-                                ui.add_space(10.0);
+                            // ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
+                            //     ui.add_space(10.0);
 
-                                let is_busy = matches!(
-                                    self.update_status,
-                                    UpdateStatus::Checking | UpdateStatus::Downloading(_)
-                                );
+                            //     let is_busy = matches!(
+                            //         self.update_status,
+                            //         UpdateStatus::Checking | UpdateStatus::Downloading(_)
+                            //     );
 
-                                ui.add_enabled_ui(!is_busy, |ui| {
-                                    let label = if is_busy {
-                                        "⏳ ЖДИТЕ..."
-                                    } else {
-                                        "🔄 ПРОВЕРИТЬ ОБНОВЛЕНИЯ"
-                                    };
+                            //     ui.add_enabled_ui(!is_busy, |ui| {
+                            //         let label = if is_busy {
+                            //             "⏳ ЖДИТЕ..."
+                            //         } else {
+                            //             "🔄 ПРОВЕРИТЬ ОБНОВЛЕНИЯ"
+                            //         };
 
-                                    let btn_text = egui::RichText
-                                        ::new(label)
-                                        .size(11.0)
-                                        .strong()
-                                        .color(gold_color);
-                                    if
-                                        ui
-                                            .add(
-                                                egui::Button
-                                                    ::new(btn_text)
-                                                    .fill(egui::Color32::from_rgb(45, 45, 45))
-                                            )
-                                            .clicked()
-                                    {
-                                        self.check_for_updates();
-                                    }
-                                });
-                            });
+                            //         let btn_text = egui::RichText
+                            //             ::new(label)
+                            //             .size(11.0)
+                            //             .strong()
+                            //             .color(gold_color);
+                            //         if
+                            //             ui
+                            //                 .add(
+                            //                     egui::Button
+                            //                         ::new(btn_text)
+                            //                         .fill(egui::Color32::from_rgb(45, 45, 45))
+                            //                 )
+                            //                 .clicked()
+                            //         {
+                            //             self.check_for_updates();
+                            //         }
+                            //     });
+                            // });
 
-                            let (show_upd, release_data, progress) = match &self.update_status {
-                                UpdateStatus::Available(r) => (true, Some(r.clone()), None),
-                                UpdateStatus::Downloading(p) => (true, None, Some(*p)),
-                                _ => (false, None, None),
-                            };
-
-                            if show_upd {
-                                let modal_bg = egui::Color32::from_rgb(32, 32, 32);
-
-                                egui::Window
-                                    ::new("UPDATE_SYSTEM")
-                                    .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-                                    .collapsible(false)
-                                    .resizable(false)
-                                    .title_bar(false)
-                                    .order(egui::Order::Foreground)
-                                    .frame(
-                                        egui::Frame::NONE
-                                            .fill(modal_bg)
-                                            .stroke(egui::Stroke::new(3.0, gold_color))
-                                            .inner_margin(24.0)
-                                            .corner_radius(4.0)
-                                    )
-                                    .show(ctx, |ui| {
-                                        ui.vertical_centered(|ui| {
-                                            ui.label(
-                                                egui::RichText
-                                                    ::new("SYSTEM UPDATE")
-                                                    .size(22.0)
-                                                    .strong()
-                                                    .color(gold_color)
-                                            );
-
-                                            if let Some(rel) = release_data {
-                                                ui.label(
-                                                    egui::RichText
-                                                        ::new(
-                                                            format!(
-                                                                "Доступна версия: {}",
-                                                                rel.tag_name
-                                                            )
-                                                        )
-                                                        .size(16.0)
-                                                        .color(gold_color)
-                                                );
-                                                ui.add_space(16.0);
-                                                ui.add_space(16.0);
-                                                ui.label(
-                                                    egui::RichText
-                                                        ::new("Список изменений:")
-                                                        .size(14.0)
-                                                        .color(gold_color)
-                                                        .strong()
-                                                );
-                                                ui.add_space(4.0);
-
-                                                ui.style_mut().spacing.scroll.foreground_color = false;
-                                                ui.style_mut().visuals.widgets.inactive.bg_fill =
-                                                    egui::Color32::from_rgb(80, 80, 80);
-                                                ui.style_mut().visuals.widgets.hovered.bg_fill =
-                                                    egui::Color32::from_rgb(120, 120, 120);
-                                                ui.style_mut().visuals.widgets.active.bg_fill =
-                                                    egui::Color32::from_rgb(160, 160, 160);
-
-                                                egui::ScrollArea
-                                                    ::vertical()
-                                                    .max_height(180.0)
-                                                    .auto_shrink([false, true])
-                                                    .scroll_bar_visibility(
-                                                        ScrollBarVisibility::AlwaysVisible
-                                                    )
-                                                    .show(ui, |ui| {
-                                                        let changelog = rel.body
-                                                            .as_deref()
-                                                            .unwrap_or(
-                                                                "Описание изменений отсутствует."
-                                                            );
-                                                        ui.add(
-                                                            egui::Label
-                                                                ::new(
-                                                                    egui::RichText
-                                                                        ::new(changelog)
-                                                                        .size(13.0)
-                                                                        .color(gold_color)
-                                                                        .family(
-                                                                            egui::FontFamily::Monospace
-                                                                        )
-                                                                )
-                                                                .wrap()
-                                                        );
-                                                    });
-                                                ui.add_space(24.0);
-                                                ui.horizontal(|ui| {
-                                                    ui.add_space(ui.available_width() / 6.0);
-
-                                                    let btn_update = egui::Button
-                                                        ::new(
-                                                            egui::RichText
-                                                                ::new("ОБНОВИТЬ")
-                                                                .size(16.0)
-                                                                .strong()
-                                                                .color(egui::Color32::BLACK)
-                                                        )
-                                                        .fill(gold_color)
-                                                        .min_size(egui::vec2(120.0, 36.0));
-
-                                                    if ui.add(btn_update).clicked() {
-                                                        let r_clone = rel.clone();
-                                                        self.logs
-                                                            .lock()
-                                                            .unwrap()
-                                                            .push(
-                                                                format!(
-                                                                    "> Обновляемся на {}",
-                                                                    rel.tag_name
-                                                                )
-                                                            );
-                                                        self.update_status =
-                                                            UpdateStatus::Downloading(0.0);
-                                                        self.rt.spawn(async move {
-                                                            if
-                                                                let Err(e) =
-                                                                    Updater::download_and_apply(
-                                                                        r_clone
-                                                                    ).await
-                                                            {
-                                                                anet_client_core::events::err(
-                                                                    format!("Ошибка загрузки: {}", e)
-                                                                );
-                                                            }
-                                                        });
-                                                    }
-
-                                                    ui.add_space(20.0);
-
-                                                    let btn_cancel = egui::Button
-                                                        ::new(
-                                                            egui::RichText
-                                                                ::new("ПОЗДНЕЕ")
-                                                                .size(16.0)
-                                                                .strong()
-                                                                .color(egui::Color32::BLACK)
-                                                        )
-                                                        .fill(gold_color)
-                                                        .min_size(egui::vec2(120.0, 36.0));
-
-                                                    if ui.add(btn_cancel).clicked() {
-                                                        self.update_status = UpdateStatus::Idle;
-                                                    }
-                                                });
-                                            } else if let Some(p) = progress {
-                                                ui.add_space(20.0);
-                                                ui.label(
-                                                    egui::RichText
-                                                        ::new("СКАЧИВАНИЕ НОВЫХ БИНАРНИКОВ...")
-                                                        .color(gold_color)
-                                                        .strong()
-                                                );
-                                                ui.add_space(12.0);
-
-                                                ui.add(
-                                                    egui::ProgressBar
-                                                        ::new(p)
-                                                        .text(format!("{:.1}%", p * 100.0))
-                                                        .desired_width(260.0)
-                                                        .fill(gold_color)
-                                                );
-
-                                                ui.add_space(20.0);
-                                                ui.label(
-                                                    egui::RichText
-                                                        ::new(
-                                                            "Пожалуйста, не закрывайте приложение"
-                                                        )
-                                                        .size(11.0)
-                                                        .italics()
-                                                        .color(gold_color)
-                                                );
-                                            }
-                                        });
-                                    });
-                            }
+                            
                         });
                 });
         }
@@ -3033,6 +3537,341 @@ if let Ok(logs) = self.logs.try_lock() {
                 });
         }
 
+
+  
+
+        if self.exclbar_open {
+    egui::Area
+        ::new(egui::Id::new("config_exclbar"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(egui::pos2(0.0, 0.0))
+        .show(ctx, |ui| {
+            let screen_rect = ui.ctx().screen_rect();
+            let corner_radius = 14.0;
+
+            egui::Frame
+                ::none()
+                .fill(ui.visuals().window_fill())
+                .inner_margin(margin)
+                .corner_radius(corner_radius)
+                .show(ui, |ui| {
+                    ui.set_width(
+                        screen_rect.width() - margin * 2.0
+                    );
+
+                    ui.set_height(
+                        screen_rect.height() - margin * 2.0
+                    );
+
+                   if ui.input(|i| {
+    i.key_pressed(egui::Key::Escape)
+}) {
+    self.close_exclbar();
+}
+
+                    // HEADER
+                    ui.horizontal(|ui| {
+                        let circle_button =
+                            egui::Button
+                                ::new("⏴")
+                                .min_size(button_size)
+                                .stroke(Stroke::NONE)
+                                .rounding(
+                                    button_size.y / 2.0
+                                );
+
+                        let response = ui
+                            .add(circle_button)
+                            .on_hover_cursor(
+                                egui::CursorIcon::PointingHand
+                            );
+
+                       if response.clicked() {
+    self.close_exclbar();
+}
+
+                        ui.heading(
+                            "Исключить адреса из туннеля"
+                        );
+                    });
+
+                    ui.separator();
+                    ui.add_space(8.0);
+
+                    ui.label(
+                        egui::RichText::new(
+                            "Эти адреса будут исключены из VPN-туннеля."
+                        )
+                        .size(11.0)
+                        .color(grey_color)
+                        .family(
+                            egui::FontFamily::Name(
+                                "Inter-V".into()
+                            )
+                        )
+                    );
+
+                    ui.add_space(14.0);
+
+                    // ==============================
+                    // ADD ADDRESS
+                    // ==============================
+                    ui.horizontal(|ui| {
+                        let input_width =
+                            (ui.available_width() - 92.0)
+                                .max(160.0);
+
+                        let response = ui.add(
+                            egui::TextEdit::singleline(
+                                &mut self.exclude_route_input
+                            )
+                            .desired_width(input_width)
+                            .hint_text(
+                                "IP, CIDR или домен"
+                            )
+                        );
+
+                        let add_clicked = ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new(
+                                        "ДОБАВИТЬ"
+                                    )
+                                    .size(11.0)
+                                    .strong()
+                                )
+                                .min_size(
+                                    egui::vec2(
+                                        82.0,
+                                        28.0
+                                    )
+                                )
+                            )
+                            .on_hover_cursor(
+                                egui::CursorIcon::PointingHand
+                            )
+                            .clicked();
+
+                        let enter_pressed =
+                            response.lost_focus()
+                                && ui.input(|i| {
+                                    i.key_pressed(
+                                        egui::Key::Enter
+                                    )
+                                });
+
+                        if add_clicked || enter_pressed {
+                            let route =
+                                self.exclude_route_input
+                                    .trim()
+                                    .to_string();
+
+                            if !Self::validate_exclude_route(
+                                &route
+                            ) {
+                                self.log(&format!(
+                                    "Некорректный адрес: {}",
+                                    route
+                                ));
+                            } else if self
+                                .exclude_routes
+                                .iter()
+                                .any(|r| r == &route)
+                            {
+                                self.log(&format!(
+                                    "Адрес уже добавлен: {}",
+                                    route
+                                ));
+                            } else {
+                                self.log(&format!("Адрес добавлен: {}",route));                               
+
+                                self.exclude_routes.push(route);
+self.exclude_route_input.clear();
+self.exclude_routes_changed = true;
+
+                            }
+                        }
+                    });
+
+                    ui.add_space(18.0);
+
+                    // ==============================
+                    // LIST HEADER
+                    // ==============================
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(
+                                "ИСКЛЮЧЁННЫЕ АДРЕСА"
+                            )
+                            .size(11.0)
+                            .strong()
+                            .color(gold_color)
+                        );
+
+                        ui.label(
+                            egui::RichText::new(
+                                self.exclude_routes
+                                    .len()
+                                    .to_string()
+                            )
+                            .size(10.0)
+                            .color(grey_color)
+                        );
+                    });
+
+                    ui.add_space(8.0);
+
+                    // ==============================
+                    // LIST
+                    // ==============================
+                    egui::Frame::NONE
+                        .fill(
+                            egui::Color32::from_rgb(
+                                25, 27, 33
+                            )
+                        )
+                        .stroke(
+                            egui::Stroke::new(
+                                1.0,
+                                egui::Color32::from_rgb(
+                                    45, 47, 54
+                                )
+                            )
+                        )
+                        .corner_radius(8.0)
+                        .inner_margin(
+                            egui::Margin::same(8)
+                        )
+                        .show(ui, |ui| {
+                            egui::ScrollArea::vertical()
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    if self.exclude_routes.is_empty() {
+                                        ui.vertical_centered(
+                                            |ui| {
+                                                ui.add_space(
+                                                    20.0
+                                                );
+
+                                                ui.label(
+                                                    egui::RichText::new(
+                                                        "Нет исключённых адресов"
+                                                    )
+                                                    .size(11.0)
+                                                    .color(
+                                                        grey_color
+                                                    )
+                                                );
+                                            }
+                                        );
+                                    } else {
+                                        let mut remove_index =
+                                            None;
+
+                                        for (
+                                            index,
+                                            route
+                                        ) in self
+                                            .exclude_routes
+                                            .iter()
+                                            .enumerate()
+                                        {
+                                            egui::Frame::NONE
+                                                .fill(
+                                                    if index % 2 == 0 {
+                                                        egui::Color32::from_rgb(
+                                                            30, 32, 39
+                                                        )
+                                                    } else {
+                                                        egui::Color32::TRANSPARENT
+                                                    }
+                                                )
+                                                .corner_radius(
+                                                    6.0
+                                                )
+                                                .inner_margin(
+                                                    egui::Margin::symmetric(
+                                                        8,
+                                                        5
+                                                    )
+                                                )
+                                                .show(
+                                                    ui,
+                                                    |ui| {
+                                                        ui.horizontal(
+                                                            |ui| {
+                                                                ui.label(
+                                                                    egui::RichText::new(
+                                                                        "•"
+                                                                    )
+                                                                    .color(
+                                                                        gold_color
+                                                                    )
+                                                                );
+
+                                                                ui.label(
+                                                                    egui::RichText::new(
+                                                                        route
+                                                                    )
+                                                                    .size(
+                                                                        11.0
+                                                                    )
+                                                                    .family(
+                                                                        egui::FontFamily::Name(
+                                                                            "JetBrainsMono"
+                                                                                .into()
+                                                                        )
+                                                                    )
+                                                                );
+
+                                                                ui.with_layout(
+                                                                    egui::Layout::right_to_left(
+                                                                        egui::Align::Center
+                                                                    ),
+                                                                    |ui| {
+                                                                        let delete =
+                                                                            ui.add(
+                                                                                egui::Button::new(
+                                                                                    egui::RichText::new(
+                                                                                        "Удалить"
+                                                                                    )
+                                                                                    .size(
+                                                                                        10.0
+                                                                                    )
+                                                                                )
+                                                                                .frame(false)
+                                                                            )
+                                                                            .on_hover_cursor(
+                                                                                egui::CursorIcon::PointingHand
+                                                                            );
+
+                                                                        if delete.clicked() {
+                                                                              
+                                                                            remove_index =
+                                                                                Some(index);
+                                                                                self.log(&format!("Адрес удален")); 
+                                                                        }
+                                                                    }
+                                                                );
+                                                            }
+                                                        );
+                                                    }
+                                                );
+                                        }
+
+                                        if let Some(index) =
+                                            remove_index
+                                        {
+                                            self.exclude_routes.remove(index);
+    self.exclude_routes_changed = true;
+                                        }
+                                    }
+                                });
+                        });
+                });
+        });
+}
+
         if let Some(err_msg) = self.error_modal.clone() {
             let modal_bg = egui::Color32::from_rgb(32, 32, 32);
             egui::Window
@@ -3103,6 +3942,5 @@ if let Ok(logs) = self.logs.try_lock() {
             egui::Stroke::new(1.0, egui::Color32::from_rgb(100, 100, 100)),
             egui::StrokeKind::Inside // Прижимаем обводку внутрь, чтобы она не обрезалась границами экрана
         );
-        
     }
 }
