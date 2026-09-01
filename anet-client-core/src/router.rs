@@ -156,16 +156,15 @@ pub mod desktop {
             // Удаляем старый если был
             let _ = self.handle.delete(&route).await;
 
+            error!("Debug route params - target: {}, prefix: {}, gw: {}, ifindex: {}", target, prefix, gateway, ifindex);
+
             // Добавляем
-            match self.handle
-                .add(&route)
-                .await
-                .context("Failed to add bypass route") {
+            match self.handle.add(&route).await {
                 Ok(_) => {},
                 Err(e) => {
-                    error!("Failed to add bypass route: {}", e);
-                    err(format!("Failed to add bypass route: {}", e));
-                    return Err(anyhow::anyhow!("Failed to add bypass route: {}", e));
+                    error!("Failed to add bypass route: {:?}", e);
+                    err(format!("Failed to add bypass route: {:?}", e));
+                    return Err(anyhow::anyhow!(e).context("Failed to add bypass route"));
                 }
             }
 
@@ -195,8 +194,8 @@ pub mod desktop {
             for route in routes_to_add {
                 let _ = self.handle.delete(&route).await;
                 if let Err(e) = self.handle.add(&route).await {
-                    warn!("Failed to add redirect route {:?}: {}", route, e);
-                    warn(format!("Failed to add redirect route {:?}: {}", route, e));
+                    warn!("Failed to add redirect route {:?}: {:?}", route, e);
+                    warn(format!("Failed to add redirect route {:?}: {:?}", route, e));
                 } else {
                     state.added_routes.push(route);
                 }
@@ -230,9 +229,9 @@ pub mod desktop {
                     Ok(())
                 }
                 Err(e) => {
-                    error!("Failed to add route {}/{}: {}", target, prefix, e);
-                    err(format!("Failed to add route {}/{}: {}", target, prefix, e));
-                    Err(anyhow::anyhow!(e))
+                    error!("Failed to add route {}/{}: {:?}", target, prefix, e);
+                    err(format!("Failed to add route {}/{}: {:?}", target, prefix, e));
+                    Err(anyhow::anyhow!(e).context(format!("Failed to add route {}/{}", target, prefix)))
                 }
             }
         }
