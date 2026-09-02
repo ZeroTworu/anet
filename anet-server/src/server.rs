@@ -67,6 +67,24 @@ impl ANetServer {
     pub async fn run(&mut self) -> Result<()> {
         let (tx_tun, mut rx_tun) = self.tun_manager.run().await?;
 
+        // eBPF-шейпер (per-user speed_limit) вешается на TUN только после
+        // того, как интерфейс реально поднят — имя может отличаться от
+        // запрошенного (`get_actual_name()`), если ОС его переименовала.
+        if self.cfg.shaper.enabled {
+            let iface = self
+                .tun_manager
+                .get_actual_name()
+                .unwrap_or(self.cfg.network.if_name.as_str())
+                .to_string();
+            match crate::shaper::Shaper::attach(&iface).await {
+                Ok(shaper) => self.registry.set_shaper(Arc::new(shaper)),
+                Err(e) => error!(
+                    "[Shaper] Failed to attach eBPF shaper to '{}': {}. Speed limits will not be enforced.",
+                    iface, e
+                ),
+            }
+        }
+
         let control_config = self.cfg.control_plane.clone();
         let control_registry = self.registry.clone();
         tokio::spawn(async move {

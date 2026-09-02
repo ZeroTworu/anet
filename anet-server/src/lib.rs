@@ -7,4 +7,5 @@ pub(crate) mod ip_pool;
 pub(crate) mod multikey_udp_socket;
 pub mod server;
 pub mod servers;
+pub(crate) mod shaper;
 pub(crate) mod utils;

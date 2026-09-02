@@ -90,7 +90,7 @@ impl AuthApi {
                     message: "Not found".into(),
                     static_ip: None,
                     user_id: None,
-                    speed_limit: None,
+                    speed_limit_kbps: None,
                 }))
             }
         };
@@ -101,7 +101,7 @@ impl AuthApi {
                 message: "Учетная запись заблокирована".into(),
                 static_ip: None,
                 user_id: None,
-                speed_limit: None,
+                speed_limit_kbps: None,
             }));
         }
 
@@ -185,7 +185,7 @@ impl AuthApi {
                     message: "Время действия подписки истекло".into(),
                     static_ip: None,
                     user_id: None,
-                    speed_limit: None,
+                    speed_limit_kbps: None,
                 }));
             }
 
@@ -206,7 +206,7 @@ impl AuthApi {
                         message: "Достигнут лимит одновременных подключений".into(),
                         static_ip: None,
                         user_id: None,
-                        speed_limit: None,
+                        speed_limit_kbps: None,
                     }));
                 }
             }
@@ -230,7 +230,7 @@ impl AuthApi {
                             message: "Лимит трафика на этот период исчерпан".into(),
                             static_ip: None,
                             user_id: None,
-                            speed_limit: None,
+                            speed_limit_kbps: None,
                         }));
                     }
                 }
@@ -243,7 +243,7 @@ impl AuthApi {
             message: "OK".into(),
             static_ip: user.static_ip.clone(),
             user_id: Some(user.id.to_string()),
-            speed_limit: Some(speed_limit),
+            speed_limit_kbps: Some(speed_limit),
         }))
     }
 

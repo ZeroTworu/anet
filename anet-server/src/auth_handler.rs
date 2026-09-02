@@ -263,7 +263,10 @@ impl ServerAuthHandler {
             .registry
             .can_resume(&req.resume_session_id, &client_fingerprint);
         let access = if resume_allowed {
-            Ok(crate::auth_provider::AccessGrant { static_ip: None, user_id: None })
+            // На resume лимит скорости берём из уже существующей suspended-
+            // сессии в handle_encrypted_auth (см. ниже), а не из свежего
+            // AccessGrant — как и с user_id/static_ip для того же случая.
+            Ok(crate::auth_provider::AccessGrant { static_ip: None, user_id: None, speed_limit_kbps: None })
         } else if !self.registry.is_accepting_connections() {
             Err("Node is not accepting new connections".to_string())
         } else {
@@ -301,6 +304,7 @@ impl ServerAuthHandler {
                         user_id: grant.user_id,
                         resume_session_id: req.resume_session_id,
                         created_at: Instant::now(),
+                        speed_limit_kbps: grant.speed_limit_kbps,
                     },
                 );
 
@@ -383,7 +387,7 @@ impl ServerAuthHandler {
         if !req.resume_session_id.is_empty() && resumed.is_none() {
             anyhow::bail!("Requested VPN session is not available for resume");
         }
-        let (assigned_ip, session_id, is_resume, user_id) = if let Some(previous) = resumed {
+        let (assigned_ip, session_id, is_resume, user_id, speed_limit_kbps) = if let Some(previous) = resumed {
             info!(
                 "[AUTH] Resuming logical session {} on a new transport",
                 previous.session_id
@@ -393,6 +397,7 @@ impl ServerAuthHandler {
                 previous.session_id.clone(),
                 true,
                 previous.user_id.clone(),
+                previous.speed_limit_kbps,
             )
         } else {
             let assigned_ip = if let Some(static_ip) = temp_info.static_ip {
@@ -407,7 +412,13 @@ impl ServerAuthHandler {
                     .context("IP POOL FOOL")?
                     .to_string()
             };
-            (assigned_ip, generate_seid(), false, temp_info.user_id.clone())
+            (
+                assigned_ip,
+                generate_seid(),
+                false,
+                temp_info.user_id.clone(),
+                temp_info.speed_limit_kbps,
+            )
         };
 
         let nonce_prefix = generate_unique_nonce_prefix(self.registry.clone());
@@ -422,6 +433,7 @@ impl ServerAuthHandler {
             fingerprint: temp_info.client_fingerprint.clone(),
             user_id,
             protocol: protocol.to_string(),
+            speed_limit_kbps,
         });
 
         self.registry.pre_register_client(client_info.clone());

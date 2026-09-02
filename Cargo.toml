@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
-members = ["anet-server", "anet-client-cli", "anet-common", "anet-keygen", "anet-client-core", "anet-mobile", "anet-client-gui", "anet-auth", "anet-appfilter"]
+members = ["anet-server", "anet-client-cli", "anet-common", "anet-keygen",
+    "anet-client-core", "anet-mobile", "anet-client-gui", "anet-auth", "anet-appfilter", "anet-ebpf-common", "anet-ebpf"]
 default-members = ["anet-server", "anet-client-cli", "anet-common", "anet-auth", "anet-client-gui", "anet-keygen"]
 
 
@@ -34,6 +35,12 @@ http = "1.3.1"
 windows-sys = { version = "0.59" }
 dashmap = { version = "7.0.0-rc2" }
 reqwest = { version = "0.12.28", default-features = false }
+
+# eBPF-шейпер трафика (anet-ebpf / anet-ebpf-common), собирается и
+# встраивается в anet-server через anet-server/build.rs (aya-build).
+aya = "0.13"
+aya-log = "0.2"
+aya-build = "0.2"
 
 [profile.release.package.anet-client-cli]
 debug = 2

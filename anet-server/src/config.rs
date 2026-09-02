@@ -26,7 +26,9 @@ impl Default for CryptoConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct StatsConfig {
+    /// Включить или выключить периодический вывод статистики соединения.
     pub enabled: bool,
+    /// Интервал вывода статистики в минутах.
     pub interval_minutes: u64,
 }
 
@@ -41,9 +43,14 @@ impl Default for StatsConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AuthenticationConfig {
+    /// Локальный список разрешенных клиентов (работает всегда)
     pub allowed_clients: Vec<String>,
+
+    /// Список URL серверов авторизации (например, ["http://127.0.0.1:3000/api/v1"])
     #[serde(default)]
     pub auth_servers: Vec<String>,
+
+    /// Токен для доступа к API авторизации (X-Auth-Key)
     #[serde(default)]
     pub auth_server_token: String,
 }
@@ -61,9 +68,13 @@ impl Default for AuthenticationConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct ControlPlaneConfig {
+    /// UUID узла из панели управления. Пустое значение отключает heartbeat.
     pub node_id: String,
+    /// Базовый URL API, например http://127.0.0.1:3000/api/v1.
     pub url: String,
+    /// Одноразово выданный в WebUI секрет этой ноды. Передаётся в X-Node-Token.
     pub token: String,
+    /// Период исходящего heartbeat, отчёта трафика и polling команд.
     pub heartbeat_interval_seconds: u64,
 }
 
@@ -130,6 +141,22 @@ impl Default for ServerCoreConfig {
     }
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ShaperConfig {
+    /// Включает eBPF-шейпер трафика (per-user `speed_limit`) на TUN-
+    /// интерфейсе. Требует `CAP_BPF` + `CAP_NET_ADMIN` (или root) и qdisc
+    /// `fq` на TUN-интерфейсе (настраивается автоматически при старте).
+    /// См. `anet-server::shaper`.
+    pub enabled: bool,
+}
+
+impl Default for ShaperConfig {
+    fn default() -> Self {
+        Self { enabled: false }
+    }
+}
+
 // Новая структура для настройки HTTP-транспорта на стороне сервера
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -169,18 +196,28 @@ impl Default for AhttpServerConfig {
 pub struct Config {
     #[serde(default)]
     pub network: NetworkConfig,
+
     #[serde(default)]
     pub server: ServerCoreConfig,
+
     #[serde(default)]
     pub quic_transport: QuicConfig,
+
     #[serde(default)]
     pub crypto: CryptoConfig,
+
     #[serde(default)]
     pub authentication: AuthenticationConfig,
+
     #[serde(default)]
     pub control_plane: ControlPlaneConfig,
+
     #[serde(default)]
     pub stealth: StealthConfig,
+
+    #[serde(default)]
+    pub shaper: ShaperConfig,
+
     #[serde(default)]
     pub ahttp: AhttpServerConfig,
 }

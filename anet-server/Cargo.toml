@@ -33,6 +33,10 @@ russh = { workspace = true }
 
 arc-swap = "1.6"
 
+# eBPF-шейпер трафика (per-user speed_limit) на TUN-интерфейсе, см. src/shaper.rs
+anet-ebpf-common = { path = "../anet-ebpf-common", features = ["user"] }
+aya = { workspace = true }
+aya-log = { workspace = true }
 
 anet-common = { path = "../anet-common", features = ["poem"] }
 httparse = "1.10.1"
@@ -40,6 +44,13 @@ url = "2.5.7"
 
 [dev-dependencies]
 anet-client-core = { path = "../anet-client-core" }
+
+[build-dependencies]
+# Только как путь к манифесту для build.rs/aya-build — Rust-код отсюда не
+# импортируется, крейт anet-ebpf компилируется отдельно под bpfel-unknown-none
+# нужным ему nightly-тулчейном (см. build.rs), стабильный тулчейн, которым
+# собирается сам anet-server, не переключается.
+aya-build = { workspace = true }
 
 [[bin]]
 name = "anet-server"

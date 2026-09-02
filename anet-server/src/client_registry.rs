@@ -3,7 +3,7 @@ use crate::ip_pool::IpPool;
 use crate::multikey_udp_socket::StreamSender;
 use anet_common::encryption::Cipher;
 use anet_common::dto::TrafficUsageSample;
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use bytes::Bytes;
 use dashmap::DashMap;
 use log::{info, warn};
@@ -22,6 +22,9 @@ pub struct ClientTransportInfo {
     pub fingerprint: String,
     pub user_id: Option<String>,
     pub protocol: String, // "quic" | "ssh" | "vnc" | "ws"
+    /// Ограничение скорости в kbps, `None` = без ограничения. Применяется
+    /// eBPF-шейпером на TUN-интерфейсе (см. `crate::shaper::Shaper`).
+    pub speed_limit_kbps: Option<u32>,
 }
 
 struct TrafficCounters {
@@ -62,6 +65,7 @@ mod tests {
             fingerprint: fingerprint.to_string(),
             user_id: None,
             protocol: "quic".to_string(),
+            speed_limit_kbps: None,
         })
     }
 
@@ -137,6 +141,10 @@ pub struct ClientRegistry {
     ip_pool: IpPool,
     accepting_connections: Arc<AtomicBool>,
     traffic_totals: Arc<DashMap<String, Arc<TrafficCounters>>>,
+    /// TUN-интерфейс появляется только после `TunManager::run()`, т.е. уже
+    /// после конструирования реестра — поэтому шейпер подключается
+    /// постфактум через `set_shaper`, а не передаётся в `new()`.
+    shaper: ArcSwapOption<crate::shaper::Shaper>,
 }
 
 impl ClientRegistry {
@@ -151,6 +159,7 @@ impl ClientRegistry {
             ip_pool,
             accepting_connections: Arc::new(AtomicBool::new(true)),
             traffic_totals: Arc::new(DashMap::new()),
+            shaper: ArcSwapOption::empty(),
         }
     }
 
@@ -159,6 +168,37 @@ impl ClientRegistry {
             .iter()
             .find(|entry| entry.value().session_id == session_id)
             .map(|entry| entry.value().clone())
+    }
+
+    pub fn set_shaper(&self, shaper: Arc<crate::shaper::Shaper>) {
+        self.shaper.store(Some(shaper));
+    }
+
+    fn apply_shaper_limit(&self, client_info: &ClientTransportInfo) {
+        let (Some(shaper), Some(kbps)) = (self.shaper.load().clone(), client_info.speed_limit_kbps)
+        else {
+            return;
+        };
+        let Ok(ip) = client_info.assigned_ip.parse::<Ipv4Addr>() else {
+            return;
+        };
+        tokio::spawn(async move {
+            if let Err(e) = shaper.set_limit(ip, kbps).await {
+                warn!("[Shaper] Failed to apply speed limit for {}: {}", ip, e);
+            }
+        });
+    }
+
+    fn clear_shaper_limit(&self, assigned_ip: &str) {
+        let Some(shaper) = self.shaper.load().clone() else {
+            return;
+        };
+        let Ok(ip) = assigned_ip.parse::<Ipv4Addr>() else {
+            return;
+        };
+        tokio::spawn(async move {
+            shaper.clear_limit(ip).await;
+        });
     }
 
     pub fn get_network_params(&self) -> (String, String, i32) {
@@ -239,6 +279,7 @@ impl ClientRegistry {
         self.clients_by_addr.insert(remote_addr, client_info.clone());
         self.clients_by_ip
             .insert(client_info.assigned_ip.clone(), client_info.clone());
+        self.apply_shaper_limit(&client_info);
     }
 
     pub fn finalize_client(&self, client_ip: &str, router_sender: StreamSender) {
@@ -259,6 +300,7 @@ impl ClientRegistry {
         self.clients_by_prefix.remove(&client_info.nonce_prefix);
         self.clients_by_addr.remove(&remote_addr);
         self.clients_by_ip.remove(client_ip);
+        self.clear_shaper_limit(client_ip);
 
         // Очищаем локальные счетчики трафика отключенной сессии во избежание утечки памяти
         let key = format!("{}#{}", client_info.fingerprint, client_info.protocol);
@@ -287,6 +329,9 @@ impl ClientRegistry {
         self.clients_by_prefix.remove(&client_info.nonce_prefix);
         self.clients_by_addr.remove(&remote_addr);
         self.clients_by_ip.remove(&client_ip);
+        // ПРИМЕЧАНИЕ: лимит скорости намеренно НЕ снимается — плановая
+        // ротация WS-сессии ожидаемо резюмируется на том же assigned_ip, и
+        // держать правило в BPF-карте дешевле, чем пересоздавать его.
         self.suspended_sessions.insert(
             client_info.session_id.clone(),
             SuspendedSession {
@@ -348,6 +393,7 @@ impl ClientRegistry {
         if let Ok(ip_addr) = client_info.assigned_ip.parse::<Ipv4Addr>() {
             self.ip_pool.release(ip_addr);
         }
+        self.clear_shaper_limit(&client_info.assigned_ip);
 
         // Очищаем локальные счетчики трафика истекшей сессии
         let key = format!("{}#{}", client_info.fingerprint, client_info.protocol);
