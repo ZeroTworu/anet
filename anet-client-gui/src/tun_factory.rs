@@ -158,6 +158,24 @@ mod windows_impl {
                 ]
             };
 
+            // Небольшая задержка перед настройкой, чтобы Windows успела перевести интерфейс в готовность
+            tokio::time::sleep(Duration::from_millis(500)).await;
+
+            let mut ip_configured = false;
+            for attempt in 1..=5 {
+                if let Ok(()) = Self::run_silent_cmd("netsh", &set_ip_args) {
+                    ip_configured = true;
+                    break;
+                }
+                log::warn!("Attempt {}/5: Netsh failed to set IP on '{}'. Retrying in 500ms...", attempt, target_name);
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+
+            if !ip_configured {
+                error!("IP Config failed after 5 attempts! Check interface name or permissions.");
+                anyhow::bail!("Failed to assign IP address to interface '{}'", target_name);
+            }
+
             if let Err(e) = Self::run_silent_cmd("netsh", &set_ip_args) {
                 error!("IP Config failed! Check interface name or permissions.");
                 return Err(e);
