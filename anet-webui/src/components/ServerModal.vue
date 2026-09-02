@@ -25,7 +25,8 @@ const form = ref({
   quic_port: null as number | null,
   ssh_port: null as number | null,
   vnc_port: null as number | null,
-  websocket_url: ''
+  websocket_url: '',
+  ahttp_url: '',
 })
 
 const loading = ref(false)
@@ -108,7 +109,8 @@ watch(
           quic_port: val.quic_port !== undefined ? val.quic_port : null,
           ssh_port: val.ssh_port !== undefined ? val.ssh_port : null,
           vnc_port: val.vnc_port !== undefined ? val.vnc_port : null,
-          websocket_url: val.websocket_url || ''
+          websocket_url: val.websocket_url || '',
+          ahttp_url: val.ahttp_url || '',
         }
       }
     },
@@ -187,6 +189,14 @@ const close = () => {
               v-model="form.websocket_url"
               label="WebSocket URL"
               placeholder="ws://127.0.0.1:8080/s"
+              variant="filled"
+              class="mb-3"
+          />
+
+          <v-text-field
+              v-model="form.ahttp_url"
+              label="AHTTP URL (CDN)"
+              placeholder="https://your-cdn.some-host.net/api/v2/telemetry"
               variant="filled"
               class="mb-3"
           />

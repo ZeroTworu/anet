@@ -242,6 +242,14 @@ impl ServerConfig {
     }
 
     pub fn get_name(&self) -> String {
+        // Если имя задано в конфигурации и оно не пустое — используем его
+        if let Some(ref name) = self.name {
+            if !name.trim().is_empty() {
+                return name.clone();
+            }
+        }
+
+        // Автогенерация на основе IP в случае отсутствия имени
         let host = self.host_port().map(|(host, _)| host).unwrap_or_else(|_| self.dsn.clone());
         let mode_str = match self.mode().unwrap_or(TransportMode::Quic) {
             TransportMode::Quic => "QUIC",

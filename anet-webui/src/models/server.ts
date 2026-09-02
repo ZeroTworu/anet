@@ -12,6 +12,7 @@ export type Server = {
     ssh_port: number | null
     vnc_port: number | null
     websocket_url: string | null
+    ahttp_url: string | null
 }
 
 export type NodeRuntime = {
@@ -56,4 +57,5 @@ export type CreateServerRequest = {
     ssh_port?: number | null
     vnc_port?: number | null
     websocket_url?: string | null
+    ahttp_url?: string | null
 }

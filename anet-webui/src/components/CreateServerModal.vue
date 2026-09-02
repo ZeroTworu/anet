@@ -23,7 +23,8 @@ const defaultForm = (): CreateServerRequest => ({
   quic_port: 4519,
   ssh_port: 822,
   vnc_port: 56678,
-  websocket_url: 'ws://127.0.0.1:8080/s',
+  websocket_url: 'ws://127.0.0.1:8080/socket',
+  ahttp_url: 'https://your-cdn.some-host.net/api/v2/telemetry',
 })
 
 const form = ref<CreateServerRequest>(defaultForm())
@@ -118,6 +119,14 @@ const close = () => {
               v-model="form.websocket_url"
               label="WebSocket URL"
               placeholder="ws://127.0.0.1:8080/s"
+              variant="filled"
+              class="mb-3"
+          />
+
+          <v-text-field
+              v-model="form.ahttp_url"
+              label="AHTTP URL (CDN)"
+              placeholder="https://your-cdn.some-host.net/api/v2/telemetry"
               variant="filled"
               class="mb-3"
           />

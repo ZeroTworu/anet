@@ -783,6 +783,13 @@ impl UsersApi {
                 ));
             };
 
+            if let Some(ref ahttp) = server.ahttp_url {
+                if !ahttp.trim().is_empty() {
+                    let proto = if ahttp.starts_with("http://") { "http" } else { "https" };
+                    write_server_block(proto, ahttp);
+                }
+            }
+
             if let Some(quic) = server.quic_port {
                 if quic > 0 {
                     write_server_block("quic", &quic.to_string());

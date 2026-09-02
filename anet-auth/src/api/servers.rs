@@ -41,6 +41,7 @@ impl ServersApi {
             ssh_port: Set(req.0.ssh_port),
             vnc_port: Set(req.0.vnc_port),
             websocket_url: Set(req.0.websocket_url.clone()),
+            ahttp_url: Set(req.0.ahttp_url.clone()),
             ssh_user: Set(req.0.ssh_user.clone()),
             is_active: Set(req.0.is_active.unwrap_or(true)),
             control_token_hash: Set(None),
@@ -58,6 +59,7 @@ impl ServersApi {
                 ssh_port: saved.ssh_port,
                 vnc_port: saved.vnc_port,
                 websocket_url: saved.websocket_url,
+                ahttp_url: saved.ahttp_url,
                 ssh_user: saved.ssh_user,
                 is_active: saved.is_active,
                 has_control_credential: saved.control_token_hash.is_some(),
@@ -126,6 +128,10 @@ impl ServersApi {
             active_model.is_active = Set(is_active);
             changed = true;
         }
+        if let Some(ahttp_url) = req.0.ahttp_url {
+            active_model.ahttp_url = Set(ahttp_url);
+            changed = true;
+        }
 
         if changed {
             active_model.updated_at = Set(Utc::now().naive_utc());
@@ -139,6 +145,7 @@ impl ServersApi {
                     ssh_port: saved.ssh_port,
                     vnc_port: saved.vnc_port,
                     websocket_url: saved.websocket_url,
+                    ahttp_url: saved.ahttp_url,
                     ssh_user: saved.ssh_user,
                     is_active: saved.is_active,
                     has_control_credential: saved.control_token_hash.is_some(),
@@ -156,6 +163,7 @@ impl ServersApi {
                 ssh_port: server_model.ssh_port,
                 vnc_port: server_model.vnc_port,
                 websocket_url: server_model.websocket_url,
+                ahttp_url: server_model.ahttp_url,
                 ssh_user: server_model.ssh_user,
                 is_active: server_model.is_active,
                 has_control_credential: server_model.control_token_hash.is_some(),
@@ -207,6 +215,7 @@ impl ServersApi {
                         ssh_port: s.ssh_port,
                         vnc_port: s.vnc_port,
                         websocket_url: s.websocket_url,
+                        ahttp_url: s.ahttp_url,
                         ssh_user: s.ssh_user,
                         is_active: s.is_active,
                         has_control_credential: s.control_token_hash.is_some(),
