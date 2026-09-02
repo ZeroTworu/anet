@@ -1,7 +1,7 @@
 use crate::client_registry::ClientRegistry;
 use crate::auth_handler::ServerAuthHandler;
 use crate::config::Config;
-use anet_common::consts::{CHANNEL_BUFFER_SIZE, MAX_PACKET_SIZE, COALESCE_BUDGET_BYTES};
+use anet_common::consts::{CHANNEL_BUFFER_SIZE, MAX_PACKET_SIZE};
 use anet_common::transport::wrap_packet_padded;
 use anet_common::reassembly::ReassemblyQueue;
 use anyhow::{Context, Result};
@@ -246,7 +246,7 @@ async fn handle_http_connection(
                             let mut body_buf = BytesMut::new();
                             let padding_step = config.stealth.padding_step;
 
-                            let timeout_duration = std::time::Duration::from_millis(30);
+                            let timeout_duration = std::time::Duration::from_millis(config.ahttp.poll_timeout_ms);
 
                             // Инлайним шифрование пакетов и полностью убираем замыкания
                             if let Ok(Some(packet)) = tokio::time::timeout(timeout_duration, rx_router.recv()).await {
@@ -278,7 +278,7 @@ async fn handle_http_connection(
                                             body_buf.extend_from_slice(&framed);
                                         }
                                     }
-                                    if body_buf.len() >= COALESCE_BUDGET_BYTES {
+                                    if body_buf.len() >= config.ahttp.coalesce_budget_bytes {
                                         break;
                                     }
                                 }
