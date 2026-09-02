@@ -11,8 +11,9 @@ NoNewPrivileges=yes
 
 StateDirectory=anet
 
-AmbientCapabilities=CAP_NET_ADMIN  CAP_NET_BIND_SERVICE
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+# CAP_BPF нужен только если [shaper].enabled = true в server.toml.
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_BPF
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_BPF
 
 Environment=RUST_LOG=info
 

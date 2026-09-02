@@ -17,7 +17,10 @@ pub struct CheckAccessResponse {
     pub message: String,
     pub static_ip: Option<String>,
     pub user_id: Option<String>,
-    pub speed_limit: Option<i32>,
+    /// Ограничение скорости в килобитах/сек (`rates.speed_limit`), `None`
+    /// или `0` = без ограничения. Читается `anet-server::shaper` при
+    /// финализации клиента.
+    pub speed_limit_kbps: Option<i32>,
 }
 
 /// [ VPN Core Communication: Session Events ]

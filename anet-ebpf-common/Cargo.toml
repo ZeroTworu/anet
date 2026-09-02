@@ -1,0 +1,11 @@
+[package]
+name = "anet-ebpf-common"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[features]
+user = ["dep:aya"]
+
+[dependencies]
+aya = { workspace = true, optional = true }

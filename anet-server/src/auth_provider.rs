@@ -8,6 +8,9 @@ use anet_common::dto::{CheckAccessRequest, CheckAccessResponse, SessionEventRequ
 pub struct AccessGrant {
     pub static_ip: Option<String>,
     pub user_id: Option<String>,
+    /// Ограничение скорости в kbps из `rates.speed_limit`, `None` = без
+    /// ограничения. Применяется eBPF-шейпером на TUN-интерфейсе.
+    pub speed_limit_kbps: Option<u32>,
 }
 
 #[derive(Clone)]
@@ -46,9 +49,9 @@ impl AuthProvider {
 
     /// Проверяет, разрешен ли доступ клиенту с данным fingerprint
     pub async fn is_client_allowed(&self, fingerprint: &str) -> Result<AccessGrant, String> {
-        // 1. Локальный список (VIP)
+        // 1. Локальный список (VIP) — без ограничения скорости.
         if self.allowed_clients.iter().any(|c| c == fingerprint) {
-            return Ok(AccessGrant { static_ip: None, user_id: None });
+            return Ok(AccessGrant { static_ip: None, user_id: None, speed_limit_kbps: None });
         }
 
         // 2. Внешние сервера
@@ -65,7 +68,11 @@ impl AuthProvider {
                         reqwest::StatusCode::OK => {
                             if let Ok(json) = resp.json::<CheckAccessResponse>().await {
                                 return if json.allowed {
-                                    Ok(AccessGrant { static_ip: json.static_ip, user_id: json.user_id })
+                                    Ok(AccessGrant {
+                                        static_ip: json.static_ip,
+                                        user_id: json.user_id,
+                                        speed_limit_kbps: Some(json.speed_limit_kbps.unwrap_or(0) as u32),
+                                    })
                                 } else {
                                     Err(json.message)
                                 }

@@ -36,6 +36,10 @@ pub struct TempDHInfo {
     pub static_ip: Option<String>,
     pub user_id: Option<String>,
     pub resume_session_id: String,
+    /// Ограничение скорости в kbps из `AccessGrant`, `None` = без
+    /// ограничения. Переносится в `ClientTransportInfo` при завершении
+    /// хендшейка (см. `auth_handler::handle_encrypted_auth`).
+    pub speed_limit_kbps: Option<u32>,
 }
 
 pub type HandshakeData = (Bytes, SocketAddr);
