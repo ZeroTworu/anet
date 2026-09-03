@@ -144,7 +144,12 @@ pub struct ClientRegistry {
     /// TUN-интерфейс появляется только после `TunManager::run()`, т.е. уже
     /// после конструирования реестра — поэтому шейпер подключается
     /// постфактум через `set_shaper`, а не передаётся в `new()`.
-    shaper: ArcSwapOption<crate::shaper::Shaper>,
+    ///
+    /// Обёрнуто в Arc: сам ArcSwapOption НЕ реализует Clone (это lock-free
+    /// примитив, клонировать его напрямую некорректно), а весь остальной
+    /// ClientRegistry рассчитан на дешёвое derive(Clone) через клонирование
+    /// Arc-указателей у каждого поля — держим ту же конвенцию.
+    shaper: Arc<ArcSwapOption<crate::shaper::Shaper>>,
 }
 
 impl ClientRegistry {
@@ -159,7 +164,7 @@ impl ClientRegistry {
             ip_pool,
             accepting_connections: Arc::new(AtomicBool::new(true)),
             traffic_totals: Arc::new(DashMap::new()),
-            shaper: ArcSwapOption::empty(),
+            shaper: Arc::new(ArcSwapOption::empty()),
         }
     }
 

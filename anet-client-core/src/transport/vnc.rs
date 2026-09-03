@@ -1,4 +1,4 @@
-use super::{ClientTransport, ConnectionResult, MutexVpnStream};
+use super::{ClientTransport, ConnectionResult};
 use crate::auth::{AuthChannel, AuthHandler};
 use crate::config::{CoreConfig, ServerConfig};
 use anet_common::consts::{MAX_PACKET_SIZE, PADDING_MTU};
@@ -154,7 +154,9 @@ impl ClientTransport for VncTransport {
 
         Ok(ConnectionResult {
             auth_response,
-            vpn_stream: Box::new(MutexVpnStream(Arc::new(Mutex::new(client_stream)))),
+            // См. аналогичный комментарий в ssh.rs: client_stream уже сам по
+            // себе VpnStream, MutexVpnStream был лишним и дефектным слоем.
+            vpn_stream: Box::new(client_stream),
             endpoint: None,
             connection: None,
             health_pause: None,

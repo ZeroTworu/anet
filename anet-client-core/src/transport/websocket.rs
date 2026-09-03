@@ -26,7 +26,9 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, frame::coding::CloseCode};
-use tokio_tungstenite::{Connector, MaybeTlsStream, WebSocketStream, connect_async_tls_with_config};
+use tokio_tungstenite::{
+    Connector, MaybeTlsStream, WebSocketStream, client_async_tls_with_config,
+};
 
 type ClientSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 const MAX_WS_MESSAGE_SIZE: usize = 64 * 1024;
@@ -217,10 +219,24 @@ async fn connect_authenticated(
         .max_write_buffer_size(128 * 1024)
         .max_message_size(Some(MAX_WS_MESSAGE_SIZE))
         .max_frame_size(Some(MAX_WS_MESSAGE_SIZE));
-    let (socket, _) = connect_async_tls_with_config(
+
+    // connect_async_tls_with_config() резолвит DNS и коннектит TCP-сокет
+    // внутри себя, без возможности выставить TCP_NODELAY до TLS/WS
+    // хендшейка. В отличие от SSH/VNC-клиентов и WS-сервера (все явно
+    // делают stream.set_nodelay(true)), здесь Nagle оставался включённым:
+    // мелкие ANet-кадры (u16-префикс длины + IP-пакет) залипали в буфере
+    // ядра до ~40мс в ожидании пиггибека ACK. Коннектим TCP сами и сразу
+    // выставляем nodelay перед тем, как отдать сокет в TLS/WS слой.
+    let endpoint = server.endpoint()?;
+    let tcp_stream = TcpStream::connect(&endpoint)
+        .await
+        .with_context(|| format!("failed to connect to WebSocket endpoint {endpoint}"))?;
+    tcp_stream.set_nodelay(true)?;
+
+    let (socket, _) = client_async_tls_with_config(
         request,
+        tcp_stream,
         Some(ws_config),
-        true,
         Some(connector_for(server)?),
     )
     .await?;
