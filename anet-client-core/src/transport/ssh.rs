@@ -1,4 +1,4 @@
-use super::{ClientTransport, ConnectionResult, MutexVpnStream};
+use super::{ClientTransport, ConnectionResult};
 use crate::auth::{AuthHandler, StreamAuthChannel};
 use crate::config::{CoreConfig, ServerConfig};
 use anet_common::consts::{CHANNEL_BUFFER_SIZE, MAX_PACKET_SIZE};
@@ -185,7 +185,16 @@ impl ClientTransport for SshTransport {
 
         Ok(ConnectionResult {
             auth_response,
-            vpn_stream: Box::new(MutexVpnStream(Arc::new(Mutex::new(client_stream)))),
+            // `client_stream` — это одна половина tokio::io::duplex(), уже
+            // реализующая VpnStream (AsyncRead + AsyncWrite + Unpin + Send +
+            // Sync) сама по себе. Оборачивание в Arc<Mutex<>> здесь не давало
+            // никакой реальной защиты (сравни с websocket.rs/ahttp.rs/quic.rs,
+            // которые отдают такой же duplex-стрим без обёртки), а
+            // MutexVpnStream::poll_read/poll_write при этом на каждый вызов
+            // аллоцировал новый Box::pin(lock()) вместо переиспользования
+            // pending-future — под нагрузкой это чистый малловый оверхед на
+            // хот-пути.
+            vpn_stream: Box::new(client_stream),
             endpoint: None,
             connection: None,
             health_pause: None,

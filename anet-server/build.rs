@@ -26,4 +26,28 @@ fn main() {
         aya_build::Toolchain::Nightly,
     )
     .expect("Failed to build embedded anet-ebpf object");
+
+    // ВАЖНО: aya_build::build_ebpf() иногда возвращает Ok(()) даже когда
+    // bpf-linker молча не смог слинковать финальный BPF ELF (например, из-за
+    // повреждённой/битой libLLVM в самом nightly-тулчейне — Cargo в этом
+    // случае печатает это только как "warning: linker stderr: ...", а не как
+    // hard error). Без этой проверки ошибка всплывает намного позже и куда
+    // менее понятно — прямо в src/shaper.rs на `include_bytes_aligned!`,
+    // с сообщением "No such file or directory", по которому не видно
+    // истинной причины. Проверяем результат сразу здесь и на месте.
+    let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR is not set");
+    let embedded_object = std::path::Path::new(&out_dir).join("anet-ebpf");
+    if !embedded_object.exists() {
+        panic!(
+            "anet-ebpf object was not produced at '{}' even though aya_build::build_ebpf() \
+             reported success. This usually means bpf-linker failed to actually link the BPF \
+             ELF (check the build log above for a 'linker stderr' warning — a common cause is \
+             a corrupted/truncated libLLVM-*.so inside the nightly toolchain). Try:\n\
+             \n\
+             \trustup toolchain uninstall nightly\n\
+             \trustup toolchain install nightly --component rust-src\n\
+             \tcargo install bpf-linker --force\n",
+            embedded_object.display()
+        );
+    }
 }
