@@ -213,9 +213,10 @@ impl AuthApi {
 
             // Проверка исчерпания трафика за расчетный период
             if max_traffic > 0 {
-                let sum_result = crate::entities::traffic_totals::Entity::find()
-                    .filter(crate::entities::traffic_totals::Column::UserId.eq(user.id))
-                    .filter(crate::entities::traffic_totals::Column::UpdatedAt.gte(cycle_start))
+                // ИСПРАВЛЕНО: Проверяем реальное потребление по дельтам из traffic_hourly
+                let sum_result = crate::entities::traffic_hourly::Entity::find()
+                    .filter(crate::entities::traffic_hourly::Column::UserId.eq(user.id))
+                    .filter(crate::entities::traffic_hourly::Column::BucketStart.gte(cycle_start))
                     .select_only()
                     .column_as(sea_orm::sea_query::Expr::cust("CAST(SUM(rx_bytes) + SUM(tx_bytes) AS BIGINT)"), "total")
                     .into_tuple::<Option<i64>>()

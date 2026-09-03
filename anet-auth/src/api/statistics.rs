@@ -165,29 +165,18 @@ impl StatisticsApi {
 
                 let now = chrono::Utc::now().naive_utc();
 
-                // Вычисляем календарные границы текущего месяца
+                // 1. Вычисляем календарное начало текущего месяца на случай отсутствия личного тарифа
                 let first_day_current_month = chrono::NaiveDate::from_ymd_opt(now.year(), now.month(), 1)
                     .unwrap()
                     .and_hms_opt(0, 0, 0)
                     .unwrap();
 
-                let (next_year, next_month) = if now.month() == 12 {
-                    (now.year() + 1, 1)
-                } else {
-                    (now.year(), now.month() + 1)
-                };
-                let mut expiration_date = chrono::NaiveDate::from_ymd_opt(next_year, next_month, 1)
-                    .unwrap()
-                    .and_hms_opt(0, 0, 0)
-                    .unwrap();
-
-                // Определение временных границ периода
+                // 2. Определяем временную границу начала расчетного цикла
                 let mut cycle_start = first_day_current_month;
 
                 if let Some(ref rate) = rate_opt {
-                    expiration_date = rate.date_end;
                     let duration_days = group_opt.as_ref().map(|g| g.duration_days).unwrap_or(30).max(1) as i64;
-                    cycle_start = expiration_date - chrono::Duration::days(duration_days);
+                    cycle_start = rate.date_end - chrono::Duration::days(duration_days);
                 }
 
                 // Определение лимита трафика
@@ -211,9 +200,10 @@ impl StatisticsApi {
 
                 // Сверяем трафик за ТЕКУЩИЙ расчетный период с лимитом
                 if has_traffic_limit {
-                    let sum_result = traffic_totals::Entity::find()
-                        .filter(traffic_totals::Column::UserId.eq(usr_id))
-                        .filter(traffic_totals::Column::UpdatedAt.gte(cycle_start)) // Считаем только с начала периода
+                    // ИСПРАВЛЕНО: Считаем дельты из почасовой таблицы вместо накопительных сессий
+                    let sum_result = traffic_hourly::Entity::find()
+                        .filter(traffic_hourly::Column::UserId.eq(usr_id))
+                        .filter(traffic_hourly::Column::BucketStart.gte(cycle_start)) // Считаем строго от начала периода
                         .select_only()
                         .column_as(sea_orm::sea_query::Expr::cust("CAST(SUM(rx_bytes) + SUM(tx_bytes) AS BIGINT)"), "total")
                         .into_tuple::<Option<i64>>()
