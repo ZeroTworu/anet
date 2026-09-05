@@ -91,24 +91,7 @@ fn event_message(event: AnetEvent) -> Option<String> {
         AnetEvent::UpdateProgress(p) => Some(format!("PROGRESS:{p:.2}")),
         AnetEvent::UpdateAvailable(rel) => Some(format!("Найдено обновление: {}", rel.tag_name)),
         AnetEvent::UpdateReady => Some("Update downloaded to cache".to_string()),
-        AnetEvent::TrafficUpdate { .. } | AnetEvent::ClientStateChanged { .. } => None, 
-        AnetEvent::Stats { rx, tx, rtt, rxm, txm } => {
-            // Формируем JSON вручную (или через serde_json, если он подключен)
-            let json = format!(
-                r#"{{"type": "stats", "rx": "{}", "tx": "{}", "rtt": "{}", "rxm": "{}", "txm": "{}"}}"#,
-                rx, tx, rtt, rxm, txm
-            );
-            Some(json)
-        }
-
-        // Заглушка для TrafficUpdate, если вы решите использовать u64 вместо String
-        AnetEvent::TrafficUpdate { rx, tx, rtt, rxm, txm } => {
-            let json = format!(
-                r#"{{"type": "stats", "rx": "{}", "tx": "{}", "rtt": "{}", "rxm": "{}", "txm": "{}"}}"#,
-                rx, tx, rtt, rxm, txm
-            );
-            Some(json)
-        }
+        AnetEvent::TrafficUpdate { .. } | AnetEvent::ClientStateChanged { .. } => None,
     }
 }
 
@@ -387,6 +370,11 @@ pub extern "system" fn Java_org_alco_anet_ANetVpnService_connectVpn(
     selected_server_jstr: JString,
 ) {
     info!("JNI: connectVpn called");
+
+    // ИНИЦИАЛИЗАЦИЯ КРИПТО-ПРОВАЙДЕРА ДЛЯ ANDROID
+    // Игнорируем ошибку, так как при реконнектах (когда сервис не умирал, а просто
+    // перезапускал туннель) провайдер уже может быть установлен.
+    rustls::crypto::ring::default_provider().install_default().ok();
 
     // Подготавливаем потокобезопасные структуры за пределами Tokio-рантайма
     let jvm = env.get_java_vm().unwrap();
