@@ -30,32 +30,3 @@ pub struct ConnectionResult {
 pub trait ClientTransport: Send + Sync {
     async fn connect(&self) -> Result<ConnectionResult>;
 }
-
-// ------------------------------------------------------------------
-// УНИВЕРСАЛЬНАЯ ОБЕРТКА (Shared Stream Adapter)
-// ------------------------------------------------------------------
-pub struct MutexVpnStream<S>(pub Arc<Mutex<S>>);
-
-impl<S: AsyncRead + Unpin + Send> AsyncRead for MutexVpnStream<S> {
-    fn poll_read(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &mut ReadBuf<'_>) -> std::task::Poll<std::io::Result<()>> {
-        let mut guard = futures::ready!(Box::pin(self.0.lock()).as_mut().poll(cx));
-        Pin::new(&mut *guard).poll_read(cx, buf)
-    }
-}
-
-impl<S: AsyncWrite + Unpin + Send> AsyncWrite for MutexVpnStream<S> {
-    fn poll_write(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &[u8]) -> std::task::Poll<std::io::Result<usize>> {
-        let mut guard = futures::ready!(Box::pin(self.0.lock()).as_mut().poll(cx));
-        Pin::new(&mut *guard).poll_write(cx, buf)
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
-        let mut guard = futures::ready!(Box::pin(self.0.lock()).as_mut().poll(cx));
-        Pin::new(&mut *guard).poll_flush(cx)
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
-        let mut guard = futures::ready!(Box::pin(self.0.lock()).as_mut().poll(cx));
-        Pin::new(&mut *guard).poll_shutdown(cx)
-    }
-}

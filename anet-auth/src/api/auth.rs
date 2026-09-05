@@ -239,7 +239,6 @@ impl AuthApi {
         }
 
         // УСПЕШНЫЙ ВХОД: возвращаем разрешенную скорость для eBPF-шейпера на сервере
-        info!("CheckAccessResponse: speed_limit: {}", speed_limit);
         Ok(Json(CheckAccessResponse {
             allowed: true,
             message: "OK".into(),

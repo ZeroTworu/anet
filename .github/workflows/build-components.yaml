@@ -44,16 +44,16 @@ jobs:
         with:
           targets: x86_64-unknown-linux-musl, x86_64-pc-windows-gnu
 
-      # anet-ebpf собирается nightly-тулчейном через aya-build / bpf-linker
-      - name: "Install Rust Nightly & bpf-linker for anet-ebpf"
+      # 1. Ставим nightly с rust-src для компиляции anet-ebpf
+      - name: "Install Rust Nightly (for anet-ebpf)"
         run: |
           rustup toolchain install nightly --component rust-src
-          cargo +nightly install bpf-linker --force
-          
-          # Передаем путь к libLLVM от nightly в общее окружение GitHub Actions,
-          # чтобы bpf-linker находил библиотеки при запуске из build.rs
-          NIGHTLY_SYSROOT=$(rustc +nightly --print sysroot)
-          echo "LD_LIBRARY_PATH=$NIGHTLY_SYSROOT/lib:$LD_LIBRARY_PATH" >> $GITHUB_ENV
+
+      # 2. Скачиваем готовый статический бинарник bpf-linker (за 1 секунду вместо 5 минут сборки)
+      - name: "Install bpf-linker"
+        uses: taiki-e/install-action@v2
+        with:
+          tool: bpf-linker
 
       - name: "Cache Rust dependencies"
         uses: actions/cache@v4

@@ -2,7 +2,7 @@
 #![no_main]
 
 use aya_ebpf::{
-    bindings::{xdp_action, TC_ACT_OK},
+    bindings::{xdp_action, TC_ACT_OK, TC_ACT_SHOT},
     helpers::{bpf_ktime_get_ns, bpf_skb_set_tstamp},
     macros::{classifier, map, xdp},
     maps::HashMap,
@@ -78,17 +78,23 @@ fn try_tc_egress(ctx: &TcContext) -> Result<i32, ()> {
     // 10^9 * packet_len (максимум ~65535) = ~6.5 * 10^13, что с запасом
     // укладывается в u64 (предел u64: 1.84 * 10^19). 128-битная арифметика не требуется.
     let cost_ns = (1_000_000_000u64 * packet_len) / rule.rate_bytes_per_sec;
-    let mut next_departure = scheduled_from.saturating_add(cost_ns);
+    let next_departure = scheduled_from.saturating_add(cost_ns);
 
-    // Не даём очереди "убегать" в будущее дальше чем на burst — иначе клиент,
-    // долго простаивавший (накопивший виртуальный кредит), потом продавит
-    // канал одним залпом. burst_bytes / rate = максимальная глубина пейсинга.
+    // Ограничиваем глубину виртуального буфера очереди размером burst_bytes.
+    // Если время отправки пакета (next_departure) выходит за пределы горизонта планирования
+    // (horizon), это сигнализирует о переполнении буфера шейпера.
+    //
+    // Чтобы лимит работал корректно, мы уничтожаем этот пакет (возвращаем TC_ACT_SHOT / Tail Drop),
+    // а не сдвигаем его на границу горизонта. Это заставляет алгоритм контроля перегрузки
+    // TCP (BBR или Cubic) на стороне отправителя вовремя зафиксировать потерю, сжать
+    // свое окно отправки и замедлить передачу данных до уровня нашего лимита.
+    //
     // Ограничиваем burst 1 ГБ для гарантии отсутствия переполнения u64 при умножении.
     let safe_burst = rule.burst_bytes.max(1).min(1_000_000_000);
     let max_horizon_ns = (1_000_000_000u64 * safe_burst) / rule.rate_bytes_per_sec;
     let horizon = now.saturating_add(max_horizon_ns.max(cost_ns));
     if next_departure > horizon {
-        next_departure = horizon;
+        return Ok(TC_ACT_SHOT);
     }
 
     let _ = EDT_STATE.insert(&dst_ip, &EdtState { next_departure_ns: next_departure }, 0);
