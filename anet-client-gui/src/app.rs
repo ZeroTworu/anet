@@ -36,6 +36,8 @@ use crate::{
 
 use std::{
     collections::BTreeMap,
+    collections::hash_map::DefaultHasher,
+    hash::{ Hash, Hasher },
     path::PathBuf,
     sync::{ mpsc::{ channel, Receiver, Sender }, Arc, Mutex },
 };
@@ -49,6 +51,12 @@ pub enum UpdateStatus {
     Downloading(f32),
     ReadyToRestart,
     Error(String),
+}
+
+// Результат фонового построения AnetClient с флагом необходимости перезапуска
+pub enum ConfigLoadOutcome {
+    Loaded { id: String, name: String, reconnect: bool },
+    Failed { id: String, error: String },
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -72,65 +80,18 @@ pub struct ProcessItem {
     pub is_selected: bool,
 }
 
-pub struct AppState {
-    pub processes: Vec<ProcessItem>,
-    pub sys: System,
-}
-
-impl AppState {
-    #[cfg(target_os = "windows")]
-    pub fn new() -> Self {
-        let mut slf = Self {
-            processes: Vec::new(),
-            sys: System::new_all(),
-        };
-        slf.refresh_processes();
-        slf
-    }
-
-    // Обновление списка .exe процессов
-    #[cfg(target_os = "windows")]
-    pub fn refresh_processes(&mut self) {
-        let selected_apps: std::collections::HashSet<String> = self.processes
-            .iter()
-            .filter(|p| p.is_selected)
-            .map(|p| p.name.clone())
-            .collect();
-
-        self.sys.refresh_all();
-
-        let mut map: BTreeMap<String, ProcessItem> = BTreeMap::new();
-
-        for (pid, process) in self.sys.processes() {
-            let name = process.name().to_string();
-
-            if name.ends_with(".exe") || cfg!(windows) {
-                let is_selected = selected_apps.contains(&name);
-
-                map.entry(name.clone()).or_insert(ProcessItem {
-                    pid: pid.as_u32(),
-                    name,
-                    is_selected,
-                });
-            }
-        }
-
-        self.processes = map.into_values().collect();
-    }
-}
-
 impl EventHandler for GuiEventHandler {
     fn on_event(&self, event: AnetEvent) {
         let _ = self.tx.send(event.clone());
 
         if let AnetEvent::ClientStateChanged { state, .. } = &event {
-            let mut guard = self.shared.lock().unwrap();
+            let mut guard = lock_ignore_poison(&self.shared);
             guard.state = match state {
                 ClientState::Connected => ConnectionState::Connected,
-                ClientState::Connecting | ClientState::Reconnecting | ClientState::Stopping => {
+                ClientState::Connecting | ClientState::Reconnecting => {
                     ConnectionState::Connecting
                 }
-                ClientState::Disconnected | ClientState::Stopped | ClientState::Failed => {
+                ClientState::Stopping | ClientState::Disconnected | ClientState::Stopped | ClientState::Failed => {
                     ConnectionState::Disconnected
                 }
             };
@@ -153,7 +114,21 @@ pub struct SharedState {
     pub state: ConnectionState,
 }
 
-// --- App Struct ---
+fn lock_ignore_poison<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+fn push_log(logs: &Arc<Mutex<Vec<String>>>, msg: &str) {
+    let mut guard = lock_ignore_poison(logs);
+    guard.push(msg.to_string());
+    if guard.len() > 1000 {
+        guard.drain(0..100);
+    }
+}
+
 pub struct ANetApp {
     rt: Runtime,
     logs: Arc<Mutex<Vec<String>>>,
@@ -162,6 +137,15 @@ pub struct ANetApp {
     event_rx: Receiver<AnetEvent>,
     settings: Arc<Mutex<AppSettings>>,
     shared: Arc<Mutex<SharedState>>,
+
+    config_load_tx: Sender<ConfigLoadOutcome>,
+    config_load_rx: Receiver<ConfigLoadOutcome>,
+
+    file_dialog_tx: Sender<PathBuf>,
+    file_dialog_rx: Receiver<PathBuf>,
+
+    server_names_cache: Vec<String>,
+    server_names_cache_key: Option<(String, u64)>,
 
     tray_cmd_tx: Sender<TrayCommand>,
 
@@ -190,12 +174,10 @@ pub struct ANetApp {
 
     tray_value: bool,
 
-    // Адреса, исключённые из VPN-туннеля.
     exclude_routes: Vec<String>,
     exclude_route_input: String,
     exclude_routes_changed: bool,
 
-    // Всплывающее уведомление
     toast_message: Option<String>,
     toast_until: Option<std::time::Instant>,
 
@@ -217,7 +199,7 @@ pub fn toggle_vpn(
     rt_handle: &Handle,
     logs: &Arc<Mutex<Vec<String>>>
 ) {
-    let mut guard = shared.lock().unwrap();
+    let mut guard = lock_ignore_poison(&shared);
 
     if guard.state == ConnectionState::Disconnected {
         if let Some(client_clone) = guard.client.clone() {
@@ -227,14 +209,14 @@ pub fn toggle_vpn(
             let logs_clone = logs.clone();
             let shared_clone = shared.clone();
             rt_handle.spawn(async move {
-                logs_clone.lock().unwrap().push("> Starting service...".into());
+                push_log(&logs_clone, "> Starting service...");
                 match client_clone.start().await {
                     Ok(_) => {
-                        logs_clone.lock().unwrap().push("> VPN Stopped (Ok)".into());
+                        push_log(&logs_clone, "> Service stopped");
                     }
                     Err(e) => {
-                        logs_clone.lock().unwrap().push(format!("> Error: {}", e));
-                        shared_clone.lock().unwrap().state = ConnectionState::Disconnected;
+                        push_log(&logs_clone, &format!("> Error: {}", e));
+                        lock_ignore_poison(&shared_clone).state = ConnectionState::Disconnected;
                         anet_client_core::events::err(e.to_string());
                     }
                 }
@@ -246,7 +228,7 @@ pub fn toggle_vpn(
 
         let logs_clone = logs.clone();
         rt_handle.spawn(async move {
-            logs_clone.lock().unwrap().push("> Stopping service...".into());
+            push_log(&logs_clone, "> Stopping service...");
             let _ = client_clone.stop().await;
         });
     }
@@ -255,7 +237,7 @@ pub fn toggle_vpn(
 impl ANetApp {
     fn show_toast(&mut self, message: impl Into<String>) {
         self.toast_message = Some(message.into());
-        self.toast_until = Some(std::time::Instant::now() + std::time::Duration::from_secs(1));
+        self.toast_until = Some(std::time::Instant::now() + std::time::Duration::from_millis(2500));
     }
 
     #[cfg(target_os = "windows")]
@@ -291,45 +273,16 @@ impl ANetApp {
     fn render_process_list(&mut self, ui: &mut egui::Ui) {
         ui.vertical(|ui| {
             ui.label("Режим фильтрации:");
-
-            if
-                ui
-                    .radio_value(&mut self.filter_mode, FilterMode::All, "Vpn для всех приложений")
-                    .changed()
-            {
-                println!("Переключено на All");
-            }
-
-            if
-                ui
-                    .radio_value(
-                        &mut self.filter_mode,
-                        FilterMode::Include,
-                        "Vpn только для выбранных"
-                    )
-                    .changed()
-            {
-                println!("Переключено на Include");
-            }
-
-            if
-                ui
-                    .radio_value(
-                        &mut self.filter_mode,
-                        FilterMode::Exclude,
-                        "Vpn для всего, кроме выбранных"
-                    )
-                    .changed()
-            {
-                println!("Переключено на Exclude");
-            }
+            ui.radio_value(&mut self.filter_mode, FilterMode::All, "Vpn для всех приложений");
+            ui.radio_value(&mut self.filter_mode, FilterMode::Include, "Vpn только для выбранных");
+            ui.radio_value(&mut self.filter_mode, FilterMode::Exclude, "Vpn для всего, кроме выбранных");
         });
         ui.separator();
         ui.horizontal(|ui| {
             if ui.button("🔄 Обновить").clicked() {
                 self.refresh_processes();
             }
-            if ui.button(" Применить").clicked() {
+            if ui.button("Применить").clicked() {
                 let selected_apps: Vec<String> = self.processes
                     .iter()
                     .filter(|p| p.is_selected)
@@ -340,7 +293,7 @@ impl ANetApp {
                 let mut updated_config_data: Option<(String, String, String)> = None;
 
                 {
-                    let mut settings = self.settings.lock().unwrap();
+                    let mut settings = lock_ignore_poison(&self.settings);
                     let active_id = settings.active_config_id.clone();
 
                     if let Some(id) = active_id {
@@ -365,12 +318,8 @@ impl ANetApp {
                 }
 
                 if let Some((id, content, name)) = updated_config_data {
-                    let path_by_id = std::path::PathBuf
-                        ::from("configs")
-                        .join(format!("{}.toml", id));
-                    let path_by_name = std::path::PathBuf
-                        ::from("configs")
-                        .join(format!("{}.toml", name));
+                    let path_by_id = std::path::PathBuf::from("configs").join(format!("{}.toml", id));
+                    let path_by_name = std::path::PathBuf::from("configs").join(format!("{}.toml", name));
 
                     let target_path = if path_by_id.exists() {
                         Some(path_by_id)
@@ -390,66 +339,20 @@ impl ANetApp {
 
                     if let Some(path) = target_path {
                         match std::fs::write(&path, &content) {
-                            Ok(_) => {
-                                self.log(
-                                    &format!("Конфиг успешно перезаписан на диске: {:?}", path)
-                                );
-                            }
-                            Err(e) => self.log(&format!(" Ошибка записи в {:?}: {}", path, e)),
+                            Ok(_) => self.log(&format!("Конфиг сохранен: {:?}", path)),
+                            Err(e) => self.log(&format!("Ошибка записи в {:?}: {}", path, e)),
                         }
-                    } else {
-                        self.log(
-                            &format!(
-                                " Предупреждение: Не удалось найти путь к файлу для ID: {} / Имя: {}",
-                                id,
-                                name
-                            )
-                        );
                     }
 
-                    self.load_config_from_content(&id, &content, &name);
+                    let should_reconnect = lock_ignore_poison(&self.shared).state == ConnectionState::Connected;
+                    if should_reconnect {
+                        self.log("Переподключение VPN с новыми настройками приложений...");
+                    }
+
+                    self.load_config_from_content(&id, &content, &name, should_reconnect);
                     self.log("Настройки приложений применены.");
-
-                    let current_state = self.shared.lock().unwrap().state;
-                    if current_state == ConnectionState::Connected {
-                        self.log("Переподключение VPN из-за изменения настроек...");
-                        self.stop_vpn();
-
-                        let shared_clone = self.shared.clone();
-                        let logs_clone = self.logs.clone();
-                        let rt_handle = self.rt.handle().clone();
-
-                        rt_handle.spawn(async move {
-                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-                            let client_opt = {
-                                let mut guard = shared_clone.lock().unwrap();
-                                guard.state = ConnectionState::Connecting;
-                                guard.client.clone()
-                            };
-
-                            if let Some(client_clone) = client_opt {
-                                logs_clone.lock().unwrap().push("> Re-starting service...".into());
-
-                                match client_clone.start().await {
-                                    Ok(_) => {
-                                        logs_clone
-                                            .lock()
-                                            .unwrap()
-                                            .push("> VPN Stopped (Ok)".into());
-                                    }
-                                    Err(e) => {
-                                        logs_clone.lock().unwrap().push(format!("> Error: {}", e));
-                                        shared_clone.lock().unwrap().state =
-                                            ConnectionState::Disconnected;
-                                        anet_client_core::events::err(e.to_string());
-                                    }
-                                }
-                            }
-                        });
-                    }
                 } else {
-                    self.log(" Ошибка: нет активного конфига для применения настроек.");
+                    self.log("Ошибка: нет активного конфига для применения настроек.");
                 }
             }
         });
@@ -461,13 +364,11 @@ impl ANetApp {
         ui.style_mut().visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(120, 120, 120);
         ui.style_mut().visuals.widgets.active.bg_fill = egui::Color32::from_rgb(160, 160, 160);
 
-        egui::ScrollArea
-            ::vertical()
+        egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .scroll_bar_visibility(ScrollBarVisibility::AlwaysVisible)
             .show(ui, |ui| {
-                egui::Grid
-                    ::new("process_grid")
+                egui::Grid::new("process_grid")
                     .striped(true)
                     .spacing([12.0, 8.0])
                     .min_col_width(24.0)
@@ -485,33 +386,21 @@ impl ANetApp {
 
                                 let checkbox_stroke = egui::Stroke::new(2.0, checkbox_gold);
                                 let checkbox_active_stroke = egui::Stroke::new(2.0, checkbox_gold);
-                                let checkbox_inactive_stroke = egui::Stroke::new(
-                                    2.0,
-                                    checkbox_grey
-                                );
-                                let checkbox_inactive_chevron = egui::Stroke::new(
-                                    2.0,
-                                    checkbox_white
-                                );
+                                let checkbox_inactive_stroke = egui::Stroke::new(2.0, checkbox_grey);
+                                let checkbox_inactive_chevron = egui::Stroke::new(2.0, checkbox_white);
 
-                                ui.style_mut().visuals.widgets.inactive.fg_stroke =
-                                    checkbox_inactive_chevron;
+                                ui.style_mut().visuals.widgets.inactive.fg_stroke = checkbox_inactive_chevron;
 
                                 if proc.is_selected {
-                                    ui.style_mut().visuals.widgets.inactive.bg_stroke =
-                                        checkbox_active_stroke;
+                                    ui.style_mut().visuals.widgets.inactive.bg_stroke = checkbox_active_stroke;
                                     ui.style_mut().visuals.widgets.inactive.bg_fill = checkbox_gold;
-                                    ui.style_mut().visuals.widgets.inactive.fg_stroke =
-                                        egui::Stroke::new(2.0, checkbox_grey);
+                                    ui.style_mut().visuals.widgets.inactive.fg_stroke = egui::Stroke::new(2.0, checkbox_grey);
                                 } else {
-                                    ui.style_mut().visuals.widgets.inactive.bg_stroke =
-                                        checkbox_inactive_stroke;
+                                    ui.style_mut().visuals.widgets.inactive.bg_stroke = checkbox_inactive_stroke;
                                 }
 
                                 ui.style_mut().visuals.widgets.hovered.bg_stroke = checkbox_stroke;
-
-                                if ui.checkbox(&mut proc.is_selected, "").changed() {
-                                }
+                                ui.checkbox(&mut proc.is_selected, "");
                             });
                             ui.label("⚙");
 
@@ -522,170 +411,55 @@ impl ANetApp {
                             };
 
                             ui.colored_label(text_color, &proc.name);
-
                             ui.end_row();
                         }
                     });
             });
     }
 
-    #[cfg(target_os = "windows")]
     fn inject_per_app_to_toml(content: &str, apps: &[String], mode: FilterMode) -> String {
-        let normalized = content.replace("\r\n", "\n");
-        let mut lines: Vec<String> = normalized
-            .lines()
-            .map(|s| s.to_string())
-            .collect();
-
-        let apps_str = apps
-            .iter()
-            .map(|app| format!("\"{}\"", app))
-            .collect::<Vec<_>>()
-            .join(", ");
-
-        let per_app_line = format!("per_app = [{}]", apps_str);
-
-        let mode_str = match mode {
-            FilterMode::All => "all",
-            FilterMode::Include => "include",
-            FilterMode::Exclude => "exclude",
-        };
-        let mode_line = format!("per_app_mode = \"{}\"", mode_str);
-
-        let mut in_main = false;
-        let mut main_end_idx = None;
-        let mut per_app_idx = None;
-        let mut mode_idx = None;
-        let mut old_exclude_idx = None;
-
-        for (i, line) in lines.iter().enumerate() {
-            let trimmed = line.trim();
-
-            if trimmed.starts_with('[') && trimmed.ends_with(']') {
-                if trimmed == "[main]" {
-                    in_main = true;
-                } else if in_main {
-                    main_end_idx = Some(i);
-                    in_main = false;
-                }
-            } else if in_main {
-                if trimmed.starts_with('#') {
-                    continue;
-                }
-
-                let clean_line: String = trimmed
-                    .chars()
-                    .filter(|c| !c.is_whitespace())
-                    .collect();
-
-                if clean_line.starts_with("per_app=[") {
-                    per_app_idx = Some(i);
-                } else if clean_line.starts_with("per_app_mode=") {
-                    mode_idx = Some(i);
-                } else if clean_line.starts_with("per_app_exclude=") {
-                    old_exclude_idx = Some(i);
+        if let Ok(mut val) = toml::from_str::<toml::Value>(content) {
+            if let Some(main) = val.get_mut("main").and_then(|m| m.as_table_mut()) {
+                let apps_val = apps.iter().cloned().map(toml::Value::String).collect();
+                main.insert("per_app".to_string(), toml::Value::Array(apps_val));
+                let mode_str = match mode {
+                    FilterMode::All => "all",
+                    FilterMode::Include => "include",
+                    FilterMode::Exclude => "exclude",
+                };
+                main.insert("per_app_mode".to_string(), toml::Value::String(mode_str.to_string()));
+                main.remove("per_app_exclude");
+                if let Ok(serialized) = toml::to_string_pretty(&val) {
+                    return serialized;
                 }
             }
         }
-
-        if let Some(idx) = old_exclude_idx {
-            lines.remove(idx);
-            if let Some(ref mut p) = per_app_idx {
-                if *p > idx {
-                    *p -= 1;
-                }
-            }
-            if let Some(ref mut m) = mode_idx {
-                if *m > idx {
-                    *m -= 1;
-                }
-            }
-            if let Some(ref mut e) = main_end_idx {
-                if *e > idx {
-                    *e -= 1;
-                }
-            }
-        }
-
-        match per_app_idx {
-            Some(idx) => {
-                lines[idx] = per_app_line.clone();
-            }
-            None => {
-                let default_insert_pos = main_end_idx.unwrap_or(lines.len());
-                lines.insert(default_insert_pos, per_app_line.clone());
-                main_end_idx = Some(default_insert_pos + 1);
-            }
-        }
-
-        match mode_idx {
-            Some(idx) => {
-                lines[idx] = mode_line.clone();
-            }
-            None => {
-                let insert_pos = main_end_idx.unwrap_or(lines.len());
-                lines.insert(insert_pos.min(lines.len()), mode_line.clone());
-            }
-        }
-
-        lines.join("\n")
+        content.to_string()
     }
 
     fn inject_exclude_route_to_toml(content: &str, routes: &[String]) -> String {
-        let normalized = content.replace("\r\n", "\n");
-
-        let mut lines: Vec<String> = normalized
-            .lines()
-            .map(|s| s.to_string())
-            .collect();
-
-        let routes_str = routes
-            .iter()
-            .map(|route| { format!("\"{}\"", Self::toml_escape_string(route)) })
-            .collect::<Vec<_>>()
-            .join(", ");
-
-        let exclude_line = format!("exclude_route_for = [{}]", routes_str);
-
-        let mut in_main = false;
-        let mut main_end_idx = None;
-        let mut exclude_idx = None;
-
-        for (i, line) in lines.iter().enumerate() {
-            let trimmed = line.trim();
-
-            if trimmed.starts_with('[') && trimmed.ends_with(']') {
-                if trimmed == "[main]" {
-                    in_main = true;
-                } else if in_main {
-                    main_end_idx = Some(i);
-                    in_main = false;
-                }
-            } else if in_main {
-                let clean_line: String = trimmed
-                    .chars()
-                    .filter(|c| !c.is_whitespace())
-                    .collect();
-
-                if clean_line.starts_with("exclude_route_for=") {
-                    exclude_idx = Some(i);
+        if let Ok(mut val) = toml::from_str::<toml::Value>(content) {
+            if let Some(main) = val.get_mut("main").and_then(|m| m.as_table_mut()) {
+                let routes_val = routes.iter().cloned().map(toml::Value::String).collect();
+                main.insert("exclude_route_for".to_string(), toml::Value::Array(routes_val));
+                if let Ok(serialized) = toml::to_string_pretty(&val) {
+                    return serialized;
                 }
             }
         }
+        content.to_string()
+    }
 
-        match exclude_idx {
-            Some(idx) => {
-                lines[idx] = exclude_line;
-            }
-
-            None => {
-                let insert_pos = main_end_idx.unwrap_or(lines.len());
-
-                lines.insert(insert_pos.min(lines.len()), exclude_line);
+    fn inject_tray_mode_to_toml(content: &str, tray_mode: bool) -> String {
+        if let Ok(mut val) = toml::from_str::<toml::Value>(content) {
+            if let Some(main) = val.get_mut("main").and_then(|m| m.as_table_mut()) {
+                main.insert("tray_mode".to_string(), toml::Value::Boolean(tray_mode));
+                if let Ok(serialized) = toml::to_string_pretty(&val) {
+                    return serialized;
+                }
             }
         }
-
-        lines.join("\n")
+        content.to_string()
     }
 
     fn close_exclbar(&mut self) {
@@ -701,22 +475,12 @@ impl ANetApp {
         let mut updated_config_data: Option<(String, String, String)> = None;
 
         {
-            let mut settings = self.settings.lock().unwrap();
-
+            let mut settings = lock_ignore_poison(&self.settings);
             if let Some(active_id) = settings.active_config_id.clone() {
                 if let Some(cfg) = settings.configs.iter_mut().find(|c| c.id == active_id) {
-                    cfg.content = Self::inject_exclude_route_to_toml(
-                        &cfg.content,
-                        &self.exclude_routes
-                    );
-
-                    updated_config_data = Some((
-                        cfg.id.clone(),
-                        cfg.content.clone(),
-                        cfg.name.clone(),
-                    ));
+                    cfg.content = Self::inject_exclude_route_to_toml(&cfg.content, &self.exclude_routes);
+                    updated_config_data = Some((cfg.id.clone(), cfg.content.clone(), cfg.name.clone()));
                 }
-
                 settings.save();
             }
         }
@@ -727,7 +491,6 @@ impl ANetApp {
         };
 
         let path_by_id = std::path::PathBuf::from("configs").join(format!("{}.toml", id));
-
         let path_by_name = std::path::PathBuf::from("configs").join(format!("{}.toml", name));
 
         let target_path = if path_by_id.exists() {
@@ -736,9 +499,7 @@ impl ANetApp {
             Some(path_by_name)
         } else {
             let root_id = std::path::PathBuf::from(format!("{}.toml", id));
-
             let root_name = std::path::PathBuf::from(format!("{}.toml", name));
-
             if root_id.exists() {
                 Some(root_id)
             } else if root_name.exists() {
@@ -750,10 +511,7 @@ impl ANetApp {
 
         if let Some(path) = target_path {
             match std::fs::write(&path, &content) {
-                Ok(_) => {
-                    self.log("Список исключённых адресов сохранён.");
-                }
-
+                Ok(_) => self.log("Список исключённых адресов сохранён."),
                 Err(e) => {
                     self.log(&format!("Ошибка записи исключений в {:?}: {}", path, e));
                     return;
@@ -761,103 +519,12 @@ impl ANetApp {
             }
         }
 
-        // Создаём новый AnetClient с обновлённым CoreConfig.
-        self.load_config_from_content(&id, &content, &name);
-
-        // Если VPN уже работает — применяем изменение сразу.
-        let current_state = self.shared.lock().unwrap().state;
-
-        if current_state == ConnectionState::Connected {
-            self.log("Переподключение VPN из-за изменения исключений...");
-
-            self.stop_vpn();
-
-            let shared_clone = self.shared.clone();
-            let logs_clone = self.logs.clone();
-            let rt_handle = self.rt.handle().clone();
-
-            rt_handle.spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-                let client_opt = {
-                    let mut guard = shared_clone.lock().unwrap();
-
-                    guard.state = ConnectionState::Connecting;
-
-                    guard.client.clone()
-                };
-
-                if let Some(client_clone) = client_opt {
-                    logs_clone
-                        .lock()
-                        .unwrap()
-                        .push("> Restarting VPN with updated route exclusions...".into());
-
-                    match client_clone.start().await {
-                        Ok(_) => {
-                            logs_clone.lock().unwrap().push("> VPN restarted successfully.".into());
-                        }
-
-                        Err(e) => {
-                            logs_clone.lock().unwrap().push(format!("> Error: {}", e));
-
-                            shared_clone.lock().unwrap().state = ConnectionState::Disconnected;
-
-                            anet_client_core::events::err(e.to_string());
-                        }
-                    }
-                }
-            });
-        }
-    }
-
-    #[cfg(target_os = "windows")]
-    fn inject_tray_mode_to_toml(content: &str, tray_mode: bool) -> String {
-        let normalized = content.replace("\r\n", "\n");
-        let mut lines: Vec<String> = normalized
-            .lines()
-            .map(|s| s.to_string())
-            .collect();
-
-        let tray_line = format!("tray_mode = {}", tray_mode);
-
-        let mut in_main = false;
-        let mut main_end_idx = None;
-        let mut tray_mode_idx = None;
-
-        for (i, line) in lines.iter().enumerate() {
-            let trimmed = line.trim();
-
-            if trimmed.starts_with('[') && trimmed.ends_with(']') {
-                if trimmed == "[main]" {
-                    in_main = true;
-                } else if in_main {
-                    main_end_idx = Some(i);
-                    in_main = false;
-                }
-            } else if in_main {
-                let clean_line: String = trimmed
-                    .chars()
-                    .filter(|c| !c.is_whitespace())
-                    .collect();
-
-                if clean_line.starts_with("tray_mode=") {
-                    tray_mode_idx = Some(i);
-                }
-            }
+        let should_reconnect = lock_ignore_poison(&self.shared).state == ConnectionState::Connected;
+        if should_reconnect {
+            self.log("Переподключение VPN с обновленными исключениями...");
         }
 
-        match tray_mode_idx {
-            Some(idx) => {
-                lines[idx] = tray_line;
-            }
-            None => {
-                let insert_pos = main_end_idx.unwrap_or(lines.len());
-                lines.insert(insert_pos, tray_line);
-            }
-        }
-
-        lines.join("\n")
+        self.load_config_from_content(&id, &content, &name, should_reconnect);
     }
 
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
@@ -877,6 +544,8 @@ impl ANetApp {
 
         let (event_tx, event_rx) = channel::<AnetEvent>();
         let (tray_cmd_tx, tray_cmd_rx) = channel::<TrayCommand>();
+        let (config_load_tx, config_load_rx) = channel::<ConfigLoadOutcome>();
+        let (file_dialog_tx, file_dialog_rx) = channel::<PathBuf>();
 
         let shared_for_handler = shared.clone();
         set_handler(
@@ -915,6 +584,12 @@ impl ANetApp {
             event_rx,
             settings: settings_arc,
             shared,
+            config_load_tx,
+            config_load_rx,
+            file_dialog_tx,
+            file_dialog_rx,
+            server_names_cache: Vec::new(),
+            server_names_cache_key: None,
             tray_cmd_tx,
             last_known_state: ConnectionState::Disconnected,
             is_in_tray: false,
@@ -953,16 +628,16 @@ impl ANetApp {
         #[cfg(target_os = "windows")]
         app.refresh_processes();
 
-        let config_to_load = app.settings.lock().unwrap().get_active_config();
+        let config_to_load = lock_ignore_poison(&app.settings).get_active_config();
         if let Some(config) = config_to_load {
-            app.load_config_from_content(&config.id, &config.content, &config.name);
+            app.load_config_from_content(&config.id, &config.content, &config.name, false);
         }
 
         app
     }
 
     fn check_for_updates(&mut self) {
-        let update_url = if let Some(client) = self.shared.lock().unwrap().client.as_ref() {
+        let update_url = if let Some(client) = lock_ignore_poison(&self.shared).client.as_ref() {
             client.get_config().main.update_url.clone()
         } else {
             "https://api.github.com/repos/ZeroTworu/anet/releases/latest".to_string()
@@ -990,13 +665,123 @@ impl ANetApp {
     }
 
     fn log(&self, msg: &str) {
-        if let Ok(mut logs) = self.logs.lock() {
-            logs.push(format!("> {}", msg));
+        push_log(&self.logs, msg);
+    }
+
+    fn drain_events(&mut self) {
+        while let Ok(event) = self.event_rx.try_recv() {
+            match event {
+                AnetEvent::Stats { rx, tx, rtt, rxm, txm } => {
+                    self.total_rx = rx;
+                    self.total_tx = tx;
+                    self.total_rtt = rtt;
+                    self.total_rxm = rxm;
+                    self.total_txm = txm;
+                }
+
+                AnetEvent::Status(msg) => {
+                    self.log(&msg);
+                }
+                AnetEvent::ClientStateChanged { state, message, server_name } => {
+                    self.log(&message);
+
+                    if matches!(
+                        state,
+                        ClientState::Disconnected | ClientState::Stopped | ClientState::Failed
+                    ) {
+                        self.total_rx = "0 B".to_string();
+                        self.total_tx = "0 B".to_string();
+                        self.total_rtt = "0".to_string();
+                        self.total_rxm = "0 B".to_string();
+                        self.total_txm = "0 B".to_string();
+                    }
+
+                    if let Some(active_name) = server_name {
+                        let mut settings = lock_ignore_poison(&self.settings);
+                        if let Some(active_cfg) = settings.get_active_config() {
+                            settings.selected_servers.insert(active_cfg.id.clone(), active_name);
+                            settings.save();
+                        }
+                    }
+                }
+                AnetEvent::Error(msg) => {
+                    let err = format!("CRITICAL ERROR: {}", msg);
+                    self.log(&err);
+                    self.error_modal = Some(msg.clone());
+                    if matches!(self.update_status, UpdateStatus::Downloading(_) | UpdateStatus::Checking) {
+                        self.update_status = UpdateStatus::Error(msg);
+                    }
+                    if !lock_ignore_poison(&self.settings).disable_notifications {
+                        send_notification("Ошибка ANeT", &err);
+                    }
+                }
+                AnetEvent::UpdateProgress(p) => {
+                    self.update_status = UpdateStatus::Downloading(p);
+                }
+                AnetEvent::UpdateStatus(msg) => self.log(&msg),
+                AnetEvent::UpdateAvailable(release) => {
+                    self.log(&format!("Найдено обновление: {}", release.tag_name));
+                    self.update_status = UpdateStatus::Available(release);
+                }
+                AnetEvent::UpdateReady => {
+                    self.update_status = UpdateStatus::ReadyToRestart;
+                }
+                _ => {}
+            }
+        }
+
+        while let Ok(outcome) = self.config_load_rx.try_recv() {
+            match outcome {
+                ConfigLoadOutcome::Loaded { id, name, reconnect } => {
+                    let is_still_active = lock_ignore_poison(&self.settings)
+                        .active_config_id.as_deref() == Some(id.as_str());
+                    if is_still_active {
+                        self.config_err = None;
+                        self.config_name = name.clone();
+                        self.log(&format!("Config loaded: {}", name));
+
+                        if reconnect {
+                            self.start_vpn();
+                        }
+                    }
+                }
+                ConfigLoadOutcome::Failed { id, error } => {
+                    let is_still_active = lock_ignore_poison(&self.settings)
+                        .active_config_id.as_deref() == Some(id.as_str());
+                    if is_still_active {
+                        self.config_err = Some(error);
+                        self.log("Failed to create route manager");
+                    }
+                }
+            }
+        }
+
+        while let Ok(path) = self.file_dialog_rx.try_recv() {
+            self.add_config_from_path(path);
         }
     }
 
+    fn refresh_server_names_cache(&mut self, active_config_id: &str, content: &str) {
+        let mut hasher = DefaultHasher::new();
+        content.hash(&mut hasher);
+        let key = (active_config_id.to_string(), hasher.finish());
+
+        if self.server_names_cache_key.as_ref() == Some(&key) {
+            return;
+        }
+
+        self.server_names_cache = match toml::from_str::<CoreConfig>(content) {
+            Ok(mut raw_cfg) => {
+                let _ = raw_cfg.sanitize();
+                raw_cfg.servers.iter().map(|s| s.get_name()).collect()
+            }
+            Err(_) => Vec::new(),
+        };
+        self.server_names_cache_key = Some(key);
+    }
+
     fn start_vpn(&mut self) {
-        let mut guard = self.shared.lock().unwrap();
+        let mut guard = lock_ignore_poison(&self.shared);
         if let Some(client_clone) = guard.client.clone() {
             guard.state = ConnectionState::Connecting;
             drop(guard);
@@ -1004,12 +789,12 @@ impl ANetApp {
             let logs_clone = self.logs.clone();
             let shared_clone = self.shared.clone();
             self.rt.spawn(async move {
-                logs_clone.lock().unwrap().push("> Starting service...".into());
+                push_log(&logs_clone, "> Starting service...");
                 match client_clone.start().await {
-                    Ok(_) => logs_clone.lock().unwrap().push("> VPN Stopped (Ok)".into()),
+                    Ok(_) => push_log(&logs_clone, "> Service stopped"),
                     Err(e) => {
-                        logs_clone.lock().unwrap().push(format!("> Error: {}", e));
-                        shared_clone.lock().unwrap().state = ConnectionState::Disconnected;
+                        push_log(&logs_clone, &format!("> Error: {}", e));
+                        lock_ignore_poison(&shared_clone).state = ConnectionState::Disconnected;
                         anet_client_core::events::err(e.to_string());
                     }
                 }
@@ -1018,23 +803,26 @@ impl ANetApp {
     }
 
     fn stop_vpn(&mut self) {
-        let mut guard = self.shared.lock().unwrap();
+        let mut guard = lock_ignore_poison(&self.shared);
         if let Some(client_clone) = guard.client.clone() {
             guard.state = ConnectionState::Disconnected;
             drop(guard);
 
             let logs_clone = self.logs.clone();
             self.rt.spawn(async move {
-                logs_clone.lock().unwrap().push("> Stopping service...".into());
+                push_log(&logs_clone, "> Stopping service...");
                 let _ = client_clone.stop().await;
             });
         }
     }
 
     fn open_file_dialog(&mut self) {
-        if let Some(path) = rfd::FileDialog::new().add_filter("TOML Config", &["toml"]).pick_file() {
-            self.add_config_from_path(path);
-        }
+        let tx = self.file_dialog_tx.clone();
+        std::thread::spawn(move || {
+            if let Some(path) = rfd::FileDialog::new().add_filter("TOML Config", &["toml"]).pick_file() {
+                let _ = tx.send(path);
+            }
+        });
     }
 
     fn add_config_from_path(&mut self, path: PathBuf) {
@@ -1061,15 +849,23 @@ impl ANetApp {
             .trim_end_matches(".toml")
             .to_string();
         let id = {
-            let mut settings = self.settings.lock().unwrap();
+            let mut settings = lock_ignore_poison(&self.settings);
             settings.add_config(name, content)
         };
         self.select_config(&id);
     }
 
     fn delete_config(&mut self, id: &str) {
-        self.settings.lock().unwrap().remove_config(id);
-        if self.shared.lock().unwrap().client.is_none() {
+        if lock_ignore_poison(&self.shared).state != ConnectionState::Disconnected {
+            let is_active = lock_ignore_poison(&self.settings).active_config_id.as_deref() == Some(id);
+            if is_active {
+                self.show_toast("Нельзя удалить активный конфиг при подключенном VPN");
+                self.log("Нельзя удалить активную конфигурацию при подключенном VPN");
+                return;
+            }
+        }
+        lock_ignore_poison(&self.settings).remove_config(id);
+        if lock_ignore_poison(&self.shared).client.is_none() {
             self.config_name = "Config deleted".to_string();
         }
     }
@@ -1083,7 +879,7 @@ impl ANetApp {
         if let Some(id) = &self.editing_config_id {
             let new_name = self.edit_name_buffer.trim().to_string();
             if !new_name.is_empty() {
-                let mut settings = self.settings.lock().unwrap();
+                let mut settings = lock_ignore_poison(&self.settings);
                 settings.rename_config(id, new_name);
             }
         }
@@ -1092,20 +888,22 @@ impl ANetApp {
     }
 
     fn select_config(&mut self, id: &str) {
+        if lock_ignore_poison(&self.shared).state != ConnectionState::Disconnected {
+            self.show_toast("Сначала отключите VPN для смены конфигурации");
+            self.log("Нельзя сменить конфигурацию при активном подключении");
+            return;
+        }
         let config = {
-            let mut settings = self.settings.lock().unwrap();
+            let mut settings = lock_ignore_poison(&self.settings);
             settings.set_active(id);
             settings.get_active_config()
         };
         if let Some(config) = config {
-            self.load_config_from_content(&config.id, &config.content, &config.name);
+            self.load_config_from_content(&config.id, &config.content, &config.name, false);
         }
     }
 
-    fn load_config_from_content(&mut self, id: &str, content: &str, name: &str) {
-        let _ = self.rt.enter();
-        let route_result = self.rt.block_on(async { create_route_manager(false) });
-
+    fn load_config_from_content(&mut self, id: &str, content: &str, name: &str, reconnect: bool) {
         match toml::from_str::<CoreConfig>(content) {
             Ok(mut cfg) => {
                 let _ = cfg.sanitize();
@@ -1115,7 +913,6 @@ impl ANetApp {
                     anet_client_core::config::PerAppMode::Exclude => FilterMode::Exclude,
                 };
 
-                // Загружаем настройку сворачивания в трей из [main]
                 if let Ok(raw_toml) = toml::from_str::<toml::Value>(content) {
                     self.tray_value = raw_toml
                         .get("main")
@@ -1130,7 +927,7 @@ impl ANetApp {
                         .map(|values| {
                             values
                                 .iter()
-                                .filter_map(|value| { value.as_str().map(ToOwned::to_owned) })
+                                .filter_map(|value| value.as_str().map(ToOwned::to_owned))
                                 .collect()
                         })
                         .unwrap_or_default();
@@ -1141,15 +938,14 @@ impl ANetApp {
                 }
 
                 let selected_name_opt = {
-                    let settings = self.settings.lock().unwrap();
+                    let settings = lock_ignore_poison(&self.settings);
                     settings.selected_servers.get(id).cloned()
                 };
 
                 if let Some(selected_name) = selected_name_opt {
-                    if
-                        let Some(idx) = cfg.servers
-                            .iter()
-                            .position(|s| s.get_name() == selected_name)
+                    if let Some(idx) = cfg.servers
+                        .iter()
+                        .position(|s| s.get_name() == selected_name)
                     {
                         cfg.servers.rotate_left(idx);
                     }
@@ -1159,20 +955,43 @@ impl ANetApp {
                     DesktopTunFactory::new(cfg.main.tun_name.clone(), !cfg.main.per_app.is_empty())
                 );
 
-                let route = match route_result {
-                    Ok(r) => r,
-                    Err(e) => {
-                        self.config_err = Some(format!("Failed to create route manager: {}", e));
-                        self.log("Failed to create route manager");
-                        return;
-                    }
-                };
                 self.config_err = None;
-                self.config_name = name.to_string();
-                self.shared.lock().unwrap().client = Some(
-                    Arc::new(AnetClient::new(cfg, tun, route))
-                );
-                self.log(&format!("Config loaded: {}", self.config_name));
+                self.log(&format!("Загрузка конфигурации: {}...", name));
+
+                let shared_clone = self.shared.clone();
+                let config_load_tx = self.config_load_tx.clone();
+                let id_owned = id.to_string();
+                let name_owned = name.to_string();
+                let old_client = if reconnect {
+                    lock_ignore_poison(&self.shared).client.clone()
+                } else {
+                    None
+                };
+
+                self.rt.spawn(async move {
+                    if let Some(old) = old_client {
+                        let _ = old.stop().await;
+                    }
+                    let _ = tokio::task::spawn_blocking(move || {
+                        match create_route_manager(false) {
+                            Ok(route) => {
+                                let client = Arc::new(AnetClient::new(cfg, tun, route));
+                                lock_ignore_poison(&shared_clone).client = Some(client);
+                                let _ = config_load_tx.send(ConfigLoadOutcome::Loaded {
+                                    id: id_owned,
+                                    name: name_owned,
+                                    reconnect,
+                                });
+                            }
+                            Err(e) => {
+                                let _ = config_load_tx.send(ConfigLoadOutcome::Failed {
+                                    id: id_owned,
+                                    error: format!("Failed to create route manager: {}", e),
+                                });
+                            }
+                        }
+                    }).await;
+                });
             }
             Err(e) => {
                 self.config_err = Some(e.to_string());
@@ -1181,12 +1000,6 @@ impl ANetApp {
         }
     }
 
-    /// Проверка адреса для exclude_route_for.
-    ///
-    /// Поддерживаются:
-    /// - IPv4 / IPv6
-    /// - IPv4 / IPv6 с CIDR
-    /// - hostname / domain
     fn validate_exclude_route(value: &str) -> bool {
         let value = value.trim();
 
@@ -1194,58 +1007,40 @@ impl ANetApp {
             return false;
         }
 
-        // Обычный IP.
         if value.parse::<std::net::IpAddr>().is_ok() {
             return true;
         }
 
-        // IP/CIDR.
         if let Some((ip, prefix)) = value.split_once('/') {
             if let (Ok(addr), Ok(prefix)) = (ip.parse::<std::net::IpAddr>(), prefix.parse::<u8>()) {
                 let max_prefix = match addr {
                     std::net::IpAddr::V4(_) => 32,
                     std::net::IpAddr::V6(_) => 128,
                 };
-
                 return prefix <= max_prefix;
             }
         }
 
-        // URL, порт, wildcard и некорректные точки запрещены.
-        if
-            value.contains("://") ||
-            value.contains(':') ||
-            value.contains('*') ||
-            value.starts_with('.') ||
-            value.ends_with('.')
+        if value.contains("://")
+            || value.contains(':')
+            || value.contains('*')
+            || value.starts_with('.')
+            || value.ends_with('.')
         {
             return false;
         }
 
-        // Проверка hostname/domain.
-        value
-            .split('.')
-            .all(|label| {
-                !label.is_empty() &&
-                    label.len() <= 63 &&
-                    !label.starts_with('-') &&
-                    !label.ends_with('-') &&
-                    label.chars().all(|c| (c.is_ascii_alphanumeric() || c == '-'))
-            })
-    }
-
-    fn toml_escape_string(value: &str) -> String {
-        value
-            .replace('\\', "\\\\")
-            .replace('"', "\\\"")
-            .replace('\n', "\\n")
-            .replace('\r', "\\r")
-            .replace('\t', "\\t")
+        value.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        })
     }
 
     fn styled_label_text(&self, text: impl Into<String>, color: egui::Color32) -> egui::RichText {
-        egui::RichText
-            ::new(text)
+        egui::RichText::new(text)
             .family(egui::FontFamily::Name("Inter-V".into()))
             .size(11.0)
             .color(color)
@@ -1295,7 +1090,6 @@ pub fn force_wake_up_window(ctx: &egui::Context) {
             EnumWindows(Some(enum_window_callback), pid as LPARAM);
         }
     }
-    // Сбрасываем состояние минимизации и делаем окно видимым
     ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Minimized(false));
     ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Visible(true));
     ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Focus);
@@ -1383,37 +1177,28 @@ impl eframe::App for ANetApp {
         ctx.set_visuals(visuals);
         ctx.request_repaint_after(std::time::Duration::from_millis(500));
 
-        // --- ОБРАБОТКА СВОРАЧИВАНИЯ ---
-        let is_minimized = ctx.input(|i| { i.viewport().minimized.unwrap_or(false) });
+        self.drain_events();
+
+        let is_minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
 
         if self.tray_value {
-            // Режим "Сворачивать приложение в трей"
             if is_minimized {
                 if !self.is_in_tray {
                     self.is_in_tray = true;
-
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-
                     let _ = self.tray_cmd_tx.send(TrayCommand::WindowVisible(false));
-
                     let _ = self.tray_cmd_tx.send(TrayCommand::NotifyHidden);
                 }
-
                 return;
             } else if self.is_in_tray {
                 self.is_in_tray = false;
-
                 let _ = self.tray_cmd_tx.send(TrayCommand::WindowVisible(true));
             }
         }
 
-        // Если tray_value == false —
-        // обычная минимизация окна никак не перехватывается.
-
         let titlebar_button = egui::vec2(42.0, 38.0);
 
-        egui::TopBottomPanel
-            ::top("custom_titlebar")
+        egui::TopBottomPanel::top("custom_titlebar")
             .frame(egui::Frame::none().outer_margin(0.0).inner_margin(0.0))
             .exact_height(38.0)
             .show(ctx, |ui| {
@@ -1422,38 +1207,28 @@ impl eframe::App for ANetApp {
                 rect.max.x = ctx.screen_rect().max.x;
                 rect.max.y = rect.min.y + 38.0;
 
-                // 1. Рисуем сплошной фон на всю высоту и ширину
                 ui.painter().rect_filled(
                     rect,
-                    egui::CornerRadius {
-                        nw: 14,
-                        ne: 14,
-                        sw: 0,
-                        se: 0,
-                    },
+                    egui::CornerRadius { nw: 14, ne: 14, sw: 0, se: 0 },
                     title_bg
                 );
 
-                // 2. Интерактивная зона для перетаскивания окна
                 let response = ui.interact(
                     rect,
                     ui.id().with("title_bar"),
                     egui::Sense::click_and_drag()
                 );
-                if
-                    response.dragged_by(egui::PointerButton::Primary) ||
-                    response.drag_started_by(egui::PointerButton::Primary)
+                if response.dragged_by(egui::PointerButton::Primary)
+                    || response.drag_started_by(egui::PointerButton::Primary)
                 {
                     ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
                 }
 
-                // 3. Рисуем содержимое внутри точного прямоугольника высотой 38px
                 ui.allocate_ui_at_rect(rect, |ui| {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
                         let available_height = 38.0;
 
-                        // ЛЕВАЯ ЧАСТЬ (Индикатор + Текст)
                         let left_width = ui.available_width() - 80.0;
                         let left_rect = egui::Rect::from_min_size(
                             rect.min + egui::vec2(6.0, 0.0),
@@ -1500,7 +1275,6 @@ impl eframe::App for ANetApp {
                             });
                         });
 
-                        // ПРАВАЯ ЧАСТЬ (Кнопки управления)
                         let right_rect = egui::Rect::from_min_size(
                             rect.right_top() - egui::vec2(80.0, 0.0),
                             egui::vec2(80.0, available_height)
@@ -1513,7 +1287,6 @@ impl eframe::App for ANetApp {
 
                                 let size = titlebar_button;
 
-                                // 1. Кнопка "Закрыть"
                                 let (close_rect, close_response) = ui.allocate_exact_size(
                                     size,
                                     egui::Sense::click()
@@ -1522,18 +1295,12 @@ impl eframe::App for ANetApp {
                                 if close_response.hovered() {
                                     ui.painter().rect_filled(
                                         close_rect,
-                                        egui::CornerRadius {
-                                            nw: 0,
-                                            ne: 14,
-                                            sw: 0,
-                                            se: 0,
-                                        },
+                                        egui::CornerRadius { nw: 0, ne: 14, sw: 0, se: 0 },
                                         egui::Color32::from_rgb(205, 39, 39)
                                     );
                                 }
 
-                                let close_img = egui::Image
-                                    ::new(egui::include_image!("./assets/close.svg"))
+                                let close_img = egui::Image::new(egui::include_image!("./assets/close.svg"))
                                     .fit_to_exact_size(egui::vec2(14.0, 14.0));
                                 let close_img_rect = egui::Rect::from_center_size(
                                     close_rect.center(),
@@ -1545,7 +1312,6 @@ impl eframe::App for ANetApp {
                                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                                 }
 
-                                // 2. Кнопка "Свернуть"
                                 let (min_rect, min_response) = ui.allocate_exact_size(
                                     size,
                                     egui::Sense::click()
@@ -1559,8 +1325,7 @@ impl eframe::App for ANetApp {
                                     );
                                 }
 
-                                let minimize_img = egui::Image
-                                    ::new(egui::include_image!("./assets/minimize.svg"))
+                                let minimize_img = egui::Image::new(egui::include_image!("./assets/minimize.svg"))
                                     .fit_to_exact_size(egui::vec2(14.0, 14.0));
                                 let min_img_rect = egui::Rect::from_center_size(
                                     min_rect.center(),
@@ -1568,31 +1333,14 @@ impl eframe::App for ANetApp {
                                 );
                                 minimize_img.paint_at(ui, min_img_rect);
 
-                                // Прямое скрытие окна в трей
-                                // Кнопка "Свернуть"
                                 if min_response.clicked() {
                                     if self.tray_value {
-                                        // ==========================================
-                                        // РЕЖИМ: СВОРАЧИВАНИЕ В ТРЕЙ
-                                        // ==========================================
                                         self.is_in_tray = true;
-
-                                        ctx.send_viewport_cmd(
-                                            egui::ViewportCommand::Visible(false)
-                                        );
-
-                                        let _ = self.tray_cmd_tx.send(
-                                            TrayCommand::WindowVisible(false)
-                                        );
-
+                                        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                                        let _ = self.tray_cmd_tx.send(TrayCommand::WindowVisible(false));
                                         let _ = self.tray_cmd_tx.send(TrayCommand::NotifyHidden);
                                     } else {
-                                        // ==========================================
-                                        // ОБЫЧНЫЙ РЕЖИМ: МИНИМИЗАЦИЯ ОКНА
-                                        // ==========================================
-                                        ctx.send_viewport_cmd(
-                                            egui::ViewportCommand::Minimized(true)
-                                        );
+                                        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
                                     }
                                 }
                             });
@@ -1600,7 +1348,6 @@ impl eframe::App for ANetApp {
                     });
                 });
 
-                // 4. Разделительная линия
                 let painter = ui.painter();
                 painter.line_segment(
                     [rect.left_bottom(), rect.right_bottom()],
@@ -1608,68 +1355,7 @@ impl eframe::App for ANetApp {
                 );
             });
 
-        while let Ok(event) = self.event_rx.try_recv() {
-            match event {
-                // 1. Каждую секунду обновляем переменные интерфейса (без записи в лог)
-                AnetEvent::Stats { rx, tx, rtt, rxm, txm } => {
-                    self.total_rx = rx;
-                    self.total_tx = tx;
-                    self.total_rtt = rtt;
-                    self.total_rxm = rxm;
-                    self.total_txm = txm;
-                }
-
-                AnetEvent::Status(msg) => {
-                    self.log(&msg);
-                }
-                AnetEvent::ClientStateChanged { state, message, server_name } => {
-                    self.log(&message);
-
-                    if
-                        matches!(
-                            state,
-                            ClientState::Disconnected | ClientState::Stopped | ClientState::Failed
-                        )
-                    {
-                        self.total_rx = "0 B".to_string();
-                        self.total_tx = "0 B".to_string();
-                        self.total_rtt = "0".to_string();
-                        self.total_rxm = "0 B".to_string();
-                        self.total_txm = "0 B".to_string();
-                    }
-
-                    if let Some(active_name) = server_name {
-                        let mut settings = self.settings.lock().unwrap();
-                        if let Some(active_cfg) = settings.get_active_config() {
-                            settings.selected_servers.insert(active_cfg.id.clone(), active_name);
-                            settings.save();
-                        }
-                    }
-                }
-                AnetEvent::Error(msg) => {
-                    let err = format!("CRITICAL ERROR: {}", msg);
-                    self.log(&err);
-                    self.error_modal = Some(msg);
-                    if !self.settings.lock().unwrap().disable_notifications {
-                        send_notification("Ошибка ANeT", &err);
-                    }
-                }
-                AnetEvent::UpdateProgress(p) => {
-                    self.update_status = UpdateStatus::Downloading(p);
-                }
-                AnetEvent::UpdateStatus(msg) => self.log(&msg),
-                AnetEvent::UpdateAvailable(release) => {
-                    self.log(&format!("Найдено обновление: {}", release.tag_name));
-                    self.update_status = UpdateStatus::Available(release);
-                }
-                AnetEvent::UpdateReady => {
-                    self.update_status = UpdateStatus::ReadyToRestart;
-                }
-                _ => {}
-            }
-        }
-
-        self.last_known_state = self.shared.lock().unwrap().state;
+        self.last_known_state = lock_ignore_poison(&self.shared).state;
 
         let panel_frame = egui::Frame::NONE.fill(console_bg).corner_radius(egui::CornerRadius {
             nw: 0,
@@ -1678,115 +1364,72 @@ impl eframe::App for ANetApp {
             se: 14,
         });
 
-        let console_inner_frame = egui::Frame::NONE
-            .fill(console_bg)
-            .inner_margin(egui::Margin::same(10))
-            .outer_margin(egui::Margin::same(0))
-            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(38, 41, 50)))
-            .corner_radius(egui::CornerRadius {
-                nw: 0,
-                ne: 0,
-                sw: 14,
-                se: 14,
-            });
-
         let border_color = egui::Color32::from_rgb(38, 41, 50);
         let text_muted = egui::Color32::from_rgb(140, 145, 155);
         let text_white = egui::Color32::WHITE;
 
-        egui::TopBottomPanel
-            ::bottom("stalker_console")
+        egui::TopBottomPanel::bottom("stalker_console")
             .resizable(false)
             .min_height(170.0)
             .default_height(170.0)
             .show_separator_line(false)
             .frame(panel_frame)
             .show(ctx, |ui| {
-                // Внутренняя карточка со внешними отступами от границ окна
                 egui::Frame::NONE
                     .fill(dark_color)
                     .stroke(egui::Stroke::new(1.0, border_color))
-                    .corner_radius(egui::CornerRadius {
-                        nw: 14,
-                        ne: 14,
-                        sw: 14,
-                        se: 14,
-                    })
-                    .outer_margin(egui::Margin::same(10)) // Внешний отступ, отделяющий карточку от краев
-                    .inner_margin(egui::Margin::same(12)) // Внутренние отступы контента
+                    .corner_radius(egui::CornerRadius { nw: 14, ne: 14, sw: 14, se: 14 })
+                    .outer_margin(egui::Margin::same(10))
+                    .inner_margin(egui::Margin::same(12))
                     .show(ui, |ui| {
                         ui.vertical(|ui| {
-                            // --- HEADER ---
                             ui.horizontal(|ui| {
                                 let text_muted = egui::Color32::GRAY;
-                                ui.label(
-                                    self.styled_label_text(&self.status_text, self.status_color)
-                                );
+                                ui.label(self.styled_label_text(&self.status_text, self.status_color));
 
-                                // Захватываем блокировку только если Mutex свободен прямо сейчас
                                 if let Ok(logs) = self.logs.try_lock() {
-                                    if
-                                        let Some((text, color)) = logs
-                                            .iter()
-                                            .rev()
-                                            .find_map(|line| {
-                                                if
-                                                    line.contains("Error") ||
-                                                    line.contains("Failed") ||
-                                                    line.contains("Connection lost")
-                                                {
-                                                    Some((line.clone(), red_color))
-                                                } else if line.contains("Tunnel UP") {
-                                                    Some((line.clone(), green_color))
-                                                } else if
-                                                    line.contains("Config loaded") ||
-                                                    line.contains("Найдено обновление")
-                                                {
-                                                    Some((line.clone(), gold_color))
-                                                } else if
-                                                    line.contains("Cleaning up dead session") ||
-                                                    line.contains("добавлен") ||
-                                                    line.contains("удален")
-                                                {
-                                                    Some((line.clone(), orange_color))
-                                                } else {
-                                                    None
-                                                }
-                                            })
-                                    {
+                                    if let Some((text, color)) = logs.iter().rev().find_map(|line| {
+                                        if line.contains("Error")
+                                            || line.contains("Failed")
+                                            || line.contains("Connection lost")
+                                        {
+                                            Some((line.clone(), red_color))
+                                        } else if line.contains("Tunnel UP") {
+                                            Some((line.clone(), green_color))
+                                        } else if line.contains("Config loaded") || line.contains("Найдено обновление") {
+                                            Some((line.clone(), gold_color))
+                                        } else if line.contains("Cleaning up dead session")
+                                            || line.contains("добавлен")
+                                            || line.contains("удален")
+                                        {
+                                            Some((line.clone(), orange_color))
+                                        } else {
+                                            None
+                                        }
+                                    }) {
                                         self.status_text = text;
                                         self.status_color = color;
                                     }
                                 }
-                                // Блокировка `logs` автоматически освобождается в конце блока `if let`
 
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        let btn = ui.add(
-                                            egui::Label
-                                                ::new(
-                                                    egui::RichText
-                                                        ::new("VIEW LOG →")
-                                                        .family(
-                                                            egui::FontFamily::Name("Inter-V".into())
-                                                        )
-                                                        .size(11.0)
-                                                        .color(text_muted)
-                                                )
-                                                .sense(egui::Sense::click())
-                                        );
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    let btn = ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new("VIEW LOG →")
+                                                .family(egui::FontFamily::Name("Inter-V".into()))
+                                                .size(11.0)
+                                                .color(text_muted)
+                                        )
+                                        .sense(egui::Sense::click())
+                                    );
 
-                                        if btn.hovered() {
-                                            ui.ctx().set_cursor_icon(
-                                                egui::CursorIcon::PointingHand
-                                            );
-                                        }
-                                        if btn.clicked() {
-                                            self.logbar_open = !self.logbar_open;
-                                        }
+                                    if btn.hovered() {
+                                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                                     }
-                                );
+                                    if btn.clicked() {
+                                        self.logbar_open = !self.logbar_open;
+                                    }
+                                });
                             });
 
                             ui.add_space(6.0);
@@ -1800,21 +1443,17 @@ impl eframe::App for ANetApp {
                             );
                             ui.add_space(6.0);
 
-                            // --- TOP ROW: RTT | DOWNLOAD | UPLOAD ---
                             ui.columns(3, |cols| {
-                                // 1. RTT
                                 cols[0].vertical(|ui| {
                                     ui.label(
-                                        egui::RichText
-                                            ::new("RTT")
+                                        egui::RichText::new("RTT")
                                             .size(10.0)
                                             .color(text_muted)
                                             .family(egui::FontFamily::Name("Inter-V".into()))
                                     );
                                     ui.add_space(2.0);
                                     ui.label(
-                                        egui::RichText
-                                            ::new(format!("{}", self.total_rtt))
+                                        egui::RichText::new(format!("{}", self.total_rtt))
                                             .size(15.0)
                                             .color(text_white)
                                             .strong()
@@ -1822,19 +1461,16 @@ impl eframe::App for ANetApp {
                                     );
                                 });
 
-                                // 2. DOWNLOAD
                                 cols[1].vertical(|ui| {
                                     ui.label(
-                                        egui::RichText
-                                            ::new("↓ DOWNLOAD")
+                                        egui::RichText::new("↓ DOWNLOAD")
                                             .size(10.0)
                                             .color(text_muted)
                                             .family(egui::FontFamily::Name("Inter-V".into()))
                                     );
                                     ui.add_space(2.0);
                                     ui.label(
-                                        egui::RichText
-                                            ::new(format!("{:.2} Mbps", self.total_rxm))
+                                        egui::RichText::new(&self.total_rxm)
                                             .size(15.0)
                                             .color(text_white)
                                             .strong()
@@ -1842,19 +1478,16 @@ impl eframe::App for ANetApp {
                                     );
                                 });
 
-                                // 3. UPLOAD
                                 cols[2].vertical(|ui| {
                                     ui.label(
-                                        egui::RichText
-                                            ::new("↑ UPLOAD")
+                                        egui::RichText::new("↑ UPLOAD")
                                             .size(10.0)
                                             .color(text_muted)
                                             .family(egui::FontFamily::Name("Inter-V".into()))
                                     );
                                     ui.add_space(2.0);
                                     ui.label(
-                                        egui::RichText
-                                            ::new(format!("{:.2} Mbps", self.total_txm))
+                                        egui::RichText::new(&self.total_txm)
                                             .size(15.0)
                                             .color(text_white)
                                             .strong()
@@ -1874,21 +1507,17 @@ impl eframe::App for ANetApp {
                             );
                             ui.add_space(6.0);
 
-                            // --- BOTTOM ROW: TOTAL RX | TOTAL TX ---
                             ui.columns(2, |cols| {
-                                // 1. TOTAL RX
                                 cols[0].vertical(|ui| {
                                     ui.label(
-                                        egui::RichText
-                                            ::new("↓ TOTAL RX")
+                                        egui::RichText::new("↓ TOTAL RX")
                                             .size(10.0)
                                             .color(text_muted)
                                             .family(egui::FontFamily::Name("Inter-V".into()))
                                     );
                                     ui.add_space(2.0);
                                     ui.label(
-                                        egui::RichText
-                                            ::new(format!("{}", self.total_rx))
+                                        egui::RichText::new(format!("{}", self.total_rx))
                                             .size(15.0)
                                             .color(text_white)
                                             .strong()
@@ -1896,19 +1525,16 @@ impl eframe::App for ANetApp {
                                     );
                                 });
 
-                                // 2. TOTAL TX
                                 cols[1].vertical(|ui| {
                                     ui.label(
-                                        egui::RichText
-                                            ::new("↑ TOTAL TX")
+                                        egui::RichText::new("↑ TOTAL TX")
                                             .size(10.0)
                                             .color(text_muted)
                                             .family(egui::FontFamily::Name("Inter-V".into()))
                                     );
                                     ui.add_space(2.0);
                                     ui.label(
-                                        egui::RichText
-                                            ::new(format!("{}", self.total_tx))
+                                        egui::RichText::new(format!("{}", self.total_tx))
                                             .size(15.0)
                                             .color(text_white)
                                             .strong()
@@ -1920,73 +1546,68 @@ impl eframe::App for ANetApp {
                     });
             });
 
-        let settings_guard = self.settings.lock().unwrap();
+        let settings_guard = lock_ignore_poison(&self.settings);
         let configs = settings_guard.configs.clone();
         let active_id = settings_guard.active_config_id.clone();
         let editing_id = self.editing_config_id.clone();
         drop(settings_guard);
 
-        let mut server_names = Vec::new();
         let mut selected_server_name = String::new();
         {
-            let settings = self.settings.lock().unwrap();
+            let settings = lock_ignore_poison(&self.settings);
             if let Some(active_cfg) = settings.get_active_config() {
-                if let Ok(mut raw_cfg) = toml::from_str::<CoreConfig>(&active_cfg.content) {
-                    let _ = raw_cfg.sanitize();
-                    server_names = raw_cfg.servers
-                        .iter()
-                        .map(|s| s.get_name())
-                        .collect();
-                }
+                let active_cfg_id = active_cfg.id.clone();
+                let active_cfg_content = active_cfg.content.clone();
+                drop(settings);
+
+                self.refresh_server_names_cache(&active_cfg_id, &active_cfg_content);
+
+                let settings = lock_ignore_poison(&self.settings);
                 selected_server_name = settings.selected_servers
-                    .get(&active_cfg.id)
+                    .get(&active_cfg_id)
                     .cloned()
-                    .unwrap_or_else(|| server_names.first().cloned().unwrap_or_default());
+                    .unwrap_or_else(|| self.server_names_cache.first().cloned().unwrap_or_default());
+            } else {
+                self.server_names_cache.clear();
+                self.server_names_cache_key = None;
             }
         }
+        let server_names = self.server_names_cache.clone();
 
         let main_frame = egui::Frame::NONE.fill(dark_color).inner_margin(margin);
 
-        egui::CentralPanel
-            ::default()
+        egui::CentralPanel::default()
             .frame(main_frame)
             .show(ctx, |ui| {
-                let state = self.shared.lock().unwrap().state.clone();
+                let state = lock_ignore_poison(&self.shared).state.clone();
 
                 ui.horizontal(|ui| {
                     ui.allocate_ui_with_layout(
                         egui::vec2(60.0, ui.available_height()),
                         egui::Layout::top_down(egui::Align::Center),
                         |ui| {
-                            let anim_id = ui.id().with("gear_btn_color");
+                            let anim_id = ui.id().with("settings_gear_btn_color");
                             let hover_t: f32 = ui.data(|d| d.get_temp(anim_id)).unwrap_or(0.0);
 
                             let normal_color = white_color;
                             let hover_color = gold_color;
 
-                            let r = ((normal_color.r() as f32) * (1.0 - hover_t) +
-                                (hover_color.r() as f32) * hover_t) as u8;
-                            let g = ((normal_color.g() as f32) * (1.0 - hover_t) +
-                                (hover_color.g() as f32) * hover_t) as u8;
-                            let b = ((normal_color.b() as f32) * (1.0 - hover_t) +
-                                (hover_color.b() as f32) * hover_t) as u8;
+                            let r = ((normal_color.r() as f32) * (1.0 - hover_t) + (hover_color.r() as f32) * hover_t) as u8;
+                            let g = ((normal_color.g() as f32) * (1.0 - hover_t) + (hover_color.g() as f32) * hover_t) as u8;
+                            let b = ((normal_color.b() as f32) * (1.0 - hover_t) + (hover_color.b() as f32) * hover_t) as u8;
                             let current_color = egui::Color32::from_rgb(r, g, b);
 
-                            let icon = egui::Image
-                                ::new(egui::include_image!("./assets/gear_3.svg"))
+                            let icon = egui::Image::new(egui::include_image!("./assets/gear_3.svg"))
                                 .fit_to_exact_size(button_icon_size)
                                 .tint(current_color);
 
-                            let menu_button = egui::Button
-                                ::image(icon)
+                            let menu_button = egui::Button::image(icon)
                                 .min_size(button_size)
                                 .stroke(egui::Stroke::NONE)
                                 .frame(false)
                                 .rounding(button_size.y / 2.0);
 
-                            let response = ui
-                                .add(menu_button)
-                                .on_hover_cursor(egui::CursorIcon::PointingHand);
+                            let response = ui.add(menu_button).on_hover_cursor(egui::CursorIcon::PointingHand);
 
                             let target_t = if response.hovered() { 1.0 } else { 0.0 };
                             let dt = ui.input(|i| i.stable_dt);
@@ -2009,9 +1630,7 @@ impl eframe::App for ANetApp {
 
                             ui.add_space(2.0);
                             ui.label(RichText::new("SETTINGS").size(label_size).color(grey_color));
-                            ui.label(
-                                RichText::new("CONFIGS").size(sub_label_size).color(grey_color)
-                            );
+                            ui.label(RichText::new("CONFIGS").size(sub_label_size).color(grey_color));
                         }
                     );
 
@@ -2025,10 +1644,7 @@ impl eframe::App for ANetApp {
                         egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
                         |ui| {
                             let mut job = LayoutJob::default();
-                            let font_id = egui::FontId::new(
-                                24.0,
-                                egui::FontFamily::Name("Inter-V".into())
-                            );
+                            let font_id = egui::FontId::new(24.0, egui::FontFamily::Name("Inter-V".into()));
 
                             job.append("ANET ", 0.0, TextFormat {
                                 font_id: font_id.clone(),
@@ -2052,35 +1668,28 @@ impl eframe::App for ANetApp {
                             egui::vec2(60.0, ui.available_height()),
                             egui::Layout::top_down(egui::Align::Center),
                             |ui| {
-                                let anim_id = ui.id().with("apps_btn_color");
+                                let anim_id = ui.id().with("per_app_btn_color");
                                 let hover_t: f32 = ui.data(|d| d.get_temp(anim_id)).unwrap_or(0.0);
 
                                 let normal_color = white_color;
                                 let hover_color = gold_color;
 
-                                let r = ((normal_color.r() as f32) * (1.0 - hover_t) +
-                                    (hover_color.r() as f32) * hover_t) as u8;
-                                let g = ((normal_color.g() as f32) * (1.0 - hover_t) +
-                                    (hover_color.g() as f32) * hover_t) as u8;
-                                let b = ((normal_color.b() as f32) * (1.0 - hover_t) +
-                                    (hover_color.b() as f32) * hover_t) as u8;
+                                let r = ((normal_color.r() as f32) * (1.0 - hover_t) + (hover_color.r() as f32) * hover_t) as u8;
+                                let g = ((normal_color.g() as f32) * (1.0 - hover_t) + (hover_color.g() as f32) * hover_t) as u8;
+                                let b = ((normal_color.b() as f32) * (1.0 - hover_t) + (hover_color.b() as f32) * hover_t) as u8;
                                 let current_color = egui::Color32::from_rgb(r, g, b);
 
-                                let icon = egui::Image
-                                    ::new(egui::include_image!("./assets/apps_white.svg"))
+                                let icon = egui::Image::new(egui::include_image!("./assets/apps_white.svg"))
                                     .fit_to_exact_size(button_icon_size)
                                     .tint(current_color);
 
-                                let menu_button = egui::Button
-                                    ::image(icon)
+                                let menu_button = egui::Button::image(icon)
                                     .min_size(button_size)
                                     .stroke(egui::Stroke::NONE)
                                     .frame(false)
                                     .rounding(button_size.y / 2.0);
 
-                                let response = ui
-                                    .add(menu_button)
-                                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+                                let response = ui.add(menu_button).on_hover_cursor(egui::CursorIcon::PointingHand);
 
                                 let target_t = if response.hovered() { 1.0 } else { 0.0 };
                                 let dt = ui.input(|i| i.stable_dt);
@@ -2102,14 +1711,8 @@ impl eframe::App for ANetApp {
                                 }
 
                                 ui.add_space(2.0);
-                                ui.label(
-                                    RichText::new("PER APP").size(label_size).color(grey_color)
-                                );
-                                ui.label(
-                                    RichText::new("TUNNELING")
-                                        .size(sub_label_size)
-                                        .color(grey_color)
-                                );
+                                ui.label(RichText::new("PER APP").size(label_size).color(grey_color));
+                                ui.label(RichText::new("TUNNELING").size(sub_label_size).color(grey_color));
                             }
                         );
                     }
@@ -2122,10 +1725,9 @@ impl eframe::App for ANetApp {
                     } else {
                         ui.label(egui::RichText::new(&self.config_name).color(gold_color));
                     }
-                    if self.shared.lock().unwrap().client.is_none() && self.config_err.is_none() {
+                    if lock_ignore_poison(&self.shared).client.is_none() && self.config_err.is_none() {
                         ui.label(
-                            egui::RichText
-                                ::new("(Выберите конфиг слева или добавьте новый)")
+                            egui::RichText::new("(Выберите конфиг слева или добавьте новый)")
                                 .size(15.0)
                                 .strong()
                                 .color(egui::Color32::from_gray(80))
@@ -2143,24 +1745,18 @@ impl eframe::App for ANetApp {
                         };
 
                         ui.label(
-                            egui::RichText
-                                ::new(header_text)
+                            egui::RichText::new(header_text)
                                 .size(13.0)
                                 .color(ivory_color)
                                 .family(egui::FontFamily::Name("Inter-V".into()))
                         );
                         ui.add_space(7.0);
 
-                        // Один и тот же геометрический компонент в обоих состояниях.
-                        // Важно: здесь НЕТ Frame с inner_margin — он больше не может
-                        // увеличивать фактическую высоту активной ноды.
                         const NODE_WIDTH: f32 = 266.0;
                         const NODE_HEIGHT: f32 = 36.0;
                         const NODE_RADIUS: u8 = 18;
                         const ITEM_HEIGHT: f32 = 34.0;
 
-                        // Node status indicator: gray until the client is REALLY connected.
-                        // Selecting a node/config must not make the indicator orange.
                         let orange = egui::Color32::from_rgb(235, 140, 52);
                         let indicator = match state {
                             ConnectionState::Connected => orange,
@@ -2183,8 +1779,6 @@ impl eframe::App for ANetApp {
                             }
                         );
 
-                        // Popup state belongs to the app, not egui temporary data.
-                        // This makes closing on item click deterministic.
                         if state != ConnectionState::Disconnected {
                             self.node_popup_open = false;
                         }
@@ -2195,12 +1789,7 @@ impl eframe::App for ANetApp {
 
                         let popup_open = self.node_popup_open;
 
-                        // The field itself is painted manually, so active and inactive
-                        // states are pixel-identical in size and shape.
-                        let field_fill = if
-                            response.hovered() &&
-                            state == ConnectionState::Disconnected
-                        {
+                        let field_fill = if response.hovered() && state == ConnectionState::Disconnected {
                             hover_bg
                         } else {
                             bg
@@ -2229,7 +1818,6 @@ impl eframe::App for ANetApp {
                             text
                         );
 
-                        // Only the disconnected state gets the small dropdown chevron.
                         if state == ConnectionState::Disconnected {
                             let cx = rect.right() - 17.0;
                             let cy = center_y;
@@ -2246,15 +1834,12 @@ impl eframe::App for ANetApp {
                             );
                         }
 
-                        // Custom popup: no ScrollArea and no ComboBox-internal scrolling.
-                        // Its height is exactly the number of nodes that must be shown.
                         if state == ConnectionState::Disconnected && popup_open {
                             let popup_height = 12.0 + (server_names.len() as f32) * ITEM_HEIGHT;
                             let popup_pos = egui::pos2(rect.left(), rect.bottom() + 6.0);
                             let popup_area_id = egui::Id::new("node_selection_popup");
 
-                            egui::Area
-                                ::new(popup_area_id)
+                            egui::Area::new(popup_area_id)
                                 .order(egui::Order::Foreground)
                                 .fixed_pos(popup_pos)
                                 .interactable(true)
@@ -2270,69 +1855,42 @@ impl eframe::App for ANetApp {
                                         .show(popup_ui, |popup_ui| {
                                             for name in &server_names {
                                                 let selected = name == &selected_server_name;
-                                                let (item_rect, item_response) =
-                                                    popup_ui.allocate_exact_size(
-                                                        egui::vec2(NODE_WIDTH - 12.0, ITEM_HEIGHT),
-                                                        egui::Sense::click()
-                                                    );
+                                                let (item_rect, item_response) = popup_ui.allocate_exact_size(
+                                                    egui::vec2(NODE_WIDTH - 12.0, ITEM_HEIGHT),
+                                                    egui::Sense::click()
+                                                );
 
                                                 if item_response.hovered() {
-                                                    popup_ui
-                                                        .painter()
-                                                        .rect_filled(
-                                                            item_rect,
-                                                            egui::CornerRadius::same(9),
-                                                            hover_bg
-                                                        );
+                                                    popup_ui.painter().rect_filled(
+                                                        item_rect,
+                                                        egui::CornerRadius::same(9),
+                                                        hover_bg
+                                                    );
                                                 }
 
                                                 if selected {
-                                                    popup_ui
-                                                        .painter()
-                                                        .circle_filled(
-                                                            egui::pos2(
-                                                                item_rect.left() + 13.0,
-                                                                item_rect.center().y
-                                                            ),
-                                                            4.0,
-                                                            orange
-                                                        );
+                                                    popup_ui.painter().circle_filled(
+                                                        egui::pos2(item_rect.left() + 13.0, item_rect.center().y),
+                                                        4.0,
+                                                        orange
+                                                    );
                                                 }
 
-                                                popup_ui
-                                                    .painter()
-                                                    .text(
-                                                        egui::pos2(
-                                                            item_rect.left() + 25.0,
-                                                            item_rect.center().y
-                                                        ),
-                                                        egui::Align2::LEFT_CENTER,
-                                                        name,
-                                                        egui::FontId::new(
-                                                            13.0,
-                                                            egui::FontFamily::Name("Inter-V".into())
-                                                        ),
-                                                        if selected {
-                                                            text
-                                                        } else {
-                                                            muted
-                                                        }
-                                                    );
+                                                popup_ui.painter().text(
+                                                    egui::pos2(item_rect.left() + 25.0, item_rect.center().y),
+                                                    egui::Align2::LEFT_CENTER,
+                                                    name,
+                                                    egui::FontId::new(13.0, egui::FontFamily::Name("Inter-V".into())),
+                                                    if selected { text } else { muted }
+                                                );
 
                                                 if item_response.clicked() {
-                                                    // Select the node and immediately collapse the popup.
-                                                    // This is the authoritative popup state.
                                                     self.node_popup_open = false;
 
                                                     let selected_name = name.clone();
                                                     {
-                                                        let mut settings = self.settings
-                                                            .lock()
-                                                            .unwrap();
-                                                        if
-                                                            let Some(active_cfg) =
-                                                                settings.get_active_config()
-                                                        {
+                                                        let mut settings = lock_ignore_poison(&self.settings);
+                                                        if let Some(active_cfg) = settings.get_active_config() {
                                                             settings.selected_servers.insert(
                                                                 active_cfg.id.clone(),
                                                                 selected_name.clone()
@@ -2342,42 +1900,22 @@ impl eframe::App for ANetApp {
                                                     }
 
                                                     let active_cfg_data = {
-                                                        let settings = self.settings
-                                                            .lock()
-                                                            .unwrap();
-                                                        settings
-                                                            .get_active_config()
-                                                            .map(|cfg| {
-                                                                (
-                                                                    cfg.id.clone(),
-                                                                    cfg.content.clone(),
-                                                                    cfg.name.clone(),
-                                                                )
-                                                            })
+                                                        let settings = lock_ignore_poison(&self.settings);
+                                                        settings.get_active_config().map(|cfg| {
+                                                            (cfg.id.clone(), cfg.content.clone(), cfg.name.clone())
+                                                        })
                                                     };
 
-                                                    if
-                                                        let Some((id, content, name)) =
-                                                            active_cfg_data
-                                                    {
-                                                        self.load_config_from_content(
-                                                            &id,
-                                                            &content,
-                                                            &name
-                                                        );
+                                                    if let Some((id, content, name)) = active_cfg_data {
+                                                        self.load_config_from_content(&id, &content, &name, false);
                                                     }
                                                 }
                                             }
                                         });
 
-                                    // Close the popup when clicking outside it.
                                     let pointer_pos = popup_ui.input(|i| i.pointer.interact_pos());
-                                    let outside_click =
-                                        popup_ui.input(|i| i.pointer.any_pressed()) &&
-                                        pointer_pos.map_or(
-                                            false,
-                                            |p| !popup_ui.max_rect().contains(p)
-                                        );
+                                    let outside_click = popup_ui.input(|i| i.pointer.any_pressed())
+                                        && pointer_pos.map_or(false, |p| !popup_ui.max_rect().contains(p));
                                     if outside_click {
                                         self.node_popup_open = false;
                                     }
@@ -2406,12 +1944,11 @@ impl eframe::App for ANetApp {
                                 egui::Color32::from_rgb(244, 46, 82),
                             )
                         }
-                        ConnectionState::Connected =>
-                            (
-                                "DISCONNECT",
-                                egui::Color32::from_rgb(255, 43, 68),
-                                egui::Color32::from_rgb(131, 140, 251),
-                            ),
+                        ConnectionState::Connected => (
+                            "DISCONNECT",
+                            egui::Color32::from_rgb(255, 43, 68),
+                            egui::Color32::from_rgb(131, 140, 251),
+                        ),
                     };
 
                     let (rect, response) = ui.allocate_exact_size(btn_size, egui::Sense::click());
@@ -2420,9 +1957,7 @@ impl eframe::App for ANetApp {
                     let radius = btn_size.x / 2.0;
 
                     let hover_animation_id = response.id.with("hover_glow");
-                    let hover_t = ui
-                        .ctx()
-                        .animate_bool_with_time(hover_animation_id, response.hovered(), 0.5);
+                    let hover_t = ui.ctx().animate_bool_with_time(hover_animation_id, response.hovered(), 0.5);
 
                     if hover_t > 0.0 {
                         for glow_i in (1..=6).rev() {
@@ -2445,7 +1980,6 @@ impl eframe::App for ANetApp {
                                 );
                             }
                         }
-                        ui.ctx().request_repaint();
                     }
 
                     let stroke_width = 5.0;
@@ -2461,36 +1995,28 @@ impl eframe::App for ANetApp {
                         let y_mid = (p0.y + p1.y) / 2.0;
                         let t = ((y_mid - center.y + radius) / (radius * 2.0)).clamp(0.0, 1.0);
 
-                        let r_col = ((color_top.r() as f32) * (1.0 - t) +
-                            (color_bottom.r() as f32) * t) as u8;
-                        let g_col = ((color_top.g() as f32) * (1.0 - t) +
-                            (color_bottom.g() as f32) * t) as u8;
-                        let b_col = ((color_top.b() as f32) * (1.0 - t) +
-                            (color_bottom.b() as f32) * t) as u8;
+                        let r_col = ((color_top.r() as f32) * (1.0 - t) + (color_bottom.r() as f32) * t) as u8;
+                        let g_col = ((color_top.g() as f32) * (1.0 - t) + (color_bottom.g() as f32) * t) as u8;
+                        let b_col = ((color_top.b() as f32) * (1.0 - t) + (color_bottom.b() as f32) * t) as u8;
 
                         ui.painter().line_segment(
                             [p0, p1],
-                            egui::Stroke::new(
-                                stroke_width,
-                                egui::Color32::from_rgb(r_col, g_col, b_col)
-                            )
+                            egui::Stroke::new(stroke_width, egui::Color32::from_rgb(r_col, g_col, b_col))
                         );
                     }
 
-                    let galley = ui
-                        .painter()
-                        .layout_no_wrap(
-                            btn_text.to_string(),
-                            egui::FontId::proportional(24.0),
-                            egui::Color32::WHITE
-                        );
+                    let galley = ui.painter().layout_no_wrap(
+                        btn_text.to_string(),
+                        egui::FontId::proportional(24.0),
+                        egui::Color32::WHITE
+                    );
                     let text_pos = center - galley.size() / 2.0;
                     ui.painter().galley(text_pos, galley, egui::Color32::WHITE);
 
                     if response.clicked() {
                         match state {
                             ConnectionState::Disconnected => {
-                                if self.shared.lock().unwrap().client.is_none() {
+                                if lock_ignore_poison(&self.shared).client.is_none() {
                                     self.open_file_dialog();
                                 } else {
                                     self.start_vpn();
@@ -2507,45 +2033,33 @@ impl eframe::App for ANetApp {
                     let total_width = ui.available_width();
                     let height = 48.0;
 
-                    // Резервируем общую область
-                    let (rect, _) = ui.allocate_exact_size(
-                        egui::vec2(total_width, height),
-                        egui::Sense::hover()
-                    );
+                    let (rect, _) = ui.allocate_exact_size(egui::vec2(total_width, height), egui::Sense::hover());
 
-                    // 1. ЛЕВАЯ КНОПКА: CONF (x: 0..60)
                     let left_rect = egui::Rect::from_min_size(rect.min, egui::vec2(60.0, height));
                     ui.allocate_ui_at_rect(left_rect, |ui| {
                         ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
-                            let anim_id = ui.id().with("gear_btn_color");
+                            let anim_id = ui.id().with("excl_btn_color");
                             let hover_t: f32 = ui.data(|d| d.get_temp(anim_id)).unwrap_or(0.0);
 
                             let normal_color = white_color;
                             let hover_color = gold_color;
 
-                            let r = ((normal_color.r() as f32) * (1.0 - hover_t) +
-                                (hover_color.r() as f32) * hover_t) as u8;
-                            let g = ((normal_color.g() as f32) * (1.0 - hover_t) +
-                                (hover_color.g() as f32) * hover_t) as u8;
-                            let b = ((normal_color.b() as f32) * (1.0 - hover_t) +
-                                (hover_color.b() as f32) * hover_t) as u8;
+                            let r = ((normal_color.r() as f32) * (1.0 - hover_t) + (hover_color.r() as f32) * hover_t) as u8;
+                            let g = ((normal_color.g() as f32) * (1.0 - hover_t) + (hover_color.g() as f32) * hover_t) as u8;
+                            let b = ((normal_color.b() as f32) * (1.0 - hover_t) + (hover_color.b() as f32) * hover_t) as u8;
                             let current_color = egui::Color32::from_rgb(r, g, b);
 
-                            let icon = egui::Image
-                                ::new(egui::include_image!("./assets/excl.svg"))
+                            let icon = egui::Image::new(egui::include_image!("./assets/excl.svg"))
                                 .fit_to_exact_size(button_icon_size)
                                 .tint(current_color);
 
-                            let menu_button = egui::Button
-                                ::image(icon)
+                            let menu_button = egui::Button::image(icon)
                                 .min_size(button_size)
                                 .stroke(egui::Stroke::NONE)
                                 .frame(false)
                                 .rounding(button_size.y / 2.0);
 
-                            let response = ui
-                                .add(menu_button)
-                                .on_hover_cursor(egui::CursorIcon::PointingHand);
+                            let response = ui.add(menu_button).on_hover_cursor(egui::CursorIcon::PointingHand);
 
                             let target_t = if response.hovered() { 1.0 } else { 0.0 };
                             let dt = ui.input(|i| i.stable_dt);
@@ -2567,19 +2081,11 @@ impl eframe::App for ANetApp {
                             }
 
                             ui.add_space(2.0);
-                            ui.label(
-                                egui::RichText::new("EXCLUDED").size(label_size).color(grey_color)
-                            );
-                            ui.label(
-                                egui::RichText
-                                    ::new("ADDRESSES")
-                                    .size(sub_label_size)
-                                    .color(grey_color)
-                            );
+                            ui.label(egui::RichText::new("EXCLUDED").size(label_size).color(grey_color));
+                            ui.label(egui::RichText::new("ADDRESSES").size(sub_label_size).color(grey_color));
                         });
                     });
 
-                    // 2. ПРАВАЯ КНОПКА: APPS (x: total_width - 60 .. total_width)
                     {
                         let (show_upd, release_data, progress) = match &self.update_status {
                             UpdateStatus::Available(r) => (true, Some(r.clone()), None),
@@ -2590,8 +2096,7 @@ impl eframe::App for ANetApp {
                         if show_upd {
                             let modal_bg = egui::Color32::from_rgb(32, 32, 32);
 
-                            egui::Window
-                                ::new("UPDATE_SYSTEM")
+                            egui::Window::new("UPDATE_SYSTEM")
                                 .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
                                 .collapsible(false)
                                 .resizable(false)
@@ -2607,8 +2112,7 @@ impl eframe::App for ANetApp {
                                 .show(ctx, |ui| {
                                     ui.vertical_centered(|ui| {
                                         ui.label(
-                                            egui::RichText
-                                                ::new("SYSTEM UPDATE")
+                                            egui::RichText::new("SYSTEM UPDATE")
                                                 .size(22.0)
                                                 .strong()
                                                 .color(gold_color)
@@ -2616,18 +2120,13 @@ impl eframe::App for ANetApp {
 
                                         if let Some(rel) = release_data {
                                             ui.label(
-                                                egui::RichText
-                                                    ::new(
-                                                        format!("Доступна версия: {}", rel.tag_name)
-                                                    )
+                                                egui::RichText::new(format!("Доступна версия: {}", rel.tag_name))
                                                     .size(16.0)
                                                     .color(gold_color)
                                             );
                                             ui.add_space(16.0);
-                                            ui.add_space(16.0);
                                             ui.label(
-                                                egui::RichText
-                                                    ::new("Список изменений:")
+                                                egui::RichText::new("Список изменений:")
                                                     .size(14.0)
                                                     .color(gold_color)
                                                     .strong()
@@ -2635,94 +2134,60 @@ impl eframe::App for ANetApp {
                                             ui.add_space(4.0);
 
                                             ui.style_mut().spacing.scroll.foreground_color = false;
-                                            ui.style_mut().visuals.widgets.inactive.bg_fill =
-                                                egui::Color32::from_rgb(80, 80, 80);
-                                            ui.style_mut().visuals.widgets.hovered.bg_fill =
-                                                egui::Color32::from_rgb(120, 120, 120);
-                                            ui.style_mut().visuals.widgets.active.bg_fill =
-                                                egui::Color32::from_rgb(160, 160, 160);
+                                            ui.style_mut().visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(80, 80, 80);
+                                            ui.style_mut().visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(120, 120, 120);
+                                            ui.style_mut().visuals.widgets.active.bg_fill = egui::Color32::from_rgb(160, 160, 160);
 
-                                            egui::ScrollArea
-                                                ::vertical()
+                                            egui::ScrollArea::vertical()
                                                 .max_height(180.0)
                                                 .auto_shrink([false, true])
-                                                .scroll_bar_visibility(
-                                                    ScrollBarVisibility::AlwaysVisible
-                                                )
+                                                .scroll_bar_visibility(ScrollBarVisibility::AlwaysVisible)
                                                 .show(ui, |ui| {
-                                                    let changelog = rel.body
-                                                        .as_deref()
-                                                        .unwrap_or(
-                                                            "Описание изменений отсутствует."
-                                                        );
+                                                    let changelog = rel.body.as_deref().unwrap_or("Описание изменений отсутствует.");
                                                     ui.add(
-                                                        egui::Label
-                                                            ::new(
-                                                                egui::RichText
-                                                                    ::new(changelog)
-                                                                    .size(13.0)
-                                                                    .color(gold_color)
-                                                                    .family(
-                                                                        egui::FontFamily::Monospace
-                                                                    )
-                                                            )
-                                                            .wrap()
+                                                        egui::Label::new(
+                                                            egui::RichText::new(changelog)
+                                                                .size(13.0)
+                                                                .color(gold_color)
+                                                                .family(egui::FontFamily::Monospace)
+                                                        )
+                                                        .wrap()
                                                     );
                                                 });
                                             ui.add_space(24.0);
                                             ui.horizontal(|ui| {
                                                 ui.add_space(ui.available_width() / 6.0);
 
-                                                let btn_update = egui::Button
-                                                    ::new(
-                                                        egui::RichText
-                                                            ::new("ОБНОВИТЬ")
-                                                            .size(16.0)
-                                                            .strong()
-                                                            .color(egui::Color32::BLACK)
-                                                    )
-                                                    .fill(gold_color)
-                                                    .min_size(egui::vec2(120.0, 36.0));
+                                                let btn_update = egui::Button::new(
+                                                    egui::RichText::new("ОБНОВИТЬ")
+                                                        .size(16.0)
+                                                        .strong()
+                                                        .color(egui::Color32::BLACK)
+                                                )
+                                                .fill(gold_color)
+                                                .min_size(egui::vec2(120.0, 36.0));
 
                                                 if ui.add(btn_update).clicked() {
                                                     let r_clone = rel.clone();
-                                                    self.logs
-                                                        .lock()
-                                                        .unwrap()
-                                                        .push(
-                                                            format!(
-                                                                "> Обновляемся на {}",
-                                                                rel.tag_name
-                                                            )
-                                                        );
-                                                    self.update_status =
-                                                        UpdateStatus::Downloading(0.0);
+                                                    push_log(&self.logs, &format!("> Обновляемся на {}", rel.tag_name));
+                                                    self.update_status = UpdateStatus::Downloading(0.0);
                                                     self.rt.spawn(async move {
-                                                        if
-                                                            let Err(e) =
-                                                                Updater::download_and_apply(
-                                                                    r_clone
-                                                                ).await
-                                                        {
-                                                            anet_client_core::events::err(
-                                                                format!("Ошибка загрузки: {}", e)
-                                                            );
+                                                        if let Err(e) = Updater::download_and_apply(r_clone).await {
+                                                            anet_client_core::events::err(format!("Ошибка загрузки: {}", e));
                                                         }
                                                     });
                                                 }
 
                                                 ui.add_space(20.0);
 
-                                                let btn_cancel = egui::Button
-                                                    ::new(
-                                                        egui::RichText
-                                                            ::new("ПОЗДНЕЕ")
-                                                            .size(16.0)
-                                                            .strong()
-                                                            .color(egui::Color32::BLACK)
-                                                    )
-                                                    .fill(gold_color)
-                                                    .min_size(egui::vec2(120.0, 36.0));
+                                                let btn_cancel = egui::Button::new(
+                                                    egui::RichText::new("ПОЗДНЕЕ")
+                                                        .size(16.0)
+                                                        .strong()
+                                                        .color(egui::Color32::BLACK)
+                                                )
+                                                .fill(gold_color)
+                                                .min_size(egui::vec2(120.0, 36.0));
 
                                                 if ui.add(btn_cancel).clicked() {
                                                     self.update_status = UpdateStatus::Idle;
@@ -2731,16 +2196,14 @@ impl eframe::App for ANetApp {
                                         } else if let Some(p) = progress {
                                             ui.add_space(20.0);
                                             ui.label(
-                                                egui::RichText
-                                                    ::new("СКАЧИВАНИЕ НОВЫХ БИНАРНИКОВ...")
+                                                egui::RichText::new("СКАЧИВАНИЕ НОВЫХ БИНАРНИКОВ...")
                                                     .color(gold_color)
                                                     .strong()
                                             );
                                             ui.add_space(12.0);
 
                                             ui.add(
-                                                egui::ProgressBar
-                                                    ::new(p)
+                                                egui::ProgressBar::new(p)
                                                     .text(format!("{:.1}%", p * 100.0))
                                                     .desired_width(260.0)
                                                     .fill(gold_color)
@@ -2748,8 +2211,7 @@ impl eframe::App for ANetApp {
 
                                             ui.add_space(20.0);
                                             ui.label(
-                                                egui::RichText
-                                                    ::new("Пожалуйста, не закрывайте приложение")
+                                                egui::RichText::new("Пожалуйста, не закрывайте приложение")
                                                     .size(11.0)
                                                     .italics()
                                                     .color(gold_color)
@@ -2765,35 +2227,28 @@ impl eframe::App for ANetApp {
                         );
                         ui.allocate_ui_at_rect(right_rect, |ui| {
                             ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
-                                let anim_id = ui.id().with("apps_btn_color");
+                                let anim_id = ui.id().with("update_btn_color");
                                 let hover_t: f32 = ui.data(|d| d.get_temp(anim_id)).unwrap_or(0.0);
 
                                 let normal_color = white_color;
                                 let hover_color = gold_color;
 
-                                let r = ((normal_color.r() as f32) * (1.0 - hover_t) +
-                                    (hover_color.r() as f32) * hover_t) as u8;
-                                let g = ((normal_color.g() as f32) * (1.0 - hover_t) +
-                                    (hover_color.g() as f32) * hover_t) as u8;
-                                let b = ((normal_color.b() as f32) * (1.0 - hover_t) +
-                                    (hover_color.b() as f32) * hover_t) as u8;
+                                let r = ((normal_color.r() as f32) * (1.0 - hover_t) + (hover_color.r() as f32) * hover_t) as u8;
+                                let g = ((normal_color.g() as f32) * (1.0 - hover_t) + (hover_color.g() as f32) * hover_t) as u8;
+                                let b = ((normal_color.b() as f32) * (1.0 - hover_t) + (hover_color.b() as f32) * hover_t) as u8;
                                 let current_color = egui::Color32::from_rgb(r, g, b);
 
-                                let icon = egui::Image
-                                    ::new(egui::include_image!("./assets/update.svg"))
+                                let icon = egui::Image::new(egui::include_image!("./assets/update.svg"))
                                     .fit_to_exact_size(button_icon_size)
                                     .tint(current_color);
 
-                                let menu_button = egui::Button
-                                    ::image(icon)
+                                let menu_button = egui::Button::image(icon)
                                     .min_size(button_size)
                                     .stroke(egui::Stroke::NONE)
                                     .frame(false)
                                     .rounding(button_size.y / 2.0);
 
-                                let response = ui
-                                    .add(menu_button)
-                                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+                                let response = ui.add(menu_button).on_hover_cursor(egui::CursorIcon::PointingHand);
 
                                 let target_t = if response.hovered() { 1.0 } else { 0.0 };
                                 let dt = ui.input(|i| i.stable_dt);
@@ -2815,27 +2270,12 @@ impl eframe::App for ANetApp {
                                 }
 
                                 ui.add_space(2.0);
-                                ui.label(
-                                    egui::RichText::new("UPDATE").size(label_size).color(grey_color)
-                                );
-                                ui.label(
-                                    egui::RichText
-                                        ::new("CHECK")
-                                        .size(sub_label_size)
-                                        .color(grey_color)
-                                );
+                                ui.label(egui::RichText::new("UPDATE").size(label_size).color(grey_color));
+                                ui.label(egui::RichText::new("CHECK").size(sub_label_size).color(grey_color));
                             });
                         });
                     }
 
-                    // 3. ЦЕНТРАЛЬНЫЙ БЛОК: СТАТУС
-                    #[cfg(target_os = "windows")]
-                    let center_rect = egui::Rect::from_min_max(
-                        egui::pos2(rect.min.x + 60.0, rect.min.y),
-                        egui::pos2(rect.max.x - 60.0, rect.max.y)
-                    );
-
-                    #[cfg(not(target_os = "windows"))]
                     let center_rect = egui::Rect::from_min_max(
                         egui::pos2(rect.min.x + 60.0, rect.min.y),
                         egui::pos2(rect.max.x - 60.0, rect.max.y)
@@ -2849,23 +2289,11 @@ impl eframe::App for ANetApp {
                                 let icon_size = egui::vec2(16.0, 16.0);
                                 let spacing = 6.0;
 
-                                // Запрашиваем у egui точный размер готового текста до его отрисовки
-                                let galley = egui::WidgetText
-                                    ::from(
-                                        egui::RichText
-                                            ::new(text_str)
-                                            .size(16.0)
-                                            .strong()
-                                            .color(green_color)
-                                    )
-                                    .into_galley(
-                                        ui,
-                                        Some(egui::TextWrapMode::Extend),
-                                        f32::INFINITY,
-                                        egui::FontSelection::Default
-                                    );
+                                let galley = egui::WidgetText::from(
+                                    egui::RichText::new(text_str).size(16.0).strong().color(green_color)
+                                )
+                                .into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, egui::FontSelection::Default);
 
-                                // Вычисляем точную позицию x для старта всей группы (иконка + текст)
                                 let total_width = icon_size.x + spacing + galley.size().x;
                                 let center = center_rect.center();
                                 let start_x = center.x - total_width / 2.0;
@@ -2875,25 +2303,19 @@ impl eframe::App for ANetApp {
                                     icon_size
                                 );
 
-                                egui::Image
-                                    ::new(egui::include_image!("./assets/dot.svg"))
+                                egui::Image::new(egui::include_image!("./assets/dot.svg"))
                                     .tint(indicator_color.linear_multiply(0.15))
                                     .paint_at(ui, i_rect.expand(4.0));
 
-                                egui::Image
-                                    ::new(egui::include_image!("./assets/dot.svg"))
+                                egui::Image::new(egui::include_image!("./assets/dot.svg"))
                                     .tint(indicator_color.linear_multiply(0.35))
                                     .paint_at(ui, i_rect.expand(2.0));
 
-                                egui::Image
-                                    ::new(egui::include_image!("./assets/dot.svg"))
+                                egui::Image::new(egui::include_image!("./assets/dot.svg"))
                                     .fit_to_exact_size(icon_size)
                                     .paint_at(ui, i_rect);
 
-                                let text_pos = egui::pos2(
-                                    start_x + icon_size.x + spacing,
-                                    center.y - galley.size().y / 2.0
-                                );
+                                let text_pos = egui::pos2(start_x + icon_size.x + spacing, center.y - galley.size().y / 2.0);
                                 ui.painter().galley(text_pos, galley, green_color);
                             }
                             ConnectionState::Disconnected => {
@@ -2902,20 +2324,10 @@ impl eframe::App for ANetApp {
                                 let icon_size = egui::vec2(16.0, 16.0);
                                 let spacing = 6.0;
 
-                                let galley = egui::WidgetText
-                                    ::from(
-                                        egui::RichText
-                                            ::new(text_str)
-                                            .size(16.0)
-                                            .strong()
-                                            .color(grey_color)
-                                    )
-                                    .into_galley(
-                                        ui,
-                                        Some(egui::TextWrapMode::Extend),
-                                        f32::INFINITY,
-                                        egui::FontSelection::Default
-                                    );
+                                let galley = egui::WidgetText::from(
+                                    egui::RichText::new(text_str).size(16.0).strong().color(grey_color)
+                                )
+                                .into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, egui::FontSelection::Default);
 
                                 let total_width = icon_size.x + spacing + galley.size().x;
                                 let center = center_rect.center();
@@ -2926,25 +2338,19 @@ impl eframe::App for ANetApp {
                                     icon_size
                                 );
 
-                                egui::Image
-                                    ::new(egui::include_image!("./assets/block.svg"))
+                                egui::Image::new(egui::include_image!("./assets/block.svg"))
                                     .tint(indicator_color.linear_multiply(0.15))
                                     .paint_at(ui, i_rect.expand(4.0));
 
-                                egui::Image
-                                    ::new(egui::include_image!("./assets/block.svg"))
+                                egui::Image::new(egui::include_image!("./assets/block.svg"))
                                     .tint(indicator_color.linear_multiply(0.35))
                                     .paint_at(ui, i_rect.expand(2.0));
 
-                                egui::Image
-                                    ::new(egui::include_image!("./assets/block.svg"))
+                                egui::Image::new(egui::include_image!("./assets/block.svg"))
                                     .fit_to_exact_size(icon_size)
                                     .paint_at(ui, i_rect);
 
-                                let text_pos = egui::pos2(
-                                    start_x + icon_size.x + spacing,
-                                    center.y - galley.size().y / 2.0
-                                );
+                                let text_pos = egui::pos2(start_x + icon_size.x + spacing, center.y - galley.size().y / 2.0);
                                 ui.painter().galley(text_pos, galley, grey_color);
                             }
                             ConnectionState::Connecting => {
@@ -2953,20 +2359,10 @@ impl eframe::App for ANetApp {
                                 let icon_size = egui::vec2(16.0, 16.0);
                                 let spacing = 6.0;
 
-                                let galley = egui::WidgetText
-                                    ::from(
-                                        egui::RichText
-                                            ::new(text_str)
-                                            .size(16.0)
-                                            .strong()
-                                            .color(orange_color)
-                                    )
-                                    .into_galley(
-                                        ui,
-                                        Some(egui::TextWrapMode::Extend),
-                                        f32::INFINITY,
-                                        egui::FontSelection::Default
-                                    );
+                                let galley = egui::WidgetText::from(
+                                    egui::RichText::new(text_str).size(16.0).strong().color(orange_color)
+                                )
+                                .into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, egui::FontSelection::Default);
 
                                 let total_width = icon_size.x + spacing + galley.size().x;
                                 let center = center_rect.center();
@@ -2977,20 +2373,15 @@ impl eframe::App for ANetApp {
                                     icon_size
                                 );
 
-                                egui::Image
-                                    ::new(egui::include_image!("./assets/connecting.svg"))
+                                egui::Image::new(egui::include_image!("./assets/connecting.svg"))
                                     .tint(indicator_color.linear_multiply(0.35))
                                     .paint_at(ui, i_rect.expand(2.0));
 
-                                egui::Image
-                                    ::new(egui::include_image!("./assets/connecting.svg"))
+                                egui::Image::new(egui::include_image!("./assets/connecting.svg"))
                                     .fit_to_exact_size(icon_size)
                                     .paint_at(ui, i_rect);
 
-                                let text_pos = egui::pos2(
-                                    start_x + icon_size.x + spacing,
-                                    center.y - galley.size().y / 2.0
-                                );
+                                let text_pos = egui::pos2(start_x + icon_size.x + spacing, center.y - galley.size().y / 2.0);
                                 ui.painter().galley(text_pos, galley, orange_color);
                             }
                         }
@@ -3001,16 +2392,14 @@ impl eframe::App for ANetApp {
             });
 
         if self.sidebar_open {
-            egui::Area
-                ::new(egui::Id::new("config_sidebara"))
+            egui::Area::new(egui::Id::new("config_sidebara"))
                 .order(egui::Order::Foreground)
                 .fixed_pos(egui::pos2(0.0, 0.0))
                 .show(ctx, |ui| {
                     let screen_rect = ui.ctx().screen_rect();
                     let corner_radius = 14.0;
 
-                    egui::Frame
-                        ::none()
+                    egui::Frame::none()
                         .fill(ui.visuals().window_fill())
                         .inner_margin(margin)
                         .corner_radius(corner_radius)
@@ -3023,16 +2412,12 @@ impl eframe::App for ANetApp {
                             }
 
                             ui.horizontal(|ui| {
-                                let circle_button = egui::Button
-                                    ::new("⏴")
+                                let circle_button = egui::Button::new("⏴")
                                     .min_size(button_size)
                                     .stroke(Stroke::NONE)
                                     .rounding(button_size.y / 2.0);
 
-                                let response = ui
-                                    .add(circle_button)
-                                    .on_hover_cursor(egui::CursorIcon::PointingHand);
-
+                                let response = ui.add(circle_button).on_hover_cursor(egui::CursorIcon::PointingHand);
                                 if response.clicked() {
                                     self.sidebar_open = false;
                                 }
@@ -3042,75 +2427,36 @@ impl eframe::App for ANetApp {
                             ui.separator();
 
                             ui.style_mut().spacing.scroll.foreground_color = false;
-                            ui.style_mut().visuals.widgets.inactive.bg_fill =
-                                egui::Color32::from_rgb(80, 80, 80);
-                            ui.style_mut().visuals.widgets.hovered.bg_fill =
-                                egui::Color32::from_rgb(120, 120, 120);
-                            ui.style_mut().visuals.widgets.active.bg_fill = egui::Color32::from_rgb(
-                                160,
-                                160,
-                                160
-                            );
+                            ui.style_mut().visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(80, 80, 80);
+                            ui.style_mut().visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(120, 120, 120);
+                            ui.style_mut().visuals.widgets.active.bg_fill = egui::Color32::from_rgb(160, 160, 160);
 
-                            if
-                                ui
-                                    .checkbox(&mut self.tray_value, "Сворачивать приложение в трэй")
-                                    .changed()
-                            {
+                            if ui.checkbox(&mut self.tray_value, "Сворачивать приложение в трэй").changed() {
                                 let tray_mode = self.tray_value;
-
-                                let mut updated_config_data: Option<
-                                    (String, String, String)
-                                > = None;
+                                let mut updated_config_data: Option<(String, String, String)> = None;
 
                                 {
-                                    let mut settings = self.settings.lock().unwrap();
-
+                                    let mut settings = lock_ignore_poison(&self.settings);
                                     if let Some(active_id) = settings.active_config_id.clone() {
-                                        if
-                                            let Some(cfg) = settings.configs
-                                                .iter_mut()
-                                                .find(|c| c.id == active_id)
-                                        {
-                                            cfg.content = Self::inject_tray_mode_to_toml(
-                                                &cfg.content,
-                                                tray_mode
-                                            );
-
-                                            updated_config_data = Some((
-                                                cfg.id.clone(),
-                                                cfg.content.clone(),
-                                                cfg.name.clone(),
-                                            ));
+                                        if let Some(cfg) = settings.configs.iter_mut().find(|c| c.id == active_id) {
+                                            cfg.content = Self::inject_tray_mode_to_toml(&cfg.content, tray_mode);
+                                            updated_config_data = Some((cfg.id.clone(), cfg.content.clone(), cfg.name.clone()));
                                         }
-
                                         settings.save();
                                     }
                                 }
 
-                                // Записываем изменения непосредственно в .toml
                                 if let Some((id, content, name)) = updated_config_data {
-                                    let path_by_id = std::path::PathBuf
-                                        ::from("configs")
-                                        .join(format!("{}.toml", id));
-
-                                    let path_by_name = std::path::PathBuf
-                                        ::from("configs")
-                                        .join(format!("{}.toml", name));
+                                    let path_by_id = std::path::PathBuf::from("configs").join(format!("{}.toml", id));
+                                    let path_by_name = std::path::PathBuf::from("configs").join(format!("{}.toml", name));
 
                                     let target_path = if path_by_id.exists() {
                                         Some(path_by_id)
                                     } else if path_by_name.exists() {
                                         Some(path_by_name)
                                     } else {
-                                        let root_id = std::path::PathBuf::from(
-                                            format!("{}.toml", id)
-                                        );
-
-                                        let root_name = std::path::PathBuf::from(
-                                            format!("{}.toml", name)
-                                        );
-
+                                        let root_id = std::path::PathBuf::from(format!("{}.toml", id));
+                                        let root_name = std::path::PathBuf::from(format!("{}.toml", name));
                                         if root_id.exists() {
                                             Some(root_id)
                                         } else if root_name.exists() {
@@ -3123,31 +2469,18 @@ impl eframe::App for ANetApp {
                                     if let Some(path) = target_path {
                                         match std::fs::write(&path, &content) {
                                             Ok(_) => {
-                                                self.log(
-                                                    &format!("Настройка tray_mode сохранена: {}", tray_mode)
-                                                );
-                                                self.show_toast(
-                                                    &format!("Настройка tray_mode сохранена: {}", tray_mode)
-                                                );
+                                                self.log(&format!("Настройка tray_mode сохранена: {}", tray_mode));
+                                                self.show_toast(&format!("Настройка tray_mode сохранена: {}", tray_mode));
                                             }
-
                                             Err(e) => {
-                                                self.log(
-                                                    &format!(
-                                                        "Ошибка записи tray_mode в {:?}: {}",
-                                                        path,
-                                                        e
-                                                    )
-                                                );
+                                                self.log(&format!("Ошибка записи tray_mode в {:?}: {}", path, e));
                                             }
                                         }
                                     }
                                 }
                             }
                             ui.separator();
-                            ui.label(
-                                egui::RichText::new("КОНФИГИ").size(12.0).strong().color(gold_color)
-                            );
+                            ui.label(egui::RichText::new("КОНФИГИ").size(12.0).strong().color(gold_color));
                             ui.add_space(8.0);
 
                             for config in configs {
@@ -3160,148 +2493,53 @@ impl eframe::App for ANetApp {
                                     egui::Color32::from_rgb(30, 30, 30)
                                 };
 
-                                egui::Frame::NONE
-                                    .fill(bg_color)
-                                    .inner_margin(4.0)
-                                    .show(ui, |ui| {
-                                        ui.horizontal(|ui| {
-                                            if is_editing {
-                                                let response = ui.add(
-                                                    egui::TextEdit
-                                                        ::singleline(&mut self.edit_name_buffer)
-                                                        .desired_width(120.0)
-                                                );
-                                                if response.lost_focus() {
-                                                    self.finish_edit_name();
-                                                }
-                                                if ui.button("✔").clicked() {
-                                                    self.finish_edit_name();
-                                                }
-                                            } else {
-                                                let text_color = if is_active {
-                                                    egui::Color32::WHITE
-                                                } else {
-                                                    gold_color
-                                                };
-                                                if
-                                                    ui
-                                                        .add(
-                                                            egui::Label
-                                                                ::new(
-                                                                    egui::RichText
-                                                                        ::new(&config.name)
-                                                                        .color(text_color)
-                                                                )
-                                                                .sense(egui::Sense::click())
-                                                        )
-                                                        .clicked()
-                                                {
-                                                    self.select_config(&config.id);
-                                                }
-                                                ui.with_layout(
-                                                    egui::Layout::right_to_left(
-                                                        egui::Align::Center
-                                                    ),
-                                                    |ui| {
-                                                        if
-                                                            ui
-                                                                .add(
-                                                                    egui::Button
-                                                                        ::new("✏")
-                                                                        .frame(false)
-                                                                        .small()
-                                                                )
-                                                                .clicked()
-                                                        {
-                                                            self.start_edit_name(
-                                                                &config.id,
-                                                                &config.name
-                                                            );
-                                                        }
-                                                        if
-                                                            ui
-                                                                .add(
-                                                                    egui::Button
-                                                                        ::new("🗑")
-                                                                        .frame(false)
-                                                                        .small()
-                                                                )
-                                                                .clicked()
-                                                        {
-                                                            self.delete_config(&config.id);
-                                                        }
-                                                    }
-                                                );
+                                egui::Frame::NONE.fill(bg_color).inner_margin(4.0).show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        if is_editing {
+                                            let response = ui.add(
+                                                egui::TextEdit::singleline(&mut self.edit_name_buffer).desired_width(120.0)
+                                            );
+                                            if response.lost_focus() {
+                                                self.finish_edit_name();
                                             }
-                                        });
+                                            if ui.button("✔").clicked() {
+                                                self.finish_edit_name();
+                                            }
+                                        } else {
+                                            let text_color = if is_active { egui::Color32::WHITE } else { gold_color };
+                                            if ui.add(egui::Label::new(egui::RichText::new(&config.name).color(text_color)).sense(egui::Sense::click())).clicked() {
+                                                self.select_config(&config.id);
+                                            }
+                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                if ui.add(egui::Button::new("✏").frame(false).small()).clicked() {
+                                                    self.start_edit_name(&config.id, &config.name);
+                                                }
+                                                if ui.add(egui::Button::new("🗑").frame(false).small()).clicked() {
+                                                    self.delete_config(&config.id);
+                                                }
+                                            });
+                                        }
                                     });
+                                });
                             }
                             ui.add_space(16.0);
 
-                            if
-                                ui
-                                    .add(
-                                        egui::Button
-                                            ::new(
-                                                egui::RichText
-                                                    ::new("➕ Добавить конфиг")
-                                                    .color(gold_color)
-                                            )
-                                            .fill(egui::Color32::from_rgb(45, 45, 45))
-                                    )
-                                    .clicked()
-                            {
+                            if ui.add(egui::Button::new(egui::RichText::new("➕ Добавить конфиг").color(gold_color)).fill(egui::Color32::from_rgb(45, 45, 45))).clicked() {
                                 self.open_file_dialog();
                             }
-
-                            // ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
-                            //     ui.add_space(10.0);
-
-                            //     let is_busy = matches!(
-                            //         self.update_status,
-                            //         UpdateStatus::Checking | UpdateStatus::Downloading(_)
-                            //     );
-
-                            //     ui.add_enabled_ui(!is_busy, |ui| {
-                            //         let label = if is_busy {
-                            //             "⏳ ЖДИТЕ..."
-                            //         } else {
-                            //             "🔄 ПРОВЕРИТЬ ОБНОВЛЕНИЯ"
-                            //         };
-
-                            //         let btn_text = egui::RichText
-                            //             ::new(label)
-                            //             .size(11.0)
-                            //             .strong()
-                            //             .color(gold_color);
-                            //         if
-                            //             ui
-                            //                 .add(
-                            //                     egui::Button
-                            //                         ::new(btn_text)
-                            //                         .fill(egui::Color32::from_rgb(45, 45, 45))
-                            //                 )
-                            //                 .clicked()
-                            //         {
-                            //             self.check_for_updates();
-                            //         }
-                            //     });
-                            // });
                         });
                 });
         }
 
         #[cfg(target_os = "windows")]
         if self.appbar_open {
-            egui::Area
-                ::new(egui::Id::new("config_appbar"))
+            egui::Area::new(egui::Id::new("config_appbar"))
                 .order(egui::Order::Foreground)
                 .fixed_pos(egui::pos2(0.0, 0.0))
                 .show(ctx, |ui| {
                     let screen_rect = ui.ctx().screen_rect();
                     let corner_radius = 14.0;
-                    egui::Frame
-                        ::none()
+                    egui::Frame::none()
                         .fill(ui.visuals().window_fill())
                         .inner_margin(margin)
                         .corner_radius(corner_radius)
@@ -3314,16 +2552,12 @@ impl eframe::App for ANetApp {
                             }
 
                             ui.horizontal(|ui| {
-                                let circle_button = egui::Button
-                                    ::new("⏴")
+                                let circle_button = egui::Button::new("⏴")
                                     .min_size(button_size)
                                     .stroke(Stroke::NONE)
                                     .rounding(button_size.y / 2.0);
 
-                                let response = ui
-                                    .add(circle_button)
-                                    .on_hover_cursor(egui::CursorIcon::PointingHand);
-
+                                let response = ui.add(circle_button).on_hover_cursor(egui::CursorIcon::PointingHand);
                                 if response.clicked() {
                                     self.appbar_open = false;
                                 }
@@ -3338,16 +2572,14 @@ impl eframe::App for ANetApp {
         }
 
         if self.logbar_open {
-            egui::Area
-                ::new(egui::Id::new("config_logbar"))
+            egui::Area::new(egui::Id::new("config_logbar"))
                 .order(egui::Order::Foreground)
                 .fixed_pos(egui::pos2(0.0, 0.0))
                 .show(ctx, |ui| {
                     let screen_rect = ui.ctx().screen_rect();
                     let corner_radius = 14.0;
 
-                    egui::Frame
-                        ::none()
+                    egui::Frame::none()
                         .fill(ui.visuals().window_fill())
                         .inner_margin(margin)
                         .corner_radius(corner_radius)
@@ -3360,16 +2592,12 @@ impl eframe::App for ANetApp {
                             }
 
                             ui.horizontal(|ui| {
-                                let circle_button = egui::Button
-                                    ::new("⏴")
+                                let circle_button = egui::Button::new("⏴")
                                     .min_size(button_size)
                                     .stroke(Stroke::NONE)
                                     .rounding(button_size.y / 2.0);
 
-                                let response = ui
-                                    .add(circle_button)
-                                    .on_hover_cursor(egui::CursorIcon::PointingHand);
-
+                                let response = ui.add(circle_button).on_hover_cursor(egui::CursorIcon::PointingHand);
                                 if response.clicked() {
                                     self.logbar_open = false;
                                 }
@@ -3380,57 +2608,39 @@ impl eframe::App for ANetApp {
 
                             let console_inner_frame = egui::Frame::NONE;
                             console_inner_frame.show(ui, |ui| {
-                                let output2 = egui::ScrollArea
-                                    ::vertical()
+                                let output2 = egui::ScrollArea::vertical()
                                     .auto_shrink([false, false])
-                                    .scroll_bar_visibility(
-                                        egui::scroll_area::ScrollBarVisibility::AlwaysHidden
-                                    )
+                                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                                     .stick_to_bottom(true)
                                     .show(ui, |ui| {
-                                        let logs = self.logs.lock().unwrap();
+                                        let logs = lock_ignore_poison(&self.logs);
 
                                         for line in logs.iter() {
                                             let mut color = grey_color;
 
-                                            if
-                                                line.contains("Error") ||
-                                                line.contains("Failed") ||
-                                                line.contains("Connection lost")
+                                            if line.contains("Error")
+                                                || line.contains("Failed")
+                                                || line.contains("Connection lost")
                                             {
                                                 color = red_color;
-                                                self.status_text = line.to_string();
-                                                self.status_color = color;
                                             } else if line.contains("Tunnel UP") {
                                                 color = green_color;
-                                                self.status_text = line.to_string();
-                                                self.status_color = color;
                                             } else if line.contains("Config loaded") {
                                                 color = gold_color;
-                                                self.status_text = line.to_string();
-                                                self.status_color = color;
                                             } else if line.contains("Cleaning up dead session") {
                                                 color = orange_color;
-                                                self.status_text = line.to_string();
-                                                self.status_color = color;
-                                            } else {
-                                                // color = grey_color;
-                                                // self.status_text = "CONNECTION".to_string();
-                                                // self.status_color = color;
                                             }
 
                                             ui.horizontal(|ui| {
                                                 ui.add(
-                                                    egui::Label
-                                                        ::new(
-                                                            egui::RichText
-                                                                ::new(line)
-                                                                .family(egui::FontFamily::Monospace)
-                                                                .size(11.0)
-                                                                .color(color)
-                                                        )
-                                                        .selectable(true)
-                                                        .wrap()
+                                                    egui::Label::new(
+                                                        egui::RichText::new(line)
+                                                            .family(egui::FontFamily::Monospace)
+                                                            .size(11.0)
+                                                            .color(color)
+                                                    )
+                                                    .selectable(true)
+                                                    .wrap()
                                                 );
                                             });
                                         }
@@ -3451,9 +2661,7 @@ impl eframe::App for ANetApp {
                                     );
 
                                     let thumb_proportion2 = viewport_height2 / content_height2;
-                                    let thumb_height2 = (viewport_height2 * thumb_proportion2).max(
-                                        20.0
-                                    );
+                                    let thumb_height2 = (viewport_height2 * thumb_proportion2).max(20.0);
 
                                     let max_scroll2 = content_height2 - viewport_height2;
                                     let scroll_ratio2 = if max_scroll2 > 0.0 {
@@ -3461,9 +2669,7 @@ impl eframe::App for ANetApp {
                                     } else {
                                         0.0
                                     };
-                                    let thumb_start_y2 =
-                                        track_rect2.top() +
-                                        scroll_ratio2 * (viewport_height2 - thumb_height2);
+                                    let thumb_start_y2 = track_rect2.top() + scroll_ratio2 * (viewport_height2 - thumb_height2);
 
                                     let thumb_rect2 = egui::Rect::from_min_size(
                                         egui::pos2(track_rect2.left(), thumb_start_y2),
@@ -3472,11 +2678,7 @@ impl eframe::App for ANetApp {
 
                                     let painter2 = ui.painter();
                                     painter2.rect_filled(track_rect2, track_corner, track_color);
-                                    painter2.rect_filled(
-                                        thumb_rect2,
-                                        tracker_corner,
-                                        tracker_color
-                                    );
+                                    painter2.rect_filled(thumb_rect2, tracker_corner, tracker_color);
                                 }
                             });
                         });
@@ -3484,40 +2686,32 @@ impl eframe::App for ANetApp {
         }
 
         if self.exclbar_open {
-            egui::Area
-                ::new(egui::Id::new("config_exclbar"))
+            egui::Area::new(egui::Id::new("config_exclbar"))
                 .order(egui::Order::Foreground)
                 .fixed_pos(egui::pos2(0.0, 0.0))
                 .show(ctx, |ui| {
                     let screen_rect = ui.ctx().screen_rect();
                     let corner_radius = 14.0;
 
-                    egui::Frame
-                        ::none()
+                    egui::Frame::none()
                         .fill(ui.visuals().window_fill())
                         .inner_margin(margin)
                         .corner_radius(corner_radius)
                         .show(ui, |ui| {
                             ui.set_width(screen_rect.width() - margin * 2.0);
-
                             ui.set_height(screen_rect.height() - margin * 2.0);
 
-                            if ui.input(|i| { i.key_pressed(egui::Key::Escape) }) {
+                            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                                 self.close_exclbar();
                             }
 
-                            // HEADER
                             ui.horizontal(|ui| {
-                                let circle_button = egui::Button
-                                    ::new("⏴")
+                                let circle_button = egui::Button::new("⏴")
                                     .min_size(button_size)
                                     .stroke(Stroke::NONE)
                                     .rounding(button_size.y / 2.0);
 
-                                let response = ui
-                                    .add(circle_button)
-                                    .on_hover_cursor(egui::CursorIcon::PointingHand);
-
+                                let response = ui.add(circle_button).on_hover_cursor(egui::CursorIcon::PointingHand);
                                 if response.clicked() {
                                     self.close_exclbar();
                                 }
@@ -3529,8 +2723,7 @@ impl eframe::App for ANetApp {
                             ui.add_space(8.0);
 
                             ui.label(
-                                egui::RichText
-                                    ::new("Эти адреса будут исключены из VPN-туннеля.")
+                                egui::RichText::new("Эти адреса будут исключены из VPN-туннеля.")
                                     .size(11.0)
                                     .color(grey_color)
                                     .family(egui::FontFamily::Name("Inter-V".into()))
@@ -3538,33 +2731,26 @@ impl eframe::App for ANetApp {
 
                             ui.add_space(14.0);
 
-                            // ==============================
-                            // ADD ADDRESS
-                            // ==============================
                             ui.horizontal(|ui| {
                                 let input_width = (ui.available_width() - 92.0).max(160.0);
 
                                 let response = ui.add(
-                                    egui::TextEdit
-                                        ::singleline(&mut self.exclude_route_input)
+                                    egui::TextEdit::singleline(&mut self.exclude_route_input)
                                         .desired_width(input_width)
                                         .hint_text("IP, CIDR или домен")
                                 );
 
-                                let add_clicked = ui
-                                    .add(
-                                        egui::Button
-                                            ::new(
-                                                egui::RichText::new("ДОБАВИТЬ").size(11.0).strong()
-                                            )
-                                            .min_size(egui::vec2(82.0, 28.0))
+                                let add_clicked = ui.add(
+                                    egui::Button::new(
+                                        egui::RichText::new("ДОБАВИТЬ").size(11.0).strong()
                                     )
-                                    .on_hover_cursor(egui::CursorIcon::PointingHand)
-                                    .clicked();
+                                    .min_size(egui::vec2(82.0, 28.0))
+                                )
+                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                .clicked();
 
-                                let enter_pressed =
-                                    response.lost_focus() &&
-                                    ui.input(|i| { i.key_pressed(egui::Key::Enter) });
+                                let enter_pressed = response.lost_focus()
+                                    && ui.input(|i| i.key_pressed(egui::Key::Enter));
 
                                 if add_clicked || enter_pressed {
                                     let route = self.exclude_route_input.trim().to_string();
@@ -3588,21 +2774,15 @@ impl eframe::App for ANetApp {
 
                             ui.add_space(18.0);
 
-                            // ==============================
-                            // LIST HEADER
-                            // ==============================
                             ui.horizontal(|ui| {
                                 ui.label(
-                                    egui::RichText
-                                        ::new("ИСКЛЮЧЁННЫЕ АДРЕСА")
+                                    egui::RichText::new("ИСКЛЮЧЁННЫЕ АДРЕСА")
                                         .size(11.0)
                                         .strong()
                                         .color(gold_color)
                                 );
-
                                 ui.label(
-                                    egui::RichText
-                                        ::new(self.exclude_routes.len().to_string())
+                                    egui::RichText::new(self.exclude_routes.len().to_string())
                                         .size(10.0)
                                         .color(grey_color)
                                 );
@@ -3610,94 +2790,52 @@ impl eframe::App for ANetApp {
 
                             ui.add_space(8.0);
 
-                            // ==============================
-                            // LIST
-                            // ==============================
                             egui::Frame::NONE
                                 .fill(egui::Color32::from_rgb(25, 27, 33))
                                 .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(45, 47, 54)))
                                 .corner_radius(8.0)
                                 .inner_margin(egui::Margin::same(8))
                                 .show(ui, |ui| {
-                                    egui::ScrollArea
-                                        ::vertical()
+                                    egui::ScrollArea::vertical()
                                         .auto_shrink([false, false])
                                         .show(ui, |ui| {
                                             if self.exclude_routes.is_empty() {
                                                 ui.vertical_centered(|ui| {
                                                     ui.add_space(20.0);
-
                                                     ui.label(
-                                                        egui::RichText
-                                                            ::new("Нет исключённых адресов")
+                                                        egui::RichText::new("Нет исключённых адресов")
                                                             .size(11.0)
                                                             .color(grey_color)
                                                     );
                                                 });
                                             } else {
                                                 let mut remove_index = None;
-
-                                                for (index, route) in self.exclude_routes
-                                                    .iter()
-                                                    .enumerate() {
+                                                for (index, route) in self.exclude_routes.iter().enumerate() {
                                                     egui::Frame::NONE
-                                                        .fill(
-                                                            if index % 2 == 0 {
-                                                                egui::Color32::from_rgb(30, 32, 39)
-                                                            } else {
-                                                                egui::Color32::TRANSPARENT
-                                                            }
-                                                        )
+                                                        .fill(if index % 2 == 0 {
+                                                            egui::Color32::from_rgb(30, 32, 39)
+                                                        } else {
+                                                            egui::Color32::TRANSPARENT
+                                                        })
                                                         .corner_radius(6.0)
                                                         .inner_margin(egui::Margin::symmetric(8, 5))
                                                         .show(ui, |ui| {
                                                             ui.horizontal(|ui| {
+                                                                ui.label(egui::RichText::new("•").color(gold_color));
                                                                 ui.label(
-                                                                    egui::RichText
-                                                                        ::new("•")
-                                                                        .color(gold_color)
-                                                                );
-
-                                                                ui.label(
-                                                                    egui::RichText
-                                                                        ::new(route)
+                                                                    egui::RichText::new(route)
                                                                         .size(11.0)
-                                                                        .family(
-                                                                            egui::FontFamily::Name(
-                                                                                "JetBrainsMono".into()
-                                                                            )
-                                                                        )
+                                                                        .family(egui::FontFamily::Name("JetBrainsMono".into()))
                                                                 );
 
-                                                                ui.with_layout(
-                                                                    egui::Layout::right_to_left(
-                                                                        egui::Align::Center
-                                                                    ),
-                                                                    |ui| {
-                                                                        let delete = ui
-                                                                            .add(
-                                                                                egui::Button
-                                                                                    ::new(
-                                                                                        egui::RichText
-                                                                                            ::new(
-                                                                                                "Удалить"
-                                                                                            )
-                                                                                            .size(
-                                                                                                10.0
-                                                                                            )
-                                                                                    )
-                                                                                    .frame(false)
-                                                                            )
-                                                                            .on_hover_cursor(
-                                                                                egui::CursorIcon::PointingHand
-                                                                            );
-
-                                                                        if delete.clicked() {
-                                                                            remove_index =
-                                                                                Some(index);
-                                                                        }
+                                                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                                    if ui.add(egui::Button::new(egui::RichText::new("Удалить").size(10.0)).frame(false))
+                                                                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                                                        .clicked()
+                                                                    {
+                                                                        remove_index = Some(index);
                                                                     }
-                                                                );
+                                                                });
                                                             });
                                                         });
                                                 }
@@ -3705,7 +2843,6 @@ impl eframe::App for ANetApp {
                                                 if let Some(index) = remove_index {
                                                     self.exclude_routes.remove(index);
                                                     self.exclude_routes_changed = true;
-
                                                     self.show_toast("Адрес удален");
                                                     self.log("Адрес удален");
                                                 }
@@ -3718,8 +2855,7 @@ impl eframe::App for ANetApp {
 
         if let Some(err_msg) = self.error_modal.clone() {
             let modal_bg = egui::Color32::from_rgb(32, 32, 32);
-            egui::Window
-                ::new("ERROR_SYSTEM")
+            egui::Window::new("ERROR_SYSTEM")
                 .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
                 .collapsible(false)
                 .resizable(false)
@@ -3733,67 +2869,38 @@ impl eframe::App for ANetApp {
                 )
                 .show(ctx, |ui| {
                     ui.vertical_centered(|ui| {
-                        ui.label(
-                            egui::RichText
-                                ::new("ОШИБКА ДОСТУПА")
-                                .size(22.0)
-                                .strong()
-                                .color(gold_color)
-                        );
+                        ui.label(egui::RichText::new("ОШИБКА").size(22.0).strong().color(gold_color));
                         ui.add_space(16.0);
                         ui.label(
-                            egui::RichText
-                                ::new(&err_msg)
-                                .size(16.0)
-                                .line_height(Some(20.0))
+                            egui::RichText::new(&err_msg)
+                                .size(14.0)
                                 .color(gold_color)
                                 .family(egui::FontFamily::Monospace)
                         );
                         ui.add_space(24.0);
-                        if
-                            ui
-                                .add(
-                                    egui::Button
-                                        ::new(
-                                            egui::RichText
-                                                ::new("ЗАКРЫТЬ")
-                                                .size(16.0)
-                                                .strong()
-                                                .color(egui::Color32::BLACK)
-                                        )
-                                        .fill(gold_color)
-                                        .min_size(egui::vec2(120.0, 36.0))
-                                )
-                                .clicked()
-                        {
+                        if ui.add(
+                            egui::Button::new(egui::RichText::new("ЗАКРЫТЬ").size(16.0).strong().color(egui::Color32::BLACK))
+                                .fill(gold_color)
+                                .min_size(egui::vec2(120.0, 36.0))
+                        ).clicked() {
                             self.error_modal = None;
                         }
                     });
                 });
         }
 
-        let painter = ctx.layer_painter(
-            egui::LayerId::new(egui::Order::Foreground, egui::Id::new("window_border"))
-        );
-        let screen_rect = ctx.screen_rect();
-
-        // Укажите реальный радиус скругления ваших углов вместо 8.0
-        let corner_radius = 14.0;
-
+        let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("window_border")));
         painter.rect_stroke(
-            screen_rect,
-            corner_radius,
+            ctx.screen_rect(),
+            14.0,
             egui::Stroke::new(1.0, egui::Color32::from_rgb(100, 100, 100)),
-            egui::StrokeKind::Inside // Прижимаем обводку внутрь, чтобы она не обрезалась границами экрана
+            egui::StrokeKind::Inside
         );
 
-        // ==============================
-        // TOAST NOTIFICATION
-        // ==============================
         if let (Some(message), Some(until)) = (&self.toast_message, self.toast_until) {
-            if std::time::Instant::now() < until {
-                egui::Area
-                    ::new(egui::Id::new("toast_notification"))
+            let now = std::time::Instant::now();
+            if now < until {
+                egui::Area::new(egui::Id::new("toast_notification"))
                     .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -30.0))
                     .order(egui::Order::Foreground)
                     .show(ctx, |ui| {
@@ -3803,18 +2910,10 @@ impl eframe::App for ANetApp {
                             .inner_margin(egui::Margin::symmetric(16, 10))
                             .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(60, 63, 72)))
                             .show(ui, |ui| {
-                                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
-
-                                ui.label(
-                                    egui::RichText
-                                        ::new(message)
-                                        .size(11.0)
-                                        .color(egui::Color32::WHITE)
-                                );
+                                ui.label(egui::RichText::new(message).size(11.0).color(egui::Color32::WHITE));
                             });
                     });
-
-                ctx.request_repaint();
+                ctx.request_repaint_after(until.duration_since(now));
             } else {
                 self.toast_message = None;
                 self.toast_until = None;

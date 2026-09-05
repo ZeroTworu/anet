@@ -1,14 +1,14 @@
-use std::time::Duration;
+use crate::events::status;
+use crate::events::{AnetEvent, emit};
 use log::info;
 use quinn::Connection;
-use std::sync::Arc;
-use tokio::time::sleep;
-use tokio::sync::Notify;
-use std::sync::atomic::{ AtomicU32, AtomicU64, Ordering };
-use crate::events::status;
-use crate::events::{ emit, AnetEvent };
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::time::Duration;
 use std::time::Instant;
+use tokio::sync::Notify;
+use tokio::time::sleep;
 
 const KIB: f64 = 1024.0;
 const MIB: f64 = 1024.0 * 1024.0;
@@ -25,6 +25,19 @@ fn format_bytes(bytes: u64) -> String {
         format!("{:.2} MiB", bytes_f / MIB)
     } else {
         format!("{:.2} GiB", bytes_f / GIB)
+    }
+}
+
+/// Форматирование скорости передаваемых байт в секунду в человекочитаемый вид
+fn format_bytes_per_sec(bytes_per_sec: f64) -> String {
+    if bytes_per_sec < KIB {
+        format!("{:.0} B/s", bytes_per_sec)
+    } else if bytes_per_sec < MIB {
+        format!("{:.0} KiB/s", bytes_per_sec / KIB)
+    } else if bytes_per_sec < GIB {
+        format!("{:.0} MiB/s", bytes_per_sec / MIB)
+    } else {
+        format!("{:.0} GiB/s", bytes_per_sec / GIB)
     }
 }
 
@@ -95,8 +108,9 @@ impl PingStatsProvider {
                 // Пробуем установить TCP-соединение с таймаутом 1 секунда
                 let res = tokio::time::timeout(
                     Duration::from_secs(1),
-                    tokio::net::TcpStream::connect(target_addr)
-                ).await;
+                    tokio::net::TcpStream::connect(target_addr),
+                )
+                .await;
 
                 match res {
                     Ok(Ok(_stream)) => {
@@ -153,7 +167,7 @@ impl StreamStatsProvider {
         total_rx_bytes: Arc<AtomicU64>,
         total_tx_bytes: Arc<AtomicU64>,
         total_rx_packets: Arc<AtomicU64>,
-        total_tx_packets: Arc<AtomicU64>
+        total_tx_packets: Arc<AtomicU64>,
     ) -> Self {
         Self {
             total_rx_bytes,
@@ -187,10 +201,16 @@ impl StatsProvider for StreamStatsProvider {
 pub fn start_stats_monitor(
     provider: Arc<dyn StatsProvider>,
     interval_minutes: u64,
-    shutdown_notify: Arc<Notify>
+    shutdown_notify: Arc<Notify>,
 ) -> tokio::task::JoinHandle<()> {
-    info!("[STATS] Monitor enabled. Interval: {} minute(s).", interval_minutes);
-    status(format!("[STATS] Monitor enabled. Interval: {} minute(s).", interval_minutes));
+    info!(
+        "[STATS] Monitor enabled. Interval: {} minute(s).",
+        interval_minutes
+    );
+    status(format!(
+        "[STATS] Monitor enabled. Interval: {} minute(s).",
+        interval_minutes
+    ));
 
     tokio::spawn(async move {
         let interval = Duration::from_secs(interval_minutes * 60);
@@ -216,9 +236,9 @@ pub fn start_stats_monitor(
                     let tx_bytes_delta = current_stats
                         .total_tx_bytes
                         .saturating_sub(last_stats.total_tx_bytes);
-                        
+
                     let interval_secs = interval.as_secs_f64();
-                    
+
                     // Расчет скорости передачи в мегабитах
                     let rx_mbps = if interval_secs > 0.0 {
                         (rx_bytes_delta * 8) as f64 / (1000.0 * 1000.0 * interval_secs)
@@ -235,18 +255,18 @@ pub fn start_stats_monitor(
                     let rtt_str = current_stats.rtt_ms
                         .map(|rtt| format!("{:>6.2}ms", rtt))
                         .unwrap_or_else(|| "N/A".to_string());
-                        
+
                     let cwnd_str = current_stats.cwnd_bytes
                         .map(|cwnd| format!("{:>9}", format_bytes(cwnd)))
                         .unwrap_or_else(|| "N/A".to_string());
-                        
+
                     let lost_str = current_stats.lost_packets
                         .map(|lost| {
                             let last_lost = last_stats.lost_packets.unwrap_or(0);
                             format!("{:<5}", lost.saturating_sub(last_lost))
                         })
                         .unwrap_or_else(|| "N/A".to_string());
-                        
+
                     let mtu_str = current_stats.mtu_bytes
                         .map(|mtu| format!("{} B", mtu))
                         .unwrap_or_else(|| "N/A".to_string());
@@ -286,12 +306,12 @@ pub fn start_stats_monitor(
 /// Запуск секундного мониторинга трафика для обновления UI
 pub fn start_fast_stats_monitor(
     provider: Arc<dyn StatsProvider>,
-    shutdown_notify: Arc<Notify>
+    shutdown_notify: Arc<Notify>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let interval = Duration::from_secs(1);
         let mut last_stats = provider.get_stats();
-        let start_time = std::time::Instant::now();
+        let mut last_time = Instant::now();
 
         loop {
             tokio::select! {
@@ -303,16 +323,14 @@ pub fn start_fast_stats_monitor(
                     // 1. Получаем актуальный снимок метрик
                     let current_stats = provider.get_stats();
 
-                    let interval_secs = interval.as_secs_f64();
-
-                    // 2. Форматируем байты в строки
+                    // 2. Форматируем общие байты и RTT
                     let rx_str = format_bytes(current_stats.total_rx_bytes);
                     let tx_str = format_bytes(current_stats.total_tx_bytes);
-                   let rtt_str = current_stats.rtt_ms
-    .map(|rtt| format!("{:.0}ms", rtt))
-    .unwrap_or_else(|| "N/A".to_string());
+                    let rtt_str = current_stats.rtt_ms
+                        .map(|rtt| format!("{:.0}ms", rtt))
+                        .unwrap_or_else(|| "N/A".to_string());
 
-                    // Считаем разницу переданных данных за интервал
+                    // 3. Считаем дельту байт
                     let rx_bytes_delta = current_stats
                         .total_rx_bytes
                         .saturating_sub(last_stats.total_rx_bytes);
@@ -320,27 +338,44 @@ pub fn start_fast_stats_monitor(
                         .total_tx_bytes
                         .saturating_sub(last_stats.total_tx_bytes);
 
-                    // Расчет скорости передачи в мегабитах
-                    let rx_mbps = if interval_secs > 0.0 {
-                        (rx_bytes_delta * 8) as f64 / (1000.0 * 1000.0 * interval_secs)
+                    // 4. Замеряем точное прошедшее время
+                    let now = Instant::now();
+                    let elapsed_secs = now.duration_since(last_time).as_secs_f64();
+                    last_time = now;
+
+                    // 5. Расчет скорости в байтах/сек и Мбит/сек
+                    let (rx_bytes_per_sec, rx_mbps) = if elapsed_secs > 0.0 {
+                        let bytes_per_sec = rx_bytes_delta as f64 / elapsed_secs;
+                        let mbps = (rx_bytes_delta as f64 * 8.0) / (1_000_000.0 * elapsed_secs);
+                        (bytes_per_sec, mbps)
                     } else {
-                        0.0
+                        (0.0, 0.0)
                     };
-                    let tx_mbps = if interval_secs > 0.0 {
-                        (tx_bytes_delta * 8) as f64 / (1000.0 * 1000.0 * interval_secs)
+
+                    let (tx_bytes_per_sec, tx_mbps) = if elapsed_secs > 0.0 {
+                        let bytes_per_sec = tx_bytes_delta as f64 / elapsed_secs;
+                        let mbps = (tx_bytes_delta as f64 * 8.0) / (1_000_000.0 * elapsed_secs);
+                        (bytes_per_sec, mbps)
                     } else {
-                        0.0
-                    };    
+                        (0.0, 0.0)
+                    };
+
+                    // Обновляем базовый снимок для следующей итерации
+                    last_stats = current_stats;
+
+                    // Форматируем скорость только в байтах/сек
+                    let rx_speed_formatted = format_bytes_per_sec(rx_bytes_per_sec);
+                    let tx_speed_formatted = format_bytes_per_sec(tx_bytes_per_sec);
 
 
 
-                    // 3. Излучаем событие через глобальный emit
+                    // 6. Излучаем событие
                     emit(AnetEvent::Stats {
                         rx: rx_str,
                         tx: tx_str,
-                        rtt: rtt_str.to_string(),
-                        rxm: rx_mbps.to_string(),
-                        txm: tx_mbps.to_string()
+                        rtt: rtt_str,
+                        rxm: rx_speed_formatted, // Подаем отформатированную скорость
+                        txm: tx_speed_formatted,
                     });
                 }
                 _ = shutdown_notify.notified() => {

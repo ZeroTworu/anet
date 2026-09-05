@@ -695,6 +695,7 @@ impl AnetClient {
 
         if self.stop_requested.load(Ordering::SeqCst) {
             info!("[Core] Connection cancelled before storing session.");
+            status("[Core] Connection cancelled before storing session.");
             let _ = self.dns_manager.restore_dns(&iface_name);
             let _ = self.route_manager.restore_routes().await;
             return Ok(());
