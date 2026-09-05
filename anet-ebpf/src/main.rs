@@ -1,7 +1,14 @@
 #![no_std]
 #![no_main]
 
-use aya_ebpf::{bindings::{xdp_action, TC_ACT_OK}, helpers::{bpf_ktime_get_ns, bpf_skb_set_tstamp}, macros::{classifier, map, xdp}, maps::HashMap, programs::{TcContext, XdpContext}, EbpfContext};
+use aya_ebpf::{
+    bindings::{xdp_action, TC_ACT_OK},
+    helpers::{bpf_ktime_get_ns, bpf_skb_set_tstamp},
+    macros::{classifier, map, xdp},
+    maps::HashMap,
+    programs::{TcContext, XdpContext},
+    EbpfContext,
+};
 use aya_log_ebpf::debug;
 
 use anet_ebpf_common::{EdtState, RateRule, TokenBucketState};
@@ -68,17 +75,17 @@ fn try_tc_egress(ctx: &TcContext) -> Result<i32, ()> {
         None => now,
     };
 
-    // 1e9 нс / (байт/сек) * длина_пакета = сколько нс "стоит" этот пакет на
-    // заданной скорости. Считаем через u128, чтобы не терять точность на
-    // маленьких rate_bytes_per_sec / больших пакетах.
-    let cost_ns = ((1_000_000_000u128 * packet_len as u128) / rule.rate_bytes_per_sec as u128) as u64;
+    // 10^9 * packet_len (максимум ~65535) = ~6.5 * 10^13, что с запасом
+    // укладывается в u64 (предел u64: 1.84 * 10^19). 128-битная арифметика не требуется.
+    let cost_ns = (1_000_000_000u64 * packet_len) / rule.rate_bytes_per_sec;
     let mut next_departure = scheduled_from.saturating_add(cost_ns);
 
     // Не даём очереди "убегать" в будущее дальше чем на burst — иначе клиент,
     // долго простаивавший (накопивший виртуальный кредит), потом продавит
     // канал одним залпом. burst_bytes / rate = максимальная глубина пейсинга.
-    let max_horizon_ns =
-        ((1_000_000_000u128 * rule.burst_bytes.max(1) as u128) / rule.rate_bytes_per_sec as u128) as u64;
+    // Ограничиваем burst 1 ГБ для гарантии отсутствия переполнения u64 при умножении.
+    let safe_burst = rule.burst_bytes.max(1).min(1_000_000_000);
+    let max_horizon_ns = (1_000_000_000u64 * safe_burst) / rule.rate_bytes_per_sec;
     let horizon = now.saturating_add(max_horizon_ns.max(cost_ns));
     if next_departure > horizon {
         next_departure = horizon;
@@ -87,15 +94,8 @@ fn try_tc_egress(ctx: &TcContext) -> Result<i32, ()> {
     let _ = EDT_STATE.insert(&dst_ip, &EdtState { next_departure_ns: next_departure }, 0);
 
     // ВНИМАНИЕ: bpf_skb_set_tstamp — helper, появившийся в Linux 5.18
-    // (BPF_FUNC_skb_set_tstamp). На более старых ядрах (или если сигнатура
-    // хелпера в вашей версии aya-ebpf/aya-ebpf-bindings отличается) может
-    // потребоваться прямая запись поля `(*ctx.skb.skb).tstamp = next_departure`
-    // через raw-указатель вместо хелпера — сверьте с версией, закреплённой
-    // в Cargo.lock на момент сборки.
+    // (BPF_FUNC_skb_set_tstamp).
     unsafe {
-        // ctx.skb.as_ptr() приватен вовне aya-ebpf (SkBuff::as_ptr —
-        // pub(crate)); у самого TcContext есть публичный as_ptr() верхнего
-        // уровня, который делегирует туда же изнутри крейта.
         let _ = bpf_skb_set_tstamp(
             ctx.as_ptr() as *mut _,
             next_departure,
@@ -144,8 +144,12 @@ fn try_xdp_ingress(ctx: &XdpContext) -> Result<u32, ()> {
         },
     };
 
-    let elapsed_ns = now.saturating_sub(state.last_update_ns);
-    let refill = ((rule.rate_bytes_per_sec as u128 * elapsed_ns as u128) / 1_000_000_000u128) as i64;
+    // Ограничиваем elapsed_ns 1 секундой (1_000_000_000 нс).
+    // Это полностью защищает умножение (rate * elapsed_ns) от переполнения u64
+    // даже на скоростях 100 Гбит/с и исключает вызовы встроенных функций 128-битной математики.
+    let elapsed_ns = now.saturating_sub(state.last_update_ns).min(1_000_000_000);
+    let refill = ((rule.rate_bytes_per_sec * elapsed_ns) / 1_000_000_000) as i64;
+
     state.tokens = state.tokens.saturating_add(refill).min(rule.burst_bytes as i64);
     state.last_update_ns = now;
 

@@ -30,33 +30,33 @@ jobs:
     name: "Build Linux Server & Tools"
     runs-on: "ubuntu-latest"
     steps:
-      - uses: "actions/checkout@v6"
+      - uses: "actions/checkout@v4"
 
       - name: "Install dependencies"
         run: |
-            sudo apt-get update
-            sudo apt-get install -y musl-tools protobuf-compiler gcc-aarch64-linux-gnu mingw-w64 llvm clang
+          sudo apt-get update
+          # ВАЖНО: 'llvm' и 'clang' убраны из apt-get, чтобы системный llvm-config 
+          # не ломал сборку bpf-linker под nightly!
+          sudo apt-get install -y musl-tools protobuf-compiler gcc-aarch64-linux-gnu mingw-w64
 
-      - name: "Install Rust"
-        uses: "actions-rs/toolchain@v1"
+      - name: "Install Rust Stable"
+        uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "stable"
-          override: "true"
-      - name: "Add Rust Targets"
-        run: |
-          rustup target add x86_64-unknown-linux-musl
-          rustup target add x86_64-pc-windows-gnu  
+          targets: x86_64-unknown-linux-musl, x86_64-pc-windows-gnu
 
-      # anet-ebpf (встроенный eBPF-шейпер трафика в anet-server) собирается
-      # отдельным nightly-тулчейном через aya-build/bpf-linker; сам
-      # anet-server по-прежнему собирается стабильным тулчейном выше.
-      - name: "Install nightly toolchain + bpf-linker for anet-ebpf"
+      # anet-ebpf собирается nightly-тулчейном через aya-build / bpf-linker
+      - name: "Install Rust Nightly & bpf-linker for anet-ebpf"
         run: |
           rustup toolchain install nightly --component rust-src
-          cargo install bpf-linker
+          cargo +nightly install bpf-linker --force
+          
+          # Передаем путь к libLLVM от nightly в общее окружение GitHub Actions,
+          # чтобы bpf-linker находил библиотеки при запуске из build.rs
+          NIGHTLY_SYSROOT=$(rustc +nightly --print sysroot)
+          echo "LD_LIBRARY_PATH=$NIGHTLY_SYSROOT/lib:$LD_LIBRARY_PATH" >> $GITHUB_ENV
 
       - name: "Cache Rust dependencies"
-        uses: actions/cache@v5
+        uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
@@ -66,7 +66,7 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-server-full-
 
-      # 1. Сборка Linux бинарников (Static MUSL)
+      # 1. Сборка Linux бинарников со встроенным eBPF (Static MUSL)
       - name: "Build Linux Binaries (Musl)"
         run: |
           RUSTFLAGS="-C target-feature=+crt-static" cargo build --release --package anet-server --target x86_64-unknown-linux-musl
@@ -91,7 +91,7 @@ jobs:
           # Windows
           cp target/x86_64-pc-windows-gnu/release/anet-keygen.exe server_bin/
 
-      - uses: "actions/upload-artifact@v6"
+      - uses: "actions/upload-artifact@v4"
         with:
           name: "anet-server-full"
           path: "server_bin/"

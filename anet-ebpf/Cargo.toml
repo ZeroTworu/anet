@@ -5,17 +5,12 @@ edition = "2024"
 license = "MIT"
 
 [dependencies]
-aya-ebpf = "0.1"
-aya-log-ebpf = "0.1"
+aya-ebpf = "0.2.1"
+aya-log-ebpf = "0.2.0"
 anet-ebpf-common = { path = "../anet-ebpf-common" }
 
-# ВАЖНО: имя bin намеренно отличается от имени пакета — если они совпадают,
-# aya-build пытается скопировать собранный BPF-объект поверх собственной
-# промежуточной директории и падает с невнятной "Is a directory" ошибкой.
-# anet-server::shaper всё равно грузит объект по имени ПАКЕТА ("anet-ebpf"),
-# это имя bin-таргета наружу нигде не используется.
 [[bin]]
-name = "anet-ebpf-prog"
+name = "anet-ebpf"
 path = "src/main.rs"
 
 [profile.release]
