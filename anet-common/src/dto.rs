@@ -46,6 +46,8 @@ pub struct CheckAccessResponse {
 
     pub active_sessions: Option<i32>,
     pub allowed_sessions: Option<i32>,
+
+    pub expires_at: Option<String>,
 }
 
 /// [ VPN Core Communication: Session Events ]

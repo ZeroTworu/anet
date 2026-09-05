@@ -56,6 +56,9 @@ message AuthResponse {
     // Сессии (активные и разрешенные)
     int32 active_sessions = 12;
     int32 allowed_sessions = 13;
+
+    optional int32 speed_limit_kbps = 14;  // Лимит скорости в Кбит/с
+    optional string expires_at = 15;       // Дата окончания доступа (YYYY-MM-DD HH:MM)
 }
 
 message Message {

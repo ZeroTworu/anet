@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use log::{error, info, warn};
+use log::{error, info};
 use reqwest::Client as HttpClient;
 
 use anet_common::dto::{
@@ -21,6 +21,7 @@ pub struct AccessGrant {
 
     pub active_sessions: Option<i32>,
     pub allowed_sessions: Option<i32>,
+    pub expires_at: Option<String>,
 }
 
 #[derive(Clone)]
@@ -71,6 +72,7 @@ impl AuthProvider {
                 traffic_consumed: None,
                 allowed_sessions: None,
                 active_sessions: None,
+                expires_at: None,
             });
         }
 
@@ -109,6 +111,7 @@ impl AuthProvider {
                                         traffic_consumed: json.traffic_consumed,
                                         allowed_sessions: json.allowed_sessions,
                                         active_sessions: json.active_sessions,
+                                        expires_at: json.expires_at,
                                     })
                                 } else {
                                     Err(json.message)

@@ -50,6 +50,7 @@ pub struct TempDHInfo {
 
     pub active_sessions: Option<i32>,
     pub allowed_sessions: Option<i32>,
+    pub expires_at: Option<String>,
 }
 
 pub type HandshakeData = (Bytes, SocketAddr);

@@ -277,6 +277,7 @@ impl ServerAuthHandler {
                 traffic_consumed: None,
                 allowed_sessions: None,
                 active_sessions: None,
+                expires_at: None,
             })
         } else if !self.registry.is_accepting_connections() {
             Err("Node is not accepting new connections".to_string())
@@ -321,6 +322,7 @@ impl ServerAuthHandler {
                         traffic_consumed: grant.traffic_consumed,
                         allowed_sessions: grant.allowed_sessions,
                         active_sessions: grant.active_sessions,
+                        expires_at: grant.expires_at,
                     },
                 );
 
@@ -411,6 +413,7 @@ impl ServerAuthHandler {
             traffic_consumed,
             active_sessions,
             allowed_sessions,
+            expires_at,
         ) = if let Some(previous) = resumed {
             info!(
                 "[AUTH] Resuming logical session {} on a new transport",
@@ -428,6 +431,7 @@ impl ServerAuthHandler {
                 previous.traffic_consumed,
                 previous.active_sessions,
                 previous.allowed_sessions,
+                previous.expires_at.clone(),
             )
         } else {
             let assigned_ip = if let Some(static_ip) = temp_info.static_ip {
@@ -454,6 +458,7 @@ impl ServerAuthHandler {
                 temp_info.traffic_consumed,
                 temp_info.active_sessions,
                 temp_info.allowed_sessions,
+                temp_info.expires_at.clone(),
             )
         };
 
@@ -476,6 +481,7 @@ impl ServerAuthHandler {
             traffic_consumed,
             allowed_sessions,
             active_sessions,
+            expires_at: expires_at.clone(),
         });
 
         self.registry.pre_register_client(client_info.clone());
@@ -491,11 +497,11 @@ impl ServerAuthHandler {
         let (netmask, gateway, mtu) = self.registry.get_network_params();
 
         let pb_billing = match billing_type.unwrap_or(DtoBillingType::NoTariffNoGroup) {
+            DtoBillingType::Unknown => ProtoBillingType::Unknown,
             DtoBillingType::NoTariffNoGroup => ProtoBillingType::NoTariffNoGroup,
             DtoBillingType::Group => ProtoBillingType::Group,
             DtoBillingType::Individual => ProtoBillingType::Individual,
             DtoBillingType::GroupAndIndividual => ProtoBillingType::GroupAndIndividual,
-            DtoBillingType::Unknown => ProtoBillingType::Unknown,
         };
 
         let response_payload = AuthResponse {
@@ -512,6 +518,8 @@ impl ServerAuthHandler {
             traffic_consumed,
             active_sessions: active_sessions.unwrap_or(1),
             allowed_sessions: allowed_sessions.unwrap_or(0),
+            speed_limit_kbps: speed_limit_kbps.map(|v| v as i32),
+            expires_at,
         };
 
         let mut inner_msg = AnetMessage {

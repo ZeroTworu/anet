@@ -99,6 +99,7 @@ impl AuthApi {
                     traffic_consumed: None,
                     active_sessions: None,
                     allowed_sessions: None,
+                    expires_at: None,
                 }))
             }
         };
@@ -116,6 +117,7 @@ impl AuthApi {
                 traffic_consumed: None,
                 active_sessions: None,
                 allowed_sessions: None,
+                expires_at: None,
             }));
         }
 
@@ -247,6 +249,7 @@ impl AuthApi {
                     traffic_consumed,
                     active_sessions: Some(current_sessions),
                     allowed_sessions: Some(allowed_sessions),
+                    expires_at: None,
                 }));
             }
 
@@ -263,6 +266,7 @@ impl AuthApi {
                     traffic_consumed,
                     active_sessions: Some(current_sessions),
                     allowed_sessions: Some(allowed_sessions),
+                    expires_at: None,
                 }));
             }
 
@@ -281,6 +285,7 @@ impl AuthApi {
                             traffic_consumed,
                             active_sessions: Some(current_sessions),
                             allowed_sessions: Some(allowed_sessions),
+                            expires_at: None
                         }));
                     }
                 }
@@ -288,6 +293,11 @@ impl AuthApi {
         }
 
         let reported_active = current_sessions + 1;
+        let expires_at = if check_expiration {
+            Some(expiration_date.format("%Y-%m-%d %H:%M").to_string())
+        } else {
+            None
+        };
 
         Ok(Json(CheckAccessResponse {
             allowed: true,
@@ -301,6 +311,7 @@ impl AuthApi {
             traffic_consumed,
             active_sessions: Some(reported_active),
             allowed_sessions: Some(allowed_sessions),
+            expires_at,
         }))
     }
 
