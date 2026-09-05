@@ -61,6 +61,8 @@ pub struct AnetClient {
     // тем же путём (через reconnect_signal), поэтому раньше stop() всегда
     // трактовался как обрыв связи и немедленно вызывал реконнект.
     stop_requested: AtomicBool,
+    is_active: AtomicBool,
+    cancel_signal: Arc<Notify>,
 }
 
 impl AnetClient {
@@ -77,6 +79,8 @@ impl AnetClient {
             dns_manager,
             session: Mutex::new(None),
             stop_requested: AtomicBool::new(false),
+            is_active: AtomicBool::new(false),
+            cancel_signal: Arc::new(Notify::new()),
         }
     }
 
@@ -137,8 +141,7 @@ impl AnetClient {
     }
 
     pub fn is_running(&self) -> bool {
-        let state = self.session.lock().unwrap();
-        state.is_some()
+        self.is_active.load(Ordering::SeqCst) || self.session.lock().unwrap().is_some()
     }
 
     /// Главный метод запуска VPN. Управляет циклом каскадного переподключения серверов.
@@ -147,12 +150,15 @@ impl AnetClient {
             return Err(anyhow!("VPN tunnel is already active"));
         }
 
-        // Свежий цикл подключения — сбрасываем флаг от возможного
-        // предыдущего stop().
+        self.is_active.store(true, Ordering::SeqCst);
         self.stop_requested.store(false, Ordering::SeqCst);
 
         let mut config_clone = self.config.clone();
-        config_clone.sanitize()?;
+        if let Err(e) = config_clone.sanitize() {
+            self.is_active.store(false, Ordering::SeqCst);
+            client_state(ClientState::Failed, format!("Config error: {}", e), None);
+            return Err(e);
+        }
 
         info!("[Core] Starting failover connection loop...");
         warn("[Core] Starting connection loop...");
@@ -162,6 +168,13 @@ impl AnetClient {
         let mut current_server_index = 0;
 
         loop {
+            if self.stop_requested.load(Ordering::SeqCst) {
+                info!("[Core] Stop requested by user. Exiting connection loop.");
+                status("VPN Stopped");
+                client_state(ClientState::Stopped, "VPN stopped", None);
+                break;
+            }
+
             let server = &config_clone.servers[current_server_index];
 
             let server_name = server.get_name();
@@ -195,6 +208,13 @@ impl AnetClient {
 
                     current_server_index = (current_server_index + 1) % config_clone.servers.len();
                     sleep(Duration::from_secs(2)).await;
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+                        _ = self.cancel_signal.notified() => {
+                            info!("[Core] Connection loop sleep cancelled by user.");
+                            break;
+                        }
+                    }
                 }
                 Err(e) => {
                     if self.stop_requested.load(Ordering::SeqCst) {
@@ -216,11 +236,18 @@ impl AnetClient {
                     );
 
                     current_server_index = (current_server_index + 1) % config_clone.servers.len();
-                    sleep(Duration::from_secs(2)).await;
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+                        _ = self.cancel_signal.notified() => {
+                            info!("[Core] Connection loop sleep cancelled by user.");
+                            break;
+                        }
+                    }
                 }
             }
         }
 
+        self.is_active.store(false, Ordering::SeqCst);
         Ok(())
     }
 
@@ -347,6 +374,27 @@ impl AnetClient {
         let result = tokio::time::timeout(conn_timeout, transport.connect())
             .await
             .map_err(|_| anyhow!("Connection handshake timed out"))??;
+        let cancel_token = self.cancel_signal.clone();
+        let connect_fut = transport.connect();
+
+        let result = tokio::select! {
+            res = tokio::time::timeout(conn_timeout, connect_fut) => {
+                match res {
+                    Ok(Ok(auth_res)) => auth_res,
+                    Ok(Err(e)) => return Err(e),
+                    Err(_) => return Err(anyhow::anyhow!("Connection handshake timed out")),
+                }
+            }
+            _ = cancel_token.notified() => {
+                info!("[Core] Handshake cancelled by user.");
+                return Ok(());
+            }
+        };
+
+        if self.stop_requested.load(Ordering::SeqCst) {
+            info!("[Core] Connection cancelled before configuring tunnel.");
+            return Ok(());
+        }
 
         info!("[Core] Authentication successful. Configuring tunnel interface...");
         status("[Core] Authentication successful. Configuring tunnel interface...");
@@ -644,6 +692,13 @@ let stats_task = {
             }))
         };
 
+        if self.stop_requested.load(Ordering::SeqCst) {
+            info!("[Core] Connection cancelled before storing session.");
+            let _ = self.dns_manager.restore_dns(&iface_name);
+            let _ = self.route_manager.restore_routes().await;
+            return Ok(());
+        }
+
         {
             let mut state = self.session.lock().unwrap();
             *state = Some(RunningSession {
@@ -780,6 +835,7 @@ let stats_task = {
         // Взводим ДО notify_one() ниже — start() должен увидеть флаг сразу,
         // как только проснётся от сигнала reconnect_signal.
         self.stop_requested.store(true, Ordering::SeqCst);
+        self.cancel_signal.notify_waiters();
 
         let session = {
             let mut state = self.session.lock().unwrap();
@@ -806,6 +862,10 @@ let stats_task = {
             let _ = self.dns_manager.restore_dns(&running.iface_name);
             let _ = self.route_manager.restore_routes().await;
             info!("[Core] VPN Stopped.");
+            status("[Core] VPN Stopped.");
+            client_state(ClientState::Stopped, "VPN stopped", None);
+        } else {
+            info!("[Core] VPN Stopped (no active session).");
             status("[Core] VPN Stopped.");
             client_state(ClientState::Stopped, "VPN stopped", None);
         }
