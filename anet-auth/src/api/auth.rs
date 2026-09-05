@@ -14,6 +14,7 @@ use sea_orm::{
 use std::env;
 use uuid::Uuid;
 use chrono::Datelike;
+use log::info;
 
 pub struct AuthApi {
     pub db: DatabaseConnection,
@@ -175,7 +176,7 @@ impl AuthApi {
             speed_limit = group.speed_limit; // Берем скорость из группы
             has_limits = true;
         }
-
+        info!("CheckAccessResponse: has_limits: {}, speed_limit: {}", has_limits, speed_limit);
         // 4. Проверяем лимиты, если они активны
         if has_limits {
             // Проверка срока действия
@@ -238,6 +239,7 @@ impl AuthApi {
         }
 
         // УСПЕШНЫЙ ВХОД: возвращаем разрешенную скорость для eBPF-шейпера на сервере
+        info!("CheckAccessResponse: speed_limit: {}", speed_limit);
         Ok(Json(CheckAccessResponse {
             allowed: true,
             message: "OK".into(),

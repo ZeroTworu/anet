@@ -1,4 +1,4 @@
-use log::error;
+use log::{error, info};
 use reqwest::Client as HttpClient;
 use std::time::Duration;
 
@@ -67,6 +67,7 @@ impl AuthProvider {
                     match resp.status() {
                         reqwest::StatusCode::OK => {
                             if let Ok(json) = resp.json::<CheckAccessResponse>().await {
+                                info!("Check access response: {:?}", json);
                                 return if json.allowed {
                                     Ok(AccessGrant {
                                         static_ip: json.static_ip,

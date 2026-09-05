@@ -38,7 +38,9 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
     // 1. Инициализация окружения
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .filter(Some("sqlx"), log::LevelFilter::Warn) // Игнорировать INFO-логи от sqlx
+        .init();
     dotenvy::dotenv().ok();
 
     // 2. Парсинг аргументов
