@@ -57,6 +57,19 @@ pub struct AuthResponse {
     pub nonce_prefix: ::prost::alloc::vec::Vec<u8>,
     #[prost(bytes = "vec", tag = "7")]
     pub quic_cert: ::prost::alloc::vec::Vec<u8>,
+    #[prost(enumeration = "BillingType", tag = "8")]
+    pub billing_type: i32,
+    #[prost(string, optional, tag = "9")]
+    pub group_name: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(int64, optional, tag = "10")]
+    pub traffic_limit: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "11")]
+    pub traffic_consumed: ::core::option::Option<i64>,
+    /// Сессии (активные и разрешенные)
+    #[prost(int32, tag = "12")]
+    pub active_sessions: i32,
+    #[prost(int32, tag = "13")]
+    pub allowed_sessions: i32,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Message {
@@ -89,6 +102,41 @@ pub mod message {
 pub struct AuthDenyNotification {
     #[prost(string, tag = "1")]
     pub message: ::prost::alloc::string::String,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum BillingType {
+    Unknown = 0,
+    NoTariffNoGroup = 1,
+    Group = 2,
+    Individual = 3,
+    GroupAndIndividual = 4,
+}
+impl BillingType {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unknown => "BILLING_TYPE_UNKNOWN",
+            Self::NoTariffNoGroup => "BILLING_TYPE_NO_TARIFF_NO_GROUP",
+            Self::Group => "BILLING_TYPE_GROUP",
+            Self::Individual => "BILLING_TYPE_INDIVIDUAL",
+            Self::GroupAndIndividual => "BILLING_TYPE_GROUP_AND_INDIVIDUAL",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "BILLING_TYPE_UNKNOWN" => Some(Self::Unknown),
+            "BILLING_TYPE_NO_TARIFF_NO_GROUP" => Some(Self::NoTariffNoGroup),
+            "BILLING_TYPE_GROUP" => Some(Self::Group),
+            "BILLING_TYPE_INDIVIDUAL" => Some(Self::Individual),
+            "BILLING_TYPE_GROUP_AND_INDIVIDUAL" => Some(Self::GroupAndIndividual),
+            _ => None,
+        }
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]

@@ -1,29 +1,34 @@
-use crate::auth_provider::AuthProvider;
-use crate::client_registry::{ClientRegistry, ClientTransportInfo};
-use crate::multikey_udp_socket::TempDHInfo;
-use crate::utils::{generate_seid, generate_unique_nonce_prefix};
-use anet_common::consts::{NONCE_LEN, PROTO_PAD_FIELD_OVERHEAD};
-use anet_common::encryption::Cipher;
-use anet_common::padding_utils::{calculate_padding_needed, generate_random_padding};
-use anet_common::protocol::{
-    AuthResponse, DhClientExchange, DhServerExchange, EncryptedAuthRequest, EncryptedAuthResponse,
-    Message as AnetMessage, message::Content,
-};
-use anet_common::{AuthDenyNotification, crypto_utils};
-use anyhow::{Context, Result, anyhow};
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::time::Instant;
+
+use anyhow::{anyhow, Context, Result};
 use arc_swap::ArcSwap;
 use bytes::{BufMut, Bytes, BytesMut};
 use dashmap::DashMap;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use log::{info, warn};
 use prost::Message;
-use rand::RngCore;
 use rand::rngs::OsRng;
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
-use std::time::Instant;
+use rand::RngCore;
 use x25519_dalek::{PublicKey, StaticSecret};
+
+use anet_common::consts::{NONCE_LEN, PROTO_PAD_FIELD_OVERHEAD};
+use anet_common::crypto_utils;
+use anet_common::dto::BillingType as DtoBillingType;
+use anet_common::encryption::Cipher;
+use anet_common::padding_utils::{calculate_padding_needed, generate_random_padding};
+use anet_common::protocol::{
+    message::Content, AuthDenyNotification, AuthResponse, BillingType as ProtoBillingType,
+    DhClientExchange, DhServerExchange, EncryptedAuthRequest, EncryptedAuthResponse,
+    Message as AnetMessage,
+};
+
+use crate::auth_provider::{AccessGrant, AuthProvider};
+use crate::client_registry::{ClientRegistry, ClientTransportInfo};
+use crate::multikey_udp_socket::TempDHInfo;
+use crate::utils::{generate_seid, generate_unique_nonce_prefix};
 
 #[derive(Clone)]
 pub struct ServerAuthHandler {
@@ -39,15 +44,14 @@ pub struct ServerAuthHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth_provider::AuthProvider;
     use crate::ip_pool::IpPool;
     use anet_client_core::auth::{AuthChannel, AuthHandler};
     use anet_client_core::config::CoreConfig;
     use anet_common::crypto_utils::generate_key_fingerprint;
     use anet_common::handshake_fragmentation::FragmentConfig;
     use async_trait::async_trait;
-    use base64::Engine;
     use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+    use base64::Engine;
     use std::sync::Mutex;
     use std::time::Duration;
 
@@ -134,9 +138,9 @@ mod tests {
             Duration::from_secs(2),
             first_auth.authenticate(&first_channel),
         )
-        .await
-        .expect("initial authentication timed out")
-        .unwrap();
+            .await
+            .expect("initial authentication timed out")
+            .unwrap();
         let first_info = first_channel
             .authenticated
             .lock()
@@ -151,14 +155,14 @@ mod tests {
             None,
             Some(first_response.session_id.clone()),
         )
-        .unwrap();
+            .unwrap();
         let (resumed_response, _) = tokio::time::timeout(
             Duration::from_secs(2),
             resumed_auth.authenticate(&resumed_channel),
         )
-        .await
-        .expect("resume authentication timed out")
-        .unwrap();
+            .await
+            .expect("resume authentication timed out")
+            .unwrap();
 
         assert_eq!(resumed_response.session_id, first_response.session_id);
         assert_eq!(resumed_response.ip, first_response.ip);
@@ -193,7 +197,7 @@ impl ServerAuthHandler {
         &self,
         packet: Bytes,
         remote_addr: SocketAddr,
-        protocol: &str, // <--- Добавили аргумент типа протокола
+        protocol: &str,
     ) -> Result<(
         Option<Bytes>,
         Option<(Arc<ClientTransportInfo>, AuthResponse)>,
@@ -210,7 +214,7 @@ impl ServerAuthHandler {
             }
             Some(Content::EncryptedAuthRequest(enc_req)) => {
                 let (resp_msg, client_info, auth_resp) = self
-                    .handle_encrypted_auth(enc_req, remote_addr, protocol) // <--- Передаем дальше
+                    .handle_encrypted_auth(enc_req, remote_addr, protocol)
                     .await
                     .context("ASTP shared-key authentication failed")?;
                 let resp_bytes = self.encode_obfuscated_packet(resp_msg)?;
@@ -222,7 +226,7 @@ impl ServerAuthHandler {
 
     fn decode_obfuscated_packet(&self, packet: Bytes) -> Result<AnetMessage> {
         if packet.len() < NONCE_LEN + 16 {
-            return Err(anyhow::anyhow!("Packet too short"));
+            return Err(anyhow!("Packet too short"));
         }
         let (nonce, ciphertext) = packet.split_at(NONCE_LEN);
         let plaintext = self
@@ -253,9 +257,9 @@ impl ServerAuthHandler {
         let client_public_key = VerifyingKey::from_bytes(
             &req.client_public_key
                 .try_into()
-                .map_err(|_| anyhow::anyhow!("Invalid key length"))?,
+                .map_err(|_| anyhow!("Invalid key length"))?,
         )
-        .map_err(|_| anyhow::anyhow!("Invalid verifying key"))?;
+            .map_err(|_| anyhow!("Invalid verifying key"))?;
 
         let client_fingerprint = crypto_utils::generate_key_fingerprint(&client_public_key);
 
@@ -263,10 +267,17 @@ impl ServerAuthHandler {
             .registry
             .can_resume(&req.resume_session_id, &client_fingerprint);
         let access = if resume_allowed {
-            // На resume лимит скорости берём из уже существующей suspended-
-            // сессии в handle_encrypted_auth (см. ниже), а не из свежего
-            // AccessGrant — как и с user_id/static_ip для того же случая.
-            Ok(crate::auth_provider::AccessGrant { static_ip: None, user_id: None, speed_limit_kbps: None })
+            Ok(AccessGrant {
+                static_ip: None,
+                user_id: None,
+                speed_limit_kbps: None,
+                billing_type: None,
+                group_name: None,
+                traffic_limit: None,
+                traffic_consumed: None,
+                allowed_sessions: None,
+                active_sessions: None,
+            })
         } else if !self.registry.is_accepting_connections() {
             Err("Node is not accepting new connections".to_string())
         } else {
@@ -275,7 +286,6 @@ impl ServerAuthHandler {
 
         match access {
             Ok(grant) => {
-                // --- ЛОГИКА УСПЕХА (DH Phase 1) ---
                 let mut signed_handshake = req.public_key.clone();
                 if !req.resume_session_id.is_empty() {
                     signed_handshake.extend_from_slice(req.resume_session_id.as_bytes());
@@ -305,6 +315,12 @@ impl ServerAuthHandler {
                         resume_session_id: req.resume_session_id,
                         created_at: Instant::now(),
                         speed_limit_kbps: grant.speed_limit_kbps,
+                        billing_type: grant.billing_type,
+                        group_name: grant.group_name,
+                        traffic_limit: grant.traffic_limit,
+                        traffic_consumed: grant.traffic_consumed,
+                        allowed_sessions: grant.allowed_sessions,
+                        active_sessions: grant.active_sessions,
                     },
                 );
 
@@ -321,29 +337,25 @@ impl ServerAuthHandler {
                     padding: vec![],
                 };
 
-                // Расчет паддинга
-                let wire_len = response_message.encoded_len() + 16; // Примерный оверхед
+                let wire_len = response_message.encoded_len() + 16;
                 response_message.padding =
                     generate_random_padding(calculate_padding_needed(wire_len, self.padding_step));
 
                 Ok(response_message)
             }
             Err(reason) => {
-                // --- ЛОГИКА ОТКАЗА ---
                 warn!(
                     "[AUTH] DH Exchange Phase 1 failed: {}, Reason: {}, Fingerprint: {}",
                     remote_addr, reason, client_fingerprint
                 );
 
-                // Вместо DhServerExchange пихаем AuthError (вариант 7 в oneof)
                 let mut response_message = AnetMessage {
                     content: Some(Content::AuthError(AuthDenyNotification {
-                        message: reason, // Тот самый текст из anet-auth
+                        message: reason,
                     })),
                     padding: vec![],
                 };
 
-                // Важно: наводим маскировку даже на пакет ошибки
                 let wire_len = response_message.encoded_len() + 16;
                 response_message.padding =
                     generate_random_padding(calculate_padding_needed(wire_len, self.padding_step));
@@ -372,13 +384,13 @@ impl ServerAuthHandler {
 
         let req = match auth_message.content {
             Some(Content::AuthRequest(r)) => r,
-            _ => return Err(anyhow::anyhow!("Invalid content type")),
+            _ => return Err(anyhow!("Invalid content type")),
         };
         if req.client_id != temp_info.client_fingerprint {
-            return Err(anyhow::anyhow!("Client ID mismatch"));
+            return Err(anyhow!("Client ID mismatch"));
         }
         if req.resume_session_id != temp_info.resume_session_id {
-            return Err(anyhow::anyhow!("Resume session ID changed during handshake"));
+            return Err(anyhow!("Resume session ID changed during handshake"));
         }
 
         let resumed = self
@@ -387,7 +399,19 @@ impl ServerAuthHandler {
         if !req.resume_session_id.is_empty() && resumed.is_none() {
             anyhow::bail!("Requested VPN session is not available for resume");
         }
-        let (assigned_ip, session_id, is_resume, user_id, speed_limit_kbps) = if let Some(previous) = resumed {
+        let (
+            assigned_ip,
+            session_id,
+            is_resume,
+            user_id,
+            speed_limit_kbps,
+            billing_type,
+            group_name,
+            traffic_limit,
+            traffic_consumed,
+            active_sessions,
+            allowed_sessions,
+        ) = if let Some(previous) = resumed {
             info!(
                 "[AUTH] Resuming logical session {} on a new transport",
                 previous.session_id
@@ -398,6 +422,12 @@ impl ServerAuthHandler {
                 true,
                 previous.user_id.clone(),
                 previous.speed_limit_kbps,
+                previous.billing_type,
+                previous.group_name.clone(),
+                previous.traffic_limit,
+                previous.traffic_consumed,
+                previous.active_sessions,
+                previous.allowed_sessions,
             )
         } else {
             let assigned_ip = if let Some(static_ip) = temp_info.static_ip {
@@ -418,6 +448,12 @@ impl ServerAuthHandler {
                 false,
                 temp_info.user_id.clone(),
                 temp_info.speed_limit_kbps,
+                temp_info.billing_type,
+                temp_info.group_name.clone(),
+                temp_info.traffic_limit,
+                temp_info.traffic_consumed,
+                temp_info.active_sessions,
+                temp_info.allowed_sessions,
             )
         };
 
@@ -434,6 +470,12 @@ impl ServerAuthHandler {
             user_id,
             protocol: protocol.to_string(),
             speed_limit_kbps,
+            billing_type,
+            group_name: group_name.clone(),
+            traffic_limit,
+            traffic_consumed,
+            allowed_sessions,
+            active_sessions,
         });
 
         self.registry.pre_register_client(client_info.clone());
@@ -447,6 +489,15 @@ impl ServerAuthHandler {
         }
 
         let (netmask, gateway, mtu) = self.registry.get_network_params();
+
+        let pb_billing = match billing_type.unwrap_or(DtoBillingType::NoTariffNoGroup) {
+            DtoBillingType::NoTariffNoGroup => ProtoBillingType::NoTariffNoGroup,
+            DtoBillingType::Group => ProtoBillingType::Group,
+            DtoBillingType::Individual => ProtoBillingType::Individual,
+            DtoBillingType::GroupAndIndividual => ProtoBillingType::GroupAndIndividual,
+            DtoBillingType::Unknown => ProtoBillingType::Unknown,
+        };
+
         let response_payload = AuthResponse {
             ip: assigned_ip,
             netmask: netmask.to_string(),
@@ -455,6 +506,12 @@ impl ServerAuthHandler {
             session_id,
             nonce_prefix: nonce_prefix.to_vec(),
             quic_cert: self.quic_cert_pem.as_bytes().to_vec(),
+            billing_type: pb_billing as i32,
+            group_name,
+            traffic_limit,
+            traffic_consumed,
+            active_sessions: active_sessions.unwrap_or(1),
+            allowed_sessions: allowed_sessions.unwrap_or(0),
         };
 
         let mut inner_msg = AnetMessage {

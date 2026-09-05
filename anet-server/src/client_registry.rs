@@ -2,7 +2,7 @@ use crate::auth_provider::AuthProvider;
 use crate::ip_pool::IpPool;
 use crate::multikey_udp_socket::StreamSender;
 use anet_common::encryption::Cipher;
-use anet_common::dto::TrafficUsageSample;
+use anet_common::dto::{TrafficUsageSample, BillingType};
 use arc_swap::{ArcSwap, ArcSwapOption};
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -25,6 +25,14 @@ pub struct ClientTransportInfo {
     /// Ограничение скорости в kbps, `None` = без ограничения. Применяется
     /// eBPF-шейпером на TUN-интерфейсе (см. `crate::shaper::Shaper`).
     pub speed_limit_kbps: Option<u32>,
+
+    pub billing_type: Option<BillingType>,
+    pub group_name: Option<String>,
+    pub traffic_limit: Option<i64>,
+    pub traffic_consumed: Option<i64>,
+
+    pub active_sessions: Option<i32>,
+    pub allowed_sessions: Option<i32>,
 }
 
 struct TrafficCounters {
@@ -66,6 +74,12 @@ mod tests {
             user_id: None,
             protocol: "quic".to_string(),
             speed_limit_kbps: None,
+            traffic_consumed: None,
+            billing_type: None,
+            group_name: None,
+            traffic_limit: None,
+            allowed_sessions: None,
+            active_sessions: None,
         })
     }
 

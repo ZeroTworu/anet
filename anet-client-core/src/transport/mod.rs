@@ -24,6 +24,7 @@ pub struct ConnectionResult {
     pub connection: Option<Connection>,
     /// Set only while a transport performs a planned internal reconnect.
     pub health_pause: Option<Arc<AtomicBool>>,
+
 }
 
 #[async_trait]

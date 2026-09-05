@@ -2,6 +2,14 @@ syntax = "proto3";
 
 package anet;
 
+enum BillingType {
+    BILLING_TYPE_UNKNOWN = 0;
+    BILLING_TYPE_NO_TARIFF_NO_GROUP = 1;
+    BILLING_TYPE_GROUP = 2;
+    BILLING_TYPE_INDIVIDUAL = 3;
+    BILLING_TYPE_GROUP_AND_INDIVIDUAL = 4;
+}
+
 message DHClientExchange {
     bytes public_key = 1;
     bytes client_signed_dh_key = 2;  // Подпись клиентом своего DH ключа
@@ -38,6 +46,16 @@ message AuthResponse {
     string session_id = 5;
     bytes nonce_prefix = 6;
     bytes quic_cert = 7;
+
+    BillingType billing_type = 8;
+
+    optional string group_name = 9;
+    optional int64 traffic_limit = 10;
+    optional int64 traffic_consumed = 11;
+
+    // Сессии (активные и разрешенные)
+    int32 active_sessions = 12;
+    int32 allowed_sessions = 13;
 }
 
 message Message {
