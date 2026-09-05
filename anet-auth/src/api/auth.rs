@@ -3,6 +3,7 @@ use crate::api::dto::{
     LoginResponse, SessionEventRequest, SessionEventResponse,
 };
 use crate::entities::{admins, sessions, users};
+use anet_common::dto::BillingType;
 use bcrypt::verify;
 use jsonwebtoken::{encode, EncodingKey, Header};
 use poem::Result;
@@ -92,6 +93,12 @@ impl AuthApi {
                     static_ip: None,
                     user_id: None,
                     speed_limit_kbps: None,
+                    billing_type: None,
+                    group_name: None,
+                    traffic_limit: None,
+                    traffic_consumed: None,
+                    active_sessions: None,
+                    allowed_sessions: None,
                 }))
             }
         };
@@ -103,6 +110,12 @@ impl AuthApi {
                 static_ip: None,
                 user_id: None,
                 speed_limit_kbps: None,
+                billing_type: None,
+                group_name: None,
+                traffic_limit: None,
+                traffic_consumed: None,
+                active_sessions: None,
+                allowed_sessions: None,
             }));
         }
 
@@ -113,19 +126,30 @@ impl AuthApi {
             .await
             .unwrap_or(None);
 
-        // Загружаем группу (если привязана)
+        // Загружаем группу с логированием ошибок вместо тихого unwrap_or(None)
         let group_opt = if let Some(group_id) = user.group_id {
-            crate::entities::groups::Entity::find_by_id(group_id)
-                .one(&self.db)
-                .await
-                .unwrap_or(None)
+            match crate::entities::groups::Entity::find_by_id(group_id).one(&self.db).await {
+                Ok(g) => g,
+                Err(e) => {
+                    log::error!("[check_access] Ошибка загрузки группы {}: {}", group_id, e);
+                    None
+                }
+            }
         } else {
             None
         };
 
+        info!(
+            "[check_access] Авторизован UID='{}', ID={}, group_id={:?}, группа найдена={}",
+            user.uid.as_deref().unwrap_or("none"),
+            user.id,
+            user.group_id,
+            group_opt.is_some()
+        );
+
         let now = chrono::Utc::now().naive_utc();
 
-        // 1. Вычисляем календарные границы текущего месяца на случай отсутствия тарифа
+        // 1. Границы расчетного месяца
         let first_day_current_month = chrono::NaiveDate::from_ymd_opt(now.year(), now.month(), 1)
             .unwrap()
             .and_hms_opt(0, 0, 0)
@@ -141,7 +165,6 @@ impl AuthApi {
             .and_hms_opt(0, 0, 0)
             .unwrap();
 
-        // 2. Определяем временные границы цикла
         let mut expiration_date = first_day_next_month;
         let mut cycle_start = first_day_current_month;
         let mut check_expiration = false;
@@ -154,32 +177,63 @@ impl AuthApi {
             cycle_start = expiration_date - chrono::Duration::days(duration_days);
         }
 
-        // 3. Определяем значения лимитов трафика, сессий и СКОРОСТИ
+        // 2. Определение значений лимитов
         let mut allowed_sessions = 0;
         let mut max_traffic: i64 = 0;
-        let mut speed_limit = 0; // Скорость в Кбит/с (по умолчанию 0 — безлимит)
+        let mut speed_limit = 0;
         let mut has_limits = false;
 
         let rate_has_limits = rate_opt.as_ref().is_some_and(|r| r.sessions > 0 || r.traffic_limit > 0 || r.speed_limit > 0);
 
         if rate_has_limits {
-            // Лимиты заданы в тарифе напрямую (полный приоритет)
             let rate = rate_opt.as_ref().unwrap();
             max_traffic = rate.traffic_limit;
             allowed_sessions = rate.sessions as i32;
-            speed_limit = rate.speed_limit; // Берем скорость из тарифа
+            speed_limit = rate.speed_limit;
             has_limits = true;
         } else if let Some(ref group) = group_opt {
-            // В тарифе нули (или его нет) -> откатываемся на группу
             max_traffic = group.traffic_limit;
             allowed_sessions = group.sessions_limit;
-            speed_limit = group.speed_limit; // Берем скорость из группы
+            speed_limit = group.speed_limit;
             has_limits = true;
         }
-        info!("CheckAccessResponse: has_limits: {}, speed_limit: {}", has_limits, speed_limit);
-        // 4. Проверяем лимиты, если они активны
+
+        let billing_type = match (&rate_opt, &group_opt) {
+            (None, None) => BillingType::NoTariffNoGroup,
+            (None, Some(_)) => BillingType::Group,
+            (Some(_), None) => BillingType::Individual,
+            (Some(_), Some(_)) => BillingType::GroupAndIndividual,
+        };
+
+        let group_name = group_opt.as_ref().map(|g| g.name.clone());
+
+        // Активные сессии
+        let current_sessions = crate::entities::active_sessions::Entity::find()
+            .filter(crate::entities::active_sessions::Column::UserId.eq(user.id))
+            .one(&self.db)
+            .await
+            .ok()
+            .flatten()
+            .map(|s| s.sessions)
+            .unwrap_or(0);
+
+        // Расход трафика
+        let mut traffic_consumed: Option<i64> = Some(0);
+        let sum_result = crate::entities::traffic_totals::Entity::find()
+            .filter(crate::entities::traffic_totals::Column::UserId.eq(user.id))
+            .filter(crate::entities::traffic_totals::Column::UpdatedAt.gte(cycle_start))
+            .select_only()
+            .column_as(sea_orm::sea_query::Expr::cust("CAST(SUM(rx_bytes) + SUM(tx_bytes) AS BIGINT)"), "total")
+            .into_tuple::<Option<i64>>()
+            .one(&self.db)
+            .await;
+
+        if let Ok(Some(Some(total_bytes))) = sum_result {
+            traffic_consumed = Some(total_bytes);
+        }
+
+        // 3. Проверка лимитов
         if has_limits {
-            // Проверка срока действия
             if check_expiration && chrono::Utc::now().naive_utc() > expiration_date {
                 return Ok(Json(CheckAccessResponse {
                     allowed: false,
@@ -187,44 +241,33 @@ impl AuthApi {
                     static_ip: None,
                     user_id: None,
                     speed_limit_kbps: None,
+                    billing_type: Some(billing_type),
+                    group_name,
+                    traffic_limit: None,
+                    traffic_consumed,
+                    active_sessions: Some(current_sessions),
+                    allowed_sessions: Some(allowed_sessions),
                 }));
             }
 
-            // Проверка активных сессий
-            if allowed_sessions > 0 {
-                let current_sessions = crate::entities::active_sessions::Entity::find()
-                    .filter(crate::entities::active_sessions::Column::UserId.eq(user.id))
-                    .one(&self.db)
-                    .await
-                    .ok()
-                    .flatten()
-                    .map(|s| s.sessions)
-                    .unwrap_or(0);
-
-                if current_sessions >= allowed_sessions {
-                    return Ok(Json(CheckAccessResponse {
-                        allowed: false,
-                        message: "Достигнут лимит одновременных подключений".into(),
-                        static_ip: None,
-                        user_id: None,
-                        speed_limit_kbps: None,
-                    }));
-                }
+            if allowed_sessions > 0 && current_sessions >= allowed_sessions {
+                return Ok(Json(CheckAccessResponse {
+                    allowed: false,
+                    message: "Достигнут лимит одновременных подключений".into(),
+                    static_ip: None,
+                    user_id: None,
+                    speed_limit_kbps: None,
+                    billing_type: Some(billing_type),
+                    group_name,
+                    traffic_limit: None,
+                    traffic_consumed,
+                    active_sessions: Some(current_sessions),
+                    allowed_sessions: Some(allowed_sessions),
+                }));
             }
 
-            // Проверка исчерпания трафика за расчетный период
             if max_traffic > 0 {
-                // ИСПРАВЛЕНО: Проверяем реальное потребление по дельтам из traffic_hourly
-                let sum_result = crate::entities::traffic_hourly::Entity::find()
-                    .filter(crate::entities::traffic_hourly::Column::UserId.eq(user.id))
-                    .filter(crate::entities::traffic_hourly::Column::BucketStart.gte(cycle_start))
-                    .select_only()
-                    .column_as(sea_orm::sea_query::Expr::cust("CAST(SUM(rx_bytes) + SUM(tx_bytes) AS BIGINT)"), "total")
-                    .into_tuple::<Option<i64>>()
-                    .one(&self.db)
-                    .await;
-
-                if let Ok(Some(Some(total_bytes))) = sum_result {
+                if let Some(total_bytes) = traffic_consumed {
                     if total_bytes >= max_traffic {
                         return Ok(Json(CheckAccessResponse {
                             allowed: false,
@@ -232,19 +275,32 @@ impl AuthApi {
                             static_ip: None,
                             user_id: None,
                             speed_limit_kbps: None,
+                            billing_type: Some(billing_type),
+                            group_name,
+                            traffic_limit: Some(max_traffic),
+                            traffic_consumed,
+                            active_sessions: Some(current_sessions),
+                            allowed_sessions: Some(allowed_sessions),
                         }));
                     }
                 }
             }
         }
 
-        // УСПЕШНЫЙ ВХОД: возвращаем разрешенную скорость для eBPF-шейпера на сервере
+        let reported_active = current_sessions + 1;
+
         Ok(Json(CheckAccessResponse {
             allowed: true,
             message: "OK".into(),
             static_ip: user.static_ip.clone(),
             user_id: Some(user.id.to_string()),
             speed_limit_kbps: Some(speed_limit),
+            billing_type: Some(billing_type),
+            group_name,
+            traffic_limit: if max_traffic > 0 { Some(max_traffic) } else { None },
+            traffic_consumed,
+            active_sessions: Some(reported_active),
+            allowed_sessions: Some(allowed_sessions),
         }))
     }
 

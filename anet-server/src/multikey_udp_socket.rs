@@ -7,6 +7,8 @@ use anet_common::handshake_fragmentation::DatagramReassembler;
 use anet_common::padding_utils::calculate_padding_needed;
 use anet_common::transport;
 use anet_common::udp_poller::TokioUdpPoller;
+use anet_common::dto::BillingType;
+
 use bytes::Bytes;
 use dashmap::DashMap;
 use log::{debug, warn};
@@ -40,6 +42,14 @@ pub struct TempDHInfo {
     /// ограничения. Переносится в `ClientTransportInfo` при завершении
     /// хендшейка (см. `auth_handler::handle_encrypted_auth`).
     pub speed_limit_kbps: Option<u32>,
+
+    pub billing_type: Option<BillingType>,
+    pub group_name: Option<String>,
+    pub traffic_limit: Option<i64>,
+    pub traffic_consumed: Option<i64>,
+
+    pub active_sessions: Option<i32>,
+    pub allowed_sessions: Option<i32>,
 }
 
 pub type HandshakeData = (Bytes, SocketAddr);

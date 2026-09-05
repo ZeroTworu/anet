@@ -1,5 +1,22 @@
 use serde::{Deserialize, Serialize};
 
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "poem", derive(poem_openapi::Enum))]
+#[cfg_attr(feature = "poem", oai(rename = "BillingType", rename_all = "snake_case"))]
+#[serde(rename_all = "snake_case")]
+pub enum BillingType {
+    #[serde(alias = "UNKNOWN", alias = "BILLING_TYPE_UNKNOWN", alias = "Unknown")]
+    Unknown = 0,
+    #[serde(alias = "NO_TARIFF_NO_GROUP", alias = "BILLING_TYPE_NO_TARIFF_NO_GROUP", alias = "NoTariffNoGroup")]
+    NoTariffNoGroup = 1,
+    #[serde(alias = "GROUP", alias = "BILLING_TYPE_GROUP", alias = "Group")]
+    Group = 2,
+    #[serde(alias = "INDIVIDUAL", alias = "BILLING_TYPE_INDIVIDUAL", alias = "Individual")]
+    Individual = 3,
+    #[serde(alias = "GROUP_AND_INDIVIDUAL", alias = "BILLING_TYPE_GROUP_AND_INDIVIDUAL", alias = "GroupAndIndividual")]
+    GroupAndIndividual = 4,
+}
 /// [ VPN Core Communication: Check Access ]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "poem", derive(poem_openapi::Object))]
@@ -21,6 +38,14 @@ pub struct CheckAccessResponse {
     /// или `0` = без ограничения. Читается `anet-server::shaper` при
     /// финализации клиента.
     pub speed_limit_kbps: Option<i32>,
+
+    pub billing_type: Option<BillingType>,
+    pub group_name: Option<String>,
+    pub traffic_limit: Option<i64>,
+    pub traffic_consumed: Option<i64>,
+
+    pub active_sessions: Option<i32>,
+    pub allowed_sessions: Option<i32>,
 }
 
 /// [ VPN Core Communication: Session Events ]
