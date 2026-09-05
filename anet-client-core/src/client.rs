@@ -17,7 +17,7 @@ use tokio::io::{split as io_split, AsyncWriteExt};
 use tokio::net::lookup_host;
 use tokio::select;
 use tokio::spawn;
-use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
@@ -28,7 +28,10 @@ use anet_common::consts::COALESCE_BUDGET_BYTES;
 use anet_common::protocol::{AuthResponse, BillingType as ProtoBillingType};
 use anet_common::stream_framing::{frame_packet_into, read_next_packet};
 
-use crate::config::{CoreConfig, PerAppMode, ServerConfig};
+#[cfg(all(windows, feature = "per-app"))]
+use crate::config::PerAppMode;
+
+use crate::config::{CoreConfig, ServerConfig};
 use crate::dns::{get_dns_manager, DnsManager};
 use crate::events::{client_state, status, warn, ClientState};
 use crate::statistic::{
@@ -550,11 +553,11 @@ impl AnetClient {
         // =========================================================================
         // ВЫВОД ИНФОРМАЦИИ О ТАРИФЕ И АККАУНТЕ
         // =========================================================================
-        let billing_str = match ProtoBillingType::from_i32(result.auth_response.billing_type) {
-            Some(ProtoBillingType::NoTariffNoGroup) => "Без тарифа и группы",
-            Some(ProtoBillingType::Group) => "Группа",
-            Some(ProtoBillingType::Individual) => "Индивидуальный тариф",
-            Some(ProtoBillingType::GroupAndIndividual) => "Группа + индивидуальный тариф",
+        let billing_str = match ProtoBillingType::try_from(result.auth_response.billing_type).unwrap() {
+            ProtoBillingType::NoTariffNoGroup => "Без тарифа и группы",
+            ProtoBillingType::Group => "Группа",
+            ProtoBillingType::Individual => "Индивидуальный тариф",
+            ProtoBillingType::GroupAndIndividual => "Группа + индивидуальный тариф",
             _ => "Не указан",
         };
 
@@ -576,6 +579,23 @@ impl AnetClient {
             .map(|l| format_bytes(l.max(0) as u64))
             .unwrap_or_else(|| "Безлимит".to_string());
 
+        let speed_str = match result.auth_response.speed_limit_kbps {
+            Some(kbps) if kbps > 0 => {
+                if kbps >= 1024 {
+                    format!("{:.2} Мбит/с", kbps as f64 / 1024.0)
+                } else {
+                    format!("{} Кбит/с", kbps)
+                }
+            }
+            _ => "Безлимит".to_string(),
+        };
+
+        let expires_str = result
+            .auth_response
+            .expires_at
+            .as_deref()
+            .unwrap_or("Бессрочно");
+
         let sessions_str = if result.auth_response.allowed_sessions > 0 {
             format!(
                 "{} / {}",
@@ -592,10 +612,12 @@ impl AnetClient {
              ║  Тарификация:      {:<56} ║\n\
              ║  Группа:           {:<56} ║\n\
              ║  Сессии:           {:<56} ║\n\
+             ║  Скорость:         {:<56} ║\n\
              ║  Трафик за период: {:<56} ║\n\
              ║  Лимит трафика:    {:<56} ║\n\
+             ║  Действует до:     {:<56} ║\n\
              ╚═══════════════════════════════════════════════════════════════════════════════╝",
-            billing_str, group_str, sessions_str, consumed_str, limit_str,
+            billing_str, group_str, sessions_str, speed_str, consumed_str, limit_str, expires_str,
         );
 
         status(format!(

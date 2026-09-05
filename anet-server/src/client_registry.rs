@@ -33,6 +33,9 @@ pub struct ClientTransportInfo {
 
     pub active_sessions: Option<i32>,
     pub allowed_sessions: Option<i32>,
+
+    pub expires_at: Option<String>,
+
 }
 
 struct TrafficCounters {
@@ -80,6 +83,7 @@ mod tests {
             traffic_limit: None,
             allowed_sessions: None,
             active_sessions: None,
+            expires_at: None,
         })
     }
 

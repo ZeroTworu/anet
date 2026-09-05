@@ -70,6 +70,12 @@ pub struct AuthResponse {
     pub active_sessions: i32,
     #[prost(int32, tag = "13")]
     pub allowed_sessions: i32,
+    /// Лимит скорости в Кбит/с
+    #[prost(int32, optional, tag = "14")]
+    pub speed_limit_kbps: ::core::option::Option<i32>,
+    /// Дата окончания доступа (YYYY-MM-DD HH:MM)
+    #[prost(string, optional, tag = "15")]
+    pub expires_at: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Message {
