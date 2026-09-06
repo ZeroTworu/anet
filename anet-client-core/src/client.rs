@@ -371,12 +371,14 @@ impl AnetClient {
         let transport = create_transport(&config_clone, server)?;
         let conn_timeout = Duration::from_secs(server.timeout_secs);
 
-        let result = tokio::time::timeout(conn_timeout, transport.connect())
-            .await
-            .map_err(|_| anyhow!("Connection handshake timed out"))??;
-        let cancel_token = self.cancel_signal.clone();
         let connect_fut = transport.connect();
+        let stop_flag = &self.stop_requested;
 
+        // Отмена по опросу флага, а не по Notify::notify_waiters():
+        // notify_waiters будит только уже зарегистрированные ожидания и не
+        // сохраняет разрешение, поэтому стоп, нажатый до входа в select
+        // (создание транспорта, DNS-резолв сервера), терялся и рукопожатие
+        // продолжалось до таймаута, игнорируя отмену. Флаг потерять нельзя.
         let result = tokio::select! {
             res = tokio::time::timeout(conn_timeout, connect_fut) => {
                 match res {
@@ -385,7 +387,14 @@ impl AnetClient {
                     Err(_) => return Err(anyhow::anyhow!("Connection handshake timed out")),
                 }
             }
-            _ = cancel_token.notified() => {
+            _ = async {
+                loop {
+                    if stop_flag.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            } => {
                 info!("[Core] Handshake cancelled by user.");
                 return Ok(());
             }

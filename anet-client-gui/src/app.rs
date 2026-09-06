@@ -85,8 +85,7 @@ impl EventHandler for GuiEventHandler {
         let _ = self.tx.send(event.clone());
 
         if let AnetEvent::ClientStateChanged { state, .. } = &event {
-            let mut guard = lock_ignore_poison(&self.shared);
-            guard.state = match state {
+            let new_state = match state {
                 ClientState::Connected => ConnectionState::Connected,
                 ClientState::Connecting | ClientState::Reconnecting => {
                     ConnectionState::Connecting
@@ -95,6 +94,19 @@ impl EventHandler for GuiEventHandler {
                     ConnectionState::Disconnected
                 }
             };
+
+            // Событие "идёт подключение" могло быть отправлено core до того,
+            // как пользователь нажал кнопку стоп (UI уже Disconnected) — не
+            // даём такому отложенному событию перебрать состояние обратно на
+            // Connecting/Connected. Легитимный запуск сначала сам ставит
+            // Connecting в start_vpn(), поэтому его это не блокирует.
+            let mut guard = lock_ignore_poison(&self.shared);
+            let stale_after_user_stop = guard.state == ConnectionState::Disconnected
+                && matches!(new_state, ConnectionState::Connecting | ConnectionState::Connected);
+
+            if !stale_after_user_stop {
+                guard.state = new_state;
+            }
         }
 
         self.ctx.request_repaint();
@@ -240,12 +252,41 @@ impl ANetApp {
         self.toast_until = Some(std::time::Instant::now() + std::time::Duration::from_millis(2500));
     }
 
+    /// Список приложений из `per_app` активного конфига (.toml).
+    /// Возвращает их даже если они сейчас не запущены.
+    #[cfg(target_os = "windows")]
+    fn configured_per_app(&self) -> Vec<String> {
+        let config = lock_ignore_poison(&self.settings).get_active_config();
+        let Some(config) = config else {
+            return Vec::new();
+        };
+
+        toml::from_str::<toml::Value>(&config.content)
+            .ok()
+            .and_then(|val| {
+                val.get("main")
+                    .and_then(|main| main.get("per_app"))
+                    .and_then(|apps| apps.as_array())
+                    .map(|apps| {
+                        apps.iter()
+                            .filter_map(|value| value.as_str().map(ToOwned::to_owned))
+                            .filter(|name| !name.is_empty())
+                            .collect()
+                    })
+            })
+            .unwrap_or_default()
+    }
+
     #[cfg(target_os = "windows")]
     pub fn refresh_processes(&mut self) {
         let selected_apps: std::collections::HashSet<String> = self.processes
             .iter()
             .filter(|p| p.is_selected)
-            .map(|p| p.name.clone())
+            .map(|p| p.name.to_lowercase())
+            .collect();
+        let listed_names: std::collections::HashSet<String> = self.processes
+            .iter()
+            .map(|p| p.name.to_lowercase())
             .collect();
 
         self.sys.refresh_all();
@@ -256,14 +297,34 @@ impl ANetApp {
             let name = process.name().to_string();
 
             if name.ends_with(".exe") || cfg!(windows) {
-                let is_selected = selected_apps.contains(&name);
+                let is_selected = selected_apps.contains(&name.to_lowercase());
 
-                map.entry(name.clone()).or_insert(ProcessItem {
+                map.entry(name.to_lowercase()).or_insert(ProcessItem {
                     pid: pid.as_u32(),
                     name,
                     is_selected,
                 });
             }
+        }
+
+        // Приложения из per_app конфига показываем всегда, даже если они
+        // сейчас не запущены (pid = 0). Для уже отображавшихся записей
+        // сохраняем состояние галочки, новые из конфига считаем выбранными.
+        for name in self.configured_per_app() {
+            let key = name.to_lowercase();
+            if map.contains_key(&key) {
+                continue;
+            }
+            let is_selected = if listed_names.contains(&key) {
+                selected_apps.contains(&key)
+            } else {
+                true
+            };
+            map.entry(key).or_insert(ProcessItem {
+                pid: 0,
+                name,
+                is_selected,
+            });
         }
 
         self.processes = map.into_values().collect();
@@ -934,7 +995,7 @@ impl ANetApp {
                 }
 
                 for proc in &mut self.processes {
-                    proc.is_selected = cfg.main.per_app.contains(&proc.name);
+                    proc.is_selected = cfg.main.per_app.iter().any(|app| app.eq_ignore_ascii_case(&proc.name));
                 }
 
                 let selected_name_opt = {

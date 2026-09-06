@@ -176,11 +176,6 @@ mod windows_impl {
                 anyhow::bail!("Failed to assign IP address to interface '{}'", target_name);
             }
 
-            if let Err(e) = Self::run_silent_cmd("netsh", &set_ip_args) {
-                error!("IP Config failed! Check interface name or permissions.");
-                return Err(e);
-            }
-
             if mtu > 0 {
                 info!("Step 7: Setting MTU...");
                 let mtu_str = mtu.to_string();
