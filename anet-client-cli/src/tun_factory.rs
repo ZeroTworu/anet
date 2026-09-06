@@ -8,6 +8,7 @@ use tokio::sync::mpsc;
 
 pub struct DesktopTunFactory {
     tun_name: String,
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     per_app_mode: bool,
 }
 

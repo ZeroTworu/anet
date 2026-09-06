@@ -15,7 +15,6 @@ use sea_orm::{
 use std::env;
 use uuid::Uuid;
 use chrono::Datelike;
-use log::info;
 
 pub struct AuthApi {
     pub db: DatabaseConnection,
@@ -71,6 +70,7 @@ impl AuthApi {
         }))
     }
 
+    /// Проверка VPN Сервера при Handshake
     /// Проверка VPN Сервера при Handshake
     #[oai(path = "/check_access", method = "post")]
     async fn check_access(
@@ -128,7 +128,7 @@ impl AuthApi {
             .await
             .unwrap_or(None);
 
-        // Загружаем группу с логированием ошибок вместо тихого unwrap_or(None)
+        // Загружаем группу (если привязана)
         let group_opt = if let Some(group_id) = user.group_id {
             match crate::entities::groups::Entity::find_by_id(group_id).one(&self.db).await {
                 Ok(g) => g,
@@ -141,17 +141,9 @@ impl AuthApi {
             None
         };
 
-        info!(
-            "[check_access] Авторизован UID='{}', ID={}, group_id={:?}, группа найдена={}",
-            user.uid.as_deref().unwrap_or("none"),
-            user.id,
-            user.group_id,
-            group_opt.is_some()
-        );
-
         let now = chrono::Utc::now().naive_utc();
 
-        // 1. Границы расчетного месяца
+        // 1. Дефолтные границы по календарному месяцу
         let first_day_current_month = chrono::NaiveDate::from_ymd_opt(now.year(), now.month(), 1)
             .unwrap()
             .and_hms_opt(0, 0, 0)
@@ -167,49 +159,77 @@ impl AuthApi {
             .and_hms_opt(0, 0, 0)
             .unwrap();
 
-        let mut expiration_date = first_day_next_month;
-        let mut cycle_start = first_day_current_month;
-        let mut check_expiration = false;
-
-        if let Some(ref rate) = rate_opt {
-            expiration_date = rate.date_end;
-            check_expiration = true;
-
-            let duration_days = group_opt.as_ref().map(|g| g.duration_days).unwrap_or(30).max(1) as i64;
-            cycle_start = expiration_date - chrono::Duration::days(duration_days);
-        }
-
-        // 2. Определение значений лимитов
-        let mut allowed_sessions = 0;
-        let mut max_traffic: i64 = 0;
-        let mut speed_limit = 0;
-        let mut has_limits = false;
-
-        let rate_has_limits = rate_opt.as_ref().is_some_and(|r| r.sessions > 0 || r.traffic_limit > 0 || r.speed_limit > 0);
-
-        if rate_has_limits {
-            let rate = rate_opt.as_ref().unwrap();
-            max_traffic = rate.traffic_limit;
-            allowed_sessions = rate.sessions as i32;
-            speed_limit = rate.speed_limit;
-            has_limits = true;
-        } else if let Some(ref group) = group_opt {
-            max_traffic = group.traffic_limit;
-            allowed_sessions = group.sessions_limit;
-            speed_limit = group.speed_limit;
-            has_limits = true;
-        }
-
-        let billing_type = match (&rate_opt, &group_opt) {
-            (None, None) => BillingType::NoTariffNoGroup,
-            (None, Some(_)) => BillingType::Group,
-            (Some(_), None) => BillingType::Individual,
-            (Some(_), Some(_)) => BillingType::GroupAndIndividual,
-        };
+        // Объявляем переменные без холостой инициализации — компилятор проверит,
+        // что каждая из них гарантированно заполнится в ветках if / else
+        let expiration_date: chrono::NaiveDateTime;
+        let cycle_start: chrono::NaiveDateTime;
+        let check_expiration: bool;
+        let allowed_sessions: i32;
+        let max_traffic: i64;
+        let speed_limit: i32;
+        let has_limits: bool;
+        let billing_type: BillingType;
 
         let group_name = group_opt.as_ref().map(|g| g.name.clone());
 
-        // Активные сессии
+        // =========================================================================
+        // ЛЕСТНИЦА ПРИОРИТЕТОВ: Рейт -> Группа -> Анлим
+        // =========================================================================
+        if let Some(ref rate) = rate_opt {
+            // --- ПРИОРИТЕТ 1: Персональный тариф ---
+            billing_type = if group_opt.is_some() {
+                BillingType::GroupAndIndividual
+            } else {
+                BillingType::Individual
+            };
+
+            expiration_date = rate.date_end;
+            check_expiration = true;
+
+            let duration_days = group_opt
+                .as_ref()
+                .map(|g| g.duration_days)
+                .filter(|&d| d > 0)
+                .unwrap_or(30) as i64;
+            cycle_start = expiration_date - chrono::Duration::days(duration_days);
+
+            allowed_sessions = rate.sessions;
+            max_traffic = rate.traffic_limit;
+            speed_limit = rate.speed_limit;
+            has_limits = true;
+        } else if let Some(ref group) = group_opt {
+            // --- ПРИОРИТЕТ 2: Группа (без персонального тарифа) ---
+            billing_type = BillingType::Group;
+
+            if group.duration_days > 0 {
+                check_expiration = true;
+                let duration = chrono::Duration::days(group.duration_days as i64);
+
+                cycle_start = user.updated_at;
+                expiration_date = user.updated_at + duration;
+            } else {
+                check_expiration = false;
+                cycle_start = first_day_current_month;
+                expiration_date = first_day_next_month;
+            }
+
+            allowed_sessions = group.sessions_limit;
+            max_traffic = group.traffic_limit;
+            speed_limit = group.speed_limit;
+            has_limits = true;
+        } else {
+            // --- ПРИОРИТЕТ 3: Нет ни тарифа, ни группы (Полный анлим) ---
+            billing_type = BillingType::NoTariffNoGroup;
+            check_expiration = false;
+            has_limits = false;
+            cycle_start = first_day_current_month;
+            expiration_date = first_day_next_month;
+            allowed_sessions = 0;
+            max_traffic = 0;
+            speed_limit = 0;
+        }
+
+        // Подсчет активных сессий пользователя
         let current_sessions = crate::entities::active_sessions::Entity::find()
             .filter(crate::entities::active_sessions::Column::UserId.eq(user.id))
             .one(&self.db)
@@ -219,13 +239,18 @@ impl AuthApi {
             .map(|s| s.sessions)
             .unwrap_or(0);
 
-        // Расход трафика
+        // Корректный подсчет израсходованного трафика:
+        // Суммируем почасовые дельты из traffic_hourly strictly начиная с cycle_start
         let mut traffic_consumed: Option<i64> = Some(0);
-        let sum_result = crate::entities::traffic_totals::Entity::find()
-            .filter(crate::entities::traffic_totals::Column::UserId.eq(user.id))
-            .filter(crate::entities::traffic_totals::Column::UpdatedAt.gte(cycle_start))
+        let sum_result = crate::entities::traffic_hourly::Entity::find()
+            .filter(
+                sea_orm::Condition::any()
+                    .add(crate::entities::traffic_hourly::Column::UserId.eq(user.id))
+                    .add(crate::entities::traffic_hourly::Column::Fingerprint.eq(&user.fingerprint))
+            )
+            .filter(crate::entities::traffic_hourly::Column::BucketStart.gte(cycle_start))
             .select_only()
-            .column_as(sea_orm::sea_query::Expr::cust("CAST(SUM(rx_bytes) + SUM(tx_bytes) AS BIGINT)"), "total")
+            .column_as(sea_orm::sea_query::Expr::cust("CAST(COALESCE(SUM(rx_bytes), 0) + COALESCE(SUM(tx_bytes), 0) AS BIGINT)"), "total")
             .into_tuple::<Option<i64>>()
             .one(&self.db)
             .await;
@@ -234,8 +259,16 @@ impl AuthApi {
             traffic_consumed = Some(total_bytes);
         }
 
-        // 3. Проверка лимитов
+        // Форматируем дату окончания для передачи клиенту
+        let expires_at = if check_expiration {
+            Some(expiration_date.format("%Y-%m-%d %H:%M").to_string())
+        } else {
+            None
+        };
+
+        // 4. Проверка ограничений (если есть лимиты)
         if has_limits {
+            // Проверка срока действия
             if check_expiration && chrono::Utc::now().naive_utc() > expiration_date {
                 return Ok(Json(CheckAccessResponse {
                     allowed: false,
@@ -249,10 +282,11 @@ impl AuthApi {
                     traffic_consumed,
                     active_sessions: Some(current_sessions),
                     allowed_sessions: Some(allowed_sessions),
-                    expires_at: None,
+                    expires_at,
                 }));
             }
 
+            // Проверка лимита сессий
             if allowed_sessions > 0 && current_sessions >= allowed_sessions {
                 return Ok(Json(CheckAccessResponse {
                     allowed: false,
@@ -266,10 +300,11 @@ impl AuthApi {
                     traffic_consumed,
                     active_sessions: Some(current_sessions),
                     allowed_sessions: Some(allowed_sessions),
-                    expires_at: None,
+                    expires_at,
                 }));
             }
 
+            // Проверка исчерпания трафика
             if max_traffic > 0 {
                 if let Some(total_bytes) = traffic_consumed {
                     if total_bytes >= max_traffic {
@@ -285,7 +320,7 @@ impl AuthApi {
                             traffic_consumed,
                             active_sessions: Some(current_sessions),
                             allowed_sessions: Some(allowed_sessions),
-                            expires_at: None
+                            expires_at,
                         }));
                     }
                 }
@@ -293,11 +328,6 @@ impl AuthApi {
         }
 
         let reported_active = current_sessions + 1;
-        let expires_at = if check_expiration {
-            Some(expiration_date.format("%Y-%m-%d %H:%M").to_string())
-        } else {
-            None
-        };
 
         Ok(Json(CheckAccessResponse {
             allowed: true,
