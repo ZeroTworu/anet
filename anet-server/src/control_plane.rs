@@ -134,7 +134,7 @@ async fn execute_and_report_command(
         },
         "disconnect_user" => match command.target_fingerprint {
             Some(ref fp) => {
-                if registry.disconnect_by_fingerprint(fp) {
+                if registry.disconnect_by_fingerprint(fp).await {
                     info!("[ControlPlane] Disconnected client with fingerprint: {}", fp);
                     Ok(())
                 } else {

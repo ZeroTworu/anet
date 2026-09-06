@@ -12,7 +12,7 @@ use anet_ebpf_common::{EdtState, RateRule, TokenBucketState, EDT_STATE, RULES, T
 use anyhow::{Context, Result};
 use aya::maps::HashMap as AyaHashMap;
 use aya::programs::tc::{SchedClassifier, TcAttachType};
-use aya::programs::{Xdp, XdpFlags};
+use aya::programs::{Xdp, XdpMode};
 use aya::Ebpf;
 use log::{info, warn};
 use std::net::Ipv4Addr;
@@ -39,13 +39,6 @@ impl Shaper {
         let bytes = aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/anet-ebpf"));
         let mut ebpf = Ebpf::load(bytes).context("Failed to load embedded anet-ebpf object")?;
 
-        // Логи из BPF (aya_log_ebpf::debug!) необязательны для работы шейпера;
-        // при желании включить — сверьте инициализацию с версией aya-log,
-        // закреплённой в Cargo.lock (API периодически меняется между релизами).
-        // if let Err(e) = aya_log::EbpfLogger::init(&mut ebpf) {
-        //     warn!("[Shaper] eBPF logger init failed (non-fatal): {}", e);
-        // }
-
         Self::ensure_clsact(iface).await;
         Self::ensure_fq_qdisc(iface).await;
         // Best-effort: если TC-фильтр остался от предыдущего аварийно
@@ -68,8 +61,10 @@ impl Shaper {
             .context("xdp_ingress program missing from anet-ebpf object")?
             .try_into()?;
         ingress.load()?;
+
+
         ingress
-            .attach(iface, XdpFlags::SKB_MODE)
+            .attach(iface, XdpMode::Skb)
             .context("Failed to attach xdp_ingress to TUN ingress (generic/SKB mode)")?;
 
         info!("[Shaper] Attached tc_egress + xdp_ingress to '{}'", iface);

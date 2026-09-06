@@ -116,7 +116,7 @@ async fn handle_vnc_session(
         outbound.abort();
         let _ = outbound.await;
     }
-    registry.remove_client(&client_info);
+    registry.remove_client(&client_info).await;
     result
 }
 

@@ -11,6 +11,14 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+use std::time::SystemTime;
+
+fn current_timestamp_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
 
 pub struct ClientTransportInfo {
     pub cipher: Arc<Cipher>,
@@ -35,6 +43,9 @@ pub struct ClientTransportInfo {
     pub allowed_sessions: Option<i32>,
 
     pub expires_at: Option<String>,
+
+    /// Метка времени последней активности для сторожевого таймера
+    pub last_activity: Arc<AtomicU64>,
 
 }
 
@@ -84,6 +95,7 @@ mod tests {
             allowed_sessions: None,
             active_sessions: None,
             expires_at: None,
+            last_activity: Arc::new(AtomicU64::new(current_timestamp_secs())),
         })
     }
 
@@ -250,9 +262,31 @@ impl ClientRegistry {
     }
 
     pub fn record_rx(&self, client: &ClientTransportInfo, bytes: usize, protocol: &str) {
+        client.last_activity.store(current_timestamp_secs(), Ordering::Relaxed);
         self.traffic_counters(client, protocol)
             .rx_bytes
             .fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    /// Проверяет и выселяет сессии, от которых не было входящих пакетов дольше timeout_secs
+    pub async fn cleanup_inactive_clients(&self, timeout_secs: u64) {
+        let now = current_timestamp_secs();
+        let dead_clients: Vec<Arc<ClientTransportInfo>> = self.clients_by_ip
+            .iter()
+            .filter(|entry| {
+                let last = entry.value().last_activity.load(Ordering::Relaxed);
+                now.saturating_sub(last) > timeout_secs
+            })
+            .map(|entry| entry.value().clone())
+            .collect();
+
+        for client in dead_clients {
+            info!(
+                "[Registry] Client {} (FP: {}, proto: {}) inactive for >{}s. Evicting dead session.",
+                client.assigned_ip, client.fingerprint, client.protocol, timeout_secs
+            );
+            self.remove_client(&client).await;
+        }
     }
 
     pub fn traffic_snapshot(&self) -> Vec<TrafficUsageSample> {
@@ -315,7 +349,7 @@ impl ClientRegistry {
         );
     }
 
-    pub fn remove_client(&self, client_info: &ClientTransportInfo) {
+    pub async fn remove_client(&self, client_info: &ClientTransportInfo) {
         let client_ip = &client_info.assigned_ip;
         let remote_addr = **client_info.remote_addr.load();
 
@@ -337,9 +371,8 @@ impl ClientRegistry {
         let ap = self.auth_provider.clone();
         let fp = client_info.fingerprint.clone();
 
-        tokio::spawn(async move {
-            ap.report_session_stop(fp).await;
-        });
+        ap.report_session_stop(fp).await;
+
 
         info!("[Registry] Client {} removed.", client_ip);
     }
@@ -398,7 +431,7 @@ impl ClientRegistry {
                 })
     }
 
-    pub fn cleanup_suspended(&self) {
+    pub async fn cleanup_suspended(&self) {
         let expired: Vec<String> = self
             .suspended_sessions
             .iter()
@@ -407,12 +440,12 @@ impl ClientRegistry {
             .collect();
         for session_id in expired {
             if let Some((_, session)) = self.suspended_sessions.remove(&session_id) {
-                self.finish_suspended(session.client_info);
+                self.finish_suspended(session.client_info).await;
             }
         }
     }
 
-    fn finish_suspended(&self, client_info: Arc<ClientTransportInfo>) {
+    async fn finish_suspended(&self, client_info: Arc<ClientTransportInfo>) {
         if let Ok(ip_addr) = client_info.assigned_ip.parse::<Ipv4Addr>() {
             self.ip_pool.release(ip_addr);
         }
@@ -424,9 +457,9 @@ impl ClientRegistry {
 
         let auth_provider = self.auth_provider.clone();
         let fingerprint = client_info.fingerprint.clone();
-        tokio::spawn(async move {
-            auth_provider.report_session_stop(fingerprint).await;
-        });
+
+        auth_provider.report_session_stop(fingerprint).await;
+
         info!(
             "[Registry] Suspended session {} expired",
             client_info.session_id
@@ -486,7 +519,7 @@ impl ClientRegistry {
         }
     }
 
-    pub fn disconnect_by_fingerprint(&self, fingerprint: &str) -> bool {
+    pub async fn disconnect_by_fingerprint(&self, fingerprint: &str) -> bool {
         let mut found_client = None;
         for entry in self.clients_by_ip.iter() {
             if entry.value().fingerprint == fingerprint {
@@ -496,7 +529,7 @@ impl ClientRegistry {
         }
         if let Some(client_info) = found_client {
             // Закрывает каналы, освобождает виртуальный IP, шлет стоп-сессию в Auth
-            self.remove_client(&client_info);
+            self.remove_client(&client_info).await;
             true
         } else {
             false

@@ -168,9 +168,9 @@ pub async fn run_quic_server(
 
                 conn.close(0u32.into(), b"Disconnected by admin");
 
-                r.remove_client(&client_info);
+                r.remove_client(&client_info).await;
             } else {
-                r.remove_client(&client_info);
+                r.remove_client(&client_info).await;
             }
         });
     }

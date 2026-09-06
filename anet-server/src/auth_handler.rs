@@ -482,16 +482,22 @@ impl ServerAuthHandler {
             allowed_sessions,
             active_sessions,
             expires_at: expires_at.clone(),
+
+            // Инициализация сторожевого таймера:
+            last_activity: Arc::new(AtomicU64::new(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+            )),
         });
 
         self.registry.pre_register_client(client_info.clone());
 
         if !is_resume {
-            let ap = self.auth_provider.clone();
-            let fp = temp_info.client_fingerprint.clone();
-            tokio::spawn(async move {
-                ap.report_session_start(fp).await;
-            });
+            // Мгновенно убиваем зомби-сессии этого же клиента перед стартом новой
+            self.registry.disconnect_by_fingerprint(&temp_info.client_fingerprint).await;
+            self.auth_provider.report_session_start(temp_info.client_fingerprint).await;
         }
 
         let (netmask, gateway, mtu) = self.registry.get_network_params();

@@ -38,8 +38,8 @@ reqwest = { version = "0.12.28", default-features = false }
 
 # eBPF-шейпер трафика (anet-ebpf / anet-ebpf-common), собирается и
 # встраивается в anet-server через anet-server/build.rs (aya-build).
-aya = "0.13"
-aya-log = "0.2"
+aya = "0.14.0"
+aya-log = "0.3.0"
 aya-build = "0.2"
 
 [profile.release.package.anet-client-cli]

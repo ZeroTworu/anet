@@ -211,6 +211,14 @@ async fn handle_http_connection(
 
                         if let Some(client_info) = registry.get_by_session(&session_id) {
 
+                            client_info.last_activity.store(
+                                std::time::SystemTime::now()
+                                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs(),
+                                Ordering::Relaxed
+                            );
+
                             // Получаем или инициализируем контекст сессии (Очередь + Реассемблер)
                             let session = sessions.entry(session_id.clone()).or_insert_with(|| {
                                 let (tx_router, rx_router) = mpsc::channel::<Bytes>(CHANNEL_BUFFER_SIZE);

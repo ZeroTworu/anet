@@ -109,7 +109,8 @@ impl ANetServer {
             loop {
                 tokio::time::sleep(Duration::from_secs(10)).await;
                 gcx.retain(|_, v| v.created_at.elapsed() <= Duration::from_secs(30));
-                gc_registry.cleanup_suspended();
+                gc_registry.cleanup_suspended().await;
+                gc_registry.cleanup_inactive_clients(30).await;
             }
         });
 
