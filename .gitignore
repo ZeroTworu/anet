@@ -7,3 +7,4 @@ android-build/*
 .env
 /node_modules
 /.vscode
+/jniLibs

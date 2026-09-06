@@ -209,7 +209,7 @@ fn send_notification(title: &str, body: &str) {
 pub fn toggle_vpn(
     shared: &Arc<Mutex<SharedState>>,
     rt_handle: &Handle,
-    logs: &Arc<Mutex<Vec<String>>>
+    _logs: &Arc<Mutex<Vec<String>>>
 ) {
     let mut guard = lock_ignore_poison(&shared);
 
@@ -218,19 +218,11 @@ pub fn toggle_vpn(
             guard.state = ConnectionState::Connecting;
             drop(guard);
 
-            let logs_clone = logs.clone();
             let shared_clone = shared.clone();
             rt_handle.spawn(async move {
-                push_log(&logs_clone, "> Starting service...");
-                match client_clone.start().await {
-                    Ok(_) => {
-                        push_log(&logs_clone, "> Service stopped");
-                    }
-                    Err(e) => {
-                        push_log(&logs_clone, &format!("> Error: {}", e));
-                        lock_ignore_poison(&shared_clone).state = ConnectionState::Disconnected;
-                        anet_client_core::events::err(e.to_string());
-                    }
+                if let Err(e) = client_clone.start().await {
+                    lock_ignore_poison(&shared_clone).state = ConnectionState::Disconnected;
+                    anet_client_core::events::err(e.to_string());
                 }
             });
         }
@@ -238,9 +230,7 @@ pub fn toggle_vpn(
         guard.state = ConnectionState::Disconnected;
         drop(guard);
 
-        let logs_clone = logs.clone();
         rt_handle.spawn(async move {
-            push_log(&logs_clone, "> Stopping service...");
             let _ = client_clone.stop().await;
         });
     }
@@ -743,9 +733,10 @@ impl ANetApp {
                 AnetEvent::Status(msg) => {
                     self.log(&msg);
                 }
-                AnetEvent::ClientStateChanged { state, message, server_name } => {
-                    self.log(&message);
-
+                AnetEvent::Warn(msg) => {
+                    self.log(&msg);
+                }
+                AnetEvent::ClientStateChanged { state, server_name, .. } => {
                     if matches!(
                         state,
                         ClientState::Disconnected | ClientState::Stopped | ClientState::Failed
@@ -847,17 +838,11 @@ impl ANetApp {
             guard.state = ConnectionState::Connecting;
             drop(guard);
 
-            let logs_clone = self.logs.clone();
             let shared_clone = self.shared.clone();
             self.rt.spawn(async move {
-                push_log(&logs_clone, "> Starting service...");
-                match client_clone.start().await {
-                    Ok(_) => push_log(&logs_clone, "> Service stopped"),
-                    Err(e) => {
-                        push_log(&logs_clone, &format!("> Error: {}", e));
-                        lock_ignore_poison(&shared_clone).state = ConnectionState::Disconnected;
-                        anet_client_core::events::err(e.to_string());
-                    }
+                if let Err(e) = client_clone.start().await {
+                    lock_ignore_poison(&shared_clone).state = ConnectionState::Disconnected;
+                    anet_client_core::events::err(e.to_string());
                 }
             });
         }
@@ -869,9 +854,7 @@ impl ANetApp {
             guard.state = ConnectionState::Disconnected;
             drop(guard);
 
-            let logs_clone = self.logs.clone();
             self.rt.spawn(async move {
-                push_log(&logs_clone, "> Stopping service...");
                 let _ = client_clone.stop().await;
             });
         }

@@ -31,15 +31,13 @@ futures = { workspace = true }
 tokio-tungstenite = { workspace = true }
 http = { workspace = true }
 
-reqwest = { workspace = true, features = ["json", "rustls-tls-webpki-roots", "http2"] }
+reqwest = { workspace = true, features = ["json", "rustls-tls-webpki-roots"] }
 
 russh = { workspace = true }
 zip = "8.6.0"
 
 hickory-resolver = { version = "0.24", features = ["tokio"] }
 anet-common = { path = "../anet-common" }
-httparse = "1.10.1"
-tokio-rustls = "0.26.4"
 
 
 # Platform-specific dependencies for route management

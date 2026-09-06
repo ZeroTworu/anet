@@ -83,6 +83,37 @@ fn client_state_code(state: ClientState) -> i32 {
     }
 }
 
+fn format_bytes(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    let bytes_f = bytes as f64;
+    if bytes_f < KIB {
+        format!("{} B", bytes)
+    } else if bytes_f < MIB {
+        format!("{:.2} KiB", bytes_f / KIB)
+    } else if bytes_f < GIB {
+        format!("{:.2} MiB", bytes_f / MIB)
+    } else {
+        format!("{:.2} GiB", bytes_f / GIB)
+    }
+}
+
+fn format_bytes_per_sec(bytes_per_sec: f64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    if bytes_per_sec < KIB {
+        format!("{:.0} B/s", bytes_per_sec)
+    } else if bytes_per_sec < MIB {
+        format!("{:.0} KiB/s", bytes_per_sec / KIB)
+    } else if bytes_per_sec < GIB {
+        format!("{:.0} MiB/s", bytes_per_sec / MIB)
+    } else {
+        format!("{:.0} GiB/s", bytes_per_sec / GIB)
+    }
+}
+
 fn event_message(event: AnetEvent) -> Option<String> {
     match event {
         AnetEvent::Status(s) | AnetEvent::UpdateStatus(s) => Some(s),
@@ -91,24 +122,9 @@ fn event_message(event: AnetEvent) -> Option<String> {
         AnetEvent::UpdateProgress(p) => Some(format!("PROGRESS:{p:.2}")),
         AnetEvent::UpdateAvailable(rel) => Some(format!("Найдено обновление: {}", rel.tag_name)),
         AnetEvent::UpdateReady => Some("Update downloaded to cache".to_string()),
-        AnetEvent::TrafficUpdate { .. } | AnetEvent::ClientStateChanged { .. } => None, 
-        AnetEvent::Stats { rx, tx, rtt, rxm, txm } => {
-            // Формируем JSON вручную (или через serde_json, если он подключен)
-            let json = format!(
-                r#"{{"type": "stats", "rx": "{}", "tx": "{}", "rtt": "{}", "rxm": "{}", "txm": "{}"}}"#,
-                rx, tx, rtt, rxm, txm
-            );
-            Some(json)
-        }
-
-        // Заглушка для TrafficUpdate, если вы решите использовать u64 вместо String
-        AnetEvent::TrafficUpdate { rx, tx, rtt, rxm, txm } => {
-            let json = format!(
-                r#"{{"type": "stats", "rx": "{}", "tx": "{}", "rtt": "{}", "rxm": "{}", "txm": "{}"}}"#,
-                rx, tx, rtt, rxm, txm
-            );
-            Some(json)
-        }
+        AnetEvent::Stats { .. }
+        | AnetEvent::TrafficUpdate { .. }
+        | AnetEvent::ClientStateChanged { .. } => None,
     }
 }
 
@@ -145,6 +161,52 @@ mod tests {
     #[test]
     fn config_inspection_reports_invalid_toml() {
         assert!(inspect_config("not toml").starts_with("ERROR\n"));
+    }
+
+    #[test]
+    fn event_message_skips_stats_and_traffic() {
+        let stats_event = AnetEvent::Stats {
+            rx: "10 MiB".to_string(),
+            tx: "2 MiB".to_string(),
+            rtt: "40ms".to_string(),
+            rxm: "1.5 MiB/s".to_string(),
+            txm: "200 KiB/s".to_string(),
+        };
+        assert!(event_message(stats_event).is_none());
+
+        let traffic_event = AnetEvent::TrafficUpdate {
+            rx: 1024,
+            tx: 2048,
+            rtt: 50,
+            rxm: 1000,
+            txm: 2000,
+        };
+        assert!(event_message(traffic_event).is_none());
+
+        let state_event = AnetEvent::ClientStateChanged {
+            state: ClientState::Connected,
+            message: "Connected".to_string(),
+            server_name: Some("Server1".to_string()),
+        };
+        assert!(event_message(state_event).is_none());
+
+        let status_event = AnetEvent::Status("Hello".to_string());
+        assert_eq!(event_message(status_event), Some("Hello".to_string()));
+    }
+
+    #[test]
+    fn format_bytes_works_correctly() {
+        assert_eq!(format_bytes(500), "500 B");
+        assert_eq!(format_bytes(1024), "1.00 KiB");
+        assert_eq!(format_bytes(1024 * 1024), "1.00 MiB");
+        assert_eq!(format_bytes(1024 * 1024 * 1024), "1.00 GiB");
+    }
+
+    #[test]
+    fn format_bytes_per_sec_works_correctly() {
+        assert_eq!(format_bytes_per_sec(500.0), "500 B/s");
+        assert_eq!(format_bytes_per_sec(1024.0), "1 KiB/s");
+        assert_eq!(format_bytes_per_sec(1024.0 * 1024.0), "1 MiB/s");
     }
 }
 
@@ -240,24 +302,75 @@ fn init_jni_bridge_thread(jvm: Arc<JavaVM>) {
                     };
 
                     if let Some(callback_ref) = callback_ref_opt {
-                        if let AnetEvent::ClientStateChanged { state, message, server_name } = event {
-                            let jmsg = env.new_string(message);
-                            let jserver = env.new_string(server_name.unwrap_or_default());
-                            if let (Ok(jmsg), Ok(jserver)) = (jmsg, jserver) {
-                                let _ = env.call_method(&callback_ref, "onVpnStateChanged", "(ILjava/lang/String;Ljava/lang/String;)V", &[
-                                    JValue::Int(client_state_code(state)),
-                                    JValue::Object(&jmsg),
-                                    JValue::Object(&jserver),
-                                ]);
+                        match event {
+                            AnetEvent::ClientStateChanged { state, message, server_name } => {
+                                let jmsg = env.new_string(message);
+                                let jserver = env.new_string(server_name.unwrap_or_default());
+                                if let (Ok(jmsg), Ok(jserver)) = (jmsg, jserver) {
+                                    let _ = env.call_method(&callback_ref, "onVpnStateChanged", "(ILjava/lang/String;Ljava/lang/String;)V", &[
+                                        JValue::Int(client_state_code(state)),
+                                        JValue::Object(&jmsg),
+                                        JValue::Object(&jserver),
+                                    ]);
+                                }
                             }
-                        } else if let Some(msg) = event_message(event) {
-                            if let Ok(jmsg) = env.new_string(msg) {
-                                let _ = env.call_method(
-                                    &callback_ref,
-                                    "onStatusChanged",
-                                    "(Ljava/lang/String;)V",
-                                    &[JValue::Object(&jmsg)],
-                                );
+                            AnetEvent::Stats { rx, tx, rtt, rxm, txm } => {
+                                let j_rx = env.new_string(rx);
+                                let j_tx = env.new_string(tx);
+                                let j_rtt = env.new_string(rtt);
+                                let j_rxm = env.new_string(rxm);
+                                let j_txm = env.new_string(txm);
+                                if let (Ok(j_rx), Ok(j_tx), Ok(j_rtt), Ok(j_rxm), Ok(j_txm)) =
+                                    (j_rx, j_tx, j_rtt, j_rxm, j_txm)
+                                {
+                                    let _ = env.call_method(
+                                        &callback_ref,
+                                        "onTrafficStats",
+                                        "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
+                                        &[
+                                            JValue::Object(&j_rx),
+                                            JValue::Object(&j_tx),
+                                            JValue::Object(&j_rtt),
+                                            JValue::Object(&j_rxm),
+                                            JValue::Object(&j_txm),
+                                        ],
+                                    );
+                                }
+                            }
+                            AnetEvent::TrafficUpdate { rx, tx, rtt, rxm, txm } => {
+                                let j_rx = env.new_string(format_bytes(rx));
+                                let j_tx = env.new_string(format_bytes(tx));
+                                let j_rtt = env.new_string(format!("{rtt}ms"));
+                                let j_rxm = env.new_string(format_bytes_per_sec(rxm as f64));
+                                let j_txm = env.new_string(format_bytes_per_sec(txm as f64));
+                                if let (Ok(j_rx), Ok(j_tx), Ok(j_rtt), Ok(j_rxm), Ok(j_txm)) =
+                                    (j_rx, j_tx, j_rtt, j_rxm, j_txm)
+                                {
+                                    let _ = env.call_method(
+                                        &callback_ref,
+                                        "onTrafficStats",
+                                        "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
+                                        &[
+                                            JValue::Object(&j_rx),
+                                            JValue::Object(&j_tx),
+                                            JValue::Object(&j_rtt),
+                                            JValue::Object(&j_rxm),
+                                            JValue::Object(&j_txm),
+                                        ],
+                                    );
+                                }
+                            }
+                            other => {
+                                if let Some(msg) = event_message(other) {
+                                    if let Ok(jmsg) = env.new_string(msg) {
+                                        let _ = env.call_method(
+                                            &callback_ref,
+                                            "onStatusChanged",
+                                            "(Ljava/lang/String;)V",
+                                            &[JValue::Object(&jmsg)],
+                                        );
+                                    }
+                                }
                             }
                         }
                     }
@@ -387,11 +500,6 @@ pub extern "system" fn Java_org_alco_anet_ANetVpnService_connectVpn(
     selected_server_jstr: JString,
 ) {
     info!("JNI: connectVpn called");
-
-    // ИНИЦИАЛИЗАЦИЯ КРИПТО-ПРОВАЙДЕРА ДЛЯ ANDROID
-    // Игнорируем ошибку, так как при реконнектах (когда сервис не умирал, а просто
-    // перезапускал туннель) провайдер уже может быть установлен.
-    rustls::crypto::ring::default_provider().install_default().ok();
 
     // Подготавливаем потокобезопасные структуры за пределами Tokio-рантайма
     let jvm = env.get_java_vm().unwrap();

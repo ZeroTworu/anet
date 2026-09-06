@@ -1,0 +1,2769 @@
+================================================
+����: W:\Work\anet\anet\anet-common\build.rs
+================================================
+use std::io::Result;
+
+fn main() -> Result<()> {
+    let ci = std::env::var("CI").unwrap_or_default() == "true";
+
+    if !ci {
+        std::fs::create_dir_all("src/generated").unwrap();
+
+        prost_build::Config::new()
+            .out_dir("src/generated")
+            .compile_protos(&["proto/protocol.proto"], &["proto/"])?;
+    }
+
+    Ok(())
+}
+
+
+
+
+================================================
+����: W:\Work\anet\anet\anet-common\Cargo.toml
+================================================
+[package]
+name = "anet-common"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[features]
+default = []
+poem = ["dep:poem-openapi"]
+
+[dependencies]
+tun = {workspace = true}
+bytes = {workspace = true}
+futures = {workspace = true}
+prost = {workspace = true}
+tokio = {workspace = true}
+log = {workspace = true}
+anyhow = {workspace = true}
+quinn = {workspace = true }
+chacha20poly1305 = {workspace = true}
+aes-gcm = "0.10.3"
+aead = { version = "0.5.2", features = ["getrandom"] }
+serde = { workspace = true, features = ["derive"] }
+rand = {workspace = true}
+x25519-dalek = {workspace = true}
+ed25519-dalek = {workspace = true}
+sha2 = {workspace = true}
+poem-openapi = { version = "5.1.12", features = ["uuid"], optional = true }
+
+base64 = "0.22.1"
+
+
+[build-dependencies]
+prost-build = "0.14.1"
+
+[lib]
+path = "src/lib.rs"
+
+
+
+
+================================================
+����: W:\Work\anet\anet\anet-common\process_files.ps1
+================================================
+# ========== ��������� ==========
+$outputFile = "project_report.txt"
+
+# ������ ���������� (�������� ��� ������)
+$exclude = @(
+    "*target*", "*github*", "*.lock*", "*project*", "*android-build*", 
+    "LICENSE.md", "README.md", "free_ai.md", "*node_modules*", 
+    "CoC.md", "*dist*", ".*", "project_report.txt","*.png","*.webp","*.so","*.ttf","*.svg"
+)
+
+# ������ ��������� (���������!)
+# ���� �������� ������ @() � ����� ���������� ��� ����� (����� �����������).
+# �������: @("*src*", "*docs*") � ������ �����, ���������� "src" ��� "docs"
+#           @("C:\Projects\MyApp\src\*") � ������ ���������� �����
+$include = @(
+    # ���������������� � ��������� ������ �������, ��������:
+    #"W:\Work\anet\anet\anet-client-core\*",
+   # "W:\Work\anet\anet\anet-client-gui\*"    
+    #"W:\Work\anet\anet\anet-mobile\*"
+    #"W:\Work\anet-android\anet-android\app\src\main\java\org\alco\anet*"
+)
+
+# ========== ���������� ==========
+if (Test-Path $outputFile) { Remove-Item $outputFile }
+
+# �������� ��� �����, �������� �� ����� (���������� ������� �����)
+$files = Get-ChildItem -Recurse -File -Exclude $exclude | Where-Object { 
+    $_.FullName -notmatch "(\\|\/)\." 
+}
+
+# ========== ��������� INCLUDE (���� �����) ==========
+if ($include -and $include.Count -gt 0) {
+    $files = $files | Where-Object {
+        $path = $_.FullName
+        # ���������, ������������� �� ���� ���� �� ������ ������� �� $include
+        $include | ForEach-Object { $path -like $_ } | Where-Object { $_ } | Select-Object -First 1
+    }
+}
+
+# ��������� ����� ���� ��������
+$files = $files | Sort-Object FullName
+
+# ========== ��������� ==========
+foreach ($file in $files) {
+    Add-Content $outputFile "================================================"
+    Add-Content $outputFile "����: $($file.FullName)"
+    Add-Content $outputFile "================================================"
+    
+    try {
+        $content = Get-Content $file.FullName -Raw -ErrorAction Stop
+        Add-Content $outputFile $content
+    }
+    catch {
+        Add-Content $outputFile "[�������� ���� ��� ������ ������]"
+    }
+
+    Add-Content $outputFile "`n`n"
+    Write-Host "���������: $($file.Name)"
+}
+
+Write-Host "������! ����� �������� � ����: $outputFile"
+
+
+
+================================================
+����: W:\Work\anet\anet\anet-common\proto\protocol.proto
+================================================
+syntax = "proto3";
+
+package anet;
+
+message DHClientExchange {
+    bytes public_key = 1;
+    bytes client_signed_dh_key = 2;  // Подпись клиентом своего DH ключа
+    bytes client_public_key = 3;     // Публичный ключ клиента для верификации
+    string resume_session_id = 4;
+}
+
+message DHServerExchange {
+    bytes public_key = 1;
+    bytes server_signed_dh_key = 2;
+}
+
+message EncryptedAuthRequest {
+    bytes ciphertext = 1;
+    bytes nonce = 2;
+}
+
+message EncryptedAuthResponse {
+    bytes ciphertext = 1;
+    bytes nonce = 2;
+}
+
+message AuthRequest {
+    string client_id = 1;
+    // Existing logical VPN session requested after a transport rotation.
+    string resume_session_id = 2;
+}
+
+message AuthResponse {
+    string ip = 1;
+    string netmask = 2;
+    string gateway = 3;
+    int32 mtu = 4;
+    string session_id = 5;
+    bytes nonce_prefix = 6;
+    bytes quic_cert = 7;
+}
+
+message Message {
+    oneof content {
+        DHClientExchange dh_client_exchange = 1;
+        DHServerExchange dh_server_exchange = 2;
+        EncryptedAuthRequest encrypted_auth_request = 3;
+        EncryptedAuthResponse encrypted_auth_response = 4;
+        AuthRequest auth_request = 5;
+        AuthResponse auth_response = 6;
+        AuthDenyNotification auth_error = 7;
+    }
+    bytes padding = 8;
+}
+
+enum DenyReason {
+    UNKNOWN = 0;
+    SESSIONS_LIMIT_REACHED = 1;
+    SUBSCRIPTION_EXPIRED = 2;
+    BANNED = 3;
+}
+
+message AuthDenyNotification {
+    string message = 1;
+}
+
+
+
+
+================================================
+����: W:\Work\anet\anet\anet-common\src\atun.rs
+================================================
+use crate::consts::{CHANNEL_BUFFER_SIZE, MAX_PACKET_SIZE};
+use crate::tun_params::TunParams;
+use anyhow::Result;
+use bytes::{Bytes, BytesMut};
+#[cfg(target_os = "macos")]
+use log::warn;
+use log::{error, info};
+#[cfg(target_os = "macos")]
+use tokio::process::Command;
+
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::mpsc;
+use tun::AbstractDevice;
+
+#[derive(Debug)]
+pub struct TunChannels {
+    pub tx_to_tun: mpsc::Sender<Bytes>,
+    pub rx_from_tun: mpsc::Receiver<Bytes>,
+    pub tun_index: Option<u32>,
+}
+
+impl TunChannels {
+    pub fn new(
+        tx_to_tun: mpsc::Sender<Bytes>,
+        rx_from_tun: mpsc::Receiver<Bytes>,
+        tun_index: Option<u32>,
+    ) -> Self {
+        Self {
+            tx_to_tun,
+            rx_from_tun,
+            tun_index,
+        }
+    }
+}
+
+/// Результат успешного создания TUN устройства
+pub struct TunCreationResult {
+    pub tx: mpsc::Sender<Bytes>,
+    pub rx: mpsc::Receiver<Bytes>,
+    pub interface_name: String,
+}
+
+pub struct TunManager {
+    params: TunParams,
+    tun_index: Option<u32>,
+    actual_name: Option<String>,
+}
+
+impl Clone for TunManager {
+    fn clone(&self) -> Self {
+        Self {
+            params: self.params.clone(),
+            tun_index: self.tun_index,
+            actual_name: self.actual_name.clone(),
+        }
+    }
+}
+
+impl TunManager {
+    pub fn new(params: TunParams) -> Result<Self> {
+        Ok(Self {
+            params,
+            tun_index: None,
+            actual_name: None,
+        })
+    }
+
+    pub fn get_tun_index(&self) -> u32 {
+        if self.tun_index.is_none() {
+            error!("Attempted to get tun index from a not created device!");
+            return 0;
+        }
+        self.tun_index.unwrap()
+    }
+
+    pub fn get_actual_name(&self) -> Option<&str> {
+        self.actual_name.as_deref()
+    }
+
+    pub async fn run_with_name(&mut self) -> Result<TunCreationResult> {
+        let (tx, rx) = self.run().await?;
+        let interface_name = self
+            .actual_name
+            .clone()
+            .unwrap_or_else(|| self.params.name.clone());
+        Ok(TunCreationResult {
+            tx,
+            rx,
+            interface_name,
+        })
+    }
+
+    pub async fn run(&mut self) -> Result<(mpsc::Sender<Bytes>, mpsc::Receiver<Bytes>)> {
+        let (tx_to_tun, mut rx_to_tun) = mpsc::channel::<Bytes>(CHANNEL_BUFFER_SIZE);
+        let (tx_from_tun, rx_from_tun) = mpsc::channel::<Bytes>(CHANNEL_BUFFER_SIZE);
+
+        let config = self.params.create_config()?;
+        let device = match tun::create_as_async(&config) {
+            Ok(device) => device,
+            Err(e) => anyhow::bail!("Failed to create async TUN device: {}", e),
+        };
+
+        self.tun_index = Some(device.tun_index()? as u32);
+
+        let actual_name = device
+            .tun_name()
+            .unwrap_or_else(|_| self.params.name.clone());
+
+        self.actual_name = Some(actual_name.clone());
+
+        #[cfg(target_os = "macos")]
+        self.configure_macos_interface(&actual_name).await?;
+
+        // Нативный split устройства: reader и writer получают независимые
+        // регистрации AsyncFd. Раньше здесь был tokio::io::split(), который
+        // оборачивает устройство в BiLock — чтение и запись конкурировали
+        // за один лок на каждом пакете (а VPN-трафик всегда двунаправленный).
+        let (mut writer, mut reader) = device.split()?;
+
+        info!(
+            "Created TUN with: [{}] (actual name: {})",
+            self.params.get_info(),
+            actual_name
+        );
+
+        // Задача чтения из TUN устройства (TUN -> NETWORK)
+        let tx_clone = tx_from_tun.clone();
+        tokio::spawn(async move {
+            // Читаем в переиспользуемый BytesMut: одно выделение памяти
+            // амортизируется на ~64 пакета, а split().freeze() отдает пакет
+            // без дополнительного memcpy (раньше было: ядро -> стек-буфер,
+            // затем стек -> Bytes::copy_from_slice, т.е. лишняя копия на пакет).
+            const READ_CHUNK: usize = 64 * MAX_PACKET_SIZE;
+            let mut buf = BytesMut::with_capacity(READ_CHUNK);
+            loop {
+                // Гарантируем, что в буфере всегда есть место под целый пакет,
+                // иначе read() на TUN обрежет пакет.
+                if buf.capacity() < MAX_PACKET_SIZE {
+                    buf = BytesMut::with_capacity(READ_CHUNK);
+                }
+                tokio::select! {
+                    // Читаем входящие пакеты от операционной системы
+                    res = reader.read_buf(&mut buf) => {
+                        match res {
+                            Ok(0) => {
+                                info!("TUN reader stream ended.");
+                                break;
+                            }
+                            Ok(_) => {
+                                let packet = buf.split().freeze();
+                                if tx_clone.send(packet).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                error!("Failed to read from TUN: {}", e);
+                                break;
+                            }
+                        }
+                    }
+                    // ВАЖНО: Мониторим закрытие канала на стороне клиента.
+                    // Как только клиент дропнет приемник, этот фьючерс мгновенно разрешится,
+                    // прервав висящий вызов read и освободив файловый дескриптор устройства.
+                    _ = tx_clone.closed() => {
+                        info!("TUN reader channel closed, stopping read task.");
+                        break;
+                    }
+                }
+            }
+        });
+
+        // Задача записи в TUN устройство (NETWORK -> TUN)
+        tokio::spawn(async move {
+            'outer: while let Some(mut packet) = rx_to_tun.recv().await {
+                // Пишем бурст целиком: после первого пакета выгребаем всё,
+                // что уже накопилось в канале, через try_recv(), не отдавая
+                // управление планировщику между пакетами одного бурста.
+                // (Каждый write в TUN обязан оставаться отдельным вызовом —
+                // это один пакет на write() без IFF_VNET_HDR.)
+                loop {
+                    if let Err(e) = writer.write_all(&packet).await {
+                        error!("Failed to write to TUN: {}, bytes: {:?}", e, packet);
+                        break 'outer;
+                    }
+                    match rx_to_tun.try_recv() {
+                        Ok(next) => packet = next,
+                        Err(_) => break,
+                    }
+                }
+            }
+        });
+        info!("TUN reader/writer stream started.");
+        Ok((tx_to_tun, rx_from_tun))
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn configure_macos_interface(&self, interface_name: &str) -> Result<()> {
+        use std::process::Stdio;
+
+        let output = Command::new("ifconfig")
+            .args([
+                interface_name,
+                "inet",
+                &self.params.address.to_string(),
+                &self.params.gateway.to_string(),
+                "netmask",
+                &self.params.netmask.to_string(),
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .await?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            warn!(
+                "ifconfig inet configuration warning: {} (interface may already be configured)",
+                stderr.trim()
+            );
+        }
+
+        let output = Command::new("ifconfig")
+            .args([interface_name, "mtu", &self.params.mtu.to_string()])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .await?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            warn!("ifconfig mtu configuration warning: {}", stderr.trim());
+        }
+
+        info!(
+            "Configured macOS interface {}: {} -> {} netmask {} mtu {}",
+            interface_name,
+            self.params.address,
+            self.params.gateway,
+            self.params.netmask,
+            self.params.mtu
+        );
+
+        Ok(())
+    }
+}
+
+
+
+
+================================================
+����: W:\Work\anet\anet\anet-common\src\config.rs
+================================================
+use serde::Deserialize;
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct StealthConfig {
+    /// Минимальная задержка джиттера (наносекунды)
+    pub min_jitter_ns: u64,
+    /// Максимальная задержка джиттера (наносекунды)
+    pub max_jitter_ns: u64,
+    /// Шаг выравнивания паддинга (байты)
+    pub padding_step: u16,
+
+    /// Фрагментировать самый первый пакет рукопожатия (до появления
+    /// сессионного ключа, поэтому вне обычного padding/jitter-конвейера).
+    pub frag_enabled: bool,
+    /// Минимальное число частей, на которое дробится хендшейк.
+    pub frag_min_chunks: u8,
+    /// Максимальное число частей, на которое дробится хендшейк.
+    pub frag_max_chunks: u8,
+}
+
+impl Default for StealthConfig {
+    fn default() -> Self {
+        Self {
+            min_jitter_ns: 0,
+            max_jitter_ns: 0,
+            padding_step: 0,
+            frag_enabled: false,
+            frag_min_chunks: 2,
+            frag_max_chunks: 3,
+        }
+    }
+}
+
+
+
+
+================================================
+����: W:\Work\anet\anet\anet-common\src\consts.rs
+================================================
+// Все константы обсалютно научны, и соответствуют числу тараканов на лолу и кол-ву бычков в пепельнице.
+// Не научные - числу мух на потолке.
+
+pub const MAX_PACKET_SIZE: usize = 2048;
+pub const CHANNEL_BUFFER_SIZE: usize = 1024;
+pub const NONCE_PREFIX_LEN: usize = 4;
+pub const NONCE_LEN: usize = 12;
+pub const PADDING_MTU: usize = 1450;
+/// Nonce (12) + Poly1305 tag (16) + sequence (8) + payload length (2).
+pub const TRANSPORT_ENVELOPE_OVERHEAD: usize = 38;
+pub const PROTO_PAD_FIELD_OVERHEAD: usize = 3;
+
+// Минимальный размер пакета рукопожатия для фильтрации мусора на сервере
+// Nonce (12) + Tag (16) + Min Protobuf (~50)
+pub const MIN_HANDSHAKE_LEN: usize = 78;
+
+/// Бюджет коалесценции для группировки мелких IP-пакетов перед записью в сокет.
+pub const COALESCE_BUDGET_BYTES: usize = 64 * 1024;
+
+/// Безопасный бюджет коалесценции для SSH/VNC (16 KB)
+/// Гарантирует, что размер пакета никогда не превысит стандартное окно SSH-канала (32 KB),
+/// предотвращая переполнение буферов и панику CryptoVec::resize.
+pub const CRYPTO_COALESCE_BUDGET_BYTES: usize = 16 * 1024;
+
+
+
+
+================================================
+����: W:\Work\anet\anet\anet-common\src\crypto_utils.rs
+================================================
+use crate::encryption::Cipher;
+use base64::prelude::*;
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use sha2::{Digest, Sha256};
+use x25519_dalek::SharedSecret;
+
+/// Создает Cipher для шифрования/дешифрования ПЕРВОГО пакета (Handshake).
+/// В качестве ключа используется SHA256 от публичного ключа сервера (Ed25519).
+/// Обеспечивает обфускацию: пакет выглядит как шум для любого, кто не знает PubKey сервера.
+pub fn create_handshake_cipher(server_pub_key_bytes: &[u8]) -> Cipher {
+    let mut hasher = Sha256::new();
+    hasher.update(server_pub_key_bytes);
+    let key: [u8; 32] = hasher.finalize().into();
+    Cipher::new(&key)
+}
+
+/// Выведение симметричного ключа из DH Shared Secret
+pub fn derive_shared_key(shared_secret: &SharedSecret) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(shared_secret.as_bytes());
+    let output: [u8; 32] = hasher.finalize().into();
+    output
+}
+
+/// Подписывает данные личным ключом клиента
+pub fn sign_data(signing_key: &SigningKey, data: &[u8]) -> Vec<u8> {
+    let signature: Signature = signing_key.sign(data);
+    signature.to_bytes().to_vec()
+}
+
+/// Проверяет подпись с помощью публичного ключа
+pub fn verify_signature(
+    verifying_key: &VerifyingKey,
+    data: &[u8],
+    signature: &[u8],
+) -> Result<(), anyhow::Error> {
+    let signature = Signature::from_bytes(signature.try_into()?);
+    verifying_key.verify(data, &signature)?;
+    Ok(())
+}
+
+/// Генерирует fingerprint публичного ключа для идентификации клиента
+pub fn generate_key_fingerprint(public_key: &VerifyingKey) -> String {
+    let key_bytes = public_key.to_bytes();
+    let mut hasher = Sha256::new();
+    hasher.update(&key_bytes);
+    let hash = hasher.finalize();
+    BASE64_STANDARD.encode(&hash[..16])
+}
+
+
+
+
+================================================
+����: W:\Work\anet\anet\anet-common\src\dto.rs
+================================================
+use serde::{Deserialize, Serialize};
+
+/// [ VPN Core Communication: Check Access ]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "poem", derive(poem_openapi::Object))]
+#[cfg_attr(feature = "poem", oai(rename = "CheckAccessRequest"))]
+pub struct CheckAccessRequest {
+    #[cfg_attr(feature = "poem", oai(validator(min_length = 10)))]
+    pub fingerprint: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "poem", derive(poem_openapi::Object))]
+#[cfg_attr(feature = "poem", oai(rename = "CheckAccessResponse"))]
+pub struct CheckAccessResponse {
+    pub allowed: bool,
+    pub message: String,
+    pub static_ip: Option<String>,
+    pub user_id: Option<String>,
+    pub speed_limit: Option<i32>,
+}
+
+/// [ VPN Core Communication: Session Events ]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "poem", derive(poem_openapi::Object))]
+#[cfg_attr(feature = "poem", oai(rename = "SessionEventRequest"))]
+pub struct SessionEventRequest {
+    pub fingerprint: String,
+}
+
+/// Периодический отчёт фактического состояния ноды для control plane.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "poem", derive(poem_openapi::Object))]
+#[cfg_attr(feature = "poem", oai(rename = "NodeHeartbeatRequest"))]
+pub struct NodeHeartbeatRequest {
+    pub node_id: String,
+    pub version: String,
+    pub uptime_seconds: u64,
+    pub active_connections: u64,
+    pub accepting_connections: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "poem", derive(poem_openapi::Object))]
+#[cfg_attr(feature = "poem", oai(rename = "NodeCommand"))]
+pub struct NodeCommand {
+    /// Идентификатор записи очереди в панели.
+    pub command_id: String,
+    /// Тип команды, который нода должна выполнить локально.
+    pub command_type: String,
+    /// Параметр команды admission: принимать ли новые подключения.
+    pub accepting_connections: Option<bool>,
+    /// Отпечаток целевого пользователя для отключения.
+    pub target_fingerprint: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "poem", derive(poem_openapi::Object))]
+#[cfg_attr(feature = "poem", oai(rename = "NodeCommandResultRequest"))]
+pub struct NodeCommandResultRequest {
+    pub node_id: String,
+    pub succeeded: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "poem", derive(poem_openapi::Object))]
+#[cfg_attr(feature = "poem", oai(rename = "TrafficUsageSample"))]
+pub struct TrafficUsageSample {
+    /// Пользователь из ответа auth provider; может отсутствовать для legacy/VIP.
+    pub user_id: Option<String>,
+    /// Отпечаток клиента — стабильный fallback-идентификатор агрегации.
+    pub fingerprint: String,
+    /// Байты от клиента к VPN-ноде и от VPN-ноды к клиенту.
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
+    pub protocol: Option<String>, // Тип транспорта: "quic", "ssh", "vnc", "ws"
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "poem", derive(poem_openapi::Object))]
+#[cfg_attr(feature = "poem", oai(rename = "NodeTrafficReport"))]
+pub struct NodeTrafficReport {
+    pub node_id: String,
+    pub boot_id: String,
+    pub samples: Vec<TrafficUsageSample>,
+}
+
+
+
+
+================================================
+����: W:\Work\anet\anet\anet-common\src\encryption.rs
+================================================
+use aead::{Aead, AeadInPlace, KeyInit, Nonce, Tag}; // <--- Добавили AeadInPlace
+use aes_gcm::Key;
+// use aes_gcm::Aes256Gcm;
+use bytes::Bytes;
+use chacha20poly1305::ChaCha20Poly1305;
+use std::sync::Arc;
+
+// Заменить на `ChaCha20Poly1305` / `Aes256Gcm` при необходимости.
+type CryptoAlgorithm = ChaCha20Poly1305;
+
+#[derive(Clone)]
+pub struct Cipher {
+    cipher: Arc<CryptoAlgorithm>,
+}
+
+impl Cipher {
+    pub fn new(key: &[u8]) -> Self {
+        if key.len() != 32 {
+            panic!("Invalid key length for AES-256-GCM. Must be 32 bytes.");
+        }
+
+        let key_generic: &Key<CryptoAlgorithm> = key.try_into().expect("Key must be 32 bytes");
+
+        Self {
+            cipher: Arc::new(CryptoAlgorithm::new(key_generic)),
+        }
+    }
+
+    #[inline]
+    pub fn encrypt(&self, nonce_bytes: &[u8], data: Bytes) -> Result<Bytes, EncryptionError> {
+        let nonce = Nonce::<CryptoAlgorithm>::from_slice(nonce_bytes);
+
+        let ciphertext = self
+            .cipher
+            .encrypt(nonce, data.as_ref())
+            .map_err(|_| EncryptionError::EncryptionFailed)?;
+
+        Ok(Bytes::from(ciphertext))
+    }
+
+    #[inline]
+    pub fn decrypt(&self, nonce_bytes: &[u8], data: Bytes) -> Result<Bytes, EncryptionError> {
+        let nonce = Nonce::<CryptoAlgorithm>::from_slice(nonce_bytes);
+
+        let plaintext = self
+            .cipher
+            .decrypt(nonce, data.as_ref())
+            .map_err(|_| EncryptionError::DecryptionFailed)?;
+
+        Ok(Bytes::from(plaintext))
+    }
+
+    /// Расшифровывает данные прямо в переданном буфере.
+    /// Буфер должен содержать [Ciphertext + Tag].
+    /// После успеха буфер будет содержать [Plaintext], а "хвост" (где был тег) станет мусором.
+    #[inline]
+    pub fn decrypt_in_place(
+        &self,
+        nonce_bytes: &[u8],
+        buffer: &mut [u8],
+    ) -> Result<(), EncryptionError> {
+        let nonce = Nonce::<CryptoAlgorithm>::from_slice(nonce_bytes);
+        let len = buffer.len();
+
+        // 16 байт - размер тега Poly1305 для ChaCha20Poly1305
+        if len < 16 {
+            return Err(EncryptionError::DecryptionFailed);
+        }
+
+        // Разделяем буфер на сообщение и тег
+        let (msg, tag_bytes) = buffer.split_at_mut(len - 16);
+        let tag = Tag::<CryptoAlgorithm>::from_slice(tag_bytes);
+
+        // Используем detached версию, которая работает с сырыми слайсами
+        self.cipher
+            .decrypt_in_place_detached(nonce, &[], msg, tag)
+            .map_err(|_| EncryptionError::DecryptionFailed)?;
+
+        Ok(())
+    }
+
+    /// Encrypts a mutable buffer without allocating and returns its detached tag.
+    #[inline]
+    pub fn encrypt_in_place_detached(
+        &self,
+        nonce_bytes: &[u8],
+        buffer: &mut [u8],
+    ) -> Result<[u8; 16], EncryptionError> {
+        let nonce = Nonce::<CryptoAlgorithm>::from_slice(nonce_bytes);
+        let tag = self
+            .cipher
+            .encrypt_in_place_detached(nonce, &[], buffer)
+            .map_err(|_| EncryptionError::EncryptionFailed)?;
+        Ok(tag.into())
+    }
+
+    pub fn generate_nonce(sequence: u64) -> [u8; 12] {
+        let mut nonce = [0u8; 12];
+        nonce[4..].copy_from_slice(&sequence.to_be_bytes());
+        nonce
+    }
+}
+
+#[derive(Debug)]
+pub enum EncryptionError {
+    EncryptionFailed,
+    DecryptionFailed,
+}
+
+impl std::fmt::Display for EncryptionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EncryptionError::EncryptionFailed => write!(f, "Encryption failed"),
+            EncryptionError::DecryptionFailed => write!(f, "Decryption failed"),
+        }
+    }
+}
+
+impl std::error::Error for EncryptionError {}
+
+
+
+
+================================================
+����: W:\Work\anet\anet\anet-common\src\generated\anet.rs
+================================================
+// This file is @generated by prost-build.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DhClientExchange {
+    #[prost(bytes = "vec", tag = "1")]
+    pub public_key: ::prost::alloc::vec::Vec<u8>,
+    /// Подпись клиентом своего DH ключа
+    #[prost(bytes = "vec", tag = "2")]
+    pub client_signed_dh_key: ::prost::alloc::vec::Vec<u8>,
+    /// Публичный ключ клиента для верификации
+    #[prost(bytes = "vec", tag = "3")]
+    pub client_public_key: ::prost::alloc::vec::Vec<u8>,
+    #[prost(string, tag = "4")]
+    pub resume_session_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DhServerExchange {
+    #[prost(bytes = "vec", tag = "1")]
+    pub public_key: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "vec", tag = "2")]
+    pub server_signed_dh_key: ::prost::alloc::vec::Vec<u8>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct EncryptedAuthRequest {
+    #[prost(bytes = "vec", tag = "1")]
+    pub ciphertext: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "vec", tag = "2")]
+    pub nonce: ::prost::alloc::vec::Vec<u8>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct EncryptedAuthResponse {
+    #[prost(bytes = "vec", tag = "1")]
+    pub ciphertext: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "vec", tag = "2")]
+    pub nonce: ::prost::alloc::vec::Vec<u8>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AuthRequest {
+    #[prost(string, tag = "1")]
+    pub client_id: ::prost::alloc::string::String,
+    /// Existing logical VPN session requested after a transport rotation.
+    #[prost(string, tag = "2")]
+    pub resume_session_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AuthResponse {
+    #[prost(string, tag = "1")]
+    pub ip: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub netmask: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub gateway: ::prost::alloc::string::String,
+    #[prost(int32, tag = "4")]
+    pub mtu: i32,
+    #[prost(string, tag = "5")]
+    pub session_id: ::prost::alloc::string::String,
+    #[prost(bytes = "vec", tag = "6")]
+    pub nonce_prefix: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "vec", tag = "7")]
+    pub quic_cert: ::prost::alloc::vec::Vec<u8>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct Message {
+    #[prost(bytes = "vec", tag = "8")]
+    pub padding: ::prost::alloc::vec::Vec<u8>,
+    #[prost(oneof = "message::Content", tags = "1, 2, 3, 4, 5, 6, 7")]
+    pub content: ::core::option::Option<message::Content>,
+}
+/// Nested message and enum types in `Message`.
+pub mod message {
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Content {
+        #[prost(message, tag = "1")]
+        DhClientExchange(super::DhClientExchange),
+        #[prost(message, tag = "2")]
+        DhServerExchange(super::DhServerExchange),
+        #[prost(message, tag = "3")]
+        EncryptedAuthRequest(super::EncryptedAuthRequest),
+        #[prost(message, tag = "4")]
+        EncryptedAuthResponse(super::EncryptedAuthResponse),
+        #[prost(message, tag = "5")]
+        AuthRequest(super::AuthRequest),
+        #[prost(message, tag = "6")]
+        AuthResponse(super::AuthResponse),
+        #[prost(message, tag = "7")]
+        AuthError(super::AuthDenyNotification),
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AuthDenyNotification {
+    #[prost(string, tag = "1")]
+    pub message: ::prost::alloc::string::String,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum DenyReason {
+    Unknown = 0,
+    SessionsLimitReached = 1,
+    SubscriptionExpired = 2,
+    Banned = 3,
+}
+impl DenyReason {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unknown => "UNKNOWN",
+            Self::SessionsLimitReached => "SESSIONS_LIMIT_REACHED",
+            Self::SubscriptionExpired => "SUBSCRIPTION_EXPIRED",
+            Self::Banned => "BANNED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "UNKNOWN" => Some(Self::Unknown),
+            "SESSIONS_LIMIT_REACHED" => Some(Self::SessionsLimitReached),
+            "SUBSCRIPTION_EXPIRED" => Some(Self::SubscriptionExpired),
+            "BANNED" => Some(Self::Banned),
+            _ => None,
+        }
+    }
+}
+
+
+
+
+================================================
+����: W:\Work\anet\anet\anet-common\src\generated\mod.rs
+================================================
+#![allow(dead_code)]
+#![allow(clippy::all)]
+
+mod anet;
+
+include!("anet.rs");
+
+
+
+
+================================================
+����: W:\Work\anet\anet\anet-common\src\handshake_fragmentation.rs
+================================================
+//! Фрагментация самого первого пакета рукопожатия — до появления сессионного
+//! ключа, поэтому вне обычного padding/jitter-конвейера (`jitter.rs`,
+//! `bridge_crypto_stream_with_jitter`), который требует уже готовый `Cipher`.
+//!
+//! Цель — не дать DPI опознать фиксированную по размеру/структуре сигнатуру
+//! первого пакета, разбив его на несколько частей со случайными точками
+//! разреза и джиттером между ними (аналог `--native-frag` в GoodbyeDPI, но
+//! применённый проактивно к своему же исходящему хендшейку).
+//!
+//! Два независимых бэкенда:
+//!
+//! - [`write_fragmented`] — для любого потокового транспорта
+//!   (`AsyncWrite + Unpin`: TCP/SSH/VNC, и в будущем WS(S)). Получателю не
+//!   требуется НИКАКИХ изменений — поток сам доставляет байты по порядку
+//!   независимо от границ TCP-сегментов, это встроенное свойство байтовых
+//!   потоков. Новый транспорт получает фрагментацию бесплатно, просто реализуя
+//!   `VpnStream` (`transport_trait.rs`).
+//!
+//! - [`send_fragmented_datagrams`] + [`DatagramReassembler`] — для UDP/QUIC-
+//!   конверта, где датаграммы независимы, порядок и доставка не гарантированы.
+//!   Здесь нужен явный 2-байтный заголовок фрагмента и восстановление на приёме.
+
+use crate::config::StealthConfig;
+use log::debug;
+use rand::rngs::OsRng;
+use rand::Rng;
+use std::collections::BTreeMap;
+use std::io;
+use std::time::Duration;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
+
+/// Настройки фрагментации хендшейка.
+#[derive(Debug, Clone)]
+pub struct FragmentConfig {
+    pub enabled: bool,
+    pub min_chunks: u8,
+    pub max_chunks: u8,
+    pub min_delay_ns: u64,
+    pub max_delay_ns: u64,
+}
+
+impl Default for FragmentConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            min_chunks: 2,
+            max_chunks: 2,
+            min_delay_ns: 0,
+            max_delay_ns: 0,
+        }
+    }
+}
+
+impl FragmentConfig {
+    pub fn from_stealth(cfg: &StealthConfig) -> Self {
+        let min_chunks = cfg.frag_min_chunks.max(2);
+        let max_chunks = cfg.frag_max_chunks.max(min_chunks);
+        Self {
+            enabled: cfg.frag_enabled,
+            min_chunks,
+            max_chunks,
+            min_delay_ns: cfg.min_jitter_ns,
+            max_delay_ns: cfg.max_jitter_ns,
+        }
+    }
+}
+
+/// Выбирает случайные, неповторяющиеся точки разреза строго внутри `[1, len)`.
+/// Точки НЕ выравниваются на фиксированную границу — иначе сама точка разреза
+/// становится новой сигнатурой. Возвращает меньше точек, если `len` слишком
+/// мал для запрошенного числа кусков (деградирует, а не паникует).
+fn random_split_points(len: usize, n_chunks: u8) -> Vec<usize> {
+    let n_chunks = n_chunks.max(1) as usize;
+    if len < 2 || n_chunks <= 1 {
+        return vec![];
+    }
+
+    let n_cuts = (n_chunks - 1).min(len.saturating_sub(1));
+    if n_cuts == 0 {
+        return vec![];
+    }
+
+    let mut rng = OsRng;
+    let mut points: Vec<usize> = Vec::with_capacity(n_cuts);
+    while points.len() < n_cuts {
+        let p = rng.gen_range(1..len);
+        if !points.contains(&p) {
+            points.push(p);
+        }
+    }
+    points.sort_unstable();
+    points
+}
+
+fn pick_chunk_count(cfg: &FragmentConfig) -> u8 {
+    let lo = cfg.min_chunks.max(2);
+    let hi = cfg.max_chunks.max(lo);
+    if hi > lo {
+        OsRng.gen_range(lo..=hi)
+    } else {
+        lo
+    }
+}
+
+async fn jittered_delay(cfg: &FragmentConfig) {
+    if cfg.max_delay_ns == 0 && cfg.min_delay_ns == 0 {
+        return;
+    }
+    let lo = cfg.min_delay_ns.min(cfg.max_delay_ns);
+    let hi = cfg.max_delay_ns.max(cfg.min_delay_ns);
+    let ns = if hi > lo { OsRng.gen_range(lo..=hi) } else { lo };
+    if ns > 0 {
+        tokio::time::sleep(Duration::from_nanos(ns)).await;
+    }
+}
+
+// ============================================================================
+// СТРИМОВЫЕ ТРАНСПОРТЫ (TCP/SSH/VNC/etc)
+// ============================================================================
+
+/// Пишет `data` в поток несколькими отдельными `write_all + flush` вызовами
+/// вместо одного, со случайными точками разреза и джиттером между частями.
+///
+/// Получателю не требуется никаких изменений на уровне протокола — поток
+/// гарантирует доставку байт по порядку независимо от того, сколькими
+/// TCP-сегментами это было разбито на передаче.
+///
+/// ВАЖНО: для реального эффекта на TCP-сокете должен быть выставлен
+/// `TCP_NODELAY` (отключён Nagle) — иначе ОС может успеть склеить несколько
+/// быстрых `write()` обратно в один сегмент до отправки. Для `TcpStream`
+/// вызовите `.set_nodelay(true)?` при установлении соединения, до вызова
+/// этой функции.
+pub async fn write_fragmented<S>(stream: &mut S, data: &[u8], cfg: &FragmentConfig) -> io::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    if !cfg.enabled || data.len() < 2 {
+        debug!(
+            "handshake_fragmentation: DISABLED or too short — sending {} bytes as a single write",
+            data.len()
+        );
+        stream.write_all(data).await?;
+        return stream.flush().await;
+    }
+
+    let n_chunks = pick_chunk_count(cfg);
+    let mut boundaries = random_split_points(data.len(), n_chunks);
+
+    if boundaries.is_empty() {
+        debug!(
+            "handshake_fragmentation: no valid split points for {} bytes — sending as a single write",
+            data.len()
+        );
+        stream.write_all(data).await?;
+        return stream.flush().await;
+    }
+    boundaries.push(data.len());
+
+    debug!(
+        "handshake_fragmentation: STREAM splitting {} bytes into {} chunk(s) at boundaries {:?}",
+        data.len(),
+        boundaries.len(),
+        boundaries
+    );
+
+    let mut start = 0usize;
+    for (i, &end) in boundaries.iter().enumerate() {
+        let t0 = std::time::Instant::now();
+        stream.write_all(&data[start..end]).await?;
+        stream.flush().await?;
+        debug!(
+            "handshake_fragmentation: STREAM chunk {}/{} = {} bytes written+flushed in {:?}",
+            i + 1,
+            boundaries.len(),
+            end - start,
+            t0.elapsed()
+        );
+        start = end;
+
+        if i + 1 < boundaries.len() {
+            jittered_delay(cfg).await;
+        }
+    }
+
+    Ok(())
+}
+
+// ============================================================================
+// UDP / QUIC-КОНВЕРТ
+// ============================================================================
+
+/// Заголовок фрагмента датаграммы: `[index: u8][total: u8]` + полезная
+/// нагрузка. 2 байта оверхеда на фрагмент — приемлемо для одноразового
+/// хендшейка, который в остальном не имеет собственного framing на этом
+/// уровне (в отличие от `stream_framing.rs`).
+const FRAG_HEADER_LEN: usize = 2;
+
+fn wrap_single(data: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(FRAG_HEADER_LEN + data.len());
+    buf.push(0);
+    buf.push(1);
+    buf.extend_from_slice(data);
+    buf
+}
+
+/// Разбивает `data` на фрагменты-датаграммы, каждая со своим заголовком.
+/// При выключенной фрагментации (или коротком `data`) возвращает один
+/// элемент с `total == 1` — получатель обрабатывает оба случая одинаково.
+fn split_datagram_fragments(data: &[u8], cfg: &FragmentConfig) -> Vec<Vec<u8>> {
+    if !cfg.enabled || data.len() < 2 {
+        return vec![wrap_single(data)];
+    }
+
+    let n_chunks = pick_chunk_count(cfg);
+    let mut cuts = random_split_points(data.len(), n_chunks);
+    if cuts.is_empty() {
+        return vec![wrap_single(data)];
+    }
+    cuts.push(data.len());
+
+    let total = cuts.len() as u8;
+    let mut out = Vec::with_capacity(cuts.len());
+    let mut start = 0usize;
+    for (i, &end) in cuts.iter().enumerate() {
+        let mut frag = Vec::with_capacity(FRAG_HEADER_LEN + (end - start));
+        frag.push(i as u8);
+        frag.push(total);
+        frag.extend_from_slice(&data[start..end]);
+        out.push(frag);
+        start = end;
+    }
+    out
+}
+
+/// Отправляет `data` как одну или несколько отдельных UDP-датаграмм.
+///
+/// `send_fn` — фактическая отправка одной уже готовой (с заголовком фрагмента)
+/// датаграммы. Сигнатура намеренно абстрактна (не привязана к конкретному
+/// типу сокета), чтобы подходить и для `tokio::net::UdpSocket::send_to`,
+/// и для кастомной обёртки поверх `quinn`-совместимого сокета.
+pub async fn send_fragmented_datagrams<F, Fut>(
+    data: &[u8],
+    cfg: &FragmentConfig,
+    mut send_fn: F,
+) -> io::Result<()>
+where
+    F: FnMut(Vec<u8>) -> Fut,
+    Fut: std::future::Future<Output = io::Result<()>>,
+{
+    let fragments = split_datagram_fragments(data, cfg);
+
+    for (i, frag) in fragments.iter().enumerate() {
+        send_fn(frag.clone()).await?;
+        if i + 1 < fragments.len() {
+            jittered_delay(cfg).await;
+        }
+    }
+
+    Ok(())
+}
+
+/// Восстанавливает фрагментированную (или обычную, `total == 1`) датаграмму
+/// хендшейка на стороне получателя.
+///
+/// Один экземпляр — на один ожидаемый хендшейк/источник (например, держите
+/// `DatagramReassembler` в `HashMap<SocketAddr, DatagramReassembler>`, пока
+/// для этого адреса ещё не установлена полноценная сессия). После того как
+/// `feed()` вернул `Some(..)`, состояние уже сброшено — экземпляр готов для
+/// следующего хендшейка того же источника, пересоздавать не нужно.
+#[derive(Debug, Default)]
+pub struct DatagramReassembler {
+    total: Option<u8>,
+    parts: BTreeMap<u8, Vec<u8>>,
+}
+
+impl DatagramReassembler {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Скармливает очередную полученную датаграмму. Возвращает `Some(data)`,
+    /// когда собраны все фрагменты (в т.ч. сразу для нефрагментированного
+    /// случая `total == 1`). Датаграммы короче заголовка или с некорректным
+    /// `index`/`total` молча игнорируются (не относящийся к хендшейку мусор).
+    pub fn feed(&mut self, datagram: &[u8]) -> Option<Vec<u8>> {
+        if datagram.len() < FRAG_HEADER_LEN {
+            return None;
+        }
+        let index = datagram[0];
+        let total = datagram[1];
+        if total == 0 || index >= total {
+            return None;
+        }
+
+        // Датаграмма из другого набора (total изменился) — считаем это новым
+        // хендшейком и сбрасываем ранее накопленные части.
+        if self.total.is_some_and(|t| t != total) {
+            self.parts.clear();
+        }
+        self.total = Some(total);
+        self.parts.insert(index, datagram[FRAG_HEADER_LEN..].to_vec());
+
+        if self.parts.len() as u8 == total {
+            let mut out = Vec::new();
+            for i in 0..total {
+                out.extend_from_slice(self.parts.get(&i)?);
+            }
+            self.parts.clear();
+            self.total = None;
+            Some(out)
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frag_cfg(min: u8, max: u8) -> FragmentConfig {
+        FragmentConfig {
+            enabled: true,
+            min_chunks: min,
+            max_chunks: max,
+            min_delay_ns: 0,
+            max_delay_ns: 0,
+        }
+    }
+
+    #[test]
+    fn split_points_are_within_bounds_and_sorted() {
+        let points = random_split_points(100, 3);
+        assert!(points.len() <= 2);
+        for w in points.windows(2) {
+            assert!(w[0] < w[1]);
+        }
+        for &p in &points {
+            assert!(p > 0 && p < 100);
+        }
+    }
+
+    #[test]
+    fn split_points_handle_tiny_input() {
+        assert!(random_split_points(1, 4).is_empty());
+        assert!(random_split_points(0, 4).is_empty());
+    }
+
+    #[tokio::test]
+    async fn write_fragmented_reassembles_correctly_over_stream() {
+        let cfg = frag_cfg(3, 3);
+        let data = b"hello world this is a handshake payload of some length";
+
+        let (mut client, mut server) = tokio::io::duplex(4096);
+
+        let data_owned = data.to_vec();
+        let writer = tokio::spawn(async move {
+            write_fragmented(&mut client, &data_owned, &cfg).await.unwrap();
+        });
+
+        let mut buf = vec![0u8; data.len()];
+        tokio::io::AsyncReadExt::read_exact(&mut server, &mut buf)
+            .await
+            .unwrap();
+        writer.await.unwrap();
+
+        assert_eq!(&buf, data);
+    }
+
+    #[tokio::test]
+    async fn write_fragmented_disabled_is_a_single_write() {
+        let cfg = FragmentConfig::default(); // enabled = false
+        let data = b"unfragmented payload";
+
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let data_owned = data.to_vec();
+        let writer = tokio::spawn(async move {
+            write_fragmented(&mut client, &data_owned, &cfg).await.unwrap();
+        });
+
+        let mut buf = vec![0u8; data.len()];
+        tokio::io::AsyncReadExt::read_exact(&mut server, &mut buf)
+            .await
+            .unwrap();
+        writer.await.unwrap();
+
+        assert_eq!(&buf, data);
+    }
+
+    #[test]
+    fn datagram_fragments_reassemble_out_of_order() {
+        let cfg = frag_cfg(3, 3);
+        let data = b"another handshake payload, split across several datagrams";
+
+        let fragments = split_datagram_fragments(data, &cfg);
+        assert!(fragments.len() >= 2);
+
+        // получатель может увидеть их в перемешанном порядке
+        let mut shuffled = fragments.clone();
+        shuffled.reverse();
+
+        let mut reassembler = DatagramReassembler::new();
+        let mut result = None;
+        for frag in &shuffled {
+            result = reassembler.feed(frag);
+        }
+
+        assert_eq!(result.unwrap(), data);
+    }
+
+    #[test]
+    fn single_fragment_case_is_transparent() {
+        let cfg = FragmentConfig::default(); // enabled = false
+        let fragments = split_datagram_fragments(b"short", &cfg);
+        assert_eq!(fragments.len(), 1);
+
+        let mut reassembler = DatagramReassembler::new();
+        let result = reassembler.feed(&fragments[0]);
+        assert_eq!(result.unwrap(), b"short".to_vec());
+    }
+
+    #[test]
+    fn garbage_datagram_is_ignored() {
+        let mut reassembler = DatagramReassembler::new();
+        assert!(reassembler.feed(&[]).is_none());
+        assert!(reassembler.feed(&[0]).is_none()); // короче заголовка
+        assert!(reassembler.feed(&[5, 2, 1, 2, 3]).is_none()); // index >= total
+    }
+}
+
+
+
+
+================================================
+����: W:\Work\anet\anet\anet-common\src\http_help.rs
+================================================
+use rand::{Rng, seq::SliceRandom};
+
+pub const CHROME_USER_AGENTS: &[&str] = &[
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+];
+
+pub const FIREFOX_USER_AGENTS: &[&str] = &[
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+    "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:125.0) Gecko/20100101 Firefox/125.0",
+];
+
+pub const SAFARI_USER_AGENTS: &[&str] = &[
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1",
+];
+
+pub const CHROME_BRANDS: &[&str] = &[
+    "\"Chromium\";v=\"124\", \"Google Chrome\";v=\"124\", \"Not-A.Brand\";v=\"99\"",
+    "\"Google Chrome\";v=\"123\", \"Chromium\";v=\"123\", \"Not:A-Brand\";v=\"8\"",
+    "\"Chromium\";v=\"124\", \"Google Chrome\";v=\"124\", \"Not-A.Brand\";v=\"99\"",
+];
+
+pub const CHROME_PLATFORMS: &[&str] = &["\"Windows\"", "\"Linux\"", "\"macOS\""];
+
+pub const ACCEPT_LANGUAGES: &[&str] = &[
+    "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+    "en-US,en;q=0.9",
+    "en-GB,en;q=0.9,en-US;q=0.8,en;q=0.7",
+];
+
+#[derive(Clone, Debug)]
+pub struct BrowserProfile {
+    pub user_agent: &'static str,
+    pub accept_language: &'static str,
+    pub chrome_profile: Option<usize>,
+}
+
+impl BrowserProfile {
+    pub fn random() -> Self {
+        let mut rng = rand::thread_rng();
+        let family = rng.gen_range(0..3);
+        let (user_agent, chrome_profile) = match family {
+            0 => {
+                let index = rng.gen_range(0..CHROME_USER_AGENTS.len());
+                (CHROME_USER_AGENTS[index], Some(index))
+            }
+            1 => (
+                *FIREFOX_USER_AGENTS.choose(&mut rng).unwrap(),
+                None,
+            ),
+            _ => (
+                *SAFARI_USER_AGENTS.choose(&mut rng).unwrap(),
+                None,
+            ),
+        };
+        Self {
+            user_agent,
+            accept_language: *ACCEPT_LANGUAGES.choose(&mut rng).unwrap(),
+            chrome_profile,
+        }
+    }
+
+    /// Генерирует HTTP-заголовок, идеально имитирующий браузер
+    pub fn build_headers(
+        &self,
+        method: &str,
+        host: &str,
+        path: &str,
+        content_length: Option<usize>,
+        is_chunked: bool,
+    ) -> String {
+        let mut req = format!(
+            "{} {} HTTP/1.1\r\n\
+             Host: {}\r\n\
+             User-Agent: {}\r\n\
+             Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8\r\n\
+             Accept-Language: {}\r\n\
+             Accept-Encoding: gzip, deflate, br\r\n\
+             Connection: keep-alive\r\n\
+             Sec-Fetch-Dest: document\r\n\
+             Sec-Fetch-Mode: navigate\r\n\
+             Sec-Fetch-Site: none\r\n\
+             Cache-Control: no-cache\r\n\
+             Pragma: no-cache\r\n",
+            method, path, host, self.user_agent, self.accept_language
+        );
+
+        if let Some(index) = self.chrome_profile {
+            req.push_str(&format!("sec-ch-ua: {}\r\n", CHROME_BRANDS[index]));
+            req.push_str("sec-ch-ua-mobile: ?0\r\n");
+            req.push_str(&format!("sec-ch-ua-platform: {}\r\n", CHROME_PLATFORMS[index]));
+        }
+
+        if is_chunked {
+            req.push_str("Transfer-Encoding: chunked\r\n");
+        } else if let Some(len) = content_length {
+            req.push_str(&format!("Content-Length: {}\r\n", len));
+        }
+
+        req.push_str("\r\n");
+        req
+    }
+}
+
+
+
+
+================================================
+����: W:\Work\anet\anet\anet-common\src\jitter.rs
+================================================
+use crate::config::StealthConfig;
+use crate::consts::{COALESCE_BUDGET_BYTES, CRYPTO_COALESCE_BUDGET_BYTES};
+use crate::encryption::Cipher;
+use crate::padding_utils::calculate_padding_needed;
+use crate::stream_framing::frame_packet_into;
+use bytes::{Bytes, BytesMut};
+use futures::future::BoxFuture;
+use futures::stream::FuturesUnordered;
+use futures::{FutureExt, StreamExt};
+use rand::Rng;
+use rand::SeedableRng;
+use rand::rngs::StdRng;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+use tokio::io::AsyncWriteExt;
+use tokio::sync::mpsc;
+use tokio::time::sleep;
+
+const MAX_PENDING_JITTER_PACKETS: usize = 256;
+
+pub async fn bridge_with_jitter<S>(
+    mut rx: mpsc::Receiver<Bytes>,
+    mut stream: S,
+    config: StealthConfig,
+) -> anyhow::Result<()>
+where
+    S: AsyncWriteExt + Unpin + Send + 'static,
+{
+    let jitter_enabled = config.max_jitter_ns > config.min_jitter_ns;
+    let mut rng = StdRng::from_entropy();
+    let mut pending = FuturesUnordered::<BoxFuture<'static, Bytes>>::new();
+    let mut input_open = true;
+    let mut buf = BytesMut::with_capacity(COALESCE_BUDGET_BYTES);
+
+    while input_open || !pending.is_empty() {
+        let packet = if !jitter_enabled {
+            match rx.recv().await {
+                Some(packet) => packet,
+                None => break,
+            }
+        } else if pending.is_empty() {
+            match rx.recv().await {
+                Some(packet) => {
+                    schedule_with_jitter(&mut pending, packet, &config, &mut rng);
+                    continue;
+                }
+                None => {
+                    input_open = false;
+                    continue;
+                }
+            }
+        } else if !input_open || pending.len() >= MAX_PENDING_JITTER_PACKETS {
+            pending.next().await.expect("jitter queue is not empty")
+        } else {
+            tokio::select! {
+                packet = rx.recv() => {
+                    match packet {
+                        Some(packet) => {
+                            schedule_with_jitter(&mut pending, packet, &config, &mut rng);
+                            continue;
+                        }
+                        None => {
+                            input_open = false;
+                            continue;
+                        }
+                    }
+                }
+                packet = pending.next() => packet.expect("jitter queue is not empty"),
+            }
+        };
+
+        if packet.len() < 20 {
+            continue;
+        }
+
+        buf.clear();
+        frame_packet_into(&mut buf, &packet);
+
+        // On the fast path, drain ready packets into one stream write. With jitter enabled,
+        // completion order is intentionally retained and each timer stays independently delayed.
+        while !jitter_enabled && buf.len() < COALESCE_BUDGET_BYTES {
+            match rx.try_recv() {
+                Ok(packet) if packet.len() >= 20 => frame_packet_into(&mut buf, &packet),
+                Ok(_) => continue,
+                Err(_) => break,
+            }
+        }
+
+        stream.write_all(&buf).await?;
+        stream.flush().await?;
+    }
+
+    stream.shutdown().await?;
+    Ok(())
+}
+
+/// Шифрует и объединяет пакеты потокового SSH-транспорта с ограниченным джиттером.
+pub async fn bridge_crypto_stream_with_jitter<S>(
+    mut rx: mpsc::Receiver<Bytes>,
+    mut stream: S,
+    config: StealthConfig,
+    cipher: Arc<Cipher>,
+    sequence: Arc<AtomicU64>,
+    nonce_prefix: [u8; 4],
+) -> anyhow::Result<()>
+where
+    S: AsyncWriteExt + Unpin + Send + 'static,
+{
+    let padding_step = config.padding_step;
+    let jitter_enabled = config.max_jitter_ns > config.min_jitter_ns;
+    let mut rng = StdRng::from_entropy();
+    let mut pending = FuturesUnordered::<BoxFuture<'static, Bytes>>::new();
+    let mut input_open = true;
+    let mut buf = BytesMut::with_capacity(CRYPTO_COALESCE_BUDGET_BYTES);
+
+    let encrypt_into = |packet: Bytes, buf: &mut BytesMut| -> anyhow::Result<()> {
+        let seq = sequence.fetch_add(1, Ordering::Relaxed);
+        let total_len = packet.len() + 38;
+        let pad = calculate_padding_needed(total_len, padding_step);
+        let safe_pad = if total_len + (pad as usize) > crate::consts::PADDING_MTU {
+            0
+        } else {
+            pad
+        };
+
+        let encrypted =
+            crate::transport::wrap_packet(&cipher, &nonce_prefix, seq, packet, safe_pad)?;
+        frame_packet_into(buf, &encrypted);
+        Ok(())
+    };
+
+    while input_open || !pending.is_empty() {
+        let packet = if !jitter_enabled {
+            match rx.recv().await {
+                Some(packet) => packet,
+                None => break,
+            }
+        } else if pending.is_empty() {
+            match rx.recv().await {
+                Some(packet) => {
+                    schedule_with_jitter(&mut pending, packet, &config, &mut rng);
+                    continue;
+                }
+                None => {
+                    input_open = false;
+                    continue;
+                }
+            }
+        } else if !input_open || pending.len() >= MAX_PENDING_JITTER_PACKETS {
+            pending.next().await.expect("очередь джиттера не пуста")
+        } else {
+            tokio::select! {
+                packet = rx.recv() => {
+                    match packet {
+                        Some(packet) => {
+                            schedule_with_jitter(&mut pending, packet, &config, &mut rng);
+                            continue;
+                        }
+                        None => {
+                            input_open = false;
+                            continue;
+                        }
+                    }
+                }
+                packet = pending.next() => packet.expect("очередь джиттера не пуста"),
+            }
+        };
+        if packet.len() < 20 {
+            continue;
+        }
+
+        buf.clear();
+        encrypt_into(packet, &mut buf)?;
+
+        // При выключенном джиттере объединяем уже ожидающие пакеты в одну SSH-запись.
+        while !jitter_enabled && buf.len() < CRYPTO_COALESCE_BUDGET_BYTES {
+            match rx.try_recv() {
+                Ok(packet) if packet.len() >= 20 => encrypt_into(packet, &mut buf)?,
+                Ok(_) => continue,
+                Err(_) => break,
+            }
+        }
+
+        if buf.is_empty() {
+            continue;
+        }
+
+        stream.write_all(&buf).await?;
+        stream.flush().await?;
+    }
+
+    stream.shutdown().await?;
+    Ok(())
+}
+
+fn schedule_with_jitter(
+    pending: &mut FuturesUnordered<BoxFuture<'static, Bytes>>,
+    packet: Bytes,
+    config: &StealthConfig,
+    rng: &mut StdRng,
+) {
+    let delay = rng.gen_range(config.min_jitter_ns..=config.max_jitter_ns);
+    pending.push(
+        async move {
+            if delay > 0 {
+                sleep(Duration::from_nanos(delay)).await;
+            }
+            packet
+        }
+        .boxed(),
+    );
+}
+
+pub async fn receive_crypto_stream<R>(
+    mut reader: R,
+    tx: mpsc::Sender<Bytes>,
+    cipher: Arc<Cipher>,
+) -> anyhow::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    while let Some(encrypted) = crate::stream_framing::read_next_packet(&mut reader).await? {
+        let packet = crate::transport::unwrap_packet_bytes_in_place(&cipher, encrypted)?;
+        tx.send(packet)
+            .await
+            .map_err(|_| anyhow::anyhow!("очередь входящих пакетов закрыта"))?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn test_fast_path_preserves_order_and_framing() {
+        let (tx, rx) = mpsc::channel::<Bytes>(64);
+        let (writer, mut read_half) = tokio::io::duplex(1 << 20);
+
+        for i in 0..50u8 {
+            tx.send(Bytes::from(vec![i; 24])).await.unwrap();
+        }
+        drop(tx);
+
+        let bridge = tokio::spawn(bridge_with_jitter(rx, writer, StealthConfig::default()));
+
+        let mut data = Vec::new();
+        read_half.read_to_end(&mut data).await.unwrap();
+        bridge.await.unwrap().unwrap();
+
+        let mut reader = std::io::Cursor::new(data);
+        for i in 0..50u8 {
+            let pkt = crate::stream_framing::read_next_packet(&mut reader)
+                .await
+                .unwrap()
+                .expect("packet missing");
+            assert_eq!(pkt.len(), 24);
+            assert_eq!(pkt[0], i, "packet order violated");
+        }
+        assert!(
+            crate::stream_framing::read_next_packet(&mut reader)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn crypto_stream_fast_path_round_trip() {
+        let cipher = Arc::new(Cipher::new(&[5; 32]));
+        let sequence = Arc::new(AtomicU64::new(0));
+        let nonce_prefix = [1, 2, 3, 4];
+        let rx = {
+            let (tx, rx) = mpsc::channel::<Bytes>(64);
+            for value in 0..32u8 {
+                tx.send(Bytes::from(vec![value; 64])).await.unwrap();
+            }
+            rx
+        };
+        let (writer, mut reader) = tokio::io::duplex(1 << 20);
+
+        bridge_crypto_stream_with_jitter(
+            rx,
+            writer,
+            StealthConfig::default(),
+            cipher.clone(),
+            sequence,
+            nonce_prefix,
+        )
+        .await
+        .unwrap();
+
+        for value in 0..32u8 {
+            let encrypted = crate::stream_framing::read_next_packet(&mut reader)
+                .await
+                .unwrap()
+                .expect("зашифрованный пакет отсутствует");
+            let packet = crate::transport::unwrap_packet_bytes_in_place(&cipher, encrypted)
+                .expect("пакет должен расшифровываться");
+            assert_eq!(packet, Bytes::from(vec![value; 64]));
+        }
+        assert!(
+            crate::stream_framing::read_next_packet(&mut reader)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fast_path_filters_garbage() {
+        let (tx, rx) = mpsc::channel::<Bytes>(8);
+        let (writer, mut read_half) = tokio::io::duplex(1 << 16);
+
+        tx.send(Bytes::from_static(&[1, 2, 3])).await.unwrap();
+        tx.send(Bytes::from(vec![7u8; 32])).await.unwrap();
+        drop(tx);
+
+        let bridge = tokio::spawn(bridge_with_jitter(rx, writer, StealthConfig::default()));
+
+        let mut data = Vec::new();
+        read_half.read_to_end(&mut data).await.unwrap();
+        bridge.await.unwrap().unwrap();
+
+        let mut reader = std::io::Cursor::new(data);
+        let pkt = crate::stream_framing::read_next_packet(&mut reader)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pkt.len(), 32);
+        assert!(
+            crate::stream_framing::read_next_packet(&mut reader)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+
+
+
+================================================
+����: W:\Work\anet\anet\anet-common\src\lib.rs
+================================================
+pub mod atun;
+pub mod config;
+pub mod consts;
+pub mod crypto_utils;
+pub mod encryption;
+pub mod generated;
+pub mod handshake_fragmentation;
+pub mod jitter;
+pub mod padding_utils;
+pub mod quic_settings;
+pub mod stream_framing;
+pub mod transport;
+pub mod transport_trait;
+pub mod tun_params;
+pub mod udp_poller;
+pub mod vnc;
+pub mod dto;
+pub mod http_help;
+pub mod reassembly;
+
+pub use generated::*;
+pub mod protocol {
+    pub use super::*;
+}
+
+
+
+
+================================================
+����: W:\Work\anet\anet\anet-common\src\padding_utils.rs
+================================================
+use rand::Rng;
+
+/// Рассчитывает, сколько байт нужно добавить, чтобы `current_len` стало кратным `step`.
+pub fn calculate_padding_needed(current_len: usize, step: u16) -> u16 {
+    if step == 0 {
+        return 0;
+    }
+    let step = step as usize;
+
+    // Округляем вверх: ((x + step - 1) / step) * step
+    let target = ((current_len + step - 1) / step) * step;
+
+    target.saturating_sub(current_len) as u16
+}
+
+/// Генерирует вектор случайных байт для Protobuf (где паддинг виден или просто XOR-ен).
+pub fn generate_random_padding(needed: u16) -> Vec<u8> {
+    if needed == 0 {
+        return Vec::new();
+    }
+    let mut rng = rand::thread_rng();
+    let mut buf = vec![0u8; needed as usize];
+    rng.fill(&mut buf[..]);
+    buf
+}
+
+
+
+
+================================================
+����: W:\Work\anet\anet\anet-common\src\protocol.rs
+================================================
+include!(concat!(env!("OUT_DIR"), "/protocol.rs"));
+
+
+
+
+================================================
+����: W:\Work\anet\anet\anet-common\src\quic_settings.rs
+================================================
+// Файл: anet-common/src/quic_settings.rs
+
+use anyhow::Result;
+use log::info;
+use quinn::congestion::{BbrConfig, ControllerFactory, CubicConfig};
+use quinn::{IdleTimeout, MtuDiscoveryConfig, TransportConfig, VarInt};
+use serde::Deserialize;
+use std::{sync::Arc, time::Duration};
+
+const BYTES_IN_MEGABIT: u64 = 125_000;
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct QuicConfig {
+    pub algorithm: String,
+    pub expected_rtt_ms: u32,
+
+    // ИЗМЕНЕНО: Разделяем пропускную способность для более точного расчета
+    /// Bandwidth for incoming traffic (e.g., download speed).
+    pub bandwidth_down_mbps: u32,
+    /// Bandwidth for outgoing traffic (e.g., upload speed).
+    pub bandwidth_up_mbps: u32,
+
+    // ИЗМЕНЕНО: Разделяем окна, делаем их опциональными
+    /// Stream receive window size (bytes). If not set, calculated automatically.
+    pub stream_receive_window: Option<u64>,
+    /// Connection receive window size (bytes). If not set, calculated automatically.
+    pub receive_window: Option<u64>,
+    /// Connection send window size (bytes). If not set, calculated automatically.
+    pub send_window: Option<u64>,
+
+    pub max_mtu: u16,
+
+    pub enable_gso: bool,
+    pub idle_timeout_seconds: Option<u64>,
+    pub keep_alive_interval_seconds: Option<u64>,
+}
+
+impl Default for QuicConfig {
+    fn default() -> Self {
+        Self {
+            algorithm: "bbr".to_string(),
+            expected_rtt_ms: 60,
+            bandwidth_down_mbps: 200, // Значения по умолчанию
+            bandwidth_up_mbps: 100,
+            stream_receive_window: None,
+            receive_window: None,
+            send_window: None,
+            enable_gso: true,
+            idle_timeout_seconds: Some(3600),
+            max_mtu: 1500,
+            keep_alive_interval_seconds: Some(20),
+        }
+    }
+}
+
+/// Helper to calculate window size based on BDP.
+/// BDP = bandwidth (bytes/sec) * RTT (sec)
+/// We use BDP * 2.5 as a common recommendation for window size.
+fn calculate_window_from_bdp(mbps: u32, rtt_ms: u32) -> u64 {
+    let bandwidth_bytes_per_sec = mbps as u64 * BYTES_IN_MEGABIT;
+    let rtt_seconds_float = rtt_ms as f64 / 1000.0;
+    let bdp = (bandwidth_bytes_per_sec as f64 * rtt_seconds_float) as u64;
+
+    // Window should be at least 2-3x BDP. Let's take 2.5x.
+    // Also, ensure a reasonable minimum window size (e.g., 1MB).
+    (bdp * 5 / 2).max(1_048_576)
+}
+
+pub fn build_transport_config(cfg: &QuicConfig, mtu: u16) -> Result<TransportConfig> {
+    let mut config = TransportConfig::default();
+    let rtt_duration = Duration::from_millis(cfg.expected_rtt_ms.max(1) as u64);
+
+    let final_receive_window = cfg
+        .receive_window
+        .unwrap_or_else(|| calculate_window_from_bdp(cfg.bandwidth_down_mbps, cfg.expected_rtt_ms));
+
+    let final_send_window = cfg
+        .send_window
+        .unwrap_or_else(|| calculate_window_from_bdp(cfg.bandwidth_up_mbps, cfg.expected_rtt_ms));
+
+    // The VPN uses one long-lived bidirectional stream, so its flow-control window must not
+    // become the connection bottleneck.
+    let final_stream_receive_window = cfg.stream_receive_window.unwrap_or(final_receive_window);
+
+    let factory: Arc<dyn ControllerFactory + Send + Sync> =
+        match cfg.algorithm.to_lowercase().as_str() {
+            "bbr" => {
+                info!("QUIC Transport using BBR Congestion Control.");
+                Arc::new(BbrConfig::default())
+            }
+            _ => {
+                // "cubic" or default
+                info!("QUIC Transport using CUBIC Congestion Control.");
+                Arc::new(CubicConfig::default())
+            }
+        };
+
+    config.congestion_controller_factory(factory);
+    config.initial_rtt(rtt_duration);
+    // The encrypted UDP adapter advertises one datagram per transmit. A GSO super-packet cannot
+    // be encrypted as one datagram without changing QUIC packet boundaries.
+    config.enable_segmentation_offload(false);
+    if cfg.enable_gso {
+        info!("QUIC GSO disabled: the encrypted UDP adapter requires per-datagram nonces.");
+    }
+
+    // --- ПРИМЕНЯЕМ РАЗДЕЛЬНЫЕ ОКНА ---
+    info!(
+        "QUIC Transport Windows: Recv (Conn/Stream) = {} / {} bytes. Send = {} bytes. RTT = {}",
+        final_receive_window, final_stream_receive_window, final_send_window, cfg.expected_rtt_ms
+    );
+    config
+        .receive_window(VarInt::from_u64(final_receive_window)?)
+        .stream_receive_window(VarInt::from_u64(final_stream_receive_window)?)
+        .send_window(final_send_window);
+
+    // Настройка MTU Discovery
+    let envelope_limit =
+        (crate::consts::PADDING_MTU - crate::consts::TRANSPORT_ENVELOPE_OVERHEAD) as u16;
+    let initial_mtu = mtu.min(envelope_limit).max(1200);
+    let max_mtu = cfg.max_mtu.min(envelope_limit).max(initial_mtu);
+    let mut mtu_config = MtuDiscoveryConfig::default();
+    mtu_config.upper_bound(max_mtu);
+    config
+        .initial_mtu(initial_mtu)
+        .mtu_discovery_config(Some(mtu_config));
+    info!(
+        "QUIC MTU: initial {}, discovery ceiling {} ({} bytes reserved for encryption).",
+        initial_mtu,
+        max_mtu,
+        crate::consts::TRANSPORT_ENVELOPE_OVERHEAD
+    );
+
+    // Таймаут
+    if let Some(timeout_secs) = cfg.idle_timeout_seconds
+        && timeout_secs > 0
+    {
+        let timeout = IdleTimeout::try_from(Duration::from_secs(timeout_secs))?;
+        config.max_idle_timeout(Some(timeout));
+        info!(
+            "QUIC Transport: Max Idle Timeout set to {} seconds.",
+            timeout_secs
+        );
+    }
+
+    // Настройка Keep-Alive (Пингов) во избежание протухания NAT-таблиц провайдеров
+    if let Some(interval_secs) = cfg.keep_alive_interval_seconds
+        && interval_secs > 0
+    {
+        config.keep_alive_interval(Some(Duration::from_secs(interval_secs)));
+        info!(
+            "QUIC Transport: Keep-Alive Interval set to {} seconds.",
+            interval_secs
+        );
+    }
+
+    Ok(config)
+}
+
+
+
+
+================================================
+����: W:\Work\anet\anet\anet-common\src\reassembly.rs
+================================================
+use std::collections::BTreeMap;
+use bytes::Bytes;
+
+pub struct ReassemblyQueue {
+    next_seq: u64,
+    buffer: BTreeMap<u64, Bytes>,
+    max_size: usize,
+}
+
+impl ReassemblyQueue {
+    pub fn new(max_size: usize) -> Self {
+        Self {
+            next_seq: 0,
+            buffer: BTreeMap::new(),
+            max_size,
+        }
+    }
+
+    /// Вставляет пакет с порядковым номером `seq` в очередь.
+    /// Если в результате вставки образовалась непрерывная цепочка готовых к отправке пакетов,
+    /// возвращает их в правильном порядке.
+    pub fn insert(&mut self, seq: u64, payload: Bytes) -> Vec<Bytes> {
+        if seq < self.next_seq {
+            return Vec::new(); // Дубликат или старый пакет — игнорируем
+        }
+
+        self.buffer.insert(seq, payload);
+
+        // Ограничиваем размер буфера
+        if self.buffer.len() > self.max_size {
+            if let Some(&oldest_seq) = self.buffer.keys().next() {
+                self.buffer.remove(&oldest_seq);
+                self.next_seq = oldest_seq + 1;
+            }
+        }
+
+        let mut drained = Vec::new();
+        while let Some(packet) = self.buffer.remove(&self.next_seq) {
+            drained.push(packet);
+            self.next_seq += 1;
+        }
+        drained
+    }
+}
+
+
+
+
+================================================
+����: W:\Work\anet\anet\anet-common\src\stream_framing.rs
+================================================
+use crate::consts::MAX_PACKET_SIZE;
+use bytes::{BufMut, Bytes, BytesMut};
+use log::error;
+use std::io;
+
+const LENGTH_PREFIX_SIZE: usize = 2; // u16 длина префикса
+
+/// Создает сегмент потока: [u16 length][payload]
+/// Используется в QUIC TX задаче.
+pub fn frame_packet(payload: Bytes) -> Bytes {
+    let len = payload.len() as u16;
+    let mut framed_data = BytesMut::with_capacity(LENGTH_PREFIX_SIZE + payload.len());
+
+    // 1. Добавляем u16 длины (Big Endian)
+    framed_data.put_u16(len);
+    // 2. Добавляем полезную нагрузку (IP пакет)
+    framed_data.put(payload);
+
+    framed_data.freeze()
+}
+
+/// Дописывает сегмент [u16 length][payload] в существующий буфер.
+/// В отличие от `frame_packet` не выделяет память на каждый пакет —
+/// используется для коалесценции нескольких пакетов в одну запись стрима.
+#[inline]
+pub fn frame_packet_into(buf: &mut BytesMut, payload: &Bytes) {
+    buf.reserve(LENGTH_PREFIX_SIZE + payload.len());
+    buf.put_u16(payload.len() as u16);
+    buf.put_slice(payload);
+}
+
+/// Читает ровно один IP-пакет из QUIC стрима.
+/// Возвращает None, если стрим закрыт, или Result<Bytes, io::Error>
+/// Используется в QUIC RX задаче.
+#[inline]
+pub async fn read_next_packet<R: tokio::io::AsyncRead + tokio::io::AsyncReadExt + Unpin>(
+    reader: &mut R,
+) -> io::Result<Option<Bytes>> {
+    loop {
+        let mut len_buf = [0u8; LENGTH_PREFIX_SIZE];
+
+        // 1. Считываем префикс длины (2 байта)
+        match reader.read_exact(&mut len_buf).await {
+            Ok(_) => {
+                let len = u16::from_be_bytes(len_buf) as usize;
+
+                if len == 0 {
+                    // Пакет нулевой длины игнорируем, но продолжаем читать.
+                    // ВАЖНО: раньше тут возвращался Ok(None), который все вызывающие
+                    // трактуют как EOF и рвут туннель. Теперь честно пропускаем фрейм.
+                    error!("Received packet with zero length prefix, skipping frame.");
+                    continue;
+                }
+                if len > MAX_PACKET_SIZE {
+                    error!(
+                        "Received oversized packet length: {}. Max allowed: {}",
+                        len, MAX_PACKET_SIZE
+                    );
+                    // Критическая ошибка фрейминга, разрываем соединение
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Oversized packet received",
+                    ));
+                }
+
+                // 2. Считываем полный пакет данных
+                let mut buf = vec![0u8; len];
+                reader.read_exact(&mut buf).await?;
+
+                return Ok(Some(Bytes::from(buf)));
+            }
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                // EOF при чтении префикса
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_read_normal_packet() {
+        let payload = vec![0xAB; 100];
+        let mut data = vec![0u8, 100]; // длина 100 BE
+        data.extend_from_slice(&payload);
+        let mut reader = std::io::Cursor::new(data);
+
+        let pkt = read_next_packet(&mut reader).await.unwrap().unwrap();
+        assert_eq!(pkt.len(), 100);
+        assert_eq!(pkt[0], 0xAB);
+    }
+
+    #[tokio::test]
+    async fn test_zero_length_frame_is_skipped_not_eof() {
+        // [len=0][len=3][3 байта] — нулевой фрейм должен быть пропущен,
+        // а следующий пакет — прочитан (раньше тут возвращался Ok(None) => разрыв туннеля)
+        let data = vec![0, 0, 0, 3, 1, 2, 3];
+        let mut reader = std::io::Cursor::new(data);
+
+        let pkt = read_next_packet(&mut reader).await.unwrap().unwrap();
+        assert_eq!(&pkt[..], &[1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn test_eof_returns_none() {
+        let mut reader = std::io::Cursor::new(Vec::<u8>::new());
+        assert!(read_next_packet(&mut reader).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_oversized_frame_is_error() {
+        let len = (MAX_PACKET_SIZE + 1) as u16;
+        let data = len.to_be_bytes().to_vec();
+        let mut reader = std::io::Cursor::new(data);
+        assert!(read_next_packet(&mut reader).await.is_err());
+    }
+
+    #[test]
+    fn test_frame_packet_into_matches_frame_packet() {
+        let payload = Bytes::from_static(&[9, 8, 7, 6]);
+        let framed = frame_packet(payload.clone());
+
+        let mut buf = BytesMut::new();
+        frame_packet_into(&mut buf, &payload);
+        assert_eq!(&framed[..], &buf[..]);
+    }
+}
+
+
+
+
+================================================
+����: W:\Work\anet\anet\anet-common\src\transport.rs
+================================================
+use crate::consts::{NONCE_LEN, NONCE_PREFIX_LEN, PADDING_MTU, TRANSPORT_ENVELOPE_OVERHEAD};
+use crate::encryption::{Cipher, EncryptionError};
+use crate::padding_utils::calculate_padding_needed;
+use anyhow::{Result, anyhow};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
+
+/// Упаковывает и шифрует QUIC-пакет с новым протоколом
+pub fn wrap_packet(
+    cipher: &Cipher,
+    nonce_prefix: &[u8; NONCE_PREFIX_LEN],
+    sequence: u64,
+    quic_payload: Bytes,
+    padding_size: u16,
+) -> Result<Bytes, EncryptionError> {
+    wrap_packet_slice(cipher, nonce_prefix, sequence, &quic_payload, padding_size)
+}
+
+/// Packs and encrypts a packet using a single output allocation.
+pub fn wrap_packet_slice(
+    cipher: &Cipher,
+    nonce_prefix: &[u8; NONCE_PREFIX_LEN],
+    sequence: u64,
+    payload: &[u8],
+    padding_size: u16,
+) -> Result<Bytes, EncryptionError> {
+    let payload_len = payload.len();
+
+    // Nonce = [prefix][sequence]
+    let mut nonce = [0u8; NONCE_LEN];
+    nonce[..NONCE_PREFIX_LEN].copy_from_slice(nonce_prefix);
+    // Последние 8 байт nonce - это сам sequence, для уникальности
+    nonce[NONCE_PREFIX_LEN..].copy_from_slice(&sequence.to_be_bytes());
+
+    // Reserve the final wire buffer once: nonce + plaintext + authentication tag.
+    let mut final_packet =
+        BytesMut::with_capacity(NONCE_LEN + 10 + payload_len + padding_size as usize + 16);
+    final_packet.put_slice(&nonce);
+    final_packet.put_u64(sequence);
+    final_packet.put_u16(payload_len as u16);
+    final_packet.put_slice(payload);
+    final_packet.put_bytes(0, padding_size as usize);
+
+    let tag = {
+        let plaintext = &mut final_packet[NONCE_LEN..];
+        cipher.encrypt_in_place_detached(&nonce, plaintext)?
+    };
+    final_packet.put_slice(&tag);
+
+    Ok(final_packet.freeze())
+}
+
+/// Applies the configured transport padding and encrypts an owned packet.
+#[inline]
+pub fn wrap_packet_padded(
+    cipher: &Cipher,
+    nonce_prefix: &[u8; NONCE_PREFIX_LEN],
+    sequence: u64,
+    payload: Bytes,
+    padding_step: u16,
+) -> Result<Bytes, EncryptionError> {
+    let wire_len_without_padding = payload.len() + TRANSPORT_ENVELOPE_OVERHEAD;
+    let requested_padding = calculate_padding_needed(wire_len_without_padding, padding_step);
+    let padding = if wire_len_without_padding + usize::from(requested_padding) <= PADDING_MTU {
+        requested_padding
+    } else {
+        0
+    };
+    wrap_packet_slice(cipher, nonce_prefix, sequence, &payload, padding)
+}
+
+/// Расшифровывает пакет, полученный от сервера
+pub fn unwrap_packet(cipher: &Cipher, raw_packet: &[u8]) -> Result<Bytes> {
+    if raw_packet.len() < NONCE_LEN + 1 {
+        // Nonce + минимум 1 байт payload
+        return Err(anyhow!("Packet too short"));
+    }
+
+    // Извлекаем nonce и зашифрованные данные
+    let (nonce, ciphertext) = raw_packet.split_at(NONCE_LEN);
+
+    // Расшифровываем
+    let mut plaintext = cipher.decrypt(nonce, Bytes::copy_from_slice(ciphertext))?;
+
+    if plaintext.len() < 10 {
+        return Err(anyhow!("Payload too short"));
+    }
+
+    let _seq = plaintext.get_u64();
+    let data_len = plaintext.get_u16() as usize; // Читаем длину
+
+    if data_len > plaintext.remaining() {
+        return Err(anyhow!("Malformed packet length"));
+    }
+    // Обрезаем паддинг
+    Ok(plaintext.copy_to_bytes(data_len))
+}
+
+/// Расшифровывает пакет на месте (без выделения памяти).
+/// buffer: полный пакет (Nonce + Ciphertext + Tag).
+/// Возвращает срез с полезной нагрузкой (Quic Payload).
+pub fn unwrap_packet_in_place<'a>(cipher: &Cipher, buffer: &'a mut [u8]) -> Result<&'a [u8]> {
+    // 16 байт - размер тега Poly1305
+    if buffer.len() < NONCE_LEN + 16 {
+        return Err(anyhow!("Packet too short"));
+    }
+
+    // 1. Копируем Nonce (12 байт), так как decrypt_in_place будет менять buffer
+    let mut nonce = [0u8; NONCE_LEN];
+    nonce.copy_from_slice(&buffer[..NONCE_LEN]);
+
+    // 2. Берем срез данных (включая Tag в конце)
+    let payload_buffer = &mut buffer[NONCE_LEN..];
+
+    // 3. Расшифровываем на месте
+    cipher.decrypt_in_place(&nonce, payload_buffer)?;
+
+    // 4. Отрезаем тег (логически).
+    // Реальная длина данных теперь меньше на 16 байт.
+    let plaintext_len = payload_buffer.len() - 16;
+    let plaintext = &payload_buffer[..plaintext_len];
+
+    // 5. Парсим заголовок ANet: [Seq (8)] [Len (2)] [Payload...] [Padding...]
+    if plaintext.len() < 10 {
+        return Err(anyhow!("Payload too short (header missing)"));
+    }
+
+    // Читаем длину (offset 8, 2 байта) вручную, чтобы не использовать Buf
+    let data_len = u16::from_be_bytes([plaintext[8], plaintext[9]]) as usize;
+
+    if 10 + data_len > plaintext.len() {
+        return Err(anyhow!("Malformed packet length"));
+    }
+
+    // Возвращаем срез чистого пейлоуда
+    Ok(&plaintext[10..10 + data_len])
+}
+
+/// Decrypts an owned packet in place and returns a zero-copy view of its IP payload.
+///
+/// Unlike [`unwrap_packet`], this reuses the receive buffer for both ciphertext and
+/// plaintext. `Bytes` produced directly from a freshly read `Vec` is normally unique;
+/// a shared buffer is rejected rather than silently copied.
+pub fn unwrap_packet_bytes_in_place(cipher: &Cipher, raw_packet: Bytes) -> Result<Bytes> {
+    let mut buffer = raw_packet
+        .try_into_mut()
+        .map_err(|_| anyhow!("Encrypted packet buffer is unexpectedly shared"))?;
+
+    let payload = unwrap_packet_in_place(cipher, &mut buffer)?;
+    let payload_len = payload.len();
+    let payload_start = NONCE_LEN + 10;
+    let payload_end = payload_start + payload_len;
+    buffer.truncate(payload_end);
+    Ok(buffer.freeze().slice(payload_start..payload_end))
+}
+
+/// Decrypts an owned packet in place when its buffer is unique and falls back to the
+/// allocating path for shared buffers such as slices owned by a WebSocket frame parser.
+pub fn unwrap_packet_bytes(cipher: &Cipher, raw_packet: Bytes) -> Result<Bytes> {
+    let mut buffer = match raw_packet.try_into_mut() {
+        Ok(buffer) => buffer,
+        Err(shared) => return unwrap_packet(cipher, &shared),
+    };
+
+    let payload = unwrap_packet_in_place(cipher, &mut buffer)?;
+    let payload_len = payload.len();
+    let payload_start = NONCE_LEN + 10;
+    let payload_end = payload_start + payload_len;
+    buffer.truncate(payload_end);
+    Ok(buffer.freeze().slice(payload_start..payload_end))
+}
+
+#[cfg(test)]
+mod in_place_tests {
+    use super::*;
+
+    #[test]
+    fn owned_in_place_unwrap_matches_allocating_path() {
+        let cipher = Cipher::new(&[9; 32]);
+        let payload = Bytes::from_static(b"test IP packet payload");
+        let encrypted = wrap_packet(&cipher, &[1, 2, 3, 4], 7, payload.clone(), 13).unwrap();
+
+        let allocating = unwrap_packet(&cipher, &encrypted).unwrap();
+        let in_place = unwrap_packet_bytes_in_place(&cipher, encrypted).unwrap();
+
+        assert_eq!(allocating, payload);
+        assert_eq!(in_place, payload);
+    }
+
+    #[test]
+    fn padded_wrap_round_trips_without_changing_payload() {
+        let cipher = Cipher::new(&[3; 32]);
+        let payload = Bytes::from(vec![7; 1400]);
+        let encrypted = wrap_packet_padded(&cipher, &[4, 3, 2, 1], 9, payload.clone(), 64)
+            .expect("packet must encrypt");
+
+        assert!(encrypted.len() <= PADDING_MTU);
+        assert_eq!(unwrap_packet(&cipher, &encrypted).unwrap(), payload);
+    }
+
+    #[test]
+    fn owned_unwrap_falls_back_for_shared_buffers() {
+        let cipher = Cipher::new(&[8; 32]);
+        let payload = Bytes::from_static(b"shared WebSocket frame payload");
+        let encrypted = wrap_packet(&cipher, &[9, 8, 7, 6], 11, payload.clone(), 0).unwrap();
+        let shared = encrypted.clone();
+
+        assert_eq!(unwrap_packet_bytes(&cipher, encrypted).unwrap(), payload);
+        assert!(!shared.is_empty());
+    }
+}
+
+
+
+
+================================================
+����: W:\Work\anet\anet\anet-common\src\transport_trait.rs
+================================================
+use tokio::io::{AsyncRead, AsyncWrite};
+
+// Маркерный трейт для стрима, который можно читать/писать и отправлять между потоками
+pub trait VpnStream: AsyncRead + AsyncWrite + Unpin + Send + Sync {}
+
+// Авто-реализация для всего, что подходит (TcpStream, QuicStream, SshChannelStream)
+impl<T> VpnStream for T where T: AsyncRead + AsyncWrite + Unpin + Send + Sync {}
+
+
+
+
+================================================
+����: W:\Work\anet\anet\anet-common\src\tun_params.rs
+================================================
+use crate::AuthResponse;
+use std::net::Ipv4Addr;
+use tun::Configuration;
+
+#[derive(Clone)]
+pub struct TunParams {
+    pub address: Ipv4Addr,
+    pub netmask: Ipv4Addr,
+    pub gateway: Ipv4Addr,
+    pub name: String,
+    pub mtu: u16,
+
+    pub network: Option<Ipv4Addr>,
+
+}
+
+impl TunParams {
+    pub fn from_auth_response(auth_response: &AuthResponse, adapter: &str) -> Self {
+        Self {
+            address: auth_response.ip.parse().unwrap(),
+            netmask: auth_response.netmask.parse().unwrap(),
+            gateway: auth_response.gateway.parse().unwrap(),
+            name: adapter.to_string(),
+            mtu: auth_response.mtu as u16,
+            network: None,
+        }
+    }
+
+    /// Create TUN configuration for Linux
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "windows"))]
+    pub fn create_config(&self) -> anyhow::Result<Configuration> {
+        let mut config = Configuration::default();
+
+        config.up();
+        config.tun_name(&self.name);
+        config.address(self.address);
+        config.netmask(self.netmask);
+        config.destination(self.gateway);
+        config.mtu(self.mtu);
+
+        Ok(config)
+    }
+
+    /// Create TUN configuration for macOS
+    ///
+    /// macOS utun interfaces have specific behavior:
+    /// - Interface names are assigned dynamically (utun0, utun1, etc.)
+    /// - Custom names like "myvpn" are NOT supported - must be "utunX" with a number
+    /// - If no valid utunX name is provided, we don't set a name and let macOS auto-assign
+    /// - We configure address/netmask but skip destination (point-to-point not needed)
+    #[cfg(target_os = "macos")]
+    pub fn create_config(&self) -> anyhow::Result<Configuration> {
+        let mut config = Configuration::default();
+
+        // Bring interface up
+        config.up();
+
+        // macOS only supports utun interface names with a number (utun0, utun1, etc.)
+        // The tun crate parses the number suffix, so "utun" alone causes an error.
+        // Only set the name if it's a valid "utunX" format with a number.
+        if self.name.starts_with("utun") && self.name.len() > 4 {
+            // Check if the suffix is a valid number
+            if self.name[4..].parse::<u32>().is_ok() {
+                config.tun_name(&self.name);
+            }
+            // Otherwise, don't set name - let macOS auto-assign
+        }
+        // For non-utun names, don't set name - let macOS auto-assign
+
+        // Set IP configuration
+        config.address(self.address);
+        config.netmask(self.netmask);
+
+        // On macOS, we don't set destination for the utun interface
+        // The routing is handled separately via route commands
+        // config.destination(self.gateway);  // Skipped for macOS
+
+        // Set MTU
+        config.mtu(self.mtu);
+
+        Ok(config)
+    }
+
+    pub fn get_info(&self) -> String {
+        format!(
+            "Address: {}, Netmask: {}, Destination: {}, Name: {}, MTU: {}",
+            self.address, self.netmask, self.gateway, self.name, self.mtu
+        )
+    }
+}
+
+
+
+
+================================================
+����: W:\Work\anet\anet\anet-common\src\udp_poller.rs
+================================================
+use quinn::UdpPoller;
+use std::fmt::Debug;
+use std::future::Future;
+use std::io;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
+use tokio::net::UdpSocket;
+
+#[derive(Debug)]
+pub struct TokioUdpPoller {
+    pub io: Arc<UdpSocket>,
+}
+
+impl Future for TokioUdpPoller {
+    type Output = io::Result<()>;
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.io.poll_send_ready(cx).map(|res| res.map(|_| ()))
+    }
+}
+
+impl UdpPoller for TokioUdpPoller {
+    fn poll_writable(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self).poll(cx)
+    }
+}
+
+
+
+
+================================================
+����: W:\Work\anet\anet\anet-common\src\vnc.rs
+================================================
+use crate::consts::MAX_PACKET_SIZE;
+use bytes::{BufMut, Bytes, BytesMut};
+use std::io;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+pub const RFB_VERSION: &[u8; 12] = b"RFB 003.008\n";
+pub const SECURITY_TYPE_NONE: u8 = 1;
+pub const CLIENT_CUT_TEXT: u8 = 6;
+pub const SERVER_CUT_TEXT: u8 = 3;
+
+const CUT_TEXT_HEADER_LEN: usize = 8;
+const MAX_CUT_TEXT_PAYLOAD: usize = MAX_PACKET_SIZE * 2;
+
+pub fn encode_cut_text(message_type: u8, payload: &[u8]) -> io::Result<Bytes> {
+    if !matches!(message_type, CLIENT_CUT_TEXT | SERVER_CUT_TEXT) {
+        return Err(invalid_data("unsupported RFB CutText message type"));
+    }
+    if payload.len() > MAX_CUT_TEXT_PAYLOAD {
+        return Err(invalid_data(
+            "RFB CutText payload exceeds the transport limit",
+        ));
+    }
+
+    let mut frame = BytesMut::with_capacity(CUT_TEXT_HEADER_LEN + payload.len());
+    frame.put_u8(message_type);
+    frame.put_slice(&[0; 3]);
+    frame.put_u32(payload.len() as u32);
+    frame.put_slice(payload);
+    Ok(frame.freeze())
+}
+
+pub async fn write_cut_text<W>(writer: &mut W, message_type: u8, payload: &[u8]) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    writer
+        .write_all(&encode_cut_text(message_type, payload)?)
+        .await
+}
+
+pub async fn read_cut_text<R>(reader: &mut R, expected_type: u8) -> io::Result<Option<Bytes>>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut header = [0u8; CUT_TEXT_HEADER_LEN];
+    match reader.read_exact(&mut header[..1]).await {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(error) => return Err(error),
+    }
+    reader.read_exact(&mut header[1..]).await?;
+
+    if header[0] != expected_type {
+        return Err(invalid_data("unexpected RFB message type"));
+    }
+    if header[1..4] != [0; 3] {
+        return Err(invalid_data("non-zero RFB CutText padding"));
+    }
+
+    let payload_len =
+        u32::from_be_bytes(header[4..8].try_into().expect("fixed-size header")) as usize;
+    if payload_len > MAX_CUT_TEXT_PAYLOAD {
+        return Err(invalid_data(
+            "RFB CutText payload exceeds the transport limit",
+        ));
+    }
+
+    let mut payload = vec![0; payload_len];
+    reader.read_exact(&mut payload).await?;
+    Ok(Some(Bytes::from(payload)))
+}
+
+fn invalid_data(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cut_text_round_trip() {
+        let payload = Bytes::from_static(b"astp packet");
+        let frame = encode_cut_text(CLIENT_CUT_TEXT, &payload).unwrap();
+        let mut reader = std::io::Cursor::new(frame);
+
+        let decoded = read_cut_text(&mut reader, CLIENT_CUT_TEXT)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(decoded, payload);
+    }
+
+    #[tokio::test]
+    async fn rejects_wrong_message_type() {
+        let frame = encode_cut_text(SERVER_CUT_TEXT, b"packet").unwrap();
+        let mut reader = std::io::Cursor::new(frame);
+
+        let error = read_cut_text(&mut reader, CLIENT_CUT_TEXT)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn rejects_oversized_payload_before_allocation() {
+        let mut frame = vec![CLIENT_CUT_TEXT, 0, 0, 0];
+        frame.extend_from_slice(&((MAX_CUT_TEXT_PAYLOAD + 1) as u32).to_be_bytes());
+        let mut reader = io::Cursor::new(frame);
+
+        let error = read_cut_text(&mut reader, CLIENT_CUT_TEXT)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn truncated_header_is_not_treated_as_clean_eof() {
+        let mut reader = std::io::Cursor::new(vec![CLIENT_CUT_TEXT, 0, 0]);
+
+        let error = read_cut_text(&mut reader, CLIENT_CUT_TEXT)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn rejects_oversized_payload_when_encoding() {
+        let payload = vec![0; MAX_CUT_TEXT_PAYLOAD + 1];
+        assert!(encode_cut_text(CLIENT_CUT_TEXT, &payload).is_err());
+    }
+}
+
+
+
+
