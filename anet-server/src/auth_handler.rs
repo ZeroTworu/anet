@@ -492,13 +492,15 @@ impl ServerAuthHandler {
             )),
         });
 
-        self.registry.pre_register_client(client_info.clone());
+
 
         if !is_resume {
             // Мгновенно убиваем зомби-сессии этого же клиента перед стартом новой
             self.registry.disconnect_by_fingerprint(&temp_info.client_fingerprint).await;
-            self.auth_provider.report_session_start(temp_info.client_fingerprint).await;
         }
+
+        self.registry.pre_register_client(client_info.clone());
+        self.auth_provider.report_session_start(temp_info.client_fingerprint).await;
 
         let (netmask, gateway, mtu) = self.registry.get_network_params();
 
