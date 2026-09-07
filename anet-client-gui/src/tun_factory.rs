@@ -1,9 +1,5 @@
+#[cfg(not(target_os = "windows"))]
 use anet_client_core::traits::TunFactory;
-use anet_common::protocol::AuthResponse;
-use anyhow::Result;
-use bytes::Bytes;
-use tokio::sync::mpsc;
-
 /// Фабрика TUN-интерфейса для десктопных платформ.
 ///
 /// - **Windows**: собственная реализация поверх `wintun` + `netsh`. Умеет

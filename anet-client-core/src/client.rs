@@ -34,9 +34,6 @@ use crate::config::PerAppMode;
 use crate::config::{CoreConfig, ServerConfig};
 use crate::dns::{get_dns_manager, DnsManager};
 use crate::events::{client_state, status, warn, ClientState, err};
-use crate::statistic::{
-    start_stats_monitor, QuicStatsProvider, StatsProvider, StreamStatsProvider,
-};
 use crate::traits::{RouteManager, TunFactory};
 use crate::transport::factory::create_transport;
 

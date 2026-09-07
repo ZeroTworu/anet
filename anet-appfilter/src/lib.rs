@@ -11,9 +11,13 @@ mod windivert_backend;
 pub use flow_map::{BypassSet, FlowKey, FlowMap, FlowOwner};
 pub use policy::AppPolicy;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
+
+#[cfg(all(windows, feature = "windivert"))]
+use anyhow::Context;
 use bytes::Bytes;
 use std::net::IpAddr;
+#[cfg(all(windows, feature = "windivert"))]
 use std::sync::Arc;
 use tokio::sync::mpsc;
 

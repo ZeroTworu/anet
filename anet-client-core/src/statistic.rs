@@ -344,20 +344,18 @@ pub fn start_fast_stats_monitor(
                     last_time = now;
 
                     // 5. Расчет скорости в байтах/сек и Мбит/сек
-                    let (rx_bytes_per_sec, rx_mbps) = if elapsed_secs > 0.0 {
+                    let rx_bytes_per_sec = if elapsed_secs > 0.0 {
                         let bytes_per_sec = rx_bytes_delta as f64 / elapsed_secs;
-                        let mbps = (rx_bytes_delta as f64 * 8.0) / (1_000_000.0 * elapsed_secs);
-                        (bytes_per_sec, mbps)
+                        bytes_per_sec
                     } else {
-                        (0.0, 0.0)
+                        0.0
                     };
 
-                    let (tx_bytes_per_sec, tx_mbps) = if elapsed_secs > 0.0 {
+                    let tx_bytes_per_sec = if elapsed_secs > 0.0 {
                         let bytes_per_sec = tx_bytes_delta as f64 / elapsed_secs;
-                        let mbps = (tx_bytes_delta as f64 * 8.0) / (1_000_000.0 * elapsed_secs);
-                        (bytes_per_sec, mbps)
+                        bytes_per_sec
                     } else {
-                        (0.0, 0.0)
+                        0.0
                     };
 
                     // Обновляем базовый снимок для следующей итерации
@@ -367,14 +365,11 @@ pub fn start_fast_stats_monitor(
                     let rx_speed_formatted = format_bytes_per_sec(rx_bytes_per_sec);
                     let tx_speed_formatted = format_bytes_per_sec(tx_bytes_per_sec);
 
-
-
-                    // 6. Излучаем событие
                     emit(AnetEvent::Stats {
                         rx: rx_str,
                         tx: tx_str,
                         rtt: rtt_str,
-                        rxm: rx_speed_formatted, // Подаем отформатированную скорость
+                        rxm: rx_speed_formatted,
                         txm: tx_speed_formatted,
                     });
                 }

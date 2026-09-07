@@ -86,7 +86,7 @@ fn configure_styles(ctx: &egui::Context) {
 
     // Акцентный зеленый (как в твоем GUI)
     visuals.selection.bg_fill = egui::Color32::from_rgb(76, 175, 80);
-    visuals.selection.stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
+    visuals.selection.stroke = egui::Stroke::new(1.0f32, egui::Color32::WHITE);
 
     ctx.set_visuals(visuals);
     ctx.set_style(style);
