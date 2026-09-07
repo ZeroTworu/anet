@@ -282,7 +282,6 @@ pub extern "system" fn Java_org_alco_anet_ANetVpnService_initLogger(_env: JNIEnv
     info!("Rust Logger Initialized");
 }
 
-
 // Запуск выделенного фонового потока JNI-моста (выполняется один раз на весь жизненный цикл приложения)
 fn init_jni_bridge_thread(jvm: Arc<JavaVM>) {
     JNI_SENDER.get_or_init(move || {
@@ -585,6 +584,21 @@ pub extern "system" fn Java_org_alco_anet_ANetVpnService_connectVpn(
             }
         }
     });
+}
+
+// =========================================================================
+// ПЕРЕНЕСЕНО ИЗ 073: Внешний триггер мгновенного переподключения
+// =========================================================================
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_alco_anet_ANetVpnService_reconnectVpn(_env: JNIEnv, _class: JClass) {
+    info!("Rust: reconnectVpn JNI trigger received");
+    let client_opt = {
+        let client_guard = CLIENT.lock().unwrap();
+        client_guard.clone()
+    };
+    if let Some(client) = client_opt {
+        client.trigger_reconnect();
+    }
 }
 
 #[unsafe(no_mangle)]

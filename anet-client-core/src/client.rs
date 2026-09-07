@@ -1,24 +1,24 @@
+use crate::statistic;
+#[cfg(all(windows, feature = "per-app"))]
+use anyhow::Context;
+use anyhow::{Result, anyhow};
+use bytes::{Bytes, BytesMut};
+use hickory_resolver::TokioAsyncResolver;
+use hickory_resolver::config::{NameServerConfig, Protocol, ResolverConfig, ResolverOpts};
+use ipnet::IpNet;
+use log::{error, info, warn};
+use quinn::Endpoint;
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use crate::statistic;
-use anyhow::{anyhow, Result};
-#[cfg(all(windows, feature = "per-app"))]
-use anyhow::Context;
-use bytes::{Bytes, BytesMut};
-use hickory_resolver::config::{NameServerConfig, Protocol, ResolverConfig, ResolverOpts};
-use hickory_resolver::TokioAsyncResolver;
-use ipnet::IpNet;
-use log::{error, info, warn};
-use quinn::Endpoint;
-use tokio::io::{split as io_split, AsyncWriteExt};
+use tokio::io::{AsyncWriteExt, split as io_split};
 use tokio::net::lookup_host;
 use tokio::select;
 use tokio::spawn;
-use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::Notify;
+use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
@@ -32,8 +32,8 @@ use anet_common::stream_framing::{frame_packet_into, read_next_packet};
 use crate::config::PerAppMode;
 
 use crate::config::{CoreConfig, ServerConfig};
-use crate::dns::{get_dns_manager, DnsManager};
-use crate::events::{client_state, status, warn, ClientState, err};
+use crate::dns::{DnsManager, get_dns_manager};
+use crate::events::{ClientState, client_state, err, status, warn};
 use crate::traits::{RouteManager, TunFactory};
 use crate::transport::factory::create_transport;
 
@@ -167,15 +167,16 @@ impl AnetClient {
         loop {
             if self.stop_requested.load(Ordering::SeqCst) {
                 info!("[Core] Stop requested by user. Exiting connection loop.");
-                status("VPN Stopped");
-                client_state(ClientState::Stopped, "VPN stopped", None);
                 break;
             }
 
             let server = &config_clone.servers[current_server_index];
 
             let server_name = server.get_name();
-            info!("[Core] Connecting to server '{}' ({})", server_name, server.dsn);
+            info!(
+                "[Core] Connecting to server '{}' ({})",
+                server_name, server.dsn
+            );
             status(format!("Connecting to '{}'...", server_name));
             client_state(
                 ClientState::Connecting,
@@ -191,8 +192,6 @@ impl AnetClient {
                     // "связь потеряна" и тут же запускал реконнект.
                     if self.stop_requested.load(Ordering::SeqCst) {
                         info!("[Core] Stop requested by user. Exiting connection loop.");
-                        status("VPN Stopped");
-                        client_state(ClientState::Stopped, "VPN stopped", None);
                         break;
                     }
 
@@ -200,11 +199,14 @@ impl AnetClient {
                         "[Core] Connection with server '{}' lost. Switching to the next node...",
                         server_name
                     );
-                    warn("Connection lost. Reconnecting...");
-                    client_state(ClientState::Reconnecting, "Connection lost; reconnecting", Some(server_name.clone()));
+                    status("Connection lost. Reconnecting...");
+                    client_state(
+                        ClientState::Reconnecting,
+                        "Connection lost; reconnecting",
+                        Some(server_name.clone()),
+                    );
 
                     current_server_index = (current_server_index + 1) % config_clone.servers.len();
-                    sleep(Duration::from_secs(2)).await;
                     tokio::select! {
                         _ = tokio::time::sleep(Duration::from_secs(2)) => {}
                         _ = self.cancel_signal.notified() => {
@@ -216,8 +218,6 @@ impl AnetClient {
                 Err(e) => {
                     if self.stop_requested.load(Ordering::SeqCst) {
                         info!("[Core] Stop requested by user. Exiting connection loop.");
-                        status("VPN Stopped");
-                        client_state(ClientState::Stopped, "VPN stopped", None);
                         break;
                     }
 
@@ -225,7 +225,7 @@ impl AnetClient {
                         "[Core] Connection failed or timed out for server '{}': {}",
                         server_name, e
                     );
-                    err(format!("Node error: {}", e));
+                    status(format!("Node error: {}", e));
                     client_state(
                         ClientState::Reconnecting,
                         format!("Node error: {e}"),
@@ -310,7 +310,9 @@ impl AnetClient {
         let (server_host, server_port) = _server.host_port()?;
         if let Ok(ip) = IpAddr::from_str(&server_host) {
             filter.add_bypass(ip).await;
-        } else if let Ok(mut addrs) = tokio::net::lookup_host((server_host.as_str(), server_port)).await {
+        } else if let Ok(mut addrs) =
+            tokio::net::lookup_host((server_host.as_str(), server_port)).await
+        {
             if let Some(sa) = addrs.next() {
                 filter.add_bypass(sa.ip()).await;
             }
@@ -325,13 +327,11 @@ impl AnetClient {
 
         info!(
             "[Core] Per-app mode active, apps: [{}], mode: [{}]",
-            apps_names,
-            mode_str,
+            apps_names, mode_str,
         );
         status(format!(
             "[Core] Per-app mode active, apps: [{}], mode: [{}]",
-            apps_names,
-            mode_str,
+            apps_names, mode_str,
         ));
 
         // Утилизируем входящий канал TUN (tun_rx) в фоновом режиме
@@ -418,7 +418,9 @@ impl AnetClient {
         }
         for server_ip in bypass_ips {
             let prefix = if server_ip.is_ipv4() { 32 } else { 128 };
-            self.route_manager.add_bypass_route(server_ip, prefix).await?;
+            self.route_manager
+                .add_bypass_route(server_ip, prefix)
+                .await?;
         }
 
         // Источник/приёмник IP-пакетов. Обычно это TUN. На Windows, если задан
@@ -428,8 +430,9 @@ impl AnetClient {
         // `_app_filter` держит хэндл фильтра живым на всё время сессии; при
         // выходе из функции он дропается и рабочие потоки WinDivert
         // останавливаются вместе с закрытием каналов.
-        let (tx_to_tun, mut rx_from_tun, iface_name, _app_filter) =
-            self.acquire_packet_source(server, &result.auth_response).await?;
+        let (tx_to_tun, mut rx_from_tun, iface_name, _app_filter) = self
+            .acquire_packet_source(server, &result.auth_response)
+            .await?;
 
         let last_rx_time = Arc::new(Mutex::new(Instant::now()));
         let last_tx_time = Arc::new(Mutex::new(Instant::now()));
@@ -546,19 +549,24 @@ impl AnetClient {
             if !config_clone.main.route_for.is_empty() {
                 let include_routes = self.resolve_list(&config_clone.main.route_for).await;
                 for net in include_routes.iter() {
-                    self.route_manager.add_specific_route(
-                        net.network(),
-                        net.prefix_len(),
-                        &result.auth_response.gateway,
-                        &iface_name,
-                    ).await?;
+                    self.route_manager
+                        .add_specific_route(
+                            net.network(),
+                            net.prefix_len(),
+                            &result.auth_response.gateway,
+                            &iface_name,
+                        )
+                        .await?;
                 }
             } else {
                 if !config_clone.main.exclude_route_for.is_empty() {
-                    let exclude_routes =
-                        self.resolve_list(&config_clone.main.exclude_route_for).await;
+                    let exclude_routes = self
+                        .resolve_list(&config_clone.main.exclude_route_for)
+                        .await;
                     for net in exclude_routes.iter() {
-                        self.route_manager.add_bypass_route(net.network(), net.prefix_len()).await?;
+                        self.route_manager
+                            .add_bypass_route(net.network(), net.prefix_len())
+                            .await?;
                     }
                 }
                 self.route_manager
@@ -587,23 +595,23 @@ impl AnetClient {
             }
         }
 
-        // АКТИВНЫЙ ВОРКЕР КОНТРОЛЯ ЗДОРОВЬЯ (HEALTH MONITOR)
+        // АКТИВНЫЙ ВОРКЕР КОНТРОЛЯ ЗДОРОВЬЯ (HEALTH MONITOR ИЗ 073)
         // =========================================================================
         let monitor_shutdown = shutdown_notify.clone();
         let monitor_reconnect = reconnect_signal.clone();
         let rx_check = last_rx_time.clone();
-
-        //  Забираем время последней отправки пакета!
         let tx_check = last_tx_time.clone();
+        let quic_conn = result.connection.clone();
 
         let health_pause = result.health_pause.clone();
-        let health_task = spawn(async move {
-            let check_interval = Duration::from_secs(4);
+        let health_task = tokio::spawn(async move {
+            let check_interval = Duration::from_secs(3);
             let mut is_initial_phase = true;
+            let mut stalled_counter: u32 = 0;
 
             loop {
-                select! {
-                    _ = sleep(check_interval) => {}
+                tokio::select! {
+                    _ = tokio::time::sleep(check_interval) => {}
                     _ = monitor_shutdown.notified() => {
                         break;
                     }
@@ -615,25 +623,50 @@ impl AnetClient {
                 if health_pause.as_ref().is_some_and(|pause| pause.load(Ordering::Acquire)) {
                     *rx_check.lock().unwrap() = Instant::now();
                     *tx_check.lock().unwrap() = Instant::now();
+                    stalled_counter = 0;
                     continue;
                 }
 
-                if is_initial_phase {
-                    // Если мы отправляли данные в последние 4 сек, но ответа нет 8 сек -> Блокировка
-                    if elapsed_rx > Duration::from_secs(8) && elapsed_tx < Duration::from_secs(4) {
-                        warn!("[Health] CASE 1 Detected: Connection established, but payload traffic is blocked!");
-                        warn("[Health] CASE 1 Detected: Connection established, but payload traffic is blocked!");
+                // 1. Проверяем, не закрыто ли уже базовое QUIC-соединение (по таймауту/ошибке)
+                if let Some(ref conn) = quic_conn {
+                    if let Some(reason) = conn.close_reason() {
+                        warn!("[Health] Underlying QUIC connection closed: {:?}. Triggering reconnect...", reason);
+                        client_state(ClientState::Reconnecting, format!("Connection closed: {reason:?}"), None);
                         monitor_reconnect.notify_one();
                         break;
                     }
-                    is_initial_phase = false;
+                }
+
+                if is_initial_phase {
+                    // Если мы отправляли данные в первые 4 сек, но ответа нет 8 сек -> Блокировка
+                    if elapsed_rx > Duration::from_secs(8) && elapsed_tx < Duration::from_secs(4) {
+                        warn!("[Health] CASE 1 Detected: Connection established, but payload traffic is blocked!");
+                        client_state(ClientState::Reconnecting, "Payload traffic blocked; reconnecting", None);
+                        monitor_reconnect.notify_one();
+                        break;
+                    }
+                    if elapsed_rx <= Duration::from_secs(8) || elapsed_tx >= Duration::from_secs(4) {
+                        is_initial_phase = false;
+                    }
                 } else {
-                    // После успешного старта отсутствие входящих IP-пакетов не
-                    // доказывает разрыв туннеля: трафик может быть асимметричным,
-                    // идти пакетами, не попадающими в TUN, или временно не иметь
-                    // обратного направления. Реальный обрыв определяется
-                    // сетевыми worker-ами по EOF/ошибке чтения или записи.
-                    // Поэтому payload inactivity больше не вызывает реконнект.
+                    // Если пользователь или система активно отправляют данные (elapsed_tx < 8s),
+                    // но входящего трафика нет более 18s (не приходят даже TCP ACK/DNS-ответы):
+                    // Соединение ушло в "черную дыру" (отвал NAT/соты/роутера).
+                    if elapsed_tx < Duration::from_secs(8) && elapsed_rx > Duration::from_secs(18) {
+                        stalled_counter += 1;
+                        if stalled_counter >= 2 {
+                            warn!(
+                                "[Health] Dead connection detected: active TX ({:?}), but no RX for {:?}. Triggering reconnect...",
+                                elapsed_tx, elapsed_rx
+                            );
+                            status("[Health] Connection stalled (no response). Reconnecting...");
+                            client_state(ClientState::Reconnecting, "Connection stalled; reconnecting", None);
+                            monitor_reconnect.notify_one();
+                            break;
+                        }
+                    } else {
+                        stalled_counter = 0;
+                    }
                 }
             }
         });
@@ -641,55 +674,56 @@ impl AnetClient {
         // =========================================================================
         // УНИВЕРСАЛЬНЫЙ СБОРЩИК СТАТИСТИКИ
         // =========================================================================
-         // =========================================================================
         let stats_shutdown = shutdown_notify.clone();
         let stats_task = {
-        let provider: Arc<dyn statistic::StatsProvider> = if let Some(ref conn) = result.connection {
-            Arc::new(statistic::QuicStatsProvider::new(conn.clone()))
-        } else {
-            Arc::new(statistic::StreamStatsProvider::new(
-                total_rx_bytes.clone(),
-                total_tx_bytes.clone(),
-                total_rx_packets.clone(),
-                total_tx_packets.clone(),
-            ))
-        };
+            let provider: Arc<dyn statistic::StatsProvider> =
+                if let Some(ref conn) = result.connection {
+                    Arc::new(statistic::QuicStatsProvider::new(conn.clone()))
+                } else {
+                    Arc::new(statistic::StreamStatsProvider::new(
+                        total_rx_bytes.clone(),
+                        total_tx_bytes.clone(),
+                        total_rx_packets.clone(),
+                        total_tx_packets.clone(),
+                    ))
+                };
 
-        // 1. Получаем IP:Port текущего сервера
-        let (server_host, server_port) = server.host_port().unwrap_or_default();
-        let mut resolved_addr: Option<SocketAddr> = None;
+            // 1. Получаем IP:Port текущего сервера
+            let (server_host, server_port) = server.host_port().unwrap_or_default();
+            let mut resolved_addr: Option<SocketAddr> = None;
 
-        if let Ok(ip) = IpAddr::from_str(&server_host) {
-            resolved_addr = Some(SocketAddr::new(ip, server_port));
-        } else if let Ok(mut addrs) = tokio::net::lookup_host((server_host.as_str(), server_port)).await {
-            resolved_addr = addrs.next();
-        }
+            if let Ok(ip) = IpAddr::from_str(&server_host) {
+                resolved_addr = Some(SocketAddr::new(ip, server_port));
+            } else if let Ok(mut addrs) =
+                tokio::net::lookup_host((server_host.as_str(), server_port)).await
+            {
+                resolved_addr = addrs.next();
+            }
 
-        // 2. Оборачиваем provider в PingStatsProvider (если адрес успешно определён)
-        let fast_provider: Arc<dyn statistic::StatsProvider> = if let Some(addr) = resolved_addr {
-            statistic::PingStatsProvider::new(provider.clone(), addr)
-        } else {
-            provider.clone()
-        };
+            // 2. Оборачиваем provider в PingStatsProvider (если адрес успешно определён)
+            let fast_provider: Arc<dyn statistic::StatsProvider> = if let Some(addr) = resolved_addr
+            {
+                statistic::PingStatsProvider::new(provider.clone(), addr)
+            } else {
+                provider.clone()
+            };
 
-        // 3. Быстрый монитор для обновления UI-меток (каждую секунду)
-        let fast_handle = statistic::start_fast_stats_monitor(
-            fast_provider,
-            stats_shutdown.clone(),
-        );
+            // 3. Быстрый монитор для обновления UI-меток (каждую секунду)
+            let fast_handle =
+                statistic::start_fast_stats_monitor(fast_provider, stats_shutdown.clone());
 
-        // 4. Медленный монитор для записи детальной статистики в лог (по интервалу)
-        let slow_handle = if config_clone.stats.enabled {
-            Some(statistic::start_stats_monitor(
-                provider,
-                config_clone.stats.interval_minutes,
-                stats_shutdown,
-            ))
-        } else {
-            None
-        };
+            // 4. Медленный монитор для записи детальной статистики в лог (по интервалу)
+            let slow_handle = if config_clone.stats.enabled {
+                Some(statistic::start_stats_monitor(
+                    provider,
+                    config_clone.stats.interval_minutes,
+                    stats_shutdown,
+                ))
+            } else {
+                None
+            };
 
-        // Объединяем выполнение обоих мониторов в единый JoinHandle
+            // Объединяем выполнение обоих мониторов в единый JoinHandle
             Some(spawn(async move {
                 if let Some(slow) = slow_handle {
                     let _ = tokio::join!(fast_handle, slow);
@@ -722,21 +756,18 @@ impl AnetClient {
         }
 
         // =========================================================================
-        // ВЫВОД ИНФОРМАЦИИ О ТАРИФЕ И АККАУНТЕ
+        // ВЫВОД ИНФОРМАЦИИ О ТАРИФЕ И АККАУНТЕ (СОХРАНЕНО ИЗ СВЕЖЕЙ БАЗЫ REBASE)
         // =========================================================================
-        let billing_str = match ProtoBillingType::try_from(result.auth_response.billing_type).unwrap() {
-            ProtoBillingType::NoTariffNoGroup => "Без тарифа и группы",
-            ProtoBillingType::Group => "Группа",
-            ProtoBillingType::Individual => "Индивидуальный тариф",
-            ProtoBillingType::GroupAndIndividual => "Группа + индивидуальный тариф",
-            _ => "Не указан",
-        };
+        let billing_str =
+            match ProtoBillingType::try_from(result.auth_response.billing_type).unwrap() {
+                ProtoBillingType::NoTariffNoGroup => "Без тарифа и группы",
+                ProtoBillingType::Group => "Группа",
+                ProtoBillingType::Individual => "Индивидуальный тариф",
+                ProtoBillingType::GroupAndIndividual => "Группа + индивидуальный тариф",
+                _ => "Не указан",
+            };
 
-        let group_str = result
-            .auth_response
-            .group_name
-            .as_deref()
-            .unwrap_or("—");
+        let group_str = result.auth_response.group_name.as_deref().unwrap_or("—");
 
         let consumed_str = result
             .auth_response
@@ -777,17 +808,7 @@ impl AnetClient {
         };
 
         info!(
-            "\n╔═══════════════════════════════════════════════════════════════════════════════╗\n\
-             ║                          ACCOUNT & TARIFF INFO                                ║\n\
-             ╠═══════════════════════════════════════════════════════════════════════════════╣\n\
-             ║  Тарификация:      {:<56} ║\n\
-             ║  Группа:           {:<56} ║\n\
-             ║  Сессии:           {:<56} ║\n\
-             ║  Скорость:         {:<56} ║\n\
-             ║  Трафик за период: {:<56} ║\n\
-             ║  Лимит трафика:    {:<56} ║\n\
-             ║  Действует до:     {:<56} ║\n\
-             ╚═══════════════════════════════════════════════════════════════════════════════╝",
+            "\n╔═══════════════════════════════════════════════════════════════════════════════╗\n             ║                          ACCOUNT & TARIFF INFO                                ║\n             ╠═══════════════════════════════════════════════════════════════════════════════╣\n             ║  Тарификация:      {:<56} ║\n             ║  Группа:           {:<56} ║\n             ║  Сессии:           {:<56} ║\n             ║  Скорость:         {:<56} ║\n             ║  Трафик за период: {:<56} ║\n             ║  Лимит трафика:    {:<56} ║\n             ║  Действует до:     {:<56} ║\n             ╚═══════════════════════════════════════════════════════════════════════════════╝",
             billing_str, group_str, sessions_str, speed_str, consumed_str, limit_str, expires_str,
         );
 
@@ -837,6 +858,19 @@ impl AnetClient {
         let _ = self.route_manager.restore_routes().await;
 
         Ok(())
+    }
+
+    /// Внешний триггер мгновенного переподключения (из 073: для мобильного watchdog и смены сети)
+    pub fn trigger_reconnect(&self) {
+        if self.stop_requested.load(Ordering::SeqCst) {
+            return;
+        }
+        let state = self.session.lock().unwrap();
+        if let Some(ref running) = *state {
+            info!("[Core] Reconnect requested externally (network switch or watchdog).");
+            running.shutdown_notify.notify_waiters();
+            running.reconnect_signal.notify_one();
+        }
     }
 
     pub async fn stop(&self) -> anyhow::Result<()> {

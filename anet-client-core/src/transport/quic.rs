@@ -81,8 +81,19 @@ impl ClientTransport for QuicTransport {
         let auth_handler = AuthHandler::new(&self.config, self.server.server_pub_key.as_deref())?;
         let (auth_response, shared_key) = auth_handler.authenticate(&channel).await?;
 
+        let mut quic_cfg = self.config.quic_transport.clone();
+        // Для клиентского соединения выставляем надежный keep-alive (10s) во избежание
+        // сброса NAT мобильными операторами/роутерами и разумный idle timeout (30s),
+        // чтобы обрыв сети определялся за полминуты, а не висел часами без интернета.
+        quic_cfg.keep_alive_interval_seconds = Some(
+            quic_cfg.keep_alive_interval_seconds.unwrap_or(10).min(10)
+        );
+        quic_cfg.idle_timeout_seconds = Some(
+            quic_cfg.idle_timeout_seconds.unwrap_or(30).min(30)
+        );
+
         let transport_config =
-            build_transport_config(&self.config.quic_transport, auth_response.mtu as u16)?;
+            build_transport_config(&quic_cfg, auth_response.mtu as u16)?;
 
         let cipher = Arc::new(Cipher::new(&shared_key));
         let nonce_prefix: [u8; 4] = auth_response
