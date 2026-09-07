@@ -31,7 +31,7 @@ futures = { workspace = true }
 tokio-tungstenite = { workspace = true }
 http = { workspace = true }
 
-reqwest = { workspace = true, features = ["json", "rustls-tls-webpki-roots"] }
+reqwest = { workspace = true, features = ["json", "rustls-tls-webpki-roots", "http2"] }
 
 russh = { workspace = true }
 zip = "8.6.0"

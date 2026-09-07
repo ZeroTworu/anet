@@ -104,6 +104,7 @@ pub enum TransportMode {
     Ssh,
     Vnc,
     Websocket,
+    Ahttp,
 }
 
 impl Default for TransportMode {
@@ -159,6 +160,7 @@ impl ServerConfig {
             Some("ssh") => Ok(TransportMode::Ssh),
             Some("vnc") => Ok(TransportMode::Vnc),
             Some("ws") | Some("wss") => Ok(TransportMode::Websocket),
+            Some("http") | Some("https") => Ok(TransportMode::Ahttp),
             Some(scheme) => anyhow::bail!("unsupported server DSN scheme '{scheme}'"),
             None => anyhow::bail!("server DSN '{}' has no scheme", self.dsn),
         }
@@ -180,9 +182,14 @@ impl ServerConfig {
     pub fn host_port(&self) -> anyhow::Result<(String, u16)> {
         let uri: http::Uri = self.dsn.parse()?;
         let host = uri.host().ok_or_else(|| anyhow::anyhow!("server DSN '{}' has no host", self.dsn))?;
-        let port = uri.port_u16().unwrap_or(match self.mode()? {
-            TransportMode::Websocket if self.dsn.starts_with("wss://") => 443,
-            TransportMode::Websocket => 80,
+
+        let scheme = uri.scheme_str().unwrap_or("").to_lowercase();
+        let port = uri.port_u16().unwrap_or(match scheme.as_str() {
+            "https" | "wss" => 443,
+            "http" | "ws" => 80,
+            "ssh" => 22,
+            "vnc" => 5900,
+            "quic" => 443,
             _ => 0,
         });
         anyhow::ensure!(port != 0, "server DSN '{}' has no port", self.dsn);
@@ -199,6 +206,7 @@ impl ServerConfig {
                 TransportMode::Ssh => "SSH",
                 TransportMode::Vnc => "VNC",
                 TransportMode::Websocket => "WS",
+                TransportMode::Ahttp => "AHTTP",
             };
 
             format!("{}:{}", host, mode_str)
@@ -212,6 +220,55 @@ fn default_timeout_secs() -> u64 {
 
 fn default_websocket_min_session_secs() -> u64 { 8 * 60 }
 fn default_websocket_max_session_secs() -> u64 { 25 * 60 }
+
+// Новая расширенная структура для настройки HTTP-транспорта на стороне клиента
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct AhttpConfig {
+    pub pool_max_idle_per_host: usize,
+    pub pool_idle_timeout_secs: u64,
+    pub tcp_nodelay: bool,
+    pub timeout_secs: u64,
+    pub handshake_path: String,
+    pub auth_path: String,
+    pub traffic_path: String,
+    pub coalesce_budget_bytes: usize,
+    pub poll_timeout_ms: u64,
+    pub concurrency: usize,
+    pub reassembly_queue_max_size: usize,
+
+    pub http2_adaptive_window: bool,
+    pub http2_max_frame_size: Option<u32>,
+    pub http2_max_header_list_size: Option<u32>,
+    pub http2_keep_alive_interval_secs: Option<u64>,
+    pub http2_keep_alive_timeout_secs: Option<u64>,
+    pub http2_keep_alive_while_idle: bool,
+}
+
+impl Default for AhttpConfig {
+    fn default() -> Self {
+        Self {
+            pool_max_idle_per_host: 8,
+            pool_idle_timeout_secs: 60,
+            tcp_nodelay: true,
+            timeout_secs: 10,
+            handshake_path: "/handshake".to_string(),
+            auth_path: "/auth".to_string(),
+            traffic_path: "/traffic".to_string(),
+            coalesce_budget_bytes: 65536,
+            poll_timeout_ms: 15,
+            concurrency: 4, // 4 параллельных потока по умолчанию для обхода HOL-blocking
+            reassembly_queue_max_size: 1024,
+
+            http2_adaptive_window: true,
+            http2_max_frame_size: None,
+            http2_max_header_list_size: Some(16384),
+            http2_keep_alive_interval_secs: Some(20),
+            http2_keep_alive_timeout_secs: Some(10),
+            http2_keep_alive_while_idle: true,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct CoreConfig {
@@ -236,6 +293,9 @@ pub struct CoreConfig {
     // Наш новый массив серверов [[servers]] для переключения при сбоях
     #[serde(default)]
     pub servers: Vec<ServerConfig>,
+
+    #[serde(default)]
+    pub ahttp: AhttpConfig,
 }
 
 impl CoreConfig {
