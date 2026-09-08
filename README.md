@@ -94,9 +94,13 @@ make cert
 ### Mobile Android Application
 <p align="center">
 <img src=".assets/mobile_1.png" height="380" alt="Базовое окно" />
-<img src=".assets/mobile_2.png" height="380" alt="Окно обновления" />
-<img src=".assets/mobile_3.png" height="380" alt="Окно выбора приложений для туннелирования" />
 <img src=".assets/mobile_4.png" height="380" alt="Процесс соединения" />
 <img src=".assets/mobile_5.png" height="380" alt="Успешное соединение" />
+<img src=".assets/mobile_3.png" height="380" alt="Окно выбора приложений для туннелирования" />
+<img src=".assets/mobile_2.png" height="380" alt="Окно обновления" />
+<img src=".assets/mobile_6.png" height="380" alt="Выбор ноды" />
+<img src=".assets/mobile_7.png" height="380" alt="Выбор конфига" />
+<img src=".assets/mobile_8.png" height="380" alt="Редактирование конфига" />
+<img src=".assets/mobile_9.png" height="380" alt="Удаление конфига" />
 
 </p>
