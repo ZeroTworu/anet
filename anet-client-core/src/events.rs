@@ -9,6 +9,37 @@ pub enum ClientState {
     Failed,
 }
 
+/// Информация об аккаунте и тарифе пользователя
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct AccountInfo {
+    /// Тип тарификации строкой ("Индивидуальный тариф", "Группа", и т.д.)
+    pub billing_str: String,
+    /// Название группы доступа
+    pub group_str: String,
+    /// Сессии строкой ("1 / 5" или "1 / Безлимит")
+    pub sessions_str: String,
+    /// Ограничение скорости ("100.00 Мбит/с" или "Безлимит")
+    pub speed_str: String,
+    /// Израсходованный трафик строкой ("1.42 GiB")
+    pub consumed_str: String,
+    /// Лимит трафика строкой ("100.00 GiB" или "Безлимит")
+    pub limit_str: String,
+    /// Срок действия ("2026-12-31" или "Бессрочно")
+    pub expires_str: String,
+    /// Активные сессии
+    pub active_sessions: i32,
+    /// Разрешённые сессии (0 - безлимит)
+    pub allowed_sessions: i32,
+    /// Ограничение скорости в Кбит/с
+    pub speed_limit_kbps: Option<u64>,
+    /// Израсходованный трафик в байтах
+    pub traffic_consumed_bytes: Option<u64>,
+    /// Лимит трафика в байтах
+    pub traffic_limit_bytes: Option<u64>,
+    /// Дата окончания действия
+    pub expires_at: Option<String>,
+}
+
 /// Типы событий
 #[derive(Clone, Debug)]
 pub enum AnetEvent {
@@ -26,6 +57,7 @@ pub enum AnetEvent {
         message: String,
         server_name: Option<String>,
     },
+    AccountInfo(AccountInfo),
     TrafficUpdate {
         rx: u64,
         tx: u64,
@@ -83,4 +115,8 @@ pub fn warn(s: impl Into<String>) {
 
 pub fn update_progress(p: f32) {
     emit(AnetEvent::UpdateProgress(p));
+}
+
+pub fn account_info(info: AccountInfo) {
+    emit(AnetEvent::AccountInfo(info));
 }

@@ -33,7 +33,7 @@ use crate::config::PerAppMode;
 
 use crate::config::{CoreConfig, ServerConfig};
 use crate::dns::{DnsManager, get_dns_manager};
-use crate::events::{ClientState, client_state, err, status, warn};
+use crate::events::{AccountInfo, ClientState, account_info, client_state, err, status, warn};
 use crate::traits::{RouteManager, TunFactory};
 use crate::transport::factory::create_transport;
 
@@ -746,6 +746,22 @@ impl AnetClient {
             "Тариф: {} | Группа: {} | Трафик: {} / {}",
             billing_str, group_str, consumed_str, limit_str
         ));
+
+        account_info(AccountInfo {
+            billing_str: billing_str.to_string(),
+            group_str: group_str.to_string(),
+            sessions_str: sessions_str.clone(),
+            speed_str: speed_str.clone(),
+            consumed_str: consumed_str.clone(),
+            limit_str: limit_str.clone(),
+            expires_str: expires_str.to_string(),
+            active_sessions: result.auth_response.active_sessions,
+            allowed_sessions: result.auth_response.allowed_sessions,
+            speed_limit_kbps: result.auth_response.speed_limit_kbps.map(|k| k as u64),
+            traffic_consumed_bytes: result.auth_response.traffic_consumed.map(|c| c.max(0) as u64),
+            traffic_limit_bytes: result.auth_response.traffic_limit.map(|l| l.max(0) as u64),
+            expires_at: result.auth_response.expires_at.clone(),
+        });
 
         info!(
             "[Core] VPN interface configured. Tunnel UP. Active node: {}",

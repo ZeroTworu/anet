@@ -23,7 +23,7 @@ use notify_rust::Notification;
 use anet_client_core::{
     client::AnetClient,
     config::CoreConfig,
-    events::{ set_handler, AnetEvent, ClientState, EventHandler },
+    events::{ set_handler, AccountInfo, AnetEvent, ClientState, EventHandler },
     platform::create_route_manager,
     updater::{ GithubRelease, Updater },
 };
@@ -183,6 +183,16 @@ pub struct ANetApp {
     pub total_rtt: String,
     pub total_rxm: String,
     pub total_txm: String,
+    pub account_info: Option<AccountInfo>,
+
+    // Показатели тарифа и аккаунта пользователя (для вывода в UI через ui.label)
+    pub tariff_billing: String,
+    pub tariff_group: String,
+    pub tariff_sessions: String,
+    pub tariff_speed: String,
+    pub tariff_consumed: String,
+    pub tariff_limit: String,
+    pub tariff_expires: String,
 
     tray_value: bool,
 
@@ -662,6 +672,15 @@ impl ANetApp {
             total_rtt: "0".to_string(),
             total_rxm: "0 B".to_string(),
             total_txm: "0 B".to_string(),
+            account_info: None,
+
+            tariff_billing: "—".to_string(),
+            tariff_group: "—".to_string(),
+            tariff_sessions: "—".to_string(),
+            tariff_speed: "—".to_string(),
+            tariff_consumed: "0 B".to_string(),
+            tariff_limit: "—".to_string(),
+            tariff_expires: "—".to_string(),
 
             tray_value: true,
 
@@ -746,6 +765,15 @@ impl ANetApp {
                         self.total_rtt = "0".to_string();
                         self.total_rxm = "0 B".to_string();
                         self.total_txm = "0 B".to_string();
+                        self.account_info = None;
+
+                        self.tariff_billing = "—".to_string();
+                        self.tariff_group = "—".to_string();
+                        self.tariff_sessions = "—".to_string();
+                        self.tariff_speed = "—".to_string();
+                        self.tariff_consumed = "0 B".to_string();
+                        self.tariff_limit = "—".to_string();
+                        self.tariff_expires = "—".to_string();
                     }
 
                     if let Some(active_name) = server_name {
@@ -755,6 +783,16 @@ impl ANetApp {
                             settings.save();
                         }
                     }
+                }
+                AnetEvent::AccountInfo(info) => {
+                    self.tariff_billing = info.billing_str.clone();
+                    self.tariff_group = info.group_str.clone();
+                    self.tariff_sessions = info.sessions_str.clone();
+                    self.tariff_speed = info.speed_str.clone();
+                    self.tariff_consumed = info.consumed_str.clone();
+                    self.tariff_limit = info.limit_str.clone();
+                    self.tariff_expires = info.expires_str.clone();
+                    self.account_info = Some(info);
                 }
                 AnetEvent::Error(msg) => {
                     let err = format!("CRITICAL ERROR: {}", msg);
