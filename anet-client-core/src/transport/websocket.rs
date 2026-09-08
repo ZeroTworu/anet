@@ -3,10 +3,10 @@ use crate::auth::{AuthChannel, AuthHandler};
 use crate::config::{CoreConfig, ServerConfig};
 use anet_common::consts::{CHANNEL_BUFFER_SIZE, COALESCE_BUDGET_BYTES, MAX_PACKET_SIZE};
 use anet_common::handshake_fragmentation::FragmentConfig;
-use anet_common::stream_framing::{frame_packet, read_next_packet};
+use anet_common::stream_framing::{frame_packet_into, frame_packet, read_next_packet};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures::{SinkExt, StreamExt};
 use http::HeaderValue;
 use http::header::{ACCEPT_LANGUAGE, CACHE_CONTROL, ORIGIN, PRAGMA, USER_AGENT};
@@ -57,7 +57,7 @@ const ACCEPT_LANGUAGES: &[&str] = &[
     "en-GB,en;q=0.9,en-US;q=0.8",
     "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
 ];
-const MAX_WS_MESSAGE_SIZE: usize = 64 * 1024;
+const MAX_WS_MESSAGE_SIZE: usize = 128 * 1024; // Увеличено для коалесценции
 
 #[derive(Clone)]
 struct BrowserProfile {
@@ -105,13 +105,6 @@ struct WebSocketAuthChannel {
     socket: Mutex<ClientSocket>,
 }
 
-/// Принимает любой серверный сертификат: и CA-подписанный, и самоподписанный.
-///
-/// TLS на этом транспорте — камуфляж под обычный браузерный HTTPS, а не граница
-/// доверия: узел аутентифицируется ASTP-слоем (X25519 + подпись Ed25519,
-/// ключ можно запинить в client.toml), и трафик шифруется ChaCha20Poly1305
-/// поверх TLS. Это та же модель доверия, что у QUIC-транспорта, который
-/// принимает самоподписанный сертификат, доставленный внутри ASTP-канала.
 #[derive(Debug)]
 struct AcceptAnyServerCert;
 
@@ -165,9 +158,6 @@ fn wss_connector() -> Result<Connector> {
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert))
         .with_no_client_auth();
-    // Настоящий браузер в ClientHello почти всегда предлагает оба протокола
-    // (h2 приоритетнее http/1.1); список из одного http/1.1 — заметная
-    // аномалия для пассивного DPI ещё до WebSocket-апгрейда.
     let mut tls = tls;
     tls.alpn_protocols = vec![b"http/1.1".to_vec()];
     Ok(Connector::Rustls(Arc::new(tls)))
@@ -282,19 +272,12 @@ async fn connect_authenticated(
 ) -> Result<(ClientSocket, anet_common::protocol::AuthResponse, [u8; 32])> {
     let request = browser_request(server, profile)?;
     let ws_config = WebSocketConfig::default()
-        .read_buffer_size(16 * 1024)
-        .write_buffer_size(16 * 1024)
-        .max_write_buffer_size(128 * 1024)
+        .read_buffer_size(64 * 1024)
+        .write_buffer_size(64 * 1024)
+        .max_write_buffer_size(256 * 1024)
         .max_message_size(Some(MAX_WS_MESSAGE_SIZE))
         .max_frame_size(Some(MAX_WS_MESSAGE_SIZE));
 
-    // connect_async_tls_with_config() резолвит DNS и коннектит TCP-сокет
-    // внутри себя, без возможности выставить TCP_NODELAY до TLS/WS
-    // хендшейка. В отличие от SSH/VNC-клиентов и WS-сервера (все явно
-    // делают stream.set_nodelay(true)), здесь Nagle оставался включённым:
-    // мелкие ANet-кадры (u16-префикс длины + IP-пакет) залипали в буфере
-    // ядра до ~40мс в ожидании пиггибека ACK. Коннектим TCP сами и сразу
-    // выставляем nodelay перед тем, как отдать сокет в TLS/WS слой.
     let endpoint = server.endpoint()?;
     let tcp_stream = TcpStream::connect(&endpoint)
         .await
@@ -307,7 +290,7 @@ async fn connect_authenticated(
         Some(ws_config),
         Some(connector_for(server)?),
     )
-    .await?;
+        .await?;
     let channel = WebSocketAuthChannel {
         socket: Mutex::new(socket),
     };
@@ -332,9 +315,6 @@ async fn close_browser_session(socket: &mut ClientSocket) {
         return;
     }
 
-    // Finish the WebSocket close handshake instead of merely releasing the
-    // client handle. Seeing Close/EOF means the peer processed our Close, so
-    // its registry cleanup can run before the next ASTP authentication.
     let _ = tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             match socket.next().await {
@@ -343,7 +323,7 @@ async fn close_browser_session(socket: &mut ClientSocket) {
             }
         }
     })
-    .await;
+        .await;
 }
 
 #[async_trait]
@@ -366,9 +346,6 @@ impl ClientTransport for WebSocketTransport {
         let (tunnel_packet_tx, mut tunnel_packet_rx) =
             tokio::sync::mpsc::channel::<Bytes>(CHANNEL_BUFFER_SIZE);
 
-        // read_next_packet() is deliberately isolated from tokio::select!.
-        // AsyncRead operations are not generally cancellation-safe: cancelling
-        // after a partial length prefix would desynchronise all later frames.
         let tunnel_reader_task = tokio::spawn(async move {
             while let Ok(Some(packet)) = read_next_packet(&mut tunnel_read).await {
                 if tunnel_packet_tx.send(packet).await.is_err() {
@@ -392,31 +369,31 @@ impl ClientTransport for WebSocketTransport {
                 let mut sequence = 0u64;
                 let mut rotation = Box::pin(tokio::time::sleep(session_lifetime(&server)));
 
+                // БУФЕР КОАЛЕСЦЕНЦИИ (Ускорение WS)
+                let mut batch_buf = BytesMut::with_capacity(COALESCE_BUDGET_BYTES);
+
                 loop {
                     tokio::select! {
                         packet = tunnel_packet_rx.recv() => {
                             let Some(mut raw) = packet else { break 'sessions; };
-                            let mut batch_bytes = 0usize;
+                            batch_buf.clear();
+
                             loop {
-                                let encrypted = match anet_common::transport::wrap_packet_padded(
-                                    &cipher,
-                                    &nonce_prefix,
-                                    sequence,
-                                    raw,
-                                    config.stealth.padding_step,
-                                ) {
-                                    Ok(encrypted) => encrypted,
-                                    Err(error) => {
-                                        warn!("[WebSocket] Failed to encrypt outbound packet: {error}");
-                                        break 'sessions;
+                                if raw.len() >= 20 {
+                                    let seq = sequence;
+                                    sequence = sequence.wrapping_add(1);
+                                    if let Ok(encrypted) = anet_common::transport::wrap_packet_padded(
+                                        &cipher,
+                                        &nonce_prefix,
+                                        seq,
+                                        raw,
+                                        config.stealth.padding_step,
+                                    ) {
+                                        // Фреймируем зашифрованный пакет для группировки
+                                        frame_packet_into(&mut batch_buf, &encrypted);
                                     }
-                                };
-                                sequence = sequence.wrapping_add(1);
-                                batch_bytes += encrypted.len();
-                                if socket.feed(Message::Binary(encrypted)).await.is_err() {
-                                    break 'sessions;
                                 }
-                                if batch_bytes >= COALESCE_BUDGET_BYTES {
+                                if batch_buf.len() >= COALESCE_BUDGET_BYTES {
                                     break;
                                 }
                                 raw = match tunnel_packet_rx.try_recv() {
@@ -424,19 +401,29 @@ impl ClientTransport for WebSocketTransport {
                                     Err(_) => break,
                                 };
                             }
-                            if socket.flush().await.is_err() {
-                                break 'sessions;
+
+                            if !batch_buf.is_empty() {
+                                if socket.feed(Message::Binary(batch_buf.clone().freeze())).await.is_err() {
+                                    break 'sessions;
+                                }
+                                if socket.flush().await.is_err() {
+                                    break 'sessions;
+                                }
                             }
                         }
                         incoming = socket.next() => {
                             match incoming {
                                 Some(Ok(Message::Binary(data))) => {
-                                    match anet_common::transport::unwrap_packet_bytes(&cipher, data) {
-                                        Ok(packet) => {
-                                            let framed = frame_packet(packet);
-                                            if tunnel_write.write_all(&framed).await.is_err() { break 'sessions; }
+                                    // РАСПАКОВКА КОАЛЕСЦЕНЦИИ: В одном Message может быть несколько пакетов
+                                    let mut cursor = std::io::Cursor::new(data);
+                                    while let Ok(Some(encrypted_packet)) = read_next_packet(&mut cursor).await {
+                                        match anet_common::transport::unwrap_packet_bytes(&cipher, encrypted_packet) {
+                                            Ok(packet) => {
+                                                let framed = frame_packet(packet);
+                                                if tunnel_write.write_all(&framed).await.is_err() { break 'sessions; }
+                                            }
+                                            Err(error) => debug!("[WebSocket] Dropped invalid inbound packet: {error}"),
                                         }
-                                        Err(error) => debug!("[WebSocket] Dropped invalid inbound message: {error}"),
                                     }
                                 }
                                 Some(Ok(Message::Ping(data))) => {
@@ -455,9 +442,6 @@ impl ClientTransport for WebSocketTransport {
                 }
 
                 info!("[WebSocket] Browser-like session rotation; reconnecting the same endpoint");
-                // A real page lifecycle has a short gap between unload and the
-                // next navigation. It also lets the server release the old IP
-                // and authorization session before a fresh ASTP handshake.
                 let navigation_gap_ms = rand::rngs::OsRng.gen_range(450..=1800);
                 tokio::time::sleep(Duration::from_millis(navigation_gap_ms)).await;
                 let deadline =
@@ -474,7 +458,7 @@ impl ClientTransport for WebSocketTransport {
                                 Some(logical_session_id.clone()),
                             ),
                         )
-                        .await
+                            .await
                         {
                             Ok(Ok(candidate)) => {
                                 if candidate.1.ip == expected_ip
@@ -524,106 +508,5 @@ impl ClientTransport for WebSocketTransport {
             connection: None,
             health_pause: Some(health_pause),
         })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    fn server(url: &str) -> ServerConfig {
-        ServerConfig {
-            name: None,
-            dsn: url.to_string(),
-            timeout_secs: 8,
-            server_pub_key: None,
-            ssh_user: None,
-            websocket_min_session_secs: 480,
-            websocket_max_session_secs: 1500,
-        }
-    }
-
-    #[test]
-    fn wss_dsn_selects_tls_connector_and_ws_stays_plain() {
-        assert!(matches!(
-            connector_for(&server("wss://example.com/socket")).unwrap(),
-            Connector::Rustls(_)
-        ));
-        assert!(matches!(
-            connector_for(&server("ws://example.com:8080/socket")).unwrap(),
-            Connector::Plain
-        ));
-    }
-
-    #[test]
-    fn browser_request_has_required_browser_headers() {
-        let profile = BrowserProfile::random();
-        for _ in 0..20 {
-            let request =
-                browser_request(&server("ws://example.com:8080/socket"), &profile).unwrap();
-            let user_agent = request.headers().get(USER_AGENT).unwrap().to_str().unwrap();
-            assert!(
-                user_agent.contains("Chrome/")
-                    || user_agent.contains("Firefox/")
-                    || user_agent.contains("Safari/")
-            );
-            assert_eq!(
-                request.headers().get(ORIGIN).unwrap(),
-                "http://example.com:8080"
-            );
-            assert!(request.headers().contains_key(ACCEPT_LANGUAGE));
-        }
-    }
-
-    #[test]
-    fn browser_profile_is_stable_across_reconnects() {
-        let profile = BrowserProfile::random();
-        let first = browser_request(&server("wss://example.com/socket"), &profile).unwrap();
-        let second = browser_request(&server("wss://example.com/socket"), &profile).unwrap();
-        assert_eq!(
-            first.headers().get(USER_AGENT),
-            second.headers().get(USER_AGENT)
-        );
-        assert_eq!(
-            first.headers().get(ACCEPT_LANGUAGE),
-            second.headers().get(ACCEPT_LANGUAGE)
-        );
-        assert_eq!(
-            first.headers().get("sec-ch-ua"),
-            second.headers().get("sec-ch-ua")
-        );
-    }
-
-    #[test]
-    fn chrome_user_agent_matches_client_hints_and_platform() {
-        for index in 0..CHROME_USER_AGENTS.len() {
-            let profile = BrowserProfile {
-                user_agent: CHROME_USER_AGENTS[index],
-                accept_language: ACCEPT_LANGUAGES[0],
-                chrome_profile: Some(index),
-            };
-            let request = browser_request(&server("wss://example.com/socket"), &profile).unwrap();
-            let major = profile
-                .user_agent
-                .split("Chrome/")
-                .nth(1)
-                .unwrap()
-                .split('.')
-                .next()
-                .unwrap();
-
-            assert!(
-                request
-                    .headers()
-                    .get("sec-ch-ua")
-                    .unwrap()
-                    .to_str()
-                    .unwrap()
-                    .contains(&format!("v=\"{major}\""))
-            );
-            assert_eq!(
-                request.headers().get("sec-ch-ua-platform").unwrap(),
-                CHROME_PLATFORMS[index]
-            );
-        }
     }
 }

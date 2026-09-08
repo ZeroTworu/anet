@@ -2,13 +2,15 @@ use crate::auth_handler::ServerAuthHandler;
 use crate::client_registry::ClientRegistry;
 use crate::config::Config;
 use anet_common::consts::{CHANNEL_BUFFER_SIZE, COALESCE_BUDGET_BYTES};
+use anet_common::stream_framing::read_next_packet;
 use anyhow::{Context, Result};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures::{SinkExt, StreamExt};
 use log::{debug, info, warn};
 use rand::Rng;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
@@ -19,7 +21,7 @@ use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::http::StatusCode;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
-const MAX_WS_MESSAGE_SIZE: usize = 64 * 1024;
+const MAX_WS_MESSAGE_SIZE: usize = 128 * 1024; // Увеличено для коалесценции
 
 async fn upgrade(
     stream: TcpStream,
@@ -27,22 +29,21 @@ async fn upgrade(
 ) -> Result<tokio_tungstenite::WebSocketStream<TcpStream>> {
     let callback = move |request: &Request,
                          mut response: Response|
-          -> std::result::Result<Response, ErrorResponse> {
+                         -> std::result::Result<Response, ErrorResponse> {
         if request.uri().path() != expected_path {
             let mut rejected = ErrorResponse::new(Some("Not Found".to_string()));
             *rejected.status_mut() = StatusCode::NOT_FOUND;
             return Err(rejected);
         }
-        // A small, ordinary-looking response surface instead of a protocol brand.
         response
             .headers_mut()
             .insert("cache-control", HeaderValue::from_static("no-store"));
         Ok(response)
     };
     let ws_config = WebSocketConfig::default()
-        .read_buffer_size(16 * 1024)
-        .write_buffer_size(16 * 1024)
-        .max_write_buffer_size(128 * 1024)
+        .read_buffer_size(64 * 1024)
+        .write_buffer_size(64 * 1024)
+        .max_write_buffer_size(256 * 1024)
         .max_message_size(Some(MAX_WS_MESSAGE_SIZE))
         .max_frame_size(Some(MAX_WS_MESSAGE_SIZE));
     Ok(accept_hdr_async_with_config(stream, callback, Some(ws_config)).await?)
@@ -90,18 +91,24 @@ async fn handle_session(
             let padding_step = config.stealth.padding_step;
             let mut ping_timer = Box::pin(tokio::time::sleep(random_ping_interval()));
 
+            let mut batch_buf = BytesMut::with_capacity(COALESCE_BUDGET_BYTES);
+
             loop {
                 tokio::select! {
                     incoming = socket.next() => {
                         match incoming {
                             Some(Ok(Message::Binary(data))) => {
-                                match anet_common::transport::unwrap_packet_bytes(&cipher, data) {
-                                    Ok(packet) => {
-                                        let packet_len = packet.len();
-                                        if tun_tx.send(packet).await.is_err() { break; }
-                                        registry.record_rx(&client_info, packet_len, "ws");
+                                // РАСПАКОВКА БАТЧА: Читаем все пакеты из одного Message
+                                let mut cursor = std::io::Cursor::new(data);
+                                while let Ok(Some(encrypted_packet)) = read_next_packet(&mut cursor).await {
+                                    match anet_common::transport::unwrap_packet_bytes(&cipher, encrypted_packet) {
+                                        Ok(packet) => {
+                                            let packet_len = packet.len();
+                                            if tun_tx.send(packet).await.is_err() { break; }
+                                            registry.record_rx(&client_info, packet_len, "ws");
+                                        }
+                                        Err(error) => debug!("[WebSocket] Dropped invalid message from {remote_addr}: {error}"),
                                     }
-                                    Err(error) => debug!("[WebSocket] Dropped invalid message from {remote_addr}: {error}"),
                                 }
                             }
                             Some(Ok(Message::Ping(data))) => {
@@ -109,8 +116,6 @@ async fn handle_session(
                             }
                             Some(Ok(Message::Pong(_))) => {}
                             Some(Ok(Message::Close(_))) => {
-                                // Reserve the logical VPN session before the
-                                // close acknowledgement reaches the client.
                                 registry.suspend_client(client_info.clone());
                                 let _ = socket.close(None).await;
                                 return Ok(());
@@ -121,29 +126,22 @@ async fn handle_session(
                     }
                     packet = rx_router.recv() => {
                         let Some(mut raw) = packet else { break; };
-                        let mut batch_bytes = 0usize;
+                        batch_buf.clear();
+
                         loop {
                             if raw.len() >= 20 {
-                                let seq = sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                let encrypted = match anet_common::transport::wrap_packet_padded(
+                                let seq = sequence.fetch_add(1, Ordering::Relaxed);
+                                if let Ok(encrypted) = anet_common::transport::wrap_packet_padded(
                                     &cipher,
                                     &nonce_prefix,
                                     seq,
                                     raw,
                                     padding_step,
                                 ) {
-                                    Ok(encrypted) => encrypted,
-                                    Err(error) => {
-                                        warn!("[WebSocket] Failed to encrypt packet for {remote_addr}: {error}");
-                                        return Err(error.into());
-                                    }
-                                };
-                                batch_bytes += encrypted.len();
-                                if socket.feed(Message::Binary(encrypted)).await.is_err() {
-                                    break;
+                                    anet_common::stream_framing::frame_packet_into(&mut batch_buf, &encrypted);
                                 }
                             }
-                            if batch_bytes >= COALESCE_BUDGET_BYTES {
+                            if batch_buf.len() >= COALESCE_BUDGET_BYTES {
                                 break;
                             }
                             raw = match rx_router.try_recv() {
@@ -151,8 +149,14 @@ async fn handle_session(
                                 Err(_) => break,
                             };
                         }
-                        if socket.flush().await.is_err() {
-                            break;
+
+                        if !batch_buf.is_empty() {
+                            if socket.feed(Message::Binary(batch_buf.clone().freeze())).await.is_err() {
+                                break;
+                            }
+                            if socket.flush().await.is_err() {
+                                break;
+                            }
                         }
                     }
                     _ = &mut ping_timer => {

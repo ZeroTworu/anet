@@ -11,6 +11,8 @@ use log::info;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+// Используем синхронный Mutex для быстрых, неблокирующих операций
+use std::sync::Mutex as StdMutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex};
@@ -105,7 +107,8 @@ fn unwrap_packet_with_seq(cipher: &anet_common::encryption::Cipher, raw_packet: 
 /// Контекст сессии на сервере (Очередь вывода + Скользящее окно ввода)
 struct ServerSession {
     rx_router: Arc<Mutex<mpsc::Receiver<Bytes>>>,
-    reassembler: Arc<Mutex<ReassemblyQueue>>,
+    // ИСПОЛЬЗУЕМ std::sync::Mutex для синхронных операций без .await
+    reassembler: Arc<StdMutex<ReassemblyQueue>>,
 }
 
 pub async fn run_http_stream_server(
@@ -150,7 +153,7 @@ async fn handle_http_connection(
     auth_handler: ServerAuthHandler,
     sessions: Arc<DashMap<String, Arc<ServerSession>>>,
 ) -> Result<()> {
-    let mut buffer = BytesMut::with_capacity(MAX_PACKET_SIZE * 2);
+    let mut buffer = BytesMut::with_capacity(MAX_PACKET_SIZE * 4);
 
     // Чтение путей из конфигурационного файла [ahttp]
     let path_handshake = format!("{}{}", config.server.ahttp_path, config.ahttp.handshake_path);
@@ -158,7 +161,8 @@ async fn handle_http_connection(
     let path_traffic = format!("{}{}", config.server.ahttp_path, config.ahttp.traffic_path);
 
     loop {
-        let mut temp = [0u8; 8192];
+        // УВЕЛИЧЕН БУФЕР ЧТЕНИЯ: 64 КБ (размер окна TCP) вместо 8 КБ
+        let mut temp = [0u8; 65536];
         let n = stream.read(&mut temp).await?;
         if n == 0 { return Ok(()); }
         buffer.extend_from_slice(&temp[..n]);
@@ -181,7 +185,7 @@ async fn handle_http_connection(
                 }
 
                 while buffer.len() < header_len + content_length {
-                    let mut temp = [0u8; 8192];
+                    let mut temp = [0u8; 65536];
                     let n = stream.read(&mut temp).await?;
                     if n == 0 { return Err(anyhow::anyhow!("Connection closed while reading body")); }
                     buffer.extend_from_slice(&temp[..n]);
@@ -219,80 +223,85 @@ async fn handle_http_connection(
                                 Ordering::Relaxed
                             );
 
-                            // Получаем или инициализируем контекст сессии (Очередь + Реассемблер)
+                            // Получаем или инициализируем контекст сессии
                             let session = sessions.entry(session_id.clone()).or_insert_with(|| {
                                 let (tx_router, rx_router) = mpsc::channel::<Bytes>(CHANNEL_BUFFER_SIZE);
                                 registry.finalize_client(&client_info.assigned_ip, tx_router);
                                 Arc::new(ServerSession {
                                     rx_router: Arc::new(Mutex::new(rx_router)),
-                                    reassembler: Arc::new(Mutex::new(ReassemblyQueue::new(config.ahttp.reassembly_queue_max_size))),
+                                    reassembler: Arc::new(StdMutex::new(ReassemblyQueue::new(config.ahttp.reassembly_queue_max_size))),
                                 })
                             }).value().clone();
 
                             // 1. Прием Uplink-трафика (Распаковка через окно упорядочивания)
                             if !body.is_empty() {
                                 let mut cursor = std::io::Cursor::new(body);
-                                let mut reassembler = session.reassembler.lock().await;
+                                let mut to_forward: Vec<Bytes> = Vec::new();
 
+                                // Читаем пакеты асинхронно, а лок берем только для быстрой вставки
                                 while let Ok(Some(encrypted_packet)) = read_next_packet(&mut cursor).await {
                                     if let Ok((seq, decrypted)) = unwrap_packet_with_seq(&client_info.cipher, encrypted_packet) {
-
-                                        // Получаем готовые упорядоченные пакеты
-                                        let ready_packets = reassembler.insert(seq, decrypted);
-                                        for packet in ready_packets {
-                                            let packet_len = packet.len();
-                                            let _ = tun_tx.send(packet).await;
-                                            // Записываем статистику на сервере
-                                            registry.record_rx(&client_info, packet_len, "ahttp");
-                                        }
+                                        // Ограничиваем область видимости лока
+                                        let ready_packets = {
+                                            let mut reassembler = session.reassembler.lock().unwrap();
+                                            reassembler.insert(seq, decrypted)
+                                        };
+                                        to_forward.extend(ready_packets);
                                     }
+                                }
+
+                                for packet in to_forward {
+                                    let packet_len = packet.len();
+                                    let _ = tun_tx.send(packet).await;
+                                    // Записываем статистику на сервере
+                                    registry.record_rx(&client_info, packet_len, "ahttp");
                                 }
                             }
 
-                            // 2. Отдача Downlink-трафика (Short-Polling: ждем до 30мс)
-                            let mut rx_router = session.rx_router.lock().await;
+                            // 2. Отдача Downlink-трафика
                             let mut body_buf = BytesMut::new();
                             let padding_step = config.stealth.padding_step;
 
-                            let timeout_duration = std::time::Duration::from_millis(config.ahttp.poll_timeout_ms);
+                            if let Ok(mut rx_router) = session.rx_router.try_lock() {
+                                let timeout_duration = std::time::Duration::from_millis(config.ahttp.poll_timeout_ms);
 
-                            // Инлайним шифрование пакетов и полностью убираем замыкания
-                            if let Ok(Some(packet)) = tokio::time::timeout(timeout_duration, rx_router.recv()).await {
-                                if packet.len() >= 20 {
-                                    let seq = client_info.sequence.fetch_add(1, Ordering::Relaxed);
-                                    if let Ok(encrypted) = wrap_packet_padded(
-                                        &client_info.cipher,
-                                        &client_info.nonce_prefix,
-                                        seq,
-                                        packet,
-                                        padding_step
-                                    ) {
-                                        let framed = anet_common::stream_framing::frame_packet(encrypted);
-                                        body_buf.extend_from_slice(&framed);
-                                    }
-                                }
-
-                                while let Ok(next_packet) = rx_router.try_recv() {
-                                    if next_packet.len() >= 20 {
+                                if let Ok(Some(packet)) = tokio::time::timeout(timeout_duration, rx_router.recv()).await {
+                                    if packet.len() >= 20 {
                                         let seq = client_info.sequence.fetch_add(1, Ordering::Relaxed);
                                         if let Ok(encrypted) = wrap_packet_padded(
                                             &client_info.cipher,
                                             &client_info.nonce_prefix,
                                             seq,
-                                            next_packet,
+                                            packet,
                                             padding_step
                                         ) {
                                             let framed = anet_common::stream_framing::frame_packet(encrypted);
                                             body_buf.extend_from_slice(&framed);
                                         }
                                     }
-                                    if body_buf.len() >= config.ahttp.coalesce_budget_bytes {
-                                        break;
+
+                                    while let Ok(next_packet) = rx_router.try_recv() {
+                                        if next_packet.len() >= 20 {
+                                            let seq = client_info.sequence.fetch_add(1, Ordering::Relaxed);
+                                            if let Ok(encrypted) = wrap_packet_padded(
+                                                &client_info.cipher,
+                                                &client_info.nonce_prefix,
+                                                seq,
+                                                next_packet,
+                                                padding_step
+                                            ) {
+                                                let framed = anet_common::stream_framing::frame_packet(encrypted);
+                                                body_buf.extend_from_slice(&framed);
+                                            }
+                                        }
+                                        if body_buf.len() >= config.ahttp.coalesce_budget_bytes {
+                                            break;
+                                        }
                                     }
                                 }
                             }
 
-                            // 3. Отвечаем клиенту на основе кастомных заголовков
+                            // 3. Отвечаем клиенту
                             let response_header = config.ahttp.response_headers
                                 .replace("\r\n", "\n")
                                 .replace('\n', "\r\n")
@@ -314,7 +323,6 @@ async fn handle_http_connection(
                     }
                 }
 
-                // Очищаем буфер для следующего запроса в рамках Keep-Alive сессии
                 let total_consumed = header_len + content_length;
                 let _ = buffer.split_to(total_consumed);
             }

@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::UdpSocket;
+use anet_common::consts::PADDING_MTU;
 
 pub struct QuicDuplexStream {
     send: SendStream,
@@ -109,8 +110,11 @@ impl ClientTransport for QuicTransport {
             self.config.stealth.clone(),
         ));
 
+        let mut ep_config = EndpointConfig::default();
+        let _ = ep_config.max_udp_payload_size(PADDING_MTU as u16);
+
         let mut endpoint = Endpoint::new_with_abstract_socket(
-            EndpointConfig::default(),
+            ep_config,
             None,
             anet_socket,
             Arc::new(TokioRuntime),

@@ -52,11 +52,6 @@ pub struct AnetClient {
     route_manager: Box<dyn RouteManager>,
     dns_manager: Box<dyn DnsManager>,
     session: Mutex<Option<RunningSession>>,
-    // Взводится в stop(): цикл переподключения в start() использует этот
-    // флаг, чтобы отличить "пользователь нажал disconnect" от "сессия
-    // умерла сама" — оба случая возвращаются из connect_and_run() одним и
-    // тем же путём (через reconnect_signal), поэтому раньше stop() всегда
-    // трактовался как обрыв связи и немедленно вызывал реконнект.
     stop_requested: AtomicBool,
     is_active: AtomicBool,
     cancel_signal: Arc<Notify>,
@@ -125,7 +120,6 @@ impl AnetClient {
             }
         }
 
-        // Нормализуем адреса (сбрасываем биты хоста, чтобы избежать ошибок масок вроде /24 с адресом .1) и удаляем дубликаты
         let mut normalized_result: Vec<IpNet> = result
             .into_iter()
             .filter_map(|net| IpNet::new(net.network(), net.prefix_len()).ok())
@@ -141,7 +135,6 @@ impl AnetClient {
         self.is_active.load(Ordering::SeqCst) || self.session.lock().unwrap().is_some()
     }
 
-    /// Главный метод запуска VPN. Управляет циклом каскадного переподключения серверов.
     pub async fn start(&self) -> Result<()> {
         if self.is_running() {
             return Err(anyhow!("VPN tunnel is already active"));
@@ -186,10 +179,6 @@ impl AnetClient {
 
             match self.connect_and_run(server, reconnect_signal.clone()).await {
                 Ok(()) => {
-                    // connect_and_run() возвращается через reconnect_signal и
-                    // при обрыве сессии, и при вызове stop() — различаем эти
-                    // случаи флагом, иначе disconnect всегда трактовался как
-                    // "связь потеряна" и тут же запускал реконнект.
                     if self.stop_requested.load(Ordering::SeqCst) {
                         info!("[Core] Stop requested by user. Exiting connection loop.");
                         break;
@@ -199,7 +188,7 @@ impl AnetClient {
                         "[Core] Connection with server '{}' lost. Switching to the next node...",
                         server_name
                     );
-                    status("Connection lost. Reconnecting...");
+                    warn("Connection lost. Reconnecting...");
                     client_state(
                         ClientState::Reconnecting,
                         "Connection lost; reconnecting",
@@ -207,8 +196,8 @@ impl AnetClient {
                     );
 
                     current_server_index = (current_server_index + 1) % config_clone.servers.len();
-                    tokio::select! {
-                        _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+                    select! {
+                        _ = sleep(Duration::from_secs(2)) => {}
                         _ = self.cancel_signal.notified() => {
                             info!("[Core] Connection loop sleep cancelled by user.");
                             break;
@@ -225,7 +214,7 @@ impl AnetClient {
                         "[Core] Connection failed or timed out for server '{}': {}",
                         server_name, e
                     );
-                    status(format!("Node error: {}", e));
+                    err(format!("Node error: {}", e));
                     client_state(
                         ClientState::Reconnecting,
                         format!("Node error: {e}"),
@@ -233,8 +222,8 @@ impl AnetClient {
                     );
 
                     current_server_index = (current_server_index + 1) % config_clone.servers.len();
-                    tokio::select! {
-                        _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+                    select! {
+                        _ = sleep(Duration::from_secs(2)) => {}
                         _ = self.cancel_signal.notified() => {
                             info!("[Core] Connection loop sleep cancelled by user.");
                             break;
@@ -248,10 +237,6 @@ impl AnetClient {
         Ok(())
     }
 
-    /// Получает источник IP-пакетов для сессии.
-    ///
-    /// Возвращает `(tx_to_source, rx_from_source, iface_name, filter_handle)`,
-    /// где `filter_handle` держит WinDivert-фильтр живым (None для TUN-режима).
     #[cfg(all(windows, feature = "per-app"))]
     async fn acquire_packet_source(
         &self,
@@ -263,11 +248,7 @@ impl AnetClient {
         String,
         Option<anet_appfilter::AppFilter>,
     )> {
-        // МЫ ВСЕГДА создаем TUN-интерфейс (Wintun), чтобы операционная система зарегистрировала
-        // выделенный виртуальный IP-адрес на хосте.
         let (tun_tx, tun_rx, iface_name) = self.tun_factory.create_tun(auth).await?;
-
-        // Проверяем режим работы через обновленный enum
         let mode = self.config.main.per_app_mode;
 
         if mode == PerAppMode::All
@@ -275,11 +256,9 @@ impl AnetClient {
         {
             info!("[Core] Per-app mode is disabled (All applications)");
             status("[Core] Per-app mode is disabled (All applications)");
-            // Обычный полнотуннельный режим через TUN для всех приложений
             return Ok((tun_tx, tun_rx, iface_name, None));
         }
 
-        // Статический bypass: IP-литералы всех серверов из конфига.
         let initial_bypass: Vec<IpAddr> = self
             .config
             .servers
@@ -288,7 +267,6 @@ impl AnetClient {
             .filter_map(|(host, _)| IpAddr::from_str(&host).ok())
             .collect();
 
-        // Формируем политику на основе enum с явным указанием типов для пустых векторов
         let policy = match mode {
             crate::config::PerAppMode::Exclude => {
                 anet_appfilter::AppPolicy::exclude(self.config.main.per_app.clone())
@@ -301,12 +279,10 @@ impl AnetClient {
             }
         };
 
-        // Парсим выданный VPN IP
         let vpn_ip = IpAddr::from_str(&auth.ip).context("Failed to parse assigned VPN IP")?;
 
         let (filter, tx, rx) = anet_appfilter::AppFilter::start(policy, initial_bypass, vpn_ip)?;
 
-        // Динамический bypass: фактический адрес текущего сервера.
         let (server_host, server_port) = _server.host_port()?;
         if let Ok(ip) = IpAddr::from_str(&server_host) {
             filter.add_bypass(ip).await;
@@ -334,7 +310,6 @@ impl AnetClient {
             apps_names, mode_str,
         ));
 
-        // Утилизируем входящий канал TUN (tun_rx) в фоновом режиме
         tokio::spawn(async move {
             let mut rx = tun_rx;
             while rx.recv().await.is_some() {}
@@ -343,9 +318,6 @@ impl AnetClient {
         Ok((tx, rx, iface_name, Some(filter)))
     }
 
-    /// Fallback: per-app недоступен (не Windows, либо фича `per-app`
-    /// выключена) — всегда обычный TUN. Тип хэндла — (), чтобы сигнатура
-    /// вызова совпадала на всех платформах.
     #[cfg(not(all(windows, feature = "per-app")))]
     async fn acquire_packet_source(
         &self,
@@ -356,7 +328,6 @@ impl AnetClient {
         Ok((tx, rx, iface, None))
     }
 
-    /// Внутренний метод, который держит активную сессию и мониторит её здоровье
     async fn connect_and_run(
         &self,
         server: &ServerConfig,
@@ -371,11 +342,6 @@ impl AnetClient {
         let connect_fut = transport.connect();
         let stop_flag = &self.stop_requested;
 
-        // Отмена по опросу флага, а не по Notify::notify_waiters():
-        // notify_waiters будит только уже зарегистрированные ожидания и не
-        // сохраняет разрешение, поэтому стоп, нажатый до входа в select
-        // (создание транспорта, DNS-резолв сервера), терялся и рукопожатие
-        // продолжалось до таймаута, игнорируя отмену. Флаг потерять нельзя.
         let result = tokio::select! {
             res = tokio::time::timeout(conn_timeout, connect_fut) => {
                 match res {
@@ -389,7 +355,7 @@ impl AnetClient {
                     if stop_flag.load(Ordering::SeqCst) {
                         break;
                     }
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    sleep(Duration::from_millis(100)).await;
                 }
             } => {
                 info!("[Core] Handshake cancelled by user.");
@@ -423,13 +389,6 @@ impl AnetClient {
                 .await?;
         }
 
-        // Источник/приёмник IP-пакетов. Обычно это TUN. На Windows, если задан
-        // per-app список, вместо TUN поднимаем WinDivert-фильтр, который отдаёт
-        // ту же пару каналов (Sender/Receiver<Bytes>) — транспорт не меняется.
-        //
-        // `_app_filter` держит хэндл фильтра живым на всё время сессии; при
-        // выходе из функции он дропается и рабочие потоки WinDivert
-        // останавливаются вместе с закрытием каналов.
         let (tx_to_tun, mut rx_from_tun, iface_name, _app_filter) = self
             .acquire_packet_source(server, &result.auth_response)
             .await?;
@@ -448,9 +407,6 @@ impl AnetClient {
 
         let (mut stream_reader, mut stream_writer) = io_split(result.vpn_stream);
 
-        // =========================================================================
-        // Задача TUN -> NETWORK (Отправка пакетов) с КOАЛЕСЦЕНЦИЕЙ и СИГНАЛОМ ОТМЕНЫ
-        // =========================================================================
         let tx_time = last_tx_time.clone();
         let tx_bytes = total_tx_bytes.clone();
         let tx_packets = total_tx_packets.clone();
@@ -459,16 +415,14 @@ impl AnetClient {
             let mut write_buf = BytesMut::with_capacity(COALESCE_BUDGET_BYTES);
 
             loop {
-                // ИССПРАВЛЕНИЕ ДЕДЛОКА: Асинхронно ждем либо пакет из TUN, либо сигнал отмены сессии
                 let packet = tokio::select! {
                     pkt = rx_from_tun.recv() => {
                         match pkt {
                             Some(p) => p,
-                            None => break, // Канал закрылся
+                            None => break,
                         }
                     }
                     _ = notify_tx.notified() => {
-                        // Получен сигнал отмены сессии при очистке — немедленно выходим!
                         break;
                     }
                 };
@@ -482,7 +436,6 @@ impl AnetClient {
 
                 frame_packet_into(&mut write_buf, &packet);
 
-                // Пакетная выгрузка без ожидания (выгребаем готовое)
                 while write_buf.len() < COALESCE_BUDGET_BYTES {
                     match rx_from_tun.try_recv() {
                         Ok(p) => {
@@ -499,16 +452,14 @@ impl AnetClient {
                     continue;
                 }
 
-                if stream_writer.write_all(&write_buf).await.is_err()
-                    || stream_writer.flush().await.is_err()
-                {
+                // ВНИМАНИЕ: ЗДЕСЬ УДАЛЁН flush().await, ИНАЧЕ QUIC И SSH РАБОТАЮТ КАК STOP-AND-WAIT
+                if stream_writer.write_all(&write_buf).await.is_err() {
                     sig_t1.notify_one();
                     break;
                 }
             }
         });
 
-        // Задача NETWORK -> TUN (Прием пакетов)
         let rx_time = last_rx_time.clone();
         let rx_bytes = total_rx_bytes.clone();
         let rx_packets = total_rx_packets.clone();
@@ -540,9 +491,6 @@ impl AnetClient {
             }
         });
 
-        // В per-app режиме (Windows/WinDivert) маршрутизацией управляет сам
-        // фильтр на уровне пакетов: нет реального интерфейса, дефолтный маршрут
-        // и системный DNS трогать нельзя. `_app_filter.is_some()` == per-app.
         let per_app_active = _app_filter.is_some();
 
         if !per_app_active {
@@ -595,8 +543,6 @@ impl AnetClient {
             }
         }
 
-        // АКТИВНЫЙ ВОРКЕР КОНТРОЛЯ ЗДОРОВЬЯ (HEALTH MONITOR ИЗ 073)
-        // =========================================================================
         let monitor_shutdown = shutdown_notify.clone();
         let monitor_reconnect = reconnect_signal.clone();
         let rx_check = last_rx_time.clone();
@@ -611,7 +557,7 @@ impl AnetClient {
 
             loop {
                 tokio::select! {
-                    _ = tokio::time::sleep(check_interval) => {}
+                    _ = sleep(check_interval) => {}
                     _ = monitor_shutdown.notified() => {
                         break;
                     }
@@ -627,7 +573,6 @@ impl AnetClient {
                     continue;
                 }
 
-                // 1. Проверяем, не закрыто ли уже базовое QUIC-соединение (по таймауту/ошибке)
                 if let Some(ref conn) = quic_conn {
                     if let Some(reason) = conn.close_reason() {
                         warn!("[Health] Underlying QUIC connection closed: {:?}. Triggering reconnect...", reason);
@@ -638,7 +583,6 @@ impl AnetClient {
                 }
 
                 if is_initial_phase {
-                    // Если мы отправляли данные в первые 4 сек, но ответа нет 8 сек -> Блокировка
                     if elapsed_rx > Duration::from_secs(8) && elapsed_tx < Duration::from_secs(4) {
                         warn!("[Health] CASE 1 Detected: Connection established, but payload traffic is blocked!");
                         client_state(ClientState::Reconnecting, "Payload traffic blocked; reconnecting", None);
@@ -649,9 +593,6 @@ impl AnetClient {
                         is_initial_phase = false;
                     }
                 } else {
-                    // Если пользователь или система активно отправляют данные (elapsed_tx < 8s),
-                    // но входящего трафика нет более 18s (не приходят даже TCP ACK/DNS-ответы):
-                    // Соединение ушло в "черную дыру" (отвал NAT/соты/роутера).
                     if elapsed_tx < Duration::from_secs(8) && elapsed_rx > Duration::from_secs(18) {
                         stalled_counter += 1;
                         if stalled_counter >= 2 {
@@ -671,9 +612,6 @@ impl AnetClient {
             }
         });
 
-        // =========================================================================
-        // УНИВЕРСАЛЬНЫЙ СБОРЩИК СТАТИСТИКИ
-        // =========================================================================
         let stats_shutdown = shutdown_notify.clone();
         let stats_task = {
             let provider: Arc<dyn statistic::StatsProvider> =
@@ -688,7 +626,6 @@ impl AnetClient {
                     ))
                 };
 
-            // 1. Получаем IP:Port текущего сервера
             let (server_host, server_port) = server.host_port().unwrap_or_default();
             let mut resolved_addr: Option<SocketAddr> = None;
 
@@ -700,7 +637,6 @@ impl AnetClient {
                 resolved_addr = addrs.next();
             }
 
-            // 2. Оборачиваем provider в PingStatsProvider (если адрес успешно определён)
             let fast_provider: Arc<dyn statistic::StatsProvider> = if let Some(addr) = resolved_addr
             {
                 statistic::PingStatsProvider::new(provider.clone(), addr)
@@ -708,11 +644,9 @@ impl AnetClient {
                 provider.clone()
             };
 
-            // 3. Быстрый монитор для обновления UI-меток (каждую секунду)
             let fast_handle =
                 statistic::start_fast_stats_monitor(fast_provider, stats_shutdown.clone());
 
-            // 4. Медленный монитор для записи детальной статистики в лог (по интервалу)
             let slow_handle = if config_clone.stats.enabled {
                 Some(statistic::start_stats_monitor(
                     provider,
@@ -723,7 +657,6 @@ impl AnetClient {
                 None
             };
 
-            // Объединяем выполнение обоих мониторов в единый JoinHandle
             Some(spawn(async move {
                 if let Some(slow) = slow_handle {
                     let _ = tokio::join!(fast_handle, slow);
@@ -755,9 +688,6 @@ impl AnetClient {
             });
         }
 
-        // =========================================================================
-        // ВЫВОД ИНФОРМАЦИИ О ТАРИФЕ И АККАУНТЕ (СОХРАНЕНО ИЗ СВЕЖЕЙ БАЗЫ REBASE)
-        // =========================================================================
         let billing_str =
             match ProtoBillingType::try_from(result.auth_response.billing_type).unwrap() {
                 ProtoBillingType::NoTariffNoGroup => "Без тарифа и группы",
@@ -833,10 +763,8 @@ impl AnetClient {
             Some(server.get_name()),
         );
 
-        // Засыпаем и ждем сигнала о необходимости реконнекта от воркера здоровья или задач t1/t2
         reconnect_signal.notified().await;
 
-        // Очистка текущей нерабочей сессии
         info!("[Core] Cleaning up dead session...");
         status("[Core] Cleaning up dead session...");
         shutdown_notify.notify_waiters();
@@ -850,7 +778,6 @@ impl AnetClient {
             if let Some(task) = sess.stats_task {
                 task.abort();
             }
-            // Теперь main_task разрешится за доли миллисекунды без зависания!
             let _ = sess.main_task.await;
         }
 
@@ -860,7 +787,6 @@ impl AnetClient {
         Ok(())
     }
 
-    /// Внешний триггер мгновенного переподключения (из 073: для мобильного watchdog и смены сети)
     pub fn trigger_reconnect(&self) {
         if self.stop_requested.load(Ordering::SeqCst) {
             return;
@@ -874,8 +800,6 @@ impl AnetClient {
     }
 
     pub async fn stop(&self) -> anyhow::Result<()> {
-        // Взводим ДО notify_one() ниже — start() должен увидеть флаг сразу,
-        // как только проснётся от сигнала reconnect_signal.
         self.stop_requested.store(true, Ordering::SeqCst);
         self.cancel_signal.notify_waiters();
 
@@ -889,7 +813,7 @@ impl AnetClient {
             status("[Core] Stopping VPN...");
             client_state(ClientState::Stopping, "Stopping VPN", None);
             running.shutdown_notify.notify_waiters();
-            running.reconnect_signal.notify_one(); // <-- Сигнализируем выходу из connect_and_run!
+            running.reconnect_signal.notify_one();
 
             if let Some(task) = running.stats_task {
                 task.abort();
@@ -915,7 +839,6 @@ impl AnetClient {
     }
 }
 
-/// Вспомогательная функция форматирования байт в читаемые единицы
 fn format_bytes(bytes: u64) -> String {
     const KIB: f64 = 1024.0;
     const MIB: f64 = 1024.0 * 1024.0;

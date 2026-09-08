@@ -2,7 +2,7 @@ use crate::auth_handler::ServerAuthHandler;
 use crate::client_registry::ClientRegistry;
 use crate::config::Config;
 use crate::multikey_udp_socket::{HandshakeData, MultiKeyAnetUdpSocket};
-use anet_common::consts::CHANNEL_BUFFER_SIZE;
+use anet_common::consts::{CHANNEL_BUFFER_SIZE, PADDING_MTU};
 use anet_common::jitter::bridge_with_jitter;
 use anet_common::quic_settings::build_transport_config;
 use anet_common::stream_framing::read_next_packet;
@@ -92,9 +92,12 @@ pub async fn run_quic_server(
     ));
 
     info!("Starting ASTP[Crypted QUIC] Proxy Layer on {}", bind_to);
+    let mut ep_config = EndpointConfig::default();
+    // Увеличиваем батчинг UDP-пакетов (sendmmsg/recvmmsg)
+    let _ =ep_config.max_udp_payload_size(PADDING_MTU as u16);
 
     let endpoint = Endpoint::new_with_abstract_socket(
-        EndpointConfig::default(),
+        ep_config,
         Some(s_cfg),
         socket_wrapper,
         Arc::new(TokioRuntime),

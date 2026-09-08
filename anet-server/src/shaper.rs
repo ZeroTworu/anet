@@ -36,6 +36,7 @@ impl Shaper {
     /// (актуальное имя TUN-интерфейса сервера, после `TunManager::run()`).
     /// Требует `CAP_BPF` + `CAP_NET_ADMIN` (или root).
     pub async fn attach(iface: &str) -> Result<Self> {
+        info!("Attaching shaper...");
         let bytes = aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/anet-ebpf"));
         let mut ebpf = Ebpf::load(bytes).context("Failed to load embedded anet-ebpf object")?;
 

@@ -1,13 +1,13 @@
 use crate::auth_handler::ServerAuthHandler;
 use crate::client_registry::{ClientRegistry, ClientTransportInfo};
 use crate::config::Config;
-use anet_common::consts::PADDING_MTU;
+use anet_common::consts::{CRYPTO_COALESCE_BUDGET_BYTES, PADDING_MTU};
 use anet_common::vnc::{
-    CLIENT_CUT_TEXT, RFB_VERSION, SECURITY_TYPE_NONE, SERVER_CUT_TEXT, read_cut_text,
-    write_cut_text,
+    CLIENT_CUT_TEXT, RFB_VERSION, SECURITY_TYPE_NONE, SERVER_CUT_TEXT, encode_cut_text,
+    read_cut_text, write_cut_text,
 };
 use anyhow::{Context, Result};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt, StreamExt};
@@ -67,16 +67,16 @@ async fn handle_vnc_session(
         RFB_HANDSHAKE_TIMEOUT,
         emulate_rfb_server_handshake(&mut stream),
     )
-    .await
-    .context("RFB handshake timed out")??;
+        .await
+        .context("RFB handshake timed out")??;
     info!("[VNC] RFB handshake complete for {remote_addr}");
 
     let client_info = tokio::time::timeout(
         ASTP_AUTH_TIMEOUT,
         authenticate(&mut stream, remote_addr, &auth_handler),
     )
-    .await
-    .context("ASTP authentication timed out")??;
+        .await
+        .context("ASTP authentication timed out")??;
     info!(
         "[VNC] ASTP authenticated for {}; assigned IP {}",
         remote_addr, client_info.assigned_ip
@@ -179,8 +179,11 @@ async fn send_to_client(
     let mut pending = FuturesUnordered::<BoxFuture<'static, Bytes>>::new();
     let mut input_open = true;
 
+    // БУФЕР КОАЛЕСЦЕНЦИИ
+    let mut batch_buf = BytesMut::with_capacity(CRYPTO_COALESCE_BUDGET_BYTES);
+
     while input_open || !pending.is_empty() {
-        let packet = if !jitter_enabled {
+        let mut packet = if !jitter_enabled {
             match router_rx.recv().await {
                 Some(packet) => packet,
                 None => break,
@@ -218,26 +221,43 @@ async fn send_to_client(
                 packet = pending.next() => packet.expect("pending jitter queue is not empty"),
             }
         };
-        if packet.len() < 20 {
-            continue;
+
+        batch_buf.clear();
+
+        loop {
+            if packet.len() >= 20 {
+                let sequence = client_info.sequence.fetch_add(1, Ordering::Relaxed);
+                let total_len = packet.len() + 38;
+                let padding = anet_common::padding_utils::calculate_padding_needed(total_len, stealth.padding_step);
+                let safe_padding = if total_len + usize::from(padding) > PADDING_MTU { 0 } else { padding };
+
+                let encrypted = anet_common::transport::wrap_packet(
+                    &client_info.cipher,
+                    &client_info.nonce_prefix,
+                    sequence,
+                    packet,
+                    safe_padding,
+                )?;
+
+                if let Ok(frame) = encode_cut_text(SERVER_CUT_TEXT, &encrypted) {
+                    batch_buf.extend_from_slice(&frame);
+                }
+            }
+
+            if batch_buf.len() >= CRYPTO_COALESCE_BUDGET_BYTES {
+                break;
+            }
+
+            packet = match router_rx.try_recv() {
+                Ok(p) => p,
+                Err(_) => break,
+            };
         }
-        let sequence = client_info.sequence.fetch_add(1, Ordering::Relaxed);
-        let total_len = packet.len() + 38;
-        let padding =
-            anet_common::padding_utils::calculate_padding_needed(total_len, stealth.padding_step);
-        let safe_padding = if total_len + usize::from(padding) > PADDING_MTU {
-            0
-        } else {
-            padding
-        };
-        let encrypted = anet_common::transport::wrap_packet(
-            &client_info.cipher,
-            &client_info.nonce_prefix,
-            sequence,
-            packet,
-            safe_padding,
-        )?;
-        write_cut_text(&mut writer, SERVER_CUT_TEXT, &encrypted).await?;
+
+        if !batch_buf.is_empty() {
+            writer.write_all(&batch_buf).await?;
+            // FLUSH УДАЛЕН (сеть отправляет пакеты по мере заполнения окна TCP)
+        }
     }
     writer.shutdown().await?;
     Ok(())
@@ -257,7 +277,7 @@ fn schedule_with_jitter(
             }
             packet
         }
-        .boxed(),
+            .boxed(),
     );
 }
 

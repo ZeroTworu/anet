@@ -2,7 +2,8 @@
 // Не научные - числу мух на потолке.
 
 pub const MAX_PACKET_SIZE: usize = 2048;
-pub const CHANNEL_BUFFER_SIZE: usize = 1024;
+// Увеличено с 1024 до 4096 для сглаживания сетевого джиттера
+pub const CHANNEL_BUFFER_SIZE: usize = 4096;
 pub const NONCE_PREFIX_LEN: usize = 4;
 pub const NONCE_LEN: usize = 12;
 pub const PADDING_MTU: usize = 1450;
@@ -21,3 +22,5 @@ pub const COALESCE_BUDGET_BYTES: usize = 64 * 1024;
 /// Гарантирует, что размер пакета никогда не превысит стандартное окно SSH-канала (32 KB),
 /// предотвращая переполнение буферов и панику CryptoVec::resize.
 pub const CRYPTO_COALESCE_BUDGET_BYTES: usize = 16 * 1024;
+
+pub const MAX_UDP_PAYLOAD_SIZE: usize = 1450;

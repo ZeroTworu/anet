@@ -156,7 +156,7 @@ pub mod desktop {
             // Удаляем старый если был
             let _ = self.handle.delete(&route).await;
 
-            error!("Debug route params - target: {}, prefix: {}, gw: {}, ifindex: {}", target, prefix, gateway, ifindex);
+            debug!("Debug route params - target: {}, prefix: {}, gw: {}, ifindex: {}", target, prefix, gateway, ifindex);
 
             // Добавляем
             match self.handle.add(&route).await {

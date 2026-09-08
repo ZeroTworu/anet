@@ -1,7 +1,7 @@
 use super::{ClientTransport, ConnectionResult};
 use crate::auth::{AuthChannel, AuthHandler};
 use crate::config::{CoreConfig, ServerConfig};
-use anet_common::consts::{MAX_PACKET_SIZE, PADDING_MTU};
+use anet_common::consts::{CRYPTO_COALESCE_BUDGET_BYTES, MAX_PACKET_SIZE, PADDING_MTU};
 use anet_common::handshake_fragmentation::{FragmentConfig, write_fragmented};
 use anet_common::stream_framing::{frame_packet, read_next_packet};
 use anet_common::vnc::{
@@ -10,7 +10,7 @@ use anet_common::vnc::{
 };
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt, StreamExt};
@@ -74,8 +74,8 @@ impl ClientTransport for VncTransport {
             RFB_HANDSHAKE_TIMEOUT,
             emulate_rfb_client_handshake(&mut stream),
         )
-        .await
-        .context("timed out during the VNC handshake")??;
+            .await
+            .context("timed out during the VNC handshake")??;
 
         info!("[VNC] RFB handshake complete; starting ASTP authentication");
         let auth_channel = VncAuthChannel {
@@ -154,8 +154,6 @@ impl ClientTransport for VncTransport {
 
         Ok(ConnectionResult {
             auth_response,
-            // См. аналогичный комментарий в ssh.rs: client_stream уже сам по
-            // себе VpnStream, MutexVpnStream был лишним и дефектным слоем.
             vpn_stream: Box::new(client_stream),
             endpoint: None,
             connection: None,
@@ -235,8 +233,10 @@ async fn send_to_server(
     let mut pending = FuturesUnordered::<BoxFuture<'static, Bytes>>::new();
     let mut input_open = true;
 
+    let mut batch_buf = BytesMut::with_capacity(CRYPTO_COALESCE_BUDGET_BYTES);
+
     while input_open || !pending.is_empty() {
-        let packet = if !jitter_enabled {
+        let mut packet = if !jitter_enabled {
             match packet_rx.recv().await {
                 Some(packet) => packet,
                 None => break,
@@ -274,26 +274,43 @@ async fn send_to_server(
                 packet = pending.next() => packet.expect("pending jitter queue is not empty"),
             }
         };
-        if packet.len() < 20 {
-            continue;
+
+        batch_buf.clear();
+
+        loop {
+            if packet.len() >= 20 {
+                let seq = sequence.fetch_add(1, Ordering::Relaxed);
+                let total_len = packet.len() + 38;
+                let padding = anet_common::padding_utils::calculate_padding_needed(total_len, stealth.padding_step);
+                let safe_padding = if total_len + usize::from(padding) > PADDING_MTU { 0 } else { padding };
+
+                let encrypted = anet_common::transport::wrap_packet(
+                    &cipher,
+                    &nonce_prefix,
+                    seq,
+                    packet,
+                    safe_padding,
+                )?;
+
+                if let Ok(frame) = encode_cut_text(CLIENT_CUT_TEXT, &encrypted) {
+                    batch_buf.extend_from_slice(&frame);
+                }
+            }
+
+            if batch_buf.len() >= CRYPTO_COALESCE_BUDGET_BYTES {
+                break;
+            }
+
+            packet = match packet_rx.try_recv() {
+                Ok(p) => p,
+                Err(_) => break,
+            };
         }
-        let sequence = sequence.fetch_add(1, Ordering::Relaxed);
-        let total_len = packet.len() + 38;
-        let padding =
-            anet_common::padding_utils::calculate_padding_needed(total_len, stealth.padding_step);
-        let safe_padding = if total_len + usize::from(padding) > PADDING_MTU {
-            0
-        } else {
-            padding
-        };
-        let encrypted = anet_common::transport::wrap_packet(
-            &cipher,
-            &nonce_prefix,
-            sequence,
-            packet,
-            safe_padding,
-        )?;
-        write_cut_text(&mut writer, CLIENT_CUT_TEXT, &encrypted).await?;
+
+        if !batch_buf.is_empty() {
+            writer.write_all(&batch_buf).await?;
+            // FLUSH УДАЛЕН
+        }
     }
     writer.shutdown().await?;
     Ok(())
@@ -326,7 +343,7 @@ fn schedule_with_jitter(
             }
             packet
         }
-        .boxed(),
+            .boxed(),
     );
 }
 
