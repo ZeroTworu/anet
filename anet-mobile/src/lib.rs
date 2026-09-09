@@ -64,9 +64,26 @@ fn inspect_config(config_toml: &str) -> String {
     }
 
     let mut result = String::from("OK");
-    for server in config.servers {
-        result.push('\n');
-        result.push_str(&server.get_name().replace(['\r', '\n'], " "));
+    let has_groups = config.servers.iter().any(|s| {
+        s.group_name.as_ref().map_or(false, |g| !g.trim().is_empty())
+    });
+
+    if has_groups {
+        let mut seen = std::collections::HashSet::new();
+        for server in &config.servers {
+            if let Some(ref g) = server.group_name {
+                let g = g.trim();
+                if !g.is_empty() && seen.insert(g.to_string()) {
+                    result.push('\n');
+                    result.push_str(&g.replace(['\r', '\n'], " "));
+                }
+            }
+        }
+    } else {
+        for server in config.servers {
+            result.push('\n');
+            result.push_str(&server.get_name().replace(['\r', '\n'], " "));
+        }
     }
     result
 }
@@ -561,7 +578,32 @@ pub extern "system" fn Java_org_alco_anet_ANetVpnService_connectVpn(
                 return;
             }
 
-        if !selected_server.is_empty() {
+        let has_groups = config.servers.iter().any(|s| {
+            s.group_name.as_ref().map_or(false, |g| !g.trim().is_empty())
+        });
+
+        if has_groups {
+            let selected_group = if !selected_server.is_empty() {
+                selected_server.as_str()
+            } else {
+                config.servers.iter()
+                    .find_map(|s| s.group_name.as_deref().map(str::trim).filter(|g| !g.is_empty()))
+                    .unwrap_or("")
+            };
+
+            let mut group_servers: Vec<_> = config.servers
+                .iter()
+                .filter(|s| s.group_name.as_deref().map(str::trim) == Some(selected_group))
+                .cloned()
+                .collect();
+
+            group_servers.sort_by(|a, b| b.weight().cmp(&a.weight()));
+
+            if !group_servers.is_empty() {
+                config.servers = group_servers;
+                anet_client_core::events::status(format!("Группа выбрана: {}", selected_group));
+            }
+        } else if !selected_server.is_empty() {
             if let Some(idx) = config.servers.iter().position(|s| s.get_name() == selected_server) {
                 config.servers.rotate_left(idx);
                 anet_client_core::events::status(format!("Приоритет установлен: {}", selected_server));

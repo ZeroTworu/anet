@@ -777,10 +777,12 @@ impl ANetApp {
                     }
 
                     if let Some(active_name) = server_name {
-                        let mut settings = lock_ignore_poison(&self.settings);
-                        if let Some(active_cfg) = settings.get_active_config() {
-                            settings.selected_servers.insert(active_cfg.id.clone(), active_name);
-                            settings.save();
+                        if self.server_names_cache.contains(&active_name) {
+                            let mut settings = lock_ignore_poison(&self.settings);
+                            if let Some(active_cfg) = settings.get_active_config() {
+                                settings.selected_servers.insert(active_cfg.id.clone(), active_name);
+                                settings.save();
+                            }
                         }
                     }
                 }
@@ -863,7 +865,25 @@ impl ANetApp {
         self.server_names_cache = match toml::from_str::<CoreConfig>(content) {
             Ok(mut raw_cfg) => {
                 let _ = raw_cfg.sanitize();
-                raw_cfg.servers.iter().map(|s| s.get_name()).collect()
+                let has_groups = raw_cfg.servers.iter().any(|s| {
+                    s.group_name.as_ref().map_or(false, |g| !g.trim().is_empty())
+                });
+
+                if has_groups {
+                    let mut groups = Vec::new();
+                    let mut seen = std::collections::HashSet::new();
+                    for s in &raw_cfg.servers {
+                        if let Some(ref g) = s.group_name {
+                            let g = g.trim();
+                            if !g.is_empty() && seen.insert(g.to_string()) {
+                                groups.push(g.to_string());
+                            }
+                        }
+                    }
+                    groups
+                } else {
+                    raw_cfg.servers.iter().map(|s| s.get_name()).collect()
+                }
             }
             Err(_) => Vec::new(),
         };
@@ -1024,7 +1044,43 @@ impl ANetApp {
                     settings.selected_servers.get(id).cloned()
                 };
 
-                if let Some(selected_name) = selected_name_opt {
+                let has_groups = cfg.servers.iter().any(|s| {
+                    s.group_name.as_ref().map_or(false, |g| !g.trim().is_empty())
+                });
+
+                if has_groups {
+                    let selected_group = selected_name_opt
+                        .filter(|name| {
+                            cfg.servers
+                                .iter()
+                                .any(|s| s.group_name.as_deref().map(str::trim) == Some(name.as_str()))
+                        })
+                        .unwrap_or_else(|| {
+                            cfg.servers
+                                .iter()
+                                .find_map(|s| s.group_name.as_deref().map(str::trim).filter(|g| !g.is_empty()))
+                                .unwrap_or("")
+                                .to_string()
+                        });
+
+                    if !selected_group.is_empty() {
+                        let mut settings = lock_ignore_poison(&self.settings);
+                        settings.selected_servers.insert(id.to_string(), selected_group.clone());
+                        settings.save();
+                    }
+
+                    let mut group_servers: Vec<_> = cfg.servers
+                        .iter()
+                        .filter(|s| s.group_name.as_deref().map(str::trim) == Some(selected_group.as_str()))
+                        .cloned()
+                        .collect();
+
+                    group_servers.sort_by(|a, b| b.weight().cmp(&a.weight()));
+
+                    if !group_servers.is_empty() {
+                        cfg.servers = group_servers;
+                    }
+                } else if let Some(selected_name) = selected_name_opt {
                     if let Some(idx) = cfg.servers
                         .iter()
                         .position(|s| s.get_name() == selected_name)
@@ -1647,6 +1703,7 @@ impl eframe::App for ANetApp {
                 let settings = lock_ignore_poison(&self.settings);
                 selected_server_name = settings.selected_servers
                     .get(&active_cfg_id)
+                    .filter(|name| self.server_names_cache.contains(name))
                     .cloned()
                     .unwrap_or_else(|| self.server_names_cache.first().cloned().unwrap_or_default());
             } else {

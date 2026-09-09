@@ -745,14 +745,18 @@ impl UsersApi {
                     .unwrap_or_default();
 
                 if !active_pools.is_empty() {
+                    let pool_map: std::collections::HashMap<Uuid, node_pools::Model> =
+                        active_pools.iter().map(|p| (p.id, p.clone())).collect();
                     let active_pool_ids: Vec<Uuid> = active_pools.iter().map(|p| p.id).collect();
-                    let members = node_pool_members::Entity::find()
+                    let mut members = node_pool_members::Entity::find()
                         .filter(node_pool_members::Column::PoolId.is_in(active_pool_ids))
                         .all(&self.db)
                         .await
                         .unwrap_or_default();
 
                     if !members.is_empty() {
+                        members.sort_by(|a, b| b.weight.cmp(&a.weight));
+
                         let member_server_ids: Vec<Uuid> =
                             members.iter().map(|m| m.server_id).collect();
                         let pool_servers = servers::Entity::find()
@@ -767,7 +771,7 @@ impl UsersApi {
 
                         let mut toml_str = String::new();
                         let mut fallback_key = String::new();
-                        let mut emitted: std::collections::HashSet<(Uuid, ProtocolType, String)> =
+                        let mut emitted: std::collections::HashSet<(Uuid, Uuid, ProtocolType, String)> =
                             std::collections::HashSet::new();
 
                         for member in members {
@@ -853,7 +857,14 @@ impl UsersApi {
                                 format!("{}://{}:{}", proto_str, server.address, port_or_url)
                             };
 
-                            if emitted.insert((server.id, member.protocol, dsn.clone())) {
+                            let pool_name = pool_map
+                                .get(&member.pool_id)
+                                .map(|p| p.name.as_str())
+                                .unwrap_or("Default Pool");
+                            let pool_id = member.pool_id;
+                            let weight = member.weight.max(1);
+
+                            if emitted.insert((member.pool_id, server.id, member.protocol, dsn.clone())) {
                                 if fallback_key.is_empty() {
                                     fallback_key = server.public_key.clone();
                                 }
@@ -871,8 +882,8 @@ impl UsersApi {
                                 );
 
                                 toml_str.push_str(&format!(
-                                    "[[servers]]\nname = \"{}\"\ndsn = \"{}\"\n{}timeout_secs = 8\nserver_pub_key = \"{}\"\n\n",
-                                    display_name, dsn, ssh_user, server.public_key
+                                    "[[servers]]\nname = \"{}\"\ndsn = \"{}\"\n{}timeout_secs = 8\nserver_pub_key = \"{}\"\ngroup_name = \"{}\"\ngroup_id = \"{}\"\nweight = {}\nweigth = {}\n\n",
+                                    display_name, dsn, ssh_user, server.public_key, pool_name, pool_id, weight, weight
                                 ));
                             }
                         }
