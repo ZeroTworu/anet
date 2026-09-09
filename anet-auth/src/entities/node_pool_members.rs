@@ -35,4 +35,16 @@ pub enum Relation {
     Server,
 }
 
+impl Related<super::node_pools::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::Pool.def()
+    }
+}
+
+impl Related<super::servers::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::Server.def()
+    }
+}
+
 impl ActiveModelBehavior for ActiveModel {}

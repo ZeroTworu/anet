@@ -2,7 +2,7 @@ use poem_openapi::Enum;
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, EnumIter, DeriveActiveEnum, Serialize, Deserialize, Enum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, EnumIter, DeriveActiveEnum, Serialize, Deserialize, Enum)]
 #[sea_orm(rs_type = "String", db_type = "Enum", enum_name = "protocol_type")]
 #[oai(rename_all = "lowercase")]
 #[serde(rename_all = "lowercase")]
