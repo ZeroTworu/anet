@@ -198,6 +198,7 @@ impl ClientTransport for SshTransport {
             endpoint: None,
             connection: None,
             health_pause: None,
+            remote_ip: Some(address.ip()), // Передаем IP в bypass
         })
     }
 }

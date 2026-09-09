@@ -2,7 +2,6 @@ use anet_common::config::StealthConfig;
 use anet_common::quic_settings::QuicConfig;
 use serde::Deserialize;
 
-// Добавьте этот enum рядом с другими (например, над MainConfig или под TransportMode)
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PerAppMode {
@@ -166,11 +165,10 @@ impl ServerConfig {
         }
     }
 
+    /// ИСПРАВЛЕНИЕ: гарантированно возвращает "host:port" даже если порт не был указан в DSN!
     pub fn endpoint(&self) -> anyhow::Result<String> {
-        let uri: http::Uri = self.dsn.parse()?;
-        uri.authority()
-            .map(ToString::to_string)
-            .ok_or_else(|| anyhow::anyhow!("server DSN '{}' has no host", self.dsn))
+        let (host, port) = self.host_port()?;
+        Ok(format!("{}:{}", host, port))
     }
 
     pub fn websocket_url(&self) -> anyhow::Result<String> {
@@ -192,7 +190,7 @@ impl ServerConfig {
             "quic" => 443,
             _ => 0,
         });
-        anyhow::ensure!(port != 0, "server DSN '{}' has no port", self.dsn);
+        anyhow::ensure!(port != 0, "server DSN '{}' has no port and unknown scheme", self.dsn);
         Ok((host.to_string(), port))
     }
 
@@ -348,5 +346,17 @@ mod tests {
         };
         assert_eq!(websocket.mode().unwrap(), TransportMode::Websocket);
         assert_eq!(websocket.websocket_url().unwrap(), "wss://vpn.example.com:8443/socket");
+
+        // Тест дефолтного порта
+        let ws_no_port = ServerConfig {
+            name: None,
+            dsn: "wss://gm1.anet-project.org/socket".to_string(),
+            timeout_secs: 10,
+            server_pub_key: None,
+            ssh_user: None,
+            websocket_min_session_secs: 480,
+            websocket_max_session_secs: 1500,
+        };
+        assert_eq!(ws_no_port.endpoint().unwrap(), "gm1.anet-project.org:443");
     }
 }

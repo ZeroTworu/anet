@@ -158,15 +158,9 @@ impl ClientTransport for VncTransport {
             endpoint: None,
             connection: None,
             health_pause: None,
+            remote_ip: Some(addr.ip()), // Передаем IP в bypass
         })
     }
-}
-
-fn flatten_worker_result(
-    worker: &'static str,
-    result: std::result::Result<Result<()>, tokio::task::JoinError>,
-) -> Result<()> {
-    result.with_context(|| format!("VNC {worker} task failed"))?
 }
 
 fn resolve_address(address: &str) -> Result<SocketAddr> {
@@ -309,11 +303,17 @@ async fn send_to_server(
 
         if !batch_buf.is_empty() {
             writer.write_all(&batch_buf).await?;
-            // FLUSH УДАЛЕН
         }
     }
     writer.shutdown().await?;
     Ok(())
+}
+
+fn flatten_worker_result(
+    worker: &'static str,
+    result: std::result::Result<Result<()>, tokio::task::JoinError>,
+) -> Result<()> {
+    result.with_context(|| format!("VNC {worker} task failed"))?
 }
 
 async fn read_tunnel_packets(

@@ -391,6 +391,7 @@ impl ClientTransport for AHttpTransport {
             endpoint: None,
             connection: None,
             health_pause: Some(health_pause),
+            remote_ip: Some(resolved_addr.ip()),
         })
     }
 }

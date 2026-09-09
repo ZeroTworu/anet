@@ -2,6 +2,7 @@ use super::{ClientTransport, ConnectionResult};
 use crate::auth::{AuthHandler, UdpAuthChannel};
 use crate::config::{CoreConfig, ServerConfig};
 use crate::socket::AnetUdpSocket;
+use anet_common::consts::PADDING_MTU;
 use anet_common::encryption::Cipher;
 use anet_common::quic_settings::build_transport_config;
 use anyhow::Result;
@@ -16,7 +17,6 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::UdpSocket;
-use anet_common::consts::PADDING_MTU;
 
 pub struct QuicDuplexStream {
     send: SendStream,
@@ -57,7 +57,7 @@ impl AsyncWrite for QuicDuplexStream {
 
 pub struct QuicTransport {
     config: CoreConfig,
-    server: ServerConfig, // Сохраняем индивидуальные параметры ноды
+    server: ServerConfig,
 }
 
 impl QuicTransport {
@@ -152,6 +152,7 @@ impl ClientTransport for QuicTransport {
             endpoint: Some(endpoint),
             connection: Some(connection),
             health_pause: None,
+            remote_ip: Some(server_addr.ip()), // Передаем IP в bypass
         })
     }
 }
