@@ -6,7 +6,7 @@ use anet_common::handshake_fragmentation::{FragmentConfig, write_fragmented};
 use anet_common::stream_framing::{frame_packet, read_next_packet};
 use anet_common::vnc::{
     CLIENT_CUT_TEXT, RFB_VERSION, SECURITY_TYPE_NONE, SERVER_CUT_TEXT, encode_cut_text,
-    read_cut_text, write_cut_text,
+    read_cut_text,
 };
 use anyhow::{Context, Result};
 use async_trait::async_trait;

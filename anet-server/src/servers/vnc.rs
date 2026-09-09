@@ -159,11 +159,20 @@ async fn receive_from_client(
         let packet =
             anet_common::transport::unwrap_packet_bytes_in_place(&client_info.cipher, encrypted)?;
         let packet_len = packet.len();
-        tun_tx
-            .send(packet)
-            .await
-            .context("TUN input queue closed")?;
-        registry.record_rx(&client_info, packet_len, "vnc");
+
+        // BACKPRESSURE: Если TUN-очередь переполнена, отбрасываем пакет,
+        // чтобы не блокировать TCP-чтение и не создавать Deadlock.
+        match tun_tx.try_send(packet) {
+            Ok(_) => {
+                registry.record_rx(&client_info, packet_len, "vnc");
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                warn!("[VNC] TUN queue full, dropping uplink packet from {}", client_info.assigned_ip);
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                anyhow::bail!("TUN input queue closed");
+            }
+        }
     }
     Ok(())
 }
