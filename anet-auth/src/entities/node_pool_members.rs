@@ -1,15 +1,20 @@
-//! Связь pool ↔ node с весом участника.
+//! Связь pool ↔ node с весом участника, выбранным протоколом и кастомным портом/URL.
 
+use super::protocol_type::ProtocolType;
 use sea_orm::entity::prelude::*;
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+#[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "node_pool_members")]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub pool_id: Uuid,
     #[sea_orm(primary_key, auto_increment = false)]
     pub server_id: Uuid,
+    #[sea_orm(primary_key, auto_increment = false)]
+    pub protocol: ProtocolType,
     pub weight: i32,
+    pub port_or_url: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

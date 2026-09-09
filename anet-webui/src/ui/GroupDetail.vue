@@ -2,8 +2,10 @@
 import { onMounted, ref, watch, computed } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { GetGroup, UpdateGroup, GetGroupMembers, AddGroupMember, RemoveGroupMember } from '@/api/groups'
+import { GetPools } from '@/api/pools'
 import { GetUsers } from '@/api/users'
 import type { UserGroup, SaveGroupRequest } from '@/models/group'
+import type { NodePool } from '@/models/pool'
 import type { User } from '@/models/user'
 import { useAppMessage } from '@/composables/useAppMessage'
 
@@ -21,6 +23,7 @@ const searchLoading = ref(false)
 
 // Данные
 const group = ref<UserGroup | null>(null)
+const availablePools = ref<NodePool[]>([])
 const members = ref<User[]>([])
 const totalMembers = ref(0)
 const showAddModal = ref(false)
@@ -35,12 +38,20 @@ const searchInput = ref('')
 const searchResults = ref<User[]>([])
 
 // Временные поля ввода группы в удобных пользователю величинах
-const form = ref({
+const form = ref<{
+  name: string
+  traffic_limit_gb: number
+  speed_limit_mbps: number
+  sessions_limit: number
+  duration_days: number
+  pool_ids: string[]
+}>({
   name: '',
   traffic_limit_gb: 0,
   speed_limit_mbps: 0,
   sessions_limit: 0,
   duration_days: 0,
+  pool_ids: [],
 })
 
 const headers = [
@@ -57,14 +68,19 @@ const formatSpeed = (kbps: number) => !kbps ? 'Максимальная' : `${(k
 const loadGroupData = async () => {
   loadingGroup.value = true
   try {
-    const data = await GetGroup(groupId)
+    const [data, poolsData] = await Promise.all([
+      GetGroup(groupId),
+      GetPools().catch(() => [] as NodePool[]),
+    ])
     group.value = data
+    availablePools.value = poolsData.filter(p => p.is_active)
     form.value = {
       name: data.name || '',
       traffic_limit_gb: !data.traffic_limit ? 0 : Math.round(data.traffic_limit / (1024 * 1024 * 1024)),
       speed_limit_mbps: !data.speed_limit ? 0 : Math.round(data.speed_limit / 1024),
       sessions_limit: data.sessions_limit ?? 0,
       duration_days: data.duration_days ?? 0,
+      pool_ids: [...(data.pool_ids || [])],
     }
   } catch (e) {
     message.error('Не удалось загрузить параметры группы')
@@ -140,6 +156,7 @@ const saveGroupSettings = async () => {
       speed_limit: (form.value.speed_limit_mbps || 0) * 1024,
       sessions_limit: form.value.sessions_limit ?? 0,
       duration_days: form.value.duration_days ?? 0,
+      pool_ids: form.value.pool_ids,
     }
     const updated = await UpdateGroup(groupId, payload)
     group.value = updated
@@ -245,7 +262,22 @@ onMounted(() => {
                 label="Срок действия (в днях)"
                 min="0"
                 variant="filled"
+                class="mb-3"
+            />
+            <v-select
+                v-model="form.pool_ids"
+                :items="availablePools"
+                item-title="name"
+                item-value="id"
+                label="Группы серверов (Node Pools)"
+                placeholder="Выберите группы серверов"
+                multiple
+                chips
+                closable-chips
+                variant="filled"
                 class="mb-4"
+                hint="Если пусто — выдаются все доступные серверы"
+                persistent-hint
             />
             <v-btn
                 color="primary"

@@ -9,7 +9,10 @@ use crate::api::dto::{
     UpdateRateRequest, UpdateUserApiResult, UpdateUserRequest, VpnUserDto,
 };
 use crate::crypto::DbEncryptor;
-use crate::entities::{groups, servers, user_node_pools, user_servers, users};
+use crate::entities::{
+    group_node_pools, groups, node_pool_members, node_pools, servers, user_node_pools,
+    user_servers, users, ProtocolType,
+};
 use crate::route_compiler::toml_string_array;
 use chrono::{NaiveDateTime, Utc};
 use log::{error, info, warn};
@@ -675,30 +678,6 @@ impl UsersApi {
             ));
         }
 
-        let assigned_servers =
-            match resolve_client_servers(&self.db, user_opt.id, assigned_servers).await {
-                Ok(servers) => servers,
-                Err(e) => {
-                    error!(
-                        "[CONFIG] Failed to resolve node pools for user {}: {}",
-                        id.0, e
-                    );
-                    return DownloadConfigResponse::Error(Json(
-                        "Failed to resolve node pools".to_string(),
-                    ));
-                }
-            };
-
-        if assigned_servers.is_empty() {
-            warn!(
-                "[CONFIG] Download cancelled: No servers assigned to user {}",
-                id.0
-            );
-            return DownloadConfigResponse::Error(Json(
-                "No available servers for this user".to_string(),
-            ));
-        }
-
         let compiled_routes = match compiled_routes_for_user(&self.db, user_opt.id).await {
             Ok(routes) => routes,
             Err(e) => {
@@ -738,83 +717,308 @@ impl UsersApi {
             }
         };
 
-        let mut servers_toml = String::new();
-        servers_toml.push_str(
-            "\n# =========================================================================\n",
-        );
-        servers_toml.push_str("# ANET Client: Load-balanced Entry Point + Failover Nodes\n");
-        servers_toml.push_str(
-            "# =========================================================================\n",
-        );
+        // Логика формирования конфигурации:
+        // 1. Пользователь состоит в "группе"?
+        // 2. К ней привязаны "группы серверов"?
+        // Если оба условия выполнены: генерируем конфиг из этих серверов + только те схемы, которые были выбраны в настройках группы серверов.
+        // Если хотя бы одно условие не удовлетворено: фаллбак на "старый" (текущий) вариант.
 
-        let mut fallback_pub_key = String::new();
+        let mut group_based_servers_toml: Option<String> = None;
+        let mut group_fallback_pub_key: Option<String> = None;
 
-        for server in assigned_servers {
-            if !server.is_active {
-                continue;
-            }
+        if let Some(user_group_id) = user_opt.group_id {
+            let linked_pool_ids: Vec<Uuid> = group_node_pools::Entity::find()
+                .filter(group_node_pools::Column::GroupId.eq(user_group_id))
+                .all(&self.db)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|gp| gp.pool_id)
+                .collect();
 
-            if fallback_pub_key.is_empty() {
-                fallback_pub_key = server.public_key.clone();
-            }
+            if !linked_pool_ids.is_empty() {
+                let active_pools = node_pools::Entity::find()
+                    .filter(node_pools::Column::Id.is_in(linked_pool_ids))
+                    .filter(node_pools::Column::IsActive.eq(true))
+                    .all(&self.db)
+                    .await
+                    .unwrap_or_default();
 
-            if server.address.trim().is_empty() {
-                continue;
-            }
+                if !active_pools.is_empty() {
+                    let active_pool_ids: Vec<Uuid> = active_pools.iter().map(|p| p.id).collect();
+                    let members = node_pool_members::Entity::find()
+                        .filter(node_pool_members::Column::PoolId.is_in(active_pool_ids))
+                        .all(&self.db)
+                        .await
+                        .unwrap_or_default();
 
-            let ssh_user = server
-                .ssh_user
-                .as_deref()
-                .map(|user| format!("ssh_user = \"{}\"\n", user))
-                .unwrap_or_default();
+                    if !members.is_empty() {
+                        let member_server_ids: Vec<Uuid> =
+                            members.iter().map(|m| m.server_id).collect();
+                        let pool_servers = servers::Entity::find()
+                            .filter(servers::Column::Id.is_in(member_server_ids))
+                            .filter(servers::Column::IsActive.eq(true))
+                            .all(&self.db)
+                            .await
+                            .unwrap_or_default();
 
-            let mut write_server_block = |protocol: &str, port_or_url: &str| {
-                let dsn = if port_or_url.contains("://") {
-                    port_or_url.to_string()
-                } else {
-                    format!("{}://{}:{}", protocol, server.address, port_or_url)
-                };
+                        let server_map: std::collections::HashMap<Uuid, servers::Model> =
+                            pool_servers.into_iter().map(|s| (s.id, s)).collect();
 
-                let display_name = format!("{} [{}]", server.name.trim(), protocol.to_uppercase());
+                        let mut toml_str = String::new();
+                        let mut fallback_key = String::new();
+                        let mut emitted: std::collections::HashSet<(Uuid, ProtocolType, String)> =
+                            std::collections::HashSet::new();
 
-                servers_toml.push_str(&format!(
-                    "[[servers]]\nname = \"{}\"\ndsn = \"{}\"\n{}timeout_secs = 8\nserver_pub_key = \"{}\"\n\n",
-                    display_name, dsn, ssh_user, server.public_key
-                ));
-            };
+                        for member in members {
+                            let Some(server) = server_map.get(&member.server_id) else {
+                                continue;
+                            };
+                            if server.address.trim().is_empty() {
+                                continue;
+                            }
 
-            if let Some(ref ahttp) = server.ahttp_url {
-                if !ahttp.trim().is_empty() {
-                    let proto = if ahttp.starts_with("http://") { "http" } else { "https" };
-                    write_server_block(proto, ahttp);
-                }
-            }
+                            let custom_endpoint = member
+                                .port_or_url
+                                .as_deref()
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty());
 
-            if let Some(quic) = server.quic_port {
-                if quic > 0 {
-                    write_server_block("quic", &quic.to_string());
-                }
-            }
+                            let (proto_str, port_or_url) = match member.protocol {
+                                ProtocolType::Quic => {
+                                    let port = custom_endpoint
+                                        .map(|s| s.to_string())
+                                        .or_else(|| {
+                                            server
+                                                .quic_port
+                                                .filter(|&p| p > 0)
+                                                .map(|p| p.to_string())
+                                        });
+                                    ("quic", port)
+                                }
+                                ProtocolType::Ssh => {
+                                    let port = custom_endpoint
+                                        .map(|s| s.to_string())
+                                        .or_else(|| {
+                                            server
+                                                .ssh_port
+                                                .filter(|&p| p > 0)
+                                                .map(|p| p.to_string())
+                                        });
+                                    ("ssh", port)
+                                }
+                                ProtocolType::Vnc => {
+                                    let port = custom_endpoint
+                                        .map(|s| s.to_string())
+                                        .or_else(|| {
+                                            server
+                                                .vnc_port
+                                                .filter(|&p| p > 0)
+                                                .map(|p| p.to_string())
+                                        });
+                                    ("vnc", port)
+                                }
+                                ProtocolType::Ws => {
+                                    let url = custom_endpoint.map(|s| s.to_string()).or_else(|| {
+                                        server
+                                            .websocket_url
+                                            .clone()
+                                            .filter(|u| !u.trim().is_empty())
+                                    });
+                                    let proto = match url.as_deref() {
+                                        Some(u) if u.starts_with("ws://") => "ws",
+                                        _ => "wss",
+                                    };
+                                    (proto, url)
+                                }
+                                ProtocolType::Ahttp => {
+                                    let url = custom_endpoint.map(|s| s.to_string()).or_else(|| {
+                                        server.ahttp_url.clone().filter(|u| !u.trim().is_empty())
+                                    });
+                                    let proto = match url.as_deref() {
+                                        Some(u) if u.starts_with("http://") => "http",
+                                        _ => "https",
+                                    };
+                                    (proto, url)
+                                }
+                            };
 
-            if let Some(ref ws) = server.websocket_url {
-                if !ws.trim().is_empty() {
-                    let proto = if ws.starts_with("ws://") { "ws" } else { "wss" };
-                    write_server_block(proto, ws);
-                }
-            }
+                            let Some(port_or_url) = port_or_url else {
+                                continue;
+                            };
 
-            if let Some(ssh) = server.ssh_port {
-                if ssh > 0 {
-                    write_server_block("ssh", &ssh.to_string());
-                }
-            }
+                            let dsn = if port_or_url.contains("://") {
+                                port_or_url
+                            } else {
+                                format!("{}://{}:{}", proto_str, server.address, port_or_url)
+                            };
 
-            if let Some(vnc) = server.vnc_port {
-                if vnc > 0 {
-                    write_server_block("vnc", &vnc.to_string());
+                            if emitted.insert((server.id, member.protocol, dsn.clone())) {
+                                if fallback_key.is_empty() {
+                                    fallback_key = server.public_key.clone();
+                                }
+
+                                let ssh_user = server
+                                    .ssh_user
+                                    .as_deref()
+                                    .map(|u| format!("ssh_user = \"{}\"\n", u))
+                                    .unwrap_or_default();
+
+                                let display_name = format!(
+                                    "{} [{}]",
+                                    server.name.trim(),
+                                    member.protocol.as_str().to_uppercase()
+                                );
+
+                                toml_str.push_str(&format!(
+                                    "[[servers]]\nname = \"{}\"\ndsn = \"{}\"\n{}timeout_secs = 8\nserver_pub_key = \"{}\"\n\n",
+                                    display_name, dsn, ssh_user, server.public_key
+                                ));
+                            }
+                        }
+
+                        if !toml_str.is_empty() {
+                            group_based_servers_toml = Some(toml_str);
+                            group_fallback_pub_key = Some(fallback_key);
+                        }
+                    }
                 }
             }
         }
+
+        let (servers_toml, fallback_pub_key) = if let (Some(toml), Some(fb_key)) =
+            (group_based_servers_toml, group_fallback_pub_key)
+        {
+            info!(
+                "[CONFIG] Generated configuration from server group(s) for user {} (group ID: {:?})",
+                user_opt.id, user_opt.group_id
+            );
+            let mut header = String::new();
+            header.push_str(
+                "\n# =========================================================================\n",
+            );
+            header.push_str("# ANET Client: Group-based Entry Point Nodes\n");
+            header.push_str(
+                "# =========================================================================\n",
+            );
+            header.push_str(&toml);
+            (header, fb_key)
+        } else {
+            // Фаллбак на "старый" (текущий) вариант:
+            info!(
+                "[CONFIG] Falling back to default/direct assigned servers for user {}",
+                user_opt.id
+            );
+
+            let fallback_assigned_servers =
+                match resolve_client_servers(&self.db, user_opt.id, assigned_servers).await {
+                    Ok(servers) => servers,
+                    Err(e) => {
+                        error!(
+                            "[CONFIG] Failed to resolve node pools for user {}: {}",
+                            id.0, e
+                        );
+                        return DownloadConfigResponse::Error(Json(
+                            "Failed to resolve node pools".to_string(),
+                        ));
+                    }
+                };
+
+            if fallback_assigned_servers.is_empty() {
+                warn!(
+                    "[CONFIG] Download cancelled: No servers assigned to user {}",
+                    id.0
+                );
+                return DownloadConfigResponse::Error(Json(
+                    "No available servers for this user".to_string(),
+                ));
+            }
+
+            let mut servers_toml = String::new();
+            servers_toml.push_str(
+                "\n# =========================================================================\n",
+            );
+            servers_toml.push_str("# ANET Client: Load-balanced Entry Point + Failover Nodes\n");
+            servers_toml.push_str(
+                "# =========================================================================\n",
+            );
+
+            let mut fallback_pub_key = String::new();
+
+            for server in fallback_assigned_servers {
+                if !server.is_active {
+                    continue;
+                }
+
+                if fallback_pub_key.is_empty() {
+                    fallback_pub_key = server.public_key.clone();
+                }
+
+                if server.address.trim().is_empty() {
+                    continue;
+                }
+
+                let ssh_user = server
+                    .ssh_user
+                    .as_deref()
+                    .map(|user| format!("ssh_user = \"{}\"\n", user))
+                    .unwrap_or_default();
+
+                let mut write_server_block = |protocol: &str, port_or_url: &str| {
+                    let dsn = if port_or_url.contains("://") {
+                        port_or_url.to_string()
+                    } else {
+                        format!("{}://{}:{}", protocol, server.address, port_or_url)
+                    };
+
+                    let display_name =
+                        format!("{} [{}]", server.name.trim(), protocol.to_uppercase());
+
+                    servers_toml.push_str(&format!(
+                        "[[servers]]\nname = \"{}\"\ndsn = \"{}\"\n{}timeout_secs = 8\nserver_pub_key = \"{}\"\n\n",
+                        display_name, dsn, ssh_user, server.public_key
+                    ));
+                };
+
+                if let Some(ref ahttp) = server.ahttp_url {
+                    if !ahttp.trim().is_empty() {
+                        let proto = if ahttp.starts_with("http://") {
+                            "http"
+                        } else {
+                            "https"
+                        };
+                        write_server_block(proto, ahttp);
+                    }
+                }
+
+                if let Some(quic) = server.quic_port {
+                    if quic > 0 {
+                        write_server_block("quic", &quic.to_string());
+                    }
+                }
+
+                if let Some(ref ws) = server.websocket_url {
+                    if !ws.trim().is_empty() {
+                        let proto = if ws.starts_with("ws://") { "ws" } else { "wss" };
+                        write_server_block(proto, ws);
+                    }
+                }
+
+                if let Some(ssh) = server.ssh_port {
+                    if ssh > 0 {
+                        write_server_block("ssh", &ssh.to_string());
+                    }
+                }
+
+                if let Some(vnc) = server.vnc_port {
+                    if vnc > 0 {
+                        write_server_block("vnc", &vnc.to_string());
+                    }
+                }
+            }
+
+            (servers_toml, fallback_pub_key)
+        };
 
         let template_content = match tokio::fs::read_to_string(&self.client_template_path).await {
             Ok(content) => content,

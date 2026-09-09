@@ -104,6 +104,8 @@ pub async fn load_pool_dto(
         .into_iter()
         .map(|member| NodePoolMemberDto {
             server_id: member.server_id,
+            protocol: member.protocol,
+            port_or_url: member.port_or_url,
             weight: member.weight.max(1) as i32,
         })
         .collect();

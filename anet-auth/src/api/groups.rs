@@ -1,14 +1,15 @@
-use crate::api::api::validate_admin_session;
+use crate::api::api::{load_pool_dto, validate_admin_session};
 use crate::api::dto::{
-    AddGroupMemberRequest, AdminToken, DeleteGroupResponse, GetGroupsResponse, GroupDto,
-    PaginatedUsers, SaveGroupRequest, SaveGroupResponse,
+    AddGroupMemberRequest, AdminToken, DeleteGroupResponse, GetGroupPoolsResponse,
+    GetGroupsResponse, GroupDto, PaginatedUsers, SaveGroupRequest, SaveGroupResponse,
+    SetGroupPoolsRequest, SetGroupPoolsResponse,
 };
-use crate::entities::{groups, users};
+use crate::entities::{group_node_pools, groups, node_pools, users};
 use chrono::Utc;
 use poem_openapi::{param::Query, payload::Json, ApiResponse, OpenApi};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, IntoActiveModel, Set,
-    QueryFilter, QueryOrder, QuerySelect, PaginatorTrait
+    QueryFilter, QueryOrder, QuerySelect, PaginatorTrait, TransactionTrait,
 };
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -24,7 +25,7 @@ fn validate_group_request(req: &SaveGroupRequest) -> std::result::Result<(), Str
     Ok(())
 }
 
-fn map_group_model_to_dto(group: groups::Model, user_count: i64) -> GroupDto {
+fn map_group_model_to_dto(group: groups::Model, user_count: i64, pool_ids: Vec<Uuid>) -> GroupDto {
     GroupDto {
         id: group.id,
         name: group.name,
@@ -33,6 +34,7 @@ fn map_group_model_to_dto(group: groups::Model, user_count: i64) -> GroupDto {
         sessions_limit: group.sessions_limit,
         duration_days: group.duration_days,
         user_count,
+        pool_ids,
         created_at: group.created_at.and_utc().to_rfc3339(),
         updated_at: group.updated_at.and_utc().to_rfc3339(),
     }
@@ -120,11 +122,21 @@ impl GroupsApi {
             Err(e) => return GetGroupsResponse::Error(Json(e.to_string())),
         };
 
+        let pool_links = group_node_pools::Entity::find()
+            .all(&self.db)
+            .await
+            .unwrap_or_default();
+        let mut pool_map: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
+        for link in pool_links {
+            pool_map.entry(link.group_id).or_default().push(link.pool_id);
+        }
+
         let dtos = list
             .into_iter()
             .map(|group| {
                 let user_count = counts_map.get(&group.id).copied().unwrap_or(0);
-                map_group_model_to_dto(group, user_count)
+                let pool_ids = pool_map.remove(&group.id).unwrap_or_default();
+                map_group_model_to_dto(group, user_count, pool_ids)
             })
             .collect();
 
@@ -157,7 +169,16 @@ impl GroupsApi {
             Err(e) => return GetGroupResponse::Error(Json(e.to_string())),
         };
 
-        GetGroupResponse::Ok(Json(map_group_model_to_dto(group, count)))
+        let pool_ids = group_node_pools::Entity::find()
+            .filter(group_node_pools::Column::GroupId.eq(group.id))
+            .all(&self.db)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|l| l.pool_id)
+            .collect();
+
+        GetGroupResponse::Ok(Json(map_group_model_to_dto(group, count, pool_ids)))
     }
 
     /// Получить лениво загружаемый, пагинируемый список участников группы
@@ -319,10 +340,35 @@ impl GroupsApi {
             updated_at: Set(now),
         };
 
-        match new_group.insert(&self.db).await {
-            Ok(group) => SaveGroupResponse::Ok(Json(map_group_model_to_dto(group, 0))),
-            Err(e) => SaveGroupResponse::Error(Json(e.to_string())),
+        let txn = match self.db.begin().await {
+            Ok(t) => t,
+            Err(e) => return SaveGroupResponse::Error(Json(e.to_string())),
+        };
+
+        let group = match new_group.insert(&txn).await {
+            Ok(group) => group,
+            Err(e) => return SaveGroupResponse::Error(Json(e.to_string())),
+        };
+
+        let mut assigned_pool_ids = Vec::new();
+        if let Some(ref p_ids) = req.0.pool_ids {
+            for &p_id in p_ids {
+                let link = group_node_pools::ActiveModel {
+                    group_id: Set(group_id),
+                    pool_id: Set(p_id),
+                };
+                if let Err(e) = link.insert(&txn).await {
+                    return SaveGroupResponse::Error(Json(e.to_string()));
+                }
+                assigned_pool_ids.push(p_id);
+            }
         }
+
+        if let Err(e) = txn.commit().await {
+            return SaveGroupResponse::Error(Json(e.to_string()));
+        }
+
+        SaveGroupResponse::Ok(Json(map_group_model_to_dto(group, 0, assigned_pool_ids)))
     }
 
     /// Обновить исключительно основные параметры группы
@@ -346,6 +392,11 @@ impl GroupsApi {
             Err(e) => return SaveGroupResponse::Error(Json(e.to_string())),
         };
 
+        let txn = match self.db.begin().await {
+            Ok(t) => t,
+            Err(e) => return SaveGroupResponse::Error(Json(e.to_string())),
+        };
+
         let mut active = existing.into_active_model();
         active.name = Set(req.0.name.trim().to_string());
         active.traffic_limit = Set(req.0.traffic_limit as i64);
@@ -356,17 +407,143 @@ impl GroupsApi {
 
         let count = match users::Entity::find()
             .filter(users::Column::GroupId.eq(id.0))
-            .count(&self.db)
+            .count(&txn)
             .await
         {
             Ok(c) => c as i64,
             Err(e) => return SaveGroupResponse::Error(Json(e.to_string())),
         };
 
-        match active.update(&self.db).await {
-            Ok(group) => SaveGroupResponse::Ok(Json(map_group_model_to_dto(group, count))),
-            Err(e) => SaveGroupResponse::Error(Json(e.to_string())),
+        let group = match active.update(&txn).await {
+            Ok(group) => group,
+            Err(e) => return SaveGroupResponse::Error(Json(e.to_string())),
+        };
+
+        let mut assigned_pool_ids = Vec::new();
+        if let Some(ref p_ids) = req.0.pool_ids {
+            if let Err(e) = group_node_pools::Entity::delete_many()
+                .filter(group_node_pools::Column::GroupId.eq(id.0))
+                .exec(&txn)
+                .await
+            {
+                return SaveGroupResponse::Error(Json(e.to_string()));
+            }
+            for &p_id in p_ids {
+                let link = group_node_pools::ActiveModel {
+                    group_id: Set(id.0),
+                    pool_id: Set(p_id),
+                };
+                if let Err(e) = link.insert(&txn).await {
+                    return SaveGroupResponse::Error(Json(e.to_string()));
+                }
+                assigned_pool_ids.push(p_id);
+            }
+        } else {
+            assigned_pool_ids = group_node_pools::Entity::find()
+                .filter(group_node_pools::Column::GroupId.eq(id.0))
+                .all(&txn)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|l| l.pool_id)
+                .collect();
         }
+
+        if let Err(e) = txn.commit().await {
+            return SaveGroupResponse::Error(Json(e.to_string()));
+        }
+
+        SaveGroupResponse::Ok(Json(map_group_model_to_dto(group, count, assigned_pool_ids)))
+    }
+
+    /// Получить привязанные к группе пулы серверов
+    #[oai(path = "/groups/:id/pools", method = "get")]
+    async fn get_group_pools(
+        &self,
+        auth: AdminToken,
+        id: poem_openapi::param::Path<Uuid>,
+    ) -> GetGroupPoolsResponse {
+        if let Err(err) = validate_admin_session(&self.db, &auth.0.token).await {
+            return GetGroupPoolsResponse::Unauthorized(Json(err));
+        }
+
+        let links = match group_node_pools::Entity::find()
+            .filter(group_node_pools::Column::GroupId.eq(id.0))
+            .all(&self.db)
+            .await
+        {
+            Ok(l) => l,
+            Err(e) => return GetGroupPoolsResponse::Error(Json(e.to_string())),
+        };
+
+        let pool_ids: Vec<Uuid> = links.into_iter().map(|l| l.pool_id).collect();
+        let pools = match node_pools::Entity::find()
+            .filter(node_pools::Column::Id.is_in(pool_ids))
+            .order_by_asc(node_pools::Column::Name)
+            .all(&self.db)
+            .await
+        {
+            Ok(p) => p,
+            Err(e) => return GetGroupPoolsResponse::Error(Json(e.to_string())),
+        };
+
+        let mut dtos = Vec::with_capacity(pools.len());
+        for pool in pools {
+            match load_pool_dto(&self.db, pool).await {
+                Ok(dto) => dtos.push(dto),
+                Err(e) => return GetGroupPoolsResponse::Error(Json(e.to_string())),
+            }
+        }
+
+        GetGroupPoolsResponse::Ok(Json(dtos))
+    }
+
+    /// Привязать/обновить список пулов серверов для группы
+    #[oai(path = "/groups/:id/pools", method = "put")]
+    async fn set_group_pools(
+        &self,
+        auth: AdminToken,
+        id: poem_openapi::param::Path<Uuid>,
+        req: Json<SetGroupPoolsRequest>,
+    ) -> SetGroupPoolsResponse {
+        if let Err(err) = validate_admin_session(&self.db, &auth.0.token).await {
+            return SetGroupPoolsResponse::Unauthorized(Json(err));
+        }
+
+        let existing = match crate::entities::groups::Entity::find_by_id(id.0).one(&self.db).await {
+            Ok(Some(g)) => g,
+            Ok(None) => return SetGroupPoolsResponse::NotFound(Json("Group not found".to_string())),
+            Err(e) => return SetGroupPoolsResponse::Error(Json(e.to_string())),
+        };
+
+        let txn = match self.db.begin().await {
+            Ok(t) => t,
+            Err(e) => return SetGroupPoolsResponse::Error(Json(e.to_string())),
+        };
+
+        if let Err(e) = group_node_pools::Entity::delete_many()
+            .filter(group_node_pools::Column::GroupId.eq(existing.id))
+            .exec(&txn)
+            .await
+        {
+            return SetGroupPoolsResponse::Error(Json(e.to_string()));
+        }
+
+        for &p_id in &req.0.pool_ids {
+            let link = group_node_pools::ActiveModel {
+                group_id: Set(existing.id),
+                pool_id: Set(p_id),
+            };
+            if let Err(e) = link.insert(&txn).await {
+                return SetGroupPoolsResponse::Error(Json(e.to_string()));
+            }
+        }
+
+        if let Err(e) = txn.commit().await {
+            return SetGroupPoolsResponse::Error(Json(e.to_string()));
+        }
+
+        SetGroupPoolsResponse::Ok(Json(req.0.pool_ids))
     }
 
     #[oai(path = "/groups/:id", method = "delete")]
