@@ -23,6 +23,7 @@ pub mod m20260830_000022_add_groups_and_update_rates;
 pub mod m20260901_000023_add_target_fingerprint_to_commands;
 pub mod m20260902_000024_add_ahttp_to_protocol_type;
 pub mod m20260902_000025_add_ahttp_url_to_servers;
+pub mod m20260909_000026_link_server_groups_and_add_protocols;
 
 use sea_orm_migration::prelude::*;
 
@@ -57,6 +58,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260901_000023_add_target_fingerprint_to_commands::Migration),
             Box::new(m20260902_000024_add_ahttp_to_protocol_type::Migration),
             Box::new(m20260902_000025_add_ahttp_url_to_servers::Migration),
+            Box::new(m20260909_000026_link_server_groups_and_add_protocols::Migration),
         ]
     }
 }

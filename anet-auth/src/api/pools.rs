@@ -31,9 +31,13 @@ fn validate_pool_request(req: &SaveNodePoolRequest) -> std::result::Result<(), S
     {
         return Err("Member weight must be between 1 and 10000".to_string());
     }
-    let unique: HashSet<_> = req.members.iter().map(|member| member.server_id).collect();
+    let unique: HashSet<_> = req
+        .members
+        .iter()
+        .map(|member| (member.server_id, member.protocol))
+        .collect();
     if unique.len() != req.members.len() {
-        return Err("Pool contains duplicate nodes".to_string());
+        return Err("Pool contains duplicate node and protocol combinations".to_string());
     }
     Ok(())
 }
@@ -98,6 +102,8 @@ impl PoolsApi {
             if let Err(e) = (node_pool_members::ActiveModel {
                 pool_id: Set(pool.id),
                 server_id: Set(member.server_id),
+                protocol: Set(member.protocol),
+                port_or_url: Set(member.port_or_url.clone()),
                 weight: Set(member.weight),
             })
                 .insert(&txn)
@@ -157,6 +163,8 @@ impl PoolsApi {
             if let Err(e) = (node_pool_members::ActiveModel {
                 pool_id: Set(id.0),
                 server_id: Set(member.server_id),
+                protocol: Set(member.protocol),
+                port_or_url: Set(member.port_or_url.clone()),
                 weight: Set(member.weight),
             })
                 .insert(&txn)

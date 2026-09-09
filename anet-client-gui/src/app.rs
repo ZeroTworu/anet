@@ -156,7 +156,7 @@ pub struct ANetApp {
     file_dialog_tx: Sender<PathBuf>,
     file_dialog_rx: Receiver<PathBuf>,
 
-    server_names_cache: Vec<String>,
+    server_names_cache: Vec<(String, String)>,
     server_names_cache_key: Option<(String, u64)>,
 
     tray_cmd_tx: Sender<TrayCommand>,
@@ -777,10 +777,12 @@ impl ANetApp {
                     }
 
                     if let Some(active_name) = server_name {
-                        let mut settings = lock_ignore_poison(&self.settings);
-                        if let Some(active_cfg) = settings.get_active_config() {
-                            settings.selected_servers.insert(active_cfg.id.clone(), active_name);
-                            settings.save();
+                        if let Some((active_id, _)) = self.server_names_cache.iter().find(|(_, name)| name == &active_name) {
+                            let mut settings = lock_ignore_poison(&self.settings);
+                            if let Some(active_cfg) = settings.get_active_config() {
+                                settings.selected_servers.insert(active_cfg.id.clone(), active_id.clone());
+                                settings.save();
+                            }
                         }
                     }
                 }
@@ -863,7 +865,27 @@ impl ANetApp {
         self.server_names_cache = match toml::from_str::<CoreConfig>(content) {
             Ok(mut raw_cfg) => {
                 let _ = raw_cfg.sanitize();
-                raw_cfg.servers.iter().map(|s| s.get_name()).collect()
+                let has_groups = raw_cfg.servers.iter().any(|s| {
+                    s.group_name.as_ref().map_or(false, |g| !g.trim().is_empty())
+                });
+
+                if has_groups {
+                    let mut groups = Vec::new();
+                    let mut seen = std::collections::HashSet::new();
+                    for s in &raw_cfg.servers {
+                        if let Some(ref g_name) = s.group_name {
+                            let g_name = g_name.trim();
+                            if g_name.is_empty() { continue; }
+                            let g_id = s.group_id.as_deref().unwrap_or(g_name).trim();
+                            if seen.insert(g_id.to_string()) {
+                                groups.push((g_id.to_string(), g_name.to_string()));
+                            }
+                        }
+                    }
+                    groups
+                } else {
+                    raw_cfg.servers.iter().map(|s| (s.dsn.clone(), s.get_name())).collect()
+                }
             }
             Err(_) => Vec::new(),
         };
@@ -1024,10 +1046,56 @@ impl ANetApp {
                     settings.selected_servers.get(id).cloned()
                 };
 
-                if let Some(selected_name) = selected_name_opt {
+                let has_groups = cfg.servers.iter().any(|s| {
+                    s.group_name.as_ref().map_or(false, |g| !g.trim().is_empty())
+                });
+
+                if has_groups {
+                    let selected_group_id = selected_name_opt
+                        .filter(|id| {
+                            cfg.servers
+                                .iter()
+                                .any(|s| {
+                                    let g_name = s.group_name.as_deref().unwrap_or("");
+                                    let g_id = s.group_id.as_deref().unwrap_or(g_name).trim();
+                                    g_id == id.as_str()
+                                })
+                        })
+                        .unwrap_or_else(|| {
+                            cfg.servers
+                                .iter()
+                                .find_map(|s| {
+                                    if s.group_name.as_deref().map_or(true, |g| g.trim().is_empty()) { return None; }
+                                    Some(s.group_id.as_deref().unwrap_or(s.group_name.as_ref().unwrap()).trim().to_string())
+                                })
+                                .unwrap_or_default()
+                        });
+
+                    if !selected_group_id.is_empty() {
+                        let mut settings = lock_ignore_poison(&self.settings);
+                        settings.selected_servers.insert(id.to_string(), selected_group_id.clone());
+                        settings.save();
+                    }
+
+                    let mut group_servers: Vec<_> = cfg.servers
+                        .iter()
+                        .filter(|s| {
+                            if s.group_name.as_deref().map_or(true, |g| g.trim().is_empty()) { return false; }
+                            let g_id = s.group_id.as_deref().unwrap_or(s.group_name.as_ref().unwrap()).trim();
+                            g_id == selected_group_id.as_str()
+                        })
+                        .cloned()
+                        .collect();
+
+                    group_servers.sort_by(|a, b| b.weight().cmp(&a.weight()));
+
+                    if !group_servers.is_empty() {
+                        cfg.servers = group_servers;
+                    }
+                } else if let Some(selected_id) = selected_name_opt {
                     if let Some(idx) = cfg.servers
                         .iter()
-                        .position(|s| s.get_name() == selected_name)
+                        .position(|s| s.dsn == selected_id)
                     {
                         cfg.servers.rotate_left(idx);
                     }
@@ -1635,6 +1703,7 @@ impl eframe::App for ANetApp {
         drop(settings_guard);
 
         let mut selected_server_name = String::new();
+        let mut selected_display_name = String::new();
         {
             let settings = lock_ignore_poison(&self.settings);
             if let Some(active_cfg) = settings.get_active_config() {
@@ -1647,8 +1716,14 @@ impl eframe::App for ANetApp {
                 let settings = lock_ignore_poison(&self.settings);
                 selected_server_name = settings.selected_servers
                     .get(&active_cfg_id)
+                    .filter(|id| self.server_names_cache.iter().any(|(cid, _)| cid == *id))
                     .cloned()
-                    .unwrap_or_else(|| self.server_names_cache.first().cloned().unwrap_or_default());
+                    .unwrap_or_else(|| self.server_names_cache.first().map(|(id, _)| id.clone()).unwrap_or_default());
+                    
+                selected_display_name = self.server_names_cache.iter()
+                    .find(|(id, _)| id == &selected_server_name)
+                    .map(|(_, name)| name.clone())
+                    .unwrap_or_else(|| selected_server_name.clone());
             } else {
                 self.server_names_cache.clear();
                 self.server_names_cache_key = None;
@@ -1895,7 +1970,7 @@ impl eframe::App for ANetApp {
                         ui.painter().text(
                             egui::pos2(rect.left() + 32.0, center_y),
                             egui::Align2::LEFT_CENTER,
-                            &selected_server_name,
+                            &selected_display_name,
                             egui::FontId::new(13.0, egui::FontFamily::Name("Inter-V".into())),
                             text
                         );
@@ -1935,8 +2010,8 @@ impl eframe::App for ANetApp {
                                         .corner_radius(egui::CornerRadius::same(14))
                                         .inner_margin(egui::Margin::symmetric(6, 6))
                                         .show(popup_ui, |popup_ui| {
-                                            for name in &server_names {
-                                                let selected = name == &selected_server_name;
+                                            for (id, name) in &server_names {
+                                                let selected = id == &selected_server_name;
                                                 let (item_rect, item_response) = popup_ui.allocate_exact_size(
                                                     egui::vec2(NODE_WIDTH - 12.0, ITEM_HEIGHT),
                                                     egui::Sense::click()
@@ -1969,13 +2044,13 @@ impl eframe::App for ANetApp {
                                                 if item_response.clicked() {
                                                     self.node_popup_open = false;
 
-                                                    let selected_name = name.clone();
+                                                    let selected_id = id.clone();
                                                     {
                                                         let mut settings = lock_ignore_poison(&self.settings);
                                                         if let Some(active_cfg) = settings.get_active_config() {
                                                             settings.selected_servers.insert(
                                                                 active_cfg.id.clone(),
-                                                                selected_name.clone()
+                                                                selected_id.clone()
                                                             );
                                                             settings.save();
                                                         }

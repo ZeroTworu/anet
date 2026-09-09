@@ -124,8 +124,13 @@ const save = async () => {
     await UpdateServer(props.server.id, form.value)
     emit('updated')
     show.value = false
-  } catch (e) {
+  } catch (e: any) {
     console.error(e)
+    if (e.response?.data) {
+      alert(`Ошибка: ${e.response.data}`)
+    } else {
+      alert('Произошла ошибка при сохранении')
+    }
   } finally {
     loading.value = false
   }

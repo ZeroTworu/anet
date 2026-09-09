@@ -64,9 +64,31 @@ fn inspect_config(config_toml: &str) -> String {
     }
 
     let mut result = String::from("OK");
-    for server in config.servers {
-        result.push('\n');
-        result.push_str(&server.get_name().replace(['\r', '\n'], " "));
+    let has_groups = config.servers.iter().any(|s| {
+        s.group_name.as_ref().map_or(false, |g| !g.trim().is_empty())
+    });
+
+    if has_groups {
+        let mut seen = std::collections::HashSet::new();
+        for server in &config.servers {
+            if let Some(ref g_name) = server.group_name {
+                let g_name = g_name.trim();
+                let g_id = server.group_id.as_deref().unwrap_or(g_name).trim();
+                if !g_name.is_empty() && seen.insert(g_id.to_string()) {
+                    result.push('\n');
+                    let id_safe = g_id.replace(['\r', '\n', '|'], " ");
+                    let name_safe = g_name.replace(['\r', '\n', '|'], " ");
+                    result.push_str(&format!("{}|{}", id_safe, name_safe));
+                }
+            }
+        }
+    } else {
+        for server in config.servers {
+            result.push('\n');
+            let id_safe = server.dsn.replace(['\r', '\n', '|'], " ");
+            let name_safe = server.get_name().replace(['\r', '\n', '|'], " ");
+            result.push_str(&format!("{}|{}", id_safe, name_safe));
+        }
     }
     result
 }
@@ -124,7 +146,7 @@ fn event_message(event: AnetEvent) -> Option<String> {
         AnetEvent::UpdateReady => Some("Update downloaded to cache".to_string()),
         AnetEvent::Stats { .. }
         | AnetEvent::TrafficUpdate { .. }
-        | AnetEvent::ClientStateChanged { .. } => None,
+        | AnetEvent::ClientStateChanged { .. } | AnetEvent::AccountInfo(_) => None,
     }
 }
 
@@ -359,6 +381,33 @@ fn init_jni_bridge_thread(jvm: Arc<JavaVM>) {
                                     );
                                 }
                             }
+                            AnetEvent::AccountInfo(info) => {
+                                let j_billing = env.new_string(&info.billing_str);
+                                let j_group = env.new_string(&info.group_str);
+                                let j_sessions = env.new_string(&info.sessions_str);
+                                let j_speed = env.new_string(&info.speed_str);
+                                let j_consumed = env.new_string(&info.consumed_str);
+                                let j_limit = env.new_string(&info.limit_str);
+                                let j_expires = env.new_string(&info.expires_str);
+                                
+                                if let (Ok(jb), Ok(jg), Ok(jse), Ok(jsp), Ok(jc), Ok(jl), Ok(je)) = 
+                                    (j_billing, j_group, j_sessions, j_speed, j_consumed, j_limit, j_expires) {
+                                    let _ = env.call_method(
+                                        &callback_ref,
+                                        "onAccountInfo",
+                                        "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
+                                        &[
+                                            JValue::Object(&jb),
+                                            JValue::Object(&jg),
+                                            JValue::Object(&jse),
+                                            JValue::Object(&jsp),
+                                            JValue::Object(&jc),
+                                            JValue::Object(&jl),
+                                            JValue::Object(&je),
+                                        ]
+                                    );
+                                }
+                            }
                             other => {
                                 if let Some(msg) = event_message(other) {
                                     if let Ok(jmsg) = env.new_string(msg) {
@@ -561,8 +610,40 @@ pub extern "system" fn Java_org_alco_anet_ANetVpnService_connectVpn(
                 return;
             }
 
-        if !selected_server.is_empty() {
-            if let Some(idx) = config.servers.iter().position(|s| s.get_name() == selected_server) {
+        let has_groups = config.servers.iter().any(|s| {
+            s.group_name.as_ref().map_or(false, |g| !g.trim().is_empty())
+        });
+
+        if has_groups {
+            let selected_group_id = if !selected_server.is_empty() {
+                selected_server.clone()
+            } else {
+                config.servers.iter()
+                    .find_map(|s| {
+                        if s.group_name.as_deref().map_or(true, |g| g.trim().is_empty()) { return None; }
+                        Some(s.group_id.as_deref().unwrap_or(s.group_name.as_ref().unwrap()).trim().to_string())
+                    })
+                    .unwrap_or_default()
+            };
+
+            let mut group_servers: Vec<_> = config.servers
+                .iter()
+                .filter(|s| {
+                    if s.group_name.as_deref().map_or(true, |g| g.trim().is_empty()) { return false; }
+                    let g_id = s.group_id.as_deref().unwrap_or(s.group_name.as_ref().unwrap()).trim();
+                    g_id == selected_group_id.as_str()
+                })
+                .cloned()
+                .collect();
+
+            group_servers.sort_by(|a, b| b.weight().cmp(&a.weight()));
+
+            if !group_servers.is_empty() {
+                config.servers = group_servers;
+                anet_client_core::events::status(format!("Группа выбрана (id): {}", selected_group_id));
+            }
+        } else if !selected_server.is_empty() {
+            if let Some(idx) = config.servers.iter().position(|s| s.dsn == selected_server) {
                 config.servers.rotate_left(idx);
                 anet_client_core::events::status(format!("Приоритет установлен: {}", selected_server));
             }

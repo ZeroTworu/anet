@@ -112,12 +112,14 @@ onMounted(load)
       <template #item.members="{ item }">
         <div class="d-flex flex-wrap ga-1">
           <v-chip
-              v-for="member in item.members"
-              :key="member.server_id"
+              v-for="(member, idx) in item.members"
+              :key="`${member.server_id}-${idx}`"
               size="x-small"
               variant="tonal"
           >
             {{ serverById.get(member.server_id)?.name || member.server_id }}
+            <span v-if="member.protocol" class="ml-1 font-weight-bold text-uppercase">[{{ member.protocol }}]</span>
+            <span v-if="member.port_or_url" class="ml-1 text-medium-emphasis">({{ member.port_or_url }})</span>
             <strong class="ml-1 text-primary">w{{ member.weight }}</strong>
           </v-chip>
           <span v-if="!item.members.length" class="text-caption text-medium-emphasis">—</span>

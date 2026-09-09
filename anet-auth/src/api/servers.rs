@@ -15,6 +15,50 @@ pub struct ServersApi {
     pub db: DatabaseConnection,
 }
 
+
+fn validate_server_urls(
+    address: &str,
+    websocket_url: &Option<String>,
+    ahttp_url: &Option<String>
+) -> Result<(), String> {
+    if !address.is_empty() {
+        if !address.is_ascii() {
+            return Err(format!("Адрес '{}' содержит недопустимые (не латинские) символы", address));
+        }
+        let fake_url = format!("http://{}", address);
+        if fake_url.parse::<poem::http::Uri>().is_err() {
+            return Err(format!("Некорректный формат адреса: '{}'", address));
+        }
+    }
+    
+    if let Some(ws) = websocket_url {
+        if !ws.trim().is_empty() {
+            if !ws.is_ascii() {
+                return Err(format!("Websocket URL '{}' содержит недопустимые (не латинские) символы", ws));
+            }
+            let parsed = ws.parse::<poem::http::Uri>().map_err(|e| format!("Некорректный Websocket URL '{}': {}", ws, e))?;
+            let scheme = parsed.scheme_str().unwrap_or("");
+            if scheme != "ws" && scheme != "wss" {
+                return Err(format!("Неподдерживаемый протокол '{}' для Websocket URL. Ожидается ws:// или wss://", scheme));
+            }
+        }
+    }
+
+    if let Some(ahttp) = ahttp_url {
+        if !ahttp.trim().is_empty() {
+            if !ahttp.is_ascii() {
+                return Err(format!("AHTTP URL '{}' содержит недопустимые (не латинские) символы", ahttp));
+            }
+            let parsed = ahttp.parse::<poem::http::Uri>().map_err(|e| format!("Некорректный AHTTP URL '{}': {}", ahttp, e))?;
+            let scheme = parsed.scheme_str().unwrap_or("");
+            if scheme != "http" && scheme != "https" {
+                return Err(format!("Неподдерживаемый протокол '{}' для AHTTP URL. Ожидается http:// или https://", scheme));
+            }
+        }
+    }
+    Ok(())
+}
+
 #[OpenApi]
 impl ServersApi {
     /// Регистрация нового физического VPN-сервера (ноды) в системе
@@ -28,6 +72,13 @@ impl ServersApi {
             return Err(poem::Error::from_string(
                 err,
                 poem::http::StatusCode::UNAUTHORIZED,
+            ));
+        }
+
+        if let Err(err) = validate_server_urls(&req.0.address, &req.0.websocket_url, &req.0.ahttp_url) {
+            return Err(poem::Error::from_string(
+                err,
+                poem::http::StatusCode::BAD_REQUEST,
             ));
         }
 
@@ -79,6 +130,13 @@ impl ServersApi {
     ) -> crate::api::dto::UpdateServerApiResult {
         if let Err(err) = validate_admin_session(&self.db, &auth.0.token).await {
             return crate::api::dto::UpdateServerApiResult::Unauthorized(Json(err));
+        }
+
+        let addr = req.0.address.clone().unwrap_or_default();
+        let ws_url = req.0.websocket_url.clone().flatten();
+        let ahttp_url = req.0.ahttp_url.clone().flatten();
+        if let Err(err) = validate_server_urls(&addr, &ws_url, &ahttp_url) {
+            return crate::api::dto::UpdateServerApiResult::BadRequest(Json(err));
         }
 
         let server_model = match servers::Entity::find_by_id(id.0).one(&self.db).await {
