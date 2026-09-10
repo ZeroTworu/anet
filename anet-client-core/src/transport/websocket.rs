@@ -165,12 +165,12 @@ fn wss_connector() -> Result<Connector> {
 }
 
 fn connector_for(server: &ServerConfig) -> Result<Connector> {
-    let scheme = server
-        .dsn
-        .parse::<http::Uri>()?
-        .scheme_str()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
+    let scheme = if let Some((scheme, _)) = server.dsn.split_once("://") {
+        scheme.to_lowercase()
+    } else {
+        String::new()
+    };
+
     if scheme == "wss" {
         wss_connector()
     } else {
