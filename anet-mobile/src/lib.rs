@@ -141,7 +141,7 @@ fn event_message(event: AnetEvent) -> Option<String> {
         AnetEvent::UpdateReady => Some("Update downloaded to cache".to_string()),
         AnetEvent::Stats { .. }
         | AnetEvent::TrafficUpdate { .. }
-        | AnetEvent::ClientStateChanged { .. } => None,
+        | AnetEvent::ClientStateChanged { .. } | AnetEvent::AccountInfo(_) => None,
     }
 }
 
@@ -376,6 +376,33 @@ fn init_jni_bridge_thread(jvm: Arc<JavaVM>) {
                                     );
                                 }
                             }
+                            AnetEvent::AccountInfo(info) => {
+                                let j_billing = env.new_string(&info.billing_str);
+                                let j_group = env.new_string(&info.group_str);
+                                let j_sessions = env.new_string(&info.sessions_str);
+                                let j_speed = env.new_string(&info.speed_str);
+                                let j_consumed = env.new_string(&info.consumed_str);
+                                let j_limit = env.new_string(&info.limit_str);
+                                let j_expires = env.new_string(&info.expires_str);
+                                
+                                if let (Ok(jb), Ok(jg), Ok(jse), Ok(jsp), Ok(jc), Ok(jl), Ok(je)) = 
+                                    (j_billing, j_group, j_sessions, j_speed, j_consumed, j_limit, j_expires) {
+                                    let _ = env.call_method(
+                                        &callback_ref,
+                                        "onAccountInfo",
+                                        "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
+                                        &[
+                                            JValue::Object(&jb),
+                                            JValue::Object(&jg),
+                                            JValue::Object(&jse),
+                                            JValue::Object(&jsp),
+                                            JValue::Object(&jc),
+                                            JValue::Object(&jl),
+                                            JValue::Object(&je),
+                                        ]
+                                    );
+                                }
+                            }
                             other => {
                                 if let Some(msg) = event_message(other) {
                                     if let Ok(jmsg) = env.new_string(msg) {
@@ -584,16 +611,16 @@ pub extern "system" fn Java_org_alco_anet_ANetVpnService_connectVpn(
 
         if has_groups {
             let selected_group = if !selected_server.is_empty() {
-                selected_server.as_str()
+                selected_server.clone()
             } else {
                 config.servers.iter()
                     .find_map(|s| s.group_name.as_deref().map(str::trim).filter(|g| !g.is_empty()))
-                    .unwrap_or("")
+                    .unwrap_or("").to_string()
             };
 
             let mut group_servers: Vec<_> = config.servers
                 .iter()
-                .filter(|s| s.group_name.as_deref().map(str::trim) == Some(selected_group))
+                .filter(|s| s.group_name.as_deref().map(str::trim) == Some(selected_group.as_str()))
                 .cloned()
                 .collect();
 
