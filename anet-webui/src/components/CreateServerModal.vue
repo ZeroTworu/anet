@@ -36,8 +36,13 @@ const handleCreate = async () => {
     form.value = defaultForm() // Сбрасываем форму после успеха
     emit('created')            // Сообщаем родителю, что надо обновить список
     show.value = false         // Закрываем модалку
-  } catch (error) {
+  } catch (error: any) {
     console.error('Ошибка при создании сервера:', error)
+    if (error.response?.data) {
+      alert(`Ошибка: ${error.response.data}`)
+    } else {
+      alert('Произошла ошибка при создании сервера')
+    }
   } finally {
     loading.value = false
   }

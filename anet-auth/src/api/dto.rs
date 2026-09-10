@@ -252,6 +252,8 @@ pub struct UpdateServerRequest {
 pub enum UpdateServerApiResult {
     #[oai(status = 200)]
     Ok(Json<ServerDto>),
+    #[oai(status = 400)]
+    BadRequest(Json<String>),
     #[oai(status = 401)]
     Unauthorized(Json<String>),
     #[oai(status = 404)]
