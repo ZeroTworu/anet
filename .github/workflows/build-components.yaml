@@ -673,16 +673,34 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-gradle-
 
+      # ВАЖНО: релизный keystore не хранится в репозитории anet-android —
+      # он приходит из секрета этого репозитория (anet) и распаковывается
+      # прямо перед сборкой. Это заменяет старую схему, где release
+      # подписывался debug-keystore, генерируемым заново на каждом свежем
+      # раннере — из-за этого каждый релиз получал новый случайный
+      # сертификат, и апдейт поверх старой версии у пользователей падал с
+      # "Приложение не установлено".
+      - name: "Restore release keystore"
+        run: |
+          mkdir -p android-ui/app/keystore
+          echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > android-ui/app/keystore/anet-release.jks
+
       - name: "Build APK"
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
           cd android-ui
           chmod +x gradlew
-          ./gradlew assembleDebug
+          # Собираем release, а не debug — см. комментарий у шага восстановления
+          # keystore выше.
+          ./gradlew assembleRelease
 
       - uses: "actions/upload-artifact@v6"
         with:
           name: "anet-android-apk"
-          path: "android-ui/app/build/outputs/apk/debug/app-debug.apk"
+          path: "android-ui/app/build/outputs/apk/release/app-release.apk"
   build-push-webui-docker:
     name: "Build & Push WebUI to GHCR"
     runs-on: "ubuntu-latest"
