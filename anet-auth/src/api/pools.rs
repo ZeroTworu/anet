@@ -21,9 +21,11 @@ fn validate_pool_request(req: &SaveNodePoolRequest) -> std::result::Result<(), S
     if req.name.trim().is_empty() {
         return Err("Pool name cannot be empty".to_string());
     }
+
     if req.strategy != "weighted" && req.strategy != "least_connections" {
         return Err("Strategy must be weighted or least_connections".to_string());
     }
+
     if req
         .members
         .iter()
@@ -31,14 +33,40 @@ fn validate_pool_request(req: &SaveNodePoolRequest) -> std::result::Result<(), S
     {
         return Err("Member weight must be between 1 and 10000".to_string());
     }
-    let unique: HashSet<_> = req
+    
+    for member in &req.members {
+        if let Some(url_str) = &member.port_or_url {
+            if member.protocol == crate::entities::ProtocolType::Ws || member.protocol == crate::entities::ProtocolType::Ahttp {
+                if !url_str.trim().is_empty() {
+                    if !url_str.is_ascii() {
+                        return Err(format!("URL '{}' содержит недопустимые (не латинские) символы", url_str));
+                    }
+                    let parsed = url_str.parse::<poem::http::Uri>().map_err(|e| format!("Некорректный URL '{}': {}", url_str, e))?;
+                    let scheme = parsed.scheme_str().unwrap_or("");
+                    if member.protocol == crate::entities::ProtocolType::Ws {
+                        if scheme != "ws" && scheme != "wss" {
+                            return Err(format!("Неподдерживаемый протокол '{}' для Websocket URL. Ожидается ws:// или wss://", scheme));
+                        }
+                    } else if member.protocol == crate::entities::ProtocolType::Ahttp {
+                        if scheme != "http" && scheme != "https" {
+                            return Err(format!("Неподдерживаемый протокол '{}' для AHTTP URL. Ожидается http:// или https://", scheme));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let unique: std::collections::HashSet<_> = req
         .members
         .iter()
         .map(|member| (member.server_id, member.protocol))
         .collect();
+
     if unique.len() != req.members.len() {
         return Err("Pool contains duplicate node and protocol combinations".to_string());
     }
+
     Ok(())
 }
 
