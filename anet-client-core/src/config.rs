@@ -192,21 +192,14 @@ impl ServerConfig {
     }
 
     pub fn mode(&self) -> anyhow::Result<TransportMode> {
-        let scheme = if let Some((scheme, _)) = self.dsn.split_once("://") {
-            scheme.to_lowercase()
-        } else {
-            let parsed = reqwest::Url::parse(&self.dsn)
-                .map_err(|e| anyhow::anyhow!("Failed to parse DSN '{}': {}", self.dsn, e))?;
-            parsed.scheme().to_lowercase()
-        };
-
-        match scheme.as_str() {
-            "quic" => Ok(TransportMode::Quic),
-            "ssh" => Ok(TransportMode::Ssh),
-            "vnc" => Ok(TransportMode::Vnc),
-            "ws" | "wss" => Ok(TransportMode::Websocket),
-            "http" | "https" => Ok(TransportMode::Ahttp),
-            scheme => anyhow::bail!("unsupported server DSN scheme '{scheme}'"),
+        match self.dsn.parse::<http::Uri>()?.scheme_str() {
+            Some("quic") => Ok(TransportMode::Quic),
+            Some("ssh") => Ok(TransportMode::Ssh),
+            Some("vnc") => Ok(TransportMode::Vnc),
+            Some("ws") | Some("wss") => Ok(TransportMode::Websocket),
+            Some("http") | Some("https") => Ok(TransportMode::Ahttp),
+            Some(scheme) => anyhow::bail!("unsupported server DSN scheme '{scheme}'"),
+            None => anyhow::bail!("server DSN '{}' has no scheme", self.dsn),
         }
     }
 
@@ -219,31 +212,15 @@ impl ServerConfig {
     pub fn websocket_url(&self) -> anyhow::Result<String> {
         let mode = self.mode()?;
         anyhow::ensure!(mode == TransportMode::Websocket, "DSN '{}' is not a websocket endpoint", self.dsn);
-        let url = reqwest::Url::parse(&self.dsn)
-            .map_err(|e| anyhow::anyhow!("Failed to parse websocket DSN '{}': {}", self.dsn, e))?;
-        Ok(url.to_string())
+        Ok(self.dsn.clone())
     }
 
     pub fn host_port(&self) -> anyhow::Result<(String, u16)> {
-        // Use http scheme temporarily to enforce standard URL parsing (including IDNA punycode)
-        let dsn_for_parsing = if let Some((_, rest)) = self.dsn.split_once("://") {
-            format!("http://{}", rest)
-        } else {
-            self.dsn.clone()
-        };
+        let uri: http::Uri = self.dsn.parse()?;
+        let host = uri.host().ok_or_else(|| anyhow::anyhow!("server DSN '{}' has no host", self.dsn))?;
 
-        let url = reqwest::Url::parse(&dsn_for_parsing)
-            .map_err(|e| anyhow::anyhow!("Failed to parse DSN {}: {}", self.dsn, e))?;
-            
-        let host = url.host_str().ok_or_else(|| anyhow::anyhow!("server DSN {} has no host", self.dsn))?;
-        
-        let scheme = if let Some((scheme, _)) = self.dsn.split_once("://") {
-            scheme.to_lowercase()
-        } else {
-            url.scheme().to_lowercase()
-        };
-
-        let port = url.port().unwrap_or(match scheme.as_str() {
+        let scheme = uri.scheme_str().unwrap_or("").to_lowercase();
+        let port = uri.port_u16().unwrap_or(match scheme.as_str() {
             "https" | "wss" => 443,
             "http" | "ws" => 80,
             "ssh" => 22,
@@ -251,8 +228,7 @@ impl ServerConfig {
             "quic" => 443,
             _ => 0,
         });
-
-        anyhow::ensure!(port != 0, "server DSN {} has no port and unknown scheme", self.dsn);
+        anyhow::ensure!(port != 0, "server DSN '{}' has no port and unknown scheme", self.dsn);
         Ok((host.to_string(), port))
     }
 
