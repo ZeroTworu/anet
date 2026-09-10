@@ -71,18 +71,23 @@ fn inspect_config(config_toml: &str) -> String {
     if has_groups {
         let mut seen = std::collections::HashSet::new();
         for server in &config.servers {
-            if let Some(ref g) = server.group_name {
-                let g = g.trim();
-                if !g.is_empty() && seen.insert(g.to_string()) {
+            if let Some(ref g_name) = server.group_name {
+                let g_name = g_name.trim();
+                let g_id = server.group_id.as_deref().unwrap_or(g_name).trim();
+                if !g_name.is_empty() && seen.insert(g_id.to_string()) {
                     result.push('\n');
-                    result.push_str(&g.replace(['\r', '\n'], " "));
+                    let id_safe = g_id.replace(['\r', '\n', '|'], " ");
+                    let name_safe = g_name.replace(['\r', '\n', '|'], " ");
+                    result.push_str(&format!("{}|{}", id_safe, name_safe));
                 }
             }
         }
     } else {
         for server in config.servers {
             result.push('\n');
-            result.push_str(&server.get_name().replace(['\r', '\n'], " "));
+            let id_safe = server.dsn.replace(['\r', '\n', '|'], " ");
+            let name_safe = server.get_name().replace(['\r', '\n', '|'], " ");
+            result.push_str(&format!("{}|{}", id_safe, name_safe));
         }
     }
     result
@@ -610,17 +615,24 @@ pub extern "system" fn Java_org_alco_anet_ANetVpnService_connectVpn(
         });
 
         if has_groups {
-            let selected_group = if !selected_server.is_empty() {
+            let selected_group_id = if !selected_server.is_empty() {
                 selected_server.clone()
             } else {
                 config.servers.iter()
-                    .find_map(|s| s.group_name.as_deref().map(str::trim).filter(|g| !g.is_empty()))
-                    .unwrap_or("").to_string()
+                    .find_map(|s| {
+                        if s.group_name.as_deref().map_or(true, |g| g.trim().is_empty()) { return None; }
+                        Some(s.group_id.as_deref().unwrap_or(s.group_name.as_ref().unwrap()).trim().to_string())
+                    })
+                    .unwrap_or_default()
             };
 
             let mut group_servers: Vec<_> = config.servers
                 .iter()
-                .filter(|s| s.group_name.as_deref().map(str::trim) == Some(selected_group.as_str()))
+                .filter(|s| {
+                    if s.group_name.as_deref().map_or(true, |g| g.trim().is_empty()) { return false; }
+                    let g_id = s.group_id.as_deref().unwrap_or(s.group_name.as_ref().unwrap()).trim();
+                    g_id == selected_group_id.as_str()
+                })
                 .cloned()
                 .collect();
 
@@ -628,10 +640,10 @@ pub extern "system" fn Java_org_alco_anet_ANetVpnService_connectVpn(
 
             if !group_servers.is_empty() {
                 config.servers = group_servers;
-                anet_client_core::events::status(format!("Группа выбрана: {}", selected_group));
+                anet_client_core::events::status(format!("Группа выбрана (id): {}", selected_group_id));
             }
         } else if !selected_server.is_empty() {
-            if let Some(idx) = config.servers.iter().position(|s| s.get_name() == selected_server) {
+            if let Some(idx) = config.servers.iter().position(|s| s.dsn == selected_server) {
                 config.servers.rotate_left(idx);
                 anet_client_core::events::status(format!("Приоритет установлен: {}", selected_server));
             }
