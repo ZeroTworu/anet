@@ -1,5 +1,3 @@
-#[cfg(not(target_os = "windows"))]
-use anet_client_core::traits::TunFactory;
 /// Фабрика TUN-интерфейса для десктопных платформ.
 ///
 /// - **Windows**: собственная реализация поверх `wintun` + `netsh`. Умеет
