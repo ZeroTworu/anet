@@ -7,7 +7,7 @@ use anet_common::reassembly::ReassemblyQueue;
 use anyhow::{Context, Result};
 use bytes::{Bytes, BytesMut};
 use httparse::{Request, Status};
-use log::info;
+use log::{info, warn};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -238,10 +238,8 @@ async fn handle_http_connection(
                                 let mut cursor = std::io::Cursor::new(body);
                                 let mut to_forward: Vec<Bytes> = Vec::new();
 
-                                // Читаем пакеты асинхронно, а лок берем только для быстрой вставки
                                 while let Ok(Some(encrypted_packet)) = read_next_packet(&mut cursor).await {
                                     if let Ok((seq, decrypted)) = unwrap_packet_with_seq(&client_info.cipher, encrypted_packet) {
-                                        // Ограничиваем область видимости лока
                                         let ready_packets = {
                                             let mut reassembler = session.reassembler.lock().unwrap();
                                             reassembler.insert(seq, decrypted)
@@ -252,9 +250,20 @@ async fn handle_http_connection(
 
                                 for packet in to_forward {
                                     let packet_len = packet.len();
-                                    let _ = tun_tx.send(packet).await;
-                                    // Записываем статистику на сервере
-                                    registry.record_rx(&client_info, packet_len, "ahttp");
+
+                                    // BACKPRESSURE
+                                    match tun_tx.try_send(packet) {
+                                        Ok(_) => {
+                                            registry.record_rx(&client_info, packet_len, "ahttp");
+                                        }
+                                        Err(mpsc::error::TrySendError::Full(_)) => {
+                                            warn!("[AHTTP] TUN queue full, dropping uplink packet");
+                                        }
+                                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                                            // Если TUN мертв, нет смысла продолжать сессию
+                                            break;
+                                        }
+                                    }
                                 }
                             }
 

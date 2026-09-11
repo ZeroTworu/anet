@@ -1,7 +1,9 @@
 <script setup lang="ts">
-import { ref, watch } from 'vue'
+import { onMounted, ref, watch } from 'vue'
 import { CreateGroup } from '@/api/groups'
+import { GetPools } from '@/api/pools'
 import type { SaveGroupRequest } from '@/models/group'
+import type { NodePool } from '@/models/pool'
 import { useAppMessage } from '@/composables/useAppMessage'
 
 const show = defineModel<boolean>()
@@ -12,16 +14,34 @@ const emit = defineEmits<{
 }>()
 
 const loading = ref(false)
+const availablePools = ref<NodePool[]>([])
 const message = useAppMessage()
 
 // Поля ввода новой группы
-const form = ref({
+const form = ref<{
+  name: string
+  traffic_limit_gb: number
+  speed_limit_mbps: number
+  sessions_limit: number
+  duration_days: number
+  pool_ids: string[]
+}>({
   name: '',
   traffic_limit_gb: 0,
   speed_limit_mbps: 0,
   sessions_limit: 0,
   duration_days: 0,
+  pool_ids: [],
 })
+
+const loadPools = async () => {
+  try {
+    const pools = await GetPools()
+    availablePools.value = pools.filter(p => p.is_active)
+  } catch (e) {
+    console.error('Failed to load pools', e)
+  }
+}
 
 const resetForm = () => {
   form.value = {
@@ -30,13 +50,20 @@ const resetForm = () => {
     speed_limit_mbps: 0,
     sessions_limit: 0,
     duration_days: 0,
+    pool_ids: [],
   }
 }
 
 watch(show, (visible) => {
-  if (!visible) {
+  if (visible) {
+    loadPools()
+  } else {
     resetForm()
   }
+})
+
+onMounted(() => {
+  loadPools()
 })
 
 const save = async () => {
@@ -48,6 +75,7 @@ const save = async () => {
       speed_limit: (form.value.speed_limit_mbps || 0) * 1024,
       sessions_limit: form.value.sessions_limit ?? 0,
       duration_days: form.value.duration_days ?? 0,
+      pool_ids: form.value.pool_ids,
     }
 
     await CreateGroup(payload)
@@ -134,6 +162,26 @@ const close = () => {
                   placeholder="0 - бессрочный доступ"
                   variant="filled"
                   hide-details
+              />
+            </v-col>
+          </v-row>
+
+          <!-- Ряд 4: Привязка групп серверов -->
+          <v-row class="mb-2">
+            <v-col cols="12">
+              <v-select
+                  v-model="form.pool_ids"
+                  :items="availablePools"
+                  item-title="name"
+                  item-value="id"
+                  label="Привязанные группы серверов (Node Pools)"
+                  placeholder="Выберите группы серверов"
+                  multiple
+                  chips
+                  closable-chips
+                  variant="filled"
+                  hint="Если группы не выбраны, для участников действует стандартный список серверов"
+                  persistent-hint
               />
             </v-col>
           </v-row>

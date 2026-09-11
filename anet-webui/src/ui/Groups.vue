@@ -1,20 +1,26 @@
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { GetGroups, DeleteGroup } from '@/api/groups'
+import { GetPools } from '@/api/pools'
 import type { UserGroup } from '@/models/group'
+import type { NodePool } from '@/models/pool'
 import GroupModal from '@/components/GroupModal.vue'
 import { useAppMessage } from '@/composables/useAppMessage'
 
 const router = useRouter()
 const groups = ref<UserGroup[]>([])
+const pools = ref<NodePool[]>([])
 const loading = ref(false)
 const showEditor = ref(false)
 const searchQuery = ref('')
 const message = useAppMessage()
 
+const poolById = computed(() => new Map(pools.value.map(p => [p.id, p])))
+
 const headers = [
   { title: 'Группа', key: 'name', sortable: true },
+  { title: 'Группы серверов', key: 'pool_ids', sortable: false },
   { title: 'Ограничение трафика', key: 'traffic_limit', sortable: true },
   { title: 'Ограничение скорости', key: 'speed_limit', sortable: true },
   { title: 'Сессий', key: 'sessions_limit', sortable: true, align: 'center' as const },
@@ -48,8 +54,12 @@ const formatDuration = (days: number | null | undefined) => {
 const load = async () => {
   loading.value = true
   try {
-    const res = await GetGroups()
-    groups.value = res || []
+    const [resGroups, resPools] = await Promise.all([
+      GetGroups(),
+      GetPools().catch(() => [] as NodePool[]),
+    ])
+    groups.value = resGroups || []
+    pools.value = resPools || []
   } catch (err) {
     message.error('Не удалось загрузить группы пользователей')
   } finally {
@@ -125,6 +135,21 @@ onMounted(() => {
     >
       <template #item.name="{ item }">
         <span class="group-name-col">{{ item.name }}</span>
+      </template>
+
+      <template #item.pool_ids="{ item }">
+        <div class="d-flex flex-wrap ga-1">
+          <v-chip
+              v-for="pId in (item.pool_ids || [])"
+              :key="pId"
+              size="x-small"
+              variant="tonal"
+              color="primary"
+          >
+            {{ poolById.get(pId)?.name || pId }}
+          </v-chip>
+          <span v-if="!item.pool_ids?.length" class="text-caption text-medium-emphasis">Все (стандартно)</span>
+        </div>
       </template>
 
       <template #item.traffic_limit="{ item }">

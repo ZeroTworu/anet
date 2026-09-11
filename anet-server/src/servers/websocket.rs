@@ -104,8 +104,20 @@ async fn handle_session(
                                     match anet_common::transport::unwrap_packet_bytes(&cipher, encrypted_packet) {
                                         Ok(packet) => {
                                             let packet_len = packet.len();
-                                            if tun_tx.send(packet).await.is_err() { break; }
-                                            registry.record_rx(&client_info, packet_len, "ws");
+
+                                            // ВНЕДРЕНО: BACKPRESSURE ДЛЯ WEBSOCKET (Защита от Deadlock)
+                                            match tun_tx.try_send(packet) {
+                                                Ok(_) => {
+                                                    registry.record_rx(&client_info, packet_len, "ws");
+                                                }
+                                                Err(mpsc::error::TrySendError::Full(_)) => {
+                                                    warn!("[WebSocket] TUN queue full, dropping uplink packet from {}", client_info.assigned_ip);
+                                                }
+                                                Err(mpsc::error::TrySendError::Closed(_)) => {
+                                                    // Если TUN мертв, нет смысла продолжать сессию
+                                                    break;
+                                                }
+                                            }
                                         }
                                         Err(error) => debug!("[WebSocket] Dropped invalid message from {remote_addr}: {error}"),
                                     }

@@ -252,6 +252,8 @@ pub struct UpdateServerRequest {
 pub enum UpdateServerApiResult {
     #[oai(status = 200)]
     Ok(Json<ServerDto>),
+    #[oai(status = 400)]
+    BadRequest(Json<String>),
     #[oai(status = 401)]
     Unauthorized(Json<String>),
     #[oai(status = 404)]
@@ -475,7 +477,20 @@ pub enum DeleteRouteMapResponse {
 #[derive(Object, Debug, Clone, Serialize, Deserialize)]
 pub struct NodePoolMemberDto {
     pub server_id: uuid::Uuid,
+    #[oai(default = "default_protocol")]
+    pub protocol: crate::entities::ProtocolType,
+    #[oai(default)]
+    pub port_or_url: Option<String>,
+    #[oai(default = "default_member_weight")]
     pub weight: i32,
+}
+
+fn default_protocol() -> crate::entities::ProtocolType {
+    crate::entities::ProtocolType::Quic
+}
+
+fn default_member_weight() -> i32 {
+    1
 }
 
 #[derive(Object, Debug, Clone, Serialize, Deserialize)]
@@ -653,6 +668,8 @@ pub struct GroupDto {
     pub sessions_limit: i32,
     pub duration_days: i32,
     pub user_count: i64,
+    #[oai(default)]
+    pub pool_ids: Vec<uuid::Uuid>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -669,6 +686,37 @@ pub struct SaveGroupRequest {
     pub speed_limit: i32,
     pub sessions_limit: i32,
     pub duration_days: i32,
+    #[oai(default)]
+    pub pool_ids: Option<Vec<uuid::Uuid>>,
+}
+
+#[derive(Object, Debug, Clone, Serialize, Deserialize)]
+pub struct SetGroupPoolsRequest {
+    pub pool_ids: Vec<uuid::Uuid>,
+}
+
+#[derive(ApiResponse)]
+pub enum GetGroupPoolsResponse {
+    #[oai(status = 200)]
+    Ok(Json<Vec<NodePoolDto>>),
+    #[oai(status = 401)]
+    Unauthorized(Json<String>),
+    #[oai(status = 404)]
+    NotFound(Json<String>),
+    #[oai(status = 500)]
+    Error(Json<String>),
+}
+
+#[derive(ApiResponse)]
+pub enum SetGroupPoolsResponse {
+    #[oai(status = 200)]
+    Ok(Json<Vec<uuid::Uuid>>),
+    #[oai(status = 401)]
+    Unauthorized(Json<String>),
+    #[oai(status = 404)]
+    NotFound(Json<String>),
+    #[oai(status = 500)]
+    Error(Json<String>),
 }
 
 #[derive(ApiResponse)]

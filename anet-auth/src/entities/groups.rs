@@ -20,11 +20,22 @@ pub struct Model {
 pub enum Relation {
     #[sea_orm(has_many = "super::users::Entity")]
     User,
+    #[sea_orm(has_many = "super::group_node_pools::Entity")]
+    GroupNodePool,
 }
 
 impl Related<super::users::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::User.def()
+    }
+}
+
+impl Related<super::node_pools::Entity> for Entity {
+    fn to() -> RelationDef {
+        super::group_node_pools::Relation::Pool.def()
+    }
+    fn via() -> Option<RelationDef> {
+        Some(super::group_node_pools::Relation::Group.def().rev())
     }
 }
 

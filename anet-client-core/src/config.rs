@@ -145,6 +145,22 @@ pub struct ServerConfig {
     // Опциональное переопределение пользователя SSH
     pub ssh_user: Option<String>,
 
+    // Имя пула / группы серверов
+    #[serde(default)]
+    pub group_name: Option<String>,
+
+    // Идентификатор пула / группы серверов
+    #[serde(default)]
+    pub group_id: Option<String>,
+
+    // Вес сервера в группе
+    #[serde(default, deserialize_with = "deserialize_weight")]
+    pub weight: Option<i32>,
+
+    // Поддержка опечатки weigth из конфига
+    #[serde(default, deserialize_with = "deserialize_weight")]
+    pub weigth: Option<i32>,
+
     /// Bounds for a browser-like WebSocket session rotation.
     #[serde(default = "default_websocket_min_session_secs")]
     pub websocket_min_session_secs: u64,
@@ -152,7 +168,29 @@ pub struct ServerConfig {
     pub websocket_max_session_secs: u64,
 }
 
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            name: None,
+            dsn: String::new(),
+            timeout_secs: default_timeout_secs(),
+            server_pub_key: None,
+            ssh_user: None,
+            group_name: None,
+            group_id: None,
+            weight: None,
+            weigth: None,
+            websocket_min_session_secs: default_websocket_min_session_secs(),
+            websocket_max_session_secs: default_websocket_max_session_secs(),
+        }
+    }
+}
+
 impl ServerConfig {
+    pub fn weight(&self) -> i32 {
+        self.weight.or(self.weigth).unwrap_or(1)
+    }
+
     pub fn mode(&self) -> anyhow::Result<TransportMode> {
         match self.dsn.parse::<http::Uri>()?.scheme_str() {
             Some("quic") => Ok(TransportMode::Quic),
@@ -218,6 +256,44 @@ fn default_timeout_secs() -> u64 {
 
 fn default_websocket_min_session_secs() -> u64 { 8 * 60 }
 fn default_websocket_max_session_secs() -> u64 { 25 * 60 }
+
+fn deserialize_weight<'de, D>(deserializer: D) -> Result<Option<i32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de;
+    struct WeightVisitor;
+
+    impl<'de> de::Visitor<'de> for WeightVisitor {
+        type Value = Option<i32>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("an integer or string representing server weight")
+        }
+
+        fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E> {
+            Ok(Some(v as i32))
+        }
+
+        fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E> {
+            Ok(Some(v as i32))
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+            v.trim().parse::<i32>().map(Some).map_err(de::Error::custom)
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_some<D: serde::Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+            deserializer.deserialize_any(WeightVisitor)
+        }
+    }
+
+    deserializer.deserialize_option(WeightVisitor)
+}
 
 // Новая расширенная структура для настройки HTTP-транспорта на стороне клиента
 #[derive(Debug, Clone, Deserialize)]
@@ -325,6 +401,7 @@ impl CoreConfig {
 #[cfg(test)]
 mod tests {
     use super::{ServerConfig, TransportMode};
+    use serde::Deserialize;
 
     #[test]
     fn dsn_selects_transport_and_endpoint() {
@@ -334,6 +411,10 @@ mod tests {
             timeout_secs: 10,
             server_pub_key: None,
             ssh_user: None,
+            group_name: None,
+            group_id: None,
+            weight: None,
+            weigth: None,
             websocket_min_session_secs: 480,
             websocket_max_session_secs: 1500,
         };
@@ -342,7 +423,7 @@ mod tests {
 
         let websocket = ServerConfig {
             dsn: "wss://vpn.example.com:8443/socket".to_string(),
-            ..server
+            ..server.clone()
         };
         assert_eq!(websocket.mode().unwrap(), TransportMode::Websocket);
         assert_eq!(websocket.websocket_url().unwrap(), "wss://vpn.example.com:8443/socket");
@@ -354,9 +435,48 @@ mod tests {
             timeout_secs: 10,
             server_pub_key: None,
             ssh_user: None,
+
+            group_name: None,
+            group_id: None,
+            weight: None,
+            weigth: None,
+
             websocket_min_session_secs: 480,
             websocket_max_session_secs: 1500,
         };
         assert_eq!(ws_no_port.endpoint().unwrap(), "gm1.anet-project.org:443");
+
+    }
+
+    #[test]
+    fn server_group_and_weight_deserialization() {
+        let toml_str = r#"
+            [[servers]]
+            name = "Node 1"
+            dsn = "quic://1.2.3.4:443"
+            group_name = "Group A"
+            group_id = "11111111-2222-3333-4444-555555555555"
+            weight = 50
+            weigth = 50
+
+            [[servers]]
+            name = "Node 2"
+            dsn = "quic://1.2.3.4:444"
+            group_name = "Group A"
+            group_id = "11111111-2222-3333-4444-555555555555"
+            weight = "100"
+        "#;
+
+        #[derive(Deserialize)]
+        struct TestConfig {
+            servers: Vec<ServerConfig>,
+        }
+
+        let cfg: TestConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.servers.len(), 2);
+        assert_eq!(cfg.servers[0].group_name.as_deref(), Some("Group A"));
+        assert_eq!(cfg.servers[0].weight(), 50);
+        assert_eq!(cfg.servers[1].weight(), 100);
+
     }
 }

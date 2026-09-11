@@ -5,6 +5,7 @@ export type UserGroup = {
     speed_limit: number
     sessions_limit: number
     duration_days: number
+    pool_ids?: string[]
     created_at: string
     updated_at: string
     user_count: number

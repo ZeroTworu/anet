@@ -104,3 +104,13 @@ make cert
 <img src=".assets/mobile_9.png" height="380" alt="Удаление конфига" />
 
 </p>
+
+
+### Web Admin
+<p align="center">
+<img src=".assets/web_admin_1.png" height="380" />
+<img src=".assets/web_admin_2.png" height="380" a />
+<img src=".assets/web_admin_3.png" height="380" alt="Успешное соединение" />
+<img src=".assets/web_admin_4.png" height="380"  />
+<img src=".assets/web_admin_5.png" height="380" />
+</p>

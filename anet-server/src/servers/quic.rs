@@ -146,10 +146,21 @@ pub async fn run_quic_server(
                 let mut reader_task = tokio::spawn(async move {
                     while let Ok(Some(pkt)) = read_next_packet(&mut recv).await {
                         let packet_len = pkt.len();
-                        if t_tx.send(pkt).await.is_err() {
-                            break;
+
+                        // BACKPRESSURE ДЛЯ QUIC
+                        // Если очередь TUN переполнена, отбрасываем пакет,
+                        // чтобы не раздувать пинг (Bufferbloat) и не тормозить сокет.
+                        match t_tx.try_send(pkt) {
+                            Ok(_) => {
+                                rx_registry.record_rx(&ci_rx, packet_len, "quic");
+                            }
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                warn!("[QUIC] TUN queue full, dropping uplink packet from {}", ci_rx.assigned_ip);
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                break;
+                            }
                         }
-                        rx_registry.record_rx(&ci_rx, packet_len, "quic");
                     }
                     warn!("Client {} rx abort", ci_rx.assigned_ip);
                 });
