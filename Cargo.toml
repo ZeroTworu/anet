@@ -69,7 +69,6 @@ codegen-units = 1
 panic = 'abort'
 incremental = false
 
-
 [profile.release.package."*"]
 opt-level = 3
 

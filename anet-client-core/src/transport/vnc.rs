@@ -6,7 +6,7 @@ use anet_common::handshake_fragmentation::{FragmentConfig, write_fragmented};
 use anet_common::stream_framing::{frame_packet, read_next_packet};
 use anet_common::vnc::{
     CLIENT_CUT_TEXT, RFB_VERSION, SECURITY_TYPE_NONE, SERVER_CUT_TEXT, encode_cut_text,
-    read_cut_text, write_cut_text,
+    read_cut_text,
 };
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -158,15 +158,9 @@ impl ClientTransport for VncTransport {
             endpoint: None,
             connection: None,
             health_pause: None,
+            remote_ip: Some(addr.ip()), // Передаем IP в bypass
         })
     }
-}
-
-fn flatten_worker_result(
-    worker: &'static str,
-    result: std::result::Result<Result<()>, tokio::task::JoinError>,
-) -> Result<()> {
-    result.with_context(|| format!("VNC {worker} task failed"))?
 }
 
 fn resolve_address(address: &str) -> Result<SocketAddr> {
@@ -309,11 +303,17 @@ async fn send_to_server(
 
         if !batch_buf.is_empty() {
             writer.write_all(&batch_buf).await?;
-            // FLUSH УДАЛЕН
         }
     }
     writer.shutdown().await?;
     Ok(())
+}
+
+fn flatten_worker_result(
+    worker: &'static str,
+    result: std::result::Result<Result<()>, tokio::task::JoinError>,
+) -> Result<()> {
+    result.with_context(|| format!("VNC {worker} task failed"))?
 }
 
 async fn read_tunnel_packets(

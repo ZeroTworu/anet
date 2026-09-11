@@ -3,7 +3,7 @@ use crate::auth::{AuthChannel, AuthHandler};
 use crate::config::{CoreConfig, ServerConfig};
 use anet_common::consts::{CHANNEL_BUFFER_SIZE, COALESCE_BUDGET_BYTES, MAX_PACKET_SIZE};
 use anet_common::handshake_fragmentation::FragmentConfig;
-use anet_common::stream_framing::{frame_packet_into, frame_packet, read_next_packet};
+use anet_common::stream_framing::{frame_packet, frame_packet_into, read_next_packet};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
@@ -12,6 +12,7 @@ use http::HeaderValue;
 use http::header::{ACCEPT_LANGUAGE, CACHE_CONTROL, ORIGIN, PRAGMA, USER_AGENT};
 use log::{debug, info, warn};
 use rand::{Rng, seq::SliceRandom};
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -57,7 +58,7 @@ const ACCEPT_LANGUAGES: &[&str] = &[
     "en-GB,en;q=0.9,en-US;q=0.8",
     "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
 ];
-const MAX_WS_MESSAGE_SIZE: usize = 128 * 1024; // Увеличено для коалесценции
+const MAX_WS_MESSAGE_SIZE: usize = 128 * 1024;
 
 #[derive(Clone)]
 struct BrowserProfile {
@@ -269,7 +270,7 @@ async fn connect_authenticated(
     server: &ServerConfig,
     profile: &BrowserProfile,
     resume_session_id: Option<String>,
-) -> Result<(ClientSocket, anet_common::protocol::AuthResponse, [u8; 32])> {
+) -> Result<(ClientSocket, anet_common::protocol::AuthResponse, [u8; 32], Option<IpAddr>)> {
     let request = browser_request(server, profile)?;
     let ws_config = WebSocketConfig::default()
         .read_buffer_size(64 * 1024)
@@ -282,6 +283,9 @@ async fn connect_authenticated(
     let tcp_stream = TcpStream::connect(&endpoint)
         .await
         .with_context(|| format!("failed to connect to WebSocket endpoint {endpoint}"))?;
+
+    // Запоминаем реальный IP, к которому подключились
+    let peer_ip = tcp_stream.peer_addr().ok().map(|sa| sa.ip());
     tcp_stream.set_nodelay(true)?;
 
     let (socket, _) = client_async_tls_with_config(
@@ -297,7 +301,7 @@ async fn connect_authenticated(
     let auth =
         AuthHandler::new_with_resume(config, server.server_pub_key.as_deref(), resume_session_id)?;
     let (response, key) = auth.authenticate_once(&channel).await?;
-    Ok((channel.socket.into_inner(), response, key))
+    Ok((channel.socket.into_inner(), response, key, peer_ip))
 }
 
 fn session_lifetime(server: &ServerConfig) -> Duration {
@@ -330,7 +334,7 @@ async fn close_browser_session(socket: &mut ClientSocket) {
 impl ClientTransport for WebSocketTransport {
     async fn connect(&self) -> Result<ConnectionResult> {
         let browser_profile = BrowserProfile::random();
-        let (initial_socket, auth_response, initial_key) =
+        let (initial_socket, auth_response, initial_key, remote_ip) =
             connect_authenticated(&self.config, &self.server, &browser_profile, None).await?;
         let expected_ip = auth_response.ip.clone();
         let expected_gateway = auth_response.gateway.clone();
@@ -369,7 +373,6 @@ impl ClientTransport for WebSocketTransport {
                 let mut sequence = 0u64;
                 let mut rotation = Box::pin(tokio::time::sleep(session_lifetime(&server)));
 
-                // БУФЕР КОАЛЕСЦЕНЦИИ (Ускорение WS)
                 let mut batch_buf = BytesMut::with_capacity(COALESCE_BUDGET_BYTES);
 
                 loop {
@@ -389,7 +392,6 @@ impl ClientTransport for WebSocketTransport {
                                         raw,
                                         config.stealth.padding_step,
                                     ) {
-                                        // Фреймируем зашифрованный пакет для группировки
                                         frame_packet_into(&mut batch_buf, &encrypted);
                                     }
                                 }
@@ -414,7 +416,6 @@ impl ClientTransport for WebSocketTransport {
                         incoming = socket.next() => {
                             match incoming {
                                 Some(Ok(Message::Binary(data))) => {
-                                    // РАСПАКОВКА КОАЛЕСЦЕНЦИИ: В одном Message может быть несколько пакетов
                                     let mut cursor = std::io::Cursor::new(data);
                                     while let Ok(Some(encrypted_packet)) = read_next_packet(&mut cursor).await {
                                         match anet_common::transport::unwrap_packet_bytes(&cipher, encrypted_packet) {
@@ -464,11 +465,11 @@ impl ClientTransport for WebSocketTransport {
                                 if candidate.1.ip == expected_ip
                                     && candidate.1.gateway == expected_gateway
                                 {
-                                    reconnected = Some(candidate);
+                                    reconnected = Some((candidate.0, candidate.1, candidate.2));
                                     break;
                                 }
                                 {
-                                    let (mut rejected_socket, _, _) = candidate;
+                                    let (mut rejected_socket, _, _, _) = candidate;
                                     close_browser_session(&mut rejected_socket).await;
                                 }
                                 warn!(
@@ -507,6 +508,7 @@ impl ClientTransport for WebSocketTransport {
             endpoint: None,
             connection: None,
             health_pause: Some(health_pause),
+            remote_ip, // Передаем IP для добавления в bypass
         })
     }
 }

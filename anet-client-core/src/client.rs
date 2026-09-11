@@ -389,6 +389,15 @@ impl AnetClient {
                 .await?;
         }
 
+        // ГАРАНТИЯ: если транспорт закрепил конкретный IP CDN (Round-Robin),
+        // обязательно добавляем его в обход туннеля, чтобы избежать петли маршрутизации!
+        if let Some(pinned_ip) = result.remote_ip {
+            let prefix = if pinned_ip.is_ipv4() { 32 } else { 128 };
+            self.route_manager
+                .add_bypass_route(pinned_ip, prefix)
+                .await?;
+        }
+
         let (tx_to_tun, mut rx_from_tun, iface_name, _app_filter) = self
             .acquire_packet_source(server, &result.auth_response)
             .await?;

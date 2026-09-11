@@ -1,5 +1,5 @@
 ================================================
-ÔøΩÔøΩÔøΩÔøΩ: W:\Work\anet\anet\anet-common\build.rs
+‘‡ÈÎ: W:\Work\_anet\anet\anet-common\build.rs
 ================================================
 use std::io::Result;
 
@@ -21,7 +21,7 @@ fn main() -> Result<()> {
 
 
 ================================================
-ÔøΩÔøΩÔøΩÔøΩ: W:\Work\anet\anet\anet-common\Cargo.toml
+‘‡ÈÎ: W:\Work\_anet\anet\anet-common\Cargo.toml
 ================================================
 [package]
 name = "anet-common"
@@ -65,54 +65,55 @@ path = "src/lib.rs"
 
 
 ================================================
-ÔøΩÔøΩÔøΩÔøΩ: W:\Work\anet\anet\anet-common\process_files.ps1
+‘‡ÈÎ: W:\Work\_anet\anet\anet-common\process_files.ps1
 ================================================
-# ========== ÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩ ==========
+# ========== Õ¿—“–Œ… » ==========
 $outputFile = "project_report.txt"
 
-# ÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩ ÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩ (ÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩ ÔøΩÔøΩÔøΩ ÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩ)
+# —ÔËÒÓÍ ËÒÍÎ˛˜ÂÌËÈ (‡·ÓÚ‡ÂÚ Í‡Í ‡Ì¸¯Â)
 $exclude = @(
     "*target*", "*github*", "*.lock*", "*project*", "*android-build*", 
     "LICENSE.md", "README.md", "free_ai.md", "*node_modules*", 
-    "CoC.md", "*dist*", ".*", "project_report.txt","*.png","*.webp","*.so","*.ttf","*.svg"
+    "CoC.md", "*dist*", ".*", "project_report.txt","*.png","*.webp","*.so","*.ttf","*.otf","*.svg","*.ico"
 )
 
-# ÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩ ÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩ (ÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩ!)
-# ÔøΩÔøΩÔøΩÔøΩ ÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩ ÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩ @() ÔøΩ ÔøΩÔøΩÔøΩÔøΩÔøΩ ÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩ ÔøΩÔøΩÔøΩ ÔøΩÔøΩÔøΩÔøΩÔøΩ (ÔøΩÔøΩÔøΩÔøΩÔøΩ ÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩ).
-# ÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩ: @("*src*", "*docs*") ÔøΩ ÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩ ÔøΩÔøΩÔøΩÔøΩÔøΩ, ÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩ "src" ÔøΩÔøΩÔøΩ "docs"
-#           @("C:\Projects\MyApp\src\*") ÔøΩ ÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩ ÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩ ÔøΩÔøΩÔøΩÔøΩÔøΩ
+# —œ»—Œ  ¬ Àﬁ◊≈Õ»… (‰Ó·‡‚ÎÂÌÓ!)
+# ≈ÒÎË ÓÒÚ‡‚ËÚ¸ ÔÛÒÚ˚Ï @() ñ ·Û‰ÛÚ Ó·‡·ÓÚ‡Ì˚ ‚ÒÂ Ù‡ÈÎ˚ (ÍÓÏÂ ËÒÍÎ˛˜∏ÌÌ˚ı).
+# œËÏÂ˚: @("*src*", "*docs*") ñ ÚÓÎ¸ÍÓ Ô‡ÔÍË, ÒÓ‰ÂÊ‡˘ËÂ "src" ËÎË "docs"
+#           @("C:\Projects\MyApp\src\*") ñ ÚÓÎ¸ÍÓ ÍÓÌÍÂÚÌ‡ˇ Ô‡ÔÍ‡
 $include = @(
-    # ÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩ ÔøΩ ÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩ ÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩ ÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩ, ÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩ:
-    #"W:\Work\anet\anet\anet-client-core\*",
-   # "W:\Work\anet\anet\anet-client-gui\*"    
+    # ‡ÒÍÓÏÏÂÌÚËÛÈÚÂ Ë ÔÓÔË¯ËÚÂ ÌÛÊÌ˚Â ¯‡·ÎÓÌ˚, Ì‡ÔËÏÂ:
+    #"W:\Work\_anet\anet\anet-client-core\*",
+    #"W:\Work\_anet\anet\anet-client-gui\*",  
+    #"W:\Work\_anet\anet\anet-mobile\*"  
     #"W:\Work\anet\anet\anet-mobile\*"
     #"W:\Work\anet-android\anet-android\app\src\main\java\org\alco\anet*"
 )
 
-# ========== ÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩ ==========
+# ========== œŒƒ√Œ“Œ¬ ¿ ==========
 if (Test-Path $outputFile) { Remove-Item $outputFile }
 
-# ÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩ ÔøΩÔøΩÔøΩ ÔøΩÔøΩÔøΩÔøΩÔøΩ, ÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩ ÔøΩÔøΩ ÔøΩÔøΩÔøΩÔøΩÔøΩ (ÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩ ÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩ ÔøΩÔøΩÔøΩÔøΩÔøΩ)
+# œÓÎÛ˜‡ÂÏ ‚ÒÂ Ù‡ÈÎ˚, ËÒÍÎ˛˜‡ˇ ÔÓ ËÏÂÌË (Ë„ÌÓËÛÂÏ ÒÍ˚Ú˚Â Ô‡ÔÍË)
 $files = Get-ChildItem -Recurse -File -Exclude $exclude | Where-Object { 
     $_.FullName -notmatch "(\\|\/)\." 
 }
 
-# ========== ÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩ INCLUDE (ÔøΩÔøΩÔøΩÔøΩ ÔøΩÔøΩÔøΩÔøΩÔøΩ) ==========
+# ========== œ–»Ã≈Õﬂ≈Ã INCLUDE (ÂÒÎË Á‡‰‡Ì) ==========
 if ($include -and $include.Count -gt 0) {
     $files = $files | Where-Object {
         $path = $_.FullName
-        # ÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩ, ÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩ ÔøΩÔøΩ ÔøΩÔøΩÔøΩÔøΩ ÔøΩÔøΩÔøΩÔøΩ ÔøΩÔøΩ ÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩ ÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩ ÔøΩÔøΩ $include
+        # œÓ‚ÂˇÂÏ, ÒÓÓÚ‚ÂÚÒÚ‚ÛÂÚ ÎË ÔÛÚ¸ ıÓÚˇ ·˚ Ó‰ÌÓÏÛ ¯‡·ÎÓÌÛ ËÁ $include
         $include | ForEach-Object { $path -like $_ } | Where-Object { $_ } | Select-Object -First 1
     }
 }
 
-# ÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩ ÔøΩÔøΩÔøΩÔøΩÔøΩ ÔøΩÔøΩÔøΩÔøΩ ÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩ
+# —ÓÚËÛÂÏ ÔÓÒÎÂ ‚ÒÂı ÙËÎ¸ÚÓ‚
 $files = $files | Sort-Object FullName
 
-# ========== ÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩ ==========
+# ========== Œ¡–¿¡Œ“ ¿ ==========
 foreach ($file in $files) {
     Add-Content $outputFile "================================================"
-    Add-Content $outputFile "ÔøΩÔøΩÔøΩÔøΩ: $($file.FullName)"
+    Add-Content $outputFile "‘‡ÈÎ: $($file.FullName)"
     Add-Content $outputFile "================================================"
     
     try {
@@ -120,23 +121,31 @@ foreach ($file in $files) {
         Add-Content $outputFile $content
     }
     catch {
-        Add-Content $outputFile "[ÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩ ÔøΩÔøΩÔøΩÔøΩ ÔøΩÔøΩÔøΩ ÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩ ÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩ]"
+        Add-Content $outputFile "[¡ËÌ‡Ì˚È Ù‡ÈÎ ËÎË Ó¯Ë·Í‡ ˜ÚÂÌËˇ]"
     }
 
     Add-Content $outputFile "`n`n"
-    Write-Host "ÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩ: $($file.Name)"
+    Write-Host "Œ·‡·ÓÚ‡Ì: $($file.Name)"
 }
 
-Write-Host "ÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩ! ÔøΩÔøΩÔøΩÔøΩÔøΩ ÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩ ÔøΩ ÔøΩÔøΩÔøΩÔøΩ: $outputFile"
+Write-Host "√ÓÚÓ‚Ó! ŒÚ˜ÂÚ ÒÓı‡ÌÂÌ ‚ Ù‡ÈÎ: $outputFile"
 
 
 
 ================================================
-ÔøΩÔøΩÔøΩÔøΩ: W:\Work\anet\anet\anet-common\proto\protocol.proto
+‘‡ÈÎ: W:\Work\_anet\anet\anet-common\proto\protocol.proto
 ================================================
 syntax = "proto3";
 
 package anet;
+
+enum BillingType {
+    BILLING_TYPE_UNKNOWN = 0;
+    BILLING_TYPE_NO_TARIFF_NO_GROUP = 1;
+    BILLING_TYPE_GROUP = 2;
+    BILLING_TYPE_INDIVIDUAL = 3;
+    BILLING_TYPE_GROUP_AND_INDIVIDUAL = 4;
+}
 
 message DHClientExchange {
     bytes public_key = 1;
@@ -174,6 +183,19 @@ message AuthResponse {
     string session_id = 5;
     bytes nonce_prefix = 6;
     bytes quic_cert = 7;
+
+    BillingType billing_type = 8;
+
+    optional string group_name = 9;
+    optional int64 traffic_limit = 10;
+    optional int64 traffic_consumed = 11;
+
+    // –°–µ—Å—Å–∏–∏ (–∞–∫—Ç–∏–≤–Ω—ã–µ –∏ —Ä–∞–∑—Ä–µ—à–µ–Ω–Ω—ã–µ)
+    int32 active_sessions = 12;
+    int32 allowed_sessions = 13;
+
+    optional int32 speed_limit_kbps = 14;  // –õ–∏–º–∏—Ç —Å–∫–æ—Ä–æ—Å—Ç–∏ –≤ –ö–±–∏—Ç/—Å
+    optional string expires_at = 15;       // –î–∞—Ç–∞ –æ–∫–æ–Ω—á–∞–Ω–∏—è –¥–æ—Å—Ç—É–ø–∞ (YYYY-MM-DD HH:MM)
 }
 
 message Message {
@@ -204,7 +226,7 @@ message AuthDenyNotification {
 
 
 ================================================
-ÔøΩÔøΩÔøΩÔøΩ: W:\Work\anet\anet\anet-common\src\atun.rs
+‘‡ÈÎ: W:\Work\_anet\anet\anet-common\src\atun.rs
 ================================================
 use crate::consts::{CHANNEL_BUFFER_SIZE, MAX_PACKET_SIZE};
 use crate::tun_params::TunParams;
@@ -456,7 +478,7 @@ impl TunManager {
 
 
 ================================================
-ÔøΩÔøΩÔøΩÔøΩ: W:\Work\anet\anet\anet-common\src\config.rs
+‘‡ÈÎ: W:\Work\_anet\anet\anet-common\src\config.rs
 ================================================
 use serde::Deserialize;
 
@@ -496,13 +518,14 @@ impl Default for StealthConfig {
 
 
 ================================================
-ÔøΩÔøΩÔøΩÔøΩ: W:\Work\anet\anet\anet-common\src\consts.rs
+‘‡ÈÎ: W:\Work\_anet\anet\anet-common\src\consts.rs
 ================================================
 // –í—Å–µ –∫–æ–Ω—Å—Ç–∞–Ω—Ç—ã –æ–±—Å–∞–ª—é—Ç–Ω–æ –Ω–∞—É—á–Ω—ã, –∏ —Å–æ–æ—Ç–≤–µ—Ç—Å—Ç–≤—É—é—Ç —á–∏—Å–ª—É —Ç–∞—Ä–∞–∫–∞–Ω–æ–≤ –Ω–∞ –ª–æ–ª—É –∏ –∫–æ–ª-–≤—É –±—ã—á–∫–æ–≤ –≤ –ø–µ–ø–µ–ª—å–Ω–∏—Ü–µ.
 // –ù–µ –Ω–∞—É—á–Ω—ã–µ - —á–∏—Å–ª—É –º—É—Ö –Ω–∞ –ø–æ—Ç–æ–ª–∫–µ.
 
 pub const MAX_PACKET_SIZE: usize = 2048;
-pub const CHANNEL_BUFFER_SIZE: usize = 1024;
+// –£–≤–µ–ª–∏—á–µ–Ω–æ —Å 1024 –¥–æ 4096 –¥–ª—è —Å–≥–ª–∞–∂–∏–≤–∞–Ω–∏—è —Å–µ—Ç–µ–≤–æ–≥–æ –¥–∂–∏—Ç—Ç–µ—Ä–∞
+pub const CHANNEL_BUFFER_SIZE: usize = 4096;
 pub const NONCE_PREFIX_LEN: usize = 4;
 pub const NONCE_LEN: usize = 12;
 pub const PADDING_MTU: usize = 1450;
@@ -522,11 +545,12 @@ pub const COALESCE_BUDGET_BYTES: usize = 64 * 1024;
 /// –ø—Ä–µ–¥–æ—Ç–≤—Ä–∞—â–∞—è –ø–µ—Ä–µ–ø–æ–ª–Ω–µ–Ω–∏–µ –±—É—Ñ–µ—Ä–æ–≤ –∏ –ø–∞–Ω–∏–∫—É CryptoVec::resize.
 pub const CRYPTO_COALESCE_BUDGET_BYTES: usize = 16 * 1024;
 
+pub const MAX_UDP_PAYLOAD_SIZE: usize = 1450;
 
 
 
 ================================================
-ÔøΩÔøΩÔøΩÔøΩ: W:\Work\anet\anet\anet-common\src\crypto_utils.rs
+‘‡ÈÎ: W:\Work\_anet\anet\anet-common\src\crypto_utils.rs
 ================================================
 use crate::encryption::Cipher;
 use base64::prelude::*;
@@ -582,10 +606,27 @@ pub fn generate_key_fingerprint(public_key: &VerifyingKey) -> String {
 
 
 ================================================
-ÔøΩÔøΩÔøΩÔøΩ: W:\Work\anet\anet\anet-common\src\dto.rs
+‘‡ÈÎ: W:\Work\_anet\anet\anet-common\src\dto.rs
 ================================================
 use serde::{Deserialize, Serialize};
 
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "poem", derive(poem_openapi::Enum))]
+#[cfg_attr(feature = "poem", oai(rename = "BillingType", rename_all = "snake_case"))]
+#[serde(rename_all = "snake_case")]
+pub enum BillingType {
+    #[serde(alias = "UNKNOWN", alias = "BILLING_TYPE_UNKNOWN", alias = "Unknown")]
+    Unknown = 0,
+    #[serde(alias = "NO_TARIFF_NO_GROUP", alias = "BILLING_TYPE_NO_TARIFF_NO_GROUP", alias = "NoTariffNoGroup")]
+    NoTariffNoGroup = 1,
+    #[serde(alias = "GROUP", alias = "BILLING_TYPE_GROUP", alias = "Group")]
+    Group = 2,
+    #[serde(alias = "INDIVIDUAL", alias = "BILLING_TYPE_INDIVIDUAL", alias = "Individual")]
+    Individual = 3,
+    #[serde(alias = "GROUP_AND_INDIVIDUAL", alias = "BILLING_TYPE_GROUP_AND_INDIVIDUAL", alias = "GroupAndIndividual")]
+    GroupAndIndividual = 4,
+}
 /// [ VPN Core Communication: Check Access ]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "poem", derive(poem_openapi::Object))]
@@ -603,7 +644,20 @@ pub struct CheckAccessResponse {
     pub message: String,
     pub static_ip: Option<String>,
     pub user_id: Option<String>,
-    pub speed_limit: Option<i32>,
+    /// –û–≥—Ä–∞–Ω–∏—á–µ–Ω–∏–µ —Å–∫–æ—Ä–æ—Å—Ç–∏ –≤ –∫–∏–ª–æ–±–∏—Ç–∞—Ö/—Å–µ–∫ (`rates.speed_limit`), `None`
+    /// –∏–ª–∏ `0` = –±–µ–∑ –æ–≥—Ä–∞–Ω–∏—á–µ–Ω–∏—è. –ß–∏—Ç–∞–µ—Ç—Å—è `anet-server::shaper` –ø—Ä–∏
+    /// —Ñ–∏–Ω–∞–ª–∏–∑–∞—Ü–∏–∏ –∫–ª–∏–µ–Ω—Ç–∞.
+    pub speed_limit_kbps: Option<i32>,
+
+    pub billing_type: Option<BillingType>,
+    pub group_name: Option<String>,
+    pub traffic_limit: Option<i64>,
+    pub traffic_consumed: Option<i64>,
+
+    pub active_sessions: Option<i32>,
+    pub allowed_sessions: Option<i32>,
+
+    pub expires_at: Option<String>,
 }
 
 /// [ VPN Core Communication: Session Events ]
@@ -676,7 +730,7 @@ pub struct NodeTrafficReport {
 
 
 ================================================
-ÔøΩÔøΩÔøΩÔøΩ: W:\Work\anet\anet\anet-common\src\encryption.rs
+‘‡ÈÎ: W:\Work\_anet\anet\anet-common\src\encryption.rs
 ================================================
 use aead::{Aead, AeadInPlace, KeyInit, Nonce, Tag}; // <--- –î–æ–±–∞–≤–∏–ª–∏ AeadInPlace
 use aes_gcm::Key;
@@ -802,7 +856,7 @@ impl std::error::Error for EncryptionError {}
 
 
 ================================================
-ÔøΩÔøΩÔøΩÔøΩ: W:\Work\anet\anet\anet-common\src\generated\anet.rs
+‘‡ÈÎ: W:\Work\_anet\anet\anet-common\src\generated\anet.rs
 ================================================
 // This file is @generated by prost-build.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -863,6 +917,25 @@ pub struct AuthResponse {
     pub nonce_prefix: ::prost::alloc::vec::Vec<u8>,
     #[prost(bytes = "vec", tag = "7")]
     pub quic_cert: ::prost::alloc::vec::Vec<u8>,
+    #[prost(enumeration = "BillingType", tag = "8")]
+    pub billing_type: i32,
+    #[prost(string, optional, tag = "9")]
+    pub group_name: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(int64, optional, tag = "10")]
+    pub traffic_limit: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "11")]
+    pub traffic_consumed: ::core::option::Option<i64>,
+    /// –°–µ—Å—Å–∏–∏ (–∞–∫—Ç–∏–≤–Ω—ã–µ –∏ —Ä–∞–∑—Ä–µ—à–µ–Ω–Ω—ã–µ)
+    #[prost(int32, tag = "12")]
+    pub active_sessions: i32,
+    #[prost(int32, tag = "13")]
+    pub allowed_sessions: i32,
+    /// –õ–∏–º–∏—Ç —Å–∫–æ—Ä–æ—Å—Ç–∏ –≤ –ö–±–∏—Ç/—Å
+    #[prost(int32, optional, tag = "14")]
+    pub speed_limit_kbps: ::core::option::Option<i32>,
+    /// –î–∞—Ç–∞ –æ–∫–æ–Ω—á–∞–Ω–∏—è –¥–æ—Å—Ç—É–ø–∞ (YYYY-MM-DD HH:MM)
+    #[prost(string, optional, tag = "15")]
+    pub expires_at: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Message {
@@ -895,6 +968,41 @@ pub mod message {
 pub struct AuthDenyNotification {
     #[prost(string, tag = "1")]
     pub message: ::prost::alloc::string::String,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum BillingType {
+    Unknown = 0,
+    NoTariffNoGroup = 1,
+    Group = 2,
+    Individual = 3,
+    GroupAndIndividual = 4,
+}
+impl BillingType {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unknown => "BILLING_TYPE_UNKNOWN",
+            Self::NoTariffNoGroup => "BILLING_TYPE_NO_TARIFF_NO_GROUP",
+            Self::Group => "BILLING_TYPE_GROUP",
+            Self::Individual => "BILLING_TYPE_INDIVIDUAL",
+            Self::GroupAndIndividual => "BILLING_TYPE_GROUP_AND_INDIVIDUAL",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "BILLING_TYPE_UNKNOWN" => Some(Self::Unknown),
+            "BILLING_TYPE_NO_TARIFF_NO_GROUP" => Some(Self::NoTariffNoGroup),
+            "BILLING_TYPE_GROUP" => Some(Self::Group),
+            "BILLING_TYPE_INDIVIDUAL" => Some(Self::Individual),
+            "BILLING_TYPE_GROUP_AND_INDIVIDUAL" => Some(Self::GroupAndIndividual),
+            _ => None,
+        }
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
@@ -933,7 +1041,7 @@ impl DenyReason {
 
 
 ================================================
-ÔøΩÔøΩÔøΩÔøΩ: W:\Work\anet\anet\anet-common\src\generated\mod.rs
+‘‡ÈÎ: W:\Work\_anet\anet\anet-common\src\generated\mod.rs
 ================================================
 #![allow(dead_code)]
 #![allow(clippy::all)]
@@ -946,7 +1054,7 @@ include!("anet.rs");
 
 
 ================================================
-ÔøΩÔøΩÔøΩÔøΩ: W:\Work\anet\anet\anet-common\src\handshake_fragmentation.rs
+‘‡ÈÎ: W:\Work\_anet\anet\anet-common\src\handshake_fragmentation.rs
 ================================================
 //! –§—Ä–∞–≥–º–µ–Ω—Ç–∞—Ü–∏—è —Å–∞–º–æ–≥–æ –ø–µ—Ä–≤–æ–≥–æ –ø–∞–∫–µ—Ç–∞ —Ä—É–∫–æ–ø–æ–∂–∞—Ç–∏—è ‚Äî –¥–æ –ø–æ—è–≤–ª–µ–Ω–∏—è —Å–µ—Å—Å–∏–æ–Ω–Ω–æ–≥–æ
 //! –∫–ª—é—á–∞, –ø–æ—ç—Ç–æ–º—É –≤–Ω–µ –æ–±—ã—á–Ω–æ–≥–æ padding/jitter-–∫–æ–Ω–≤–µ–π–µ—Ä–∞ (`jitter.rs`,
@@ -1382,7 +1490,7 @@ mod tests {
 
 
 ================================================
-ÔøΩÔøΩÔøΩÔøΩ: W:\Work\anet\anet\anet-common\src\http_help.rs
+‘‡ÈÎ: W:\Work\_anet\anet\anet-common\src\http_help.rs
 ================================================
 use rand::{Rng, seq::SliceRandom};
 
@@ -1495,7 +1603,7 @@ impl BrowserProfile {
 
 
 ================================================
-ÔøΩÔøΩÔøΩÔøΩ: W:\Work\anet\anet\anet-common\src\jitter.rs
+‘‡ÈÎ: W:\Work\_anet\anet\anet-common\src\jitter.rs
 ================================================
 use crate::config::StealthConfig;
 use crate::consts::{COALESCE_BUDGET_BYTES, CRYPTO_COALESCE_BUDGET_BYTES};
@@ -1576,8 +1684,6 @@ where
         buf.clear();
         frame_packet_into(&mut buf, &packet);
 
-        // On the fast path, drain ready packets into one stream write. With jitter enabled,
-        // completion order is intentionally retained and each timer stays independently delayed.
         while !jitter_enabled && buf.len() < COALESCE_BUDGET_BYTES {
             match rx.try_recv() {
                 Ok(packet) if packet.len() >= 20 => frame_packet_into(&mut buf, &packet),
@@ -1586,15 +1692,16 @@ where
             }
         }
 
-        stream.write_all(&buf).await?;
-        stream.flush().await?;
+        if !buf.is_empty() {
+            stream.write_all(&buf).await?;
+            // FLUSH –£–î–ê–õ–ï–ù
+        }
     }
 
     stream.shutdown().await?;
     Ok(())
 }
 
-/// –®–∏—Ñ—Ä—É–µ—Ç –∏ –æ–±—ä–µ–¥–∏–Ω—è–µ—Ç –ø–∞–∫–µ—Ç—ã –ø–æ—Ç–æ–∫–æ–≤–æ–≥–æ SSH-—Ç—Ä–∞–Ω—Å–ø–æ—Ä—Ç–∞ —Å –æ–≥—Ä–∞–Ω–∏—á–µ–Ω–Ω—ã–º –¥–∂–∏—Ç—Ç–µ—Ä–æ–º.
 pub async fn bridge_crypto_stream_with_jitter<S>(
     mut rx: mpsc::Receiver<Bytes>,
     mut stream: S,
@@ -1625,12 +1732,12 @@ where
 
         let encrypted =
             crate::transport::wrap_packet(&cipher, &nonce_prefix, seq, packet, safe_pad)?;
-        frame_packet_into(buf, &encrypted);
+        crate::stream_framing::frame_packet_into(buf, &encrypted);
         Ok(())
     };
 
     while input_open || !pending.is_empty() {
-        let packet = if !jitter_enabled {
+        let mut packet = if !jitter_enabled {
             match rx.recv().await {
                 Some(packet) => packet,
                 None => break,
@@ -1665,28 +1772,28 @@ where
                 packet = pending.next() => packet.expect("–æ—á–µ—Ä–µ–¥—å –¥–∂–∏—Ç—Ç–µ—Ä–∞ –Ω–µ –ø—É—Å—Ç–∞"),
             }
         };
-        if packet.len() < 20 {
-            continue;
-        }
 
         buf.clear();
-        encrypt_into(packet, &mut buf)?;
 
-        // –ü—Ä–∏ –≤—ã–∫–ª—é—á–µ–Ω–Ω–æ–º –¥–∂–∏—Ç—Ç–µ—Ä–µ –æ–±—ä–µ–¥–∏–Ω—è–µ–º —É–∂–µ –æ–∂–∏–¥–∞—é—â–∏–µ –ø–∞–∫–µ—Ç—ã –≤ –æ–¥–Ω—É SSH-–∑–∞–ø–∏—Å—å.
-        while !jitter_enabled && buf.len() < CRYPTO_COALESCE_BUDGET_BYTES {
-            match rx.try_recv() {
-                Ok(packet) if packet.len() >= 20 => encrypt_into(packet, &mut buf)?,
-                Ok(_) => continue,
-                Err(_) => break,
+        loop {
+            if packet.len() >= 20 {
+                encrypt_into(packet, &mut buf)?;
             }
+
+            if buf.len() >= CRYPTO_COALESCE_BUDGET_BYTES {
+                break;
+            }
+
+            packet = match rx.try_recv() {
+                Ok(p) => p,
+                Err(_) => break,
+            };
         }
 
-        if buf.is_empty() {
-            continue;
+        if !buf.is_empty() {
+            stream.write_all(&buf).await?;
+            // FLUSH –£–î–ê–õ–ï–ù
         }
-
-        stream.write_all(&buf).await?;
-        stream.flush().await?;
     }
 
     stream.shutdown().await?;
@@ -1707,7 +1814,7 @@ fn schedule_with_jitter(
             }
             packet
         }
-        .boxed(),
+            .boxed(),
     );
 }
 
@@ -1728,121 +1835,11 @@ where
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tokio::io::AsyncReadExt;
-
-    #[tokio::test]
-    async fn test_fast_path_preserves_order_and_framing() {
-        let (tx, rx) = mpsc::channel::<Bytes>(64);
-        let (writer, mut read_half) = tokio::io::duplex(1 << 20);
-
-        for i in 0..50u8 {
-            tx.send(Bytes::from(vec![i; 24])).await.unwrap();
-        }
-        drop(tx);
-
-        let bridge = tokio::spawn(bridge_with_jitter(rx, writer, StealthConfig::default()));
-
-        let mut data = Vec::new();
-        read_half.read_to_end(&mut data).await.unwrap();
-        bridge.await.unwrap().unwrap();
-
-        let mut reader = std::io::Cursor::new(data);
-        for i in 0..50u8 {
-            let pkt = crate::stream_framing::read_next_packet(&mut reader)
-                .await
-                .unwrap()
-                .expect("packet missing");
-            assert_eq!(pkt.len(), 24);
-            assert_eq!(pkt[0], i, "packet order violated");
-        }
-        assert!(
-            crate::stream_framing::read_next_packet(&mut reader)
-                .await
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    #[tokio::test]
-    async fn crypto_stream_fast_path_round_trip() {
-        let cipher = Arc::new(Cipher::new(&[5; 32]));
-        let sequence = Arc::new(AtomicU64::new(0));
-        let nonce_prefix = [1, 2, 3, 4];
-        let rx = {
-            let (tx, rx) = mpsc::channel::<Bytes>(64);
-            for value in 0..32u8 {
-                tx.send(Bytes::from(vec![value; 64])).await.unwrap();
-            }
-            rx
-        };
-        let (writer, mut reader) = tokio::io::duplex(1 << 20);
-
-        bridge_crypto_stream_with_jitter(
-            rx,
-            writer,
-            StealthConfig::default(),
-            cipher.clone(),
-            sequence,
-            nonce_prefix,
-        )
-        .await
-        .unwrap();
-
-        for value in 0..32u8 {
-            let encrypted = crate::stream_framing::read_next_packet(&mut reader)
-                .await
-                .unwrap()
-                .expect("–∑–∞—à–∏—Ñ—Ä–æ–≤–∞–Ω–Ω—ã–π –ø–∞–∫–µ—Ç –æ—Ç—Å—É—Ç—Å—Ç–≤—É–µ—Ç");
-            let packet = crate::transport::unwrap_packet_bytes_in_place(&cipher, encrypted)
-                .expect("–ø–∞–∫–µ—Ç –¥–æ–ª–∂–µ–Ω —Ä–∞—Å—à–∏—Ñ—Ä–æ–≤—ã–≤–∞—Ç—å—Å—è");
-            assert_eq!(packet, Bytes::from(vec![value; 64]));
-        }
-        assert!(
-            crate::stream_framing::read_next_packet(&mut reader)
-                .await
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    #[tokio::test]
-    async fn test_fast_path_filters_garbage() {
-        let (tx, rx) = mpsc::channel::<Bytes>(8);
-        let (writer, mut read_half) = tokio::io::duplex(1 << 16);
-
-        tx.send(Bytes::from_static(&[1, 2, 3])).await.unwrap();
-        tx.send(Bytes::from(vec![7u8; 32])).await.unwrap();
-        drop(tx);
-
-        let bridge = tokio::spawn(bridge_with_jitter(rx, writer, StealthConfig::default()));
-
-        let mut data = Vec::new();
-        read_half.read_to_end(&mut data).await.unwrap();
-        bridge.await.unwrap().unwrap();
-
-        let mut reader = std::io::Cursor::new(data);
-        let pkt = crate::stream_framing::read_next_packet(&mut reader)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(pkt.len(), 32);
-        assert!(
-            crate::stream_framing::read_next_packet(&mut reader)
-                .await
-                .unwrap()
-                .is_none()
-        );
-    }
-}
-
 
 
 
 ================================================
-ÔøΩÔøΩÔøΩÔøΩ: W:\Work\anet\anet\anet-common\src\lib.rs
+‘‡ÈÎ: W:\Work\_anet\anet\anet-common\src\lib.rs
 ================================================
 pub mod atun;
 pub mod config;
@@ -1861,8 +1858,8 @@ pub mod tun_params;
 pub mod udp_poller;
 pub mod vnc;
 pub mod dto;
-pub mod http_help;
 pub mod reassembly;
+pub mod http_help;
 
 pub use generated::*;
 pub mod protocol {
@@ -1873,7 +1870,7 @@ pub mod protocol {
 
 
 ================================================
-ÔøΩÔøΩÔøΩÔøΩ: W:\Work\anet\anet\anet-common\src\padding_utils.rs
+‘‡ÈÎ: W:\Work\_anet\anet\anet-common\src\padding_utils.rs
 ================================================
 use rand::Rng;
 
@@ -1905,7 +1902,7 @@ pub fn generate_random_padding(needed: u16) -> Vec<u8> {
 
 
 ================================================
-ÔøΩÔøΩÔøΩÔøΩ: W:\Work\anet\anet\anet-common\src\protocol.rs
+‘‡ÈÎ: W:\Work\_anet\anet\anet-common\src\protocol.rs
 ================================================
 include!(concat!(env!("OUT_DIR"), "/protocol.rs"));
 
@@ -1913,7 +1910,7 @@ include!(concat!(env!("OUT_DIR"), "/protocol.rs"));
 
 
 ================================================
-ÔøΩÔøΩÔøΩÔøΩ: W:\Work\anet\anet\anet-common\src\quic_settings.rs
+‘‡ÈÎ: W:\Work\_anet\anet\anet-common\src\quic_settings.rs
 ================================================
 // –§–∞–π–ª: anet-common/src/quic_settings.rs
 
@@ -2079,7 +2076,7 @@ pub fn build_transport_config(cfg: &QuicConfig, mtu: u16) -> Result<TransportCon
 
 
 ================================================
-ÔøΩÔøΩÔøΩÔøΩ: W:\Work\anet\anet\anet-common\src\reassembly.rs
+‘‡ÈÎ: W:\Work\_anet\anet\anet-common\src\reassembly.rs
 ================================================
 use std::collections::BTreeMap;
 use bytes::Bytes;
@@ -2130,7 +2127,7 @@ impl ReassemblyQueue {
 
 
 ================================================
-ÔøΩÔøΩÔøΩÔøΩ: W:\Work\anet\anet\anet-common\src\stream_framing.rs
+‘‡ÈÎ: W:\Work\_anet\anet\anet-common\src\stream_framing.rs
 ================================================
 use crate::consts::MAX_PACKET_SIZE;
 use bytes::{BufMut, Bytes, BytesMut};
@@ -2268,7 +2265,7 @@ mod tests {
 
 
 ================================================
-ÔøΩÔøΩÔøΩÔøΩ: W:\Work\anet\anet\anet-common\src\transport.rs
+‘‡ÈÎ: W:\Work\_anet\anet\anet-common\src\transport.rs
 ================================================
 use crate::consts::{NONCE_LEN, NONCE_PREFIX_LEN, PADDING_MTU, TRANSPORT_ENVELOPE_OVERHEAD};
 use crate::encryption::{Cipher, EncryptionError};
@@ -2485,7 +2482,7 @@ mod in_place_tests {
 
 
 ================================================
-ÔøΩÔøΩÔøΩÔøΩ: W:\Work\anet\anet\anet-common\src\transport_trait.rs
+‘‡ÈÎ: W:\Work\_anet\anet\anet-common\src\transport_trait.rs
 ================================================
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -2499,7 +2496,7 @@ impl<T> VpnStream for T where T: AsyncRead + AsyncWrite + Unpin + Send + Sync {}
 
 
 ================================================
-ÔøΩÔøΩÔøΩÔøΩ: W:\Work\anet\anet\anet-common\src\tun_params.rs
+‘‡ÈÎ: W:\Work\_anet\anet\anet-common\src\tun_params.rs
 ================================================
 use crate::AuthResponse;
 use std::net::Ipv4Addr;
@@ -2596,7 +2593,7 @@ impl TunParams {
 
 
 ================================================
-ÔøΩÔøΩÔøΩÔøΩ: W:\Work\anet\anet\anet-common\src\udp_poller.rs
+‘‡ÈÎ: W:\Work\_anet\anet\anet-common\src\udp_poller.rs
 ================================================
 use quinn::UdpPoller;
 use std::fmt::Debug;
@@ -2629,7 +2626,7 @@ impl UdpPoller for TokioUdpPoller {
 
 
 ================================================
-ÔøΩÔøΩÔøΩÔøΩ: W:\Work\anet\anet\anet-common\src\vnc.rs
+‘‡ÈÎ: W:\Work\_anet\anet\anet-common\src\vnc.rs
 ================================================
 use crate::consts::MAX_PACKET_SIZE;
 use bytes::{BufMut, Bytes, BytesMut};

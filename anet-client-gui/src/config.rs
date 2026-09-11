@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use uuid::Uuid;
+use anet_client_core::events::AccountInfo;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ConfigEntry {
@@ -18,6 +19,8 @@ pub struct AppSettings {
     pub disable_notifications: bool,
     #[serde(default)]
     pub selected_servers: HashMap<String, String>,
+    #[serde(default)]
+    pub cached_accounts: HashMap<String, AccountInfo>,
 }
 
 impl AppSettings {
@@ -84,6 +87,7 @@ impl AppSettings {
             self.active_config_id = None;
         }
         self.selected_servers.remove(id);
+        self.cached_accounts.remove(id);
         self.save();
     }
 
