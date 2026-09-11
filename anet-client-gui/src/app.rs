@@ -756,10 +756,19 @@ impl ANetApp {
 
                              
                             }
-                            #[cfg(target_os = "windows")]
                             SettingsCategory::PerApp => {
-                                #[cfg(target_os = "windows")]        
-                                self.render_process_list(ui);        
+                                #[cfg(target_os = "windows")]
+                                self.render_process_list(ui);
+
+                                #[cfg(not(target_os = "windows"))]
+                                {
+                                    ui.label(
+                                        egui::RichText::new("Туннелирование по приложениям поддерживается только на Windows.")
+                                            .size(13.0)
+                                            .color(grey_color)
+                                            .family(egui::FontFamily::Name("Inter-V".into()))
+                                    );
+                                }
                             }
                             SettingsCategory::ExcludedAdds => {                           
                             self.exclbar_open = true;
@@ -2934,7 +2943,7 @@ impl eframe::App for ANetApp {
                         );
                         ui.add_space(7.0);
 
-                        const NODE_WIDTH: f32 = 300.0;
+                        const NODE_WIDTH: f32 = 266.0;
                         const NODE_HEIGHT: f32 = 36.0;
                         const NODE_RADIUS: u8 = 18;
                         const ITEM_HEIGHT: f32 = 34.0;
