@@ -154,7 +154,6 @@ impl AnetClient {
         warn("[Core] Starting connection loop...");
         client_state(ClientState::Connecting, "Starting connection loop", None);
 
-        let reconnect_signal = Arc::new(Notify::new());
         let mut current_server_index = 0;
 
         loop {
@@ -162,6 +161,8 @@ impl AnetClient {
                 info!("[Core] Stop requested by user. Exiting connection loop.");
                 break;
             }
+
+            let reconnect_signal = Arc::new(Notify::new());
 
             let server = &config_clone.servers[current_server_index];
 
@@ -337,7 +338,7 @@ impl AnetClient {
         config_clone.sanitize()?;
 
         let transport = create_transport(&config_clone, server)?;
-        let conn_timeout = Duration::from_secs(server.timeout_secs);
+        let conn_timeout = Duration::from_secs(server.timeout_secs.max(15));
 
         let connect_fut = transport.connect();
         let stop_flag = &self.stop_requested;
@@ -428,7 +429,10 @@ impl AnetClient {
                     pkt = rx_from_tun.recv() => {
                         match pkt {
                             Some(p) => p,
-                            None => break,
+                            None => {
+                                sig_t1.notify_one();
+                                break;
+                            }
                         }
                     }
                     _ = notify_tx.notified() => {
@@ -592,19 +596,21 @@ impl AnetClient {
                 }
 
                 if is_initial_phase {
-                    if elapsed_rx > Duration::from_secs(8) && elapsed_tx < Duration::from_secs(4) {
+                    if elapsed_rx > Duration::from_secs(12) && elapsed_tx < Duration::from_secs(4) {
                         warn!("[Health] CASE 1 Detected: Connection established, but payload traffic is blocked!");
                         client_state(ClientState::Reconnecting, "Payload traffic blocked; reconnecting", None);
                         monitor_reconnect.notify_one();
                         break;
                     }
-                    if elapsed_rx <= Duration::from_secs(8) || elapsed_tx >= Duration::from_secs(4) {
+                    if elapsed_rx <= Duration::from_secs(12) || elapsed_tx >= Duration::from_secs(4) {
                         is_initial_phase = false;
                     }
                 } else {
-                    if elapsed_tx < Duration::from_secs(8) && elapsed_rx > Duration::from_secs(18) {
+                    // Проверяем зависание: активный исходящий трафик (за последние 5 сек)
+                    // при полном отсутствии входящего ответа более 40 секунд подряд
+                    if elapsed_tx < Duration::from_secs(5) && elapsed_rx > Duration::from_secs(40) {
                         stalled_counter += 1;
-                        if stalled_counter >= 2 {
+                        if stalled_counter >= 3 {
                             warn!(
                                 "[Health] Dead connection detected: active TX ({:?}), but no RX for {:?}. Triggering reconnect...",
                                 elapsed_tx, elapsed_rx
@@ -623,6 +629,7 @@ impl AnetClient {
 
         let stats_shutdown = shutdown_notify.clone();
         let stats_task = {
+            let is_quic = result.connection.is_some();
             let provider: Arc<dyn statistic::StatsProvider> =
                 if let Some(ref conn) = result.connection {
                     Arc::new(statistic::QuicStatsProvider::new(conn.clone()))
@@ -635,20 +642,23 @@ impl AnetClient {
                     ))
                 };
 
-            let (server_host, server_port) = server.host_port().unwrap_or_default();
-            let mut resolved_addr: Option<SocketAddr> = None;
+            // Для QUIC RTT измеряется Quinn нативно по ACK-пакетам.
+            // PingStatsProvider (TCP-пробы) используем только для потоковых транспортов (SSH/VNC/AHTTP)
+            let fast_provider: Arc<dyn statistic::StatsProvider> = if !is_quic {
+                let (server_host, server_port) = server.host_port().unwrap_or_default();
+                let target_addr = if let Some(ip) = result.remote_ip {
+                    Some(SocketAddr::new(ip, server_port))
+                } else if let Ok(ip) = IpAddr::from_str(&server_host) {
+                    Some(SocketAddr::new(ip, server_port))
+                } else {
+                    None
+                };
 
-            if let Ok(ip) = IpAddr::from_str(&server_host) {
-                resolved_addr = Some(SocketAddr::new(ip, server_port));
-            } else if let Ok(mut addrs) =
-                tokio::net::lookup_host((server_host.as_str(), server_port)).await
-            {
-                resolved_addr = addrs.next();
-            }
-
-            let fast_provider: Arc<dyn statistic::StatsProvider> = if let Some(addr) = resolved_addr
-            {
-                statistic::PingStatsProvider::new(provider.clone(), addr)
+                if let Some(addr) = target_addr {
+                    statistic::PingStatsProvider::new(provider.clone(), addr)
+                } else {
+                    provider.clone()
+                }
             } else {
                 provider.clone()
             };
@@ -800,10 +810,16 @@ impl AnetClient {
             state.take()
         };
         if let Some(sess) = session_to_clean {
+            if let Some(ref endpoint) = sess.endpoint {
+                endpoint.close(0u32.into(), b"reconnecting");
+            }
             if let Some(task) = sess.stats_task {
                 task.abort();
             }
-            let _ = sess.main_task.await;
+            sess.shutdown_notify.notify_waiters();
+            if tokio::time::timeout(Duration::from_secs(2), sess.main_task).await.is_err() {
+                warn!("[Core] Main task did not finish in 2s during cleanup, proceeding");
+            }
         }
 
         let _ = self.dns_manager.restore_dns(&iface_name);

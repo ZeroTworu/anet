@@ -128,8 +128,8 @@ impl PingStatsProvider {
                     }
                 }
 
-                // Пауза перед следующим замером
-                sleep(Duration::from_secs(1)).await;
+                // Пауза перед следующим замером (безопасный интервал 5с для предотвращения срабатывания защиты от флуда)
+                sleep(Duration::from_secs(5)).await;
             }
         });
 

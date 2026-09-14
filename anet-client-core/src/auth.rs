@@ -29,8 +29,8 @@ use tokio::time::sleep;
 use x25519_dalek::{PublicKey, StaticSecret};
 
 const MAX_RETRIES: u32 = 10;
-const INITIAL_DELAY: u64 = 5;
-const MAX_DELAY: u64 = 60;
+const INITIAL_DELAY: u64 = 2;
+const MAX_DELAY: u64 = 10;
 
 #[async_trait]
 pub trait AuthChannel: Send + Sync {
@@ -195,8 +195,8 @@ impl AuthHandler {
                         "[AUTH] Handshake attempt {} failed: {}",
                         attempt, e
                     ));
-                    delay = (delay * 2).min(MAX_DELAY);
-                    sleep(Duration::from_secs(delay)).await;
+                    delay = (delay + 1).min(MAX_DELAY);
+                    sleep(Duration::from_millis(600)).await;
                 }
             }
         }

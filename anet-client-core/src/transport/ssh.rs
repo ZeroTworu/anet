@@ -106,7 +106,10 @@ impl ClientTransport for SshTransport {
         let sequence = Arc::new(AtomicU64::new(0));
         let stealth = self.config.stealth.clone();
 
+        let ssh_session = session;
+
         tokio::spawn(async move {
+            let _session_guard = ssh_session;
             let (packet_tx, packet_rx) = mpsc::channel(CHANNEL_BUFFER_SIZE);
             let (network_tx, mut network_rx) = mpsc::channel(CHANNEL_BUFFER_SIZE);
             let mut tunnel_input = tokio::spawn(read_tunnel_packets(tunnel_reader, packet_tx));
