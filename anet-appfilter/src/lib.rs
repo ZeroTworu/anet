@@ -53,6 +53,7 @@ impl AppFilter {
         let bypass = BypassSet::with_initial(initial_bypass);
         let nat_map: windivert_backend::NatMap = Arc::new(dashmap::DashMap::new());
         let decisions: windivert_backend::DecisionSet = Arc::new(dashmap::DashMap::new());
+        let logged_bypass: windivert_backend::LoggedBypass = Arc::new(dashmap::DashMap::new());
 
         let (uplink_tx, uplink_rx) = mpsc::channel::<Bytes>(CHANNEL_BUFFER_SIZE);
         let (downlink_tx, downlink_rx) = mpsc::channel::<Bytes>(CHANNEL_BUFFER_SIZE);
@@ -85,8 +86,15 @@ impl AppFilter {
             let handle = socket_handle.clone();
             let nat_map_clone = nat_map.clone();
             let decisions_clone = decisions.clone();
+            let logged_bypass_clone = logged_bypass.clone();
             tokio::task::spawn_blocking(move || {
-                if let Err(e) = windivert_backend::run_socket_tracker(handle, map, nat_map_clone, decisions_clone) {
+                if let Err(e) = windivert_backend::run_socket_tracker(
+                    handle,
+                    map,
+                    nat_map_clone,
+                    decisions_clone,
+                    logged_bypass_clone,
+                ) {
                     log::error!("appfilter: socket tracker exited: {e:#}");
                 }
             });
@@ -99,10 +107,20 @@ impl AppFilter {
             let handle = network_handle.clone();
             let nat_map_clone = nat_map.clone();
             let decisions_clone = decisions.clone();
+            let logged_bypass_clone = logged_bypass.clone();
 
             tokio::task::spawn_blocking(move || {
                 if let Err(e) = windivert_backend::run_packet_router(
-                    handle, map, bypass, policy, uplink_tx, downlink_rx, vpn_ip, nat_map_clone, decisions_clone
+                    handle,
+                    map,
+                    bypass,
+                    policy,
+                    uplink_tx,
+                    downlink_rx,
+                    vpn_ip,
+                    nat_map_clone,
+                    decisions_clone,
+                    logged_bypass_clone,
                 ) {
                     log::error!("appfilter: packet router exited: {e:#}");
                 }

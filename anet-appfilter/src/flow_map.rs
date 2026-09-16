@@ -19,15 +19,21 @@ use tokio::sync::RwLock as AsyncRwLock;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FlowKey {
     pub protocol: u8,
+    pub local_addr: IpAddr,
     pub local_port: u16,
+    pub remote_addr: IpAddr,
+    pub remote_port: u16,
 }
 
 impl FlowKey {
-    pub fn new(protocol: u8, local_port: u16) -> Self {
-        Self {
-            protocol,
-            local_port,
-        }
+    pub fn new(
+        protocol: u8,
+        local_addr: IpAddr,
+        local_port: u16,
+        remote_addr: IpAddr,
+        remote_port: u16,
+    ) -> Self {
+        Self { protocol, local_addr, local_port, remote_addr, remote_port }
     }
 }
 
