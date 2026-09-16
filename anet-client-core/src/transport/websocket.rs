@@ -430,7 +430,18 @@ impl ClientTransport for WebSocketTransport {
                                 Some(Ok(Message::Ping(data))) => {
                                     if socket.send(Message::Pong(data)).await.is_err() { break 'sessions; }
                                 }
-                                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break 'sessions,
+                                Some(Ok(Message::Close(frame))) => {
+                                    info!("[WebSocket] Server sent Close frame: {:?}", frame);
+                                    break 'sessions;
+                                }
+                                None => {
+                                    info!("[WebSocket] Connection stream closed (EOF from server).");
+                                    break 'sessions;
+                                }
+                                Some(Err(e)) => {
+                                    warn!("[WebSocket] Socket error received: {e:#}");
+                                    break 'sessions;
+                                }
                                 _ => {}
                             }
                         }

@@ -51,17 +51,24 @@ where
     reader.read_exact(&mut header[1..]).await?;
 
     if header[0] != expected_type {
-        return Err(invalid_data("unexpected RFB message type"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unexpected RFB message type: {} (0x{:02x}), expected {} (0x{:02x})", header[0], header[0], expected_type, expected_type),
+        ));
     }
     if header[1..4] != [0; 3] {
-        return Err(invalid_data("non-zero RFB CutText padding"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("non-zero RFB CutText padding: {:?}", &header[1..4]),
+        ));
     }
 
     let payload_len =
         u32::from_be_bytes(header[4..8].try_into().expect("fixed-size header")) as usize;
     if payload_len > MAX_CUT_TEXT_PAYLOAD {
-        return Err(invalid_data(
-            "RFB CutText payload exceeds the transport limit",
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("RFB CutText payload exceeds limit: payload_len={} > MAX={}", payload_len, MAX_CUT_TEXT_PAYLOAD),
         ));
     }
 

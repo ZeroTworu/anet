@@ -6,7 +6,7 @@ use anet_common::stream_framing::{frame_packet, read_next_packet};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
-use log::{info, warn};
+use log::{debug, info, warn};
 use russh::client::Handler;
 use std::future::ready;
 use std::net::{SocketAddr, ToSocketAddrs};
@@ -69,16 +69,22 @@ impl ClientTransport for SshTransport {
             .await
             .context("timed out connecting to the SSH endpoint")??;
         stream.set_nodelay(true)?;
+        info!(
+            "[SSH] TCP socket connected to {address} (local: {:?}, nodelay: true)",
+            stream.local_addr().ok()
+        );
+        info!("[SSH] Initiating SSH handshake with user '{user}'");
         let mut session = russh::client::connect_stream(ssh_config, stream, ClientHandler).await?;
 
         anyhow::ensure!(
             session.authenticate_none(user).await?.success(),
             "SSH none authentication was rejected"
         );
-        info!("[SSH] Authenticated; opening the VPN channel");
+        info!("[SSH] Authenticated; opening the VPN channel with exec 'anet-vpn'");
 
         let channel = session.channel_open_session().await?;
         channel.exec(true, "anet-vpn").await?;
+        info!("[SSH] Exec 'anet-vpn' accepted by server; channel stream opened");
         let channel_stream = channel.into_stream();
         let stream = Arc::new(Mutex::new(channel_stream));
 
@@ -109,6 +115,7 @@ impl ClientTransport for SshTransport {
         let ssh_session = session;
 
         tokio::spawn(async move {
+            let tunnel_start = std::time::Instant::now();
             let _session_guard = ssh_session;
             let (packet_tx, packet_rx) = mpsc::channel(CHANNEL_BUFFER_SIZE);
             let (network_tx, mut network_rx) = mpsc::channel(CHANNEL_BUFFER_SIZE);
@@ -126,10 +133,13 @@ impl ClientTransport for SshTransport {
             ));
             let mut tunnel_output = tokio::spawn(async move {
                 let mut tunnel_writer = tunnel_writer;
+                let mut count = 0u64;
                 while let Some(packet) = network_rx.recv().await {
+                    count += 1;
                     tunnel_writer.write_all(&frame_packet(packet)).await?;
                 }
                 tunnel_writer.shutdown().await?;
+                debug!("[SSH/TunnelOutput] Tunnel writer finished after {count} packets");
                 Result::<()>::Ok(())
             });
 
@@ -137,6 +147,7 @@ impl ClientTransport for SshTransport {
             // нельзя повторно poll-ить через `.await`: Tokio завершает процесс
             // с "JoinHandle polled after completion". Запоминаем победителя,
             // отменяем только остальные задачи и ждём только их.
+            #[derive(Debug)]
             enum FinishedWorker {
                 TunnelInput,
                 Outbound,
@@ -180,9 +191,30 @@ impl ClientTransport for SshTransport {
                 let _ = tunnel_output.await;
             }
 
+            let duration = tunnel_start.elapsed().as_secs_f64();
             match result {
-                Ok(()) => info!("[SSH] Tunnel closed"),
-                Err(error) => warn!("[SSH] Tunnel stopped: {error:#}"),
+                Ok(()) => match finished_worker {
+                    FinishedWorker::Inbound => info!(
+                        "[SSH] Tunnel closed: remote SSH server closed channel/connection (EOF / session limit or idle timeout). Duration: {:.1}s ({:.2} min)",
+                        duration, duration / 60.0
+                    ),
+                    FinishedWorker::TunnelInput => info!(
+                        "[SSH] Tunnel closed: client TUN stream closed. Duration: {:.1}s",
+                        duration
+                    ),
+                    FinishedWorker::Outbound => info!(
+                        "[SSH] Tunnel closed: outbound network queue closed. Duration: {:.1}s",
+                        duration
+                    ),
+                    FinishedWorker::TunnelOutput => info!(
+                        "[SSH] Tunnel closed: TUN writer closed. Duration: {:.1}s",
+                        duration
+                    ),
+                },
+                Err(error) => warn!(
+                    "[SSH] Tunnel stopped on {:?}: {error:#}. Duration: {:.1}s",
+                    finished_worker, duration
+                ),
             }
         });
 

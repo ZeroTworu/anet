@@ -129,6 +129,10 @@ where
         Ok(())
     };
 
+    let mut pkt_count = 0u64;
+    let mut byte_count = 0u64;
+    let start = std::time::Instant::now();
+
     while input_open || !pending.is_empty() {
         let mut packet = if !jitter_enabled {
             match rx.recv().await {
@@ -170,6 +174,7 @@ where
 
         loop {
             if packet.len() >= 20 {
+                pkt_count += 1;
                 encrypt_into(packet, &mut buf)?;
             }
 
@@ -184,11 +189,22 @@ where
         }
 
         if !buf.is_empty() {
-            stream.write_all(&buf).await?;
+            byte_count += buf.len() as u64;
+            if let Err(e) = stream.write_all(&buf).await {
+                log::warn!(
+                    "[CryptoStream/Tx] Stream write failed: {e:#}. Sent so far: {} packets, {} bytes in {:.1}s",
+                    pkt_count, byte_count, start.elapsed().as_secs_f64()
+                );
+                return Err(e.into());
+            }
             // FLUSH УДАЛЕН
         }
     }
 
+    log::info!(
+        "[CryptoStream/Tx] Finished outbound crypto stream. Total sent: {} packets, {} bytes in {:.1}s",
+        pkt_count, byte_count, start.elapsed().as_secs_f64()
+    );
     stream.shutdown().await?;
     Ok(())
 }
@@ -219,11 +235,25 @@ pub async fn receive_crypto_stream<R>(
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
+    let mut pkt_count = 0u64;
+    let mut byte_count = 0u64;
+    let start = std::time::Instant::now();
+    let mut last_pkt = start;
+
     while let Some(encrypted) = crate::stream_framing::read_next_packet(&mut reader).await? {
+        pkt_count += 1;
+        byte_count += encrypted.len() as u64;
+        last_pkt = std::time::Instant::now();
+
         let packet = crate::transport::unwrap_packet_bytes_in_place(&cipher, encrypted)?;
         tx.send(packet)
             .await
             .map_err(|_| anyhow::anyhow!("очередь входящих пакетов закрыта"))?;
     }
+
+    log::info!(
+        "[CryptoStream/Rx] Reached EOF on inbound stream. Read: {} packets ({} bytes) in {:.1}s (last packet {:.3}s ago)",
+        pkt_count, byte_count, start.elapsed().as_secs_f64(), last_pkt.elapsed().as_secs_f64()
+    );
     Ok(())
 }

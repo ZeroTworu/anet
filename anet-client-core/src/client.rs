@@ -41,6 +41,7 @@ struct RunningSession {
     endpoint: Option<Endpoint>,
     shutdown_notify: Arc<Notify>,
     reconnect_signal: Arc<Notify>,
+    disconnect_reason: Arc<Mutex<String>>,
     main_task: JoinHandle<()>,
     stats_task: Option<JoinHandle<()>>,
     iface_name: String,
@@ -136,12 +137,16 @@ impl AnetClient {
     }
 
     pub async fn start(&self) -> Result<()> {
-        if self.is_running() {
-            return Err(anyhow!("VPN tunnel is already active"));
-        }
+        if self
+        .is_active
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Err(anyhow!("VPN tunnel is already active"));
+    }
 
-        self.is_active.store(true, Ordering::SeqCst);
-        self.stop_requested.store(false, Ordering::SeqCst);
+    self.stop_requested.store(false, Ordering::SeqCst);
+
 
         let mut config_clone = self.config.clone();
         if let Err(e) = config_clone.sanitize() {
@@ -403,6 +408,9 @@ impl AnetClient {
             .acquire_packet_source(server, &result.auth_response)
             .await?;
 
+        let session_start = Instant::now();
+        let disconnect_reason = Arc::new(Mutex::new("Normal session termination".to_string()));
+
         let last_rx_time = Arc::new(Mutex::new(Instant::now()));
         let last_tx_time = Arc::new(Mutex::new(Instant::now()));
 
@@ -421,6 +429,7 @@ impl AnetClient {
         let tx_bytes = total_tx_bytes.clone();
         let tx_packets = total_tx_packets.clone();
         let sig_t1 = reconnect_signal.clone();
+        let reason_t1 = disconnect_reason.clone();
         let t1 = spawn(async move {
             let mut write_buf = BytesMut::with_capacity(COALESCE_BUDGET_BYTES);
 
@@ -430,12 +439,15 @@ impl AnetClient {
                         match pkt {
                             Some(p) => p,
                             None => {
+                                info!("[Tunnel/Tx] Local TUN packet channel closed (adapter or worker stopped).");
+                                *reason_t1.lock().unwrap() = "Local TUN packet channel closed (adapter or worker stopped)".to_string();
                                 sig_t1.notify_one();
                                 break;
                             }
                         }
                     }
                     _ = notify_tx.notified() => {
+                        info!("[Tunnel/Tx] Worker received shutdown notification.");
                         break;
                     }
                 };
@@ -466,7 +478,9 @@ impl AnetClient {
                 }
 
                 // ВНИМАНИЕ: ЗДЕСЬ УДАЛЁН flush().await, ИНАЧЕ QUIC И SSH РАБОТАЮТ КАК STOP-AND-WAIT
-                if stream_writer.write_all(&write_buf).await.is_err() {
+                if let Err(e) = stream_writer.write_all(&write_buf).await {
+                    warn!("[Tunnel/Tx] Failed to write {} bytes to VPN stream: {e:#}", write_buf.len());
+                    *reason_t1.lock().unwrap() = format!("Failed to write {} bytes to VPN stream: {e:#}", write_buf.len());
                     sig_t1.notify_one();
                     break;
                 }
@@ -477,6 +491,7 @@ impl AnetClient {
         let rx_bytes = total_rx_bytes.clone();
         let rx_packets = total_rx_packets.clone();
         let sig_t2 = reconnect_signal.clone();
+        let reason_t2 = disconnect_reason.clone();
         let t2 = spawn(async move {
             loop {
                 select! {
@@ -489,17 +504,30 @@ impl AnetClient {
                                 rx_packets.fetch_add(1, Ordering::Relaxed);
 
                                 if tx_to_tun.send(packet).await.is_err() {
+                                    warn!("[Tunnel/Rx] Failed to send packet to TUN channel (channel closed or dropped).");
+                                    *reason_t2.lock().unwrap() = "Failed to send packet to TUN channel (channel closed or dropped)".to_string();
                                     sig_t2.notify_one();
                                     break;
                                 }
                             }
-                            _ => {
+                            Ok(None) => {
+                                info!("[Tunnel/Rx] VPN stream reached EOF (server or remote transport closed stream).");
+                                *reason_t2.lock().unwrap() = "VPN stream reached EOF (server or remote transport closed stream)".to_string();
+                                sig_t2.notify_one();
+                                break;
+                            }
+                            Err(e) => {
+                                warn!("[Tunnel/Rx] Failed reading frame/packet from VPN stream: {e:#}");
+                                *reason_t2.lock().unwrap() = format!("Failed reading frame/packet from VPN stream: {e:#}");
                                 sig_t2.notify_one();
                                 break;
                             }
                         }
                     }
-                    _ = notify_rx.notified() => { break; }
+                    _ = notify_rx.notified() => {
+                        info!("[Tunnel/Rx] Worker received shutdown notification.");
+                        break;
+                    }
                 }
             }
         });
@@ -561,12 +589,11 @@ impl AnetClient {
         let rx_check = last_rx_time.clone();
         let tx_check = last_tx_time.clone();
         let quic_conn = result.connection.clone();
+        let reason_health = disconnect_reason.clone();
 
         let health_pause = result.health_pause.clone();
         let health_task = tokio::spawn(async move {
             let check_interval = Duration::from_secs(3);
-            let mut is_initial_phase = true;
-            let mut stalled_counter: u32 = 0;
 
             loop {
                 tokio::select! {
@@ -576,52 +603,23 @@ impl AnetClient {
                     }
                 }
 
-                let elapsed_rx = rx_check.lock().unwrap().elapsed();
-                let elapsed_tx = tx_check.lock().unwrap().elapsed();
-
                 if health_pause.as_ref().is_some_and(|pause| pause.load(Ordering::Acquire)) {
                     *rx_check.lock().unwrap() = Instant::now();
                     *tx_check.lock().unwrap() = Instant::now();
-                    stalled_counter = 0;
                     continue;
                 }
 
                 if let Some(ref conn) = quic_conn {
                     if let Some(reason) = conn.close_reason() {
-                        warn!("[Health] Underlying QUIC connection closed: {:?}. Triggering reconnect...", reason);
+                        let stats = conn.stats();
+                        warn!(
+                            "[Health] Underlying QUIC connection closed: {:?}. Stats: RTT={:?}, Lost(Tx)={}, UDP Tx={}/Rx={} datagrams, Cwnd={} B. Triggering reconnect...",
+                            reason, stats.path.rtt, stats.path.lost_packets, stats.udp_tx.datagrams, stats.udp_rx.datagrams, stats.path.cwnd
+                        );
+                        *reason_health.lock().unwrap() = format!("Underlying QUIC connection closed: {reason:?}");
                         client_state(ClientState::Reconnecting, format!("Connection closed: {reason:?}"), None);
                         monitor_reconnect.notify_one();
                         break;
-                    }
-                }
-
-                if is_initial_phase {
-                    if elapsed_rx > Duration::from_secs(12) && elapsed_tx < Duration::from_secs(4) {
-                        warn!("[Health] CASE 1 Detected: Connection established, but payload traffic is blocked!");
-                        client_state(ClientState::Reconnecting, "Payload traffic blocked; reconnecting", None);
-                        monitor_reconnect.notify_one();
-                        break;
-                    }
-                    if elapsed_rx <= Duration::from_secs(12) || elapsed_tx >= Duration::from_secs(4) {
-                        is_initial_phase = false;
-                    }
-                } else {
-                    // Проверяем зависание: активный исходящий трафик (за последние 5 сек)
-                    // при полном отсутствии входящего ответа более 40 секунд подряд
-                    if elapsed_tx < Duration::from_secs(5) && elapsed_rx > Duration::from_secs(40) {
-                        stalled_counter += 1;
-                        if stalled_counter >= 3 {
-                            warn!(
-                                "[Health] Dead connection detected: active TX ({:?}), but no RX for {:?}. Triggering reconnect...",
-                                elapsed_tx, elapsed_rx
-                            );
-                            status("[Health] Connection stalled (no response). Reconnecting...");
-                            client_state(ClientState::Reconnecting, "Connection stalled; reconnecting", None);
-                            monitor_reconnect.notify_one();
-                            break;
-                        }
-                    } else {
-                        stalled_counter = 0;
                     }
                 }
             }
@@ -699,6 +697,7 @@ impl AnetClient {
                 endpoint: result.endpoint,
                 shutdown_notify: shutdown_notify.clone(),
                 reconnect_signal: reconnect_signal.clone(),
+                disconnect_reason: disconnect_reason.clone(),
                 main_task: tokio::spawn(async move {
                     let _ = tokio::join!(t1, t2);
                 }),
@@ -800,6 +799,39 @@ impl AnetClient {
 
         reconnect_signal.notified().await;
 
+        let duration = session_start.elapsed();
+        let last_rx = last_rx_time.lock().unwrap().elapsed();
+        let last_tx = last_tx_time.lock().unwrap().elapsed();
+        let rx_b = total_rx_bytes.load(Ordering::Relaxed);
+        let rx_p = total_rx_packets.load(Ordering::Relaxed);
+        let tx_b = total_tx_bytes.load(Ordering::Relaxed);
+        let tx_p = total_tx_packets.load(Ordering::Relaxed);
+        let final_reason = disconnect_reason.lock().unwrap().clone();
+
+        warn!(
+            "[Core] ==================== SESSION DISCONNECT REPORT ====================\n\
+             [Core] Active Server: '{}' ({})\n\
+             [Core] Assigned IP: {}\n\
+             [Core] Session Duration: {:.1}s ({:.2} min)\n\
+             [Core] Disconnect Trigger: {}\n\
+             [Core] Traffic Statistics:\n\
+             [Core]   -> Tx (Uploaded):   {} in {} packets (last packet sent {:.3}s ago)\n\
+             [Core]   <- Rx (Downloaded): {} in {} packets (last packet received {:.3}s ago)\n\
+             [Core] ===================================================================",
+            server.get_name(),
+            server.endpoint().unwrap_or_default(),
+            result.auth_response.ip,
+            duration.as_secs_f64(),
+            duration.as_secs_f64() / 60.0,
+            final_reason,
+            format_bytes(tx_b),
+            tx_p,
+            last_tx.as_secs_f64(),
+            format_bytes(rx_b),
+            rx_p,
+            last_rx.as_secs_f64(),
+        );
+
         info!("[Core] Cleaning up dead session...");
         status("[Core] Cleaning up dead session...");
         shutdown_notify.notify_waiters();
@@ -835,6 +867,7 @@ impl AnetClient {
         let state = self.session.lock().unwrap();
         if let Some(ref running) = *state {
             info!("[Core] Reconnect requested externally (network switch or watchdog).");
+            *running.disconnect_reason.lock().unwrap() = "External reconnect request (network switch or watchdog)".to_string();
             running.shutdown_notify.notify_waiters();
             running.reconnect_signal.notify_one();
         }
@@ -853,6 +886,7 @@ impl AnetClient {
             info!("[Core] Stopping VPN...");
             status("[Core] Stopping VPN...");
             client_state(ClientState::Stopping, "Stopping VPN", None);
+            *running.disconnect_reason.lock().unwrap() = "User requested stop".to_string();
             running.shutdown_notify.notify_waiters();
             running.reconnect_signal.notify_one();
 

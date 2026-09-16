@@ -70,6 +70,10 @@ impl ClientTransport for VncTransport {
             .await
             .context("timed out connecting to the VNC endpoint")??;
         stream.set_nodelay(true)?;
+        info!(
+            "[VNC] TCP socket connected to {addr} (local: {:?}, nodelay: true)",
+            stream.local_addr().ok()
+        );
         tokio::time::timeout(
             RFB_HANDSHAKE_TIMEOUT,
             emulate_rfb_client_handshake(&mut stream),
@@ -100,6 +104,7 @@ impl ClientTransport for VncTransport {
         let stealth = self.config.stealth.clone();
 
         tokio::spawn(async move {
+            let tunnel_start = std::time::Instant::now();
             let (packet_tx, packet_rx) = mpsc::channel(anet_common::consts::CHANNEL_BUFFER_SIZE);
             let mut tunnel_input = tokio::spawn(read_tunnel_packets(tunnel_reader, packet_tx));
             let mut inbound =
@@ -113,6 +118,7 @@ impl ClientTransport for VncTransport {
                 stealth,
             ));
 
+            #[derive(Debug)]
             enum FinishedWorker {
                 TunnelInput,
                 Inbound,
@@ -146,9 +152,27 @@ impl ClientTransport for VncTransport {
                 outbound.abort();
                 let _ = outbound.await;
             }
+
+            let duration = tunnel_start.elapsed().as_secs_f64();
             match result {
-                Ok(()) => info!("[VNC] Tunnel closed"),
-                Err(error) => warn!("[VNC] Tunnel stopped: {error:#}"),
+                Ok(()) => match finished_worker {
+                    FinishedWorker::Inbound => info!(
+                        "[VNC] Tunnel closed: remote VNC server closed TCP connection (EOF / session limit reached). Duration: {:.1}s ({:.2} min)",
+                        duration, duration / 60.0
+                    ),
+                    FinishedWorker::TunnelInput => info!(
+                        "[VNC] Tunnel closed: client TUN stream closed. Duration: {:.1}s",
+                        duration
+                    ),
+                    FinishedWorker::Outbound => info!(
+                        "[VNC] Tunnel closed: outbound packet queue closed. Duration: {:.1}s",
+                        duration
+                    ),
+                },
+                Err(error) => warn!(
+                    "[VNC] Tunnel stopped on {:?}: {error:#}. Duration: {:.1}s",
+                    finished_worker, duration
+                ),
             }
         });
 
@@ -228,6 +252,9 @@ async fn send_to_server(
     let mut input_open = true;
 
     let mut batch_buf = BytesMut::with_capacity(CRYPTO_COALESCE_BUDGET_BYTES);
+    let mut pkt_count = 0u64;
+    let mut byte_count = 0u64;
+    let start = std::time::Instant::now();
 
     while input_open || !pending.is_empty() {
         let mut packet = if !jitter_enabled {
@@ -273,6 +300,7 @@ async fn send_to_server(
 
         loop {
             if packet.len() >= 20 {
+                pkt_count += 1;
                 let seq = sequence.fetch_add(1, Ordering::Relaxed);
                 let total_len = packet.len() + 38;
                 let padding = anet_common::padding_utils::calculate_padding_needed(total_len, stealth.padding_step);
@@ -302,9 +330,20 @@ async fn send_to_server(
         }
 
         if !batch_buf.is_empty() {
-            writer.write_all(&batch_buf).await?;
+            byte_count += batch_buf.len() as u64;
+            if let Err(e) = writer.write_all(&batch_buf).await {
+                warn!(
+                    "[VNC/Tx] TCP write failed on batch ({} bytes): {e:#}. Sent so far: {} packets, {} bytes in {:.1}s",
+                    batch_buf.len(), pkt_count, byte_count, start.elapsed().as_secs_f64()
+                );
+                return Err(e.into());
+            }
         }
     }
+    info!(
+        "[VNC/Tx] Finished outbound stream. Total sent: {} packets, {} bytes in {:.1}s",
+        pkt_count, byte_count, start.elapsed().as_secs_f64()
+    );
     writer.shutdown().await?;
     Ok(())
 }
@@ -352,10 +391,30 @@ async fn receive_from_server(
     mut tunnel_writer: tokio::io::WriteHalf<tokio::io::DuplexStream>,
     cipher: Arc<anet_common::encryption::Cipher>,
 ) -> Result<()> {
+    let mut pkt_count = 0u64;
+    let mut byte_count = 0u64;
+    let start = std::time::Instant::now();
+    let mut last_rx = start;
+
     while let Some(encrypted) = read_cut_text(&mut reader, SERVER_CUT_TEXT).await? {
-        let packet = anet_common::transport::unwrap_packet_bytes_in_place(&cipher, encrypted)?;
+        pkt_count += 1;
+        byte_count += encrypted.len() as u64;
+        last_rx = std::time::Instant::now();
+
+        let packet = match anet_common::transport::unwrap_packet_bytes_in_place(&cipher, encrypted) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!("[VNC/Rx] Failed to unwrap/decrypt frame #{pkt_count}: {e:#}");
+                return Err(e.into());
+            }
+        };
         tunnel_writer.write_all(&frame_packet(packet)).await?;
     }
+
+    info!(
+        "[VNC/Rx] Server closed RFB connection (clean TCP EOF / FIN). Total received: {} frames, {} bytes in {:.1}s (last frame was {:.3}s ago)",
+        pkt_count, byte_count, start.elapsed().as_secs_f64(), last_rx.elapsed().as_secs_f64()
+    );
     tunnel_writer.shutdown().await?;
     Ok(())
 }

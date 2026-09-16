@@ -15,7 +15,7 @@ const MIB: f64 = 1024.0 * 1024.0;
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 
 /// Форматирование байт в человекочитаемый вид
-fn format_bytes(bytes: u64) -> String {
+pub fn format_bytes(bytes: u64) -> String {
     let bytes_f = bytes as f64;
     if bytes_f < KIB {
         format!("{} B", bytes)

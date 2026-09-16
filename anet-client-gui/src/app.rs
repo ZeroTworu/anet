@@ -1413,20 +1413,24 @@ impl ANetApp {
     }
 
     fn start_vpn(&mut self) {
-        let mut guard = lock_ignore_poison(&self.shared);
-        if let Some(client_clone) = guard.client.clone() {
-            guard.state = ConnectionState::Connecting;
-            drop(guard);
-
-            let shared_clone = self.shared.clone();
-            self.rt.spawn(async move {
-                if let Err(e) = client_clone.start().await {
-                    lock_ignore_poison(&shared_clone).state = ConnectionState::Disconnected;
-                    anet_client_core::events::err(e.to_string());
-                }
-            });
-        }
+    let mut guard = lock_ignore_poison(&self.shared);
+    // Не запускаем второй цикл поверх уже идущего подключения/сессии.
+    if guard.state != ConnectionState::Disconnected {
+        return;
     }
+    if let Some(client_clone) = guard.client.clone() {
+        guard.state = ConnectionState::Connecting;
+        drop(guard);
+
+        let shared_clone = self.shared.clone();
+        self.rt.spawn(async move {
+            if let Err(e) = client_clone.start().await {
+                lock_ignore_poison(&shared_clone).state = ConnectionState::Disconnected;
+                anet_client_core::events::err(e.to_string());
+            }
+        });
+    }
+}
 
     fn stop_vpn(&mut self) {
         let mut guard = lock_ignore_poison(&self.shared);
