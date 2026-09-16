@@ -223,12 +223,22 @@ pub fn run_socket_tracker(
                     continue;
                 }
 
+                // Loopback / multicast / link-local — не наш трафик.
+                // Отсекаем здесь, чтобы не забивать FlowMap записями,
+                // которые роутер всё равно проигнорирует.
+                if is_ignored_ip(&local_addr) || is_ignored_ip(&remote_addr) {
+                    continue;
+                }
+
                 let key = FlowKey::new(protocol, local_addr, local_port, remote_addr, remote_port);
 
                 let new_image_name = image_name_for_pid(pid);
 
                 if let Some(ref img) = new_image_name {
-                    info!(
+                    // Перенесено в debug: при policy=Include это событие
+                    // случается на каждый DNS-запрос svchost'а и на каждое
+                    // loopback-соединение Battle.net — info-уровень слишком шумный.
+                    debug!(
                         "appfilter: Socket track | Event: {:?} | App: {} (PID: {}) | {}:{} -> {}:{} | Proto: {}",
                         event, img, pid, local_addr, local_port, remote_addr, remote_port, protocol
                     );
@@ -285,7 +295,6 @@ pub fn run_socket_tracker(
     }
     Ok(())
 }
-
 // ============================================================================
 // ПОТОК 2: МАРШРУТИЗАТОР И NAT ПАКЕТОВ (PACKET ROUTER)
 // ============================================================================
