@@ -8,3 +8,7 @@ android-build/*
 /node_modules
 /.vscode
 /jniLibs
+jniLibs/
+/jniLibs/
+process_files.ps1
+project_report.txt

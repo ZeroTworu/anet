@@ -214,6 +214,9 @@ pub struct ANetApp {
     file_dialog_tx: Sender<PathBuf>,
     file_dialog_rx: Receiver<PathBuf>,
 
+    log_save_tx: Sender<Result<PathBuf, String>>,
+    log_save_rx: Receiver<Result<PathBuf, String>>,
+
     server_names_cache: Vec<(String, String)>,
     server_names_cache_key: Option<(String, u64)>,
 
@@ -1129,6 +1132,7 @@ impl ANetApp {
         let (tray_cmd_tx, tray_cmd_rx) = channel::<TrayCommand>();
         let (config_load_tx, config_load_rx) = channel::<ConfigLoadOutcome>();
         let (file_dialog_tx, file_dialog_rx) = channel::<PathBuf>();
+        let (log_save_tx, log_save_rx) = channel::<Result<PathBuf, String>>();
 
         let shared_for_handler = shared.clone();
         set_handler(
@@ -1171,6 +1175,8 @@ impl ANetApp {
             config_load_rx,
             file_dialog_tx,
             file_dialog_rx,
+            log_save_tx,      
+            log_save_rx,      
             server_names_cache: Vec::new(),
             server_names_cache_key: None,
             tray_cmd_tx,
@@ -1371,6 +1377,20 @@ impl ANetApp {
         while let Ok(path) = self.file_dialog_rx.try_recv() {
             self.add_config_from_path(path);
         }
+        while let Ok(result) = self.log_save_rx.try_recv() {
+    match result {
+        Ok(path) => {
+            let msg = format!("Лог сохранён: {}", path.display());
+            self.log(&msg);
+            self.show_toast(msg);
+        }
+        Err(e) => {
+            let msg = format!("Ошибка сохранения лога: {}", e);
+            self.log(&msg);
+            self.show_toast(msg);
+        }
+    }
+}
     }
 
     fn refresh_server_names_cache(&mut self, active_config_id: &str, content: &str) {
@@ -1452,6 +1472,38 @@ impl ANetApp {
             }
         });
     }
+
+    fn save_logs_to_file(&mut self) {
+    let logs = self.logs.clone();
+    let tx = self.log_save_tx.clone();
+
+    std::thread::spawn(move || {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let default_name = format!("anet_logs_{}.log", timestamp);
+
+        let Some(path) = rfd::FileDialog::new()
+            .set_file_name(&default_name)
+            .add_filter("Log files", &["log", "txt"])
+            .save_file()
+        else {
+            return;
+        };
+
+        let content = {
+            let guard = lock_ignore_poison(&logs);
+            guard.join("\n")
+        };
+
+        let result = match std::fs::write(&path, content) {
+            Ok(_) => Ok(path),
+            Err(e) => Err(e.to_string()),
+        };
+        let _ = tx.send(result);
+    });
+}
 
     fn add_config_from_path(&mut self, path: PathBuf) {
         let ext = path
@@ -3173,18 +3225,39 @@ impl eframe::App for ANetApp {
                             }
 
                             ui.horizontal(|ui| {
-                                let circle_button = egui::Button::new("⏴")
-                                    .min_size(button_size)
-                                    .stroke(Stroke::NONE)
-                                    .rounding(button_size.y / 2.0);
+    let circle_button = egui::Button::new("⏴")
+        .min_size(button_size)
+        .stroke(Stroke::NONE)
+        .rounding(button_size.y / 2.0);
 
-                                let response = ui.add(circle_button).on_hover_cursor(egui::CursorIcon::PointingHand);
-                                if response.clicked() {
-                                    self.logbar_open = false;
-                                }
+    let response = ui.add(circle_button).on_hover_cursor(egui::CursorIcon::PointingHand);
+    if response.clicked() {
+        self.logbar_open = false;
+    }
 
-                                ui.heading("Log");
-                            });
+    ui.heading("Log");
+
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        let btn = ui.add(
+            egui::Button::new(
+                egui::RichText::new("💾  СОХРАНИТЬ В ФАЙЛ")
+                    .size(11.0)
+                    .strong()
+                    .color(gold_color)
+                    .family(egui::FontFamily::Name("Inter-V".into()))
+            )
+            .min_size(egui::vec2(170.0, 28.0))
+            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(60, 63, 72)))
+        );
+
+        if btn.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        if btn.clicked() {
+            self.save_logs_to_file();
+        }
+    });
+});
                             ui.separator();
 
                             let console_inner_frame = egui::Frame::NONE;
