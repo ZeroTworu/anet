@@ -7,7 +7,7 @@ use tray_icon::{
 
 use crate::icons;
 use crate::config::AppSettings;
-use crate::app::{SharedState, ConnectionState};
+use crate::types::{SharedState, ConnectionState};
 use notify_rust::Notification;
 
 #[cfg(target_os = "windows")]
