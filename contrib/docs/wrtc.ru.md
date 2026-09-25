@@ -5,7 +5,10 @@
 ## 1. Введение и архитектурная концепция
 
 ### 1.1. Назначение
-Транспорт `wrtc` предназначен для скрытной передачи туннелированного IP-трафика ANet через инфраструктуру корпоративной видеоконференцсвязи (ВКС) сервиса **Ktalk (Контур.Толк)**. Сервис функционирует на базе стека **Jitsi (Prosody + Jicofo + Jitsi Videobridge / JVB)**. Трафик маскируется под легитимные медиапотоки WebRTC (SRTP/DTLS) и сервисные данные (SCTP DataChannel) к серверам, находящимся в белых списках.
+Транспорт `wrtc` предназначен для скрытной передачи туннелированного IP-трафика ANet через инфраструктуру корпоративной видеоконференцсвязи (ВКС) сервиса **Ktalk (Контур.Толк)**. Сервис функционирует на базе стека **Jitsi (Prosody + Jicofo + Jitsi Videobridge / JVB)**. Трафик маскируется под легитимный браузер в видеоконференции:
+1. **HTTP/WSS уровень:** маскировка под реальный браузер (Chrome / Firefox / Safari) с валидными Client Hints (`sec-ch-ua`), Fetch Metadata (`Sec-Fetch-*`), языковыми заголовками и реалистичными случайными именами гостей.
+2. **WebRTC уровень:** медиапотоки (SRTP/DTLS) со вспомогательным Opus-аудиотреком тишины и сервисные данные (SCTP DataChannel) к серверам, находящимся в корпоративных белых списках.
+3. **Реализация:** на базе `webrtc = "0.21.0"` (с подсистемами SCTP и DataChannel).
 
 ### 1.2. Базовая топология
 * **Топология сети:** Клиент-серверное соединение поверх топологии **SFU (Selective Forwarding Unit)**. Прямое соединение (P2P) между пирами не используется; все участники взаимодействуют с медиасервером Контура (JVB).
@@ -13,13 +16,13 @@
 * **Роли в парадигме ANet:**
     * `anet-server` физически выступает в роли клиента сервиса ВКС, непрерывно присутствующего в комнате.
     * `anet-client` подключается к комнате в произвольный момент времени, обнаруживает сервер и инициирует внутреннее рукопожатие ASTP.
-* **Канал передачи данных:** Штатный протокол **Colibri** поверх `RTCDataChannel` (SCTP). Сообщения инкапсулируются в структуру `colibriClass: "EndpointMessage"` с адресной маршрутизацией через поле `to`.
+* **Канал передачи данных:** Штатный протокол **Colibri** поверх `RTCDataChannel` (SCTP). Сообщения инкапсулируются в типизированную структуру `colibriClass: ColibriClass::EndpointMessage` с адресной маршрутизацией через поле `to`.
 
 ---
 
 ## 2. Этап 1. Авторизация и предстартовое согласование (REST API)
 
-Подключение к WebSockets и сигнальной сети Jitsi требует предварительного получения гостевого сессионного токена и внутреннего идентификатора конференции (`conferenceId`). Выполняется клиентом и сервером единообразно с помощью двух HTTP-запросов.
+Подключение к WebSockets и сигнальной сети Jitsi требует предварительного получения гостевого сессионного токена и внутреннего идентификатора конференции (`conferenceId`). Выполняется клиентом и сервером единообразно с использованием случайного профиля браузера (`BrowserProfile`) и маскировочных заголовков.
 
 ```
 +-------------+                     +----------------------+
@@ -28,13 +31,16 @@
 +-------------+                     +----------------------+
        |                                       |
        | 1. POST /api/authorize/session        |
+       |    Headers: Browser Stealth + Hints   |
+       |    Body: { name: "Гость ...", ... }   |
        |-------------------------------------->|
        |                                       |
        | 2. JSON: { token, expiresIn: 6 days } |
        |<--------------------------------------|
        |                                       |
        | 3. GET /api/rooms/{short_name}        |
-       |    Header: Authorization: Session {t} |
+       |    Headers: Browser Stealth           |
+       |             Authorization: Session {t}|
        |-------------------------------------->|
        |                                       |
        | 4. JSON: { conferenceId: "{name}_{h}"}|
@@ -44,24 +50,32 @@
    [Готовность к открытию WSS сигналинга Jitsi]
 ```
 
-### 2.1. Получение сессионного токена гостя
+### 2.1. Получение сессионного токена гостя (с маскировкой)
 Клиент формирует запрос на создание анонимной сессии.
 
 * **HTTP Метод:** `POST`
 * **URL:** `https://{domain}/api/authorize/session`
-* **Заголовки:**
+* **Заголовки маскировки под браузер:**
     * `Content-Type: application/json`
     * `Origin: https://{domain}`
     * `Referer: https://{domain}/{room_short_name}`
+    * `User-Agent: Mozilla/5.0 ... Chrome/124.0.0.0 Safari/537.36` (выбирается из пула `BrowserProfile`)
+    * `Accept-Language: ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7`
+    * `sec-ch-ua: "Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"`
+    * `sec-ch-ua-mobile: ?0`
+    * `sec-ch-ua-platform: "Windows"`
+    * `Sec-Fetch-Dest: empty`, `Sec-Fetch-Mode: cors`, `Sec-Fetch-Site: same-origin`
+    * `Cache-Control: no-cache`, `Pragma: no-cache`
 * **Тело запроса (JSON):**
   ```json
   {
-    "name": "ANet-Node",
+    "name": "Гость 4821",
     "anonymousSecret": "GYJ0ELL13CY24UG",
     "consentOnCreate": true
   }
   ```
-  *Где `anonymousSecret` — сгенерированная клиентом случайная буквенно-цифровая последовательность длиной 15 символов.*
+  *Примечание: Имя участника генерируется случайно при каждом подключении (`generate_random_guest_name()`) в естественных форматах («Гость 4821», «Алексей», «Пользователь 528»), исключая любые упоминания ANet.*
+  *`anonymousSecret` — случайная буквенно-цифровая последовательность длиной 15 символов.*
 
 * **Фактический ответ Ktalk API:**
   ```json
@@ -75,13 +89,11 @@
 * **Результат:** Значение `token` извлекается для последующего использования. Токен действителен ~6 суток (`expiresIn: ~543740` сек).
 
 ### 2.2. Разрешение внутреннего имени конференции Jitsi
-Короткое имя комнаты (из ссылки) транслируется во внутренний хэшированный идентификатор комнаты Jicofo.
+Короткое имя комнаты транслируется во внутренний хэшированный идентификатор комнаты Jicofo.
 
 * **HTTP Метод:** `GET`
 * **URL:** `https://{domain}/api/rooms/{room_short_name}`
-* **Заголовки:**
-    * `Authorization: Session {token}`
-    * `Accept: application/json`
+* **Заголовки:** `Authorization: Session {token}`, браузерные Client Hints и `Accept: application/json`.
 * **Фактический ответ Ktalk API:**
   ```json
   {
@@ -103,162 +115,170 @@
        |                                 |                                  |
        | 1. Connect WebSocket            |                                  |
        |    /jitsi/xmpp-websocket        |                                  |
+       |    (Browser Stealth Headers)    |                                  |
        |-------------------------------->|                                  |
        | 2. SASL ANONYMOUS Auth          |                                  |
        |<------------------------------->|                                  |
        | 3. MUC Presence (Enter Room)    |                                  |
+       |    with random guest nickname   |                                  |
        |-------------------------------->|                                  |
        |                                 | 4. Conference allocation request |
+       |                                 |    <iq type="set" ... />         |
        |                                 |--------------------------------->|
-       |                                 | 5. Jingle Offer (SDP)            |
-       | 6. Jingle Offer via XMPP        |<---------------------------------|
+       |                                 | 5. Jingle Offer (session-initiate)|
+       | 6. Jingle Offer (Dynamic ICE)   |<---------------------------------|
        |<--------------------------------|                                  |
-       | 7. Jingle Answer (SDP)          |                                  |
-       |-------------------------------->|--------------------------------->|
-       |                                                                    |
-       | 8. ICE / DTLS Handshake (UDP to JVB: 89.169.16.6:10002)            |
+       | 7. Parse candidates, DTLS, ufrag|                                  |
+       |    (with JVB fallback if empty) |                                  |
+       |                                 |                                  |
+       | 8. ICE / DTLS Handshake to JVB  |                                  |
        |<==================================================================>|
        | 9. Open SCTP DataChannel: "JVB data channel"                       |
        |<==================================================================>|
+       | 10. Background Keep-Alive:                                         |
+       |     - Opus Audio silence frame every 20ms                          |
+       |     - WebSocket & XMPP whitespace ping every 30s                   |
 ```
 
-### 3.1. Параметры WebSocket-сигналинга
+### 3.1. Параметры WebSocket-сигналинга и маскировка
 * **Endpoint:** `wss://{domain}/jitsi/xmpp-websocket?room={conferenceId}&sessionToken={token}`
 * **Subprotocol:** `xmpp`
+* **Маскировка WS Handshake:** Установка полного комплекта браузерных заголовков (`User-Agent`, `Origin: https://{domain}`, `Accept-Language`, `sec-ch-ua`, `Cache-Control`, `Pragma`).
 
 ### 3.2. Этапы XMPP-сессии:
 1. Инициализация обрамления: `<open to="meet.jitsi" version="1.0" xmlns="urn:ietf:params:xml:ns:xmpp-framing"/>`.
 2. Аутентификация: `<auth mechanism="ANONYMOUS" xmlns="urn:ietf:params:xml:ns:xmpp-sasl"/>`.
-3. Вход в MUC комнаты: отправка `<presence to="{conferenceId}@muc.meet.jitsi/{random_8hex_endpoint_id}">`.
+3. Привязка ресурса: `<iq type="set" id="_bind_auth_2"><bind xmlns="urn:ietf:params:xml:ns:xmpp-bind"/></iq>`.
+4. Вход в MUC комнаты: отправка `<presence to="{conferenceId}@muc.meet.jitsi/{random_8hex_endpoint_id}"><nick>{random_guest_name}</nick></presence>`.
+5. Запрос выделения видеомоста Jicofo: `<iq type="set" to="focus@auth.meet.jitsi"><conference xmlns="http://jitsi.org/protocol/focus" room="{conferenceId}@muc.meet.jitsi"/></iq>`.
 
-### 3.3. Параметры SDP и DataChannel (извлечено из JVB)
-* **Медиасервер JVB:** Хост `89.169.16.6`, UDP-порт `10002` (тип кандидата: `host`).
-* **Резервные TURN (TCP/TLS):** `turns:dtl-talk-stun7.ktalk.host:443?transport=tcp`.
+### 3.3. Динамический ICE-сигналинг и WebRTC DataChannel
+* **Парсинг Jingle Offer:** Извлекаются актуальные параметры, возвращаемые Jicofo:
+  * `<candidate ip="..." port="..." protocol="..." type="..." />`
+  * `ufrag`, `pwd`, `<fingerprint hash="..." setup="...">`
+  * Параметры SCTP (порт 5000).
+* **Динамический Fallback:** Если Jicofo не вернул кандидатов, применяются значения по умолчанию:
+  * Медиасервер JVB: хост `89.169.16.6`, UDP-порт `10002` (тип `host`).
+  * Резервные TURN (TCP/TLS): `turns:dtl-talk-stun7.ktalk.host:443?transport=tcp`.
 * **Спецификация DataChannel:**
-    * **Label:** `"JVB data channel"`
-    * **Protocol:** `"http://jitsi.org/protocols/colibri"`
-    * **SCTP Port:** `5000`
-    * **Max Message Size:** `262144` байт (256 КБ).
-* **Эмуляция медиа:** Клиент и сервер обязаны согласовать в SDP фиктивную аудиосекцию (`m=audio`, Opus 48kHz, SSRC) и отправлять регулярные пустые RTP-фреймы тишины (с интервалом 20 мс) во избежание сброса сессии со стороны Jicofo по таймауту неактивности медиа.
+  * **Label:** `"JVB data channel"`
+  * **Protocol:** `"http://jitsi.org/protocols/colibri"`
+  * **Ordered:** `false`, `maxRetransmits: 0`.
+
+### 3.4. Защита от сброса соединения (Anti-Drop)
+1. **Эмуляция медиа (Opus silence keep-alive):**
+   * В `RTCPeerConnection` регистрируется фиктивный аудиотрек (`mime_type: audio/opus`, 48000 Hz, stereo).
+   * Фоновый воркер каждые `wrtc_media_keepalive_interval_ms` (по умолчанию 20 мс) отправляет 3-байтовый фрейм тишины Opus (`0xf8, 0xff, 0xfe`). Это предотвращает закрытие моста со стороны JVB/Jicofo по таймауту отсутствия медиа.
+2. **Двойной Ping сигналинга:**
+   * Фоновый воркер каждые `wrtc_ping_interval_secs` (по умолчанию 30 с) отправляет WebSocket `Ping` и XMPP whitespace-пинг (`" "`), поддерживая WSS-соединение через промежуточные корпоративные прокси и NAT.
 
 ---
 
-## 4. Этап 3. Обнаружение участников, криптографическая верификация и мультиплексирование
+## 4. Этап 3. Строгая типизация Colibri, обнаружение и мультиплексирование
 
-Поскольку клиенты и сервер подключаются в комнату в **произвольном порядке**, топология не может опираться на предположение о том, кто зашел первым. Задача разделена на:
-1. Идентификацию узла-сервера с защитой от самозванцев.
-2. Маршрутизацию N клиентов в рамках одной комнаты без взаимной интерференции.
+### 4.1. Строгая схема сообщений (Enum)
+
+Все протокольные взаимодействия типизированы без хрупкого парсинга XML-подстрок:
+
+```rust
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ColibriClass {
+    #[serde(rename = "EndpointMessage")]
+    EndpointMessage,
+    #[serde(rename = "DominantSpeakerEndpointChangeEvent")]
+    DominantSpeaker,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum WrtcMessage {
+    #[serde(rename = "anet_discover")]
+    Discover { client_nonce: String },
+    #[serde(rename = "anet_beacon")]
+    Beacon {
+        server_id: String,
+        client_nonce: String,
+        signature: String,
+    },
+    #[serde(rename = "astp")]
+    Astp { data: String },
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ColibriMessage {
+    #[serde(rename = "colibriClass")]
+    pub colibri_class: ColibriClass,
+    pub to: Option<String>,
+    pub from: Option<String>,
+    #[serde(rename = "msgPayload")]
+    pub msg_payload: WrtcMessage,
+}
+```
 
 ```
        [Клиент А]                  [JVB Мост]                  [Сервер]
-           |                            |                         |
-           |                            |<--- Сервер уже в комнате|
-           |                            |     (или входит позже)  |
-           |                            |                         |
-1. Вошел в комнату                      |                         |
-   Шлет Discovery:                      |                         |
-   {"type":"discover", nonce:"N1"}      |                         |
-   ------------------------------------>|                         |
-   (broadcast без "to")                 |--- forwards to all ---->| 2. Принял Discovery
-                                        |                         |    Подписал (N1 + SrvId)
-                                        |                         |    ключом server_signing_key
-                                        |                         |
-                                        |<--- Beacon (to: Client) | 3. Отправил Beacon
-   4. Проверил подпись                  |<------------------------|    {"type":"beacon", sig:...}
-      по server_pub_key.                |
-      Сервер верифицирован!             |
-                                        |
-   5. ASTP Handshake Phase 1-4          |
-      (unicast to: ServerId)            |
-   <=============================================================>| 6. Выдача IP (10.0.0.X)
-                                        |                         |    Привязка ClientId <-> IP
-                                        |                         |
-   7. Туннелирование трафика            |                         |
-      {"to": ServerId, payload: ...}    |                         |
-   ==============================================================>|
+            |                            |                         |
+            |                            |<--- Сервер уже в комнате|
+            |                            |     (или входит позже)  |
+            |                            |                         |
+ 1. Вошел в комнату                      |                         |
+    Шлет Discovery:                      |                         |
+    {"colibriClass":"EndpointMessage",   |                         |
+     "msgPayload":{"type":"anet_discover"|                         |
+                   "client_nonce":"N1"}} |                         |
+    ------------------------------------>|                         |
+    (broadcast без "to")                 |--- forwards to all ---->| 2. Принял Discovery
+                                         |                         |    Подписал (N1 + SrvId)
+                                         |                         |    ключом server_signing_key
+                                         |                         |
+                                         |<--- Beacon (to: Client) | 3. Отправил Beacon
+    4. Проверил подпись                  |<------------------------|    {"type":"anet_beacon",
+       по server_pub_key.                |                              "signature":"..."}
+       Сервер верифицирован!             |
+                                         |
+    5. ASTP Handshake Phase 1-4          |
+       (unicast to: ServerId)            |
+    <=============================================================>| 6. Выдача IP (10.0.0.X)
+                                         |                         |    Привязка ClientId <-> IP
+                                         |                         |
+    7. Туннелирование трафика            |                         |
+       {"to": ServerId, payload: ...}    |                         |
+    ==============================================================>|
 ```
 
-### 4.1. Протокол обнаружения сервера (Challenge-Response Discovery)
-* Клиент при подключении к DataChannel отправляет широковещательный запрос обнаружения (без указания поля `to`). Повторяет с интервалом в 2 секунды до получения ответа:
-  ```json
-  {
-    "colibriClass": "EndpointMessage",
-    "msgPayload": {
-      "type": "anet_discover",
-      "client_nonce": "<случайные_16_байт_hex>"
-    }
-  }
-  ```
-* Сервер, получив сообщение с типом `anet_discover`, извлекает идентификатор отправителя из поля `from` (добавляется мостом JVB) и отвечает строго по этому адресу (`to`):
-  ```json
-  {
-    "colibriClass": "EndpointMessage",
-    "to": "<endpoint_id_клиента>",
-    "msgPayload": {
-      "type": "anet_beacon",
-      "server_id": "<endpoint_id_сервера>",
-      "client_nonce": "<client_nonce_из_запроса>",
-      "signature": "<Ed25519_подпись(client_nonce + server_id)>"
-    }
-  }
-  ```
-* Клиент выполняет верификацию `signature` открытым ключом `server_pub_key`. При успехе `endpoint_id_сервера` сохраняется как шлюз назначения. Любые сообщения от узлов, не подтвердивших владение `server_signing_key`, отбрасываются.
+### 4.2. Протокол обнаружения сервера (Challenge-Response Discovery)
+* Клиент при подключении к DataChannel отправляет широковещательный `WrtcMessage::Discover`. Повторяет каждые 2 секунды до получения ответа.
+* Сервер, получив `WrtcMessage::Discover`, извлекает идентификатор отправителя из поля `from` и отвечает строго по этому адресу (`to`):
+  `WrtcMessage::Beacon` с Ed25519 подписью `(client_nonce + server_id)`, выполненной с помощью имеющегося `config.crypto.server_signing_key`.
+* Клиент проверяет подпись открытым ключом `server_pub_key`. При успехе `server_id` фиксируется как целевой шлюз.
 
-### 4.2. Сквозное рукопожатие ASTP (внутри WebRTC DataChannel)
-После верификации сервера клиент выполняет штатное 4-фазное рукопожатие ASTP (X25519 DH + шифрование запроса):
-1. Пакеты фаз 1–4 упаковываются в Protobuf `anet.Message`, кодируются в Base64 и передаются в теле `msgPayload`:
-   ```json
-   {
-     "colibriClass": "EndpointMessage",
-     "to": "<TARGET_ENDPOINT_ID>",
-     "msgPayload": {
-       "type": "astp",
-       "data": "<BASE64_PROTOBUF_DATA>"
-     }
-   }
-   ```
-2. Сервер валидирует фингерпринт клиента через провайдер авторизации `anet-auth` / белый список и аллоцирует виртуальный IPv4-адрес из `IpPool`.
-
-### 4.3. Маршрутизация и изоляция N клиентов на сервере
-* **Входящий DataChannel (от клиентов к серверу):**
-    * JVB доставляет сообщение серверу с метаданными: `{"from": "<CLIENT_ENDPOINT_ID>", "msgPayload": {...}}`.
-    * Сервер по значению поля `from` находит сессионный контекст клиента (`ClientTransportInfo`), расшифровывает полезную нагрузку ChaCha20Poly1305 и передает расшифрованный IP-пакет в локальный интерфейс TUN.
-* **Исходящий DataChannel (из TUN к клиентам):**
-    * Ядро Linux направляет ответный пакет в TUN.
-    * Сервер извлекает IPv4 Destination (`extract_ip_dst`).
-    * По `dst_ip` в `ClientRegistry` определяется `ClientTransportInfo`, содержащий актуальный `webrtc_endpoint_id` клиента.
-    * Пакет шифруется сессионным ключом, кодируется в Base64 и передается адресно:
-      ```json
-      {
-        "colibriClass": "EndpointMessage",
-        "to": "<CLIENT_ENDPOINT_ID>",
-        "msgPayload": {
-          "type": "astp",
-          "data": "<BASE64_ENCRYPTED_PACKET>"
-        }
-      }
-      ```
-* **Изоляция:** JVB доставляет сообщение **исключительно** узлу, указанному в поле `to`. Другие клиенты в комнате не имеют доступа к чужим пакетам на канальном уровне. Дополнительно трафик защищен сквозным сессионным шифрованием (E2EE).
+### 4.3. Сквозное рукопожатие ASTP и туннелирование
+1. Клиент инициирует 4-фазный ASTP Handshake (X25519 DH + ChaCha20Poly1305), передавая Protobuf-пакеты в `WrtcMessage::Astp { data: base64 }`.
+2. Сервер валидирует фингерпринт клиента и аллоцирует IPv4 из `IpPool`.
+3. **Маршрутизация пакетов:**
+   * Входящие из DataChannel клиенты маршрутизируются в TUN.
+   * Ответные пакеты из TUN упаковываются в `WrtcMessage::Astp` и отправляются адресно в `to: client_endpoint_id`.
 
 ---
 
-## 5. Этап 4. Обработка разрыва соединения (Лимит 40 минут) и восстановление сессии
+## 5. Этап 4. Лимит 40 минут и бесшовное восстановление сессии
 
 ### 5.1. Условия работы таймера Ktalk
 * При нахождении в комнате **одного** участника (дежурный `anet-server`) счетчик 40 минут остановлен.
 * Счетчик запускается в момент входа второго участника.
-* По истечении 40 минут комната принудительно расформировывается Контуром: WebSockets и WebRTC закрываются у всех участников.
+* По истечении 40 минут комната расформировывается Контуром: WebSockets и WebRTC закрываются у всех участников.
 
-### 5.2. Процедура реконнекта при произвольном порядке возврата
-1. Клиент и сервер ловят разрыв соединения на уровне сокета и независимо перезапускают цикл подключения к той же комнате.
-2. Сторона, подключившаяся первой, переходит в режим ожидания:
-    * Если первым вернулся клиент: рассылает `anet_discover` до появления сервера.
-    * Если первым вернулся сервер: ожидает входящих пакетов.
-3. После повторного обнаружения сервера клиент инициирует ASTP с флагом возобновления, передавая ранее выданный `resume_session_id`.
+### 5.2. Процедура реконнекта
+1. Клиент и сервер ловят обрыв сокета и независимо перезапускают цикл входа в комнату.
+2. При разрыве сервер переводит активные клиентские контексты в `suspended` через `registry.suspend_client`.
+3. После входа и повторного обнаружения клиент отправляет ASTP с флагом возобновления и сохраненным `resume_session_id`.
 4. Сервер вызывает `ClientRegistry::take_suspended`:
-    * Идентифицирует клиента по `resume_session_id` и `fingerprint`.
-    * Мгновенно ассоциирует **новый** `CLIENT_ENDPOINT_ID` со старым выделенным `assigned_ip` (`10.0.0.X`).
-    * Сессионный контекст восстанавливается без сброса TCP-соединений пользователя.
+   * Связывает **новый** `endpoint_id` клиента со старым выделенным IP (`10.0.0.X`).
+   * Сессия восстанавливается мгновенно без сброса пользовательских TCP-соединений.
 
 ---
 
@@ -269,14 +289,22 @@
 [[servers]]
 name = "Ktalk Node [WRTC]"
 dsn = "wrtc://ycs3y048.ktalk.ru/oaj4kr56yubb"
-timeout_secs = 10
+timeout_secs = 15
 server_pub_key = "<BASE64_ED25519_PUBLIC_KEY>"
+wrtc_media_keepalive_interval_ms = 20 # Эмуляция Opus тишины (мс)
+wrtc_ping_interval_secs = 30          # Двойной пинг WebSocket и XMPP (сек)
+wrtc_fallback_jvb_ip = "89.169.16.6"  # Fallback IP медиасервера JVB
+wrtc_fallback_jvb_port = 10002        # Fallback UDP порт JVB
 ```
 
 ### В `server.toml`:
 ```toml
 [server]
 wrtc_room_url = "https://ycs3y048.ktalk.ru/oaj4kr56yubb"
+wrtc_media_keepalive_interval_ms = 20 # Эмуляция Opus тишины (мс)
+wrtc_ping_interval_secs = 30          # Двойной пинг WebSocket и XMPP (сек)
+wrtc_fallback_jvb_ip = "89.169.16.6"  # Fallback IP медиасервера JVB
+wrtc_fallback_jvb_port = 10002        # Fallback UDP порт JVB
 
 [crypto]
 server_signing_key = "<BASE64_ED25519_PRIVATE_KEY>"

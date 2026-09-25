@@ -204,6 +204,17 @@ websocket_min_session_secs = 480
 websocket_max_session_secs = 1500
 timeout_secs = 8
 
+# 5. WebRTC (Ktalk SFU): скрытный транспорт поверх корпоративной ВКС Контур.Толк
+# [[servers]]
+# name = "Ktalk Node [WRTC]"
+# dsn = "wrtc://ycs3y048.ktalk.ru/oaj4kr56yubb"
+# timeout_secs = 15
+# server_pub_key = "<BASE64_ED25519_PUBLIC_KEY>"
+# wrtc_media_keepalive_interval_ms = 20 # Эмуляция Opus тишины (мс)
+# wrtc_ping_interval_secs = 30          # Двойной пинг WebSocket и XMPP (сек)
+# wrtc_fallback_jvb_ip = "89.169.16.6"  # Fallback IP медиасервера JVB
+# wrtc_fallback_jvb_port = 10002        # Fallback UDP порт JVB
+
 
 # =========================================================================
 # ANET Client: Криптографические ключи

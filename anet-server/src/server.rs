@@ -4,7 +4,7 @@ use crate::client_registry::ClientRegistry;
 use crate::config::Config;
 use crate::ip_pool::IpPool;
 use crate::multikey_udp_socket::TempDHInfo;
-use crate::servers::{http_stream, quic, ssh, vnc, websocket};
+use crate::servers::{http_stream, quic, ssh, vnc, websocket, wrtc};
 
 use anet_common::atun::TunManager;
 use anet_common::tun_params::TunParams;
@@ -177,6 +177,20 @@ impl ANetServer {
                     error!("Fatal error: [AHTTP-Stream] Server halted: {}", e);
                 }
             }));
+        }
+
+        if let Some(ref wrtc_url) = self.cfg.server.wrtc_room_url {
+            if !wrtc_url.trim().is_empty() {
+                let c = self.cfg.clone();
+                let rg = self.registry.clone();
+                let tx = tx_tun.clone();
+                let auth = self.auth_handler_core.clone();
+                handle_collection.push(tokio::spawn(async move {
+                    if let Err(e) = wrtc::run_wrtc_server(c, rg, tx, auth).await {
+                        error!("Fatal error: [WRTC] Server halted: {}", e);
+                    }
+                }));
+            }
         }
 
         futures::future::join_all(handle_collection).await;

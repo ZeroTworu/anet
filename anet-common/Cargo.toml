@@ -28,6 +28,7 @@ rand = {workspace = true}
 x25519-dalek = {workspace = true}
 ed25519-dalek = {workspace = true}
 sha2 = {workspace = true}
+webrtc = { workspace = true }
 poem-openapi = { version = "5.1.12", features = ["uuid"], optional = true }
 
 base64 = "0.22.1"

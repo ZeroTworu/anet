@@ -124,6 +124,11 @@ pub struct ServerCoreConfig {
     pub ahttp_bind_to: String,
     pub ahttp_path: String,
     pub ssh_host_key: String,
+    pub wrtc_room_url: Option<String>,
+    pub wrtc_media_keepalive_interval_ms: u64,
+    pub wrtc_ping_interval_secs: u64,
+    pub wrtc_fallback_jvb_ip: String,
+    pub wrtc_fallback_jvb_port: u16,
 }
 
 impl Default for ServerCoreConfig {
@@ -137,6 +142,11 @@ impl Default for ServerCoreConfig {
             ahttp_bind_to: "127.0.0.1:8081".to_string(),
             ahttp_path: "/api/v2/telemetry".to_string(),
             ssh_host_key: "/etc/ssh/ssh_host_rsa_key".to_string(),
+            wrtc_room_url: None,
+            wrtc_media_keepalive_interval_ms: 20,
+            wrtc_ping_interval_secs: 30,
+            wrtc_fallback_jvb_ip: "89.169.16.6".to_string(),
+            wrtc_fallback_jvb_port: 10002,
         }
     }
 }
