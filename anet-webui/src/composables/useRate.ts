@@ -1,6 +1,5 @@
-import { computed, ref } from 'vue'
+import { ref } from 'vue'
 import { AddRate, UpdateRate } from '@/api/rate'
-import type { User } from '@/models/user'
 
 export function useRate(user: any) {
   const saving = ref(false)

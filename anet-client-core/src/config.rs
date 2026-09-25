@@ -104,6 +104,7 @@ pub enum TransportMode {
     Vnc,
     Websocket,
     Ahttp,
+    Wrtc,
 }
 
 impl Default for TransportMode {
@@ -198,9 +199,18 @@ impl ServerConfig {
             Some("vnc") => Ok(TransportMode::Vnc),
             Some("ws") | Some("wss") => Ok(TransportMode::Websocket),
             Some("http") | Some("https") => Ok(TransportMode::Ahttp),
+            Some("wrtc") => Ok(TransportMode::Wrtc),
             Some(scheme) => anyhow::bail!("unsupported server DSN scheme '{scheme}'"),
             None => anyhow::bail!("server DSN '{}' has no scheme", self.dsn),
         }
+    }
+
+    pub fn wrtc_room(&self) -> anyhow::Result<(String, String)> {
+        let uri: http::Uri = self.dsn.parse()?;
+        let host = uri.host().ok_or_else(|| anyhow::anyhow!("server DSN '{}' has no host", self.dsn))?;
+        let path = uri.path().trim_start_matches('/');
+        anyhow::ensure!(!path.is_empty(), "WRTC DSN '{}' has no room name in path", self.dsn);
+        Ok((host.to_string(), path.to_string()))
     }
 
     /// ИСПРАВЛЕНИЕ: гарантированно возвращает "host:port" даже если порт не был указан в DSN!
@@ -221,7 +231,7 @@ impl ServerConfig {
 
         let scheme = uri.scheme_str().unwrap_or("").to_lowercase();
         let port = uri.port_u16().unwrap_or(match scheme.as_str() {
-            "https" | "wss" => 443,
+            "https" | "wss" | "wrtc" => 443,
             "http" | "ws" => 80,
             "ssh" => 22,
             "vnc" => 5900,
@@ -243,6 +253,7 @@ impl ServerConfig {
                 TransportMode::Vnc => "VNC",
                 TransportMode::Websocket => "WS",
                 TransportMode::Ahttp => "AHTTP",
+                TransportMode::Wrtc => "WRTC",
             };
 
             format!("{}:{}", host, mode_str)
