@@ -1,28 +1,47 @@
 import { fileURLToPath, URL } from 'node:url'
-import { defineConfig } from 'vite'
+import { defineConfig, type Plugin } from 'vite'
 import vue from '@vitejs/plugin-vue'
-import vueDevTools from 'vite-plugin-vue-devtools'
+import { handleMockApi } from './mock-server'
 
-// Берем таргет из переменных окружения Node при запуске Vite
-const apiProxyTarget = process.env.VITE_API_PROXY_TARGET || 'http://localhost:3000'
+const apiProxyTarget = process.env.VITE_API_PROXY_TARGET
+
+const mockApiPlugin = (): Plugin => ({
+  name: 'anet-mock-api-plugin',
+  configureServer(server) {
+    server.middlewares.use((req, res, next) => {
+      if (handleMockApi(req, res)) {
+        return
+      }
+      next()
+    })
+  },
+})
 
 // https://vite.dev/config/
 export default defineConfig({
   plugins: [
     vue(),
-    vueDevTools(),
+    ...(!apiProxyTarget ? [mockApiPlugin()] : []),
   ],
   resolve: {
     alias: {
-      '@': fileURLToPath(new URL('./src', import.meta.url))
+      '@': fileURLToPath(new URL('./src', import.meta.url)),
     },
   },
   server: {
-    proxy: {
-      '/api': {
-        target: apiProxyTarget,
-        changeOrigin: true
-      }
-    }
-  }
+    host: '0.0.0.0',
+    port: 3000,
+    strictPort: true,
+    allowedHosts: true,
+    ...(apiProxyTarget
+      ? {
+          proxy: {
+            '/api': {
+              target: apiProxyTarget,
+              changeOrigin: true,
+            },
+          },
+        }
+      : {}),
+  },
 })

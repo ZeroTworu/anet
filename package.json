@@ -1,0 +1,15 @@
+{
+  "name": "anet",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "anet-webui"
+  ],
+  "scripts": {
+    "dev": "npm run dev --workspace=anet-webui",
+    "build": "npm run build --workspace=anet-webui",
+    "preview": "npm run preview --workspace=anet-webui",
+    "lint": "npm run lint --workspace=anet-webui"
+  }
+}

@@ -17,6 +17,7 @@ pub mod vnc;
 pub mod dto;
 pub mod reassembly;
 pub mod http_help;
+pub mod wrtc;
 
 pub use generated::*;
 pub mod protocol {

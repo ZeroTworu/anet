@@ -1,4 +1,4 @@
-use super::{ClientTransport, quic::QuicTransport, ssh::SshTransport, vnc::VncTransport, websocket::WebSocketTransport, ahttp::AHttpTransport};
+use super::{ClientTransport, quic::QuicTransport, ssh::SshTransport, vnc::VncTransport, websocket::WebSocketTransport, ahttp::AHttpTransport, wrtc::WrtcTransport};
 use crate::config::{CoreConfig, ServerConfig, TransportMode};
 
 pub fn create_transport(config: &CoreConfig, server: &ServerConfig) -> anyhow::Result<Box<dyn ClientTransport>> {
@@ -8,5 +8,6 @@ pub fn create_transport(config: &CoreConfig, server: &ServerConfig) -> anyhow::R
         TransportMode::Vnc => Box::new(VncTransport::new(config.clone(), server.clone())),
         TransportMode::Websocket => Box::new(WebSocketTransport::new(config.clone(), server.clone())),
         TransportMode::Ahttp => Box::new(AHttpTransport::new(config.clone(), server.clone())),
+        TransportMode::Wrtc => Box::new(WrtcTransport::new(config.clone(), server.clone())),
     })
 }

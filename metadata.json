@@ -1,0 +1,8 @@
+{
+  "name": "ANet WebUI",
+  "description": "Administrative Web Dashboard for ANet VPN & Proxy Management",
+  "permissions": [],
+  "capabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
