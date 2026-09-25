@@ -1,5 +1,5 @@
 use crate::http_help::{BrowserProfile, CHROME_BRANDS, CHROME_PLATFORMS};
-use http::header::{ACCEPT, ACCEPT_LANGUAGE, CACHE_CONTROL, ORIGIN, PRAGMA, REFERER, USER_AGENT};
+use http::header::{ACCEPT, ACCEPT_LANGUAGE, CACHE_CONTROL, ORIGIN, PRAGMA, USER_AGENT};
 use http::HeaderValue;
 use rand::Rng;
 

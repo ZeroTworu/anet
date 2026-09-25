@@ -1,7 +1,7 @@
 use crate::auth_handler::ServerAuthHandler;
 use crate::client_registry::{ClientRegistry, ClientTransportInfo};
 use crate::config::Config;
-use anet_common::consts::{CHANNEL_BUFFER_SIZE, MAX_PACKET_SIZE};
+use anet_common::consts::CHANNEL_BUFFER_SIZE;
 use anet_common::http_help::BrowserProfile;
 use anet_common::wrtc::{
     colibri::{sign_beacon, ColibriMessage, WrtcMessage},
@@ -15,7 +15,7 @@ use anyhow::{Context, Result};
 use base64::prelude::*;
 use bytes::Bytes;
 use dashmap::DashMap;
-use log::{debug, error, info, warn};
+use log::{debug, info, warn};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;

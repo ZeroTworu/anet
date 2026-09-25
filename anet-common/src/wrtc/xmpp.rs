@@ -159,7 +159,7 @@ impl XmppSession {
                     }
                     _ = ping_interval.tick() => {
                         // 1. WebSocket protocol ping
-                        if let Err(e) = ws_sink.send(Message::Ping(vec![0x01, 0x02])).await {
+                        if let Err(e) = ws_sink.send(Message::Ping(bytes::Bytes::from_static(&[0x01, 0x02]))).await {
                             log::debug!("[XMPP] WS ping send error: {e}");
                             break;
                         }
