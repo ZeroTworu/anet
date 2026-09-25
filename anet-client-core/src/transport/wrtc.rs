@@ -5,8 +5,6 @@ use anet_common::consts::MAX_PACKET_SIZE;
 use anet_common::encryption::Cipher;
 use anet_common::handshake_fragmentation::FragmentConfig;
 use anet_common::http_help::BrowserProfile;
-use anet_common::stream_framing::{frame_packet, read_next_packet};
-use anet_common::transport_trait::VpnStream;
 use anet_common::wrtc::{
     colibri::{verify_beacon, ColibriMessage, WrtcMessage},
     jingle::parse_jingle_session,
