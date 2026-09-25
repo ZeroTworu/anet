@@ -35,6 +35,7 @@ http = { workspace = true }
 reqwest = { workspace = true, features = ["json", "rustls-tls-webpki-roots", "http2"] }
 
 russh = { workspace = true }
+webrtc = { workspace = true }
 zip = "8.6.0"
 
 hickory-resolver = { version = "0.24", features = ["tokio"] }

@@ -1,3 +1,5 @@
+use crate::http_help::BrowserProfile;
+use crate::wrtc::stealth::{apply_reqwest_browser_headers, generate_random_guest_name};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 
@@ -33,20 +35,22 @@ pub struct RoomInfoResponse {
 
 pub struct KtalkClient {
     http: reqwest::Client,
+    pub profile: BrowserProfile,
 }
 
 impl Default for KtalkClient {
     fn default() -> Self {
-        Self::new()
+        Self::new(BrowserProfile::random())
     }
 }
 
 impl KtalkClient {
-    pub fn new() -> Self {
+    pub fn new(profile: BrowserProfile) -> Self {
         Self {
             http: reqwest::Client::builder()
                 .build()
                 .unwrap_or_default(),
+            profile,
         }
     }
 
@@ -62,33 +66,37 @@ impl KtalkClient {
             .collect()
     }
 
-    /// Authorize a guest session in Ktalk.
+    /// Authorize a guest session in Ktalk with browser stealth headers and natural guest name.
     pub async fn authorize_session(
         &self,
         domain: &str,
         room_short_name: &str,
-        client_name: &str,
+        client_name_opt: Option<&str>,
         anonymous_secret: &str,
     ) -> anyhow::Result<AuthorizeSessionResponse> {
         let url = format!("https://{domain}/api/authorize/session");
         let origin = format!("https://{domain}");
         let referer = format!("https://{domain}/{room_short_name}");
 
+        let effective_name = match client_name_opt {
+            Some(name) if !name.is_empty() && name != "ANet-Node" => name.to_string(),
+            _ => generate_random_guest_name(),
+        };
+
         let body = AuthorizeSessionRequest {
-            name: client_name.to_string(),
+            name: effective_name,
             anonymous_secret: anonymous_secret.to_string(),
             consent_on_create: true,
         };
 
-        let resp = self
+        let req = self
             .http
             .post(&url)
-            .header("Content-Type", "application/json")
-            .header("Origin", origin)
-            .header("Referer", referer)
-            .json(&body)
-            .send()
-            .await?;
+            .header("Content-Type", "application/json");
+
+        let req = apply_reqwest_browser_headers(req, &self.profile, Some(&origin), Some(&referer));
+
+        let resp = req.json(&body).send().await?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -100,7 +108,7 @@ impl KtalkClient {
         Ok(auth_res)
     }
 
-    /// Resolve conference room ID from short room name.
+    /// Resolve conference room ID from short room name with browser stealth headers.
     pub async fn resolve_room(
         &self,
         domain: &str,
@@ -108,14 +116,18 @@ impl KtalkClient {
         session_token: &str,
     ) -> anyhow::Result<RoomInfoResponse> {
         let url = format!("https://{domain}/api/rooms/{room_short_name}");
+        let origin = format!("https://{domain}");
+        let referer = format!("https://{domain}/{room_short_name}");
 
-        let resp = self
+        let req = self
             .http
             .get(&url)
             .header("Authorization", format!("Session {session_token}"))
-            .header("Accept", "application/json")
-            .send()
-            .await?;
+            .header("Accept", "application/json");
+
+        let req = apply_reqwest_browser_headers(req, &self.profile, Some(&origin), Some(&referer));
+
+        let resp = req.send().await?;
 
         if !resp.status().is_success() {
             let status = resp.status();

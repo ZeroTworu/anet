@@ -167,6 +167,12 @@ pub struct ServerConfig {
     pub websocket_min_session_secs: u64,
     #[serde(default = "default_websocket_max_session_secs")]
     pub websocket_max_session_secs: u64,
+
+    /// WebRTC Ktalk keepalive and fallback settings
+    pub wrtc_media_keepalive_interval_ms: Option<u64>,
+    pub wrtc_ping_interval_secs: Option<u64>,
+    pub wrtc_fallback_jvb_ip: Option<String>,
+    pub wrtc_fallback_jvb_port: Option<u16>,
 }
 
 impl Default for ServerConfig {
@@ -183,6 +189,10 @@ impl Default for ServerConfig {
             weigth: None,
             websocket_min_session_secs: default_websocket_min_session_secs(),
             websocket_max_session_secs: default_websocket_max_session_secs(),
+            wrtc_media_keepalive_interval_ms: None,
+            wrtc_ping_interval_secs: None,
+            wrtc_fallback_jvb_ip: None,
+            wrtc_fallback_jvb_port: None,
         }
     }
 }

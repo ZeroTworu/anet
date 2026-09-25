@@ -2,62 +2,25 @@ use base64::prelude::*;
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ColibriMessage {
-    #[serde(rename = "colibriClass")]
-    pub colibri_class: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub to: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub from: Option<String>,
-    #[serde(rename = "msgPayload")]
-    pub msg_payload: ColibriPayload,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ColibriClass {
+    #[serde(rename = "EndpointMessage")]
+    EndpointMessage,
+    #[serde(rename = "DominantSpeakerEndpointChangeEvent")]
+    DominantSpeaker,
+    #[serde(other)]
+    Unknown,
 }
 
-impl ColibriMessage {
-    pub fn new_endpoint_message(to: Option<String>, payload: ColibriPayload) -> Self {
-        Self {
-            colibri_class: "EndpointMessage".to_string(),
-            to,
-            from: None,
-            msg_payload: payload,
-        }
-    }
-
-    pub fn discover(client_nonce: String) -> Self {
-        Self::new_endpoint_message(
-            None,
-            ColibriPayload::Discover { client_nonce },
-        )
-    }
-
-    pub fn beacon(
-        to_client_endpoint: String,
-        server_id: String,
-        client_nonce: String,
-        signature: String,
-    ) -> Self {
-        Self::new_endpoint_message(
-            Some(to_client_endpoint),
-            ColibriPayload::Beacon {
-                server_id,
-                client_nonce,
-                signature,
-            },
-        )
-    }
-
-    pub fn astp(to: String, base64_data: String) -> Self {
-        Self::new_endpoint_message(
-            Some(to),
-            ColibriPayload::Astp { data: base64_data },
-        )
+impl Default for ColibriClass {
+    fn default() -> Self {
+        ColibriClass::EndpointMessage
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
-pub enum ColibriPayload {
+pub enum WrtcMessage {
     #[serde(rename = "anet_discover")]
     Discover {
         client_nonce: String,
@@ -74,6 +37,61 @@ pub enum ColibriPayload {
     },
     #[serde(other)]
     Unknown,
+}
+
+pub type ColibriPayload = WrtcMessage;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ColibriMessage {
+    #[serde(rename = "colibriClass")]
+    pub colibri_class: ColibriClass,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    #[serde(rename = "msgPayload")]
+    pub msg_payload: WrtcMessage,
+}
+
+impl ColibriMessage {
+    pub fn new_endpoint_message(to: Option<String>, payload: WrtcMessage) -> Self {
+        Self {
+            colibri_class: ColibriClass::EndpointMessage,
+            to,
+            from: None,
+            msg_payload: payload,
+        }
+    }
+
+    pub fn discover(client_nonce: String) -> Self {
+        Self::new_endpoint_message(
+            None,
+            WrtcMessage::Discover { client_nonce },
+        )
+    }
+
+    pub fn beacon(
+        to_client_endpoint: String,
+        server_id: String,
+        client_nonce: String,
+        signature: String,
+    ) -> Self {
+        Self::new_endpoint_message(
+            Some(to_client_endpoint),
+            WrtcMessage::Beacon {
+                server_id,
+                client_nonce,
+                signature,
+            },
+        )
+    }
+
+    pub fn astp(to: String, base64_data: String) -> Self {
+        Self::new_endpoint_message(
+            Some(to),
+            WrtcMessage::Astp { data: base64_data },
+        )
+    }
 }
 
 /// Sign (client_nonce + server_id) with server Ed25519 private key.

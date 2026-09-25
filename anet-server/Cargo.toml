@@ -29,6 +29,7 @@ dashmap = { workspace = true }
 reqwest = { workspace = true, default-features = false, features = ["json", "rustls-tls"] }
 
 russh = { workspace = true }
+webrtc = { workspace = true }
 
 
 arc-swap = "1.6"
