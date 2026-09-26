@@ -27,7 +27,7 @@ futures = { workspace = true }
 tokio-tungstenite = { workspace = true }
 dashmap = { workspace = true }
 reqwest = { workspace = true, default-features = false, features = ["json", "rustls-tls"] }
-
+http = { workspace = true }
 russh = { workspace = true }
 webrtc = { workspace = true }
 

@@ -343,7 +343,7 @@ impl AnetClient {
         config_clone.sanitize()?;
 
         let transport = create_transport(&config_clone, server)?;
-        let conn_timeout = Duration::from_secs(server.timeout_secs.max(15));
+        let conn_timeout = Duration::from_secs(server.timeout_secs.max(30));
 
         let connect_fut = transport.connect();
         let stop_flag = &self.stop_requested;

@@ -3,6 +3,7 @@ use crate::client_registry::{ClientRegistry, ClientTransportInfo};
 use crate::config::Config;
 use anet_common::consts::CHANNEL_BUFFER_SIZE;
 use anet_common::http_help::BrowserProfile;
+use anet_common::transport::{unwrap_packet_bytes_in_place, wrap_packet_padded};
 use anet_common::wrtc::{
     colibri::{sign_beacon, ColibriMessage, WrtcMessage},
     jingle::parse_jingle_session,
@@ -15,11 +16,18 @@ use anyhow::{Context, Result};
 use base64::prelude::*;
 use bytes::Bytes;
 use dashmap::DashMap;
+use ed25519_dalek::SigningKey;
 use log::{debug, info, warn};
 use std::net::SocketAddr;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
+
+fn endpoint_to_socket_addr(ep: &str) -> SocketAddr {
+    let num = u32::from_str_radix(ep, 16).unwrap_or(0);
+    SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::from(num)), 0)
+}
 
 pub async fn run_wrtc_server(
     config: Arc<Config>,
@@ -46,20 +54,20 @@ pub async fn run_wrtc_server(
         .try_into()
         .map_err(|_| anyhow::anyhow!("Invalid server_signing_key length (expected 32 bytes)"))?;
 
+    let signing_key = SigningKey::from_bytes(&signing_key_bytes);
+    let server_pub_key_b64 = BASE64_STANDARD.encode(signing_key.verifying_key().to_bytes());
     info!(
-        "[WRTC Server] Starting server worker for Ktalk room '{}' at domain '{}'...",
+        "[WRTC Server] Server Public Key (must match client.toml server_pub_key): {server_pub_key_b64}"
+    );
+
+    info!(
+        "[WRTC Server] Starting worker for Ktalk room '{}' at domain '{}'...",
         room_name, domain
     );
 
-    // Continuous reconnection loop (handles Ktalk 40-minute conference limit)
     loop {
         let browser_profile = BrowserProfile::random();
         let guest_name = generate_random_guest_name();
-
-        info!(
-            "[WRTC Server] Authorizing guest session in Ktalk as '{}'...",
-            guest_name
-        );
 
         let ktalk = KtalkClient::new(browser_profile.clone());
         let anon_secret = KtalkClient::generate_anonymous_secret();
@@ -85,11 +93,6 @@ pub async fn run_wrtc_server(
             }
         };
 
-        info!(
-            "[WRTC Server] Resolved conference ID: {}. Connecting XMPP signaling WebSocket...",
-            room_info.conference_id
-        );
-
         let ping_secs = config.server.wrtc_ping_interval_secs;
         let mut xmpp = match XmppSession::connect(
             &domain,
@@ -99,7 +102,7 @@ pub async fn run_wrtc_server(
             &browser_profile,
             ping_secs,
         )
-        .await
+            .await
         {
             Ok(session) => session,
             Err(e) => {
@@ -115,57 +118,58 @@ pub async fn run_wrtc_server(
             server_endpoint_id
         );
 
-        // Jicofo allocation & Jingle negotiation
-        let _ = xmpp.request_conference_allocation().await;
-
         let fallback_ip = &config.server.wrtc_fallback_jvb_ip;
         let fallback_port = config.server.wrtc_fallback_jvb_port;
 
-        let mut parsed_candidates = Vec::new();
+        let mut parsed_session = None;
         let jingle_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
 
         while tokio::time::Instant::now() < jingle_deadline {
-            if let Ok(Some(stanza)) = tokio::time::timeout(Duration::from_millis(500), xmpp.recv_stanza()).await {
+            if let Ok(Some(stanza)) =
+                tokio::time::timeout(Duration::from_millis(400), xmpp.recv_stanza()).await
+            {
                 if let Some(session) = parse_jingle_session(&stanza, fallback_ip, fallback_port) {
-                    debug!(
-                        "[WRTC Server] Extracted {} dynamic candidates from Jingle offer",
-                        session.transport.candidates.len()
-                    );
-                    parsed_candidates = session.transport.candidates;
+                    parsed_session = Some(session);
                     break;
                 }
             }
         }
 
+        if parsed_session.is_none() {
+            info!("[WRTC Server] Using fallback JVB: {fallback_ip}:{fallback_port}");
+        }
+
         let audio_keepalive_ms = config.server.wrtc_media_keepalive_interval_ms;
         let peer = match WrtcPeer::create(
-            &parsed_candidates,
+            parsed_session.as_ref(),
+            &domain,
             fallback_ip,
             fallback_port,
             audio_keepalive_ms,
         )
-        .await
+            .await
         {
             Ok(p) => p,
             Err(e) => {
-                warn!("[WRTC Server] Failed to initialize WebRTC Peer: {e}. Retrying in 5s...");
+                warn!("[WRTC Server] Failed to initialize WebRTC Peer: {e:#}. Retrying in 5s...");
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 continue;
             }
         };
 
-        info!("[WRTC Server] WebRTC PeerConnection and DataChannel active. Standing by for clients...");
+        info!("[WRTC Server] WebRTC connection active. Waiting for clients...");
 
         let shared_peer = Arc::new(Mutex::new(peer));
-        let active_clients: Arc<DashMap<String, Arc<ClientTransportInfo>>> = Arc::new(DashMap::new());
+        let active_clients: Arc<DashMap<String, Arc<ClientTransportInfo>>> =
+            Arc::new(DashMap::new());
 
-        // Read loop from DataChannel
         let p_clone = shared_peer.clone();
         let reg_clone = registry.clone();
         let auth_clone = auth_handler.clone();
         let tun_clone = tun_tx.clone();
         let clients_map = active_clients.clone();
         let srv_id = server_endpoint_id.clone();
+        let padding_step = config.stealth.padding_step;
 
         loop {
             let msg_opt = {
@@ -174,7 +178,7 @@ pub async fn run_wrtc_server(
             };
 
             let Some(msg) = msg_opt else {
-                warn!("[WRTC Server] DataChannel closed (room expired or disconnected). Initiating reconnection...");
+                warn!("[WRTC Server] Connection closed (room expired or connection reset).");
                 break;
             };
 
@@ -186,8 +190,7 @@ pub async fn run_wrtc_server(
             match msg.msg_payload {
                 WrtcMessage::Discover { client_nonce } => {
                     info!(
-                        "[WRTC Server] Received anet_discover from client {} (nonce: {}). Answering beacon...",
-                        from_endpoint, client_nonce
+                        "[WRTC Server] Received anet_discover from client {from_endpoint} (nonce: {client_nonce})! Answering beacon..."
                     );
                     let signature = sign_beacon(&signing_key_bytes, &client_nonce, &srv_id);
                     let beacon_msg = ColibriMessage::beacon(
@@ -202,24 +205,26 @@ pub async fn run_wrtc_server(
                 WrtcMessage::Astp { data } => {
                     if let Ok(raw_bytes) = BASE64_STANDARD.decode(&data) {
                         if let Some(client_info) = clients_map.get(&from_endpoint) {
-                            // Established session: decrypt and send to TUN
-                            if let Ok(plaintext) = client_info.cipher.decrypt(&raw_bytes) {
-                                let packet_len = plaintext.len();
-                                if let Ok(_) = tun_clone.try_send(Bytes::from(plaintext)) {
+                            if let Ok(packet) = unwrap_packet_bytes_in_place(
+                                &client_info.cipher,
+                                Bytes::from(raw_bytes),
+                            ) {
+                                let packet_len = packet.len();
+                                if let Ok(_) = tun_clone.try_send(packet) {
                                     reg_clone.record_rx(&client_info, packet_len, "wrtc");
                                 }
                             }
                         } else {
-                            // Handshake phase
-                            let dummy_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+                            let client_addr = endpoint_to_socket_addr(&from_endpoint);
                             match auth_clone
-                                .process_handshake_packet(Bytes::from(raw_bytes), dummy_addr, "wrtc")
+                                .process_handshake_packet(Bytes::from(raw_bytes), client_addr, "wrtc")
                                 .await
                             {
                                 Ok((response, result)) => {
                                     if let Some(resp_bytes) = response {
                                         let b64 = BASE64_STANDARD.encode(&resp_bytes);
-                                        let resp_msg = ColibriMessage::astp(from_endpoint.clone(), b64);
+                                        let resp_msg =
+                                            ColibriMessage::astp(from_endpoint.clone(), b64);
                                         let p = p_clone.lock().await;
                                         let _ = p.send(resp_msg).await;
                                     }
@@ -227,32 +232,43 @@ pub async fn run_wrtc_server(
                                     if let Some((client_info, _)) = result {
                                         let assigned_ip = client_info.assigned_ip.clone();
                                         info!(
-                                            "[WRTC Server] Handshake completed for client {}! Assigned IP: {}",
-                                            from_endpoint, assigned_ip
+                                            "[WRTC Server] Client {from_endpoint} authenticated! Assigned IP: {assigned_ip}"
                                         );
 
                                         let (tx_router, mut rx_router) =
                                             mpsc::channel::<Bytes>(CHANNEL_BUFFER_SIZE);
                                         reg_clone.finalize_client(&assigned_ip, tx_router);
-                                        clients_map.insert(from_endpoint.clone(), client_info.clone());
+                                        clients_map
+                                            .insert(from_endpoint.clone(), client_info.clone());
 
-                                        // Spawn downlink forwarder task (TUN -> DataChannel)
                                         let target_client_id = from_endpoint.clone();
-                                        let client_cipher = client_info.cipher.clone();
+                                        let c_info = client_info.clone();
                                         let peer_downlink = p_clone.clone();
 
                                         tokio::spawn(async move {
                                             while let Some(packet) = rx_router.recv().await {
-                                                let encrypted = client_cipher.encrypt(&packet);
-                                                let b64 = BASE64_STANDARD.encode(&encrypted);
-                                                let msg = ColibriMessage::astp(
-                                                    target_client_id.clone(),
-                                                    b64,
-                                                );
-                                                let p = peer_downlink.lock().await;
-                                                if let Err(e) = p.send(msg).await {
-                                                    debug!("[WRTC Downlink] Send error: {e}");
-                                                    break;
+                                                if packet.len() < 20 {
+                                                    continue;
+                                                }
+                                                let seq = c_info
+                                                    .sequence
+                                                    .fetch_add(1, Ordering::Relaxed);
+                                                if let Ok(encrypted) = wrap_packet_padded(
+                                                    &c_info.cipher,
+                                                    &c_info.nonce_prefix,
+                                                    seq,
+                                                    packet,
+                                                    padding_step,
+                                                ) {
+                                                    let b64 = BASE64_STANDARD.encode(&encrypted);
+                                                    let msg = ColibriMessage::astp(
+                                                        target_client_id.clone(),
+                                                        b64,
+                                                    );
+                                                    let p = peer_downlink.lock().await;
+                                                    if p.send(msg).await.is_err() {
+                                                        break;
+                                                    }
                                                 }
                                             }
                                         });
@@ -269,7 +285,6 @@ pub async fn run_wrtc_server(
             }
         }
 
-        // Suspend all active sessions so they can be smoothly resumed upon reconnection
         for entry in active_clients.iter() {
             registry.suspend_client(entry.value().clone());
         }

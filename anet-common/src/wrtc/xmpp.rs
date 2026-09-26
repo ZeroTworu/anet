@@ -2,6 +2,8 @@ use crate::http_help::BrowserProfile;
 use crate::wrtc::stealth::{apply_ws_browser_headers, generate_random_guest_name};
 use futures::{SinkExt, StreamExt};
 use rand::Rng;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -13,8 +15,16 @@ pub struct XmppSession {
     pub conference_id: String,
     pub jid: String,
     pub client_name: String,
+    pub occupants: Arc<Mutex<HashSet<String>>>,
     write_tx: mpsc::Sender<String>,
     read_rx: mpsc::Receiver<String>,
+}
+
+fn extract_attr(text: &str, attr_name: &str) -> Option<String> {
+    let pattern = format!("{attr_name}=\"");
+    let start = text.find(&pattern)? + pattern.len();
+    let end = text[start..].find('"')? + start;
+    Some(text[start..end].to_string())
 }
 
 impl XmppSession {
@@ -24,8 +34,11 @@ impl XmppSession {
         format!("{val:08x}")
     }
 
-    /// Connect to Ktalk Jitsi XMPP WebSocket, perform SASL ANONYMOUS, join MUC room,
-    /// with browser stealth headers, natural guest name, and dual keep-alive ping.
+    pub fn get_other_occupants(&self) -> Vec<String> {
+        let occ = self.occupants.lock().unwrap();
+        occ.iter().cloned().collect()
+    }
+
     pub async fn connect(
         domain: &str,
         conference_id: &str,
@@ -49,23 +62,20 @@ impl XmppSession {
         apply_ws_browser_headers(&mut request, profile, &origin)?;
 
         let (ws_stream, response) = tokio_tungstenite::connect_async(request).await?;
-        log::debug!("[XMPP] WebSocket handshake response: {:?}", response.status());
+        log::info!("[XMPP] WebSocket connected (HTTP status: {:?})", response.status());
 
         let (mut ws_sink, mut ws_stream) = ws_stream.split();
 
-        // 1. Initial framing open
-        log::debug!("[XMPP] Sending initial framing open");
-        ws_sink
-            .send(Message::text(
-                r#"<open to="meet.jitsi" version="1.0" xmlns="urn:ietf:params:xml:ns:xmpp-framing"/>"#,
-            ))
-            .await?;
+        let open_xml = r#"<open to="meet.jitsi" version="1.0" xmlns="urn:ietf:params:xml:ns:xmpp-framing"/>"#;
+        log::info!("[XMPP OUT]: {open_xml}");
+        ws_sink.send(Message::text(open_xml)).await?;
 
-        // 2. Wait for features with SASL mechanism ANONYMOUS
         let mut authed = false;
+        let mut bind_sent = false;
         let mut bound = false;
         let mut jid = String::new();
         let endpoint_id = Self::generate_endpoint_id();
+        let occupants = Arc::new(Mutex::new(HashSet::new()));
 
         let effective_client_name = match client_name_opt {
             Some(name) if !name.is_empty() && name != "ANet-Node" => name.to_string(),
@@ -73,38 +83,51 @@ impl XmppSession {
         };
 
         let timeout = Duration::from_secs(15);
+        let occ_track = occupants.clone();
+        let my_ep = endpoint_id.clone();
+        let conf_muc = format!("{conference_id}@muc.meet.jitsi/");
+
         let handshake_fut = async {
             while let Some(msg_res) = ws_stream.next().await {
                 let msg = msg_res?;
                 if let Message::Text(text) = msg {
                     let text_str = text.as_str();
-                    log::trace!("[XMPP HANDSHAKE]: {text_str}");
 
-                    if text_str.contains(r#"<open"#) {
-                        log::debug!("[XMPP] Stream opened, waiting for SASL mechanisms");
-                    } else if text_str.contains(r#"<mechanisms"#) && !authed {
-                        log::debug!("[XMPP] Requesting SASL ANONYMOUS auth");
-                        ws_sink
-                            .send(Message::text(
-                                r#"<auth mechanism="ANONYMOUS" xmlns="urn:ietf:params:xml:ns:xmpp-sasl"/>"#,
-                            ))
-                            .await?;
-                    } else if text_str.contains(r#"<success xmlns="urn:ietf:params:xml:ns:xmpp-sasl"#) {
-                        log::debug!("[XMPP] SASL auth success, resetting stream");
+                    // Трекинг участников из presence
+                    if text_str.contains("<presence") {
+                        if let Some(from) = extract_attr(text_str, "from") {
+                            if let Some(occupant) = from.strip_prefix(&conf_muc) {
+                                if occupant != my_ep && occupant != "focus" {
+                                    if text_str.contains("type=\"unavailable\"") {
+                                        occ_track.lock().unwrap().remove(occupant);
+                                    } else {
+                                        occ_track.lock().unwrap().insert(occupant.to_string());
+                                        log::info!("[XMPP] Detected occupant in room: {occupant}");
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if text_str.contains(r#"<mechanisms"#) && !authed {
+                        log::info!("[XMPP] SASL mechanisms received, sending ANONYMOUS auth");
+                        let auth_xml = r#"<auth mechanism="ANONYMOUS" xmlns="urn:ietf:params:xml:ns:xmpp-sasl"/>"#;
+                        ws_sink.send(Message::text(auth_xml)).await?;
+                    } else if text_str.contains(r#"<success"#) && text_str.contains(r#"urn:ietf:params:xml:ns:xmpp-sasl"#) {
+                        log::info!("[XMPP] SASL auth success, resetting stream");
                         authed = true;
-                        ws_sink
-                            .send(Message::text(
-                                r#"<open to="meet.jitsi" version="1.0" xmlns="urn:ietf:params:xml:ns:xmpp-framing"/>"#,
-                            ))
-                            .await?;
-                    } else if authed && text_str.contains(r#"<bind xmlns="urn:ietf:params:xml:ns:xmpp-bind"#) && !bound {
-                        log::debug!("[XMPP] Binding resource");
-                        ws_sink
-                            .send(Message::text(
-                                r#"<iq type="set" id="_bind_auth_2"><bind xmlns="urn:ietf:params:xml:ns:xmpp-bind"/></iq>"#,
-                            ))
-                            .await?;
-                    } else if authed && text_str.contains(r#"id="_bind_auth_2""#) && text_str.contains(r#"<jid>"#) {
+                        let open_reset = r#"<open to="meet.jitsi" version="1.0" xmlns="urn:ietf:params:xml:ns:xmpp-framing"/>"#;
+                        ws_sink.send(Message::text(open_reset)).await?;
+                    }
+
+                    if authed && text_str.contains("<features") && text_str.contains(r#"<bind xmlns="urn:ietf:params:xml:ns:xmpp-bind"#) && !bind_sent {
+                        bind_sent = true;
+                        log::info!("[XMPP] Binding resource...");
+                        let bind_xml = r#"<iq type="set" id="_bind_auth_2"><bind xmlns="urn:ietf:params:xml:ns:xmpp-bind"/></iq>"#;
+                        ws_sink.send(Message::text(bind_xml)).await?;
+                    }
+
+                    if authed && text_str.contains(r#"id="_bind_auth_2""#) && text_str.contains(r#"<jid>"#) && !bound {
                         bound = true;
                         if let Some(start) = text_str.find("<jid>") {
                             if let Some(end) = text_str.find("</jid>") {
@@ -113,7 +136,6 @@ impl XmppSession {
                             }
                         }
 
-                        // 3. Send MUC presence to enter the conference room
                         log::info!(
                             "[XMPP] Entering MUC room {conference_id} with occupant {endpoint_id} (name: {effective_client_name})..."
                         );
@@ -121,11 +143,17 @@ impl XmppSession {
                             r#"<presence to="{conference_id}@muc.meet.jitsi/{endpoint_id}"><x xmlns="http://jabber.org/protocol/muc"/><nick xmlns="http://jabber.org/protocol/nick">{effective_client_name}</nick></presence>"#
                         );
                         ws_sink.send(Message::text(presence)).await?;
-                    } else if text_str.contains(r#"<presence"#) && text_str.contains(r#"status code="110""#) {
+                    }
+
+                    if text_str.contains(r#"<presence"#) && (text_str.contains(r#"code="110""#) || text_str.contains(r#"code='110'"#)) {
                         log::info!(
-                            "[XMPP] Joined MUC room {conference_id} as occupant {endpoint_id}"
+                            "[XMPP] Successfully joined MUC room {conference_id} as occupant {endpoint_id}"
                         );
                         break;
+                    }
+
+                    if text_str.contains(r#"<failure xmlns="urn:ietf:params:xml:ns:xmpp-sasl"#) {
+                        anyhow::bail!("XMPP SASL authentication failed: {text_str}");
                     }
                 }
             }
@@ -141,7 +169,6 @@ impl XmppSession {
 
         let ping_secs = if ping_interval_secs > 0 { ping_interval_secs } else { 30 };
 
-        // Background write loop with dual ping (whitespace + WS ping)
         tokio::spawn(async move {
             let mut ping_interval = tokio::time::interval(Duration::from_secs(ping_secs));
             loop {
@@ -158,14 +185,10 @@ impl XmppSession {
                         }
                     }
                     _ = ping_interval.tick() => {
-                        // 1. WebSocket protocol ping
-                        if let Err(e) = ws_sink.send(Message::Ping(bytes::Bytes::from_static(&[0x01, 0x02]))).await {
-                            log::debug!("[XMPP] WS ping send error: {e}");
+                        if ws_sink.send(Message::Ping(bytes::Bytes::from_static(&[0x01, 0x02]))).await.is_err() {
                             break;
                         }
-                        // 2. XMPP whitespace ping
-                        if let Err(e) = ws_sink.send(Message::text(" ")).await {
-                            log::debug!("[XMPP] XMPP whitespace ping send error: {e}");
+                        if ws_sink.send(Message::text(" ")).await.is_err() {
                             break;
                         }
                     }
@@ -173,25 +196,51 @@ impl XmppSession {
             }
         });
 
-        // Background read loop
+        let write_tx_ack = write_tx.clone();
+        let occ_track_bg = occupants.clone();
         tokio::spawn(async move {
             while let Some(msg_res) = ws_stream.next().await {
                 match msg_res {
                     Ok(Message::Text(text)) => {
-                        log::trace!("[XMPP INCOMING]: {text}");
+                        let text_str = text.as_str();
+
+                        // Трекинг участников в фоне
+                        if text_str.contains("<presence") {
+                            if let Some(from) = extract_attr(text_str, "from") {
+                                if let Some(occupant) = from.strip_prefix(&conf_muc) {
+                                    if occupant != my_ep && occupant != "focus" {
+                                        if text_str.contains("type=\"unavailable\"") {
+                                            occ_track_bg.lock().unwrap().remove(occupant);
+                                        } else {
+                                            occ_track_bg.lock().unwrap().insert(occupant.to_string());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        if text_str.contains("disco#info") && text_str.contains("type=\"get\"") {
+                            if let (Some(iq_id), Some(from_jid)) = (extract_attr(text_str, "id"), extract_attr(text_str, "from")) {
+                                let disco_reply = format!(
+                                    r#"<iq type="result" to="{from_jid}" id="{iq_id}"><query xmlns="http://jabber.org/protocol/disco#info"><identity category="client" type="bot" name="jitsi-meet"/><feature var="urn:xmpp:jingle:1"/><feature var="urn:xmpp:jingle:apps:rtp:1"/><feature var="urn:xmpp:jingle:apps:rtp:audio"/><feature var="urn:xmpp:jingle:apps:rtp:video"/><feature var="urn:xmpp:jingle:apps:dtls:0"/><feature var="urn:xmpp:jingle:transports:ice-udp:1"/><feature var="http://jitsi.org/protocols/colibri"/></query></iq>"#
+                                );
+                                let _ = write_tx_ack.send(disco_reply).await;
+                            }
+                        }
+
+                        if text_str.contains("urn:xmpp:jingle:1") && text_str.contains("type=\"set\"") {
+                            if let (Some(iq_id), Some(from_jid)) = (extract_attr(text_str, "id"), extract_attr(text_str, "from")) {
+                                let ack = format!(r#"<iq type="result" to="{from_jid}" id="{iq_id}"/>"#);
+                                let _ = write_tx_ack.send(ack).await;
+                            }
+                        }
+
                         if read_tx.send(text.to_string()).await.is_err() {
                             break;
                         }
                     }
-                    Ok(Message::Ping(p)) => {
-                        log::trace!("[XMPP] Received Ping ({} bytes)", p.len());
-                    }
-                    Ok(Message::Close(c)) => {
-                        log::info!("[XMPP] Signaling WebSocket closed: {c:?}");
-                        break;
-                    }
-                    Err(e) => {
-                        log::warn!("[XMPP] WebSocket read error: {e}");
+                    Ok(Message::Ping(_)) => {}
+                    Ok(Message::Close(_)) | Err(_) => {
                         break;
                     }
                     _ => {}
@@ -204,30 +253,29 @@ impl XmppSession {
             conference_id: conference_id.to_string(),
             jid,
             client_name: effective_client_name,
+            occupants,
             write_tx,
             read_rx,
         })
     }
 
-    /// Request Jicofo bridge conference allocation IQ.
     pub async fn request_conference_allocation(&self) -> anyhow::Result<()> {
-        let iq = format!(
-            r#"<iq type="set" to="focus@auth.meet.jitsi" id="conf_req_1"><conference xmlns="http://jitsi.org/protocol/focus" room="{}@muc.meet.jitsi"/></iq>"#,
-            self.conference_id
-        );
-        self.send_stanza(iq).await
+        Ok(())
     }
 
-    /// Send an XMPP stanza.
     pub async fn send_stanza(&self, stanza: String) -> anyhow::Result<()> {
+        log::info!("[XMPP OUT]: {stanza}");
         self.write_tx
             .send(stanza)
             .await
             .map_err(|_| anyhow::anyhow!("XMPP write channel closed"))
     }
 
-    /// Receive the next XMPP stanza.
     pub async fn recv_stanza(&mut self) -> Option<String> {
-        self.read_rx.recv().await
+        let s = self.read_rx.recv().await;
+        if let Some(ref text) = s {
+            log::info!("[XMPP IN]: {text}");
+        }
+        s
     }
 }
