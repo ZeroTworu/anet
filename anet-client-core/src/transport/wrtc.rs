@@ -121,7 +121,7 @@ impl ClientTransport for WrtcTransport {
         let _ = xmpp.request_conference_allocation().await;
 
         let mut parsed_session = None;
-        let jingle_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let jingle_deadline = tokio::time::Instant::now() + Duration::from_secs(8);
 
         while tokio::time::Instant::now() < jingle_deadline {
             if let Ok(Some(stanza)) =

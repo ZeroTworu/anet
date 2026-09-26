@@ -121,8 +121,10 @@ pub async fn run_wrtc_server(
         let fallback_ip = &config.server.wrtc_fallback_jvb_ip;
         let fallback_port = config.server.wrtc_fallback_jvb_port;
 
+        let _ = xmpp.request_conference_allocation().await;
+
         let mut parsed_session = None;
-        let jingle_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let jingle_deadline = tokio::time::Instant::now() + Duration::from_secs(8);
 
         while tokio::time::Instant::now() < jingle_deadline {
             if let Ok(Some(stanza)) =
