@@ -183,6 +183,7 @@ impl ClientTransport for VncTransport {
             connection: None,
             health_pause: None,
             remote_ip: Some(addr.ip()), // Передаем IP в bypass
+            bypass_ips: Vec::new(),
         })
     }
 }

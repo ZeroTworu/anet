@@ -213,6 +213,7 @@ pub async fn run_wrtc_server(
                                             match tun_clone.try_send(packet) {
                                                 Ok(_) => {
                                                     reg_clone.record_rx(&client_info, packet_len, "wrtc");
+                                                    log::debug!("[WRTC Server] Injected {} bytes into TUN for {}", packet_len, client_info.assigned_ip);
                                                 }
                                                 Err(e) => {
                                                     warn!("[WRTC Server] TUN queue error for {}: {e}", client_info.assigned_ip);
@@ -220,7 +221,7 @@ pub async fn run_wrtc_server(
                                             }
                                         }
                                         Err(e) => {
-                                            debug!("[WRTC Server] Decrypt packet failed for {from_endpoint}: {e}");
+                                            warn!("[WRTC Server] Decrypt packet failed for {from_endpoint}: {e}");
                                             client_found = false;
                                         }
                                     }
