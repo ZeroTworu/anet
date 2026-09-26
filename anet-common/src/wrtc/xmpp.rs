@@ -21,10 +21,19 @@ pub struct XmppSession {
 }
 
 fn extract_attr(text: &str, attr_name: &str) -> Option<String> {
-    let pattern = format!("{attr_name}=\"");
-    let start = text.find(&pattern)? + pattern.len();
-    let end = text[start..].find('"')? + start;
-    Some(text[start..end].to_string())
+    let pattern_double = format!("{attr_name}=\"");
+    if let Some(pos) = text.find(&pattern_double) {
+        let start = pos + pattern_double.len();
+        let end = text[start..].find('"')? + start;
+        return Some(text[start..end].to_string());
+    }
+    let pattern_single = format!("{attr_name}='");
+    if let Some(pos) = text.find(&pattern_single) {
+        let start = pos + pattern_single.len();
+        let end = text[start..].find('\'')? + start;
+        return Some(text[start..end].to_string());
+    }
+    None
 }
 
 impl XmppSession {
@@ -140,7 +149,7 @@ impl XmppSession {
                             "[XMPP] Entering MUC room {conference_id} with occupant {endpoint_id} (name: {effective_client_name})..."
                         );
                         let presence = format!(
-                            r#"<presence to="{conference_id}@muc.meet.jitsi/{endpoint_id}"><x xmlns="http://jabber.org/protocol/muc"/><nick xmlns="http://jabber.org/protocol/nick">{effective_client_name}</nick></presence>"#
+                            r#"<presence to="{conference_id}@muc.meet.jitsi/{endpoint_id}"><x xmlns="http://jabber.org/protocol/muc"/><nick xmlns="http://jabber.org/protocol/nick">{effective_client_name}</nick><c xmlns="http://jabber.org/protocol/caps" hash="sha-1" node="https://jitsi.org/jitsi-meet" ver="7Y4Yx3m5c03c5188efb8b2ebda41e8c072e912da"/><jitsi_participant_id>{endpoint_id}</jitsi_participant_id></presence>"#
                         );
                         ws_sink.send(Message::text(presence)).await?;
                     }
@@ -219,16 +228,16 @@ impl XmppSession {
                             }
                         }
 
-                        if text_str.contains("disco#info") && text_str.contains("type=\"get\"") {
+                        if text_str.contains("disco#info") && (text_str.contains("type=\"get\"") || text_str.contains("type='get'")) {
                             if let (Some(iq_id), Some(from_jid)) = (extract_attr(text_str, "id"), extract_attr(text_str, "from")) {
                                 let disco_reply = format!(
-                                    r#"<iq type="result" to="{from_jid}" id="{iq_id}"><query xmlns="http://jabber.org/protocol/disco#info"><identity category="client" type="bot" name="jitsi-meet"/><feature var="urn:xmpp:jingle:1"/><feature var="urn:xmpp:jingle:apps:rtp:1"/><feature var="urn:xmpp:jingle:apps:rtp:audio"/><feature var="urn:xmpp:jingle:apps:rtp:video"/><feature var="urn:xmpp:jingle:apps:dtls:0"/><feature var="urn:xmpp:jingle:transports:ice-udp:1"/><feature var="http://jitsi.org/protocols/colibri"/></query></iq>"#
+                                    r#"<iq type="result" to="{from_jid}" id="{iq_id}"><query xmlns="http://jabber.org/protocol/disco#info"><identity category="client" type="web" name="jitsi-meet"/><feature var="urn:xmpp:jingle:1"/><feature var="urn:xmpp:jingle:apps:rtp:1"/><feature var="urn:xmpp:jingle:apps:rtp:audio"/><feature var="urn:xmpp:jingle:apps:rtp:video"/><feature var="urn:xmpp:jingle:apps:dtls:0"/><feature var="urn:xmpp:jingle:transports:ice-udp:1"/><feature var="http://jitsi.org/protocols/colibri"/><feature var="urn:ietf:rfc:5761"/><feature var="urn:ietf:rfc:5888"/><feature var="http://jabber.org/protocol/caps"/></query></iq>"#
                                 );
                                 let _ = write_tx_ack.send(disco_reply).await;
                             }
                         }
 
-                        if text_str.contains("urn:xmpp:jingle:1") && text_str.contains("type=\"set\"") {
+                        if text_str.contains("urn:xmpp:jingle:1") && (text_str.contains("type=\"set\"") || text_str.contains("type='set'")) {
                             if let (Some(iq_id), Some(from_jid)) = (extract_attr(text_str, "id"), extract_attr(text_str, "from")) {
                                 let ack = format!(r#"<iq type="result" to="{from_jid}" id="{iq_id}"/>"#);
                                 let _ = write_tx_ack.send(ack).await;
@@ -260,7 +269,17 @@ impl XmppSession {
     }
 
     pub async fn request_conference_allocation(&self) -> anyhow::Result<()> {
-        Ok(())
+        let conf_room = format!("{}@muc.meet.jitsi", self.conference_id);
+        let iq_id = format!("conf_alloc_{}", self.endpoint_id);
+        let stanza = format!(
+            r#"<iq to="focus.meet.jitsi" type="set" id="{iq_id}"><conference xmlns="http://jitsi.org/protocol/focus" room="{conf_room}" machine-uid="{}"/></iq>"#,
+            self.endpoint_id
+        );
+        log::info!(
+            "[XMPP] Requesting conference focus allocation for {conf_room} (machine-uid: {})...",
+            self.endpoint_id
+        );
+        self.send_stanza(stanza).await
     }
 
     pub async fn send_stanza(&self, stanza: String) -> anyhow::Result<()> {
