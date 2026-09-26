@@ -404,6 +404,13 @@ impl AnetClient {
                 .await?;
         }
 
+        for bypass_ip in result.bypass_ips {
+            let prefix = if bypass_ip.is_ipv4() { 32 } else { 128 };
+            self.route_manager
+                .add_bypass_route(bypass_ip, prefix)
+                .await?;
+        }
+
         let (tx_to_tun, mut rx_from_tun, iface_name, _app_filter) = self
             .acquire_packet_source(server, &result.auth_response)
             .await?;

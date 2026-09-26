@@ -392,6 +392,7 @@ impl ClientTransport for AHttpTransport {
             connection: None,
             health_pause: Some(health_pause),
             remote_ip: Some(resolved_addr.ip()),
+            bypass_ips: Vec::new(),
         })
     }
 }

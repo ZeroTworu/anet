@@ -520,6 +520,7 @@ impl ClientTransport for WebSocketTransport {
             connection: None,
             health_pause: Some(health_pause),
             remote_ip, // Передаем IP для добавления в bypass
+            bypass_ips: Vec::new(),
         })
     }
 }

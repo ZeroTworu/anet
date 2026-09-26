@@ -139,6 +139,47 @@ impl ClientTransport for WrtcTransport {
             );
         };
 
+        // Собираем IP-адреса медиа-сервера (Colibri WS host + ICE candidates + fallback),
+        // чтобы клиент гарантированно добавил их в BYPASS-маршруты и избежал петли маршрутизации!
+        let mut bypass_ips: Vec<std::net::IpAddr> = Vec::new();
+
+        if let Some(ref ws_url) = session.transport.colibri_ws_url {
+            if let Ok(uri) = ws_url.parse::<http::Uri>() {
+                if let Some(host) = uri.host() {
+                    let port = uri.port_u16().unwrap_or(443);
+                    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+                        if !ip.is_loopback() {
+                            bypass_ips.push(ip);
+                        }
+                    } else if let Ok(resolved) = tokio::net::lookup_host((host, port)).await {
+                        for addr in resolved {
+                            if !addr.ip().is_loopback() {
+                                bypass_ips.push(addr.ip());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        for candidate in &session.transport.candidates {
+            if let Ok(ip) = candidate.ip.parse::<std::net::IpAddr>() {
+                if !ip.is_loopback() {
+                    bypass_ips.push(ip);
+                }
+            }
+        }
+
+        if let Ok(ip) = fallback_ip.parse::<std::net::IpAddr>() {
+            if !ip.is_loopback() {
+                bypass_ips.push(ip);
+            }
+        }
+
+        bypass_ips.sort_unstable();
+        bypass_ips.dedup();
+        info!("[WRTC] Discovered media bypass IPs: {:?}", bypass_ips);
+
         // 5. Создание соединения (Colibri-WS или WebRTC PeerConnection)
         let audio_keepalive_ms = self.server.wrtc_media_keepalive_interval_ms.unwrap_or(20);
         let mut peer = WrtcPeer::create(
@@ -313,7 +354,7 @@ impl ClientTransport for WrtcTransport {
                                             }
                                         }
                                         Err(e) => {
-                                            debug!("[WRTC Client] Decrypt packet error: {e}");
+                                            warn!("[WRTC Client] Decrypt packet error: {e}");
                                         }
                                     }
                                 }
@@ -328,13 +369,15 @@ impl ClientTransport for WrtcTransport {
             }
         });
 
+        let remote_ip = bypass_ips.first().copied();
         Ok(ConnectionResult {
             auth_response,
             vpn_stream: Box::new(client_stream),
             endpoint: None,
             connection: None,
             health_pause: None,
-            remote_ip: None,
+            remote_ip,
+            bypass_ips,
         })
     }
 }
