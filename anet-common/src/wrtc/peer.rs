@@ -2,7 +2,7 @@ use crate::wrtc::colibri::ColibriMessage;
 use crate::wrtc::jingle::{JingleCandidate, JingleSession, JingleTransportInfo};
 use futures::{SinkExt, StreamExt};
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use webrtc::data_channel::{DataChannel, DataChannelEvent, RTCDataChannelInit};
@@ -26,7 +26,7 @@ pub struct WrtcPeer {
     pub peer_connection: Option<Arc<dyn PeerConnection>>,
     pub data_channel: Option<Arc<dyn DataChannel>>,
     pub outgoing_tx: mpsc::Sender<ColibriMessage>,
-    pub incoming_rx: mpsc::Receiver<ColibriMessage>,
+    pub incoming_rx: Mutex<mpsc::Receiver<ColibriMessage>>,
 }
 
 impl WrtcPeer {
@@ -63,17 +63,44 @@ impl WrtcPeer {
                         );
                         let (mut ws_sink, mut ws_stream) = ws_stream.split();
 
-                        // Воркер отправки сообщений в JVB WebSocket
+                        // Воркер отправки сообщений в JVB WebSocket + keepalive ping
                         tokio::spawn(async move {
-                            while let Some(msg) = outgoing_rx.recv().await {
-                                if let Ok(json_str) = serde_json::to_string(&msg) {
-                                    log::info!("[JVB WS OUT]: {json_str}");
-                                    if let Err(e) = ws_sink
-                                        .send(tokio_tungstenite::tungstenite::Message::text(json_str))
-                                        .await
-                                    {
-                                        log::warn!("[WRTC] JVB WS send error: {e}");
-                                        break;
+                            let mut ping_interval =
+                                tokio::time::interval(std::time::Duration::from_secs(10));
+                            loop {
+                                tokio::select! {
+                                    msg_opt = outgoing_rx.recv() => {
+                                        match msg_opt {
+                                            Some(msg) => {
+                                                if let Ok(json_str) = serde_json::to_string(&msg) {
+                                                    match msg.msg_payload {
+                                                        crate::wrtc::colibri::WrtcMessage::Astp { .. } => {
+                                                            log::trace!("[JVB WS OUT ASTP]");
+                                                        }
+                                                        _ => {
+                                                            log::info!("[JVB WS OUT]: {json_str}");
+                                                        }
+                                                    }
+                                                    if let Err(e) = ws_sink
+                                                        .send(tokio_tungstenite::tungstenite::Message::text(json_str))
+                                                        .await
+                                                    {
+                                                        log::warn!("[WRTC] JVB WS send error: {e}");
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                            None => break,
+                                        }
+                                    }
+                                    _ = ping_interval.tick() => {
+                                        if ws_sink
+                                            .send(tokio_tungstenite::tungstenite::Message::Ping(bytes::Bytes::from_static(&[0x09])))
+                                            .await
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
                                     }
                                 }
                             }
@@ -85,12 +112,20 @@ impl WrtcPeer {
                             while let Some(msg_res) = ws_stream.next().await {
                                 match msg_res {
                                     Ok(tokio_tungstenite::tungstenite::Message::Text(text)) => {
-                                        log::info!("[JVB WS IN]: {text}");
                                         match serde_json::from_str::<ColibriMessage>(text.as_str()) {
                                             Ok(c_msg) => {
+                                                match c_msg.msg_payload {
+                                                    crate::wrtc::colibri::WrtcMessage::Astp { .. } => {
+                                                        log::trace!("[JVB WS IN ASTP]");
+                                                    }
+                                                    _ => {
+                                                        log::info!("[JVB WS IN]: {text}");
+                                                    }
+                                                }
                                                 let _ = in_tx.send(c_msg).await;
                                             }
                                             Err(e) => {
+                                                log::info!("[JVB WS IN non-colibri]: {text}");
                                                 log::debug!("[WRTC] Non-ColibriMessage payload: {e}");
                                             }
                                         }
@@ -113,7 +148,7 @@ impl WrtcPeer {
                             peer_connection: None,
                             data_channel: None,
                             outgoing_tx,
-                            incoming_rx,
+                            incoming_rx: Mutex::new(incoming_rx),
                         });
                     }
                     Err(e) => {
@@ -239,7 +274,7 @@ impl WrtcPeer {
             peer_connection: Some(peer_connection),
             data_channel: Some(data_channel),
             outgoing_tx,
-            incoming_rx,
+            incoming_rx: Mutex::new(incoming_rx),
         })
     }
 
@@ -250,7 +285,8 @@ impl WrtcPeer {
             .map_err(|_| anyhow::anyhow!("DataChannel write channel closed"))
     }
 
-    pub async fn recv(&mut self) -> Option<ColibriMessage> {
-        self.incoming_rx.recv().await
+    pub async fn recv(&self) -> Option<ColibriMessage> {
+        let mut rx = self.incoming_rx.lock().await;
+        rx.recv().await
     }
 }

@@ -38,7 +38,7 @@ impl WrtcTransport {
 }
 
 struct WrtcAuthChannel {
-    peer: Arc<Mutex<WrtcPeer>>,
+    peer: Arc<WrtcPeer>,
     target_server_id: String,
 }
 
@@ -47,15 +47,13 @@ impl AuthChannel for WrtcAuthChannel {
     async fn send(&self, data: Bytes, _frag: &FragmentConfig) -> Result<()> {
         let b64 = BASE64_STANDARD.encode(&data);
         let msg = ColibriMessage::astp(self.target_server_id.clone(), b64);
-        let peer = self.peer.lock().await;
-        peer.send(msg).await?;
+        self.peer.send(msg).await?;
         Ok(())
     }
 
     async fn recv(&self, timeout: Duration) -> Result<Bytes> {
         let receive = async {
-            let mut peer = self.peer.lock().await;
-            while let Some(msg) = peer.recv().await {
+            while let Some(msg) = self.peer.recv().await {
                 if let WrtcMessage::Astp { data } = msg.msg_payload {
                     if let Ok(bytes) = BASE64_STANDARD.decode(&data) {
                         return Ok(Bytes::from(bytes));
@@ -229,7 +227,7 @@ impl ClientTransport for WrtcTransport {
         info!("[WRTC] Starting ASTP authentication with server: {target_server_id}");
 
         // 7. ASTP аутентификация
-        let shared_peer = Arc::new(Mutex::new(peer));
+        let shared_peer = Arc::new(peer);
         let auth_channel = WrtcAuthChannel {
             peer: shared_peer.clone(),
             target_server_id: target_server_id.clone(),
@@ -279,8 +277,7 @@ impl ClientTransport for WrtcTransport {
                 {
                     let b64 = BASE64_STANDARD.encode(&encrypted);
                     let msg = ColibriMessage::astp(target_srv_tx.clone(), b64);
-                    let p = peer_tx.lock().await;
-                    if p.send(msg).await.is_err() {
+                    if peer_tx.send(msg).await.is_err() {
                         break;
                     }
                 }
@@ -294,10 +291,7 @@ impl ClientTransport for WrtcTransport {
 
         tokio::spawn(async move {
             loop {
-                let msg_opt = {
-                    let mut p = peer_rx.lock().await;
-                    p.recv().await
-                };
+                let msg_opt = peer_rx.recv().await;
                 match msg_opt {
                     Some(msg) => {
                         if let WrtcMessage::Astp { data } = msg.msg_payload {
