@@ -159,11 +159,10 @@ pub async fn run_wrtc_server(
 
         info!("[WRTC Server] WebRTC connection active. Waiting for clients...");
 
-        let shared_peer = Arc::new(Mutex::new(peer));
+        let shared_peer = Arc::new(peer);
         let active_clients: Arc<DashMap<String, Arc<ClientTransportInfo>>> =
             Arc::new(DashMap::new());
 
-        let p_clone = shared_peer.clone();
         let reg_clone = registry.clone();
         let auth_clone = auth_handler.clone();
         let tun_clone = tun_tx.clone();
@@ -172,10 +171,7 @@ pub async fn run_wrtc_server(
         let padding_step = config.stealth.padding_step;
 
         loop {
-            let msg_opt = {
-                let mut p = p_clone.lock().await;
-                p.recv().await
-            };
+            let msg_opt = shared_peer.recv().await;
 
             let Some(msg) = msg_opt else {
                 warn!("[WRTC Server] Connection closed (room expired or connection reset).");
@@ -199,8 +195,7 @@ pub async fn run_wrtc_server(
                         client_nonce,
                         signature,
                     );
-                    let p = p_clone.lock().await;
-                    let _ = p.send(beacon_msg).await;
+                    let _ = shared_peer.send(beacon_msg).await;
                 }
                 WrtcMessage::Astp { data } => {
                     if let Ok(raw_bytes) = BASE64_STANDARD.decode(&data) {
@@ -225,8 +220,7 @@ pub async fn run_wrtc_server(
                                         let b64 = BASE64_STANDARD.encode(&resp_bytes);
                                         let resp_msg =
                                             ColibriMessage::astp(from_endpoint.clone(), b64);
-                                        let p = p_clone.lock().await;
-                                        let _ = p.send(resp_msg).await;
+                                        let _ = shared_peer.send(resp_msg).await;
                                     }
 
                                     if let Some((client_info, _)) = result {
@@ -236,14 +230,14 @@ pub async fn run_wrtc_server(
                                         );
 
                                         let (tx_router, mut rx_router) =
-                                            mpsc::channel::<Bytes>(CHANNEL_BUFFER_SIZE);
+                                             mpsc::channel::<Bytes>(CHANNEL_BUFFER_SIZE);
                                         reg_clone.finalize_client(&assigned_ip, tx_router);
                                         clients_map
                                             .insert(from_endpoint.clone(), client_info.clone());
 
                                         let target_client_id = from_endpoint.clone();
                                         let c_info = client_info.clone();
-                                        let peer_downlink = p_clone.clone();
+                                        let peer_downlink = shared_peer.clone();
 
                                         tokio::spawn(async move {
                                             while let Some(packet) = rx_router.recv().await {
@@ -265,8 +259,7 @@ pub async fn run_wrtc_server(
                                                         target_client_id.clone(),
                                                         b64,
                                                     );
-                                                    let p = peer_downlink.lock().await;
-                                                    if p.send(msg).await.is_err() {
+                                                    if peer_downlink.send(msg).await.is_err() {
                                                         break;
                                                     }
                                                 }
