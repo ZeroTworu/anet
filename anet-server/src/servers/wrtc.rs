@@ -3,7 +3,7 @@ use crate::client_registry::{ClientRegistry, ClientTransportInfo};
 use crate::config::Config;
 use anet_common::consts::CHANNEL_BUFFER_SIZE;
 use anet_common::http_help::BrowserProfile;
-use anet_common::transport::{unwrap_packet_bytes_in_place, wrap_packet_padded};
+use anet_common::transport::{unwrap_packet_bytes, wrap_packet_padded};
 use anet_common::wrtc::{
     colibri::{sign_beacon, ColibriMessage, WrtcMessage},
     jingle::parse_jingle_session,
@@ -198,79 +198,104 @@ pub async fn run_wrtc_server(
                     let _ = shared_peer.send(beacon_msg).await;
                 }
                 WrtcMessage::Astp { data } => {
-                    if let Ok(raw_bytes) = BASE64_STANDARD.decode(&data) {
-                        if let Some(client_info) = clients_map.get(&from_endpoint) {
-                            if let Ok(packet) = unwrap_packet_bytes_in_place(
-                                &client_info.cipher,
-                                Bytes::from(raw_bytes),
-                            ) {
-                                let packet_len = packet.len();
-                                if let Ok(_) = tun_clone.try_send(packet) {
-                                    reg_clone.record_rx(&client_info, packet_len, "wrtc");
-                                }
-                            }
-                        } else {
-                            let client_addr = endpoint_to_socket_addr(&from_endpoint);
-                            match auth_clone
-                                .process_handshake_packet(Bytes::from(raw_bytes), client_addr, "wrtc")
-                                .await
-                            {
-                                Ok((response, result)) => {
-                                    if let Some(resp_bytes) = response {
-                                        let b64 = BASE64_STANDARD.encode(&resp_bytes);
-                                        let resp_msg =
-                                            ColibriMessage::astp(from_endpoint.clone(), b64);
-                                        let _ = shared_peer.send(resp_msg).await;
-                                    }
-
-                                    if let Some((client_info, _)) = result {
-                                        let assigned_ip = client_info.assigned_ip.clone();
-                                        info!(
-                                            "[WRTC Server] Client {from_endpoint} authenticated! Assigned IP: {assigned_ip}"
-                                        );
-
-                                        let (tx_router, mut rx_router) =
-                                             mpsc::channel::<Bytes>(CHANNEL_BUFFER_SIZE);
-                                        reg_clone.finalize_client(&assigned_ip, tx_router);
-                                        clients_map
-                                            .insert(from_endpoint.clone(), client_info.clone());
-
-                                        let target_client_id = from_endpoint.clone();
-                                        let c_info = client_info.clone();
-                                        let peer_downlink = shared_peer.clone();
-
-                                        tokio::spawn(async move {
-                                            while let Some(packet) = rx_router.recv().await {
-                                                if packet.len() < 20 {
-                                                    continue;
+                    match BASE64_STANDARD.decode(&data) {
+                        Ok(raw_bytes) => {
+                            let mut client_found = false;
+                            if let Some(client_info) = clients_map.get(&from_endpoint) {
+                                if reg_clone.get_by_session(&client_info.session_id).is_some() {
+                                    client_found = true;
+                                    match unwrap_packet_bytes(
+                                        &client_info.cipher,
+                                        Bytes::from(raw_bytes.clone()),
+                                    ) {
+                                        Ok(packet) => {
+                                            let packet_len = packet.len();
+                                            match tun_clone.try_send(packet) {
+                                                Ok(_) => {
+                                                    reg_clone.record_rx(&client_info, packet_len, "wrtc");
                                                 }
-                                                let seq = c_info
-                                                    .sequence
-                                                    .fetch_add(1, Ordering::Relaxed);
-                                                if let Ok(encrypted) = wrap_packet_padded(
-                                                    &c_info.cipher,
-                                                    &c_info.nonce_prefix,
-                                                    seq,
-                                                    packet,
-                                                    padding_step,
-                                                ) {
-                                                    let b64 = BASE64_STANDARD.encode(&encrypted);
-                                                    let msg = ColibriMessage::astp(
-                                                        target_client_id.clone(),
-                                                        b64,
-                                                    );
-                                                    if peer_downlink.send(msg).await.is_err() {
-                                                        break;
-                                                    }
+                                                Err(e) => {
+                                                    warn!("[WRTC Server] TUN queue error for {}: {e}", client_info.assigned_ip);
                                                 }
                                             }
-                                        });
+                                        }
+                                        Err(e) => {
+                                            debug!("[WRTC Server] Decrypt packet failed for {from_endpoint}: {e}");
+                                            client_found = false;
+                                        }
                                     }
-                                }
-                                Err(e) => {
-                                    warn!("[WRTC Server] Handshake packet processing error: {e}");
+                                } else {
+                                    drop(client_info);
+                                    clients_map.remove(&from_endpoint);
                                 }
                             }
+
+                            if !client_found {
+                                let client_addr = endpoint_to_socket_addr(&from_endpoint);
+                                match auth_clone
+                                    .process_handshake_packet(Bytes::from(raw_bytes), client_addr, "wrtc")
+                                    .await
+                                {
+                                    Ok((response, result)) => {
+                                        if let Some(resp_bytes) = response {
+                                            let b64 = BASE64_STANDARD.encode(&resp_bytes);
+                                            let resp_msg =
+                                                ColibriMessage::astp(from_endpoint.clone(), b64);
+                                            let _ = shared_peer.send(resp_msg).await;
+                                        }
+
+                                        if let Some((client_info, _)) = result {
+                                            let assigned_ip = client_info.assigned_ip.clone();
+                                            info!(
+                                                "[WRTC Server] Client {from_endpoint} authenticated! Assigned IP: {assigned_ip}"
+                                            );
+
+                                            let (tx_router, mut rx_router) =
+                                                mpsc::channel::<Bytes>(CHANNEL_BUFFER_SIZE);
+                                            reg_clone.finalize_client(&assigned_ip, tx_router);
+                                            clients_map
+                                                .insert(from_endpoint.clone(), client_info.clone());
+
+                                            let target_client_id = from_endpoint.clone();
+                                            let c_info = client_info.clone();
+                                            let peer_downlink = shared_peer.clone();
+
+                                            tokio::spawn(async move {
+                                                while let Some(packet) = rx_router.recv().await {
+                                                    if packet.len() < 20 {
+                                                        continue;
+                                                    }
+                                                    let seq = c_info
+                                                        .sequence
+                                                        .fetch_add(1, Ordering::Relaxed);
+                                                    if let Ok(encrypted) = wrap_packet_padded(
+                                                        &c_info.cipher,
+                                                        &c_info.nonce_prefix,
+                                                        seq,
+                                                        packet,
+                                                        padding_step,
+                                                    ) {
+                                                        let b64 = BASE64_STANDARD.encode(&encrypted);
+                                                        let msg = ColibriMessage::astp(
+                                                            target_client_id.clone(),
+                                                            b64,
+                                                        );
+                                                        if peer_downlink.send(msg).await.is_err() {
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                            });
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!("[WRTC Server] Handshake packet processing error: {e}");
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!("[WRTC Server] Base64 decode error from {from_endpoint}: {e}");
                         }
                     }
                 }
