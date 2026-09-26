@@ -141,9 +141,10 @@ pub fn unwrap_packet_in_place<'a>(cipher: &Cipher, buffer: &'a mut [u8]) -> Resu
 /// plaintext. `Bytes` produced directly from a freshly read `Vec` is normally unique;
 /// a shared buffer is rejected rather than silently copied.
 pub fn unwrap_packet_bytes_in_place(cipher: &Cipher, raw_packet: Bytes) -> Result<Bytes> {
-    let mut buffer = raw_packet
-        .try_into_mut()
-        .map_err(|_| anyhow!("Encrypted packet buffer is unexpectedly shared"))?;
+    let mut buffer = match raw_packet.try_into_mut() {
+        Ok(buffer) => buffer,
+        Err(shared) => return unwrap_packet(cipher, &shared),
+    };
 
     let payload = unwrap_packet_in_place(cipher, &mut buffer)?;
     let payload_len = payload.len();

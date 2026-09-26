@@ -75,7 +75,7 @@ impl WrtcPeer {
                                                 if let Ok(json_str) = serde_json::to_string(&msg) {
                                                     match msg.msg_payload {
                                                         crate::wrtc::colibri::WrtcMessage::Astp { .. } => {
-                                                            log::trace!("[JVB WS OUT ASTP]");
+                                                            log::debug!("[JVB WS OUT ASTP]");
                                                         }
                                                         _ => {
                                                             log::info!("[JVB WS OUT]: {json_str}");
@@ -116,7 +116,7 @@ impl WrtcPeer {
                                             Ok(c_msg) => {
                                                 match c_msg.msg_payload {
                                                     crate::wrtc::colibri::WrtcMessage::Astp { .. } => {
-                                                        log::trace!("[JVB WS IN ASTP]");
+                                                        log::debug!("[JVB WS IN ASTP]");
                                                     }
                                                     _ => {
                                                         log::info!("[JVB WS IN]: {text}");

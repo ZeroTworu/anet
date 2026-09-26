@@ -272,13 +272,17 @@ impl ClientTransport for WrtcTransport {
                     continue;
                 }
                 let seq = sequence_tx.fetch_add(1, Ordering::Relaxed);
-                if let Ok(encrypted) =
-                    wrap_packet_padded(&cipher_tx, &nonce_prefix, seq, packet, padding_step)
-                {
-                    let b64 = BASE64_STANDARD.encode(&encrypted);
-                    let msg = ColibriMessage::astp(target_srv_tx.clone(), b64);
-                    if peer_tx.send(msg).await.is_err() {
-                        break;
+                match wrap_packet_padded(&cipher_tx, &nonce_prefix, seq, packet, padding_step) {
+                    Ok(encrypted) => {
+                        let b64 = BASE64_STANDARD.encode(&encrypted);
+                        let msg = ColibriMessage::astp(target_srv_tx.clone(), b64);
+                        if let Err(e) = peer_tx.send(msg).await {
+                            warn!("[WRTC Client] Peer send error: {e}");
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        warn!("[WRTC Client] wrap_packet_padded error: {e}");
                     }
                 }
             }
@@ -295,15 +299,26 @@ impl ClientTransport for WrtcTransport {
                 match msg_opt {
                     Some(msg) => {
                         if let WrtcMessage::Astp { data } = msg.msg_payload {
-                            if let Ok(raw_encrypted) = BASE64_STANDARD.decode(&data) {
-                                if let Ok(packet) = unwrap_packet_bytes(
-                                    &cipher_rx,
-                                    Bytes::from(raw_encrypted),
-                                ) {
-                                    let framed = frame_packet(packet);
-                                    if tunnel_write.write_all(&framed).await.is_err() {
-                                        break;
+                            match BASE64_STANDARD.decode(&data) {
+                                Ok(raw_encrypted) => {
+                                    match unwrap_packet_bytes(
+                                        &cipher_rx,
+                                        Bytes::from(raw_encrypted),
+                                    ) {
+                                        Ok(packet) => {
+                                            let framed = frame_packet(packet);
+                                            if let Err(e) = tunnel_write.write_all(&framed).await {
+                                                warn!("[WRTC Client] tunnel_write error: {e}");
+                                                break;
+                                            }
+                                        }
+                                        Err(e) => {
+                                            debug!("[WRTC Client] Decrypt packet error: {e}");
+                                        }
                                     }
+                                }
+                                Err(e) => {
+                                    warn!("[WRTC Client] Base64 decode error: {e}");
                                 }
                             }
                         }
