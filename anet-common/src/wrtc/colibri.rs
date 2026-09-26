@@ -1,5 +1,6 @@
+use anyhow::Context;
 use base64::prelude::*;
-use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,7 +40,9 @@ pub enum WrtcMessage {
     Unknown,
 }
 
-pub type ColibriPayload = WrtcMessage;
+fn default_wrtc_message() -> WrtcMessage {
+    WrtcMessage::Unknown
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ColibriMessage {
@@ -49,7 +52,7 @@ pub struct ColibriMessage {
     pub to: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub from: Option<String>,
-    #[serde(rename = "msgPayload")]
+    #[serde(rename = "msgPayload", default = "default_wrtc_message")]
     pub msg_payload: WrtcMessage,
 }
 
@@ -63,9 +66,9 @@ impl ColibriMessage {
         }
     }
 
-    pub fn discover(client_nonce: String) -> Self {
+    pub fn discover(to: Option<String>, client_nonce: String) -> Self {
         Self::new_endpoint_message(
-            None,
+            to,
             WrtcMessage::Discover { client_nonce },
         )
     }
@@ -94,7 +97,6 @@ impl ColibriMessage {
     }
 }
 
-/// Sign (client_nonce + server_id) with server Ed25519 private key.
 pub fn sign_beacon(
     signing_key_bytes: &[u8; 32],
     client_nonce: &str,
@@ -109,14 +111,14 @@ pub fn sign_beacon(
     BASE64_STANDARD.encode(signature.to_bytes())
 }
 
-/// Verify beacon signature against server public key.
 pub fn verify_beacon(
     server_pub_key_b64: &str,
     client_nonce: &str,
     server_id: &str,
     signature_b64: &str,
 ) -> anyhow::Result<bool> {
-    let pub_bytes = BASE64_STANDARD.decode(server_pub_key_b64.trim())?;
+    let pub_bytes = BASE64_STANDARD.decode(server_pub_key_b64.trim())
+        .context("Failed to base64 decode server_pub_key")?;
     let pub_array: [u8; 32] = pub_bytes
         .as_slice()
         .try_into()
@@ -125,7 +127,8 @@ pub fn verify_beacon(
     let verifying_key = VerifyingKey::from_bytes(&pub_array)
         .map_err(|e| anyhow::anyhow!("Invalid Ed25519 verifying key: {e}"))?;
 
-    let sig_bytes = BASE64_STANDARD.decode(signature_b64.trim())?;
+    let sig_bytes = BASE64_STANDARD.decode(signature_b64.trim())
+        .context("Failed to base64 decode beacon signature")?;
     let sig_array: [u8; 64] = sig_bytes
         .as_slice()
         .try_into()
@@ -137,5 +140,5 @@ pub fn verify_beacon(
     message.extend_from_slice(client_nonce.as_bytes());
     message.extend_from_slice(server_id.as_bytes());
 
-    Ok(verifying_key.verify_strict(&message, &signature).is_ok())
+    Ok(verifying_key.verify(&message, &signature).is_ok())
 }

@@ -29,9 +29,11 @@ x25519-dalek = {workspace = true}
 ed25519-dalek = {workspace = true}
 sha2 = {workspace = true}
 webrtc = { workspace = true }
+http = { workspace = true }
 poem-openapi = { version = "5.1.12", features = ["uuid"], optional = true }
 
 base64 = "0.22.1"
+async-trait = "0.1.89"
 
 
 [build-dependencies]

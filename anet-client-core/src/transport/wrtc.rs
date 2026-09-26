@@ -1,10 +1,12 @@
 use super::{ClientTransport, ConnectionResult};
 use crate::auth::{AuthChannel, AuthHandler};
 use crate::config::{CoreConfig, ServerConfig};
-use anet_common::consts::MAX_PACKET_SIZE;
+use anet_common::consts::{CHANNEL_BUFFER_SIZE, MAX_PACKET_SIZE};
 use anet_common::encryption::Cipher;
 use anet_common::handshake_fragmentation::FragmentConfig;
 use anet_common::http_help::BrowserProfile;
+use anet_common::stream_framing::{frame_packet, read_next_packet};
+use anet_common::transport::{unwrap_packet_bytes, wrap_packet_padded};
 use anet_common::wrtc::{
     colibri::{verify_beacon, ColibriMessage, WrtcMessage},
     jingle::parse_jingle_session,
@@ -16,13 +18,12 @@ use anet_common::wrtc::{
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use base64::prelude::*;
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use log::{debug, info, warn};
-use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 
 pub struct WrtcTransport {
@@ -70,103 +71,6 @@ impl AuthChannel for WrtcAuthChannel {
     }
 }
 
-pub struct WrtcStream {
-    peer: Arc<Mutex<WrtcPeer>>,
-    cipher: Arc<Cipher>,
-    target_server_id: String,
-    read_buffer: BytesMut,
-}
-
-impl WrtcStream {
-    pub fn new(peer: WrtcPeer, cipher: Cipher, target_server_id: String) -> Self {
-        Self {
-            peer: Arc::new(Mutex::new(peer)),
-            cipher: Arc::new(cipher),
-            target_server_id,
-            read_buffer: BytesMut::with_capacity(MAX_PACKET_SIZE * 2),
-        }
-    }
-}
-
-impl AsyncRead for WrtcStream {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        // Return existing buffered data first
-        if !self.read_buffer.is_empty() {
-            let to_read = std::cmp::min(buf.remaining(), self.read_buffer.len());
-            buf.put_slice(&self.read_buffer.split_to(to_read));
-            return Poll::Ready(Ok(()));
-        }
-
-        let peer = self.peer.clone();
-        let cipher = self.cipher.clone();
-
-        let mut fut = Box::pin(async move {
-            let mut p = peer.lock().await;
-            while let Some(msg) = p.recv().await {
-                if let WrtcMessage::Astp { data } = msg.msg_payload {
-                    if let Ok(encrypted_packet) = BASE64_STANDARD.decode(&data) {
-                        // Decrypt packet using session cipher
-                        if let Ok(plaintext) = cipher.decrypt(&encrypted_packet) {
-                            return Some(plaintext);
-                        }
-                    }
-                }
-            }
-            None
-        });
-
-        match fut.as_mut().poll(cx) {
-            Poll::Ready(Some(packet)) => {
-                let to_read = std::cmp::min(buf.remaining(), packet.len());
-                buf.put_slice(&packet[..to_read]);
-                if to_read < packet.len() {
-                    self.read_buffer.extend_from_slice(&packet[to_read..]);
-                }
-                Poll::Ready(Ok(()))
-            }
-            Poll::Ready(None) => Poll::Ready(Ok(())), // EOF
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
-impl AsyncWrite for WrtcStream {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-        buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        let peer = self.peer.clone();
-        let target_id = self.target_server_id.clone();
-        let encrypted = self.cipher.encrypt(buf);
-        let b64 = BASE64_STANDARD.encode(&encrypted);
-        let msg = ColibriMessage::astp(target_id, b64);
-
-        let mut fut = Box::pin(async move {
-            let p = peer.lock().await;
-            p.send(msg).await
-        });
-
-        match fut.as_mut().poll(cx) {
-            Poll::Ready(Ok(())) => Poll::Ready(Ok(buf.len())),
-            Poll::Ready(Err(e)) => Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, e))),
-            Poll::Pending => Poll::Pending,
-        }
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-}
-
 #[async_trait]
 impl ClientTransport for WrtcTransport {
     async fn connect(&self) -> Result<ConnectionResult> {
@@ -179,29 +83,21 @@ impl ClientTransport for WrtcTransport {
             room_name, domain, guest_name
         );
 
-        // 1. Authorize session in Ktalk REST API with browser stealth headers
+        // 1. Авторизация гостя через REST API
         let ktalk = KtalkClient::new(browser_profile.clone());
         let anon_secret = KtalkClient::generate_anonymous_secret();
         let auth_res = ktalk
             .authorize_session(&domain, &room_name, Some(&guest_name), &anon_secret)
             .await
             .context("Failed to authorize Ktalk session")?;
-        info!(
-            "[WRTC] Ktalk session authorized (token: {}). Resolving conference ID...",
-            auth_res.token
-        );
 
-        // 2. Resolve room name into conferenceId
+        // 2. Получение conferenceId
         let room_info = ktalk
             .resolve_room(&domain, &room_name, &auth_res.token)
             .await
             .context("Failed to resolve Ktalk room")?;
-        info!(
-            "[WRTC] Conference ID resolved: {}",
-            room_info.conference_id
-        );
 
-        // 3. XMPP Signaling: Connect WebSocket, SASL ANONYMOUS, join MUC with dual ping keep-alive
+        // 3. XMPP сигналинг через WebSocket
         let ping_secs = self.server.wrtc_ping_interval_secs.unwrap_or(30);
         let mut xmpp = XmppSession::connect(
             &domain,
@@ -211,14 +107,10 @@ impl ClientTransport for WrtcTransport {
             &browser_profile,
             ping_secs,
         )
-        .await
-        .context("Failed to establish XMPP session and join conference MUC")?;
-        info!(
-            "[WRTC] Successfully joined conference MUC as occupant: {}",
-            xmpp.endpoint_id
-        );
+            .await
+            .context("Failed to establish XMPP session and join conference MUC")?;
 
-        // 4. Jicofo allocation & Jingle negotiation with dynamic ICE fallback
+        // 4. Jingle negotiation и получение параметров JVB
         let fallback_ip = self
             .server
             .wrtc_fallback_jvb_ip
@@ -228,43 +120,41 @@ impl ClientTransport for WrtcTransport {
 
         let _ = xmpp.request_conference_allocation().await;
 
-        let mut parsed_candidates = Vec::new();
-        let jingle_timeout = Duration::from_secs(3);
-        let jingle_deadline = tokio::time::Instant::now() + jingle_timeout;
+        let mut parsed_session = None;
+        let jingle_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
 
         while tokio::time::Instant::now() < jingle_deadline {
-            if let Ok(Some(stanza)) = tokio::time::timeout(Duration::from_millis(500), xmpp.recv_stanza()).await {
+            if let Ok(Some(stanza)) =
+                tokio::time::timeout(Duration::from_millis(400), xmpp.recv_stanza()).await
+            {
                 if let Some(session) = parse_jingle_session(&stanza, fallback_ip, fallback_port) {
-                    debug!("[WRTC] Extracted {} dynamic candidates from Jingle offer", session.transport.candidates.len());
-                    parsed_candidates = session.transport.candidates;
+                    parsed_session = Some(session);
                     break;
                 }
             }
         }
 
-        // 5. Initialize WebRTC PeerConnection, DataChannel "JVB data channel", and Opus silence keep-alive
+        if parsed_session.is_none() {
+            info!("[WRTC] Using fallback JVB: {fallback_ip}:{fallback_port}");
+        }
+
+        // 5. Создание соединения (Colibri-WS или WebRTC PeerConnection)
         let audio_keepalive_ms = self.server.wrtc_media_keepalive_interval_ms.unwrap_or(20);
         let mut peer = WrtcPeer::create(
-            &parsed_candidates,
+            parsed_session.as_ref(),
+            &domain,
             fallback_ip,
             fallback_port,
             audio_keepalive_ms,
         )
-        .await
-        .context("Failed to initialize WebRTC PeerConnection and DataChannel")?;
+            .await
+            .context("Failed to initialize WebRTC PeerConnection and DataChannel")?;
 
-        // 6. Discovery Phase: Challenge-Response over DataChannel
+        info!("[WRTC] WebRTC Peer created. Starting server discovery...");
+
+        // 6. Discovery фаза: опрос участников комнаты
         let client_nonce = format!("{:016x}", rand::random::<u64>());
-        info!(
-            "[WRTC] Starting server discovery in room over DataChannel (nonce: {})...",
-            client_nonce
-        );
-
-        let timeout_secs = if self.server.timeout_secs > 0 {
-            self.server.timeout_secs
-        } else {
-            10
-        };
+        let timeout_secs = self.server.timeout_secs.max(15);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
         let mut interval = tokio::time::interval(Duration::from_secs(2));
 
@@ -280,45 +170,48 @@ impl ClientTransport for WrtcTransport {
                 }
             });
 
-        let mut verified_server_id: Option<String> = None;
-
+        let mut verified_server_id = None;
         while tokio::time::Instant::now() < deadline {
             tokio::select! {
                 _ = interval.tick() => {
-                    debug!("[WRTC] Sending anet_discover into DataChannel...");
-                    let discover_msg = ColibriMessage::discover(client_nonce.clone());
-                    let _ = peer.send(discover_msg).await;
+                    info!("[WRTC] Sending anet_discover broadcast (nonce: {client_nonce})...");
+                    let discover_broadcast = ColibriMessage::discover(None, client_nonce.clone());
+                    let _ = peer.send(discover_broadcast).await;
+
+                    let current_occupants = xmpp.get_other_occupants();
+                    for occupant in current_occupants {
+                        info!("[WRTC] Sending anet_discover to occupant: {occupant}");
+                        let unicast_discover = ColibriMessage::discover(Some(occupant), client_nonce.clone());
+                        let _ = peer.send(unicast_discover).await;
+                    }
                 }
                 msg_opt = peer.recv() => {
                     if let Some(msg) = msg_opt {
                         if let WrtcMessage::Beacon { server_id, client_nonce: beacon_nonce, signature } = msg.msg_payload {
+                            info!("[WRTC] Received beacon from server: {server_id} (nonce match: {})", beacon_nonce == client_nonce);
                             if beacon_nonce == client_nonce {
-                                info!("[WRTC] Received anet_beacon from server: {}", server_id);
                                 if let Some(pub_key) = server_pub_key {
                                     match verify_beacon(pub_key, &client_nonce, &server_id, &signature) {
                                         Ok(true) => {
-                                            info!("[WRTC] Server beacon signature verified successfully!");
+                                            info!("[WRTC] Server beacon signature verified successfully! Server ID: {server_id}");
                                             verified_server_id = Some(server_id);
                                             break;
                                         }
                                         Ok(false) => {
-                                            warn!("[WRTC] Server beacon signature verification failed");
-                                            continue;
+                                            warn!("[WRTC] Server beacon signature verification FAILED! Check server_pub_key in client.toml vs server_signing_key in server.toml");
                                         }
                                         Err(e) => {
-                                            warn!("[WRTC] Error verifying server beacon: {e}");
-                                            continue;
+                                            warn!("[WRTC] Error verifying server beacon: {e:#}");
                                         }
                                     }
                                 } else {
-                                    info!("[WRTC] No server_pub_key configured, accepting server: {}", server_id);
+                                    info!("[WRTC] No server_pub_key configured, accepting server: {server_id}");
                                     verified_server_id = Some(server_id);
                                     break;
                                 }
                             }
                         }
                     } else {
-                        warn!("[WRTC] DataChannel closed during server discovery");
                         break;
                     }
                 }
@@ -331,8 +224,9 @@ impl ClientTransport for WrtcTransport {
             )
         })?;
 
-        info!("[WRTC] Authenticating ASTP session with server {}...", target_server_id);
+        info!("[WRTC] Starting ASTP authentication with server: {target_server_id}");
 
+        // 7. ASTP аутентификация
         let shared_peer = Arc::new(Mutex::new(peer));
         let auth_channel = WrtcAuthChannel {
             peer: shared_peer.clone(),
@@ -340,23 +234,92 @@ impl ClientTransport for WrtcTransport {
         };
 
         let auth_handler = AuthHandler::new(&self.config, self.server.server_pub_key.as_deref())?;
-        let (auth_response, cipher) = auth_handler.authenticate(&auth_channel).await?;
+        let (auth_response, shared_key) = auth_handler.authenticate(&auth_channel).await?;
 
         info!(
             "[WRTC] ASTP Authentication succeeded! Assigned VPN IP: {}",
-            auth_response.assigned_ip
+            auth_response.ip
         );
 
-        let vpn_stream = Box::new(WrtcStream {
-            peer: shared_peer,
-            cipher: Arc::new(cipher),
-            target_server_id,
-            read_buffer: BytesMut::with_capacity(MAX_PACKET_SIZE * 2),
+        let cipher = Arc::new(Cipher::new(&shared_key));
+        let nonce_prefix: [u8; 4] = auth_response.nonce_prefix.as_slice().try_into()?;
+        let sequence = Arc::new(AtomicU64::new(0));
+
+        // 8. Создание дуплексного потока для ядра VPN
+        let (client_stream, internal_router) = tokio::io::duplex(MAX_PACKET_SIZE * 10);
+        let (mut tunnel_read, mut tunnel_write) = tokio::io::split(internal_router);
+        let (tunnel_packet_tx, mut tunnel_packet_rx) =
+            tokio::sync::mpsc::channel::<Bytes>(CHANNEL_BUFFER_SIZE);
+
+        let tunnel_reader_task = tokio::spawn(async move {
+            while let Ok(Some(packet)) = read_next_packet(&mut tunnel_read).await {
+                if tunnel_packet_tx.send(packet).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        // Воркер Uplink: TUN -> WebRTC
+        let peer_tx = shared_peer.clone();
+        let target_srv_tx = target_server_id.clone();
+        let cipher_tx = cipher.clone();
+        let sequence_tx = sequence.clone();
+        let padding_step = self.config.stealth.padding_step;
+
+        tokio::spawn(async move {
+            while let Some(packet) = tunnel_packet_rx.recv().await {
+                if packet.len() < 20 {
+                    continue;
+                }
+                let seq = sequence_tx.fetch_add(1, Ordering::Relaxed);
+                if let Ok(encrypted) =
+                    wrap_packet_padded(&cipher_tx, &nonce_prefix, seq, packet, padding_step)
+                {
+                    let b64 = BASE64_STANDARD.encode(&encrypted);
+                    let msg = ColibriMessage::astp(target_srv_tx.clone(), b64);
+                    let p = peer_tx.lock().await;
+                    if p.send(msg).await.is_err() {
+                        break;
+                    }
+                }
+            }
+            tunnel_reader_task.abort();
+        });
+
+        // Воркер Downlink: WebRTC -> TUN
+        let peer_rx = shared_peer.clone();
+        let cipher_rx = cipher.clone();
+
+        tokio::spawn(async move {
+            loop {
+                let msg_opt = {
+                    let mut p = peer_rx.lock().await;
+                    p.recv().await
+                };
+                match msg_opt {
+                    Some(msg) => {
+                        if let WrtcMessage::Astp { data } = msg.msg_payload {
+                            if let Ok(raw_encrypted) = BASE64_STANDARD.decode(&data) {
+                                if let Ok(packet) = unwrap_packet_bytes(
+                                    &cipher_rx,
+                                    Bytes::from(raw_encrypted),
+                                ) {
+                                    let framed = frame_packet(packet);
+                                    if tunnel_write.write_all(&framed).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    None => break,
+                }
+            }
         });
 
         Ok(ConnectionResult {
             auth_response,
-            vpn_stream,
+            vpn_stream: Box::new(client_stream),
             endpoint: None,
             connection: None,
             health_pause: None,

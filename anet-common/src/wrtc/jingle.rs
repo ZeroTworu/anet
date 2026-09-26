@@ -19,17 +19,75 @@ pub struct JingleTransportInfo {
     pub fingerprint_hash: Option<String>,
     pub fingerprint_setup: Option<String>,
     pub candidates: Vec<JingleCandidate>,
+    pub colibri_ws_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JingleSession {
+    pub iq_id: Option<String>,
     pub sid: String,
     pub from: String,
     pub action: String,
     pub transport: JingleTransportInfo,
 }
 
-/// Parses Jingle session from XMPP XML stanza.
+impl JingleSession {
+    pub fn to_sdp(&self, fallback_ip: &str, fallback_port: u16) -> String {
+        let (primary_ip, primary_port) = if let Some(first) = self.transport.candidates.first() {
+            (first.ip.as_str(), first.port)
+        } else {
+            (fallback_ip, fallback_port)
+        };
+
+        let ufrag = if !self.transport.ufrag.is_empty() {
+            &self.transport.ufrag
+        } else {
+            "jvb_ufrag"
+        };
+        let pwd = if !self.transport.pwd.is_empty() {
+            &self.transport.pwd
+        } else {
+            "jvb_pwd_secret"
+        };
+        let fp_hash = self.transport.fingerprint_hash.as_deref().unwrap_or("sha-256");
+        let fp = self.transport.fingerprint.as_deref().unwrap_or("00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00");
+        let setup = self.transport.fingerprint_setup.as_deref().unwrap_or("actpass");
+
+        let mut candidate_lines = String::new();
+        if self.transport.candidates.is_empty() {
+            candidate_lines.push_str(&format!(
+                "a=candidate:1 1 udp 2130706431 {} {} typ host\r\n",
+                fallback_ip, fallback_port
+            ));
+        } else {
+            for c in &self.transport.candidates {
+                candidate_lines.push_str(&format!(
+                    "a=candidate:{} {} {} {} {} {} typ {}\r\n",
+                    c.foundation, c.component, c.protocol, c.priority, c.ip, c.port, c.candidate_type
+                ));
+            }
+        }
+
+        // По RFC 8841 для webrtc-datachannel параметром должен быть именно `webrtc-datachannel`
+        format!(
+            "v=0\r\n\
+             o=- 123456789 2 IN IP4 0.0.0.0\r\n\
+             s=-\r\n\
+             t=0 0\r\n\
+             a=group:BUNDLE 0\r\n\
+             m=application {primary_port} UDP/DTLS/SCTP webrtc-datachannel\r\n\
+             c=IN IP4 {primary_ip}\r\n\
+             a=ice-ufrag:{ufrag}\r\n\
+             a=ice-pwd:{pwd}\r\n\
+             a=fingerprint:{fp_hash} {fp}\r\n\
+             a=setup:{setup}\r\n\
+             a=mid:0\r\n\
+             a=sctp-port:5000\r\n\
+             {candidate_lines}"
+        )
+    }
+}
+
 pub fn parse_jingle_session(
     xml: &str,
     fallback_ip: &str,
@@ -39,6 +97,7 @@ pub fn parse_jingle_session(
         return None;
     }
 
+    let iq_id = extract_attr(xml, "id");
     let sid = extract_attr(xml, "sid")?;
     let action = extract_attr(xml, "action")?;
     let from = extract_attr(xml, "from").unwrap_or_default();
@@ -50,7 +109,13 @@ pub fn parse_jingle_session(
     let fingerprint_hash = extract_attr(xml, "hash");
     let fingerprint_setup = extract_attr(xml, "setup");
 
-    // Dynamic ICE candidate parsing from XML
+    // Извлекаем прямой WebSocket URL моста JVB
+    let colibri_ws_url = if let Some(ws_start) = xml.find("<web-socket") {
+        extract_attr(&xml[ws_start..], "url")
+    } else {
+        None
+    };
+
     let mut candidates = Vec::new();
     let mut search_from = 0;
     while let Some(c_start) = xml[search_from..].find("<candidate") {
@@ -92,7 +157,6 @@ pub fn parse_jingle_session(
         }
     }
 
-    // Dynamic fallback: if remote server returned no candidates, use fallback values
     if candidates.is_empty() {
         candidates.push(JingleCandidate {
             ip: fallback_ip.to_string(),
@@ -106,6 +170,7 @@ pub fn parse_jingle_session(
     }
 
     Some(JingleSession {
+        iq_id,
         sid,
         from,
         action,
@@ -116,6 +181,7 @@ pub fn parse_jingle_session(
             fingerprint_hash,
             fingerprint_setup,
             candidates,
+            colibri_ws_url,
         },
     })
 }
