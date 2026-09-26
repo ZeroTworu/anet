@@ -123,27 +123,25 @@ pub async fn run_wrtc_server(
 
         let _ = xmpp.request_conference_allocation().await;
 
+        info!("[WRTC Server] Waiting for Jicofo session-initiate (client arrival)...");
         let mut parsed_session = None;
-        let jingle_deadline = tokio::time::Instant::now() + Duration::from_secs(8);
 
-        while tokio::time::Instant::now() < jingle_deadline {
-            if let Ok(Some(stanza)) =
-                tokio::time::timeout(Duration::from_millis(400), xmpp.recv_stanza()).await
-            {
-                if let Some(session) = parse_jingle_session(&stanza, fallback_ip, fallback_port) {
-                    parsed_session = Some(session);
-                    break;
-                }
+        while let Some(stanza) = xmpp.recv_stanza().await {
+            if let Some(session) = parse_jingle_session(&stanza, fallback_ip, fallback_port) {
+                parsed_session = Some(session);
+                break;
             }
         }
 
-        if parsed_session.is_none() {
-            info!("[WRTC Server] Using fallback JVB: {fallback_ip}:{fallback_port}");
-        }
+        let Some(session) = parsed_session else {
+            warn!("[WRTC Server] XMPP stream closed while waiting for session-initiate. Reconnecting in 3s...");
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            continue;
+        };
 
         let audio_keepalive_ms = config.server.wrtc_media_keepalive_interval_ms;
         let peer = match WrtcPeer::create(
-            parsed_session.as_ref(),
+            Some(&session),
             &domain,
             fallback_ip,
             fallback_port,

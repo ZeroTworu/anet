@@ -120,8 +120,9 @@ impl ClientTransport for WrtcTransport {
 
         let _ = xmpp.request_conference_allocation().await;
 
+        let timeout_secs = self.server.timeout_secs.max(15);
         let mut parsed_session = None;
-        let jingle_deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+        let jingle_deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
 
         while tokio::time::Instant::now() < jingle_deadline {
             if let Ok(Some(stanza)) =
@@ -134,14 +135,16 @@ impl ClientTransport for WrtcTransport {
             }
         }
 
-        if parsed_session.is_none() {
-            info!("[WRTC] Using fallback JVB: {fallback_ip}:{fallback_port}");
-        }
+        let Some(session) = parsed_session else {
+            anyhow::bail!(
+                "Failed to receive Jicofo session-initiate within {timeout_secs}s (no server or bridge session in room)"
+            );
+        };
 
         // 5. Создание соединения (Colibri-WS или WebRTC PeerConnection)
         let audio_keepalive_ms = self.server.wrtc_media_keepalive_interval_ms.unwrap_or(20);
         let mut peer = WrtcPeer::create(
-            parsed_session.as_ref(),
+            Some(&session),
             &domain,
             fallback_ip,
             fallback_port,
@@ -154,7 +157,6 @@ impl ClientTransport for WrtcTransport {
 
         // 6. Discovery фаза: опрос участников комнаты
         let client_nonce = format!("{:016x}", rand::random::<u64>());
-        let timeout_secs = self.server.timeout_secs.max(15);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
         let mut interval = tokio::time::interval(Duration::from_secs(2));
 
