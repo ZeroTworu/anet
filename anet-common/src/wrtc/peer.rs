@@ -437,6 +437,18 @@ impl WrtcPeer {
         })
     }
 
+    pub async fn send(&self, msg: ColibriMessage) -> anyhow::Result<()> {
+        self.outgoing_tx
+            .send(msg)
+            .await
+            .map_err(|_| anyhow::anyhow!("DataChannel write channel closed"))
+    }
+
+    pub async fn recv(&self) -> Option<ColibriMessage> {
+        let mut rx = self.incoming_rx.lock().await;
+        rx.recv().await
+    }
+
     pub async fn close(&self) -> anyhow::Result<()> {
         if let Some(ref pc) = self.peer_connection {
             let _ = pc.close().await;
