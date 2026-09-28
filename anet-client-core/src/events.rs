@@ -43,7 +43,7 @@ pub struct AccountInfo {
 /// Типы событий
 #[derive(Clone, Debug)]
 pub enum AnetEvent {
-    // Новый вариант специально для передачи метрик трафика
+    // Метрики трафика в человекочитаемом виде
     Stats {
         rx: String,
         tx: String,
@@ -64,7 +64,7 @@ pub enum AnetEvent {
         rtt: u64,
         rxm: u64,
         txm: u64,
-    }, // а точно так?
+    },
     Warn(String),
     Error(String),
     UpdateAvailable(crate::updater::GithubRelease),
@@ -73,9 +73,27 @@ pub enum AnetEvent {
     UpdateReady,
 }
 
-/// Трейт для подписчика
+/// Универсальная обёртка над любым событием с меткой времени
+#[derive(Clone, Debug)]
+pub struct TimestampedEvent {
+    /// Строковое представление времени, например "14:26:05" или "14:26:05.123"
+    pub timestamp: String,
+    /// Само событие
+    pub event: AnetEvent,
+}
+
+impl TimestampedEvent {
+    pub fn new(event: AnetEvent) -> Self {
+        Self {
+            timestamp: chrono::Local::now().format("%H:%M:%S").to_string(),
+            event,
+        }
+    }
+}
+
+/// Трейт для подписчика (GUI / логгер)
 pub trait EventHandler: Send + Sync {
-    fn on_event(&self, event: AnetEvent);
+    fn on_event(&self, event: TimestampedEvent);
 }
 
 static GLOBAL_HANDLER: std::sync::OnceLock<Box<dyn EventHandler>> = std::sync::OnceLock::new();
@@ -85,14 +103,14 @@ pub fn set_handler(handler: Box<dyn EventHandler>) {
     let _ = GLOBAL_HANDLER.set(handler);
 }
 
-// Публичная функция для отправки событий откуда угодно
+// Публичная функция для отправки событий: автоматически оборачивает в TimestampedEvent
 pub fn emit(event: AnetEvent) {
     if let Some(handler) = GLOBAL_HANDLER.get() {
-        handler.on_event(event);
+        handler.on_event(TimestampedEvent::new(event));
     }
 }
 
-// Хелперы для удобства
+// Хелперы для удобного вызова из любых модулей ядра
 pub fn status(s: impl Into<String>) {
     emit(AnetEvent::Status(s.into()));
 }
@@ -115,6 +133,10 @@ pub fn warn(s: impl Into<String>) {
 
 pub fn update_progress(p: f32) {
     emit(AnetEvent::UpdateProgress(p));
+}
+
+pub fn update_status(s: impl Into<String>) {
+    emit(AnetEvent::UpdateStatus(s.into()));
 }
 
 pub fn account_info(info: AccountInfo) {

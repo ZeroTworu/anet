@@ -15,10 +15,18 @@ pub fn lock_ignore_poison<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     }
 }
 
-/// Добавление строки в циклический буфер логов
+/// Добавление строки в циклический буфер логов (с автоматическим таймстемпом)
 pub fn push_log(logs: &Arc<Mutex<Vec<String>>>, msg: &str) {
+    // Если в строке уже есть таймстемп вида [17:03:51], не дублируем его
+    let formatted_msg = if msg.starts_with('[') && msg.len() >= 10 && &msg[9..10] == "]" {
+        msg.to_string()
+    } else {
+        let time = chrono::Local::now().format("[%H:%M:%S]");
+        format!("{} {}", time, msg)
+    };
+
     let mut guard = lock_ignore_poison(logs);
-    guard.push(msg.to_string());
+    guard.push(formatted_msg);
     if guard.len() > 1000 {
         guard.drain(0..100);
     }

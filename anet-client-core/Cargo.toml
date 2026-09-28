@@ -30,6 +30,7 @@ ipnet = { workspace = true }
 futures = { workspace = true }
 tokio-tungstenite = { workspace = true }
 http = { workspace = true }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
 reqwest = { workspace = true, features = ["json", "rustls-tls-webpki-roots", "http2"] }
 

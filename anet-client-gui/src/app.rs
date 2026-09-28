@@ -112,7 +112,8 @@ impl ANetApp {
         let rt = Runtime::new().unwrap();
         let settings = AppSettings::load();
         let settings_arc = Arc::new(Mutex::new(settings));
-        let logs = Arc::new(Mutex::new(vec!["> System Ready...".to_string()]));
+        let start_time = chrono::Local::now().format("[%H:%M:%S]");
+        let logs = Arc::new(Mutex::new(vec![format!("{} > System Ready...", start_time)]));
 
         let shared = Arc::new(
             Mutex::new(SharedState {
