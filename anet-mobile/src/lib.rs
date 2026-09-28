@@ -6,7 +6,7 @@ use crate::android_impl::AndroidCallbackTunFactory;
 use android_logger::Config;
 use anet_client_core::client::AnetClient;
 use anet_client_core::config::CoreConfig;
-use anet_client_core::events::{self, AnetEvent, ClientState, EventHandler, client_state, status};
+use anet_client_core::events::{self, AnetEvent, ClientState, EventHandler, TimestampedEvent, client_state, status};
 use anet_client_core::updater::{GithubRelease, Updater};
 use anet_client_core::platform::NoOpRouteManager;
 use jni::objects::{GlobalRef, JClass, JObject, JString, JValue};
@@ -27,7 +27,7 @@ static CURRENT_CLIENT_STATE: AtomicI32 = AtomicI32::new(0);
 static CURRENT_SERVER_NAME: Mutex<Option<String>> = Mutex::new(None);
 
 // --- ГЛОБАЛЬНЫЙ МНОГОПОТОЧНЫЙ JNI-МОСТ (Защита от утечек и дедлоков) ---
-static JNI_SENDER: OnceLock<Sender<AnetEvent>> = OnceLock::new();
+static JNI_SENDER: OnceLock<Sender<TimestampedEvent>> = OnceLock::new();
 static VPN_CALLBACK_REF: Mutex<Option<GlobalRef>> = Mutex::new(None);
 static UI_CALLBACK_REF: Mutex<Option<GlobalRef>> = Mutex::new(None);
 
@@ -36,10 +36,10 @@ static UI_CALLBACK_REF: Mutex<Option<GlobalRef>> = Mutex::new(None);
 struct AndroidEventHandler;
 
 impl EventHandler for AndroidEventHandler {
-    fn on_event(&self, event: AnetEvent) {
+    fn on_event(&self, event: TimestampedEvent) {
         if let AnetEvent::ClientStateChanged {
             state, server_name, ..
-        } = &event
+        } = &event.event
         {
             CURRENT_CLIENT_STATE.store(client_state_code(*state), Ordering::SeqCst);
             if let Some(server_name) = server_name {
@@ -307,15 +307,20 @@ pub extern "system" fn Java_org_alco_anet_ANetVpnService_initLogger(_env: JNIEnv
 // Запуск выделенного фонового потока JNI-моста (выполняется один раз на весь жизненный цикл приложения)
 fn init_jni_bridge_thread(jvm: Arc<JavaVM>) {
     JNI_SENDER.get_or_init(move || {
-        let (tx, rx) = mpsc::channel::<AnetEvent>();
+        let (tx, rx) = mpsc::channel::<TimestampedEvent>(); // <-- изменили на TimestampedEvent
 
         std::thread::spawn(move || {
             info!("Rust JNI Bridge: Dedicated OS thread started.");
 
-            // Прикрепляем выделенный системный поток к JVM один раз
             if let Ok(mut env) = jvm.attach_current_thread() {
-                while let Ok(event) = rx.recv() {
-                    let is_update_event = matches!(event, AnetEvent::UpdateAvailable(_) | AnetEvent::UpdateProgress(_) | AnetEvent::UpdateStatus(_) | AnetEvent::UpdateReady);
+                while let Ok(TimestampedEvent { timestamp: _timestamp, event }) = rx.recv() { // <-- распаковываем TimestampedEvent
+                    let is_update_event = matches!(
+                        event,
+                        AnetEvent::UpdateAvailable(_)
+                            | AnetEvent::UpdateProgress(_)
+                            | AnetEvent::UpdateStatus(_)
+                            | AnetEvent::UpdateReady
+                    );
                     let callback_ref_opt = if is_update_event {
                         UI_CALLBACK_REF.lock().unwrap().clone()
                     } else {
@@ -328,11 +333,16 @@ fn init_jni_bridge_thread(jvm: Arc<JavaVM>) {
                                 let jmsg = env.new_string(message);
                                 let jserver = env.new_string(server_name.unwrap_or_default());
                                 if let (Ok(jmsg), Ok(jserver)) = (jmsg, jserver) {
-                                    let _ = env.call_method(&callback_ref, "onVpnStateChanged", "(ILjava/lang/String;Ljava/lang/String;)V", &[
-                                        JValue::Int(client_state_code(state)),
-                                        JValue::Object(&jmsg),
-                                        JValue::Object(&jserver),
-                                    ]);
+                                    let _ = env.call_method(
+                                        &callback_ref,
+                                        "onVpnStateChanged",
+                                        "(ILjava/lang/String;Ljava/lang/String;)V",
+                                        &[
+                                            JValue::Int(client_state_code(state)),
+                                            JValue::Object(&jmsg),
+                                            JValue::Object(&jserver),
+                                        ],
+                                    );
                                 }
                             }
                             AnetEvent::Stats { rx, tx, rtt, rxm, txm } => {
