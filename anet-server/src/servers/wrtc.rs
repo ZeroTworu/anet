@@ -142,10 +142,12 @@ pub async fn run_wrtc_server(
         let audio_keepalive_ms = config.server.wrtc_media_keepalive_interval_ms;
         let peer = match WrtcPeer::create(
             Some(&session),
+            Some(&xmpp),
             &domain,
             fallback_ip,
             fallback_port,
             audio_keepalive_ms,
+            true,
         )
             .await
         {

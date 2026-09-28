@@ -102,7 +102,6 @@ impl XmppSession {
                 if let Message::Text(text) = msg {
                     let text_str = text.as_str();
 
-                    // Трекинг участников из presence
                     if text_str.contains("<presence") {
                         if let Some(from) = extract_attr(text_str, "from") {
                             if let Some(occupant) = from.strip_prefix(&conf_muc) {
@@ -175,8 +174,9 @@ impl XmppSession {
 
         let (write_tx, mut write_rx) = mpsc::channel::<String>(128);
         let (read_tx, read_rx) = mpsc::channel::<String>(128);
+        let (raw_ws_tx, mut raw_ws_rx) = mpsc::channel::<Message>(32);
 
-        let ping_secs = if ping_interval_secs > 0 { ping_interval_secs } else { 30 };
+        let ping_secs = if ping_interval_secs > 0 { ping_interval_secs } else { 20 };
 
         tokio::spawn(async move {
             let mut ping_interval = tokio::time::interval(Duration::from_secs(ping_secs));
@@ -193,11 +193,13 @@ impl XmppSession {
                             None => break,
                         }
                     }
+                    raw_opt = raw_ws_rx.recv() => {
+                        if let Some(msg) = raw_opt {
+                            if ws_sink.send(msg).await.is_err() { break; }
+                        } else { break; }
+                    }
                     _ = ping_interval.tick() => {
                         if ws_sink.send(Message::Ping(bytes::Bytes::from_static(&[0x01, 0x02]))).await.is_err() {
-                            break;
-                        }
-                        if ws_sink.send(Message::text(" ")).await.is_err() {
                             break;
                         }
                     }
@@ -207,13 +209,14 @@ impl XmppSession {
 
         let write_tx_ack = write_tx.clone();
         let occ_track_bg = occupants.clone();
+        let raw_ws_tx_clone = raw_ws_tx.clone();
+
         tokio::spawn(async move {
             while let Some(msg_res) = ws_stream.next().await {
                 match msg_res {
                     Ok(Message::Text(text)) => {
                         let text_str = text.as_str();
 
-                        // Трекинг участников в фоне
                         if text_str.contains("<presence") {
                             if let Some(from) = extract_attr(text_str, "from") {
                                 if let Some(occupant) = from.strip_prefix(&conf_muc) {
@@ -237,6 +240,13 @@ impl XmppSession {
                             }
                         }
 
+                        if text_str.contains("urn:xmpp:ping") && (text_str.contains("type=\"get\"") || text_str.contains("type='get'")) {
+                            if let (Some(iq_id), Some(from_jid)) = (extract_attr(text_str, "id"), extract_attr(text_str, "from")) {
+                                let pong = format!(r#"<iq type="result" to="{from_jid}" id="{iq_id}"/>"#);
+                                let _ = write_tx_ack.send(pong).await;
+                            }
+                        }
+
                         if text_str.contains("urn:xmpp:jingle:1") && (text_str.contains("type=\"set\"") || text_str.contains("type='set'")) {
                             if let (Some(iq_id), Some(from_jid)) = (extract_attr(text_str, "id"), extract_attr(text_str, "from")) {
                                 let ack = format!(r#"<iq type="result" to="{from_jid}" id="{iq_id}"/>"#);
@@ -244,11 +254,11 @@ impl XmppSession {
                             }
                         }
 
-                        if read_tx.send(text.to_string()).await.is_err() {
-                            break;
-                        }
+                        let _ = read_tx.try_send(text.to_string());
                     }
-                    Ok(Message::Ping(_)) => {}
+                    Ok(Message::Ping(data)) => {
+                        let _ = raw_ws_tx_clone.send(Message::Pong(data)).await;
+                    }
                     Ok(Message::Close(_)) | Err(_) => {
                         break;
                     }
@@ -266,6 +276,68 @@ impl XmppSession {
             write_tx,
             read_rx,
         })
+    }
+
+    /// Отправляет Jingle session-accept в ответ на session-initiate от Jicofo
+    pub async fn accept_session(
+        &self,
+        sid: &str,
+        focus_jid: &str,
+        ssrc: u32,
+        ufrag: &str,
+        pwd: &str,
+        fingerprint: &str,
+        fingerprint_hash: &str,
+        candidates: &[String],
+    ) -> anyhow::Result<()> {
+        let req_id = format!("accept_{:08x}", rand::random::<u32>());
+        let cname = format!("cname_{:08x}", rand::random::<u32>());
+        let msid = format!("msid_{:08x}", rand::random::<u32>());
+
+        let mut candidate_xml = String::new();
+        for (i, c_line) in candidates.iter().enumerate() {
+            let parts: Vec<&str> = c_line.split_whitespace().collect();
+            if parts.len() >= 8 && parts[6] == "typ" {
+                let foundation = parts[0];
+                let component = parts[1];
+                let protocol = parts[2].to_lowercase();
+                let priority = parts[3];
+                let ip = parts[4];
+                let port = parts[5];
+                let c_type = parts[7];
+                if ip == "0.0.0.0" {
+                    continue;
+                }
+                candidate_xml.push_str(&format!(
+                    r#"<candidate component="{component}" foundation="{foundation}" generation="0" id="c_{i}" ip="{ip}" port="{port}" priority="{priority}" protocol="{protocol}" type="{c_type}" network="0"/>"#
+                ));
+            }
+        }
+
+        if candidate_xml.is_empty() {
+            log::warn!("[XMPP] No valid ICE candidates gathered for session-accept");
+        }
+
+        let stanza = format!(
+            r#"<iq to="{focus_jid}" type="set" id="{req_id}"><jingle xmlns="urn:xmpp:jingle:1" action="session-accept" initiator="{focus_jid}" responder="{}" sid="{sid}"><content creator="initiator" name="audio" senders="both"><description xmlns="urn:xmpp:jingle:apps:rtp:1" media="audio"><payload-type id="111" name="opus" clockrate="48000" channels="2"/><rtcp-mux/><source xmlns="urn:xmpp:jingle:apps:rtp:ssma:0" ssrc="{ssrc}"><parameter xmlns="urn:xmpp:jingle:apps:rtp:1" name="cname" value="{cname}"/><parameter xmlns="urn:xmpp:jingle:apps:rtp:1" name="msid" value="{msid} a0"/></source></description><transport xmlns="urn:xmpp:jingle:transports:ice-udp:1" ufrag="{ufrag}" pwd="{pwd}"><rtcp-mux/><fingerprint xmlns="urn:xmpp:jingle:apps:dtls:0" hash="{fingerprint_hash}" setup="active">{fingerprint}</fingerprint>{candidate_xml}</transport></content><content creator="initiator" name="data"><description xmlns="urn:xmpp:jingle:apps:sctp:1"><payload-type id="5000"/></description><transport xmlns="urn:xmpp:jingle:transports:ice-udp:1" ufrag="{ufrag}" pwd="{pwd}"><fingerprint xmlns="urn:xmpp:jingle:apps:dtls:0" hash="{fingerprint_hash}" setup="active">{fingerprint}</fingerprint>{candidate_xml}</transport></content></jingle></iq>"#,
+            self.jid
+        );
+
+        log::info!("[XMPP] Sending Jingle session-accept (sid: {sid}) to Jicofo ({focus_jid})...");
+        self.send_stanza(stanza).await
+    }
+
+    /// Анонсирует SSRC аудиотрека для Jicofo и JVB через Jingle source-add
+    pub async fn announce_source(&self, sid: &str, focus_jid: &str, ssrc: u32) -> anyhow::Result<()> {
+        let req_id = format!("src_add_{:08x}", rand::random::<u32>());
+        let cname = format!("cname_{:08x}", rand::random::<u32>());
+        let msid = format!("msid_{:08x}", rand::random::<u32>());
+
+        let stanza = format!(
+            r#"<iq to="{focus_jid}" type="set" id="{req_id}"><jingle xmlns="urn:xmpp:jingle:1" action="source-add" initiator="{focus_jid}" sid="{sid}"><content name="audio"><description xmlns="urn:xmpp:jingle:apps:rtp:1" media="audio"><source xmlns="urn:xmpp:jingle:apps:rtp:ssma:0" ssrc="{ssrc}"><parameter name="cname" value="{cname}"/><parameter name="msid" value="{msid} a0"/></source></description></content></jingle></iq>"#
+        );
+        log::info!("[XMPP] Announcing audio SSRC {ssrc} to Jicofo ({focus_jid})...");
+        self.send_stanza(stanza).await
     }
 
     pub async fn request_conference_allocation(&self) -> anyhow::Result<()> {

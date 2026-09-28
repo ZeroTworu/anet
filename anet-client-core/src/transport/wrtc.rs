@@ -180,14 +180,16 @@ impl ClientTransport for WrtcTransport {
         bypass_ips.dedup();
         info!("[WRTC] Discovered media bypass IPs: {:?}", bypass_ips);
 
-        // 5. Создание соединения (Colibri-WS или WebRTC PeerConnection)
+        // 5. Создание соединения (Colibri-WS с фоновым WebRTC keepalive)
         let audio_keepalive_ms = self.server.wrtc_media_keepalive_interval_ms.unwrap_or(20);
         let mut peer = WrtcPeer::create(
             Some(&session),
+            Some(&xmpp),
             &domain,
             fallback_ip,
             fallback_port,
             audio_keepalive_ms,
+            false,
         )
             .await
             .context("Failed to initialize WebRTC PeerConnection and DataChannel")?;

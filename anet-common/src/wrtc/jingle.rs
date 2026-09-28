@@ -29,11 +29,17 @@ pub struct JingleSession {
     pub from: String,
     pub action: String,
     pub transport: JingleTransportInfo,
+    pub sources: Vec<u32>,
 }
 
 impl JingleSession {
-    pub fn to_sdp(&self, fallback_ip: &str, fallback_port: u16) -> String {
-        let (primary_ip, primary_port) = if let Some(first) = self.transport.candidates.first() {
+    pub fn to_sdp(&self, fallback_ip: &str, fallback_port: u16, remote_ssrc: u32) -> String {
+        let (primary_ip, primary_port) = if let Some(first) = self
+            .transport
+            .candidates
+            .iter()
+            .find(|c| c.ip != "127.0.0.1" && !c.ip.starts_with("127.") && c.ip != "0.0.0.0")
+        {
             (first.ip.as_str(), first.port)
         } else {
             (fallback_ip, fallback_port)
@@ -54,39 +60,69 @@ impl JingleSession {
         let setup = self.transport.fingerprint_setup.as_deref().unwrap_or("actpass");
 
         let mut candidate_lines = String::new();
-        if self.transport.candidates.is_empty() {
+        for c in &self.transport.candidates {
+            if c.ip == "127.0.0.1" || c.ip.starts_with("127.") || c.ip == "0.0.0.0" {
+                continue;
+            }
+            let proto_upper = c.protocol.to_uppercase();
             candidate_lines.push_str(&format!(
-                "a=candidate:1 1 udp 2130706431 {} {} typ host\r\n",
+                "a=candidate:{} {} {} {} {} {} typ {}\r\n",
+                c.foundation, c.component, proto_upper, c.priority, c.ip, c.port, c.candidate_type
+            ));
+        }
+        if candidate_lines.is_empty() {
+            candidate_lines.push_str(&format!(
+                "a=candidate:1 1 UDP 2130706431 {} {} typ host\r\n",
                 fallback_ip, fallback_port
             ));
-        } else {
-            for c in &self.transport.candidates {
-                candidate_lines.push_str(&format!(
-                    "a=candidate:{} {} {} {} {} {} typ {}\r\n",
-                    c.foundation, c.component, c.protocol, c.priority, c.ip, c.port, c.candidate_type
+        }
+        let mut ssrc_lines = String::new();
+        if remote_ssrc != 0 {
+            ssrc_lines.push_str(&format!(
+                "a=ssrc:{remote_ssrc} cname:cname_{remote_ssrc:x}\r\n\
+                 a=ssrc:{remote_ssrc} msid:msid_{remote_ssrc:x} a0\r\n"
+            ));
+        }
+        for ssrc in &self.sources {
+            if *ssrc != remote_ssrc && *ssrc != 0 {
+                ssrc_lines.push_str(&format!(
+                    "a=ssrc:{ssrc} cname:cname_{ssrc:x}\r\n\
+                     a=ssrc:{ssrc} msid:msid_{ssrc:x} a0\r\n"
                 ));
             }
         }
 
-        // По RFC 8841 для webrtc-datachannel параметром должен быть именно `webrtc-datachannel`
+        // Формируем BUNDLE аудио (Opus) + WebRTC DataChannel (SCTP)
         format!(
             "v=0\r\n\
              o=- 123456789 2 IN IP4 0.0.0.0\r\n\
              s=-\r\n\
              t=0 0\r\n\
-             a=group:BUNDLE 0\r\n\
+             a=ice-lite\r\n\
+             a=group:BUNDLE audio data\r\n\
+             m=audio {primary_port} UDP/TLS/RTP/SAVPF 111\r\n\
+             c=IN IP4 {primary_ip}\r\n\
+             a=rtcp-mux\r\n\
+             a=rtpmap:111 opus/48000/2\r\n\
+             a=ice-ufrag:{ufrag}\r\n\
+             a=ice-pwd:{pwd}\r\n\
+             a=fingerprint:{fp_hash} {fp}\r\n\
+             a=setup:{setup}\r\n\
+             a=mid:audio\r\n\
+             a=sendrecv\r\n\
+             {ssrc_lines}\
+             {candidate_lines}\
              m=application {primary_port} UDP/DTLS/SCTP webrtc-datachannel\r\n\
              c=IN IP4 {primary_ip}\r\n\
              a=ice-ufrag:{ufrag}\r\n\
              a=ice-pwd:{pwd}\r\n\
              a=fingerprint:{fp_hash} {fp}\r\n\
              a=setup:{setup}\r\n\
-             a=mid:0\r\n\
+             a=mid:data\r\n\
              a=sctp-port:5000\r\n\
              {candidate_lines}"
         )
-    }
-}
+    }}
 
 pub fn parse_jingle_session(
     xml: &str,
@@ -109,7 +145,6 @@ pub fn parse_jingle_session(
     let fingerprint_hash = extract_attr(xml, "hash");
     let fingerprint_setup = extract_attr(xml, "setup");
 
-    // Извлекаем прямой WebSocket URL моста JVB
     let colibri_ws_url = if let Some(ws_start) = xml.find("<web-socket") {
         extract_attr(&xml[ws_start..], "url")
     } else {
@@ -127,6 +162,12 @@ pub fn parse_jingle_session(
                 extract_attr(candidate_str, "port"),
             ) {
                 if let Ok(port) = port_str.parse::<u16>() {
+                    // Игнорируем loopback-кандидаты JVB (127.0.0.1, 0.0.0.0 и т.д.), которые ломают ICE
+                    if ip == "127.0.0.1" || ip.starts_with("127.") || ip == "0.0.0.0" {
+                        search_from = actual_start + c_end + 2;
+                        continue;
+                    }
+
                     let protocol = extract_attr(candidate_str, "protocol")
                         .unwrap_or_else(|| "udp".to_string());
                     let candidate_type = extract_attr(candidate_str, "type")
@@ -169,6 +210,23 @@ pub fn parse_jingle_session(
         });
     }
 
+    let mut sources = Vec::new();
+    let mut search_from = 0;
+    while let Some(s_start) = xml[search_from..].find("<source") {
+        let actual_start = search_from + s_start;
+        if let Some(s_end) = xml[actual_start..].find('>') {
+            let source_str = &xml[actual_start..actual_start + s_end + 1];
+            if let Some(ssrc_str) = extract_attr(source_str, "ssrc") {
+                if let Ok(ssrc) = ssrc_str.parse::<u32>() {
+                    sources.push(ssrc);
+                }
+            }
+            search_from = actual_start + s_end + 1;
+        } else {
+            break;
+        }
+    }
+
     Some(JingleSession {
         iq_id,
         sid,
@@ -183,6 +241,7 @@ pub fn parse_jingle_session(
             candidates,
             colibri_ws_url,
         },
+        sources,
     })
 }
 
@@ -200,4 +259,46 @@ fn extract_tag_content(text: &str, tag_name: &str) -> Option<String> {
     let end_open = text[start_open..].find('>')? + start_open + 1;
     let end_close = text[end_open..].find(&close_tag)? + end_open;
     Some(text[end_open..end_close].trim().to_string())
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct LocalJingleParams {
+    pub ufrag: String,
+    pub pwd: String,
+    pub fingerprint: String,
+    pub fingerprint_hash: String,
+    pub candidates: Vec<String>,
+}
+
+pub fn parse_sdp_answer(sdp: &str) -> LocalJingleParams {
+    let mut ufrag = String::new();
+    let mut pwd = String::new();
+    let mut fingerprint = String::new();
+    let mut fingerprint_hash = "sha-256".to_string();
+    let mut candidates = Vec::new();
+
+    for line in sdp.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("a=ice-ufrag:") {
+            ufrag = rest.to_string();
+        } else if let Some(rest) = line.strip_prefix("a=ice-pwd:") {
+            pwd = rest.to_string();
+        } else if let Some(rest) = line.strip_prefix("a=fingerprint:") {
+            let parts: Vec<&str> = rest.split_whitespace().collect();
+            if parts.len() >= 2 {
+                fingerprint_hash = parts[0].to_string();
+                fingerprint = parts[1].to_string();
+            }
+        } else if let Some(rest) = line.strip_prefix("a=candidate:") {
+            candidates.push(rest.to_string());
+        }
+    }
+
+    LocalJingleParams {
+        ufrag,
+        pwd,
+        fingerprint,
+        fingerprint_hash,
+        candidates,
+    }
 }
