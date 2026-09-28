@@ -278,7 +278,6 @@ impl XmppSession {
         })
     }
 
-    /// Отправляет Jingle session-accept в ответ на session-initiate от Jicofo
     pub async fn accept_session(
         &self,
         sid: &str,
@@ -300,7 +299,6 @@ impl XmppSession {
             if parts.len() >= 8 && parts[6] == "typ" {
                 let foundation = parts[0];
                 let component = parts[1];
-                // При rtcp-mux допустим только component 1 (RTP)
                 if component != "1" {
                     continue;
                 }
@@ -331,7 +329,6 @@ impl XmppSession {
         self.send_stanza(stanza).await
     }
 
-    /// Анонсирует SSRC аудиотрека для Jicofo и JVB через Jingle source-add
     pub async fn announce_source(&self, sid: &str, focus_jid: &str, ssrc: u32) -> anyhow::Result<()> {
         let req_id = format!("src_add_{:08x}", rand::random::<u32>());
         let cname = format!("cname_{:08x}", rand::random::<u32>());

@@ -61,7 +61,7 @@ impl WrtcPeer {
         domain: &str,
         fallback_ip: &str,
         fallback_port: u16,
-        _audio_keepalive_ms: u64,
+        audio_keepalive_ms: u64,
         is_server: bool,
     ) -> anyhow::Result<Self> {
         let (incoming_tx, incoming_rx) = mpsc::channel::<ColibriMessage>(1024);
@@ -75,7 +75,6 @@ impl WrtcPeer {
         };
 
         // 1. ПРИОРИТЕТНЫЙ И ЕДИНСТВЕННЫЙ ТРАНСПОРТ ДАННЫХ: Colibri-WS
-        // Весь трафик ASTP передается строго через надежный Colibri WebSocket.
         if let Some(session) = session_opt {
             if let Some(ref ws_url) = session.transport.colibri_ws_url {
                 log::info!("[WRTC] Connecting to JVB Colibri-WS for data transport: {ws_url}");
@@ -171,14 +170,12 @@ impl WrtcPeer {
         }
 
         // 2. МИНИМАЛЬНЫЙ ФОНОВЫЙ WebRTC: ICE/DTLS хендшейк + keepalive тишины для JVB
-        // Это необходимо, чтобы JVB не выставлял active: false через 15 секунд и не убивал сокет.
         let mut peer_connection_opt = None;
         let mut audio_track_opt = None;
 
         if let (Some(session), Some(xmpp)) = (session_opt, xmpp_opt) {
             log::info!("[WRTC Media] Initializing background WebRTC session for JVB keepalive...");
 
-            // Создаем MediaEngine под Opus
             let mut media_engine = MediaEngine::default();
             let audio_codec = RTCRtpCodecParameters {
                 rtp_codec: RTCRtpCodec {
@@ -194,49 +191,8 @@ impl WrtcPeer {
             media_engine.register_codec(audio_codec.clone(), RtpCodecKind::Audio)?;
             let registry = register_default_interceptors(Registry::new(), &mut media_engine)?;
 
-            // Определяем реальный исходящий IP сетевого интерфейса (вместо 0.0.0.0:9)
-            let target_ip = session
-                .transport
-                .candidates
-                .iter()
-                .find(|c| c.ip != "127.0.0.1" && !c.ip.starts_with("127.") && c.ip != "0.0.0.0")
-                .map(|c| c.ip.as_str())
-                .unwrap_or(fallback_ip);
-
-            let target_port = session
-                .transport
-                .candidates
-                .iter()
-                .find(|c| c.ip != "127.0.0.1" && !c.ip.starts_with("127.") && c.ip != "0.0.0.0")
-                .map(|c| c.port)
-                .unwrap_or(fallback_port);
-
-            let (outbound_ip, bound_port) = match std::net::UdpSocket::bind("0.0.0.0:0") {
-                Ok(sock) => {
-                    let p = sock.local_addr().map(|a| a.port()).unwrap_or(0);
-                    let _ = sock.connect((target_ip, target_port));
-                    let mut ip = sock.local_addr().map(|a| a.ip()).unwrap_or_else(|_| {
-                        std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1))
-                    });
-                    if ip.is_loopback() || ip.is_unspecified() {
-                        let _ = sock.connect(("8.8.8.8", 80));
-                        if let Ok(addr) = sock.local_addr() {
-                            ip = addr.ip();
-                        }
-                    }
-                    (ip, p)
-                }
-                Err(_) => (std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)), 0),
-            };
-
-            let bind_addr = if !outbound_ip.is_loopback() && !outbound_ip.is_unspecified() {
-                format!("{outbound_ip}:0")
-            } else {
-                "0.0.0.0:0".to_string()
-            };
-            log::info!(
-                "[WRTC Media] Discovered outbound route IP: {outbound_ip} (port: {bound_port}), binding UDP to {bind_addr}"
-            );
+            // Позволяем webrtc-rs биндиться ко всем интерфейсам и самостоятельно собирать кандидатов.
+            let bind_addr = "0.0.0.0:0".to_string();
 
             let config = RTCConfigurationBuilder::new()
                 .with_ice_servers(vec![])
@@ -261,7 +217,6 @@ impl WrtcPeer {
 
             if let Ok(pc_impl) = pc_res {
                 let pc: Arc<dyn PeerConnection> = Arc::new(pc_impl);
-                // Добавляем аудиотрек
                 let track = MediaStreamTrack::new(
                     format!("webrtc-rs-stream-id-{}", RtpCodecKind::Audio),
                     format!("webrtc-rs-track-id-{}", RtpCodecKind::Audio),
@@ -281,14 +236,12 @@ impl WrtcPeer {
                     .add_track(Arc::clone(&audio_track) as Arc<dyn TrackLocal>)
                     .await;
 
-                // Применяем оффер от JVB и создаем локальный Answer
                 let sdp_str = session.to_sdp(fallback_ip, fallback_port, remote_ssrc);
                 if let Ok(offer) = RTCSessionDescription::offer(sdp_str) {
                     if pc.set_remote_description(offer).await.is_ok() {
                         if let Ok(answer) = pc.create_answer(None).await {
                             let _ = pc.set_local_description(answer.clone()).await;
 
-                            // Добавляем ICE кандидатов от JVB
                             for c in &session.transport.candidates {
                                 if c.ip == "127.0.0.1" || c.ip.starts_with("127.") || c.ip == "0.0.0.0" {
                                     continue;
@@ -313,7 +266,6 @@ impl WrtcPeer {
                                 let _ = pc.add_ice_candidate(init).await;
                             }
 
-                            // Ожидаем формирования локальных ICE-кандидатов в local_description
                             let mut final_sdp = answer.sdp.clone();
                             for _ in 0..25 {
                                 if let Some(desc) = pc.local_description().await {
@@ -325,21 +277,7 @@ impl WrtcPeer {
                                 tokio::time::sleep(Duration::from_millis(20)).await;
                             }
 
-                            let mut local_params = crate::wrtc::jingle::parse_sdp_answer(&final_sdp);
-
-                            // Если webrtc-rs не успел добавить кандидата в SDP, внедряем реальный локальный host-кандидат
-                            if local_params.candidates.is_empty()
-                                && !outbound_ip.is_loopback()
-                                && !outbound_ip.is_unspecified()
-                            {
-                                let port = if bound_port > 0 { bound_port } else { 10000 };
-                                let synthetic =
-                                    format!("1 1 UDP 2130706431 {outbound_ip} {port} typ host");
-                                log::info!(
-                                    "[WRTC Media] Injected synthesized host candidate: {synthetic}"
-                                );
-                                local_params.candidates.push(synthetic);
-                            }
+                            let local_params = crate::wrtc::jingle::parse_sdp_answer(&final_sdp);
 
                             log::info!(
                                 "[WRTC Media] Generated local SDP Answer: ufrag={}, pwd={}, fp={}, candidates count={}",
@@ -349,7 +287,6 @@ impl WrtcPeer {
                                 local_params.candidates.len()
                             );
 
-                            // Отправляем Jingle session-accept в Jicofo
                             let _ = xmpp
                                 .accept_session(
                                     &session.sid,
@@ -366,14 +303,13 @@ impl WrtcPeer {
                     }
                 }
 
-                // Фоновый таск: посылка Opus silence в JVB ТОЛЬКО после завершения ICE/DTLS подключения
                 let track_keepalive = Arc::clone(&audio_track);
                 let seq_c = Arc::new(AtomicU16::new(0));
                 let ts_c = Arc::new(AtomicU32::new(0));
                 tokio::spawn(async move {
-                    if tokio::time::timeout(Duration::from_secs(10), connected_rx.recv()).await.is_ok() {
+                    if tokio::time::timeout(Duration::from_secs(30), connected_rx.recv()).await.is_ok() {
                         log::info!("[WRTC Media] WebRTC ICE/DTLS connected, starting Opus silence keepalive");
-                        let mut interval = tokio::time::interval(Duration::from_millis(1000));
+                        let mut interval = tokio::time::interval(Duration::from_millis(audio_keepalive_ms.max(20)));
                         let silence_payload = Bytes::from_static(&[0xf8, 0xff, 0xfe]);
                         loop {
                             interval.tick().await;
@@ -401,7 +337,7 @@ impl WrtcPeer {
                             }
                         }
                     } else {
-                        log::warn!("[WRTC Media] WebRTC connection did not reach Connected in 10s (continuing with WS)");
+                        log::warn!("[WRTC Media] WebRTC connection did not reach Connected in 30s (continuing with WS)");
                     }
                 });
 

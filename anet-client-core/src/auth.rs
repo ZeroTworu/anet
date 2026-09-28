@@ -254,9 +254,25 @@ impl AuthHandler {
             .await
             .context("Failed Phase I send")?;
 
-        let response_buf = channel.recv(Duration::from_secs(delay)).await?;
+        // Цикл ожидания Фазы II (игнорирует нерасшифровываемый мусор)
+        let start_ii = std::time::Instant::now();
+        let timeout_ii = Duration::from_secs(delay);
+        let shared_key = loop {
+            let elapsed = start_ii.elapsed();
+            if elapsed >= timeout_ii {
+                anyhow::bail!("Phase II timeout (no valid response)");
+            }
 
-        let shared_key = self.handle_phase_ii_response(&response_buf)?;
+            let response_buf = channel.recv(timeout_ii - elapsed).await?;
+            match self.handle_phase_ii_response(&response_buf) {
+                Ok(key) => break key,
+                Err(e) => {
+                    log::warn!("[AUTH] Ignored packet during Phase II (likely noise): {}", e);
+                    continue;
+                }
+            }
+        };
+
         info!("[AUTH] Phase II complete. Shared secret derived.");
         status("[AUTH] Phase II complete. Shared secret derived.");
 
@@ -335,43 +351,66 @@ impl AuthHandler {
         delay: u64,
     ) -> Result<(AuthResponse, [u8; 32])> {
         let (request_packet, cipher) = self.create_encrypted_auth_request(&shared_key)?;
-        info!(
-        "[AUTH] Phase III: Sending Encrypted Auth Request ({} bytes).",
-        request_packet.len()
-    );
+        info!("[AUTH] Phase III: Sending Encrypted Auth Request ({} bytes).", request_packet.len());
 
         channel
             .send(request_packet, &self.frag_cfg)
             .await
             .context("Failed Phase III send")?;
 
-        let response_buf = channel.recv(Duration::from_secs(delay)).await?;
         let handshake_cipher = crypto_utils::create_handshake_cipher(&self.server_pub_key_bytes);
 
-        if response_buf.len() < NONCE_LEN {
-            return Err(anyhow::anyhow!("Short response"));
-        }
-        let (nonce, ciphertext) = response_buf.split_at(NONCE_LEN);
+        // ИСПРАВЛЕНИЕ: Цикл ожидания Фазы IV (игнорирует нерасшифровываемый мусор)
+        let start_iv = std::time::Instant::now();
+        let timeout_iv = Duration::from_secs(delay);
 
-        let plaintext_outer = handshake_cipher
-            .decrypt(nonce, Bytes::copy_from_slice(ciphertext))
-            .context("Failed to de-obfuscate Phase IV")?;
-
-        let outer_msg: AnetMessage = Message::decode(plaintext_outer)?;
-
-        match outer_msg.content {
-            Some(Content::EncryptedAuthResponse(enc_res)) => {
-                let auth_response = self.decrypt_auth_response(enc_res, &cipher)?;
-                info!("[AUTH] Phase IV complete.");
-                status("[AUTH] Phase IV complete.");
-                Ok((auth_response, shared_key))
+        loop {
+            let elapsed = start_iv.elapsed();
+            if elapsed >= timeout_iv {
+                return Err(anyhow::anyhow!("Phase IV timeout (no valid response received)"));
             }
-            //  ОШИБКИ В КОНЦЕ ХЕНДШЕЙКА ?
-            Some(Content::AuthError(err)) => {
-                serr(format!("[CORE AUTH] {}", err.message));
-                Err(anyhow::anyhow!("{}", err.message))
+
+            let response_buf = channel.recv(timeout_iv - elapsed).await?;
+
+            if response_buf.len() < NONCE_LEN {
+                log::debug!("[AUTH] Ignored short packet in Phase IV");
+                continue;
             }
-            _ => Err(anyhow::anyhow!("Unexpected Phase IV content")),
+
+            let (nonce, ciphertext) = response_buf.split_at(NONCE_LEN);
+
+            let plaintext_outer = match handshake_cipher.decrypt(nonce, Bytes::copy_from_slice(ciphertext)) {
+                Ok(pt) => pt,
+                Err(e) => {
+                    log::debug!("[AUTH] Ignored invalid packet in Phase IV (decryption failed): {}", e);
+                    continue;
+                }
+            };
+
+            let outer_msg: AnetMessage = match Message::decode(plaintext_outer) {
+                Ok(msg) => msg,
+                Err(e) => {
+                    log::debug!("[AUTH] Ignored invalid packet in Phase IV (decode failed): {}", e);
+                    continue;
+                }
+            };
+
+            match outer_msg.content {
+                Some(Content::EncryptedAuthResponse(enc_res)) => {
+                    let auth_response = self.decrypt_auth_response(enc_res, &cipher)?;
+                    info!("[AUTH] Phase IV complete.");
+                    status("[AUTH] Phase IV complete.");
+                    return Ok((auth_response, shared_key));
+                }
+                Some(Content::AuthError(err)) => {
+                    serr(format!("[CORE AUTH] {}", err.message));
+                    return Err(anyhow::anyhow!("{}", err.message));
+                }
+                _ => {
+                    log::debug!("[AUTH] Ignored unexpected Phase IV content");
+                    continue;
+                }
+            }
         }
     }
 

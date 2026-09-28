@@ -36,6 +36,10 @@ pub enum WrtcMessage {
     Astp {
         data: String,
     },
+    #[serde(rename = "anet_ping")]
+    Ping,
+    #[serde(rename = "anet_pong")]
+    Pong,
     #[serde(other)]
     Unknown,
 }
@@ -93,6 +97,20 @@ impl ColibriMessage {
         Self::new_endpoint_message(
             Some(to),
             WrtcMessage::Astp { data: base64_data },
+        )
+    }
+
+    pub fn ping(to: String) -> Self {
+        Self::new_endpoint_message(
+            Some(to),
+            WrtcMessage::Ping,
+        )
+    }
+
+    pub fn pong(to: String) -> Self {
+        Self::new_endpoint_message(
+            Some(to),
+            WrtcMessage::Pong,
         )
     }
 }

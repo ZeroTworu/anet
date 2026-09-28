@@ -199,6 +199,22 @@ pub async fn run_wrtc_server(
                     );
                     let _ = shared_peer.send(beacon_msg).await;
                 }
+                WrtcMessage::Ping => {
+                    if let Some(client_info) = clients_map.get(&from_endpoint) {
+                        client_info.last_activity.store(
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs(),
+                            Ordering::Relaxed,
+                        );
+                        let pong_msg = ColibriMessage::pong(from_endpoint.clone());
+                        let _ = shared_peer.send(pong_msg).await;
+                    }
+                }
+                WrtcMessage::Pong => {
+                    // Pongs от клиентов можно игнорировать
+                }
                 WrtcMessage::Astp { data } => {
                     match BASE64_STANDARD.decode(&data) {
                         Ok(raw_bytes) => {

@@ -26,6 +26,13 @@ use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 
+fn current_timestamp_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 pub struct WrtcTransport {
     config: CoreConfig,
     server: ServerConfig,
@@ -139,8 +146,6 @@ impl ClientTransport for WrtcTransport {
             );
         };
 
-        // Собираем IP-адреса медиа-сервера (Colibri WS host + ICE candidates + fallback),
-        // чтобы клиент гарантированно добавил их в BYPASS-маршруты и избежал петли маршрутизации!
         let mut bypass_ips: Vec<std::net::IpAddr> = Vec::new();
 
         if let Some(ref ws_url) = session.transport.colibri_ws_url {
@@ -309,23 +314,44 @@ impl ClientTransport for WrtcTransport {
         let sequence_tx = sequence.clone();
         let padding_step = self.config.stealth.padding_step;
 
+        let mut ping_interval = tokio::time::interval(Duration::from_secs(15));
+        let last_pong = Arc::new(AtomicU64::new(current_timestamp_secs()));
+        let last_pong_tx = last_pong.clone();
+
         tokio::spawn(async move {
-            while let Some(packet) = tunnel_packet_rx.recv().await {
-                if packet.len() < 20 {
-                    continue;
-                }
-                let seq = sequence_tx.fetch_add(1, Ordering::Relaxed);
-                match wrap_packet_padded(&cipher_tx, &nonce_prefix, seq, packet, padding_step) {
-                    Ok(encrypted) => {
-                        let b64 = BASE64_STANDARD.encode(&encrypted);
-                        let msg = ColibriMessage::astp(target_srv_tx.clone(), b64);
-                        if let Err(e) = peer_tx.send(msg).await {
-                            warn!("[WRTC Client] Peer send error: {e}");
-                            break;
+            loop {
+                tokio::select! {
+                    packet_opt = tunnel_packet_rx.recv() => {
+                        let Some(packet) = packet_opt else { break; };
+                        if packet.len() < 20 {
+                            continue;
+                        }
+                        let seq = sequence_tx.fetch_add(1, Ordering::Relaxed);
+                        match wrap_packet_padded(&cipher_tx, &nonce_prefix, seq, packet, padding_step) {
+                            Ok(encrypted) => {
+                                let b64 = BASE64_STANDARD.encode(&encrypted);
+                                let msg = ColibriMessage::astp(target_srv_tx.clone(), b64);
+                                if let Err(e) = peer_tx.send(msg).await {
+                                    warn!("[WRTC Client] Peer send error: {e}");
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                warn!("[WRTC Client] wrap_packet_padded error: {e}");
+                            }
                         }
                     }
-                    Err(e) => {
-                        warn!("[WRTC Client] wrap_packet_padded error: {e}");
+                    _ = ping_interval.tick() => {
+                        let now = current_timestamp_secs();
+                        if now.saturating_sub(last_pong_tx.load(Ordering::Relaxed)) > 45 {
+                            warn!("[WRTC Client] Ping timeout (no pong from server for 45s). Reconnecting...");
+                            break; // Обрываем цикл, транспорт вернется, клиент переподключится
+                        }
+                        let ping_msg = ColibriMessage::ping(target_srv_tx.clone());
+                        if let Err(e) = peer_tx.send(ping_msg).await {
+                            warn!("[WRTC Client] Peer ping error: {e}");
+                            break;
+                        }
                     }
                 }
             }
@@ -341,29 +367,36 @@ impl ClientTransport for WrtcTransport {
                 let msg_opt = peer_rx.recv().await;
                 match msg_opt {
                     Some(msg) => {
-                        if let WrtcMessage::Astp { data } = msg.msg_payload {
-                            match BASE64_STANDARD.decode(&data) {
-                                Ok(raw_encrypted) => {
-                                    match unwrap_packet_bytes(
-                                        &cipher_rx,
-                                        Bytes::from(raw_encrypted),
-                                    ) {
-                                        Ok(packet) => {
-                                            let framed = frame_packet(packet);
-                                            if let Err(e) = tunnel_write.write_all(&framed).await {
-                                                warn!("[WRTC Client] tunnel_write error: {e}");
-                                                break;
+                        match msg.msg_payload {
+                            WrtcMessage::Astp { data } => {
+                                match BASE64_STANDARD.decode(&data) {
+                                    Ok(raw_encrypted) => {
+                                        match unwrap_packet_bytes(
+                                            &cipher_rx,
+                                            Bytes::from(raw_encrypted),
+                                        ) {
+                                            Ok(packet) => {
+                                                let framed = frame_packet(packet);
+                                                if let Err(e) = tunnel_write.write_all(&framed).await {
+                                                    warn!("[WRTC Client] tunnel_write error: {e}");
+                                                    break;
+                                                }
+                                            }
+                                            Err(e) => {
+                                                warn!("[WRTC Client] Decrypt packet error: {e}");
                                             }
                                         }
-                                        Err(e) => {
-                                            warn!("[WRTC Client] Decrypt packet error: {e}");
-                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!("[WRTC Client] Base64 decode error: {e}");
                                     }
                                 }
-                                Err(e) => {
-                                    warn!("[WRTC Client] Base64 decode error: {e}");
-                                }
                             }
+                            WrtcMessage::Pong => {
+                                // Сервер ответил на пинг
+                                last_pong.store(current_timestamp_secs(), Ordering::Relaxed);
+                            }
+                            _ => {}
                         }
                     }
                     None => break,
