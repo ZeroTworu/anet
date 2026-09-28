@@ -21,7 +21,6 @@ use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
-use webrtc::data_channel::RTCDataChannelInit;
 use webrtc::media_stream::track_local::static_rtp::TrackLocalStaticRTP;
 use webrtc::media_stream::track_local::TrackLocal;
 use webrtc::peer_connection::{
@@ -282,18 +281,6 @@ impl WrtcPeer {
                     .add_track(Arc::clone(&audio_track) as Arc<dyn TrackLocal>)
                     .await;
 
-                // Создаем DataChannel (для совместимости с SDP m=application)
-                let dc_init = RTCDataChannelInit {
-                    ordered: false,
-                    max_packet_life_time: None,
-                    max_retransmits: Some(0),
-                    protocol: "http://jitsi.org/protocols/colibri".to_string(),
-                    negotiated: None,
-                };
-                let _ = pc
-                    .create_data_channel("JVB data channel", Some(dc_init))
-                    .await;
-
                 // Применяем оффер от JVB и создаем локальный Answer
                 let sdp_str = session.to_sdp(fallback_ip, fallback_port, remote_ssrc);
                 if let Ok(offer) = RTCSessionDescription::offer(sdp_str) {
@@ -301,7 +288,7 @@ impl WrtcPeer {
                         if let Ok(answer) = pc.create_answer(None).await {
                             let _ = pc.set_local_description(answer.clone()).await;
 
-                            // Добавляем ICE кандидатов
+                            // Добавляем ICE кандидатов от JVB
                             for c in &session.transport.candidates {
                                 if c.ip == "127.0.0.1" || c.ip.starts_with("127.") || c.ip == "0.0.0.0" {
                                     continue;
@@ -375,53 +362,48 @@ impl WrtcPeer {
                                     &local_params.candidates,
                                 )
                                 .await;
-
-                            // Анонсируем SSRC аудиотрека для Jicofo и JVB
-                            let _ = xmpp
-                                .announce_source(&session.sid, &session.from, local_ssrc)
-                                .await;
                         }
                     }
                 }
 
-                // Фоновый таск: периодическая посылка Opus silence в JVB для удержания активного статуса
+                // Фоновый таск: посылка Opus silence в JVB ТОЛЬКО после завершения ICE/DTLS подключения
                 let track_keepalive = Arc::clone(&audio_track);
                 let seq_c = Arc::new(AtomicU16::new(0));
                 let ts_c = Arc::new(AtomicU32::new(0));
                 tokio::spawn(async move {
-                    let mut interval = tokio::time::interval(Duration::from_millis(1000));
-                    // Opus DTX/silence payload: 3 байта [0xf8, 0xff, 0xfe]
-                    let silence_payload = Bytes::from_static(&[0xf8, 0xff, 0xfe]);
-                    loop {
-                        interval.tick().await;
-                        let seq = seq_c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let ts = ts_c.fetch_add(960, std::sync::atomic::Ordering::Relaxed);
-                        let rtp_packet = RtpPacket {
-                            header: RtpHeader {
-                                version: 2,
-                                padding: false,
-                                extension: false,
-                                marker: false,
-                                payload_type: 111,
-                                sequence_number: seq,
-                                timestamp: ts,
-                                ssrc: local_ssrc,
-                                csrc: vec![],
-                                extension_profile: 0,
-                                extensions: vec![],
-                                extensions_padding: 0,
-                            },
-                            payload: silence_payload.clone(),
-                        };
-                        if track_keepalive.write_rtp(rtp_packet).await.is_err() {
-                            break;
+                    if tokio::time::timeout(Duration::from_secs(10), connected_rx.recv()).await.is_ok() {
+                        log::info!("[WRTC Media] WebRTC ICE/DTLS connected, starting Opus silence keepalive");
+                        let mut interval = tokio::time::interval(Duration::from_millis(1000));
+                        let silence_payload = Bytes::from_static(&[0xf8, 0xff, 0xfe]);
+                        loop {
+                            interval.tick().await;
+                            let seq = seq_c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let ts = ts_c.fetch_add(960, std::sync::atomic::Ordering::Relaxed);
+                            let rtp_packet = RtpPacket {
+                                header: RtpHeader {
+                                    version: 2,
+                                    padding: false,
+                                    extension: false,
+                                    marker: false,
+                                    payload_type: 111,
+                                    sequence_number: seq,
+                                    timestamp: ts,
+                                    ssrc: local_ssrc,
+                                    csrc: vec![],
+                                    extension_profile: 0,
+                                    extensions: vec![],
+                                    extensions_padding: 0,
+                                },
+                                payload: silence_payload.clone(),
+                            };
+                            if track_keepalive.write_rtp(rtp_packet).await.is_err() {
+                                break;
+                            }
                         }
+                    } else {
+                        log::warn!("[WRTC Media] WebRTC connection did not reach Connected in 10s (continuing with WS)");
                     }
                 });
-
-                // Ждем подтверждения DTLS & ICE хэндшейка в фоне
-                let _ = tokio::time::timeout(Duration::from_millis(3000), connected_rx.recv()).await;
-                log::info!("[WRTC Media] Background WebRTC ICE/DTLS keepalive established");
 
                 peer_connection_opt = Some(pc);
                 audio_track_opt = Some(audio_track);

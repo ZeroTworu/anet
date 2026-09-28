@@ -300,6 +300,10 @@ impl XmppSession {
             if parts.len() >= 8 && parts[6] == "typ" {
                 let foundation = parts[0];
                 let component = parts[1];
+                // При rtcp-mux допустим только component 1 (RTP)
+                if component != "1" {
+                    continue;
+                }
                 let protocol = parts[2].to_lowercase();
                 let priority = parts[3];
                 let ip = parts[4];
@@ -309,7 +313,7 @@ impl XmppSession {
                     continue;
                 }
                 candidate_xml.push_str(&format!(
-                    r#"<candidate component="{component}" foundation="{foundation}" generation="0" id="c_{i}" ip="{ip}" port="{port}" priority="{priority}" protocol="{protocol}" type="{c_type}" network="0"/>"#
+                    r#"<candidate component="1" foundation="{foundation}" generation="0" id="c_{i}" ip="{ip}" port="{port}" priority="{priority}" protocol="{protocol}" type="{c_type}" network="0"/>"#
                 ));
             }
         }
@@ -319,7 +323,7 @@ impl XmppSession {
         }
 
         let stanza = format!(
-            r#"<iq to="{focus_jid}" type="set" id="{req_id}"><jingle xmlns="urn:xmpp:jingle:1" action="session-accept" initiator="{focus_jid}" responder="{}" sid="{sid}"><content creator="initiator" name="audio" senders="both"><description xmlns="urn:xmpp:jingle:apps:rtp:1" media="audio"><payload-type id="111" name="opus" clockrate="48000" channels="2"/><rtcp-mux/><source xmlns="urn:xmpp:jingle:apps:rtp:ssma:0" ssrc="{ssrc}"><parameter xmlns="urn:xmpp:jingle:apps:rtp:1" name="cname" value="{cname}"/><parameter xmlns="urn:xmpp:jingle:apps:rtp:1" name="msid" value="{msid} a0"/></source></description><transport xmlns="urn:xmpp:jingle:transports:ice-udp:1" ufrag="{ufrag}" pwd="{pwd}"><rtcp-mux/><fingerprint xmlns="urn:xmpp:jingle:apps:dtls:0" hash="{fingerprint_hash}" setup="active">{fingerprint}</fingerprint>{candidate_xml}</transport></content><content creator="initiator" name="data"><description xmlns="urn:xmpp:jingle:apps:sctp:1"><payload-type id="5000"/></description><transport xmlns="urn:xmpp:jingle:transports:ice-udp:1" ufrag="{ufrag}" pwd="{pwd}"><fingerprint xmlns="urn:xmpp:jingle:apps:dtls:0" hash="{fingerprint_hash}" setup="active">{fingerprint}</fingerprint>{candidate_xml}</transport></content></jingle></iq>"#,
+            r#"<iq to="{focus_jid}" type="set" id="{req_id}"><jingle xmlns="urn:xmpp:jingle:1" action="session-accept" initiator="{focus_jid}" responder="{}" sid="{sid}"><content creator="initiator" name="audio" senders="both"><description xmlns="urn:xmpp:jingle:apps:rtp:1" media="audio"><payload-type id="111" name="opus" clockrate="48000" channels="2"/><rtcp-mux/><source xmlns="urn:xmpp:jingle:apps:rtp:ssma:0" ssrc="{ssrc}"><parameter xmlns="urn:xmpp:jingle:apps:rtp:1" name="cname" value="{cname}"/><parameter xmlns="urn:xmpp:jingle:apps:rtp:1" name="msid" value="{msid} a0"/></source></description><transport xmlns="urn:xmpp:jingle:transports:ice-udp:1" ufrag="{ufrag}" pwd="{pwd}"><rtcp-mux/><fingerprint xmlns="urn:xmpp:jingle:apps:dtls:0" hash="{fingerprint_hash}" setup="active">{fingerprint}</fingerprint>{candidate_xml}</transport></content></jingle></iq>"#,
             self.jid
         );
 

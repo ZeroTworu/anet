@@ -92,14 +92,14 @@ impl JingleSession {
             }
         }
 
-        // Формируем BUNDLE аудио (Opus) + WebRTC DataChannel (SCTP)
+        // Формируем чистый аудио (Opus) SDP
         format!(
             "v=0\r\n\
              o=- 123456789 2 IN IP4 0.0.0.0\r\n\
              s=-\r\n\
              t=0 0\r\n\
              a=ice-lite\r\n\
-             a=group:BUNDLE audio data\r\n\
+             a=group:BUNDLE audio\r\n\
              m=audio {primary_port} UDP/TLS/RTP/SAVPF 111\r\n\
              c=IN IP4 {primary_ip}\r\n\
              a=rtcp-mux\r\n\
@@ -111,15 +111,6 @@ impl JingleSession {
              a=mid:audio\r\n\
              a=sendrecv\r\n\
              {ssrc_lines}\
-             {candidate_lines}\
-             m=application {primary_port} UDP/DTLS/SCTP webrtc-datachannel\r\n\
-             c=IN IP4 {primary_ip}\r\n\
-             a=ice-ufrag:{ufrag}\r\n\
-             a=ice-pwd:{pwd}\r\n\
-             a=fingerprint:{fp_hash} {fp}\r\n\
-             a=setup:{setup}\r\n\
-             a=mid:data\r\n\
-             a=sctp-port:5000\r\n\
              {candidate_lines}"
         )
     }}
