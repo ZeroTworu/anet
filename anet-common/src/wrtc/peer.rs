@@ -297,7 +297,7 @@ impl WrtcPeer {
                                     "candidate:{} {} {} {} {} {} typ {}",
                                     c.foundation,
                                     c.component,
-                                    c.protocol.to_uppercase(),
+                                    c.protocol.to_lowercase(),
                                     c.priority,
                                     c.ip,
                                     c.port,

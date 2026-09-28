@@ -64,15 +64,15 @@ impl JingleSession {
             if c.ip == "127.0.0.1" || c.ip.starts_with("127.") || c.ip == "0.0.0.0" {
                 continue;
             }
-            let proto_upper = c.protocol.to_uppercase();
+            let proto_lower = c.protocol.to_lowercase();
             candidate_lines.push_str(&format!(
                 "a=candidate:{} {} {} {} {} {} typ {}\r\n",
-                c.foundation, c.component, proto_upper, c.priority, c.ip, c.port, c.candidate_type
+                c.foundation, c.component, proto_lower, c.priority, c.ip, c.port, c.candidate_type
             ));
         }
         if candidate_lines.is_empty() {
             candidate_lines.push_str(&format!(
-                "a=candidate:1 1 UDP 2130706431 {} {} typ host\r\n",
+                "a=candidate:1 1 udp 2130706431 {} {} typ host\r\n",
                 fallback_ip, fallback_port
             ));
         }
@@ -98,7 +98,6 @@ impl JingleSession {
              o=- 123456789 2 IN IP4 0.0.0.0\r\n\
              s=-\r\n\
              t=0 0\r\n\
-             a=ice-lite\r\n\
              a=ice-ufrag:{ufrag}\r\n\
              a=ice-pwd:{pwd}\r\n\
              a=fingerprint:{fp_hash} {fp}\r\n\
