@@ -1,5 +1,5 @@
 use crate::wrtc::colibri::ColibriMessage;
-use crate::wrtc::jingle::{JingleSession, JingleTransportInfo};
+use crate::wrtc::jingle::JingleSession;
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
 use rtc::interceptor::Registry;
@@ -249,23 +249,19 @@ impl WrtcPeer {
 
             let handler = Arc::new(PeerEvents { connected_tx });
 
-            let pc_result: anyhow::Result<Arc<dyn PeerConnection>> = async {
-                let pc = PeerConnectionBuilder::new()
-                    .with_configuration(config)
-                    .with_setting_engine(setting_engine)
-                    .with_media_engine(media_engine)
-                    .with_interceptor_registry(registry)
-                    .with_handler(handler)
-                    .with_runtime(Arc::new(TokioRuntime))
-                    .with_udp_addrs(vec![bind_addr])
-                    .build()
-                    .await
-                    .map_err(|e| anyhow::anyhow!("PeerConnectionBuilder failed: {e:#}"))?;
-                Ok(Arc::new(pc))
-            }
-            .await;
+            let pc_res = PeerConnectionBuilder::new()
+                .with_configuration(config)
+                .with_setting_engine(setting_engine)
+                .with_media_engine(media_engine)
+                .with_interceptor_registry(registry)
+                .with_handler(handler)
+                .with_runtime(Arc::new(TokioRuntime))
+                .with_udp_addrs(vec![bind_addr])
+                .build()
+                .await;
 
-            if let Ok(pc) = pc_result {
+            if let Ok(pc_impl) = pc_res {
+                let pc: Arc<dyn PeerConnection> = Arc::new(pc_impl);
                 // Добавляем аудиотрек
                 let track = MediaStreamTrack::new(
                     format!("webrtc-rs-stream-id-{}", RtpCodecKind::Audio),
