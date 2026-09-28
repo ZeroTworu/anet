@@ -99,6 +99,9 @@ impl JingleSession {
              s=-\r\n\
              t=0 0\r\n\
              a=ice-lite\r\n\
+             a=ice-ufrag:{ufrag}\r\n\
+             a=ice-pwd:{pwd}\r\n\
+             a=fingerprint:{fp_hash} {fp}\r\n\
              a=group:BUNDLE audio\r\n\
              m=audio {primary_port} UDP/TLS/RTP/SAVPF 111\r\n\
              c=IN IP4 {primary_ip}\r\n\

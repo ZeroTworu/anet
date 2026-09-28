@@ -307,7 +307,7 @@ impl WrtcPeer {
                                     candidate: candidate_sdp,
                                     sdp_mid: Some("audio".to_string()),
                                     sdp_mline_index: Some(0),
-                                    username_fragment: None,
+                                    username_fragment: Some(session.transport.ufrag.clone()),
                                     url: None,
                                 };
                                 let _ = pc.add_ice_candidate(init).await;
