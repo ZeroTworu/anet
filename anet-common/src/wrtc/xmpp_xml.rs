@@ -75,17 +75,71 @@ pub fn parse_xmpp_message(
     parse_xmpp_stanzas(xml, fallback_ip, fallback_port).into_iter().next()
 }
 
+/// Верхнеуровневые XML-теги протокола XMPP (RFC 6120 / RFC 7395).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XmppElementTag {
+    Open,
+    Close,
+    Features,
+    Mechanisms,
+    Success,
+    Failure,
+    Presence,
+    Iq,
+    Message,
+    Other,
+}
+
+impl<'a> From<&'a str> for XmppElementTag {
+    fn from(name: &'a str) -> Self {
+        match name {
+            "open" => Self::Open,
+            "close" => Self::Close,
+            "features" => Self::Features,
+            "mechanisms" => Self::Mechanisms,
+            "success" => Self::Success,
+            "failure" => Self::Failure,
+            "presence" => Self::Presence,
+            "iq" => Self::Iq,
+            "message" => Self::Message,
+            _ => Self::Other,
+        }
+    }
+}
+
+/// Типы станзы IQ в XMPP (RFC 6120 §8.2.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IqType {
+    Get,
+    Set,
+    Result,
+    Error,
+    Other,
+}
+
+impl<'a> From<&'a str> for IqType {
+    fn from(s: &'a str) -> Self {
+        match s {
+            "get" => Self::Get,
+            "set" => Self::Set,
+            "result" => Self::Result,
+            "error" => Self::Error,
+            _ => Self::Other,
+        }
+    }
+}
+
 fn parse_single_element(
     root: &roxmltree::Node,
     fallback_ip: &str,
     fallback_port: u16,
 ) -> Option<InboundXmpp> {
-    let tag = root.tag_name().name();
+    let tag = XmppElementTag::from(root.tag_name().name());
 
     match tag {
-        "open" => Some(InboundXmpp::Open),
-        "mechanisms" => Some(InboundXmpp::SaslMechanisms),
-        "features" => {
+        XmppElementTag::Open => Some(InboundXmpp::Open),
+        XmppElementTag::Mechanisms => Some(InboundXmpp::SaslMechanisms),
+        XmppElementTag::Features => {
             // В XMPP mechanisms приходят внутри <features><mechanisms>...</mechanisms></features>!
             if root.descendants().any(|n| n.has_tag_name("mechanisms")) {
                 Some(InboundXmpp::SaslMechanisms)
@@ -94,9 +148,11 @@ fn parse_single_element(
                 Some(InboundXmpp::Features { has_bind })
             }
         }
-        "success" => Some(InboundXmpp::SaslSuccess),
-        "failure" => Some(InboundXmpp::SaslFailure("SASL authentication failed".to_string())),
-        "presence" => {
+        XmppElementTag::Success => Some(InboundXmpp::SaslSuccess),
+        XmppElementTag::Failure => {
+            Some(InboundXmpp::SaslFailure("SASL authentication failed".to_string()))
+        }
+        XmppElementTag::Presence => {
             let from = root.attribute("from").unwrap_or_default().to_string();
             let p_type = root.attribute("type").unwrap_or_default();
             let is_unavailable = p_type == "unavailable";
@@ -109,10 +165,10 @@ fn parse_single_element(
                 is_self_110,
             })
         }
-        "iq" => {
+        XmppElementTag::Iq => {
             let iq_id = root.attribute("id").unwrap_or_default().to_string();
             let from = root.attribute("from").unwrap_or_default().to_string();
-            let iq_type = root.attribute("type").unwrap_or_default();
+            let iq_type = IqType::from(root.attribute("type").unwrap_or_default());
 
             // 1. Проверяем bind result:
             if let Some(bind_node) = root.descendants().find(|n| n.has_tag_name("bind")) {
@@ -127,12 +183,12 @@ fn parse_single_element(
             }
 
             // 2. Проверяем ping get:
-            if iq_type == "get" && root.descendants().any(|n| n.has_tag_name("ping")) {
+            if iq_type == IqType::Get && root.descendants().any(|n| n.has_tag_name("ping")) {
                 return Some(InboundXmpp::Ping { id: iq_id, from });
             }
 
             // 3. Проверяем disco#info get:
-            if iq_type == "get" {
+            if iq_type == IqType::Get {
                 if let Some(query_node) = root.descendants().find(|n| n.has_tag_name("query")) {
                     let node = query_node.attribute("node").map(|s| s.to_string());
                     return Some(InboundXmpp::DiscoInfo {
@@ -153,13 +209,15 @@ fn parse_single_element(
             }
 
             // 5. Проверяем Jingle ACK result:
-            if iq_type == "result" {
+            if iq_type == IqType::Result {
                 return Some(InboundXmpp::JingleAck { id: iq_id, from });
             }
 
             Some(InboundXmpp::Other)
         }
-        _ => Some(InboundXmpp::Other),
+        XmppElementTag::Close | XmppElementTag::Message | XmppElementTag::Other => {
+            Some(InboundXmpp::Other)
+        }
     }
 }
 
