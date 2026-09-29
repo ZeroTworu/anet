@@ -101,6 +101,7 @@ impl WrtcPeer {
                 let (ws_raw_tx, mut ws_raw_rx) = mpsc::channel::<tokio_tungstenite::tungstenite::Message>(64);
 
                 // Воркер отправки данных в JVB WebSocket
+                let raw_tx_ping = ws_raw_tx.clone();
                 tokio::spawn(async move {
                     let mut ping_interval = tokio::time::interval(Duration::from_secs(10));
                     loop {
@@ -213,8 +214,45 @@ impl WrtcPeer {
             media_engine.register_codec(audio_codec.clone(), RtpCodecKind::Audio)?;
             let registry = register_default_interceptors(Registry::new(), &mut media_engine)?;
 
-            // Позволяем webrtc-rs биндиться ко всем интерфейсам и самостоятельно собирать кандидатов.
-            let bind_addr = "0.0.0.0:0".to_string();
+            // Определяем реальный исходящий IP сетевого интерфейса (вместо прослушивания мультикаста на 0.0.0.0)
+            let target_ip = session
+                .transport
+                .candidates
+                .iter()
+                .find(|c| c.ip != "127.0.0.1" && !c.ip.starts_with("127.") && c.ip != "0.0.0.0")
+                .map(|c| c.ip.as_str())
+                .unwrap_or(fallback_ip);
+
+            let target_port = session
+                .transport
+                .candidates
+                .iter()
+                .find(|c| c.ip != "127.0.0.1" && !c.ip.starts_with("127.") && c.ip != "0.0.0.0")
+                .map(|c| c.port)
+                .unwrap_or(fallback_port);
+
+            let outbound_ip = match std::net::UdpSocket::bind("0.0.0.0:0") {
+                Ok(sock) => {
+                    let _ = sock.connect((target_ip, target_port));
+                    let mut ip = sock.local_addr().map(|a| a.ip()).unwrap_or_else(|_| {
+                        std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1))
+                    });
+                    if ip.is_loopback() || ip.is_unspecified() {
+                        let _ = sock.connect(("8.8.8.8", 80));
+                        if let Ok(addr) = sock.local_addr() {
+                            ip = addr.ip();
+                        }
+                    }
+                    ip
+                }
+                Err(_) => std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+            };
+
+            let bind_addr = if !outbound_ip.is_loopback() && !outbound_ip.is_unspecified() {
+                format!("{outbound_ip}:0")
+            } else {
+                "0.0.0.0:0".to_string()
+            };
 
             let config = RTCConfigurationBuilder::new()
                 .with_ice_servers(vec![])
