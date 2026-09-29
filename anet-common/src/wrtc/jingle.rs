@@ -122,10 +122,12 @@ pub fn parse_jingle_session(
     fallback_ip: &str,
     fallback_port: u16,
 ) -> Option<JingleSession> {
-    match crate::wrtc::xmpp_xml::parse_xmpp_message(xml, fallback_ip, fallback_port)? {
-        crate::wrtc::xmpp_xml::InboundXmpp::Jingle(session) => Some(session),
-        _ => None,
+    for stanza in crate::wrtc::xmpp_xml::parse_xmpp_stanzas(xml, fallback_ip, fallback_port) {
+        if let crate::wrtc::xmpp_xml::InboundXmpp::Jingle(session) = stanza {
+            return Some(session);
+        }
     }
+    None
 }
 
 #[derive(Debug, Clone, Default)]

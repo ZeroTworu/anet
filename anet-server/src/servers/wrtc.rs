@@ -200,25 +200,19 @@ pub async fn run_wrtc_server(
                     let _ = shared_peer.send(beacon_msg).await;
                 }
                 WrtcMessage::Ping => {
-                    let mut is_dead = false;
                     if let Some(client_info) = clients_map.get(&from_endpoint) {
-                        if reg_clone.get_by_session(&client_info.session_id).is_some() {
-                            client_info.last_activity.store(
-                                std::time::SystemTime::now()
-                                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_secs(),
-                                Ordering::Relaxed,
-                            );
-                            let pong_msg = ColibriMessage::pong(from_endpoint.clone());
-                            let _ = shared_peer.send(pong_msg).await;
-                        } else {
-                            is_dead = true;
+                        client_info.last_activity.store(
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs(),
+                            Ordering::Relaxed,
+                        );
+                        if let Some(reg_client) = reg_clone.get_by_session(&client_info.session_id) {
+                            reg_clone.record_rx(&reg_client, 0, "wrtc");
                         }
-                    }
-                    if is_dead {
-                        clients_map.remove(&from_endpoint);
-                        log::info!("[WRTC Server] Dropped Ping from {from_endpoint}: session was killed in registry");
+                        let pong_msg = ColibriMessage::pong(from_endpoint.clone());
+                        let _ = shared_peer.send(pong_msg).await;
                     }
                 }
                 WrtcMessage::Pong => {
@@ -229,32 +223,27 @@ pub async fn run_wrtc_server(
                         Ok(raw_bytes) => {
                             let mut client_found = false;
                             if let Some(client_info) = clients_map.get(&from_endpoint) {
-                                if reg_clone.get_by_session(&client_info.session_id).is_some() {
-                                    client_found = true;
-                                    match unwrap_packet_bytes(
-                                        &client_info.cipher,
-                                        Bytes::from(raw_bytes.clone()),
-                                    ) {
-                                        Ok(packet) => {
-                                            let packet_len = packet.len();
-                                            match tun_clone.try_send(packet) {
-                                                Ok(_) => {
-                                                    reg_clone.record_rx(&client_info, packet_len, "wrtc");
-                                                    log::debug!("[WRTC Server] Injected {} bytes into TUN for {}", packet_len, client_info.assigned_ip);
-                                                }
-                                                Err(e) => {
-                                                    warn!("[WRTC Server] TUN queue error for {}: {e}", client_info.assigned_ip);
-                                                }
+                                client_found = true;
+                                match unwrap_packet_bytes(
+                                    &client_info.cipher,
+                                    Bytes::from(raw_bytes.clone()),
+                                ) {
+                                    Ok(packet) => {
+                                        let packet_len = packet.len();
+                                        match tun_clone.try_send(packet) {
+                                            Ok(_) => {
+                                                reg_clone.record_rx(&client_info, packet_len, "wrtc");
+                                                log::debug!("[WRTC Server] Injected {} bytes into TUN for {}", packet_len, client_info.assigned_ip);
+                                            }
+                                            Err(e) => {
+                                                warn!("[WRTC Server] TUN queue error for {}: {e}", client_info.assigned_ip);
                                             }
                                         }
-                                        Err(e) => {
-                                            warn!("[WRTC Server] Decrypt packet failed for {from_endpoint}: {e}");
-                                            client_found = false;
-                                        }
                                     }
-                                } else {
-                                    drop(client_info);
-                                    clients_map.remove(&from_endpoint);
+                                    Err(e) => {
+                                        warn!("[WRTC Server] Decrypt packet failed for {from_endpoint}: {e}");
+                                        client_found = false;
+                                    }
                                 }
                             }
 

@@ -196,7 +196,13 @@ impl XmppSession {
                         } else { break; }
                     }
                     _ = ping_interval.tick() => {
+                        // 1. WebSocket keepalive
                         if ws_sink.send(Message::Ping(bytes::Bytes::from_static(&[0x01, 0x02]))).await.is_err() {
+                            break;
+                        }
+                        // 2. XMPP keepalive (предотвращает закрытие сессии Prosody по 120s c2s таймауту)
+                        let ping_iq = XmppBuilder::ping("meet.jitsi", &format!("ping_{:08x}", rand::random::<u32>()));
+                        if ws_sink.send(Message::text(ping_iq)).await.is_err() {
                             break;
                         }
                     }
