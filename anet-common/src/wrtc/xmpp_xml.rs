@@ -366,6 +366,14 @@ impl XmppBuilder {
             msid = escape_xml_attr(msid)
         )
     }
+
+    pub fn ping(to: &str, id: &str) -> String {
+        format!(
+            r#"<iq to="{}" type="get" id="{}"><ping xmlns="urn:xmpp:ping"/></iq>"#,
+            escape_xml_attr(to),
+            escape_xml_attr(id)
+        )
+    }
 }
 
 #[cfg(test)]
