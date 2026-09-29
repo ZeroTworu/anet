@@ -193,7 +193,6 @@ impl ClientTransport for WrtcTransport {
             fallback_ip,
             fallback_port,
             audio_keepalive_ms,
-            false,
         )
             .await
             .context("Failed to initialize WebRTC PeerConnection and DataChannel")?;

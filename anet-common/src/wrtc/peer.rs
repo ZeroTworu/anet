@@ -24,7 +24,7 @@ use tokio_tungstenite::tungstenite::http::HeaderValue;
 use webrtc::media_stream::track_local::static_rtp::TrackLocalStaticRTP;
 use webrtc::media_stream::track_local::TrackLocal;
 use webrtc::peer_connection::{
-    PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler, RTCIceCandidateInit,
+    PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler,
     RTCPeerConnectionState,
 };
 use webrtc::runtime::TokioRuntime;
@@ -63,7 +63,6 @@ impl WrtcPeer {
         fallback_ip: &str,
         fallback_port: u16,
         audio_keepalive_ms: u64,
-        is_server: bool,
     ) -> anyhow::Result<Self> {
         let (incoming_tx, incoming_rx) = mpsc::channel::<ColibriMessage>(1024);
         let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<ColibriMessage>(1024);

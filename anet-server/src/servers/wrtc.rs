@@ -147,7 +147,6 @@ pub async fn run_wrtc_server(
             fallback_ip,
             fallback_port,
             audio_keepalive_ms,
-            true,
         )
             .await
         {
