@@ -17,12 +17,12 @@ use base64::prelude::*;
 use bytes::Bytes;
 use dashmap::DashMap;
 use ed25519_dalek::SigningKey;
-use log::{debug, info, warn};
+use log::{info, warn};
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::mpsc;
 
 fn endpoint_to_socket_addr(ep: &str) -> SocketAddr {
     let num = u32::from_str_radix(ep, 16).unwrap_or(0);
