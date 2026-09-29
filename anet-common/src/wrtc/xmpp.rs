@@ -1,6 +1,6 @@
 use crate::http_help::BrowserProfile;
 use crate::wrtc::stealth::{apply_ws_browser_headers, generate_random_guest_name};
-use crate::wrtc::xmpp_xml::{escape_xml_attr, parse_xmpp_message, InboundXmpp, XmppBuilder};
+use crate::wrtc::xmpp_xml::{escape_xml_attr, parse_xmpp_stanzas, InboundXmpp, XmppBuilder};
 use futures::{SinkExt, StreamExt};
 use rand::Rng;
 use std::collections::HashSet;
@@ -82,75 +82,83 @@ impl XmppSession {
         let conf_muc = format!("{conference_id}@muc.meet.jitsi/");
 
         let handshake_fut = async {
+            let mut joined = false;
             while let Some(msg_res) = ws_stream.next().await {
                 let msg = msg_res?;
                 if let Message::Text(text) = msg {
-                    let parsed = parse_xmpp_message(text.as_str(), "0.0.0.0", 0);
-                    match parsed {
-                        Some(InboundXmpp::Presence {
-                            from,
-                            is_unavailable,
-                            is_self_110,
-                        }) => {
-                            if let Some(occupant) = from.strip_prefix(&conf_muc) {
-                                if occupant != my_ep && occupant != "focus" {
-                                    if is_unavailable {
-                                        occ_track.lock().unwrap().remove(occupant);
-                                    } else {
-                                        occ_track.lock().unwrap().insert(occupant.to_string());
-                                        log::info!("[XMPP] Detected occupant in room: {occupant}");
+                    log::info!("[XMPP IN]: {text}");
+                    let stanzas = parse_xmpp_stanzas(text.as_str(), "0.0.0.0", 0);
+                    for parsed in stanzas {
+                        match parsed {
+                            InboundXmpp::Presence {
+                                from,
+                                is_unavailable,
+                                is_self_110,
+                            } => {
+                                if let Some(occupant) = from.strip_prefix(&conf_muc) {
+                                    if occupant != my_ep && occupant != "focus" {
+                                        if is_unavailable {
+                                            occ_track.lock().unwrap().remove(occupant);
+                                        } else {
+                                            occ_track.lock().unwrap().insert(occupant.to_string());
+                                            log::info!("[XMPP] Detected occupant in room: {occupant}");
+                                        }
                                     }
                                 }
+                                if is_self_110 {
+                                    log::info!(
+                                        "[XMPP] Successfully joined MUC room {conference_id} as occupant {endpoint_id}"
+                                    );
+                                    joined = true;
+                                    break;
+                                }
                             }
-                            if is_self_110 {
-                                log::info!(
-                                    "[XMPP] Successfully joined MUC room {conference_id} as occupant {endpoint_id}"
-                                );
-                                break;
+                            InboundXmpp::SaslMechanisms if !authed => {
+                                log::info!("[XMPP] SASL mechanisms received, sending ANONYMOUS auth");
+                                ws_sink
+                                    .send(Message::text(XmppBuilder::auth_anonymous()))
+                                    .await?;
                             }
-                        }
-                        Some(InboundXmpp::SaslMechanisms) if !authed => {
-                            log::info!("[XMPP] SASL mechanisms received, sending ANONYMOUS auth");
-                            ws_sink
-                                .send(Message::text(XmppBuilder::auth_anonymous()))
-                                .await?;
-                        }
-                        Some(InboundXmpp::SaslSuccess) => {
-                            log::info!("[XMPP] SASL auth success, resetting stream");
-                            authed = true;
-                            ws_sink.send(Message::text(XmppBuilder::open())).await?;
-                        }
-                        Some(InboundXmpp::Features { has_bind })
-                            if authed && has_bind && !bind_sent =>
-                        {
-                            bind_sent = true;
-                            log::info!("[XMPP] Binding resource...");
-                            ws_sink
-                                .send(Message::text(XmppBuilder::bind_resource("_bind_auth_2")))
-                                .await?;
-                        }
-                        Some(InboundXmpp::BindResult {
-                            id,
-                            jid: bound_jid,
-                        }) if authed && id == "_bind_auth_2" && !bound => {
-                            bound = true;
-                            jid = bound_jid;
-                            log::info!("[XMPP] Bound JID: {jid}");
+                            InboundXmpp::SaslSuccess => {
+                                log::info!("[XMPP] SASL auth success, resetting stream");
+                                authed = true;
+                                ws_sink.send(Message::text(XmppBuilder::open())).await?;
+                            }
+                            InboundXmpp::Features { has_bind }
+                                if authed && has_bind && !bind_sent =>
+                            {
+                                bind_sent = true;
+                                log::info!("[XMPP] Binding resource...");
+                                ws_sink
+                                    .send(Message::text(XmppBuilder::bind_resource("_bind_auth_2")))
+                                    .await?;
+                            }
+                            InboundXmpp::BindResult {
+                                id,
+                                jid: bound_jid,
+                            } if authed && id == "_bind_auth_2" && !bound => {
+                                bound = true;
+                                jid = bound_jid;
+                                log::info!("[XMPP] Bound JID: {jid}");
 
-                            log::info!(
-                                "[XMPP] Entering MUC room {conference_id} with occupant {endpoint_id} (name: {effective_client_name})..."
-                            );
-                            let presence = XmppBuilder::muc_presence(
-                                conference_id,
-                                &endpoint_id,
-                                &effective_client_name,
-                            );
-                            ws_sink.send(Message::text(presence)).await?;
+                                log::info!(
+                                    "[XMPP] Entering MUC room {conference_id} with occupant {endpoint_id} (name: {effective_client_name})..."
+                                );
+                                let presence = XmppBuilder::muc_presence(
+                                    conference_id,
+                                    &endpoint_id,
+                                    &effective_client_name,
+                                );
+                                ws_sink.send(Message::text(presence)).await?;
+                            }
+                            InboundXmpp::SaslFailure(err) => {
+                                anyhow::bail!("XMPP SASL authentication failed: {err}");
+                            }
+                            _ => {}
                         }
-                        Some(InboundXmpp::SaslFailure(err)) => {
-                            anyhow::bail!("XMPP SASL authentication failed: {err}");
-                        }
-                        _ => {}
+                    }
+                    if joined {
+                        break;
                     }
                 }
             }
@@ -204,41 +212,43 @@ impl XmppSession {
             while let Some(msg_res) = ws_stream.next().await {
                 match msg_res {
                     Ok(Message::Text(text)) => {
-                        let parsed = parse_xmpp_message(text.as_str(), "0.0.0.0", 0);
-                        match parsed {
-                            Some(InboundXmpp::Presence {
-                                from,
-                                is_unavailable,
-                                ..
-                            }) => {
-                                if let Some(occupant) = from.strip_prefix(&conf_muc) {
-                                    if occupant != my_ep && occupant != "focus" {
-                                        if is_unavailable {
-                                            occ_track_bg.lock().unwrap().remove(occupant);
-                                        } else {
-                                            occ_track_bg
-                                                .lock()
-                                                .unwrap()
-                                                .insert(occupant.to_string());
+                        let stanzas = parse_xmpp_stanzas(text.as_str(), "0.0.0.0", 0);
+                        for parsed in stanzas {
+                            match parsed {
+                                InboundXmpp::Presence {
+                                    from,
+                                    is_unavailable,
+                                    ..
+                                } => {
+                                    if let Some(occupant) = from.strip_prefix(&conf_muc) {
+                                        if occupant != my_ep && occupant != "focus" {
+                                            if is_unavailable {
+                                                occ_track_bg.lock().unwrap().remove(occupant);
+                                            } else {
+                                                occ_track_bg
+                                                    .lock()
+                                                    .unwrap()
+                                                    .insert(occupant.to_string());
+                                            }
                                         }
                                     }
                                 }
-                            }
-                            Some(InboundXmpp::DiscoInfo { id, from }) => {
-                                let disco_reply = XmppBuilder::disco_info_result(&from, &id);
-                                let _ = write_tx_ack.send(disco_reply).await;
-                            }
-                            Some(InboundXmpp::Ping { id, from }) => {
-                                let pong = XmppBuilder::iq_result(&from, &id);
-                                let _ = write_tx_ack.send(pong).await;
-                            }
-                            Some(InboundXmpp::Jingle(ref sess)) => {
-                                if let Some(ref iq_id) = sess.iq_id {
-                                    let ack = XmppBuilder::iq_result(&sess.from, iq_id);
-                                    let _ = write_tx_ack.send(ack).await;
+                                InboundXmpp::DiscoInfo { id, from } => {
+                                    let disco_reply = XmppBuilder::disco_info_result(&from, &id);
+                                    let _ = write_tx_ack.send(disco_reply).await;
                                 }
+                                InboundXmpp::Ping { id, from } => {
+                                    let pong = XmppBuilder::iq_result(&from, &id);
+                                    let _ = write_tx_ack.send(pong).await;
+                                }
+                                InboundXmpp::Jingle(ref sess) => {
+                                    if let Some(ref iq_id) = sess.iq_id {
+                                        let ack = XmppBuilder::iq_result(&sess.from, iq_id);
+                                        let _ = write_tx_ack.send(ack).await;
+                                    }
+                                }
+                                _ => {}
                             }
-                            _ => {}
                         }
 
                         let _ = read_tx.try_send(text.to_string());

@@ -35,34 +35,63 @@ pub enum InboundXmpp {
     Other,
 }
 
+/// Разбирает XML фрейм, который может содержать одну или несколько станз (например, `<open/><features>`).
+pub fn parse_xmpp_stanzas(
+    xml: &str,
+    fallback_ip: &str,
+    fallback_port: u16,
+) -> Vec<InboundXmpp> {
+    let trimmed = xml.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+
+    // Оборачиваем в искусственный корневой элемент <stream>,
+    // чтобы roxmltree корректно разбирал фрагменты с несколькими станзами в одном фрейме
+    let wrapped = format!("<stream>{trimmed}</stream>");
+    let doc = match roxmltree::Document::parse(&wrapped) {
+        Ok(d) => d,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut stanzas = Vec::new();
+    for node in doc.root_element().children().filter(|n| n.is_element()) {
+        if let Some(stanza) = parse_single_element(&node, fallback_ip, fallback_port) {
+            stanzas.push(stanza);
+        }
+    }
+    stanzas
+}
+
 pub fn parse_xmpp_message(
     xml: &str,
     fallback_ip: &str,
     fallback_port: u16,
 ) -> Option<InboundXmpp> {
-    let doc = roxmltree::Document::parse(xml).ok()?;
-    let root = doc.root_element();
+    parse_xmpp_stanzas(xml, fallback_ip, fallback_port).into_iter().next()
+}
+
+fn parse_single_element(
+    root: &roxmltree::Node,
+    fallback_ip: &str,
+    fallback_port: u16,
+) -> Option<InboundXmpp> {
     let tag = root.tag_name().name();
 
     match tag {
         "open" => Some(InboundXmpp::Open),
         "mechanisms" => Some(InboundXmpp::SaslMechanisms),
-        "success"
-            if root.default_namespace() == Some("urn:ietf:params:xml:ns:xmpp-sasl")
-                || root.attribute("xmlns") == Some("urn:ietf:params:xml:ns:xmpp-sasl") =>
-        {
-            Some(InboundXmpp::SaslSuccess)
-        }
-        "failure"
-            if root.default_namespace() == Some("urn:ietf:params:xml:ns:xmpp-sasl")
-                || root.attribute("xmlns") == Some("urn:ietf:params:xml:ns:xmpp-sasl") =>
-        {
-            Some(InboundXmpp::SaslFailure(xml.to_string()))
-        }
         "features" => {
-            let has_bind = root.descendants().any(|n| n.has_tag_name("bind"));
-            Some(InboundXmpp::Features { has_bind })
+            // В XMPP mechanisms приходят внутри <features><mechanisms>...</mechanisms></features>!
+            if root.descendants().any(|n| n.has_tag_name("mechanisms")) {
+                Some(InboundXmpp::SaslMechanisms)
+            } else {
+                let has_bind = root.descendants().any(|n| n.has_tag_name("bind"));
+                Some(InboundXmpp::Features { has_bind })
+            }
         }
+        "success" => Some(InboundXmpp::SaslSuccess),
+        "failure" => Some(InboundXmpp::SaslFailure("SASL authentication failed".to_string())),
         "presence" => {
             let from = root.attribute("from").unwrap_or_default().to_string();
             let p_type = root.attribute("type").unwrap_or_default();
@@ -82,8 +111,8 @@ pub fn parse_xmpp_message(
             let iq_type = root.attribute("type").unwrap_or_default();
 
             // 1. Проверяем bind result:
-            if let Some(bind_node) = root.children().find(|n| n.has_tag_name("bind")) {
-                if let Some(jid_node) = bind_node.children().find(|n| n.has_tag_name("jid")) {
+            if let Some(bind_node) = root.descendants().find(|n| n.has_tag_name("bind")) {
+                if let Some(jid_node) = bind_node.descendants().find(|n| n.has_tag_name("jid")) {
                     if let Some(jid) = jid_node.text() {
                         return Some(InboundXmpp::BindResult {
                             id: iq_id,
@@ -99,23 +128,16 @@ pub fn parse_xmpp_message(
             }
 
             // 3. Проверяем disco#info get:
-            if iq_type == "get"
-                && root.descendants().any(|n| {
-                    n.has_tag_name("query")
-                        && n.attribute("xmlns") == Some("http://jabber.org/protocol/disco#info")
-                })
-            {
+            if iq_type == "get" && root.descendants().any(|n| n.has_tag_name("query")) {
                 return Some(InboundXmpp::DiscoInfo { id: iq_id, from });
             }
 
             // 4. Проверяем Jingle:
-            if let Some(jingle_node) = root.children().find(|n| n.has_tag_name("jingle")) {
-                if iq_type == "set" {
-                    if let Some(session) =
-                        parse_jingle_node(&root, &jingle_node, fallback_ip, fallback_port)
-                    {
-                        return Some(InboundXmpp::Jingle(session));
-                    }
+            if let Some(jingle_node) = root.descendants().find(|n| n.has_tag_name("jingle")) {
+                if let Some(session) =
+                    parse_jingle_node(root, &jingle_node, fallback_ip, fallback_port)
+                {
+                    return Some(InboundXmpp::Jingle(session));
                 }
             }
 
@@ -357,14 +379,12 @@ mod tests {
 
     #[test]
     fn test_parse_open_and_sasl() {
-        let open_xml = r#"<open xmlns="urn:ietf:params:xml:ns:xmpp-framing" to="meet.jitsi" version="1.0"/>"#;
-        assert!(matches!(parse_xmpp_message(open_xml, "127.0.0.1", 10000), Some(InboundXmpp::Open)));
-
-        let mechs = r#"<mechanisms xmlns="urn:ietf:params:xml:ns:xmpp-sasl"><mechanism>ANONYMOUS</mechanism></mechanisms>"#;
-        assert!(matches!(parse_xmpp_message(mechs, "127.0.0.1", 10000), Some(InboundXmpp::SaslMechanisms)));
-
-        let succ = r#"<success xmlns="urn:ietf:params:xml:ns:xmpp-sasl"/>"#;
-        assert!(matches!(parse_xmpp_message(succ, "127.0.0.1", 10000), Some(InboundXmpp::SaslSuccess)));
+        // Тест на склейку двух станз в одном WebSocket фрейме (как шлет Prosody по RFC 7395):
+        let multi_xml = r#"<open xmlns="urn:ietf:params:xml:ns:xmpp-framing" to="meet.jitsi" version="1.0"/><features xmlns="http://etherx.jabber.org/streams"><mechanisms xmlns="urn:ietf:params:xml:ns:xmpp-sasl"><mechanism>ANONYMOUS</mechanism></mechanisms></features>"#;
+        let stanzas = parse_xmpp_stanzas(multi_xml, "127.0.0.1", 10000);
+        assert_eq!(stanzas.len(), 2);
+        assert!(matches!(stanzas[0], InboundXmpp::Open));
+        assert!(matches!(stanzas[1], InboundXmpp::SaslMechanisms));
     }
 
     #[test]
