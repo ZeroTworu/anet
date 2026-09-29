@@ -5,3 +5,4 @@ pub mod peer;
 pub mod session;
 pub mod stealth;
 pub mod xmpp;
+pub mod xmpp_xml;
