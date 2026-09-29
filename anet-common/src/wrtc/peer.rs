@@ -29,8 +29,9 @@ use webrtc::peer_connection::{
 };
 use webrtc::runtime::TokioRuntime;
 
-pub const WRTC_SERVER_SSRC: u32 = 0x53525631; // 1397962289 ("SRV1")
-pub const WRTC_CLIENT_SSRC: u32 = 0x434c4931; // 1129072945 ("CLI1")
+fn generate_random_ssrc() -> u32 {
+    (rand::random::<u32>() & 0x7FFFFFFF) | 0x1000
+}
 
 struct PeerEvents {
     connected_tx: mpsc::Sender<()>,
@@ -68,11 +69,8 @@ impl WrtcPeer {
         let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<ColibriMessage>(1024);
         let (connected_tx, mut connected_rx) = mpsc::channel::<()>(1);
 
-        let (local_ssrc, remote_ssrc) = if is_server {
-            (WRTC_SERVER_SSRC, WRTC_CLIENT_SSRC)
-        } else {
-            (WRTC_CLIENT_SSRC, WRTC_SERVER_SSRC)
-        };
+        let local_ssrc = generate_random_ssrc();
+        let remote_ssrc = 0;
 
         // 1. ПРИОРИТЕТНЫЙ И ЕДИНСТВЕННЫЙ ТРАНСПОРТ ДАННЫХ: Colibri-WS
         if let Some(session) = session_opt {
@@ -301,30 +299,6 @@ impl WrtcPeer {
                     if pc.set_remote_description(offer).await.is_ok() {
                         if let Ok(answer) = pc.create_answer(None).await {
                             let _ = pc.set_local_description(answer.clone()).await;
-
-                            for c in &session.transport.candidates {
-                                if c.ip == "127.0.0.1" || c.ip.starts_with("127.") || c.ip == "0.0.0.0" {
-                                    continue;
-                                }
-                                let candidate_sdp = format!(
-                                    "candidate:{} {} {} {} {} {} typ {}",
-                                    c.foundation,
-                                    c.component,
-                                    c.protocol.to_lowercase(),
-                                    c.priority,
-                                    c.ip,
-                                    c.port,
-                                    c.candidate_type
-                                );
-                                let init = RTCIceCandidateInit {
-                                    candidate: candidate_sdp,
-                                    sdp_mid: Some("audio".to_string()),
-                                    sdp_mline_index: Some(0),
-                                    username_fragment: Some(session.transport.ufrag.clone()),
-                                    url: None,
-                                };
-                                let _ = pc.add_ice_candidate(init).await;
-                            }
 
                             let mut final_sdp = answer.sdp.clone();
                             for _ in 0..25 {

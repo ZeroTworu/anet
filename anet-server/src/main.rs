@@ -14,7 +14,10 @@ async fn main() -> Result<()> {
         // Можно запустить процесс дальше, но проблема в том, что build() падает
         // Return Err(e) if crucial. Here, we must prevent panic.
     }
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("info,rtc::peer_connection::handler=error"),
+    )
+    .init();
     let cfg = load().await?;
 
     let mut server = ANetServer::new(&cfg)?;
