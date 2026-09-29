@@ -98,14 +98,25 @@ impl WrtcPeer {
                     response.status()
                 );
                 let (mut ws_sink, mut ws_stream) = ws_stream.split();
+                let (ws_raw_tx, mut ws_raw_rx) = mpsc::channel::<tokio_tungstenite::tungstenite::Message>(64);
 
                 // Воркер отправки данных в JVB WebSocket
+                let raw_tx_ping = ws_raw_tx.clone();
                 tokio::spawn(async move {
                     let mut ping_interval = tokio::time::interval(Duration::from_secs(10));
                     loop {
                         tokio::select! {
-                            biased;
-
+                            raw_opt = ws_raw_rx.recv() => {
+                                match raw_opt {
+                                    Some(raw) => {
+                                        if let Err(e) = ws_sink.send(raw).await {
+                                            log::warn!("[WRTC] JVB WS raw send error: {e}");
+                                            break;
+                                        }
+                                    }
+                                    None => break,
+                                }
+                            }
                             msg_opt = outgoing_rx.recv() => {
                                 match msg_opt {
                                     Some(msg) => {
@@ -145,12 +156,15 @@ impl WrtcPeer {
 
                 // Воркер вычитывания входящих данных из JVB WebSocket
                 let in_tx = incoming_tx.clone();
+                let raw_tx_pong = ws_raw_tx.clone();
                 tokio::spawn(async move {
                     while let Some(msg_res) = ws_stream.next().await {
                         match msg_res {
                             Ok(tokio_tungstenite::tungstenite::Message::Text(text)) => {
                                 if let Ok(c_msg) = serde_json::from_str::<ColibriMessage>(&text) {
                                     let _ = in_tx.send(c_msg).await;
+                                } else {
+                                    log::debug!("[JVB WS UNHANDLED TEXT]: {text}");
                                 }
                             }
                             Ok(tokio_tungstenite::tungstenite::Message::Binary(bin)) => {
@@ -158,8 +172,17 @@ impl WrtcPeer {
                                     let _ = in_tx.send(c_msg).await;
                                 }
                             }
-                            Ok(tokio_tungstenite::tungstenite::Message::Close(_)) | Err(_) => {
-                                log::info!("[WRTC] JVB Colibri-WS closed");
+                            Ok(tokio_tungstenite::tungstenite::Message::Ping(data)) => {
+                                let _ = raw_tx_pong
+                                    .send(tokio_tungstenite::tungstenite::Message::Pong(data))
+                                    .await;
+                            }
+                            Ok(tokio_tungstenite::tungstenite::Message::Close(frame)) => {
+                                log::warn!("[WRTC] JVB Colibri-WS closed by server: {:?}", frame);
+                                break;
+                            }
+                            Err(e) => {
+                                log::warn!("[WRTC] JVB Colibri-WS error: {e}");
                                 break;
                             }
                             _ => {}
@@ -306,15 +329,25 @@ impl WrtcPeer {
                 let track_keepalive = Arc::clone(&audio_track);
                 let seq_c = Arc::new(AtomicU16::new(0));
                 let ts_c = Arc::new(AtomicU32::new(0));
+                let interval_ms = if audio_keepalive_ms > 0 && audio_keepalive_ms <= 100 {
+                    audio_keepalive_ms as u64
+                } else {
+                    20
+                };
+                let samples_per_packet = (48000 * interval_ms / 1000) as u32;
+
                 tokio::spawn(async move {
                     if tokio::time::timeout(Duration::from_secs(30), connected_rx.recv()).await.is_ok() {
-                        log::info!("[WRTC Media] WebRTC ICE/DTLS connected, starting Opus silence keepalive");
-                        let mut interval = tokio::time::interval(Duration::from_millis(audio_keepalive_ms.max(20)));
+                        log::info!(
+                            "[WRTC Media] WebRTC ICE/DTLS connected, starting Opus silence keepalive (interval: {}ms, samples: {})",
+                            interval_ms, samples_per_packet
+                        );
+                        let mut interval = tokio::time::interval(Duration::from_millis(interval_ms));
                         let silence_payload = Bytes::from_static(&[0xf8, 0xff, 0xfe]);
                         loop {
                             interval.tick().await;
                             let seq = seq_c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            let ts = ts_c.fetch_add(960, std::sync::atomic::Ordering::Relaxed);
+                            let ts = ts_c.fetch_add(samples_per_packet, std::sync::atomic::Ordering::Relaxed);
                             let rtp_packet = RtpPacket {
                                 header: RtpHeader {
                                     version: 2,
