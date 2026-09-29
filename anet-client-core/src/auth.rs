@@ -29,8 +29,8 @@ use tokio::time::sleep;
 use x25519_dalek::{PublicKey, StaticSecret};
 
 const MAX_RETRIES: u32 = 10;
-const INITIAL_DELAY: u64 = 2;
-const MAX_DELAY: u64 = 10;
+const INITIAL_DELAY: u64 = 6;
+const MAX_DELAY: u64 = 60;
 
 #[async_trait]
 pub trait AuthChannel: Send + Sync {
