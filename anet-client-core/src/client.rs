@@ -901,7 +901,9 @@ impl AnetClient {
                 task.abort();
             }
 
-            let _ = running.main_task.await;
+            if tokio::time::timeout(Duration::from_millis(500), running.main_task).await.is_err() {
+                warn!("[Core] Main task did not exit in 500ms, proceeding with teardown");
+            }
 
             if let Some(endpoint) = running.endpoint {
                 endpoint.close(0u32.into(), b"Disconnected by user");

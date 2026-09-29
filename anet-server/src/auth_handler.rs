@@ -495,8 +495,12 @@ impl ServerAuthHandler {
 
 
         if !is_resume {
-            // Мгновенно убиваем зомби-сессии этого же клиента перед стартом новой
-            self.registry.disconnect_by_fingerprint(&temp_info.client_fingerprint).await;
+            let limit = allowed_sessions.unwrap_or(0);
+            // Если лимит строго 1, убиваем зомби-сессию (например, при смене Wi-Fi -> LTE).
+            // Если лимит 0 (безлимит) или > 1, разрешаем параллельные подключения с разных устройств!
+            if limit == 1 {
+                self.registry.disconnect_by_fingerprint(&temp_info.client_fingerprint).await;
+            }
         }
 
         self.registry.pre_register_client(client_info.clone());

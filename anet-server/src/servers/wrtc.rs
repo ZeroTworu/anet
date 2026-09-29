@@ -200,16 +200,25 @@ pub async fn run_wrtc_server(
                     let _ = shared_peer.send(beacon_msg).await;
                 }
                 WrtcMessage::Ping => {
+                    let mut is_dead = false;
                     if let Some(client_info) = clients_map.get(&from_endpoint) {
-                        client_info.last_activity.store(
-                            std::time::SystemTime::now()
-                                .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs(),
-                            Ordering::Relaxed,
-                        );
-                        let pong_msg = ColibriMessage::pong(from_endpoint.clone());
-                        let _ = shared_peer.send(pong_msg).await;
+                        if reg_clone.get_by_session(&client_info.session_id).is_some() {
+                            client_info.last_activity.store(
+                                std::time::SystemTime::now()
+                                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs(),
+                                Ordering::Relaxed,
+                            );
+                            let pong_msg = ColibriMessage::pong(from_endpoint.clone());
+                            let _ = shared_peer.send(pong_msg).await;
+                        } else {
+                            is_dead = true;
+                        }
+                    }
+                    if is_dead {
+                        clients_map.remove(&from_endpoint);
+                        log::info!("[WRTC Server] Dropped Ping from {from_endpoint}: session was killed in registry");
                     }
                 }
                 WrtcMessage::Pong => {
