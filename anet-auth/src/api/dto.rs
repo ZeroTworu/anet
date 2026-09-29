@@ -22,6 +22,7 @@ pub struct ServerDto {
     pub vnc_port: Option<i32>,
     pub websocket_url: Option<String>,
     pub ahttp_url: Option<String>,
+    pub wrtc_url: Option<String>,
     pub ssh_user: Option<String>,
     pub is_active: bool,
     pub has_control_credential: bool,
@@ -220,6 +221,7 @@ pub struct CreateServerRequest {
     pub vnc_port: Option<i32>,
     pub websocket_url: Option<String>,
     pub ahttp_url: Option<String>,
+    pub wrtc_url: Option<String>,
     pub ssh_user: Option<String>,
     pub is_active: Option<bool>,
 }
@@ -244,6 +246,7 @@ pub struct UpdateServerRequest {
     pub vnc_port: Option<Option<i32>>,
     pub websocket_url: Option<Option<String>>,
     pub ahttp_url: Option<Option<String>>,
+    pub wrtc_url: Option<Option<String>>,
     pub ssh_user: Option<Option<String>>,
     pub is_active: Option<bool>,
 }

@@ -25,6 +25,7 @@ const defaultForm = (): CreateServerRequest => ({
   vnc_port: 56678,
   websocket_url: 'ws://127.0.0.1:8080/socket',
   ahttp_url: 'https://your-cdn.some-host.net/api/v2/telemetry',
+  wrtc_url: 'wrtc://meet.jit.si/your-telemetry-room',
 })
 
 const form = ref<CreateServerRequest>(defaultForm())
@@ -132,6 +133,14 @@ const close = () => {
               v-model="form.ahttp_url"
               label="AHTTP URL (CDN)"
               placeholder="https://your-cdn.some-host.net/api/v2/telemetry"
+              variant="filled"
+              class="mb-3"
+          />
+
+          <v-text-field
+              v-model="form.wrtc_url"
+              label="WRTC URL (Jitsi / WebRTC Room)"
+              placeholder="wrtc://meet.jit.si/your-telemetry-room"
               variant="filled"
               class="mb-3"
           />

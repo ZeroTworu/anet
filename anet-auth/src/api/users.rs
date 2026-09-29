@@ -845,6 +845,12 @@ impl UsersApi {
                                     };
                                     (proto, url)
                                 }
+                                ProtocolType::Wrtc => {
+                                    let url = custom_endpoint.map(|s| s.to_string()).or_else(|| {
+                                        server.wrtc_url.clone().filter(|u| !u.trim().is_empty())
+                                    });
+                                    ("wrtc", url)
+                                }
                             };
 
                             let Some(port_or_url) = port_or_url else {
@@ -999,6 +1005,12 @@ impl UsersApi {
                             "https"
                         };
                         write_server_block(proto, ahttp);
+                    }
+                }
+
+                if let Some(ref wrtc) = server.wrtc_url {
+                    if !wrtc.trim().is_empty() {
+                        write_server_block("wrtc", wrtc);
                     }
                 }
 

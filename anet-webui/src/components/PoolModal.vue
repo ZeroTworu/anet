@@ -35,6 +35,7 @@ const strategyOptions = [
 
 const protocolOptions: { title: string; value: ProtocolType }[] = [
   { title: 'QUIC', value: 'quic' },
+  { title: 'WRTC / Jitsi WebRTC', value: 'wrtc' },
   { title: 'AHTTP / HTTP(S)', value: 'ahttp' },
   { title: 'WebSocket (WS/WSS)', value: 'ws' },
   { title: 'SSH', value: 'ssh' },
@@ -203,7 +204,7 @@ const close = () => {
                   <v-text-field
                       v-model="member.port_or_url"
                       label="Порт или URL"
-                      :placeholder="member.protocol === 'ahttp' || member.protocol === 'ws' ? 'URL (напр. cdn / tunnel)' : 'Порт (напр. 443)'"
+                      :placeholder="member.protocol === 'ahttp' || member.protocol === 'ws' || member.protocol === 'wrtc' ? 'URL (напр. cdn / room / tunnel)' : 'Порт (напр. 443)'"
                       density="compact"
                       variant="outlined"
                       hide-details

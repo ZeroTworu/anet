@@ -19,6 +19,7 @@ pub struct Model {
     pub vnc_port: Option<i32>,
     pub websocket_url: Option<String>,
     pub ahttp_url: Option<String>,
+    pub wrtc_url: Option<String>,
     pub ssh_user: Option<String>,
     pub created_at: DateTime,
     pub updated_at: DateTime,

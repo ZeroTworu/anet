@@ -56,6 +56,7 @@
       "vnc_port": 56678,
       "websocket_url": "wss://tunnel.example.com/socket",
       "ahttp_url": "https://cdn.example.com/api/v2/telemetry",
+      "wrtc_url": "wrtc://meet.jit.si/your-telemetry-room",
       "ssh_user": "hanyuu",
       "is_active": true,
       "has_control_credential": true,
@@ -83,6 +84,7 @@
     "vnc_port": 56678,
     "websocket_url": "wss://144.31.186.196:8080/socket",
     "ahttp_url": "https://cdn.example.net/api/v2/telemetry",
+    "wrtc_url": "wrtc://meet.jit.si/your-telemetry-room",
     "ssh_user": "hanyuu",
     "is_active": true
   }

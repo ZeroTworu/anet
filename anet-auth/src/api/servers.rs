@@ -19,7 +19,8 @@ pub struct ServersApi {
 fn validate_server_urls(
     address: &str,
     websocket_url: &Option<String>,
-    ahttp_url: &Option<String>
+    ahttp_url: &Option<String>,
+    wrtc_url: &Option<String>,
 ) -> Result<(), String> {
     if !address.is_empty() {
         if !address.is_ascii() {
@@ -56,6 +57,26 @@ fn validate_server_urls(
             }
         }
     }
+
+    if let Some(wrtc) = wrtc_url {
+        if !wrtc.trim().is_empty() {
+            if !wrtc.is_ascii() {
+                return Err(format!("WRTC URL '{}' содержит недопустимые (не латинские) символы", wrtc));
+            }
+            let parsed = wrtc.parse::<poem::http::Uri>().map_err(|e| format!("Некорректный WRTC URL '{}': {}", wrtc, e))?;
+            let scheme = parsed.scheme_str().unwrap_or("");
+            if scheme != "wrtc" && scheme != "http" && scheme != "https" {
+                return Err(format!("Неподдерживаемый протокол '{}' для WRTC URL. Ожидается wrtc://, https:// или http://", scheme));
+            }
+            if parsed.host().is_none() {
+                return Err(format!("WRTC URL '{}' не содержит хост", wrtc));
+            }
+            let path = parsed.path().trim_start_matches('/');
+            if path.is_empty() {
+                return Err(format!("WRTC URL '{}' не содержит имя комнаты (room)", wrtc));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -75,7 +96,7 @@ impl ServersApi {
             ));
         }
 
-        if let Err(err) = validate_server_urls(&req.0.address, &req.0.websocket_url, &req.0.ahttp_url) {
+        if let Err(err) = validate_server_urls(&req.0.address, &req.0.websocket_url, &req.0.ahttp_url, &req.0.wrtc_url) {
             return Err(poem::Error::from_string(
                 err,
                 poem::http::StatusCode::BAD_REQUEST,
@@ -93,6 +114,7 @@ impl ServersApi {
             vnc_port: Set(req.0.vnc_port),
             websocket_url: Set(req.0.websocket_url.clone()),
             ahttp_url: Set(req.0.ahttp_url.clone()),
+            wrtc_url: Set(req.0.wrtc_url.clone()),
             ssh_user: Set(req.0.ssh_user.clone()),
             is_active: Set(req.0.is_active.unwrap_or(true)),
             control_token_hash: Set(None),
@@ -111,6 +133,7 @@ impl ServersApi {
                 vnc_port: saved.vnc_port,
                 websocket_url: saved.websocket_url,
                 ahttp_url: saved.ahttp_url,
+                wrtc_url: saved.wrtc_url,
                 ssh_user: saved.ssh_user,
                 is_active: saved.is_active,
                 has_control_credential: saved.control_token_hash.is_some(),
@@ -135,7 +158,8 @@ impl ServersApi {
         let addr = req.0.address.clone().unwrap_or_default();
         let ws_url = req.0.websocket_url.clone().flatten();
         let ahttp_url = req.0.ahttp_url.clone().flatten();
-        if let Err(err) = validate_server_urls(&addr, &ws_url, &ahttp_url) {
+        let wrtc_url = req.0.wrtc_url.clone().flatten();
+        if let Err(err) = validate_server_urls(&addr, &ws_url, &ahttp_url, &wrtc_url) {
             return crate::api::dto::UpdateServerApiResult::BadRequest(Json(err));
         }
 
@@ -190,6 +214,10 @@ impl ServersApi {
             active_model.ahttp_url = Set(ahttp_url);
             changed = true;
         }
+        if let Some(wrtc_url) = req.0.wrtc_url {
+            active_model.wrtc_url = Set(wrtc_url);
+            changed = true;
+        }
 
         if changed {
             active_model.updated_at = Set(Utc::now().naive_utc());
@@ -204,6 +232,7 @@ impl ServersApi {
                     vnc_port: saved.vnc_port,
                     websocket_url: saved.websocket_url,
                     ahttp_url: saved.ahttp_url,
+                    wrtc_url: saved.wrtc_url,
                     ssh_user: saved.ssh_user,
                     is_active: saved.is_active,
                     has_control_credential: saved.control_token_hash.is_some(),
@@ -222,6 +251,7 @@ impl ServersApi {
                 vnc_port: server_model.vnc_port,
                 websocket_url: server_model.websocket_url,
                 ahttp_url: server_model.ahttp_url,
+                wrtc_url: server_model.wrtc_url,
                 ssh_user: server_model.ssh_user,
                 is_active: server_model.is_active,
                 has_control_credential: server_model.control_token_hash.is_some(),
@@ -274,6 +304,7 @@ impl ServersApi {
                         vnc_port: s.vnc_port,
                         websocket_url: s.websocket_url,
                         ahttp_url: s.ahttp_url,
+                        wrtc_url: s.wrtc_url,
                         ssh_user: s.ssh_user,
                         is_active: s.is_active,
                         has_control_credential: s.control_token_hash.is_some(),

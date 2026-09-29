@@ -28,6 +28,7 @@ const mockServers = [
     vnc_port: null,
     websocket_url: 'wss://fra-01.anet.net/ws',
     ahttp_url: 'https://fra-01.anet.net/vpn',
+    wrtc_url: 'wrtc://meet.jit.si/anet-fra-01',
     runtime: {
       status: 'online',
       last_seen_at: new Date().toISOString(),
@@ -50,6 +51,7 @@ const mockServers = [
     vnc_port: null,
     websocket_url: 'wss://ams-02.anet.net/ws',
     ahttp_url: 'https://ams-02.anet.net/vpn',
+    wrtc_url: 'wrtc://meet.jit.si/anet-ams-02',
     runtime: {
       status: 'online',
       last_seen_at: new Date().toISOString(),
@@ -72,6 +74,7 @@ const mockServers = [
     vnc_port: null,
     websocket_url: null,
     ahttp_url: null,
+    wrtc_url: null,
     runtime: {
       status: 'offline',
       last_seen_at: new Date(Date.now() - 3600000).toISOString(),
@@ -245,6 +248,7 @@ export function handleMockApi(req: IncomingMessage, res: ServerResponse): boolea
         vnc_port: body.vnc_port || null,
         websocket_url: body.websocket_url || null,
         ahttp_url: body.ahttp_url || null,
+        wrtc_url: body.wrtc_url || null,
         runtime: {
           status: 'online',
           last_seen_at: new Date().toISOString(),

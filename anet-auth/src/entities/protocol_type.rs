@@ -17,6 +17,8 @@ pub enum ProtocolType {
     Ws,
     #[sea_orm(string_value = "ahttp")]
     Ahttp,
+    #[sea_orm(string_value = "wrtc")]
+    Wrtc,
 }
 
 impl ProtocolType {
@@ -26,6 +28,7 @@ impl ProtocolType {
             "vnc" => Self::Vnc,
             "ws" | "wss" => Self::Ws,
             "ahttp" => Self::Ahttp,
+            "wrtc" => Self::Wrtc,
             _ => Self::Quic,
         }
     }
@@ -37,6 +40,7 @@ impl ProtocolType {
             Self::Vnc => "vnc",
             Self::Ws => "ws",
             Self::Ahttp => "ahttp",
+            Self::Wrtc => "wrtc",
         }
     }
 }

@@ -27,6 +27,7 @@ const form = ref({
   vnc_port: null as number | null,
   websocket_url: '',
   ahttp_url: '',
+  wrtc_url: '',
 })
 
 const loading = ref(false)
@@ -111,6 +112,7 @@ watch(
           vnc_port: val.vnc_port !== undefined ? val.vnc_port : null,
           websocket_url: val.websocket_url || '',
           ahttp_url: val.ahttp_url || '',
+          wrtc_url: val.wrtc_url || '',
         }
       }
     },
@@ -202,6 +204,14 @@ const close = () => {
               v-model="form.ahttp_url"
               label="AHTTP URL (CDN)"
               placeholder="https://your-cdn.some-host.net/api/v2/telemetry"
+              variant="filled"
+              class="mb-3"
+          />
+
+          <v-text-field
+              v-model="form.wrtc_url"
+              label="WRTC URL (Jitsi / WebRTC Room)"
+              placeholder="wrtc://meet.jit.si/your-telemetry-room"
               variant="filled"
               class="mb-3"
           />

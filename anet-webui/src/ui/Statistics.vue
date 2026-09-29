@@ -419,6 +419,7 @@ const connectionHeaders = [
               <v-btn value="ssh">SSH</v-btn>
               <v-btn value="vnc">VNC</v-btn>
               <v-btn value="ahttp">AHTTP</v-btn>
+              <v-btn value="wrtc">WRTC</v-btn>
             </v-btn-toggle>
 
             <v-btn-toggle

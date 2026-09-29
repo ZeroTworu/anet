@@ -35,7 +35,10 @@ fn validate_pool_request(req: &SaveNodePoolRequest) -> std::result::Result<(), S
     
     for member in &req.members {
         if let Some(url_str) = &member.port_or_url {
-            if member.protocol == crate::entities::ProtocolType::Ws || member.protocol == crate::entities::ProtocolType::Ahttp {
+            if member.protocol == crate::entities::ProtocolType::Ws
+                || member.protocol == crate::entities::ProtocolType::Ahttp
+                || member.protocol == crate::entities::ProtocolType::Wrtc
+            {
                 if !url_str.trim().is_empty() {
                     if !url_str.is_ascii() {
                         return Err(format!("URL '{}' содержит недопустимые (не латинские) символы", url_str));
@@ -49,6 +52,17 @@ fn validate_pool_request(req: &SaveNodePoolRequest) -> std::result::Result<(), S
                     } else if member.protocol == crate::entities::ProtocolType::Ahttp {
                         if scheme != "http" && scheme != "https" {
                             return Err(format!("Неподдерживаемый протокол '{}' для AHTTP URL. Ожидается http:// или https://", scheme));
+                        }
+                    } else if member.protocol == crate::entities::ProtocolType::Wrtc {
+                        if scheme != "wrtc" && scheme != "http" && scheme != "https" {
+                            return Err(format!("Неподдерживаемый протокол '{}' для WRTC URL. Ожидается wrtc://, https:// или http://", scheme));
+                        }
+                        if parsed.host().is_none() {
+                            return Err(format!("WRTC URL '{}' не содержит хост", url_str));
+                        }
+                        let path = parsed.path().trim_start_matches('/');
+                        if path.is_empty() {
+                            return Err(format!("WRTC URL '{}' не содержит имя комнаты (room)", url_str));
                         }
                     }
                 }
