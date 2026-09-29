@@ -404,7 +404,6 @@ impl ServerAuthHandler {
         let (
             assigned_ip,
             session_id,
-            is_resume,
             user_id,
             speed_limit_kbps,
             billing_type,
@@ -422,7 +421,6 @@ impl ServerAuthHandler {
             (
                 previous.assigned_ip.clone(),
                 previous.session_id.clone(),
-                true,
                 previous.user_id.clone(),
                 previous.speed_limit_kbps,
                 previous.billing_type,
@@ -449,7 +447,6 @@ impl ServerAuthHandler {
             (
                 assigned_ip,
                 generate_seid(),
-                false,
                 temp_info.user_id.clone(),
                 temp_info.speed_limit_kbps,
                 temp_info.billing_type,
@@ -491,17 +488,6 @@ impl ServerAuthHandler {
                     .as_secs()
             )),
         });
-
-
-
-        if !is_resume {
-            let limit = allowed_sessions.unwrap_or(0);
-            // Если лимит строго 1, убиваем зомби-сессию (например, при смене Wi-Fi -> LTE).
-            // Если лимит 0 (безлимит) или > 1, разрешаем параллельные подключения с разных устройств!
-            if limit == 1 {
-                self.registry.disconnect_by_fingerprint(&temp_info.client_fingerprint).await;
-            }
-        }
 
         self.registry.pre_register_client(client_info.clone());
         self.auth_provider.report_session_start(temp_info.client_fingerprint).await;
