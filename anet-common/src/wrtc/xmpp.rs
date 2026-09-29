@@ -239,17 +239,21 @@ impl XmppSession {
                                         }
                                     }
                                 }
-                                InboundXmpp::DiscoInfo { id, from } => {
-                                    let disco_reply = XmppBuilder::disco_info_result(&from, &id);
+                                InboundXmpp::DiscoInfo { id, from, node } => {
+                                    let disco_reply =
+                                        XmppBuilder::disco_info_result(&from, &id, node.as_deref());
+                                    log::info!("[XMPP OUT]: {disco_reply}");
                                     let _ = write_tx_ack.send(disco_reply).await;
                                 }
                                 InboundXmpp::Ping { id, from } => {
                                     let pong = XmppBuilder::iq_result(&from, &id);
+                                    log::info!("[XMPP OUT]: {pong}");
                                     let _ = write_tx_ack.send(pong).await;
                                 }
                                 InboundXmpp::Jingle(ref sess) => {
                                     if let Some(ref iq_id) = sess.iq_id {
                                         let ack = XmppBuilder::iq_result(&sess.from, iq_id);
+                                        log::info!("[XMPP OUT]: {ack}");
                                         let _ = write_tx_ack.send(ack).await;
                                     }
                                 }

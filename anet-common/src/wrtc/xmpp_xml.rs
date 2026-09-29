@@ -29,7 +29,11 @@ pub enum InboundXmpp {
         is_self_110: bool,
     },
     Ping { id: String, from: String },
-    DiscoInfo { id: String, from: String },
+    DiscoInfo {
+        id: String,
+        from: String,
+        node: Option<String>,
+    },
     JingleAck { id: String, from: String },
     Jingle(JingleSession),
     Other,
@@ -128,8 +132,15 @@ fn parse_single_element(
             }
 
             // 3. Проверяем disco#info get:
-            if iq_type == "get" && root.descendants().any(|n| n.has_tag_name("query")) {
-                return Some(InboundXmpp::DiscoInfo { id: iq_id, from });
+            if iq_type == "get" {
+                if let Some(query_node) = root.descendants().find(|n| n.has_tag_name("query")) {
+                    let node = query_node.attribute("node").map(|s| s.to_string());
+                    return Some(InboundXmpp::DiscoInfo {
+                        id: iq_id,
+                        from,
+                        node,
+                    });
+                }
             }
 
             // 4. Проверяем Jingle:
@@ -294,11 +305,16 @@ impl XmppBuilder {
         )
     }
 
-    pub fn disco_info_result(to: &str, id: &str) -> String {
+    pub fn disco_info_result(to: &str, id: &str, node: Option<&str>) -> String {
+        let node_attr = match node {
+            Some(n) if !n.is_empty() => format!(r#" node="{}""#, escape_xml_attr(n)),
+            _ => String::new(),
+        };
         format!(
-            r#"<iq type="result" to="{}" id="{}"><query xmlns="http://jabber.org/protocol/disco#info"><identity category="client" type="web" name="jitsi-meet"/><feature var="urn:xmpp:jingle:1"/><feature var="urn:xmpp:jingle:apps:rtp:1"/><feature var="urn:xmpp:jingle:apps:rtp:audio"/><feature var="urn:xmpp:jingle:apps:rtp:video"/><feature var="urn:xmpp:jingle:apps:dtls:0"/><feature var="urn:xmpp:jingle:transports:ice-udp:1"/><feature var="http://jitsi.org/protocols/colibri"/><feature var="urn:ietf:rfc:5761"/><feature var="urn:ietf:rfc:5888"/><feature var="http://jabber.org/protocol/caps"/></query></iq>"#,
-            escape_xml_attr(to),
-            escape_xml_attr(id)
+            r#"<iq type="result" to="{to}" id="{id}"><query xmlns="http://jabber.org/protocol/disco#info"{node_attr}><identity category="client" type="web" name="jitsi-meet"/><feature var="urn:xmpp:jingle:1"/><feature var="urn:xmpp:jingle:apps:rtp:1"/><feature var="urn:xmpp:jingle:apps:rtp:audio"/><feature var="urn:xmpp:jingle:apps:rtp:video"/><feature var="urn:xmpp:jingle:apps:dtls:0"/><feature var="urn:xmpp:jingle:transports:ice-udp:1"/><feature var="http://jitsi.org/protocols/colibri"/><feature var="urn:ietf:rfc:5761"/><feature var="urn:ietf:rfc:5888"/><feature var="http://jabber.org/protocol/caps"/></query></iq>"#,
+            to = escape_xml_attr(to),
+            id = escape_xml_attr(id),
+            node_attr = node_attr
         )
     }
 
@@ -424,11 +440,15 @@ mod tests {
             other => panic!("Unexpected: {:?}", other),
         }
 
-        let disco = r#"<iq from="focus.meet.jitsi" id="disco_1" type="get"><query xmlns="http://jabber.org/protocol/disco#info"/></iq>"#;
+        let disco = r#"<iq from="focus.meet.jitsi" id="disco_1" type="get"><query xmlns="http://jabber.org/protocol/disco#info" node="https://jitsi.org/jitsi-meet#7Y4Yx3m5c03c5188efb8b2ebda41e8c072e912da"/></iq>"#;
         match parse_xmpp_message(disco, "127.0.0.1", 10000) {
-            Some(InboundXmpp::DiscoInfo { id, from }) => {
+            Some(InboundXmpp::DiscoInfo { id, from, node }) => {
                 assert_eq!(id, "disco_1");
                 assert_eq!(from, "focus.meet.jitsi");
+                assert_eq!(
+                    node.as_deref(),
+                    Some("https://jitsi.org/jitsi-meet#7Y4Yx3m5c03c5188efb8b2ebda41e8c072e912da")
+                );
             }
             other => panic!("Unexpected: {:?}", other),
         }
