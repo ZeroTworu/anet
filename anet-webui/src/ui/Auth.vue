@@ -76,8 +76,8 @@ import { login } from '@/api/auth'
 
 const router = useRouter()
 
-const username = ref('admin')
-const password = ref('admin')
+const username = ref('')
+const password = ref('')
 const errorMessage = ref('')
 const isLoading = ref(false)
 const isFormValid = ref(false)
