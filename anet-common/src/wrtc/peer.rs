@@ -101,7 +101,6 @@ impl WrtcPeer {
                 let (ws_raw_tx, mut ws_raw_rx) = mpsc::channel::<tokio_tungstenite::tungstenite::Message>(64);
 
                 // Воркер отправки данных в JVB WebSocket
-                let raw_tx_ping = ws_raw_tx.clone();
                 tokio::spawn(async move {
                     let mut ping_interval = tokio::time::interval(Duration::from_secs(10));
                     loop {

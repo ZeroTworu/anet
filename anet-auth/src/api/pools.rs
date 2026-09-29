@@ -10,7 +10,6 @@ use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, IntoActiveModel, Set,
     QueryFilter, QueryOrder, TransactionTrait,
 };
-use std::collections::HashSet;
 use uuid::Uuid;
 
 pub struct PoolsApi {

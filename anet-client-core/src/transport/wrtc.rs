@@ -19,12 +19,11 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use base64::prelude::*;
 use bytes::Bytes;
-use log::{debug, info, warn};
+use log::{info, warn};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::Mutex;
 
 fn current_timestamp_secs() -> u64 {
     std::time::SystemTime::now()
@@ -187,7 +186,7 @@ impl ClientTransport for WrtcTransport {
 
         // 5. Создание соединения (Colibri-WS с фоновым WebRTC keepalive)
         let audio_keepalive_ms = self.server.wrtc_media_keepalive_interval_ms.unwrap_or(20);
-        let mut peer = WrtcPeer::create(
+        let peer = WrtcPeer::create(
             Some(&session),
             Some(&xmpp),
             &domain,
