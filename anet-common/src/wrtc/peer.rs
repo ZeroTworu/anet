@@ -7,7 +7,7 @@ use rtc::media_stream::MediaStreamTrack;
 use rtc::peer_connection::configuration::interceptor_registry::register_default_interceptors;
 use rtc::peer_connection::configuration::media_engine::{MediaEngine, MIME_TYPE_OPUS};
 use rtc::peer_connection::configuration::setting_engine::SettingEngineBuilder;
-use rtc::peer_connection::configuration::{RTCConfigurationBuilder, RTCIceServer};
+use rtc::peer_connection::configuration::RTCConfigurationBuilder;
 use rtc::peer_connection::sdp::RTCSessionDescription;
 use rtc::peer_connection::transport::RTCDtlsRole;
 use rtc::rtp::{Header as RtpHeader, Packet as RtpPacket};
@@ -210,17 +210,10 @@ impl WrtcPeer {
             media_engine.register_codec(audio_codec.clone(), RtpCodecKind::Audio)?;
             let registry = register_default_interceptors(Registry::new(), &mut media_engine)?;
 
-            let stun_urls = xmpp.get_stun_servers();
-            log::info!("[WRTC Media] Configuring Ktalk STUN servers: {:?}", stun_urls);
-            let ice_server = RTCIceServer {
-                urls: stun_urls,
-                ..Default::default()
-            };
-
             let bind_addr = "0.0.0.0:0".to_string();
 
             let config = RTCConfigurationBuilder::new()
-                .with_ice_servers(vec![ice_server])
+                .with_ice_servers(vec![])
                 .build();
 
             let setting_engine = SettingEngineBuilder::new()
