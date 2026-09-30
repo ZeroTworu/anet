@@ -199,25 +199,16 @@ pub async fn run_wrtc_server(
                     let _ = shared_peer.send(beacon_msg).await;
                 }
                 WrtcMessage::Ping => {
-                    let mut is_dead = false;
                     if let Some(client_info) = clients_map.get(&from_endpoint) {
-                        if reg_clone.get_by_session(&client_info.session_id).is_some() {
-                            client_info.last_activity.store(
-                                std::time::SystemTime::now()
-                                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_secs(),
-                                Ordering::Relaxed,
-                            );
-                            let pong_msg = ColibriMessage::pong(from_endpoint.clone());
-                            let _ = shared_peer.send(pong_msg).await;
-                        } else {
-                            is_dead = true;
-                        }
-                    }
-                    if is_dead {
-                        clients_map.remove(&from_endpoint);
-                        log::info!("[WRTC Server] Dropped Ping from {from_endpoint}: session was killed in registry");
+                        client_info.last_activity.store(
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs(),
+                            Ordering::Relaxed,
+                        );
+                        let pong_msg = ColibriMessage::pong(from_endpoint.clone());
+                        let _ = shared_peer.send(pong_msg).await;
                     }
                 }
                 WrtcMessage::Pong => {
@@ -264,13 +255,7 @@ pub async fn run_wrtc_server(
                                     .await
                                 {
                                     Ok((response, result)) => {
-                                        if let Some(resp_bytes) = response {
-                                            let b64 = BASE64_STANDARD.encode(&resp_bytes);
-                                            let resp_msg =
-                                                ColibriMessage::astp(from_endpoint.clone(), b64);
-                                            let _ = shared_peer.send(resp_msg).await;
-                                        }
-
+                                        // 1. Сначала финализируем и регистрируем клиента, чтобы быть готовыми к приему трафика
                                         if let Some((client_info, _)) = result {
                                             let assigned_ip = client_info.assigned_ip.clone();
                                             info!(
@@ -314,9 +299,18 @@ pub async fn run_wrtc_server(
                                                 }
                                             });
                                         }
+
+                                        // 2. Затем отправляем финальный ответ хэндшейка клиенту
+                                        if let Some(resp_bytes) = response {
+                                            let b64 = BASE64_STANDARD.encode(&resp_bytes);
+                                            let resp_msg =
+                                                ColibriMessage::astp(from_endpoint.clone(), b64);
+                                            let _ = shared_peer.send(resp_msg).await;
+                                        }
                                     }
                                     Err(e) => {
-                                        warn!("[WRTC Server] Handshake packet processing error: {e}");
+                                        // При опережающих пакетах трафика от TUN не забиваем лог warn-штормом
+                                        log::debug!("[WRTC Server] Handshake packet processing error from {from_endpoint}: {e}");
                                     }
                                 }
                             }

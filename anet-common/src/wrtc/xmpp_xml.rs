@@ -36,6 +36,7 @@ pub enum InboundXmpp {
     },
     JingleAck { id: String, from: String },
     Jingle(JingleSession),
+    ExtdiscoServices(Vec<String>),
     Other,
 }
 
@@ -208,7 +209,24 @@ fn parse_single_element(
                 }
             }
 
-            // 5. Проверяем Jingle ACK result:
+            // 5. Проверяем extdisco (XEP-0215 services):
+            if let Some(services_node) = root.descendants().find(|n| n.has_tag_name("services")) {
+                let mut stuns = Vec::new();
+                for svc in services_node.children().filter(|n| n.has_tag_name("service")) {
+                    if svc.attribute("type") == Some("stun") {
+                        if let (Some(host), Some(port)) =
+                            (svc.attribute("host"), svc.attribute("port"))
+                        {
+                            stuns.push(format!("stun:{host}:{port}"));
+                        }
+                    }
+                }
+                if !stuns.is_empty() {
+                    return Some(InboundXmpp::ExtdiscoServices(stuns));
+                }
+            }
+
+            // 6. Проверяем Jingle ACK result:
             if iq_type == IqType::Result {
                 return Some(InboundXmpp::JingleAck { id: iq_id, from });
             }
@@ -445,6 +463,13 @@ impl XmppBuilder {
         format!(
             r#"<iq to="{}" type="get" id="{}"><ping xmlns="urn:xmpp:ping"/></iq>"#,
             escape_xml_attr(to),
+            escape_xml_attr(id)
+        )
+    }
+
+    pub fn extdisco_services(id: &str) -> String {
+        format!(
+            r#"<iq to="meet.jitsi" type="get" id="{}"><services xmlns="urn:xmpp:extdisco:2"/></iq>"#,
             escape_xml_attr(id)
         )
     }

@@ -17,6 +17,7 @@ pub struct XmppSession {
     pub jid: String,
     pub client_name: String,
     pub occupants: Arc<Mutex<HashSet<String>>>,
+    pub discovered_stuns: Arc<Mutex<Vec<String>>>,
     write_tx: mpsc::Sender<String>,
     read_rx: mpsc::Receiver<String>,
 }
@@ -31,6 +32,18 @@ impl XmppSession {
     pub fn get_other_occupants(&self) -> Vec<String> {
         let occ = self.occupants.lock().unwrap();
         occ.iter().cloned().collect()
+    }
+
+    pub fn get_stun_servers(&self) -> Vec<String> {
+        let stuns = self.discovered_stuns.lock().unwrap();
+        if !stuns.is_empty() {
+            stuns.clone()
+        } else {
+            vec![
+                "stun:stun1.ktalk.host:34788".to_string(),
+                "stun:stun3.ktalk.host:34788".to_string(),
+            ]
+        }
     }
 
     pub async fn connect(
@@ -70,6 +83,7 @@ impl XmppSession {
         let mut jid = String::new();
         let endpoint_id = Self::generate_endpoint_id();
         let occupants = Arc::new(Mutex::new(HashSet::new()));
+        let discovered_stuns = Arc::new(Mutex::new(Vec::new()));
 
         let effective_client_name = match client_name_opt {
             Some(name) if !name.is_empty() && name != "ANet-Node" => name.to_string(),
@@ -109,6 +123,9 @@ impl XmppSession {
                                     log::info!(
                                         "[XMPP] Successfully joined MUC room {conference_id} as occupant {endpoint_id}"
                                     );
+                                    // Запрашиваем STUN-серверы Контура по XEP-0215 extdisco
+                                    let extdisco_req = XmppBuilder::extdisco_services("extdisco_1");
+                                    let _ = ws_sink.send(Message::text(extdisco_req)).await;
                                     joined = true;
                                     break;
                                 }
@@ -212,6 +229,7 @@ impl XmppSession {
 
         let write_tx_ack = write_tx.clone();
         let occ_track_bg = occupants.clone();
+        let discovered_stuns_bg = discovered_stuns.clone();
         let raw_ws_tx_clone = raw_ws_tx.clone();
 
         tokio::spawn(async move {
@@ -257,6 +275,11 @@ impl XmppSession {
                                         let _ = write_tx_ack.send(ack).await;
                                     }
                                 }
+                                InboundXmpp::ExtdiscoServices(stuns) => {
+                                    log::info!("[XMPP] Discovered Ktalk STUN services: {:?}", stuns);
+                                    let mut guard = discovered_stuns_bg.lock().unwrap();
+                                    *guard = stuns;
+                                }
                                 _ => {}
                             }
                         }
@@ -280,6 +303,7 @@ impl XmppSession {
             jid,
             client_name: effective_client_name,
             occupants,
+            discovered_stuns,
             write_tx,
             read_rx,
         })

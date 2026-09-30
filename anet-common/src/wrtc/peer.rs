@@ -2,6 +2,7 @@ use crate::wrtc::colibri::ColibriMessage;
 use crate::wrtc::jingle::JingleSession;
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
+use rtc::ice_transport::ice_server::RTCIceServer;
 use rtc::interceptor::Registry;
 use rtc::media_stream::MediaStreamTrack;
 use rtc::peer_connection::configuration::interceptor_registry::register_default_interceptors;
@@ -210,48 +211,17 @@ impl WrtcPeer {
             media_engine.register_codec(audio_codec.clone(), RtpCodecKind::Audio)?;
             let registry = register_default_interceptors(Registry::new(), &mut media_engine)?;
 
-            // Определяем реальный исходящий IP сетевого интерфейса (вместо прослушивания мультикаста на 0.0.0.0)
-            let target_ip = session
-                .transport
-                .candidates
-                .iter()
-                .find(|c| c.ip != "127.0.0.1" && !c.ip.starts_with("127.") && c.ip != "0.0.0.0")
-                .map(|c| c.ip.as_str())
-                .unwrap_or(fallback_ip);
-
-            let target_port = session
-                .transport
-                .candidates
-                .iter()
-                .find(|c| c.ip != "127.0.0.1" && !c.ip.starts_with("127.") && c.ip != "0.0.0.0")
-                .map(|c| c.port)
-                .unwrap_or(fallback_port);
-
-            let outbound_ip = match std::net::UdpSocket::bind("0.0.0.0:0") {
-                Ok(sock) => {
-                    let _ = sock.connect((target_ip, target_port));
-                    let mut ip = sock.local_addr().map(|a| a.ip()).unwrap_or_else(|_| {
-                        std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1))
-                    });
-                    if ip.is_loopback() || ip.is_unspecified() {
-                        let _ = sock.connect(("8.8.8.8", 80));
-                        if let Ok(addr) = sock.local_addr() {
-                            ip = addr.ip();
-                        }
-                    }
-                    ip
-                }
-                Err(_) => std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+            let stun_urls = xmpp.get_stun_servers();
+            log::info!("[WRTC Media] Configuring Ktalk STUN servers: {:?}", stun_urls);
+            let ice_server = RTCIceServer {
+                urls: stun_urls,
+                ..Default::default()
             };
 
-            let bind_addr = if !outbound_ip.is_loopback() && !outbound_ip.is_unspecified() {
-                format!("{outbound_ip}:0")
-            } else {
-                "0.0.0.0:0".to_string()
-            };
+            let bind_addr = "0.0.0.0:0".to_string();
 
             let config = RTCConfigurationBuilder::new()
-                .with_ice_servers(vec![])
+                .with_ice_servers(vec![ice_server])
                 .build();
 
             let setting_engine = SettingEngineBuilder::new()
