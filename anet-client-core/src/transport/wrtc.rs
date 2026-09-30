@@ -180,6 +180,29 @@ impl ClientTransport for WrtcTransport {
             }
         }
 
+        for stun_url in xmpp.get_stun_servers() {
+            let clean = stun_url
+                .trim_start_matches("stun:")
+                .trim_start_matches("turn:")
+                .trim_start_matches("turns:");
+            let (host, port) = if let Some((h, p)) = clean.split_once(':') {
+                (h, p.parse::<u16>().unwrap_or(3478))
+            } else {
+                (clean, 3478)
+            };
+            if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+                if !ip.is_loopback() {
+                    bypass_ips.push(ip);
+                }
+            } else if let Ok(resolved) = tokio::net::lookup_host((host, port)).await {
+                for addr in resolved {
+                    if !addr.ip().is_loopback() {
+                        bypass_ips.push(addr.ip());
+                    }
+                }
+            }
+        }
+
         bypass_ips.sort_unstable();
         bypass_ips.dedup();
         info!("[WRTC] Discovered media bypass IPs: {:?}", bypass_ips);
