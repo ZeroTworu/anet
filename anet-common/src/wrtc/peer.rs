@@ -1,7 +1,6 @@
 use crate::wrtc::colibri::ColibriMessage;
 use crate::wrtc::jingle::JingleSession;
 use bytes::Bytes;
-use futures::{SinkExt, StreamExt};
 use rtc::interceptor::Registry;
 use rtc::media_stream::MediaStreamTrack;
 use rtc::peer_connection::configuration::interceptor_registry::register_default_interceptors;
@@ -15,12 +14,11 @@ use rtc::rtp_transceiver::rtp_sender::{
     RTCRtpCodec, RTCRtpCodecParameters, RTCRtpCodingParameters, RTCRtpEncodingParameters,
     RtpCodecKind,
 };
-use std::sync::atomic::{AtomicU16, AtomicU32};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::http::HeaderValue;
+use webrtc::data_channel::{DataChannel, RTCDataChannelInit};
 use webrtc::media_stream::track_local::static_rtp::TrackLocalStaticRTP;
 use webrtc::media_stream::track_local::TrackLocal;
 use webrtc::peer_connection::{
@@ -49,6 +47,7 @@ impl PeerConnectionEventHandler for PeerEvents {
 
 pub struct WrtcPeer {
     pub peer_connection: Option<Arc<dyn PeerConnection>>,
+    pub data_channel: Option<Arc<dyn DataChannel>>,
     pub audio_track: Option<Arc<TrackLocalStaticRTP>>,
     pub ssrc: u32,
     pub outgoing_tx: mpsc::Sender<ColibriMessage>,
@@ -59,7 +58,7 @@ impl WrtcPeer {
     pub async fn create(
         session_opt: Option<&JingleSession>,
         xmpp_opt: Option<&crate::wrtc::xmpp::XmppSession>,
-        domain: &str,
+        _domain: &str,
         fallback_ip: &str,
         fallback_port: u16,
         audio_keepalive_ms: u64,
@@ -71,129 +70,12 @@ impl WrtcPeer {
         let local_ssrc = generate_random_ssrc();
         let remote_ssrc = 0;
 
-        // 1. ПРИОРИТЕТНЫЙ И ЕДИНСТВЕННЫЙ ТРАНСПОРТ ДАННЫХ: Colibri-WS
-        if let Some(session) = session_opt {
-            if let Some(ref ws_url) = session.transport.colibri_ws_url {
-                log::info!("[WRTC] Connecting to JVB Colibri-WS for data transport: {ws_url}");
-
-                let mut request = ws_url.as_str().into_client_request()?;
-                request.headers_mut().insert(
-                    "Origin",
-                    HeaderValue::from_str(&format!("https://{domain}"))?,
-                );
-                request.headers_mut().insert(
-                    "User-Agent",
-                    HeaderValue::from_static("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
-                );
-
-                let (ws_stream, response) = tokio_tungstenite::connect_async(request)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("Colibri-WS connection failed: {e}"))?;
-
-                log::info!(
-                    "[WRTC] Connected to JVB Colibri-WS (HTTP status: {:?})",
-                    response.status()
-                );
-                let (mut ws_sink, mut ws_stream) = ws_stream.split();
-                let (ws_raw_tx, mut ws_raw_rx) = mpsc::channel::<tokio_tungstenite::tungstenite::Message>(64);
-
-                // Воркер отправки данных в JVB WebSocket
-                tokio::spawn(async move {
-                    let mut ping_interval = tokio::time::interval(Duration::from_secs(10));
-                    loop {
-                        tokio::select! {
-                            raw_opt = ws_raw_rx.recv() => {
-                                match raw_opt {
-                                    Some(raw) => {
-                                        if let Err(e) = ws_sink.send(raw).await {
-                                            log::warn!("[WRTC] JVB WS raw send error: {e}");
-                                            break;
-                                        }
-                                    }
-                                    None => break,
-                                }
-                            }
-                            msg_opt = outgoing_rx.recv() => {
-                                match msg_opt {
-                                    Some(msg) => {
-                                        if let Ok(json_str) = serde_json::to_string(&msg) {
-                                            match msg.msg_payload {
-                                                crate::wrtc::colibri::WrtcMessage::Astp { .. } => {
-                                                    log::trace!("[JVB WS OUT ASTP]");
-                                                }
-                                                _ => {
-                                                    log::info!("[JVB WS OUT]: {json_str}");
-                                                }
-                                            }
-                                            if let Err(e) = ws_sink
-                                                .send(tokio_tungstenite::tungstenite::Message::text(json_str))
-                                                .await
-                                            {
-                                                log::warn!("[WRTC] JVB WS send error: {e}");
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    None => break,
-                                }
-                            }
-                            _ = ping_interval.tick() => {
-                                if ws_sink
-                                    .send(tokio_tungstenite::tungstenite::Message::Ping(bytes::Bytes::from_static(&[0x09])))
-                                    .await
-                                    .is_err()
-                                {
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                });
-
-                // Воркер вычитывания входящих данных из JVB WebSocket
-                let in_tx = incoming_tx.clone();
-                let raw_tx_pong = ws_raw_tx.clone();
-                tokio::spawn(async move {
-                    while let Some(msg_res) = ws_stream.next().await {
-                        match msg_res {
-                            Ok(tokio_tungstenite::tungstenite::Message::Text(text)) => {
-                                if let Ok(c_msg) = serde_json::from_str::<ColibriMessage>(&text) {
-                                    let _ = in_tx.send(c_msg).await;
-                                } else {
-                                    log::debug!("[JVB WS UNHANDLED TEXT]: {text}");
-                                }
-                            }
-                            Ok(tokio_tungstenite::tungstenite::Message::Binary(bin)) => {
-                                if let Ok(c_msg) = serde_json::from_slice::<ColibriMessage>(&bin) {
-                                    let _ = in_tx.send(c_msg).await;
-                                }
-                            }
-                            Ok(tokio_tungstenite::tungstenite::Message::Ping(data)) => {
-                                let _ = raw_tx_pong
-                                    .send(tokio_tungstenite::tungstenite::Message::Pong(data))
-                                    .await;
-                            }
-                            Ok(tokio_tungstenite::tungstenite::Message::Close(frame)) => {
-                                log::warn!("[WRTC] JVB Colibri-WS closed by server: {:?}", frame);
-                                break;
-                            }
-                            Err(e) => {
-                                log::warn!("[WRTC] JVB Colibri-WS error: {e}");
-                                break;
-                            }
-                            _ => {}
-                        }
-                    }
-                });
-            }
-        }
-
-        // 2. МИНИМАЛЬНЫЙ ФОНОВЫЙ WebRTC: ICE/DTLS хендшейк + keepalive тишины для JVB
         let mut peer_connection_opt = None;
+        let mut data_channel_opt = None;
         let mut audio_track_opt = None;
 
         if let (Some(session), Some(xmpp)) = (session_opt, xmpp_opt) {
-            log::info!("[WRTC Media] Initializing background WebRTC session for JVB keepalive...");
+            log::info!("[WRTC Media] Initializing WebRTC PeerConnection and DataChannel...");
 
             let mut media_engine = MediaEngine::default();
             let audio_codec = RTCRtpCodecParameters {
@@ -235,6 +117,8 @@ impl WrtcPeer {
 
             if let Ok(pc_impl) = pc_res {
                 let pc: Arc<dyn PeerConnection> = Arc::new(pc_impl);
+
+                // 1. Добавляем Opus-аудиотрек для удержания сессии в JVB
                 let track = MediaStreamTrack::new(
                     format!("webrtc-rs-stream-id-{}", RtpCodecKind::Audio),
                     format!("webrtc-rs-track-id-{}", RtpCodecKind::Audio),
@@ -254,6 +138,58 @@ impl WrtcPeer {
                     .add_track(Arc::clone(&audio_track) as Arc<dyn TrackLocal>)
                     .await;
 
+                // 2. Создаем WebRTC DataChannel для прямой передачи пакетов по UDP/SCTP
+                let dc_init = RTCDataChannelInit {
+                    ordered: false,
+                    max_packet_life_time: None,
+                    max_retransmits: Some(0),
+                    protocol: "http://jitsi.org/protocols/colibri".to_string(),
+                    negotiated: None,
+                };
+                let data_channel: Arc<dyn DataChannel> = pc
+                    .create_data_channel("JVB data channel", Some(dc_init))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("create_data_channel failed: {e:#}"))?;
+
+                let dc_is_open = Arc::new(AtomicBool::new(false));
+                let dc_is_open_on_open = dc_is_open.clone();
+                let dc_open_notify = Arc::new(tokio::sync::Notify::new());
+                let dc_open_notify_on_open = dc_open_notify.clone();
+
+                data_channel.on_open(Box::new(move || {
+                    log::info!("[WRTC DataChannel] 'JVB data channel' state is now OPEN!");
+                    dc_is_open_on_open.store(true, Ordering::SeqCst);
+                    dc_open_notify_on_open.notify_waiters();
+                    Box::pin(async move {})
+                }));
+
+                let dc_is_open_on_close = dc_is_open.clone();
+                data_channel.on_close(Box::new(move || {
+                    log::info!("[WRTC DataChannel] 'JVB data channel' closed.");
+                    dc_is_open_on_close.store(false, Ordering::SeqCst);
+                    Box::pin(async move {})
+                }));
+
+                data_channel.on_error(Box::new(move |err| {
+                    log::warn!("[WRTC DataChannel] Error: {err}");
+                    Box::pin(async move {})
+                }));
+
+                let in_tx = incoming_tx.clone();
+                data_channel.on_message(Box::new(move |msg| {
+                    let tx = in_tx.clone();
+                    Box::pin(async move {
+                        if let Ok(colibri_msg) = serde_json::from_slice::<ColibriMessage>(&msg.data) {
+                            let _ = tx.send(colibri_msg).await;
+                        } else if let Ok(text) = std::str::from_utf8(&msg.data) {
+                            if let Ok(colibri_msg) = serde_json::from_str::<ColibriMessage>(text) {
+                                let _ = tx.send(colibri_msg).await;
+                            }
+                        }
+                    })
+                }));
+
+                // 3. Применяем Jingle Offer от Jicofo/JVB и создаем локальный Answer
                 let sdp_str = session.to_sdp(fallback_ip, fallback_port, remote_ssrc);
                 if let Ok(offer) = RTCSessionDescription::offer(sdp_str) {
                     if pc.set_remote_description(offer).await.is_ok() {
@@ -297,6 +233,51 @@ impl WrtcPeer {
                     }
                 }
 
+                // 4. Воркер отправки данных в DataChannel
+                let dc_out = Arc::clone(&data_channel);
+                let dc_is_open_out = dc_is_open.clone();
+                let dc_open_notify_out = dc_open_notify.clone();
+
+                tokio::spawn(async move {
+                    if !dc_is_open_out.load(Ordering::SeqCst) {
+                        let _ = tokio::time::timeout(Duration::from_secs(30), dc_open_notify_out.notified()).await;
+                    }
+                    log::info!(
+                        "[WRTC DataChannel] Outgoing sender loop active (is_open={})",
+                        dc_is_open_out.load(Ordering::SeqCst)
+                    );
+
+                    while let Some(msg) = outgoing_rx.recv().await {
+                        let Ok(json_str) = serde_json::to_string(&msg) else { continue; };
+                        match msg.msg_payload {
+                            crate::wrtc::colibri::WrtcMessage::Astp { .. } => {
+                                log::trace!("[JVB DC OUT ASTP]");
+                            }
+                            _ => {
+                                log::info!("[JVB DC OUT]: {json_str}");
+                            }
+                        }
+
+                        // Отправка с ретраями при временном backpressure; никогда не делаем break из цикла!
+                        for attempt in 0..5 {
+                            if !dc_is_open_out.load(Ordering::SeqCst) {
+                                let _ = tokio::time::timeout(Duration::from_millis(500), dc_open_notify_out.notified()).await;
+                            }
+                            match dc_out.send_text(&json_str).await {
+                                Ok(_) => break,
+                                Err(e) => {
+                                    if attempt == 4 {
+                                        log::warn!("[WRTC DataChannel] Failed to send message after 5 attempts: {e}");
+                                    } else {
+                                        tokio::time::sleep(Duration::from_millis(20)).await;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
+
+                // 5. Фоновый keepalive аудио-тишины
                 let track_keepalive = Arc::clone(&audio_track);
                 let seq_c = Arc::new(AtomicU16::new(0));
                 let ts_c = Arc::new(AtomicU32::new(0));
@@ -317,8 +298,8 @@ impl WrtcPeer {
                         let silence_payload = Bytes::from_static(&[0xf8, 0xff, 0xfe]);
                         loop {
                             interval.tick().await;
-                            let seq = seq_c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            let ts = ts_c.fetch_add(samples_per_packet, std::sync::atomic::Ordering::Relaxed);
+                            let seq = seq_c.fetch_add(1, Ordering::Relaxed);
+                            let ts = ts_c.fetch_add(samples_per_packet, Ordering::Relaxed);
                             let rtp_packet = RtpPacket {
                                 header: RtpHeader {
                                     version: 2,
@@ -341,17 +322,19 @@ impl WrtcPeer {
                             }
                         }
                     } else {
-                        log::warn!("[WRTC Media] WebRTC connection did not reach Connected in 30s (continuing with WS)");
+                        log::warn!("[WRTC Media] WebRTC connection did not reach Connected in 30s");
                     }
                 });
 
                 peer_connection_opt = Some(pc);
+                data_channel_opt = Some(data_channel);
                 audio_track_opt = Some(audio_track);
             }
         }
 
         Ok(Self {
             peer_connection: peer_connection_opt,
+            data_channel: data_channel_opt,
             audio_track: audio_track_opt,
             ssrc: local_ssrc,
             outgoing_tx,
@@ -363,7 +346,7 @@ impl WrtcPeer {
         self.outgoing_tx
             .send(msg)
             .await
-            .map_err(|_| anyhow::anyhow!("DataChannel write channel closed"))
+            .map_err(|_| anyhow::anyhow!("WebRTC DataChannel write channel closed"))
     }
 
     pub async fn recv(&self) -> Option<ColibriMessage> {

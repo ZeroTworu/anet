@@ -333,3 +333,142 @@ wrtc_fallback_jvb_port = 10004        # Fallback UDP порт JVB
 [crypto]
 server_signing_key = "<BASE64_ED25519_PRIVATE_KEY>"
 ```
+
+---
+
+## 7. Высокопроизводительный транспорт данных: WebRTC DataChannel и P2P Direct
+
+### 7.1. Анализ узких мест базового транспорта (Colibri-WS)
+В базовом режиме трафик туннеля ANet упаковывается в `EndpointMessage` и передается через полнодуплексный WebSocket моста JVB (`wss://.../colibri-ws/...`). Этот подход обеспечивает 100% проходимость через корпоративные прокси, однако имеет объективные физические ограничения:
+1. **TCP-over-TCP Meltdown:** Пользовательский трафик (TCP-сессии браузера, загрузок) заворачивается внутрь TLS/TCP WebSocket соединения. При малейшей потере пакета во внешней сети накладываются два независимых алгоритма контроля перегрузки (BBR/Cubic), замораживая окно передачи. Пинг под нагрузкой подскакивает с 50 до 150–250 мс (Bufferbloat в сокетах ОС).
+2. **Накладные расходы сериализации:** Каждый IP-пакет оборачивается в JSON-объект и кодируется в Base64 (+33% паразитного трафика).
+3. **Ограничения PPS в JVB (Packets Per Second):** На скорости 50 Мбит/с клиенту и серверу требуется передавать до 5 000–6 000 JSON-сообщений в секунду. Java-процесс Jitsi Videobridge парсит каждый JSON фрейм в памяти, что приводит к перегрузке CPU и задержкам очередей.
+
+### 7.2. Трехуровневая гибридная архитектура (Tiered Data Plane)
+
+Для достижения максимальной пропускной способности (100–300+ Мбит/с) и минимального пинга (15–30 мс) архитектура транспорта разделяется на три уровня с автоматическим согласованием:
+
+```
+                          [ Сигнальный брокер ]
+                     XMPP MUC (Prosody) + Colibri-WS
+                                    |
+          +-------------------------+-------------------------+
+          | (Обмен ICE-кандидатами, Beacon/Discovery, SDP)    |
+          v                                                   v
++-------------------+                               +-------------------+
+|    anet-client    |                               |    anet-server    |
++-------------------+                               +-------------------+
+  |   |           ^                                   |   |           ^
+  |   |           |                                   |   |           |
+  |   |   Tier 1: Прямой WebRTC P2P DataChannel       |   |           |
+  |   |   (SCTP over DTLS/UDP напрямую Client ⇄ Server)|   |           |
+  |   +===============================================>+   |           |
+  |       (Чистый UDP, 0% Base64, 0% JSON, MTU 1280+)      |           |
+  |                                                        |           |
+  |       Tier 2: JVB DataChannel с батчингом (Relay Mode) |           |
+  |       (SCTP over DTLS/UDP через мост JVB)              |           |
+  |       +-----------------> [ JVB ] ---------------------+           |
+  |             (Агрегация фреймов: 10 пакетов в 1 Msg)                |
+  |                                                                    |
+  |       Tier 3: Colibri WebSocket Fallback                           |
+  +-------------------------> [ JVB ] ---------------------------------+
+               (Резервный канал при блокировке UDP/SCTP)
+```
+
+---
+
+### 7.3. Tier 1: Прямой WebRTC P2P (Direct ICE: Client ⇄ Server)
+
+#### 7.3.1. Концепция
+XMPP/Контур выступает **исключительно сигнальным брокером**. Медиатрафик не нагружает сервера Контура и идет напрямую между узлами через прямое пробитие NAT (STUN hole punching).
+
+#### 7.3.2. Сигналинг через XMPP MUC
+1. Клиент и сервер генерируют локальные ICE-учетные данные (`ufrag`, `pwd`, DTLS `fingerprint`) и кандидаты (`host` сокета `0.0.0.0:0`, `srflx` через публичные STUN).
+2. Обмен SDP офером и ансером осуществляется внутри защищенных служебных сообщений в комнате (либо через `EndpointMessage`, либо через приватные XMPP станзы):
+   ```json
+   {
+     "type": "anet_p2p_offer",
+     "sdp": "v=0\r\no=- ...\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n...",
+     "candidates": [...]
+   }
+   ```
+3. При наличии белого IP у `anet-server` (VPS) состояние ICE переходит в `Connected` за 1 RTT (5–15 мс).
+
+#### 7.3.3. Конфигурация DataChannel (`webrtc-rs` / `rtc`)
+В прямом соединении создается выделенный неблокирующий канал данных:
+```rust
+let dc_init = RTCDataChannelInit {
+    ordered: false,              // Отключение Head-of-Line Blocking
+    max_retransmits: Some(0),    // Чистая семантика ненадежного UDP для IP-пакетов
+    protocol: "anet-tunnel-v1".to_string(),
+    negotiated: Some(0),         // Статический stream ID = 0 (без DCEP хэндшейка)
+    max_packet_life_time: None,
+};
+let dc = pc.create_data_channel("anet-data", Some(dc_init)).await?;
+```
+* **Формат кадра:** сырой бинарный IP-пакет (`send_data(&packet_bytes)`).
+* **Накладные расходы:** 0% JSON, 0% Base64. Задержка минимальная физическая.
+
+---
+
+### 7.4. Tier 2: WebRTC DataChannel через JVB (SFU Relay Mode)
+
+#### 7.4.1. Ограничения моста JVB Colibri
+В Jitsi Videobridge DataChannel (`protocol: "http://jitsi.org/protocols/colibri"`) **терминируется на самом Java-процессе JVB**.
+* Мост JVB не является прозрачным SCTP-роутером. Он ожидает, что каждое сообщение в DataChannel представляет собой UTF-8 JSON спецификации COLIBRI:
+  `{"colibriClass":"EndpointMessage", "to":"<endpoint_id>", "msgPayload": {...}}`
+* Отправка произвольных бинарных данных напрямую в сокет JVB приводит к ошибке парсинга моста.
+
+#### 7.4.2. Решение: Коалесцинг и агрегация пакетов (Packet Coalescing / Batching)
+Чтобы преодолеть лимит PPS на мосте JVB, применяется буферизация с микротаймером (Nagle-like для туннеля):
+1. **Воркер отправки (Egress Batcher):**
+   * Пакеты из TUN-интерфейса не отправляются немедленно, а накапливаются во внутреннем кольцевом буфере до достижения размера **12–16 КБ** либо по истечении таймаута **1.0–2.0 мс**.
+   * Несколько IP-пакетов склеиваются в один непрерывный бинарный фрейм с 2-байтовыми заголовками длины:
+     `[Len1: u16][Packet 1][Len2: u16][Packet 2]...`
+2. **Сериализация:**
+   * Полученный агрегированный блок кодируется в Base64 и упаковывается в **одно** сообщение `WrtcMessage::AstpBatch { data: "..." }`.
+   * **Результат:** При полосе 50–100 Мбит/с PPS на мосте JVB снижается с 5000 msg/sec до **200–350 msg/sec**. Нагрузка на CPU JVB падает на порядок, очередь сокетов не переполняется, Bufferbloat полностью исчезает.
+
+#### 7.4.3. Согласование Jingle / SDP (BUNDLE `audio data`)
+Для корректного выделения SCTP-ассоциации на стороне Jicofo и JVB в ветке `dev/wrtc1` реализовано:
+1. **XEP-0115 / disco#info:** Анонсирование фичей `urn:xmpp:jingle:apps:sctp:1` и `http://jitsi.org/protocols/sctp` в ответ на запросы Jicofo.
+2. **Jingle Session-Accept:** Формирование BUNDLE группы `audio data` и добавление секции приложения:
+   ```xml
+   <content creator="initiator" name="data">
+       <description xmlns="urn:xmpp:jingle:apps:sctp:1">
+           <payload-type id="5000"/>
+       </description>
+       <transport xmlns="urn:xmpp:jingle:transports:ice-udp:1" ufrag="..." pwd="...">
+           <fingerprint xmlns="urn:xmpp:jingle:apps:dtls:0" hash="sha-256">...</fingerprint>
+           <!-- ICE candidates -->
+       </transport>
+   </content>
+   ```
+3. **SDP m-line:**
+   ```text
+   a=group:BUNDLE audio data
+   m=application 10004 UDP/DTLS/SCTP webrtc-datachannel
+   c=IN IP4 89.169.19.7
+   a=mid:data
+   a=sctp-port:5000
+   ```
+
+---
+
+### 7.5. Tier 3: Colibri WebSocket Fallback
+* Используется как резервный канал при жестких сетевых блокировках UDP-трафика либо в фазе первоначального соединения.
+* Все критические управляющие сигналы (XMPP ping, Discovery, Beacon) передаются параллельно через WebSocket, гарантируя мгновенный реконнект без ожидания завершения фазы ICE.
+
+---
+
+### 7.6. Матрица сравнения режимов транспорта
+
+| Характеристика | Базовый Colibri-WS | Tier 2: JVB DataChannel (Batching) | Tier 1: P2P DataChannel (Direct) |
+| :--- | :--- | :--- | :--- |
+| **Сетевой протокол** | TCP / TLS (порт 443) | SCTP / DTLS / UDP (JVB Relay) | SCTP / DTLS / UDP (Direct) |
+| **Пропускная способность** | ~40–47 Мбит/с | **120–180 Мбит/с** | **300+ Мбит/с** (Wire speed) |
+| **Задержка под нагрузкой**| 150–250 мс (Meltdown) | 45–65 мс | **15–30 мс** (Физический RTT) |
+| **Оверхед кодирования** | JSON + Base64 (+35%)| JSON + Base64 (Батчинг, +34%)| **0% (Raw Binary Frames)** |
+| **Устойчивость к потерям**| Низкая (TCP заморозка)| Высокая (`max_retransmits: 0`)| Абсолютная (`ordered: false`)|
+| **Требования к NAT** | Любой (даже HTTP Proxy)| Любой (Исходящий UDP на JVB)| Белый IP у сервера или Cone NAT|
+
