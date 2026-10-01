@@ -309,7 +309,6 @@ impl WrtcPeer {
     pub async fn create(
         session_opt: Option<&JingleSession>,
         xmpp_opt: Option<&crate::wrtc::xmpp::XmppSession>,
-        _domain: &str,
         fallback_ip: &str,
         fallback_port: u16,
         audio_keepalive_ms: u64,

@@ -146,7 +146,6 @@ pub async fn run_wrtc_server(
         let peer = match WrtcPeer::create(
             Some(&session),
             Some(&xmpp),
-            &domain,
             fallback_ip,
             fallback_port,
             audio_keepalive_ms,
