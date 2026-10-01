@@ -38,12 +38,14 @@ fn generate_random_ssrc() -> u32 {
 struct PeerEvents {
     connected_tx: mpsc::Sender<()>,
     is_connected: Arc<AtomicBool>,
+    failed_notify: Arc<tokio::sync::Notify>,
     dc_is_open: Arc<AtomicBool>,
     dc_open_notify: Arc<tokio::sync::Notify>,
     incoming_tx: mpsc::Sender<ColibriMessage>,
     remote_dc: Arc<Mutex<Option<Arc<dyn DataChannel>>>>,
     video_incoming_tx: mpsc::Sender<Bytes>,
     expected_peer_video_ssrc: Arc<AtomicU32>,
+    first_video_rx: Arc<AtomicBool>,
 }
 
 #[async_trait::async_trait]
@@ -58,6 +60,9 @@ impl PeerConnectionEventHandler for PeerEvents {
             || state == RTCPeerConnectionState::Closed
         {
             self.is_connected.store(false, Ordering::SeqCst);
+            if state == RTCPeerConnectionState::Failed || state == RTCPeerConnectionState::Closed {
+                self.failed_notify.notify_waiters();
+            }
         }
     }
 
@@ -67,6 +72,7 @@ impl PeerConnectionEventHandler for PeerEvents {
         if kind == RtpCodecKind::Video {
             let in_tx = self.video_incoming_tx.clone();
             let expected_ssrc = self.expected_peer_video_ssrc.clone();
+            let first_rx = self.first_video_rx.clone();
             tokio::spawn(async move {
                 while let Some(event) = track.poll().await {
                     match event {
@@ -78,6 +84,12 @@ impl PeerConnectionEventHandler for PeerEvents {
                             }
                             // Проверяем 1-байтовый VP8 Payload Descriptor (RFC 7741, 0x10)
                             if pkt.payload.len() > 1 && pkt.payload[0] == 0x10 {
+                                if first_rx.swap(false, Ordering::Relaxed) {
+                                    log::info!(
+                                        "[WRTC Media Video IN] First video frame received (SSRC: {}, len: {} bytes)",
+                                        pkt.header.ssrc, pkt.payload.len()
+                                    );
+                                }
                                 let mut data = pkt.payload.slice(1..);
                                 if data.starts_with(&VP8_KEYFRAME_HEADER) {
                                     data = data.slice(VP8_KEYFRAME_HEADER.len()..);
@@ -90,6 +102,15 @@ impl PeerConnectionEventHandler for PeerEvents {
                             break;
                         }
                         _ => {}
+                    }
+                }
+            });
+        } else if kind == RtpCodecKind::Audio {
+            // Вычитываем аудио-пакеты тишины Opus от JVB, чтобы предотвратить переполнение буфера track remote a0
+            tokio::spawn(async move {
+                while let Some(event) = track.poll().await {
+                    if matches!(event, TrackRemoteEvent::OnEnded) {
+                        break;
                     }
                 }
             });
@@ -303,6 +324,8 @@ pub struct WrtcPeer {
     pub mode: WrtcMode,
     pub dc_is_open: Arc<AtomicBool>,
     pub is_connected: Arc<AtomicBool>,
+    pub failed_notify: Arc<tokio::sync::Notify>,
+    pub first_video_tx: Arc<AtomicBool>,
 }
 
 impl WrtcPeer {
@@ -320,7 +343,10 @@ impl WrtcPeer {
         let (raw_outgoing_tx, mut raw_outgoing_rx) = mpsc::channel::<String>(1024);
         let (connected_tx, _connected_rx) = mpsc::channel::<()>(1);
         let is_connected = Arc::new(AtomicBool::new(false));
+        let failed_notify = Arc::new(tokio::sync::Notify::new());
         let dc_is_open = Arc::new(AtomicBool::new(false));
+        let first_video_rx = Arc::new(AtomicBool::new(true));
+        let first_video_tx = Arc::new(AtomicBool::new(true));
 
         let local_ssrc = generate_random_ssrc();
         let local_video_ssrc = generate_random_ssrc();
@@ -457,12 +483,14 @@ impl WrtcPeer {
             let handler = Arc::new(PeerEvents {
                 connected_tx,
                 is_connected: is_connected.clone(),
+                failed_notify: failed_notify.clone(),
                 dc_is_open: dc_is_open.clone(),
                 dc_open_notify: dc_open_notify.clone(),
                 incoming_tx: incoming_tx.clone(),
                 remote_dc: remote_dc.clone(),
                 video_incoming_tx,
                 expected_peer_video_ssrc: expected_peer_video_ssrc.clone(),
+                first_video_rx,
             });
 
             let pc_res = PeerConnectionBuilder::new()
@@ -793,6 +821,8 @@ impl WrtcPeer {
             mode,
             dc_is_open,
             is_connected,
+            failed_notify,
+            first_video_tx,
         })
     }
 
@@ -804,6 +834,13 @@ impl WrtcPeer {
         let Some(ref track) = self.video_track else {
             anyhow::bail!("Video track not initialized");
         };
+
+        if self.first_video_tx.swap(false, Ordering::Relaxed) {
+            log::info!(
+                "[WRTC Media Video OUT] First video frame transmitted (SSRC: {}, len: {} bytes)",
+                self.video_ssrc, astp_data.len()
+            );
+        }
 
         // Формируем полезную нагрузку VP8: 1 байт Payload Descriptor (0x10) + VP8_KEYFRAME_HEADER + ASTP данные
         let mut payload = BytesMut::with_capacity(1 + VP8_KEYFRAME_HEADER.len() + astp_data.len());

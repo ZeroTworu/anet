@@ -314,7 +314,18 @@ impl ClientTransport for WrtcTransport {
         };
 
         let auth_handler = AuthHandler::new(&self.config, self.server.server_pub_key.as_deref())?;
-        let (auth_response, shared_key) = auth_handler.authenticate(&auth_channel).await?;
+        let (mut auth_response, shared_key) = auth_handler.authenticate(&auth_channel).await?;
+
+        // Для WebRTC транспорта безопасный MTU интерфейса TUN равен 1200 байт
+        // (RFC 8831 / JVB safe UDP MTU = 1280), чтобы гарантированно исключить EMSGSIZE (os error 90)
+        // и фрагментацию на уровне UDP/SFU.
+        if wrtc_mode == anet_common::wrtc::colibri::WrtcMode::MediaVideo || auth_response.mtu > 1200 {
+            info!(
+                "[WRTC] Setting safe TUN MTU {} (clamped from {}) for WebRTC DTLS-SRTP packetization",
+                1200, auth_response.mtu
+            );
+            auth_response.mtu = 1200;
+        }
 
         info!(
             "[WRTC] ASTP Authentication succeeded! Assigned VPN IP: {}",
@@ -628,10 +639,17 @@ impl ClientTransport for WrtcTransport {
         let cipher_video = cipher.clone();
         let tun_inject_video = tun_inject_tx.clone();
 
+        let first_client_rx = Arc::new(AtomicBool::new(true));
         tokio::spawn(async move {
             while let Some(raw_astp) = peer_video_rx.recv_video_frame().await {
                 match unwrap_packet_bytes(&cipher_video, raw_astp) {
                     Ok(packet) => {
+                        if first_client_rx.swap(false, Ordering::Relaxed) {
+                            info!(
+                                "[WRTC Client Video IN] First video frame decrypted from server (len: {} bytes)",
+                                packet.len()
+                            );
+                        }
                         log::trace!("[WRTC Media Video IN] Decrypted packet ({} bytes)", packet.len());
                         let _ = tun_inject_video.send(packet).await;
                     }

@@ -182,12 +182,19 @@ pub async fn run_wrtc_server(
         let tun_clone_video = tun_clone.clone();
         let reg_clone_video = reg_clone.clone();
 
+        let first_server_rx = Arc::new(AtomicBool::new(true));
         tokio::spawn(async move {
             while let Some(raw_astp) = peer_video_rx.recv_video_frame().await {
                 for entry in clients_map_video.iter() {
                     let client_info = entry.value();
                     if let Ok(packet) = unwrap_packet_bytes(&client_info.cipher, raw_astp.clone()) {
                         let packet_len = packet.len();
+                        if first_server_rx.swap(false, Ordering::Relaxed) {
+                            info!(
+                                "[WRTC Server Video IN] First video frame decrypted from client {} (len: {} bytes)",
+                                client_info.assigned_ip, packet_len
+                            );
+                        }
                         if tun_clone_video.try_send(packet).is_ok() {
                             reg_clone_video.record_rx(client_info, packet_len, "wrtc_video");
                         }
@@ -198,7 +205,14 @@ pub async fn run_wrtc_server(
         });
 
         loop {
-            let msg_opt = shared_peer.recv().await;
+            let msg_opt = tokio::select! {
+                res = shared_peer.recv() => res,
+                _ = shared_peer.failed_notify.notified() => {
+                    warn!("[WRTC Server] WebRTC PeerConnection failed/closed by JVB. Re-establishing server session in 3s...");
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    break;
+                }
+            };
 
             let Some(msg) = msg_opt else {
                 warn!("[WRTC Server] Connection closed (room expired or connection reset).");
