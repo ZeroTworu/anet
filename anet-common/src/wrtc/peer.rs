@@ -1,6 +1,6 @@
 use crate::wrtc::colibri::{ColibriMessage, WrtcMessage, WrtcMode};
 use crate::wrtc::jingle::JingleSession;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures::{SinkExt, StreamExt};
 use rtc::interceptor::Registry;
 use rtc::media_stream::MediaStreamTrack;
@@ -112,7 +112,7 @@ impl P2pSession {
             anyhow::bail!("P2P DataChannel is not open");
         }
         self.dc
-            .send(data)
+            .send(BytesMut::from(data.as_ref()))
             .await
             .map_err(|e| anyhow::anyhow!("P2P DataChannel send error: {e}"))?;
         Ok(())
