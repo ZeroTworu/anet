@@ -32,10 +32,18 @@ pub struct JingleSession {
     pub sources: Vec<u32>,
     #[serde(default)]
     pub has_data_channel: bool,
+    #[serde(default)]
+    pub has_video: bool,
 }
 
 impl JingleSession {
-    pub fn to_sdp(&self, fallback_ip: &str, fallback_port: u16, remote_ssrc: u32) -> String {
+    pub fn to_sdp(
+        &self,
+        fallback_ip: &str,
+        fallback_port: u16,
+        remote_ssrc: u32,
+        video_ssrc: u32,
+    ) -> String {
         let (primary_ip, primary_port) = if let Some(first) = self
             .transport
             .candidates
@@ -94,30 +102,45 @@ impl JingleSession {
             }
         }
 
+        let include_video = video_ssrc != 0 || self.has_video;
+        let mut bundle_groups = vec!["audio"];
+        if include_video {
+            bundle_groups.push("video");
+        }
         if self.has_data_channel {
-            // Формируем BUNDLE аудио (Opus) + WebRTC DataChannel (SCTP)
+            bundle_groups.push("data");
+        }
+        let bundle_str = bundle_groups.join(" ");
+
+        let video_section = if include_video {
+            let mut v_ssrc_lines = String::new();
+            if video_ssrc != 0 {
+                v_ssrc_lines.push_str(&format!(
+                    "a=ssrc:{video_ssrc} cname:cname_{video_ssrc:x}\r\n\
+                     a=ssrc:{video_ssrc} msid:msid_{video_ssrc:x} v0\r\n"
+                ));
+            }
             format!(
-                "v=0\r\n\
-                 o=- 123456789 2 IN IP4 0.0.0.0\r\n\
-                 s=-\r\n\
-                 t=0 0\r\n\
-                 a=ice-ufrag:{ufrag}\r\n\
-                 a=ice-pwd:{pwd}\r\n\
-                 a=fingerprint:{fp_hash} {fp}\r\n\
-                 a=group:BUNDLE audio data\r\n\
-                 m=audio {primary_port} UDP/TLS/RTP/SAVPF 111\r\n\
+                "m=video {primary_port} UDP/TLS/RTP/SAVPF 96\r\n\
                  c=IN IP4 {primary_ip}\r\n\
                  a=rtcp-mux\r\n\
-                 a=rtpmap:111 opus/48000/2\r\n\
+                 a=rtpmap:96 VP8/90000\r\n\
                  a=ice-ufrag:{ufrag}\r\n\
                  a=ice-pwd:{pwd}\r\n\
                  a=fingerprint:{fp_hash} {fp}\r\n\
                  a=setup:{setup}\r\n\
-                 a=mid:audio\r\n\
+                 a=mid:video\r\n\
                  a=sendrecv\r\n\
-                 {ssrc_lines}\
-                 {candidate_lines}\
-                 m=application {primary_port} UDP/DTLS/SCTP webrtc-datachannel\r\n\
+                 {v_ssrc_lines}\
+                 {candidate_lines}"
+            )
+        } else {
+            String::new()
+        };
+
+        let data_section = if self.has_data_channel {
+            format!(
+                "m=application {primary_port} UDP/DTLS/SCTP webrtc-datachannel\r\n\
                  c=IN IP4 {primary_ip}\r\n\
                  a=ice-ufrag:{ufrag}\r\n\
                  a=ice-pwd:{pwd}\r\n\
@@ -128,31 +151,35 @@ impl JingleSession {
                  {candidate_lines}"
             )
         } else {
-            // JVB мост Ktalk не анонсирует SCTP content, формируем чистый audio BUNDLE
-            format!(
-                "v=0\r\n\
-                 o=- 123456789 2 IN IP4 0.0.0.0\r\n\
-                 s=-\r\n\
-                 t=0 0\r\n\
-                 a=ice-ufrag:{ufrag}\r\n\
-                 a=ice-pwd:{pwd}\r\n\
-                 a=fingerprint:{fp_hash} {fp}\r\n\
-                 a=group:BUNDLE audio\r\n\
-                 m=audio {primary_port} UDP/TLS/RTP/SAVPF 111\r\n\
-                 c=IN IP4 {primary_ip}\r\n\
-                 a=rtcp-mux\r\n\
-                 a=rtpmap:111 opus/48000/2\r\n\
-                 a=ice-ufrag:{ufrag}\r\n\
-                 a=ice-pwd:{pwd}\r\n\
-                 a=fingerprint:{fp_hash} {fp}\r\n\
-                 a=setup:{setup}\r\n\
-                 a=mid:audio\r\n\
-                 a=sendrecv\r\n\
-                 {ssrc_lines}\
-                 {candidate_lines}"
-            )
-        }
-    }}
+            String::new()
+        };
+
+        format!(
+            "v=0\r\n\
+             o=- 123456789 2 IN IP4 0.0.0.0\r\n\
+             s=-\r\n\
+             t=0 0\r\n\
+             a=ice-ufrag:{ufrag}\r\n\
+             a=ice-pwd:{pwd}\r\n\
+             a=fingerprint:{fp_hash} {fp}\r\n\
+             a=group:BUNDLE {bundle_str}\r\n\
+             m=audio {primary_port} UDP/TLS/RTP/SAVPF 111\r\n\
+             c=IN IP4 {primary_ip}\r\n\
+             a=rtcp-mux\r\n\
+             a=rtpmap:111 opus/48000/2\r\n\
+             a=ice-ufrag:{ufrag}\r\n\
+             a=ice-pwd:{pwd}\r\n\
+             a=fingerprint:{fp_hash} {fp}\r\n\
+             a=setup:{setup}\r\n\
+             a=mid:audio\r\n\
+             a=sendrecv\r\n\
+             {ssrc_lines}\
+             {candidate_lines}\
+             {video_section}\
+             {data_section}"
+        )
+    }
+}
 
 pub fn parse_jingle_session(
     xml: &str,

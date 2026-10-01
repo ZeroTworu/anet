@@ -177,6 +177,27 @@ pub async fn run_wrtc_server(
         let srv_id = server_endpoint_id.clone();
         let padding_step = config.stealth.padding_step;
 
+        // Воркер Downlink из Fake Video Track (VP8 over DTLS-SRTP / JVB)
+        let peer_video_rx = shared_peer.clone();
+        let clients_map_video = clients_map.clone();
+        let tun_clone_video = tun_clone.clone();
+        let reg_clone_video = reg_clone.clone();
+
+        tokio::spawn(async move {
+            while let Some(raw_astp) = peer_video_rx.recv_video_frame().await {
+                for entry in clients_map_video.iter() {
+                    let client_info = entry.value();
+                    if let Ok(packet) = unwrap_packet_bytes(&client_info.cipher, raw_astp.clone()) {
+                        let packet_len = packet.len();
+                        if tun_clone_video.try_send(packet).is_ok() {
+                            reg_clone_video.record_rx(client_info, packet_len, "wrtc_video");
+                        }
+                        break;
+                    }
+                }
+            }
+        });
+
         loop {
             let msg_opt = shared_peer.recv().await;
 
@@ -191,16 +212,21 @@ pub async fn run_wrtc_server(
             }
 
             match msg.msg_payload {
-                WrtcMessage::Discover { client_nonce } => {
+                WrtcMessage::Discover { client_nonce, video_ssrc } => {
                     info!(
-                        "[WRTC Server] Received anet_discover from client {from_endpoint} (nonce: {client_nonce})! Answering beacon..."
+                        "[WRTC Server] Received anet_discover from client {from_endpoint} (nonce: {client_nonce}, client_video_ssrc: {video_ssrc:?})! Answering beacon..."
                     );
+                    if let Some(c_v_ssrc) = video_ssrc {
+                        shared_peer.set_expected_peer_video_ssrc(c_v_ssrc);
+                        info!("[WRTC Server] Set expected client video SSRC: {c_v_ssrc}");
+                    }
                     let signature = sign_beacon(&signing_key_bytes, &client_nonce, &srv_id);
                     let beacon_msg = ColibriMessage::beacon(
                         from_endpoint.clone(),
                         srv_id.clone(),
                         client_nonce,
                         signature,
+                        Some(shared_peer.video_ssrc),
                     );
                     let _ = shared_peer.send(beacon_msg).await;
                 }
@@ -278,6 +304,7 @@ pub async fn run_wrtc_server(
                                             let c_info = client_info.clone();
                                             let peer_downlink = shared_peer.clone();
                                             let p2p_clients_dl = p2p_clients.clone();
+                                            let srv_mode = server_mode;
 
                                             tokio::spawn(async move {
                                                 let mut batcher = PacketBatcher::new(16384, 2);
@@ -302,7 +329,15 @@ pub async fn run_wrtc_server(
                                                                 let enc_bytes = Bytes::from(encrypted);
                                                                 let mut sent_p2p = false;
 
-                                                                // 1. Проверяем P2P DataChannel с клиентом
+                                                                // 1. Проверяем режим MediaVideo (Fake Video Track over DTLS-SRTP / JVB)
+                                                                if srv_mode == anet_common::wrtc::colibri::WrtcMode::MediaVideo {
+                                                                    if let Err(e) = peer_downlink.send_video_frame(&enc_bytes).await {
+                                                                        warn!("[WRTC Server Video OUT] send error: {e}");
+                                                                    }
+                                                                    continue;
+                                                                }
+
+                                                                // 2. Проверяем P2P DataChannel с клиентом
                                                                 if let Some(p2p_entry) = p2p_clients_dl.get(&target_client_id) {
                                                                     if p2p_entry.is_open.load(Ordering::SeqCst) {
                                                                         if p2p_entry.send_packet(&enc_bytes).await.is_ok() {

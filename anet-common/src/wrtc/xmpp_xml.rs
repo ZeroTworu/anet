@@ -253,10 +253,14 @@ pub fn parse_jingle_node(
     let mut transport_info = JingleTransportInfo::default();
     let mut sources = Vec::new();
     let mut has_data_channel = false;
+    let mut has_video = false;
 
     for content in jingle_node.children().filter(|n| n.has_tag_name("content")) {
         if content.attribute("name") == Some("data") {
             has_data_channel = true;
+        }
+        if content.attribute("name") == Some("video") {
+            has_video = true;
         }
 
         for desc in content.children().filter(|n| n.has_tag_name("description")) {
@@ -345,6 +349,7 @@ pub fn parse_jingle_node(
         transport: transport_info,
         sources,
         has_data_channel,
+        has_video,
     })
 }
 
@@ -419,6 +424,7 @@ impl XmppBuilder {
         my_jid: &str,
         sid: &str,
         ssrc: u32,
+        video_ssrc: u32,
         cname: &str,
         msid: &str,
         ufrag: &str,
@@ -427,7 +433,24 @@ impl XmppBuilder {
         fingerprint: &str,
         candidate_xml: &str,
         include_data_content: bool,
+        include_video_content: bool,
     ) -> String {
+        let video_section = if include_video_content && video_ssrc != 0 {
+            format!(
+                r#"<content creator="initiator" name="video" senders="both"><description xmlns="urn:xmpp:jingle:apps:rtp:1" media="video"><payload-type id="96" name="VP8" clockrate="90000"/><rtcp-mux/><source xmlns="urn:xmpp:jingle:apps:rtp:ssma:0" ssrc="{video_ssrc}"><parameter xmlns="urn:xmpp:jingle:apps:rtp:1" name="cname" value="{cname}"/><parameter xmlns="urn:xmpp:jingle:apps:rtp:1" name="msid" value="{msid} v0"/></source></description><transport xmlns="urn:xmpp:jingle:transports:ice-udp:1" ufrag="{ufrag}" pwd="{pwd}"><rtcp-mux/><fingerprint xmlns="urn:xmpp:jingle:apps:dtls:0" hash="{fingerprint_hash}" setup="active">{fingerprint}</fingerprint>{candidate_xml}</transport></content>"#,
+                ufrag = escape_xml_attr(ufrag),
+                pwd = escape_xml_attr(pwd),
+                fingerprint_hash = escape_xml_attr(fingerprint_hash),
+                fingerprint = escape_xml_attr(fingerprint),
+                candidate_xml = candidate_xml,
+                video_ssrc = video_ssrc,
+                cname = escape_xml_attr(cname),
+                msid = escape_xml_attr(msid),
+            )
+        } else {
+            String::new()
+        };
+
         let data_section = if include_data_content {
             format!(
                 r#"<content creator="initiator" name="data"><description xmlns="urn:xmpp:jingle:apps:sctp:1"><payload-type id="5000"/></description><transport xmlns="urn:xmpp:jingle:transports:ice-udp:1" ufrag="{ufrag}" pwd="{pwd}"><fingerprint xmlns="urn:xmpp:jingle:apps:dtls:0" hash="{fingerprint_hash}" setup="active">{fingerprint}</fingerprint>{candidate_xml}</transport></content>"#,
@@ -442,7 +465,7 @@ impl XmppBuilder {
         };
 
         format!(
-            r#"<iq to="{to}" type="set" id="{id}"><jingle xmlns="urn:xmpp:jingle:1" action="session-accept" initiator="{init}" responder="{resp}" sid="{sid}"><content creator="initiator" name="audio" senders="both"><description xmlns="urn:xmpp:jingle:apps:rtp:1" media="audio"><payload-type id="111" name="opus" clockrate="48000" channels="2"/><rtcp-mux/><source xmlns="urn:xmpp:jingle:apps:rtp:ssma:0" ssrc="{ssrc}"><parameter xmlns="urn:xmpp:jingle:apps:rtp:1" name="cname" value="{cname}"/><parameter xmlns="urn:xmpp:jingle:apps:rtp:1" name="msid" value="{msid} a0"/></source></description><transport xmlns="urn:xmpp:jingle:transports:ice-udp:1" ufrag="{ufrag}" pwd="{pwd}"><rtcp-mux/><fingerprint xmlns="urn:xmpp:jingle:apps:dtls:0" hash="{fp_hash}" setup="active">{fp}</fingerprint>{candidate_xml}</transport></content>{data_section}</jingle></iq>"#,
+            r#"<iq to="{to}" type="set" id="{id}"><jingle xmlns="urn:xmpp:jingle:1" action="session-accept" initiator="{init}" responder="{resp}" sid="{sid}"><content creator="initiator" name="audio" senders="both"><description xmlns="urn:xmpp:jingle:apps:rtp:1" media="audio"><payload-type id="111" name="opus" clockrate="48000" channels="2"/><rtcp-mux/><source xmlns="urn:xmpp:jingle:apps:rtp:ssma:0" ssrc="{ssrc}"><parameter xmlns="urn:xmpp:jingle:apps:rtp:1" name="cname" value="{cname}"/><parameter xmlns="urn:xmpp:jingle:apps:rtp:1" name="msid" value="{msid} a0"/></source></description><transport xmlns="urn:xmpp:jingle:transports:ice-udp:1" ufrag="{ufrag}" pwd="{pwd}"><rtcp-mux/><fingerprint xmlns="urn:xmpp:jingle:apps:dtls:0" hash="{fp_hash}" setup="active">{fp}</fingerprint>{candidate_xml}</transport></content>{video_section}{data_section}</jingle></iq>"#,
             to = escape_xml_attr(focus_jid),
             id = escape_xml_attr(req_id),
             init = escape_xml_attr(focus_jid),
@@ -456,6 +479,7 @@ impl XmppBuilder {
             fp_hash = escape_xml_attr(fingerprint_hash),
             fp = escape_xml_attr(fingerprint),
             candidate_xml = candidate_xml,
+            video_section = video_section,
             data_section = data_section
         )
     }

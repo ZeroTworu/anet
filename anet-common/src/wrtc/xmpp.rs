@@ -314,12 +314,14 @@ impl XmppSession {
         sid: &str,
         focus_jid: &str,
         ssrc: u32,
+        video_ssrc: u32,
         ufrag: &str,
         pwd: &str,
         fingerprint: &str,
         fingerprint_hash: &str,
         candidates: &[String],
         has_data_channel: bool,
+        has_video: bool,
     ) -> anyhow::Result<()> {
         let req_id = format!("accept_{:08x}", rand::random::<u32>());
         let cname = format!("cname_{:08x}", rand::random::<u32>());
@@ -358,6 +360,7 @@ impl XmppSession {
             &self.jid,
             sid,
             ssrc,
+            video_ssrc,
             &cname,
             &msid,
             ufrag,
@@ -366,6 +369,7 @@ impl XmppSession {
             fingerprint,
             &candidate_xml,
             has_data_channel,
+            has_video,
         );
 
         log::info!("[XMPP] Sending Jingle session-accept (sid: {sid}) to Jicofo ({focus_jid})...");

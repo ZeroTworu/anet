@@ -1,11 +1,11 @@
 use crate::wrtc::colibri::{ColibriMessage, WrtcMessage, WrtcMode};
 use crate::wrtc::jingle::JingleSession;
-use bytes::{Bytes, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use futures::{SinkExt, StreamExt};
 use rtc::interceptor::Registry;
 use rtc::media_stream::MediaStreamTrack;
 use rtc::peer_connection::configuration::interceptor_registry::register_default_interceptors;
-use rtc::peer_connection::configuration::media_engine::{MediaEngine, MIME_TYPE_OPUS};
+use rtc::peer_connection::configuration::media_engine::{MediaEngine, MIME_TYPE_OPUS, MIME_TYPE_VP8};
 use rtc::peer_connection::configuration::setting_engine::SettingEngineBuilder;
 use rtc::peer_connection::configuration::RTCConfigurationBuilder;
 use rtc::peer_connection::sdp::RTCSessionDescription;
@@ -22,6 +22,7 @@ use tokio::sync::{mpsc, Mutex};
 use webrtc::data_channel::{DataChannel, DataChannelEvent, RTCDataChannelInit};
 use webrtc::media_stream::track_local::static_rtp::TrackLocalStaticRTP;
 use webrtc::media_stream::track_local::TrackLocal;
+use webrtc::media_stream::track_remote::{TrackRemote, TrackRemoteEvent};
 use webrtc::peer_connection::{
     PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler,
     RTCPeerConnectionState,
@@ -39,6 +40,8 @@ struct PeerEvents {
     dc_open_notify: Arc<tokio::sync::Notify>,
     incoming_tx: mpsc::Sender<ColibriMessage>,
     remote_dc: Arc<Mutex<Option<Arc<dyn DataChannel>>>>,
+    video_incoming_tx: mpsc::Sender<Bytes>,
+    expected_peer_video_ssrc: Arc<AtomicU32>,
 }
 
 #[async_trait::async_trait]
@@ -53,6 +56,38 @@ impl PeerConnectionEventHandler for PeerEvents {
             || state == RTCPeerConnectionState::Closed
         {
             self.is_connected.store(false, Ordering::SeqCst);
+        }
+    }
+
+    async fn on_track(&self, track: Arc<dyn TrackRemote>) {
+        let kind = track.kind().await;
+        log::info!("[WRTC Media] Inbound remote track: kind={kind:?}");
+        if kind == RtpCodecKind::Video {
+            let in_tx = self.video_incoming_tx.clone();
+            let expected_ssrc = self.expected_peer_video_ssrc.clone();
+            tokio::spawn(async move {
+                while let Some(event) = track.poll().await {
+                    match event {
+                        TrackRemoteEvent::OnRtpPacket(pkt) => {
+                            let exp = expected_ssrc.load(Ordering::Relaxed);
+                            // Если peer_video_ssrc согласован, отсекаем чужие SSRC (anti-storm)
+                            if exp != 0 && pkt.header.ssrc != exp {
+                                continue;
+                            }
+                            // Проверяем 1-байтовый VP8 Payload Descriptor (RFC 7741, 0x10)
+                            if pkt.payload.len() > 1 && pkt.payload[0] == 0x10 {
+                                let data = pkt.payload.slice(1..);
+                                let _ = in_tx.send(data).await;
+                            }
+                        }
+                        TrackRemoteEvent::OnEnded => {
+                            log::info!("[WRTC Media] Remote video track ended");
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            });
         }
     }
 
@@ -249,9 +284,15 @@ pub struct WrtcPeer {
     pub peer_connection: Option<Arc<dyn PeerConnection>>,
     pub data_channel: Option<Arc<dyn DataChannel>>,
     pub audio_track: Option<Arc<TrackLocalStaticRTP>>,
+    pub video_track: Option<Arc<TrackLocalStaticRTP>>,
     pub ssrc: u32,
+    pub video_ssrc: u32,
+    pub video_seq: Arc<AtomicU16>,
+    pub video_ts: Arc<AtomicU32>,
+    pub expected_peer_video_ssrc: Arc<AtomicU32>,
     pub outgoing_tx: mpsc::Sender<ColibriMessage>,
     pub incoming_rx: Mutex<mpsc::Receiver<ColibriMessage>>,
+    pub video_incoming_rx: Mutex<mpsc::Receiver<Bytes>>,
     pub mode: WrtcMode,
     pub dc_is_open: Arc<AtomicBool>,
     pub is_connected: Arc<AtomicBool>,
@@ -268,12 +309,17 @@ impl WrtcPeer {
         mode: WrtcMode,
     ) -> anyhow::Result<Self> {
         let (incoming_tx, incoming_rx) = mpsc::channel::<ColibriMessage>(1024);
+        let (video_incoming_tx, video_incoming_rx) = mpsc::channel::<Bytes>(1024);
         let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<ColibriMessage>(1024);
         let (connected_tx, _connected_rx) = mpsc::channel::<()>(1);
         let is_connected = Arc::new(AtomicBool::new(false));
         let dc_is_open = Arc::new(AtomicBool::new(false));
 
         let local_ssrc = generate_random_ssrc();
+        let local_video_ssrc = generate_random_ssrc();
+        let video_seq = Arc::new(AtomicU16::new(0));
+        let video_ts = Arc::new(AtomicU32::new(0));
+        let expected_peer_video_ssrc = Arc::new(AtomicU32::new(0));
         let remote_ssrc = 0;
 
         // Подключаем Colibri-WS (основной канал для Ws, параллельный fallback для Auto/JvbDatachannel)
@@ -329,9 +375,10 @@ impl WrtcPeer {
         let mut peer_connection_opt = None;
         let mut data_channel_opt = None;
         let mut audio_track_opt = None;
+        let mut video_track_opt = None;
 
         if let (Some(session), Some(xmpp)) = (session_opt, xmpp_opt) {
-            log::info!("[WRTC Media] Initializing WebRTC PeerConnection and DataChannel...");
+            log::info!("[WRTC Media] Initializing WebRTC PeerConnection with Audio (Opus) and Video (VP8)...");
 
             let mut media_engine = MediaEngine::default();
             let audio_codec = RTCRtpCodecParameters {
@@ -346,6 +393,20 @@ impl WrtcPeer {
                 ..Default::default()
             };
             media_engine.register_codec(audio_codec.clone(), RtpCodecKind::Audio)?;
+
+            let video_codec = RTCRtpCodecParameters {
+                rtp_codec: RTCRtpCodec {
+                    mime_type: MIME_TYPE_VP8.to_owned(),
+                    clock_rate: 90000,
+                    channels: 0,
+                    sdp_fmtp_line: "".to_owned(),
+                    rtcp_feedback: vec![],
+                },
+                payload_type: 96,
+                ..Default::default()
+            };
+            media_engine.register_codec(video_codec.clone(), RtpCodecKind::Video)?;
+
             let registry = register_default_interceptors(Registry::new(), &mut media_engine)?;
 
             let bind_addr = "0.0.0.0:0".to_string();
@@ -379,6 +440,8 @@ impl WrtcPeer {
                 dc_open_notify: dc_open_notify.clone(),
                 incoming_tx: incoming_tx.clone(),
                 remote_dc: remote_dc.clone(),
+                video_incoming_tx,
+                expected_peer_video_ssrc: expected_peer_video_ssrc.clone(),
             });
 
             let pc_res = PeerConnectionBuilder::new()
@@ -397,7 +460,7 @@ impl WrtcPeer {
                 let pc: Arc<dyn PeerConnection> = Arc::new(pc_impl);
 
                 // 1. Добавляем Opus-аудиотрек для удержания сессии в JVB
-                let track = MediaStreamTrack::new(
+                let audio_track_desc = MediaStreamTrack::new(
                     format!("webrtc-rs-stream-id-{}", RtpCodecKind::Audio),
                     format!("webrtc-rs-track-id-{}", RtpCodecKind::Audio),
                     format!("webrtc-rs-track-label-{}", RtpCodecKind::Audio),
@@ -411,12 +474,32 @@ impl WrtcPeer {
                         ..Default::default()
                     }],
                 );
-                let audio_track = Arc::new(TrackLocalStaticRTP::new(track));
+                let audio_track = Arc::new(TrackLocalStaticRTP::new(audio_track_desc));
                 let _ = pc
                     .add_track(Arc::clone(&audio_track) as Arc<dyn TrackLocal>)
                     .await;
 
-                // 2. Создаем WebRTC DataChannel только если JVB/Jicofo анонсировал секцию данных
+                // 2. Добавляем Fake Video Track (VP8) для высокоскоростного Data Plane
+                let video_track_desc = MediaStreamTrack::new(
+                    format!("webrtc-rs-stream-id-{}", RtpCodecKind::Video),
+                    format!("webrtc-rs-track-id-{}", RtpCodecKind::Video),
+                    format!("webrtc-rs-track-label-{}", RtpCodecKind::Video),
+                    RtpCodecKind::Video,
+                    vec![RTCRtpEncodingParameters {
+                        rtp_coding_parameters: RTCRtpCodingParameters {
+                            ssrc: Some(local_video_ssrc),
+                            ..Default::default()
+                        },
+                        codec: video_codec.rtp_codec.clone(),
+                        ..Default::default()
+                    }],
+                );
+                let video_track = Arc::new(TrackLocalStaticRTP::new(video_track_desc));
+                let _ = pc
+                    .add_track(Arc::clone(&video_track) as Arc<dyn TrackLocal>)
+                    .await;
+
+                // 3. Создаем WebRTC DataChannel только если JVB/Jicofo анонсировал секцию данных
                 let mut data_channel_res = None;
                 if session.has_data_channel && mode != WrtcMode::Ws {
                     let dc_init = RTCDataChannelInit {
@@ -472,8 +555,8 @@ impl WrtcPeer {
                     log::info!("[WRTC DataChannel] JVB bridge does not announce SCTP DataChannel in session-initiate. Operating over Colibri-WS with PacketBatcher.");
                 }
 
-                // 3. Применяем Jingle Offer от Jicofo/JVB и создаем локальный Answer
-                let sdp_str = session.to_sdp(fallback_ip, fallback_port, remote_ssrc);
+                // 4. Применяем Jingle Offer от Jicofo/JVB и создаем локальный Answer
+                let sdp_str = session.to_sdp(fallback_ip, fallback_port, remote_ssrc, local_video_ssrc);
                 if let Ok(offer) = RTCSessionDescription::offer(sdp_str) {
                     if pc.set_remote_description(offer).await.is_ok() {
                         if let Ok(answer) = pc.create_answer(None).await {
@@ -505,19 +588,21 @@ impl WrtcPeer {
                                     &session.sid,
                                     &session.from,
                                     local_ssrc,
+                                    local_video_ssrc,
                                     &local_params.ufrag,
                                     &local_params.pwd,
                                     &local_params.fingerprint,
                                     &local_params.fingerprint_hash,
                                     &local_params.candidates,
                                     session.has_data_channel,
+                                    session.has_video || local_video_ssrc != 0,
                                 )
                                 .await;
                         }
                     }
                 }
 
-                // 4. Воркер отправки данных в DataChannel с бесшовным fallback в Colibri-WS
+                // 5. Воркер отправки данных в DataChannel с бесшовным fallback в Colibri-WS
                 let dc_opt_out = data_channel_res.clone();
                 let remote_dc_out = remote_dc.clone();
                 let dc_is_open_out = dc_is_open.clone();
@@ -592,7 +677,7 @@ impl WrtcPeer {
                     }
                 });
 
-                // 5. Фоновый keepalive аудио-тишины Opus (непрерывный, устойчивый к мобильному CGNAT)
+                // 6. Фоновый keepalive аудио-тишины Opus (непрерывный, устойчивый к мобильному CGNAT)
                 let track_keepalive = Arc::clone(&audio_track);
                 let seq_c = Arc::new(AtomicU16::new(0));
                 let ts_c = Arc::new(AtomicU32::new(0));
@@ -643,6 +728,7 @@ impl WrtcPeer {
                 peer_connection_opt = Some(pc);
                 data_channel_opt = data_channel_res;
                 audio_track_opt = Some(audio_track);
+                video_track_opt = Some(video_track);
             }
         }
 
@@ -650,13 +736,65 @@ impl WrtcPeer {
             peer_connection: peer_connection_opt,
             data_channel: data_channel_opt,
             audio_track: audio_track_opt,
+            video_track: video_track_opt,
             ssrc: local_ssrc,
+            video_ssrc: local_video_ssrc,
+            video_seq,
+            video_ts,
+            expected_peer_video_ssrc,
             outgoing_tx,
             incoming_rx: Mutex::new(incoming_rx),
+            video_incoming_rx: Mutex::new(video_incoming_rx),
             mode,
             dc_is_open,
             is_connected,
         })
+    }
+
+    pub fn set_expected_peer_video_ssrc(&self, ssrc: u32) {
+        self.expected_peer_video_ssrc.store(ssrc, Ordering::SeqCst);
+    }
+
+    pub async fn send_video_frame(&self, astp_data: &[u8]) -> anyhow::Result<()> {
+        let Some(ref track) = self.video_track else {
+            anyhow::bail!("Video track not initialized");
+        };
+
+        // Формируем полезную нагрузку VP8: 1 байт Payload Descriptor (0x10) + ASTP данные
+        let mut payload = BytesMut::with_capacity(1 + astp_data.len());
+        payload.put_u8(0x10); // Start of partition, PartID = 0 (RFC 7741)
+        payload.put_slice(astp_data);
+
+        let seq = self.video_seq.fetch_add(1, Ordering::Relaxed);
+        let ts = self.video_ts.fetch_add(3000, Ordering::Relaxed); // 90000 / 30fps = 3000
+
+        let rtp_packet = RtpPacket {
+            header: RtpHeader {
+                version: 2,
+                padding: false,
+                extension: false,
+                marker: true, // Маркер конца кадра для немедленной отправки в JVB
+                payload_type: 96,
+                sequence_number: seq,
+                timestamp: ts,
+                ssrc: self.video_ssrc,
+                csrc: vec![],
+                extension_profile: 0,
+                extensions: vec![],
+                extensions_padding: 0,
+            },
+            payload: payload.freeze(),
+        };
+
+        track
+            .write_rtp(rtp_packet)
+            .await
+            .map_err(|e| anyhow::anyhow!("VP8 write_rtp error: {e}"))
+    }
+
+    pub async fn recv_video_frame(&self) -> Option<Bytes> {
+        let mut rx = self.video_incoming_rx.lock().await;
+        rx.recv().await
     }
 
     pub async fn send(&self, msg: ColibriMessage) -> anyhow::Result<()> {

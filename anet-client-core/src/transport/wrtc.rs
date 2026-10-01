@@ -250,22 +250,26 @@ impl ClientTransport for WrtcTransport {
         while tokio::time::Instant::now() < deadline {
             tokio::select! {
                 _ = interval.tick() => {
-                    info!("[WRTC] Sending anet_discover broadcast (nonce: {client_nonce})...");
-                    let discover_broadcast = ColibriMessage::discover(None, client_nonce.clone());
+                    info!("[WRTC] Sending anet_discover broadcast (nonce: {client_nonce}, video_ssrc: {})...", peer.video_ssrc);
+                    let discover_broadcast = ColibriMessage::discover(None, client_nonce.clone(), Some(peer.video_ssrc));
                     let _ = peer.send(discover_broadcast).await;
 
                     let current_occupants = xmpp.get_other_occupants();
                     for occupant in current_occupants {
                         info!("[WRTC] Sending anet_discover to occupant: {occupant}");
-                        let unicast_discover = ColibriMessage::discover(Some(occupant), client_nonce.clone());
+                        let unicast_discover = ColibriMessage::discover(Some(occupant), client_nonce.clone(), Some(peer.video_ssrc));
                         let _ = peer.send(unicast_discover).await;
                     }
                 }
                 msg_opt = peer.recv() => {
                     if let Some(msg) = msg_opt {
-                        if let WrtcMessage::Beacon { server_id, client_nonce: beacon_nonce, signature } = msg.msg_payload {
-                            info!("[WRTC] Received beacon from server: {server_id} (nonce match: {})", beacon_nonce == client_nonce);
+                        if let WrtcMessage::Beacon { server_id, client_nonce: beacon_nonce, signature, video_ssrc } = msg.msg_payload {
+                            info!("[WRTC] Received beacon from server: {server_id} (nonce match: {}, server_video_ssrc: {video_ssrc:?})", beacon_nonce == client_nonce);
                             if beacon_nonce == client_nonce {
+                                if let Some(v_ssrc) = video_ssrc {
+                                    peer.set_expected_peer_video_ssrc(v_ssrc);
+                                    info!("[WRTC Client] Set expected server video SSRC: {v_ssrc}");
+                                }
                                 if let Some(pub_key) = server_pub_key {
                                     match verify_beacon(pub_key, &client_nonce, &server_id, &signature) {
                                         Ok(true) => {
@@ -437,7 +441,15 @@ impl ClientTransport for WrtcTransport {
                                 let enc_bytes = Bytes::from(encrypted);
                                 let mut sent_p2p = false;
 
-                                // 1. Проверяем прямой P2P DataChannel (Tier 1)
+                                // 1. Проверяем режим MediaVideo (Fake Video Track over DTLS-SRTP / JVB)
+                                if wrtc_mode == anet_common::wrtc::colibri::WrtcMode::MediaVideo {
+                                    if let Err(e) = peer_tx.send_video_frame(&enc_bytes).await {
+                                        warn!("[WRTC Media Video OUT] send error: {e}");
+                                    }
+                                    continue;
+                                }
+
+                                // 2. Проверяем прямой P2P DataChannel (Tier 1)
                                 let p2p_opt = {
                                     let guard = p2p_uplink.lock().await;
                                     guard.clone()
@@ -451,7 +463,7 @@ impl ClientTransport for WrtcTransport {
                                     }
                                 }
 
-                                // 2. Если P2P еще не открыт или недоступен, отправляем через батчер (Tier 2/3)
+                                // 3. Если P2P еще не открыт или недоступен, отправляем через батчер (Tier 2/3)
                                 if !sent_p2p {
                                     batcher.push(enc_bytes);
                                     if batcher.should_flush() {
@@ -608,6 +620,25 @@ impl ClientTransport for WrtcTransport {
                     }
                 }
                 tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        });
+
+        // Воркер Downlink из Fake Video Track (VP8 over DTLS-SRTP / JVB)
+        let peer_video_rx = shared_peer.clone();
+        let cipher_video = cipher.clone();
+        let tun_inject_video = tun_inject_tx.clone();
+
+        tokio::spawn(async move {
+            while let Some(raw_astp) = peer_video_rx.recv_video_frame().await {
+                match unwrap_packet_bytes(&cipher_video, raw_astp) {
+                    Ok(packet) => {
+                        log::trace!("[WRTC Media Video IN] Decrypted packet ({} bytes)", packet.len());
+                        let _ = tun_inject_video.send(packet).await;
+                    }
+                    Err(e) => {
+                        warn!("[WRTC Media Video IN] Decrypt packet error: {e}");
+                    }
+                }
             }
         });
 

@@ -26,6 +26,7 @@ pub enum WrtcMode {
     P2pDirect,
     JvbDatachannel,
     Ws,
+    MediaVideo,
 }
 
 impl Default for WrtcMode {
@@ -42,6 +43,7 @@ impl std::str::FromStr for WrtcMode {
             "p2p" | "p2p_direct" | "direct" => WrtcMode::P2pDirect,
             "dc" | "datachannel" | "jvb_dc" | "jvb_datachannel" => WrtcMode::JvbDatachannel,
             "ws" | "websocket" | "colibri_ws" => WrtcMode::Ws,
+            "media_video" | "video" | "vp8" | "media_rtp" | "media" => WrtcMode::MediaVideo,
             _ => WrtcMode::Auto,
         })
     }
@@ -53,12 +55,16 @@ pub enum WrtcMessage {
     #[serde(rename = "anet_discover")]
     Discover {
         client_nonce: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        video_ssrc: Option<u32>,
     },
     #[serde(rename = "anet_beacon")]
     Beacon {
         server_id: String,
         client_nonce: String,
         signature: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        video_ssrc: Option<u32>,
     },
     #[serde(rename = "astp")]
     Astp {
@@ -116,10 +122,13 @@ impl ColibriMessage {
         }
     }
 
-    pub fn discover(to: Option<String>, client_nonce: String) -> Self {
+    pub fn discover(to: Option<String>, client_nonce: String, video_ssrc: Option<u32>) -> Self {
         Self::new_endpoint_message(
             to,
-            WrtcMessage::Discover { client_nonce },
+            WrtcMessage::Discover {
+                client_nonce,
+                video_ssrc,
+            },
         )
     }
 
@@ -128,6 +137,7 @@ impl ColibriMessage {
         server_id: String,
         client_nonce: String,
         signature: String,
+        video_ssrc: Option<u32>,
     ) -> Self {
         Self::new_endpoint_message(
             Some(to_client_endpoint),
@@ -135,6 +145,7 @@ impl ColibriMessage {
                 server_id,
                 client_nonce,
                 signature,
+                video_ssrc,
             },
         )
     }
