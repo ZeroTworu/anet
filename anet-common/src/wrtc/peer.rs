@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
-use webrtc::data_channel::{DataChannel, RTCDataChannelInit};
+use webrtc::data_channel::{DataChannel, DataChannelEvent, RTCDataChannelInit};
 use webrtc::media_stream::track_local::static_rtp::TrackLocalStaticRTP;
 use webrtc::media_stream::track_local::TrackLocal;
 use webrtc::peer_connection::{
@@ -34,6 +34,11 @@ fn generate_random_ssrc() -> u32 {
 
 struct PeerEvents {
     connected_tx: mpsc::Sender<()>,
+    is_connected: Arc<AtomicBool>,
+    dc_is_open: Arc<AtomicBool>,
+    dc_open_notify: Arc<tokio::sync::Notify>,
+    incoming_tx: mpsc::Sender<ColibriMessage>,
+    remote_dc: Arc<Mutex<Option<Arc<dyn DataChannel>>>>,
 }
 
 #[async_trait::async_trait]
@@ -41,9 +46,149 @@ impl PeerConnectionEventHandler for PeerEvents {
     async fn on_connection_state_change(&self, state: RTCPeerConnectionState) {
         log::info!("[WRTC Media] WebRTC PeerConnection state: {state:?}");
         if state == RTCPeerConnectionState::Connected {
+            self.is_connected.store(true, Ordering::SeqCst);
             let _ = self.connected_tx.try_send(());
+        } else if state == RTCPeerConnectionState::Disconnected
+            || state == RTCPeerConnectionState::Failed
+            || state == RTCPeerConnectionState::Closed
+        {
+            self.is_connected.store(false, Ordering::SeqCst);
         }
     }
+
+    async fn on_data_channel(&self, data_channel: Arc<dyn DataChannel>) {
+        let label = data_channel.label().await.unwrap_or_default();
+        let proto = data_channel.protocol().await.unwrap_or_default();
+        log::info!(
+            "[WRTC DataChannel] Inbound DataChannel negotiated by JVB/peer: label='{label}', protocol='{proto}'"
+        );
+        *self.remote_dc.lock().await = Some(Arc::clone(&data_channel));
+        self.dc_is_open.store(true, Ordering::SeqCst);
+        self.dc_open_notify.notify_waiters();
+
+        let in_tx = self.incoming_tx.clone();
+        let dc_is_open_c = self.dc_is_open.clone();
+        let dc_poll = Arc::clone(&data_channel);
+
+        tokio::spawn(async move {
+            while let Some(event) = dc_poll.poll().await {
+                match event {
+                    DataChannelEvent::OnOpen => {
+                        log::info!("[WRTC DataChannel] Inbound DataChannel state is OPEN!");
+                        dc_is_open_c.store(true, Ordering::SeqCst);
+                    }
+                    DataChannelEvent::OnClose => {
+                        log::info!("[WRTC DataChannel] Inbound DataChannel closed.");
+                        dc_is_open_c.store(false, Ordering::SeqCst);
+                        break;
+                    }
+                    DataChannelEvent::OnMessage(msg) => {
+                        if let Ok(c_msg) = serde_json::from_slice::<ColibriMessage>(&msg.data) {
+                            let _ = in_tx.send(c_msg).await;
+                        } else if let Ok(text) = std::str::from_utf8(&msg.data) {
+                            if let Ok(c_msg) = serde_json::from_str::<ColibriMessage>(text) {
+                                let _ = in_tx.send(c_msg).await;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        });
+    }
+}
+
+pub struct P2pSession {
+    pub pc: Arc<dyn PeerConnection>,
+    pub dc: Arc<dyn DataChannel>,
+    pub is_open: Arc<AtomicBool>,
+    pub open_notify: Arc<tokio::sync::Notify>,
+}
+
+pub async fn create_p2p_channel(stun_servers: &[String]) -> anyhow::Result<P2pSession> {
+    let mut media_engine = MediaEngine::default();
+    let registry = register_default_interceptors(Registry::new(), &mut media_engine)?;
+
+    use rtc::peer_connection::configuration::RTCIceServer;
+    let mut ice_servers = Vec::new();
+    for s in stun_servers {
+        ice_servers.push(RTCIceServer {
+            urls: vec![s.clone()],
+            username: String::new(),
+            credential: String::new(),
+        });
+    }
+    if ice_servers.is_empty() {
+        ice_servers.push(RTCIceServer {
+            urls: vec!["stun:stun.l.google.com:19302".to_string()],
+            username: String::new(),
+            credential: String::new(),
+        });
+    }
+
+    let config = RTCConfigurationBuilder::new()
+        .with_ice_servers(ice_servers)
+        .build();
+
+    let setting_engine = SettingEngineBuilder::new()
+        .with_ice_timeouts(
+            Some(Duration::from_secs(10)),
+            Some(Duration::from_secs(25)),
+            Some(Duration::from_millis(2000)),
+        )
+        .with_sctp_max_receive_buffer_size(2 * 1024 * 1024)
+        .with_sctp_mtu(1280)
+        .with_receive_mtu(1500)
+        .build();
+
+    let pc_res = PeerConnectionBuilder::new()
+        .with_configuration(config)
+        .with_setting_engine(setting_engine)
+        .with_media_engine(media_engine)
+        .with_interceptor_registry(registry)
+        .with_runtime(Arc::new(TokioRuntime))
+        .with_udp_addrs(vec!["0.0.0.0:0".to_string()])
+        .with_dedicated_reactor_pool_size(1)
+        .build()
+        .await?;
+
+    let pc: Arc<dyn PeerConnection> = Arc::new(pc_res);
+
+    let dc_init = RTCDataChannelInit {
+        ordered: false,
+        max_packet_life_time: None,
+        max_retransmits: Some(0),
+        protocol: "anet-tunnel-v1".to_string(),
+        negotiated: Some(0),
+    };
+
+    let dc: Arc<dyn DataChannel> = pc.create_data_channel("anet-data", Some(dc_init)).await?;
+    let is_open = Arc::new(AtomicBool::new(false));
+    let open_notify = Arc::new(tokio::sync::Notify::new());
+
+    let is_open_c = is_open.clone();
+    let notify_c = open_notify.clone();
+    let dc_poll = Arc::clone(&dc);
+
+    tokio::spawn(async move {
+        while let Some(event) = dc_poll.poll().await {
+            match event {
+                DataChannelEvent::OnOpen => {
+                    log::info!("[P2P Direct] established: DataChannel 'anet-data' is now OPEN!");
+                    is_open_c.store(true, Ordering::SeqCst);
+                    notify_c.notify_waiters();
+                }
+                DataChannelEvent::OnClose => {
+                    log::info!("[P2P Direct] DataChannel closed");
+                    is_open_c.store(false, Ordering::SeqCst);
+                    break;
+                }
+                _ => {}
+            }
+        }
+    });
+
+    Ok(P2pSession { pc, dc, is_open, open_notify })
 }
 
 pub struct WrtcPeer {
@@ -54,6 +199,8 @@ pub struct WrtcPeer {
     pub outgoing_tx: mpsc::Sender<ColibriMessage>,
     pub incoming_rx: Mutex<mpsc::Receiver<ColibriMessage>>,
     pub mode: WrtcMode,
+    pub dc_is_open: Arc<AtomicBool>,
+    pub is_connected: Arc<AtomicBool>,
 }
 
 impl WrtcPeer {
@@ -68,7 +215,9 @@ impl WrtcPeer {
     ) -> anyhow::Result<Self> {
         let (incoming_tx, incoming_rx) = mpsc::channel::<ColibriMessage>(1024);
         let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<ColibriMessage>(1024);
-        let (connected_tx, mut connected_rx) = mpsc::channel::<()>(1);
+        let (connected_tx, _connected_rx) = mpsc::channel::<()>(1);
+        let is_connected = Arc::new(AtomicBool::new(false));
+        let dc_is_open = Arc::new(AtomicBool::new(false));
 
         let local_ssrc = generate_random_ssrc();
         let remote_ssrc = 0;
@@ -136,12 +285,64 @@ impl WrtcPeer {
                             outgoing_tx,
                             incoming_rx: Mutex::new(incoming_rx),
                             mode,
+                            dc_is_open,
+                            is_connected,
                         });
                     }
                     Err(e) => {
                         log::warn!("[WRTC WS] Failed to connect to Colibri-WS at {ws_url}: {e}");
                     }
                 }
+            }
+        }
+
+        // Подключаем Colibri-WS в параллель как fallback при Auto/DataChannel
+        let (ws_fallback_tx, mut ws_fallback_rx) = mpsc::channel::<String>(1024);
+        let has_ws = Arc::new(AtomicBool::new(false));
+
+        if let Some(session) = session_opt {
+            if let Some(ref ws_url) = session.transport.colibri_ws_url {
+                let ws_url_c = ws_url.clone();
+                let in_tx_ws = incoming_tx.clone();
+                let has_ws_c = has_ws.clone();
+                tokio::spawn(async move {
+                    if let Ok((ws_stream, _)) = tokio_tungstenite::connect_async(&ws_url_c).await {
+                        has_ws_c.store(true, Ordering::SeqCst);
+                        log::info!("[WRTC WS] Parallel Colibri-WS fallback connected");
+                        let (mut ws_sink, mut ws_stream) = ws_stream.split();
+
+                        let in_tx = in_tx_ws;
+                        let has_ws_read = has_ws_c.clone();
+                        tokio::spawn(async move {
+                            while let Some(msg_res) = ws_stream.next().await {
+                                match msg_res {
+                                    Ok(tokio_tungstenite::tungstenite::Message::Text(text)) => {
+                                        if let Ok(c_msg) = serde_json::from_str::<ColibriMessage>(&text) {
+                                            let _ = in_tx.send(c_msg).await;
+                                        }
+                                    }
+                                    Ok(tokio_tungstenite::tungstenite::Message::Binary(bin)) => {
+                                        if let Ok(c_msg) = serde_json::from_slice::<ColibriMessage>(&bin) {
+                                            let _ = in_tx.send(c_msg).await;
+                                        }
+                                    }
+                                    Ok(tokio_tungstenite::tungstenite::Message::Close(_)) | Err(_) => {
+                                        has_ws_read.store(false, Ordering::SeqCst);
+                                        break;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        });
+
+                        while let Some(json_text) = ws_fallback_rx.recv().await {
+                            if ws_sink.send(tokio_tungstenite::tungstenite::Message::Text(json_text.into())).await.is_err() {
+                                has_ws_c.store(false, Ordering::SeqCst);
+                                break;
+                            }
+                        }
+                    }
+                });
             }
         }
 
@@ -169,15 +370,49 @@ impl WrtcPeer {
 
             let bind_addr = "0.0.0.0:0".to_string();
 
+            let mut ice_servers = Vec::new();
+            for stun_url in xmpp.get_stun_servers() {
+                ice_servers.push(rtc::peer_connection::configuration::RTCIceServer {
+                    urls: vec![stun_url],
+                    username: String::new(),
+                    credential: String::new(),
+                });
+            }
+            if ice_servers.is_empty() {
+                ice_servers.push(rtc::peer_connection::configuration::RTCIceServer {
+                    urls: vec!["stun:turn.ktalk.ru:3478".to_string()],
+                    username: String::new(),
+                    credential: String::new(),
+                });
+            }
+
             let config = RTCConfigurationBuilder::new()
-                .with_ice_servers(vec![])
+                .with_ice_servers(ice_servers)
                 .build();
 
             let setting_engine = SettingEngineBuilder::new()
                 .with_answering_dtls_role(RTCDtlsRole::Client)
+                .with_ice_timeouts(
+                    Some(Duration::from_secs(10)),
+                    Some(Duration::from_secs(25)),
+                    Some(Duration::from_millis(2000)),
+                )
+                .with_sctp_max_receive_buffer_size(2 * 1024 * 1024)
+                .with_sctp_mtu(1280)
+                .with_receive_mtu(1500)
                 .build();
 
-            let handler = Arc::new(PeerEvents { connected_tx });
+            let remote_dc: Arc<Mutex<Option<Arc<dyn DataChannel>>>> = Arc::new(Mutex::new(None));
+            let dc_open_notify = Arc::new(tokio::sync::Notify::new());
+
+            let handler = Arc::new(PeerEvents {
+                connected_tx,
+                is_connected: is_connected.clone(),
+                dc_is_open: dc_is_open.clone(),
+                dc_open_notify: dc_open_notify.clone(),
+                incoming_tx: incoming_tx.clone(),
+                remote_dc: remote_dc.clone(),
+            });
 
             let pc_res = PeerConnectionBuilder::new()
                 .with_configuration(config)
@@ -187,6 +422,7 @@ impl WrtcPeer {
                 .with_handler(handler)
                 .with_runtime(Arc::new(TokioRuntime))
                 .with_udp_addrs(vec![bind_addr])
+                .with_dedicated_reactor_pool_size(1)
                 .build()
                 .await;
 
@@ -213,7 +449,7 @@ impl WrtcPeer {
                     .add_track(Arc::clone(&audio_track) as Arc<dyn TrackLocal>)
                     .await;
 
-                // 2. Создаем WebRTC DataChannel для прямой передачи пакетов по UDP/SCTP
+                // 2. Создаем WebRTC DataChannel для передачи пакетов по UDP/SCTP
                 let dc_init = RTCDataChannelInit {
                     ordered: false,
                     max_packet_life_time: None,
@@ -226,43 +462,42 @@ impl WrtcPeer {
                     .await
                     .map_err(|e| anyhow::anyhow!("create_data_channel failed: {e:#}"))?;
 
-                let dc_is_open = Arc::new(AtomicBool::new(false));
-                let dc_is_open_on_open = dc_is_open.clone();
+                let dc_is_open_in = dc_is_open.clone();
                 let dc_open_notify = Arc::new(tokio::sync::Notify::new());
-                let dc_open_notify_on_open = dc_open_notify.clone();
+                let dc_open_notify_in = dc_open_notify.clone();
 
-                data_channel.on_open(Box::new(move || {
-                    log::info!("[WRTC DataChannel] 'JVB data channel' state is now OPEN!");
-                    dc_is_open_on_open.store(true, Ordering::SeqCst);
-                    dc_open_notify_on_open.notify_waiters();
-                    Box::pin(async move {})
-                }));
-
-                let dc_is_open_on_close = dc_is_open.clone();
-                data_channel.on_close(Box::new(move || {
-                    log::info!("[WRTC DataChannel] 'JVB data channel' closed.");
-                    dc_is_open_on_close.store(false, Ordering::SeqCst);
-                    Box::pin(async move {})
-                }));
-
-                data_channel.on_error(Box::new(move |err| {
-                    log::warn!("[WRTC DataChannel] Error: {err}");
-                    Box::pin(async move {})
-                }));
-
+                let dc_in = Arc::clone(&data_channel);
                 let in_tx = incoming_tx.clone();
-                data_channel.on_message(Box::new(move |msg| {
-                    let tx = in_tx.clone();
-                    Box::pin(async move {
-                        if let Ok(colibri_msg) = serde_json::from_slice::<ColibriMessage>(&msg.data) {
-                            let _ = tx.send(colibri_msg).await;
-                        } else if let Ok(text) = std::str::from_utf8(&msg.data) {
-                            if let Ok(colibri_msg) = serde_json::from_str::<ColibriMessage>(text) {
-                                let _ = tx.send(colibri_msg).await;
+
+                tokio::spawn(async move {
+                    while let Some(event) = dc_in.poll().await {
+                        match event {
+                            DataChannelEvent::OnOpen => {
+                                log::info!("[WRTC DataChannel] 'JVB data channel' state is now OPEN!");
+                                dc_is_open_in.store(true, Ordering::SeqCst);
+                                dc_open_notify_in.notify_waiters();
                             }
+                            DataChannelEvent::OnClose => {
+                                log::info!("[WRTC DataChannel] 'JVB data channel' closed.");
+                                dc_is_open_in.store(false, Ordering::SeqCst);
+                                break;
+                            }
+                            DataChannelEvent::OnError => {
+                                log::warn!("[WRTC DataChannel] Error event received");
+                            }
+                            DataChannelEvent::OnMessage(msg) => {
+                                if let Ok(colibri_msg) = serde_json::from_slice::<ColibriMessage>(&msg.data) {
+                                    let _ = in_tx.send(colibri_msg).await;
+                                } else if let Ok(text) = std::str::from_utf8(&msg.data) {
+                                    if let Ok(colibri_msg) = serde_json::from_str::<ColibriMessage>(text) {
+                                        let _ = in_tx.send(colibri_msg).await;
+                                    }
+                                }
+                            }
+                            _ => {}
                         }
-                    })
-                }));
+                    }
+                });
 
                 // 3. Применяем Jingle Offer от Jicofo/JVB и создаем локальный Answer
                 let sdp_str = session.to_sdp(fallback_ip, fallback_port, remote_ssrc);
@@ -308,14 +543,17 @@ impl WrtcPeer {
                     }
                 }
 
-                // 4. Воркер отправки данных в DataChannel
+                // 4. Воркер отправки данных в DataChannel с бесшовным fallback в Colibri-WS
                 let dc_out = Arc::clone(&data_channel);
+                let remote_dc_out = remote_dc.clone();
                 let dc_is_open_out = dc_is_open.clone();
                 let dc_open_notify_out = dc_open_notify.clone();
+                let has_ws_out = has_ws.clone();
+                let ws_fallback_tx_out = ws_fallback_tx.clone();
 
                 tokio::spawn(async move {
                     if !dc_is_open_out.load(Ordering::SeqCst) {
-                        let _ = tokio::time::timeout(Duration::from_secs(30), dc_open_notify_out.notified()).await;
+                        let _ = tokio::time::timeout(Duration::from_secs(3), dc_open_notify_out.notified()).await;
                     }
                     log::info!(
                         "[WRTC DataChannel] Outgoing sender loop active (is_open={})",
@@ -324,38 +562,54 @@ impl WrtcPeer {
 
                     while let Some(msg) = outgoing_rx.recv().await {
                         let Ok(json_str) = serde_json::to_string(&msg) else { continue; };
-                        match msg.msg_payload {
-                            crate::wrtc::colibri::WrtcMessage::Astp { .. } => {
-                                log::trace!("[JVB DC OUT ASTP]");
-                            }
-                            crate::wrtc::colibri::WrtcMessage::AstpBatch { .. } => {
+                        let is_batch = matches!(msg.msg_payload, crate::wrtc::colibri::WrtcMessage::AstpBatch { .. });
+                        let is_astp = matches!(msg.msg_payload, crate::wrtc::colibri::WrtcMessage::Astp { .. });
+
+                        let mut sent = false;
+                        if dc_is_open_out.load(Ordering::SeqCst) {
+                            if is_batch {
                                 log::debug!("[JVB DC OUT Batch]");
-                            }
-                            _ => {
+                            } else if is_astp {
+                                log::trace!("[JVB DC OUT ASTP]");
+                            } else {
                                 log::info!("[JVB DC OUT]: {json_str}");
                             }
-                        }
 
-                        // Отправка с ретраями при временном backpressure; никогда не делаем break из цикла!
-                        for attempt in 0..5 {
-                            if !dc_is_open_out.load(Ordering::SeqCst) {
-                                let _ = tokio::time::timeout(Duration::from_millis(500), dc_open_notify_out.notified()).await;
-                            }
-                            match dc_out.send_text(&json_str).await {
-                                Ok(_) => break,
-                                Err(e) => {
-                                    if attempt == 4 {
-                                        log::warn!("[WRTC DataChannel] Failed to send message after 5 attempts: {e}");
-                                    } else {
-                                        tokio::time::sleep(Duration::from_millis(20)).await;
+                            for attempt in 0..3 {
+                                match dc_out.send_text(&json_str).await {
+                                    Ok(_) => {
+                                        sent = true;
+                                        break;
+                                    }
+                                    Err(_) => {
+                                        let r_dc_opt = remote_dc_out.lock().await.clone();
+                                        if let Some(r_dc) = r_dc_opt {
+                                            if r_dc.send_text(&json_str).await.is_ok() {
+                                                sent = true;
+                                                break;
+                                            }
+                                        }
+                                        if attempt < 2 {
+                                            tokio::time::sleep(Duration::from_millis(10)).await;
+                                        }
                                     }
                                 }
                             }
                         }
+
+                        // Fallback в Colibri-WS если DataChannel еще не открыт или временно перегружен
+                        if !sent && has_ws_out.load(Ordering::SeqCst) {
+                            if is_astp || is_batch {
+                                log::trace!("[JVB WS OUT ASTP]");
+                            } else {
+                                log::info!("[JVB WS OUT]: {json_str}");
+                            }
+                            let _ = ws_fallback_tx_out.try_send(json_str);
+                        }
                     }
                 });
 
-                // 5. Фоновый keepalive аудио-тишины
+                // 5. Фоновый keepalive аудио-тишины Opus (непрерывный, устойчивый к мобильному CGNAT)
                 let track_keepalive = Arc::clone(&audio_track);
                 let seq_c = Arc::new(AtomicU16::new(0));
                 let ts_c = Arc::new(AtomicU32::new(0));
@@ -367,40 +621,39 @@ impl WrtcPeer {
                 let samples_per_packet = (48000 * interval_ms / 1000) as u32;
 
                 tokio::spawn(async move {
-                    if tokio::time::timeout(Duration::from_secs(30), connected_rx.recv()).await.is_ok() {
-                        log::info!(
-                            "[WRTC Media] WebRTC ICE/DTLS connected, starting Opus silence keepalive (interval: {}ms, samples: {})",
-                            interval_ms, samples_per_packet
-                        );
-                        let mut interval = tokio::time::interval(Duration::from_millis(interval_ms));
-                        let silence_payload = Bytes::from_static(&[0xf8, 0xff, 0xfe]);
-                        loop {
-                            interval.tick().await;
-                            let seq = seq_c.fetch_add(1, Ordering::Relaxed);
-                            let ts = ts_c.fetch_add(samples_per_packet, Ordering::Relaxed);
-                            let rtp_packet = RtpPacket {
-                                header: RtpHeader {
-                                    version: 2,
-                                    padding: false,
-                                    extension: false,
-                                    marker: false,
-                                    payload_type: 111,
-                                    sequence_number: seq,
-                                    timestamp: ts,
-                                    ssrc: local_ssrc,
-                                    csrc: vec![],
-                                    extension_profile: 0,
-                                    extensions: vec![],
-                                    extensions_padding: 0,
-                                },
-                                payload: silence_payload.clone(),
-                            };
-                            if track_keepalive.write_rtp(rtp_packet).await.is_err() {
-                                break;
-                            }
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    log::info!(
+                        "[WRTC Media] Starting Opus silence keepalive (interval: {}ms, samples: {})",
+                        interval_ms, samples_per_packet
+                    );
+                    let mut interval = tokio::time::interval(Duration::from_millis(interval_ms));
+                    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    let silence_payload = Bytes::from_static(&[0xf8, 0xff, 0xfe]);
+                    loop {
+                        interval.tick().await;
+                        let seq = seq_c.fetch_add(1, Ordering::Relaxed);
+                        let ts = ts_c.fetch_add(samples_per_packet, Ordering::Relaxed);
+                        let rtp_packet = RtpPacket {
+                            header: RtpHeader {
+                                version: 2,
+                                padding: false,
+                                extension: false,
+                                marker: false,
+                                payload_type: 111,
+                                sequence_number: seq,
+                                timestamp: ts,
+                                ssrc: local_ssrc,
+                                csrc: vec![],
+                                extension_profile: 0,
+                                extensions: vec![],
+                                extensions_padding: 0,
+                            },
+                            payload: silence_payload.clone(),
+                        };
+                        // Отправляем пакет тишины. Никогда не делаем break из цикла при ошибках сокета/CGNAT!
+                        if let Err(e) = track_keepalive.write_rtp(rtp_packet).await {
+                            log::trace!("[WRTC Media] Opus silence write_rtp transient error: {e}");
                         }
-                    } else {
-                        log::warn!("[WRTC Media] WebRTC connection did not reach Connected in 30s");
                     }
                 });
 
@@ -418,6 +671,8 @@ impl WrtcPeer {
             outgoing_tx,
             incoming_rx: Mutex::new(incoming_rx),
             mode,
+            dc_is_open,
+            is_connected,
         })
     }
 
