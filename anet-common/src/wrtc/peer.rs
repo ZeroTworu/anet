@@ -35,6 +35,59 @@ fn generate_random_ssrc() -> u32 {
     (rand::random::<u32>() & 0x7FFFFFFF) | 0x1000
 }
 
+/// Корректный парсинг и отсечение VP8 Payload Descriptor (RFC 7741).
+/// Учитывает расширенные заголовки (X, I, L, T, K) и PictureID, которые JVB / SFU
+/// может вставлять или перезаписывать при роутинге видеопотока.
+pub fn strip_vp8_payload_descriptor(payload: Bytes) -> Option<Bytes> {
+    if payload.is_empty() {
+        return None;
+    }
+    let mut offset = 1;
+    let b0 = payload[0];
+    let has_x = (b0 & 0x80) != 0;
+    if has_x {
+        if payload.len() <= offset {
+            return None;
+        }
+        let b1 = payload[offset];
+        offset += 1;
+        let has_i = (b1 & 0x80) != 0;
+        let has_l = (b1 & 0x40) != 0;
+        let has_t = (b1 & 0x20) != 0;
+        let has_k = (b1 & 0x10) != 0;
+        if has_i {
+            if payload.len() <= offset {
+                return None;
+            }
+            let pic_id_b0 = payload[offset];
+            offset += 1;
+            // Если бит M (старший) установлен, PictureID занимает 16 бит (2 байта)
+            if (pic_id_b0 & 0x80) != 0 {
+                if payload.len() <= offset {
+                    return None;
+                }
+                offset += 1;
+            }
+        }
+        if has_l {
+            if payload.len() <= offset {
+                return None;
+            }
+            offset += 1;
+        }
+        if has_t || has_k {
+            if payload.len() <= offset {
+                return None;
+            }
+            offset += 1;
+        }
+    }
+    if payload.len() < offset {
+        return None;
+    }
+    Some(payload.slice(offset..))
+}
+
 struct PeerEvents {
     connected_tx: mpsc::Sender<()>,
     is_connected: Arc<AtomicBool>,
@@ -82,17 +135,19 @@ impl PeerConnectionEventHandler for PeerEvents {
                             if exp != 0 && pkt.header.ssrc != exp {
                                 continue;
                             }
-                            // Проверяем 1-байтовый VP8 Payload Descriptor (RFC 7741, 0x10)
-                            if pkt.payload.len() > 1 && pkt.payload[0] == 0x10 {
+                            if let Some(mut data) = strip_vp8_payload_descriptor(pkt.payload) {
+                                if data.starts_with(&VP8_KEYFRAME_HEADER) {
+                                    data = data.slice(VP8_KEYFRAME_HEADER.len()..);
+                                }
+                                if data.is_empty() {
+                                    // Пустой keyframe keepalive от пира для прогрева JVB
+                                    continue;
+                                }
                                 if first_rx.swap(false, Ordering::Relaxed) {
                                     log::info!(
                                         "[WRTC Media Video IN] First video frame received (SSRC: {}, len: {} bytes)",
-                                        pkt.header.ssrc, pkt.payload.len()
+                                        pkt.header.ssrc, data.len()
                                     );
-                                }
-                                let mut data = pkt.payload.slice(1..);
-                                if data.starts_with(&VP8_KEYFRAME_HEADER) {
-                                    data = data.slice(VP8_KEYFRAME_HEADER.len()..);
                                 }
                                 let _ = in_tx.send(data).await;
                             }
@@ -644,6 +699,7 @@ impl WrtcPeer {
                                     &session.from,
                                     local_ssrc,
                                     local_video_ssrc,
+                                    video_pt,
                                     &local_params.ufrag,
                                     &local_params.pwd,
                                     &local_params.fingerprint,
@@ -792,6 +848,50 @@ impl WrtcPeer {
                         // Отправляем пакет тишины. Никогда не делаем break из цикла при ошибках сокета/CGNAT!
                         if let Err(e) = track_keepalive.write_rtp(rtp_packet).await {
                             log::trace!("[WRTC Media] Opus silence write_rtp transient error: {e}");
+                        }
+                    }
+                });
+
+                // 7. Фоновый keepalive видео-трека VP8 для удержания полосы и SFU-маршрутизации JVB
+                let video_track_keepalive = Arc::clone(&video_track);
+                let video_seq_c = Arc::clone(&video_seq);
+                let video_ts_c = Arc::clone(&video_ts);
+                let v_pt = video_pt;
+                let v_ssrc = local_video_ssrc;
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    log::info!("[WRTC Media] Starting VP8 video keepalive (interval: 1000ms)");
+                    let mut interval = tokio::time::interval(Duration::from_millis(1000));
+                    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+                    let mut keepalive_payload = BytesMut::with_capacity(1 + VP8_KEYFRAME_HEADER.len());
+                    keepalive_payload.put_u8(0x10);
+                    keepalive_payload.put_slice(&VP8_KEYFRAME_HEADER);
+                    let keepalive_frozen = keepalive_payload.freeze();
+
+                    loop {
+                        interval.tick().await;
+                        let seq = video_seq_c.fetch_add(1, Ordering::Relaxed);
+                        let ts = video_ts_c.fetch_add(3000, Ordering::Relaxed);
+                        let rtp_packet = RtpPacket {
+                            header: RtpHeader {
+                                version: 2,
+                                padding: false,
+                                extension: false,
+                                marker: true,
+                                payload_type: v_pt,
+                                sequence_number: seq,
+                                timestamp: ts,
+                                ssrc: v_ssrc,
+                                csrc: vec![],
+                                extension_profile: 0,
+                                extensions: vec![],
+                                extensions_padding: 0,
+                            },
+                            payload: keepalive_frozen.clone(),
+                        };
+                        if let Err(e) = video_track_keepalive.write_rtp(rtp_packet).await {
+                            log::trace!("[WRTC Media] VP8 video keepalive transient error: {e}");
                         }
                     }
                 });
