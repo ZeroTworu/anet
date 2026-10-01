@@ -22,7 +22,7 @@ use base64::prelude::*;
 use bytes::Bytes;
 use log::{info, warn};
 use rtc::peer_connection::sdp::RTCSessionDescription;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;

@@ -21,7 +21,7 @@ use ed25519_dalek::SigningKey;
 use log::{info, warn};
 use rtc::peer_connection::sdp::RTCSessionDescription;
 use std::net::SocketAddr;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
