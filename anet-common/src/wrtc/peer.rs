@@ -112,7 +112,7 @@ impl P2pSession {
             anyhow::bail!("P2P DataChannel is not open");
         }
         self.dc
-            .send_data(data)
+            .send(data)
             .await
             .map_err(|e| anyhow::anyhow!("P2P DataChannel send error: {e}"))?;
         Ok(())
@@ -209,7 +209,7 @@ pub async fn create_p2p_channel(stun_servers: &[String]) -> anyhow::Result<P2pSe
                     break;
                 }
                 DataChannelEvent::OnMessage(msg) => {
-                    let _ = in_tx.send(msg.data).await;
+                    let _ = in_tx.send(msg.data.into()).await;
                 }
                 _ => {}
             }
