@@ -319,6 +319,7 @@ impl XmppSession {
         fingerprint: &str,
         fingerprint_hash: &str,
         candidates: &[String],
+        has_data_channel: bool,
     ) -> anyhow::Result<()> {
         let req_id = format!("accept_{:08x}", rand::random::<u32>());
         let cname = format!("cname_{:08x}", rand::random::<u32>());
@@ -364,6 +365,7 @@ impl XmppSession {
             fingerprint_hash,
             fingerprint,
             &candidate_xml,
+            has_data_channel,
         );
 
         log::info!("[XMPP] Sending Jingle session-accept (sid: {sid}) to Jicofo ({focus_jid})...");

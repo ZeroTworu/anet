@@ -9,7 +9,7 @@ use anet_common::wrtc::{
     colibri::{sign_beacon, ColibriMessage, WrtcMessage},
     jingle::parse_jingle_session,
     ktalk::KtalkClient,
-    peer::WrtcPeer,
+    peer::{create_p2p_channel, P2pSession, WrtcPeer},
     stealth::generate_random_guest_name,
     xmpp::XmppSession,
 };
@@ -19,6 +19,7 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use ed25519_dalek::SigningKey;
 use log::{info, warn};
+use rtc::peer_connection::sdp::RTCSessionDescription;
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -166,6 +167,8 @@ pub async fn run_wrtc_server(
         let shared_peer = Arc::new(peer);
         let active_clients: Arc<DashMap<String, Arc<ClientTransportInfo>>> =
             Arc::new(DashMap::new());
+        let p2p_clients: Arc<DashMap<String, Arc<P2pSession>>> =
+            Arc::new(DashMap::new());
 
         let reg_clone = registry.clone();
         let auth_clone = auth_handler.clone();
@@ -274,6 +277,7 @@ pub async fn run_wrtc_server(
                                             let target_client_id = from_endpoint.clone();
                                             let c_info = client_info.clone();
                                             let peer_downlink = shared_peer.clone();
+                                            let p2p_clients_dl = p2p_clients.clone();
 
                                             tokio::spawn(async move {
                                                 let mut batcher = PacketBatcher::new(16384, 2);
@@ -295,16 +299,31 @@ pub async fn run_wrtc_server(
                                                                 packet,
                                                                 padding_step,
                                                             ) {
-                                                                batcher.push(Bytes::from(encrypted));
-                                                                if batcher.should_flush() {
-                                                                    if let Some(batch_data) = batcher.flush() {
-                                                                        let b64 = BASE64_STANDARD.encode(&batch_data);
-                                                                        let msg = ColibriMessage::astp_batch(
-                                                                            target_client_id.clone(),
-                                                                            b64,
-                                                                        );
-                                                                        if peer_downlink.send(msg).await.is_err() {
-                                                                            break;
+                                                                let enc_bytes = Bytes::from(encrypted);
+                                                                let mut sent_p2p = false;
+
+                                                                // 1. Проверяем P2P DataChannel с клиентом
+                                                                if let Some(p2p_entry) = p2p_clients_dl.get(&target_client_id) {
+                                                                    if p2p_entry.is_open.load(Ordering::SeqCst) {
+                                                                        if p2p_entry.send_packet(&enc_bytes).await.is_ok() {
+                                                                            sent_p2p = true;
+                                                                        }
+                                                                    }
+                                                                }
+
+                                                                // 2. Если P2P еще не открыт или недоступен, шлем через батчер (Colibri-WS)
+                                                                if !sent_p2p {
+                                                                    batcher.push(enc_bytes);
+                                                                    if batcher.should_flush() {
+                                                                        if let Some(batch_data) = batcher.flush() {
+                                                                            let b64 = BASE64_STANDARD.encode(&batch_data);
+                                                                            let msg = ColibriMessage::astp_batch(
+                                                                                target_client_id.clone(),
+                                                                                b64,
+                                                                            );
+                                                                            if peer_downlink.send(msg).await.is_err() {
+                                                                                break;
+                                                                            }
                                                                         }
                                                                     }
                                                                 }
@@ -385,8 +404,98 @@ pub async fn run_wrtc_server(
                         }
                     }
                 }
-                WrtcMessage::P2pOffer { .. } => {
-                    info!("[WRTC Server] P2P Offer received from {from_endpoint}");
+                WrtcMessage::P2pOffer { sdp, .. } => {
+                    info!("[P2P Direct] Received anet_p2p_offer from client {from_endpoint}! Setting up P2P DataChannel...");
+                    let p2p_map_c = p2p_clients.clone();
+                    let peer_c = shared_peer.clone();
+                    let tun_tx_c = tun_clone.clone();
+                    let clients_map_c = clients_map.clone();
+                    let reg_c = reg_clone.clone();
+                    let client_ep = from_endpoint.clone();
+                    let stun_servers = xmpp.get_stun_servers();
+
+                    tokio::spawn(async move {
+                        match create_p2p_channel(&stun_servers).await {
+                            Ok(p2p) => {
+                                let p2p_arc = Arc::new(p2p);
+                                match RTCSessionDescription::offer(sdp) {
+                                    Ok(offer_desc) => {
+                                        if let Err(e) = p2p_arc.pc.set_remote_description(offer_desc).await {
+                                            warn!("[P2P Direct] Server set_remote_description error: {e}");
+                                            return;
+                                        }
+                                        match p2p_arc.pc.create_answer(None).await {
+                                            Ok(answer) => {
+                                                if let Err(e) = p2p_arc.pc.set_local_description(answer.clone()).await {
+                                                    warn!("[P2P Direct] Server set_local_description error: {e}");
+                                                    return;
+                                                }
+
+                                                let mut answer_sdp = answer.sdp.clone();
+                                                for _ in 0..25 {
+                                                    if let Some(desc) = p2p_arc.pc.local_description().await {
+                                                        if desc.sdp.contains("a=candidate:") {
+                                                            answer_sdp = desc.sdp;
+                                                            break;
+                                                        }
+                                                    }
+                                                    tokio::time::sleep(Duration::from_millis(20)).await;
+                                                }
+                                                if answer_sdp.is_empty() {
+                                                    if let Some(desc) = p2p_arc.pc.local_description().await {
+                                                        answer_sdp = desc.sdp;
+                                                    }
+                                                }
+
+                                                let answer_msg = ColibriMessage::p2p_answer(client_ep.clone(), answer_sdp, vec![]);
+                                                if let Err(e) = peer_c.send(answer_msg).await {
+                                                    warn!("[P2P Direct] Failed to send anet_p2p_answer: {e}");
+                                                    return;
+                                                }
+                                                info!("[P2P Direct] Sent anet_p2p_answer to client {client_ep}");
+
+                                                p2p_map_c.insert(client_ep.clone(), p2p_arc.clone());
+
+                                                // Воркер чтения пакетов из прямого DataChannel клиента в TUN
+                                                let p2p_read = p2p_arc.clone();
+                                                let client_id_read = client_ep.clone();
+                                                tokio::spawn(async move {
+                                                    while let Some(raw_bytes) = p2p_read.recv_packet().await {
+                                                        if let Some(c_info) = clients_map_c.get(&client_id_read) {
+                                                            if reg_c.get_by_session(&c_info.session_id).is_some() {
+                                                                match unwrap_packet_bytes(&c_info.cipher, raw_bytes) {
+                                                                    Ok(packet) => {
+                                                                        let packet_len = packet.len();
+                                                                        if tun_tx_c.try_send(packet).is_ok() {
+                                                                            reg_c.record_rx(&c_info, packet_len, "wrtc");
+                                                                            log::trace!("[P2P Direct IN] {} bytes from {}", packet_len, c_info.assigned_ip);
+                                                                        }
+                                                                    }
+                                                                    Err(e) => {
+                                                                        log::debug!("[P2P Direct] Decrypt error from {client_id_read}: {e}");
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                    log::info!("[P2P Direct] Receiver loop stopped for {client_id_read}");
+                                                });
+                                            }
+                                            Err(e) => {
+                                                warn!("[P2P Direct] Server create_answer error: {e}");
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!("[P2P Direct] Invalid remote offer SDP from {client_ep}: {e}");
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!("[P2P Direct] Failed to create server P2P channel: {e:#}");
+                            }
+                        }
+                    });
                 }
                 _ => {}
             }
@@ -396,6 +505,7 @@ pub async fn run_wrtc_server(
             registry.suspend_client(entry.value().clone());
         }
         active_clients.clear();
+        p2p_clients.clear();
 
         info!("[WRTC Server] Pausing 2s before re-entering conference room...");
         tokio::time::sleep(Duration::from_secs(2)).await;

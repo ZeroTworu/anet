@@ -371,12 +371,11 @@ server_signing_key = "<BASE64_ED25519_PRIVATE_KEY>"
   |   +===============================================>+   |           |
   |       (Чистый UDP, 0% Base64, 0% JSON, MTU 1280+)      |           |
   |                                                        |           |
-  |       Tier 2: JVB DataChannel с батчингом (Relay Mode) |           |
-  |       (SCTP over DTLS/UDP через мост JVB)              |           |
+  |       Tier 2: Colibri-WS с микробатчингом / JVB DC     |           |
+  |       (Агрегация фреймов: 10–15 пакетов в 1 Msg)       |           |
   |       +-----------------> [ JVB ] ---------------------+           |
-  |             (Агрегация фреймов: 10 пакетов в 1 Msg)                |
   |                                                                    |
-  |       Tier 3: Colibri WebSocket Fallback                           |
+  |       Tier 3: Базовый Colibri WebSocket Fallback                   |
   +-------------------------> [ JVB ] ---------------------------------+
                (Резервный канал при блокировке UDP/SCTP)
 ```
@@ -388,17 +387,12 @@ server_signing_key = "<BASE64_ED25519_PRIVATE_KEY>"
 #### 7.3.1. Концепция
 XMPP/Контур выступает **исключительно сигнальным брокером**. Медиатрафик не нагружает сервера Контура и идет напрямую между узлами через прямое пробитие NAT (STUN hole punching).
 
-#### 7.3.2. Сигналинг через XMPP MUC
-1. Клиент и сервер генерируют локальные ICE-учетные данные (`ufrag`, `pwd`, DTLS `fingerprint`) и кандидаты (`host` сокета `0.0.0.0:0`, `srflx` через публичные STUN).
-2. Обмен SDP офером и ансером осуществляется внутри защищенных служебных сообщений в комнате (либо через `EndpointMessage`, либо через приватные XMPP станзы):
-   ```json
-   {
-     "type": "anet_p2p_offer",
-     "sdp": "v=0\r\no=- ...\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n...",
-     "candidates": [...]
-   }
-   ```
-3. При наличии белого IP у `anet-server` (VPS) состояние ICE переходит в `Connected` за 1 RTT (5–15 мс).
+#### 7.3.2. Сигналинг через комнату Ktalk
+1. После завершения Discovery и ASTP-авторизации клиент и сервер инициируют создание независимой P2P-сессии (`P2pSession`):
+   * Клиент вызывает `create_p2p_channel(&stun_servers)` и формирует SDP Offer.
+   * Клиент отправляет серверу сообщение `ColibriMessage` с типом `WrtcMessage::P2pOffer { sdp, candidates }`.
+2. Сервер, получив `P2pOffer`, вызывает `create_p2p_channel(&stun_servers)`, применяет оффер через `set_remote_description`, генерирует SDP Answer и отсылает `WrtcMessage::P2pAnswer { sdp, candidates }` обратно клиенту.
+3. Клиент применяет ответ через `set_remote_description`. Состояние ICE переходит в `Connected` за 1 RTT (5–15 мс при наличии белого IP у сервера или Cone NAT).
 
 #### 7.3.3. Конфигурация DataChannel (`webrtc-rs` / `rtc`)
 В прямом соединении создается выделенный неблокирующий канал данных:
@@ -412,130 +406,89 @@ let dc_init = RTCDataChannelInit {
 };
 let dc = pc.create_data_channel("anet-data", Some(dc_init)).await?;
 ```
-* **Формат кадра:** сырой бинарный IP-пакет (`send_data(&packet_bytes)`).
-* **Накладные расходы:** 0% JSON, 0% Base64. Задержка минимальная физическая.
+* **Формат кадра:** сырой бинарный IP-пакет (`send_packet(&enc_bytes)`).
+* **Маркеры в логах:** `[P2P Direct] established: DataChannel 'anet-data' is now OPEN!`, `[P2P Direct OUT]`, `[P2P Direct IN]`.
+* **Накладные расходы:** 0% JSON, 0% Base64. Задержка минимальная физическая (Wire speed).
+* **Отказоустойчивость:** Если прямое P2P-соединение не может установиться (например, симметричный корпоративный NAT на обоих концах), трафик прозрачно продолжает передаваться через Colibri-WS с микробатчингом без потери пакетов.
 
 ---
 
-### 7.4. Tier 2: WebRTC DataChannel через JVB (SFU Relay Mode)
+### 7.4. Tier 2: Colibri WebSocket с микробатчингом (Packet Batching) и особенности JVB Ktalk
 
-#### 7.4.1. Ограничения моста JVB Colibri
-В Jitsi Videobridge DataChannel (`protocol: "http://jitsi.org/protocols/colibri"`) **терминируется на самом Java-процессе JVB**.
-* Мост JVB не является прозрачным SCTP-роутером. Он ожидает, что каждое сообщение в DataChannel представляет собой UTF-8 JSON спецификации COLIBRI:
-  `{"colibriClass":"EndpointMessage", "to":"<endpoint_id>", "msgPayload": {...}}`
-* Отправка произвольных бинарных данных напрямую в сокет JVB приводит к ошибке парсинга моста.
+#### 7.4.1. Реалии инфраструктуры Контур.Толк (Ktalk SFU)
+В публичной облачной инфраструктуре Контур.Толк компонент Jicofo конфигурирует сессии Jingle исключительно для аудио/видео (`<content name="audio">`, `<content name="video">`).
+* Секция `<content name="data">` (SCTP DataChannel на мосте JVB) со стороны Jicofo **не создается**; вместо этого для сигналов и данных предоставляется выделенный Colibri WebSocket (`wss://.../colibri-ws/...`).
+* Клиент ANet автоматически определяет наличие секции `name="data"` в `session-initiate` (`session.has_data_channel`):
+  * Если секция данных отсутствует, клиент не форсирует пустые запросы к порту JVB, а мгновенно переходит на работу через высокопроизводительный Colibri-WS с модулем `PacketBatcher`.
+  * Для предотвращения ложных ошибок `STUN error: TransactionTimeOut` соединение с JVB конфигурируется с `with_ice_servers(vec![])`, так как медиамост JVB всегда доступен напрямую по публичному IP.
 
-#### 7.4.2. Решение: Коалесцинг и агрегация пакетов (Packet Coalescing / Batching)
-Чтобы преодолеть лимит PPS на мосте JVB, применяется буферизация с микротаймером (Nagle-like для туннеля):
+#### 7.4.2. Механизм агрегации пакетов (Packet Coalescing / Batching)
+Чтобы полностью устранить узкое место базового WebSocket (TCP-in-TCP Meltdown и перегрузку CPU JVB из-за высокого PPS), применяется буферизация с микротаймером (Nagle-like для туннеля):
 1. **Воркер отправки (Egress Batcher):**
-   * Пакеты из TUN-интерфейса не отправляются немедленно, а накапливаются во внутреннем кольцевом буфере до достижения размера **12–16 КБ** либо по истечении таймаута **1.0–2.0 мс**.
+   * Пакеты из TUN-интерфейса накапливаются во внутреннем кольцевом буфере до достижения размера **16 КБ** либо по истечении таймаута **2.0 мс**.
    * Несколько IP-пакетов склеиваются в один непрерывный бинарный фрейм с 2-байтовыми заголовками длины:
      `[Len1: u16][Packet 1][Len2: u16][Packet 2]...`
 2. **Сериализация:**
    * Полученный агрегированный блок кодируется в Base64 и упаковывается в **одно** сообщение `WrtcMessage::AstpBatch { data: "..." }`.
    * **Результат:** При полосе 50–100 Мбит/с PPS на мосте JVB снижается с 5000 msg/sec до **200–350 msg/sec**. Нагрузка на CPU JVB падает на порядок, очередь сокетов не переполняется, Bufferbloat полностью исчезает.
 
-#### 7.4.3. Согласование Jingle / SDP (BUNDLE `audio data`)
-Для корректного выделения SCTP-ассоциации на стороне Jicofo и JVB в ветке `dev/wrtc1` реализовано:
-1. **XEP-0115 / disco#info:** Анонсирование фичей `urn:xmpp:jingle:apps:sctp:1` и `http://jitsi.org/protocols/sctp` в ответ на запросы Jicofo.
-2. **Jingle Session-Accept:** Формирование BUNDLE группы `audio data` и добавление секции приложения:
-   ```xml
-   <content creator="initiator" name="data">
-       <description xmlns="urn:xmpp:jingle:apps:sctp:1">
-           <payload-type id="5000"/>
-       </description>
-       <transport xmlns="urn:xmpp:jingle:transports:ice-udp:1" ufrag="..." pwd="...">
-           <fingerprint xmlns="urn:xmpp:jingle:apps:dtls:0" hash="sha-256">...</fingerprint>
-           <!-- ICE candidates -->
-       </transport>
-   </content>
-   ```
-3. **SDP m-line:**
-   ```text
-   a=group:BUNDLE audio data
-   m=application 10004 UDP/DTLS/SCTP webrtc-datachannel
-   c=IN IP4 89.169.19.7
-   a=mid:data
-   a=sctp-port:5000
-   ```
-
 ---
 
 ### 7.5. Tier 3: Colibri WebSocket Fallback
 * Используется как резервный канал при жестких сетевых блокировках UDP-трафика либо в фазе первоначального соединения.
-* Все критические управляющие сигналы (XMPP ping, Discovery, Beacon) передаются параллельно через WebSocket, гарантируя мгновенный реконнект без ожидания завершения фазы ICE.
+* Все критические управляющие сигналы (XMPP ping, Discovery, Beacon, P2P Offer/Answer) передаются параллельно через WebSocket, гарантируя мгновенный реконнект без ожидания завершения фазы ICE.
 
 ---
 
 ### 7.6. Матрица сравнения режимов транспорта
 
-| Характеристика | Базовый Colibri-WS | Tier 2: JVB DataChannel (Batching) | Tier 1: P2P DataChannel (Direct) |
+| Характеристика | Базовый Colibri-WS | Tier 2: Colibri-WS + PacketBatcher | Tier 1: P2P DataChannel (Direct) |
 | :--- | :--- | :--- | :--- |
-| **Сетевой протокол** | TCP / TLS (порт 443) | SCTP / DTLS / UDP (JVB Relay) | SCTP / DTLS / UDP (Direct) |
+| **Сетевой протокол** | TCP / TLS (порт 443) | TCP / TLS (порт 443, батчинг) | SCTP / DTLS / UDP (Direct) |
 | **Пропускная способность** | ~40–47 Мбит/с | **120–180 Мбит/с** | **300+ Мбит/с** (Wire speed) |
 | **Задержка под нагрузкой**| 150–250 мс (Meltdown) | 45–65 мс | **15–30 мс** (Физический RTT) |
 | **Оверхед кодирования** | JSON + Base64 (+35%)| JSON + Base64 (Батчинг, +34%)| **0% (Raw Binary Frames)** |
-| **Устойчивость к потерям**| Низкая (TCP заморозка)| Высокая (`max_retransmits: 0`)| Абсолютная (`ordered: false`)|
-| **Требования к NAT** | Любой (даже HTTP Proxy)| Любой (Исходящий UDP на JVB)| Белый IP у сервера или Cone NAT|
+| **Устойчивость к потерям**| Низкая (TCP заморозка)| Высокая (микробатчинг 2мс)| Абсолютная (`ordered: false`)|
+| **Требования к NAT** | Любой (даже HTTP Proxy)| Любой (Исходящий TCP на 443)| Белый IP у сервера или Cone NAT|
 
 ---
 
-### 7.7. Локальное тестирование и проверка всех трех режимов (Инструкция разработчика)
+### 7.7. Локальное тестирование и проверка режимов (Инструкция разработчика)
 
-Для проверки работы всех трех режимов транспорта прямо на одном компьютере (без необходимости настраивать внешний тестовый стенд) используется параметр `wrtc_mode` в `client.toml` и консольные утилиты `tcpdump`, `ss` и логи самого клиента/сервера.
+Для проверки работы режимов транспорта используется параметр `wrtc_mode` в `client.toml` и консольные утилиты `tcpdump`, `ss` и логи самого клиента/сервера.
 
 #### 1. Сводная таблица физических маркеров проверки
 
 | Режим (`wrtc_mode`) | Сетевой сокет | Фильтр `tcpdump` | Маркер в логах | Поведение пинга под нагрузкой |
 | :--- | :--- | :--- | :--- | :--- |
-| **`p2p_direct`** | UDP `127.0.0.1 ⇄ 127.0.0.1` | `tcpdump -nn -i lo udp` | `[P2P Direct OUT]`, `[P2P Direct] established` | Минимальный (< 1 мс локально) |
-| **`jvb_datachannel`** | UDP к JVB (порт 10004/udp) | `tcpdump -nn -i any udp port 10004` | `[JVB DC OUT Batch]`, `[WRTC DataChannel] Outgoing sender loop active` | Ровный (~40–60 мс) |
-| **`ws`** | TCP к Ktalk (порт 443/tcp) | `tcpdump -nn -i any tcp port 443` | `[JVB WS OUT ASTP]`, `[WRTC WS] Colibri-WS connected` | Скачет (150–250 мс из-за TCP-in-TCP) |
+| **`p2p_direct`** | UDP между клиентом и сервером | `tcpdump -nn -i any udp portrange 10000-65535` | `[P2P Direct] established`, `[P2P Direct OUT]`, `[P2P Direct IN]` | Минимальный (физический RTT) |
+| **`jvb_datachannel` / `auto`** | TCP к Ktalk (порт 443/tcp) + UDP к JVB (keepalive) | `tcpdump -nn -i any tcp port 443` | `[WRTC DataChannel] JVB bridge does not announce SCTP...`, `AstpBatch` | Ровный (~40–60 мс) |
+| **`ws`** | TCP к Ktalk (порт 443/tcp) | `tcpdump -nn -i any tcp port 443` | `[WRTC Transport] Mode is set to 'ws'. Connecting directly via Colibri-WS...` | 40–80 мс без нагрузки |
 
 #### 2. Пошаговая проверка каждого режима
 
-##### Шаг А. Проверка режима `ws` (Colibri WebSocket)
+##### Шаг А. Проверка режима `ws` / `jvb_datachannel` (Colibri WebSocket с микробатчингом)
 1. В `client.toml` выставляем:
    ```toml
-   wrtc_mode = "ws"
+   wrtc_mode = "jvb_datachannel" # или "ws"
    ```
-2. Запускаем перехват TCP-трафика на порт 443:
-   ```bash
-   sudo tcpdump -nn -i any tcp port 443 -c 20
-   ```
-3. Подключаем клиент и пускаем пинг через туннель: `ping 172.112.224.1`.
-4. **Что наблюдаем:**
-   * В логах клиента появляется: `[WRTC Transport] Mode is set to 'ws'. Connecting directly via Colibri-WS...` и `[JVB WS OUT ASTP]`.
-   * В `tcpdump` бегут пакеты `Flags [P.]` (TLS Application Data) исключительно по TCP порту 443. В сокетах UDP тишина.
+2. Подключаем клиент и пускаем трафик через туннель: `ping 172.112.224.1`.
+3. **Что наблюдаем:**
+   * В логах клиента появляется: `[WRTC DataChannel] JVB bridge does not announce SCTP DataChannel in session-initiate. Operating over Colibri-WS with PacketBatcher.`.
+   * При передаче трафика пакеты агрегируются модулем `PacketBatcher` и передаются через `AstpBatch`.
+   * Отсутствуют ошибки STUN `TransactionTimeOut`.
 
-##### Шаг Б. Проверка режима `jvb_datachannel` (WebRTC DataChannel через JVB с микробатчингом)
-1. В `client.toml` выставляем:
-   ```toml
-   wrtc_mode = "jvb_datachannel"
-   ```
-2. Запускаем перехват UDP-трафика к порту JVB (10004):
-   ```bash
-   sudo tcpdump -nn -i any udp port 10004 -c 20
-   ```
-3. Подключаем клиент и пускаем трафик через туннель.
-4. **Что наблюдаем:**
-   * В логах клиента появляется: `[WRTC DataChannel] 'JVB data channel' state is now OPEN!` и `[JVB DC OUT Batch]`.
-   * В `tcpdump` идет непрерывный поток UDP-датаграмм на порт 10004 (JVB relay).
-   * Количество пакетов в секунду (PPS) снижено в 10–15 раз благодаря модулю `PacketBatcher`.
-
-##### Шаг В. Проверка режима `p2p_direct` (Прямой WebRTC P2P DataChannel)
+##### Шаг Б. Проверка режима `p2p_direct` (Прямой WebRTC P2P DataChannel)
 1. В `client.toml` выставляем:
    ```toml
    wrtc_mode = "p2p_direct"
    ```
-2. Запускаем перехват локального UDP:
-   ```bash
-   sudo tcpdump -nn -i lo udp -c 20
-   ```
-3. Подключаем клиент.
-4. **Что наблюдаем:**
-   * Сервер и клиент обмениваются `anet_p2p_offer` / `anet_p2p_answer` через комнату Ktalk и открывают прямой DataChannel.
-   * Трафик идет напрямую между сокетами клиента и сервера без транзита пакетов через JVB.
-   * В логах: `[P2P Direct OUT]` и нулевой оверхед (чистые бинарные кадры IP).
+2. Подключаем клиент.
+3. **Что наблюдаем:**
+   * В логах клиента появляется: `[P2P Direct] Initiating direct WebRTC P2P DataChannel with server...` и `[P2P Direct] Sent anet_p2p_offer to server`.
+   * В логах сервера появляется: `[P2P Direct] Received anet_p2p_offer from client ...! Setting up P2P DataChannel...` и `[P2P Direct] Sent anet_p2p_answer to client`.
+   * Клиент применяет ответ сервера: `[P2P Direct] Applied remote answer successfully. Awaiting DataChannel open...`.
+   * Канал переходит в открытое состояние: `[P2P Direct] established: DataChannel 'anet-data' is now OPEN!`.
+   * При передаче сетевого трафика пакеты идут напрямую с нулевым оверхедом: в логах клиента фиксируются маркеры `[P2P Direct OUT]`, а на сервере `[P2P Direct IN]`.
 
 

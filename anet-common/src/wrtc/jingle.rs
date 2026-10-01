@@ -30,6 +30,8 @@ pub struct JingleSession {
     pub action: String,
     pub transport: JingleTransportInfo,
     pub sources: Vec<u32>,
+    #[serde(default)]
+    pub has_data_channel: bool,
 }
 
 impl JingleSession {
@@ -92,38 +94,64 @@ impl JingleSession {
             }
         }
 
-        // Формируем BUNDLE аудио (Opus) + WebRTC DataChannel (SCTP)
-        format!(
-            "v=0\r\n\
-             o=- 123456789 2 IN IP4 0.0.0.0\r\n\
-             s=-\r\n\
-             t=0 0\r\n\
-             a=ice-ufrag:{ufrag}\r\n\
-             a=ice-pwd:{pwd}\r\n\
-             a=fingerprint:{fp_hash} {fp}\r\n\
-             a=group:BUNDLE audio data\r\n\
-             m=audio {primary_port} UDP/TLS/RTP/SAVPF 111\r\n\
-             c=IN IP4 {primary_ip}\r\n\
-             a=rtcp-mux\r\n\
-             a=rtpmap:111 opus/48000/2\r\n\
-             a=ice-ufrag:{ufrag}\r\n\
-             a=ice-pwd:{pwd}\r\n\
-             a=fingerprint:{fp_hash} {fp}\r\n\
-             a=setup:{setup}\r\n\
-             a=mid:audio\r\n\
-             a=sendrecv\r\n\
-             {ssrc_lines}\
-             {candidate_lines}\
-             m=application {primary_port} UDP/DTLS/SCTP webrtc-datachannel\r\n\
-             c=IN IP4 {primary_ip}\r\n\
-             a=ice-ufrag:{ufrag}\r\n\
-             a=ice-pwd:{pwd}\r\n\
-             a=fingerprint:{fp_hash} {fp}\r\n\
-             a=setup:{setup}\r\n\
-             a=mid:data\r\n\
-             a=sctp-port:5000\r\n\
-             {candidate_lines}"
-        )
+        if self.has_data_channel {
+            // Формируем BUNDLE аудио (Opus) + WebRTC DataChannel (SCTP)
+            format!(
+                "v=0\r\n\
+                 o=- 123456789 2 IN IP4 0.0.0.0\r\n\
+                 s=-\r\n\
+                 t=0 0\r\n\
+                 a=ice-ufrag:{ufrag}\r\n\
+                 a=ice-pwd:{pwd}\r\n\
+                 a=fingerprint:{fp_hash} {fp}\r\n\
+                 a=group:BUNDLE audio data\r\n\
+                 m=audio {primary_port} UDP/TLS/RTP/SAVPF 111\r\n\
+                 c=IN IP4 {primary_ip}\r\n\
+                 a=rtcp-mux\r\n\
+                 a=rtpmap:111 opus/48000/2\r\n\
+                 a=ice-ufrag:{ufrag}\r\n\
+                 a=ice-pwd:{pwd}\r\n\
+                 a=fingerprint:{fp_hash} {fp}\r\n\
+                 a=setup:{setup}\r\n\
+                 a=mid:audio\r\n\
+                 a=sendrecv\r\n\
+                 {ssrc_lines}\
+                 {candidate_lines}\
+                 m=application {primary_port} UDP/DTLS/SCTP webrtc-datachannel\r\n\
+                 c=IN IP4 {primary_ip}\r\n\
+                 a=ice-ufrag:{ufrag}\r\n\
+                 a=ice-pwd:{pwd}\r\n\
+                 a=fingerprint:{fp_hash} {fp}\r\n\
+                 a=setup:{setup}\r\n\
+                 a=mid:data\r\n\
+                 a=sctp-port:5000\r\n\
+                 {candidate_lines}"
+            )
+        } else {
+            // JVB мост Ktalk не анонсирует SCTP content, формируем чистый audio BUNDLE
+            format!(
+                "v=0\r\n\
+                 o=- 123456789 2 IN IP4 0.0.0.0\r\n\
+                 s=-\r\n\
+                 t=0 0\r\n\
+                 a=ice-ufrag:{ufrag}\r\n\
+                 a=ice-pwd:{pwd}\r\n\
+                 a=fingerprint:{fp_hash} {fp}\r\n\
+                 a=group:BUNDLE audio\r\n\
+                 m=audio {primary_port} UDP/TLS/RTP/SAVPF 111\r\n\
+                 c=IN IP4 {primary_ip}\r\n\
+                 a=rtcp-mux\r\n\
+                 a=rtpmap:111 opus/48000/2\r\n\
+                 a=ice-ufrag:{ufrag}\r\n\
+                 a=ice-pwd:{pwd}\r\n\
+                 a=fingerprint:{fp_hash} {fp}\r\n\
+                 a=setup:{setup}\r\n\
+                 a=mid:audio\r\n\
+                 a=sendrecv\r\n\
+                 {ssrc_lines}\
+                 {candidate_lines}"
+            )
+        }
     }}
 
 pub fn parse_jingle_session(

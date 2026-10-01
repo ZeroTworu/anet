@@ -12,7 +12,7 @@ use anet_common::wrtc::{
     colibri::{verify_beacon, ColibriMessage, WrtcMessage},
     jingle::parse_jingle_session,
     ktalk::KtalkClient,
-    peer::WrtcPeer,
+    peer::{create_p2p_channel, P2pSession, WrtcPeer},
     stealth::generate_random_guest_name,
     xmpp::XmppSession,
 };
@@ -21,10 +21,12 @@ use async_trait::async_trait;
 use base64::prelude::*;
 use bytes::Bytes;
 use log::{info, warn};
+use rtc::peer_connection::sdp::RTCSessionDescription;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
+use tokio::sync::Mutex;
 
 fn current_timestamp_secs() -> u64 {
     std::time::SystemTime::now()
@@ -319,7 +321,65 @@ impl ClientTransport for WrtcTransport {
         let nonce_prefix: [u8; 4] = auth_response.nonce_prefix.as_slice().try_into()?;
         let sequence = Arc::new(AtomicU64::new(0));
 
-        // 8. Создание дуплексного потока для ядра VPN
+        // 8. Инициализация Tier 1 P2P Direct если включен режим P2pDirect или Auto
+        let p2p_session_opt: Arc<Mutex<Option<Arc<P2pSession>>>> = Arc::new(Mutex::new(None));
+        if wrtc_mode == anet_common::wrtc::colibri::WrtcMode::P2pDirect
+            || wrtc_mode == anet_common::wrtc::colibri::WrtcMode::Auto
+        {
+            info!("[P2P Direct] Initiating direct WebRTC P2P DataChannel with server {target_server_id}...");
+            let p2p_store = p2p_session_opt.clone();
+            let peer_sig = shared_peer.clone();
+            let target_srv = target_server_id.clone();
+            let stun_servers = xmpp.get_stun_servers();
+
+            tokio::spawn(async move {
+                match create_p2p_channel(&stun_servers).await {
+                    Ok(p2p) => {
+                        let p2p_arc = Arc::new(p2p);
+                        *p2p_store.lock().await = Some(p2p_arc.clone());
+
+                        match p2p_arc.pc.create_offer(None).await {
+                            Ok(offer) => {
+                                if let Err(e) = p2p_arc.pc.set_local_description(offer.clone()).await {
+                                    warn!("[P2P Direct] set_local_description error: {e}");
+                                    return;
+                                }
+                                let mut final_sdp = offer.sdp.clone();
+                                for _ in 0..25 {
+                                    if let Some(desc) = p2p_arc.pc.local_description().await {
+                                        if desc.sdp.contains("a=candidate:") {
+                                            final_sdp = desc.sdp;
+                                            break;
+                                        }
+                                    }
+                                    tokio::time::sleep(Duration::from_millis(20)).await;
+                                }
+                                if final_sdp.is_empty() {
+                                    if let Some(desc) = p2p_arc.pc.local_description().await {
+                                        final_sdp = desc.sdp;
+                                    }
+                                }
+
+                                let offer_msg = ColibriMessage::p2p_offer(target_srv.clone(), final_sdp, vec![]);
+                                if let Err(e) = peer_sig.send(offer_msg).await {
+                                    warn!("[P2P Direct] Failed to send anet_p2p_offer: {e}");
+                                } else {
+                                    info!("[P2P Direct] Sent anet_p2p_offer to server {target_srv}");
+                                }
+                            }
+                            Err(e) => {
+                                warn!("[P2P Direct] create_offer error: {e}");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!("[P2P Direct] Failed to create P2P channel: {e:#}");
+                    }
+                }
+            });
+        }
+
+        // 9. Создание дуплексного потока для ядра VPN
         let (client_stream, internal_router) = tokio::io::duplex(MAX_PACKET_SIZE * 10);
         let (mut tunnel_read, mut tunnel_write) = tokio::io::split(internal_router);
         let (tunnel_packet_tx, mut tunnel_packet_rx) =
@@ -333,12 +393,27 @@ impl ClientTransport for WrtcTransport {
             }
         });
 
-        // Воркер Uplink: TUN -> WebRTC (с микробатчингом до 16KB / 2ms)
+        // Канал доставки декодированных IP-пакетов в TUN
+        let (tun_inject_tx, mut tun_inject_rx) =
+            tokio::sync::mpsc::channel::<Bytes>(CHANNEL_BUFFER_SIZE);
+
+        tokio::spawn(async move {
+            while let Some(packet) = tun_inject_rx.recv().await {
+                let framed = frame_packet(packet);
+                if let Err(e) = tunnel_write.write_all(&framed).await {
+                    warn!("[WRTC Client] tunnel_write error: {e}");
+                    break;
+                }
+            }
+        });
+
+        // Воркер Uplink: TUN -> WebRTC (P2P Direct или микробатчинг Colibri-WS)
         let peer_tx = shared_peer.clone();
         let target_srv_tx = target_server_id.clone();
         let cipher_tx = cipher.clone();
         let sequence_tx = sequence.clone();
         let padding_step = self.config.stealth.padding_step;
+        let p2p_uplink = p2p_session_opt.clone();
 
         let mut ping_interval = tokio::time::interval(Duration::from_secs(15));
         let mut batch_interval = tokio::time::interval(Duration::from_millis(2));
@@ -357,14 +432,34 @@ impl ClientTransport for WrtcTransport {
                         let seq = sequence_tx.fetch_add(1, Ordering::Relaxed);
                         match wrap_packet_padded(&cipher_tx, &nonce_prefix, seq, packet, padding_step) {
                             Ok(encrypted) => {
-                                batcher.push(Bytes::from(encrypted));
-                                if batcher.should_flush() {
-                                    if let Some(batch_data) = batcher.flush() {
-                                        let b64 = BASE64_STANDARD.encode(&batch_data);
-                                        let msg = ColibriMessage::astp_batch(target_srv_tx.clone(), b64);
-                                        if let Err(e) = peer_tx.send(msg).await {
-                                            warn!("[WRTC Client] Peer send batch error: {e}");
-                                            break;
+                                let enc_bytes = Bytes::from(encrypted);
+                                let mut sent_p2p = false;
+
+                                // 1. Проверяем прямой P2P DataChannel (Tier 1)
+                                let p2p_opt = {
+                                    let guard = p2p_uplink.lock().await;
+                                    guard.clone()
+                                };
+                                if let Some(p2p) = p2p_opt {
+                                    if p2p.is_open.load(Ordering::SeqCst) {
+                                        if p2p.send_packet(&enc_bytes).await.is_ok() {
+                                            log::trace!("[P2P Direct OUT]");
+                                            sent_p2p = true;
+                                        }
+                                    }
+                                }
+
+                                // 2. Если P2P еще не открыт или недоступен, отправляем через батчер (Tier 2/3)
+                                if !sent_p2p {
+                                    batcher.push(enc_bytes);
+                                    if batcher.should_flush() {
+                                        if let Some(batch_data) = batcher.flush() {
+                                            let b64 = BASE64_STANDARD.encode(&batch_data);
+                                            let msg = ColibriMessage::astp_batch(target_srv_tx.clone(), b64);
+                                            if let Err(e) = peer_tx.send(msg).await {
+                                                warn!("[WRTC Client] Peer send batch error: {e}");
+                                                break;
+                                            }
                                         }
                                     }
                                 }
@@ -390,7 +485,7 @@ impl ClientTransport for WrtcTransport {
                         let now = current_timestamp_secs();
                         if now.saturating_sub(last_pong_tx.load(Ordering::Relaxed)) > 45 {
                             warn!("[WRTC Client] Ping timeout (no pong from server for 45s). Reconnecting...");
-                            break; // Обрываем цикл, транспорт вернется, клиент переподключится
+                            break;
                         }
                         let ping_msg = ColibriMessage::ping(target_srv_tx.clone());
                         if let Err(e) = peer_tx.send(ping_msg).await {
@@ -403,9 +498,11 @@ impl ClientTransport for WrtcTransport {
             tunnel_reader_task.abort();
         });
 
-        // Воркер Downlink: WebRTC -> TUN
+        // Воркер Downlink из сигнального канала и Colibri-WS (Astp/AstpBatch/P2pAnswer)
         let peer_rx = shared_peer.clone();
         let cipher_rx = cipher.clone();
+        let tun_inject_ws = tun_inject_tx.clone();
+        let p2p_sig = p2p_session_opt.clone();
 
         tokio::spawn(async move {
             loop {
@@ -413,6 +510,22 @@ impl ClientTransport for WrtcTransport {
                 match msg_opt {
                     Some(msg) => {
                         match msg.msg_payload {
+                            WrtcMessage::P2pAnswer { sdp, .. } => {
+                                info!("[P2P Direct] Received anet_p2p_answer from server! Applying remote SDP...");
+                                let p2p_opt = {
+                                    let guard = p2p_sig.lock().await;
+                                    guard.clone()
+                                };
+                                if let Some(p2p) = p2p_opt {
+                                    if let Ok(answer_desc) = RTCSessionDescription::answer(sdp) {
+                                        if let Err(e) = p2p.pc.set_remote_description(answer_desc).await {
+                                            warn!("[P2P Direct] set_remote_description error: {e}");
+                                        } else {
+                                            info!("[P2P Direct] Applied remote answer successfully. Awaiting DataChannel open...");
+                                        }
+                                    }
+                                }
+                            }
                             WrtcMessage::Astp { data } => {
                                 match BASE64_STANDARD.decode(&data) {
                                     Ok(raw_encrypted) => {
@@ -421,11 +534,7 @@ impl ClientTransport for WrtcTransport {
                                             Bytes::from(raw_encrypted),
                                         ) {
                                             Ok(packet) => {
-                                                let framed = frame_packet(packet);
-                                                if let Err(e) = tunnel_write.write_all(&framed).await {
-                                                    warn!("[WRTC Client] tunnel_write error: {e}");
-                                                    break;
-                                                }
+                                                let _ = tun_inject_ws.send(packet).await;
                                             }
                                             Err(e) => {
                                                 warn!("[WRTC Client] Decrypt packet error: {e}");
@@ -444,11 +553,7 @@ impl ClientTransport for WrtcTransport {
                                         for enc_pkt in packets {
                                             match unwrap_packet_bytes(&cipher_rx, enc_pkt) {
                                                 Ok(packet) => {
-                                                    let framed = frame_packet(packet);
-                                                    if let Err(e) = tunnel_write.write_all(&framed).await {
-                                                        warn!("[WRTC Client] tunnel_write batch error: {e}");
-                                                        break;
-                                                    }
+                                                    let _ = tun_inject_ws.send(packet).await;
                                                 }
                                                 Err(e) => {
                                                     warn!("[WRTC Client] Decrypt batch packet error: {e}");
@@ -462,7 +567,6 @@ impl ClientTransport for WrtcTransport {
                                 }
                             }
                             WrtcMessage::Pong => {
-                                // Сервер ответил на пинг
                                 last_pong.store(current_timestamp_secs(), Ordering::Relaxed);
                             }
                             _ => {}
@@ -470,6 +574,38 @@ impl ClientTransport for WrtcTransport {
                     }
                     None => break,
                 }
+            }
+        });
+
+        // Воркер Downlink из прямого P2P DataChannel (Tier 1)
+        let p2p_rx_task = p2p_session_opt.clone();
+        let cipher_p2p = cipher.clone();
+        let tun_inject_p2p = tun_inject_tx.clone();
+
+        tokio::spawn(async move {
+            loop {
+                let p2p_opt = {
+                    let guard = p2p_rx_task.lock().await;
+                    guard.clone()
+                };
+
+                if let Some(p2p) = p2p_opt {
+                    if p2p.is_open.load(Ordering::SeqCst) {
+                        while let Some(raw_bytes) = p2p.recv_packet().await {
+                            match unwrap_packet_bytes(&cipher_p2p, raw_bytes) {
+                                Ok(packet) => {
+                                    log::trace!("[P2P Direct IN] Decrypted packet ({} bytes)", packet.len());
+                                    let _ = tun_inject_p2p.send(packet).await;
+                                }
+                                Err(e) => {
+                                    warn!("[P2P Direct] Decrypt packet error: {e}");
+                                }
+                            }
+                        }
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
         });
 
