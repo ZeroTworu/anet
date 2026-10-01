@@ -173,6 +173,9 @@ pub struct ServerConfig {
     pub wrtc_ping_interval_secs: Option<u64>,
     pub wrtc_fallback_jvb_ip: Option<String>,
     pub wrtc_fallback_jvb_port: Option<u16>,
+    /// WebRTC Data Transport mode: "auto" | "p2p_direct" | "jvb_datachannel" | "ws"
+    #[serde(default)]
+    pub wrtc_mode: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -193,6 +196,7 @@ impl Default for ServerConfig {
             wrtc_ping_interval_secs: None,
             wrtc_fallback_jvb_ip: None,
             wrtc_fallback_jvb_port: None,
+            wrtc_mode: None,
         }
     }
 }
@@ -221,6 +225,13 @@ impl ServerConfig {
         let path = uri.path().trim_start_matches('/');
         anyhow::ensure!(!path.is_empty(), "WRTC DSN '{}' has no room name in path", self.dsn);
         Ok((host.to_string(), path.to_string()))
+    }
+
+    pub fn wrtc_transport_mode(&self) -> anet_common::wrtc::colibri::WrtcMode {
+        match self.wrtc_mode.as_deref() {
+            Some(s) => s.parse().unwrap_or_default(),
+            None => anet_common::wrtc::colibri::WrtcMode::Auto,
+        }
     }
 
     /// ИСПРАВЛЕНИЕ: гарантированно возвращает "host:port" даже если порт не был указан в DSN!

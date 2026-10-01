@@ -19,6 +19,34 @@ impl Default for ColibriClass {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WrtcMode {
+    Auto,
+    P2pDirect,
+    JvbDatachannel,
+    Ws,
+}
+
+impl Default for WrtcMode {
+    fn default() -> Self {
+        WrtcMode::Auto
+    }
+}
+
+impl std::str::FromStr for WrtcMode {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s.trim().to_lowercase().as_str() {
+            "p2p" | "p2p_direct" | "direct" => WrtcMode::P2pDirect,
+            "dc" | "datachannel" | "jvb_dc" | "jvb_datachannel" => WrtcMode::JvbDatachannel,
+            "ws" | "websocket" | "colibri_ws" => WrtcMode::Ws,
+            _ => WrtcMode::Auto,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum WrtcMessage {
@@ -35,6 +63,24 @@ pub enum WrtcMessage {
     #[serde(rename = "astp")]
     Astp {
         data: String,
+    },
+    #[serde(rename = "astp_batch")]
+    AstpBatch {
+        data: String,
+    },
+    #[serde(rename = "anet_p2p_offer")]
+    P2pOffer {
+        sdp: String,
+        candidates: Vec<String>,
+    },
+    #[serde(rename = "anet_p2p_answer")]
+    P2pAnswer {
+        sdp: String,
+        candidates: Vec<String>,
+    },
+    #[serde(rename = "anet_p2p_candidate")]
+    P2pCandidate {
+        candidate: String,
     },
     #[serde(rename = "anet_ping")]
     Ping,
@@ -97,6 +143,34 @@ impl ColibriMessage {
         Self::new_endpoint_message(
             Some(to),
             WrtcMessage::Astp { data: base64_data },
+        )
+    }
+
+    pub fn astp_batch(to: String, base64_data: String) -> Self {
+        Self::new_endpoint_message(
+            Some(to),
+            WrtcMessage::AstpBatch { data: base64_data },
+        )
+    }
+
+    pub fn p2p_offer(to: String, sdp: String, candidates: Vec<String>) -> Self {
+        Self::new_endpoint_message(
+            Some(to),
+            WrtcMessage::P2pOffer { sdp, candidates },
+        )
+    }
+
+    pub fn p2p_answer(to: String, sdp: String, candidates: Vec<String>) -> Self {
+        Self::new_endpoint_message(
+            Some(to),
+            WrtcMessage::P2pAnswer { sdp, candidates },
+        )
+    }
+
+    pub fn p2p_candidate(to: String, candidate: String) -> Self {
+        Self::new_endpoint_message(
+            Some(to),
+            WrtcMessage::P2pCandidate { candidate },
         )
     }
 

@@ -8,6 +8,7 @@ use anet_common::http_help::BrowserProfile;
 use anet_common::stream_framing::{frame_packet, read_next_packet};
 use anet_common::transport::{unwrap_packet_bytes, wrap_packet_padded};
 use anet_common::wrtc::{
+    batcher::{unpack_batch, PacketBatcher},
     colibri::{verify_beacon, ColibriMessage, WrtcMessage},
     jingle::parse_jingle_session,
     ktalk::KtalkClient,
@@ -207,7 +208,10 @@ impl ClientTransport for WrtcTransport {
         bypass_ips.dedup();
         info!("[WRTC] Discovered media bypass IPs: {:?}", bypass_ips);
 
-        // 5. Создание соединения (Colibri-WS с фоновым WebRTC keepalive)
+        // 5. Создание соединения (Colibri-WS с фоновым WebRTC keepalive или DataChannel)
+        let wrtc_mode = self.server.wrtc_transport_mode();
+        info!("[WRTC] Selected WebRTC transport mode: {:?}", wrtc_mode);
+
         let audio_keepalive_ms = self.server.wrtc_media_keepalive_interval_ms.unwrap_or(20);
         let peer = WrtcPeer::create(
             Some(&session),
@@ -216,6 +220,7 @@ impl ClientTransport for WrtcTransport {
             fallback_ip,
             fallback_port,
             audio_keepalive_ms,
+            wrtc_mode,
         )
             .await
             .context("Failed to initialize WebRTC PeerConnection and DataChannel")?;
@@ -328,7 +333,7 @@ impl ClientTransport for WrtcTransport {
             }
         });
 
-        // Воркер Uplink: TUN -> WebRTC
+        // Воркер Uplink: TUN -> WebRTC (с микробатчингом до 16KB / 2ms)
         let peer_tx = shared_peer.clone();
         let target_srv_tx = target_server_id.clone();
         let cipher_tx = cipher.clone();
@@ -336,8 +341,10 @@ impl ClientTransport for WrtcTransport {
         let padding_step = self.config.stealth.padding_step;
 
         let mut ping_interval = tokio::time::interval(Duration::from_secs(15));
+        let mut batch_interval = tokio::time::interval(Duration::from_millis(2));
         let last_pong = Arc::new(AtomicU64::new(current_timestamp_secs()));
         let last_pong_tx = last_pong.clone();
+        let mut batcher = PacketBatcher::new(16384, 2);
 
         tokio::spawn(async move {
             loop {
@@ -350,15 +357,32 @@ impl ClientTransport for WrtcTransport {
                         let seq = sequence_tx.fetch_add(1, Ordering::Relaxed);
                         match wrap_packet_padded(&cipher_tx, &nonce_prefix, seq, packet, padding_step) {
                             Ok(encrypted) => {
-                                let b64 = BASE64_STANDARD.encode(&encrypted);
-                                let msg = ColibriMessage::astp(target_srv_tx.clone(), b64);
-                                if let Err(e) = peer_tx.send(msg).await {
-                                    warn!("[WRTC Client] Peer send error: {e}");
-                                    break;
+                                batcher.push(Bytes::from(encrypted));
+                                if batcher.should_flush() {
+                                    if let Some(batch_data) = batcher.flush() {
+                                        let b64 = BASE64_STANDARD.encode(&batch_data);
+                                        let msg = ColibriMessage::astp_batch(target_srv_tx.clone(), b64);
+                                        if let Err(e) = peer_tx.send(msg).await {
+                                            warn!("[WRTC Client] Peer send batch error: {e}");
+                                            break;
+                                        }
+                                    }
                                 }
                             }
                             Err(e) => {
                                 warn!("[WRTC Client] wrap_packet_padded error: {e}");
+                            }
+                        }
+                    }
+                    _ = batch_interval.tick() => {
+                        if !batcher.is_empty() {
+                            if let Some(batch_data) = batcher.flush() {
+                                let b64 = BASE64_STANDARD.encode(&batch_data);
+                                let msg = ColibriMessage::astp_batch(target_srv_tx.clone(), b64);
+                                if let Err(e) = peer_tx.send(msg).await {
+                                    warn!("[WRTC Client] Peer flush batch send error: {e}");
+                                    break;
+                                }
                             }
                         }
                     }
@@ -410,6 +434,30 @@ impl ClientTransport for WrtcTransport {
                                     }
                                     Err(e) => {
                                         warn!("[WRTC Client] Base64 decode error: {e}");
+                                    }
+                                }
+                            }
+                            WrtcMessage::AstpBatch { data } => {
+                                match BASE64_STANDARD.decode(&data) {
+                                    Ok(raw_batch) => {
+                                        let packets = unpack_batch(&raw_batch);
+                                        for enc_pkt in packets {
+                                            match unwrap_packet_bytes(&cipher_rx, enc_pkt) {
+                                                Ok(packet) => {
+                                                    let framed = frame_packet(packet);
+                                                    if let Err(e) = tunnel_write.write_all(&framed).await {
+                                                        warn!("[WRTC Client] tunnel_write batch error: {e}");
+                                                        break;
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    warn!("[WRTC Client] Decrypt batch packet error: {e}");
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!("[WRTC Client] Base64 batch decode error: {e}");
                                     }
                                 }
                             }

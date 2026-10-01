@@ -5,6 +5,7 @@ use anet_common::consts::CHANNEL_BUFFER_SIZE;
 use anet_common::http_help::BrowserProfile;
 use anet_common::transport::{unwrap_packet_bytes, wrap_packet_padded};
 use anet_common::wrtc::{
+    batcher::{unpack_batch, PacketBatcher},
     colibri::{sign_beacon, ColibriMessage, WrtcMessage},
     jingle::parse_jingle_session,
     ktalk::KtalkClient,
@@ -139,6 +140,7 @@ pub async fn run_wrtc_server(
             continue;
         };
 
+        let server_mode = config.server.wrtc_transport_mode();
         let audio_keepalive_ms = config.server.wrtc_media_keepalive_interval_ms;
         let peer = match WrtcPeer::create(
             Some(&session),
@@ -147,6 +149,7 @@ pub async fn run_wrtc_server(
             fallback_ip,
             fallback_port,
             audio_keepalive_ms,
+            server_mode,
         )
             .await
         {
@@ -273,27 +276,53 @@ pub async fn run_wrtc_server(
                                             let peer_downlink = shared_peer.clone();
 
                                             tokio::spawn(async move {
-                                                while let Some(packet) = rx_router.recv().await {
-                                                    if packet.len() < 20 {
-                                                        continue;
-                                                    }
-                                                    let seq = c_info
-                                                        .sequence
-                                                        .fetch_add(1, Ordering::Relaxed);
-                                                    if let Ok(encrypted) = wrap_packet_padded(
-                                                        &c_info.cipher,
-                                                        &c_info.nonce_prefix,
-                                                        seq,
-                                                        packet,
-                                                        padding_step,
-                                                    ) {
-                                                        let b64 = BASE64_STANDARD.encode(&encrypted);
-                                                        let msg = ColibriMessage::astp(
-                                                            target_client_id.clone(),
-                                                            b64,
-                                                        );
-                                                        if peer_downlink.send(msg).await.is_err() {
-                                                            break;
+                                                let mut batcher = PacketBatcher::new(16384, 2);
+                                                let mut batch_interval = tokio::time::interval(Duration::from_millis(2));
+                                                loop {
+                                                    tokio::select! {
+                                                        packet_opt = rx_router.recv() => {
+                                                            let Some(packet) = packet_opt else { break; };
+                                                            if packet.len() < 20 {
+                                                                continue;
+                                                            }
+                                                            let seq = c_info
+                                                                .sequence
+                                                                .fetch_add(1, Ordering::Relaxed);
+                                                            if let Ok(encrypted) = wrap_packet_padded(
+                                                                &c_info.cipher,
+                                                                &c_info.nonce_prefix,
+                                                                seq,
+                                                                packet,
+                                                                padding_step,
+                                                            ) {
+                                                                batcher.push(Bytes::from(encrypted));
+                                                                if batcher.should_flush() {
+                                                                    if let Some(batch_data) = batcher.flush() {
+                                                                        let b64 = BASE64_STANDARD.encode(&batch_data);
+                                                                        let msg = ColibriMessage::astp_batch(
+                                                                            target_client_id.clone(),
+                                                                            b64,
+                                                                        );
+                                                                        if peer_downlink.send(msg).await.is_err() {
+                                                                            break;
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                        _ = batch_interval.tick() => {
+                                                            if !batcher.is_empty() {
+                                                                if let Some(batch_data) = batcher.flush() {
+                                                                    let b64 = BASE64_STANDARD.encode(&batch_data);
+                                                                    let msg = ColibriMessage::astp_batch(
+                                                                        target_client_id.clone(),
+                                                                        b64,
+                                                                    );
+                                                                    if peer_downlink.send(msg).await.is_err() {
+                                                                        break;
+                                                                    }
+                                                                }
+                                                            }
                                                         }
                                                     }
                                                 }
@@ -319,6 +348,45 @@ pub async fn run_wrtc_server(
                             warn!("[WRTC Server] Base64 decode error from {from_endpoint}: {e}");
                         }
                     }
+                }
+                WrtcMessage::AstpBatch { data } => {
+                    match BASE64_STANDARD.decode(&data) {
+                        Ok(raw_bytes) => {
+                            let packets = unpack_batch(&raw_bytes);
+                            if let Some(client_info) = clients_map.get(&from_endpoint) {
+                                if reg_clone.get_by_session(&client_info.session_id).is_some() {
+                                    for enc_pkt in packets {
+                                        match unwrap_packet_bytes(
+                                            &client_info.cipher,
+                                            enc_pkt,
+                                        ) {
+                                            Ok(packet) => {
+                                                let packet_len = packet.len();
+                                                match tun_clone.try_send(packet) {
+                                                    Ok(_) => {
+                                                        reg_clone.record_rx(&client_info, packet_len, "wrtc");
+                                                    }
+                                                    Err(e) => {
+                                                        warn!("[WRTC Server] TUN queue error for {}: {e}", client_info.assigned_ip);
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => {
+                                                warn!("[WRTC Server] Decrypt batch packet failed for {from_endpoint}: {e}");
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!("[WRTC Server] Base64 batch decode error from {from_endpoint}: {e}");
+                        }
+                    }
+                }
+                WrtcMessage::P2pOffer { .. } => {
+                    info!("[WRTC Server] P2P Offer received from {from_endpoint}");
                 }
                 _ => {}
             }

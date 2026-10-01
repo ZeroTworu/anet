@@ -319,6 +319,9 @@ wrtc_media_keepalive_interval_ms = 20 # Эмуляция Opus тишины (мс
 wrtc_ping_interval_secs = 20          # Пинг сигнального WSS (сек)
 wrtc_fallback_jvb_ip = "89.169.19.7"  # Fallback IP медиасервера JVB
 wrtc_fallback_jvb_port = 10004        # Fallback UDP порт JVB
+
+# Режим транспорта данных: "auto" | "p2p_direct" | "jvb_datachannel" | "ws"
+wrtc_mode = "jvb_datachannel"
 ```
 
 ### В `server.toml`:
@@ -329,6 +332,9 @@ wrtc_media_keepalive_interval_ms = 20 # Эмуляция Opus тишины (мс
 wrtc_ping_interval_secs = 20          # Пинг сигнального WSS (сек)
 wrtc_fallback_jvb_ip = "89.169.19.7"  # Fallback IP медиасервера JVB
 wrtc_fallback_jvb_port = 10004        # Fallback UDP порт JVB
+
+# Режим транспорта данных: "auto" | "p2p_direct" | "jvb_datachannel" | "ws"
+wrtc_mode = "jvb_datachannel"
 
 [crypto]
 server_signing_key = "<BASE64_ED25519_PRIVATE_KEY>"
@@ -471,4 +477,65 @@ let dc = pc.create_data_channel("anet-data", Some(dc_init)).await?;
 | **Оверхед кодирования** | JSON + Base64 (+35%)| JSON + Base64 (Батчинг, +34%)| **0% (Raw Binary Frames)** |
 | **Устойчивость к потерям**| Низкая (TCP заморозка)| Высокая (`max_retransmits: 0`)| Абсолютная (`ordered: false`)|
 | **Требования к NAT** | Любой (даже HTTP Proxy)| Любой (Исходящий UDP на JVB)| Белый IP у сервера или Cone NAT|
+
+---
+
+### 7.7. Локальное тестирование и проверка всех трех режимов (Инструкция разработчика)
+
+Для проверки работы всех трех режимов транспорта прямо на одном компьютере (без необходимости настраивать внешний тестовый стенд) используется параметр `wrtc_mode` в `client.toml` и консольные утилиты `tcpdump`, `ss` и логи самого клиента/сервера.
+
+#### 1. Сводная таблица физических маркеров проверки
+
+| Режим (`wrtc_mode`) | Сетевой сокет | Фильтр `tcpdump` | Маркер в логах | Поведение пинга под нагрузкой |
+| :--- | :--- | :--- | :--- | :--- |
+| **`p2p_direct`** | UDP `127.0.0.1 ⇄ 127.0.0.1` | `tcpdump -nn -i lo udp` | `[P2P Direct OUT]`, `[P2P Direct] established` | Минимальный (< 1 мс локально) |
+| **`jvb_datachannel`** | UDP к JVB (порт 10004/udp) | `tcpdump -nn -i any udp port 10004` | `[JVB DC OUT Batch]`, `[WRTC DataChannel] Outgoing sender loop active` | Ровный (~40–60 мс) |
+| **`ws`** | TCP к Ktalk (порт 443/tcp) | `tcpdump -nn -i any tcp port 443` | `[JVB WS OUT ASTP]`, `[WRTC WS] Colibri-WS connected` | Скачет (150–250 мс из-за TCP-in-TCP) |
+
+#### 2. Пошаговая проверка каждого режима
+
+##### Шаг А. Проверка режима `ws` (Colibri WebSocket)
+1. В `client.toml` выставляем:
+   ```toml
+   wrtc_mode = "ws"
+   ```
+2. Запускаем перехват TCP-трафика на порт 443:
+   ```bash
+   sudo tcpdump -nn -i any tcp port 443 -c 20
+   ```
+3. Подключаем клиент и пускаем пинг через туннель: `ping 172.112.224.1`.
+4. **Что наблюдаем:**
+   * В логах клиента появляется: `[WRTC Transport] Mode is set to 'ws'. Connecting directly via Colibri-WS...` и `[JVB WS OUT ASTP]`.
+   * В `tcpdump` бегут пакеты `Flags [P.]` (TLS Application Data) исключительно по TCP порту 443. В сокетах UDP тишина.
+
+##### Шаг Б. Проверка режима `jvb_datachannel` (WebRTC DataChannel через JVB с микробатчингом)
+1. В `client.toml` выставляем:
+   ```toml
+   wrtc_mode = "jvb_datachannel"
+   ```
+2. Запускаем перехват UDP-трафика к порту JVB (10004):
+   ```bash
+   sudo tcpdump -nn -i any udp port 10004 -c 20
+   ```
+3. Подключаем клиент и пускаем трафик через туннель.
+4. **Что наблюдаем:**
+   * В логах клиента появляется: `[WRTC DataChannel] 'JVB data channel' state is now OPEN!` и `[JVB DC OUT Batch]`.
+   * В `tcpdump` идет непрерывный поток UDP-датаграмм на порт 10004 (JVB relay).
+   * Количество пакетов в секунду (PPS) снижено в 10–15 раз благодаря модулю `PacketBatcher`.
+
+##### Шаг В. Проверка режима `p2p_direct` (Прямой WebRTC P2P DataChannel)
+1. В `client.toml` выставляем:
+   ```toml
+   wrtc_mode = "p2p_direct"
+   ```
+2. Запускаем перехват локального UDP:
+   ```bash
+   sudo tcpdump -nn -i lo udp -c 20
+   ```
+3. Подключаем клиент.
+4. **Что наблюдаем:**
+   * Сервер и клиент обмениваются `anet_p2p_offer` / `anet_p2p_answer` через комнату Ktalk и открывают прямой DataChannel.
+   * Трафик идет напрямую между сокетами клиента и сервера без транзита пакетов через JVB.
+   * В логах: `[P2P Direct OUT]` и нулевой оверхед (чистые бинарные кадры IP).
+
 

@@ -1,6 +1,7 @@
-use crate::wrtc::colibri::ColibriMessage;
+use crate::wrtc::colibri::{ColibriMessage, WrtcMessage, WrtcMode};
 use crate::wrtc::jingle::JingleSession;
 use bytes::Bytes;
+use futures::{SinkExt, StreamExt};
 use rtc::interceptor::Registry;
 use rtc::media_stream::MediaStreamTrack;
 use rtc::peer_connection::configuration::interceptor_registry::register_default_interceptors;
@@ -52,16 +53,18 @@ pub struct WrtcPeer {
     pub ssrc: u32,
     pub outgoing_tx: mpsc::Sender<ColibriMessage>,
     pub incoming_rx: Mutex<mpsc::Receiver<ColibriMessage>>,
+    pub mode: WrtcMode,
 }
 
 impl WrtcPeer {
     pub async fn create(
         session_opt: Option<&JingleSession>,
         xmpp_opt: Option<&crate::wrtc::xmpp::XmppSession>,
-        _domain: &str,
+        domain: &str,
         fallback_ip: &str,
         fallback_port: u16,
         audio_keepalive_ms: u64,
+        mode: WrtcMode,
     ) -> anyhow::Result<Self> {
         let (incoming_tx, incoming_rx) = mpsc::channel::<ColibriMessage>(1024);
         let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<ColibriMessage>(1024);
@@ -69,6 +72,78 @@ impl WrtcPeer {
 
         let local_ssrc = generate_random_ssrc();
         let remote_ssrc = 0;
+
+        // Режим 3: Принудительный Colibri WebSocket (bypass UDP/SCTP)
+        if mode == WrtcMode::Ws {
+            log::info!("[WRTC Transport] Mode is set to 'ws'. Connecting directly via Colibri-WS...");
+            if let Some(session) = session_opt {
+                let ws_url = session.transport.colibri_ws_url.clone().unwrap_or_else(|| {
+                    format!("wss://{}/colibri-ws/default", domain)
+                });
+                log::info!("[WRTC Transport] Connecting to Colibri-WS endpoint: {ws_url}");
+                match tokio_tungstenite::connect_async(&ws_url).await {
+                    Ok((ws_stream, _)) => {
+                        log::info!("[WRTC WS] Colibri-WS connected successfully");
+                        let (mut ws_sink, mut ws_stream) = ws_stream.split();
+                        let in_tx = incoming_tx.clone();
+
+                        tokio::spawn(async move {
+                            while let Some(msg_res) = ws_stream.next().await {
+                                match msg_res {
+                                    Ok(tokio_tungstenite::tungstenite::Message::Text(text)) => {
+                                        if let Ok(c_msg) = serde_json::from_str::<ColibriMessage>(&text) {
+                                            let _ = in_tx.send(c_msg).await;
+                                        }
+                                    }
+                                    Ok(tokio_tungstenite::tungstenite::Message::Binary(bin)) => {
+                                        if let Ok(c_msg) = serde_json::from_slice::<ColibriMessage>(&bin) {
+                                            let _ = in_tx.send(c_msg).await;
+                                        }
+                                    }
+                                    Ok(tokio_tungstenite::tungstenite::Message::Close(_)) | Err(_) => {
+                                        log::info!("[WRTC WS] JVB Colibri-WS closed");
+                                        break;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        });
+
+                        tokio::spawn(async move {
+                            while let Some(msg) = outgoing_rx.recv().await {
+                                if let Ok(json_str) = serde_json::to_string(&msg) {
+                                    match &msg.msg_payload {
+                                        WrtcMessage::Astp { .. } | WrtcMessage::AstpBatch { .. } => {
+                                            log::trace!("[JVB WS OUT ASTP]");
+                                        }
+                                        _ => {
+                                            log::info!("[JVB WS OUT]: {json_str}");
+                                        }
+                                    }
+                                    if let Err(e) = ws_sink.send(tokio_tungstenite::tungstenite::Message::Text(json_str.into())).await {
+                                        log::warn!("[WRTC WS] Failed to send WS message: {e}");
+                                        break;
+                                    }
+                                }
+                            }
+                        });
+
+                        return Ok(Self {
+                            peer_connection: None,
+                            data_channel: None,
+                            audio_track: None,
+                            ssrc: local_ssrc,
+                            outgoing_tx,
+                            incoming_rx: Mutex::new(incoming_rx),
+                            mode,
+                        });
+                    }
+                    Err(e) => {
+                        log::warn!("[WRTC WS] Failed to connect to Colibri-WS at {ws_url}: {e}");
+                    }
+                }
+            }
+        }
 
         let mut peer_connection_opt = None;
         let mut data_channel_opt = None;
@@ -253,6 +328,9 @@ impl WrtcPeer {
                             crate::wrtc::colibri::WrtcMessage::Astp { .. } => {
                                 log::trace!("[JVB DC OUT ASTP]");
                             }
+                            crate::wrtc::colibri::WrtcMessage::AstpBatch { .. } => {
+                                log::debug!("[JVB DC OUT Batch]");
+                            }
                             _ => {
                                 log::info!("[JVB DC OUT]: {json_str}");
                             }
@@ -339,6 +417,7 @@ impl WrtcPeer {
             ssrc: local_ssrc,
             outgoing_tx,
             incoming_rx: Mutex::new(incoming_rx),
+            mode,
         })
     }
 
