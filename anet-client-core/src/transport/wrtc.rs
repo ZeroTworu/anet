@@ -345,14 +345,16 @@ impl ClientTransport for WrtcTransport {
                                     return;
                                 }
                                 let mut final_sdp = offer.sdp.clone();
-                                for _ in 0..25 {
+                                for _ in 0..50 {
                                     if let Some(desc) = p2p_arc.pc.local_description().await {
                                         if desc.sdp.contains("a=candidate:") {
                                             final_sdp = desc.sdp;
-                                            break;
+                                            if final_sdp.contains("typ srflx") {
+                                                break;
+                                            }
                                         }
                                     }
-                                    tokio::time::sleep(Duration::from_millis(20)).await;
+                                    tokio::time::sleep(Duration::from_millis(50)).await;
                                 }
                                 if final_sdp.is_empty() {
                                     if let Some(desc) = p2p_arc.pc.local_description().await {

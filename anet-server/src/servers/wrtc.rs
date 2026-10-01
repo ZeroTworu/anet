@@ -432,14 +432,16 @@ pub async fn run_wrtc_server(
                                                 }
 
                                                 let mut answer_sdp = answer.sdp.clone();
-                                                for _ in 0..25 {
+                                                for _ in 0..50 {
                                                     if let Some(desc) = p2p_arc.pc.local_description().await {
                                                         if desc.sdp.contains("a=candidate:") {
                                                             answer_sdp = desc.sdp;
-                                                            break;
+                                                            if answer_sdp.contains("typ srflx") {
+                                                                break;
+                                                            }
                                                         }
                                                     }
-                                                    tokio::time::sleep(Duration::from_millis(20)).await;
+                                                    tokio::time::sleep(Duration::from_millis(50)).await;
                                                 }
                                                 if answer_sdp.is_empty() {
                                                     if let Some(desc) = p2p_arc.pc.local_description().await {

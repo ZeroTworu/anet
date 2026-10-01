@@ -98,6 +98,20 @@ impl PeerConnectionEventHandler for PeerEvents {
     }
 }
 
+struct P2pEvents {
+    is_open: Arc<AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl PeerConnectionEventHandler for P2pEvents {
+    async fn on_connection_state_change(&self, state: RTCPeerConnectionState) {
+        log::info!("[P2P Direct] WebRTC PeerConnection state: {state:?}");
+        if state == RTCPeerConnectionState::Failed || state == RTCPeerConnectionState::Closed {
+            self.is_open.store(false, Ordering::SeqCst);
+        }
+    }
+}
+
 pub struct P2pSession {
     pub pc: Arc<dyn PeerConnection>,
     pub dc: Arc<dyn DataChannel>,
@@ -163,11 +177,19 @@ pub async fn create_p2p_channel(stun_servers: &[String]) -> anyhow::Result<P2pSe
         .with_receive_mtu(1500)
         .build();
 
+    let is_open = Arc::new(AtomicBool::new(false));
+    let open_notify = Arc::new(tokio::sync::Notify::new());
+
+    let handler = Arc::new(P2pEvents {
+        is_open: is_open.clone(),
+    });
+
     let pc_res = PeerConnectionBuilder::new()
         .with_configuration(config)
         .with_setting_engine(setting_engine)
         .with_media_engine(media_engine)
         .with_interceptor_registry(registry)
+        .with_handler(handler)
         .with_runtime(Arc::new(TokioRuntime))
         .with_udp_addrs(vec!["0.0.0.0:0".to_string()])
         .with_dedicated_reactor_pool_size(1)
@@ -185,8 +207,6 @@ pub async fn create_p2p_channel(stun_servers: &[String]) -> anyhow::Result<P2pSe
     };
 
     let dc: Arc<dyn DataChannel> = pc.create_data_channel("anet-data", Some(dc_init)).await?;
-    let is_open = Arc::new(AtomicBool::new(false));
-    let open_notify = Arc::new(tokio::sync::Notify::new());
 
     let (incoming_tx, incoming_rx) = mpsc::channel::<Bytes>(1024);
     let in_tx = incoming_tx.clone();
@@ -256,82 +276,8 @@ impl WrtcPeer {
         let local_ssrc = generate_random_ssrc();
         let remote_ssrc = 0;
 
-        // Режим 3: Принудительный Colibri WebSocket (bypass UDP/SCTP)
-        if mode == WrtcMode::Ws {
-            log::info!("[WRTC Transport] Mode is set to 'ws'. Connecting directly via Colibri-WS...");
-            if let Some(session) = session_opt {
-                let ws_url = session.transport.colibri_ws_url.clone().unwrap_or_else(|| {
-                    format!("wss://{}/colibri-ws/default", domain)
-                });
-                log::info!("[WRTC Transport] Connecting to Colibri-WS endpoint: {ws_url}");
-                match tokio_tungstenite::connect_async(&ws_url).await {
-                    Ok((ws_stream, _)) => {
-                        log::info!("[WRTC WS] Colibri-WS connected successfully");
-                        let (mut ws_sink, mut ws_stream) = ws_stream.split();
-                        let in_tx = incoming_tx.clone();
-
-                        tokio::spawn(async move {
-                            while let Some(msg_res) = ws_stream.next().await {
-                                match msg_res {
-                                    Ok(tokio_tungstenite::tungstenite::Message::Text(text)) => {
-                                        if let Ok(c_msg) = serde_json::from_str::<ColibriMessage>(&text) {
-                                            let _ = in_tx.send(c_msg).await;
-                                        }
-                                    }
-                                    Ok(tokio_tungstenite::tungstenite::Message::Binary(bin)) => {
-                                        if let Ok(c_msg) = serde_json::from_slice::<ColibriMessage>(&bin) {
-                                            let _ = in_tx.send(c_msg).await;
-                                        }
-                                    }
-                                    Ok(tokio_tungstenite::tungstenite::Message::Close(_)) | Err(_) => {
-                                        log::info!("[WRTC WS] JVB Colibri-WS closed");
-                                        break;
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        });
-
-                        tokio::spawn(async move {
-                            while let Some(msg) = outgoing_rx.recv().await {
-                                if let Ok(json_str) = serde_json::to_string(&msg) {
-                                    match &msg.msg_payload {
-                                        WrtcMessage::Astp { .. } | WrtcMessage::AstpBatch { .. } => {
-                                            log::trace!("[JVB WS OUT ASTP]");
-                                        }
-                                        _ => {
-                                            log::info!("[JVB WS OUT]: {json_str}");
-                                        }
-                                    }
-                                    if let Err(e) = ws_sink.send(tokio_tungstenite::tungstenite::Message::Text(json_str.into())).await {
-                                        log::warn!("[WRTC WS] Failed to send WS message: {e}");
-                                        break;
-                                    }
-                                }
-                            }
-                        });
-
-                        return Ok(Self {
-                            peer_connection: None,
-                            data_channel: None,
-                            audio_track: None,
-                            ssrc: local_ssrc,
-                            outgoing_tx,
-                            incoming_rx: Mutex::new(incoming_rx),
-                            mode,
-                            dc_is_open,
-                            is_connected,
-                        });
-                    }
-                    Err(e) => {
-                        log::warn!("[WRTC WS] Failed to connect to Colibri-WS at {ws_url}: {e}");
-                    }
-                }
-            }
-        }
-
-        // Подключаем Colibri-WS в параллель как fallback при Auto/DataChannel
-        let (ws_fallback_tx, mut ws_fallback_rx) = mpsc::channel::<String>(1024);
+        // Подключаем Colibri-WS (основной канал для Ws, параллельный fallback для Auto/JvbDatachannel)
+        let (ws_fallback_tx, mut ws_fallback_rx) = mpsc::channel::<String>(8192);
         let has_ws = Arc::new(AtomicBool::new(false));
 
         if let Some(session) = session_opt {
@@ -472,7 +418,7 @@ impl WrtcPeer {
 
                 // 2. Создаем WebRTC DataChannel только если JVB/Jicofo анонсировал секцию данных
                 let mut data_channel_res = None;
-                if session.has_data_channel {
+                if session.has_data_channel && mode != WrtcMode::Ws {
                     let dc_init = RTCDataChannelInit {
                         ordered: false,
                         max_packet_life_time: None,
@@ -634,7 +580,14 @@ impl WrtcPeer {
                             } else {
                                 log::info!("[JVB WS OUT]: {json_str}");
                             }
-                            let _ = ws_fallback_tx_out.try_send(json_str);
+                            if let Err(e) = ws_fallback_tx_out.try_send(json_str) {
+                                match e {
+                                    tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                                        log::warn!("[WRTC WS] Fallback queue full, frame dropped");
+                                    }
+                                    tokio::sync::mpsc::error::TrySendError::Closed(_) => {}
+                                }
+                            }
                         }
                     }
                 });
