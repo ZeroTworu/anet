@@ -368,6 +368,8 @@ pub fn parse_jingle_node(
         action,
         transport: transport_info,
         sources,
+        video_sources,
+        video_payload_type,
         has_data_channel,
         has_video,
     })

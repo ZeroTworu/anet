@@ -309,7 +309,7 @@ impl WrtcPeer {
     pub async fn create(
         session_opt: Option<&JingleSession>,
         xmpp_opt: Option<&crate::wrtc::xmpp::XmppSession>,
-        domain: &str,
+        _domain: &str,
         fallback_ip: &str,
         fallback_port: u16,
         audio_keepalive_ms: u64,
@@ -652,8 +652,8 @@ impl WrtcPeer {
                             msg_opt = outgoing_rx.recv() => {
                                 match msg_opt {
                                     Some(msg) => {
-                                        let is_batch = matches!(msg.msg_payload, crate::wrtc::colibri::WrtcMessage::AstpBatch { .. });
-                                        let is_astp = matches!(msg.msg_payload, crate::wrtc::colibri::WrtcMessage::Astp { .. });
+                                        let is_batch = matches!(msg.msg_payload, WrtcMessage::AstpBatch { .. });
+                                        let is_astp = matches!(msg.msg_payload, WrtcMessage::Astp { .. });
                                         let Ok(json_str) = serde_json::to_string(&msg) else { continue; };
                                         (json_str, is_batch, is_astp)
                                     }
