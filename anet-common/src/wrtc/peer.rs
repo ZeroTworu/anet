@@ -1,4 +1,6 @@
-use crate::wrtc::colibri::{ColibriMessage, WrtcMessage, WrtcMode};
+use crate::wrtc::colibri::{
+    ColibriMessage, ReceiverVideoConstraints, WrtcMessage, WrtcMode, VP8_KEYFRAME_HEADER,
+};
 use crate::wrtc::jingle::JingleSession;
 use bytes::{BufMut, Bytes, BytesMut};
 use futures::{SinkExt, StreamExt};
@@ -76,7 +78,10 @@ impl PeerConnectionEventHandler for PeerEvents {
                             }
                             // Проверяем 1-байтовый VP8 Payload Descriptor (RFC 7741, 0x10)
                             if pkt.payload.len() > 1 && pkt.payload[0] == 0x10 {
-                                let data = pkt.payload.slice(1..);
+                                let mut data = pkt.payload.slice(1..);
+                                if data.starts_with(&VP8_KEYFRAME_HEADER) {
+                                    data = data.slice(VP8_KEYFRAME_HEADER.len()..);
+                                }
                                 let _ = in_tx.send(data).await;
                             }
                         }
@@ -287,10 +292,12 @@ pub struct WrtcPeer {
     pub video_track: Option<Arc<TrackLocalStaticRTP>>,
     pub ssrc: u32,
     pub video_ssrc: u32,
+    pub video_payload_type: u8,
     pub video_seq: Arc<AtomicU16>,
     pub video_ts: Arc<AtomicU32>,
     pub expected_peer_video_ssrc: Arc<AtomicU32>,
     pub outgoing_tx: mpsc::Sender<ColibriMessage>,
+    pub raw_outgoing_tx: mpsc::Sender<String>,
     pub incoming_rx: Mutex<mpsc::Receiver<ColibriMessage>>,
     pub video_incoming_rx: Mutex<mpsc::Receiver<Bytes>>,
     pub mode: WrtcMode,
@@ -311,12 +318,15 @@ impl WrtcPeer {
         let (incoming_tx, incoming_rx) = mpsc::channel::<ColibriMessage>(1024);
         let (video_incoming_tx, video_incoming_rx) = mpsc::channel::<Bytes>(1024);
         let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<ColibriMessage>(1024);
+        let (raw_outgoing_tx, mut raw_outgoing_rx) = mpsc::channel::<String>(1024);
         let (connected_tx, _connected_rx) = mpsc::channel::<()>(1);
         let is_connected = Arc::new(AtomicBool::new(false));
         let dc_is_open = Arc::new(AtomicBool::new(false));
 
         let local_ssrc = generate_random_ssrc();
         let local_video_ssrc = generate_random_ssrc();
+        let video_pt = session_opt.map(|s| s.video_payload_type).unwrap_or(100);
+        let has_video_flag = session_opt.map(|s| s.has_video).unwrap_or(false) || mode == WrtcMode::MediaVideo;
         let video_seq = Arc::new(AtomicU16::new(0));
         let video_ts = Arc::new(AtomicU32::new(0));
         let expected_peer_video_ssrc = Arc::new(AtomicU32::new(0));
@@ -336,6 +346,13 @@ impl WrtcPeer {
                         has_ws_c.store(true, Ordering::SeqCst);
                         log::info!("[WRTC WS] Parallel Colibri-WS fallback connected");
                         let (mut ws_sink, mut ws_stream) = ws_stream.split();
+
+                        if has_video_flag {
+                            let constraints = ReceiverVideoConstraints::new_all(720);
+                            if let Ok(json) = serde_json::to_string(&constraints) {
+                                let _ = ws_sink.send(tokio_tungstenite::tungstenite::Message::Text(json.into())).await;
+                            }
+                        }
 
                         let in_tx = in_tx_ws;
                         let has_ws_read = has_ws_c.clone();
@@ -402,10 +419,15 @@ impl WrtcPeer {
                     sdp_fmtp_line: "".to_owned(),
                     rtcp_feedback: vec![],
                 },
-                payload_type: 96,
+                payload_type: video_pt,
                 ..Default::default()
             };
             media_engine.register_codec(video_codec.clone(), RtpCodecKind::Video)?;
+            if video_pt != 96 {
+                let mut fallback_vcodec = video_codec.clone();
+                fallback_vcodec.payload_type = 96;
+                let _ = media_engine.register_codec(fallback_vcodec, RtpCodecKind::Video);
+            }
 
             let registry = register_default_interceptors(Registry::new(), &mut media_engine)?;
 
@@ -523,6 +545,12 @@ impl WrtcPeer {
                                             log::info!("[WRTC DataChannel] 'JVB data channel' state is now OPEN!");
                                             dc_is_open_in.store(true, Ordering::SeqCst);
                                             dc_open_notify_in.notify_waiters();
+                                            if has_video_flag {
+                                                let constraints = ReceiverVideoConstraints::new_all(720);
+                                                if let Ok(json) = serde_json::to_string(&constraints) {
+                                                    let _ = dc_in.send_text(&json).await;
+                                                }
+                                            }
                                         }
                                         DataChannelEvent::OnClose => {
                                             log::info!("[WRTC DataChannel] 'JVB data channel' closed.");
@@ -619,10 +647,26 @@ impl WrtcPeer {
                         dc_is_open_out.load(Ordering::SeqCst)
                     );
 
-                    while let Some(msg) = outgoing_rx.recv().await {
-                        let Ok(json_str) = serde_json::to_string(&msg) else { continue; };
-                        let is_batch = matches!(msg.msg_payload, crate::wrtc::colibri::WrtcMessage::AstpBatch { .. });
-                        let is_astp = matches!(msg.msg_payload, crate::wrtc::colibri::WrtcMessage::Astp { .. });
+                    loop {
+                        let (json_str, is_batch, is_astp) = tokio::select! {
+                            msg_opt = outgoing_rx.recv() => {
+                                match msg_opt {
+                                    Some(msg) => {
+                                        let is_batch = matches!(msg.msg_payload, crate::wrtc::colibri::WrtcMessage::AstpBatch { .. });
+                                        let is_astp = matches!(msg.msg_payload, crate::wrtc::colibri::WrtcMessage::Astp { .. });
+                                        let Ok(json_str) = serde_json::to_string(&msg) else { continue; };
+                                        (json_str, is_batch, is_astp)
+                                    }
+                                    None => break,
+                                }
+                            }
+                            raw_opt = raw_outgoing_rx.recv() => {
+                                match raw_opt {
+                                    Some(raw) => (raw, false, false),
+                                    None => break,
+                                }
+                            }
+                        };
 
                         let mut sent = false;
                         if dc_is_open_out.load(Ordering::SeqCst) {
@@ -739,10 +783,12 @@ impl WrtcPeer {
             video_track: video_track_opt,
             ssrc: local_ssrc,
             video_ssrc: local_video_ssrc,
+            video_payload_type: video_pt,
             video_seq,
             video_ts,
             expected_peer_video_ssrc,
             outgoing_tx,
+            raw_outgoing_tx,
             incoming_rx: Mutex::new(incoming_rx),
             video_incoming_rx: Mutex::new(video_incoming_rx),
             mode,
@@ -760,9 +806,10 @@ impl WrtcPeer {
             anyhow::bail!("Video track not initialized");
         };
 
-        // Формируем полезную нагрузку VP8: 1 байт Payload Descriptor (0x10) + ASTP данные
-        let mut payload = BytesMut::with_capacity(1 + astp_data.len());
+        // Формируем полезную нагрузку VP8: 1 байт Payload Descriptor (0x10) + VP8_KEYFRAME_HEADER + ASTP данные
+        let mut payload = BytesMut::with_capacity(1 + VP8_KEYFRAME_HEADER.len() + astp_data.len());
         payload.put_u8(0x10); // Start of partition, PartID = 0 (RFC 7741)
+        payload.put_slice(&VP8_KEYFRAME_HEADER);
         payload.put_slice(astp_data);
 
         let seq = self.video_seq.fetch_add(1, Ordering::Relaxed);
@@ -774,7 +821,7 @@ impl WrtcPeer {
                 padding: false,
                 extension: false,
                 marker: true, // Маркер конца кадра для немедленной отправки в JVB
-                payload_type: 96,
+                payload_type: self.video_payload_type,
                 sequence_number: seq,
                 timestamp: ts,
                 ssrc: self.video_ssrc,
@@ -790,6 +837,14 @@ impl WrtcPeer {
             .write_rtp(rtp_packet)
             .await
             .map_err(|e| anyhow::anyhow!("VP8 write_rtp error: {e}"))
+    }
+
+    pub async fn send_video_constraints(&self, constraints: &ReceiverVideoConstraints) -> anyhow::Result<()> {
+        let json = serde_json::to_string(constraints)?;
+        self.raw_outgoing_tx
+            .send(json)
+            .await
+            .map_err(|_| anyhow::anyhow!("WebRTC DataChannel write channel closed"))
     }
 
     pub async fn recv_video_frame(&self) -> Option<Bytes> {

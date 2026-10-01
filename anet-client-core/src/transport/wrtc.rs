@@ -269,6 +269,7 @@ impl ClientTransport for WrtcTransport {
                                 if let Some(v_ssrc) = video_ssrc {
                                     peer.set_expected_peer_video_ssrc(v_ssrc);
                                     info!("[WRTC Client] Set expected server video SSRC: {v_ssrc}");
+                                    let _ = peer.send_video_constraints(&anet_common::wrtc::colibri::ReceiverVideoConstraints::new_all(720)).await;
                                 }
                                 if let Some(pub_key) = server_pub_key {
                                     match verify_beacon(pub_key, &client_nonce, &server_id, &signature) {

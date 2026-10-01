@@ -3,12 +3,71 @@ use base64::prelude::*;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
+/// Минимальный валидный заголовок ключевого кадра VP8 (20 байт).
+/// Позволяет мосту JVB / SFU успешно валидировать битовый поток VP8
+/// и форвардить пакеты подписчикам без отсечения по decode-timeout.
+pub const VP8_KEYFRAME_HEADER: [u8; 20] = [
+    0x30, 0x01, 0x00, 0x9d, 0x01, 0x2a, 0x10, 0x00,
+    0x10, 0x00, 0x00, 0x47, 0x08, 0x85, 0x85, 0x88,
+    0x99, 0x84, 0x88, 0xfc,
+];
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VideoConstraint {
+    #[serde(rename = "maxHeight")]
+    pub max_height: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReceiverVideoConstraints {
+    #[serde(rename = "colibriClass")]
+    pub colibri_class: String,
+    #[serde(rename = "lastN")]
+    pub last_n: i32,
+    #[serde(rename = "defaultConstraints")]
+    pub default_constraints: VideoConstraint,
+    #[serde(rename = "selectedEndpoints", skip_serializing_if = "Option::is_none")]
+    pub selected_endpoints: Option<Vec<String>>,
+    #[serde(rename = "onStageEndpoints", skip_serializing_if = "Option::is_none")]
+    pub on_stage_endpoints: Option<Vec<String>>,
+    #[serde(rename = "constraints", skip_serializing_if = "Option::is_none")]
+    pub constraints: Option<std::collections::HashMap<String, VideoConstraint>>,
+}
+
+impl ReceiverVideoConstraints {
+    pub fn new_all(max_height: u32) -> Self {
+        Self {
+            colibri_class: "ReceiverVideoConstraints".to_string(),
+            last_n: -1,
+            default_constraints: VideoConstraint { max_height },
+            selected_endpoints: None,
+            on_stage_endpoints: None,
+            constraints: None,
+        }
+    }
+
+    pub fn for_endpoint(endpoint: &str, max_height: u32) -> Self {
+        let mut map = std::collections::HashMap::new();
+        map.insert(endpoint.to_string(), VideoConstraint { max_height });
+        Self {
+            colibri_class: "ReceiverVideoConstraints".to_string(),
+            last_n: -1,
+            default_constraints: VideoConstraint { max_height },
+            selected_endpoints: Some(vec![endpoint.to_string()]),
+            on_stage_endpoints: Some(vec![endpoint.to_string()]),
+            constraints: Some(map),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ColibriClass {
     #[serde(rename = "EndpointMessage")]
     EndpointMessage,
     #[serde(rename = "DominantSpeakerEndpointChangeEvent")]
     DominantSpeaker,
+    #[serde(rename = "ReceiverVideoConstraints")]
+    ReceiverVideoConstraints,
     #[serde(other)]
     Unknown,
 }

@@ -252,22 +252,42 @@ pub fn parse_jingle_node(
 
     let mut transport_info = JingleTransportInfo::default();
     let mut sources = Vec::new();
+    let mut video_sources = Vec::new();
+    let mut video_payload_type: u8 = 100;
     let mut has_data_channel = false;
     let mut has_video = false;
 
     for content in jingle_node.children().filter(|n| n.has_tag_name("content")) {
-        if content.attribute("name") == Some("data") {
+        let is_video = content.attribute("name") == Some("video");
+        let is_data = content.attribute("name") == Some("data");
+        if is_data {
             has_data_channel = true;
         }
-        if content.attribute("name") == Some("video") {
+        if is_video {
             has_video = true;
         }
 
         for desc in content.children().filter(|n| n.has_tag_name("description")) {
+            if is_video {
+                for pt in desc.children().filter(|n| n.has_tag_name("payload-type")) {
+                    if pt.attribute("name").map(|s| s.eq_ignore_ascii_case("vp8")).unwrap_or(false) {
+                        if let Some(id_str) = pt.attribute("id") {
+                            if let Ok(id) = id_str.parse::<u8>() {
+                                video_payload_type = id;
+                            }
+                        }
+                    }
+                }
+            }
+
             for src in desc.children().filter(|n| n.has_tag_name("source")) {
                 if let Some(ssrc_str) = src.attribute("ssrc") {
                     if let Ok(ssrc) = ssrc_str.parse::<u32>() {
-                        sources.push(ssrc);
+                        if is_video {
+                            video_sources.push(ssrc);
+                        } else {
+                            sources.push(ssrc);
+                        }
                     }
                 }
             }

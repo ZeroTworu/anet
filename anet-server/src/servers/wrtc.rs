@@ -219,6 +219,7 @@ pub async fn run_wrtc_server(
                     if let Some(c_v_ssrc) = video_ssrc {
                         shared_peer.set_expected_peer_video_ssrc(c_v_ssrc);
                         info!("[WRTC Server] Set expected client video SSRC: {c_v_ssrc}");
+                        let _ = shared_peer.send_video_constraints(&anet_common::wrtc::colibri::ReceiverVideoConstraints::new_all(720)).await;
                     }
                     let signature = sign_beacon(&signing_key_bytes, &client_nonce, &srv_id);
                     let beacon_msg = ColibriMessage::beacon(

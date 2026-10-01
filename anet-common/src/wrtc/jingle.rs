@@ -22,6 +22,10 @@ pub struct JingleTransportInfo {
     pub colibri_ws_url: Option<String>,
 }
 
+fn default_vp8_pt() -> u8 {
+    100
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JingleSession {
     pub iq_id: Option<String>,
@@ -30,6 +34,10 @@ pub struct JingleSession {
     pub action: String,
     pub transport: JingleTransportInfo,
     pub sources: Vec<u32>,
+    #[serde(default)]
+    pub video_sources: Vec<u32>,
+    #[serde(default = "default_vp8_pt")]
+    pub video_payload_type: u8,
     #[serde(default)]
     pub has_data_channel: bool,
     #[serde(default)]
@@ -42,7 +50,7 @@ impl JingleSession {
         fallback_ip: &str,
         fallback_port: u16,
         remote_ssrc: u32,
-        video_ssrc: u32,
+        _video_ssrc: u32,
     ) -> String {
         let (primary_ip, primary_port) = if let Some(first) = self
             .transport
@@ -102,7 +110,7 @@ impl JingleSession {
             }
         }
 
-        let include_video = video_ssrc != 0 || self.has_video;
+        let include_video = self.has_video;
         let mut bundle_groups = vec!["audio"];
         if include_video {
             bundle_groups.push("video");
@@ -114,17 +122,20 @@ impl JingleSession {
 
         let video_section = if include_video {
             let mut v_ssrc_lines = String::new();
-            if video_ssrc != 0 {
-                v_ssrc_lines.push_str(&format!(
-                    "a=ssrc:{video_ssrc} cname:cname_{video_ssrc:x}\r\n\
-                     a=ssrc:{video_ssrc} msid:msid_{video_ssrc:x} v0\r\n"
-                ));
+            for ssrc in &self.video_sources {
+                if *ssrc != 0 {
+                    v_ssrc_lines.push_str(&format!(
+                        "a=ssrc:{ssrc} cname:cname_{ssrc:x}\r\n\
+                         a=ssrc:{ssrc} msid:msid_{ssrc:x} v0\r\n"
+                    ));
+                }
             }
+            let pt = self.video_payload_type;
             format!(
-                "m=video {primary_port} UDP/TLS/RTP/SAVPF 96\r\n\
+                "m=video {primary_port} UDP/TLS/RTP/SAVPF {pt}\r\n\
                  c=IN IP4 {primary_ip}\r\n\
                  a=rtcp-mux\r\n\
-                 a=rtpmap:96 VP8/90000\r\n\
+                 a=rtpmap:{pt} VP8/90000\r\n\
                  a=ice-ufrag:{ufrag}\r\n\
                  a=ice-pwd:{pwd}\r\n\
                  a=fingerprint:{fp_hash} {fp}\r\n\
