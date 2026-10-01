@@ -131,14 +131,18 @@ impl PeerConnectionEventHandler for PeerEvents {
                     match event {
                         TrackRemoteEvent::OnRtpPacket(pkt) => {
                             let exp = expected_ssrc.load(Ordering::Relaxed);
-                            // Если peer_video_ssrc согласован, отсекаем чужие SSRC (anti-storm)
-                            if exp != 0 && pkt.header.ssrc != exp {
-                                continue;
-                            }
                             if let Some(mut data) = strip_vp8_payload_descriptor(pkt.payload) {
-                                if data.starts_with(&VP8_KEYFRAME_HEADER) {
-                                    data = data.slice(VP8_KEYFRAME_HEADER.len()..);
+                                if !data.starts_with(&VP8_KEYFRAME_HEADER) {
+                                    continue;
                                 }
+                                if exp != 0 && pkt.header.ssrc != exp {
+                                    log::debug!(
+                                        "[WRTC Media Video IN] SSRC mapped from {} to actual SFU SSRC {}",
+                                        exp, pkt.header.ssrc
+                                    );
+                                    expected_ssrc.store(pkt.header.ssrc, Ordering::Relaxed);
+                                }
+                                data = data.slice(VP8_KEYFRAME_HEADER.len()..);
                                 if data.is_empty() {
                                     // Пустой keyframe keepalive от пира для прогрева JVB
                                     continue;
@@ -814,9 +818,16 @@ impl WrtcPeer {
                     20
                 };
                 let samples_per_packet = (48000 * interval_ms / 1000) as u32;
+                let is_connected_a = Arc::clone(&is_connected);
 
                 tokio::spawn(async move {
-                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    let start = std::time::Instant::now();
+                    while !is_connected_a.load(Ordering::SeqCst) {
+                        if start.elapsed() > Duration::from_secs(25) {
+                            return;
+                        }
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
                     log::info!(
                         "[WRTC Media] Starting Opus silence keepalive (interval: {}ms, samples: {})",
                         interval_ms, samples_per_packet
@@ -858,8 +869,15 @@ impl WrtcPeer {
                 let video_ts_c = Arc::clone(&video_ts);
                 let v_pt = video_pt;
                 let v_ssrc = local_video_ssrc;
+                let is_connected_v = Arc::clone(&is_connected);
                 tokio::spawn(async move {
-                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    let start = std::time::Instant::now();
+                    while !is_connected_v.load(Ordering::SeqCst) {
+                        if start.elapsed() > Duration::from_secs(25) {
+                            return;
+                        }
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
                     log::info!("[WRTC Media] Starting VP8 video keepalive (interval: 1000ms)");
                     let mut interval = tokio::time::interval(Duration::from_millis(1000));
                     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);

@@ -342,7 +342,7 @@ impl XmppSession {
                 let ip = escape_xml_attr(parts[4]);
                 let port = parts[5];
                 let c_type = escape_xml_attr(parts[7]);
-                if ip == "0.0.0.0" {
+                if ip == "0.0.0.0" || ip == "127.0.0.1" || ip.starts_with("127.") || ip.starts_with("172.112.") {
                     continue;
                 }
                 candidate_xml.push_str(&format!(

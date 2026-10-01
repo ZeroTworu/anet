@@ -79,7 +79,7 @@ impl JingleSession {
 
         let mut candidate_lines = String::new();
         for c in &self.transport.candidates {
-            if c.ip == "127.0.0.1" || c.ip.starts_with("127.") || c.ip == "0.0.0.0" {
+            if c.ip == "127.0.0.1" || c.ip.starts_with("127.") || c.ip == "0.0.0.0" || c.ip.starts_with("172.112.") {
                 continue;
             }
             let proto_lower = c.protocol.to_lowercase();
