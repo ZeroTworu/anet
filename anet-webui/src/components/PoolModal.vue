@@ -42,6 +42,14 @@ const protocolOptions: { title: string; value: ProtocolType }[] = [
   { title: 'VNC', value: 'vnc' },
 ]
 
+export const wrtcModeOptions = [
+  { title: 'Media Video (Fake Video Track over DTLS-SRTP / JVB) - 4K/Макс. скорость', value: 'media_video' },
+  { title: 'P2P Direct (Прямой WebRTC DataChannel)', value: 'p2p_direct' },
+  { title: 'JVB DataChannel (Colibri SCTP DataChannel)', value: 'jvb_datachannel' },
+  { title: 'WebSocket (Colibri-WS Fallback)', value: 'ws' },
+  { title: 'Auto (Автоматический выбор)', value: 'auto' },
+]
+
 const serverById = computed(() => new Map(props.servers.map(server => [server.id, server])))
 
 watch(
@@ -56,6 +64,7 @@ watch(
             server_id: member.server_id,
             protocol: member.protocol || 'quic',
             port_or_url: member.port_or_url || '',
+            wrtc_mode: member.wrtc_mode || 'media_video',
             weight: member.weight || 1,
           })),
         }
@@ -71,6 +80,7 @@ const addNode = (serverId: string) => {
     server_id: serverId,
     protocol: 'quic',
     port_or_url: '',
+    wrtc_mode: 'media_video',
     weight: 1,
   })
 }
@@ -101,6 +111,7 @@ const save = async () => {
         server_id: m.server_id,
         protocol: m.protocol,
         port_or_url: m.port_or_url?.trim() || null,
+        wrtc_mode: m.protocol === 'wrtc' ? (m.wrtc_mode || 'media_video') : null,
         weight: m.weight || 1,
       })),
     }
@@ -217,6 +228,18 @@ const close = () => {
                       label="Вес (1-10000)"
                       min="1"
                       max="10000"
+                      density="compact"
+                      variant="outlined"
+                      hide-details
+                  />
+                </v-col>
+                <v-col v-if="member.protocol === 'wrtc'" cols="12" class="mt-2">
+                  <v-select
+                      v-model="member.wrtc_mode"
+                      :items="wrtcModeOptions"
+                      item-title="title"
+                      item-value="value"
+                      label="Режим WRTC (wrtc_mode)"
                       density="compact"
                       variant="outlined"
                       hide-details

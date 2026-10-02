@@ -26,7 +26,16 @@ const defaultForm = (): CreateServerRequest => ({
   websocket_url: 'ws://127.0.0.1:8080/socket',
   ahttp_url: 'https://your-cdn.some-host.net/api/v2/telemetry',
   wrtc_url: 'wrtc://meet.jit.si/your-telemetry-room',
+  wrtc_mode: 'media_video',
 })
+
+const wrtcModeOptions = [
+  { title: 'Media Video (Fake Video Track over DTLS-SRTP / JVB) - 4K/Макс. скорость', value: 'media_video' },
+  { title: 'P2P Direct (Прямой WebRTC DataChannel)', value: 'p2p_direct' },
+  { title: 'JVB DataChannel (Colibri SCTP DataChannel)', value: 'jvb_datachannel' },
+  { title: 'WebSocket (Colibri-WS Fallback)', value: 'ws' },
+  { title: 'Auto (Автоматический выбор)', value: 'auto' },
+]
 
 const form = ref<CreateServerRequest>(defaultForm())
 
@@ -141,6 +150,17 @@ const close = () => {
               v-model="form.wrtc_url"
               label="WRTC URL (Jitsi / WebRTC Room)"
               placeholder="wrtc://meet.jit.si/your-telemetry-room"
+              variant="filled"
+              class="mb-3"
+          />
+
+          <v-select
+              v-if="form.wrtc_url"
+              v-model="form.wrtc_mode"
+              :items="wrtcModeOptions"
+              item-title="title"
+              item-value="value"
+              label="Режим WRTC (wrtc_mode)"
               variant="filled"
               class="mb-3"
           />

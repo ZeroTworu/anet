@@ -26,6 +26,7 @@ pub mod m20260902_000025_add_ahttp_url_to_servers;
 pub mod m20260909_000026_link_server_groups_and_add_protocols;
 pub mod m20260929_000027_add_wrtc_to_protocol_type;
 pub mod m20260929_000028_add_wrtc_url_to_servers;
+pub mod m20261002_000029_add_wrtc_mode;
 
 use sea_orm_migration::prelude::*;
 
@@ -63,6 +64,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260909_000026_link_server_groups_and_add_protocols::Migration),
             Box::new(m20260929_000027_add_wrtc_to_protocol_type::Migration),
             Box::new(m20260929_000028_add_wrtc_url_to_servers::Migration),
+            Box::new(m20261002_000029_add_wrtc_mode::Migration),
         ]
     }
 }

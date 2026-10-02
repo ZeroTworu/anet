@@ -145,6 +145,7 @@ impl PoolsApi {
                 server_id: Set(member.server_id),
                 protocol: Set(member.protocol),
                 port_or_url: Set(member.port_or_url.clone()),
+                wrtc_mode: Set(member.wrtc_mode.clone()),
                 weight: Set(member.weight),
             })
                 .insert(&txn)
@@ -206,6 +207,7 @@ impl PoolsApi {
                 server_id: Set(member.server_id),
                 protocol: Set(member.protocol),
                 port_or_url: Set(member.port_or_url.clone()),
+                wrtc_mode: Set(member.wrtc_mode.clone()),
                 weight: Set(member.weight),
             })
                 .insert(&txn)

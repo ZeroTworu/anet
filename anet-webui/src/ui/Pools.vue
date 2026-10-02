@@ -118,7 +118,7 @@ onMounted(load)
               variant="tonal"
           >
             {{ serverById.get(member.server_id)?.name || member.server_id }}
-            <span v-if="member.protocol" class="ml-1 font-weight-bold text-uppercase">[{{ member.protocol }}]</span>
+            <span v-if="member.protocol" class="ml-1 font-weight-bold text-uppercase">[{{ member.protocol }}<template v-if="member.wrtc_mode">: {{ member.wrtc_mode }}</template>]</span>
             <span v-if="member.port_or_url" class="ml-1 text-medium-emphasis">({{ member.port_or_url }})</span>
             <strong class="ml-1 text-primary">w{{ member.weight }}</strong>
           </v-chip>
