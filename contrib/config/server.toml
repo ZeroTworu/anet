@@ -47,7 +47,7 @@ ahttp_path = "/api/v2/telemetry"
 ssh_host_key = "/opt/anet/anet_ssh_host_key"
 
 # Маскированный транспорт WebRTC поверх Контур.Толк (Ktalk / Jitsi SFU)
-# wrtc_room_url = "https://ycs3y048.ktalk.ru/oaj4kr56yubb"
+# wrtc_room_url = "wrtc://vc7x91a2.ktalk.ru/k8m2v9px7q1w"
 # wrtc_mode = "media_video"              # Режим транспорта: "media_video" (Fake Video Track over DTLS-SRTP / JVB) | "p2p_direct" | "jvb_datachannel" | "ws" | "auto"
 wrtc_media_keepalive_interval_ms = 20 # Эмуляция Opus тишины (мс) для предотвращения таймаута JVB
 wrtc_ping_interval_secs = 30          # Двойной пинг WebSocket и XMPP (сек)
