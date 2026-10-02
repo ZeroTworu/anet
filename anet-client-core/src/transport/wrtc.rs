@@ -266,7 +266,7 @@ impl ClientTransport for WrtcTransport {
                                     // ИНЖЕКТИРУЕМ SSRC СЕРВЕРА В REMOTE_DESCRIPTION
                                     peer.add_remote_video_ssrc(v_ssrc).await;
 
-                                    let constraints = anet_common::wrtc::colibri::ReceiverVideoConstraints::for_endpoint(&server_id, 720);
+                                    let constraints = anet_common::wrtc::colibri::ReceiverVideoConstraints::for_endpoint(&server_id, 2160);
                                     let _ = peer.send_video_constraints(&constraints).await;
                                 }
                                 if let Some(pub_key) = server_pub_key {

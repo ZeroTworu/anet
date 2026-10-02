@@ -236,7 +236,7 @@ pub async fn run_wrtc_server(
                         // ИНЖЕКТИРУЕМ SSRC КЛИЕНТА В REMOTE_DESCRIPTION
                         shared_peer.add_remote_video_ssrc(c_v_ssrc).await;
 
-                        let constraints = anet_common::wrtc::colibri::ReceiverVideoConstraints::for_endpoint(&from_endpoint, 720);
+                        let constraints = anet_common::wrtc::colibri::ReceiverVideoConstraints::for_endpoint(&from_endpoint, 2160);
                         let _ = shared_peer.send_video_constraints(&constraints).await;
                     }
                     let signature = sign_beacon(&signing_key_bytes, &client_nonce, &srv_id);
