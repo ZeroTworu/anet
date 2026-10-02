@@ -96,6 +96,7 @@ struct PeerEvents {
     video_incoming_tx: mpsc::Sender<Bytes>,
     expected_peer_video_ssrc: Arc<AtomicU32>,
     first_video_rx: Arc<AtomicBool>,
+    local_video_ssrc: u32,
 }
 
 #[async_trait::async_trait]
@@ -123,33 +124,65 @@ impl PeerConnectionEventHandler for PeerEvents {
             let in_tx = self.video_incoming_tx.clone();
             let expected_ssrc = self.expected_peer_video_ssrc.clone();
             let first_rx = self.first_video_rx.clone();
+            let local_v_ssrc = self.local_video_ssrc;
             tokio::spawn(async move {
                 while let Some(event) = track.poll().await {
                     match event {
                         TrackRemoteEvent::OnRtpPacket(pkt) => {
+                            // 1. Никогда не принимаем свои собственные отражённые кадры (петля / broadcast storm в JVB)
+                            if pkt.header.ssrc == local_v_ssrc {
+                                continue;
+                            }
+                            // 2. Аппаратная фильтрация по SSRC пира: отсекаем старые/чужие сессии
                             let exp = expected_ssrc.load(Ordering::Relaxed);
-                            if let Some(mut data) = strip_vp8_payload_descriptor(pkt.payload) {
+                            if exp != 0 && pkt.header.ssrc != exp {
+                                continue;
+                            }
+                            if exp == 0 {
+                                expected_ssrc.store(pkt.header.ssrc, Ordering::Relaxed);
+                            }
+
+                            // 3. Отсекаем RTP-паддинг (RFC 3550 Section 5.1), если SFU/JVB выставил флаг padding
+                            let mut raw_payload = pkt.payload;
+                            if pkt.header.padding && !raw_payload.is_empty() {
+                                let pad_len = raw_payload[raw_payload.len() - 1] as usize;
+                                if pad_len > 0 && pad_len <= raw_payload.len() {
+                                    raw_payload = raw_payload.slice(..raw_payload.len() - pad_len);
+                                }
+                            }
+
+                            // 4. Отсекаем дескриптор VP8 (RFC 7741)
+                            if let Some(mut data) = strip_vp8_payload_descriptor(raw_payload) {
                                 if !data.starts_with(&VP8_KEYFRAME_HEADER) {
                                     continue;
                                 }
-                                if exp != 0 && pkt.header.ssrc != exp {
-                                    log::debug!(
-                                        "[WRTC Media Video IN] SSRC mapped from {} to actual SFU SSRC {}",
-                                        exp, pkt.header.ssrc
-                                    );
-                                    expected_ssrc.store(pkt.header.ssrc, Ordering::Relaxed);
-                                }
                                 data = data.slice(VP8_KEYFRAME_HEADER.len()..);
-                                if data.is_empty() {
+
+                                // 5. Извлекаем чистый ASTP-пакет по точной длине (отсекая хвостовой SFU padding)
+                                if data.len() < 2 {
                                     continue;
                                 }
+                                let astp_len = u16::from_be_bytes([data[0], data[1]]) as usize;
+                                if astp_len == 0 {
+                                    // Пустой keepalive-фрейм для удержания полосы в JVB
+                                    continue;
+                                }
+                                let astp_slice = if astp_len >= 38 && astp_len <= data.len() - 2 {
+                                    data.slice(2..2 + astp_len)
+                                } else if data.len() >= 38 {
+                                    // Fallback для совместимости
+                                    data
+                                } else {
+                                    continue;
+                                };
+
                                 if first_rx.swap(false, Ordering::Relaxed) {
                                     log::info!(
                                         "[WRTC Media Video IN] First video frame received (SSRC: {}, len: {} bytes)",
-                                        pkt.header.ssrc, data.len()
+                                        pkt.header.ssrc, astp_slice.len()
                                     );
                                 }
-                                let _ = in_tx.send(data).await;
+                                let _ = in_tx.send(astp_slice).await;
                             }
                         }
                         TrackRemoteEvent::OnEnded => {
@@ -549,6 +582,7 @@ impl WrtcPeer {
                 video_incoming_tx,
                 expected_peer_video_ssrc: expected_peer_video_ssrc.clone(),
                 first_video_rx,
+                local_video_ssrc,
             });
 
             let pc_res = PeerConnectionBuilder::new()
@@ -906,7 +940,7 @@ impl WrtcPeer {
                         let seq = video_seq_c.fetch_add(1, Ordering::Relaxed);
                         let ts = video_ts_c.fetch_add(3000, Ordering::Relaxed);
 
-                        let mut keepalive_payload = BytesMut::with_capacity(4 + VP8_KEYFRAME_HEADER.len());
+                        let mut keepalive_payload = BytesMut::with_capacity(4 + VP8_KEYFRAME_HEADER.len() + 2);
                         let pic_id = (seq % 0x7FFF) as u16;
 
                         keepalive_payload.put_u8(0x90);
@@ -914,6 +948,7 @@ impl WrtcPeer {
                         keepalive_payload.put_u8(0x80 | ((pic_id >> 8) as u8));
                         keepalive_payload.put_u8((pic_id & 0xFF) as u8);
                         keepalive_payload.put_slice(&VP8_KEYFRAME_HEADER);
+                        keepalive_payload.put_u16(0);
 
                         let rtp_packet = RtpPacket {
                             header: RtpHeader {
@@ -1046,7 +1081,8 @@ impl WrtcPeer {
         let elapsed_ms = self.start_instant.elapsed().as_millis() as u64;
         let ts = ((elapsed_ms * 90) & 0xFFFFFFFF) as u32;
 
-        let mut payload = BytesMut::with_capacity(4 + VP8_KEYFRAME_HEADER.len() + astp_data.len());
+        let astp_len = astp_data.len() as u16;
+        let mut payload = BytesMut::with_capacity(4 + VP8_KEYFRAME_HEADER.len() + 2 + astp_data.len());
         let pic_id = (seq % 0x7FFF) as u16;
 
         payload.put_u8(0x90);
@@ -1055,6 +1091,7 @@ impl WrtcPeer {
         payload.put_u8((pic_id & 0xFF) as u8);
 
         payload.put_slice(&VP8_KEYFRAME_HEADER);
+        payload.put_u16(astp_len);
         payload.put_slice(astp_data);
 
         let rtp_packet = RtpPacket {

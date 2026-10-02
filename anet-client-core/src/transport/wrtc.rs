@@ -654,7 +654,7 @@ impl ClientTransport for WrtcTransport {
                         let _ = tun_inject_video.send(packet).await;
                     }
                     Err(e) => {
-                        warn!("[WRTC Media Video IN] Decrypt packet error: {e}");
+                        warn!("[WRTC Media Video IN] Decrypt packet error: {e} (raw_astp len: {})", raw_astp.len());
                     }
                 }
             }
