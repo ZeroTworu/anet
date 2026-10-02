@@ -95,7 +95,7 @@ impl JingleSession {
             ));
         }
 
-        let include_video = self.has_video;
+        let include_video = self.has_video || _video_ssrc != 0;
         let mut bundle_groups = vec!["audio"];
         if include_video {
             bundle_groups.push("video");

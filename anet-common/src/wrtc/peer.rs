@@ -958,7 +958,7 @@ impl WrtcPeer {
                             in_video = false;
                         }
 
-                        if in_video && line.starts_with("a=sendrecv") {
+                        if in_video && (line.starts_with("a=sendrecv") || line.starts_with("a=recvonly") || line.starts_with("a=sendonly") || line.starts_with("a=mid:video")) {
                             new_sdp.push_str(&format!("a=ssrc:{} cname:anet_dyn\r\n", ssrc));
                             new_sdp.push_str(&format!("a=ssrc:{} msid:anet_dyn v0\r\n", ssrc));
                         }

@@ -314,12 +314,12 @@ impl ClientTransport for WrtcTransport {
         let auth_handler = AuthHandler::new(&self.config, self.server.server_pub_key.as_deref())?;
         let (mut auth_response, shared_key) = auth_handler.authenticate(&auth_channel).await?;
 
-        if wrtc_mode == anet_common::wrtc::colibri::WrtcMode::MediaVideo || auth_response.mtu > 1200 {
+        if wrtc_mode == anet_common::wrtc::colibri::WrtcMode::MediaVideo || auth_response.mtu > 1280 {
             info!(
                 "[WRTC] Setting safe TUN MTU {} (clamped from {}) for WebRTC DTLS-SRTP packetization",
-                1200, auth_response.mtu
+                1280, auth_response.mtu
             );
-            auth_response.mtu = 1200;
+            auth_response.mtu = 1280;
         }
 
         info!(
