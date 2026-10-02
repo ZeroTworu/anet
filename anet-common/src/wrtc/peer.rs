@@ -133,16 +133,8 @@ impl PeerConnectionEventHandler for PeerEvents {
                             if pkt.header.ssrc == local_v_ssrc {
                                 continue;
                             }
-                            // 2. Аппаратная фильтрация по SSRC пира: отсекаем старые/чужие сессии
-                            let exp = expected_ssrc.load(Ordering::Relaxed);
-                            if exp != 0 && pkt.header.ssrc != exp {
-                                continue;
-                            }
-                            if exp == 0 {
-                                expected_ssrc.store(pkt.header.ssrc, Ordering::Relaxed);
-                            }
 
-                            // 3. Отсекаем RTP-паддинг (RFC 3550 Section 5.1), если SFU/JVB выставил флаг padding
+                            // 2. Отсекаем RTP-паддинг (RFC 3550 Section 5.1), если SFU/JVB выставил флаг padding
                             let mut raw_payload = pkt.payload;
                             if pkt.header.padding && !raw_payload.is_empty() {
                                 let pad_len = raw_payload[raw_payload.len() - 1] as usize;
@@ -151,38 +143,37 @@ impl PeerConnectionEventHandler for PeerEvents {
                                 }
                             }
 
-                            // 4. Отсекаем дескриптор VP8 (RFC 7741)
+                            // 3. Отсекаем дескриптор VP8 (RFC 7741)
                             if let Some(mut data) = strip_vp8_payload_descriptor(raw_payload) {
                                 if !data.starts_with(&VP8_KEYFRAME_HEADER) {
                                     continue;
                                 }
-                                data = data.slice(VP8_KEYFRAME_HEADER.len()..);
 
-                                // 5. Извлекаем чистый ASTP-пакет по точной длине (отсекая хвостовой SFU padding)
-                                if data.len() < 2 {
+                                // 4. Динамический маппинг SSRC: JVB переписывает SSRC при форвардинге
+                                let exp = expected_ssrc.load(Ordering::Relaxed);
+                                if exp != 0 && pkt.header.ssrc != exp {
+                                    log::debug!(
+                                        "[WRTC Media Video IN] SSRC mapped from {} to actual SFU SSRC {}",
+                                        exp, pkt.header.ssrc
+                                    );
+                                    expected_ssrc.store(pkt.header.ssrc, Ordering::Relaxed);
+                                } else if exp == 0 {
+                                    expected_ssrc.store(pkt.header.ssrc, Ordering::Relaxed);
+                                }
+
+                                data = data.slice(VP8_KEYFRAME_HEADER.len()..);
+                                if data.is_empty() {
+                                    // Keepalive-кадр без ASTP-пейлоуда
                                     continue;
                                 }
-                                let astp_len = u16::from_be_bytes([data[0], data[1]]) as usize;
-                                if astp_len == 0 {
-                                    // Пустой keepalive-фрейм для удержания полосы в JVB
-                                    continue;
-                                }
-                                let astp_slice = if astp_len >= 38 && astp_len <= data.len() - 2 {
-                                    data.slice(2..2 + astp_len)
-                                } else if data.len() >= 38 {
-                                    // Fallback для совместимости
-                                    data
-                                } else {
-                                    continue;
-                                };
 
                                 if first_rx.swap(false, Ordering::Relaxed) {
                                     log::info!(
                                         "[WRTC Media Video IN] First video frame received (SSRC: {}, len: {} bytes)",
-                                        pkt.header.ssrc, astp_slice.len()
+                                        pkt.header.ssrc, data.len()
                                     );
                                 }
-                                let _ = in_tx.send(astp_slice).await;
+                                let _ = in_tx.send(data).await;
                             }
                         }
                         TrackRemoteEvent::OnEnded => {
@@ -836,30 +827,40 @@ impl WrtcPeer {
                         }
 
                         if !sent && json_str.contains("ReceiverVideoConstraints") {
-                            // Критично для Android/JVB: если видео-ограничения отправлены до открытия канала,
-                            // ожидаем готовности канала до 3 секунд, чтобы JVB не остался без подписки на видео!
-                            for _ in 0..30 {
-                                tokio::time::sleep(Duration::from_millis(100)).await;
-                                if dc_is_open_out.load(Ordering::SeqCst) {
-                                    if let Some(ref dc_out) = dc_opt_out {
-                                        if dc_out.send_text(&json_str).await.is_ok() {
-                                            log::info!("[WRTC Constraints] Sent delayed video constraints via DataChannel");
-                                            sent = true;
+                            // Критично: отправка отложенных ограничений выполняется в фоне,
+                            // чтобы не блокировать основной цикл отправки сообщений (discover, ping, auth)!
+                            let dc_is_open_bg = dc_is_open_out.clone();
+                            let dc_opt_bg = dc_opt_out.clone();
+                            let remote_dc_bg = remote_dc_out.clone();
+                            let has_ws_bg = has_ws_out.clone();
+                            let ws_fallback_tx_bg = ws_fallback_tx_out.clone();
+                            let json_str_bg = json_str.clone();
+                            tokio::spawn(async move {
+                                for _ in 0..30 {
+                                    tokio::time::sleep(Duration::from_millis(100)).await;
+                                    if dc_is_open_bg.load(Ordering::SeqCst) {
+                                        if let Some(ref dc_out) = dc_opt_bg {
+                                            if dc_out.send_text(&json_str_bg).await.is_ok() {
+                                                log::info!("[WRTC Constraints] Sent delayed video constraints via DataChannel");
+                                                break;
+                                            }
+                                        }
+                                        let r_dc_opt = remote_dc_bg.lock().await.clone();
+                                        if let Some(r_dc) = r_dc_opt {
+                                            if r_dc.send_text(&json_str_bg).await.is_ok() {
+                                                log::info!("[WRTC Constraints] Sent delayed video constraints via Remote DataChannel");
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    if has_ws_bg.load(Ordering::SeqCst) {
+                                        if ws_fallback_tx_bg.try_send(json_str_bg.clone()).is_ok() {
+                                            log::info!("[WRTC Constraints] Sent delayed video constraints via Colibri-WS");
                                             break;
                                         }
                                     }
                                 }
-                                if has_ws_out.load(Ordering::SeqCst) {
-                                    if ws_fallback_tx_out.try_send(json_str.clone()).is_ok() {
-                                        log::info!("[WRTC Constraints] Sent delayed video constraints via Colibri-WS");
-                                        sent = true;
-                                        break;
-                                    }
-                                }
-                            }
-                            if !sent {
-                                log::warn!("[WRTC Constraints] Failed to deliver video constraints after 3s waiting");
-                            }
+                            });
                         }
                     }
                 });
@@ -940,7 +941,7 @@ impl WrtcPeer {
                         let seq = video_seq_c.fetch_add(1, Ordering::Relaxed);
                         let ts = video_ts_c.fetch_add(3000, Ordering::Relaxed);
 
-                        let mut keepalive_payload = BytesMut::with_capacity(4 + VP8_KEYFRAME_HEADER.len() + 2);
+                        let mut keepalive_payload = BytesMut::with_capacity(4 + VP8_KEYFRAME_HEADER.len());
                         let pic_id = (seq % 0x7FFF) as u16;
 
                         keepalive_payload.put_u8(0x90);
@@ -948,7 +949,6 @@ impl WrtcPeer {
                         keepalive_payload.put_u8(0x80 | ((pic_id >> 8) as u8));
                         keepalive_payload.put_u8((pic_id & 0xFF) as u8);
                         keepalive_payload.put_slice(&VP8_KEYFRAME_HEADER);
-                        keepalive_payload.put_u16(0);
 
                         let rtp_packet = RtpPacket {
                             header: RtpHeader {
@@ -1081,8 +1081,7 @@ impl WrtcPeer {
         let elapsed_ms = self.start_instant.elapsed().as_millis() as u64;
         let ts = ((elapsed_ms * 90) & 0xFFFFFFFF) as u32;
 
-        let astp_len = astp_data.len() as u16;
-        let mut payload = BytesMut::with_capacity(4 + VP8_KEYFRAME_HEADER.len() + 2 + astp_data.len());
+        let mut payload = BytesMut::with_capacity(4 + VP8_KEYFRAME_HEADER.len() + astp_data.len());
         let pic_id = (seq % 0x7FFF) as u16;
 
         payload.put_u8(0x90);
@@ -1091,7 +1090,6 @@ impl WrtcPeer {
         payload.put_u8((pic_id & 0xFF) as u8);
 
         payload.put_slice(&VP8_KEYFRAME_HEADER);
-        payload.put_u16(astp_len);
         payload.put_slice(astp_data);
 
         let rtp_packet = RtpPacket {
