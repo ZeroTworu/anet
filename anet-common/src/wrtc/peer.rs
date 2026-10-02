@@ -411,7 +411,7 @@ impl WrtcPeer {
         let video_seq = Arc::new(AtomicU16::new(0));
         let video_ts = Arc::new(AtomicU32::new(0));
         let expected_peer_video_ssrc = Arc::new(AtomicU32::new(0));
-        let remote_ssrc = 0;
+        let _remote_ssrc = 0;
 
         let (ws_fallback_tx, mut ws_fallback_rx) = mpsc::channel::<String>(8192);
         let has_ws = Arc::new(AtomicBool::new(false));

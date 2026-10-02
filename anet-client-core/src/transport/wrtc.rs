@@ -1,7 +1,6 @@
 use super::{ClientTransport, ConnectionResult};
 use crate::auth::{AuthChannel, AuthHandler};
 use crate::config::{CoreConfig, ServerConfig};
-use anet_common::consts::{CHANNEL_BUFFER_SIZE, MAX_PACKET_SIZE};
 use anet_common::encryption::Cipher;
 use anet_common::handshake_fragmentation::FragmentConfig;
 use anet_common::http_help::BrowserProfile;
@@ -649,7 +648,7 @@ impl ClientTransport for WrtcTransport {
             let guard = p2p_session_opt.lock().await;
             guard.as_ref().map(|p| p.is_open.load(Ordering::SeqCst)).unwrap_or(false)
         };
-        let effective_mode = Some(peer.effective_mode(p2p_open).to_string());
+        let effective_mode = Some(shared_peer.effective_mode(p2p_open).to_string());
         info!("[WRTC] Active transport mode: {:?}", effective_mode.as_deref().unwrap_or("UNKNOWN"));
 
         let remote_ip = bypass_ips.first().copied();
