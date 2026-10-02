@@ -899,7 +899,7 @@ impl UsersApi {
                                 );
 
                                 toml_str.push_str(&format!(
-                                    "[[servers]]\nname = \"{}\"\ndsn = \"{}\"\n{}{}{}timeout_secs = 8\nserver_pub_key = \"{}\"\ngroup_name = \"{}\"\ngroup_id = \"{}\"\nweight = {}\nweigth = {}\n\n",
+                                    "[[servers]]\nname = \"{}\"\ndsn = \"{}\"\n{}{}{}timeout_secs = 8\nserver_pub_key = \"{}\"\ngroup_name = \"{}\"\ngroup_id = \"{}\"\nweight = {}\n\n",
                                     display_name, dsn, ssh_user, wrtc_mode_line, server.public_key, pool_name, pool_id, weight, weight
                                 ));
                             }
@@ -1003,7 +1003,7 @@ impl UsersApi {
                         format!("{} [{}]", server.name.trim(), protocol.to_uppercase());
 
                     servers_toml.push_str(&format!(
-                        "[[servers]]\nname = \"{}\"\ndsn = \"{}\"\n{}{}{}timeout_secs = 8\nserver_pub_key = \"{}\"\n\n",
+                        "[[servers]]\nname = \"{}\"\ndsn = \"{}\"\n{}{}timeout_secs = 8\nserver_pub_key = \"{}\"\n\n",
                         display_name, dsn, ssh_user, extra_lines, server.public_key
                     ));
                 };
