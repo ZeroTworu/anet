@@ -36,8 +36,6 @@ fn generate_random_ssrc() -> u32 {
 }
 
 /// Корректный парсинг и отсечение VP8 Payload Descriptor (RFC 7741).
-/// Учитывает расширенные заголовки (X, I, L, T, K) и PictureID, которые JVB / SFU
-/// может вставлять или перезаписывать при роутинге видеопотока.
 pub fn strip_vp8_payload_descriptor(payload: Bytes) -> Option<Bytes> {
     if payload.is_empty() {
         return None;
@@ -61,7 +59,6 @@ pub fn strip_vp8_payload_descriptor(payload: Bytes) -> Option<Bytes> {
             }
             let pic_id_b0 = payload[offset];
             offset += 1;
-            // Если бит M (старший) установлен, PictureID занимает 16 бит (2 байта)
             if (pic_id_b0 & 0x80) != 0 {
                 if payload.len() <= offset {
                     return None;
@@ -144,7 +141,6 @@ impl PeerConnectionEventHandler for PeerEvents {
                                 }
                                 data = data.slice(VP8_KEYFRAME_HEADER.len()..);
                                 if data.is_empty() {
-                                    // Пустой keyframe keepalive от пира для прогрева JVB
                                     continue;
                                 }
                                 if first_rx.swap(false, Ordering::Relaxed) {
@@ -165,7 +161,6 @@ impl PeerConnectionEventHandler for PeerEvents {
                 }
             });
         } else if kind == RtpCodecKind::Audio {
-            // Вычитываем аудио-пакеты тишины Opus от JVB, чтобы предотвратить переполнение буфера track remote a0
             tokio::spawn(async move {
                 while let Some(event) = track.poll().await {
                     if matches!(event, TrackRemoteEvent::OnEnded) {
@@ -416,7 +411,6 @@ impl WrtcPeer {
         let expected_peer_video_ssrc = Arc::new(AtomicU32::new(0));
         let remote_ssrc = 0;
 
-        // Подключаем Colibri-WS (основной канал для Ws, параллельный fallback для Auto/JvbDatachannel)
         let (ws_fallback_tx, mut ws_fallback_rx) = mpsc::channel::<String>(8192);
         let has_ws = Arc::new(AtomicBool::new(false));
 
@@ -507,19 +501,22 @@ impl WrtcPeer {
                 ..Default::default()
             };
             media_engine.register_codec(video_codec.clone(), RtpCodecKind::Video)?;
+
             if video_pt != 96 {
                 let mut fallback_vcodec = video_codec.clone();
                 fallback_vcodec.payload_type = 96;
                 let _ = media_engine.register_codec(fallback_vcodec, RtpCodecKind::Video);
+            }
+            if video_pt != 100 {
+                let mut fallback_vcodec2 = video_codec.clone();
+                fallback_vcodec2.payload_type = 100;
+                let _ = media_engine.register_codec(fallback_vcodec2, RtpCodecKind::Video);
             }
 
             let registry = register_default_interceptors(Registry::new(), &mut media_engine)?;
 
             let bind_addr = "0.0.0.0:0".to_string();
 
-            // ВАЖНО: Для соединения с JVB STUN-серверы НЕ используются!
-            // Мост JVB всегда имеет прямой публичный IP, а ответы STUN Контура
-            // не содержат атрибута USERNAME, что приводит к ошибкам TransactionTimeOut.
             let config = RTCConfigurationBuilder::new()
                 .with_ice_servers(vec![])
                 .build();
@@ -567,7 +564,6 @@ impl WrtcPeer {
             if let Ok(pc_impl) = pc_res {
                 let pc: Arc<dyn PeerConnection> = Arc::new(pc_impl);
 
-                // 1. Добавляем Opus-аудиотрек для удержания сессии в JVB
                 let audio_track_desc = MediaStreamTrack::new(
                     format!("webrtc-rs-stream-id-{}", RtpCodecKind::Audio),
                     format!("webrtc-rs-track-id-{}", RtpCodecKind::Audio),
@@ -587,7 +583,6 @@ impl WrtcPeer {
                     .add_track(Arc::clone(&audio_track) as Arc<dyn TrackLocal>)
                     .await;
 
-                // 2. Добавляем Fake Video Track (VP8) для высокоскоростного Data Plane
                 let video_track_desc = MediaStreamTrack::new(
                     format!("webrtc-rs-stream-id-{}", RtpCodecKind::Video),
                     format!("webrtc-rs-track-id-{}", RtpCodecKind::Video),
@@ -607,7 +602,6 @@ impl WrtcPeer {
                     .add_track(Arc::clone(&video_track) as Arc<dyn TrackLocal>)
                     .await;
 
-                // 3. Создаем WebRTC DataChannel только если JVB/Jicofo анонсировал секцию данных
                 let mut data_channel_res = None;
                 if session.has_data_channel && mode != WrtcMode::Ws {
                     let dc_init = RTCDataChannelInit {
@@ -669,8 +663,7 @@ impl WrtcPeer {
                     log::info!("[WRTC DataChannel] JVB bridge does not announce SCTP DataChannel in session-initiate. Operating over Colibri-WS with PacketBatcher.");
                 }
 
-                // 4. Применяем Jingle Offer от Jicofo/JVB и создаем локальный Answer
-                let sdp_str = session.to_sdp(fallback_ip, fallback_port, remote_ssrc, local_video_ssrc);
+                let sdp_str = session.to_sdp(fallback_ip, fallback_port, 0, local_video_ssrc);
                 if let Ok(offer) = RTCSessionDescription::offer(sdp_str) {
                     if pc.set_remote_description(offer).await.is_ok() {
                         if let Ok(answer) = pc.create_answer(None).await {
@@ -717,7 +710,6 @@ impl WrtcPeer {
                     }
                 }
 
-                // 5. Воркер отправки данных в DataChannel с бесшовным fallback в Colibri-WS
                 let dc_opt_out = data_channel_res.clone();
                 let remote_dc_out = remote_dc.clone();
                 let dc_is_open_out = dc_is_open.clone();
@@ -789,7 +781,6 @@ impl WrtcPeer {
                             }
                         }
 
-                        // Fallback в Colibri-WS если DataChannel еще не открыт или временно перегружен
                         if !sent && has_ws_out.load(Ordering::SeqCst) {
                             if is_astp || is_batch {
                                 log::trace!("[JVB WS OUT ASTP]");
@@ -808,7 +799,6 @@ impl WrtcPeer {
                     }
                 });
 
-                // 6. Фоновый keepalive аудио-тишины Opus (непрерывный, устойчивый к мобильному CGNAT)
                 let track_keepalive = Arc::clone(&audio_track);
                 let seq_c = Arc::new(AtomicU16::new(0));
                 let ts_c = Arc::new(AtomicU32::new(0));
@@ -856,14 +846,12 @@ impl WrtcPeer {
                             },
                             payload: silence_payload.clone(),
                         };
-                        // Отправляем пакет тишины. Никогда не делаем break из цикла при ошибках сокета/CGNAT!
                         if let Err(e) = track_keepalive.write_rtp(rtp_packet).await {
                             log::trace!("[WRTC Media] Opus silence write_rtp transient error: {e}");
                         }
                     }
                 });
 
-                // 7. Фоновый keepalive видео-трека VP8 для удержания полосы и SFU-маршрутизации JVB
                 let video_track_keepalive = Arc::clone(&video_track);
                 let video_seq_c = Arc::clone(&video_seq);
                 let video_ts_c = Arc::clone(&video_ts);
@@ -882,15 +870,20 @@ impl WrtcPeer {
                     let mut interval = tokio::time::interval(Duration::from_millis(1000));
                     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-                    let mut keepalive_payload = BytesMut::with_capacity(1 + VP8_KEYFRAME_HEADER.len());
-                    keepalive_payload.put_u8(0x10);
-                    keepalive_payload.put_slice(&VP8_KEYFRAME_HEADER);
-                    let keepalive_frozen = keepalive_payload.freeze();
-
                     loop {
                         interval.tick().await;
                         let seq = video_seq_c.fetch_add(1, Ordering::Relaxed);
                         let ts = video_ts_c.fetch_add(3000, Ordering::Relaxed);
+
+                        let mut keepalive_payload = BytesMut::with_capacity(4 + VP8_KEYFRAME_HEADER.len());
+                        let pic_id = (seq % 0x7FFF) as u16;
+
+                        keepalive_payload.put_u8(0x90);
+                        keepalive_payload.put_u8(0x80);
+                        keepalive_payload.put_u8(0x80 | ((pic_id >> 8) as u8));
+                        keepalive_payload.put_u8((pic_id & 0xFF) as u8);
+                        keepalive_payload.put_slice(&VP8_KEYFRAME_HEADER);
+
                         let rtp_packet = RtpPacket {
                             header: RtpHeader {
                                 version: 2,
@@ -906,7 +899,7 @@ impl WrtcPeer {
                                 extensions: vec![],
                                 extensions_padding: 0,
                             },
-                            payload: keepalive_frozen.clone(),
+                            payload: keepalive_payload.freeze(),
                         };
                         if let Err(e) = video_track_keepalive.write_rtp(rtp_packet).await {
                             log::trace!("[WRTC Media] VP8 video keepalive transient error: {e}");
@@ -948,6 +941,40 @@ impl WrtcPeer {
         self.expected_peer_video_ssrc.store(ssrc, Ordering::SeqCst);
     }
 
+    pub async fn add_remote_video_ssrc(&self, ssrc: u32) {
+        if let Some(ref pc) = self.peer_connection {
+            if let Some(mut remote_desc) = pc.remote_description().await {
+                if !remote_desc.sdp.contains(&format!("a=ssrc:{}", ssrc)) {
+                    let mut new_sdp = String::new();
+                    let mut in_video = false;
+                    for line in remote_desc.sdp.lines() {
+                        new_sdp.push_str(line);
+                        new_sdp.push_str("\r\n");
+                        if line.starts_with("m=video") {
+                            in_video = true;
+                        } else if line.starts_with("m=") && !line.starts_with("m=video") {
+                            in_video = false;
+                        }
+
+                        if in_video && line.starts_with("a=sendrecv") {
+                            new_sdp.push_str(&format!("a=ssrc:{} cname:anet_dyn\r\n", ssrc));
+                            new_sdp.push_str(&format!("a=ssrc:{} msid:anet_dyn v0\r\n", ssrc));
+                        }
+                    }
+                    remote_desc.sdp = new_sdp;
+                    if let Err(e) = pc.set_remote_description(remote_desc).await {
+                        log::warn!("[WRTC Media] Failed to inject remote SSRC {}: {}", ssrc, e);
+                    } else {
+                        log::info!("[WRTC Media] Successfully injected remote SSRC {} into PC", ssrc);
+                        if let Ok(answer) = pc.create_answer(None).await {
+                            let _ = pc.set_local_description(answer).await;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     pub async fn send_video_frame(&self, astp_data: &[u8]) -> anyhow::Result<()> {
         let Some(ref track) = self.video_track else {
             anyhow::bail!("Video track not initialized");
@@ -960,21 +987,26 @@ impl WrtcPeer {
             );
         }
 
-        // Формируем полезную нагрузку VP8: 1 байт Payload Descriptor (0x10) + VP8_KEYFRAME_HEADER + ASTP данные
-        let mut payload = BytesMut::with_capacity(1 + VP8_KEYFRAME_HEADER.len() + astp_data.len());
-        payload.put_u8(0x10); // Start of partition, PartID = 0 (RFC 7741)
+        let seq = self.video_seq.fetch_add(1, Ordering::Relaxed);
+        let ts = self.video_ts.fetch_add(3000, Ordering::Relaxed);
+
+        let mut payload = BytesMut::with_capacity(4 + VP8_KEYFRAME_HEADER.len() + astp_data.len());
+        let pic_id = (seq % 0x7FFF) as u16;
+
+        payload.put_u8(0x90);
+        payload.put_u8(0x80);
+        payload.put_u8(0x80 | ((pic_id >> 8) as u8));
+        payload.put_u8((pic_id & 0xFF) as u8);
+
         payload.put_slice(&VP8_KEYFRAME_HEADER);
         payload.put_slice(astp_data);
-
-        let seq = self.video_seq.fetch_add(1, Ordering::Relaxed);
-        let ts = self.video_ts.fetch_add(3000, Ordering::Relaxed); // 90000 / 30fps = 3000
 
         let rtp_packet = RtpPacket {
             header: RtpHeader {
                 version: 2,
                 padding: false,
                 extension: false,
-                marker: true, // Маркер конца кадра для немедленной отправки в JVB
+                marker: true,
                 payload_type: self.video_payload_type,
                 sequence_number: seq,
                 timestamp: ts,

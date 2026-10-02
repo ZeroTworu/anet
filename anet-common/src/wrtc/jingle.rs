@@ -49,7 +49,7 @@ impl JingleSession {
         &self,
         fallback_ip: &str,
         fallback_port: u16,
-        remote_ssrc: u32,
+        _remote_ssrc: u32,
         _video_ssrc: u32,
     ) -> String {
         let (primary_ip, primary_port) = if let Some(first) = self
@@ -94,21 +94,6 @@ impl JingleSession {
                 fallback_ip, fallback_port
             ));
         }
-        let mut ssrc_lines = String::new();
-        if remote_ssrc != 0 {
-            ssrc_lines.push_str(&format!(
-                "a=ssrc:{remote_ssrc} cname:cname_{remote_ssrc:x}\r\n\
-                 a=ssrc:{remote_ssrc} msid:msid_{remote_ssrc:x} a0\r\n"
-            ));
-        }
-        for ssrc in &self.sources {
-            if *ssrc != remote_ssrc && *ssrc != 0 {
-                ssrc_lines.push_str(&format!(
-                    "a=ssrc:{ssrc} cname:cname_{ssrc:x}\r\n\
-                     a=ssrc:{ssrc} msid:msid_{ssrc:x} a0\r\n"
-                ));
-            }
-        }
 
         let include_video = self.has_video;
         let mut bundle_groups = vec!["audio"];
@@ -120,29 +105,22 @@ impl JingleSession {
         }
         let bundle_str = bundle_groups.join(" ");
 
+        // ВАЖНО: Удалены жесткие a=ssrc для Remote SDP, чтобы webrtc-rs принимал любые SSRC от JVB
         let video_section = if include_video {
-            let mut v_ssrc_lines = String::new();
-            for ssrc in &self.video_sources {
-                if *ssrc != 0 {
-                    v_ssrc_lines.push_str(&format!(
-                        "a=ssrc:{ssrc} cname:cname_{ssrc:x}\r\n\
-                         a=ssrc:{ssrc} msid:msid_{ssrc:x} v0\r\n"
-                    ));
-                }
-            }
             let pt = self.video_payload_type;
+            let alt_pt = if pt == 100 { 96 } else { 100 };
             format!(
-                "m=video {primary_port} UDP/TLS/RTP/SAVPF {pt}\r\n\
+                "m=video {primary_port} UDP/TLS/RTP/SAVPF {pt} {alt_pt}\r\n\
                  c=IN IP4 {primary_ip}\r\n\
                  a=rtcp-mux\r\n\
                  a=rtpmap:{pt} VP8/90000\r\n\
+                 a=rtpmap:{alt_pt} VP8/90000\r\n\
                  a=ice-ufrag:{ufrag}\r\n\
                  a=ice-pwd:{pwd}\r\n\
                  a=fingerprint:{fp_hash} {fp}\r\n\
                  a=setup:{setup}\r\n\
                  a=mid:video\r\n\
                  a=sendrecv\r\n\
-                 {v_ssrc_lines}\
                  {candidate_lines}"
             )
         } else {
@@ -184,7 +162,6 @@ impl JingleSession {
              a=setup:{setup}\r\n\
              a=mid:audio\r\n\
              a=sendrecv\r\n\
-             {ssrc_lines}\
              {candidate_lines}\
              {video_section}\
              {data_section}"

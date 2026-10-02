@@ -232,6 +232,10 @@ pub async fn run_wrtc_server(
                     if let Some(c_v_ssrc) = video_ssrc {
                         shared_peer.set_expected_peer_video_ssrc(c_v_ssrc);
                         info!("[WRTC Server] Set expected client video SSRC: {c_v_ssrc}");
+
+                        // ИНЖЕКТИРУЕМ SSRC КЛИЕНТА В REMOTE_DESCRIPTION
+                        shared_peer.add_remote_video_ssrc(c_v_ssrc).await;
+
                         let constraints = anet_common::wrtc::colibri::ReceiverVideoConstraints::for_endpoint(&from_endpoint, 720);
                         let _ = shared_peer.send_video_constraints(&constraints).await;
                     }

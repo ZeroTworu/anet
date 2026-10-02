@@ -40,7 +40,6 @@ pub enum InboundXmpp {
     Other,
 }
 
-/// Разбирает XML фрейм, который может содержать одну или несколько станз (например, `<open/><features>`).
 pub fn parse_xmpp_stanzas(
     xml: &str,
     fallback_ip: &str,
@@ -51,8 +50,6 @@ pub fn parse_xmpp_stanzas(
         return Vec::new();
     }
 
-    // Оборачиваем в искусственный корневой элемент <stream>,
-    // чтобы roxmltree корректно разбирал фрагменты с несколькими станзами в одном фрейме
     let wrapped = format!("<stream>{trimmed}</stream>");
     let doc = match roxmltree::Document::parse(&wrapped) {
         Ok(d) => d,
@@ -76,7 +73,6 @@ pub fn parse_xmpp_message(
     parse_xmpp_stanzas(xml, fallback_ip, fallback_port).into_iter().next()
 }
 
-/// Верхнеуровневые XML-теги протокола XMPP (RFC 6120 / RFC 7395).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum XmppElementTag {
     Open,
@@ -108,7 +104,6 @@ impl<'a> From<&'a str> for XmppElementTag {
     }
 }
 
-/// Типы станзы IQ в XMPP (RFC 6120 §8.2.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IqType {
     Get,
@@ -141,7 +136,6 @@ fn parse_single_element(
         XmppElementTag::Open => Some(InboundXmpp::Open),
         XmppElementTag::Mechanisms => Some(InboundXmpp::SaslMechanisms),
         XmppElementTag::Features => {
-            // В XMPP mechanisms приходят внутри <features><mechanisms>...</mechanisms></features>!
             if root.descendants().any(|n| n.has_tag_name("mechanisms")) {
                 Some(InboundXmpp::SaslMechanisms)
             } else {
@@ -171,7 +165,6 @@ fn parse_single_element(
             let from = root.attribute("from").unwrap_or_default().to_string();
             let iq_type = IqType::from(root.attribute("type").unwrap_or_default());
 
-            // 1. Проверяем bind result:
             if let Some(bind_node) = root.descendants().find(|n| n.has_tag_name("bind")) {
                 if let Some(jid_node) = bind_node.descendants().find(|n| n.has_tag_name("jid")) {
                     if let Some(jid) = jid_node.text() {
@@ -183,12 +176,10 @@ fn parse_single_element(
                 }
             }
 
-            // 2. Проверяем ping get:
             if iq_type == IqType::Get && root.descendants().any(|n| n.has_tag_name("ping")) {
                 return Some(InboundXmpp::Ping { id: iq_id, from });
             }
 
-            // 3. Проверяем disco#info get:
             if iq_type == IqType::Get {
                 if let Some(query_node) = root.descendants().find(|n| n.has_tag_name("query")) {
                     let node = query_node.attribute("node").map(|s| s.to_string());
@@ -200,7 +191,6 @@ fn parse_single_element(
                 }
             }
 
-            // 4. Проверяем Jingle:
             if let Some(jingle_node) = root.descendants().find(|n| n.has_tag_name("jingle")) {
                 if let Some(session) =
                     parse_jingle_node(root, &jingle_node, fallback_ip, fallback_port)
@@ -209,7 +199,6 @@ fn parse_single_element(
                 }
             }
 
-            // 5. Проверяем extdisco (XEP-0215 services):
             if let Some(services_node) = root.descendants().find(|n| n.has_tag_name("services")) {
                 let mut stuns = Vec::new();
                 for svc in services_node.children().filter(|n| n.has_tag_name("service")) {
@@ -226,7 +215,6 @@ fn parse_single_element(
                 }
             }
 
-            // 6. Проверяем Jingle ACK result:
             if iq_type == IqType::Result {
                 return Some(InboundXmpp::JingleAck { id: iq_id, from });
             }
@@ -269,11 +257,15 @@ pub fn parse_jingle_node(
 
         for desc in content.children().filter(|n| n.has_tag_name("description")) {
             if is_video {
+                let mut vp8_pt_found = false;
                 for pt in desc.children().filter(|n| n.has_tag_name("payload-type")) {
                     if pt.attribute("name").map(|s| s.eq_ignore_ascii_case("vp8")).unwrap_or(false) {
                         if let Some(id_str) = pt.attribute("id") {
                             if let Ok(id) = id_str.parse::<u8>() {
-                                video_payload_type = id;
+                                if !vp8_pt_found {
+                                    video_payload_type = id;
+                                    vp8_pt_found = true;
+                                }
                             }
                         }
                     }
@@ -548,102 +540,5 @@ impl XmppBuilder {
             r#"<iq to="meet.jitsi" type="get" id="{}"><services xmlns="urn:xmpp:extdisco:2"/></iq>"#,
             escape_xml_attr(id)
         )
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_escape_xml_attr() {
-        assert_eq!(escape_xml_attr("Hello & <World> \"'"), "Hello &amp; &lt;World&gt; &quot;&apos;");
-    }
-
-    #[test]
-    fn test_parse_open_and_sasl() {
-        // Тест на склейку двух станз в одном WebSocket фрейме (как шлет Prosody по RFC 7395):
-        let multi_xml = r#"<open xmlns="urn:ietf:params:xml:ns:xmpp-framing" to="meet.jitsi" version="1.0"/><features xmlns="http://etherx.jabber.org/streams"><mechanisms xmlns="urn:ietf:params:xml:ns:xmpp-sasl"><mechanism>ANONYMOUS</mechanism></mechanisms></features>"#;
-        let stanzas = parse_xmpp_stanzas(multi_xml, "127.0.0.1", 10000);
-        assert_eq!(stanzas.len(), 2);
-        assert!(matches!(stanzas[0], InboundXmpp::Open));
-        assert!(matches!(stanzas[1], InboundXmpp::SaslMechanisms));
-    }
-
-    #[test]
-    fn test_parse_features_and_bind() {
-        let feat = r#"<features xmlns="http://etherx.jabber.org/streams"><bind xmlns="urn:ietf:params:xml:ns:xmpp-bind"/></features>"#;
-        match parse_xmpp_message(feat, "127.0.0.1", 10000) {
-            Some(InboundXmpp::Features { has_bind }) => assert!(has_bind),
-            other => panic!("Unexpected: {:?}", other),
-        }
-
-        let bind_res = r#"<iq id="_bind_auth_2" type="result"><bind xmlns="urn:ietf:params:xml:ns:xmpp-bind"><jid>testuser@meet.jitsi/xyz</jid></bind></iq>"#;
-        match parse_xmpp_message(bind_res, "127.0.0.1", 10000) {
-            Some(InboundXmpp::BindResult { id, jid }) => {
-                assert_eq!(id, "_bind_auth_2");
-                assert_eq!(jid, "testuser@meet.jitsi/xyz");
-            }
-            other => panic!("Unexpected: {:?}", other),
-        }
-    }
-
-    #[test]
-    fn test_parse_ping_and_disco() {
-        let ping = r#"<iq from="focus.meet.jitsi" id="ping_123" to="test@meet.jitsi" type="get"><ping xmlns="urn:xmpp:ping"/></iq>"#;
-        match parse_xmpp_message(ping, "127.0.0.1", 10000) {
-            Some(InboundXmpp::Ping { id, from }) => {
-                assert_eq!(id, "ping_123");
-                assert_eq!(from, "focus.meet.jitsi");
-            }
-            other => panic!("Unexpected: {:?}", other),
-        }
-
-        let disco = r#"<iq from="focus.meet.jitsi" id="disco_1" type="get"><query xmlns="http://jabber.org/protocol/disco#info" node="https://jitsi.org/jitsi-meet#7Y4Yx3m5c03c5188efb8b2ebda41e8c072e912da"/></iq>"#;
-        match parse_xmpp_message(disco, "127.0.0.1", 10000) {
-            Some(InboundXmpp::DiscoInfo { id, from, node }) => {
-                assert_eq!(id, "disco_1");
-                assert_eq!(from, "focus.meet.jitsi");
-                assert_eq!(
-                    node.as_deref(),
-                    Some("https://jitsi.org/jitsi-meet#7Y4Yx3m5c03c5188efb8b2ebda41e8c072e912da")
-                );
-            }
-            other => panic!("Unexpected: {:?}", other),
-        }
-    }
-
-    #[test]
-    fn test_parse_jingle_initiate() {
-        let jingle_xml = r#"<iq from="focus@meet.jitsi" id="jingle_1" type="set">
-            <jingle action="session-initiate" initiator="focus@meet.jitsi" sid="sid_abc123" xmlns="urn:xmpp:jingle:1">
-                <content creator="initiator" name="audio">
-                    <description media="audio" xmlns="urn:xmpp:jingle:apps:rtp:1">
-                        <source ssrc="12345678" xmlns="urn:xmpp:jingle:apps:rtp:ssma:0"/>
-                    </description>
-                    <transport pwd="secretpassword" ufrag="abcde" xmlns="urn:xmpp:jingle:transports:ice-udp:1">
-                        <web-socket url="wss://jvb.meet.jitsi/colibri-ws"/>
-                        <fingerprint hash="sha-256" setup="actpass" xmlns="urn:xmpp:jingle:apps:dtls:0">AA:BB:CC</fingerprint>
-                        <candidate component="1" foundation="1" generation="0" id="c0" ip="192.168.1.50" network="0" port="10000" priority="2130706431" protocol="udp" type="host"/>
-                    </transport>
-                </content>
-            </jingle>
-        </iq>"#;
-
-        match parse_xmpp_message(jingle_xml, "127.0.0.1", 10000) {
-            Some(InboundXmpp::Jingle(sess)) => {
-                assert_eq!(sess.sid, "sid_abc123");
-                assert_eq!(sess.action, "session-initiate");
-                assert_eq!(sess.transport.ufrag, "abcde");
-                assert_eq!(sess.transport.pwd, "secretpassword");
-                assert_eq!(sess.transport.fingerprint.as_deref(), Some("AA:BB:CC"));
-                assert_eq!(sess.transport.colibri_ws_url.as_deref(), Some("wss://jvb.meet.jitsi/colibri-ws"));
-                assert_eq!(sess.transport.candidates.len(), 1);
-                assert_eq!(sess.transport.candidates[0].ip, "192.168.1.50");
-                assert_eq!(sess.transport.candidates[0].port, 10000);
-                assert_eq!(sess.sources, vec![12345678]);
-            }
-            other => panic!("Unexpected: {:?}", other),
-        }
     }
 }

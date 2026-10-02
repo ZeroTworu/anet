@@ -90,7 +90,6 @@ impl ClientTransport for WrtcTransport {
             room_name, domain, guest_name
         );
 
-        // 1. Авторизация гостя через REST API
         let ktalk = KtalkClient::new(browser_profile.clone());
         let anon_secret = KtalkClient::generate_anonymous_secret();
         let auth_res = ktalk
@@ -98,13 +97,11 @@ impl ClientTransport for WrtcTransport {
             .await
             .context("Failed to authorize Ktalk session")?;
 
-        // 2. Получение conferenceId
         let room_info = ktalk
             .resolve_room(&domain, &room_name, &auth_res.token)
             .await
             .context("Failed to resolve Ktalk room")?;
 
-        // 3. XMPP сигналинг через WebSocket
         let ping_secs = self.server.wrtc_ping_interval_secs.unwrap_or(30);
         let mut xmpp = XmppSession::connect(
             &domain,
@@ -117,7 +114,6 @@ impl ClientTransport for WrtcTransport {
             .await
             .context("Failed to establish XMPP session and join conference MUC")?;
 
-        // 4. Jingle negotiation и получение параметров JVB
         let fallback_ip = self
             .server
             .wrtc_fallback_jvb_ip
@@ -210,7 +206,6 @@ impl ClientTransport for WrtcTransport {
         bypass_ips.dedup();
         info!("[WRTC] Discovered media bypass IPs: {:?}", bypass_ips);
 
-        // 5. Создание соединения (Colibri-WS с фоновым WebRTC keepalive или DataChannel)
         let wrtc_mode = self.server.wrtc_transport_mode();
         info!("[WRTC] Selected WebRTC transport mode: {:?}", wrtc_mode);
 
@@ -228,7 +223,6 @@ impl ClientTransport for WrtcTransport {
 
         info!("[WRTC] WebRTC Peer created. Starting server discovery...");
 
-        // 6. Discovery фаза: опрос участников комнаты
         let client_nonce = format!("{:016x}", rand::random::<u64>());
         let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
         let mut interval = tokio::time::interval(Duration::from_secs(2));
@@ -268,6 +262,10 @@ impl ClientTransport for WrtcTransport {
                                 if let Some(v_ssrc) = video_ssrc {
                                     peer.set_expected_peer_video_ssrc(v_ssrc);
                                     info!("[WRTC Client] Set expected server video SSRC: {v_ssrc}");
+
+                                    // ИНЖЕКТИРУЕМ SSRC СЕРВЕРА В REMOTE_DESCRIPTION
+                                    peer.add_remote_video_ssrc(v_ssrc).await;
+
                                     let constraints = anet_common::wrtc::colibri::ReceiverVideoConstraints::for_endpoint(&server_id, 720);
                                     let _ = peer.send_video_constraints(&constraints).await;
                                 }
@@ -307,7 +305,6 @@ impl ClientTransport for WrtcTransport {
 
         info!("[WRTC] Starting ASTP authentication with server: {target_server_id}");
 
-        // 7. ASTP аутентификация
         let shared_peer = Arc::new(peer);
         let auth_channel = WrtcAuthChannel {
             peer: shared_peer.clone(),
@@ -317,9 +314,6 @@ impl ClientTransport for WrtcTransport {
         let auth_handler = AuthHandler::new(&self.config, self.server.server_pub_key.as_deref())?;
         let (mut auth_response, shared_key) = auth_handler.authenticate(&auth_channel).await?;
 
-        // Для WebRTC транспорта безопасный MTU интерфейса TUN равен 1200 байт
-        // (RFC 8831 / JVB safe UDP MTU = 1280), чтобы гарантированно исключить EMSGSIZE (os error 90)
-        // и фрагментацию на уровне UDP/SFU.
         if wrtc_mode == anet_common::wrtc::colibri::WrtcMode::MediaVideo || auth_response.mtu > 1200 {
             info!(
                 "[WRTC] Setting safe TUN MTU {} (clamped from {}) for WebRTC DTLS-SRTP packetization",
@@ -337,7 +331,6 @@ impl ClientTransport for WrtcTransport {
         let nonce_prefix: [u8; 4] = auth_response.nonce_prefix.as_slice().try_into()?;
         let sequence = Arc::new(AtomicU64::new(0));
 
-        // 8. Инициализация Tier 1 P2P Direct если включен режим P2pDirect или Auto
         let p2p_session_opt: Arc<Mutex<Option<Arc<P2pSession>>>> = Arc::new(Mutex::new(None));
         if wrtc_mode == anet_common::wrtc::colibri::WrtcMode::P2pDirect
             || wrtc_mode == anet_common::wrtc::colibri::WrtcMode::Auto
@@ -397,7 +390,6 @@ impl ClientTransport for WrtcTransport {
             });
         }
 
-        // 9. Создание дуплексного потока для ядра VPN
         let (client_stream, internal_router) = tokio::io::duplex(MAX_PACKET_SIZE * 10);
         let (mut tunnel_read, mut tunnel_write) = tokio::io::split(internal_router);
         let (tunnel_packet_tx, mut tunnel_packet_rx) =
@@ -411,7 +403,6 @@ impl ClientTransport for WrtcTransport {
             }
         });
 
-        // Канал доставки декодированных IP-пакетов в TUN
         let (tun_inject_tx, mut tun_inject_rx) =
             tokio::sync::mpsc::channel::<Bytes>(CHANNEL_BUFFER_SIZE);
 
@@ -425,7 +416,6 @@ impl ClientTransport for WrtcTransport {
             }
         });
 
-        // Воркер Uplink: TUN -> WebRTC (P2P Direct или микробатчинг Colibri-WS)
         let peer_tx = shared_peer.clone();
         let target_srv_tx = target_server_id.clone();
         let cipher_tx = cipher.clone();
@@ -453,7 +443,6 @@ impl ClientTransport for WrtcTransport {
                                 let enc_bytes = Bytes::from(encrypted);
                                 let mut sent_p2p = false;
 
-                                // 1. Проверяем режим MediaVideo (Fake Video Track over DTLS-SRTP / JVB)
                                 if wrtc_mode == anet_common::wrtc::colibri::WrtcMode::MediaVideo {
                                     if let Err(e) = peer_tx.send_video_frame(&enc_bytes).await {
                                         warn!("[WRTC Media Video OUT] send error: {e}");
@@ -461,7 +450,6 @@ impl ClientTransport for WrtcTransport {
                                     continue;
                                 }
 
-                                // 2. Проверяем прямой P2P DataChannel (Tier 1)
                                 let p2p_opt = {
                                     let guard = p2p_uplink.lock().await;
                                     guard.clone()
@@ -475,7 +463,6 @@ impl ClientTransport for WrtcTransport {
                                     }
                                 }
 
-                                // 3. Если P2P еще не открыт или недоступен, отправляем через батчер (Tier 2/3)
                                 if !sent_p2p {
                                     batcher.push(enc_bytes);
                                     if batcher.should_flush() {
@@ -524,7 +511,6 @@ impl ClientTransport for WrtcTransport {
             tunnel_reader_task.abort();
         });
 
-        // Воркер Downlink из сигнального канала и Colibri-WS (Astp/AstpBatch/P2pAnswer)
         let peer_rx = shared_peer.clone();
         let cipher_rx = cipher.clone();
         let tun_inject_ws = tun_inject_tx.clone();
@@ -603,7 +589,6 @@ impl ClientTransport for WrtcTransport {
             }
         });
 
-        // Воркер Downlink из прямого P2P DataChannel (Tier 1)
         let p2p_rx_task = p2p_session_opt.clone();
         let cipher_p2p = cipher.clone();
         let tun_inject_p2p = tun_inject_tx.clone();
@@ -635,7 +620,6 @@ impl ClientTransport for WrtcTransport {
             }
         });
 
-        // Воркер Downlink из Fake Video Track (VP8 over DTLS-SRTP / JVB)
         let peer_video_rx = shared_peer.clone();
         let cipher_video = cipher.clone();
         let tun_inject_video = tun_inject_tx.clone();
