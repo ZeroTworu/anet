@@ -203,9 +203,10 @@ impl TunFactory for AndroidCallbackTunFactory {
 
         // Резолвим конфиги в структуры IpNet
         let include_nets = self.resolve_to_ipnet(&self.config.main.route_for).await;
-        let mut exclude_nets = self
+        let user_excludes = self
             .resolve_to_ipnet(&self.config.main.exclude_route_for)
             .await;
+        let mut exclude_nets = user_excludes.clone();
 
         // ВАЖНО: Добавляем системные IP обхода (bypass_ips) в исключения Android VpnService,
         // чтобы трафик к медиасерверам JVB/Ktalk (UDP 10000-20000) и серверу не заворачивался в tun0
@@ -227,10 +228,14 @@ impl TunFactory for AndroidCallbackTunFactory {
         let include_str = Self::ipnet_list_to_string(&include_nets);
         let exclude_str = Self::ipnet_list_to_string(&exclude_nets);
 
-        // Генерация Fallback (эмуляция exclude для старых Android)
-        // Считаем только если есть исключения и нет белого списка
-        let fallback_str = if include_nets.is_empty() && !exclude_nets.is_empty() {
-            let fallback_nets = Self::calculate_fallback_routes(&exclude_nets);
+        // Генерация Fallback (эмуляция exclude для старых Android).
+        // Для Legacy Android (Android 11 и ниже) вычисляем fallback routes ТОЛЬКО если
+        // пользователь явно настроил exclude_route_for. Если пользовательских исключений нет,
+        // системные bypass_ips гарантированно защищены через builder.addDisallowedApplication(packageName),
+        // а искусственное дробление 0.0.0.0/0 на 150-250 подсетей переполняет таблицу маршрутизации netd
+        // и ломает системный DNS на Android 11.
+        let fallback_str = if include_nets.is_empty() && !user_excludes.is_empty() {
+            let fallback_nets = Self::calculate_fallback_routes(&user_excludes);
             Self::ipnet_list_to_string(&fallback_nets)
         } else {
             String::new()

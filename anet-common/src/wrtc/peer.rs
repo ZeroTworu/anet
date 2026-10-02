@@ -672,14 +672,14 @@ impl WrtcPeer {
                             let _ = pc.set_local_description(answer.clone()).await;
 
                             let mut final_sdp = answer.sdp.clone();
-                            for _ in 0..25 {
+                            for _ in 0..50 {
                                 if let Some(desc) = pc.local_description().await {
                                     if desc.sdp.contains("a=candidate:") {
                                         final_sdp = desc.sdp;
                                         break;
                                     }
                                 }
-                                tokio::time::sleep(Duration::from_millis(20)).await;
+                                tokio::time::sleep(Duration::from_millis(30)).await;
                             }
 
                             let local_params = crate::wrtc::jingle::parse_sdp_answer(&final_sdp);
@@ -789,13 +789,42 @@ impl WrtcPeer {
                             } else {
                                 log::info!("[JVB WS OUT]: {json_str}");
                             }
-                            if let Err(e) = ws_fallback_tx_out.try_send(json_str) {
+                            if let Err(e) = ws_fallback_tx_out.try_send(json_str.clone()) {
                                 match e {
                                     tokio::sync::mpsc::error::TrySendError::Full(_) => {
                                         log::warn!("[WRTC WS] Fallback queue full, frame dropped");
                                     }
                                     tokio::sync::mpsc::error::TrySendError::Closed(_) => {}
                                 }
+                            } else {
+                                sent = true;
+                            }
+                        }
+
+                        if !sent && json_str.contains("ReceiverVideoConstraints") {
+                            // Критично для Android/JVB: если видео-ограничения отправлены до открытия канала,
+                            // ожидаем готовности канала до 3 секунд, чтобы JVB не остался без подписки на видео!
+                            for _ in 0..30 {
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                                if dc_is_open_out.load(Ordering::SeqCst) {
+                                    if let Some(ref dc_out) = dc_opt_out {
+                                        if dc_out.send_text(&json_str).await.is_ok() {
+                                            log::info!("[WRTC Constraints] Sent delayed video constraints via DataChannel");
+                                            sent = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if has_ws_out.load(Ordering::SeqCst) {
+                                    if ws_fallback_tx_out.try_send(json_str.clone()).is_ok() {
+                                        log::info!("[WRTC Constraints] Sent delayed video constraints via Colibri-WS");
+                                        sent = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            if !sent {
+                                log::warn!("[WRTC Constraints] Failed to deliver video constraints after 3s waiting");
                             }
                         }
                     }

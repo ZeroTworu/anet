@@ -624,6 +624,22 @@ impl ClientTransport for WrtcTransport {
         let tun_inject_video = tun_inject_tx.clone();
 
         let first_client_rx = Arc::new(AtomicBool::new(true));
+        if wrtc_mode == anet_common::wrtc::colibri::WrtcMode::MediaVideo {
+            let first_rx_clone = first_client_rx.clone();
+            let peer_reassert = shared_peer.clone();
+            let srv_id_reassert = target_server_id.clone();
+            tokio::spawn(async move {
+                for _ in 0..10 {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    if !first_rx_clone.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let constraints = anet_common::wrtc::colibri::ReceiverVideoConstraints::for_endpoint(&srv_id_reassert, 2160);
+                    let _ = peer_reassert.send_video_constraints(&constraints).await;
+                    log::debug!("[WRTC Client] Periodic re-assertion of ReceiverVideoConstraints for {}", srv_id_reassert);
+                }
+            });
+        }
         tokio::spawn(async move {
             while let Some(raw_astp) = peer_video_rx.recv_video_frame().await {
                 match unwrap_packet_bytes(&cipher_video, raw_astp) {
