@@ -4,7 +4,7 @@ use crate::wrtc::colibri::{
 use crate::wrtc::jingle::JingleSession;
 use bytes::{BufMut, Bytes, BytesMut};
 use futures::{SinkExt, StreamExt};
-use rtc::interceptor::{Registry, RTCPFeedback};
+use rtc::interceptor::Registry;
 use rtc::media_stream::MediaStreamTrack;
 use rtc::peer_connection::configuration::interceptor_registry::register_default_interceptors;
 use rtc::peer_connection::configuration::media_engine::{MediaEngine, MIME_TYPE_OPUS, MIME_TYPE_VP8};
@@ -14,7 +14,7 @@ use rtc::peer_connection::sdp::RTCSessionDescription;
 use rtc::peer_connection::transport::RTCDtlsRole;
 use rtc::rtp::{Header as RtpHeader, Packet as RtpPacket};
 use rtc::rtp_transceiver::rtp_sender::{
-    RTCRtpCodec, RTCRtpCodecParameters, RTCRtpCodingParameters, RTCRtpEncodingParameters,
+    RTCPFeedback, RTCRtpCodec, RTCRtpCodecParameters, RTCRtpCodingParameters, RTCRtpEncodingParameters,
     RtpCodecKind,
 };
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
@@ -30,41 +30,6 @@ use webrtc::peer_connection::{
     RTCPeerConnectionState,
 };
 use webrtc::runtime::TokioRuntime;
-
-/// Генерация RTCP REMB пакета (Receiver Estimated Maximum Bitrate) по draft-alvestrand-rmcat-remb-03.
-pub fn create_remb_packet(sender_ssrc: u32, target_ssrc: u32, bitrate_bps: u64) -> Bytes {
-    let mut exp: u8 = 0;
-    let mut mantissa: u64 = bitrate_bps;
-    while mantissa > 0x3FFFF {
-        mantissa >>= 1;
-        exp += 1;
-    }
-    let mut buf = BytesMut::with_capacity(24);
-    buf.put_u8(0x8F); // V=2, P=0, FMT=15 (Application Layer Feedback)
-    buf.put_u8(206);  // PT=206 (Payload-specific RTCP message)
-    buf.put_u16(5 - 1); // length in 32-bit words minus 1 = 4 words
-    buf.put_u32(sender_ssrc);
-    buf.put_u32(0); // media SSRC (всегда 0 для REMB)
-    buf.put_slice(b"REMB");
-    buf.put_u8(1); // num SSRC = 1
-    let br_word = ((exp as u32 & 0x3F) << 18) | (mantissa as u32 & 0x3FFFF);
-    buf.put_u8((br_word >> 16) as u8);
-    buf.put_u8((br_word >> 8) as u8);
-    buf.put_u8((br_word & 0xFF) as u8);
-    buf.put_u32(target_ssrc);
-    buf.freeze()
-}
-
-/// Генерация RTCP PLI пакета (Picture Loss Indication) по RFC 4585.
-pub fn create_pli_packet(sender_ssrc: u32, target_ssrc: u32) -> Bytes {
-    let mut buf = BytesMut::with_capacity(12);
-    buf.put_u8(0x81); // V=2, P=0, FMT=1 (Picture Loss Indication)
-    buf.put_u8(206);  // PT=206 (Payload-specific RTCP message)
-    buf.put_u16(3 - 1); // length in 32-bit words minus 1 = 2 words
-    buf.put_u32(sender_ssrc);
-    buf.put_u32(target_ssrc);
-    buf.freeze()
-}
 
 fn generate_random_ssrc() -> u32 {
     (rand::random::<u32>() & 0x7FFFFFFF) | 0x1000
@@ -966,42 +931,6 @@ impl WrtcPeer {
                     }
                 });
 
-                // 8. Фоновый REMB / BWE воркер для удержания максимальной полосы Download от JVB (250+ Мбит/с)
-                let pc_remb = Arc::clone(&pc);
-                let expected_ssrc_remb = Arc::clone(&expected_peer_video_ssrc);
-                let is_connected_remb = Arc::clone(&is_connected);
-                let local_v_ssrc = local_video_ssrc;
-                tokio::spawn(async move {
-                    let start = std::time::Instant::now();
-                    while !is_connected_remb.load(Ordering::SeqCst) {
-                        if start.elapsed() > Duration::from_secs(25) {
-                            return;
-                        }
-                        tokio::time::sleep(Duration::from_millis(50)).await;
-                    }
-                    log::info!("[WRTC Media] Starting periodic REMB bandwidth booster (250 Mbps, interval: 400ms)");
-                    let mut interval = tokio::time::interval(Duration::from_millis(400));
-                    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-                    loop {
-                        interval.tick().await;
-                        if !is_connected_remb.load(Ordering::SeqCst) {
-                            continue;
-                        }
-                        let peer_ssrc = expected_ssrc_remb.load(Ordering::Relaxed);
-                        if peer_ssrc == 0 {
-                            continue;
-                        }
-
-                        let mut remb_raw = create_remb_packet(local_v_ssrc, peer_ssrc, 250_000_000);
-                        if let Ok(packets) = rtc::rtcp::packet::unmarshal(&mut remb_raw) {
-                            if let Err(e) = pc_remb.write_rtcp(&packets).await {
-                                log::trace!("[WRTC Media] REMB write_rtcp transient error: {e}");
-                            }
-                        }
-                    }
-                });
-
                 peer_connection_opt = Some(pc);
                 data_channel_opt = data_channel_res;
                 audio_track_opt = Some(audio_track);
@@ -1064,47 +993,10 @@ impl WrtcPeer {
                         if let Ok(answer) = pc.create_answer(None).await {
                             let _ = pc.set_local_description(answer).await;
                         }
-                        // Запрашиваем ключевой кадр (PLI) и устанавливаем целевую полосу REMB 250 Мбит/с
-                        let _ = self.send_pli().await;
-                        let _ = self.send_remb(250_000_000).await;
                     }
                 }
             }
         }
-    }
-
-    pub async fn send_remb(&self, bitrate_bps: u64) -> anyhow::Result<()> {
-        let Some(ref pc) = self.peer_connection else {
-            anyhow::bail!("PeerConnection not initialized");
-        };
-        let peer_ssrc = self.expected_peer_video_ssrc.load(Ordering::Relaxed);
-        if peer_ssrc == 0 {
-            return Ok(());
-        }
-        let mut remb_raw = create_remb_packet(self.video_ssrc, peer_ssrc, bitrate_bps);
-        let packets = rtc::rtcp::packet::unmarshal(&mut remb_raw)
-            .map_err(|e| anyhow::anyhow!("REMB unmarshal error: {e}"))?;
-        pc.write_rtcp(&packets)
-            .await
-            .map_err(|e| anyhow::anyhow!("REMB write_rtcp error: {e}"))?;
-        Ok(())
-    }
-
-    pub async fn send_pli(&self) -> anyhow::Result<()> {
-        let Some(ref pc) = self.peer_connection else {
-            anyhow::bail!("PeerConnection not initialized");
-        };
-        let peer_ssrc = self.expected_peer_video_ssrc.load(Ordering::Relaxed);
-        if peer_ssrc == 0 {
-            return Ok(());
-        }
-        let mut pli_raw = create_pli_packet(self.video_ssrc, peer_ssrc);
-        let packets = rtc::rtcp::packet::unmarshal(&mut pli_raw)
-            .map_err(|e| anyhow::anyhow!("PLI unmarshal error: {e}"))?;
-        pc.write_rtcp(&packets)
-            .await
-            .map_err(|e| anyhow::anyhow!("PLI write_rtcp error: {e}"))?;
-        Ok(())
     }
 
     pub async fn send_video_frame(&self, astp_data: &[u8]) -> anyhow::Result<()> {
