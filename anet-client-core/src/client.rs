@@ -788,20 +788,25 @@ impl AnetClient {
             expires_at: result.auth_response.expires_at.clone(),
         });
 
+        let active_node_name = match result.effective_mode.as_deref() {
+            Some(mode) => format!("{} ({})", server.get_name(), mode),
+            None => server.get_name(),
+        };
+
         info!(
             "[Core] VPN interface configured. Tunnel UP. Active node: {}",
-            server.get_name()
+            active_node_name
         );
         status(format!(
             "[Core] VPN interface configured. Tunnel UP. Active node: {}",
-            server.get_name()
+            active_node_name
         ));
         status(format!("Connected. Local IP: {}", result.auth_response.ip));
         status("VPN Tunnel UP");
         client_state(
             ClientState::Connected,
             format!("Connected. Local IP: {}", result.auth_response.ip),
-            Some(server.get_name()),
+            Some(active_node_name.clone()),
         );
 
         reconnect_signal.notified().await;
@@ -825,7 +830,7 @@ impl AnetClient {
              [Core]   -> Tx (Uploaded):   {} in {} packets (last packet sent {:.3}s ago)\n\
              [Core]   <- Rx (Downloaded): {} in {} packets (last packet received {:.3}s ago)\n\
              [Core] ===================================================================",
-            server.get_name(),
+            active_node_name,
             server.endpoint().unwrap_or_default(),
             result.auth_response.ip,
             duration.as_secs_f64(),

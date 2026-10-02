@@ -377,6 +377,7 @@ pub struct WrtcPeer {
     pub video_incoming_rx: Mutex<mpsc::Receiver<Bytes>>,
     pub mode: WrtcMode,
     pub dc_is_open: Arc<AtomicBool>,
+    pub has_ws: Arc<AtomicBool>,
     pub is_connected: Arc<AtomicBool>,
     pub failed_notify: Arc<tokio::sync::Notify>,
     pub first_video_tx: Arc<AtomicBool>,
@@ -932,11 +933,34 @@ impl WrtcPeer {
             video_incoming_rx: Mutex::new(video_incoming_rx),
             mode,
             dc_is_open,
+            has_ws,
             is_connected,
             failed_notify,
             first_video_tx,
             start_instant: std::time::Instant::now(),
         })
+    }
+
+    pub fn effective_mode(&self, p2p_open: bool) -> &'static str {
+        match self.mode {
+            WrtcMode::MediaVideo => "VIDEO",
+            WrtcMode::Ws => "WS",
+            WrtcMode::JvbDatachannel => "JVB_DC",
+            WrtcMode::P2pDirect => "P2P",
+            WrtcMode::Auto => {
+                if p2p_open {
+                    "P2P"
+                } else if self.dc_is_open.load(Ordering::SeqCst) {
+                    "JVB_DC"
+                } else if self.has_ws.load(Ordering::SeqCst) {
+                    "WS"
+                } else if self.video_track.is_some() {
+                    "VIDEO"
+                } else {
+                    "WS"
+                }
+            }
+        }
     }
 
     pub fn set_expected_peer_video_ssrc(&self, ssrc: u32) {

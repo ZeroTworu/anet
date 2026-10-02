@@ -25,6 +25,7 @@ pub struct ConnectionResult {
     pub health_pause: Option<Arc<AtomicBool>>,
     pub remote_ip: Option<std::net::IpAddr>,
     pub bypass_ips: Vec<std::net::IpAddr>,
+    pub effective_mode: Option<String>,
 }
 
 #[async_trait]

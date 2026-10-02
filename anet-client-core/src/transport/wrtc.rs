@@ -645,6 +645,13 @@ impl ClientTransport for WrtcTransport {
             }
         });
 
+        let p2p_open = {
+            let guard = p2p_session_opt.lock().await;
+            guard.as_ref().map(|p| p.is_open.load(Ordering::SeqCst)).unwrap_or(false)
+        };
+        let effective_mode = Some(peer.effective_mode(p2p_open).to_string());
+        info!("[WRTC] Active transport mode: {:?}", effective_mode.as_deref().unwrap_or("UNKNOWN"));
+
         let remote_ip = bypass_ips.first().copied();
         Ok(ConnectionResult {
             auth_response,
@@ -654,6 +661,7 @@ impl ClientTransport for WrtcTransport {
             health_pause: None,
             remote_ip,
             bypass_ips,
+            effective_mode,
         })
     }
 }
