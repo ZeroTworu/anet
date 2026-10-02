@@ -42,7 +42,7 @@ const protocolOptions: { title: string; value: ProtocolType }[] = [
   { title: 'VNC', value: 'vnc' },
 ]
 
-export const wrtcModeOptions = [
+const wrtcModeOptions = [
   { title: 'Media Video (Fake Video Track over DTLS-SRTP / JVB) - 4K/Макс. скорость', value: 'media_video' },
   { title: 'P2P Direct (Прямой WebRTC DataChannel)', value: 'p2p_direct' },
   { title: 'JVB DataChannel (Colibri SCTP DataChannel)', value: 'jvb_datachannel' },
