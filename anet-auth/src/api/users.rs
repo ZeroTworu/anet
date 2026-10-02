@@ -899,8 +899,8 @@ impl UsersApi {
                                 );
 
                                 toml_str.push_str(&format!(
-                                    "[[servers]]\nname = \"{}\"\ndsn = \"{}\"\n{}{}{}timeout_secs = 8\nserver_pub_key = \"{}\"\ngroup_name = \"{}\"\ngroup_id = \"{}\"\nweight = {}\n\n",
-                                    display_name, dsn, ssh_user, wrtc_mode_line, server.public_key, pool_name, pool_id, weight, weight
+                                    "[[servers]]\nname = \"{}\"\ndsn = \"{}\"\n{}{}timeout_secs = 8\nserver_pub_key = \"{}\"\ngroup_name = \"{}\"\ngroup_id = \"{}\"\nweight = {}\n\n",
+                                    display_name, dsn, ssh_user, wrtc_mode_line, server.public_key, pool_name, pool_id, weight
                                 ));
                             }
                         }
