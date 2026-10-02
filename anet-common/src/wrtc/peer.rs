@@ -14,7 +14,7 @@ use rtc::peer_connection::sdp::RTCSessionDescription;
 use rtc::peer_connection::transport::RTCDtlsRole;
 use rtc::rtp::{Header as RtpHeader, Packet as RtpPacket};
 use rtc::rtp_transceiver::rtp_sender::{
-    RTCPFeedback, RTCRtpCodec, RTCRtpCodecParameters, RTCRtpCodingParameters, RTCRtpEncodingParameters,
+    RTCRtpCodec, RTCRtpCodecParameters, RTCRtpCodingParameters, RTCRtpEncodingParameters,
     RtpCodecKind,
 };
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
@@ -380,6 +380,7 @@ pub struct WrtcPeer {
     pub is_connected: Arc<AtomicBool>,
     pub failed_notify: Arc<tokio::sync::Notify>,
     pub first_video_tx: Arc<AtomicBool>,
+    pub start_instant: std::time::Instant,
 }
 
 impl WrtcPeer {
@@ -391,10 +392,10 @@ impl WrtcPeer {
         audio_keepalive_ms: u64,
         mode: WrtcMode,
     ) -> anyhow::Result<Self> {
-        let (incoming_tx, incoming_rx) = mpsc::channel::<ColibriMessage>(1024);
-        let (video_incoming_tx, video_incoming_rx) = mpsc::channel::<Bytes>(1024);
-        let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<ColibriMessage>(1024);
-        let (raw_outgoing_tx, mut raw_outgoing_rx) = mpsc::channel::<String>(1024);
+        let (incoming_tx, incoming_rx) = mpsc::channel::<ColibriMessage>(16384);
+        let (video_incoming_tx, video_incoming_rx) = mpsc::channel::<Bytes>(16384);
+        let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<ColibriMessage>(16384);
+        let (raw_outgoing_tx, mut raw_outgoing_rx) = mpsc::channel::<String>(16384);
         let (connected_tx, _connected_rx) = mpsc::channel::<()>(1);
         let is_connected = Arc::new(AtomicBool::new(false));
         let failed_notify = Arc::new(tokio::sync::Notify::new());
@@ -426,7 +427,7 @@ impl WrtcPeer {
                         let (mut ws_sink, mut ws_stream) = ws_stream.split();
 
                         if has_video_flag {
-                            let constraints = ReceiverVideoConstraints::new_all(720);
+                            let constraints = ReceiverVideoConstraints::new_all(2160);
                             if let Ok(json) = serde_json::to_string(&constraints) {
                                 let _ = ws_sink.send(tokio_tungstenite::tungstenite::Message::Text(json.into())).await;
                             }
@@ -482,10 +483,7 @@ impl WrtcPeer {
                     clock_rate: 48000,
                     channels: 2,
                     sdp_fmtp_line: "".to_owned(),
-                    rtcp_feedback: vec![RTCPFeedback {
-                        typ: "transport-cc".to_string(),
-                        parameter: "".to_string(),
-                    }],
+                    rtcp_feedback: vec![],
                 },
                 payload_type: 111,
                 ..Default::default()
@@ -498,28 +496,7 @@ impl WrtcPeer {
                     clock_rate: 90000,
                     channels: 0,
                     sdp_fmtp_line: "".to_owned(),
-                    rtcp_feedback: vec![
-                        RTCPFeedback {
-                            typ: "goog-remb".to_string(),
-                            parameter: "".to_string(),
-                        },
-                        RTCPFeedback {
-                            typ: "transport-cc".to_string(),
-                            parameter: "".to_string(),
-                        },
-                        RTCPFeedback {
-                            typ: "ccm".to_string(),
-                            parameter: "fir".to_string(),
-                        },
-                        RTCPFeedback {
-                            typ: "nack".to_string(),
-                            parameter: "".to_string(),
-                        },
-                        RTCPFeedback {
-                            typ: "nack".to_string(),
-                            parameter: "pli".to_string(),
-                        },
-                    ],
+                    rtcp_feedback: vec![],
                 },
                 payload_type: video_pt,
                 ..Default::default()
@@ -650,7 +627,7 @@ impl WrtcPeer {
                                             dc_is_open_in.store(true, Ordering::SeqCst);
                                             dc_open_notify_in.notify_waiters();
                                             if has_video_flag {
-                                                let constraints = ReceiverVideoConstraints::new_all(720);
+                                                let constraints = ReceiverVideoConstraints::new_all(2160);
                                                 if let Ok(json) = serde_json::to_string(&constraints) {
                                                     let _ = dc_in.send_text(&json).await;
                                                 }
@@ -958,6 +935,7 @@ impl WrtcPeer {
             is_connected,
             failed_notify,
             first_video_tx,
+            start_instant: std::time::Instant::now(),
         })
     }
 
@@ -1012,7 +990,8 @@ impl WrtcPeer {
         }
 
         let seq = self.video_seq.fetch_add(1, Ordering::Relaxed);
-        let ts = self.video_ts.fetch_add(3000, Ordering::Relaxed);
+        let elapsed_ms = self.start_instant.elapsed().as_millis() as u64;
+        let ts = ((elapsed_ms * 90) & 0xFFFFFFFF) as u32;
 
         let mut payload = BytesMut::with_capacity(4 + VP8_KEYFRAME_HEADER.len() + astp_data.len());
         let pic_id = (seq % 0x7FFF) as u16;

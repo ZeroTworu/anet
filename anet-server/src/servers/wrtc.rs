@@ -314,7 +314,7 @@ pub async fn run_wrtc_server(
                                             );
 
                                             let (tx_router, mut rx_router) =
-                                                mpsc::channel::<Bytes>(CHANNEL_BUFFER_SIZE);
+                                                mpsc::channel::<Bytes>(16384);
                                             reg_clone.finalize_client(&assigned_ip, tx_router);
                                             clients_map
                                                 .insert(from_endpoint.clone(), client_info.clone());

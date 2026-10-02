@@ -390,10 +390,10 @@ impl ClientTransport for WrtcTransport {
             });
         }
 
-        let (client_stream, internal_router) = tokio::io::duplex(MAX_PACKET_SIZE * 10);
+        let (client_stream, internal_router) = tokio::io::duplex(2 * 1024 * 1024);
         let (mut tunnel_read, mut tunnel_write) = tokio::io::split(internal_router);
         let (tunnel_packet_tx, mut tunnel_packet_rx) =
-            tokio::sync::mpsc::channel::<Bytes>(CHANNEL_BUFFER_SIZE);
+            tokio::sync::mpsc::channel::<Bytes>(16384);
 
         let tunnel_reader_task = tokio::spawn(async move {
             while let Ok(Some(packet)) = read_next_packet(&mut tunnel_read).await {
@@ -404,7 +404,7 @@ impl ClientTransport for WrtcTransport {
         });
 
         let (tun_inject_tx, mut tun_inject_rx) =
-            tokio::sync::mpsc::channel::<Bytes>(CHANNEL_BUFFER_SIZE);
+            tokio::sync::mpsc::channel::<Bytes>(16384);
 
         tokio::spawn(async move {
             while let Some(packet) = tun_inject_rx.recv().await {

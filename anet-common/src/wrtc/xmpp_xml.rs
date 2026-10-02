@@ -452,14 +452,13 @@ impl XmppBuilder {
     ) -> String {
         let video_section = if include_video_content && video_ssrc != 0 {
             let pt = if video_payload_type != 0 { video_payload_type } else { 100 };
-            let fb_xml = r#"<rtcp-fb xmlns="urn:xmpp:jingle:apps:rtp:rtcp-fb:0" type="goog-remb"/><rtcp-fb xmlns="urn:xmpp:jingle:apps:rtp:rtcp-fb:0" type="transport-cc"/><rtcp-fb xmlns="urn:xmpp:jingle:apps:rtp:rtcp-fb:0" type="ccm" subtype="fir"/><rtcp-fb xmlns="urn:xmpp:jingle:apps:rtp:rtcp-fb:0" type="nack"/><rtcp-fb xmlns="urn:xmpp:jingle:apps:rtp:rtcp-fb:0" type="nack" subtype="pli"/>"#;
             let pt_fallback = if pt != 96 {
-                format!(r#"<payload-type id="96" name="VP8" clockrate="90000">{fb_xml}</payload-type>"#)
+                r#"<payload-type id="96" name="VP8" clockrate="90000"/>"#
             } else {
-                "".to_string()
+                ""
             };
             format!(
-                r#"<content creator="initiator" name="video" senders="both"><description xmlns="urn:xmpp:jingle:apps:rtp:1" media="video"><payload-type id="{pt}" name="VP8" clockrate="90000">{fb_xml}</payload-type>{pt_fallback}<rtcp-mux/><source xmlns="urn:xmpp:jingle:apps:rtp:ssma:0" ssrc="{video_ssrc}"><parameter xmlns="urn:xmpp:jingle:apps:rtp:1" name="cname" value="{cname}"/><parameter xmlns="urn:xmpp:jingle:apps:rtp:1" name="msid" value="{msid} v0"/></source></description><transport xmlns="urn:xmpp:jingle:transports:ice-udp:1" ufrag="{ufrag}" pwd="{pwd}"><rtcp-mux/><fingerprint xmlns="urn:xmpp:jingle:apps:dtls:0" hash="{fingerprint_hash}" setup="active">{fingerprint}</fingerprint>{candidate_xml}</transport></content>"#,
+                r#"<content creator="initiator" name="video" senders="both"><description xmlns="urn:xmpp:jingle:apps:rtp:1" media="video"><payload-type id="{pt}" name="VP8" clockrate="90000"/>{pt_fallback}<rtcp-mux/><source xmlns="urn:xmpp:jingle:apps:rtp:ssma:0" ssrc="{video_ssrc}"><parameter xmlns="urn:xmpp:jingle:apps:rtp:1" name="cname" value="{cname}"/><parameter xmlns="urn:xmpp:jingle:apps:rtp:1" name="msid" value="{msid} v0"/></source></description><transport xmlns="urn:xmpp:jingle:transports:ice-udp:1" ufrag="{ufrag}" pwd="{pwd}"><rtcp-mux/><fingerprint xmlns="urn:xmpp:jingle:apps:dtls:0" hash="{fingerprint_hash}" setup="active">{fingerprint}</fingerprint>{candidate_xml}</transport></content>"#,
                 ufrag = escape_xml_attr(ufrag),
                 pwd = escape_xml_attr(pwd),
                 fingerprint_hash = escape_xml_attr(fingerprint_hash),
@@ -469,7 +468,6 @@ impl XmppBuilder {
                 cname = escape_xml_attr(cname),
                 msid = escape_xml_attr(msid),
                 pt = pt,
-                fb_xml = fb_xml,
                 pt_fallback = pt_fallback,
             )
         } else {
