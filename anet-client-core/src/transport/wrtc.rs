@@ -642,6 +642,7 @@ impl ClientTransport for WrtcTransport {
         }
         tokio::spawn(async move {
             while let Some(raw_astp) = peer_video_rx.recv_video_frame().await {
+                let raw_len = raw_astp.len();
                 match unwrap_packet_bytes(&cipher_video, raw_astp) {
                     Ok(packet) => {
                         if first_client_rx.swap(false, Ordering::Relaxed) {
@@ -654,7 +655,7 @@ impl ClientTransport for WrtcTransport {
                         let _ = tun_inject_video.send(packet).await;
                     }
                     Err(e) => {
-                        warn!("[WRTC Media Video IN] Decrypt packet error: {e} (raw_astp len: {})", raw_astp.len());
+                        warn!("[WRTC Media Video IN] Decrypt packet error: {e} (raw_astp len: {raw_len})");
                     }
                 }
             }
