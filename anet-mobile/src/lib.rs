@@ -143,9 +143,19 @@ fn event_message(event: AnetEvent) -> Option<String> {
         AnetEvent::UpdateProgress(p) => Some(format!("PROGRESS:{p:.2}")),
         AnetEvent::UpdateAvailable(rel) => Some(format!("Найдено обновление: {}", rel.tag_name)),
         AnetEvent::UpdateReady => Some("Update downloaded to cache".to_string()),
+        AnetEvent::ServerConfigUpdated { nodes_count, .. } => {
+            Some(format!("Серверный конфиг успешно обновлен (нод: {})", nodes_count))
+        }
+        AnetEvent::ServerConfigFetchFailed { error, .. } => {
+            Some(format!("Ошибка обновления конфига: {}", error))
+        }
+        AnetEvent::ServerConfigOutdatedWarning { age_hours, .. } => {
+            Some(format!("Внимание: конфиг устарел (возраст: {}ч)", age_hours))
+        }
         AnetEvent::Stats { .. }
         | AnetEvent::TrafficUpdate { .. }
-        | AnetEvent::ClientStateChanged { .. } | AnetEvent::AccountInfo(_) => None,
+        | AnetEvent::ClientStateChanged { .. }
+        | AnetEvent::AccountInfo(_) => None,
     }
 }
 
