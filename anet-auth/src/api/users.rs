@@ -881,6 +881,17 @@ impl UsersApi {
                                     .map(|u| format!("ssh_user = \"{}\"\n", u))
                                     .unwrap_or_default();
 
+                                let wrtc_mode_line = if member.protocol == ProtocolType::Wrtc {
+                                    let mode = member
+                                        .wrtc_mode
+                                        .as_deref()
+                                        .or_else(|| server.wrtc_mode.as_deref())
+                                        .unwrap_or("media_video");
+                                    format!("wrtc_mode = \"{}\"\n", mode)
+                                } else {
+                                    String::new()
+                                };
+
                                 let display_name = format!(
                                     "{} [{}]",
                                     server.name.trim(),
@@ -888,8 +899,8 @@ impl UsersApi {
                                 );
 
                                 toml_str.push_str(&format!(
-                                    "[[servers]]\nname = \"{}\"\ndsn = \"{}\"\n{}timeout_secs = 8\nserver_pub_key = \"{}\"\ngroup_name = \"{}\"\ngroup_id = \"{}\"\nweight = {}\nweigth = {}\n\n",
-                                    display_name, dsn, ssh_user, server.public_key, pool_name, pool_id, weight, weight
+                                    "[[servers]]\nname = \"{}\"\ndsn = \"{}\"\n{}{}timeout_secs = 8\nserver_pub_key = \"{}\"\ngroup_name = \"{}\"\ngroup_id = \"{}\"\nweight = {}\n\n",
+                                    display_name, dsn, ssh_user, wrtc_mode_line, server.public_key, pool_name, pool_id, weight
                                 ));
                             }
                         }
@@ -981,7 +992,7 @@ impl UsersApi {
                     .map(|user| format!("ssh_user = \"{}\"\n", user))
                     .unwrap_or_default();
 
-                let mut write_server_block = |protocol: &str, port_or_url: &str| {
+                let mut write_server_block = |protocol: &str, port_or_url: &str, extra_lines: &str| {
                     let dsn = if port_or_url.contains("://") {
                         port_or_url.to_string()
                     } else {
@@ -992,8 +1003,8 @@ impl UsersApi {
                         format!("{} [{}]", server.name.trim(), protocol.to_uppercase());
 
                     servers_toml.push_str(&format!(
-                        "[[servers]]\nname = \"{}\"\ndsn = \"{}\"\n{}timeout_secs = 8\nserver_pub_key = \"{}\"\n\n",
-                        display_name, dsn, ssh_user, server.public_key
+                        "[[servers]]\nname = \"{}\"\ndsn = \"{}\"\n{}{}timeout_secs = 8\nserver_pub_key = \"{}\"\n\n",
+                        display_name, dsn, ssh_user, extra_lines, server.public_key
                     ));
                 };
 
@@ -1004,38 +1015,40 @@ impl UsersApi {
                         } else {
                             "https"
                         };
-                        write_server_block(proto, ahttp);
+                        write_server_block(proto, ahttp, "");
                     }
                 }
 
                 if let Some(ref wrtc) = server.wrtc_url {
                     if !wrtc.trim().is_empty() {
-                        write_server_block("wrtc", wrtc);
+                        let mode = server.wrtc_mode.as_deref().unwrap_or("media_video");
+                        let wrtc_extra = format!("wrtc_mode = \"{}\"\n", mode);
+                        write_server_block("wrtc", wrtc, &wrtc_extra);
                     }
                 }
 
                 if let Some(quic) = server.quic_port {
                     if quic > 0 {
-                        write_server_block("quic", &quic.to_string());
+                        write_server_block("quic", &quic.to_string(), "");
                     }
                 }
 
                 if let Some(ref ws) = server.websocket_url {
                     if !ws.trim().is_empty() {
                         let proto = if ws.starts_with("ws://") { "ws" } else { "wss" };
-                        write_server_block(proto, ws);
+                        write_server_block(proto, ws, "");
                     }
                 }
 
                 if let Some(ssh) = server.ssh_port {
                     if ssh > 0 {
-                        write_server_block("ssh", &ssh.to_string());
+                        write_server_block("ssh", &ssh.to_string(), "");
                     }
                 }
 
                 if let Some(vnc) = server.vnc_port {
                     if vnc > 0 {
-                        write_server_block("vnc", &vnc.to_string());
+                        write_server_block("vnc", &vnc.to_string(), "");
                     }
                 }
             }

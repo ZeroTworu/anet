@@ -129,6 +129,7 @@ pub struct ServerCoreConfig {
     pub wrtc_ping_interval_secs: u64,
     pub wrtc_fallback_jvb_ip: String,
     pub wrtc_fallback_jvb_port: u16,
+    pub wrtc_mode: Option<String>,
 }
 
 impl Default for ServerCoreConfig {
@@ -147,6 +148,16 @@ impl Default for ServerCoreConfig {
             wrtc_ping_interval_secs: 30,
             wrtc_fallback_jvb_ip: "89.169.16.6".to_string(),
             wrtc_fallback_jvb_port: 10002,
+            wrtc_mode: None,
+        }
+    }
+}
+
+impl ServerCoreConfig {
+    pub fn wrtc_transport_mode(&self) -> anet_common::wrtc::colibri::WrtcMode {
+        match self.wrtc_mode.as_deref() {
+            Some(s) => s.parse().unwrap_or_default(),
+            None => anet_common::wrtc::colibri::WrtcMode::Auto,
         }
     }
 }

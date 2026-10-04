@@ -22,6 +22,10 @@ pub struct JingleTransportInfo {
     pub colibri_ws_url: Option<String>,
 }
 
+fn default_vp8_pt() -> u8 {
+    100
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JingleSession {
     pub iq_id: Option<String>,
@@ -30,10 +34,24 @@ pub struct JingleSession {
     pub action: String,
     pub transport: JingleTransportInfo,
     pub sources: Vec<u32>,
+    #[serde(default)]
+    pub video_sources: Vec<u32>,
+    #[serde(default = "default_vp8_pt")]
+    pub video_payload_type: u8,
+    #[serde(default)]
+    pub has_data_channel: bool,
+    #[serde(default)]
+    pub has_video: bool,
 }
 
 impl JingleSession {
-    pub fn to_sdp(&self, fallback_ip: &str, fallback_port: u16, remote_ssrc: u32) -> String {
+    pub fn to_sdp(
+        &self,
+        fallback_ip: &str,
+        fallback_port: u16,
+        _remote_ssrc: u32,
+        _video_ssrc: u32,
+    ) -> String {
         let (primary_ip, primary_port) = if let Some(first) = self
             .transport
             .candidates
@@ -61,7 +79,7 @@ impl JingleSession {
 
         let mut candidate_lines = String::new();
         for c in &self.transport.candidates {
-            if c.ip == "127.0.0.1" || c.ip.starts_with("127.") || c.ip == "0.0.0.0" {
+            if c.ip == "127.0.0.1" || c.ip.starts_with("127.") || c.ip == "0.0.0.0" || c.ip.starts_with("172.112.") {
                 continue;
             }
             let proto_lower = c.protocol.to_lowercase();
@@ -76,23 +94,55 @@ impl JingleSession {
                 fallback_ip, fallback_port
             ));
         }
-        let mut ssrc_lines = String::new();
-        if remote_ssrc != 0 {
-            ssrc_lines.push_str(&format!(
-                "a=ssrc:{remote_ssrc} cname:cname_{remote_ssrc:x}\r\n\
-                 a=ssrc:{remote_ssrc} msid:msid_{remote_ssrc:x} a0\r\n"
-            ));
-        }
-        for ssrc in &self.sources {
-            if *ssrc != remote_ssrc && *ssrc != 0 {
-                ssrc_lines.push_str(&format!(
-                    "a=ssrc:{ssrc} cname:cname_{ssrc:x}\r\n\
-                     a=ssrc:{ssrc} msid:msid_{ssrc:x} a0\r\n"
-                ));
-            }
-        }
 
-        // Формируем чистый аудио (Opus) SDP
+        let include_video = self.has_video || _video_ssrc != 0;
+        let mut bundle_groups = vec!["audio"];
+        if include_video {
+            bundle_groups.push("video");
+        }
+        if self.has_data_channel {
+            bundle_groups.push("data");
+        }
+        let bundle_str = bundle_groups.join(" ");
+
+        // ВАЖНО: Удалены жесткие a=ssrc для Remote SDP, чтобы webrtc-rs принимал любые SSRC от JVB
+        let video_section = if include_video {
+            let pt = self.video_payload_type;
+            let alt_pt = if pt == 100 { 96 } else { 100 };
+            format!(
+                "m=video {primary_port} UDP/TLS/RTP/SAVPF {pt} {alt_pt}\r\n\
+                 c=IN IP4 {primary_ip}\r\n\
+                 a=rtcp-mux\r\n\
+                 a=rtpmap:{pt} VP8/90000\r\n\
+                 a=rtpmap:{alt_pt} VP8/90000\r\n\
+                 a=ice-ufrag:{ufrag}\r\n\
+                 a=ice-pwd:{pwd}\r\n\
+                 a=fingerprint:{fp_hash} {fp}\r\n\
+                 a=setup:{setup}\r\n\
+                 a=mid:video\r\n\
+                 a=sendrecv\r\n\
+                 {candidate_lines}"
+            )
+        } else {
+            String::new()
+        };
+
+        let data_section = if self.has_data_channel {
+            format!(
+                "m=application {primary_port} UDP/DTLS/SCTP webrtc-datachannel\r\n\
+                 c=IN IP4 {primary_ip}\r\n\
+                 a=ice-ufrag:{ufrag}\r\n\
+                 a=ice-pwd:{pwd}\r\n\
+                 a=fingerprint:{fp_hash} {fp}\r\n\
+                 a=setup:{setup}\r\n\
+                 a=mid:data\r\n\
+                 a=sctp-port:5000\r\n\
+                 {candidate_lines}"
+            )
+        } else {
+            String::new()
+        };
+
         format!(
             "v=0\r\n\
              o=- 123456789 2 IN IP4 0.0.0.0\r\n\
@@ -101,7 +151,7 @@ impl JingleSession {
              a=ice-ufrag:{ufrag}\r\n\
              a=ice-pwd:{pwd}\r\n\
              a=fingerprint:{fp_hash} {fp}\r\n\
-             a=group:BUNDLE audio\r\n\
+             a=group:BUNDLE {bundle_str}\r\n\
              m=audio {primary_port} UDP/TLS/RTP/SAVPF 111\r\n\
              c=IN IP4 {primary_ip}\r\n\
              a=rtcp-mux\r\n\
@@ -112,10 +162,12 @@ impl JingleSession {
              a=setup:{setup}\r\n\
              a=mid:audio\r\n\
              a=sendrecv\r\n\
-             {ssrc_lines}\
-             {candidate_lines}"
+             {candidate_lines}\
+             {video_section}\
+             {data_section}"
         )
-    }}
+    }
+}
 
 pub fn parse_jingle_session(
     xml: &str,

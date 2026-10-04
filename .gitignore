@@ -13,3 +13,7 @@ jniLibs/
 process_files.ps1
 project_report.txt
 Desktop.ini
+/package.json
+/package-lock.json
+/metadata.json
+/bun.lock

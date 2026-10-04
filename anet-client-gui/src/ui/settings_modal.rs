@@ -83,6 +83,19 @@ pub fn render_settings_overlay(app: &mut ANetApp, ui: &mut egui::Ui, button_size
             .corner_radius(8.0)
             .inner_margin(egui::Margin::same(14))
             .show(ui, |ui| {
+                let is_server_cfg = lock_ignore_poison(&app.settings).active_config_id.as_deref() == Some(SERVER_CONFIG_ID);
+    
+    ui.horizontal(|ui| {
+        let (dot_color, label_text) = if is_server_cfg {
+            (Colors::GOLD, "Настройки применяются поверх Server config".to_string())
+        } else {
+            (egui::Color32::from_rgb(76, 175, 80), format!("● Профиль: {}", app.config_name))
+        };
+        let (dot_rect, _) = ui.allocate_exact_size(egui::vec2(6.0, 6.0), egui::Sense::hover());
+        ui.painter().circle_filled(dot_rect.center(), 3.0, dot_color);
+        ui.label(egui::RichText::new(label_text).size(10.5).color(dot_color));
+    });
+    ui.add_space(8.0);
                 ui.set_width(ui.available_width());
                 ui.vertical(|ui| {                    
                     match category {

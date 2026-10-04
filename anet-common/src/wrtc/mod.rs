@@ -1,3 +1,4 @@
+pub mod batcher;
 pub mod colibri;
 pub mod jingle;
 pub mod ktalk;

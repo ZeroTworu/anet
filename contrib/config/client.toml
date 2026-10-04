@@ -207,7 +207,8 @@ timeout_secs = 8
 # 5. WebRTC (Ktalk SFU): скрытный транспорт поверх корпоративной ВКС Контур.Толк
 # [[servers]]
 # name = "Ktalk Node [WRTC]"
-# dsn = "wrtc://ycs3y048.ktalk.ru/oaj4kr56yubb"
+# dsn = "wrtc://vc7x91a2.ktalk.ru/k8m2v9px7q1w"
+# wrtc_mode = "media_video"              # Режим транспорта: "media_video" (Fake Video Track over DTLS-SRTP / JVB) | "p2p_direct" | "jvb_datachannel" | "ws" | "auto"
 # timeout_secs = 15
 # server_pub_key = "<BASE64_ED25519_PUBLIC_KEY>"
 # wrtc_media_keepalive_interval_ms = 20 # Эмуляция Opus тишины (мс)

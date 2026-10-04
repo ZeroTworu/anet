@@ -521,6 +521,7 @@ impl ClientTransport for WebSocketTransport {
             health_pause: Some(health_pause),
             remote_ip, // Передаем IP для добавления в bypass
             bypass_ips: Vec::new(),
+            effective_mode: None,
         })
     }
 }

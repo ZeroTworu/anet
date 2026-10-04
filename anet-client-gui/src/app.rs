@@ -108,7 +108,7 @@ pub struct ANetApp {
     pub exclude_route_input: String,
     pub exclude_routes_changed: bool,
 
-    // --- Поля для управления DNS ---
+    // --- Управление DNS ---
     pub custom_dns_list: Vec<String>,
     pub dns_input_buffer: String,
     pub is_dns_overridden: bool,
@@ -264,9 +264,6 @@ impl ANetApp {
             is_fetching_server_config: false,
         };
 
-        #[cfg(target_os = "windows")]
-        app.refresh_processes();
-
         // 1. Загружаем активную конфигурацию (Server Config с оверлеями или пользовательский .toml)
         let config_to_load: Option<ConfigEntry> = {
             let settings = lock_ignore_poison(&app.settings);
@@ -276,7 +273,11 @@ impl ANetApp {
             app.load_config_from_content(&config.id, &config.content, &config.name, false);
         }
 
-        // 2. Проверяем наличие URL в Keystore для автообновления
+        // 2. Инициализируем список процессов ПОСЛЕ загрузки конфига (чтобы чекбоксы сразу проставились)
+        #[cfg(target_os = "windows")]
+        app.refresh_processes();
+
+        // 3. Проверяем наличие URL в Keystore для автообновления
         let saved_keystore_url = DesktopSecureStore::get_server_config_url();
         let has_user_configs = {
             let settings = lock_ignore_poison(&app.settings);
@@ -286,8 +287,10 @@ impl ANetApp {
         if let Some(url) = saved_keystore_url {
             app.url_input_buffer = url;
             app.show_url_modal = false;
+            // Подкачка с сервера при каждом запуске:
             app.fetch_and_apply_server_config(false);
         } else if !has_user_configs {
+            // Модалка открывается ТОЛЬКО при первом запуске без конфигов и ссылок
             app.show_url_modal = true;
         } else {
             app.show_url_modal = false;
@@ -296,7 +299,6 @@ impl ANetApp {
         app
     }
 
-    /// Сохранение кастомных DNS-серверов в оверлеи Server config
     /// Сохранение кастомных DNS-серверов в оверлеи Server config
     pub fn save_dns_settings(&mut self) {
         let dns_list = self.custom_dns_list.clone();
@@ -314,11 +316,12 @@ impl ANetApp {
         let is_server_active = {
             let settings = lock_ignore_poison(&self.settings);
             settings.active_config_id.as_deref() == Some(SERVER_CONFIG_ID)
+                || self.config_name == SERVER_CONFIG_DISPLAY_NAME
+                || (settings.active_config_id.is_none() && settings.cached_server_config.is_some())
         };
 
         if is_server_active {
             let should_reconnect = lock_ignore_poison(&self.shared).state == ConnectionState::Connected;
-            // Освобождаем лок settings перед вызовом &mut self
             let config_opt = {
                 let settings = lock_ignore_poison(&self.settings);
                 settings.get_active_config_with_overrides(&self.storage_key)
@@ -367,11 +370,12 @@ impl ANetApp {
         let is_server_active = {
             let settings = lock_ignore_poison(&self.settings);
             settings.active_config_id.as_deref() == Some(SERVER_CONFIG_ID)
+                || self.config_name == SERVER_CONFIG_DISPLAY_NAME
+                || (settings.active_config_id.is_none() && settings.cached_server_config.is_some())
         };
 
         if is_server_active {
             let should_reconnect = lock_ignore_poison(&self.shared).state == ConnectionState::Connected;
-            // Освобождаем лок settings перед вызовом &mut self
             let config_opt = {
                 let settings = lock_ignore_poison(&self.settings);
                 settings.get_active_config_with_overrides(&self.storage_key)
@@ -382,7 +386,7 @@ impl ANetApp {
         }
     }
 
-    /// Автоматическое обновление серверного конфига по ссылке из Keystore
+    /// Автоматическое и ручное обновление серверного конфига по ссылке из Keystore
     pub fn fetch_and_apply_server_config(&mut self, force_reconnect: bool) {
         let Some(url) = DesktopSecureStore::get_server_config_url() else {
             return;
@@ -419,6 +423,7 @@ impl ANetApp {
                         let is_server_active = {
                             let settings = lock_ignore_poison(&settings_arc);
                             settings.active_config_id.as_deref() == Some(SERVER_CONFIG_ID)
+                                || (settings.active_config_id.is_none() && settings.cached_server_config.is_some())
                         };
 
                         if is_server_active {
@@ -505,9 +510,23 @@ impl ANetApp {
         push_log(&self.logs, msg);
     }
 
-    /// Список приложений из `per_app` активного конфига (.toml)
+    /// Список приложений из `per_app` активного конфига
     #[cfg(target_os = "windows")]
     pub fn configured_per_app(&self) -> Vec<String> {
+        let is_server_cfg = {
+            let settings = lock_ignore_poison(&self.settings);
+            settings.active_config_id.as_deref() == Some(SERVER_CONFIG_ID)
+                || self.config_name == SERVER_CONFIG_DISPLAY_NAME
+                || (settings.active_config_id.is_none() && settings.cached_server_config.is_some())
+        };
+
+        if is_server_cfg {
+            let settings = lock_ignore_poison(&self.settings);
+            if let Some(ref apps) = settings.server_config_overrides.per_app {
+                return apps.clone();
+            }
+        }
+
         let config: Option<ConfigEntry> = {
             let settings = lock_ignore_poison(&self.settings);
             settings.get_active_config_with_overrides(&self.storage_key)
@@ -535,27 +554,23 @@ impl ANetApp {
     /// Обновление списка запущенных процессов (Windows)
     #[cfg(target_os = "windows")]
     pub fn refresh_processes(&mut self) {
-        let selected_apps: std::collections::HashSet<String> = self.processes
+        let configured = self.configured_per_app();
+        let configured_set: std::collections::HashSet<String> = configured
             .iter()
-            .filter(|p| p.is_selected)
-            .map(|p| p.name.to_lowercase())
-            .collect();
-        let listed_names: std::collections::HashSet<String> = self.processes
-            .iter()
-            .map(|p| p.name.to_lowercase())
+            .map(|s| s.to_lowercase())
             .collect();
 
         self.sys.refresh_all();
-
         let mut map = std::collections::BTreeMap::new();
 
         for (pid, process) in self.sys.processes() {
             let name = process.name().to_string();
+            let key = name.to_lowercase();
 
             if name.ends_with(".exe") || cfg!(windows) {
-                let is_selected = selected_apps.contains(&name.to_lowercase());
+                let is_selected = configured_set.contains(&key);
 
-                map.entry(name.to_lowercase()).or_insert(ProcessItem {
+                map.entry(key).or_insert(ProcessItem {
                     pid: pid.as_u32(),
                     name,
                     is_selected,
@@ -563,21 +578,15 @@ impl ANetApp {
             }
         }
 
-        for name in self.configured_per_app() {
+        for name in configured {
             let key = name.to_lowercase();
-            if map.contains_key(&key) {
-                continue;
-            }
-            let is_selected = if listed_names.contains(&key) {
-                selected_apps.contains(&key)
-            } else {
-                true
-            };
-            map.entry(key).or_insert(ProcessItem {
-                pid: 0,
-                name,
-                is_selected,
-            });
+            map.entry(key)
+                .and_modify(|item| item.is_selected = true)
+                .or_insert(ProcessItem {
+                    pid: 0,
+                    name,
+                    is_selected: true,
+                });
         }
 
         self.processes = map.into_values().collect();
@@ -794,43 +803,71 @@ impl ANetApp {
         self.server_names_cache_key = Some(key);
     }
 
+    /// Сохранение исключённых маршрутов
     pub fn save_exclude_routes(&mut self) {
-        let is_server_cfg = lock_ignore_poison(&self.settings).active_config_id.as_deref() == Some(SERVER_CONFIG_ID);
+        let is_server_cfg = {
+            let settings = lock_ignore_poison(&self.settings);
+            settings.active_config_id.as_deref() == Some(SERVER_CONFIG_ID)
+                || self.config_name == SERVER_CONFIG_DISPLAY_NAME
+                || (settings.active_config_id.is_none() && settings.cached_server_config.is_some())
+        };
 
+        // 1. РЕЖИМ SERVER CONFIG: сохраняем в оверлеи приложения (settings.json)
         if is_server_cfg {
             {
                 let mut settings = lock_ignore_poison(&self.settings);
+                settings.active_config_id = Some(SERVER_CONFIG_ID.to_string());
                 settings.server_config_overrides.exclude_route_for = Some(self.exclude_routes.clone());
                 settings.save();
             }
+
             self.show_toast("Исключения для Server config сохранены");
+            self.log("Исключения сохранены в оверлей Server config.");
+
             let should_reconnect = lock_ignore_poison(&self.shared).state == ConnectionState::Connected;
-            
+            if should_reconnect {
+                self.log("Переподключение VPN с обновленными исключениями...");
+            }
+
             let config_opt = {
                 let settings = lock_ignore_poison(&self.settings);
                 settings.get_active_config_with_overrides(&self.storage_key)
             };
+
             if let Some(config) = config_opt {
                 self.load_config_from_content(&config.id, &config.content, &config.name, should_reconnect);
             }
             return;
         }
 
+        // 2. РЕЖИМ ПОЛЬЗОВАТЕЛЬСКОГО КОНФИГА: сохраняем в .toml файл на диске
         let mut updated_config_data: Option<(String, String, String)> = None;
 
         {
             let mut settings = lock_ignore_poison(&self.settings);
-            if let Some(active_id) = settings.active_config_id.clone() {
-                if let Some(cfg) = settings.configs.iter_mut().find(|c| c.id == active_id) {
+            let active_id = settings.active_config_id.clone();
+
+            if let Some(id) = active_id {
+                if let Some(cfg) = settings.configs.iter_mut().find(|c| c.id == id) {
                     cfg.content = inject_exclude_route_to_toml(&cfg.content, &self.exclude_routes);
                     updated_config_data = Some((cfg.id.clone(), cfg.content.clone(), cfg.name.clone()));
                 }
+                settings.save();
+            } else if !settings.configs.is_empty() {
+                let cfg = &mut settings.configs[0];
+                cfg.content = inject_exclude_route_to_toml(&cfg.content, &self.exclude_routes);
+                let id = cfg.id.clone();
+                let content = cfg.content.clone();
+                let name = cfg.name.clone();
+                settings.active_config_id = Some(id.clone());
+                updated_config_data = Some((id, content, name));
                 settings.save();
             }
         }
 
         let Some((id, content, name)) = updated_config_data else {
             self.log("Ошибка: нет активного конфига для сохранения исключений.");
+            self.show_toast("Ошибка: нет активного конфига");
             return;
         };
 
@@ -855,11 +892,8 @@ impl ANetApp {
 
         if let Some(path) = target_path {
             match std::fs::write(&path, &content) {
-                Ok(_) => self.log("Список исключённых адресов сохранён."),
-                Err(e) => {
-                    self.log(&format!("Ошибка записи исключений в {:?}: {}", path, e));
-                    return;
-                }
+                Ok(_) => self.log(&format!("Исключения сохранены в {:?}", path)),
+                Err(e) => self.log(&format!("Ошибка записи в {:?}: {}", path, e)),
             }
         }
 
@@ -869,9 +903,10 @@ impl ANetApp {
         }
 
         self.load_config_from_content(&id, &content, &name, should_reconnect);
+        self.show_toast("Исключения сохранены в профиль");
     }
 
-    /// Сохранение настроек приложений (per_app) с учётом Server Config
+    /// Сохранение настроек туннелирования приложений (per_app)
     pub fn save_per_app_settings(&mut self) {
         let selected_apps: Vec<String> = self.processes
             .iter()
@@ -880,11 +915,19 @@ impl ANetApp {
             .collect();
 
         let filter_mode = self.filter_mode;
-        let is_server_cfg = lock_ignore_poison(&self.settings).active_config_id.as_deref() == Some(SERVER_CONFIG_ID);
 
+        let is_server_cfg = {
+            let settings = lock_ignore_poison(&self.settings);
+            settings.active_config_id.as_deref() == Some(SERVER_CONFIG_ID)
+                || self.config_name == SERVER_CONFIG_DISPLAY_NAME
+                || (settings.active_config_id.is_none() && settings.cached_server_config.is_some())
+        };
+
+        // 1. РЕЖИМ SERVER CONFIG: сохраняем в оверлеи приложения (settings.json)
         if is_server_cfg {
             {
                 let mut settings = lock_ignore_poison(&self.settings);
+                settings.active_config_id = Some(SERVER_CONFIG_ID.to_string());
                 settings.server_config_overrides.per_app = Some(selected_apps);
                 settings.server_config_overrides.per_app_mode = Some(match filter_mode {
                     FilterMode::All => PerAppMode::All,
@@ -893,19 +936,27 @@ impl ANetApp {
                 });
                 settings.save();
             }
+
             self.show_toast("Настройки приложений для Server config сохранены");
+            self.log("Настройки приложений сохранены в оверлей Server config.");
+
             let should_reconnect = lock_ignore_poison(&self.shared).state == ConnectionState::Connected;
-            
+            if should_reconnect {
+                self.log("Переподключение VPN с новыми настройками приложений...");
+            }
+
             let config_opt = {
                 let settings = lock_ignore_poison(&self.settings);
                 settings.get_active_config_with_overrides(&self.storage_key)
             };
+
             if let Some(config) = config_opt {
                 self.load_config_from_content(&config.id, &config.content, &config.name, should_reconnect);
             }
             return;
         }
 
+        // 2. РЕЖИМ ПОЛЬЗОВАТЕЛЬСКОГО КОНФИГА: сохраняем в .toml файл профиля на диске
         let mut updated_config_data: Option<(String, String, String)> = None;
 
         {
@@ -913,23 +964,28 @@ impl ANetApp {
             let active_id = settings.active_config_id.clone();
 
             if let Some(id) = active_id {
-                let updated_info = {
-                    if let Some(cfg) = settings.configs.iter_mut().find(|c| c.id == id) {
-                        cfg.content = inject_per_app_to_toml(
-                            &cfg.content,
-                            &selected_apps,
-                            filter_mode,
-                        );
-                        Some((cfg.id.clone(), cfg.content.clone(), cfg.name.clone()))
-                    } else {
-                        None
-                    }
-                };
-
-                if let Some((cfg_id, cfg_content, cfg_name)) = updated_info {
-                    settings.save();
-                    updated_config_data = Some((cfg_id, cfg_content, cfg_name));
+                if let Some(cfg) = settings.configs.iter_mut().find(|c| c.id == id) {
+                    cfg.content = inject_per_app_to_toml(
+                        &cfg.content,
+                        &selected_apps,
+                        filter_mode,
+                    );
+                    updated_config_data = Some((cfg.id.clone(), cfg.content.clone(), cfg.name.clone()));
                 }
+                settings.save();
+            } else if !settings.configs.is_empty() {
+                let cfg = &mut settings.configs[0];
+                cfg.content = inject_per_app_to_toml(
+                    &cfg.content,
+                    &selected_apps,
+                    filter_mode,
+                );
+                let id = cfg.id.clone();
+                let content = cfg.content.clone();
+                let name = cfg.name.clone();
+                settings.active_config_id = Some(id.clone());
+                updated_config_data = Some((id, content, name));
+                settings.save();
             }
         }
 
@@ -966,8 +1022,7 @@ impl ANetApp {
             }
 
             self.load_config_from_content(&id, &content, &name, should_reconnect);
-            self.log("Настройки приложений применены.");
-            self.show_toast("Настройки приложений сохранены и применены");
+            self.show_toast("Настройки приложений сохранены в профиль");
         } else {
             self.log("Ошибка: нет активного конфига для применения настроек.");
             self.show_toast("Ошибка: нет активного конфига");
@@ -977,7 +1032,12 @@ impl ANetApp {
     /// Сохранение настройки tray_mode с учётом Server Config
     pub fn save_tray_mode_setting(&mut self) {
         let tray_mode = self.tray_value;
-        let is_server_cfg = lock_ignore_poison(&self.settings).active_config_id.as_deref() == Some(SERVER_CONFIG_ID);
+        let is_server_cfg = {
+            let settings = lock_ignore_poison(&self.settings);
+            settings.active_config_id.as_deref() == Some(SERVER_CONFIG_ID)
+                || self.config_name == SERVER_CONFIG_DISPLAY_NAME
+                || (settings.active_config_id.is_none() && settings.cached_server_config.is_some())
+        };
 
         if is_server_cfg {
             {
@@ -993,11 +1053,22 @@ impl ANetApp {
 
         {
             let mut settings = lock_ignore_poison(&self.settings);
-            if let Some(active_id) = settings.active_config_id.clone() {
-                if let Some(cfg) = settings.configs.iter_mut().find(|c| c.id == active_id) {
+            let active_id = settings.active_config_id.clone();
+
+            if let Some(ref id) = active_id {
+                if let Some(cfg) = settings.configs.iter_mut().find(|c| &c.id == id) {
                     cfg.content = inject_tray_mode_to_toml(&cfg.content, tray_mode);
                     updated_config_data = Some((cfg.id.clone(), cfg.content.clone(), cfg.name.clone()));
                 }
+                settings.save();
+            } else if !settings.configs.is_empty() {
+                let cfg = &mut settings.configs[0];
+                cfg.content = inject_tray_mode_to_toml(&cfg.content, tray_mode);
+                let id = cfg.id.clone();
+                let content = cfg.content.clone();
+                let name = cfg.name.clone();
+                settings.active_config_id = Some(id.clone());
+                updated_config_data = Some((id, content, name));
                 settings.save();
             }
         }
@@ -1287,9 +1358,7 @@ impl ANetApp {
                     self.total_rxm = rxm;
                     self.total_txm = txm;
                 }
-                AnetEvent::TrafficUpdate { .. } => {
-                    // Числовые метрики трафика (обрабатываются внутри ядра/JNI)
-                }
+                AnetEvent::TrafficUpdate { .. } => {}
                 AnetEvent::Status(msg) => {
                     if msg.contains("Серверный конфиг актуален") {
                         self.show_toast("Серверный конфиг актуален");

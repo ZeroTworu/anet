@@ -170,29 +170,36 @@ pub fn apply_overrides_to_toml_str(content: &str, overrides: &ServerConfigOverri
         Err(_) => return content.to_string(),
     };
 
-    if let Some(main) = val.get_mut("main").and_then(|m| m.as_table_mut()) {
-        if let Some(ref excludes) = overrides.exclude_route_for {
-            let arr = excludes.iter().cloned().map(toml::Value::String).collect();
-            main.insert("exclude_route_for".to_string(), toml::Value::Array(arr));
+    // Гарантируем наличие секции [main] в структуре TOML
+    if let Some(root_table) = val.as_table_mut() {
+        if !root_table.contains_key("main") {
+            root_table.insert("main".to_string(), toml::Value::Table(toml::map::Map::new()));
         }
-        if let Some(ref dns) = overrides.dns_server_list {
-            let arr = dns.iter().cloned().map(toml::Value::String).collect();
-            main.insert("dns_server_list".to_string(), toml::Value::Array(arr));
-        }
-        if let Some(ref per_app) = overrides.per_app {
-            let arr = per_app.iter().cloned().map(toml::Value::String).collect();
-            main.insert("per_app".to_string(), toml::Value::Array(arr));
-        }
-        if let Some(mode) = overrides.per_app_mode {
-            let mode_str = match mode {
-                anet_client_core::config::PerAppMode::All => "all",
-                anet_client_core::config::PerAppMode::Include => "include",
-                anet_client_core::config::PerAppMode::Exclude => "exclude",
-            };
-            main.insert("per_app_mode".to_string(), toml::Value::String(mode_str.to_string()));
-        }
-        if let Some(tray) = overrides.tray_mode {
-            main.insert("tray_mode".to_string(), toml::Value::Boolean(tray));
+
+        if let Some(main) = root_table.get_mut("main").and_then(|m| m.as_table_mut()) {
+            if let Some(ref excludes) = overrides.exclude_route_for {
+                let arr = excludes.iter().cloned().map(toml::Value::String).collect();
+                main.insert("exclude_route_for".to_string(), toml::Value::Array(arr));
+            }
+            if let Some(ref dns) = overrides.dns_server_list {
+                let arr = dns.iter().cloned().map(toml::Value::String).collect();
+                main.insert("dns_server_list".to_string(), toml::Value::Array(arr));
+            }
+            if let Some(ref per_app) = overrides.per_app {
+                let arr = per_app.iter().cloned().map(toml::Value::String).collect();
+                main.insert("per_app".to_string(), toml::Value::Array(arr));
+            }
+            if let Some(mode) = overrides.per_app_mode {
+                let mode_str = match mode {
+                    anet_client_core::config::PerAppMode::All => "all",
+                    anet_client_core::config::PerAppMode::Include => "include",
+                    anet_client_core::config::PerAppMode::Exclude => "exclude",
+                };
+                main.insert("per_app_mode".to_string(), toml::Value::String(mode_str.to_string()));
+            }
+            if let Some(tray) = overrides.tray_mode {
+                main.insert("tray_mode".to_string(), toml::Value::Boolean(tray));
+            }
         }
     }
 

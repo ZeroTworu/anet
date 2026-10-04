@@ -20,6 +20,7 @@ pub struct Model {
     pub websocket_url: Option<String>,
     pub ahttp_url: Option<String>,
     pub wrtc_url: Option<String>,
+    pub wrtc_mode: Option<String>,
     pub ssh_user: Option<String>,
     pub created_at: DateTime,
     pub updated_at: DateTime,

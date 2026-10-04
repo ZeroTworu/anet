@@ -36,6 +36,7 @@ toml = "0.8"
 reqwest = { workspace = true, features = ["json", "rustls-tls-webpki-roots", "http2"] }
 
 russh = { workspace = true }
+rtc = { workspace = true }
 webrtc = { workspace = true }
 zip = "8.6.0"
 

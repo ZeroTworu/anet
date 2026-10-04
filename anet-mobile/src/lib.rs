@@ -2,13 +2,12 @@ include!(concat!(env!("OUT_DIR"), "/built.rs"));
 
 mod android_impl;
 
-use crate::android_impl::AndroidCallbackTunFactory;
+use crate::android_impl::{AndroidCallbackTunFactory, AndroidRouteManager};
 use android_logger::Config;
 use anet_client_core::client::AnetClient;
 use anet_client_core::config::CoreConfig;
 use anet_client_core::events::{self, AnetEvent, ClientState, EventHandler, TimestampedEvent, client_state, status};
 use anet_client_core::updater::{GithubRelease, Updater};
-use anet_client_core::platform::NoOpRouteManager;
 use jni::objects::{GlobalRef, JClass, JObject, JString, JValue};
 use jni::{JNIEnv, JavaVM};
 use log::{LevelFilter, error, info};
@@ -659,8 +658,14 @@ pub extern "system" fn Java_org_alco_anet_ANetVpnService_connectVpn(
             }
         }
 
-            let tun_factory = Box::new(AndroidCallbackTunFactory::new(jvm_for_factory, this_ref.clone(), config.clone()));
-            let route_manager = Box::new(NoOpRouteManager);
+            let bypass_ips = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let tun_factory = Box::new(AndroidCallbackTunFactory::new(
+                jvm_for_factory,
+                this_ref.clone(),
+                config.clone(),
+                bypass_ips.clone(),
+            ));
+            let route_manager = Box::new(AndroidRouteManager::new(bypass_ips));
             let client = Arc::new(AnetClient::new(config, tun_factory, route_manager));
             *CLIENT.lock().unwrap() = Some(client.clone());
             client

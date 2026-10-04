@@ -154,6 +154,7 @@ impl ClientTransport for QuicTransport {
             health_pause: None,
             remote_ip: Some(server_addr.ip()), // Передаем IP в bypass
             bypass_ips: Vec::new(),
+            effective_mode: None,
         })
     }
 }

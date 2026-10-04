@@ -23,6 +23,7 @@ pub struct ServerDto {
     pub websocket_url: Option<String>,
     pub ahttp_url: Option<String>,
     pub wrtc_url: Option<String>,
+    pub wrtc_mode: Option<String>,
     pub ssh_user: Option<String>,
     pub is_active: bool,
     pub has_control_credential: bool,
@@ -222,6 +223,7 @@ pub struct CreateServerRequest {
     pub websocket_url: Option<String>,
     pub ahttp_url: Option<String>,
     pub wrtc_url: Option<String>,
+    pub wrtc_mode: Option<String>,
     pub ssh_user: Option<String>,
     pub is_active: Option<bool>,
 }
@@ -247,6 +249,7 @@ pub struct UpdateServerRequest {
     pub websocket_url: Option<Option<String>>,
     pub ahttp_url: Option<Option<String>>,
     pub wrtc_url: Option<Option<String>>,
+    pub wrtc_mode: Option<Option<String>>,
     pub ssh_user: Option<Option<String>>,
     pub is_active: Option<bool>,
 }
@@ -484,6 +487,8 @@ pub struct NodePoolMemberDto {
     pub protocol: crate::entities::ProtocolType,
     #[oai(default)]
     pub port_or_url: Option<String>,
+    #[oai(default)]
+    pub wrtc_mode: Option<String>,
     #[oai(default = "default_member_weight")]
     pub weight: i32,
 }

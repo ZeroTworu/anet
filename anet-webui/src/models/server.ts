@@ -14,6 +14,7 @@ export type Server = {
     websocket_url: string | null
     ahttp_url: string | null
     wrtc_url: string | null
+    wrtc_mode: string | null
 }
 
 export type NodeRuntime = {
@@ -60,4 +61,5 @@ export type CreateServerRequest = {
     websocket_url?: string | null
     ahttp_url?: string | null
     wrtc_url?: string | null
+    wrtc_mode?: string | null
 }

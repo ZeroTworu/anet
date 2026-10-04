@@ -5,18 +5,26 @@ use eframe::egui;
 #[cfg(target_os = "windows")]
 use egui::scroll_area::ScrollBarVisibility;
 #[cfg(target_os = "windows")]
+use anet_client_core::server_config::{SERVER_CONFIG_ID, SERVER_CONFIG_DISPLAY_NAME};
+#[cfg(target_os = "windows")]
 use crate::{
     app::ANetApp,
     theme::Colors,
-    types::{ConnectionState, FilterMode},
-    utils::{
-        helpers::lock_ignore_poison,
-        toml::inject_per_app_to_toml,
-    },
+    types::FilterMode,
+    utils::helpers::lock_ignore_poison,
 };
 
 #[cfg(target_os = "windows")]
 pub fn render_process_list(app: &mut ANetApp, ui: &mut egui::Ui) {
+    let is_server_cfg = {
+        let settings = lock_ignore_poison(&app.settings);
+        settings.active_config_id.as_deref() == Some(SERVER_CONFIG_ID)
+            || app.config_name == SERVER_CONFIG_DISPLAY_NAME
+            || (settings.active_config_id.is_none() && settings.cached_server_config.is_some())
+    };
+    
+    ui.add_space(6.0);
+
     ui.vertical(|ui| {
         ui.label("Режим фильтрации:");
         ui.radio_value(&mut app.filter_mode, FilterMode::All, "VPN для всех приложений");
@@ -26,84 +34,22 @@ pub fn render_process_list(app: &mut ANetApp, ui: &mut egui::Ui) {
     ui.separator();
 
     ui.horizontal(|ui| {
-        if ui.button("🔄 Обновить").clicked() {
+        if ui.add(
+            egui::Button::new(egui::RichText::new("🔄 Обновить").size(11.0))
+                .min_size(egui::vec2(90.0, 32.0))
+                .corner_radius(6.0)
+        ).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
             app.refresh_processes();
         }
 
-        if ui.button("💾 Применить").clicked() {
-            let selected_apps: Vec<String> = app.processes
-                .iter()
-                .filter(|p| p.is_selected)
-                .map(|p| p.name.clone())
-                .collect();
-
-            let filter_mode = app.filter_mode;
-            let mut updated_config_data: Option<(String, String, String)> = None;
-
-            {
-                let mut settings = lock_ignore_poison(&app.settings);
-                let active_id = settings.active_config_id.clone();
-
-                if let Some(id) = active_id {
-                    let updated_info = {
-                        if let Some(cfg) = settings.configs.iter_mut().find(|c| c.id == id) {
-                            cfg.content = inject_per_app_to_toml(
-                                &cfg.content,
-                                &selected_apps,
-                                filter_mode,
-                            );
-                            Some((cfg.id.clone(), cfg.content.clone(), cfg.name.clone()))
-                        } else {
-                            None
-                        }
-                    };
-
-                    if let Some((cfg_id, cfg_content, cfg_name)) = updated_info {
-                        settings.save();
-                        updated_config_data = Some((cfg_id, cfg_content, cfg_name));
-                    }
-                }
-            }
-
-            if let Some((id, content, name)) = updated_config_data {
-                let path_by_id = std::path::PathBuf::from("configs").join(format!("{}.toml", id));
-                let path_by_name = std::path::PathBuf::from("configs").join(format!("{}.toml", name));
-
-                let target_path = if path_by_id.exists() {
-                    Some(path_by_id)
-                } else if path_by_name.exists() {
-                    Some(path_by_name)
-                } else {
-                    let root_id = std::path::PathBuf::from(format!("{}.toml", id));
-                    let root_name = std::path::PathBuf::from(format!("{}.toml", name));
-                    if root_id.exists() {
-                        Some(root_id)
-                    } else if root_name.exists() {
-                        Some(root_name)
-                    } else {
-                        None
-                    }
-                };
-
-                if let Some(path) = target_path {
-                    match std::fs::write(&path, &content) {
-                        Ok(_) => app.log(&format!("Конфиг сохранен: {:?}", path)),
-                        Err(e) => app.log(&format!("Ошибка записи в {:?}: {}", path, e)),
-                    }
-                }
-
-                let should_reconnect = lock_ignore_poison(&app.shared).state == ConnectionState::Connected;
-                if should_reconnect {
-                    app.log("Переподключение VPN с новыми настройками приложений...");
-                }
-
-                app.load_config_from_content(&id, &content, &name, should_reconnect);
-                app.log("Настройки приложений применены.");
-                app.show_toast("Настройки приложений сохранены и применены");
-            } else {
-                app.log("Ошибка: нет активного конфига для применения настроек.");
-                app.show_toast("Ошибка: нет активного конфига");
-            }
+        if ui.add(
+            egui::Button::new(egui::RichText::new("💾 Применить").size(11.0).strong().color(egui::Color32::BLACK))
+                .fill(Colors::GOLD)
+                .min_size(egui::vec2(90.0, 32.0))
+                .corner_radius(6.0)
+        ).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+            // Вызываем единый метод сохранения ANetApp с поддержкой Server config
+            app.save_per_app_settings();
         }
     });
 

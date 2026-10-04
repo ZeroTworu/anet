@@ -30,41 +30,58 @@ pub fn render_bottom_console(app: &mut ANetApp, ctx: &egui::Context) {
                 .inner_margin(egui::Margin::same(12))
                 .show(ui, |ui| {
                     ui.vertical(|ui| {
+                        // 1. Сначала актуализируем статус из последних записей журнала
+                        if let Ok(logs) = app.logs.try_lock() {
+                            if let Some((text, color)) = logs.iter().rev().find_map(|line| {
+                                if line.contains("Error")
+                                    || line.contains("Failed")
+                                    || line.contains("Connection lost")
+                                {
+                                    Some((line.clone(), Colors::RED))
+                                } else if line.contains("Tunnel UP") {
+                                    Some((line.clone(), Colors::GREEN))
+                                } else if line.contains("Config loaded") || line.contains("Найдено обновление") {
+                                    Some((line.clone(), Colors::GOLD))
+                                } else if line.contains("Cleaning up dead session")
+                                    || line.contains("добавлен")
+                                    || line.contains("удален")
+                                {
+                                    Some((line.clone(), Colors::ORANGE))
+                                } else {
+                                    None
+                                }
+                            }) {
+                                app.status_text = text;
+                                app.status_color = color;
+                            }
+                        }
+
+                        // 2. Строка статуса и кнопки VIEW LOG
                         ui.horizontal(|ui| {
                             let text_muted = egui::Color32::GRAY;
-                            ui.label(
-                                egui::RichText::new(&app.status_text)
-                                    .family(egui::FontFamily::Name("Inter-V".into()))
-                                    .size(11.0)
-                                    .color(app.status_color)
-                                    .strong()
+                            let button_width = 85.0;
+                            let max_label_width = (ui.available_width() - button_width - 8.0).max(60.0);
+
+                            // Ограничиваем область статус-текста, чтобы он обрезался троеточием (.truncate())
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(max_label_width, ui.available_height()),
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    ui.set_max_width(max_label_width);
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(&app.status_text)
+                                                .family(egui::FontFamily::Name("Inter-V".into()))
+                                                .size(11.0)
+                                                .color(app.status_color)
+                                                .strong()
+                                        )
+                                        .truncate()
+                                    );
+                                }
                             );
 
-                            if let Ok(logs) = app.logs.try_lock() {
-                                if let Some((text, color)) = logs.iter().rev().find_map(|line| {
-                                    if line.contains("Error")
-                                        || line.contains("Failed")
-                                        || line.contains("Connection lost")
-                                    {
-                                        Some((line.clone(), Colors::RED))
-                                    } else if line.contains("Tunnel UP") {
-                                        Some((line.clone(), Colors::GREEN))
-                                    } else if line.contains("Config loaded") || line.contains("Найдено обновление") {
-                                        Some((line.clone(), Colors::GOLD))
-                                    } else if line.contains("Cleaning up dead session")
-                                        || line.contains("добавлен")
-                                        || line.contains("удален")
-                                    {
-                                        Some((line.clone(), Colors::ORANGE))
-                                    } else {
-                                        None
-                                    }
-                                }) {
-                                    app.status_text = text;
-                                    app.status_color = color;
-                                }
-                            }
-
+                            // Кнопка перехода к логам всегда остаётся фиксированной справа
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 let btn = ui.add(
                                     egui::Label::new(

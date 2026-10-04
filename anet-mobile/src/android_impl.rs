@@ -16,18 +16,70 @@ use tokio::net::lookup_host;
 use tokio::sync::mpsc;
 use tun::Configuration;
 
+pub struct AndroidRouteManager {
+    bypass_ips: Arc<std::sync::Mutex<Vec<IpAddr>>>,
+}
+
+impl AndroidRouteManager {
+    pub fn new(bypass_ips: Arc<std::sync::Mutex<Vec<IpAddr>>>) -> Self {
+        Self { bypass_ips }
+    }
+}
+
+#[async_trait]
+impl anet_client_core::traits::RouteManager for AndroidRouteManager {
+    async fn backup_routes(&self) -> Result<()> {
+        Ok(())
+    }
+
+    async fn add_bypass_route(&self, target: IpAddr, _prefix: u8) -> Result<()> {
+        let mut list = self.bypass_ips.lock().unwrap();
+        if !list.contains(&target) {
+            info!("[Android RouteManager] Recorded bypass route: {}", target);
+            list.push(target);
+        }
+        Ok(())
+    }
+
+    async fn set_default_route(&self, _gateway: &str, _interface_name: &str) -> Result<()> {
+        Ok(())
+    }
+
+    async fn add_specific_route(
+        &self,
+        _target: IpAddr,
+        _prefix: u8,
+        _gateway: &str,
+        _interface_name: &str,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    async fn restore_routes(&self) -> Result<()> {
+        self.bypass_ips.lock().unwrap().clear();
+        Ok(())
+    }
+}
+
 pub struct AndroidCallbackTunFactory {
     jvm: Arc<JavaVM>,
     vpn_service_ref: GlobalRef,
     config: CoreConfig,
+    bypass_ips: Arc<std::sync::Mutex<Vec<IpAddr>>>,
 }
 
 impl AndroidCallbackTunFactory {
-    pub fn new(jvm: Arc<JavaVM>, vpn_service_ref: GlobalRef, config: CoreConfig) -> Self {
+    pub fn new(
+        jvm: Arc<JavaVM>,
+        vpn_service_ref: GlobalRef,
+        config: CoreConfig,
+        bypass_ips: Arc<std::sync::Mutex<Vec<IpAddr>>>,
+    ) -> Self {
         Self {
             jvm,
             vpn_service_ref,
             config,
+            bypass_ips,
         }
     }
 
@@ -151,18 +203,39 @@ impl TunFactory for AndroidCallbackTunFactory {
 
         // Резолвим конфиги в структуры IpNet
         let include_nets = self.resolve_to_ipnet(&self.config.main.route_for).await;
-        let exclude_nets = self
+        let user_excludes = self
             .resolve_to_ipnet(&self.config.main.exclude_route_for)
             .await;
+        let mut exclude_nets = user_excludes.clone();
+
+        // ВАЖНО: Добавляем системные IP обхода (bypass_ips) в исключения Android VpnService,
+        // чтобы трафик к медиасерверам JVB/Ktalk (UDP 10000-20000) и серверу не заворачивался в tun0
+        let bypass_list = self.bypass_ips.lock().unwrap().clone();
+        for ip in bypass_list {
+            let prefix = if ip.is_ipv4() { 32 } else { 128 };
+            if let Ok(net) = IpNet::new(ip, prefix) {
+                if !exclude_nets.contains(&net) {
+                    info!(
+                        "[Android VpnService] Adding bypass IP {}/{} to tunnel exclusions",
+                        ip, prefix
+                    );
+                    exclude_nets.push(net);
+                }
+            }
+        }
 
         // Генерация строк
         let include_str = Self::ipnet_list_to_string(&include_nets);
         let exclude_str = Self::ipnet_list_to_string(&exclude_nets);
 
-        // Генерация Fallback (эмуляция exclude для старых Android)
-        // Считаем только если есть исключения и нет белого списка
-        let fallback_str = if include_nets.is_empty() && !exclude_nets.is_empty() {
-            let fallback_nets = Self::calculate_fallback_routes(&exclude_nets);
+        // Генерация Fallback (эмуляция exclude для старых Android).
+        // Для Legacy Android (Android 11 и ниже) вычисляем fallback routes ТОЛЬКО если
+        // пользователь явно настроил exclude_route_for. Если пользовательских исключений нет,
+        // системные bypass_ips гарантированно защищены через builder.addDisallowedApplication(packageName),
+        // а искусственное дробление 0.0.0.0/0 на 150-250 подсетей переполняет таблицу маршрутизации netd
+        // и ломает системный DNS на Android 11.
+        let fallback_str = if include_nets.is_empty() && !user_excludes.is_empty() {
+            let fallback_nets = Self::calculate_fallback_routes(&user_excludes);
             Self::ipnet_list_to_string(&fallback_nets)
         } else {
             String::new()
@@ -188,7 +261,8 @@ impl TunFactory for AndroidCallbackTunFactory {
         let fallback_jstr = env.new_string(&fallback_str)?;
         let dns_jstr = env.new_string(&dns_str)?;
 
-        let mtu_jint = auth.mtu as i32;
+        // На Android 11+ при наличии IPv6 минимально допустимый MTU для VpnService.Builder равен 1280 (RFC 8200)
+        let mtu_jint = (auth.mtu as i32).max(1280);
         let prefix = ip_mask_to_prefix(&auth.netmask)?;
 
         // Обновленная сигнатура: добавлен fallbackRoutes

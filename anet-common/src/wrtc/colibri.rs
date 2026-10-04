@@ -3,12 +3,71 @@ use base64::prelude::*;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
+/// Минимальный валидный заголовок ключевого кадра VP8 (20 байт).
+/// Позволяет мосту JVB / SFU успешно валидировать битовый поток VP8
+/// и форвардить пакеты подписчикам без отсечения по decode-timeout.
+pub const VP8_KEYFRAME_HEADER: [u8; 20] = [
+    0x30, 0x01, 0x00, 0x9d, 0x01, 0x2a, 0x10, 0x00,
+    0x10, 0x00, 0x00, 0x47, 0x08, 0x85, 0x85, 0x88,
+    0x99, 0x84, 0x88, 0xfc,
+];
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VideoConstraint {
+    #[serde(rename = "maxHeight")]
+    pub max_height: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReceiverVideoConstraints {
+    #[serde(rename = "colibriClass")]
+    pub colibri_class: String,
+    #[serde(rename = "lastN")]
+    pub last_n: i32,
+    #[serde(rename = "defaultConstraints")]
+    pub default_constraints: VideoConstraint,
+    #[serde(rename = "selectedEndpoints", skip_serializing_if = "Option::is_none")]
+    pub selected_endpoints: Option<Vec<String>>,
+    #[serde(rename = "onStageEndpoints", skip_serializing_if = "Option::is_none")]
+    pub on_stage_endpoints: Option<Vec<String>>,
+    #[serde(rename = "constraints", skip_serializing_if = "Option::is_none")]
+    pub constraints: Option<std::collections::HashMap<String, VideoConstraint>>,
+}
+
+impl ReceiverVideoConstraints {
+    pub fn new_all(max_height: u32) -> Self {
+        Self {
+            colibri_class: "ReceiverVideoConstraints".to_string(),
+            last_n: -1,
+            default_constraints: VideoConstraint { max_height },
+            selected_endpoints: None,
+            on_stage_endpoints: None,
+            constraints: None,
+        }
+    }
+
+    pub fn for_endpoint(endpoint: &str, max_height: u32) -> Self {
+        let mut map = std::collections::HashMap::new();
+        map.insert(endpoint.to_string(), VideoConstraint { max_height });
+        Self {
+            colibri_class: "ReceiverVideoConstraints".to_string(),
+            last_n: -1,
+            default_constraints: VideoConstraint { max_height },
+            selected_endpoints: Some(vec![endpoint.to_string()]),
+            on_stage_endpoints: Some(vec![endpoint.to_string()]),
+            constraints: Some(map),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ColibriClass {
     #[serde(rename = "EndpointMessage")]
     EndpointMessage,
     #[serde(rename = "DominantSpeakerEndpointChangeEvent")]
     DominantSpeaker,
+    #[serde(rename = "ReceiverVideoConstraints")]
+    ReceiverVideoConstraints,
     #[serde(other)]
     Unknown,
 }
@@ -19,22 +78,74 @@ impl Default for ColibriClass {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WrtcMode {
+    Auto,
+    P2pDirect,
+    JvbDatachannel,
+    Ws,
+    MediaVideo,
+}
+
+impl Default for WrtcMode {
+    fn default() -> Self {
+        WrtcMode::Auto
+    }
+}
+
+impl std::str::FromStr for WrtcMode {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s.trim().to_lowercase().as_str() {
+            "p2p" | "p2p_direct" | "direct" => WrtcMode::P2pDirect,
+            "dc" | "datachannel" | "jvb_dc" | "jvb_datachannel" => WrtcMode::JvbDatachannel,
+            "ws" | "websocket" | "colibri_ws" => WrtcMode::Ws,
+            "media_video" | "video" | "vp8" | "media_rtp" | "media" => WrtcMode::MediaVideo,
+            _ => WrtcMode::Auto,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum WrtcMessage {
     #[serde(rename = "anet_discover")]
     Discover {
         client_nonce: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        video_ssrc: Option<u32>,
     },
     #[serde(rename = "anet_beacon")]
     Beacon {
         server_id: String,
         client_nonce: String,
         signature: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        video_ssrc: Option<u32>,
     },
     #[serde(rename = "astp")]
     Astp {
         data: String,
+    },
+    #[serde(rename = "astp_batch")]
+    AstpBatch {
+        data: String,
+    },
+    #[serde(rename = "anet_p2p_offer")]
+    P2pOffer {
+        sdp: String,
+        candidates: Vec<String>,
+    },
+    #[serde(rename = "anet_p2p_answer")]
+    P2pAnswer {
+        sdp: String,
+        candidates: Vec<String>,
+    },
+    #[serde(rename = "anet_p2p_candidate")]
+    P2pCandidate {
+        candidate: String,
     },
     #[serde(rename = "anet_ping")]
     Ping,
@@ -70,10 +181,13 @@ impl ColibriMessage {
         }
     }
 
-    pub fn discover(to: Option<String>, client_nonce: String) -> Self {
+    pub fn discover(to: Option<String>, client_nonce: String, video_ssrc: Option<u32>) -> Self {
         Self::new_endpoint_message(
             to,
-            WrtcMessage::Discover { client_nonce },
+            WrtcMessage::Discover {
+                client_nonce,
+                video_ssrc,
+            },
         )
     }
 
@@ -82,6 +196,7 @@ impl ColibriMessage {
         server_id: String,
         client_nonce: String,
         signature: String,
+        video_ssrc: Option<u32>,
     ) -> Self {
         Self::new_endpoint_message(
             Some(to_client_endpoint),
@@ -89,6 +204,7 @@ impl ColibriMessage {
                 server_id,
                 client_nonce,
                 signature,
+                video_ssrc,
             },
         )
     }
@@ -97,6 +213,34 @@ impl ColibriMessage {
         Self::new_endpoint_message(
             Some(to),
             WrtcMessage::Astp { data: base64_data },
+        )
+    }
+
+    pub fn astp_batch(to: String, base64_data: String) -> Self {
+        Self::new_endpoint_message(
+            Some(to),
+            WrtcMessage::AstpBatch { data: base64_data },
+        )
+    }
+
+    pub fn p2p_offer(to: String, sdp: String, candidates: Vec<String>) -> Self {
+        Self::new_endpoint_message(
+            Some(to),
+            WrtcMessage::P2pOffer { sdp, candidates },
+        )
+    }
+
+    pub fn p2p_answer(to: String, sdp: String, candidates: Vec<String>) -> Self {
+        Self::new_endpoint_message(
+            Some(to),
+            WrtcMessage::P2pAnswer { sdp, candidates },
+        )
+    }
+
+    pub fn p2p_candidate(to: String, candidate: String) -> Self {
+        Self::new_endpoint_message(
+            Some(to),
+            WrtcMessage::P2pCandidate { candidate },
         )
     }
 
