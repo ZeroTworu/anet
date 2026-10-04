@@ -6,9 +6,9 @@ use anet_client_core::updater::Updater;
 use crate::{ app::ANetApp, theme::Colors, types::UpdateStatus, utils::helpers::push_log };
 
 pub fn render_update_modal(app: &mut ANetApp, ctx: &egui::Context) {
-    let (show_upd, release_data, progress) = match &app.update_status {
+     let (show_upd, release_data, progress) = match &app.update_status {
         UpdateStatus::Available(r) => (true, Some(r.clone()), None),
-        UpdateStatus::Downloading(p) => (true, None, Some(*p)),
+        UpdateStatus::Downloading(p) => (true, None, Some(*p)), // <-- Если p: &f32, *p вернет f32. Либо: UpdateStatus::Downloading(p) => (true, None, Some(p.clone())),
         _ => (false, None, None),
     };
 

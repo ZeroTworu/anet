@@ -11,6 +11,7 @@ pub mod logs_modal;
 pub mod update_modal;
 pub mod error_modal;
 pub mod toast;
+pub mod url_modal; 
 
 #[cfg(target_os = "windows")]
 pub mod process_grid;

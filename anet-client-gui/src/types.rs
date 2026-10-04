@@ -58,12 +58,10 @@ pub struct SharedState {
 pub enum SettingsCategory {
     General,
     Configs,
+    ServerUrl,
     PerApp,
     ExcludedAdds,
-    Connection,
     Routing,
-    Security,
-    SplitTunnel,
     Updates,
 }
 
@@ -72,12 +70,10 @@ impl SettingsCategory {
         match self {
             Self::General => "Основные настройки",
             Self::Configs => "Конфиги",
+            Self::ServerUrl => "Ссылка на конфигурацию",
             Self::PerApp => "Туннелирование по приложениям",
-            Self::ExcludedAdds => "Исключенные адреса",
-            Self::Connection => "Сеть и подключение",
             Self::Routing => "Маршрутизация и DNS",
-            Self::Security => "Безопасность и Kill Switch",
-            Self::SplitTunnel => "Раздельное туннелирование",
+            Self::ExcludedAdds => "Исключенные адреса",            
             Self::Updates => "Обновления и о программе",
         }
     }
@@ -85,13 +81,11 @@ impl SettingsCategory {
     pub fn icon(&self) -> &'static str {
         match self {
             Self::General => "⚙",
-            Self::Configs => "⚙",
+            Self::Configs => "📁",
+            Self::ServerUrl => "🔗",
             Self::PerApp => "⚡",
-            Self::ExcludedAdds => "⚡",
-            Self::Connection => "⚡",
             Self::Routing => "🌐",
-            Self::Security => "🛡",
-            Self::SplitTunnel => "🔀",
+            Self::ExcludedAdds => "🛡",            
             Self::Updates => "ℹ",
         }
     }
@@ -99,13 +93,11 @@ impl SettingsCategory {
     pub fn description(&self) -> &'static str {
         match self {
             Self::General => "Параметры автозапуска, сворачивания в трей и системных оповещений",
-            Self::Configs => "Настройки конфигов",
-            Self::PerApp => "Основные настройки",
-            Self::ExcludedAdds => "Исключенные адреса",
-            Self::Connection => "Транспортные протоколы (QUIC, AHTTP, SSH, WS), размер MTU и таймауты",
+            Self::Configs => "Список профилей, выбор активного конфига и импорт из файлов",
+            Self::ServerUrl => "Просмотр, редактирование, проверка обновления и удаление персональной ссылки",
+            Self::PerApp => "Выборочное туннелирование трафика для конкретных процессов (Windows)",
+            Self::ExcludedAdds => "Список IP/CIDR/доменов, направляемых в обход VPN-туннеля",
             Self::Routing => "Настройка DNS-серверов, шлюзов по умолчанию и списков исключений",
-            Self::Security => "Kill Switch, защита от утечек DNS и WebRTC, шифрование трафика",
-            Self::SplitTunnel => "Правила выборочного туннелирования трафика приложений",
             Self::Updates => "Проверка обновлений, информация о текущей версии и лицензии",
         }
     }

@@ -65,6 +65,18 @@ pub enum AnetEvent {
         rxm: u64,
         txm: u64,
     },
+     ServerConfigUpdated {
+        updated_at: u64,
+        nodes_count: usize,
+    },
+    ServerConfigFetchFailed {
+        error: String,
+        using_cached_from: Option<u64>,
+    },
+    ServerConfigOutdatedWarning {
+        last_updated_at: u64,
+        age_hours: u64,
+    },
     Warn(String),
     Error(String),
     UpdateAvailable(crate::updater::GithubRelease),

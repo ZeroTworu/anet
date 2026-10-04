@@ -13,16 +13,18 @@ use tokio::runtime::Runtime;
 
 use anet_client_core::{
     client::AnetClient,
-    config::CoreConfig,
+    config::{CoreConfig, PerAppMode},
     events::{ set_handler, AccountInfo, AnetEvent, ClientState },
     platform::create_route_manager,
-    updater::Updater,
+    server_config::{apply_overrides, SERVER_CONFIG_ID, SERVER_CONFIG_DISPLAY_NAME},
+    updater::{ConfigFetchResult, Updater},
 };
 
 use crate::{
-    config::AppSettings,
+    config::{AppSettings, ConfigEntry},
     events::GuiEventHandler,
-    theme::{ apply_dark_theme, Colors },
+    secure_store::DesktopSecureStore,
+    theme::apply_dark_theme,
     tray::{ TrayBackground, TrayCommand },
     tun_factory::DesktopTunFactory,
     types::{
@@ -33,10 +35,16 @@ use crate::{
     utils::{
         helpers::{ force_wake_up_window, lock_ignore_poison, push_log, send_notification, toggle_vpn },
         toml::{ inject_exclude_route_to_toml, inject_per_app_to_toml, inject_tray_mode_to_toml },
-        validator::validate_exclude_route,
     },
-    GIT_TAG, // <-- импортируем из crate (объявлен в lib.rs)
+    GIT_TAG,
 };
+
+#[derive(Clone, Debug)]
+pub struct ServerConfigBanner {
+    pub message: String,
+    pub is_error: bool,
+    pub timestamp_str: String,
+}
 
 pub struct ANetApp {
     pub rt: Runtime,
@@ -100,11 +108,25 @@ pub struct ANetApp {
     pub exclude_route_input: String,
     pub exclude_routes_changed: bool,
 
+    // --- Поля для управления DNS ---
+    pub custom_dns_list: Vec<String>,
+    pub dns_input_buffer: String,
+    pub is_dns_overridden: bool,
+
     pub toast_message: Option<String>,
     pub toast_until: Option<std::time::Instant>,
 
     pub status_text: String,
     pub status_color: egui::Color32,
+
+    pub show_url_modal: bool,
+    pub url_input_buffer: String,
+    pub url_modal_error: Option<String>,
+    pub url_modal_loading: bool,
+
+    pub server_config_banner: Option<ServerConfigBanner>,
+    pub storage_key: [u8; 32],
+    pub is_fetching_server_config: bool,
 }
 
 impl ANetApp {
@@ -156,6 +178,17 @@ impl ANetApp {
             on_show,
             on_toggle
         );
+
+        let storage_key = DesktopSecureStore::get_or_create_device_storage_key();
+
+        let (initial_dns, is_dns_overridden) = {
+            let settings = lock_ignore_poison(&settings_arc);
+            if let Some(ref list) = settings.server_config_overrides.dns_server_list {
+                (list.clone(), true)
+            } else {
+                (vec!["1.1.1.1".to_string(), "8.8.8.8".to_string()], false)
+            }
+        };
 
         let mut app = Self {
             rt,
@@ -211,22 +244,256 @@ impl ANetApp {
             exclude_route_input: String::new(),
             exclude_routes_changed: false,
 
+            custom_dns_list: initial_dns,
+            dns_input_buffer: String::new(),
+            is_dns_overridden,
+
             toast_message: None,
             toast_until: None,
 
             status_text: "CONNECTION".to_string(),
             status_color: egui::Color32::from_rgb(128, 128, 128),
+
+            show_url_modal: false,
+            url_input_buffer: String::new(),
+            url_modal_error: None,
+            url_modal_loading: false,
+
+            server_config_banner: None,
+            storage_key,
+            is_fetching_server_config: false,
         };
 
         #[cfg(target_os = "windows")]
         app.refresh_processes();
 
-        let config_to_load = lock_ignore_poison(&app.settings).get_active_config();
+        // 1. Загружаем активную конфигурацию (Server Config с оверлеями или пользовательский .toml)
+        let config_to_load: Option<ConfigEntry> = {
+            let settings = lock_ignore_poison(&app.settings);
+            settings.get_active_config_with_overrides(&storage_key)
+        };
         if let Some(config) = config_to_load {
             app.load_config_from_content(&config.id, &config.content, &config.name, false);
         }
 
+        // 2. Проверяем наличие URL в Keystore для автообновления
+        let saved_keystore_url = DesktopSecureStore::get_server_config_url();
+        let has_user_configs = {
+            let settings = lock_ignore_poison(&app.settings);
+            !settings.configs.is_empty()
+        };
+
+        if let Some(url) = saved_keystore_url {
+            app.url_input_buffer = url;
+            app.show_url_modal = false;
+            app.fetch_and_apply_server_config(false);
+        } else if !has_user_configs {
+            app.show_url_modal = true;
+        } else {
+            app.show_url_modal = false;
+        }
+
         app
+    }
+
+    /// Сохранение кастомных DNS-серверов в оверлеи Server config
+    /// Сохранение кастомных DNS-серверов в оверлеи Server config
+    pub fn save_dns_settings(&mut self) {
+        let dns_list = self.custom_dns_list.clone();
+        self.is_dns_overridden = true;
+
+        {
+            let mut settings = lock_ignore_poison(&self.settings);
+            settings.server_config_overrides.dns_server_list = Some(dns_list);
+            settings.save();
+        }
+
+        self.show_toast("DNS-серверы сохранены");
+        self.log(&format!("DNS оверлей обновлен: {:?}", self.custom_dns_list));
+
+        let is_server_active = {
+            let settings = lock_ignore_poison(&self.settings);
+            settings.active_config_id.as_deref() == Some(SERVER_CONFIG_ID)
+        };
+
+        if is_server_active {
+            let should_reconnect = lock_ignore_poison(&self.shared).state == ConnectionState::Connected;
+            // Освобождаем лок settings перед вызовом &mut self
+            let config_opt = {
+                let settings = lock_ignore_poison(&self.settings);
+                settings.get_active_config_with_overrides(&self.storage_key)
+            };
+            if let Some(config) = config_opt {
+                self.load_config_from_content(&config.id, &config.content, &config.name, should_reconnect);
+            }
+        }
+    }
+
+    /// Сброс кастомных DNS к значениям по умолчанию из исходного серверного конфига
+    pub fn reset_dns_settings(&mut self) {
+        self.is_dns_overridden = false;
+
+        {
+            let mut settings = lock_ignore_poison(&self.settings);
+            settings.server_config_overrides.dns_server_list = None;
+            settings.save();
+        }
+
+        let default_dns = {
+            let settings = lock_ignore_poison(&self.settings);
+            if let Some(ref bundle) = settings.cached_server_config {
+                if let Ok(content) = anet_client_core::updater::Updater::decrypt_config(bundle, &self.storage_key) {
+                    toml::from_str::<CoreConfig>(&content)
+                        .ok()
+                        .map(|c| c.main.dns_server_list)
+                        .unwrap_or_default()
+                } else {
+                    vec!["1.1.1.1".to_string(), "8.8.8.8".to_string()]
+                }
+            } else {
+                vec!["1.1.1.1".to_string(), "8.8.8.8".to_string()]
+            }
+        };
+
+        self.custom_dns_list = if default_dns.is_empty() {
+            vec!["1.1.1.1".to_string(), "8.8.8.8".to_string()]
+        } else {
+            default_dns
+        };
+
+        self.show_toast("DNS сброшены к значениям по умолчанию");
+        self.log("DNS оверлей сброшен к серверным значениям");
+
+        let is_server_active = {
+            let settings = lock_ignore_poison(&self.settings);
+            settings.active_config_id.as_deref() == Some(SERVER_CONFIG_ID)
+        };
+
+        if is_server_active {
+            let should_reconnect = lock_ignore_poison(&self.shared).state == ConnectionState::Connected;
+            // Освобождаем лок settings перед вызовом &mut self
+            let config_opt = {
+                let settings = lock_ignore_poison(&self.settings);
+                settings.get_active_config_with_overrides(&self.storage_key)
+            };
+            if let Some(config) = config_opt {
+                self.load_config_from_content(&config.id, &config.content, &config.name, should_reconnect);
+            }
+        }
+    }
+
+    /// Автоматическое обновление серверного конфига по ссылке из Keystore
+    pub fn fetch_and_apply_server_config(&mut self, force_reconnect: bool) {
+        let Some(url) = DesktopSecureStore::get_server_config_url() else {
+            return;
+        };
+
+        self.is_fetching_server_config = true;
+        let storage_key = self.storage_key;
+        let settings_arc = self.settings.clone();
+        let logs_arc = self.logs.clone();
+        let config_load_tx = self.config_load_tx.clone();
+        let shared_clone = self.shared.clone();
+
+        let current_etag = {
+            let settings = lock_ignore_poison(&settings_arc);
+            settings.cached_server_config.as_ref().and_then(|b| b.etag.clone())
+        };
+
+        push_log(&logs_arc, "Запрос обновления серверного конфига...");
+
+        self.rt.spawn(async move {
+            match Updater::fetch_server_config(&url, current_etag.as_deref()).await {
+                Ok(ConfigFetchResult::Updated { content, updated_at, etag }) => {
+                    if let Ok(bundle) = Updater::encrypt_config(&content, &storage_key, etag) {
+                        let (merged_cfg, nodes_count) = {
+                            let mut settings = lock_ignore_poison(&settings_arc);
+                            settings.cached_server_config = Some(bundle);
+                            let core_cfg: CoreConfig = toml::from_str(&content).unwrap();
+                            let count = core_cfg.servers.len();
+                            let merged = apply_overrides(core_cfg, &settings.server_config_overrides);
+                            settings.save();
+                            (merged, count)
+                        };
+
+                        let is_server_active = {
+                            let settings = lock_ignore_poison(&settings_arc);
+                            settings.active_config_id.as_deref() == Some(SERVER_CONFIG_ID)
+                        };
+
+                        if is_server_active {
+                            let tun = Box::new(DesktopTunFactory::new(
+                                merged_cfg.main.tun_name.clone(),
+                                !merged_cfg.main.per_app.is_empty(),
+                            ));
+                            if let Ok(route) = create_route_manager(false) {
+                                let client = Arc::new(AnetClient::new(merged_cfg, tun, route));
+                                lock_ignore_poison(&shared_clone).client = Some(client);
+                                let _ = config_load_tx.send(ConfigLoadOutcome::Loaded {
+                                    id: SERVER_CONFIG_ID.to_string(),
+                                    name: SERVER_CONFIG_DISPLAY_NAME.to_string(),
+                                    reconnect: force_reconnect,
+                                });
+                            }
+                        }
+
+                        push_log(&logs_arc, &format!("Серверный конфиг успешно обновлен (нод: {}).", nodes_count));
+                        send_notification("ANet VPN", "Серверный конфиг успешно обновлен");
+
+                        anet_client_core::events::emit(AnetEvent::ServerConfigUpdated {
+                            updated_at,
+                            nodes_count,
+                        });
+                    }
+                }
+                Ok(ConfigFetchResult::NotModified) => {
+                    push_log(&logs_arc, "Серверный конфиг актуален (304 Not Modified).");
+                    anet_client_core::events::status("Серверный конфиг актуален (изменений нет)");
+                }
+                Err(e) => {
+                    let cached_date = {
+                        let settings = lock_ignore_poison(&settings_arc);
+                        settings.cached_server_config.as_ref().map(|b| b.last_updated_at)
+                    };
+
+                    let date_str = cached_date
+                        .map(|ts| {
+                            chrono::DateTime::from_timestamp(ts as i64, 0)
+                                .map(|dt| dt.format("%d.%m.%Y %H:%M").to_string())
+                                .unwrap_or_else(|| "ранее".to_string())
+                        })
+                        .unwrap_or_else(|| "неизвестно".to_string());
+
+                    let err_text = format!("Не удалось обновить конфиг: {}. Используется версия от {}", e, date_str);
+                    push_log(&logs_arc, &err_text);
+                    send_notification("ANet VPN", &err_text);
+
+                    anet_client_core::events::emit(AnetEvent::ServerConfigFetchFailed {
+                        error: e.to_string(),
+                        using_cached_from: cached_date,
+                    });
+                }
+            }
+        });
+    }
+
+    /// Сохранение ссылки в Keystore и немедленная загрузка конфигурации
+    pub fn download_and_set_config_url(&mut self, url: String) {
+        if let Err(e) = DesktopSecureStore::set_server_config_url(&url) {
+            self.log(&format!("Ошибка сохранения ссылки в Keystore: {}", e));
+            self.show_toast("Ошибка сохранения ссылки в Keystore");
+            return;
+        }
+
+        {
+            let mut settings = lock_ignore_poison(&self.settings);
+            settings.set_active(SERVER_CONFIG_ID);
+            settings.set_config_url(Some(url));
+        }
+
+        self.show_url_modal = false;
+        self.url_modal_loading = false;
+        self.fetch_and_apply_server_config(false);
     }
 
     pub fn show_toast(&mut self, message: impl Into<String>) {
@@ -241,7 +508,10 @@ impl ANetApp {
     /// Список приложений из `per_app` активного конфига (.toml)
     #[cfg(target_os = "windows")]
     pub fn configured_per_app(&self) -> Vec<String> {
-        let config = lock_ignore_poison(&self.settings).get_active_config();
+        let config: Option<ConfigEntry> = {
+            let settings = lock_ignore_poison(&self.settings);
+            settings.get_active_config_with_overrides(&self.storage_key)
+        };
         let Some(config) = config else {
             return Vec::new();
         };
@@ -323,9 +593,9 @@ impl ANetApp {
             Ok(mut cfg) => {
                 let _ = cfg.sanitize();
                 self.filter_mode = match cfg.main.per_app_mode {
-                    anet_client_core::config::PerAppMode::All => FilterMode::All,
-                    anet_client_core::config::PerAppMode::Include => FilterMode::Include,
-                    anet_client_core::config::PerAppMode::Exclude => FilterMode::Exclude,
+                    PerAppMode::All => FilterMode::All,
+                    PerAppMode::Include => FilterMode::Include,
+                    PerAppMode::Exclude => FilterMode::Exclude,
                 };
 
                 if let Ok(raw_toml) = toml::from_str::<toml::Value>(content) {
@@ -525,6 +795,27 @@ impl ANetApp {
     }
 
     pub fn save_exclude_routes(&mut self) {
+        let is_server_cfg = lock_ignore_poison(&self.settings).active_config_id.as_deref() == Some(SERVER_CONFIG_ID);
+
+        if is_server_cfg {
+            {
+                let mut settings = lock_ignore_poison(&self.settings);
+                settings.server_config_overrides.exclude_route_for = Some(self.exclude_routes.clone());
+                settings.save();
+            }
+            self.show_toast("Исключения для Server config сохранены");
+            let should_reconnect = lock_ignore_poison(&self.shared).state == ConnectionState::Connected;
+            
+            let config_opt = {
+                let settings = lock_ignore_poison(&self.settings);
+                settings.get_active_config_with_overrides(&self.storage_key)
+            };
+            if let Some(config) = config_opt {
+                self.load_config_from_content(&config.id, &config.content, &config.name, should_reconnect);
+            }
+            return;
+        }
+
         let mut updated_config_data: Option<(String, String, String)> = None;
 
         {
@@ -578,6 +869,164 @@ impl ANetApp {
         }
 
         self.load_config_from_content(&id, &content, &name, should_reconnect);
+    }
+
+    /// Сохранение настроек приложений (per_app) с учётом Server Config
+    pub fn save_per_app_settings(&mut self) {
+        let selected_apps: Vec<String> = self.processes
+            .iter()
+            .filter(|p| p.is_selected)
+            .map(|p| p.name.clone())
+            .collect();
+
+        let filter_mode = self.filter_mode;
+        let is_server_cfg = lock_ignore_poison(&self.settings).active_config_id.as_deref() == Some(SERVER_CONFIG_ID);
+
+        if is_server_cfg {
+            {
+                let mut settings = lock_ignore_poison(&self.settings);
+                settings.server_config_overrides.per_app = Some(selected_apps);
+                settings.server_config_overrides.per_app_mode = Some(match filter_mode {
+                    FilterMode::All => PerAppMode::All,
+                    FilterMode::Include => PerAppMode::Include,
+                    FilterMode::Exclude => PerAppMode::Exclude,
+                });
+                settings.save();
+            }
+            self.show_toast("Настройки приложений для Server config сохранены");
+            let should_reconnect = lock_ignore_poison(&self.shared).state == ConnectionState::Connected;
+            
+            let config_opt = {
+                let settings = lock_ignore_poison(&self.settings);
+                settings.get_active_config_with_overrides(&self.storage_key)
+            };
+            if let Some(config) = config_opt {
+                self.load_config_from_content(&config.id, &config.content, &config.name, should_reconnect);
+            }
+            return;
+        }
+
+        let mut updated_config_data: Option<(String, String, String)> = None;
+
+        {
+            let mut settings = lock_ignore_poison(&self.settings);
+            let active_id = settings.active_config_id.clone();
+
+            if let Some(id) = active_id {
+                let updated_info = {
+                    if let Some(cfg) = settings.configs.iter_mut().find(|c| c.id == id) {
+                        cfg.content = inject_per_app_to_toml(
+                            &cfg.content,
+                            &selected_apps,
+                            filter_mode,
+                        );
+                        Some((cfg.id.clone(), cfg.content.clone(), cfg.name.clone()))
+                    } else {
+                        None
+                    }
+                };
+
+                if let Some((cfg_id, cfg_content, cfg_name)) = updated_info {
+                    settings.save();
+                    updated_config_data = Some((cfg_id, cfg_content, cfg_name));
+                }
+            }
+        }
+
+        if let Some((id, content, name)) = updated_config_data {
+            let path_by_id = std::path::PathBuf::from("configs").join(format!("{}.toml", id));
+            let path_by_name = std::path::PathBuf::from("configs").join(format!("{}.toml", name));
+
+            let target_path = if path_by_id.exists() {
+                Some(path_by_id)
+            } else if path_by_name.exists() {
+                Some(path_by_name)
+            } else {
+                let root_id = std::path::PathBuf::from(format!("{}.toml", id));
+                let root_name = std::path::PathBuf::from(format!("{}.toml", name));
+                if root_id.exists() {
+                    Some(root_id)
+                } else if root_name.exists() {
+                    Some(root_name)
+                } else {
+                    None
+                }
+            };
+
+            if let Some(path) = target_path {
+                match std::fs::write(&path, &content) {
+                    Ok(_) => self.log(&format!("Конфиг сохранен: {:?}", path)),
+                    Err(e) => self.log(&format!("Ошибка записи в {:?}: {}", path, e)),
+                }
+            }
+
+            let should_reconnect = lock_ignore_poison(&self.shared).state == ConnectionState::Connected;
+            if should_reconnect {
+                self.log("Переподключение VPN с новыми настройками приложений...");
+            }
+
+            self.load_config_from_content(&id, &content, &name, should_reconnect);
+            self.log("Настройки приложений применены.");
+            self.show_toast("Настройки приложений сохранены и применены");
+        } else {
+            self.log("Ошибка: нет активного конфига для применения настроек.");
+            self.show_toast("Ошибка: нет активного конфига");
+        }
+    }
+
+    /// Сохранение настройки tray_mode с учётом Server Config
+    pub fn save_tray_mode_setting(&mut self) {
+        let tray_mode = self.tray_value;
+        let is_server_cfg = lock_ignore_poison(&self.settings).active_config_id.as_deref() == Some(SERVER_CONFIG_ID);
+
+        if is_server_cfg {
+            {
+                let mut settings = lock_ignore_poison(&self.settings);
+                settings.server_config_overrides.tray_mode = Some(tray_mode);
+                settings.save();
+            }
+            self.show_toast(&format!("Настройка tray_mode для Server config сохранена: {}", tray_mode));
+            return;
+        }
+
+        let mut updated_config_data: Option<(String, String, String)> = None;
+
+        {
+            let mut settings = lock_ignore_poison(&self.settings);
+            if let Some(active_id) = settings.active_config_id.clone() {
+                if let Some(cfg) = settings.configs.iter_mut().find(|c| c.id == active_id) {
+                    cfg.content = inject_tray_mode_to_toml(&cfg.content, tray_mode);
+                    updated_config_data = Some((cfg.id.clone(), cfg.content.clone(), cfg.name.clone()));
+                }
+                settings.save();
+            }
+        }
+
+        if let Some((id, content, name)) = updated_config_data {
+            let path_by_id = std::path::PathBuf::from("configs").join(format!("{}.toml", id));
+            let path_by_name = std::path::PathBuf::from("configs").join(format!("{}.toml", name));
+
+            let target_path = if path_by_id.exists() {
+                Some(path_by_id)
+            } else if path_by_name.exists() {
+                Some(path_by_name)
+            } else {
+                let root_id = std::path::PathBuf::from(format!("{}.toml", id));
+                let root_name = std::path::PathBuf::from(format!("{}.toml", name));
+                if root_id.exists() {
+                    Some(root_id)
+                } else if root_name.exists() {
+                    Some(root_name)
+                } else {
+                    None
+                }
+            };
+
+            if let Some(path) = target_path {
+                let _ = std::fs::write(&path, &content);
+            }
+            self.show_toast(&format!("Настройка tray_mode сохранена: {}", tray_mode));
+        }
     }
 
     pub fn check_for_updates(&mut self) {
@@ -687,15 +1136,23 @@ impl ANetApp {
             .unwrap_or("");
         if ext != "toml" {
             self.log("Please select a .toml file");
+            self.show_toast("Выберите файл с расширением .toml");
             return;
         }
         let content = match std::fs::read_to_string(&path) {
             Ok(c) => c,
             Err(e) => {
                 self.log(&format!("Failed to read file: {}", e));
+                self.show_toast("Не удалось прочитать файл");
                 return;
             }
         };
+
+        if let Err(e) = toml::from_str::<CoreConfig>(&content) {
+            self.log(&format!("Некорректный TOML конфиг: {}", e));
+            self.show_toast("Ошибка: файл не является валидным конфигом ANet");
+            return;
+        }
 
         let name = path
             .file_name()
@@ -703,14 +1160,35 @@ impl ANetApp {
             .unwrap_or("Unnamed")
             .trim_end_matches(".toml")
             .to_string();
+
         let id = {
             let mut settings = lock_ignore_poison(&self.settings);
-            settings.add_config(name, content)
+            settings.add_config(name.clone(), content)
         };
+
+        self.show_url_modal = false;
+        self.url_modal_error = None;
+
         self.select_config(&id);
+        self.show_toast(format!("Конфигурация '{}' добавлена и выбрана", name));
     }
 
     pub fn delete_config(&mut self, id: &str) {
+        if id == SERVER_CONFIG_ID {
+            let _ = DesktopSecureStore::delete_server_config_url();
+            {
+                let mut settings = lock_ignore_poison(&self.settings);
+                settings.cached_server_config = None;
+                if settings.active_config_id.as_deref() == Some(SERVER_CONFIG_ID) {
+                    settings.active_config_id = None;
+                }
+                settings.save();
+            }
+            self.show_toast("Server config удален");
+            self.check_and_show_url_modal_if_empty();
+            return;
+        }
+
         if lock_ignore_poison(&self.shared).state != ConnectionState::Disconnected {
             let is_active = lock_ignore_poison(&self.settings).active_config_id.as_deref() == Some(id);
             if is_active {
@@ -723,9 +1201,14 @@ impl ANetApp {
         if lock_ignore_poison(&self.shared).client.is_none() {
             self.config_name = "Config deleted".to_string();
         }
+        self.check_and_show_url_modal_if_empty();
     }
 
     pub fn start_edit_name(&mut self, id: &str, current_name: &str) {
+        if id == SERVER_CONFIG_ID {
+            self.show_toast("Server config нельзя переименовать");
+            return;
+        }
         self.editing_config_id = Some(id.to_string());
         self.edit_name_buffer = current_name.to_string();
     }
@@ -748,19 +1231,55 @@ impl ANetApp {
             self.log("Нельзя сменить конфигурацию при активном подключении");
             return;
         }
-        let config = {
+        let config: Option<ConfigEntry> = {
             let mut settings = lock_ignore_poison(&self.settings);
             settings.set_active(id);
-            settings.get_active_config()
+            settings.get_active_config_with_overrides(&self.storage_key)
         };
         if let Some(config) = config {
+            self.config_name = config.name.clone();
+            self.config_err = None;
             self.load_config_from_content(&config.id, &config.content, &config.name, false);
+        }
+    }
+
+    pub fn check_and_show_url_modal_if_empty(&mut self) {
+        let (has_configs, has_server_cache) = {
+            let settings = lock_ignore_poison(&self.settings);
+            (!settings.configs.is_empty(), settings.cached_server_config.is_some())
+        };
+        let has_url = DesktopSecureStore::get_server_config_url().is_some();
+
+        if !has_configs && !has_server_cache && !has_url {
+            self.show_url_modal = true;
         }
     }
 
     pub fn drain_events(&mut self) {
         while let Ok(event) = self.event_rx.try_recv() {
             match event {
+                AnetEvent::ServerConfigUpdated { nodes_count, .. } => {
+                    self.is_fetching_server_config = false;
+                    self.show_toast(format!("✔ Серверный конфиг успешно обновлен ({nodes_count} серверов)"));
+                }
+                AnetEvent::ServerConfigFetchFailed { error, using_cached_from } => {
+                    self.is_fetching_server_config = false;
+                    let msg = if let Some(ts) = using_cached_from {
+                        let date_str = chrono::DateTime::from_timestamp(ts as i64, 0)
+                            .map(|dt| dt.format("%d.%m.%Y %H:%M").to_string())
+                            .unwrap_or_else(|| "ранее".to_string());
+                        format!("Ошибка обновления: {error} (версия от {date_str})")
+                    } else {
+                        format!("Ошибка обновления: {error}")
+                    };
+                    self.show_toast(msg);
+                }
+                AnetEvent::ServerConfigOutdatedWarning { last_updated_at, age_hours } => {
+                    let date_str = chrono::DateTime::from_timestamp(last_updated_at as i64, 0)
+                        .map(|dt| dt.format("%d.%m.%Y").to_string())
+                        .unwrap_or_else(|| "ранее".to_string());
+                    self.log(&format!("Внимание: конфиг устарел (возраст: {}ч, от {})", age_hours, date_str));
+                }
                 AnetEvent::Stats { rx, tx, rtt, rxm, txm } => {
                     self.total_rx = rx;
                     self.total_tx = tx;
@@ -768,7 +1287,15 @@ impl ANetApp {
                     self.total_rxm = rxm;
                     self.total_txm = txm;
                 }
-                AnetEvent::Status(msg) => self.log(&msg),
+                AnetEvent::TrafficUpdate { .. } => {
+                    // Числовые метрики трафика (обрабатываются внутри ядра/JNI)
+                }
+                AnetEvent::Status(msg) => {
+                    if msg.contains("Серверный конфиг актуален") {
+                        self.show_toast("Серверный конфиг актуален");
+                    }
+                    self.log(&msg);
+                }
                 AnetEvent::Warn(msg) => self.log(&msg),
                 AnetEvent::ClientStateChanged { state, server_name, .. } => {
                     if matches!(
@@ -785,7 +1312,7 @@ impl ANetApp {
                     if let Some(active_name) = server_name {
                         if let Some((active_id, _)) = self.server_names_cache.iter().find(|(_, name)| name == &active_name) {
                             let mut settings = lock_ignore_poison(&self.settings);
-                            if let Some(active_cfg) = settings.get_active_config() {
+                            if let Some(active_cfg) = settings.get_active_config_with_overrides(&self.storage_key) {
                                 settings.selected_servers.insert(active_cfg.id.clone(), active_id.clone());
                                 settings.save();
                             }
@@ -803,7 +1330,7 @@ impl ANetApp {
                     self.account_info = Some(info.clone());
 
                     let mut settings = lock_ignore_poison(&self.settings);
-                    if let Some(active_cfg) = settings.get_active_config() {
+                    if let Some(active_cfg) = settings.get_active_config_with_overrides(&self.storage_key) {
                         settings.cached_accounts.insert(active_cfg.id.clone(), info);
                         settings.save();
                     }
@@ -893,6 +1420,10 @@ impl eframe::App for ANetApp {
 
         self.drain_events();
 
+        if !self.settingsbar_open && !self.logbar_open && !self.show_url_modal {
+            self.check_and_show_url_modal_if_empty();
+        }
+
         // 1. Заголовок окна (Titlebar)
         ui::titlebar::render_titlebar(self, ctx);
 
@@ -907,6 +1438,7 @@ impl eframe::App for ANetApp {
         ui::logs_modal::render_logs_modal(self, ctx);
         ui::update_modal::render_update_modal(self, ctx);
         ui::error_modal::render_error_modal(self, ctx);
+        ui::url_modal::render_url_modal(self, ctx);
         ui::toast::render_toast(self, ctx);
     }
 }

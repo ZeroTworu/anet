@@ -402,6 +402,7 @@ dependencies = [
  "serde",
  "tokio",
  "tokio-tungstenite",
+ "toml 0.8.2",
  "webrtc",
  "x25519-dalek",
  "zip",

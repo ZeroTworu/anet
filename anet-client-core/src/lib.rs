@@ -13,3 +13,4 @@ mod transport;
 pub mod vpn;
 mod statistic;
 pub mod updater;
+pub mod server_config;

@@ -14,7 +14,8 @@ pub fn render_node_selector(app: &mut ANetApp, ui: &mut egui::Ui, state: Connect
 
     {
         let settings = lock_ignore_poison(&app.settings);
-        if let Some(active_cfg) = settings.get_active_config() {
+        // Используем get_active_config_with_overrides, чтобы корректно получать и Server config, и обычные конфиги
+        if let Some(active_cfg) = settings.get_active_config_with_overrides(&app.storage_key) {
             let active_cfg_id = active_cfg.id.clone();
             let active_cfg_content = active_cfg.content.clone();
             drop(settings);
@@ -196,15 +197,15 @@ pub fn render_node_selector(app: &mut ANetApp, ui: &mut egui::Ui, state: Connect
                                     let selected_id = id.clone();
                                     {
                                         let mut settings = lock_ignore_poison(&app.settings);
-                                        if let Some(active_cfg) = settings.get_active_config() {
+                                        if let Some(active_cfg) = settings.get_active_config_with_overrides(&app.storage_key) {
                                             settings.selected_servers.insert(active_cfg.id.clone(), selected_id);
                                             settings.save();
                                         }
                                     }
 
-                                    let active_cfg_data = {
+                                    let active_cfg_data: Option<(String, String, String)> = {
                                         let settings = lock_ignore_poison(&app.settings);
-                                        settings.get_active_config().map(|cfg| {
+                                        settings.get_active_config_with_overrides(&app.storage_key).map(|cfg| {
                                             (cfg.id.clone(), cfg.content.clone(), cfg.name.clone())
                                         })
                                     };

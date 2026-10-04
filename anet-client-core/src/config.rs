@@ -1,8 +1,9 @@
 use anet_common::config::StealthConfig;
 use anet_common::quic_settings::QuicConfig;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PerAppMode {
     All,
@@ -45,10 +46,24 @@ pub struct MainConfig {
 
     #[serde(default = "default_update_url")]
     pub update_url: String,
+
+    /// URL для автоматического обновления конфигурации
+    #[serde(default)]
+    pub config_url: Option<String>,
+
+    /// Альтернативное имя поля для совместимости с подписками
+    #[serde(default)]
+    pub subscription_url: Option<String>,
 }
 
 fn default_update_url() -> String {
     "https://api.github.com/repos/ZeroTworu/anet/releases/latest".to_string()
+}
+
+impl MainConfig {
+    pub fn get_config_url(&self) -> Option<&str> {
+        self.config_url.as_deref().or(self.subscription_url.as_deref())
+    }
 }
 
 impl Default for MainConfig {
@@ -62,6 +77,8 @@ impl Default for MainConfig {
             per_app: vec![],
             per_app_mode: PerAppMode::All,
             update_url: default_update_url(),
+            config_url: None,
+            subscription_url: None,
         }
     }
 }
@@ -223,7 +240,7 @@ impl ServerConfig {
         Ok((host.to_string(), path.to_string()))
     }
 
-    /// ИСПРАВЛЕНИЕ: гарантированно возвращает "host:port" даже если порт не был указан в DSN!
+    /// Гарантированно возвращает "host:port" даже если порт не был указан в DSN
     pub fn endpoint(&self) -> anyhow::Result<String> {
         let (host, port) = self.host_port()?;
         Ok(format!("{}:{}", host, port))
@@ -352,7 +369,7 @@ impl Default for AhttpConfig {
             traffic_path: "/traffic".to_string(),
             coalesce_budget_bytes: 65536,
             poll_timeout_ms: 15,
-            concurrency: 4, // 4 параллельных потока по умолчанию для обхода HOL-blocking
+            concurrency: 4,
             reassembly_queue_max_size: 1024,
 
             http2_adaptive_window: true,
@@ -385,7 +402,7 @@ pub struct CoreConfig {
     #[serde(default)]
     pub transport: TransportConfig,
 
-    // Наш новый массив серверов [[servers]] для переключения при сбоях
+    // Массив серверов [[servers]] для переключения при сбоях
     #[serde(default)]
     pub servers: Vec<ServerConfig>,
 
@@ -438,6 +455,10 @@ mod tests {
             weigth: None,
             websocket_min_session_secs: 480,
             websocket_max_session_secs: 1500,
+            wrtc_media_keepalive_interval_ms: None,
+            wrtc_ping_interval_secs: None,
+            wrtc_fallback_jvb_ip: None,
+            wrtc_fallback_jvb_port: None,
         };
         assert_eq!(server.mode().unwrap(), TransportMode::Quic);
         assert_eq!(server.endpoint().unwrap(), "vpn.example.com:4519");
@@ -449,24 +470,24 @@ mod tests {
         assert_eq!(websocket.mode().unwrap(), TransportMode::Websocket);
         assert_eq!(websocket.websocket_url().unwrap(), "wss://vpn.example.com:8443/socket");
 
-        // Тест дефолтного порта
         let ws_no_port = ServerConfig {
             name: None,
             dsn: "wss://gm1.anet-project.org/socket".to_string(),
             timeout_secs: 10,
             server_pub_key: None,
             ssh_user: None,
-
             group_name: None,
             group_id: None,
             weight: None,
             weigth: None,
-
             websocket_min_session_secs: 480,
             websocket_max_session_secs: 1500,
+            wrtc_media_keepalive_interval_ms: None,
+            wrtc_ping_interval_secs: None,
+            wrtc_fallback_jvb_ip: None,
+            wrtc_fallback_jvb_port: None,
         };
         assert_eq!(ws_no_port.endpoint().unwrap(), "gm1.anet-project.org:443");
-
     }
 
     #[test]
@@ -498,6 +519,5 @@ mod tests {
         assert_eq!(cfg.servers[0].group_name.as_deref(), Some("Group A"));
         assert_eq!(cfg.servers[0].weight(), 50);
         assert_eq!(cfg.servers[1].weight(), 100);
-
     }
 }
