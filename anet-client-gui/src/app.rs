@@ -13,27 +13,38 @@ use tokio::runtime::Runtime;
 
 use anet_client_core::{
     client::AnetClient,
-    config::{CoreConfig, PerAppMode},
+    config::{ CoreConfig, PerAppMode },
     events::{ set_handler, AccountInfo, AnetEvent, ClientState },
     platform::create_route_manager,
-    server_config::{apply_overrides, SERVER_CONFIG_ID, SERVER_CONFIG_DISPLAY_NAME},
-    updater::{ConfigFetchResult, Updater},
+    server_config::{ apply_overrides, SERVER_CONFIG_ID, SERVER_CONFIG_DISPLAY_NAME },
+    updater::{ ConfigFetchResult, Updater },
 };
 
 use crate::{
-    config::{AppSettings, ConfigEntry},
+    config::{ AppSettings, ConfigEntry },
     events::GuiEventHandler,
     secure_store::DesktopSecureStore,
     theme::apply_dark_theme,
     tray::{ TrayBackground, TrayCommand },
     tun_factory::DesktopTunFactory,
     types::{
-        ConfigLoadOutcome, ConnectionState, FilterMode, ProcessItem,
-        SettingsCategory, SharedState, UpdateStatus,
+        ConfigLoadOutcome,
+        ConnectionState,
+        FilterMode,
+        ProcessItem,
+        SettingsCategory,
+        SharedState,
+        UpdateStatus,
     },
     ui,
     utils::{
-        helpers::{ force_wake_up_window, lock_ignore_poison, push_log, send_notification, toggle_vpn },
+        helpers::{
+            force_wake_up_window,
+            lock_ignore_poison,
+            push_log,
+            send_notification,
+            toggle_vpn,
+        },
         toml::{ inject_exclude_route_to_toml, inject_per_app_to_toml, inject_tray_mode_to_toml },
     },
     GIT_TAG,
@@ -71,7 +82,7 @@ pub struct ANetApp {
 
     pub last_known_state: ConnectionState,
     pub is_in_tray: bool,
-    pub sidebar_open: bool,    
+    pub sidebar_open: bool,
     pub exclbar_open: bool,
     pub logbar_open: bool,
     pub settingsbar_open: bool,
@@ -202,14 +213,14 @@ impl ANetApp {
             config_load_rx,
             file_dialog_tx,
             file_dialog_rx,
-            log_save_tx,      
-            log_save_rx,      
+            log_save_tx,
+            log_save_rx,
             server_names_cache: Vec::new(),
             server_names_cache_key: None,
             tray_cmd_tx,
             last_known_state: ConnectionState::Disconnected,
             is_in_tray: false,
-            sidebar_open: false,            
+            sidebar_open: false,
             exclbar_open: false,
             logbar_open: false,
             settingsbar_open: false,
@@ -315,19 +326,25 @@ impl ANetApp {
 
         let is_server_active = {
             let settings = lock_ignore_poison(&self.settings);
-            settings.active_config_id.as_deref() == Some(SERVER_CONFIG_ID)
-                || self.config_name == SERVER_CONFIG_DISPLAY_NAME
-                || (settings.active_config_id.is_none() && settings.cached_server_config.is_some())
+            settings.active_config_id.as_deref() == Some(SERVER_CONFIG_ID) ||
+                self.config_name == SERVER_CONFIG_DISPLAY_NAME ||
+                (settings.active_config_id.is_none() && settings.cached_server_config.is_some())
         };
 
         if is_server_active {
-            let should_reconnect = lock_ignore_poison(&self.shared).state == ConnectionState::Connected;
+            let should_reconnect =
+                lock_ignore_poison(&self.shared).state == ConnectionState::Connected;
             let config_opt = {
                 let settings = lock_ignore_poison(&self.settings);
                 settings.get_active_config_with_overrides(&self.storage_key)
             };
             if let Some(config) = config_opt {
-                self.load_config_from_content(&config.id, &config.content, &config.name, should_reconnect);
+                self.load_config_from_content(
+                    &config.id,
+                    &config.content,
+                    &config.name,
+                    should_reconnect
+                );
             }
         }
     }
@@ -345,7 +362,12 @@ impl ANetApp {
         let default_dns = {
             let settings = lock_ignore_poison(&self.settings);
             if let Some(ref bundle) = settings.cached_server_config {
-                if let Ok(content) = anet_client_core::updater::Updater::decrypt_config(bundle, &self.storage_key) {
+                if
+                    let Ok(content) = anet_client_core::updater::Updater::decrypt_config(
+                        bundle,
+                        &self.storage_key
+                    )
+                {
                     toml::from_str::<CoreConfig>(&content)
                         .ok()
                         .map(|c| c.main.dns_server_list)
@@ -369,19 +391,25 @@ impl ANetApp {
 
         let is_server_active = {
             let settings = lock_ignore_poison(&self.settings);
-            settings.active_config_id.as_deref() == Some(SERVER_CONFIG_ID)
-                || self.config_name == SERVER_CONFIG_DISPLAY_NAME
-                || (settings.active_config_id.is_none() && settings.cached_server_config.is_some())
+            settings.active_config_id.as_deref() == Some(SERVER_CONFIG_ID) ||
+                self.config_name == SERVER_CONFIG_DISPLAY_NAME ||
+                (settings.active_config_id.is_none() && settings.cached_server_config.is_some())
         };
 
         if is_server_active {
-            let should_reconnect = lock_ignore_poison(&self.shared).state == ConnectionState::Connected;
+            let should_reconnect =
+                lock_ignore_poison(&self.shared).state == ConnectionState::Connected;
             let config_opt = {
                 let settings = lock_ignore_poison(&self.settings);
                 settings.get_active_config_with_overrides(&self.storage_key)
             };
             if let Some(config) = config_opt {
-                self.load_config_from_content(&config.id, &config.content, &config.name, should_reconnect);
+                self.load_config_from_content(
+                    &config.id,
+                    &config.content,
+                    &config.name,
+                    should_reconnect
+                );
             }
         }
     }
@@ -415,22 +443,28 @@ impl ANetApp {
                             settings.cached_server_config = Some(bundle);
                             let core_cfg: CoreConfig = toml::from_str(&content).unwrap();
                             let count = core_cfg.servers.len();
-                            let merged = apply_overrides(core_cfg, &settings.server_config_overrides);
+                            let merged = apply_overrides(
+                                core_cfg,
+                                &settings.server_config_overrides
+                            );
                             settings.save();
                             (merged, count)
                         };
 
                         let is_server_active = {
                             let settings = lock_ignore_poison(&settings_arc);
-                            settings.active_config_id.as_deref() == Some(SERVER_CONFIG_ID)
-                                || (settings.active_config_id.is_none() && settings.cached_server_config.is_some())
+                            settings.active_config_id.as_deref() == Some(SERVER_CONFIG_ID) ||
+                                (settings.active_config_id.is_none() &&
+                                    settings.cached_server_config.is_some())
                         };
 
                         if is_server_active {
-                            let tun = Box::new(DesktopTunFactory::new(
-                                merged_cfg.main.tun_name.clone(),
-                                !merged_cfg.main.per_app.is_empty(),
-                            ));
+                            let tun = Box::new(
+                                DesktopTunFactory::new(
+                                    merged_cfg.main.tun_name.clone(),
+                                    !merged_cfg.main.per_app.is_empty()
+                                )
+                            );
                             if let Ok(route) = create_route_manager(false) {
                                 let client = Arc::new(AnetClient::new(merged_cfg, tun, route));
                                 lock_ignore_poison(&shared_clone).client = Some(client);
@@ -442,7 +476,10 @@ impl ANetApp {
                             }
                         }
 
-                        push_log(&logs_arc, &format!("Серверный конфиг успешно обновлен (нод: {}).", nodes_count));
+                        push_log(
+                            &logs_arc,
+                            &format!("Серверный конфиг успешно обновлен (нод: {}).", nodes_count)
+                        );
                         send_notification("ANet VPN", "Серверный конфиг успешно обновлен");
 
                         anet_client_core::events::emit(AnetEvent::ServerConfigUpdated {
@@ -463,13 +500,18 @@ impl ANetApp {
 
                     let date_str = cached_date
                         .map(|ts| {
-                            chrono::DateTime::from_timestamp(ts as i64, 0)
+                            chrono::DateTime
+                                ::from_timestamp(ts as i64, 0)
                                 .map(|dt| dt.format("%d.%m.%Y %H:%M").to_string())
                                 .unwrap_or_else(|| "ранее".to_string())
                         })
                         .unwrap_or_else(|| "неизвестно".to_string());
 
-                    let err_text = format!("Не удалось обновить конфиг: {}. Используется версия от {}", e, date_str);
+                    let err_text = format!(
+                        "Не удалось обновить конфиг: {}. Используется версия от {}",
+                        e,
+                        date_str
+                    );
                     push_log(&logs_arc, &err_text);
                     send_notification("ANet VPN", &err_text);
 
@@ -515,9 +557,9 @@ impl ANetApp {
     pub fn configured_per_app(&self) -> Vec<String> {
         let is_server_cfg = {
             let settings = lock_ignore_poison(&self.settings);
-            settings.active_config_id.as_deref() == Some(SERVER_CONFIG_ID)
-                || self.config_name == SERVER_CONFIG_DISPLAY_NAME
-                || (settings.active_config_id.is_none() && settings.cached_server_config.is_some())
+            settings.active_config_id.as_deref() == Some(SERVER_CONFIG_ID) ||
+                self.config_name == SERVER_CONFIG_DISPLAY_NAME ||
+                (settings.active_config_id.is_none() && settings.cached_server_config.is_some())
         };
 
         if is_server_cfg {
@@ -581,7 +623,9 @@ impl ANetApp {
         for name in configured {
             let key = name.to_lowercase();
             map.entry(key)
-                .and_modify(|item| item.is_selected = true)
+                .and_modify(|item| {
+                    item.is_selected = true;
+                })
                 .or_insert(ProcessItem {
                     pid: 0,
                     name,
@@ -597,7 +641,13 @@ impl ANetApp {
     pub fn refresh_processes(&mut self) {}
 
     /// Загрузка конфигурации TOML, выбор ноды и запуск клиента
-    pub fn load_config_from_content(&mut self, id: &str, content: &str, name: &str, reconnect: bool) {
+    pub fn load_config_from_content(
+        &mut self,
+        id: &str,
+        content: &str,
+        name: &str,
+        reconnect: bool
+    ) {
         match toml::from_str::<CoreConfig>(content) {
             Ok(mut cfg) => {
                 let _ = cfg.sanitize();
@@ -628,7 +678,9 @@ impl ANetApp {
                 }
 
                 for proc in &mut self.processes {
-                    proc.is_selected = cfg.main.per_app.iter().any(|app| app.eq_ignore_ascii_case(&proc.name));
+                    proc.is_selected = cfg.main.per_app
+                        .iter()
+                        .any(|app| app.eq_ignore_ascii_case(&proc.name));
                 }
 
                 let selected_name_opt = {
@@ -636,27 +688,37 @@ impl ANetApp {
                     settings.selected_servers.get(id).cloned()
                 };
 
-                let has_groups = cfg.servers.iter().any(|s| {
-                    s.group_name.as_ref().map_or(false, |g| !g.trim().is_empty())
-                });
+                let has_groups = cfg.servers
+                    .iter()
+                    .any(|s| { s.group_name.as_ref().map_or(false, |g| !g.trim().is_empty()) });
 
                 if has_groups {
                     let selected_group_id = selected_name_opt
                         .filter(|id| {
-                            cfg.servers
-                                .iter()
-                                .any(|s| {
-                                    let g_name = s.group_name.as_deref().unwrap_or("");
-                                    let g_id = s.group_id.as_deref().unwrap_or(g_name).trim();
-                                    g_id == id.as_str()
-                                })
+                            cfg.servers.iter().any(|s| {
+                                let g_name = s.group_name.as_deref().unwrap_or("");
+                                let g_id = s.group_id.as_deref().unwrap_or(g_name).trim();
+                                g_id == id.as_str()
+                            })
                         })
                         .unwrap_or_else(|| {
                             cfg.servers
                                 .iter()
                                 .find_map(|s| {
-                                    if s.group_name.as_deref().map_or(true, |g| g.trim().is_empty()) { return None; }
-                                    Some(s.group_id.as_deref().unwrap_or(s.group_name.as_ref().unwrap()).trim().to_string())
+                                    if
+                                        s.group_name
+                                            .as_deref()
+                                            .map_or(true, |g| g.trim().is_empty())
+                                    {
+                                        return None;
+                                    }
+                                    Some(
+                                        s.group_id
+                                            .as_deref()
+                                            .unwrap_or(s.group_name.as_ref().unwrap())
+                                            .trim()
+                                            .to_string()
+                                    )
                                 })
                                 .unwrap_or_default()
                         });
@@ -670,8 +732,13 @@ impl ANetApp {
                     let mut group_servers: Vec<_> = cfg.servers
                         .iter()
                         .filter(|s| {
-                            if s.group_name.as_deref().map_or(true, |g| g.trim().is_empty()) { return false; }
-                            let g_id = s.group_id.as_deref().unwrap_or(s.group_name.as_ref().unwrap()).trim();
+                            if s.group_name.as_deref().map_or(true, |g| g.trim().is_empty()) {
+                                return false;
+                            }
+                            let g_id = s.group_id
+                                .as_deref()
+                                .unwrap_or(s.group_name.as_ref().unwrap())
+                                .trim();
                             g_id == selected_group_id.as_str()
                         })
                         .cloned()
@@ -683,10 +750,7 @@ impl ANetApp {
                         cfg.servers = group_servers;
                     }
                 } else if let Some(selected_id) = selected_name_opt {
-                    if let Some(idx) = cfg.servers
-                        .iter()
-                        .position(|s| s.dsn == selected_id)
-                    {
+                    if let Some(idx) = cfg.servers.iter().position(|s| s.dsn == selected_id) {
                         cfg.servers.rotate_left(idx);
                     }
                 }
@@ -776,9 +840,9 @@ impl ANetApp {
         self.server_names_cache = match toml::from_str::<CoreConfig>(content) {
             Ok(mut raw_cfg) => {
                 let _ = raw_cfg.sanitize();
-                let has_groups = raw_cfg.servers.iter().any(|s| {
-                    s.group_name.as_ref().map_or(false, |g| !g.trim().is_empty())
-                });
+                let has_groups = raw_cfg.servers
+                    .iter()
+                    .any(|s| { s.group_name.as_ref().map_or(false, |g| !g.trim().is_empty()) });
 
                 if has_groups {
                     let mut groups = Vec::new();
@@ -786,7 +850,9 @@ impl ANetApp {
                     for s in &raw_cfg.servers {
                         if let Some(ref g_name) = s.group_name {
                             let g_name = g_name.trim();
-                            if g_name.is_empty() { continue; }
+                            if g_name.is_empty() {
+                                continue;
+                            }
                             let g_id = s.group_id.as_deref().unwrap_or(g_name).trim();
                             if seen.insert(g_id.to_string()) {
                                 groups.push((g_id.to_string(), g_name.to_string()));
@@ -795,7 +861,10 @@ impl ANetApp {
                     }
                     groups
                 } else {
-                    raw_cfg.servers.iter().map(|s| (s.dsn.clone(), s.get_name())).collect()
+                    raw_cfg.servers
+                        .iter()
+                        .map(|s| (s.dsn.clone(), s.get_name()))
+                        .collect()
                 }
             }
             Err(_) => Vec::new(),
@@ -807,9 +876,9 @@ impl ANetApp {
     pub fn save_exclude_routes(&mut self) {
         let is_server_cfg = {
             let settings = lock_ignore_poison(&self.settings);
-            settings.active_config_id.as_deref() == Some(SERVER_CONFIG_ID)
-                || self.config_name == SERVER_CONFIG_DISPLAY_NAME
-                || (settings.active_config_id.is_none() && settings.cached_server_config.is_some())
+            settings.active_config_id.as_deref() == Some(SERVER_CONFIG_ID) ||
+                self.config_name == SERVER_CONFIG_DISPLAY_NAME ||
+                (settings.active_config_id.is_none() && settings.cached_server_config.is_some())
         };
 
         // 1. РЕЖИМ SERVER CONFIG: сохраняем в оверлеи приложения (settings.json)
@@ -817,14 +886,17 @@ impl ANetApp {
             {
                 let mut settings = lock_ignore_poison(&self.settings);
                 settings.active_config_id = Some(SERVER_CONFIG_ID.to_string());
-                settings.server_config_overrides.exclude_route_for = Some(self.exclude_routes.clone());
+                settings.server_config_overrides.exclude_route_for = Some(
+                    self.exclude_routes.clone()
+                );
                 settings.save();
             }
 
             self.show_toast("Исключения для Server config сохранены");
             self.log("Исключения сохранены в оверлей Server config.");
 
-            let should_reconnect = lock_ignore_poison(&self.shared).state == ConnectionState::Connected;
+            let should_reconnect =
+                lock_ignore_poison(&self.shared).state == ConnectionState::Connected;
             if should_reconnect {
                 self.log("Переподключение VPN с обновленными исключениями...");
             }
@@ -835,7 +907,12 @@ impl ANetApp {
             };
 
             if let Some(config) = config_opt {
-                self.load_config_from_content(&config.id, &config.content, &config.name, should_reconnect);
+                self.load_config_from_content(
+                    &config.id,
+                    &config.content,
+                    &config.name,
+                    should_reconnect
+                );
             }
             return;
         }
@@ -850,7 +927,11 @@ impl ANetApp {
             if let Some(id) = active_id {
                 if let Some(cfg) = settings.configs.iter_mut().find(|c| c.id == id) {
                     cfg.content = inject_exclude_route_to_toml(&cfg.content, &self.exclude_routes);
-                    updated_config_data = Some((cfg.id.clone(), cfg.content.clone(), cfg.name.clone()));
+                    updated_config_data = Some((
+                        cfg.id.clone(),
+                        cfg.content.clone(),
+                        cfg.name.clone(),
+                    ));
                 }
                 settings.save();
             } else if !settings.configs.is_empty() {
@@ -918,9 +999,9 @@ impl ANetApp {
 
         let is_server_cfg = {
             let settings = lock_ignore_poison(&self.settings);
-            settings.active_config_id.as_deref() == Some(SERVER_CONFIG_ID)
-                || self.config_name == SERVER_CONFIG_DISPLAY_NAME
-                || (settings.active_config_id.is_none() && settings.cached_server_config.is_some())
+            settings.active_config_id.as_deref() == Some(SERVER_CONFIG_ID) ||
+                self.config_name == SERVER_CONFIG_DISPLAY_NAME ||
+                (settings.active_config_id.is_none() && settings.cached_server_config.is_some())
         };
 
         // 1. РЕЖИМ SERVER CONFIG: сохраняем в оверлеи приложения (settings.json)
@@ -940,7 +1021,8 @@ impl ANetApp {
             self.show_toast("Настройки приложений для Server config сохранены");
             self.log("Настройки приложений сохранены в оверлей Server config.");
 
-            let should_reconnect = lock_ignore_poison(&self.shared).state == ConnectionState::Connected;
+            let should_reconnect =
+                lock_ignore_poison(&self.shared).state == ConnectionState::Connected;
             if should_reconnect {
                 self.log("Переподключение VPN с новыми настройками приложений...");
             }
@@ -951,7 +1033,12 @@ impl ANetApp {
             };
 
             if let Some(config) = config_opt {
-                self.load_config_from_content(&config.id, &config.content, &config.name, should_reconnect);
+                self.load_config_from_content(
+                    &config.id,
+                    &config.content,
+                    &config.name,
+                    should_reconnect
+                );
             }
             return;
         }
@@ -965,21 +1052,17 @@ impl ANetApp {
 
             if let Some(id) = active_id {
                 if let Some(cfg) = settings.configs.iter_mut().find(|c| c.id == id) {
-                    cfg.content = inject_per_app_to_toml(
-                        &cfg.content,
-                        &selected_apps,
-                        filter_mode,
-                    );
-                    updated_config_data = Some((cfg.id.clone(), cfg.content.clone(), cfg.name.clone()));
+                    cfg.content = inject_per_app_to_toml(&cfg.content, &selected_apps, filter_mode);
+                    updated_config_data = Some((
+                        cfg.id.clone(),
+                        cfg.content.clone(),
+                        cfg.name.clone(),
+                    ));
                 }
                 settings.save();
             } else if !settings.configs.is_empty() {
                 let cfg = &mut settings.configs[0];
-                cfg.content = inject_per_app_to_toml(
-                    &cfg.content,
-                    &selected_apps,
-                    filter_mode,
-                );
+                cfg.content = inject_per_app_to_toml(&cfg.content, &selected_apps, filter_mode);
                 let id = cfg.id.clone();
                 let content = cfg.content.clone();
                 let name = cfg.name.clone();
@@ -1016,7 +1099,8 @@ impl ANetApp {
                 }
             }
 
-            let should_reconnect = lock_ignore_poison(&self.shared).state == ConnectionState::Connected;
+            let should_reconnect =
+                lock_ignore_poison(&self.shared).state == ConnectionState::Connected;
             if should_reconnect {
                 self.log("Переподключение VPN с новыми настройками приложений...");
             }
@@ -1034,9 +1118,9 @@ impl ANetApp {
         let tray_mode = self.tray_value;
         let is_server_cfg = {
             let settings = lock_ignore_poison(&self.settings);
-            settings.active_config_id.as_deref() == Some(SERVER_CONFIG_ID)
-                || self.config_name == SERVER_CONFIG_DISPLAY_NAME
-                || (settings.active_config_id.is_none() && settings.cached_server_config.is_some())
+            settings.active_config_id.as_deref() == Some(SERVER_CONFIG_ID) ||
+                self.config_name == SERVER_CONFIG_DISPLAY_NAME ||
+                (settings.active_config_id.is_none() && settings.cached_server_config.is_some())
         };
 
         if is_server_cfg {
@@ -1045,7 +1129,9 @@ impl ANetApp {
                 settings.server_config_overrides.tray_mode = Some(tray_mode);
                 settings.save();
             }
-            self.show_toast(&format!("Настройка tray_mode для Server config сохранена: {}", tray_mode));
+            self.show_toast(
+                &format!("Настройка tray_mode для Server config сохранена: {}", tray_mode)
+            );
             return;
         }
 
@@ -1058,7 +1144,11 @@ impl ANetApp {
             if let Some(ref id) = active_id {
                 if let Some(cfg) = settings.configs.iter_mut().find(|c| &c.id == id) {
                     cfg.content = inject_tray_mode_to_toml(&cfg.content, tray_mode);
-                    updated_config_data = Some((cfg.id.clone(), cfg.content.clone(), cfg.name.clone()));
+                    updated_config_data = Some((
+                        cfg.id.clone(),
+                        cfg.content.clone(),
+                        cfg.name.clone(),
+                    ));
                 }
                 settings.save();
             } else if !settings.configs.is_empty() {
@@ -1162,7 +1252,12 @@ impl ANetApp {
     pub fn open_file_dialog(&mut self) {
         let tx = self.file_dialog_tx.clone();
         std::thread::spawn(move || {
-            if let Some(path) = rfd::FileDialog::new().add_filter("TOML Config", &["toml"]).pick_file() {
+            if
+                let Some(path) = rfd::FileDialog
+                    ::new()
+                    .add_filter("TOML Config", &["toml"])
+                    .pick_file()
+            {
                 let _ = tx.send(path);
             }
         });
@@ -1173,17 +1268,18 @@ impl ANetApp {
         let tx = self.log_save_tx.clone();
 
         std::thread::spawn(move || {
-            let timestamp = std::time::SystemTime::now()
+            let timestamp = std::time::SystemTime
+                ::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
             let default_name = format!("anet_logs_{}.log", timestamp);
 
-            let Some(path) = rfd::FileDialog::new()
+            let Some(path) = rfd::FileDialog
+                ::new()
                 .set_file_name(&default_name)
                 .add_filter("Log files", &["log", "txt"])
-                .save_file()
-            else {
+                .save_file() else {
                 return;
             };
 
@@ -1261,7 +1357,8 @@ impl ANetApp {
         }
 
         if lock_ignore_poison(&self.shared).state != ConnectionState::Disconnected {
-            let is_active = lock_ignore_poison(&self.settings).active_config_id.as_deref() == Some(id);
+            let is_active =
+                lock_ignore_poison(&self.settings).active_config_id.as_deref() == Some(id);
             if is_active {
                 self.show_toast("Нельзя удалить активный конфиг при подключенном VPN");
                 self.log("Нельзя удалить активную конфигурацию при подключенном VPN");
@@ -1331,12 +1428,15 @@ impl ANetApp {
             match event {
                 AnetEvent::ServerConfigUpdated { nodes_count, .. } => {
                     self.is_fetching_server_config = false;
-                    self.show_toast(format!("✔ Серверный конфиг успешно обновлен ({nodes_count} серверов)"));
+                    self.show_toast(
+                        format!("✔ Серверный конфиг успешно обновлен ({nodes_count} серверов)")
+                    );
                 }
                 AnetEvent::ServerConfigFetchFailed { error, using_cached_from } => {
                     self.is_fetching_server_config = false;
                     let msg = if let Some(ts) = using_cached_from {
-                        let date_str = chrono::DateTime::from_timestamp(ts as i64, 0)
+                        let date_str = chrono::DateTime
+                            ::from_timestamp(ts as i64, 0)
                             .map(|dt| dt.format("%d.%m.%Y %H:%M").to_string())
                             .unwrap_or_else(|| "ранее".to_string());
                         format!("Ошибка обновления: {error} (версия от {date_str})")
@@ -1346,10 +1446,17 @@ impl ANetApp {
                     self.show_toast(msg);
                 }
                 AnetEvent::ServerConfigOutdatedWarning { last_updated_at, age_hours } => {
-                    let date_str = chrono::DateTime::from_timestamp(last_updated_at as i64, 0)
+                    let date_str = chrono::DateTime
+                        ::from_timestamp(last_updated_at as i64, 0)
                         .map(|dt| dt.format("%d.%m.%Y").to_string())
                         .unwrap_or_else(|| "ранее".to_string());
-                    self.log(&format!("Внимание: конфиг устарел (возраст: {}ч, от {})", age_hours, date_str));
+                    self.log(
+                        &format!(
+                            "Внимание: конфиг устарел (возраст: {}ч, от {})",
+                            age_hours,
+                            date_str
+                        )
+                    );
                 }
                 AnetEvent::Stats { rx, tx, rtt, rxm, txm } => {
                     self.total_rx = rx;
@@ -1367,10 +1474,12 @@ impl ANetApp {
                 }
                 AnetEvent::Warn(msg) => self.log(&msg),
                 AnetEvent::ClientStateChanged { state, server_name, .. } => {
-                    if matches!(
-                        state,
-                        ClientState::Disconnected | ClientState::Stopped | ClientState::Failed
-                    ) {
+                    if
+                        matches!(
+                            state,
+                            ClientState::Disconnected | ClientState::Stopped | ClientState::Failed
+                        )
+                    {
                         self.total_rx = "0 B".to_string();
                         self.total_tx = "0 B".to_string();
                         self.total_rtt = "0".to_string();
@@ -1379,10 +1488,21 @@ impl ANetApp {
                     }
 
                     if let Some(active_name) = server_name {
-                        if let Some((active_id, _)) = self.server_names_cache.iter().find(|(_, name)| name == &active_name) {
+                        if
+                            let Some((active_id, _)) = self.server_names_cache
+                                .iter()
+                                .find(|(_, name)| name == &active_name)
+                        {
                             let mut settings = lock_ignore_poison(&self.settings);
-                            if let Some(active_cfg) = settings.get_active_config_with_overrides(&self.storage_key) {
-                                settings.selected_servers.insert(active_cfg.id.clone(), active_id.clone());
+                            if
+                                let Some(active_cfg) = settings.get_active_config_with_overrides(
+                                    &self.storage_key
+                                )
+                            {
+                                settings.selected_servers.insert(
+                                    active_cfg.id.clone(),
+                                    active_id.clone()
+                                );
                                 settings.save();
                             }
                         }
@@ -1399,7 +1519,11 @@ impl ANetApp {
                     self.account_info = Some(info.clone());
 
                     let mut settings = lock_ignore_poison(&self.settings);
-                    if let Some(active_cfg) = settings.get_active_config_with_overrides(&self.storage_key) {
+                    if
+                        let Some(active_cfg) = settings.get_active_config_with_overrides(
+                            &self.storage_key
+                        )
+                    {
                         settings.cached_accounts.insert(active_cfg.id.clone(), info);
                         settings.save();
                     }
@@ -1408,7 +1532,12 @@ impl ANetApp {
                     let err = format!("CRITICAL ERROR: {}", msg);
                     self.log(&err);
                     self.error_modal = Some(msg.clone());
-                    if matches!(self.update_status, UpdateStatus::Downloading(_) | UpdateStatus::Checking) {
+                    if
+                        matches!(
+                            self.update_status,
+                            UpdateStatus::Downloading(_) | UpdateStatus::Checking
+                        )
+                    {
                         self.update_status = UpdateStatus::Error(msg);
                     }
                     if !lock_ignore_poison(&self.settings).disable_notifications {
@@ -1433,8 +1562,9 @@ impl ANetApp {
         while let Ok(outcome) = self.config_load_rx.try_recv() {
             match outcome {
                 ConfigLoadOutcome::Loaded { id, name, reconnect } => {
-                    let is_still_active = lock_ignore_poison(&self.settings)
-                        .active_config_id.as_deref() == Some(id.as_str());
+                    let is_still_active =
+                        lock_ignore_poison(&self.settings).active_config_id.as_deref() ==
+                        Some(id.as_str());
                     if is_still_active {
                         self.config_err = None;
                         self.config_name = name.clone();
@@ -1446,8 +1576,9 @@ impl ANetApp {
                     }
                 }
                 ConfigLoadOutcome::Failed { id, error } => {
-                    let is_still_active = lock_ignore_poison(&self.settings)
-                        .active_config_id.as_deref() == Some(id.as_str());
+                    let is_still_active =
+                        lock_ignore_poison(&self.settings).active_config_id.as_deref() ==
+                        Some(id.as_str());
                     if is_still_active {
                         self.config_err = Some(error);
                         self.log("Failed to create route manager");

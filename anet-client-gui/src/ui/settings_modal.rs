@@ -530,7 +530,7 @@ fn render_configs_settings(app: &mut ANetApp, ui: &mut egui::Ui) {
                                 ui.painter().text(
                                     sub_pos,
                                     egui::Align2::LEFT_CENTER,
-                                    "● АКТИВНЫЙ (ШИФРОВАННЫЙ СЕРВЕРНЫЙ КОНФИГ)",
+                                    "АКТИВНЫЙ (ШИФРОВАННЫЙ СЕРВЕРНЫЙ КОНФИГ)",
                                     egui::FontId::new(8.5, egui::FontFamily::Name("Inter-V".into())),
                                     egui::Color32::from_rgb(76, 175, 80),
                                 );
