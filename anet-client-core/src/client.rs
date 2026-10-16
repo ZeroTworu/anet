@@ -436,10 +436,7 @@ impl AnetClient {
         let client_ip_opt: Option<std::net::Ipv4Addr> = result.auth_response.ip.parse().ok();
         let gateway_ip_opt: Option<std::net::Ipv4Addr> = result.auth_response.gateway.parse().ok();
 
-        let last_rtt_ms = result
-            .last_rtt_ms
-            .clone()
-            .unwrap_or_else(|| Arc::new(AtomicU32::new(u32::MAX)));
+        let last_rtt_ms = Arc::new(AtomicU32::new(u32::MAX));
         let (tx_probe, mut rx_probe) = tokio::sync::mpsc::channel::<Bytes>(16);
 
         // Внутритуннельный генератор ICMP Echo Request для универсального измерения честного RTT.
@@ -454,7 +451,7 @@ impl AnetClient {
                 let mut seq: u16 = 0;
                 // Небольшая задержка перед первым зондом для завершения инициализации туннеля
                 tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_millis(300)) => {}
+                    _ = tokio::time::sleep(Duration::from_millis(150)) => {}
                     _ = probe_shutdown.notified() => return,
                 }
 

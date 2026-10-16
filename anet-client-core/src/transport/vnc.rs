@@ -185,7 +185,6 @@ impl ClientTransport for VncTransport {
             remote_ip: Some(addr.ip()), // Передаем IP в bypass
             bypass_ips: Vec::new(),
             effective_mode: None,
-            last_rtt_ms: None,
         })
     }
 }
