@@ -10,6 +10,7 @@ use anet_common::atun::TunManager;
 use anet_common::tun_params::TunParams;
 use anyhow::Result;
 use base64::prelude::*;
+use bytes::Bytes;
 use dashmap::DashMap;
 use ed25519_dalek::SigningKey;
 use log::error;
@@ -115,10 +116,34 @@ impl ANetServer {
         });
 
         // 3. Выборочная инъекция транспорта на основании конфигурационного манифеста
+        // Канал входящих пакетов от клиентов (все транспорты шлют сюда).
+        // Перехватываем внутритуннельные ICMP Echo Request зонды в userspace
+        // и мгновенно отправляем ICMP Echo Reply клиенту через registry.route_packet_to_client.
+        // Это гарантирует точный замер сквозного RTT на всех транспортах (WRTC/SSH/VNC/WS/AHTTP/QUIC)
+        // без зависимости от ядра ОС сервера, iptables, rp_filter или совпадения IP TUN.
+        let (client_pkt_tx, mut client_pkt_rx) =
+            tokio::sync::mpsc::channel::<Bytes>(anet_common::consts::CHANNEL_BUFFER_SIZE);
+
+        let probe_registry = self.registry.clone();
+        let tun_writer = tx_tun.clone();
+        tokio::spawn(async move {
+            while let Some(packet) = client_pkt_rx.recv().await {
+                if let Some(reply) = anet_common::icmp_probe::handle_in_tunnel_icmp_probe(&packet) {
+                    if let Some(dst_ip) = crate::utils::extract_ip_dst(&reply) {
+                        probe_registry
+                            .route_packet_to_client(&dst_ip.to_string(), reply)
+                            .await;
+                    }
+                    continue;
+                }
+                let _ = tun_writer.try_send(packet);
+            }
+        });
+
         let mut handle_collection = vec![];
 
         if !self.cfg.server.quic_bind_to.trim().is_empty() {
-            let t_tx = tx_tun.clone();
+            let t_tx = client_pkt_tx.clone();
             let auth = self.auth_handler_core.clone();
             let rg = self.registry.clone();
             let c = self.cfg.clone();
@@ -131,7 +156,7 @@ impl ANetServer {
         }
 
         if !self.cfg.server.ssh_bind_to.trim().is_empty() {
-            let t_tx = tx_tun.clone();
+            let t_tx = client_pkt_tx.clone();
             let auth = self.auth_handler_core.clone();
             let rg = self.registry.clone();
             let c = self.cfg.clone();
@@ -146,7 +171,7 @@ impl ANetServer {
         if !bnd_vnc.is_empty() {
             let v_cfg = self.cfg.clone();
             let v_reg = self.registry.clone();
-            let v_tx = tx_tun.clone();
+            let v_tx = client_pkt_tx.clone();
             let v_auth = self.auth_handler_core.clone();
             handle_collection.push(tokio::spawn(async move {
                 if let Err(e) = vnc::run_vnc_server(v_cfg, v_reg, v_tx, v_auth).await {
@@ -158,7 +183,7 @@ impl ANetServer {
         if !self.cfg.server.websocket_bind_to.trim().is_empty() {
             let c = self.cfg.clone();
             let rg = self.registry.clone();
-            let tx = tx_tun.clone();
+            let tx = client_pkt_tx.clone();
             let auth = self.auth_handler_core.clone();
             handle_collection.push(tokio::spawn(async move {
                 if let Err(e) = websocket::run_websocket_server(c, rg, tx, auth).await {
@@ -170,7 +195,7 @@ impl ANetServer {
         if !self.cfg.server.ahttp_bind_to.trim().is_empty() {
             let c = self.cfg.clone();
             let rg = self.registry.clone();
-            let tx = tx_tun.clone();
+            let tx = client_pkt_tx.clone();
             let auth = self.auth_handler_core.clone();
             handle_collection.push(tokio::spawn(async move {
                 if let Err(e) = http_stream::run_http_stream_server(c, rg, tx, auth).await {
@@ -183,7 +208,7 @@ impl ANetServer {
             if !wrtc_url.trim().is_empty() {
                 let c = self.cfg.clone();
                 let rg = self.registry.clone();
-                let tx = tx_tun.clone();
+                let tx = client_pkt_tx.clone();
                 let auth = self.auth_handler_core.clone();
                 handle_collection.push(tokio::spawn(async move {
                     if let Err(e) = wrtc::run_wrtc_server(c, rg, tx, auth).await {

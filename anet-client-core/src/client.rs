@@ -10,7 +10,7 @@ use log::{error, info, warn};
 use quinn::Endpoint;
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncWriteExt, split as io_split};
@@ -25,6 +25,9 @@ use tokio::time::sleep;
 #[cfg(all(windows, feature = "per-app"))]
 use anet_appfilter::{AppFilter, AppPolicy};
 use anet_common::consts::COALESCE_BUDGET_BYTES;
+use anet_common::icmp_probe::{
+    PROBE_IDENTIFIER, build_ipv4_icmp_echo_request, parse_ipv4_icmp_echo_reply,
+};
 use anet_common::protocol::{AuthResponse, BillingType as ProtoBillingType};
 use anet_common::stream_framing::{frame_packet_into, read_next_packet};
 
@@ -430,6 +433,51 @@ impl AnetClient {
         let notify_tx = shutdown_notify.clone();
         let notify_rx = shutdown_notify.clone();
 
+        let client_ip_opt: Option<std::net::Ipv4Addr> = result.auth_response.ip.parse().ok();
+        let gateway_ip_opt: Option<std::net::Ipv4Addr> = result.auth_response.gateway.parse().ok();
+
+        let last_rtt_ms = Arc::new(AtomicU32::new(u32::MAX));
+        let (tx_probe, mut rx_probe) = tokio::sync::mpsc::channel::<Bytes>(16);
+
+        // Внутритуннельный генератор ICMP Echo Request для универсального измерения честного RTT.
+        // Работает для ВСЕХ видов транспорта (QUIC, SSH, VNC, AHTTP, WS, WRTC) прямо внутри шифрованного потока.
+        // Не требует raw-сокетов и повышенных прав ОС (полная совместимость с Linux, Windows, macOS, Android, iOS).
+        if let (Some(client_ip), Some(gateway_ip)) = (client_ip_opt, gateway_ip_opt) {
+            let tx_probe_c = tx_probe.clone();
+            let probe_shutdown = shutdown_notify.clone();
+            let probe_start_time = session_start;
+
+            tokio::spawn(async move {
+                let mut seq: u16 = 0;
+                // Небольшая задержка перед первым зондом для завершения инициализации туннеля
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_millis(300)) => {}
+                    _ = probe_shutdown.notified() => return,
+                }
+
+                loop {
+                    seq = seq.wrapping_add(1);
+                    let now_us = probe_start_time.elapsed().as_micros() as u64;
+                    let probe_packet = build_ipv4_icmp_echo_request(
+                        client_ip,
+                        gateway_ip,
+                        PROBE_IDENTIFIER,
+                        seq,
+                        now_us,
+                    );
+
+                    if tx_probe_c.send(probe_packet).await.is_err() {
+                        break;
+                    }
+
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_secs(3)) => {}
+                        _ = probe_shutdown.notified() => break,
+                    }
+                }
+            });
+        }
+
         let (mut stream_reader, mut stream_writer) = io_split(result.vpn_stream);
 
         let tx_time = last_tx_time.clone();
@@ -453,6 +501,17 @@ impl AnetClient {
                             }
                         }
                     }
+                    probe_pkt = rx_probe.recv() => {
+                        match probe_pkt {
+                            Some(p) => p,
+                            None => {
+                                match rx_from_tun.recv().await {
+                                    Some(p) => p,
+                                    None => break,
+                                }
+                            }
+                        }
+                    }
                     _ = notify_tx.notified() => {
                         info!("[Tunnel/Tx] Worker received shutdown notification.");
                         break;
@@ -461,7 +520,6 @@ impl AnetClient {
 
                 write_buf.clear();
                 *tx_time.lock().unwrap() = Instant::now();
-
                 let len = packet.len() as u64;
                 tx_bytes.fetch_add(len, Ordering::Relaxed);
                 tx_packets.fetch_add(1, Ordering::Relaxed);
@@ -476,7 +534,15 @@ impl AnetClient {
                             tx_packets.fetch_add(1, Ordering::Relaxed);
                             frame_packet_into(&mut write_buf, &p);
                         }
-                        Err(_) => break,
+                        Err(_) => {
+                            if let Ok(p) = rx_probe.try_recv() {
+                                let len = p.len() as u64;
+                                tx_bytes.fetch_add(len, Ordering::Relaxed);
+                                tx_packets.fetch_add(1, Ordering::Relaxed);
+                                frame_packet_into(&mut write_buf, &p);
+                            }
+                            break;
+                        }
                     }
                 }
 
@@ -499,6 +565,8 @@ impl AnetClient {
         let rx_packets = total_rx_packets.clone();
         let sig_t2 = reconnect_signal.clone();
         let reason_t2 = disconnect_reason.clone();
+        let last_rtt_rx = last_rtt_ms.clone();
+        let probe_start_rx = session_start;
         let t2 = spawn(async move {
             loop {
                 select! {
@@ -509,6 +577,22 @@ impl AnetClient {
                                 let len = packet.len() as u64;
                                 rx_bytes.fetch_add(len, Ordering::Relaxed);
                                 rx_packets.fetch_add(1, Ordering::Relaxed);
+
+                                // Перехватываем внутритуннельный ICMP Echo Reply (замер честного RTT)
+                                if let Some(c_ip) = client_ip_opt {
+                                    if let Some((_seq, sent_ts_us)) = parse_ipv4_icmp_echo_reply(
+                                        &packet,
+                                        c_ip,
+                                        PROBE_IDENTIFIER,
+                                    ) {
+                                        let now_us = probe_start_rx.elapsed().as_micros() as u64;
+                                        let rtt_us = now_us.saturating_sub(sent_ts_us);
+                                        let rtt_ms = (rtt_us as f64 / 1000.0).round() as u32;
+                                        last_rtt_rx.store(rtt_ms.max(1), Ordering::Relaxed);
+                                        log::debug!("[Probe/RTT] In-tunnel RTT: {} ms (seq: {})", rtt_ms.max(1), _seq);
+                                        continue; // Поглощаем ответ зонда, не отдаем в локальный TUN интерфейс ОС
+                                    }
+                                }
 
                                 if tx_to_tun.send(packet).await.is_err() {
                                     warn!("[Tunnel/Rx] Failed to send packet to TUN channel (channel closed or dropped).");
@@ -647,33 +731,22 @@ impl AnetClient {
                     ))
                 };
 
-            // Для QUIC RTT измеряется Quinn нативно по ACK-пакетам.
-            // PingStatsProvider (TCP-пробы) используем только для потоковых транспортов (SSH/VNC/AHTTP)
-            let fast_provider: Arc<dyn statistic::StatsProvider> = if !is_quic {
-                let (server_host, server_port) = server.host_port().unwrap_or_default();
-                let target_addr = if let Some(ip) = result.remote_ip {
-                    Some(SocketAddr::new(ip, server_port))
-                } else if let Ok(ip) = IpAddr::from_str(&server_host) {
-                    Some(SocketAddr::new(ip, server_port))
-                } else {
-                    None
-                };
-
-                if let Some(addr) = target_addr {
-                    statistic::PingStatsProvider::new(provider.clone(), addr)
-                } else {
-                    provider.clone()
-                }
-            } else {
-                provider.clone()
-            };
+            // Оборачиваем provider в PingStatsProvider с общим атомиком задержки.
+            // Для QUIC: если Quinn нативно возвращает RTT, он используется в первую очередь.
+            // Для всех остальных транспортов (SSH/VNC/AHTTP/WS/WRTC): честный сквозной RTT
+            // берется из внутритуннельного замера ICMP Echo Reply от ядра сервера.
+            let full_provider: Arc<dyn statistic::StatsProvider> =
+                statistic::PingStatsProvider::new_with_atomic(
+                    provider.clone(),
+                    last_rtt_ms.clone(),
+                );
 
             let fast_handle =
-                statistic::start_fast_stats_monitor(fast_provider, stats_shutdown.clone());
+                statistic::start_fast_stats_monitor(full_provider.clone(), stats_shutdown.clone());
 
             let slow_handle = if config_clone.stats.enabled {
                 Some(statistic::start_stats_monitor(
-                    provider,
+                    full_provider,
                     config_clone.stats.interval_minutes,
                     stats_shutdown,
                 ))

@@ -97,42 +97,14 @@ impl StatsProvider for QuicStatsProvider {
 }
 
 impl PingStatsProvider {
-    pub fn new(inner: Arc<dyn StatsProvider>, target_addr: SocketAddr) -> Arc<Self> {
+    /// Создает StatsProvider с общим атомиком задержки, обновляемым внутритуннельным ICMP-обработчиком.
+    pub fn new_with_atomic(inner: Arc<dyn StatsProvider>, last_rtt_ms: Arc<AtomicU32>) -> Arc<Self> {
+        Arc::new(Self { inner, last_rtt_ms })
+    }
+
+    /// Устаревший конструктор (для обратной совместимости, если где-то вызывается)
+    pub fn new(inner: Arc<dyn StatsProvider>, _target_addr: SocketAddr) -> Arc<Self> {
         let last_rtt_ms = Arc::new(AtomicU32::new(u32::MAX));
-        let rtt_clone = last_rtt_ms.clone();
-
-        tokio::spawn(async move {
-            loop {
-                let start = Instant::now();
-
-                // Пробуем установить TCP-соединение с таймаутом 1 секунда
-                let res = tokio::time::timeout(
-                    Duration::from_secs(1),
-                    tokio::net::TcpStream::connect(target_addr),
-                )
-                .await;
-
-                match res {
-                    Ok(Ok(_stream)) => {
-                        let rtt = start.elapsed().as_secs_f64() * 1000.0;
-                        rtt_clone.store(rtt as u32, Ordering::Relaxed);
-                    }
-                    _ => {
-                        // Если порт закрыт или отброшен, но ответил RST — время все равно считаем как задержку сети
-                        let rtt = start.elapsed().as_secs_f64() * 1000.0;
-                        if rtt < 1000.0 {
-                            rtt_clone.store(rtt as u32, Ordering::Relaxed);
-                        } else {
-                            rtt_clone.store(u32::MAX, Ordering::Relaxed);
-                        }
-                    }
-                }
-
-                // Пауза перед следующим замером (безопасный интервал 5с для предотвращения срабатывания защиты от флуда)
-                sleep(Duration::from_secs(5)).await;
-            }
-        });
-
         Arc::new(Self { inner, last_rtt_ms })
     }
 }
@@ -140,12 +112,12 @@ impl PingStatsProvider {
 impl StatsProvider for PingStatsProvider {
     fn get_stats(&self) -> StatsSnapshot {
         let mut stats = self.inner.get_stats();
-        let rtt = self.last_rtt_ms.load(Ordering::Relaxed);
-
-        if rtt != u32::MAX {
-            stats.rtt_ms = Some(rtt as f64);
+        if stats.rtt_ms.is_none() {
+            let rtt = self.last_rtt_ms.load(Ordering::Relaxed);
+            if rtt != u32::MAX {
+                stats.rtt_ms = Some(rtt as f64);
+            }
         }
-
         stats
     }
 
@@ -153,6 +125,7 @@ impl StatsProvider for PingStatsProvider {
         self.inner.is_closed()
     }
 }
+
 
 /// Реализация статистики для потоковых соединений (SSH, VNC) через счетчики моста
 pub struct StreamStatsProvider {

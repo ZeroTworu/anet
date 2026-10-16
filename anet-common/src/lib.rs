@@ -18,6 +18,7 @@ pub mod dto;
 pub mod reassembly;
 pub mod http_help;
 pub mod wrtc;
+pub mod icmp_probe;
 
 pub use generated::*;
 pub mod protocol {

@@ -1,7 +1,6 @@
 use crate::auth_handler::ServerAuthHandler;
 use crate::client_registry::{ClientRegistry, ClientTransportInfo};
 use crate::config::Config;
-use anet_common::consts::CHANNEL_BUFFER_SIZE;
 use anet_common::http_help::BrowserProfile;
 use anet_common::transport::{unwrap_packet_bytes, wrap_packet_padded};
 use anet_common::wrtc::{

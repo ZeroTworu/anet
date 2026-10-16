@@ -2,7 +2,7 @@ use std::env;
 use std::fs;
 use std::process::Command;
 use reqwest::Client;
-use log::{info, warn, error};
+use log::{info, warn};
 use std::path::{Path, PathBuf};
 use crate::events::update_progress;
 use crate::events::{emit, AnetEvent};
