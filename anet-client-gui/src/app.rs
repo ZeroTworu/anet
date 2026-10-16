@@ -1555,7 +1555,7 @@ impl ANetApp {
                 AnetEvent::UpdateReady => {
                     self.update_status = UpdateStatus::ReadyToRestart;
                 }
-                _ => {}
+               // _ => {}
             }
         }
 

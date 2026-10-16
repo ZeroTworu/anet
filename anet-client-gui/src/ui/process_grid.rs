@@ -4,24 +4,24 @@
 use eframe::egui;
 #[cfg(target_os = "windows")]
 use egui::scroll_area::ScrollBarVisibility;
-#[cfg(target_os = "windows")]
-use anet_client_core::server_config::{SERVER_CONFIG_ID, SERVER_CONFIG_DISPLAY_NAME};
+// #[cfg(target_os = "windows")]
+// use anet_client_core::server_config::{SERVER_CONFIG_ID, SERVER_CONFIG_DISPLAY_NAME};
 #[cfg(target_os = "windows")]
 use crate::{
     app::ANetApp,
     theme::Colors,
     types::FilterMode,
-    utils::helpers::lock_ignore_poison,
+    //utils::helpers::lock_ignore_poison,
 };
 
 #[cfg(target_os = "windows")]
 pub fn render_process_list(app: &mut ANetApp, ui: &mut egui::Ui) {
-    let is_server_cfg = {
-        let settings = lock_ignore_poison(&app.settings);
-        settings.active_config_id.as_deref() == Some(SERVER_CONFIG_ID)
-            || app.config_name == SERVER_CONFIG_DISPLAY_NAME
-            || (settings.active_config_id.is_none() && settings.cached_server_config.is_some())
-    };
+    // let is_server_cfg = {
+    //     let settings = lock_ignore_poison(&app.settings);
+    //     settings.active_config_id.as_deref() == Some(SERVER_CONFIG_ID)
+    //         || app.config_name == SERVER_CONFIG_DISPLAY_NAME
+    //         || (settings.active_config_id.is_none() && settings.cached_server_config.is_some())
+    // };
     
     ui.add_space(6.0);
 

@@ -7,7 +7,7 @@ use egui::RichText;
 use crate::{
     app::ANetApp,
     theme::Colors,
-    types::ConnectionState,
+    //types::ConnectionState,
     ui::{
         connect_button::render_connect_button,
         node_selector::render_node_selector,
@@ -49,7 +49,7 @@ pub fn render_central_panel(app: &mut ANetApp, ctx: &egui::Context) {
                             .min_size(button_size)
                             .stroke(egui::Stroke::NONE)
                             .frame(false)
-                            .rounding(button_size.y / 2.0);
+                            .corner_radius(button_size.y / 2.0);
 
                         let response = ui.add(menu_button).on_hover_cursor(egui::CursorIcon::PointingHand);
 
@@ -124,7 +124,7 @@ pub fn render_central_panel(app: &mut ANetApp, ctx: &egui::Context) {
                             .min_size(button_size)
                             .stroke(egui::Stroke::NONE)
                             .frame(false)
-                            .rounding(button_size.y / 2.0);
+                            .corner_radius(button_size.y / 2.0);
 
                         let response = ui.add(menu_button).on_hover_cursor(egui::CursorIcon::PointingHand);
 

@@ -16,10 +16,10 @@ pub fn render_logs_modal(app: &mut ANetApp, ctx: &egui::Context) {
         .order(egui::Order::Foreground)
         .fixed_pos(egui::pos2(0.0, 0.0))
         .show(ctx, |ui| {
-            let screen_rect = ui.ctx().screen_rect();
+            let screen_rect = ui.ctx().content_rect();
             let corner_radius = 14.0;
 
-            egui::Frame::none()
+            egui::Frame::NONE 
                 .fill(ui.visuals().window_fill())
                 .inner_margin(margin)
                 .corner_radius(corner_radius)
@@ -35,7 +35,7 @@ pub fn render_logs_modal(app: &mut ANetApp, ctx: &egui::Context) {
                         let circle_button = egui::Button::new("⏴")
                             .min_size(button_size)
                             .stroke(Stroke::NONE)
-                            .rounding(button_size.y / 2.0);
+                            .corner_radius(button_size.y / 2.0); 
 
                         let response = ui.add(circle_button).on_hover_cursor(egui::CursorIcon::PointingHand);
                         if response.clicked() {

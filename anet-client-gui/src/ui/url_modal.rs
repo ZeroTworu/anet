@@ -10,7 +10,7 @@ pub fn render_url_modal(app: &mut ANetApp, ctx: &egui::Context) {
     }
 
     let modal_bg = egui::Color32::from_rgb(26, 28, 34);
-    let screen_width = ctx.screen_rect().width();
+    let screen_width = ctx.content_rect().width();
     // Адаптивная ширина с гарантированными отступами по бокам
     let modal_width = (screen_width - 48.0).clamp(280.0, 340.0);
 

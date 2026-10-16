@@ -8,12 +8,12 @@ pub fn render_titlebar(app: &mut ANetApp, ctx: &egui::Context) {
     let titlebar_button = egui::vec2(42.0, 38.0);
 
     egui::TopBottomPanel::top("custom_titlebar")
-        .frame(egui::Frame::none().outer_margin(0.0).inner_margin(0.0))
+        .frame(egui::Frame::NONE)
         .exact_height(38.0)
         .show(ctx, |ui| {
             let mut rect = ui.max_rect();
-            rect.min.x = ctx.screen_rect().min.x;
-            rect.max.x = ctx.screen_rect().max.x;
+            rect.min.x = ctx.content_rect().min.x;
+            rect.max.x = ctx.content_rect().max.x;
             rect.max.y = rect.min.y + 38.0;
 
             ui.painter().rect_filled(
@@ -33,7 +33,7 @@ pub fn render_titlebar(app: &mut ANetApp, ctx: &egui::Context) {
                 ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
             }
 
-            ui.allocate_ui_at_rect(rect, |ui| {
+            ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
                     let available_height = 38.0;
@@ -44,7 +44,7 @@ pub fn render_titlebar(app: &mut ANetApp, ctx: &egui::Context) {
                         egui::vec2(left_width, available_height)
                     );
 
-                    ui.allocate_ui_at_rect(left_rect, |ui| {
+                    ui.scope_builder(egui::UiBuilder::new().max_rect(left_rect), |ui| {
                         ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                             ui.set_min_height(available_height);
                             ui.add_space(8.0);
@@ -89,7 +89,7 @@ pub fn render_titlebar(app: &mut ANetApp, ctx: &egui::Context) {
                         egui::vec2(80.0, available_height)
                     );
 
-                    ui.allocate_ui_at_rect(right_rect, |ui| {
+                   ui.scope_builder(egui::UiBuilder::new().max_rect(right_rect), |ui| {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.set_min_height(available_height);
                             ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);

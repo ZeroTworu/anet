@@ -11,7 +11,8 @@ pub fn render_tariff_card(app: &ANetApp, ui: &mut egui::Ui) {
         .fill(Colors::CONSOLE_BG)
         .stroke(egui::Stroke::new(1.0, Colors::BORDER))
         .corner_radius(egui::CornerRadius::same(10))
-        .inner_margin(egui::Margin::symmetric(14, 10))
+        .inner_margin(egui::Margin::symmetric(10, 10))
+        .outer_margin(egui::Margin::symmetric(0, 0))
         .show(ui, |ui| {
             ui.vertical(|ui| {
                 ui.horizontal(|ui| {

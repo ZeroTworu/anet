@@ -27,7 +27,7 @@ pub fn render_settings_modal(app: &mut ANetApp, ctx: &egui::Context) {
         .order(egui::Order::Foreground)
         .fixed_pos(egui::pos2(0.0, 0.0))
         .show(ctx, |ui| {
-            let screen_rect = ui.ctx().screen_rect();
+            let screen_rect = ui.ctx().content_rect();
             let corner_radius = 14.0;
 
             egui::Frame::NONE
