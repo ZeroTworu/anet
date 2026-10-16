@@ -436,7 +436,10 @@ impl AnetClient {
         let client_ip_opt: Option<std::net::Ipv4Addr> = result.auth_response.ip.parse().ok();
         let gateway_ip_opt: Option<std::net::Ipv4Addr> = result.auth_response.gateway.parse().ok();
 
-        let last_rtt_ms = Arc::new(AtomicU32::new(u32::MAX));
+        let last_rtt_ms = result
+            .last_rtt_ms
+            .clone()
+            .unwrap_or_else(|| Arc::new(AtomicU32::new(u32::MAX)));
         let (tx_probe, mut rx_probe) = tokio::sync::mpsc::channel::<Bytes>(16);
 
         // Внутритуннельный генератор ICMP Echo Request для универсального измерения честного RTT.

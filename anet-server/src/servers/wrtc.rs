@@ -348,7 +348,8 @@ pub async fn run_wrtc_server(
                                                                 let mut sent_p2p = false;
 
                                                                 // 1. Проверяем режим MediaVideo (Fake Video Track over DTLS-SRTP / JVB)
-                                                                if srv_mode == anet_common::wrtc::colibri::WrtcMode::MediaVideo {
+                                                                if srv_mode == anet_common::wrtc::colibri::WrtcMode::MediaVideo
+                                                                    || srv_mode == anet_common::wrtc::colibri::WrtcMode::Auto {
                                                                     if let Err(e) = peer_downlink.send_video_frame(&enc_bytes).await {
                                                                         warn!("[WRTC Server Video OUT] send error: {e}");
                                                                     }

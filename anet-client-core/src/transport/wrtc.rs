@@ -21,9 +21,9 @@ use base64::prelude::*;
 use bytes::Bytes;
 use log::{info, warn};
 use rtc::peer_connection::sdp::RTCSessionDescription;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 
@@ -422,7 +422,24 @@ impl ClientTransport for WrtcTransport {
         let padding_step = self.config.stealth.padding_step;
         let p2p_uplink = p2p_session_opt.clone();
 
-        let mut ping_interval = tokio::time::interval(Duration::from_secs(15));
+        let last_rtt = Arc::new(AtomicU32::new(u32::MAX));
+        let last_rtt_tx = last_rtt.clone();
+        let ping_sent: Arc<std::sync::Mutex<Option<Instant>>> = Arc::new(std::sync::Mutex::new(None));
+        let ping_sent_tx = ping_sent.clone();
+        let ping_sent_rx = ping_sent.clone();
+
+        // Быстрый первый пинг сразу после старта туннеля для немедленного замера RTT
+        let peer_quick_ping = shared_peer.clone();
+        let target_quick_ping = target_server_id.clone();
+        let ping_sent_quick = ping_sent.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            *ping_sent_quick.lock().unwrap() = Some(Instant::now());
+            let _ = peer_quick_ping.send(ColibriMessage::ping(target_quick_ping)).await;
+        });
+
+        let mut ping_interval = tokio::time::interval(Duration::from_secs(5));
+        ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut batch_interval = tokio::time::interval(Duration::from_millis(2));
         let last_pong = Arc::new(AtomicU64::new(current_timestamp_secs()));
         let last_pong_tx = last_pong.clone();
@@ -442,13 +459,6 @@ impl ClientTransport for WrtcTransport {
                                 let enc_bytes = Bytes::from(encrypted);
                                 let mut sent_p2p = false;
 
-                                if wrtc_mode == anet_common::wrtc::colibri::WrtcMode::MediaVideo {
-                                    if let Err(e) = peer_tx.send_video_frame(&enc_bytes).await {
-                                        warn!("[WRTC Media Video OUT] send error: {e}");
-                                    }
-                                    continue;
-                                }
-
                                 let p2p_opt = {
                                     let guard = p2p_uplink.lock().await;
                                     guard.clone()
@@ -460,6 +470,13 @@ impl ClientTransport for WrtcTransport {
                                             sent_p2p = true;
                                         }
                                     }
+                                }
+
+                                if !sent_p2p && (wrtc_mode == anet_common::wrtc::colibri::WrtcMode::MediaVideo || wrtc_mode == anet_common::wrtc::colibri::WrtcMode::Auto) {
+                                    if let Err(e) = peer_tx.send_video_frame(&enc_bytes).await {
+                                        warn!("[WRTC Media Video OUT] send error: {e}");
+                                    }
+                                    continue;
                                 }
 
                                 if !sent_p2p {
@@ -499,6 +516,7 @@ impl ClientTransport for WrtcTransport {
                             warn!("[WRTC Client] Ping timeout (no pong from server for 45s). Reconnecting...");
                             break;
                         }
+                        *ping_sent_tx.lock().unwrap() = Some(Instant::now());
                         let ping_msg = ColibriMessage::ping(target_srv_tx.clone());
                         if let Err(e) = peer_tx.send(ping_msg).await {
                             warn!("[WRTC Client] Peer ping error: {e}");
@@ -514,6 +532,8 @@ impl ClientTransport for WrtcTransport {
         let cipher_rx = cipher.clone();
         let tun_inject_ws = tun_inject_tx.clone();
         let p2p_sig = p2p_session_opt.clone();
+        let ping_sent_pong = ping_sent_rx.clone();
+        let last_rtt_pong = last_rtt.clone();
 
         tokio::spawn(async move {
             loop {
@@ -579,6 +599,11 @@ impl ClientTransport for WrtcTransport {
                             }
                             WrtcMessage::Pong => {
                                 last_pong.store(current_timestamp_secs(), Ordering::Relaxed);
+                                if let Some(sent_at) = ping_sent_pong.lock().unwrap().take() {
+                                    let rtt = sent_at.elapsed().as_millis() as u32;
+                                    last_rtt_pong.store(rtt.max(1), Ordering::Relaxed);
+                                    log::debug!("[WRTC Client] Received pong from server. RTT: {} ms", rtt.max(1));
+                                }
                             }
                             _ => {}
                         }
@@ -678,6 +703,7 @@ impl ClientTransport for WrtcTransport {
             remote_ip,
             bypass_ips,
             effective_mode,
+            last_rtt_ms: Some(last_rtt),
         })
     }
 }

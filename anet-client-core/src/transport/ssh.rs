@@ -236,6 +236,7 @@ impl ClientTransport for SshTransport {
             remote_ip: Some(address.ip()), // Передаем IP в bypass
             bypass_ips: Vec::new(),
             effective_mode: None,
+            last_rtt_ms: None,
         })
     }
 }

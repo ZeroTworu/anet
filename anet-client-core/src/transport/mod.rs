@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use quinn::{Endpoint, Connection};
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU32};
 
 pub struct ConnectionResult {
     pub auth_response: AuthResponse,
@@ -26,6 +26,7 @@ pub struct ConnectionResult {
     pub remote_ip: Option<std::net::IpAddr>,
     pub bypass_ips: Vec<std::net::IpAddr>,
     pub effective_mode: Option<String>,
+    pub last_rtt_ms: Option<Arc<AtomicU32>>,
 }
 
 #[async_trait]
