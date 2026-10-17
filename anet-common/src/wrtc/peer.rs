@@ -436,6 +436,7 @@ impl WrtcPeer {
         let video_ts = Arc::new(AtomicU32::new(0));
         let expected_peer_video_ssrc = Arc::new(AtomicU32::new(0));
         let _remote_ssrc = 0;
+        let start_instant = std::time::Instant::now();
 
         let (ws_fallback_tx, mut ws_fallback_rx) = mpsc::channel::<String>(8192);
         let has_ws = Arc::new(AtomicBool::new(false));
@@ -920,7 +921,7 @@ impl WrtcPeer {
 
                 let video_track_keepalive = Arc::clone(&video_track);
                 let video_seq_c = Arc::clone(&video_seq);
-                let video_ts_c = Arc::clone(&video_ts);
+                let start_instant_c = start_instant;
                 let v_pt = video_pt;
                 let v_ssrc = local_video_ssrc;
                 let is_connected_v = Arc::clone(&is_connected);
@@ -939,7 +940,8 @@ impl WrtcPeer {
                     loop {
                         interval.tick().await;
                         let seq = video_seq_c.fetch_add(1, Ordering::Relaxed);
-                        let ts = video_ts_c.fetch_add(3000, Ordering::Relaxed);
+                        let elapsed_ms = start_instant_c.elapsed().as_millis() as u64;
+                        let ts = ((elapsed_ms * 90) & 0xFFFFFFFF) as u32;
 
                         let mut keepalive_payload = BytesMut::with_capacity(4 + VP8_KEYFRAME_HEADER.len());
                         let pic_id = (seq % 0x7FFF) as u16;
@@ -1001,7 +1003,7 @@ impl WrtcPeer {
             is_connected,
             failed_notify,
             first_video_tx,
-            start_instant: std::time::Instant::now(),
+            start_instant,
         })
     }
 

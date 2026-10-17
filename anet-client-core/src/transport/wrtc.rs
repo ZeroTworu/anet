@@ -272,7 +272,7 @@ impl ClientTransport for WrtcTransport {
                                     // ИНЖЕКТИРУЕМ SSRC СЕРВЕРА В REMOTE_DESCRIPTION
                                     peer.add_remote_video_ssrc(v_ssrc).await;
 
-                                    let constraints = anet_common::wrtc::colibri::ReceiverVideoConstraints::for_endpoint(&server_id, 2160);
+                                    let constraints = anet_common::wrtc::colibri::ReceiverVideoConstraints::new_all(2160);
                                     let _ = peer.send_video_constraints(&constraints).await;
                                 }
                                 if let Some(pub_key) = server_pub_key {
@@ -434,6 +434,8 @@ impl ClientTransport for WrtcTransport {
         let sequence_tx = sequence.clone();
         let padding_step = self.config.stealth.padding_step;
         let p2p_uplink = p2p_session_opt.clone();
+        let first_client_rx = Arc::new(AtomicBool::new(true));
+        let first_client_rx_tx = first_client_rx.clone();
 
         let mut ping_interval = tokio::time::interval(Duration::from_secs(15));
         let mut batch_interval = tokio::time::interval(Duration::from_millis(2));
@@ -472,7 +474,11 @@ impl ClientTransport for WrtcTransport {
                                     if let Err(e) = peer_tx.send_video_frame_tagged(my_client_tag, &enc_bytes).await {
                                         warn!("[WRTC Media Video OUT] send error: {e}");
                                     }
-                                    continue;
+                                    // До получения первого входящего видеокадра от сервера дублируем отправку в WS-батчер,
+                                    // чтобы не терять первые пакеты (ICMP, TCP SYN) во время прогрева видеотрансивера SFU.
+                                    if !first_client_rx_tx.load(Ordering::Relaxed) {
+                                        continue;
+                                    }
                                 }
 
                                 if !sent_p2p {
@@ -636,21 +642,19 @@ impl ClientTransport for WrtcTransport {
         let cipher_video = cipher.clone();
         let tun_inject_video = tun_inject_tx.clone();
 
-        let first_client_rx = Arc::new(AtomicBool::new(true));
         if wrtc_mode == anet_common::wrtc::colibri::WrtcMode::MediaVideo
             || wrtc_mode == anet_common::wrtc::colibri::WrtcMode::Auto {
             let first_rx_clone = first_client_rx.clone();
             let peer_reassert = shared_peer.clone();
-            let srv_id_reassert = target_server_id.clone();
             tokio::spawn(async move {
                 for _ in 0..10 {
                     tokio::time::sleep(Duration::from_secs(2)).await;
                     if !first_rx_clone.load(Ordering::Relaxed) {
                         break;
                     }
-                    let constraints = anet_common::wrtc::colibri::ReceiverVideoConstraints::for_endpoint(&srv_id_reassert, 2160);
+                    let constraints = anet_common::wrtc::colibri::ReceiverVideoConstraints::new_all(2160);
                     let _ = peer_reassert.send_video_constraints(&constraints).await;
-                    log::debug!("[WRTC Client] Periodic re-assertion of ReceiverVideoConstraints for {}", srv_id_reassert);
+                    log::debug!("[WRTC Client] Periodic re-assertion of ReceiverVideoConstraints for all endpoints");
                 }
             });
         }

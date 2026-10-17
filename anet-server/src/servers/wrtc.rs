@@ -255,8 +255,7 @@ pub async fn run_wrtc_server(
                             info!("[WRTC Server] Set expected client video SSRC: {c_v_ssrc} for {from_endpoint}");
 
                             client_video_endpoints.insert(from_endpoint.clone());
-                            let ep_list: Vec<String> = client_video_endpoints.iter().map(|e| e.clone()).collect();
-                            let constraints = anet_common::wrtc::colibri::ReceiverVideoConstraints::for_endpoints(&ep_list, 2160);
+                            let constraints = anet_common::wrtc::colibri::ReceiverVideoConstraints::new_all(2160);
                             let _ = shared_peer.send_video_constraints(&constraints).await;
                         }
                     }
@@ -360,6 +359,7 @@ pub async fn run_wrtc_server(
                                             let srv_mode = server_mode;
                                             let client_modes_dl = client_modes.clone();
                                             let client_video_ep_dl = client_video_endpoints.clone();
+                                            let first_server_rx_dl = first_server_rx.clone();
 
                                             tokio::spawn(async move {
                                                 let mut batcher = PacketBatcher::new(16384, 2);
@@ -398,7 +398,10 @@ pub async fn run_wrtc_server(
                                                                 // 1. Проверяем режим MediaVideo (Fake Video Track over DTLS-SRTP / JVB)
                                                                 if client_uses_video {
                                                                     if peer_downlink.send_video_frame_tagged(client_tag, &enc_bytes).await.is_ok() {
-                                                                        sent = true;
+                                                                        // До подтверждения приема видео от клиента дублируем в WS
+                                                                        if !first_server_rx_dl.load(Ordering::Relaxed) {
+                                                                            sent = true;
+                                                                        }
                                                                     } else {
                                                                         warn!("[WRTC Server Video OUT] send error to {target_client_id}, fallback to WS/P2P");
                                                                     }

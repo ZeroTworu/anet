@@ -115,6 +115,16 @@ impl JingleSession {
                  a=rtcp-mux\r\n\
                  a=rtpmap:{pt} VP8/90000\r\n\
                  a=rtpmap:{alt_pt} VP8/90000\r\n\
+                 a=rtcp-fb:{pt} goog-remb\r\n\
+                 a=rtcp-fb:{pt} transport-cc\r\n\
+                 a=rtcp-fb:{pt} ccm fir\r\n\
+                 a=rtcp-fb:{pt} nack\r\n\
+                 a=rtcp-fb:{pt} nack pli\r\n\
+                 a=rtcp-fb:{alt_pt} goog-remb\r\n\
+                 a=rtcp-fb:{alt_pt} transport-cc\r\n\
+                 a=rtcp-fb:{alt_pt} ccm fir\r\n\
+                 a=rtcp-fb:{alt_pt} nack\r\n\
+                 a=rtcp-fb:{alt_pt} nack pli\r\n\
                  a=ice-ufrag:{ufrag}\r\n\
                  a=ice-pwd:{pwd}\r\n\
                  a=fingerprint:{fp_hash} {fp}\r\n\
