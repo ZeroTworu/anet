@@ -190,7 +190,7 @@ pub struct ServerConfig {
     pub wrtc_ping_interval_secs: Option<u64>,
     pub wrtc_fallback_jvb_ip: Option<String>,
     pub wrtc_fallback_jvb_port: Option<u16>,
-    /// WebRTC Data Transport mode: "auto" | "p2p_direct" | "jvb_datachannel" | "ws"
+    /// WebRTC Data Transport mode: "auto" | "p2p_direct" | "jvb_datachannel" | "ws" | "media_video"
     #[serde(default)]
     pub wrtc_mode: Option<String>,
 }
