@@ -10,7 +10,7 @@ use log::{error, info, warn};
 use quinn::Endpoint;
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncWriteExt, split as io_split};
@@ -436,7 +436,8 @@ impl AnetClient {
         let client_ip_opt: Option<std::net::Ipv4Addr> = result.auth_response.ip.parse().ok();
         let gateway_ip_opt: Option<std::net::Ipv4Addr> = result.auth_response.gateway.parse().ok();
 
-        let last_rtt_ms = Arc::new(AtomicU32::new(u32::MAX));
+        let last_rtt_us = Arc::new(AtomicU64::new(u64::MAX));
+        let last_reply_us = Arc::new(AtomicU64::new(0));
         let (tx_probe, mut rx_probe) = tokio::sync::mpsc::channel::<Bytes>(16);
 
         // Внутритуннельный генератор ICMP Echo Request для универсального измерения честного RTT.
@@ -471,7 +472,7 @@ impl AnetClient {
                     }
 
                     tokio::select! {
-                        _ = tokio::time::sleep(Duration::from_secs(3)) => {}
+                        _ = tokio::time::sleep(Duration::from_secs(2)) => {}
                         _ = probe_shutdown.notified() => break,
                     }
                 }
@@ -490,17 +491,7 @@ impl AnetClient {
 
             loop {
                 let packet = tokio::select! {
-                    pkt = rx_from_tun.recv() => {
-                        match pkt {
-                            Some(p) => p,
-                            None => {
-                                info!("[Tunnel/Tx] Local TUN packet channel closed (adapter or worker stopped).");
-                                *reason_t1.lock().unwrap() = "Local TUN packet channel closed (adapter or worker stopped)".to_string();
-                                sig_t1.notify_one();
-                                break;
-                            }
-                        }
-                    }
+                    biased;
                     probe_pkt = rx_probe.recv() => {
                         match probe_pkt {
                             Some(p) => p,
@@ -509,6 +500,17 @@ impl AnetClient {
                                     Some(p) => p,
                                     None => break,
                                 }
+                            }
+                        }
+                    }
+                    pkt = rx_from_tun.recv() => {
+                        match pkt {
+                            Some(p) => p,
+                            None => {
+                                info!("[Tunnel/Tx] Local TUN packet channel closed (adapter or worker stopped).");
+                                *reason_t1.lock().unwrap() = "Local TUN packet channel closed (adapter or worker stopped)".to_string();
+                                sig_t1.notify_one();
+                                break;
                             }
                         }
                     }
@@ -565,7 +567,8 @@ impl AnetClient {
         let rx_packets = total_rx_packets.clone();
         let sig_t2 = reconnect_signal.clone();
         let reason_t2 = disconnect_reason.clone();
-        let last_rtt_rx = last_rtt_ms.clone();
+        let last_rtt_rx = last_rtt_us.clone();
+        let last_reply_rx = last_reply_us.clone();
         let probe_start_rx = session_start;
         let t2 = spawn(async move {
             loop {
@@ -586,10 +589,25 @@ impl AnetClient {
                                         PROBE_IDENTIFIER,
                                     ) {
                                         let now_us = probe_start_rx.elapsed().as_micros() as u64;
-                                        let rtt_us = now_us.saturating_sub(sent_ts_us);
-                                        let rtt_ms = (rtt_us as f64 / 1000.0).round() as u32;
-                                        last_rtt_rx.store(rtt_ms.max(1), Ordering::Relaxed);
-                                        log::debug!("[Probe/RTT] In-tunnel RTT: {} ms (seq: {})", rtt_ms.max(1), _seq);
+                                        let sample_us = now_us.saturating_sub(sent_ts_us);
+
+                                        // Экспоненциальное сглаживание EWMA (alpha = 0.25):
+                                        // smoothed_rtt = 0.75 * smoothed_rtt + 0.25 * sample
+                                        let prev_us = last_rtt_rx.load(Ordering::Relaxed);
+                                        let smoothed_us = if prev_us == u64::MAX {
+                                            sample_us
+                                        } else {
+                                            ((prev_us * 3) + sample_us) / 4
+                                        };
+
+                                        last_rtt_rx.store(smoothed_us.max(100), Ordering::Relaxed);
+                                        last_reply_rx.store(now_us, Ordering::Relaxed);
+                                        log::debug!(
+                                            "[Probe/RTT] In-tunnel RTT: {:.2} ms (sample: {:.2} ms, seq: {})",
+                                            smoothed_us as f64 / 1000.0,
+                                            sample_us as f64 / 1000.0,
+                                            _seq
+                                        );
                                         continue; // Поглощаем ответ зонда, не отдаем в локальный TUN интерфейс ОС
                                     }
                                 }
@@ -738,7 +756,9 @@ impl AnetClient {
             let full_provider: Arc<dyn statistic::StatsProvider> =
                 statistic::PingStatsProvider::new_with_atomic(
                     provider.clone(),
-                    last_rtt_ms.clone(),
+                    last_rtt_us.clone(),
+                    last_reply_us.clone(),
+                    session_start,
                 );
 
             let fast_handle =

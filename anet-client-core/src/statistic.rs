@@ -67,7 +67,9 @@ pub struct QuicStatsProvider {
 
 pub struct PingStatsProvider {
     inner: Arc<dyn StatsProvider>,
-    last_rtt_ms: Arc<AtomicU32>,
+    last_rtt_us: Arc<AtomicU64>,
+    last_reply_us: Arc<AtomicU64>,
+    session_start: Instant,
 }
 
 impl QuicStatsProvider {
@@ -97,15 +99,31 @@ impl StatsProvider for QuicStatsProvider {
 }
 
 impl PingStatsProvider {
-    /// Создает StatsProvider с общим атомиком задержки, обновляемым внутритуннельным ICMP-обработчиком.
-    pub fn new_with_atomic(inner: Arc<dyn StatsProvider>, last_rtt_ms: Arc<AtomicU32>) -> Arc<Self> {
-        Arc::new(Self { inner, last_rtt_ms })
+    /// Создает StatsProvider с общим атомиком задержки (в микросекундах) и временем последнего ответа.
+    pub fn new_with_atomic(
+        inner: Arc<dyn StatsProvider>,
+        last_rtt_us: Arc<AtomicU64>,
+        last_reply_us: Arc<AtomicU64>,
+        session_start: Instant,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            last_rtt_us,
+            last_reply_us,
+            session_start,
+        })
     }
 
     /// Устаревший конструктор (для обратной совместимости, если где-то вызывается)
     pub fn new(inner: Arc<dyn StatsProvider>, _target_addr: SocketAddr) -> Arc<Self> {
-        let last_rtt_ms = Arc::new(AtomicU32::new(u32::MAX));
-        Arc::new(Self { inner, last_rtt_ms })
+        let last_rtt_us = Arc::new(AtomicU64::new(u64::MAX));
+        let last_reply_us = Arc::new(AtomicU64::new(0));
+        Arc::new(Self {
+            inner,
+            last_rtt_us,
+            last_reply_us,
+            session_start: Instant::now(),
+        })
     }
 }
 
@@ -113,9 +131,13 @@ impl StatsProvider for PingStatsProvider {
     fn get_stats(&self) -> StatsSnapshot {
         let mut stats = self.inner.get_stats();
         if stats.rtt_ms.is_none() {
-            let rtt = self.last_rtt_ms.load(Ordering::Relaxed);
-            if rtt != u32::MAX {
-                stats.rtt_ms = Some(rtt as f64);
+            let rtt_us = self.last_rtt_us.load(Ordering::Relaxed);
+            let last_reply = self.last_reply_us.load(Ordering::Relaxed);
+            let elapsed_us = self.session_start.elapsed().as_micros() as u64;
+
+            // Если замер существует и с момента последнего ответа прошло не более 10 секунд (TTL)
+            if rtt_us != u64::MAX && elapsed_us.saturating_sub(last_reply) <= 10_000_000 {
+                stats.rtt_ms = Some(rtt_us as f64 / 1000.0);
             }
         }
         stats
@@ -300,7 +322,7 @@ pub fn start_fast_stats_monitor(
                     let rx_str = format_bytes(current_stats.total_rx_bytes);
                     let tx_str = format_bytes(current_stats.total_tx_bytes);
                     let rtt_str = current_stats.rtt_ms
-                        .map(|rtt| format!("{:.0}ms", rtt))
+                        .map(|rtt| format!("{:.1}ms", rtt))
                         .unwrap_or_else(|| "N/A".to_string());
 
                     // 3. Считаем дельту байт
