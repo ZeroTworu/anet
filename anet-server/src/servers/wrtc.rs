@@ -188,6 +188,7 @@ pub async fn run_wrtc_server(
         let reg_clone_video = reg_clone.clone();
 
         let first_server_rx = Arc::new(AtomicBool::new(true));
+        let first_server_rx_up = first_server_rx.clone();
         tokio::spawn(async move {
             while let Some(raw_frame) = peer_video_rx.recv_video_frame().await {
                 if raw_frame.len() < 50 {
@@ -202,7 +203,7 @@ pub async fn run_wrtc_server(
                 let raw_astp = raw_frame.slice(2..);
                 if let Ok(packet) = unwrap_packet_bytes(&client_info.cipher, raw_astp) {
                     let packet_len = packet.len();
-                    if first_server_rx.swap(false, Ordering::Relaxed) {
+                    if first_server_rx_up.swap(false, Ordering::Relaxed) {
                         info!(
                             "[WRTC Server Video IN] First video frame decrypted from client {} (len: {} bytes, tag: 0x{:04X})",
                             client_info.assigned_ip, packet_len, client_tag
