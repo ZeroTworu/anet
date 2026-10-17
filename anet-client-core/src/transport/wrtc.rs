@@ -326,6 +326,12 @@ impl ClientTransport for WrtcTransport {
             auth_response.ip
         );
 
+        let my_client_tag = anet_common::wrtc::colibri::client_tag_from_ip(&auth_response.ip);
+        info!(
+            "[WRTC] Fake Video Track client tag: 0x{:04X} (derived from IP {})",
+            my_client_tag, auth_response.ip
+        );
+
         let cipher = Arc::new(Cipher::new(&shared_key));
         let nonce_prefix: [u8; 4] = auth_response.nonce_prefix.as_slice().try_into()?;
         let sequence = Arc::new(AtomicU64::new(0));
@@ -456,7 +462,7 @@ impl ClientTransport for WrtcTransport {
                                 }
 
                                 if !sent_p2p && (wrtc_mode == anet_common::wrtc::colibri::WrtcMode::MediaVideo || wrtc_mode == anet_common::wrtc::colibri::WrtcMode::Auto) {
-                                    if let Err(e) = peer_tx.send_video_frame(&enc_bytes).await {
+                                    if let Err(e) = peer_tx.send_video_frame_tagged(my_client_tag, &enc_bytes).await {
                                         warn!("[WRTC Media Video OUT] send error: {e}");
                                     }
                                     continue;
@@ -641,14 +647,24 @@ impl ClientTransport for WrtcTransport {
             });
         }
         tokio::spawn(async move {
-            while let Some(raw_astp) = peer_video_rx.recv_video_frame().await {
+            while let Some(raw_frame) = peer_video_rx.recv_video_frame().await {
+                if raw_frame.len() < 50 {
+                    // Слишком короткий для ASTP кадра (2B tag + 12B nonce + 20B IPv4 + 16B MAC)
+                    continue;
+                }
+                let tag = u16::from_be_bytes([raw_frame[0], raw_frame[1]]);
+                if tag != my_client_tag {
+                    // SFU broadcast: кадр предназначен для другого участника комнаты — отбрасываем
+                    continue;
+                }
+                let raw_astp = raw_frame.slice(2..);
                 let raw_len = raw_astp.len();
                 match unwrap_packet_bytes(&cipher_video, raw_astp) {
                     Ok(packet) => {
                         if first_client_rx.swap(false, Ordering::Relaxed) {
                             info!(
-                                "[WRTC Client Video IN] First video frame decrypted from server (len: {} bytes)",
-                                packet.len()
+                                "[WRTC Client Video IN] First video frame decrypted from server (len: {} bytes, tag: 0x{:04X})",
+                                packet.len(), tag
                             );
                         }
                         log::trace!("[WRTC Media Video IN] Decrypted packet ({} bytes)", packet.len());

@@ -165,6 +165,8 @@ pub async fn run_wrtc_server(
         let shared_peer = Arc::new(peer);
         let active_clients: Arc<DashMap<String, Arc<ClientTransportInfo>>> =
             Arc::new(DashMap::new());
+        let clients_by_tag: Arc<DashMap<u16, Arc<ClientTransportInfo>>> =
+            Arc::new(DashMap::new());
         let p2p_clients: Arc<DashMap<String, Arc<P2pSession>>> =
             Arc::new(DashMap::new());
 
@@ -175,29 +177,35 @@ pub async fn run_wrtc_server(
         let srv_id = server_endpoint_id.clone();
         let padding_step = config.stealth.padding_step;
 
-        // Воркер Downlink из Fake Video Track (VP8 over DTLS-SRTP / JVB)
+        // Воркер Uplink из Fake Video Track (VP8 over DTLS-SRTP / JVB)
         let peer_video_rx = shared_peer.clone();
-        let clients_map_video = clients_map.clone();
+        let clients_by_tag_rx = clients_by_tag.clone();
         let tun_clone_video = tun_clone.clone();
         let reg_clone_video = reg_clone.clone();
 
         let first_server_rx = Arc::new(AtomicBool::new(true));
         tokio::spawn(async move {
-            while let Some(raw_astp) = peer_video_rx.recv_video_frame().await {
-                for entry in clients_map_video.iter() {
-                    let client_info = entry.value();
-                    if let Ok(packet) = unwrap_packet_bytes(&client_info.cipher, raw_astp.clone()) {
-                        let packet_len = packet.len();
-                        if first_server_rx.swap(false, Ordering::Relaxed) {
-                            info!(
-                                "[WRTC Server Video IN] First video frame decrypted from client {} (len: {} bytes)",
-                                client_info.assigned_ip, packet_len
-                            );
-                        }
-                        if tun_clone_video.try_send(packet).is_ok() {
-                            reg_clone_video.record_rx(client_info, packet_len, "wrtc_video");
-                        }
-                        break;
+            while let Some(raw_frame) = peer_video_rx.recv_video_frame().await {
+                if raw_frame.len() < 50 {
+                    // Слишком короткий для ASTP кадра (2B tag + 12B nonce + 20B IPv4 + 16B MAC)
+                    continue;
+                }
+                let client_tag = u16::from_be_bytes([raw_frame[0], raw_frame[1]]);
+                let Some(client_info) = clients_by_tag_rx.get(&client_tag) else {
+                    continue;
+                };
+
+                let raw_astp = raw_frame.slice(2..);
+                if let Ok(packet) = unwrap_packet_bytes(&client_info.cipher, raw_astp) {
+                    let packet_len = packet.len();
+                    if first_server_rx.swap(false, Ordering::Relaxed) {
+                        info!(
+                            "[WRTC Server Video IN] First video frame decrypted from client {} (len: {} bytes, tag: 0x{:04X})",
+                            client_info.assigned_ip, packet_len, client_tag
+                        );
+                    }
+                    if tun_clone_video.try_send(packet).is_ok() {
+                        reg_clone_video.record_rx(client_info.value(), packet_len, "wrtc_video");
                     }
                 }
             }
@@ -232,10 +240,8 @@ pub async fn run_wrtc_server(
                         shared_peer.set_expected_peer_video_ssrc(c_v_ssrc);
                         info!("[WRTC Server] Set expected client video SSRC: {c_v_ssrc}");
 
-                        // ИНЖЕКТИРУЕМ SSRC КЛИЕНТА В REMOTE_DESCRIPTION
-                        shared_peer.add_remote_video_ssrc(c_v_ssrc).await;
-
-                        let constraints = anet_common::wrtc::colibri::ReceiverVideoConstraints::for_endpoint(&from_endpoint, 2160);
+                        // Запрашиваем полноразмерный видеопоток для всех участников комнаты без сброса соединения
+                        let constraints = anet_common::wrtc::colibri::ReceiverVideoConstraints::new_all(2160);
                         let _ = shared_peer.send_video_constraints(&constraints).await;
                     }
                     let signature = sign_beacon(&signing_key_bytes, &client_nonce, &srv_id);
@@ -312,6 +318,19 @@ pub async fn run_wrtc_server(
                                                 "[WRTC Server] Client {from_endpoint} authenticated! Assigned IP: {assigned_ip}"
                                             );
 
+                                            // Мгновенное вытеснение предыдущей сессии того же устройства при реконнекте
+                                            if let Some(old) = reg_clone
+                                                .evict_existing_device_session(&client_info.fingerprint, "wrtc")
+                                                .await
+                                            {
+                                                let old_tag = anet_common::wrtc::colibri::client_tag_from_ip(&old.assigned_ip);
+                                                clients_by_tag.remove(&old_tag);
+                                                clients_map.retain(|_, v| v.assigned_ip != old.assigned_ip);
+                                            }
+
+                                            let client_tag = anet_common::wrtc::colibri::client_tag_from_ip(&assigned_ip);
+                                            clients_by_tag.insert(client_tag, client_info.clone());
+
                                             let (tx_router, mut rx_router) =
                                                 mpsc::channel::<Bytes>(16384);
                                             reg_clone.finalize_client(&assigned_ip, tx_router);
@@ -350,7 +369,7 @@ pub async fn run_wrtc_server(
                                                                 // 1. Проверяем режим MediaVideo (Fake Video Track over DTLS-SRTP / JVB)
                                                                 if srv_mode == anet_common::wrtc::colibri::WrtcMode::MediaVideo
                                                                     || srv_mode == anet_common::wrtc::colibri::WrtcMode::Auto {
-                                                                    if let Err(e) = peer_downlink.send_video_frame(&enc_bytes).await {
+                                                                    if let Err(e) = peer_downlink.send_video_frame_tagged(client_tag, &enc_bytes).await {
                                                                         warn!("[WRTC Server Video OUT] send error: {e}");
                                                                     }
                                                                     continue;

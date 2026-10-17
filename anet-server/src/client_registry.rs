@@ -377,6 +377,33 @@ impl ClientRegistry {
         info!("[Registry] Client {} removed.", client_ip);
     }
 
+    /// Находит и мгновенно вытесняет предыдущую сессию того же устройства (по fingerprint и протоколу).
+    /// Используется при быстром реконнекте клиента для немедленного освобождения IP, закрытия старого роутера
+    /// и предотвращения коллизий шифрования и остаточного интернет-трафика.
+    pub async fn evict_existing_device_session(
+        &self,
+        fingerprint: &str,
+        protocol: &str,
+    ) -> Option<Arc<ClientTransportInfo>> {
+        let existing = self
+            .clients_by_ip
+            .iter()
+            .find(|entry| {
+                entry.value().fingerprint == fingerprint && entry.value().protocol == protocol
+            })
+            .map(|entry| entry.value().clone());
+
+        if let Some(ref old_client) = existing {
+            info!(
+                "[Registry] Device reconnect detected for fingerprint {} (proto: {}). Evicting previous session with IP {}.",
+                fingerprint, protocol, old_client.assigned_ip
+            );
+            self.remove_client(old_client).await;
+        }
+
+        existing
+    }
+
 
     pub fn suspend_client(&self, client_info: Arc<ClientTransportInfo>) {
         let client_ip = client_info.assigned_ip.clone();

@@ -12,6 +12,25 @@ pub const VP8_KEYFRAME_HEADER: [u8; 20] = [
     0x99, 0x84, 0x88, 0xfc,
 ];
 
+/// Зарезервированный тег для широковещательных или нетегированных кадров
+pub const TAG_UNTAGGED: u16 = 0x0000;
+
+/// Вычисляет уникальный 2-байтный тег клиента из строки с IPv4-адресом.
+/// Для подсетей /16–/24 младшие два байта гарантируют уникальность каждого клиента в пуле.
+pub fn client_tag_from_ip(ip: &str) -> u16 {
+    if let Ok(ipv4) = ip.parse::<std::net::Ipv4Addr>() {
+        client_tag_from_ipv4(ipv4)
+    } else {
+        TAG_UNTAGGED
+    }
+}
+
+/// Вычисляет уникальный 2-байтный тег клиента из структуры Ipv4Addr.
+pub fn client_tag_from_ipv4(ip: std::net::Ipv4Addr) -> u16 {
+    let octets = ip.octets();
+    u16::from_be_bytes([octets[2], octets[3]])
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VideoConstraint {
     #[serde(rename = "maxHeight")]

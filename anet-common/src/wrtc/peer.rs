@@ -1032,48 +1032,26 @@ impl WrtcPeer {
     }
 
     pub async fn add_remote_video_ssrc(&self, ssrc: u32) {
-        if let Some(ref pc) = self.peer_connection {
-            if let Some(mut remote_desc) = pc.remote_description().await {
-                if !remote_desc.sdp.contains(&format!("a=ssrc:{}", ssrc)) {
-                    let mut new_sdp = String::new();
-                    let mut in_video = false;
-                    for line in remote_desc.sdp.lines() {
-                        new_sdp.push_str(line);
-                        new_sdp.push_str("\r\n");
-                        if line.starts_with("m=video") {
-                            in_video = true;
-                        } else if line.starts_with("m=") && !line.starts_with("m=video") {
-                            in_video = false;
-                        }
-
-                        if in_video && (line.starts_with("a=sendrecv") || line.starts_with("a=recvonly") || line.starts_with("a=sendonly") || line.starts_with("a=mid:video")) {
-                            new_sdp.push_str(&format!("a=ssrc:{} cname:anet_dyn\r\n", ssrc));
-                            new_sdp.push_str(&format!("a=ssrc:{} msid:anet_dyn v0\r\n", ssrc));
-                        }
-                    }
-                    remote_desc.sdp = new_sdp;
-                    if let Err(e) = pc.set_remote_description(remote_desc).await {
-                        log::warn!("[WRTC Media] Failed to inject remote SSRC {}: {}", ssrc, e);
-                    } else {
-                        log::info!("[WRTC Media] Successfully injected remote SSRC {} into PC", ssrc);
-                        if let Ok(answer) = pc.create_answer(None).await {
-                            let _ = pc.set_local_description(answer).await;
-                        }
-                    }
-                }
-            }
-        }
+        // Деструктивная ренегоциация (set_remote_description/create_answer/set_local_description)
+        // посреди живой сессии сбрасывает приемный конвейер WebRTC и оглушает track.poll().
+        // JVB форвардит потоки через согласованный видео-трансивер, а демультиплексирование
+        // выполняется на уровне 2-байтного client_tag в полезной нагрузке VP8.
+        log::debug!("[WRTC Media] add_remote_video_ssrc({ssrc}): no-op to protect active WebRTC track");
     }
 
     pub async fn send_video_frame(&self, astp_data: &[u8]) -> anyhow::Result<()> {
+        self.send_video_frame_tagged(crate::wrtc::colibri::TAG_UNTAGGED, astp_data).await
+    }
+
+    pub async fn send_video_frame_tagged(&self, client_tag: u16, astp_data: &[u8]) -> anyhow::Result<()> {
         let Some(ref track) = self.video_track else {
             anyhow::bail!("Video track not initialized");
         };
 
         if self.first_video_tx.swap(false, Ordering::Relaxed) {
             log::info!(
-                "[WRTC Media Video OUT] First video frame transmitted (SSRC: {}, len: {} bytes)",
-                self.video_ssrc, astp_data.len()
+                "[WRTC Media Video OUT] First video frame transmitted (SSRC: {}, tag: 0x{:04X}, len: {} bytes)",
+                self.video_ssrc, client_tag, astp_data.len()
             );
         }
 
@@ -1081,7 +1059,7 @@ impl WrtcPeer {
         let elapsed_ms = self.start_instant.elapsed().as_millis() as u64;
         let ts = ((elapsed_ms * 90) & 0xFFFFFFFF) as u32;
 
-        let mut payload = BytesMut::with_capacity(4 + VP8_KEYFRAME_HEADER.len() + astp_data.len());
+        let mut payload = BytesMut::with_capacity(4 + VP8_KEYFRAME_HEADER.len() + 2 + astp_data.len());
         let pic_id = (seq % 0x7FFF) as u16;
 
         payload.put_u8(0x90);
@@ -1090,6 +1068,7 @@ impl WrtcPeer {
         payload.put_u8((pic_id & 0xFF) as u8);
 
         payload.put_slice(&VP8_KEYFRAME_HEADER);
+        payload.put_u16(client_tag);
         payload.put_slice(astp_data);
 
         let rtp_packet = RtpPacket {
