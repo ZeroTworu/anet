@@ -242,14 +242,21 @@ impl ClientTransport for WrtcTransport {
         while tokio::time::Instant::now() < deadline {
             tokio::select! {
                 _ = interval.tick() => {
-                    info!("[WRTC] Sending anet_discover broadcast (nonce: {client_nonce}, video_ssrc: {})...", peer.video_ssrc);
-                    let discover_broadcast = ColibriMessage::discover(None, client_nonce.clone(), Some(peer.video_ssrc));
+                    let (c_video_ssrc, c_mode_str) = match wrtc_mode {
+                        anet_common::wrtc::colibri::WrtcMode::Ws => (None, "ws"),
+                        anet_common::wrtc::colibri::WrtcMode::MediaVideo => (Some(peer.video_ssrc), "media_video"),
+                        anet_common::wrtc::colibri::WrtcMode::P2pDirect => (Some(peer.video_ssrc), "p2p_direct"),
+                        anet_common::wrtc::colibri::WrtcMode::JvbDatachannel => (Some(peer.video_ssrc), "jvb_datachannel"),
+                        anet_common::wrtc::colibri::WrtcMode::Auto => (Some(peer.video_ssrc), "auto"),
+                    };
+                    info!("[WRTC] Sending anet_discover broadcast (nonce: {client_nonce}, mode: {c_mode_str}, video_ssrc: {c_video_ssrc:?})...");
+                    let discover_broadcast = ColibriMessage::discover(None, client_nonce.clone(), c_video_ssrc, Some(c_mode_str.to_string()));
                     let _ = peer.send(discover_broadcast).await;
 
                     let current_occupants = xmpp.get_other_occupants();
                     for occupant in current_occupants {
                         info!("[WRTC] Sending anet_discover to occupant: {occupant}");
-                        let unicast_discover = ColibriMessage::discover(Some(occupant), client_nonce.clone(), Some(peer.video_ssrc));
+                        let unicast_discover = ColibriMessage::discover(Some(occupant), client_nonce.clone(), c_video_ssrc, Some(c_mode_str.to_string()));
                         let _ = peer.send(unicast_discover).await;
                     }
                 }
@@ -630,7 +637,8 @@ impl ClientTransport for WrtcTransport {
         let tun_inject_video = tun_inject_tx.clone();
 
         let first_client_rx = Arc::new(AtomicBool::new(true));
-        if wrtc_mode == anet_common::wrtc::colibri::WrtcMode::MediaVideo {
+        if wrtc_mode == anet_common::wrtc::colibri::WrtcMode::MediaVideo
+            || wrtc_mode == anet_common::wrtc::colibri::WrtcMode::Auto {
             let first_rx_clone = first_client_rx.clone();
             let peer_reassert = shared_peer.clone();
             let srv_id_reassert = target_server_id.clone();

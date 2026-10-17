@@ -15,7 +15,7 @@ use anet_common::wrtc::{
 use anyhow::{Context, Result};
 use base64::prelude::*;
 use bytes::Bytes;
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use ed25519_dalek::SigningKey;
 use log::{info, warn};
 use rtc::peer_connection::sdp::RTCSessionDescription;
@@ -169,6 +169,10 @@ pub async fn run_wrtc_server(
             Arc::new(DashMap::new());
         let p2p_clients: Arc<DashMap<String, Arc<P2pSession>>> =
             Arc::new(DashMap::new());
+        let client_modes: Arc<DashMap<String, String>> =
+            Arc::new(DashMap::new());
+        let client_video_endpoints: Arc<DashSet<String>> =
+            Arc::new(DashSet::new());
 
         let reg_clone = registry.clone();
         let auth_clone = auth_handler.clone();
@@ -232,17 +236,29 @@ pub async fn run_wrtc_server(
             }
 
             match msg.msg_payload {
-                WrtcMessage::Discover { client_nonce, video_ssrc } => {
+                WrtcMessage::Discover { client_nonce, video_ssrc, mode } => {
+                    let pref_mode = mode.unwrap_or_else(|| {
+                        if video_ssrc.is_some() {
+                            "media_video".to_string()
+                        } else {
+                            "ws".to_string()
+                        }
+                    });
                     info!(
-                        "[WRTC Server] Received anet_discover from client {from_endpoint} (nonce: {client_nonce}, client_video_ssrc: {video_ssrc:?})! Answering beacon..."
+                        "[WRTC Server] Received anet_discover from client {from_endpoint} (nonce: {client_nonce}, mode: {pref_mode}, video_ssrc: {video_ssrc:?})! Answering beacon..."
                     );
-                    if let Some(c_v_ssrc) = video_ssrc {
-                        shared_peer.set_expected_peer_video_ssrc(c_v_ssrc);
-                        info!("[WRTC Server] Set expected client video SSRC: {c_v_ssrc}");
+                    client_modes.insert(from_endpoint.clone(), pref_mode.clone());
 
-                        // Запрашиваем полноразмерный видеопоток для всех участников комнаты без сброса соединения
-                        let constraints = anet_common::wrtc::colibri::ReceiverVideoConstraints::new_all(2160);
-                        let _ = shared_peer.send_video_constraints(&constraints).await;
+                    if let Some(c_v_ssrc) = video_ssrc {
+                        if pref_mode != "ws" {
+                            shared_peer.set_expected_peer_video_ssrc(c_v_ssrc);
+                            info!("[WRTC Server] Set expected client video SSRC: {c_v_ssrc} for {from_endpoint}");
+
+                            client_video_endpoints.insert(from_endpoint.clone());
+                            let ep_list: Vec<String> = client_video_endpoints.iter().map(|e| e.clone()).collect();
+                            let constraints = anet_common::wrtc::colibri::ReceiverVideoConstraints::for_endpoints(&ep_list, 2160);
+                            let _ = shared_peer.send_video_constraints(&constraints).await;
+                        }
                     }
                     let signature = sign_beacon(&signing_key_bytes, &client_nonce, &srv_id);
                     let beacon_msg = ColibriMessage::beacon(
@@ -318,14 +334,14 @@ pub async fn run_wrtc_server(
                                                 "[WRTC Server] Client {from_endpoint} authenticated! Assigned IP: {assigned_ip}"
                                             );
 
-                                            // Мгновенное вытеснение предыдущей сессии того же устройства при реконнекте
+                                            // Мгновенное вытеснение предыдущей сессии того же устройства при реконнекте (исключая текущую)
                                             if let Some(old) = reg_clone
-                                                .evict_existing_device_session(&client_info.fingerprint, "wrtc")
+                                                .evict_existing_device_session(&client_info.fingerprint, "wrtc", &client_info.session_id)
                                                 .await
                                             {
                                                 let old_tag = anet_common::wrtc::colibri::client_tag_from_ip(&old.assigned_ip);
                                                 clients_by_tag.remove(&old_tag);
-                                                clients_map.retain(|_, v| v.assigned_ip != old.assigned_ip);
+                                                clients_map.retain(|_, v| v.session_id != old.session_id);
                                             }
 
                                             let client_tag = anet_common::wrtc::colibri::client_tag_from_ip(&assigned_ip);
@@ -342,6 +358,8 @@ pub async fn run_wrtc_server(
                                             let peer_downlink = shared_peer.clone();
                                             let p2p_clients_dl = p2p_clients.clone();
                                             let srv_mode = server_mode;
+                                            let client_modes_dl = client_modes.clone();
+                                            let client_video_ep_dl = client_video_endpoints.clone();
 
                                             tokio::spawn(async move {
                                                 let mut batcher = PacketBatcher::new(16384, 2);
@@ -364,28 +382,41 @@ pub async fn run_wrtc_server(
                                                                 padding_step,
                                                             ) {
                                                                 let enc_bytes = Bytes::from(encrypted);
-                                                                let mut sent_p2p = false;
+                                                                let mut sent = false;
+
+                                                                let client_pref_mode = client_modes_dl
+                                                                    .get(&target_client_id)
+                                                                    .map(|m| m.clone())
+                                                                    .unwrap_or_else(|| "auto".to_string());
+                                                                let has_video = client_video_ep_dl.contains(&target_client_id);
+
+                                                                let client_uses_video = (srv_mode == anet_common::wrtc::colibri::WrtcMode::MediaVideo
+                                                                    || srv_mode == anet_common::wrtc::colibri::WrtcMode::Auto)
+                                                                    && client_pref_mode != "ws"
+                                                                    && has_video;
 
                                                                 // 1. Проверяем режим MediaVideo (Fake Video Track over DTLS-SRTP / JVB)
-                                                                if srv_mode == anet_common::wrtc::colibri::WrtcMode::MediaVideo
-                                                                    || srv_mode == anet_common::wrtc::colibri::WrtcMode::Auto {
-                                                                    if let Err(e) = peer_downlink.send_video_frame_tagged(client_tag, &enc_bytes).await {
-                                                                        warn!("[WRTC Server Video OUT] send error: {e}");
+                                                                if client_uses_video {
+                                                                    if peer_downlink.send_video_frame_tagged(client_tag, &enc_bytes).await.is_ok() {
+                                                                        sent = true;
+                                                                    } else {
+                                                                        warn!("[WRTC Server Video OUT] send error to {target_client_id}, fallback to WS/P2P");
                                                                     }
-                                                                    continue;
                                                                 }
 
                                                                 // 2. Проверяем P2P DataChannel с клиентом
-                                                                if let Some(p2p_entry) = p2p_clients_dl.get(&target_client_id) {
-                                                                    if p2p_entry.is_open.load(Ordering::SeqCst) {
-                                                                        if p2p_entry.send_packet(&enc_bytes).await.is_ok() {
-                                                                            sent_p2p = true;
+                                                                if !sent {
+                                                                    if let Some(p2p_entry) = p2p_clients_dl.get(&target_client_id) {
+                                                                        if p2p_entry.is_open.load(Ordering::SeqCst) {
+                                                                            if p2p_entry.send_packet(&enc_bytes).await.is_ok() {
+                                                                                sent = true;
+                                                                            }
                                                                         }
                                                                     }
                                                                 }
 
-                                                                // 2. Если P2P еще не открыт или недоступен, шлем через батчер (Colibri-WS)
-                                                                if !sent_p2p {
+                                                                // 3. Если Video и P2P не сработали (или клиент в WS режиме), шлем через батчер (Colibri-WS)
+                                                                if !sent {
                                                                     batcher.push(enc_bytes);
                                                                     if batcher.should_flush() {
                                                                         if let Some(batch_data) = batcher.flush() {

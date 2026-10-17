@@ -380,16 +380,20 @@ impl ClientRegistry {
     /// Находит и мгновенно вытесняет предыдущую сессию того же устройства (по fingerprint и протоколу).
     /// Используется при быстром реконнекте клиента для немедленного освобождения IP, закрытия старого роутера
     /// и предотвращения коллизий шифрования и остаточного интернет-трафика.
+    /// Исключает текущую только что созданную сессию (по current_session_id), чтобы не вытеснять саму себя!
     pub async fn evict_existing_device_session(
         &self,
         fingerprint: &str,
         protocol: &str,
+        current_session_id: &str,
     ) -> Option<Arc<ClientTransportInfo>> {
         let existing = self
             .clients_by_ip
             .iter()
             .find(|entry| {
-                entry.value().fingerprint == fingerprint && entry.value().protocol == protocol
+                entry.value().fingerprint == fingerprint
+                    && entry.value().protocol == protocol
+                    && entry.value().session_id != current_session_id
             })
             .map(|entry| entry.value().clone());
 

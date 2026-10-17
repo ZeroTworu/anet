@@ -66,14 +66,20 @@ impl ReceiverVideoConstraints {
     }
 
     pub fn for_endpoint(endpoint: &str, max_height: u32) -> Self {
+        Self::for_endpoints(&[endpoint.to_string()], max_height)
+    }
+
+    pub fn for_endpoints(endpoints: &[String], max_height: u32) -> Self {
         let mut map = std::collections::HashMap::new();
-        map.insert(endpoint.to_string(), VideoConstraint { max_height });
+        for ep in endpoints {
+            map.insert(ep.clone(), VideoConstraint { max_height });
+        }
         Self {
             colibri_class: "ReceiverVideoConstraints".to_string(),
             last_n: -1,
             default_constraints: VideoConstraint { max_height },
-            selected_endpoints: Some(vec![endpoint.to_string()]),
-            on_stage_endpoints: Some(vec![endpoint.to_string()]),
+            selected_endpoints: Some(endpoints.to_vec()),
+            on_stage_endpoints: Some(endpoints.to_vec()),
             constraints: Some(map),
         }
     }
@@ -135,6 +141,8 @@ pub enum WrtcMessage {
         client_nonce: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         video_ssrc: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mode: Option<String>,
     },
     #[serde(rename = "anet_beacon")]
     Beacon {
@@ -200,12 +208,18 @@ impl ColibriMessage {
         }
     }
 
-    pub fn discover(to: Option<String>, client_nonce: String, video_ssrc: Option<u32>) -> Self {
+    pub fn discover(
+        to: Option<String>,
+        client_nonce: String,
+        video_ssrc: Option<u32>,
+        mode: Option<String>,
+    ) -> Self {
         Self::new_endpoint_message(
             to,
             WrtcMessage::Discover {
                 client_nonce,
                 video_ssrc,
+                mode,
             },
         )
     }
