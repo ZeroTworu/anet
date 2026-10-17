@@ -65,6 +65,10 @@ codegen-units = 1
 debug = 2
 codegen-units = 1
 
+[profile.release.package.anet-ebpf]
+debug = false
+codegen-units = 1
+
 [profile.release]
 opt-level = 3
 lto = true

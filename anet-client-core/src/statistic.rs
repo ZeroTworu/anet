@@ -2,9 +2,8 @@ use crate::events::status;
 use crate::events::{AnetEvent, emit};
 use log::info;
 use quinn::Connection;
-use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use std::time::Instant;
 use tokio::sync::Notify;
@@ -111,18 +110,6 @@ impl PingStatsProvider {
             last_rtt_us,
             last_reply_us,
             session_start,
-        })
-    }
-
-    /// Устаревший конструктор (для обратной совместимости, если где-то вызывается)
-    pub fn new(inner: Arc<dyn StatsProvider>, _target_addr: SocketAddr) -> Arc<Self> {
-        let last_rtt_us = Arc::new(AtomicU64::new(u64::MAX));
-        let last_reply_us = Arc::new(AtomicU64::new(0));
-        Arc::new(Self {
-            inner,
-            last_rtt_us,
-            last_reply_us,
-            session_start: Instant::now(),
         })
     }
 }

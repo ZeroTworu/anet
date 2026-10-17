@@ -736,7 +736,6 @@ impl AnetClient {
 
         let stats_shutdown = shutdown_notify.clone();
         let stats_task = {
-            let is_quic = result.connection.is_some();
             let provider: Arc<dyn statistic::StatsProvider> =
                 if let Some(ref conn) = result.connection {
                     Arc::new(statistic::QuicStatsProvider::new(conn.clone()))

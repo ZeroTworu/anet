@@ -12,9 +12,3 @@ anet-ebpf-common = { path = "../anet-ebpf-common" }
 [[bin]]
 name = "anet-ebpf"
 path = "src/main.rs"
-
-[profile.release]
-lto = true
-panic = "abort"
-codegen-units = 1
-debug = false
