@@ -339,6 +339,12 @@ impl ClientRegistry {
         self.apply_shaper_limit(&client_info);
     }
 
+    pub fn is_session_active(&self, session_id: &str) -> bool {
+        self.clients_by_ip
+            .iter()
+            .any(|entry| entry.value().session_id == session_id)
+    }
+
     pub fn finalize_client(&self, client_ip: &str, router_sender: StreamSender) {
         self.quic_router
             .insert(client_ip.to_string(), router_sender);
@@ -353,18 +359,33 @@ impl ClientRegistry {
         let client_ip = &client_info.assigned_ip;
         let remote_addr = **client_info.remote_addr.load();
 
-        self.quic_router.remove(client_ip);
-        self.clients_by_prefix.remove(&client_info.nonce_prefix);
-        self.clients_by_addr.remove(&remote_addr);
-        self.clients_by_ip.remove(client_ip);
-        self.clear_shaper_limit(client_ip);
+        // АТОМАРНАЯ ЗАЩИТА: удаляем роутер и записи реестра только если текущая сессия
+        // по данному IP действительно совпадает с удаляемой (защита от гонки при реконнекте/перезахвате IP).
+        let is_current = if let Some(current) = self.clients_by_ip.get(client_ip) {
+            current.session_id == client_info.session_id
+        } else {
+            true
+        };
 
-        // Очищаем локальные счетчики трафика отключенной сессии во избежание утечки памяти
-        let key = format!("{}#{}", client_info.fingerprint, client_info.protocol);
-        self.traffic_totals.remove(&key);
+        if is_current {
+            self.quic_router.remove(client_ip);
+            self.clients_by_prefix.remove(&client_info.nonce_prefix);
+            self.clients_by_addr.remove(&remote_addr);
+            self.clients_by_ip.remove(client_ip);
+            self.clear_shaper_limit(client_ip);
 
-        if let Ok(ip_addr) = client_ip.parse::<Ipv4Addr>() {
-            self.ip_pool.release(ip_addr);
+            // Очищаем локальные счетчики трафика отключенной сессии во избежание утечки памяти
+            let key = format!("{}#{}", client_info.fingerprint, client_info.protocol);
+            self.traffic_totals.remove(&key);
+
+            if let Ok(ip_addr) = client_ip.parse::<Ipv4Addr>() {
+                self.ip_pool.release(ip_addr);
+            }
+        } else {
+            info!(
+                "[Registry] Skip removing IP {} routes: session_id mismatch (already replaced by newer session)",
+                client_ip
+            );
         }
 
         // dec sessions
@@ -372,7 +393,6 @@ impl ClientRegistry {
         let fp = client_info.fingerprint.clone();
 
         ap.report_session_stop(fp).await;
-
 
         info!("[Registry] Client {} removed.", client_ip);
     }
@@ -408,14 +428,30 @@ impl ClientRegistry {
         existing
     }
 
-
     pub fn suspend_client(&self, client_info: Arc<ClientTransportInfo>) {
         let client_ip = client_info.assigned_ip.clone();
         let remote_addr = **client_info.remote_addr.load();
-        self.quic_router.remove(&client_ip);
-        self.clients_by_prefix.remove(&client_info.nonce_prefix);
-        self.clients_by_addr.remove(&remote_addr);
-        self.clients_by_ip.remove(&client_ip);
+
+        // АТОМАРНАЯ ЗАЩИТА: очищаем роутер и таблицы только если в них сейчас
+        // зарегистрирована именно ЭТА сессия, а не более новая при реконнекте.
+        let is_current = if let Some(current) = self.clients_by_ip.get(&client_ip) {
+            current.session_id == client_info.session_id
+        } else {
+            true
+        };
+
+        if is_current {
+            self.quic_router.remove(&client_ip);
+            self.clients_by_prefix.remove(&client_info.nonce_prefix);
+            self.clients_by_addr.remove(&remote_addr);
+            self.clients_by_ip.remove(&client_ip);
+        } else {
+            info!(
+                "[Registry] Skip suspending IP {} routes: session_id mismatch (already superseded)",
+                client_ip
+            );
+        }
+
         // ПРИМЕЧАНИЕ: лимит скорости намеренно НЕ снимается — плановая
         // ротация WS-сессии ожидаемо резюмируется на том же assigned_ip, и
         // держать правило в BPF-карте дешевле, чем пересоздавать его.

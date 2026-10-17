@@ -189,7 +189,7 @@ pub async fn run_wrtc_server(
 
         let first_server_rx = Arc::new(AtomicBool::new(true));
         let first_server_rx_up = first_server_rx.clone();
-        tokio::spawn(async move {
+        let video_uplink_task = tokio::spawn(async move {
             while let Some(raw_frame) = peer_video_rx.recv_video_frame().await {
                 if raw_frame.len() < 50 {
                     // Слишком короткий для ASTP кадра (2B tag + 12B nonce + 20B IPv4 + 16B MAC)
@@ -272,15 +272,25 @@ pub async fn run_wrtc_server(
                 }
                 WrtcMessage::Ping => {
                     if let Some(client_info) = clients_map.get(&from_endpoint) {
-                        client_info.last_activity.store(
-                            std::time::SystemTime::now()
-                                .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs(),
-                            Ordering::Relaxed,
-                        );
-                        let pong_msg = ColibriMessage::pong(from_endpoint.clone());
-                        let _ = shared_peer.send(pong_msg).await;
+                        // Отвечаем pong только если сессия клиента реально активна в реестре.
+                        // Если сессия была выселена таймером неактивности или удалена,
+                        // не шлем pong, чтобы клиент своевременно распознал обрыв и выполнил чистый реконнект.
+                        if reg_clone.is_session_active(&client_info.session_id) {
+                            client_info.last_activity.store(
+                                std::time::SystemTime::now()
+                                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs(),
+                                Ordering::Relaxed,
+                            );
+                            let pong_msg = ColibriMessage::pong(from_endpoint.clone());
+                            let _ = shared_peer.send(pong_msg).await;
+                        } else {
+                            warn!(
+                                "[WRTC Server] Ping from {from_endpoint} dropped: session {} already evicted",
+                                client_info.session_id
+                            );
+                        }
                     }
                 }
                 WrtcMessage::Pong => {
@@ -611,11 +621,16 @@ pub async fn run_wrtc_server(
             }
         }
 
+        video_uplink_task.abort();
+
         for entry in active_clients.iter() {
             registry.suspend_client(entry.value().clone());
         }
         active_clients.clear();
+        clients_by_tag.clear();
         p2p_clients.clear();
+        client_modes.clear();
+        client_video_endpoints.clear();
 
         info!("[WRTC Server] Pausing 2s before re-entering conference room...");
         tokio::time::sleep(Duration::from_secs(2)).await;
