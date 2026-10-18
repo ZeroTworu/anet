@@ -14,6 +14,7 @@ pub fn render_tariff_card(app: &ANetApp, ui: &mut egui::Ui) {
         .inner_margin(egui::Margin::symmetric(10, 10))
         .outer_margin(egui::Margin::symmetric(0, 0))
         .show(ui, |ui| {
+            ui.set_width(ui.available_width());
             ui.vertical(|ui| {
                 ui.horizontal(|ui| {
                     let (dot_rect, _) = ui.allocate_exact_size(egui::vec2(6.0, 6.0), egui::Sense::hover());

@@ -5,6 +5,7 @@ use anet_client_core::{
     client::AnetClient,
     updater::GithubRelease,
 };
+use eframe::egui;
 
 /// Состояние подключения к VPN
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
@@ -78,15 +79,15 @@ impl SettingsCategory {
         }
     }
 
-    pub fn icon(&self) -> &'static str {
+    pub fn icon(&self) -> egui::ImageSource<'static> {
         match self {
-            Self::General => "⚙",
-            Self::Configs => "📁",
-            Self::ServerUrl => "🔗",
-            Self::PerApp => "⚡",
-            Self::Routing => "🌐",
-            Self::ExcludedAdds => "🛡",            
-            Self::Updates => "ℹ",
+            Self::General => egui::include_image!("assets/general.svg"), // шестеренка из вашего дерева
+            Self::Configs => egui::include_image!("assets/configs.svg"),
+            Self::ServerUrl => egui::include_image!("assets/server_url.svg"),
+            Self::PerApp => egui::include_image!("assets/per_app.svg"),
+            Self::Routing => egui::include_image!("assets/routing.svg"),
+            Self::ExcludedAdds => egui::include_image!("assets/excluded_adds.svg"),
+            Self::Updates => egui::include_image!("assets/updates.svg"),
         }
     }
 

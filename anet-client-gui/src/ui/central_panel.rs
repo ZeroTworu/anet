@@ -16,13 +16,17 @@ use crate::{
     utils::helpers::lock_ignore_poison,
 };
 
-pub fn render_central_panel(app: &mut ANetApp, ctx: &egui::Context) {
-    let margin = 20.0;
+pub fn render_central_panel(app: &mut ANetApp, ctx: &egui::Context) {    
     let button_size = egui::vec2(32.0, 32.0);
     let button_icon_size = egui::vec2(26.0, 26.0);
     let label_size = 10.0;
 
-    let main_frame = egui::Frame::NONE.fill(Colors::DARK).inner_margin(margin);
+    let main_frame = egui::Frame::NONE.fill(Colors::DARK).inner_margin(egui::Margin {
+        left: 10,
+        right: 10,
+        top: 20,
+        bottom: 20,
+    });
 
     egui::CentralPanel::default()
         .frame(main_frame)
@@ -31,9 +35,12 @@ pub fn render_central_panel(app: &mut ANetApp, ctx: &egui::Context) {
 
             // Верхняя шапка: Кнопка Update, Заголовок по центру, Кнопка Settings
             ui.horizontal(|ui| {
+                  let button_col_width = 60.0;
+                  let spacing_x = ui.spacing().item_spacing.x;
+
                 // Кнопка Update
                 ui.allocate_ui_with_layout(
-                    egui::vec2(60.0, ui.available_height()),
+                    egui::vec2(button_col_width, 42.0),
                     egui::Layout::top_down(egui::Align::Center),
                     |ui| {
                         let anim_id = ui.id().with("update_btn_color");
@@ -78,13 +85,13 @@ pub fn render_central_panel(app: &mut ANetApp, ctx: &egui::Context) {
                 );
 
                 #[cfg(target_os = "windows")]
-                let center_width = (ui.available_width() - 60.0).max(0.0);
+                 let center_width = (ui.available_width() - button_col_width - spacing_x).max(0.0);
                 #[cfg(not(target_os = "windows"))]
-                let center_width = ui.available_width();
+                let center_width = (ui.available_width() - button_col_width - spacing_x).max(0.0);
 
                 // Логотип ANet VPN
                 ui.allocate_ui_with_layout(
-                    egui::vec2(center_width, ui.available_height()),
+                    egui::vec2(center_width, 42.0),
                     egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
                     |ui| {
                         let mut job = LayoutJob::default();
@@ -108,7 +115,7 @@ pub fn render_central_panel(app: &mut ANetApp, ctx: &egui::Context) {
 
                 // Кнопка Settings
                 ui.allocate_ui_with_layout(
-                    egui::vec2(60.0, ui.available_height()),
+                    egui::vec2(button_col_width, 42.0),
                     egui::Layout::top_down(egui::Align::Center),
                     |ui| {
                         let anim_id = ui.id().with("settings_gear_btn_color");

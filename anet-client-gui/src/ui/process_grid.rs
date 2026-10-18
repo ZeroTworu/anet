@@ -33,25 +33,46 @@ pub fn render_process_list(app: &mut ANetApp, ui: &mut egui::Ui) {
     });
     ui.separator();
 
-    ui.horizontal(|ui| {
-        if ui.add(
-            egui::Button::new(egui::RichText::new("🔄 Обновить").size(11.0))
-                .min_size(egui::vec2(90.0, 32.0))
-                .corner_radius(6.0)
-        ).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-            app.refresh_processes();
-        }
+ ui.horizontal(|ui| {
+    let icon_size = egui::vec2(16.0, 16.0);
 
-        if ui.add(
-            egui::Button::new(egui::RichText::new("💾 Применить").size(11.0).strong().color(egui::Color32::BLACK))
-                .fill(Colors::GOLD)
-                .min_size(egui::vec2(90.0, 32.0))
-                .corner_radius(6.0)
-        ).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-            // Вызываем единый метод сохранения ANetApp с поддержкой Server config
-            app.save_per_app_settings();
-        }
-    });
+    // Кнопка «Обновить»
+    let refresh_icon = egui::Image::new(egui::include_image!("../assets/refresh.svg"))
+        .fit_to_exact_size(icon_size)
+        .tint(egui::Color32::from_rgb(220, 222, 228));
+
+    if ui.add(
+        egui::Button::image_and_text(
+            refresh_icon,
+            egui::RichText::new("Обновить").size(11.0),
+        )
+        .min_size(egui::vec2(90.0, 32.0))
+        .corner_radius(6.0)
+    ).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+        app.refresh_processes();
+    }
+
+    // Кнопка «Применить»
+    let save_icon = egui::Image::new(egui::include_image!("../assets/save.svg"))
+        .fit_to_exact_size(icon_size)
+        .tint(egui::Color32::BLACK);
+
+    if ui.add(
+        egui::Button::image_and_text(
+            save_icon,
+            egui::RichText::new("Применить")
+                .size(11.0)
+                .strong()
+                .color(egui::Color32::BLACK),
+        )
+        .fill(Colors::GOLD)
+        .min_size(egui::vec2(90.0, 32.0))
+        .corner_radius(6.0)
+    ).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+        // Вызываем единый метод сохранения ANetApp с поддержкой Server config
+        app.save_per_app_settings();
+    }
+});
 
     ui.separator();
 
