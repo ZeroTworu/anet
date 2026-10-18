@@ -668,8 +668,8 @@ fn render_configs_settings(app: &mut ANetApp, ui: &mut egui::Ui) {
             }
 
             for config in &configs {
-                let is_active = active_id.as_deref() == Some(&config.id);
-                let is_editing = editing_id.as_deref() == Some(&config.id);
+                let is_active = active_id.as_deref() == Some(config.id.as_str());
+                let is_editing = editing_id.as_deref() == Some(config.id.as_str());
 
                 let card_id = ui.id().with("config_card").with(&config.id);
                 let is_hovered: bool = ui.data(|d| d.get_temp(card_id)).unwrap_or(false);

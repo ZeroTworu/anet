@@ -1,3 +1,5 @@
+#![allow(float_literal_f32_fallback)]
+
 // src/main.rs
 #![cfg_attr(not(feature = "console"), windows_subsystem = "windows")]
 

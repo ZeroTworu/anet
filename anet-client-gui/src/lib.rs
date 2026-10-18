@@ -1,3 +1,5 @@
+#![allow(float_literal_f32_fallback)]
+
 include!(concat!(env!("OUT_DIR"), "/built.rs"));
 
 pub mod types;
