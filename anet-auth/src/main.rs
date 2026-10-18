@@ -225,12 +225,13 @@ async fn run_server(db: DatabaseConnection) -> Result<(), anyhow::Error> {
     let client_template_path = env::var("CLIENT_TEMPLATE_PATH")
         .unwrap_or_else(|_| "/opt/anet/client_template.toml".to_string());
 
+    let server_url = env::var("PUBLIC_API_URL").unwrap_or_else(|_| "/api/v1".to_string());
     let api_service = OpenApiService::new(
         api::get_api(db, client_template_path),
         "ANet Auth API",
         "1.0"
     )
-        .server(format!("http://{}/api/v1", bind_to));
+        .server(server_url);
 
     let ui = api_service.swagger_ui();
     let spec = api_service.spec_endpoint();
@@ -239,6 +240,7 @@ async fn run_server(db: DatabaseConnection) -> Result<(), anyhow::Error> {
         .nest("/api/v1", api_service)
         .nest("/swagger", ui)
         .at("/spec", spec)
+        .with(poem::middleware::Cors::new())
         .with(middleware::ApiKeyMiddleware { key: api_key });
 
     info!("ANet Auth started on {}", bind_to);
