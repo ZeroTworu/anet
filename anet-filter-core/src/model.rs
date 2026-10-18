@@ -1,11 +1,7 @@
 //! Базовые структуры данных и формат .abc (ANet Binary Cache) с поддержкой Zero-Copy (rkyv).
 
 use bytecheck::CheckBytes;
-use rkyv::{
-    check_archived_root,
-    ser::{serializers::AllocSerializer, Serializer},
-    Archive, Deserialize, Serialize,
-};
+use rkyv::{check_archived_root, Archive, Deserialize, Serialize};
 use std::fmt;
 
 use crate::radix::IpRoutingTable;
@@ -125,12 +121,9 @@ impl CompiledRoutingCache {
 
     /// Сериализует контейнер правил в байтовый массив формата .abc
     pub fn to_bytes(&self) -> Result<Vec<u8>, anyhow::Error> {
-        let mut serializer = AllocSerializer::<4096>::default();
-        serializer
-            .serialize_value(self)
+        let aligned = rkyv::to_bytes::<_, 4096>(self)
             .map_err(|e| anyhow::anyhow!("Failed to serialize CompiledRoutingCache: {e}"))?;
-        let bytes = serializer.into_serializer().into_vec();
-        Ok(bytes)
+        Ok(aligned.to_vec())
     }
 
     /// Выполняет быструю Zero-Copy валидацию и возвращает ссылку на корень архива

@@ -1,3 +1,5 @@
+#![allow(unsafe_op_in_unsafe_fn)]
+
 //! # anet-filter-core
 //!
 //! Ядро системы Smart DNS, Geo-Routing и AdBlock для ANet VPN.
