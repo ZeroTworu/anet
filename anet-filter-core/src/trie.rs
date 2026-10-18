@@ -4,13 +4,17 @@
 //! `ads.google.com` -> `["com", "google", "ads"]`.
 //! Обеспечивает O(K) поиск (где K — количество меток в домене, обычно 2-4)
 //! как для несжатых структур, так и в Zero-Copy режиме через `ArchivedDomainTrie`.
+//!
+//! Использует плоскую табличную адресацию (Flattened Arena Layout) на базе индексов:
+//! дочерние узлы любого уровня располагаются в непрерывном срезе `nodes[children_start .. children_start + children_count]`,
+//! что исключает рекурсивные типы в схеме сериализации и обеспечивает максимальную кэш-локальность.
 
 use bytecheck::CheckBytes;
 use rkyv::{Archive, Deserialize, Serialize};
 
 use crate::model::RuleAction;
 
-/// Узел инвертированного дерева доменов
+/// Узел инвертированного дерева доменов с индексной адресацией дочерних элементов
 #[derive(Archive, Deserialize, Serialize, CheckBytes, Debug, Clone, PartialEq)]
 #[archive(check_bytes)]
 pub struct TrieNode {
@@ -20,8 +24,10 @@ pub struct TrieNode {
     pub terminal_action: Option<RuleAction>,
     /// Распространяется ли действие на все поддомены ниже данного уровня (*.domain)
     pub match_subdomains: bool,
-    /// Дочерние узлы (следующие метки домена справа налево)
-    pub children: Vec<TrieNode>,
+    /// Начальный индекс дочерних узлов в плоском массиве `nodes`
+    pub children_start: u32,
+    /// Количество дочерних узлов
+    pub children_count: u16,
 }
 
 impl TrieNode {
@@ -30,7 +36,8 @@ impl TrieNode {
             label,
             terminal_action: None,
             match_subdomains: false,
-            children: Vec::new(),
+            children_start: 0,
+            children_count: 0,
         }
     }
 }
@@ -39,29 +46,36 @@ impl TrieNode {
 #[derive(Archive, Deserialize, Serialize, CheckBytes, Debug, Clone, PartialEq, Default)]
 #[archive(check_bytes)]
 pub struct DomainTrie {
-    /// Корневые узлы первого уровня (TLD домены: "com", "ru", "org", "net" и т.д.)
-    pub root_nodes: Vec<TrieNode>,
+    /// Непрерывный массив всех узлов дерева (Flattened Arena)
+    pub nodes: Vec<TrieNode>,
+    /// Начальный индекс корневых узлов (TLD)
+    pub root_start: u32,
+    /// Количество корневых узлов
+    pub root_count: u16,
 }
 
 impl DomainTrie {
     pub fn new() -> Self {
-        Self {
-            root_nodes: Vec::new(),
-        }
+        Self::default()
     }
 
     /// Поиск правила маршрутизации для заданного доменного имени
     pub fn lookup(&self, domain: &str) -> Option<RuleAction> {
         let labels = split_domain_to_reversed_labels(domain);
-        if labels.is_empty() {
+        if labels.is_empty() || self.root_count == 0 {
             return None;
         }
 
-        let mut current_nodes = &self.root_nodes;
+        let mut current_start = self.root_start as usize;
+        let mut current_count = self.root_count as usize;
         let mut last_wildcard_action: Option<RuleAction> = None;
 
         for (idx, label) in labels.iter().enumerate() {
-            let matched_node = current_nodes.iter().find(|n| n.label.as_str() == *label)?;
+            if current_start + current_count > self.nodes.len() {
+                return None;
+            }
+            let current_slice = &self.nodes[current_start..current_start + current_count];
+            let matched_node = current_slice.iter().find(|n| n.label.as_str() == *label)?;
 
             if matched_node.match_subdomains && matched_node.terminal_action.is_some() {
                 last_wildcard_action = matched_node.terminal_action;
@@ -75,7 +89,12 @@ impl DomainTrie {
                 return last_wildcard_action;
             }
 
-            current_nodes = &matched_node.children;
+            if matched_node.children_count == 0 {
+                return last_wildcard_action;
+            }
+
+            current_start = matched_node.children_start as usize;
+            current_count = matched_node.children_count as usize;
         }
 
         last_wildcard_action
@@ -87,15 +106,21 @@ impl ArchivedDomainTrie {
     /// Высокопроизводительный поиск действия без выделения памяти в куче
     pub fn lookup(&self, domain: &str) -> Option<RuleAction> {
         let labels = split_domain_to_reversed_labels(domain);
-        if labels.is_empty() {
+        if labels.is_empty() || self.root_count == 0 {
             return None;
         }
 
-        let mut current_nodes = self.root_nodes.as_slice();
+        let nodes = self.nodes.as_slice();
+        let mut current_start = self.root_start as usize;
+        let mut current_count = self.root_count as usize;
         let mut last_wildcard_action: Option<RuleAction> = None;
 
         for (idx, label) in labels.iter().enumerate() {
-            let matched_node = current_nodes
+            if current_start + current_count > nodes.len() {
+                return None;
+            }
+            let current_slice = &nodes[current_start..current_start + current_count];
+            let matched_node = current_slice
                 .iter()
                 .find(|n| n.label.as_str() == *label)?;
 
@@ -112,24 +137,36 @@ impl ArchivedDomainTrie {
                 return last_wildcard_action;
             }
 
-            current_nodes = matched_node.children.as_slice();
+            if matched_node.children_count == 0 {
+                return last_wildcard_action;
+            }
+
+            current_start = matched_node.children_start as usize;
+            current_count = matched_node.children_count as usize;
         }
 
         last_wildcard_action
     }
 }
 
+/// Промежуточный узел дерева для стадии сборки (без ограничений rkyv)
+#[derive(Debug, Default)]
+struct BuilderNode {
+    label: String,
+    terminal_action: Option<RuleAction>,
+    match_subdomains: bool,
+    children: Vec<BuilderNode>,
+}
+
 /// Построитель дерева доменов с поддержкой синтаксиса MetaCubeX / V2Ray / AdBlock
 #[derive(Debug, Default)]
 pub struct DomainTrieBuilder {
-    trie: DomainTrie,
+    roots: Vec<BuilderNode>,
 }
 
 impl DomainTrieBuilder {
     pub fn new() -> Self {
-        Self {
-            trie: DomainTrie::new(),
-        }
+        Self::default()
     }
 
     /// Добавляет правило для домена
@@ -157,7 +194,7 @@ impl DomainTrieBuilder {
             return false;
         }
 
-        let mut current_nodes = &mut self.trie.root_nodes;
+        let mut current_nodes = &mut self.roots;
 
         for (idx, label) in labels.iter().enumerate() {
             let is_last = idx == labels.len() - 1;
@@ -165,7 +202,12 @@ impl DomainTrieBuilder {
             let node_pos = match current_nodes.iter().position(|n| n.label == *label) {
                 Some(pos) => pos,
                 None => {
-                    current_nodes.push(TrieNode::new((*label).to_string()));
+                    current_nodes.push(BuilderNode {
+                        label: (*label).to_string(),
+                        terminal_action: None,
+                        match_subdomains: false,
+                        children: Vec::new(),
+                    });
                     current_nodes.len() - 1
                 }
             };
@@ -187,11 +229,69 @@ impl DomainTrieBuilder {
         false
     }
 
-    /// Завершает построение и возвращает готовое дерево `DomainTrie`
+    /// Завершает построение и укладывает иерархию в непрерывный массив `nodes` (BFS level-order)
     pub fn build(mut self) -> DomainTrie {
-        // Сортируем корневые узлы по убыванию длины метки или алфавиту для стабильности
-        self.trie.root_nodes.sort_by(|a, b| a.label.cmp(&b.label));
-        self.trie
+        if self.roots.is_empty() {
+            return DomainTrie::default();
+        }
+
+        // Сортируем корневые узлы по алфавиту
+        self.roots.sort_by(|a, b| a.label.cmp(&b.label));
+
+        let mut flat_nodes: Vec<TrieNode> = Vec::new();
+        let mut queue: std::collections::VecDeque<(usize, Vec<BuilderNode>)> =
+            std::collections::VecDeque::new();
+
+        let root_start = 0u32;
+        let root_count = self.roots.len() as u16;
+
+        for r in &self.roots {
+            flat_nodes.push(TrieNode {
+                label: r.label.clone(),
+                terminal_action: r.terminal_action,
+                match_subdomains: r.match_subdomains,
+                children_start: 0,
+                children_count: 0,
+            });
+        }
+
+        for (idx, r) in self.roots.into_iter().enumerate() {
+            if !r.children.is_empty() {
+                queue.push_back((idx, r.children));
+            }
+        }
+
+        while let Some((parent_idx, mut children)) = queue.pop_front() {
+            children.sort_by(|a, b| a.label.cmp(&b.label));
+            let children_start = flat_nodes.len() as u32;
+            let children_count = children.len() as u16;
+
+            flat_nodes[parent_idx].children_start = children_start;
+            flat_nodes[parent_idx].children_count = children_count;
+
+            let base_idx = flat_nodes.len();
+            for c in &children {
+                flat_nodes.push(TrieNode {
+                    label: c.label.clone(),
+                    terminal_action: c.terminal_action,
+                    match_subdomains: c.match_subdomains,
+                    children_start: 0,
+                    children_count: 0,
+                });
+            }
+
+            for (c_idx, c) in children.into_iter().enumerate() {
+                if !c.children.is_empty() {
+                    queue.push_back((base_idx + c_idx, c.children));
+                }
+            }
+        }
+
+        DomainTrie {
+            nodes: flat_nodes,
+            root_start,
+            root_count,
+        }
     }
 }
 

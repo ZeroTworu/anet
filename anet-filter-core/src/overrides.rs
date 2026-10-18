@@ -3,7 +3,6 @@
 //! Обеспечивают высший приоритет для правил, заданных конечным пользователем
 //! в `client.toml` или администратором в базе данных `anet-auth`.
 
-use ahash::AHashSet;
 use ipnet::IpNet;
 use std::net::IpAddr;
 
