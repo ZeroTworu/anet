@@ -31,6 +31,7 @@ ipnet = { workspace = true }
 toml = { workspace = true }
 
 anet-common = { path = "../anet-common", features = ["poem"] }
+anet-filter-core = { path = "../anet-filter-core" }
 
 [[bin]]
 name = "anet-auth"

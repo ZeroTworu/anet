@@ -1,5 +1,6 @@
 pub mod api;
 pub mod auth;
+pub mod compiled_rules;
 pub mod dto;
 pub mod groups;
 pub mod pools;
@@ -26,6 +27,7 @@ pub fn get_api(
         pools::PoolsApi { db: db.clone() },
         route_maps::RouteMapsApi { db: db.clone() },
         groups::GroupsApi { db: db.clone() },
-        statistics::StatisticsApi { db },
+        statistics::StatisticsApi { db: db.clone() },
+        compiled_rules::CompiledRulesApi { db },
     )
 }

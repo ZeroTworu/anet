@@ -42,6 +42,9 @@ zip = "8.6.0"
 
 hickory-resolver = { version = "0.24", features = ["tokio"] }
 anet-common = { path = "../anet-common" }
+anet-filter-core = { path = "../anet-filter-core" }
+memmap2 = "0.9"
+arc-swap = "1.7"
 
 
 # Platform-specific dependencies for route management

@@ -1,0 +1,19 @@
+[package]
+name = "anet-filter-core"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Core data structures and Zero-Copy .abc binary cache for ANet Smart DNS, Geo-Routing and AdBlock"
+
+[dependencies]
+rkyv = { workspace = true, features = ["validation", "alloc"] }
+bytecheck = "0.6.12"
+ipnet = { workspace = true }
+anyhow = { workspace = true }
+bytes = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+log = { workspace = true }
+ahash = "0.8"
+
+[dev-dependencies]
+rand = { workspace = true }

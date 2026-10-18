@@ -1,11 +1,13 @@
 [workspace]
 resolver = "2"
 members = ["anet-server", "anet-client-cli", "anet-common", "anet-keygen",
-    "anet-client-core", "anet-mobile", "anet-client-gui", "anet-auth", "anet-appfilter", "anet-ebpf-common", "anet-ebpf"]
-default-members = ["anet-server", "anet-client-cli", "anet-common", "anet-auth", "anet-client-gui", "anet-keygen"]
+    "anet-client-core", "anet-mobile", "anet-client-gui", "anet-auth", "anet-appfilter", "anet-ebpf-common", "anet-ebpf", "anet-filter-core"]
+default-members = ["anet-server", "anet-client-cli", "anet-common", "anet-auth", "anet-client-gui", "anet-keygen", "anet-filter-core"]
 
 
 [workspace.dependencies]
+rkyv = { version = "0.7.46", features = ["validation", "alloc"] }
+anet-filter-core = { path = "anet-filter-core" }
 tun = { version = "0.8.5", features = ["async"] }
 tokio = {version = "1.47.1", features = ["full"]}
 env_logger = "0.11.8"
