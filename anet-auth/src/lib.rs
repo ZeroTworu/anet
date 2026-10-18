@@ -6,3 +6,4 @@ pub mod migration;
 pub mod crypto;
 pub mod balancer;
 pub mod route_compiler;
+pub mod compiler_worker;

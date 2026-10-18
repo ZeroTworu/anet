@@ -9,7 +9,9 @@ use sea_orm::{ColumnTrait, Condition, DatabaseConnection, EntityTrait, QueryFilt
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::entities::{admin_custom_overrides, route_maps, route_rules};
+use crate::entities::admin_custom_overrides::{self, OverrideType};
+use crate::entities::route_rules::RouteMatchKind;
+use crate::entities::{route_maps, route_rules, rule_providers};
 
 #[derive(ApiResponse)]
 pub enum CompiledRulesResponse {
@@ -48,7 +50,7 @@ impl CompiledRulesApi {
 
         let mut compiler = RoutingCacheCompiler::new(default_action);
 
-        // Загружаем правила из route_rules
+        // 1. Загружаем правила из route_rules (используя типизированные match_kind() и rule_action())
         if let Some(map_id) = route_map_id {
             if let Ok(rules) = route_rules::Entity::find()
                 .filter(route_rules::Column::RouteMapId.eq(map_id))
@@ -56,21 +58,41 @@ impl CompiledRulesApi {
                 .await
             {
                 for rule in rules {
-                    let action = RuleAction::from_str_loose(&rule.action).unwrap_or(RuleAction::Direct);
-                    match rule.match_type.as_str() {
-                        "cidr" | "ip" => {
-                            let _ = compiler.add_provider_ips(&rule.match_value, action);
+                    if let Some(kind) = rule.match_kind() {
+                        let action = rule.rule_action();
+                        match kind {
+                            RouteMatchKind::Cidr => {
+                                let _ = compiler.add_provider_ips(&rule.match_value, action);
+                            }
+                            RouteMatchKind::Domain => {
+                                compiler.add_admin_domain_override(&rule.match_value, action);
+                            }
+                            RouteMatchKind::RuleProvider => {
+                                if let Ok(provider_id) = Uuid::parse_str(&rule.match_value) {
+                                    if let Ok(Some(provider)) = rule_providers::Entity::find_by_id(provider_id).one(&self.db).await {
+                                        let cache_dir = std::env::var("PROVIDER_CACHE_DIR").unwrap_or_else(|_| "/tmp/anet_providers".to_string());
+                                        let file_path = std::path::Path::new(&cache_dir).join(format!("{}.txt", provider.id));
+                                        if let Ok(content) = std::fs::read_to_string(file_path) {
+                                            match provider.provider_type {
+                                                rule_providers::ProviderType::DomainList => {
+                                                    compiler.add_provider_domains(&content, action);
+                                                }
+                                                rule_providers::ProviderType::IpList => {
+                                                    compiler.add_provider_ips(&content, action);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            RouteMatchKind::Application => {}
                         }
-                        "domain" => {
-                            compiler.add_admin_domain_override(&rule.match_value, action);
-                        }
-                        _ => {}
                     }
                 }
             }
         }
 
-        // Загружаем административные исключения (admin_custom_overrides)
+        // 2. Загружаем административные исключения (admin_custom_overrides) по строго типизированным енамам
         let mut override_query = admin_custom_overrides::Entity::find()
             .filter(admin_custom_overrides::Column::IsActive.eq(true));
 
@@ -85,15 +107,12 @@ impl CompiledRulesApi {
 
         if let Ok(overrides) = override_query.all(&self.db).await {
             for ov in overrides {
-                let action = match ov.category.as_str() {
-                    "custom_block" | "block" => RuleAction::Block,
-                    "custom_direct" | "direct" => RuleAction::Direct,
-                    _ => RuleAction::Proxy,
-                };
-
-                match ov.rule_type.as_str() {
-                    "cidr" | "ip" => compiler.add_admin_ip_override(&ov.pattern, action),
-                    _ => compiler.add_admin_domain_override(&ov.pattern, action),
+                let action = RuleAction::from(ov.category);
+                match ov.rule_type {
+                    OverrideType::IpNet => compiler.add_admin_ip_override(&ov.pattern, action),
+                    OverrideType::Domain | OverrideType::SubdomainWildcard => {
+                        compiler.add_admin_domain_override(&ov.pattern, action);
+                    }
                 }
             }
         }

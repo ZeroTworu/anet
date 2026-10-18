@@ -217,6 +217,9 @@ async fn handle_add_admin(db: &DatabaseConnection, login: String) -> Result<(), 
 
 /// Режим сервера (Daemon)
 async fn run_server(db: DatabaseConnection) -> Result<(), anyhow::Error> {
+    // Запускаем фоновый воркер загрузки списков и компиляции правил
+    tokio::spawn(anet_auth::compiler_worker::run_worker(db.clone()));
+
     let bind_to = env::var("BIND_TO").unwrap_or_else(|_| "127.0.0.1:3000".to_string());
     let api_key = env::var("AUTH_BACKEND_KEY").expect("AUTH_BACKEND_KEY must be set");
     let client_template_path = env::var("CLIENT_TEMPLATE_PATH")

@@ -1,15 +1,41 @@
 //! Сущность внешнего провайдера правил (DomainList / IpList).
+use poem_openapi::Enum as OpenApiEnum;
 use sea_orm::entity::prelude::*;
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, EnumIter, DeriveActiveEnum, Serialize, Deserialize, OpenApiEnum,
+)]
+#[sea_orm(rs_type = "String", db_type = "String(None)")]
+pub enum ProviderType {
+    #[sea_orm(string_value = "domain")]
+    DomainList,
+    #[sea_orm(string_value = "ip")]
+    IpList,
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, EnumIter, DeriveActiveEnum, Serialize, Deserialize, OpenApiEnum,
+)]
+#[sea_orm(rs_type = "String", db_type = "String(None)")]
+pub enum ProviderFormat {
+    #[sea_orm(string_value = "plain")]
+    PlainText,
+    #[sea_orm(string_value = "v2ray")]
+    V2RayDomain,
+    #[sea_orm(string_value = "cidr")]
+    CidrList,
+}
+
+#[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "rule_providers")]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub id: Uuid,
     pub name: String,
     pub description: String,
-    pub provider_type: String, // "domain" | "ip"
-    pub format: String,        // "plain" | "v2ray" | "cidr"
+    pub provider_type: ProviderType,
+    pub format: ProviderFormat,
     pub url: String,
     pub update_interval_hours: i32,
     pub last_fetched_at: Option<DateTime>,
