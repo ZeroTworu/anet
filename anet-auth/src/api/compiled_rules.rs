@@ -5,7 +5,7 @@ use anet_filter_core::{RoutingCacheCompiler, RuleAction};
 use poem_openapi::{
     param::Header, param::Path, payload::Binary, payload::PlainText, ApiResponse, OpenApi,
 };
-use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
+use sea_orm::{ColumnTrait, Condition, DatabaseConnection, EntityTrait, QueryFilter};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -13,8 +13,11 @@ use crate::entities::{admin_custom_overrides, route_maps, route_rules};
 
 #[derive(ApiResponse)]
 pub enum CompiledRulesResponse {
-    #[oai(status = 200, header(name = "ETag", type = "String"))]
-    Ok(Binary<Vec<u8>>, String),
+    #[oai(status = 200, content_type = "application/octet-stream")]
+    Ok(
+        Binary<Vec<u8>>,
+        #[oai(header = "ETag")] String,
+    ),
     #[oai(status = 304)]
     NotModified,
     #[oai(status = 404)]
@@ -72,11 +75,10 @@ impl CompiledRulesApi {
             .filter(admin_custom_overrides::Column::IsActive.eq(true));
 
         if let Some(map_id) = route_map_id {
-            override_query = override_query.filter(
-                admin_custom_overrides::Column::RouteMapId
-                    .eq(map_id)
-                    .or(admin_custom_overrides::Column::RouteMapId.is_null()),
-            );
+            let condition = Condition::any()
+                .add(admin_custom_overrides::Column::RouteMapId.eq(map_id))
+                .add(admin_custom_overrides::Column::RouteMapId.is_null());
+            override_query = override_query.filter(condition);
         } else {
             override_query = override_query.filter(admin_custom_overrides::Column::RouteMapId.is_null());
         }

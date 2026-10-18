@@ -6,7 +6,7 @@ use log::{debug, error, info, warn};
 use memmap2::Mmap;
 use std::fs::{self, File};
 use std::net::IpAddr;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Менеджер бинарного кэша правил

@@ -45,6 +45,7 @@ anet-common = { path = "../anet-common" }
 anet-filter-core = { path = "../anet-filter-core" }
 memmap2 = "0.9"
 arc-swap = "1.7"
+dashmap = { workspace = true }
 
 
 # Platform-specific dependencies for route management

@@ -9,7 +9,6 @@ use anet_filter_core::{
 };
 use bytes::{Bytes, BytesMut};
 use log::{debug, trace};
-use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 
 use crate::direct_ip_cache::DirectIpCache;
