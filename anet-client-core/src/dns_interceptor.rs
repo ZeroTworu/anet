@@ -40,6 +40,10 @@ pub struct DnsInterceptor {
 }
 
 impl DnsInterceptor {
+    pub fn direct_cache(&self) -> &DirectIpCache {
+        &self.direct_cache
+    }
+
     pub fn new(local_overrides: Arc<LocalOverrides>, direct_cache: DirectIpCache) -> Self {
         Self {
             local_overrides,

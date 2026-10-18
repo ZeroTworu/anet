@@ -1,8 +1,6 @@
 //! Создаёт таблицы rule_providers и admin_custom_overrides для Smart DNS, Geo-Routing и AdBlock.
 use sea_orm_migration::prelude::*;
 
-use super::m20260815_000016_create_route_maps::RouteMaps;
-
 #[derive(DeriveMigrationName)]
 pub struct Migration;
 
@@ -139,6 +137,12 @@ impl MigrationTrait for Migration {
             .await?;
         Ok(())
     }
+}
+
+#[derive(DeriveIden)]
+enum RouteMaps {
+    Table,
+    Id,
 }
 
 #[derive(DeriveIden)]

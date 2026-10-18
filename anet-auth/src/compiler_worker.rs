@@ -5,11 +5,10 @@ use chrono::Utc;
 use log::{debug, error, info, warn};
 use sea_orm::{ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
-use uuid::Uuid;
 
-use crate::entities::rule_providers::{self, ProviderFormat, ProviderType};
+use crate::entities::rule_providers;
 
 /// Директория для хранения сырых текстовых кэшей провайдеров
 pub fn get_provider_cache_dir() -> PathBuf {

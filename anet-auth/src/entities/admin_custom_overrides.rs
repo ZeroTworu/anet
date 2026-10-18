@@ -6,7 +6,9 @@ use serde::{Deserialize, Serialize};
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, EnumIter, DeriveActiveEnum, Serialize, Deserialize, OpenApiEnum,
 )]
-#[sea_orm(rs_type = "String", db_type = "String(None)")]
+#[sea_orm(rs_type = "String", db_type = "Text")]
+#[oai(rename_all = "lowercase")]
+#[serde(rename_all = "lowercase")]
 pub enum OverrideType {
     #[sea_orm(string_value = "domain")]
     Domain,
@@ -19,7 +21,9 @@ pub enum OverrideType {
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, EnumIter, DeriveActiveEnum, Serialize, Deserialize, OpenApiEnum,
 )]
-#[sea_orm(rs_type = "String", db_type = "String(None)")]
+#[sea_orm(rs_type = "String", db_type = "Text")]
+#[oai(rename_all = "lowercase")]
+#[serde(rename_all = "lowercase")]
 pub enum OverrideCategory {
     #[sea_orm(string_value = "block")]
     CustomBlock,

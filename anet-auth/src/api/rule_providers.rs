@@ -5,8 +5,7 @@ use poem_openapi::{
     param::Path, payload::Json, ApiResponse, Object, OpenApi,
 };
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, IntoActiveModel, QueryFilter,
-    QueryOrder, Set,
+    ActiveModelTrait, DatabaseConnection, EntityTrait, QueryOrder, Set,
 };
 use uuid::Uuid;
 
