@@ -237,13 +237,15 @@ pub enum OverrideCategory {
    - Генерируется хэш SHA-256 содержимого бинарного файла, служащий `ETag`.
 
 ### 3.4. REST API для клиентов
+Эндпоинт является публичным (аутентификация не требуется), что позволяет клиентам скачивать и обновлять правила автономно, а также кэшировать их на уровне CDN/Edge прокси.
+
 - **Маршрут**: `GET /api/v1/routing/compiled-rules` (или индивидуально по профилю: `/api/v1/routing/compiled-rules/:route_map_id`)
+- **Аутентификация**: Отсутствует (публичный доступ, rate-limited при необходимости).
 - **Заголовки запроса**:
-  - `Authorization: Bearer <session_token>`
   - `If-None-Match: "<ETag>"`
 - **Поведение сервера**:
   - Если переданный `ETag` совпадает с текущим: `304 Not Modified`.
-  - Если правила изменились: `200 OK`, `Content-Type: application/octet-stream`, `ETag: "<SHA256>"`, тело ответа — бинарные байты `.abc`.
+  - Если правила изменились или это первичный запрос: `200 OK`, `Content-Type: application/octet-stream`, `ETag: "<SHA256>"`, `Cache-Control: public, no-cache`, тело ответа — бинарные байты `.abc`.
 
 ---
 
