@@ -15,10 +15,12 @@ import {
   UpdateCustomOverride,
 } from '@/api/custom-overrides'
 import type { RouteMap } from '@/models/route-map'
-import type { RuleProvider, SaveRuleProviderRequest, ProviderFormat, ProviderType } from '@/models/rule-provider'
-import type { CustomOverride, SaveCustomOverrideRequest, OverrideCategory, OverrideType } from '@/models/custom-override'
+import type { RuleProvider, SaveRuleProviderRequest } from '@/models/rule-provider'
+import type { CustomOverride, SaveCustomOverrideRequest } from '@/models/custom-override'
 import RouteMapModal from '@/components/RouteMapModal.vue'
+import { useAppMessage } from '@/composables/useAppMessage'
 
+const message = useAppMessage()
 const activeTab = ref<'maps' | 'providers' | 'overrides'>('maps')
 
 // --- ROUTE MAPS ---
@@ -46,6 +48,9 @@ const loadMaps = async () => {
       ...map,
       rules_count: map.rules.length,
     }))
+  } catch (err: any) {
+    const msg = err.response?.data?.message || err.response?.data || err.message || 'Ошибка загрузки карт маршрутизации'
+    message.error(typeof msg === 'string' ? msg : JSON.stringify(msg))
   } finally {
     loadingMaps.value = false
   }
@@ -63,8 +68,14 @@ const openEditMap = (map: RouteMap) => {
 
 const removeMap = async (id: string) => {
   if (!confirm('Вы уверены, что хотите удалить эту карту? Назначения пользователей также будут сброшены.')) return
-  await DeleteRouteMap(id)
-  await loadMaps()
+  try {
+    await DeleteRouteMap(id)
+    message.success('Карта маршрутизации удалена')
+    await loadMaps()
+  } catch (err: any) {
+    const msg = err.response?.data?.message || err.response?.data || err.message || 'Ошибка удаления карты'
+    message.error(typeof msg === 'string' ? msg : JSON.stringify(msg))
+  }
 }
 
 // --- RULE PROVIDERS (.ABC COMPILER) ---
@@ -73,6 +84,8 @@ const loadingProviders = ref(false)
 const searchProviders = ref('')
 const showProviderModal = ref(false)
 const fetchingProviderId = ref<string | null>(null)
+const savingProvider = ref(false)
+const providerError = ref('')
 
 const providerForm = ref<SaveRuleProviderRequest>({
   name: '',
@@ -101,6 +114,9 @@ const loadProviders = async () => {
   loadingProviders.value = true
   try {
     providers.value = await GetRuleProviders()
+  } catch (err: any) {
+    const msg = err.response?.data?.message || err.response?.data || err.message || 'Ошибка загрузки провайдеров'
+    message.error(typeof msg === 'string' ? msg : JSON.stringify(msg))
   } finally {
     loadingProviders.value = false
   }
@@ -108,6 +124,7 @@ const loadProviders = async () => {
 
 const openCreateProvider = () => {
   editingProviderId.value = null
+  providerError.value = ''
   providerForm.value = {
     name: '',
     description: '',
@@ -122,6 +139,7 @@ const openCreateProvider = () => {
 
 const openEditProvider = (p: RuleProvider) => {
   editingProviderId.value = p.id
+  providerError.value = ''
   providerForm.value = {
     name: p.name,
     description: p.description,
@@ -135,27 +153,52 @@ const openEditProvider = (p: RuleProvider) => {
 }
 
 const saveProvider = async () => {
-  if (!providerForm.value.name.trim() || !providerForm.value.url.trim()) return
-  if (editingProviderId.value) {
-    await UpdateRuleProvider(editingProviderId.value, providerForm.value)
-  } else {
-    await CreateRuleProvider(providerForm.value)
+  if (!providerForm.value.name.trim() || !providerForm.value.url.trim()) {
+    providerError.value = 'Пожалуйста, заполните название и URL'
+    return
   }
-  showProviderModal.value = false
-  await loadProviders()
+  savingProvider.value = true
+  providerError.value = ''
+  try {
+    if (editingProviderId.value) {
+      await UpdateRuleProvider(editingProviderId.value, providerForm.value)
+      message.success('Провайдер правил успешно обновлён')
+    } else {
+      await CreateRuleProvider(providerForm.value)
+      message.success('Провайдер правил успешно создан')
+    }
+    showProviderModal.value = false
+    await loadProviders()
+  } catch (err: any) {
+    const msg = err.response?.data?.message || err.response?.data || err.message || 'Ошибка сохранения провайдера'
+    providerError.value = typeof msg === 'string' ? msg : JSON.stringify(msg)
+    message.error(providerError.value)
+  } finally {
+    savingProvider.value = false
+  }
 }
 
 const removeProvider = async (id: string) => {
   if (!confirm('Удалить этого провайдера правил?')) return
-  await DeleteRuleProvider(id)
-  await loadProviders()
+  try {
+    await DeleteRuleProvider(id)
+    message.success('Провайдер правил удалён')
+    await loadProviders()
+  } catch (err: any) {
+    const msg = err.response?.data?.message || err.response?.data || err.message || 'Ошибка удаления провайдера'
+    message.error(typeof msg === 'string' ? msg : JSON.stringify(msg))
+  }
 }
 
 const fetchProviderNow = async (id: string) => {
   fetchingProviderId.value = id
   try {
-    await FetchRuleProviderNow(id)
+    const updated = await FetchRuleProviderNow(id)
+    message.success(`Правила загружены: ${updated.item_count} записей`)
     await loadProviders()
+  } catch (err: any) {
+    const msg = err.response?.data?.message || err.response?.data || err.message || 'Ошибка загрузки правил'
+    message.error(typeof msg === 'string' ? msg : JSON.stringify(msg))
   } finally {
     fetchingProviderId.value = null
   }
@@ -167,6 +210,8 @@ const loadingOverrides = ref(false)
 const searchOverrides = ref('')
 const showOverrideModal = ref(false)
 const editingOverrideId = ref<string | null>(null)
+const savingOverride = ref(false)
+const overrideError = ref('')
 
 const overrideForm = ref<SaveCustomOverrideRequest>({
   route_map_id: null,
@@ -191,6 +236,9 @@ const loadOverrides = async () => {
   loadingOverrides.value = true
   try {
     overrides.value = await GetCustomOverrides()
+  } catch (err: any) {
+    const msg = err.response?.data?.message || err.response?.data || err.message || 'Ошибка загрузки исключений'
+    message.error(typeof msg === 'string' ? msg : JSON.stringify(msg))
   } finally {
     loadingOverrides.value = false
   }
@@ -198,9 +246,10 @@ const loadOverrides = async () => {
 
 const openCreateOverride = () => {
   editingOverrideId.value = null
+  overrideError.value = ''
   overrideForm.value = {
     route_map_id: null,
-    rule_type: 'domain',
+    rule_type: 'wildcard',
     pattern: '',
     category: 'block',
     comment: '',
@@ -211,6 +260,7 @@ const openCreateOverride = () => {
 
 const openEditOverride = (o: CustomOverride) => {
   editingOverrideId.value = o.id
+  overrideError.value = ''
   overrideForm.value = {
     route_map_id: o.route_map_id,
     rule_type: o.rule_type,
@@ -223,20 +273,41 @@ const openEditOverride = (o: CustomOverride) => {
 }
 
 const saveOverride = async () => {
-  if (!overrideForm.value.pattern.trim()) return
-  if (editingOverrideId.value) {
-    await UpdateCustomOverride(editingOverrideId.value, overrideForm.value)
-  } else {
-    await CreateCustomOverride(overrideForm.value)
+  if (!overrideForm.value.pattern.trim()) {
+    overrideError.value = 'Пожалуйста, введите шаблон домена или IP/CIDR'
+    return
   }
-  showOverrideModal.value = false
-  await loadOverrides()
+  savingOverride.value = true
+  overrideError.value = ''
+  try {
+    if (editingOverrideId.value) {
+      await UpdateCustomOverride(editingOverrideId.value, overrideForm.value)
+      message.success('Исключение успешно обновлено')
+    } else {
+      await CreateCustomOverride(overrideForm.value)
+      message.success('Исключение успешно сохранено')
+    }
+    showOverrideModal.value = false
+    await loadOverrides()
+  } catch (err: any) {
+    const msg = err.response?.data?.message || err.response?.data || err.message || 'Ошибка сохранения исключения'
+    overrideError.value = typeof msg === 'string' ? msg : JSON.stringify(msg)
+    message.error(overrideError.value)
+  } finally {
+    savingOverride.value = false
+  }
 }
 
 const removeOverride = async (id: string) => {
   if (!confirm('Удалить это исключение?')) return
-  await DeleteCustomOverride(id)
-  await loadOverrides()
+  try {
+    await DeleteCustomOverride(id)
+    message.success('Исключение удалено')
+    await loadOverrides()
+  } catch (err: any) {
+    const msg = err.response?.data?.message || err.response?.data || err.message || 'Ошибка удаления исключения'
+    message.error(typeof msg === 'string' ? msg : JSON.stringify(msg))
+  }
 }
 
 onMounted(() => {
@@ -484,6 +555,9 @@ onMounted(() => {
           {{ editingProviderId ? 'Редактировать провайдер правил' : 'Добавить провайдер правил' }}
         </v-card-title>
         <v-card-text>
+          <v-alert v-if="providerError" type="error" variant="tonal" class="mb-3" closable @click:close="providerError = ''">
+            {{ providerError }}
+          </v-alert>
           <v-text-field v-model="providerForm.name" label="Название (например, Anti-AD)" variant="outlined" class="mb-3" />
           <v-text-field v-model="providerForm.description" label="Описание" variant="outlined" class="mb-3" />
           <v-text-field v-model="providerForm.url" label="URL списка правил (.list / .txt)" variant="outlined" class="mb-3" />
@@ -516,8 +590,8 @@ onMounted(() => {
         </v-card-text>
         <v-card-actions>
           <v-spacer />
-          <v-btn variant="text" @click="showProviderModal = false">Отмена</v-btn>
-          <v-btn color="primary" @click="saveProvider">Сохранить</v-btn>
+          <v-btn variant="text" :disabled="savingProvider" @click="showProviderModal = false">Отмена</v-btn>
+          <v-btn color="primary" :loading="savingProvider" @click="saveProvider">Сохранить</v-btn>
         </v-card-actions>
       </v-card>
     </v-dialog>
@@ -529,6 +603,9 @@ onMounted(() => {
           {{ editingOverrideId ? 'Редактировать исключение' : 'Добавить исключение (Override)' }}
         </v-card-title>
         <v-card-text>
+          <v-alert v-if="overrideError" type="error" variant="tonal" class="mb-3" closable @click:close="overrideError = ''">
+            {{ overrideError }}
+          </v-alert>
           <v-text-field
             v-model="overrideForm.pattern"
             label="Шаблон (например, corp.internal, *.bank.ru, 192.168.0.0/16)"
@@ -566,8 +643,8 @@ onMounted(() => {
         </v-card-text>
         <v-card-actions>
           <v-spacer />
-          <v-btn variant="text" @click="showOverrideModal = false">Отмена</v-btn>
-          <v-btn color="primary" @click="saveOverride">Сохранить</v-btn>
+          <v-btn variant="text" :disabled="savingOverride" @click="showOverrideModal = false">Отмена</v-btn>
+          <v-btn color="primary" :loading="savingOverride" @click="saveOverride">Сохранить</v-btn>
         </v-card-actions>
       </v-card>
     </v-dialog>

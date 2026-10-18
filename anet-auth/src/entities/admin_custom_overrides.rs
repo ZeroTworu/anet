@@ -7,13 +7,19 @@ use serde::{Deserialize, Serialize};
     Debug, Clone, Copy, PartialEq, Eq, EnumIter, DeriveActiveEnum, Serialize, Deserialize, OpenApiEnum,
 )]
 #[sea_orm(rs_type = "String", db_type = "Text")]
-#[oai(rename_all = "lowercase")]
-#[serde(rename_all = "lowercase")]
 pub enum OverrideType {
+    #[oai(rename = "domain")]
+    #[serde(rename = "domain")]
     #[sea_orm(string_value = "domain")]
     Domain,
+
+    #[oai(rename = "wildcard")]
+    #[serde(rename = "wildcard")]
     #[sea_orm(string_value = "wildcard")]
     SubdomainWildcard,
+
+    #[oai(rename = "cidr")]
+    #[serde(rename = "cidr")]
     #[sea_orm(string_value = "cidr")]
     IpNet,
 }
@@ -22,13 +28,19 @@ pub enum OverrideType {
     Debug, Clone, Copy, PartialEq, Eq, EnumIter, DeriveActiveEnum, Serialize, Deserialize, OpenApiEnum,
 )]
 #[sea_orm(rs_type = "String", db_type = "Text")]
-#[oai(rename_all = "lowercase")]
-#[serde(rename_all = "lowercase")]
 pub enum OverrideCategory {
+    #[oai(rename = "block")]
+    #[serde(rename = "block")]
     #[sea_orm(string_value = "block")]
     CustomBlock,
+
+    #[oai(rename = "direct")]
+    #[serde(rename = "direct")]
     #[sea_orm(string_value = "direct")]
     CustomDirect,
+
+    #[oai(rename = "proxy")]
+    #[serde(rename = "proxy")]
     #[sea_orm(string_value = "proxy")]
     CustomProxy,
 }

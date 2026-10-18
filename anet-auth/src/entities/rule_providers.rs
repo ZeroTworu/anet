@@ -7,11 +7,14 @@ use serde::{Deserialize, Serialize};
     Debug, Clone, Copy, PartialEq, Eq, EnumIter, DeriveActiveEnum, Serialize, Deserialize, OpenApiEnum,
 )]
 #[sea_orm(rs_type = "String", db_type = "Text")]
-#[oai(rename_all = "lowercase")]
-#[serde(rename_all = "lowercase")]
 pub enum ProviderType {
+    #[oai(rename = "domain")]
+    #[serde(rename = "domain")]
     #[sea_orm(string_value = "domain")]
     DomainList,
+
+    #[oai(rename = "ip")]
+    #[serde(rename = "ip")]
     #[sea_orm(string_value = "ip")]
     IpList,
 }
@@ -20,13 +23,19 @@ pub enum ProviderType {
     Debug, Clone, Copy, PartialEq, Eq, EnumIter, DeriveActiveEnum, Serialize, Deserialize, OpenApiEnum,
 )]
 #[sea_orm(rs_type = "String", db_type = "Text")]
-#[oai(rename_all = "lowercase")]
-#[serde(rename_all = "lowercase")]
 pub enum ProviderFormat {
+    #[oai(rename = "plain")]
+    #[serde(rename = "plain")]
     #[sea_orm(string_value = "plain")]
     PlainText,
+
+    #[oai(rename = "v2ray")]
+    #[serde(rename = "v2ray")]
     #[sea_orm(string_value = "v2ray")]
     V2RayDomain,
+
+    #[oai(rename = "cidr")]
+    #[serde(rename = "cidr")]
     #[sea_orm(string_value = "cidr")]
     CidrList,
 }
