@@ -579,6 +579,8 @@ pub extern "system" fn Java_org_alco_anet_ANetVpnService_connectVpn(
                         let path_jstr = JString::from(path_obj);
                         if let Ok(path_rust) = env.get_string(&path_jstr) {
                             let cache_dir_str: String = path_rust.into();
+                            let rules_path =
+                                std::path::PathBuf::from(cache_dir_str).join("rules.abc");
                             unsafe {
                                 std::env::set_var(
                                     "ANET_RULES_CACHE_PATH",
