@@ -524,22 +524,6 @@ impl ANetApp {
                     });
                 }
             }
-
-            // Синхронизируем скомпилированные правила маршрутизации rules.abc при старте клиента
-            let rules_endpoint = if url.contains("/config/") {
-                url.replace("/config/", "/routing/compiled-rules/")
-            } else {
-                url.clone()
-            };
-            let rule_cache = anet_client_core::rule_updater::RuleCacheManager::new(
-                anet_client_core::rule_updater::default_rules_cache_path(),
-            );
-            if let Err(e) = rule_cache.update_from_server(&rules_endpoint).await {
-                push_log(
-                    &logs_arc,
-                    &format!("[RuleCache] Ошибка обновления rules.abc: {}", e),
-                );
-            }
         });
     }
 

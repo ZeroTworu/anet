@@ -55,6 +55,7 @@ pub struct AnetClient {
     tun_factory: Box<dyn TunFactory>,
     route_manager: Box<dyn RouteManager>,
     dns_manager: Box<dyn DnsManager>,
+    rule_cache: crate::rule_updater::RuleCacheManager,
     session: Mutex<Option<RunningSession>>,
     stop_requested: AtomicBool,
     is_active: AtomicBool,
@@ -68,15 +69,50 @@ impl AnetClient {
         route_manager: Box<dyn RouteManager>,
     ) -> Self {
         let dns_manager = get_dns_manager();
+        let rule_cache = crate::rule_updater::RuleCacheManager::new(
+            crate::rule_updater::default_rules_cache_path(),
+        );
         Self {
             config,
             tun_factory,
             route_manager,
             dns_manager,
+            rule_cache,
             session: Mutex::new(None),
             stop_requested: AtomicBool::new(false),
             is_active: AtomicBool::new(false),
             cancel_signal: Arc::new(Notify::new()),
+        }
+    }
+
+    async fn sync_rules_cache(&self, config: &CoreConfig) {
+        if let Some(rules_server_url) = config.get_rules_server_url() {
+            match tokio::time::timeout(
+                Duration::from_secs(5),
+                self.rule_cache.update_from_server(&rules_server_url),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    let msg = format!(
+                        "[RuleCache] Failed to download rules.abc from {rules_server_url}: {e}"
+                    );
+                    warn!("{msg}");
+                    status(&msg);
+                }
+                Err(_) => {
+                    let msg = format!(
+                        "[RuleCache] Timeout downloading rules.abc from {rules_server_url} (using cached rules if available)"
+                    );
+                    warn!("{msg}");
+                    status(&msg);
+                }
+            }
+        } else {
+            let msg = "[RuleCache] Server URL for rules.abc is not configured (set [routing] rules_url in client.toml)";
+            warn!("{msg}");
+            status(msg);
         }
     }
 
@@ -141,15 +177,14 @@ impl AnetClient {
 
     pub async fn start(&self) -> Result<()> {
         if self
-        .is_active
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
-        return Err(anyhow!("VPN tunnel is already active"));
-    }
+            .is_active
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err(anyhow!("VPN tunnel is already active"));
+        }
 
-    self.stop_requested.store(false, Ordering::SeqCst);
-
+        self.stop_requested.store(false, Ordering::SeqCst);
 
         let mut config_clone = self.config.clone();
         if let Err(e) = config_clone.sanitize() {
@@ -157,6 +192,9 @@ impl AnetClient {
             client_state(ClientState::Failed, format!("Config error: {}", e), None);
             return Err(e);
         }
+
+        // Синхронизируем rules.abc сразу при старте клиента до поднятия туннеля (едино для CLI, GUI, Android, macOS, Windows, iOS)
+        self.sync_rules_cache(&config_clone).await;
 
         info!("[Core] Starting failover connection loop...");
         warn("[Core] Starting connection loop...");
@@ -422,54 +460,97 @@ impl AnetClient {
                 .await;
         }
 
+        // Инициализация и синхронизация движка Smart DNS, Geo-Routing и AdBlock (.abc + Local Overrides)
+        // Выполняется ДО acquire_packet_source, чтобы все платформы (Linux, Windows, macOS, Android VpnService, iOS)
+        // получили актуальные статические Direct-подсети в RouteManager до поднятия TUN-интерфейса.
+        let local_overrides = Arc::new(anet_filter_core::LocalOverrides::from_config(
+            &config_clone.routing.overrides,
+        ));
+        let rule_cache = self.rule_cache.clone();
+        if let Some(rules_server_url) = config_clone.get_rules_server_url() {
+            // Добавляем IP сервера правил в обход туннеля для фоновых ETag-обновлений
+            if let Ok(uri) = rules_server_url.parse::<http::Uri>() {
+                if let Some(host) = uri.host() {
+                    let port = uri.port_u16().unwrap_or(if uri.scheme_str() == Some("https") {
+                        443
+                    } else {
+                        80
+                    });
+                    if let Ok(ip) = IpAddr::from_str(host) {
+                        let prefix = if ip.is_ipv4() { 32 } else { 128 };
+                        let _ = self.route_manager.add_bypass_route(ip, prefix).await;
+                    } else if let Ok(addrs) = lookup_host((host, port)).await {
+                        for addr in addrs {
+                            let ip = addr.ip();
+                            let prefix = if ip.is_ipv4() { 32 } else { 128 };
+                            let _ = self.route_manager.add_bypass_route(ip, prefix).await;
+                        }
+                    }
+                }
+            }
+
+            if !rule_cache.is_loaded() {
+                self.sync_rules_cache(&config_clone).await;
+            }
+
+            let rc_bg = rule_cache.clone();
+            let url_bg = rules_server_url.clone();
+            let shutdown_bg = self.cancel_signal.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = sleep(Duration::from_secs(600)) => {
+                            if let Err(e) = rc_bg.update_from_server(&url_bg).await {
+                                log::debug!("[RuleCache] Periodic rules.abc check failed: {e}");
+                            }
+                        }
+                        _ = shutdown_bg.notified() => break,
+                    }
+                }
+            });
+        }
+
+        let per_app_requested = cfg!(all(windows, feature = "per-app"))
+            && config_clone.main.per_app_mode != crate::config::PerAppMode::All
+            && !(config_clone.main.per_app_mode == crate::config::PerAppMode::Include
+                && config_clone.main.per_app.is_empty());
+
+        if !per_app_requested && config_clone.main.route_for.is_empty() {
+            // Применяем локальные исключения [routing.overrides] direct из client.toml
+            if !config_clone.routing.overrides.direct.is_empty() {
+                let local_direct_routes = self
+                    .resolve_list(&config_clone.routing.overrides.direct)
+                    .await;
+                for net in local_direct_routes.iter() {
+                    let _ = self
+                        .route_manager
+                        .add_bypass_route(net.network(), net.prefix_len())
+                        .await;
+                }
+            }
+
+            // Применяем статические CIDR-маршруты Direct из скомпилированного rules.abc
+            let abc_direct_routes = rule_cache.collect_direct_routes();
+            if !abc_direct_routes.is_empty() {
+                let mut applied = 0usize;
+                for (ip, prefix) in abc_direct_routes {
+                    if self.route_manager.add_bypass_route(ip, prefix).await.is_ok() {
+                        applied += 1;
+                    }
+                }
+                let msg = format!(
+                    "[RuleCache] Applied {} static Direct CIDR bypass routes from rules.abc",
+                    applied
+                );
+                info!("{msg}");
+                status(&msg);
+            }
+        }
+
         let (tx_to_tun, mut rx_from_tun, iface_name, _app_filter) = self
             .acquire_packet_source(server, &result.auth_response)
             .await?;
 
-        // Инициализация движка Smart DNS, Geo-Routing и AdBlock (.abc + Local Overrides)
-        let local_overrides = Arc::new(anet_filter_core::LocalOverrides::from_config(
-            &config_clone.routing.overrides,
-        ));
-        let rule_cache = crate::rule_updater::RuleCacheManager::new(
-            crate::rule_updater::default_rules_cache_path(),
-        );
-        if let Some(rules_server_url) = config_clone.get_rules_server_url() {
-            // Синхронно обновляем rules.abc перед запуском маршрутизации (с таймаутом 5с, чтобы не задерживать старт)
-            match tokio::time::timeout(
-                Duration::from_secs(5),
-                rule_cache.update_from_server(&rules_server_url),
-            )
-            .await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    let msg = format!("[RuleCache] Failed to download rules.abc from {rules_server_url}: {e}");
-                    warn!("{msg}");
-                    status(&msg);
-                }
-                Err(_) => {
-                    let msg = format!("[RuleCache] Timeout downloading rules.abc from {rules_server_url} (using cached rules if available)");
-                    warn!("{msg}");
-                    status(&msg);
-                }
-            }
-
-            // Фоновое периодическое обновление правил каждые 10 минут
-            let rc_bg = rule_cache.clone();
-            let url_bg = rules_server_url.clone();
-            tokio::spawn(async move {
-                loop {
-                    sleep(Duration::from_secs(600)).await;
-                    if let Err(e) = rc_bg.update_from_server(&url_bg).await {
-                        log::debug!("[RuleCache] Periodic rules.abc check failed: {e}");
-                    }
-                }
-            });
-        } else {
-            let msg = "[RuleCache] Server URL for rules.abc is not configured (set routing.rules_url or main.config_url in client.toml)";
-            warn!("{msg}");
-            status(msg);
-        }
         let direct_ip_cache = crate::direct_ip_cache::DirectIpCache::new();
         let dns_interceptor = crate::dns_interceptor::DnsInterceptor::new(
             local_overrides.clone(),
@@ -818,36 +899,6 @@ impl AnetClient {
                             .add_bypass_route(net.network(), net.prefix_len())
                             .await?;
                     }
-                }
-
-                // Применяем локальные исключения [routing.overrides] direct из client.toml
-                if !config_clone.routing.overrides.direct.is_empty() {
-                    let local_direct_routes = self
-                        .resolve_list(&config_clone.routing.overrides.direct)
-                        .await;
-                    for net in local_direct_routes.iter() {
-                        let _ = self
-                            .route_manager
-                            .add_bypass_route(net.network(), net.prefix_len())
-                            .await;
-                    }
-                }
-
-                // Применяем статические CIDR-маршруты Direct из скомпилированного rules.abc
-                let abc_direct_routes = rule_cache.collect_direct_routes();
-                if !abc_direct_routes.is_empty() {
-                    let mut applied = 0usize;
-                    for (ip, prefix) in abc_direct_routes {
-                        if self.route_manager.add_bypass_route(ip, prefix).await.is_ok() {
-                            applied += 1;
-                        }
-                    }
-                    let msg = format!(
-                        "[RuleCache] Applied {} static Direct CIDR bypass routes from rules.abc",
-                        applied
-                    );
-                    info!("{msg}");
-                    status(&msg);
                 }
 
                 self.route_manager

@@ -17,11 +17,11 @@ use tokio::sync::mpsc;
 use tun::Configuration;
 
 pub struct AndroidRouteManager {
-    bypass_ips: Arc<std::sync::Mutex<Vec<IpAddr>>>,
+    bypass_ips: Arc<std::sync::Mutex<Vec<(IpAddr, u8)>>>,
 }
 
 impl AndroidRouteManager {
-    pub fn new(bypass_ips: Arc<std::sync::Mutex<Vec<IpAddr>>>) -> Self {
+    pub fn new(bypass_ips: Arc<std::sync::Mutex<Vec<(IpAddr, u8)>>>) -> Self {
         Self { bypass_ips }
     }
 }
@@ -32,11 +32,14 @@ impl anet_client_core::traits::RouteManager for AndroidRouteManager {
         Ok(())
     }
 
-    async fn add_bypass_route(&self, target: IpAddr, _prefix: u8) -> Result<()> {
+    async fn add_bypass_route(&self, target: IpAddr, prefix: u8) -> Result<()> {
         let mut list = self.bypass_ips.lock().unwrap();
-        if !list.contains(&target) {
-            info!("[Android RouteManager] Recorded bypass route: {}", target);
-            list.push(target);
+        if !list.contains(&(target, prefix)) {
+            info!(
+                "[Android RouteManager] Recorded bypass route: {}/{}",
+                target, prefix
+            );
+            list.push((target, prefix));
         }
         Ok(())
     }
@@ -65,7 +68,7 @@ pub struct AndroidCallbackTunFactory {
     jvm: Arc<JavaVM>,
     vpn_service_ref: GlobalRef,
     config: CoreConfig,
-    bypass_ips: Arc<std::sync::Mutex<Vec<IpAddr>>>,
+    bypass_ips: Arc<std::sync::Mutex<Vec<(IpAddr, u8)>>>,
 }
 
 impl AndroidCallbackTunFactory {
@@ -73,7 +76,7 @@ impl AndroidCallbackTunFactory {
         jvm: Arc<JavaVM>,
         vpn_service_ref: GlobalRef,
         config: CoreConfig,
-        bypass_ips: Arc<std::sync::Mutex<Vec<IpAddr>>>,
+        bypass_ips: Arc<std::sync::Mutex<Vec<(IpAddr, u8)>>>,
     ) -> Self {
         Self {
             jvm,
@@ -211,12 +214,11 @@ impl TunFactory for AndroidCallbackTunFactory {
         // ВАЖНО: Добавляем системные IP обхода (bypass_ips) в исключения Android VpnService,
         // чтобы трафик к медиасерверам JVB/Ktalk (UDP 10000-20000) и серверу не заворачивался в tun0
         let bypass_list = self.bypass_ips.lock().unwrap().clone();
-        for ip in bypass_list {
-            let prefix = if ip.is_ipv4() { 32 } else { 128 };
+        for (ip, prefix) in bypass_list {
             if let Ok(net) = IpNet::new(ip, prefix) {
                 if !exclude_nets.contains(&net) {
                     info!(
-                        "[Android VpnService] Adding bypass IP {}/{} to tunnel exclusions",
+                        "[Android VpnService] Adding bypass route {}/{} to tunnel exclusions",
                         ip, prefix
                     );
                     exclude_nets.push(net);
