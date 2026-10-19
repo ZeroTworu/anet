@@ -2,7 +2,7 @@
 
 use anet_filter_core::{CompiledRoutingCache, RuleAction};
 use arc_swap::ArcSwap;
-use log::{debug, error, info, warn};
+use log::{error, info, warn};
 use memmap2::Mmap;
 use std::fs::{self, File};
 use std::net::IpAddr;

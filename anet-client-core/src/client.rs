@@ -53,7 +53,7 @@ struct RunningSession {
 pub struct AnetClient {
     config: CoreConfig,
     tun_factory: Box<dyn TunFactory>,
-    route_manager: Box<dyn RouteManager>,
+    route_manager: Arc<dyn RouteManager>,
     dns_manager: Box<dyn DnsManager>,
     rule_cache: crate::rule_updater::RuleCacheManager,
     session: Mutex<Option<RunningSession>>,
@@ -75,7 +75,7 @@ impl AnetClient {
         Self {
             config,
             tun_factory,
-            route_manager,
+            route_manager: Arc::from(route_manager),
             dns_manager,
             rule_cache,
             session: Mutex::new(None),

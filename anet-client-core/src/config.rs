@@ -444,14 +444,8 @@ impl CoreConfig {
                 return Some(trimmed.to_string());
             }
         }
-        for candidate in [self.main.get_config_url(), Some(self.stats.http_url.clone())]
-            .into_iter()
-            .flatten()
-        {
-            let trimmed = candidate.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
+        if let Some(cfg_url) = self.main.get_config_url() {
+            let trimmed = cfg_url.trim();
             if let Ok(uri) = trimmed.parse::<http::Uri>() {
                 if let (Some(scheme), Some(authority)) = (uri.scheme_str(), uri.authority()) {
                     let base = format!("{}://{}", scheme, authority);
