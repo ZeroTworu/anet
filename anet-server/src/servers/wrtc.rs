@@ -2,10 +2,12 @@ use crate::auth_handler::ServerAuthHandler;
 use crate::client_registry::{ClientRegistry, ClientTransportInfo};
 use crate::config::Config;
 use anet_common::http_help::BrowserProfile;
-use anet_common::transport::{unwrap_packet_bytes, wrap_packet_padded};
+use anet_common::transport::{unwrap_packet_bytes, wrap_packet_padded, wrap_packet_slice};
 use anet_common::wrtc::{
     batcher::{unpack_batch, PacketBatcher},
-    colibri::{sign_beacon, ColibriMessage, WrtcMessage},
+    colibri::{
+        sign_beacon, ColibriMessage, WrtcMessage, VIDEO_BATCH_MAGIC, VIDEO_MAX_PAYLOAD_BYTES,
+    },
     jingle::parse_jingle_session,
     ktalk::KtalkClient,
     peer::{create_p2p_channel, P2pSession, WrtcPeer},
@@ -14,7 +16,7 @@ use anet_common::wrtc::{
 };
 use anyhow::{Context, Result};
 use base64::prelude::*;
-use bytes::Bytes;
+use bytes::{BufMut, Bytes, BytesMut};
 use dashmap::{DashMap, DashSet};
 use ed25519_dalek::SigningKey;
 use log::{info, warn};
@@ -173,6 +175,8 @@ pub async fn run_wrtc_server(
             Arc::new(DashMap::new());
         let client_video_endpoints: Arc<DashSet<String>> =
             Arc::new(DashSet::new());
+        let client_v2_endpoints: Arc<DashSet<String>> =
+            Arc::new(DashSet::new());
 
         let reg_clone = registry.clone();
         let auth_clone = auth_handler.clone();
@@ -190,28 +194,47 @@ pub async fn run_wrtc_server(
         let first_server_rx = Arc::new(AtomicBool::new(true));
         let first_server_rx_up = first_server_rx.clone();
         let video_uplink_task = tokio::spawn(async move {
-            while let Some(raw_frame) = peer_video_rx.recv_video_frame().await {
-                if raw_frame.len() < 50 {
-                    // Слишком короткий для ASTP кадра (2B tag + 12B nonce + 20B IPv4 + 16B MAC)
-                    continue;
-                }
-                let client_tag = u16::from_be_bytes([raw_frame[0], raw_frame[1]]);
-                let Some(client_info) = clients_by_tag_rx.get(&client_tag) else {
-                    continue;
-                };
+            while let Some(first_frame) = peer_video_rx.recv_video_frame().await {
+                let mut current_frame = Some(first_frame);
+                while let Some(raw_frame) = current_frame.take() {
+                    if raw_frame.len() < 50 {
+                        // Слишком короткий для ASTP кадра (2B tag + 12B nonce + 20B IPv4 + 16B MAC)
+                        current_frame = peer_video_rx.try_recv_video_frame();
+                        continue;
+                    }
+                    let client_tag = u16::from_be_bytes([raw_frame[0], raw_frame[1]]);
+                    let Some(client_info) = clients_by_tag_rx.get(&client_tag) else {
+                        current_frame = peer_video_rx.try_recv_video_frame();
+                        continue;
+                    };
 
-                let raw_astp = raw_frame.slice(2..);
-                if let Ok(packet) = unwrap_packet_bytes(&client_info.cipher, raw_astp) {
-                    let packet_len = packet.len();
-                    if first_server_rx_up.swap(false, Ordering::Relaxed) {
-                        info!(
-                            "[WRTC Server Video IN] First video frame decrypted from client {} (len: {} bytes, tag: 0x{:04X})",
-                            client_info.assigned_ip, packet_len, client_tag
-                        );
+                    let raw_astp = raw_frame.slice(2..);
+                    if let Ok(decrypted) = unwrap_packet_bytes(&client_info.cipher, raw_astp) {
+                        if first_server_rx_up.swap(false, Ordering::Relaxed) {
+                            info!(
+                                "[WRTC Server Video IN] First video frame decrypted from client {} (len: {} bytes, tag: 0x{:04X})",
+                                client_info.assigned_ip,
+                                decrypted.len(),
+                                client_tag
+                            );
+                        }
+                        if decrypted.first() == Some(&VIDEO_BATCH_MAGIC) {
+                            for sub_pkt in unpack_batch(&decrypted[1..]) {
+                                let pkt_len = sub_pkt.len();
+                                if tun_clone_video.try_send(sub_pkt).is_ok() {
+                                    reg_clone_video.record_rx(client_info.value(), pkt_len, "wrtc_video");
+                                } else {
+                                    break;
+                                }
+                            }
+                        } else {
+                            let packet_len = decrypted.len();
+                            if tun_clone_video.try_send(decrypted).is_ok() {
+                                reg_clone_video.record_rx(client_info.value(), packet_len, "wrtc_video");
+                            }
+                        }
                     }
-                    if tun_clone_video.try_send(packet).is_ok() {
-                        reg_clone_video.record_rx(client_info.value(), packet_len, "wrtc_video");
-                    }
+                    current_frame = peer_video_rx.try_recv_video_frame();
                 }
             }
         });
@@ -237,7 +260,7 @@ pub async fn run_wrtc_server(
             }
 
             match msg.msg_payload {
-                WrtcMessage::Discover { client_nonce, video_ssrc, mode } => {
+                WrtcMessage::Discover { client_nonce, video_ssrc, mode, video_v2 } => {
                     let pref_mode = mode.unwrap_or_else(|| {
                         if video_ssrc.is_some() {
                             "media_video".to_string()
@@ -246,9 +269,13 @@ pub async fn run_wrtc_server(
                         }
                     });
                     info!(
-                        "[WRTC Server] Received anet_discover from client {from_endpoint} (nonce: {client_nonce}, mode: {pref_mode}, video_ssrc: {video_ssrc:?})! Answering beacon..."
+                        "[WRTC Server] Received anet_discover from client {from_endpoint} (nonce: {client_nonce}, mode: {pref_mode}, video_ssrc: {video_ssrc:?}, video_v2: {video_v2})! Answering beacon..."
                     );
                     client_modes.insert(from_endpoint.clone(), pref_mode.clone());
+                    if video_v2 {
+                        client_v2_endpoints.insert(from_endpoint.clone());
+                        shared_peer.set_video_v2(true);
+                    }
 
                     if let Some(c_v_ssrc) = video_ssrc {
                         if pref_mode != "ws" {
@@ -267,6 +294,7 @@ pub async fn run_wrtc_server(
                         client_nonce,
                         signature,
                         Some(shared_peer.video_ssrc),
+                        true,
                     );
                     let _ = shared_peer.send(beacon_msg).await;
                 }
@@ -370,94 +398,191 @@ pub async fn run_wrtc_server(
                                             let srv_mode = server_mode;
                                             let client_modes_dl = client_modes.clone();
                                             let client_video_ep_dl = client_video_endpoints.clone();
+                                            let client_v2_ep_dl = client_v2_endpoints.clone();
                                             let first_server_rx_dl = first_server_rx.clone();
 
                                             tokio::spawn(async move {
                                                 let mut batcher = PacketBatcher::new(16384, 2);
                                                 let mut batch_interval = tokio::time::interval(Duration::from_millis(2));
+                                                batch_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                                                let mut enc_buf = BytesMut::with_capacity(2048);
+                                                let mut batch_buf = BytesMut::with_capacity(2048);
+                                                let mut pending_packet: Option<Bytes> = None;
+
                                                 loop {
                                                     tokio::select! {
+                                                        biased;
                                                         packet_opt = rx_router.recv() => {
-                                                            let Some(packet) = packet_opt else { break; };
-                                                            if packet.len() < 20 {
-                                                                continue;
-                                                            }
-                                                            let seq = c_info
-                                                                .sequence
-                                                                .fetch_add(1, Ordering::Relaxed);
-                                                            if let Ok(encrypted) = wrap_packet_padded(
-                                                                &c_info.cipher,
-                                                                &c_info.nonce_prefix,
-                                                                seq,
-                                                                packet,
-                                                                padding_step,
-                                                            ) {
-                                                                let enc_bytes = Bytes::from(encrypted);
-                                                                let mut sent = false;
+                                                            let Some(mut packet) = packet_opt else { break; };
 
-                                                                let client_pref_mode = client_modes_dl
-                                                                    .get(&target_client_id)
-                                                                    .map(|m| m.clone())
-                                                                    .unwrap_or_else(|| "auto".to_string());
-                                                                let has_video = client_video_ep_dl.contains(&target_client_id);
+                                                            loop {
+                                                                if packet.len() >= 20 {
+                                                                    let client_pref_mode = client_modes_dl
+                                                                        .get(&target_client_id)
+                                                                        .map(|m| m.clone())
+                                                                        .unwrap_or_else(|| "auto".to_string());
+                                                                    let has_video = client_video_ep_dl.contains(&target_client_id);
+                                                                    let is_v2 = client_v2_ep_dl.contains(&target_client_id);
+                                                                    let video_warmed_up = !first_server_rx_dl.load(Ordering::Relaxed);
 
-                                                                let client_uses_video = (srv_mode == anet_common::wrtc::colibri::WrtcMode::MediaVideo
-                                                                    || srv_mode == anet_common::wrtc::colibri::WrtcMode::Auto)
-                                                                    && client_pref_mode != "ws"
-                                                                    && has_video;
+                                                                    let client_uses_video = (srv_mode == anet_common::wrtc::colibri::WrtcMode::MediaVideo
+                                                                        || srv_mode == anet_common::wrtc::colibri::WrtcMode::Auto)
+                                                                        && client_pref_mode != "ws"
+                                                                        && has_video;
 
-                                                                // 1. Проверяем режим MediaVideo (Fake Video Track over DTLS-SRTP / JVB)
-                                                                if client_uses_video {
-                                                                    if peer_downlink.send_video_frame_tagged(client_tag, &enc_bytes).await.is_ok() {
-                                                                        // До подтверждения приема видео от клиента дублируем в WS
-                                                                        if !first_server_rx_dl.load(Ordering::Relaxed) {
-                                                                            sent = true;
+                                                                    if client_uses_video && is_v2 {
+                                                                        if video_warmed_up && packet.len() + 3 < VIDEO_MAX_PAYLOAD_BYTES {
+                                                                            batch_buf.clear();
+                                                                            batch_buf.put_u8(VIDEO_BATCH_MAGIC);
+                                                                            batch_buf.put_u16(packet.len() as u16);
+                                                                            batch_buf.extend_from_slice(&packet);
+                                                                            let mut count = 1usize;
+
+                                                                            while count < 16 {
+                                                                                let next_p = if let Some(p) = pending_packet.take() {
+                                                                                    p
+                                                                                } else if let Ok(p) = rx_router.try_recv() {
+                                                                                    p
+                                                                                } else {
+                                                                                    break;
+                                                                                };
+                                                                                if next_p.len() < 20 {
+                                                                                    continue;
+                                                                                }
+                                                                                if batch_buf.len() + 2 + next_p.len() <= VIDEO_MAX_PAYLOAD_BYTES {
+                                                                                    batch_buf.put_u16(next_p.len() as u16);
+                                                                                    batch_buf.extend_from_slice(&next_p);
+                                                                                    count += 1;
+                                                                                } else {
+                                                                                    pending_packet = Some(next_p);
+                                                                                    break;
+                                                                                }
+                                                                            }
+
+                                                                            let seq = c_info.sequence.fetch_add(1, Ordering::Relaxed);
+                                                                            let wrap_res = if count == 1 {
+                                                                                wrap_packet_slice(
+                                                                                    &c_info.cipher,
+                                                                                    &c_info.nonce_prefix,
+                                                                                    seq,
+                                                                                    &batch_buf[3..],
+                                                                                    &mut enc_buf,
+                                                                                )
+                                                                            } else {
+                                                                                wrap_packet_slice(
+                                                                                    &c_info.cipher,
+                                                                                    &c_info.nonce_prefix,
+                                                                                    seq,
+                                                                                    &batch_buf,
+                                                                                    &mut enc_buf,
+                                                                                )
+                                                                            };
+                                                                            if wrap_res.is_ok() {
+                                                                                let _ = peer_downlink.send_video_frame_tagged(client_tag, &enc_buf).await;
+                                                                            }
+                                                                        } else {
+                                                                            // Одиночный пакет без stealth-паддинга
+                                                                            let seq = c_info.sequence.fetch_add(1, Ordering::Relaxed);
+                                                                            if wrap_packet_slice(
+                                                                                &c_info.cipher,
+                                                                                &c_info.nonce_prefix,
+                                                                                seq,
+                                                                                &packet,
+                                                                                &mut enc_buf,
+                                                                            ).is_ok() {
+                                                                                if peer_downlink.send_video_frame_tagged(client_tag, &enc_buf).await.is_ok() && !video_warmed_up {
+                                                                                    // До прогрева видео дублируем в WS батчер
+                                                                                    batcher.push(Bytes::copy_from_slice(&enc_buf));
+                                                                                    if batcher.should_flush() {
+                                                                                        if let Some(batch_data) = batcher.flush() {
+                                                                                            let b64 = BASE64_STANDARD.encode(&batch_data);
+                                                                                            let msg = ColibriMessage::astp_batch(
+                                                                                                target_client_id.clone(),
+                                                                                                b64,
+                                                                                            );
+                                                                                            if peer_downlink.send(msg).await.is_err() {
+                                                                                                break;
+                                                                                            }
+                                                                                        }
+                                                                                    }
+                                                                                }
+                                                                            }
                                                                         }
                                                                     } else {
-                                                                        warn!("[WRTC Server Video OUT] send error to {target_client_id}, fallback to WS/P2P");
-                                                                    }
-                                                                }
+                                                                        let seq = c_info
+                                                                            .sequence
+                                                                            .fetch_add(1, Ordering::Relaxed);
+                                                                        if let Ok(encrypted) = wrap_packet_padded(
+                                                                            &c_info.cipher,
+                                                                            &c_info.nonce_prefix,
+                                                                            seq,
+                                                                            packet,
+                                                                            padding_step,
+                                                                        ) {
+                                                                            let enc_bytes = Bytes::from(encrypted);
+                                                                            let mut sent = false;
 
-                                                                // 2. Проверяем P2P DataChannel с клиентом
-                                                                if !sent {
-                                                                    if let Some(p2p_entry) = p2p_clients_dl.get(&target_client_id) {
-                                                                        if p2p_entry.is_open.load(Ordering::SeqCst) {
-                                                                            if p2p_entry.send_packet(&enc_bytes).await.is_ok() {
-                                                                                sent = true;
+                                                                            // 1. Проверяем режим MediaVideo (Fake Video Track over DTLS-SRTP / JVB)
+                                                                            if client_uses_video {
+                                                                                if peer_downlink.send_video_frame_tagged(client_tag, &enc_bytes).await.is_ok() {
+                                                                                    // До подтверждения приема видео от клиента дублируем в WS
+                                                                                    if video_warmed_up {
+                                                                                        sent = true;
+                                                                                    }
+                                                                                } else {
+                                                                                    warn!("[WRTC Server Video OUT] send error to {target_client_id}, fallback to WS/P2P");
+                                                                                }
+                                                                            }
+
+                                                                            // 2. Проверяем P2P DataChannel с клиентом
+                                                                            if !sent {
+                                                                                if let Some(p2p_entry) = p2p_clients_dl.get(&target_client_id) {
+                                                                                    if p2p_entry.is_open.load(Ordering::SeqCst) {
+                                                                                        if p2p_entry.send_packet(&enc_bytes).await.is_ok() {
+                                                                                            sent = true;
+                                                                                        }
+                                                                                    }
+                                                                                }
+                                                                            }
+
+                                                                            // 3. Если Video и P2P не сработали (или клиент в WS режиме), шлем через батчер (Colibri-WS)
+                                                                            if !sent {
+                                                                                batcher.push(enc_bytes);
+                                                                                if batcher.should_flush() {
+                                                                                    if let Some(batch_data) = batcher.flush() {
+                                                                                        let b64 = BASE64_STANDARD.encode(&batch_data);
+                                                                                        let msg = ColibriMessage::astp_batch(
+                                                                                            target_client_id.clone(),
+                                                                                            b64,
+                                                                                        );
+                                                                                        if peer_downlink.send(msg).await.is_err() {
+                                                                                            break;
+                                                                                        }
+                                                                                    }
+                                                                                }
                                                                             }
                                                                         }
                                                                     }
                                                                 }
 
-                                                                // 3. Если Video и P2P не сработали (или клиент в WS режиме), шлем через батчер (Colibri-WS)
-                                                                if !sent {
-                                                                    batcher.push(enc_bytes);
-                                                                    if batcher.should_flush() {
-                                                                        if let Some(batch_data) = batcher.flush() {
-                                                                            let b64 = BASE64_STANDARD.encode(&batch_data);
-                                                                            let msg = ColibriMessage::astp_batch(
-                                                                                target_client_id.clone(),
-                                                                                b64,
-                                                                            );
-                                                                            if peer_downlink.send(msg).await.is_err() {
-                                                                                break;
-                                                                            }
-                                                                        }
-                                                                    }
+                                                                if let Some(next_p) = pending_packet.take() {
+                                                                    packet = next_p;
+                                                                } else if let Ok(next_p) = rx_router.try_recv() {
+                                                                    packet = next_p;
+                                                                } else {
+                                                                    break;
                                                                 }
                                                             }
                                                         }
-                                                        _ = batch_interval.tick() => {
-                                                            if !batcher.is_empty() {
-                                                                if let Some(batch_data) = batcher.flush() {
-                                                                    let b64 = BASE64_STANDARD.encode(&batch_data);
-                                                                    let msg = ColibriMessage::astp_batch(
-                                                                        target_client_id.clone(),
-                                                                        b64,
-                                                                    );
-                                                                    if peer_downlink.send(msg).await.is_err() {
-                                                                        break;
-                                                                    }
+                                                        _ = batch_interval.tick(), if !batcher.is_empty() => {
+                                                            if let Some(batch_data) = batcher.flush() {
+                                                                let b64 = BASE64_STANDARD.encode(&batch_data);
+                                                                let msg = ColibriMessage::astp_batch(
+                                                                    target_client_id.clone(),
+                                                                    b64,
+                                                                );
+                                                                if peer_downlink.send(msg).await.is_err() {
+                                                                    break;
                                                                 }
                                                             }
                                                         }
@@ -631,6 +756,7 @@ pub async fn run_wrtc_server(
         p2p_clients.clear();
         client_modes.clear();
         client_video_endpoints.clear();
+        client_v2_endpoints.clear();
 
         info!("[WRTC Server] Pausing 2s before re-entering conference room...");
         tokio::time::sleep(Duration::from_secs(2)).await;

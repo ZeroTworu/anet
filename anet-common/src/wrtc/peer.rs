@@ -1,5 +1,6 @@
 use crate::wrtc::colibri::{
-    ColibriMessage, ReceiverVideoConstraints, WrtcMessage, WrtcMode, VP8_KEYFRAME_HEADER,
+    is_valid_vp8_frame_header, ColibriMessage, ReceiverVideoConstraints, WrtcMessage, WrtcMode,
+    VP8_INTERFRAME_HEADER, VP8_KEYFRAME_1080P_HEADER, VP8_KEYFRAME_HEADER,
 };
 use crate::wrtc::jingle::JingleSession;
 use bytes::{BufMut, Bytes, BytesMut};
@@ -17,7 +18,7 @@ use rtc::rtp_transceiver::rtp_sender::{
     RTCRtpCodec, RTCRtpCodecParameters, RTCRtpCodingParameters, RTCRtpEncodingParameters,
     RtpCodecKind,
 };
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
@@ -145,7 +146,7 @@ impl PeerConnectionEventHandler for PeerEvents {
 
                             // 3. Отсекаем дескриптор VP8 (RFC 7741)
                             if let Some(mut data) = strip_vp8_payload_descriptor(raw_payload) {
-                                if !data.starts_with(&VP8_KEYFRAME_HEADER) {
+                                if !is_valid_vp8_frame_header(&data) {
                                     continue;
                                 }
 
@@ -406,6 +407,8 @@ pub struct WrtcPeer {
     pub failed_notify: Arc<tokio::sync::Notify>,
     pub first_video_tx: Arc<AtomicBool>,
     pub start_instant: std::time::Instant,
+    pub last_video_tx_ms: Arc<AtomicU64>,
+    pub video_v2_enabled: Arc<AtomicBool>,
 }
 
 impl WrtcPeer {
@@ -418,7 +421,7 @@ impl WrtcPeer {
         mode: WrtcMode,
     ) -> anyhow::Result<Self> {
         let (incoming_tx, incoming_rx) = mpsc::channel::<ColibriMessage>(16384);
-        let (video_incoming_tx, video_incoming_rx) = mpsc::channel::<Bytes>(16384);
+        let (video_incoming_tx, video_incoming_rx) = mpsc::channel::<Bytes>(32768);
         let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<ColibriMessage>(16384);
         let (raw_outgoing_tx, mut raw_outgoing_rx) = mpsc::channel::<String>(16384);
         let (connected_tx, _connected_rx) = mpsc::channel::<()>(1);
@@ -433,10 +436,12 @@ impl WrtcPeer {
         let video_pt = session_opt.map(|s| s.video_payload_type).unwrap_or(100);
         let has_video_flag = session_opt.map(|s| s.has_video).unwrap_or(false) || mode == WrtcMode::MediaVideo;
         let video_seq = Arc::new(AtomicU16::new(0));
-        let video_ts = Arc::new(AtomicU32::new(0));
+        let video_ts = Arc::new(AtomicU32::new(1));
         let expected_peer_video_ssrc = Arc::new(AtomicU32::new(0));
         let _remote_ssrc = 0;
         let start_instant = std::time::Instant::now();
+        let last_video_tx_ms = Arc::new(AtomicU64::new(0));
+        let video_v2_enabled = Arc::new(AtomicBool::new(false));
 
         let (ws_fallback_tx, mut ws_fallback_rx) = mpsc::channel::<String>(8192);
         let has_ws = Arc::new(AtomicBool::new(false));
@@ -540,7 +545,10 @@ impl WrtcPeer {
                 let _ = media_engine.register_codec(fallback_vcodec2, RtpCodecKind::Video);
             }
 
-            let registry = register_default_interceptors(Registry::new(), &mut media_engine)?;
+            // Отключаем стандартные RTP-интерцепторы (NackResponder, NackGenerator, TWCC),
+            // чтобы исключить клонирование каждого пакета в кольцевой буфер ретрансляции
+            // и блокировки мьютексов BWE/TWCC внутри webrtc-rs при высокоскоростном потоке.
+            let registry = Registry::new();
 
             let bind_addr = "0.0.0.0:0".to_string();
 
@@ -555,9 +563,9 @@ impl WrtcPeer {
                     Some(Duration::from_secs(25)),
                     Some(Duration::from_millis(2000)),
                 )
-                .with_sctp_max_receive_buffer_size(2 * 1024 * 1024)
+                .with_sctp_max_receive_buffer_size(4 * 1024 * 1024)
                 .with_sctp_mtu(1280)
-                .with_receive_mtu(1500)
+                .with_receive_mtu(1600)
                 .build();
 
             let remote_dc: Arc<Mutex<Option<Arc<dyn DataChannel>>>> = Arc::new(Mutex::new(None));
@@ -585,7 +593,7 @@ impl WrtcPeer {
                 .with_handler(handler)
                 .with_runtime(Arc::new(TokioRuntime))
                 .with_udp_addrs(vec![bind_addr])
-                .with_dedicated_reactor_pool_size(1)
+                .with_dedicated_reactor_pool_size(2)
                 .build()
                 .await;
 
@@ -921,6 +929,9 @@ impl WrtcPeer {
 
                 let video_track_keepalive = Arc::clone(&video_track);
                 let video_seq_c = Arc::clone(&video_seq);
+                let video_ts_c = Arc::clone(&video_ts);
+                let last_video_tx_c = Arc::clone(&last_video_tx_ms);
+                let video_v2_c = Arc::clone(&video_v2_enabled);
                 let start_instant_c = start_instant;
                 let v_pt = video_pt;
                 let v_ssrc = local_video_ssrc;
@@ -939,18 +950,29 @@ impl WrtcPeer {
 
                     loop {
                         interval.tick().await;
-                        let seq = video_seq_c.fetch_add(1, Ordering::Relaxed);
                         let elapsed_ms = start_instant_c.elapsed().as_millis() as u64;
-                        let ts = ((elapsed_ms * 90) & 0xFFFFFFFF) as u32;
+                        if elapsed_ms.saturating_sub(last_video_tx_c.load(Ordering::Relaxed)) < 800 {
+                            // Не инжектируем пустые кадры посреди активного потока данных
+                            continue;
+                        }
+
+                        let frame_num = video_ts_c.fetch_add(1, Ordering::Relaxed);
+                        let seq = (frame_num & 0xFFFF) as u16;
+                        video_seq_c.store(seq.wrapping_add(1), Ordering::Relaxed);
+                        let pic_id = (frame_num & 0x7FFF) as u16;
+                        let ts = frame_num.wrapping_mul(300);
 
                         let mut keepalive_payload = BytesMut::with_capacity(4 + VP8_KEYFRAME_HEADER.len());
-                        let pic_id = (seq % 0x7FFF) as u16;
 
                         keepalive_payload.put_u8(0x90);
                         keepalive_payload.put_u8(0x80);
                         keepalive_payload.put_u8(0x80 | ((pic_id >> 8) as u8));
                         keepalive_payload.put_u8((pic_id & 0xFF) as u8);
-                        keepalive_payload.put_slice(&VP8_KEYFRAME_HEADER);
+                        if video_v2_c.load(Ordering::Relaxed) {
+                            keepalive_payload.put_slice(&VP8_KEYFRAME_1080P_HEADER);
+                        } else {
+                            keepalive_payload.put_slice(&VP8_KEYFRAME_HEADER);
+                        }
 
                         let rtp_packet = RtpPacket {
                             header: RtpHeader {
@@ -1004,7 +1026,17 @@ impl WrtcPeer {
             failed_notify,
             first_video_tx,
             start_instant,
+            last_video_tx_ms,
+            video_v2_enabled,
         })
+    }
+
+    pub fn set_video_v2(&self, enabled: bool) {
+        self.video_v2_enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn is_video_v2(&self) -> bool {
+        self.video_v2_enabled.load(Ordering::Relaxed)
     }
 
     pub fn effective_mode(&self, p2p_open: bool) -> &'static str {
@@ -1052,24 +1084,42 @@ impl WrtcPeer {
 
         if self.first_video_tx.swap(false, Ordering::Relaxed) {
             log::info!(
-                "[WRTC Media Video OUT] First video frame transmitted (SSRC: {}, tag: 0x{:04X}, len: {} bytes)",
-                self.video_ssrc, client_tag, astp_data.len()
+                "[WRTC Media Video OUT] First video frame transmitted (SSRC: {}, tag: 0x{:04X}, len: {} bytes, v2: {})",
+                self.video_ssrc, client_tag, astp_data.len(), self.video_v2_enabled.load(Ordering::Relaxed)
             );
         }
 
-        let seq = self.video_seq.fetch_add(1, Ordering::Relaxed);
+        // Единый монотонный атомарный счетчик кадров: гарантирует уникальную тройку (seq, pic_id, ts)
+        // для каждого пакета и полностью исключает коллизии timestamp в Vp8FrameMap JVB при бурстах >1 пакета/мс.
+        let frame_num = self.video_ts.fetch_add(1, Ordering::Relaxed);
+        let seq = (frame_num & 0xFFFF) as u16;
+        self.video_seq.store(seq.wrapping_add(1), Ordering::Relaxed);
+        let pic_id = (frame_num & 0x7FFF) as u16;
+        let ts = frame_num.wrapping_mul(300);
+
         let elapsed_ms = self.start_instant.elapsed().as_millis() as u64;
-        let ts = ((elapsed_ms * 90) & 0xFFFFFFFF) as u32;
+        self.last_video_tx_ms.store(elapsed_ms, Ordering::Relaxed);
 
         let mut payload = BytesMut::with_capacity(4 + VP8_KEYFRAME_HEADER.len() + 2 + astp_data.len());
-        let pic_id = (seq % 0x7FFF) as u16;
 
         payload.put_u8(0x90);
         payload.put_u8(0x80);
         payload.put_u8(0x80 | ((pic_id >> 8) as u8));
         payload.put_u8((pic_id & 0xFF) as u8);
 
-        payload.put_slice(&VP8_KEYFRAME_HEADER);
+        let vp8_hdr = if self.video_v2_enabled.load(Ordering::Relaxed) {
+            // Каждый 32-й кадр — Keyframe 1080p (для мгновенного восстановления SFU при потере UDP пакета),
+            // остальные 31/32 — легкие P-frame (Interframe), не сбрасывающие Vp8FrameMap в JVB.
+            if (frame_num & 31) == 0 {
+                &VP8_KEYFRAME_1080P_HEADER
+            } else {
+                &VP8_INTERFRAME_HEADER
+            }
+        } else {
+            &VP8_KEYFRAME_HEADER
+        };
+
+        payload.put_slice(vp8_hdr);
         payload.put_u16(client_tag);
         payload.put_slice(astp_data);
 
@@ -1108,6 +1158,14 @@ impl WrtcPeer {
     pub async fn recv_video_frame(&self) -> Option<Bytes> {
         let mut rx = self.video_incoming_rx.lock().await;
         rx.recv().await
+    }
+
+    pub fn try_recv_video_frame(&self) -> Option<Bytes> {
+        if let Ok(mut rx) = self.video_incoming_rx.try_lock() {
+            rx.try_recv().ok()
+        } else {
+            None
+        }
     }
 
     pub async fn send(&self, msg: ColibriMessage) -> anyhow::Result<()> {
