@@ -286,4 +286,15 @@ impl RuleCacheManager {
         }
         Vec::new()
     }
+
+    /// Возвращает все доменные имена (включая wildcard базы) с действием `Direct` из `rules.abc`
+    pub fn collect_direct_domains(&self) -> Vec<String> {
+        let guard = self.current_mmap.load();
+        if let Some(mmap) = guard.as_ref() {
+            if let Ok(archived) = CompiledRoutingCache::from_bytes(mmap) {
+                return archived.domain_trie.collect_direct_domains();
+            }
+        }
+        Vec::new()
+    }
 }

@@ -102,6 +102,50 @@ impl DomainTrie {
 
         last_wildcard_action
     }
+
+    /// Возвращает все доменные имена (включая wildcard базы) с действием `Direct`
+    pub fn collect_direct_domains(&self) -> Vec<String> {
+        let mut result = Vec::new();
+        if self.nodes.is_empty() || self.root_count == 0 {
+            return result;
+        }
+
+        let mut stack = Vec::new();
+        let root_start = self.root_start as usize;
+        let root_count = self.root_count as usize;
+
+        for i in 0..root_count {
+            let idx = root_start + i;
+            if idx < self.nodes.len() {
+                stack.push((idx, Vec::new()));
+            }
+        }
+
+        while let Some((node_idx, mut labels)) = stack.pop() {
+            let node = &self.nodes[node_idx];
+            labels.push(node.label.clone());
+
+            if node.terminal_action == Some(RuleAction::Direct) {
+                let mut reversed = labels.clone();
+                reversed.reverse();
+                let domain = reversed.join(".");
+                if !result.contains(&domain) {
+                    result.push(domain);
+                }
+            }
+
+            let c_start = node.children_start as usize;
+            let c_count = node.children_count as usize;
+            for i in 0..c_count {
+                let child_idx = c_start + i;
+                if child_idx < self.nodes.len() {
+                    stack.push((child_idx, labels.clone()));
+                }
+            }
+        }
+
+        result
+    }
 }
 
 /// Zero-Copy методы поиска по архивному дереву `ArchivedDomainTrie`
@@ -152,6 +196,54 @@ impl ArchivedDomainTrie {
         }
 
         last_wildcard_action
+    }
+
+    /// Возвращает все доменные имена (включая wildcard базы) с действием `Direct` в Zero-Copy режиме
+    pub fn collect_direct_domains(&self) -> Vec<String> {
+        let mut result = Vec::new();
+        let nodes = self.nodes.as_slice();
+        if nodes.is_empty() || self.root_count == 0 {
+            return result;
+        }
+
+        let mut stack = Vec::new();
+        let root_start = self.root_start as usize;
+        let root_count = self.root_count as usize;
+
+        for i in 0..root_count {
+            let idx = root_start + i;
+            if idx < nodes.len() {
+                stack.push((idx, Vec::new()));
+            }
+        }
+
+        while let Some((node_idx, mut labels)) = stack.pop() {
+            let node = &nodes[node_idx];
+            labels.push(node.label.as_str().to_string());
+
+            if let Some(action) = node.terminal_action.as_ref() {
+                let rule_action: RuleAction = action.deserialize(&mut rkyv::Infallible).unwrap();
+                if rule_action == RuleAction::Direct {
+                    let mut reversed = labels.clone();
+                    reversed.reverse();
+                    let domain = reversed.join(".");
+                    if !result.contains(&domain) {
+                        result.push(domain);
+                    }
+                }
+            }
+
+            let c_start = node.children_start as usize;
+            let c_count = node.children_count as usize;
+            for i in 0..c_count {
+                let child_idx = c_start + i;
+                if child_idx < nodes.len() {
+                    stack.push((child_idx, labels.clone()));
+                }
+            }
+        }
+
+        result
     }
 }
 

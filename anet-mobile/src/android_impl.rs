@@ -86,25 +86,55 @@ impl AndroidCallbackTunFactory {
         }
     }
 
-    /// Резолвит строки конфига в вектор IpNet
+    /// Резолвит строки конфига, CIDR или доменов (включая wildcard-шаблоны) в вектор IpNet
     async fn resolve_to_ipnet(&self, list: &[String]) -> Vec<IpNet> {
         let mut result = Vec::new();
         for target in list {
+            let trimmed = target.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
             // 1. CIDR
-            if let Ok(net) = target.parse::<IpNet>() {
-                result.push(net);
+            if let Ok(net) = trimmed.parse::<IpNet>() {
+                if !result.contains(&net) {
+                    result.push(net);
+                }
                 continue;
             }
             // 2. IP
-            if let Ok(ip) = target.parse::<IpAddr>() {
-                result.push(IpNet::from(ip));
+            if let Ok(ip) = trimmed.parse::<IpAddr>() {
+                let net = IpNet::from(ip);
+                if !result.contains(&net) {
+                    result.push(net);
+                }
                 continue;
             }
-            // 3. DNS
-            let target_with_port = format!("{}:443", target);
-            if let Ok(addrs) = lookup_host(&target_with_port).await {
-                for addr in addrs {
-                    result.push(IpNet::from(addr.ip()));
+            // 3. Домен или Wildcard (например, "*.2ip.io", ".2ip.io", "2ip.io")
+            let clean = trimmed
+                .trim_start_matches('*')
+                .trim_start_matches('.');
+            if clean.is_empty() {
+                continue;
+            }
+
+            // Формируем список хостов: базовый домен и типовые поддомены для wildcards
+            let mut hosts = vec![clean.to_string()];
+            if trimmed.contains('*') {
+                hosts.push(format!("www.{}", clean));
+                hosts.push(format!("static.{}", clean));
+            }
+
+            for host in hosts {
+                for port in [443, 80] {
+                    let target_with_port = format!("{}:{}", host, port);
+                    if let Ok(addrs) = lookup_host(&target_with_port).await {
+                        for addr in addrs {
+                            let net = IpNet::from(addr.ip());
+                            if !result.contains(&net) {
+                                result.push(net);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -233,7 +263,7 @@ impl TunFactory for AndroidCallbackTunFactory {
         let direct_routes = rule_cache.collect_direct_routes();
         if !direct_routes.is_empty() {
             info!(
-                "[Android VpnService] Found {} static Direct routes in rules.abc",
+                "[Android VpnService] Found {} static Direct CIDR routes in rules.abc",
                 direct_routes.len()
             );
             for (ip, prefix) in direct_routes {
@@ -245,7 +275,26 @@ impl TunFactory for AndroidCallbackTunFactory {
             }
         }
 
-        // 3. Добавляем локальные пользовательские Direct-исключения из client.toml [routing.overrides]
+        // 3. Добавляем Direct-домены (включая wildcard) из rules.abc
+        let direct_domains = rule_cache.collect_direct_domains();
+        if !direct_domains.is_empty() {
+            info!(
+                "[Android VpnService] Found {} Direct domain rules in rules.abc, resolving for bypass...",
+                direct_domains.len()
+            );
+            let resolved_domain_nets = self.resolve_to_ipnet(&direct_domains).await;
+            for net in resolved_domain_nets {
+                if !exclude_nets.contains(&net) {
+                    info!(
+                        "[Android VpnService] Adding direct domain resolved subnet {} to tunnel exclusions",
+                        net
+                    );
+                    exclude_nets.push(net);
+                }
+            }
+        }
+
+        // 4. Добавляем локальные пользовательские Direct-исключения из client.toml [routing.overrides]
         let local_direct_nets = self.resolve_to_ipnet(&self.config.routing.overrides.direct).await;
         for net in local_direct_nets {
             if !exclude_nets.contains(&net) {
@@ -267,7 +316,7 @@ impl TunFactory for AndroidCallbackTunFactory {
         let fallback_str = if include_nets.is_empty() && !user_excludes.is_empty() {
             let fallback_nets = Self::calculate_fallback_routes(&user_excludes);
             Self::ipnet_list_to_string(&fallback_nets)
-        } else if include_nets.is_empty() && !exclude_nets.is_empty() && exclude_nets.len() <= 64 {
+        } else if include_nets.is_empty() && !exclude_nets.is_empty() && exclude_nets.len() <= 256 {
             let fallback_nets = Self::calculate_fallback_routes(&exclude_nets);
             Self::ipnet_list_to_string(&fallback_nets)
         } else {
