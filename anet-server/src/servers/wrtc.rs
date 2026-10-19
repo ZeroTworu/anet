@@ -6,7 +6,7 @@ use anet_common::transport::{unwrap_packet_bytes, wrap_packet_padded, wrap_packe
 use anet_common::wrtc::{
     batcher::{unpack_batch, PacketBatcher},
     colibri::{
-        sign_beacon, ColibriMessage, WrtcMessage, VIDEO_BATCH_MAGIC, VIDEO_MAX_PAYLOAD_BYTES,
+        sign_beacon, ColibriMessage, WrtcMessage, MAX_VIDEO_BATCH_BYTES, VIDEO_BATCH_MARKER,
     },
     jingle::parse_jingle_session,
     ktalk::KtalkClient,
@@ -218,7 +218,7 @@ pub async fn run_wrtc_server(
                                 client_tag
                             );
                         }
-                        if decrypted.first() == Some(&VIDEO_BATCH_MAGIC) {
+                        if decrypted.first() == Some(&VIDEO_BATCH_MARKER) {
                             for sub_pkt in unpack_batch(&decrypted[1..]) {
                                 let pkt_len = sub_pkt.len();
                                 if tun_clone_video.try_send(sub_pkt).is_ok() {
@@ -269,10 +269,10 @@ pub async fn run_wrtc_server(
                         }
                     });
                     info!(
-                        "[WRTC Server] Received anet_discover from client {from_endpoint} (nonce: {client_nonce}, mode: {pref_mode}, video_ssrc: {video_ssrc:?}, video_v2: {video_v2})! Answering beacon..."
+                        "[WRTC Server] Received anet_discover from client {from_endpoint} (nonce: {client_nonce}, mode: {pref_mode}, video_ssrc: {video_ssrc:?}, video_v2: {video_v2:?})! Answering beacon..."
                     );
                     client_modes.insert(from_endpoint.clone(), pref_mode.clone());
-                    if video_v2 {
+                    if video_v2.unwrap_or(false) {
                         client_v2_endpoints.insert(from_endpoint.clone());
                         shared_peer.set_video_v2(true);
                     }
@@ -294,7 +294,6 @@ pub async fn run_wrtc_server(
                         client_nonce,
                         signature,
                         Some(shared_peer.video_ssrc),
-                        true,
                     );
                     let _ = shared_peer.send(beacon_msg).await;
                 }
@@ -405,7 +404,6 @@ pub async fn run_wrtc_server(
                                                 let mut batcher = PacketBatcher::new(16384, 2);
                                                 let mut batch_interval = tokio::time::interval(Duration::from_millis(2));
                                                 batch_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                                                let mut enc_buf = BytesMut::with_capacity(2048);
                                                 let mut batch_buf = BytesMut::with_capacity(2048);
                                                 let mut pending_packet: Option<Bytes> = None;
 
@@ -431,9 +429,9 @@ pub async fn run_wrtc_server(
                                                                         && has_video;
 
                                                                     if client_uses_video && is_v2 {
-                                                                        if video_warmed_up && packet.len() + 3 < VIDEO_MAX_PAYLOAD_BYTES {
+                                                                        if video_warmed_up && packet.len() + 3 < MAX_VIDEO_BATCH_BYTES {
                                                                             batch_buf.clear();
-                                                                            batch_buf.put_u8(VIDEO_BATCH_MAGIC);
+                                                                            batch_buf.put_u8(VIDEO_BATCH_MARKER);
                                                                             batch_buf.put_u16(packet.len() as u16);
                                                                             batch_buf.extend_from_slice(&packet);
                                                                             let mut count = 1usize;
@@ -449,7 +447,7 @@ pub async fn run_wrtc_server(
                                                                                 if next_p.len() < 20 {
                                                                                     continue;
                                                                                 }
-                                                                                if batch_buf.len() + 2 + next_p.len() <= VIDEO_MAX_PAYLOAD_BYTES {
+                                                                                if batch_buf.len() + 2 + next_p.len() <= MAX_VIDEO_BATCH_BYTES {
                                                                                     batch_buf.put_u16(next_p.len() as u16);
                                                                                     batch_buf.extend_from_slice(&next_p);
                                                                                     count += 1;
@@ -466,7 +464,7 @@ pub async fn run_wrtc_server(
                                                                                     &c_info.nonce_prefix,
                                                                                     seq,
                                                                                     &batch_buf[3..],
-                                                                                    &mut enc_buf,
+                                                                                    0,
                                                                                 )
                                                                             } else {
                                                                                 wrap_packet_slice(
@@ -474,25 +472,25 @@ pub async fn run_wrtc_server(
                                                                                     &c_info.nonce_prefix,
                                                                                     seq,
                                                                                     &batch_buf,
-                                                                                    &mut enc_buf,
+                                                                                    0,
                                                                                 )
                                                                             };
-                                                                            if wrap_res.is_ok() {
-                                                                                let _ = peer_downlink.send_video_frame_tagged(client_tag, &enc_buf).await;
+                                                                            if let Ok(enc_bytes) = wrap_res {
+                                                                                let _ = peer_downlink.send_video_frame_tagged(client_tag, &enc_bytes).await;
                                                                             }
                                                                         } else {
                                                                             // Одиночный пакет без stealth-паддинга
                                                                             let seq = c_info.sequence.fetch_add(1, Ordering::Relaxed);
-                                                                            if wrap_packet_slice(
+                                                                            if let Ok(enc_bytes) = wrap_packet_slice(
                                                                                 &c_info.cipher,
                                                                                 &c_info.nonce_prefix,
                                                                                 seq,
                                                                                 &packet,
-                                                                                &mut enc_buf,
-                                                                            ).is_ok() {
-                                                                                if peer_downlink.send_video_frame_tagged(client_tag, &enc_buf).await.is_ok() && !video_warmed_up {
+                                                                                0,
+                                                                            ) {
+                                                                                if peer_downlink.send_video_frame_tagged(client_tag, &enc_bytes).await.is_ok() && !video_warmed_up {
                                                                                     // До прогрева видео дублируем в WS батчер
-                                                                                    batcher.push(Bytes::copy_from_slice(&enc_buf));
+                                                                                    batcher.push(enc_bytes);
                                                                                     if batcher.should_flush() {
                                                                                         if let Some(batch_data) = batcher.flush() {
                                                                                             let b64 = BASE64_STANDARD.encode(&batch_data);
