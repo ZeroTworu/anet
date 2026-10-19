@@ -27,8 +27,6 @@ pub fn compile_route_map(
     default_action: &str,
     rules: &[RouteRuleSpec],
 ) -> Result<CompiledRouteConfig, String> {
-    // Все правила являются исключениями из default action. Поэтому карта
-    // остаётся однозначной даже когда CIDR и application правила смешаны.
     if default_action != "tunnel" && default_action != "direct" {
         return Err("default_action must be tunnel or direct".to_string());
     }
@@ -40,25 +38,41 @@ pub fn compile_route_map(
     let mut cidrs = Vec::new();
     let mut applications = Vec::new();
     for rule in rules {
-        if rule.action != expected_action {
-            return Err(format!(
-                "rule action must be {expected_action} for this default action"
-            ));
-        }
         match rule.match_type.as_str() {
             "cidr" => {
+                if rule.action != expected_action && rule.action != "block" && rule.action != "proxy" {
+                    return Err(format!(
+                        "rule action must be {expected_action} or block for this default action"
+                    ));
+                }
                 let network: IpNet = rule
                     .match_value
                     .parse()
                     .map_err(|_| format!("invalid CIDR: {}", rule.match_value))?;
-                cidrs.push(network.trunc().to_string());
+                if rule.action == expected_action {
+                    cidrs.push(network.trunc().to_string());
+                }
             }
             "application" => {
+                if rule.action != expected_action {
+                    return Err(format!(
+                        "application rule action must be {expected_action} for this default action"
+                    ));
+                }
                 let value = rule.match_value.trim();
                 if value.is_empty() || value.contains('/') || value.contains('\\') {
                     return Err(format!("invalid application name: {}", rule.match_value));
                 }
                 applications.push(value.to_string());
+            }
+            "domain" | "rule_provider" | "provider" => {
+                let value = rule.match_value.trim();
+                if value.is_empty() {
+                    return Err(format!("empty value for {} rule", rule.match_type));
+                }
+                if !matches!(rule.action.as_str(), "direct" | "tunnel" | "proxy" | "block") {
+                    return Err(format!("invalid rule action: {}", rule.action));
+                }
             }
             other => return Err(format!("unsupported match type: {other}")),
         }

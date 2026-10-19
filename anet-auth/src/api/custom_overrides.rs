@@ -153,7 +153,10 @@ impl CustomOverridesApi {
         };
 
         match new_model.insert(&self.db).await {
-            Ok(saved) => SaveCustomOverrideResponse::Ok(Json(saved.into())),
+            Ok(saved) => {
+                crate::compiler_worker::invalidate_compiled_rules_cache();
+                SaveCustomOverrideResponse::Ok(Json(saved.into()))
+            }
             Err(e) => SaveCustomOverrideResponse::Error(Json(e.to_string())),
         }
     }
@@ -186,7 +189,10 @@ impl CustomOverridesApi {
         active.updated_at = Set(Utc::now().naive_utc());
 
         match active.update(&self.db).await {
-            Ok(saved) => SaveCustomOverrideResponse::Ok(Json(saved.into())),
+            Ok(saved) => {
+                crate::compiler_worker::invalidate_compiled_rules_cache();
+                SaveCustomOverrideResponse::Ok(Json(saved.into()))
+            }
             Err(e) => SaveCustomOverrideResponse::Error(Json(e.to_string())),
         }
     }
@@ -203,9 +209,13 @@ impl CustomOverridesApi {
         }
 
         match admin_custom_overrides::Entity::delete_by_id(id.0).exec(&self.db).await {
-            Ok(res) if res.rows_affected > 0 => DeleteCustomOverrideResponse::Deleted,
+            Ok(res) if res.rows_affected > 0 => {
+                crate::compiler_worker::invalidate_compiled_rules_cache();
+                DeleteCustomOverrideResponse::Deleted
+            }
             Ok(_) => DeleteCustomOverrideResponse::NotFound(Json("Override not found".into())),
             Err(e) => DeleteCustomOverrideResponse::Error(Json(e.to_string())),
         }
     }
 }
+

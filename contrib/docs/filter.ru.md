@@ -1,7 +1,7 @@
 # Техническое задание: Smart DNS, Geo-Routing и AdBlock для ANet VPN
 
 Документация актуальна для ветки `dev/filter` (ANet v0.7.0+).  
-Статус: **Архитектурная спецификация (Approved Implementation Spec)**.
+Статус: **Реализовано (Implemented & Verified in `dev/filter`)**.
 
 ---
 
@@ -24,13 +24,14 @@
 ### 1.3. Архитектурный подход: Offloaded Heavy Lifting & Zero-Copy
 Вся «тяжелая» работа выносится на управляющий бэкенд (`anet-auth`):
 - Скачивание сырых списков правил (MetaCubeX, Anti-AD, custom community lists).
-- Валидация, дедупликация, нормализация доменов и IP-подсетей.
-- Включение администраторских списков исключений (`custom_drop`/`custom_block`, `custom_direct`, `custom_proxy`).
+- Валидация, дедупликация, нормализация доменов и IP-подсетей с сохранением нормализованных элементов в таблицу кэша `rule_provider_items` для аудита и инспекции через WebUI.
+- Включение правил провайдеров (с глобальным действием или переопределением внутри маршрутной карты `route_rules`) и администраторских списков исключений (`custom_block`, `custom_direct`, `custom_proxy`).
+- Защита системных доменов проверки связности (`CAPTIVE_PORTAL_DOMAINS`) и блокировка публичных DoH-резолверов (`DEFAULT_DOH_DOMAINS`).
 - Построение эффективных структур поиска: **инвертированного префиксного дерева (Domain Trie)** и **Radix Trie (LPM)**.
 - Компиляция и бинарная упаковка в специализированный формат `.abc` (**ANet Binary Cache**) с использованием Zero-copy фреймворка `rkyv`.
 
 Клиент (`anet-client-core`):
-- Скачивает бинарный слепок `.abc` по HTTP с поддержкой `ETag` / `If-None-Match`.
+- Скачивает бинарный слепок `.abc` по HTTP (`GET /api/v1/routing/compiled`) с поддержкой `ETag` / `If-None-Match`.
 - Отображает файл в память через системный вызов `mmap` (`memmap2`).
 - Применяет локальные пользовательские исключения (Client Overrides) с наивысшим приоритетом.
 - Выполняет поиск соответствий напрямую по отображенной памяти без единой аллокации строк или векторов в куче.
@@ -44,21 +45,24 @@
 |                                    БЭКЕНД УПРАВЛЕНИЯ (anet-auth)                                   |
 |                                                                                                    |
 |  [ Внешние провайдеры ]      [ Web UI: Администратор ]                                             |
-|  (MetaCubeX, Anti-AD)        - Пользовательские правила (custom_block / custom_direct / proxy)     |
+|  (MetaCubeX, Anti-AD)        - Провайдеры (Action: Block/Direct/Proxy + инспекция кэша в БД)       |
+|           |                  - Маршрутные карты (привязка провайдеров и доменных правил)           |
+|           |                  - Пользовательские правила (custom_block / custom_direct / proxy)     |
 |           |                          |                                                             |
 |           +----------> [ Background Fetcher & Compiler ] <-----------------------------------------+
 |                                      |                                                             |
-|                       1. Парсинг, дедупликация и нормализация                                      |
-|                       2. Наложение Custom Overrides администратора                                 |
-|                       3. Построение Domain Trie & Radix LPM                                        |
-|                       4. rkyv-сериализация -> rules.abc                                            |
-|                       5. Генерация ETag (SHA-256)                                                  |
+|                       1. Парсинг, дедупликация, нормализация -> БД (rule_provider_items)           |
+|                       2. Базовые правила DoH + защита Captive Portal                               |
+|                       3. Наложение правил RouteMap и Custom Overrides администратора               |
+|                       4. Построение Domain Trie & Radix LPM                                        |
+|                       5. rkyv-сериализация -> rules.abc (глобальный и по route_map_id)             |
+|                       6. Генерация ETag (SHA-256)                                                  |
 |                                      |                                                             |
 |                                      v                                                             |
-|                            [ Local Storage / CDN ]                                                 |
+|                            [ Local Storage / Memory ]                                              |
 |                                      |                                                             |
 |                                      v                                                             |
-|              REST API: GET /api/v1/routing/compiled-rules (ETag)                                   |
+|              REST API: GET /api/v1/routing/compiled[?route_map_id=...] (ETag)                      |
 +--------------------------------------|-------------------------------------------------------------+
                                        | HTTP (mmap update)
                                        v
@@ -96,12 +100,12 @@
 
 ## 3. Бэкенд (`anet-auth`) — Компилятор правил и управление
 
-Модуль отвечает за сбор текстовых списков, обработку администраторских исключений, слияние в соответствии с политиками маршрутизации и компиляцию бинарных артефактов `.abc`.
+Модуль отвечает за сбор текстовых списков, кэширование разобранных элементов в БД для прозрачного аудита, обработку администраторских исключений, слияние в соответствии с политиками маршрутизации и компиляцию бинарных артефактов `.abc`.
 
 ### 3.1. Схема базы данных (SeaORM)
 
 #### Сущность `RuleProvider` (`rule_providers`)
-Хранит источники правил (внешние URL или локальные наборы):
+Хранит источники правил (внешние URL), действие по умолчанию для данного списка и опциональную привязку к маршрутной карте:
 ```rust
 use sea_orm::entity::prelude::*;
 
@@ -113,7 +117,9 @@ pub struct Model {
     pub name: String,
     pub description: String,
     pub provider_type: ProviderType, // DomainList | IpList
-    pub format: ProviderFormat,       // PlainText | V2RayDomain | CidrList
+    pub format: ProviderFormat,      // PlainText | V2RayDomain | CidrList
+    pub action: ProviderAction,      // Block | Direct | Proxy
+    pub route_map_id: Option<Uuid>,  // None = глобально для всех профилей
     pub url: String,
     pub update_interval_hours: i32,
     pub last_fetched_at: Option<DateTime>,
@@ -124,7 +130,7 @@ pub struct Model {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, EnumIter, DeriveActiveEnum)]
-#[sea_orm(rs_type = "String", db_type = "String(None)")]
+#[sea_orm(rs_type = "String", db_type = "Text")]
 pub enum ProviderType {
     #[sea_orm(string_value = "domain")]
     DomainList,
@@ -133,7 +139,7 @@ pub enum ProviderType {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, EnumIter, DeriveActiveEnum)]
-#[sea_orm(rs_type = "String", db_type = "String(None)")]
+#[sea_orm(rs_type = "String", db_type = "Text")]
 pub enum ProviderFormat {
     #[sea_orm(string_value = "plain")]
     PlainText,
@@ -142,10 +148,39 @@ pub enum ProviderFormat {
     #[sea_orm(string_value = "cidr")]
     CidrList,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, EnumIter, DeriveActiveEnum)]
+#[sea_orm(rs_type = "String", db_type = "Text")]
+pub enum ProviderAction {
+    #[sea_orm(string_value = "block")]
+    Block,
+    #[sea_orm(string_value = "direct")]
+    Direct,
+    #[sea_orm(string_value = "proxy")]
+    Proxy,
+}
 ```
 
-#### Расширение сущностей маршрутизации (`route_rules` и `custom_overrides`)
-В существующую таблицу `route_rules` добавляется поддержка привязки к `rule_provider_id`, а также создается сущность администраторских ручных исключений `CustomOverride`:
+#### Сущность кэша элементов провайдера `RuleProviderItem` (`rule_provider_items`)
+Хранит распарсенные и нормализованные правила каждого провайдера в базе данных. Это позволяет администратору в WebUI просматривать, какие именно домены и подсети были загружены при принудительном или фоновом обновлении провайдера, а также пересобирать `.abc` без повторного обращения к внешним URL:
+```rust
+#[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+#[sea_orm(table_name = "rule_provider_items")]
+pub struct Model {
+    #[sea_orm(primary_key, auto_increment = false)]
+    pub id: Uuid,
+    pub provider_id: Uuid,
+    pub position: i32,
+    pub raw_value: String,
+    pub normalized_value: String,
+    pub item_type: String, // "domain_exact", "domain_suffix", "ip_cidr"
+    pub match_subdomains: bool,
+    pub created_at: DateTime,
+}
+```
+
+#### Расширение сущностей маршрутизации (`route_rules` и `admin_custom_overrides`)
+В таблицу `route_rules` добавлена поддержка привязки к `rule_provider_id` и типам правил `rule_provider` / `domain` с действиями `direct`, `tunnel`/`proxy` и `block`, а также создана сущность администраторских ручных исключений `admin_custom_overrides`:
 
 ```rust
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
@@ -158,7 +193,7 @@ pub struct Model {
     pub match_type: String, // "cidr", "application", "rule_provider", "domain"
     pub match_value: String, // Значение или UUID rule_provider
     pub rule_provider_id: Option<Uuid>,
-    pub action: String,     // "direct", "proxy", "block"
+    pub action: String,     // "direct", "tunnel" / "proxy", "block"
 }
 
 /// Администраторские исключения в БД
@@ -178,7 +213,7 @@ pub struct Model {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, EnumIter, DeriveActiveEnum)]
-#[sea_orm(rs_type = "String", db_type = "String(None)")]
+#[sea_orm(rs_type = "String", db_type = "Text")]
 pub enum OverrideType {
     #[sea_orm(string_value = "domain")]
     Domain,
@@ -189,7 +224,7 @@ pub enum OverrideType {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, EnumIter, DeriveActiveEnum)]
-#[sea_orm(rs_type = "String", db_type = "String(None)")]
+#[sea_orm(rs_type = "String", db_type = "Text")]
 pub enum OverrideCategory {
     #[sea_orm(string_value = "block")]
     CustomBlock,
@@ -200,52 +235,49 @@ pub enum OverrideCategory {
 }
 ```
 
-### 3.2. Административные исключения в WebUI
-В панели управления `anet-webui` администратор получает интерфейс:
-- **Управление провайдерами списков**: добавление URL (например, `https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/...`), настройка периода автообновления, просмотр количества правил и даты последней загрузки.
-- **Интерактивные Custom Overrides**:
-  - Быстрое добавление единичных доменов или списков в категории:
-    * `custom_block` (или `custom_drop`): принудительная блокировка нежелательных ресурсов без ожидания обновления внешних фильтров.
-    * `custom_direct`: принудительный вывод из VPN критичных сервисов (банковские шлюзы, локальные корпоративные домены, стриминги).
-    * `custom_proxy`: принудительное направление в VPN ресурсов, ошибочно попавших в списки исключений.
-- Администраторские исключения имеют наивысший приоритет среди серверных правил: при компиляции они накладываются поверх списков провайдеров, переопределяя конфликтующие узлы дерева.
+### 3.2. Административные возможности в WebUI (`anet-webui`)
+В панели управления администратор получает полный цикл управления фильтрацией и маршрутизацией:
+- **Управление провайдерами списков (вкладка `Rule Providers`)**:
+  - Добавление и редактирование внешнего списка с указанием **действия (`Action`: `Block / AdBlock`, `Direct / Bypass`, `Proxy / VPN`)** и **области применения (`Scope`: глобально или для конкретной `Route Map`)**.
+  - Принудительное обновление кэша кнопкой **Fetch Now** (`POST /api/v1/rule-providers/:id/fetch`), при котором список скачивается, парсится, сохраняется в таблицу `rule_provider_items` и немедленно перекомпилирует бинарный кэш `.abc`.
+  - **Инспектор закешированных данных (`View Cached Items`)**: модальное окно с пагинацией и поиском (`GET /api/v1/rule-providers/:id/items`), отображающее точное количество правил, исходную строку (`raw_value`), нормализованное значение (`normalized_value`), тип (`domain_exact`, `domain_suffix`, `ip_cidr`) и область совпадения (`*.subdomains` или `exact`).
+- **Интеграция провайдеров и доменов в Маршрутные карты (`Route Maps` / `RouteMapModal`)**:
+  - Внутри любой маршрутной карты администратор может добавлять правила типов `CIDR`, `Application`, **`Rule Provider`** (выбор из списка провайдеров) и **`Domain`** с индивидуальным действием для этой карты (`Direct`, `Tunnel / Proxy`, `Block / AdBlock`).
+- **Интерактивные Custom Overrides (вкладка `Custom Overrides`)**:
+  - Быстрое добавление единичных доменов, wildcard-масок или подсетей в категории `custom_block`, `custom_direct`, `custom_proxy` (глобально или для выбранной маршрутной карты).
+- Администраторские исключения имеют наивысший приоритет среди серверных правил: при компиляции они накладываются поверх списков провайдеров и правил маршрутной карты, переопределяя конфликтующие узлы дерева.
 
-### 3.3. Фоновый воркер (Fetcher & Compiler)
+### 3.3. Фоновый воркер (`RuleCompilerService`)
 Фоновая служба `RuleCompilerService` запускается внутри процесса `anet-auth`:
-1. **Планировщик скачивания**:
-   - Регулярно опрашивает `rule_providers`, у которых истек `update_interval_hours`.
-   - Выполняет HTTP GET с поддержкой заголовков `If-None-Match` и `If-Modified-Since`.
-   - В случае `304 Not Modified` обновляет `last_fetched_at` без перекомпиляции.
+1. **Планировщик скачивания и кэширования в БД**:
+   - Регулярно опрашивает `rule_providers`, у которых истек `update_interval_hours` (или по сигналу `POST /rule-providers/:id/fetch`).
+   - Выполняет HTTP GET с поддержкой заголовка `If-None-Match`.
+   - В случае `304 Not Modified` (при наличии уже сохраненных записей в `rule_provider_items`) обновляет `last_fetched_at`.
+   - При получении нового списка парсит правила, нормализует их и сохраняет батчами по 500 записей в таблицу `rule_provider_items` внутри транзакции.
 2. **Стриминговый парсинг и нормализация**:
-   - Построчное чтение с отсечением комментариев (`#`, `//`, `;`).
-   - Для доменов:
-     - Приведение к нижнему регистру (lowercase ASCII).
-     - Преобразование IDN (Punycode).
-     - Удаление префиксов `+.`, `full:`, `domain:` (форматы v2ray/clash).
-     - Разделение на тип соответствия: *точное совпадение* (Exact) или *по всем поддоменам* (Subdomain suffix).
-   - Для IP-адресов:
-     - Парсинг одиночных адресов `/32` (IPv4) и `/128` (IPv6).
-     - Парсинг подсетей формата CIDR (`ipnet::IpNet`).
-     - Нормализация и слияние смежных и перекрывающихся подсетей (CIDR aggregation).
+   - Построчное чтение с отсечением комментариев (`#`, `//`, `;`) и поддержкой форматов `hosts` (`0.0.0.0 domain`, `127.0.0.1 domain`), AdGuard (`||domain^`) и Clash/V2Ray (`+.`, `*.`, `domain:`, `full:`, `DOMAIN-SUFFIX,`, `DOMAIN,`, `IP-CIDR,`).
+   - Для доменов: приведение к нижнему регистру (ASCII), разделение на *точное совпадение* (`domain_exact`) или *по всем поддоменам* (`domain_suffix`).
+   - Для IP-адресов: парсинг одиночных адресов `/32` (IPv4), `/128` (IPv6) и подсетей CIDR (`ipnet::IpNet`).
 3. **Наложение правил и построение структур**:
-   - Сначала строятся базовые деревья из провайдеров.
-   - Затем узлы дерева модифицируются записями из `admin_custom_overrides` (наложение с заменой терминального действия).
-   - Домены организуются в **Reversed Domain Trie** (дерево меток, разобранных с конца: `com` $\to$ `example` $\to$ `ads`).
-   - Сети укладываются в бинарный **Radix Tree (LPM)** с битовой глубиной до 32 (IPv4) и 128 (IPv6).
+   - В базовый слой включаются известные DoH-резолверы (`DEFAULT_DOH_DOMAINS` $\to$ `Block`).
+   - Накладываются элементы из `rule_provider_items` с действием провайдера (`provider.action`).
+   - Накладываются правила конкретной маршрутной карты из `route_rules` (включая переопределение действия для подключенных `rule_provider` и правил `domain`/`cidr`).
+   - Накладываются записи из `admin_custom_overrides` (наложение с заменой терминального действия).
+   - Применяется защита системных доменов проверки доступности интернета (`CAPTIVE_PORTAL_DOMAINS`), гарантирующая, что они никогда не блокируются AdBlock-списками.
 4. **Компиляция и кэширование**:
-   - При изменении любого из провайдеров, таблицы `route_rules` или таблицы `admin_custom_overrides` перекомпилируется артефакт `rules.abc`.
+   - При любом изменении провайдеров, `route_rules` или `admin_custom_overrides` перекомпилируется глобальный артефакт `rules.abc` и индивидуальные слепки для активных маршрутных карт.
    - Генерируется хэш SHA-256 содержимого бинарного файла, служащий `ETag`.
 
 ### 3.4. REST API для клиентов
 Эндпоинт является публичным (аутентификация не требуется), что позволяет клиентам скачивать и обновлять правила автономно, а также кэшировать их на уровне CDN/Edge прокси.
 
-- **Маршрут**: `GET /api/v1/routing/compiled-rules` (или индивидуально по профилю: `/api/v1/routing/compiled-rules/:route_map_id`)
-- **Аутентификация**: Отсутствует (публичный доступ, rate-limited при необходимости).
+- **Маршрут**: `GET /api/v1/routing/compiled` (или с параметром профиля: `GET /api/v1/routing/compiled?route_map_id=<UUID>`)
+- **Аутентификация**: Отсутствует (публичный доступ в `ApiKeyMiddleware`).
 - **Заголовки запроса**:
   - `If-None-Match: "<ETag>"`
 - **Поведение сервера**:
   - Если переданный `ETag` совпадает с текущим: `304 Not Modified`.
-  - Если правила изменились или это первичный запрос: `200 OK`, `Content-Type: application/octet-stream`, `ETag: "<SHA256>"`, `Cache-Control: public, no-cache`, тело ответа — бинарные байты `.abc`.
+  - Если правила изменились или это первичный запрос: `200 OK`, `Content-Type: application/octet-stream`, `ETag: "<SHA256>"`, тело ответа — бинарные байты `.abc`.
 
 ---
 
@@ -758,29 +790,29 @@ impl DirectIpCache {
 ## 11. План поэтапной реализации (Roadmap)
 
 ### Этап 1: Базовый крейт `anet-filter-core`
-- [ ] Определение структур данных `DomainTrie`, `IpRoutingTable`, `CompiledRoutingCache` с атрибутами `rkyv` (магическое число `ABC1`).
-- [ ] Алгоритм построения инвертированного Domain Trie с поддержкой администраторских оверрайдов.
-- [ ] Алгоритм построения Radix Trie (LPM).
-- [ ] Реализация модуля `checksum.rs` (RFC 791, RFC 768, RFC 8200) с тестами.
-- [ ] Модульные тесты на проверку сопоставления доменов (точные совпадения, поддомены, wildcard) и сетей (IPv4/IPv6).
+- [x] Определение структур данных `DomainTrie`, `IpRoutingTable`, `CompiledRoutingCache` с атрибутами `rkyv` (магическое число `ABC1`).
+- [x] Алгоритм построения инвертированного Domain Trie с поддержкой администраторских оверрайдов, защитой `CAPTIVE_PORTAL_DOMAINS` и блокировкой `DEFAULT_DOH_DOMAINS`.
+- [x] Алгоритм построения Radix Trie (LPM).
+- [x] Реализация модуля `checksum.rs` (RFC 791, RFC 768, RFC 8200) с тестами.
+- [x] Модульные тесты на проверку сопоставления доменов (точные совпадения, поддомены, wildcard) и сетей (IPv4/IPv6).
 
 ### Этап 2: Бэкенд-компилятор в `anet-auth`
-- [ ] Миграции SeaORM для таблиц `rule_providers` и `admin_custom_overrides`, модификация `route_rules`.
-- [ ] Фоновый воркер `RuleCompilerService` (скачивание списков MetaCubeX/AdBlock, нормализация, наложение оверрайдов, компиляция в `.abc`).
-- [ ] REST API эндпоинт `GET /api/v1/routing/compiled-rules` с валидацией `ETag`.
-- [ ] Интеграция в `anet-webui`: управление провайдерами, добавление `custom_block`, `custom_direct`, `custom_proxy` и просмотр статуса кэша.
+- [x] Миграции SeaORM для таблиц `rule_providers`, `rule_provider_items` и `admin_custom_overrides`, модификация `route_rules`.
+- [x] Фоновый воркер `RuleCompilerService` (скачивание списков MetaCubeX/AdBlock, нормализация, сохранение элементов в `rule_provider_items`, наложение правил маршрутных карт и оверрайдов, компиляция в `.abc`).
+- [x] REST API эндпоинт `GET /api/v1/routing/compiled` (с поддержкой `route_map_id` и валидацией `ETag`) и `GET /api/v1/rule-providers/:id/items` (инспекция кэша).
+- [x] Интеграция в `anet-webui`: управление провайдерами с выбором действия (`Block`/`Direct`/`Proxy`), просмотр закешированных элементов провайдера с поиском и пагинацией, подключение провайдеров и доменов в `Route Maps`, добавление `custom_block`, `custom_direct`, `custom_proxy`.
 
 ### Этап 3: Клиентский движок в `anet-client-core`
-- [ ] Поддержка `[routing.overrides]` в `client.toml` для локальных пользовательских правил.
-- [ ] Менеджер `RuleUpdater` с загрузкой `.abc` и маппингом через `memmap2`.
-- [ ] Внутритуннельный парсер и перехватчик `DnsInterceptor`.
-- [ ] Обработка Canary Domains (`use-application-dns.net` $\to$ NXDOMAIN).
-- [ ] Генератор синтетических ответов DNS для `RuleAction::Block` с пересчетом L3/L4 контрольных сумм.
-- [ ] Модуль `DirectIpCache` для динамического отслеживания ответов резолвера.
-- [ ] Маршрутизация исходящих пакетов в цикле туннеля (`client.rs` / `acquire_packet_source`).
+- [x] Поддержка `[routing.overrides]` в `client.toml` для локальных пользовательских правил.
+- [x] Менеджер `RuleUpdater` с загрузкой `.abc` и маппингом через `memmap2`.
+- [x] Внутритуннельный парсер и перехватчик `DnsInterceptor`.
+- [x] Обработка Canary Domains (`use-application-dns.net` $\to$ NXDOMAIN).
+- [x] Генератор синтетических ответов DNS для `RuleAction::Block` с пересчетом L3/L4 контрольных сумм.
+- [x] Модуль `DirectIpCache` для динамического отслеживания ответов резолвера и прямой UDP-резолв `RuleAction::Direct`.
+- [x] Маршрутизация исходящих пакетов в цикле туннеля (`client.rs` / `acquire_packet_source`).
 
 ### Этап 4: Платформенная интеграция и оптимизация
-- [ ] Интеграция с `anet-appfilter` (Windows WinDivert direct bypass).
-- [ ] Интеграция с Android JNI / `protect_socket`.
-- [ ] Интеграция с Linux `ip rule` / fwmark.
-- [ ] Нагрузочное тестирование (пропускная способность 1+ Gbps, задержка DNS < 0.5 мс, корректность контрольных сумм в Wireshark).
+- [x] Интеграция с `anet-appfilter` (Windows WinDivert direct bypass) и таблицей маршрутизации ОС.
+- [x] Интеграция с Android JNI / `protect_socket`.
+- [x] Интеграция с Linux `ip rule` / fwmark.
+- [ ] Нагрузочное тестирование на реальном трафике (пропускная способность 1+ Gbps, задержка DNS < 0.5 мс, проверка в Wireshark).

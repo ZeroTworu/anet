@@ -16,6 +16,22 @@ pub const CURRENT_SCHEMA_VERSION: u32 = 1;
 /// Служебный канареечный домен Mozilla Firefox для отключения DoH
 pub const MOZILLA_CANARY_DOMAIN: &str = "use-application-dns.net";
 
+/// Известные публичные DoH-резолверы, блокируемые по умолчанию для отката браузеров на системный DNS (п. 5.2 ТЗ)
+pub const DEFAULT_DOH_DOMAINS: &[&str] = &[
+    "cloudflare-dns.com",
+    "dns.google",
+    "dns.quad9.net",
+    "doh.opendns.com",
+];
+
+/// Служебные домены проверки доступности интернета ОС (Captive Portal), которые никогда не блокируются AdBlock (п. 5.3 ТЗ)
+pub const CAPTIVE_PORTAL_DOMAINS: &[&str] = &[
+    "connectivitycheck.gstatic.com",
+    "msftconnecttest.com",
+    "captive.apple.com",
+    "detectportal.firefox.com",
+];
+
 /// Действие маршрутизатора для домена или IP-адреса/сети
 #[derive(
     Archive,

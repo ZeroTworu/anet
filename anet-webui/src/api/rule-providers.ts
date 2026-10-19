@@ -1,5 +1,9 @@
 import { api } from './client'
-import type { RuleProvider, SaveRuleProviderRequest } from '@/models/rule-provider'
+import type {
+  RuleProvider,
+  RuleProviderItemsPage,
+  SaveRuleProviderRequest,
+} from '@/models/rule-provider'
 
 export const GetRuleProviders = () => api<RuleProvider[]>('/routing/rule-providers')
 
@@ -21,4 +25,13 @@ export const DeleteRuleProvider = (id: string) =>
 export const FetchRuleProviderNow = (id: string) =>
   api<RuleProvider>(`/routing/rule-providers/${id}/fetch`, {
     method: 'POST',
+  })
+
+export const GetRuleProviderItems = (
+  id: string,
+  params?: { search?: string; page?: number; per_page?: number },
+) =>
+  api<RuleProviderItemsPage>(`/routing/rule-providers/${id}/items`, {
+    method: 'GET',
+    params,
   })

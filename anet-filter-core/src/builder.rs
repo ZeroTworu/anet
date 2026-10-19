@@ -3,7 +3,9 @@
 //! Используется в `anet-auth` для компиляции внешних списков (MetaCubeX, Anti-AD)
 //! и администраторских исключений в единый бинарный файл `rules.abc`.
 
-use crate::model::{CompiledRoutingCache, RuleAction};
+use crate::model::{
+    CompiledRoutingCache, RuleAction, CAPTIVE_PORTAL_DOMAINS, DEFAULT_DOH_DOMAINS,
+};
 use crate::radix::IpRoutingTableBuilder;
 use crate::trie::DomainTrieBuilder;
 
@@ -21,9 +23,15 @@ pub struct RoutingCacheCompiler {
 impl RoutingCacheCompiler {
     /// Создает новый компилятор с заданным действием по умолчанию
     pub fn new(default_action: RuleAction) -> Self {
+        let mut domain_builder = DomainTrieBuilder::new();
+        // По умолчанию блокируем публичные DoH-резолверы (п. 5.2 ТЗ), чтобы браузеры откатывались на системный DNS
+        for doh in DEFAULT_DOH_DOMAINS {
+            domain_builder.insert_rule(doh, RuleAction::Block, false);
+        }
+
         Self {
             default_action,
-            domain_builder: DomainTrieBuilder::new(),
+            domain_builder,
             ip_builder: IpRoutingTableBuilder::new(),
             admin_domain_overrides: Vec::new(),
             admin_ip_overrides: Vec::new(),
@@ -40,10 +48,30 @@ impl RoutingCacheCompiler {
         let mut count = 0;
         for line in content.lines() {
             let trimmed = line.trim();
-            if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with(';') {
+            if trimmed.is_empty()
+                || trimmed.starts_with('#')
+                || trimmed.starts_with(';')
+                || trimmed.starts_with("//")
+            {
                 continue;
             }
             if self.domain_builder.insert_rule(trimmed, action, false) {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// Добавляет список уже нормализованных доменов из БД (таблица rule_provider_items)
+    pub fn add_provider_domain_items<I, S>(&mut self, items: I, action: RuleAction) -> usize
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut count = 0;
+        for item in items {
+            let s = item.as_ref().trim();
+            if !s.is_empty() && self.domain_builder.insert_rule(s, action, false) {
                 count += 1;
             }
         }
@@ -55,10 +83,30 @@ impl RoutingCacheCompiler {
         let mut count = 0;
         for line in content.lines() {
             let trimmed = line.trim();
-            if trimmed.is_empty() || trimmed.starts_with('#') {
+            if trimmed.is_empty()
+                || trimmed.starts_with('#')
+                || trimmed.starts_with(';')
+                || trimmed.starts_with("//")
+            {
                 continue;
             }
             if self.ip_builder.insert_str(trimmed, action).is_ok() {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// Добавляет список IP/CIDR записей из БД (таблица rule_provider_items)
+    pub fn add_provider_ip_items<I, S>(&mut self, items: I, action: RuleAction) -> usize
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut count = 0;
+        for item in items {
+            let s = item.as_ref().trim();
+            if !s.is_empty() && self.ip_builder.insert_str(s, action).is_ok() {
                 count += 1;
             }
         }
@@ -77,6 +125,16 @@ impl RoutingCacheCompiler {
 
     /// Выполняет сборку кэша с наложением администраторских исключений
     pub fn compile(mut self) -> CompiledRoutingCache {
+        // 0. Защита служебных доменов Captive Portal от случайного попадания в AdBlock-списки провайдеров (п. 5.3 ТЗ)
+        let probe_action = if self.default_action == RuleAction::Block {
+            RuleAction::Proxy
+        } else {
+            self.default_action
+        };
+        for portal in CAPTIVE_PORTAL_DOMAINS {
+            self.domain_builder.insert_rule(portal, probe_action, true);
+        }
+
         // 1. Накладываем администраторские доменные исключения (override_existing = true)
         for (pattern, action) in self.admin_domain_overrides {
             self.domain_builder.insert_rule(&pattern, action, true);

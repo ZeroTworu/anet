@@ -1,4 +1,5 @@
 pub mod m20261018_000030_create_rule_providers_and_custom_overrides;
+pub mod m20261019_000031_add_provider_action_and_items_table;
 pub mod m20240101_000001_create_users;
 pub mod m20240319_000002_create_admins;
 pub mod m20240401_000003_create_rates;
@@ -67,6 +68,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20260929_000028_add_wrtc_url_to_servers::Migration),
             Box::new(m20261002_000029_add_wrtc_mode::Migration),
             Box::new(m20261018_000030_create_rule_providers_and_custom_overrides::Migration),
+            Box::new(m20261019_000031_add_provider_action_and_items_table::Migration),
         ]
     }
 }
+

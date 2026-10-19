@@ -9,6 +9,24 @@ use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+/// Возвращает стандартный путь к локальному кэшу `rules.abc`
+pub fn default_rules_cache_path() -> PathBuf {
+    if let Ok(custom) = std::env::var("ANET_RULES_CACHE_PATH") {
+        let trimmed = custom.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+    if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
+        let dir = PathBuf::from(home).join(".cache").join("anet");
+        let _ = fs::create_dir_all(&dir);
+        return dir.join("rules.abc");
+    }
+    let dir = std::env::temp_dir().join("anet");
+    let _ = fs::create_dir_all(&dir);
+    dir.join("rules.abc")
+}
+
 /// Менеджер бинарного кэша правил
 #[derive(Clone)]
 pub struct RuleCacheManager {
@@ -23,7 +41,7 @@ impl RuleCacheManager {
             cache_path,
             current_mmap: Arc::new(ArcSwap::new(Arc::new(None))),
         };
-        // Пробуем загрузить локальный кэш с диска при старте
+        // Пробуем загрузить локальный кэш с диска при старте (Zero Cold Start)
         manager.load_from_disk();
         manager
     }
@@ -31,7 +49,10 @@ impl RuleCacheManager {
     /// Загружает локальный файл rules.abc через mmap
     pub fn load_from_disk(&self) -> bool {
         if !self.cache_path.exists() {
-            debug!("[RuleCache] Local cache file does not exist: {:?}", self.cache_path);
+            debug!(
+                "[RuleCache] Local cache file does not exist: {:?}",
+                self.cache_path
+            );
             return false;
         }
 
@@ -43,7 +64,10 @@ impl RuleCacheManager {
                         warn!("[RuleCache] Corrupted .abc file on disk: {e}");
                         return false;
                     }
-                    info!("[RuleCache] Successfully mapped rules.abc ({} bytes)", mmap.len());
+                    info!(
+                        "[RuleCache] Successfully mapped rules.abc ({} bytes)",
+                        mmap.len()
+                    );
                     self.current_mmap.store(Arc::new(Some(Arc::new(mmap))));
                     true
                 }
@@ -61,7 +85,13 @@ impl RuleCacheManager {
 
     /// Выполняет фоновое обновление правил по HTTP с проверкой ETag
     pub async fn update_from_server(&self, server_url: &str) -> anyhow::Result<()> {
-        let endpoint = format!("{}/api/v1/routing/compiled-rules", server_url.trim_end_matches('/'));
+        let clean = server_url.trim().trim_end_matches('/');
+        let endpoint = if clean.contains("/routing/compiled-rules") {
+            clean.to_string()
+        } else {
+            format!("{}/api/v1/routing/compiled-rules", clean)
+        };
+
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(15))
             .build()?;
@@ -72,7 +102,7 @@ impl RuleCacheManager {
         let etag_file = self.cache_path.with_extension("etag");
         if let Ok(etag) = fs::read_to_string(&etag_file) {
             let clean_etag = etag.trim();
-            if !clean_etag.is_empty() {
+            if !clean_etag.is_empty() && self.cache_path.exists() {
                 req = req.header("If-None-Match", clean_etag);
             }
         }
@@ -111,7 +141,10 @@ impl RuleCacheManager {
             let _ = fs::write(&etag_file, etag);
         }
 
-        info!("[RuleCache] Downloaded and applied new rules.abc ({} bytes)", bytes.len());
+        info!(
+            "[RuleCache] Downloaded and applied new rules.abc ({} bytes)",
+            bytes.len()
+        );
         self.load_from_disk();
         Ok(())
     }

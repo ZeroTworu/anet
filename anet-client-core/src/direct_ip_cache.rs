@@ -9,6 +9,9 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// Максимальное количество записей в DirectIpCache для защиты от переполнения памяти (п. 10.4 ТЗ)
+pub const MAX_DIRECT_IP_CACHE_ENTRIES: usize = 50_000;
+
 #[derive(Clone, Debug)]
 pub struct CacheEntry {
     pub action: RuleAction,
@@ -41,8 +44,24 @@ impl DirectIpCache {
         None
     }
 
-    /// Вставляет набор разрешенных IP-адресов с заданным TTL
+    /// Вставляет набор разрешенных IP-адресов с заданным TTL и защитой от переполнения (50 000 записей)
     pub fn insert_batch(&self, ips: &[IpAddr], action: RuleAction, ttl: Duration) {
+        if self.entries.len() >= MAX_DIRECT_IP_CACHE_ENTRIES {
+            self.prune_expired();
+            if self.entries.len() >= MAX_DIRECT_IP_CACHE_ENTRIES {
+                // Вытесняем часть старых записей при достижении верхнего лимита
+                let to_remove: Vec<IpAddr> = self
+                    .entries
+                    .iter()
+                    .take(1024)
+                    .map(|kv| *kv.key())
+                    .collect();
+                for k in to_remove {
+                    self.entries.remove(&k);
+                }
+            }
+        }
+
         let ttl_capped = ttl.clamp(Duration::from_secs(10), Duration::from_secs(86400));
         let expires_at = Instant::now() + ttl_capped;
 
@@ -57,7 +76,7 @@ impl DirectIpCache {
         }
     }
 
-    /// Очищает просроченные записи (вызывается периодически фоновым таском)
+    /// Очищает просроченные записи (вызывается периодически фоновым таском или при достижении лимита)
     pub fn prune_expired(&self) {
         let now = Instant::now();
         self.entries.retain(|_, entry| entry.expires_at > now);

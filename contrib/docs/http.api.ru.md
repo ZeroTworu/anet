@@ -156,7 +156,7 @@
 
 ## 4. Маршрутные карты (Route Maps / Split Tunneling)
 
-Политики выборочной маршрутизации трафика на клиентах (CIDR подсети и исполняемые файлы Windows).
+Политики выборочной маршрутизации трафика на клиентах (CIDR подсети, исполняемые файлы Windows, внешние списки `rule_provider` и доменные правила `domain`).
 Требует заголовок: `Authorization: Bearer <token>`.
 
 ### `GET /route-maps` — Список маршрутных карт
@@ -171,14 +171,18 @@
       "is_active": true,
       "revision": 3,
       "rules": [
-        { "id": "uuid", "position": 0, "match_type": "cidr", "match_value": "192.168.0.0/16", "action": "direct" },
-        { "id": "uuid", "position": 1, "match_type": "application", "match_value": "steam.exe", "action": "direct" }
+        { "id": "uuid", "position": 0, "match_type": "cidr", "match_value": "192.168.0.0/16", "rule_provider_id": null, "action": "direct" },
+        { "id": "uuid", "position": 1, "match_type": "application", "match_value": "steam.exe", "rule_provider_id": null, "action": "direct" },
+        { "id": "uuid", "position": 2, "match_type": "rule_provider", "match_value": "d290f1ee-6c54-4b01-90e6-d701748f0851", "rule_provider_id": "d290f1ee-6c54-4b01-90e6-d701748f0851", "action": "block" },
+        { "id": "uuid", "position": 3, "match_type": "domain", "match_value": "+.internal.corp", "rule_provider_id": null, "action": "direct" }
       ]
     }
   ]
   ```
 
 ### `POST /route-maps` и `PATCH /route-maps/:id` — Создание / Обновление карты
+Поддерживаемые `match_type`: `"cidr"`, `"application"`, `"rule_provider"`, `"domain"`.
+Поддерживаемые `action`: `"direct"`, `"tunnel"` (или `"proxy"`), `"block"`.
 * **Тело запроса (JSON)**:
   ```json
   {
@@ -187,7 +191,8 @@
     "default_action": "direct",
     "is_active": true,
     "rules": [
-      { "position": 0, "match_type": "cidr", "match_value": "1.1.1.1/32", "action": "tunnel" }
+      { "position": 0, "match_type": "cidr", "match_value": "1.1.1.1/32", "action": "tunnel" },
+      { "position": 1, "match_type": "rule_provider", "match_value": "d290f1ee-6c54-4b01-90e6-d701748f0851", "rule_provider_id": "d290f1ee-6c54-4b01-90e6-d701748f0851", "action": "block" }
     ]
   }
   ```
@@ -422,3 +427,88 @@
   *(Поле `speed_limit` возвращается в кбит/с и передается в eBPF-модуль ядра для ограничения полосы пропускания).*
 
 ### `POST /session/start` и `POST /session/stop` — Учет одновременных сессий
+
+---
+
+## 11. Провайдеры правил, Custom Overrides и бинарный кэш `.abc` (Smart DNS & AdBlock)
+
+Управление внешними списками доменов/IP (GeoSite, GeoIP, AdBlock), инспекция закешированных в БД правил, администраторские оверрайды и раздача бинарного слепка `.abc`.
+
+### `GET /rule-providers` — Список провайдеров правил
+* **Тип доступа**: Административная панель (`Authorization: Bearer <token>`)
+* **Ответ (200 OK)**:
+  ```json
+  [
+    {
+      "id": "d290f1ee-6c54-4b01-90e6-d701748f0851",
+      "name": "AdBlock List",
+      "description": "Block ads and trackers",
+      "provider_type": "domain",
+      "format": "plain",
+      "action": "block",
+      "route_map_id": null,
+      "url": "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts",
+      "update_interval_hours": 24,
+      "last_fetched_at": "2026-10-19 05:00:00",
+      "last_etag": "\"abc123etag\"",
+      "item_count": 78540,
+      "created_at": "2026-10-19 04:50:00",
+      "updated_at": "2026-10-19 05:00:00"
+    }
+  ]
+  ```
+
+### `POST /rule-providers` и `PATCH /rule-providers/:id` — Создание / Обновление провайдера
+* **Поля**:
+  * `provider_type`: `"domain"` | `"ip"`
+  * `format`: `"plain"` | `"v2ray"` | `"cidr"`
+  * `action`: `"block"` | `"direct"` | `"proxy"`
+  * `route_map_id`: UUID маршрутной карты или `null` (глобально для всех профилей)
+
+### `DELETE /rule-providers/:id` — Удаление провайдера и его кэша
+
+### `POST /rule-providers/:id/fetch` — Принудительное скачивание и кэширование провайдера
+Немедленно скачивает список по URL, парсит и нормализует записи, сохраняет их в таблицу `rule_provider_items` и запускает перекомпиляцию `.abc`.
+
+### `GET /rule-providers/:id/items` — Просмотр закешированных элементов провайдера
+Позволяет просмотреть в WebUI какие именно домены и подсети были распознаны и сохранены в БД.
+* **Параметры (Query)**:
+  * `offset`: Смещение (по умолчанию `0`)
+  * `limit`: Лимит на страницу (по умолчанию `100`, макс. `500`)
+  * `search`: Поиск подстроки по `normalized_value` или `raw_value`
+* **Ответ (200 OK)**:
+  ```json
+  {
+    "total": 78540,
+    "items": [
+      {
+        "id": "uuid",
+        "position": 0,
+        "raw_value": "0.0.0.0 ads.example.com",
+        "normalized_value": "ads.example.com",
+        "item_type": "domain_suffix",
+        "match_subdomains": true
+      }
+    ]
+  }
+  ```
+
+### `GET /custom-overrides`, `POST /custom-overrides`, `PATCH /custom-overrides/:id`, `DELETE /custom-overrides/:id` — Администраторские исключения
+* **Поля**:
+  * `route_map_id`: UUID маршрутной карты или `null` (глобально)
+  * `rule_type`: `"domain"` | `"wildcard"` | `"cidr"`
+  * `pattern`: Домен, маска `*.example.com` или подсеть CIDR
+  * `category`: `"block"` | `"direct"` | `"proxy"`
+  * `comment`: Комментарий администратора
+  * `is_active`: `true` | `false`
+
+### `GET /routing/compiled` — Скачивание скомпилированного бинарного кэша `rules.abc`
+* **Тип доступа**: Публичный (не требует заголовков авторизации)
+* **Параметры (Query)**:
+  * `route_map_id` (опционально): UUID маршрутной карты клиента. Если не указан, отдается глобальный кэш.
+* **Заголовки запроса**:
+  * `If-None-Match: "<SHA256_ETAG>"` (опционально)
+* **Ответ**:
+  * `200 OK` (`Content-Type: application/octet-stream`, `ETag: "<SHA256_ETAG>"`) — бинарный слепок `CompiledRoutingCache` в формате `rkyv` (`ABC1`).
+  * `304 Not Modified` — если переданный `If-None-Match` совпадает с актуальным `ETag`.
+

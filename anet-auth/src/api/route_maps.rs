@@ -109,6 +109,7 @@ impl RouteMapsApi {
         if let Err(e) = txn.commit().await {
             return SaveRouteMapResponse::Error(Json(e.to_string()));
         }
+        crate::compiler_worker::invalidate_compiled_rules_cache();
         match load_route_map_dto(&self.db, map).await {
             Ok(map) => SaveRouteMapResponse::Ok(Json(map)),
             Err(e) => SaveRouteMapResponse::Error(Json(e.to_string())),
@@ -175,6 +176,7 @@ impl RouteMapsApi {
         if let Err(e) = txn.commit().await {
             return SaveRouteMapResponse::Error(Json(e.to_string()));
         }
+        crate::compiler_worker::invalidate_compiled_rules_cache();
         match load_route_map_dto(&self.db, saved).await {
             Ok(map) => SaveRouteMapResponse::Ok(Json(map)),
             Err(e) => SaveRouteMapResponse::Error(Json(e.to_string())),
@@ -191,9 +193,13 @@ impl RouteMapsApi {
             return DeleteRouteMapResponse::Unauthorized(Json(err));
         }
         match route_maps::Entity::delete_by_id(id.0).exec(&self.db).await {
-            Ok(result) if result.rows_affected > 0 => DeleteRouteMapResponse::Deleted,
+            Ok(result) if result.rows_affected > 0 => {
+                crate::compiler_worker::invalidate_compiled_rules_cache();
+                DeleteRouteMapResponse::Deleted
+            }
             Ok(_) => DeleteRouteMapResponse::NotFound(Json("Route map not found".to_string())),
             Err(e) => DeleteRouteMapResponse::Error(Json(e.to_string())),
         }
     }
 }
+

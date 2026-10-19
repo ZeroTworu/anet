@@ -1,10 +1,13 @@
 // Декларативная политика split tunneling пользователя.
+export type RouteRuleMatchType = 'cidr' | 'application' | 'domain' | 'rule_provider'
+export type RouteRuleAction = 'tunnel' | 'direct' | 'block' | 'proxy'
+
 export type RouteRule = {
   id?: string | null
   position: number
-  match_type: 'cidr' | 'application'
+  match_type: RouteRuleMatchType
   match_value: string
-  action: 'tunnel' | 'direct'
+  action: RouteRuleAction
 }
 
 export type RouteMap = {

@@ -418,6 +418,27 @@ impl AnetClient {
             .acquire_packet_source(server, &result.auth_response)
             .await?;
 
+        // Инициализация движка Smart DNS, Geo-Routing и AdBlock (.abc + Local Overrides)
+        let local_overrides = Arc::new(anet_filter_core::LocalOverrides::from_config(
+            &config_clone.routing.overrides,
+        ));
+        let rule_cache = crate::rule_updater::RuleCacheManager::new(
+            crate::rule_updater::default_rules_cache_path(),
+        );
+        if let Some(rules_server_url) = config_clone.get_rules_server_url() {
+            let rc_bg = rule_cache.clone();
+            tokio::spawn(async move {
+                if let Err(e) = rc_bg.update_from_server(&rules_server_url).await {
+                    log::warn!("[RuleCache] Background rules.abc update failed: {e}");
+                }
+            });
+        }
+        let direct_ip_cache = crate::direct_ip_cache::DirectIpCache::new();
+        let dns_interceptor = crate::dns_interceptor::DnsInterceptor::new(
+            local_overrides.clone(),
+            direct_ip_cache.clone(),
+        );
+
         let session_start = Instant::now();
         let disconnect_reason = Arc::new(Mutex::new("Normal session termination".to_string()));
 
@@ -486,18 +507,66 @@ impl AnetClient {
         let tx_packets = total_tx_packets.clone();
         let sig_t1 = reconnect_signal.clone();
         let reason_t1 = disconnect_reason.clone();
+        let tx_to_tun_dns = tx_to_tun.clone();
+        let dns_servers_list = config_clone.main.dns_server_list.clone();
+        let dns_interceptor_tx = dns_interceptor.clone();
+        let rule_cache_tx = rule_cache.clone();
+        let local_overrides_tx = local_overrides.clone();
+        let direct_ip_cache_tx = direct_ip_cache.clone();
+
         let t1 = spawn(async move {
             let mut write_buf = BytesMut::with_capacity(COALESCE_BUDGET_BYTES);
 
+            // Возвращает true, если пакет должен идти в VPN-туннель, или false, если он перехвачен/отброшен
+            let should_forward_to_tunnel = |pkt: &Bytes| -> bool {
+                match dns_interceptor_tx.handle_packet(pkt, |domain| rule_cache_tx.lookup_domain(domain)) {
+                    crate::dns_interceptor::InterceptResult::Handled(synth_reply) => {
+                        let _ = tx_to_tun_dns.try_send(synth_reply);
+                        return false;
+                    }
+                    crate::dns_interceptor::InterceptResult::Drop => {
+                        return false;
+                    }
+                    crate::dns_interceptor::InterceptResult::DirectQuery => {
+                        let interceptor_c = dns_interceptor_tx.clone();
+                        let pkt_c = pkt.clone();
+                        let dns_c = dns_servers_list.clone();
+                        let tun_tx_c = tx_to_tun_dns.clone();
+                        tokio::spawn(async move {
+                            if let Some((reply_pkt, _resolved_ips)) =
+                                interceptor_c.resolve_direct_dns_packet(&pkt_c, &dns_c).await
+                            {
+                                let _ = tun_tx_c.send(reply_pkt).await;
+                            }
+                        });
+                        return false;
+                    }
+                    crate::dns_interceptor::InterceptResult::PassThrough => {}
+                }
+
+                if let Some(dst_ip) = crate::dns_interceptor::extract_packet_dst_ip(pkt) {
+                    let ip_action = local_overrides_tx
+                        .lookup_ip(dst_ip)
+                        .or_else(|| direct_ip_cache_tx.check(&dst_ip))
+                        .or_else(|| rule_cache_tx.lookup_ip(dst_ip));
+
+                    if matches!(ip_action, Some(anet_filter_core::RuleAction::Block)) {
+                        return false;
+                    }
+                }
+
+                true
+            };
+
             loop {
-                let packet = tokio::select! {
+                let (packet, is_probe) = tokio::select! {
                     biased;
                     probe_pkt = rx_probe.recv() => {
                         match probe_pkt {
-                            Some(p) => p,
+                            Some(p) => (p, true),
                             None => {
                                 match rx_from_tun.recv().await {
-                                    Some(p) => p,
+                                    Some(p) => (p, false),
                                     None => break,
                                 }
                             }
@@ -505,7 +574,7 @@ impl AnetClient {
                     }
                     pkt = rx_from_tun.recv() => {
                         match pkt {
-                            Some(p) => p,
+                            Some(p) => (p, false),
                             None => {
                                 info!("[Tunnel/Tx] Local TUN packet channel closed (adapter or worker stopped).");
                                 *reason_t1.lock().unwrap() = "Local TUN packet channel closed (adapter or worker stopped)".to_string();
@@ -521,20 +590,23 @@ impl AnetClient {
                 };
 
                 write_buf.clear();
-                *tx_time.lock().unwrap() = Instant::now();
-                let len = packet.len() as u64;
-                tx_bytes.fetch_add(len, Ordering::Relaxed);
-                tx_packets.fetch_add(1, Ordering::Relaxed);
-
-                frame_packet_into(&mut write_buf, &packet);
+                if is_probe || should_forward_to_tunnel(&packet) {
+                    *tx_time.lock().unwrap() = Instant::now();
+                    let len = packet.len() as u64;
+                    tx_bytes.fetch_add(len, Ordering::Relaxed);
+                    tx_packets.fetch_add(1, Ordering::Relaxed);
+                    frame_packet_into(&mut write_buf, &packet);
+                }
 
                 while write_buf.len() < COALESCE_BUDGET_BYTES {
                     match rx_from_tun.try_recv() {
                         Ok(p) => {
-                            let len = p.len() as u64;
-                            tx_bytes.fetch_add(len, Ordering::Relaxed);
-                            tx_packets.fetch_add(1, Ordering::Relaxed);
-                            frame_packet_into(&mut write_buf, &p);
+                            if should_forward_to_tunnel(&p) {
+                                let len = p.len() as u64;
+                                tx_bytes.fetch_add(len, Ordering::Relaxed);
+                                tx_packets.fetch_add(1, Ordering::Relaxed);
+                                frame_packet_into(&mut write_buf, &p);
+                            }
                         }
                         Err(_) => {
                             if let Ok(p) = rx_probe.try_recv() {

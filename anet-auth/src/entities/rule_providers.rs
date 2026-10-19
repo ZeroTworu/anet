@@ -40,6 +40,8 @@ pub enum ProviderFormat {
     CidrList,
 }
 
+use super::admin_custom_overrides::OverrideCategory;
+
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "rule_providers")]
 pub struct Model {
@@ -49,6 +51,8 @@ pub struct Model {
     pub description: String,
     pub provider_type: ProviderType,
     pub format: ProviderFormat,
+    pub action: OverrideCategory,
+    pub route_map_id: Option<Uuid>,
     pub url: String,
     pub update_interval_hours: i32,
     pub last_fetched_at: Option<DateTime>,
@@ -63,3 +67,4 @@ pub struct Model {
 pub enum Relation {}
 
 impl ActiveModelBehavior for ActiveModel {}
+

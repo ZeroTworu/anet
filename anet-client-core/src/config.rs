@@ -393,6 +393,17 @@ impl Default for AhttpConfig {
     }
 }
 
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct RoutingConfig {
+    /// Опциональный URL для скачивания скомпилированного кэша правил rules.abc
+    #[serde(default)]
+    pub rules_url: Option<String>,
+
+    /// Локальные пользовательские исключения [routing.overrides] (п. 4.2 ТЗ)
+    #[serde(default)]
+    pub overrides: anet_filter_core::LocalOverridesConfig,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct CoreConfig {
     #[serde(default)]
@@ -419,9 +430,30 @@ pub struct CoreConfig {
 
     #[serde(default)]
     pub ahttp: AhttpConfig,
+
+    #[serde(default)]
+    pub routing: RoutingConfig,
 }
 
 impl CoreConfig {
+    /// Возвращает URL эндпоинта или базового сервера anet-auth для загрузки rules.abc
+    pub fn get_rules_server_url(&self) -> Option<String> {
+        if let Some(url) = &self.routing.rules_url {
+            let trimmed = url.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+        if let Some(cfg_url) = self.main.get_config_url() {
+            if let Ok(uri) = cfg_url.parse::<http::Uri>() {
+                if let (Some(scheme), Some(authority)) = (uri.scheme_str(), uri.authority()) {
+                    return Some(format!("{}://{}", scheme, authority));
+                }
+            }
+        }
+        None
+    }
+
     /// Проверяет обязательный список DSN-серверов.
     pub fn sanitize(&mut self) -> anyhow::Result<()> {
         if self.servers.is_empty() {

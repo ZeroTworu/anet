@@ -18,9 +18,10 @@ pub use checksum::{
     verify_ipv4_checksum,
 };
 pub use model::{
-    CompiledRoutingCache, RuleAction, CURRENT_SCHEMA_VERSION, MAGIC_ABC1,
-    MOZILLA_CANARY_DOMAIN,
+    CompiledRoutingCache, RuleAction, CAPTIVE_PORTAL_DOMAINS, CURRENT_SCHEMA_VERSION,
+    DEFAULT_DOH_DOMAINS, MAGIC_ABC1, MOZILLA_CANARY_DOMAIN,
 };
 pub use overrides::{LocalOverrides, LocalOverridesConfig};
 pub use radix::{IpRoutingTable, IpRoutingTableBuilder};
 pub use trie::{DomainTrie, DomainTrieBuilder};
+
