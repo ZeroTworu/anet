@@ -144,21 +144,20 @@ impl CompiledRoutingCache {
 
     /// Выполняет быструю Zero-Copy валидацию и возвращает ссылку на корень архива
     pub fn from_bytes(bytes: &[u8]) -> Result<&ArchivedCompiledRoutingCache, anyhow::Error> {
-        if bytes.len() < 16 {
-            anyhow::bail!("Buffer is too small for a valid .abc cache");
-        }
-
-        let magic = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-        if magic != MAGIC_ABC1 {
-            anyhow::bail!(
-                "Invalid .abc cache magic: expected 0x{:08X}, got 0x{:08X}",
-                MAGIC_ABC1,
-                magic
-            );
+        if bytes.len() < std::mem::size_of::<ArchivedCompiledRoutingCache>() {
+            anyhow::bail!("Buffer is too small for a valid .abc cache ({} bytes)", bytes.len());
         }
 
         let archived = check_archived_root::<CompiledRoutingCache>(bytes)
             .map_err(|e| anyhow::anyhow!("Validation error in .abc cache: {e}"))?;
+
+        if archived.magic != MAGIC_ABC1 {
+            anyhow::bail!(
+                "Invalid .abc cache magic: expected 0x{:08X}, got 0x{:08X}",
+                MAGIC_ABC1,
+                archived.magic
+            );
+        }
 
         if archived.schema_version != CURRENT_SCHEMA_VERSION {
             anyhow::bail!(

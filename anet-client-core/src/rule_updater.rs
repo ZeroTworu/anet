@@ -217,15 +217,22 @@ impl RuleCacheManager {
 
         let bytes = resp.bytes().await?;
 
-        // Проверяем валидность полученного бинарника
-        CompiledRoutingCache::from_bytes(&bytes)?;
-
-        // Записываем во временный файл и атомарно переименовываем
+        // Записываем во временный файл, валидируем через выровненный по странице Mmap и атомарно переименовываем
         if let Some(parent) = self.cache_path.parent() {
             fs::create_dir_all(parent)?;
         }
         let tmp_path = self.cache_path.with_extension("tmp");
         fs::write(&tmp_path, &bytes)?;
+
+        {
+            let tmp_file = File::open(&tmp_path)?;
+            let tmp_mmap = unsafe { Mmap::map(&tmp_file)? };
+            if let Err(e) = CompiledRoutingCache::from_bytes(&tmp_mmap) {
+                let _ = fs::remove_file(&tmp_path);
+                return Err(e);
+            }
+        }
+
         fs::rename(&tmp_path, &self.cache_path)?;
 
         if let Some(etag) = new_etag {
