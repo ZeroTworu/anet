@@ -69,9 +69,13 @@ pub fn default_rules_cache_path() -> PathBuf {
         let pkg = cmdline.split('\0').next().unwrap_or("").trim();
         if pkg.contains('.') && !pkg.starts_with('/') {
             for base in ["/data/user/0", "/data/data"] {
-                let dir = PathBuf::from(base).join(pkg).join("cache").join("anet");
-                if is_dir_writable(&dir) {
+                let pkg_cache = PathBuf::from(base).join(pkg).join("cache");
+                let dir = pkg_cache.join("anet");
+                if dir.join("rules.abc").exists() || is_dir_writable(&dir) {
                     return dir.join("rules.abc");
+                }
+                if pkg_cache.join("rules.abc").exists() || is_dir_writable(&pkg_cache) {
+                    return pkg_cache.join("rules.abc");
                 }
             }
         }

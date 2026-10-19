@@ -211,7 +211,7 @@ impl TunFactory for AndroidCallbackTunFactory {
             .await;
         let mut exclude_nets = user_excludes.clone();
 
-        // ВАЖНО: Добавляем системные IP обхода (bypass_ips) в исключения Android VpnService,
+        // 1. Добавляем системные IP обхода (bypass_ips) в исключения Android VpnService,
         // чтобы трафик к медиасерверам JVB/Ktalk (UDP 10000-20000) и серверу не заворачивался в tun0
         let bypass_list = self.bypass_ips.lock().unwrap().clone();
         for (ip, prefix) in bypass_list {
@@ -226,24 +226,65 @@ impl TunFactory for AndroidCallbackTunFactory {
             }
         }
 
+        // 2. Добавляем статические Direct-сети из скомпилированного кэша rules.abc (GeoIP / Direct)
+        let rule_cache = anet_client_core::rule_updater::RuleCacheManager::new(
+            anet_client_core::rule_updater::default_rules_cache_path(),
+        );
+        let direct_routes = rule_cache.collect_direct_routes();
+        if !direct_routes.is_empty() {
+            info!(
+                "[Android VpnService] Found {} static Direct routes in rules.abc",
+                direct_routes.len()
+            );
+            for (ip, prefix) in direct_routes {
+                if let Ok(net) = IpNet::new(ip, prefix) {
+                    if !exclude_nets.contains(&net) {
+                        exclude_nets.push(net);
+                    }
+                }
+            }
+        }
+
+        // 3. Добавляем локальные пользовательские Direct-исключения из client.toml [routing.overrides]
+        let local_direct_nets = self.resolve_to_ipnet(&self.config.routing.overrides.direct).await;
+        for net in local_direct_nets {
+            if !exclude_nets.contains(&net) {
+                info!(
+                    "[Android VpnService] Adding local override direct subnet {} to tunnel exclusions",
+                    net
+                );
+                exclude_nets.push(net);
+            }
+        }
+
         // Генерация строк
         let include_str = Self::ipnet_list_to_string(&include_nets);
         let exclude_str = Self::ipnet_list_to_string(&exclude_nets);
 
         // Генерация Fallback (эмуляция exclude для старых Android).
         // Для Legacy Android (Android 11 и ниже) вычисляем fallback routes ТОЛЬКО если
-        // пользователь явно настроил exclude_route_for. Если пользовательских исключений нет,
-        // системные bypass_ips гарантированно защищены через builder.addDisallowedApplication(packageName),
-        // а искусственное дробление 0.0.0.0/0 на 150-250 подсетей переполняет таблицу маршрутизации netd
-        // и ломает системный DNS на Android 11.
+        // пользователь явно настроил небольшое число исключений (не перегружая netd).
         let fallback_str = if include_nets.is_empty() && !user_excludes.is_empty() {
             let fallback_nets = Self::calculate_fallback_routes(&user_excludes);
+            Self::ipnet_list_to_string(&fallback_nets)
+        } else if include_nets.is_empty() && !exclude_nets.is_empty() && exclude_nets.len() <= 64 {
+            let fallback_nets = Self::calculate_fallback_routes(&exclude_nets);
             Self::ipnet_list_to_string(&fallback_nets)
         } else {
             String::new()
         };
 
-        let dns_str = self.config.main.dns_server_list.join(",");
+        // Настройка DNS: если список пуст, используем виртуальный шлюз туннеля (auth.gateway),
+        // чтобы Android VpnService не пытался делать DoT на порт 853 (1.1.1.1:853), создавая 5-секундную задержку
+        let dns_str = if self.config.main.dns_server_list.is_empty() {
+            if !auth.gateway.trim().is_empty() {
+                auth.gateway.trim().to_string()
+            } else {
+                "1.1.1.1".to_string()
+            }
+        } else {
+            self.config.main.dns_server_list.join(",")
+        };
 
         info!(
             "Routes Calc: IncludeItems={}, ExcludeItems={}",

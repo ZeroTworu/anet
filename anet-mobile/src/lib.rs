@@ -568,6 +568,34 @@ pub extern "system" fn Java_org_alco_anet_ANetVpnService_connectVpn(
 ) {
     info!("JNI: connectVpn called");
 
+    // Автоматически определяем путь к приватному кэшу приложения через Android Context: this.getCacheDir().getAbsolutePath()
+    if let Ok(cache_dir_val) = env.call_method(&this, "getCacheDir", "()Ljava/io/File;", &[]) {
+        if let Ok(cache_dir_obj) = cache_dir_val.l() {
+            if !cache_dir_obj.as_raw().is_null() {
+                if let Ok(path_val) =
+                    env.call_method(&cache_dir_obj, "getAbsolutePath", "()Ljava/lang/String;", &[])
+                {
+                    if let Ok(path_obj) = path_val.l() {
+                        let path_jstr = JString::from(path_obj);
+                        if let Ok(path_rust) = env.get_string(&path_jstr) {
+                            let cache_dir_str: String = path_rust.into();
+                            let rules_path =
+                                std::path::PathBuf::from(cache_dir_str).join("rules.abc");
+                            std::env::set_var(
+                                "ANET_RULES_CACHE_PATH",
+                                rules_path.to_string_lossy().to_string(),
+                            );
+                            info!(
+                                "[Android JNI] Configured ANET_RULES_CACHE_PATH={}",
+                                rules_path.display()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Подготавливаем потокобезопасные структуры за пределами Tokio-рантайма
     let jvm = env.get_java_vm().unwrap();
     let jvm_arc = Arc::new(jvm);
