@@ -441,7 +441,10 @@ impl ANetApp {
                         let (merged_cfg, nodes_count) = {
                             let mut settings = lock_ignore_poison(&settings_arc);
                             settings.cached_server_config = Some(bundle);
-                            let core_cfg: CoreConfig = toml::from_str(&content).unwrap();
+                            let mut core_cfg: CoreConfig = toml::from_str(&content).unwrap();
+                            if core_cfg.main.get_config_url().is_none() {
+                                core_cfg.main.config_url = Some(url.clone());
+                            }
                             let count = core_cfg.servers.len();
                             let merged = apply_overrides(
                                 core_cfg,
@@ -520,6 +523,22 @@ impl ANetApp {
                         using_cached_from: cached_date,
                     });
                 }
+            }
+
+            // Синхронизируем скомпилированные правила маршрутизации rules.abc при старте клиента
+            let rules_endpoint = if url.contains("/config/") {
+                url.replace("/config/", "/routing/compiled-rules/")
+            } else {
+                url.clone()
+            };
+            let rule_cache = anet_client_core::rule_updater::RuleCacheManager::new(
+                anet_client_core::rule_updater::default_rules_cache_path(),
+            );
+            if let Err(e) = rule_cache.update_from_server(&rules_endpoint).await {
+                push_log(
+                    &logs_arc,
+                    &format!("[RuleCache] Ошибка обновления rules.abc: {}", e),
+                );
             }
         });
     }
@@ -650,6 +669,22 @@ impl ANetApp {
     ) {
         match toml::from_str::<CoreConfig>(content) {
             Ok(mut cfg) => {
+                if cfg.main.get_config_url().is_none() {
+                    let fallback_url = if id == SERVER_CONFIG_ID {
+                        DesktopSecureStore::get_server_config_url()
+                    } else {
+                        let settings = lock_ignore_poison(&self.settings);
+                        settings
+                            .configs
+                            .iter()
+                            .find(|c| c.id == id)
+                            .and_then(|c| c.url.clone())
+                            .or_else(DesktopSecureStore::get_server_config_url)
+                    };
+                    if let Some(u) = fallback_url {
+                        cfg.main.config_url = Some(u);
+                    }
+                }
                 let _ = cfg.sanitize();
                 self.filter_mode = match cfg.main.per_app_mode {
                     PerAppMode::All => FilterMode::All,

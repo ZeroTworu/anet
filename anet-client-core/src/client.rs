@@ -414,6 +414,14 @@ impl AnetClient {
                 .await?;
         }
 
+        // Гарантируем, что прямые DNS-резолверы для Direct-правил всегда идут в обход туннеля
+        for direct_dns_ip in crate::dns_interceptor::DIRECT_UPSTREAM_DNS_IPS {
+            let _ = self
+                .route_manager
+                .add_bypass_route(IpAddr::V4(direct_dns_ip), 32)
+                .await;
+        }
+
         let (tx_to_tun, mut rx_from_tun, iface_name, _app_filter) = self
             .acquire_packet_source(server, &result.auth_response)
             .await?;
@@ -426,12 +434,41 @@ impl AnetClient {
             crate::rule_updater::default_rules_cache_path(),
         );
         if let Some(rules_server_url) = config_clone.get_rules_server_url() {
+            // Синхронно обновляем rules.abc перед запуском маршрутизации (с таймаутом 5с, чтобы не задерживать старт)
+            match tokio::time::timeout(
+                Duration::from_secs(5),
+                rule_cache.update_from_server(&rules_server_url),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    let msg = format!("[RuleCache] Failed to download rules.abc from {rules_server_url}: {e}");
+                    warn!("{msg}");
+                    status(&msg);
+                }
+                Err(_) => {
+                    let msg = format!("[RuleCache] Timeout downloading rules.abc from {rules_server_url} (using cached rules if available)");
+                    warn!("{msg}");
+                    status(&msg);
+                }
+            }
+
+            // Фоновое периодическое обновление правил каждые 10 минут
             let rc_bg = rule_cache.clone();
+            let url_bg = rules_server_url.clone();
             tokio::spawn(async move {
-                if let Err(e) = rc_bg.update_from_server(&rules_server_url).await {
-                    log::warn!("[RuleCache] Background rules.abc update failed: {e}");
+                loop {
+                    sleep(Duration::from_secs(600)).await;
+                    if let Err(e) = rc_bg.update_from_server(&url_bg).await {
+                        log::debug!("[RuleCache] Periodic rules.abc check failed: {e}");
+                    }
                 }
             });
+        } else {
+            let msg = "[RuleCache] Server URL for rules.abc is not configured (set routing.rules_url or main.config_url in client.toml)";
+            warn!("{msg}");
+            status(msg);
         }
         let direct_ip_cache = crate::direct_ip_cache::DirectIpCache::new();
         let dns_interceptor = crate::dns_interceptor::DnsInterceptor::new(
@@ -459,7 +496,7 @@ impl AnetClient {
 
         let last_rtt_us = Arc::new(AtomicU64::new(u64::MAX));
         let last_reply_us = Arc::new(AtomicU64::new(0));
-        let (tx_probe, mut rx_probe) = tokio::sync::mpsc::channel::<Bytes>(16);
+        let (tx_probe, mut rx_probe) = tokio::sync::mpsc::channel::<Bytes>(64);
 
         // Внутритуннельный генератор ICMP Echo Request для универсального измерения честного RTT.
         // Работает для ВСЕХ видов транспорта (QUIC, SSH, VNC, AHTTP, WS, WRTC) прямо внутри шифрованного потока.
@@ -508,6 +545,8 @@ impl AnetClient {
         let sig_t1 = reconnect_signal.clone();
         let reason_t1 = disconnect_reason.clone();
         let tx_to_tun_dns = tx_to_tun.clone();
+        let tx_probe_dns = tx_probe.clone();
+        let route_manager_dns = self.route_manager.clone();
         let dns_servers_list = config_clone.main.dns_server_list.clone();
         let dns_interceptor_tx = dns_interceptor.clone();
         let rule_cache_tx = rule_cache.clone();
@@ -519,6 +558,11 @@ impl AnetClient {
 
             // Возвращает true, если пакет должен идти в VPN-туннель, или false, если он перехвачен/отброшен
             let should_forward_to_tunnel = |pkt: &Bytes| -> bool {
+                // Блокируем оппортунистический DoH/DoT к публичным резолверам, чтобы браузеры использовали UDP:53
+                if crate::dns_interceptor::is_encrypted_dns_packet(pkt) {
+                    return false;
+                }
+
                 match dns_interceptor_tx.handle_packet(pkt, |domain| rule_cache_tx.lookup_domain(domain)) {
                     crate::dns_interceptor::InterceptResult::Handled(synth_reply) => {
                         let _ = tx_to_tun_dns.try_send(synth_reply);
@@ -532,11 +576,27 @@ impl AnetClient {
                         let pkt_c = pkt.clone();
                         let dns_c = dns_servers_list.clone();
                         let tun_tx_c = tx_to_tun_dns.clone();
+                        let probe_tx_c = tx_probe_dns.clone();
+                        let rm_c = route_manager_dns.clone();
                         tokio::spawn(async move {
-                            if let Some((reply_pkt, _resolved_ips)) =
+                            if let Some((reply_pkt, resolved_ips)) =
                                 interceptor_c.resolve_direct_dns_packet(&pkt_c, &dns_c).await
                             {
+                                for ip in &resolved_ips {
+                                    let prefix = if ip.is_ipv4() { 32 } else { 128 };
+                                    let _ = rm_c.add_bypass_route(*ip, prefix).await;
+                                }
+                                if !resolved_ips.is_empty() {
+                                    log::info!(
+                                        "[DNS/Direct] Added OS bypass routes for {:?}",
+                                        resolved_ips
+                                    );
+                                }
                                 let _ = tun_tx_c.send(reply_pkt).await;
+                            } else {
+                                // Fallback: если прямой UDP:53 заблокирован провайдером, отправляем запрос в туннель
+                                // (ответ будет перехвачен в t2 и IP-адреса также получат bypass-маршруты до отдачи браузеру)
+                                let _ = probe_tx_c.send(pkt_c).await;
                             }
                         });
                         return false;
@@ -642,6 +702,9 @@ impl AnetClient {
         let last_rtt_rx = last_rtt_us.clone();
         let last_reply_rx = last_reply_us.clone();
         let probe_start_rx = session_start;
+        let dns_interceptor_rx = dns_interceptor.clone();
+        let rule_cache_rx = rule_cache.clone();
+        let route_manager_rx = self.route_manager.clone();
         let t2 = spawn(async move {
             loop {
                 select! {
@@ -681,6 +744,23 @@ impl AnetClient {
                                             _seq
                                         );
                                         continue; // Поглощаем ответ зонда, не отдаем в локальный TUN интерфейс ОС
+                                    }
+                                }
+
+                                // Если из туннеля пришел DNS-ответ для Direct-домена, регистрируем bypass-маршруты ДО передачи пакета в ОС
+                                if let Some((qname, resolved_ips)) = dns_interceptor_rx
+                                    .inspect_dns_response(&packet, |domain| rule_cache_rx.lookup_domain(domain))
+                                {
+                                    for ip in &resolved_ips {
+                                        let prefix = if ip.is_ipv4() { 32 } else { 128 };
+                                        let _ = route_manager_rx.add_bypass_route(*ip, prefix).await;
+                                    }
+                                    if !resolved_ips.is_empty() {
+                                        log::info!(
+                                            "[DNS/Direct] Domain '{}' resolved via tunnel -> added OS bypass routes for {:?}",
+                                            qname,
+                                            resolved_ips
+                                        );
                                     }
                                 }
 
@@ -739,6 +819,37 @@ impl AnetClient {
                             .await?;
                     }
                 }
+
+                // Применяем локальные исключения [routing.overrides] direct из client.toml
+                if !config_clone.routing.overrides.direct.is_empty() {
+                    let local_direct_routes = self
+                        .resolve_list(&config_clone.routing.overrides.direct)
+                        .await;
+                    for net in local_direct_routes.iter() {
+                        let _ = self
+                            .route_manager
+                            .add_bypass_route(net.network(), net.prefix_len())
+                            .await;
+                    }
+                }
+
+                // Применяем статические CIDR-маршруты Direct из скомпилированного rules.abc
+                let abc_direct_routes = rule_cache.collect_direct_routes();
+                if !abc_direct_routes.is_empty() {
+                    let mut applied = 0usize;
+                    for (ip, prefix) in abc_direct_routes {
+                        if self.route_manager.add_bypass_route(ip, prefix).await.is_ok() {
+                            applied += 1;
+                        }
+                    }
+                    let msg = format!(
+                        "[RuleCache] Applied {} static Direct CIDR bypass routes from rules.abc",
+                        applied
+                    );
+                    info!("{msg}");
+                    status(&msg);
+                }
+
                 self.route_manager
                     .set_default_route(&result.auth_response.gateway, &iface_name)
                     .await?;

@@ -9,12 +9,25 @@ use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-/// Возвращает стандартный путь к локальному кэшу `rules.abc`
+/// Возвращает стандартный путь к локальному кэшу `rules.abc` (приоритетно рядом с бинарником клиента)
 pub fn default_rules_cache_path() -> PathBuf {
     if let Ok(custom) = std::env::var("ANET_RULES_CACHE_PATH") {
         let trimmed = custom.trim();
         if !trimmed.is_empty() {
             return PathBuf::from(trimmed);
+        }
+    }
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            let candidate = exe_dir.join("rules.abc");
+            if candidate.exists() {
+                return candidate;
+            }
+            let probe = exe_dir.join(".anet_write_probe");
+            if fs::write(&probe, b"ok").is_ok() {
+                let _ = fs::remove_file(&probe);
+                return candidate;
+            }
         }
     }
     if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
@@ -46,6 +59,11 @@ impl RuleCacheManager {
         manager
     }
 
+    /// Возвращает путь к файлу rules.abc
+    pub fn cache_path(&self) -> &std::path::Path {
+        &self.cache_path
+    }
+
     /// Загружает локальный файл rules.abc через mmap
     pub fn load_from_disk(&self) -> bool {
         if !self.cache_path.exists() {
@@ -60,14 +78,28 @@ impl RuleCacheManager {
             Ok(file) => match unsafe { Mmap::map(&file) } {
                 Ok(mmap) => {
                     // Валидация Zero-Copy корня
-                    if let Err(e) = CompiledRoutingCache::from_bytes(&mmap) {
-                        warn!("[RuleCache] Corrupted .abc file on disk: {e}");
-                        return false;
-                    }
-                    info!(
-                        "[RuleCache] Successfully mapped rules.abc ({} bytes)",
-                        mmap.len()
+                    let (domains_cnt, ips_cnt) = match CompiledRoutingCache::from_bytes(&mmap) {
+                        Ok(archived) => (
+                            archived.domain_trie.nodes.len(),
+                            archived.ip_table.ipv4_nodes.len() + archived.ip_table.ipv6_nodes.len(),
+                        ),
+                        Err(e) => {
+                            warn!("[RuleCache] Corrupted .abc file on disk: {e}");
+                            crate::events::status(&format!(
+                                "[RuleCache] Corrupted rules.abc on disk: {e}"
+                            ));
+                            return false;
+                        }
+                    };
+                    let msg = format!(
+                        "[RuleCache] Loaded rules.abc ({} bytes, {} domain nodes, {} IP nodes) from {}",
+                        mmap.len(),
+                        domains_cnt,
+                        ips_cnt,
+                        self.cache_path.display()
                     );
+                    info!("{msg}");
+                    crate::events::status(&msg);
                     self.current_mmap.store(Arc::new(Some(Arc::new(mmap))));
                     true
                 }
@@ -83,17 +115,21 @@ impl RuleCacheManager {
         }
     }
 
-    /// Выполняет фоновое обновление правил по HTTP с проверкой ETag
+    /// Выполняет обновление правил по HTTP с проверкой ETag
     pub async fn update_from_server(&self, server_url: &str) -> anyhow::Result<()> {
         let clean = server_url.trim().trim_end_matches('/');
-        let endpoint = if clean.contains("/routing/compiled-rules") {
+        let endpoint = if clean.contains("/routing/compiled") {
             clean.to_string()
         } else {
             format!("{}/api/v1/routing/compiled-rules", clean)
         };
 
+        let msg = format!("[RuleCache] Checking routing rules at {endpoint} ...");
+        info!("{msg}");
+        crate::events::status(&msg);
+
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(15))
+            .timeout(std::time::Duration::from_secs(10))
             .build()?;
 
         let mut req = client.get(&endpoint);
@@ -110,7 +146,12 @@ impl RuleCacheManager {
         let resp = req.send().await?;
 
         if resp.status() == reqwest::StatusCode::NOT_MODIFIED {
-            debug!("[RuleCache] Rules are up to date (304 Not Modified)");
+            let msg = format!(
+                "[RuleCache] rules.abc is up to date (304 Not Modified, {})",
+                self.cache_path.display()
+            );
+            info!("{msg}");
+            crate::events::status(&msg);
             return Ok(());
         }
 
@@ -141,10 +182,13 @@ impl RuleCacheManager {
             let _ = fs::write(&etag_file, etag);
         }
 
-        info!(
-            "[RuleCache] Downloaded and applied new rules.abc ({} bytes)",
-            bytes.len()
+        let msg = format!(
+            "[RuleCache] Downloaded rules.abc ({} bytes) -> {}",
+            bytes.len(),
+            self.cache_path.display()
         );
+        info!("{msg}");
+        crate::events::status(&msg);
         self.load_from_disk();
         Ok(())
     }
@@ -169,5 +213,16 @@ impl RuleCacheManager {
             }
         }
         None
+    }
+
+    /// Возвращает все статические подсети (IP, prefix_len) с действием `Direct` из `rules.abc`
+    pub fn collect_direct_routes(&self) -> Vec<(IpAddr, u8)> {
+        let guard = self.current_mmap.load();
+        if let Some(mmap) = guard.as_ref() {
+            if let Ok(archived) = CompiledRoutingCache::from_bytes(mmap) {
+                return archived.ip_table.collect_direct_routes();
+            }
+        }
+        Vec::new()
     }
 }

@@ -646,7 +646,13 @@ impl UsersApi {
 
     /// ПУБЛИЧНЫЙ ЭНДПОИНТ: Скачать готовый client.toml
     #[oai(path = "/config/:id", method = "get")]
-    async fn download_config(&self, id: poem_openapi::param::Path<Uuid>) -> DownloadConfigResponse {
+    async fn download_config(
+        &self,
+        id: poem_openapi::param::Path<Uuid>,
+        #[oai(name = "Host")] host: poem_openapi::param::Header<Option<String>>,
+        #[oai(name = "X-Forwarded-Proto")] forwarded_proto: poem_openapi::param::Header<Option<String>>,
+        #[oai(name = "X-Forwarded-Host")] forwarded_host: poem_openapi::param::Header<Option<String>>,
+    ) -> DownloadConfigResponse {
         let (user_opt, assigned_servers) = match users::Entity::find_by_id(id.0)
             .find_with_related(servers::Entity)
             .all(&self.db)
@@ -1069,12 +1075,44 @@ impl UsersApi {
             }
         };
 
+        let effective_host = forwarded_host
+            .0
+            .filter(|h| !h.trim().is_empty())
+            .or_else(|| host.0.filter(|h| !h.trim().is_empty()));
+        let scheme = forwarded_proto
+            .0
+            .filter(|p| !p.trim().is_empty())
+            .unwrap_or_else(|| "http".to_string());
+        let base_auth_url = std::env::var("ANET_PUBLIC_URL")
+            .ok()
+            .filter(|u| !u.trim().is_empty())
+            .or_else(|| effective_host.map(|h| format!("{}://{}", scheme, h.trim())));
+
+        let computed_rules_url = base_auth_url
+            .as_ref()
+            .map(|base| {
+                let clean_base = base.trim_end_matches('/');
+                if let Some(rm_id) = user_opt.route_map_id {
+                    format!("{}/api/v1/routing/compiled-rules/{}", clean_base, rm_id)
+                } else {
+                    format!("{}/api/v1/routing/compiled-rules", clean_base)
+                }
+            })
+            .unwrap_or_default();
+
         let mut config_output = template_content;
+        if !config_output.contains("{{RULES_URL}}") && !config_output.contains("[routing]") {
+            config_output.push_str(&format!(
+                "\n[routing]\nrules_url = \"{}\"\n",
+                computed_rules_url
+            ));
+        }
         config_output.push_str(&servers_toml);
 
         let final_output = config_output
             .replace("{{PRIVATE_KEY}}", &decrypted_private_key)
-            .replace("{{SERVER_PUB_KEY}}", &fallback_pub_key);
+            .replace("{{SERVER_PUB_KEY}}", &fallback_pub_key)
+            .replace("{{RULES_URL}}", &computed_rules_url);
         let final_output = if let Some(routes) = compiled_routes {
             final_output
                 .replace("{{ROUTE_FOR}}", &toml_string_array(&routes.route_for))

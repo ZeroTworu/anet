@@ -176,6 +176,7 @@ mod tests {
         let rendered = include_str!("../../contrib/client_template.toml")
             .replace("{{PRIVATE_KEY}}", "private")
             .replace("{{SERVER_PUB_KEY}}", "public")
+            .replace("{{RULES_URL}}", "")
             .replace("{{ROUTE_FOR}}", &toml_string_array(&compiled.route_for))
             .replace(
                 "{{EXCLUDE_ROUTE_FOR}}",

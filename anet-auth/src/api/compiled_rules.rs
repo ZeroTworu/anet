@@ -3,8 +3,10 @@
 //! и серверное кэширование скомпилированных бинарных артефактов в памяти.
 
 use anet_filter_core::{RoutingCacheCompiler, RuleAction};
+use log::info;
 use poem_openapi::{
-    param::Header, param::Path, payload::Binary, payload::PlainText, ApiResponse, OpenApi,
+    param::Header, param::Path, param::Query, payload::Binary, payload::PlainText, ApiResponse,
+    OpenApi,
 };
 use sea_orm::{ColumnTrait, Condition, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder};
 use sha2::{Digest, Sha256};
@@ -78,38 +80,70 @@ impl CompiledRulesApi {
 
     async fn compile_and_serve(
         &self,
-        route_map_id: Option<Uuid>,
+        requested_id: Option<Uuid>,
         if_none_match: Option<String>,
     ) -> CompiledRulesResponse {
+        // Разрешаем requested_id: это может быть либо ID карты маршрутизации (route_map_id), либо ID пользователя (user_id)
+        let mut route_map_id = None;
+        let mut default_action = RuleAction::Proxy;
+
+        if let Some(id) = requested_id {
+            if let Ok(Some(map)) = route_maps::Entity::find_by_id(id).one(&self.db).await {
+                route_map_id = Some(map.id);
+                default_action =
+                    RuleAction::from_str_loose(&map.default_action).unwrap_or(RuleAction::Proxy);
+            } else if let Ok(Some(user)) =
+                crate::entities::users::Entity::find_by_id(id).one(&self.db).await
+            {
+                if let Some(user_map_id) = user.route_map_id {
+                    if let Ok(Some(map)) =
+                        route_maps::Entity::find_by_id(user_map_id).one(&self.db).await
+                    {
+                        route_map_id = Some(map.id);
+                        default_action = RuleAction::from_str_loose(&map.default_action)
+                            .unwrap_or(RuleAction::Proxy);
+                    }
+                }
+            }
+        }
+
         // 0. Проверяем скомпилированный in-memory кэш .abc
         if let Some(cached) = get_cached_abc(route_map_id) {
             if let Some(client_etag) = &if_none_match {
                 if client_etag.trim() == cached.etag {
+                    info!(
+                        "[CompiledRules] Client rules.abc up to date (304 Not Modified, route_map_id={:?})",
+                        route_map_id
+                    );
                     return CompiledRulesResponse::NotModified;
                 }
             }
+            info!(
+                "[CompiledRules] Serving cached rules.abc (route_map_id={:?}, size={} bytes, etag={})",
+                route_map_id,
+                cached.bytes.len(),
+                cached.etag
+            );
             return CompiledRulesResponse::Ok(Binary(cached.bytes), cached.etag);
         }
 
-        let default_action = if let Some(map_id) = route_map_id {
-            match route_maps::Entity::find_by_id(map_id).one(&self.db).await {
-                Ok(Some(map)) => {
-                    RuleAction::from_str_loose(&map.default_action).unwrap_or(RuleAction::Proxy)
-                }
-                Ok(None) => {
-                    return CompiledRulesResponse::NotFound(PlainText(
-                        "Route map not found".to_string(),
-                    ))
-                }
-                Err(e) => return CompiledRulesResponse::Error(PlainText(e.to_string())),
-            }
-        } else {
-            RuleAction::Proxy
-        };
-
         let mut compiler = RoutingCacheCompiler::new(default_action);
 
-        // 1. Загружаем все активные провайдеры правил (глобальные + привязанные к route_map_id)
+        // Список активных карт маршрутизации (используется, если клиент запрашивает общий профиль без привязки к одной карте)
+        let active_map_ids: Vec<Uuid> = if let Some(map_id) = route_map_id {
+            vec![map_id]
+        } else {
+            route_maps::Entity::find()
+                .filter(route_maps::Column::IsActive.eq(true))
+                .all(&self.db)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|m| m.id)
+                .collect()
+        };
+
+        // 1. Загружаем все активные провайдеры правил (глобальные + привязанные к активным картам)
         let mut provider_query = rule_providers::Entity::find()
             .filter(rule_providers::Column::IsActive.eq(true));
 
@@ -118,8 +152,11 @@ impl CompiledRulesApi {
                 .add(rule_providers::Column::RouteMapId.eq(map_id))
                 .add(rule_providers::Column::RouteMapId.is_null());
             provider_query = provider_query.filter(cond);
-        } else {
-            provider_query = provider_query.filter(rule_providers::Column::RouteMapId.is_null());
+        } else if !active_map_ids.is_empty() {
+            let cond = Condition::any()
+                .add(rule_providers::Column::RouteMapId.is_in(active_map_ids.clone()))
+                .add(rule_providers::Column::RouteMapId.is_null());
+            provider_query = provider_query.filter(cond);
         }
 
         if let Ok(providers) = provider_query.all(&self.db).await {
@@ -130,10 +167,10 @@ impl CompiledRulesApi {
             }
         }
 
-        // 2. Загружаем правила из route_rules (для конкретного профиля либо всех активных карт, если профиль не задан)
-        let rules_list = if let Some(map_id) = route_map_id {
+        // 2. Загружаем правила из route_rules (для конкретного профиля либо всех активных карт)
+        let rules_list = if !active_map_ids.is_empty() {
             route_rules::Entity::find()
-                .filter(route_rules::Column::RouteMapId.eq(map_id))
+                .filter(route_rules::Column::RouteMapId.is_in(active_map_ids.clone()))
                 .order_by_asc(route_rules::Column::Position)
                 .all(&self.db)
                 .await
@@ -178,9 +215,11 @@ impl CompiledRulesApi {
                 .add(admin_custom_overrides::Column::RouteMapId.eq(map_id))
                 .add(admin_custom_overrides::Column::RouteMapId.is_null());
             override_query = override_query.filter(condition);
-        } else {
-            override_query =
-                override_query.filter(admin_custom_overrides::Column::RouteMapId.is_null());
+        } else if !active_map_ids.is_empty() {
+            let condition = Condition::any()
+                .add(admin_custom_overrides::Column::RouteMapId.is_in(active_map_ids))
+                .add(admin_custom_overrides::Column::RouteMapId.is_null());
+            override_query = override_query.filter(condition);
         }
 
         if let Ok(overrides) = override_query.all(&self.db).await {
@@ -219,28 +258,60 @@ impl CompiledRulesApi {
         // Проверяем If-None-Match
         if let Some(client_etag) = if_none_match {
             if client_etag.trim() == etag {
+                info!(
+                    "[CompiledRules] Client rules.abc up to date (304 Not Modified, route_map_id={:?})",
+                    route_map_id
+                );
                 return CompiledRulesResponse::NotModified;
             }
         }
 
+        info!(
+            "[CompiledRules] Serving compiled rules.abc (route_map_id={:?}, size={} bytes, etag={})",
+            route_map_id,
+            bytes.len(),
+            etag
+        );
         CompiledRulesResponse::Ok(Binary(bytes), etag)
     }
 }
 
 #[OpenApi]
 impl CompiledRulesApi {
-    /// Получение скомпилированных правил (.abc) по умолчанию
+    /// Получение скомпилированных правил (.abc) по умолчанию или с query-параметром route_map_id
     #[oai(path = "/routing/compiled-rules", method = "get")]
     async fn get_default_compiled_rules(
         &self,
+        route_map_id: Query<Option<Uuid>>,
         #[oai(name = "If-None-Match")] if_none_match: Header<Option<String>>,
     ) -> CompiledRulesResponse {
-        self.compile_and_serve(None, if_none_match.0).await
+        self.compile_and_serve(route_map_id.0, if_none_match.0).await
     }
 
-    /// Получение скомпилированных правил (.abc) для конкретного профиля
+    /// Получение скомпилированных правил (.abc) по короткому пути /routing/compiled
+    #[oai(path = "/routing/compiled", method = "get")]
+    async fn get_compiled_short(
+        &self,
+        route_map_id: Query<Option<Uuid>>,
+        #[oai(name = "If-None-Match")] if_none_match: Header<Option<String>>,
+    ) -> CompiledRulesResponse {
+        self.compile_and_serve(route_map_id.0, if_none_match.0).await
+    }
+
+    /// Получение скомпилированных правил (.abc) для конкретного профиля (маршрутной карты)
     #[oai(path = "/routing/compiled-rules/:route_map_id", method = "get")]
     async fn get_compiled_rules_by_id(
+        &self,
+        route_map_id: Path<Uuid>,
+        #[oai(name = "If-None-Match")] if_none_match: Header<Option<String>>,
+    ) -> CompiledRulesResponse {
+        self.compile_and_serve(Some(route_map_id.0), if_none_match.0)
+            .await
+    }
+
+    /// Получение скомпилированных правил (.abc) для конкретного профиля по короткому пути
+    #[oai(path = "/routing/compiled/:route_map_id", method = "get")]
+    async fn get_compiled_short_by_id(
         &self,
         route_map_id: Path<Uuid>,
         #[oai(name = "If-None-Match")] if_none_match: Header<Option<String>>,

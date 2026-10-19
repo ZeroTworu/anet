@@ -72,10 +72,13 @@ impl DomainTrie {
 
         for (idx, label) in labels.iter().enumerate() {
             if current_start + current_count > self.nodes.len() {
-                return None;
+                return last_wildcard_action;
             }
             let current_slice = &self.nodes[current_start..current_start + current_count];
-            let matched_node = current_slice.iter().find(|n| n.label.as_str() == *label)?;
+            let Some(matched_node) = current_slice.iter().find(|n| n.label.as_str() == *label)
+            else {
+                return last_wildcard_action;
+            };
 
             if matched_node.match_subdomains && matched_node.terminal_action.is_some() {
                 last_wildcard_action = matched_node.terminal_action;
@@ -117,12 +120,15 @@ impl ArchivedDomainTrie {
 
         for (idx, label) in labels.iter().enumerate() {
             if current_start + current_count > nodes.len() {
-                return None;
+                return last_wildcard_action;
             }
             let current_slice = &nodes[current_start..current_start + current_count];
-            let matched_node = current_slice
+            let Some(matched_node) = current_slice
                 .iter()
-                .find(|n| n.label.as_str() == *label)?;
+                .find(|n| n.label.as_str() == *label)
+            else {
+                return last_wildcard_action;
+            };
 
             if matched_node.match_subdomains {
                 if let Some(action) = matched_node.terminal_action.as_ref() {

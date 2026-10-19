@@ -140,7 +140,8 @@ impl AppSettings {
                         id: SERVER_CONFIG_ID.to_string(),
                         name: SERVER_CONFIG_DISPLAY_NAME.to_string(),
                         content: merged_toml,
-                        url: None,
+                        url: crate::secure_store::DesktopSecureStore::get_server_config_url()
+                            .or_else(|| self.config_url.clone()),
                         is_read_only: true,
                     });
                 }

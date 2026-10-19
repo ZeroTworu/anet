@@ -181,6 +181,25 @@ impl ArchivedIpRoutingTable {
         }
         None
     }
+
+    /// Возвращает все подсети (IP, prefix_len) с действием `RuleAction::Direct`
+    pub fn collect_direct_routes(&self) -> Vec<(IpAddr, u8)> {
+        let mut out = Vec::new();
+        for node in self.ipv4_nodes.as_slice() {
+            let act: RuleAction = node.action.deserialize(&mut rkyv::Infallible).unwrap();
+            if act == RuleAction::Direct {
+                let net_u32: u32 = node.network.deserialize(&mut rkyv::Infallible).unwrap();
+                out.push((IpAddr::V4(Ipv4Addr::from(net_u32)), node.prefix_len));
+            }
+        }
+        for node in self.ipv6_nodes.as_slice() {
+            let act: RuleAction = node.action.deserialize(&mut rkyv::Infallible).unwrap();
+            if act == RuleAction::Direct {
+                out.push((IpAddr::V6(Ipv6Addr::from(node.network)), node.prefix_len));
+            }
+        }
+        out
+    }
 }
 
 /// Построитель таблицы сетей с автоматической сортировкой LPM

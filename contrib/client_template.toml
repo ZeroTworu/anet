@@ -124,3 +124,8 @@ idle_timeout_seconds = 21600
 max_mtu = 1400
 
 keep_alive_interval_seconds = 20
+
+[routing]
+# Автоматическое обновление скомпилированного кэша правил Smart DNS & AdBlock (rules.abc)
+rules_url = "{{RULES_URL}}"
+

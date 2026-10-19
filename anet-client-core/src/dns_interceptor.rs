@@ -11,7 +11,6 @@ use anet_filter_core::{
 use bytes::{Bytes, BytesMut};
 use log::{debug, trace};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
@@ -57,6 +56,53 @@ pub fn extract_packet_dst_ip(packet: &[u8]) -> Option<IpAddr> {
     }
 }
 
+/// Список публичных DoH IP-резолверов, для которых блокируется порт 443/853,
+/// чтобы браузеры (Chrome/Edge/Brave/Firefox) гарантированно переключались на стандартный UDP:53
+pub const DOH_RESOLVER_IPS: [Ipv4Addr; 8] = [
+    Ipv4Addr::new(1, 1, 1, 1),
+    Ipv4Addr::new(1, 0, 0, 1),
+    Ipv4Addr::new(8, 8, 8, 8),
+    Ipv4Addr::new(8, 8, 4, 4),
+    Ipv4Addr::new(9, 9, 9, 9),
+    Ipv4Addr::new(149, 112, 112, 112),
+    Ipv4Addr::new(208, 67, 222, 222),
+    Ipv4Addr::new(208, 67, 220, 220),
+];
+
+/// Выделенные DNS-серверы для прямых запросов (Direct), маршрутизируемые в обход VPN-туннеля
+pub const DIRECT_UPSTREAM_DNS_IPS: [Ipv4Addr; 2] = [
+    Ipv4Addr::new(77, 88, 8, 8),
+    Ipv4Addr::new(8, 8, 4, 4),
+];
+
+/// Проверяет, является ли пакет попыткой шифрованного DNS (DoT порт 853 или DoH порт 443 к публичным DNS)
+pub fn is_encrypted_dns_packet(packet: &[u8]) -> bool {
+    if packet.len() < 24 || (packet[0] >> 4) != 4 {
+        return false;
+    }
+    let ihl = ((packet[0] & 0x0F) * 4) as usize;
+    if packet.len() < ihl + 4 {
+        return false;
+    }
+    let proto = packet[9];
+    if proto != 6 && proto != 17 {
+        return false;
+    }
+    let dst_port = u16::from_be_bytes([packet[ihl + 2], packet[ihl + 3]]);
+    if dst_port == 853 {
+        return true;
+    }
+    if dst_port == 443 {
+        let dst_ip = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
+        if DOH_RESOLVER_IPS.contains(&dst_ip)
+            || DIRECT_UPSTREAM_DNS_IPS.contains(&dst_ip)
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Внутритуннельный DNS-интерцептор
 #[derive(Clone)]
 pub struct DnsInterceptor {
@@ -96,6 +142,19 @@ impl DnsInterceptor {
         // UDP Dst Port == 53
         let dst_port = u16::from_be_bytes([packet[ihl + 2], packet[ihl + 3]]);
         dst_port == 53
+    }
+
+    /// Проверяет сырой IP-пакет на принадлежность к DNS-ответам (IPv4, UDP, Src Port 53)
+    pub fn is_dns_response(packet: &[u8]) -> bool {
+        if packet.len() < 28 || (packet[0] >> 4) != 4 {
+            return false;
+        }
+        let ihl = ((packet[0] & 0x0F) * 4) as usize;
+        if packet.len() < ihl + 8 || packet[9] != 17 {
+            return false;
+        }
+        let src_port = u16::from_be_bytes([packet[ihl], packet[ihl + 1]]);
+        src_port == 53
     }
 
     /// Обрабатывает входящий пакет из TUN
@@ -161,8 +220,8 @@ impl DnsInterceptor {
 
         match action {
             RuleAction::Block => {
-                debug!(
-                    "[DNS] Domain '{}' matched BLOCK -> Synthetic 0.0.0.0",
+                log::info!(
+                    "[DNS] Domain '{}' matched BLOCK -> returning 0.0.0.0",
                     query_info.qname
                 );
                 if let Some(resp) = self.build_synthetic_dns_response(packet, &query_info, false) {
@@ -172,8 +231,8 @@ impl DnsInterceptor {
                 }
             }
             RuleAction::Direct => {
-                debug!(
-                    "[DNS] Domain '{}' matched DIRECT -> Resolving directly & caching IPs",
+                log::info!(
+                    "[DNS] Domain '{}' matched DIRECT -> resolving for direct bypass",
                     query_info.qname
                 );
                 InterceptResult::DirectQuery
@@ -185,12 +244,48 @@ impl DnsInterceptor {
         }
     }
 
-    /// Выполняет прямой UDP DNS-запрос, извлекает A/AAAA записи и TTL в `DirectIpCache`,
+    /// Анализирует входящий DNS-ответ (из туннеля) и если домен имеет правило `Direct`,
+    /// кэширует его A/AAAA записи и возвращает список IP для добавления в таблицу маршрутизации ОС.
+    pub fn inspect_dns_response(
+        &self,
+        packet: &[u8],
+        abc_domain_lookup: impl Fn(&str) -> Option<RuleAction>,
+    ) -> Option<(String, Vec<IpAddr>)> {
+        if !Self::is_dns_response(packet) {
+            return None;
+        }
+        let ihl = ((packet[0] & 0x0F) * 4) as usize;
+        let dns_data = &packet[(ihl + 8)..];
+        let qname = parse_dns_question_qname(dns_data)?;
+
+        let action = self
+            .local_overrides
+            .lookup_domain(&qname)
+            .or_else(|| abc_domain_lookup(&qname))
+            .unwrap_or(RuleAction::Proxy);
+
+        if action != RuleAction::Direct {
+            return None;
+        }
+
+        let (resolved_ips, min_ttl) = parse_dns_answers_ips_and_ttl(dns_data);
+        if !resolved_ips.is_empty() {
+            self.direct_cache.insert_batch(
+                &resolved_ips,
+                RuleAction::Direct,
+                Duration::from_secs(min_ttl as u64),
+            );
+        }
+        Some((qname, resolved_ips))
+    }
+
+    /// Выполняет прямой UDP DNS-запрос через выделенные Direct DNS серверы (в обход туннеля),
+    /// извлекает A/AAAA записи и TTL в `DirectIpCache`,
     /// и возвращает собранный IPv4/UDP ответный пакет с валидными контрольными суммами.
     pub async fn resolve_direct_dns_packet(
         &self,
         original_packet: &[u8],
-        dns_servers: &[String],
+        _dns_servers: &[String],
     ) -> Option<(Bytes, Vec<IpAddr>)> {
         let ihl = ((original_packet[0] & 0x0F) * 4) as usize;
         if original_packet.len() <= ihl + 8 {
@@ -198,22 +293,25 @@ impl DnsInterceptor {
         }
         let dns_query_payload = &original_packet[(ihl + 8)..];
 
-        let upstream_ip = dns_servers
-            .iter()
-            .filter_map(|s| IpAddr::from_str(s.trim()).ok())
-            .find(|ip| ip.is_ipv4())
-            .unwrap_or(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)));
-        let upstream_addr = SocketAddr::new(upstream_ip, 53);
-
         let socket = UdpSocket::bind("0.0.0.0:0").await.ok()?;
-        socket.send_to(dns_query_payload, upstream_addr).await.ok()?;
-
         let mut recv_buf = vec![0u8; 1500];
-        let (n, _) = tokio::time::timeout(Duration::from_secs(3), socket.recv_from(&mut recv_buf))
-            .await
-            .ok()?
-            .ok()?;
 
+        let mut received_len = None;
+        for upstream_ip in DIRECT_UPSTREAM_DNS_IPS {
+            let upstream_addr = SocketAddr::new(IpAddr::V4(upstream_ip), 53);
+            if socket.send_to(dns_query_payload, upstream_addr).await.is_err() {
+                continue;
+            }
+            if let Ok(Ok((n, _))) =
+                tokio::time::timeout(Duration::from_millis(1200), socket.recv_from(&mut recv_buf))
+                    .await
+            {
+                received_len = Some(n);
+                break;
+            }
+        }
+
+        let n = received_len?;
         let dns_resp = &recv_buf[..n];
         let (resolved_ips, min_ttl) = parse_dns_answers_ips_and_ttl(dns_resp);
 
@@ -410,6 +508,11 @@ fn parse_dns_query(dns_bytes: &[u8]) -> Option<DnsQueryInfo> {
         qname,
         qtype,
     })
+}
+
+/// Извлекает QNAME из секции Question DNS-пакета (запроса или ответа)
+fn parse_dns_question_qname(dns_bytes: &[u8]) -> Option<String> {
+    parse_dns_query(dns_bytes).map(|info| info.qname)
 }
 
 /// Пропускает DNS-имя (с учетом сжатия указателей 0xC0) и возвращает новую позицию

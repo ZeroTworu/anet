@@ -444,10 +444,28 @@ impl CoreConfig {
                 return Some(trimmed.to_string());
             }
         }
-        if let Some(cfg_url) = self.main.get_config_url() {
-            if let Ok(uri) = cfg_url.parse::<http::Uri>() {
+        for candidate in [self.main.get_config_url(), Some(self.stats.http_url.clone())]
+            .into_iter()
+            .flatten()
+        {
+            let trimmed = candidate.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Ok(uri) = trimmed.parse::<http::Uri>() {
                 if let (Some(scheme), Some(authority)) = (uri.scheme_str(), uri.authority()) {
-                    return Some(format!("{}://{}", scheme, authority));
+                    let base = format!("{}://{}", scheme, authority);
+                    if let Some(idx) = trimmed.find("/config/") {
+                        let tail = trimmed[idx + "/config/".len()..]
+                            .trim_matches('/')
+                            .split(['?', '#'])
+                            .next()
+                            .unwrap_or("");
+                        if !tail.is_empty() {
+                            return Some(format!("{}/api/v1/routing/compiled-rules/{}", base, tail));
+                        }
+                    }
+                    return Some(base);
                 }
             }
         }

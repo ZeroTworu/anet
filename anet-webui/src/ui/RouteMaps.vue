@@ -36,8 +36,8 @@ const showEditor = ref(false)
 const selectedMap = ref<RouteMap | null>(null)
 
 const routeMapSelectOptions = computed(() => [
-  { title: 'Глобально (для всех клиентов)', value: null as string | null },
-  ...maps.value.map(m => ({ title: `Профиль: ${m.name}`, value: m.id })),
+  { title: 'Глобально (для всех карт / клиентов)', value: null as string | null },
+  ...maps.value.map(m => ({ title: `Карта: ${m.name}`, value: m.id })),
 ])
 
 const getRouteMapName = (routeMapId: string | null | undefined) => {
@@ -124,16 +124,16 @@ const editingProviderId = ref<string | null>(null)
 
 const providerHeaders = [
   { title: 'Имя провайдера', key: 'name', sortable: true },
+  { title: 'Комментарий', key: 'description', sortable: false },
   { title: 'Тип', key: 'provider_type', sortable: true, align: 'center' as const },
   { title: 'Формат', key: 'format', sortable: true, align: 'center' as const },
   { title: 'Действие', key: 'action', sortable: true, align: 'center' as const },
-  { title: 'Профиль', key: 'route_map_id', sortable: true, align: 'center' as const },
-  { title: 'URL источника', key: 'url', sortable: false },
+  { title: 'Карта маршрутов', key: 'route_map_id', sortable: true, align: 'center' as const },
   { title: 'Интервал (ч)', key: 'update_interval_hours', sortable: true, align: 'center' as const },
-  { title: 'Элементов в кэше (БД)', key: 'item_count', sortable: true, align: 'center' as const },
-  { title: 'Последняя загрузка', key: 'last_fetched_at', sortable: true },
+  { title: 'В кэше (БД)', key: 'item_count', sortable: true, align: 'center' as const },
+  { title: 'Обновлено', key: 'last_fetched_at', sortable: true },
   { title: 'Статус', key: 'is_active', sortable: true, align: 'center' as const },
-  { title: 'Действия', key: 'actions', sortable: false, align: 'center' as const },
+  { title: 'Действия', key: 'actions', sortable: false, align: 'center' as const, width: '168px' },
 ]
 
 const loadProviders = async () => {
@@ -312,11 +312,11 @@ const overrideHeaders = [
   { title: 'Шаблон / Паттерн', key: 'pattern', sortable: true },
   { title: 'Тип правила', key: 'rule_type', sortable: true, align: 'center' as const },
   { title: 'Категория (Действие)', key: 'category', sortable: true, align: 'center' as const },
-  { title: 'Профиль', key: 'route_map_id', sortable: true, align: 'center' as const },
+  { title: 'Карта маршрутов', key: 'route_map_id', sortable: true, align: 'center' as const },
   { title: 'Комментарий', key: 'comment', sortable: false },
   { title: 'Статус', key: 'is_active', sortable: true, align: 'center' as const },
   { title: 'Создано', key: 'created_at', sortable: true },
-  { title: 'Действия', key: 'actions', sortable: false, align: 'center' as const },
+  { title: 'Действия', key: 'actions', sortable: false, align: 'center' as const, width: '110px' },
 ]
 
 const loadOverrides = async () => {
@@ -405,7 +405,7 @@ onMounted(() => {
 </script>
 
 <template>
-  <v-container max-width="1400" class="route-maps-page">
+  <v-container fluid class="route-maps-page">
     <div class="d-flex justify-space-between align-center flex-wrap ga-4 mb-4">
       <v-list-item
         class="px-0"
@@ -509,7 +509,9 @@ onMounted(() => {
         >
           <template #item.name="{ item }">
             <span class="font-weight-bold">{{ item.name }}</span>
-            <div class="text-caption text-medium-emphasis">{{ item.description }}</div>
+          </template>
+          <template #item.description="{ item }">
+            <span class="text-body-2 text-medium-emphasis">{{ item.description || '—' }}</span>
           </template>
           <template #item.provider_type="{ item }">
             <v-chip size="small" :color="item.provider_type === 'domain' ? 'info' : 'primary'">
@@ -530,11 +532,6 @@ onMounted(() => {
             <v-chip size="small" :variant="item.route_map_id ? 'tonal' : 'outlined'" color="secondary">
               {{ getRouteMapName(item.route_map_id) }}
             </v-chip>
-          </template>
-          <template #item.url="{ item }">
-            <span class="text-truncate d-inline-block" style="max-width: 240px" :title="item.url">{{
-              item.url
-            }}</span>
           </template>
           <template #item.item_count="{ item }">
             <v-chip
@@ -558,7 +555,7 @@ onMounted(() => {
             </v-chip>
           </template>
           <template #item.actions="{ item }">
-            <div class="d-flex ga-1 justify-center">
+            <div class="d-flex ga-1 justify-center flex-nowrap">
               <v-btn
                 icon="mdi-table-eye"
                 size="small"
@@ -733,7 +730,7 @@ onMounted(() => {
                 :items="routeMapSelectOptions"
                 item-title="title"
                 item-value="value"
-                label="Применить к профилю"
+                label="Карта маршрутизации (область действия)"
                 variant="outlined"
               />
             </v-col>
@@ -890,7 +887,7 @@ onMounted(() => {
             :items="routeMapSelectOptions"
             item-title="title"
             item-value="value"
-            label="Применить к профилю"
+            label="Карта маршрутизации (область действия)"
             variant="outlined"
             class="mb-3"
           />
@@ -909,7 +906,9 @@ onMounted(() => {
 
 <style scoped>
 .route-maps-page {
-  padding: 24px;
+  padding: 24px 32px;
+  max-width: 100% !important;
+  width: 100%;
 }
 .maps-table :deep(tbody tr) {
   cursor: pointer;
