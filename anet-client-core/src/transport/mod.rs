@@ -16,6 +16,8 @@ use quinn::{Endpoint, Connection};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+pub type ShutdownHook = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
 pub struct ConnectionResult {
     pub auth_response: AuthResponse,
     pub vpn_stream: Box<dyn VpnStream>,
@@ -26,6 +28,7 @@ pub struct ConnectionResult {
     pub remote_ip: Option<std::net::IpAddr>,
     pub bypass_ips: Vec<std::net::IpAddr>,
     pub effective_mode: Option<String>,
+    pub shutdown_hook: Option<ShutdownHook>,
 }
 
 #[async_trait]

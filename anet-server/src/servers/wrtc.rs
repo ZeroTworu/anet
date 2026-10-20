@@ -22,7 +22,7 @@ use ed25519_dalek::SigningKey;
 use log::{info, warn};
 use rtc::peer_connection::sdp::RTCSessionDescription;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -191,8 +191,8 @@ pub async fn run_wrtc_server(
         let tun_clone_video = tun_clone.clone();
         let reg_clone_video = reg_clone.clone();
 
-        let first_server_rx = Arc::new(AtomicBool::new(true));
-        let first_server_rx_up = first_server_rx.clone();
+        let client_video_warmed_up: Arc<DashSet<u16>> = Arc::new(DashSet::new());
+        let client_video_warmed_rx = client_video_warmed_up.clone();
         let video_uplink_task = tokio::spawn(async move {
             while let Some(first_frame) = peer_video_rx.recv_video_frame().await {
                 let mut current_frame = Some(first_frame);
@@ -210,7 +210,8 @@ pub async fn run_wrtc_server(
 
                     let raw_astp = raw_frame.slice(2..);
                     if let Ok(decrypted) = unwrap_packet_bytes(&client_info.cipher, raw_astp) {
-                        if first_server_rx_up.swap(false, Ordering::Relaxed) {
+                        if client_video_warmed_rx.insert(client_tag) {
+                            peer_video_rx.force_next_keyframe();
                             info!(
                                 "[WRTC Server Video IN] First video frame decrypted from client {} (len: {} bytes, tag: 0x{:04X})",
                                 client_info.assigned_ip,
@@ -242,6 +243,17 @@ pub async fn run_wrtc_server(
         loop {
             let msg_opt = tokio::select! {
                 res = shared_peer.recv() => res,
+                stanza_opt = xmpp.recv_stanza() => {
+                    if let Some(stanza) = stanza_opt {
+                        if let Some(jingle) = parse_jingle_session(&stanza, fallback_ip, fallback_port) {
+                            for v_ssrc in jingle.video_sources {
+                                info!("[WRTC Server] Jingle stanza announced remote video SSRC: {v_ssrc}");
+                                shared_peer.add_remote_video_ssrc(v_ssrc).await;
+                            }
+                        }
+                    }
+                    continue;
+                }
                 _ = shared_peer.failed_notify.notified() => {
                     warn!("[WRTC Server] WebRTC PeerConnection failed/closed by JVB. Re-establishing server session in 3s...");
                     tokio::time::sleep(Duration::from_secs(3)).await;
@@ -282,11 +294,15 @@ pub async fn run_wrtc_server(
                             shared_peer.set_expected_peer_video_ssrc(c_v_ssrc);
                             info!("[WRTC Server] Set expected client video SSRC: {c_v_ssrc} for {from_endpoint}");
 
+                            // Привязываем видео SSRC клиента к выделенному Recvonly трансиверу
+                            shared_peer.add_remote_video_ssrc(c_v_ssrc).await;
+
                             client_video_endpoints.insert(from_endpoint.clone());
                             let constraints = anet_common::wrtc::colibri::ReceiverVideoConstraints::new_all(2160);
                             let _ = shared_peer.send_video_constraints(&constraints).await;
                         }
                     }
+                    shared_peer.force_next_keyframe();
                     let signature = sign_beacon(&signing_key_bytes, &client_nonce, &srv_id);
                     let beacon_msg = ColibriMessage::beacon(
                         from_endpoint.clone(),
@@ -378,11 +394,14 @@ pub async fn run_wrtc_server(
                                             {
                                                 let old_tag = anet_common::wrtc::colibri::client_tag_from_ip(&old.assigned_ip);
                                                 clients_by_tag.remove(&old_tag);
+                                                client_video_warmed_up.remove(&old_tag);
                                                 clients_map.retain(|_, v| v.session_id != old.session_id);
                                             }
 
                                             let client_tag = anet_common::wrtc::colibri::client_tag_from_ip(&assigned_ip);
+                                            client_video_warmed_up.remove(&client_tag);
                                             clients_by_tag.insert(client_tag, client_info.clone());
+                                            shared_peer.force_next_keyframe();
 
                                             let (tx_router, mut rx_router) =
                                                 mpsc::channel::<Bytes>(16384);
@@ -398,7 +417,7 @@ pub async fn run_wrtc_server(
                                             let client_modes_dl = client_modes.clone();
                                             let client_video_ep_dl = client_video_endpoints.clone();
                                             let client_v2_ep_dl = client_v2_endpoints.clone();
-                                            let first_server_rx_dl = first_server_rx.clone();
+                                            let client_video_warmed_dl = client_video_warmed_up.clone();
 
                                             tokio::spawn(async move {
                                                 let mut batcher = PacketBatcher::new(16384, 2);
@@ -421,7 +440,7 @@ pub async fn run_wrtc_server(
                                                                         .unwrap_or_else(|| "auto".to_string());
                                                                     let has_video = client_video_ep_dl.contains(&target_client_id);
                                                                     let is_v2 = client_v2_ep_dl.contains(&target_client_id);
-                                                                    let video_warmed_up = !first_server_rx_dl.load(Ordering::Relaxed);
+                                                                    let video_warmed_up = client_video_warmed_dl.contains(&client_tag);
 
                                                                     let client_uses_video = (srv_mode == anet_common::wrtc::colibri::WrtcMode::MediaVideo
                                                                         || srv_mode == anet_common::wrtc::colibri::WrtcMode::Auto)
@@ -745,12 +764,15 @@ pub async fn run_wrtc_server(
         }
 
         video_uplink_task.abort();
+        xmpp.leave_room().await;
+        let _ = shared_peer.close().await;
 
         for entry in active_clients.iter() {
             registry.suspend_client(entry.value().clone());
         }
         active_clients.clear();
         clients_by_tag.clear();
+        client_video_warmed_up.clear();
         p2p_clients.clear();
         client_modes.clear();
         client_video_endpoints.clear();

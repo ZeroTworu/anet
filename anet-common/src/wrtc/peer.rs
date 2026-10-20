@@ -2,7 +2,7 @@ use crate::wrtc::colibri::{
     is_valid_vp8_frame_header, ColibriMessage, ReceiverVideoConstraints, WrtcMessage, WrtcMode,
     VP8_INTERFRAME_HEADER, VP8_KEYFRAME_1080P_HEADER, VP8_KEYFRAME_HEADER,
 };
-use crate::wrtc::jingle::JingleSession;
+use crate::wrtc::jingle::{append_remote_video_ssrc_to_sdp, JingleSession};
 use bytes::{BufMut, Bytes, BytesMut};
 use futures::{SinkExt, StreamExt};
 use rtc::interceptor::Registry;
@@ -409,6 +409,8 @@ pub struct WrtcPeer {
     pub start_instant: std::time::Instant,
     pub last_video_tx_ms: Arc<AtomicU64>,
     pub video_v2_enabled: Arc<AtomicBool>,
+    pub force_keyframe_remaining: Arc<AtomicU32>,
+    pub remote_sdp: Mutex<String>,
 }
 
 impl WrtcPeer {
@@ -436,12 +438,14 @@ impl WrtcPeer {
         let video_pt = session_opt.map(|s| s.video_payload_type).unwrap_or(100);
         let has_video_flag = session_opt.map(|s| s.has_video).unwrap_or(false) || mode == WrtcMode::MediaVideo;
         let video_seq = Arc::new(AtomicU16::new(0));
-        let video_ts = Arc::new(AtomicU32::new(1));
+        let video_ts = Arc::new(AtomicU32::new(0));
         let expected_peer_video_ssrc = Arc::new(AtomicU32::new(0));
         let _remote_ssrc = 0;
         let start_instant = std::time::Instant::now();
         let last_video_tx_ms = Arc::new(AtomicU64::new(0));
         let video_v2_enabled = Arc::new(AtomicBool::new(false));
+        let force_keyframe_remaining = Arc::new(AtomicU32::new(8));
+        let mut initial_remote_sdp = String::new();
 
         let (ws_fallback_tx, mut ws_fallback_rx) = mpsc::channel::<String>(8192);
         let has_ws = Arc::new(AtomicBool::new(false));
@@ -700,6 +704,7 @@ impl WrtcPeer {
                 }
 
                 let sdp_str = session.to_sdp(fallback_ip, fallback_port, 0, local_video_ssrc);
+                initial_remote_sdp = sdp_str.clone();
                 if let Ok(offer) = RTCSessionDescription::offer(sdp_str) {
                     if pc.set_remote_description(offer).await.is_ok() {
                         if let Ok(answer) = pc.create_answer(None).await {
@@ -1028,6 +1033,8 @@ impl WrtcPeer {
             start_instant,
             last_video_tx_ms,
             video_v2_enabled,
+            force_keyframe_remaining,
+            remote_sdp: Mutex::new(initial_remote_sdp),
         })
     }
 
@@ -1037,6 +1044,10 @@ impl WrtcPeer {
 
     pub fn is_video_v2(&self) -> bool {
         self.video_v2_enabled.load(Ordering::Relaxed)
+    }
+
+    pub fn force_next_keyframe(&self) {
+        self.force_keyframe_remaining.store(8, Ordering::Relaxed);
     }
 
     pub fn effective_mode(&self, p2p_open: bool) -> &'static str {
@@ -1066,11 +1077,58 @@ impl WrtcPeer {
     }
 
     pub async fn add_remote_video_ssrc(&self, ssrc: u32) {
-        // Деструктивная ренегоциация (set_remote_description/create_answer/set_local_description)
-        // посреди живой сессии сбрасывает приемный конвейер WebRTC и оглушает track.poll().
-        // JVB форвардит потоки через согласованный видео-трансивер, а демультиплексирование
-        // выполняется на уровне 2-байтного client_tag в полезной нагрузке VP8.
-        log::debug!("[WRTC Media] add_remote_video_ssrc({ssrc}): no-op to protect active WebRTC track");
+        if ssrc == 0 || ssrc == self.video_ssrc || ssrc == 10002 {
+            return;
+        }
+        let Some(ref pc) = self.peer_connection else {
+            return;
+        };
+
+        let mut sdp_guard = self.remote_sdp.lock().await;
+        if sdp_guard.is_empty() {
+            return;
+        }
+        if sdp_guard.contains(&format!("a=mid:v_{ssrc}\r\n"))
+            || sdp_guard.contains(&format!("a=ssrc:{ssrc} "))
+        {
+            self.force_next_keyframe();
+            return;
+        }
+
+        let updated_sdp = append_remote_video_ssrc_to_sdp(&sdp_guard, ssrc, self.video_payload_type);
+        match RTCSessionDescription::offer(updated_sdp.clone()) {
+            Ok(offer) => {
+                if let Err(e) = pc.set_remote_description(offer).await {
+                    log::warn!(
+                        "[WRTC Media] add_remote_video_ssrc({ssrc}) set_remote_description error: {e}"
+                    );
+                    return;
+                }
+                match pc.create_answer(None).await {
+                    Ok(answer) => {
+                        if let Err(e) = pc.set_local_description(answer).await {
+                            log::warn!(
+                                "[WRTC Media] add_remote_video_ssrc({ssrc}) set_local_description error: {e}"
+                            );
+                            return;
+                        }
+                        *sdp_guard = updated_sdp;
+                        self.force_next_keyframe();
+                        log::info!(
+                            "[WRTC Media] Bound remote video SSRC {ssrc} to dedicated Recvonly transceiver (mid=v_{ssrc})"
+                        );
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "[WRTC Media] add_remote_video_ssrc({ssrc}) create_answer error: {e}"
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                log::warn!("[WRTC Media] add_remote_video_ssrc({ssrc}) invalid SDP offer: {e}");
+            }
+        }
     }
 
     pub async fn send_video_frame(&self, astp_data: &[u8]) -> anyhow::Result<()> {
@@ -1107,10 +1165,21 @@ impl WrtcPeer {
         payload.put_u8(0x80 | ((pic_id >> 8) as u8));
         payload.put_u8((pic_id & 0xFF) as u8);
 
+        let force_kf = self
+            .force_keyframe_remaining
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |rem| {
+                if rem > 0 {
+                    Some(rem - 1)
+                } else {
+                    None
+                }
+            })
+            .is_ok();
+
         let vp8_hdr = if self.video_v2_enabled.load(Ordering::Relaxed) {
-            // Каждый 32-й кадр — Keyframe 1080p (для мгновенного восстановления SFU при потере UDP пакета),
-            // остальные 31/32 — легкие P-frame (Interframe), не сбрасывающие Vp8FrameMap в JVB.
-            if (frame_num & 31) == 0 {
+            // Первые 8 кадров после старта/подключения клиента и каждый 32-й кадр — Keyframe 1080p
+            // (для мгновенного открытия keyframe-гейта SFU JVB), остальные 31/32 — легкие P-frame.
+            if force_kf || (frame_num & 31) == 0 {
                 &VP8_KEYFRAME_1080P_HEADER
             } else {
                 &VP8_INTERFRAME_HEADER

@@ -199,6 +199,10 @@ impl XmppSession {
                     stanza_opt = write_rx.recv() => {
                         match stanza_opt {
                             Some(stanza) => {
+                                if stanza == "__CLOSE__" {
+                                    let _ = ws_sink.close().await;
+                                    break;
+                                }
                                 if let Err(e) = ws_sink.send(Message::text(stanza)).await {
                                     log::error!("[XMPP] Error sending stanza over WebSocket: {e}");
                                     break;
@@ -429,5 +433,19 @@ impl XmppSession {
             log::info!("[XMPP IN]: {text}");
         }
         s
+    }
+
+    pub async fn leave_room(&self) {
+        let leave_stanza = XmppBuilder::muc_leave(&self.conference_id, &self.endpoint_id);
+        log::info!(
+            "[XMPP] Leaving MUC room {} as occupant {}: {}",
+            self.conference_id,
+            self.endpoint_id,
+            leave_stanza
+        );
+        let _ = self.write_tx.send(leave_stanza).await;
+        let _ = self.write_tx.send(XmppBuilder::close().to_string()).await;
+        let _ = self.write_tx.send("__CLOSE__".to_string()).await;
+        tokio::time::sleep(Duration::from_millis(60)).await;
     }
 }

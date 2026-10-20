@@ -349,6 +349,32 @@ impl ClientTransport for WrtcTransport {
         let nonce_prefix: [u8; 4] = auth_response.nonce_prefix.as_slice().try_into()?;
         let sequence = Arc::new(AtomicU64::new(0));
 
+        let stun_servers = xmpp.get_stun_servers();
+        let xmpp_arc = Arc::new(Mutex::new(xmpp));
+        let xmpp_bg = Arc::clone(&xmpp_arc);
+        let peer_xmpp = Arc::clone(&shared_peer);
+        let fb_ip_owned = fallback_ip.to_string();
+        let xmpp_jingle_task = tokio::spawn(async move {
+            loop {
+                let stanza_opt = {
+                    let mut guard = xmpp_bg.lock().await;
+                    tokio::time::timeout(Duration::from_millis(250), guard.recv_stanza())
+                        .await
+                        .ok()
+                        .flatten()
+                };
+                if let Some(stanza) = stanza_opt {
+                    if let Some(jingle) = parse_jingle_session(&stanza, &fb_ip_owned, fallback_port) {
+                        for v_ssrc in jingle.video_sources {
+                            peer_xmpp.add_remote_video_ssrc(v_ssrc).await;
+                        }
+                    }
+                } else {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        });
+
         let p2p_session_opt: Arc<Mutex<Option<Arc<P2pSession>>>> = Arc::new(Mutex::new(None));
         if wrtc_mode == anet_common::wrtc::colibri::WrtcMode::P2pDirect
             || wrtc_mode == anet_common::wrtc::colibri::WrtcMode::Auto
@@ -357,7 +383,6 @@ impl ClientTransport for WrtcTransport {
             let p2p_store = p2p_session_opt.clone();
             let peer_sig = shared_peer.clone();
             let target_srv = target_server_id.clone();
-            let stun_servers = xmpp.get_stun_servers();
 
             tokio::spawn(async move {
                 match create_p2p_channel(&stun_servers).await {
@@ -794,6 +819,14 @@ impl ClientTransport for WrtcTransport {
         info!("[WRTC] Active transport mode: {:?}", effective_mode.as_deref().unwrap_or("UNKNOWN"));
 
         let remote_ip = bypass_ips.first().copied();
+        let xmpp_shutdown = Arc::clone(&xmpp_arc);
+        let peer_shutdown = Arc::clone(&shared_peer);
+        let shutdown_hook: super::ShutdownHook = Box::pin(async move {
+            xmpp_jingle_task.abort();
+            xmpp_shutdown.lock().await.leave_room().await;
+            let _ = peer_shutdown.close().await;
+        });
+
         Ok(ConnectionResult {
             auth_response,
             vpn_stream: Box::new(client_stream),
@@ -803,6 +836,7 @@ impl ClientTransport for WrtcTransport {
             remote_ip,
             bypass_ips,
             effective_mode,
+            shutdown_hook: Some(shutdown_hook),
         })
     }
 }

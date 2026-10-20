@@ -48,6 +48,7 @@ struct RunningSession {
     main_task: JoinHandle<()>,
     stats_task: Option<JoinHandle<()>>,
     iface_name: String,
+    shutdown_hook: Option<crate::transport::ShutdownHook>,
 }
 
 pub struct AnetClient {
@@ -1035,6 +1036,9 @@ impl AnetClient {
         if self.stop_requested.load(Ordering::SeqCst) {
             info!("[Core] Connection cancelled before storing session.");
             status("[Core] Connection cancelled before storing session.");
+            if let Some(hook) = result.shutdown_hook {
+                let _ = tokio::time::timeout(Duration::from_millis(500), hook).await;
+            }
             let _ = self.dns_manager.restore_dns(&iface_name);
             let _ = self.route_manager.restore_routes().await;
             return Ok(());
@@ -1052,6 +1056,7 @@ impl AnetClient {
                 }),
                 stats_task,
                 iface_name: iface_name.clone(),
+                shutdown_hook: result.shutdown_hook,
             });
         }
 
@@ -1196,6 +1201,9 @@ impl AnetClient {
             state.take()
         };
         if let Some(sess) = session_to_clean {
+            if let Some(hook) = sess.shutdown_hook {
+                let _ = tokio::time::timeout(Duration::from_millis(500), hook).await;
+            }
             if let Some(ref endpoint) = sess.endpoint {
                 endpoint.close(0u32.into(), b"reconnecting");
             }
@@ -1243,6 +1251,10 @@ impl AnetClient {
             *running.disconnect_reason.lock().unwrap() = "User requested stop".to_string();
             running.shutdown_notify.notify_waiters();
             running.reconnect_signal.notify_one();
+
+            if let Some(hook) = running.shutdown_hook {
+                let _ = tokio::time::timeout(Duration::from_millis(500), hook).await;
+            }
 
             if let Some(task) = running.stats_task {
                 task.abort();

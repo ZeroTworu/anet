@@ -105,7 +105,9 @@ impl JingleSession {
         }
         let bundle_str = bundle_groups.join(" ");
 
-        // ВАЖНО: Удалены жесткие a=ssrc для Remote SDP, чтобы webrtc-rs принимал любые SSRC от JVB
+        let remote_audio_ssrc = self.sources.first().copied().unwrap_or(10001);
+        let primary_video_ssrc = 10002u32;
+
         let video_section = if include_video {
             let pt = self.video_payload_type;
             let alt_pt = if pt == 100 { 96 } else { 100 };
@@ -116,12 +118,10 @@ impl JingleSession {
                  a=rtpmap:{pt} VP8/90000\r\n\
                  a=rtpmap:{alt_pt} VP8/90000\r\n\
                  a=rtcp-fb:{pt} goog-remb\r\n\
-                 a=rtcp-fb:{pt} transport-cc\r\n\
                  a=rtcp-fb:{pt} ccm fir\r\n\
                  a=rtcp-fb:{pt} nack\r\n\
                  a=rtcp-fb:{pt} nack pli\r\n\
                  a=rtcp-fb:{alt_pt} goog-remb\r\n\
-                 a=rtcp-fb:{alt_pt} transport-cc\r\n\
                  a=rtcp-fb:{alt_pt} ccm fir\r\n\
                  a=rtcp-fb:{alt_pt} nack\r\n\
                  a=rtcp-fb:{alt_pt} nack pli\r\n\
@@ -131,6 +131,8 @@ impl JingleSession {
                  a=setup:{setup}\r\n\
                  a=mid:video\r\n\
                  a=sendrecv\r\n\
+                 a=ssrc:{primary_video_ssrc} cname:jvb-video\r\n\
+                 a=ssrc:{primary_video_ssrc} msid:jvb-vstream-{primary_video_ssrc} jvb-vtrack-{primary_video_ssrc}\r\n\
                  {candidate_lines}"
             )
         } else {
@@ -153,7 +155,7 @@ impl JingleSession {
             String::new()
         };
 
-        format!(
+        let mut sdp = format!(
             "v=0\r\n\
              o=- 123456789 2 IN IP4 0.0.0.0\r\n\
              s=-\r\n\
@@ -172,11 +174,115 @@ impl JingleSession {
              a=setup:{setup}\r\n\
              a=mid:audio\r\n\
              a=sendrecv\r\n\
+             a=ssrc:{remote_audio_ssrc} cname:jvb-audio\r\n\
+             a=ssrc:{remote_audio_ssrc} msid:jvb-astream jvb-atrack0\r\n\
              {candidate_lines}\
              {video_section}\
              {data_section}"
-        )
+        );
+
+        if include_video {
+            for &v_ssrc in &self.video_sources {
+                if v_ssrc != 0 && v_ssrc != primary_video_ssrc {
+                    sdp = append_remote_video_ssrc_to_sdp(&sdp, v_ssrc, self.video_payload_type);
+                }
+            }
+        }
+
+        sdp
     }
+}
+
+/// Appends a dedicated `m=video` (`a=mid:v_<ssrc>`, `a=sendonly`) section to the remote SDP
+/// so `rtc-0.21.0` creates a dedicated `Recvonly` transceiver and `TrackRemote` for `new_ssrc`
+/// without overwriting any existing active video transceiver.
+pub fn append_remote_video_ssrc_to_sdp(current_sdp: &str, new_ssrc: u32, video_pt: u8) -> String {
+    let mid_tag = format!("v_{new_ssrc}");
+    if current_sdp.contains(&format!("a=mid:{mid_tag}\r\n"))
+        || current_sdp.contains(&format!("a=ssrc:{new_ssrc} "))
+    {
+        return current_sdp.to_string();
+    }
+
+    let mut primary_port = "9";
+    let mut c_line = "c=IN IP4 0.0.0.0";
+    let mut ufrag = "jvb_ufrag";
+    let mut pwd = "jvb_pwd_secret";
+    let mut fingerprint = "sha-256 00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00";
+    let mut setup = "actpass";
+    let mut candidate_lines = String::new();
+    let mut in_first_media = false;
+    let mut past_first_media = false;
+
+    for raw_line in current_sdp.lines() {
+        let line = raw_line.trim();
+        if line.starts_with("m=") {
+            if !in_first_media && !past_first_media {
+                in_first_media = true;
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    primary_port = parts[1];
+                }
+            } else if in_first_media {
+                in_first_media = false;
+                past_first_media = true;
+            }
+        } else if line.starts_with("c=IN IP4 ") {
+            c_line = line;
+        } else if let Some(u) = line.strip_prefix("a=ice-ufrag:") {
+            ufrag = u;
+        } else if let Some(p) = line.strip_prefix("a=ice-pwd:") {
+            pwd = p;
+        } else if let Some(fp) = line.strip_prefix("a=fingerprint:") {
+            fingerprint = fp;
+        } else if let Some(s) = line.strip_prefix("a=setup:") {
+            setup = s;
+        } else if in_first_media && line.starts_with("a=candidate:") {
+            candidate_lines.push_str(line);
+            candidate_lines.push_str("\r\n");
+        }
+    }
+
+    let pt = if video_pt != 0 { video_pt } else { 100 };
+    let alt_pt = if pt == 100 { 96 } else { 100 };
+
+    let mut updated = String::with_capacity(current_sdp.len() + 640);
+    for raw_line in current_sdp.lines() {
+        let line = raw_line.trim_end_matches('\r');
+        if let Some(bundle_rest) = line.strip_prefix("a=group:BUNDLE ") {
+            updated.push_str(&format!("a=group:BUNDLE {bundle_rest} {mid_tag}\r\n"));
+        } else {
+            updated.push_str(line);
+            updated.push_str("\r\n");
+        }
+    }
+
+    updated.push_str(&format!(
+        "m=video {primary_port} UDP/TLS/RTP/SAVPF {pt} {alt_pt}\r\n\
+         {c_line}\r\n\
+         a=rtcp-mux\r\n\
+         a=rtpmap:{pt} VP8/90000\r\n\
+         a=rtpmap:{alt_pt} VP8/90000\r\n\
+         a=rtcp-fb:{pt} goog-remb\r\n\
+         a=rtcp-fb:{pt} ccm fir\r\n\
+         a=rtcp-fb:{pt} nack\r\n\
+         a=rtcp-fb:{pt} nack pli\r\n\
+         a=rtcp-fb:{alt_pt} goog-remb\r\n\
+         a=rtcp-fb:{alt_pt} ccm fir\r\n\
+         a=rtcp-fb:{alt_pt} nack\r\n\
+         a=rtcp-fb:{alt_pt} nack pli\r\n\
+         a=ice-ufrag:{ufrag}\r\n\
+         a=ice-pwd:{pwd}\r\n\
+         a=fingerprint:{fingerprint}\r\n\
+         a=setup:{setup}\r\n\
+         a=mid:{mid_tag}\r\n\
+         a=sendonly\r\n\
+         a=ssrc:{new_ssrc} cname:jvb-video-{new_ssrc}\r\n\
+         a=ssrc:{new_ssrc} msid:jvb-vstream-{new_ssrc} jvb-vtrack-{new_ssrc}\r\n\
+         {candidate_lines}"
+    ));
+
+    updated
 }
 
 pub fn parse_jingle_session(

@@ -522,6 +522,7 @@ impl ClientTransport for WebSocketTransport {
             remote_ip, // Передаем IP для добавления в bypass
             bypass_ips: Vec::new(),
             effective_mode: None,
+            shutdown_hook: None,
         })
     }
 }

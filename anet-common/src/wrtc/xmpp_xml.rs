@@ -398,6 +398,18 @@ impl XmppBuilder {
         )
     }
 
+    pub fn muc_leave(conference_id: &str, endpoint_id: &str) -> String {
+        let conf_esc = escape_xml_attr(conference_id);
+        let ep_esc = escape_xml_attr(endpoint_id);
+        format!(
+            r#"<presence to="{conf_esc}@muc.meet.jitsi/{ep_esc}" type="unavailable"/>"#
+        )
+    }
+
+    pub fn close() -> &'static str {
+        r#"<close xmlns="urn:ietf:params:xml:ns:xmpp-framing"/>"#
+    }
+
     pub fn iq_result(to: &str, id: &str) -> String {
         format!(
             r#"<iq type="result" to="{}" id="{}"/>"#,
@@ -452,7 +464,7 @@ impl XmppBuilder {
     ) -> String {
         let video_section = if include_video_content && video_ssrc != 0 {
             let pt = if video_payload_type != 0 { video_payload_type } else { 100 };
-            let rtcp_fb = r#"<rtcp-fb xmlns="urn:xmpp:jingle:apps:rtp:fb:0" type="goog-remb"/><rtcp-fb xmlns="urn:xmpp:jingle:apps:rtp:fb:0" type="transport-cc"/><rtcp-fb xmlns="urn:xmpp:jingle:apps:rtp:fb:0" type="ccm" subtype="fir"/><rtcp-fb xmlns="urn:xmpp:jingle:apps:rtp:fb:0" type="nack"/><rtcp-fb xmlns="urn:xmpp:jingle:apps:rtp:fb:0" type="nack" subtype="pli"/>"#;
+            let rtcp_fb = r#"<rtcp-fb xmlns="urn:xmpp:jingle:apps:rtp:fb:0" type="goog-remb"/><rtcp-fb xmlns="urn:xmpp:jingle:apps:rtp:fb:0" type="ccm" subtype="fir"/><rtcp-fb xmlns="urn:xmpp:jingle:apps:rtp:fb:0" type="nack"/><rtcp-fb xmlns="urn:xmpp:jingle:apps:rtp:fb:0" type="nack" subtype="pli"/>"#;
             let pt_fallback = if pt != 96 {
                 format!(r#"<payload-type id="96" name="VP8" clockrate="90000">{rtcp_fb}</payload-type>"#)
             } else {
