@@ -245,10 +245,40 @@ pub async fn run_wrtc_server(
                 res = shared_peer.recv() => res,
                 stanza_opt = xmpp.recv_stanza() => {
                     if let Some(stanza) = stanza_opt {
-                        if let Some(jingle) = parse_jingle_session(&stanza, fallback_ip, fallback_port) {
-                            for v_ssrc in jingle.video_sources {
-                                info!("[WRTC Server] Jingle stanza announced remote video SSRC: {v_ssrc}");
-                                shared_peer.add_remote_video_ssrc(v_ssrc).await;
+                        for parsed in anet_common::wrtc::xmpp_xml::parse_xmpp_stanzas(&stanza, fallback_ip, fallback_port) {
+                            match parsed {
+                                anet_common::wrtc::xmpp_xml::InboundXmpp::Jingle(jingle) => {
+                                    if jingle.action == "source-add"
+                                        || jingle.action == "description-info"
+                                        || jingle.action == "session-initiate"
+                                    {
+                                        for v_ssrc in jingle.video_sources {
+                                            info!("[WRTC Server] Jingle stanza ({}) announced remote video SSRC: {v_ssrc}", jingle.action);
+                                            shared_peer.add_remote_video_ssrc(v_ssrc).await;
+                                        }
+                                    }
+                                }
+                                anet_common::wrtc::xmpp_xml::InboundXmpp::Presence { from, is_unavailable: true, .. } => {
+                                    if let Some(occupant_id) = from.split('/').nth(1) {
+                                        if occupant_id != srv_id && occupant_id != "focus" {
+                                            client_modes.remove(occupant_id);
+                                            client_video_endpoints.remove(occupant_id);
+                                            client_v2_endpoints.remove(occupant_id);
+                                            p2p_clients.remove(occupant_id);
+                                            if let Some((_, dead_client)) = clients_map.remove(occupant_id) {
+                                                info!(
+                                                    "[WRTC Server] Occupant {occupant_id} left MUC room. Removing session {} (IP: {}) immediately.",
+                                                    dead_client.session_id, dead_client.assigned_ip
+                                                );
+                                                let old_tag = anet_common::wrtc::colibri::client_tag_from_ip(&dead_client.assigned_ip);
+                                                clients_by_tag.remove(&old_tag);
+                                                client_video_warmed_up.remove(&old_tag);
+                                                reg_clone.remove_client(&dead_client).await;
+                                            }
+                                        }
+                                    }
+                                }
+                                _ => {}
                             }
                         }
                     }
@@ -387,15 +417,29 @@ pub async fn run_wrtc_server(
                                                 "[WRTC Server] Client {from_endpoint} authenticated! Assigned IP: {assigned_ip}"
                                             );
 
-                                            // Мгновенное вытеснение предыдущей сессии того же устройства при реконнекте (исключая текущую)
-                                            if let Some(old) = reg_clone
-                                                .evict_existing_device_session(&client_info.fingerprint, "wrtc", &client_info.session_id)
-                                                .await
-                                            {
-                                                let old_tag = anet_common::wrtc::colibri::client_tag_from_ip(&old.assigned_ip);
-                                                clients_by_tag.remove(&old_tag);
-                                                client_video_warmed_up.remove(&old_tag);
-                                                clients_map.retain(|_, v| v.session_id != old.session_id);
+                                            // 1. Если этот же MUC occupant (from_endpoint) переаутентифицировался, очищаем его старую сессию
+                                            if let Some((_, old_ep_client)) = clients_map.remove(&from_endpoint) {
+                                                if old_ep_client.session_id != client_info.session_id {
+                                                    let old_tag = anet_common::wrtc::colibri::client_tag_from_ip(&old_ep_client.assigned_ip);
+                                                    clients_by_tag.remove(&old_tag);
+                                                    client_video_warmed_up.remove(&old_tag);
+                                                    reg_clone.remove_client(&old_ep_client).await;
+                                                }
+                                            }
+
+                                            // 2. Вытесняем другую сессию с тем же fingerprint ТОЛЬКО если лимит сессий строго равен 1.
+                                            // Если тариф разрешает несколько устройств или безлимит (allowed_sessions == 0 / None / >1),
+                                            // параллельные сессии (например, ПК + Android под одним аккаунтом) работают одновременно!
+                                            if client_info.allowed_sessions == Some(1) {
+                                                if let Some(old) = reg_clone
+                                                    .evict_existing_device_session(&client_info.fingerprint, "wrtc", &client_info.session_id)
+                                                    .await
+                                                {
+                                                    let old_tag = anet_common::wrtc::colibri::client_tag_from_ip(&old.assigned_ip);
+                                                    clients_by_tag.remove(&old_tag);
+                                                    client_video_warmed_up.remove(&old_tag);
+                                                    clients_map.retain(|_, v| v.session_id != old.session_id);
+                                                }
                                             }
 
                                             let client_tag = anet_common::wrtc::colibri::client_tag_from_ip(&assigned_ip);

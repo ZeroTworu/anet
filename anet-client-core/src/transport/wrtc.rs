@@ -365,8 +365,14 @@ impl ClientTransport for WrtcTransport {
                 };
                 if let Some(stanza) = stanza_opt {
                     if let Some(jingle) = parse_jingle_session(&stanza, &fb_ip_owned, fallback_port) {
-                        for v_ssrc in jingle.video_sources {
-                            peer_xmpp.add_remote_video_ssrc(v_ssrc).await;
+                        if jingle.action == "source-add" || jingle.action == "description-info" {
+                            let expected_srv_ssrc = peer_xmpp.expected_peer_video_ssrc.load(Ordering::Relaxed);
+                            for v_ssrc in jingle.video_sources {
+                                // На клиенте привязываем только видео-SSRC сервера, игнорируя SSRC других клиентов в комнате
+                                if expected_srv_ssrc == 0 || v_ssrc == expected_srv_ssrc {
+                                    peer_xmpp.add_remote_video_ssrc(v_ssrc).await;
+                                }
+                            }
                         }
                     }
                 } else {
@@ -449,7 +455,7 @@ impl ClientTransport for WrtcTransport {
         let (tun_inject_tx, mut tun_inject_rx) =
             tokio::sync::mpsc::channel::<Bytes>(32768);
 
-        tokio::spawn(async move {
+        let tunnel_writer_task = tokio::spawn(async move {
             let mut write_buf = BytesMut::with_capacity(COALESCE_BUDGET_BYTES);
             while let Some(packet) = tun_inject_rx.recv().await {
                 write_buf.clear();
@@ -634,6 +640,7 @@ impl ClientTransport for WrtcTransport {
                 }
             }
             tunnel_reader_task.abort();
+            tunnel_writer_task.abort();
         });
 
         let peer_rx = shared_peer.clone();

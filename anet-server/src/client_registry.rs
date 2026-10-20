@@ -374,9 +374,15 @@ impl ClientRegistry {
             self.clients_by_ip.remove(client_ip);
             self.clear_shaper_limit(client_ip);
 
-            // Очищаем локальные счетчики трафика отключенной сессии во избежание утечки памяти
-            let key = format!("{}#{}", client_info.fingerprint, client_info.protocol);
-            self.traffic_totals.remove(&key);
+            // Очищаем локальные счетчики трафика только если больше нет активных сессий с этим fingerprint и протоколом
+            let still_has_same_fp = self.clients_by_ip.iter().any(|entry| {
+                entry.value().fingerprint == client_info.fingerprint
+                    && entry.value().protocol == client_info.protocol
+            });
+            if !still_has_same_fp {
+                let key = format!("{}#{}", client_info.fingerprint, client_info.protocol);
+                self.traffic_totals.remove(&key);
+            }
 
             if let Ok(ip_addr) = client_ip.parse::<Ipv4Addr>() {
                 self.ip_pool.release(ip_addr);
