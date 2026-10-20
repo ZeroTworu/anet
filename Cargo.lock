@@ -324,6 +324,7 @@ name = "anet-auth"
 version = "0.1.0"
 dependencies = [
  "anet-common",
+ "anet-filter-core",
  "anyhow",
  "base64 0.22.1",
  "bcrypt",
@@ -339,6 +340,7 @@ dependencies = [
  "poem",
  "poem-openapi",
  "rand 0.8.5",
+ "reqwest",
  "rpassword",
  "sea-orm",
  "sea-orm-migration",
@@ -379,17 +381,21 @@ version = "0.1.0"
 dependencies = [
  "anet-appfilter",
  "anet-common",
+ "anet-filter-core",
  "anyhow",
+ "arc-swap",
  "async-trait",
  "base64 0.22.1",
  "bytes",
  "chrono",
+ "dashmap",
  "ed25519-dalek 2.2.0",
  "futures",
  "hickory-resolver",
  "http",
  "ipnet",
  "log",
+ "memmap2",
  "net-route",
  "netdev",
  "prost",
@@ -491,6 +497,21 @@ name = "anet-ebpf-common"
 version = "0.1.0"
 dependencies = [
  "aya",
+]
+
+[[package]]
+name = "anet-filter-core"
+version = "0.1.0"
+dependencies = [
+ "ahash 0.8.12",
+ "anyhow",
+ "bytecheck 0.6.12",
+ "bytes",
+ "ipnet",
+ "log",
+ "rand 0.8.5",
+ "rkyv 0.7.46",
+ "serde",
 ]
 
 [[package]]

@@ -29,6 +29,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
+use crate::events::{status, warn};
 
 fn current_timestamp_secs() -> u64 {
     std::time::SystemTime::now()
@@ -207,9 +208,11 @@ impl ClientTransport for WrtcTransport {
         bypass_ips.sort_unstable();
         bypass_ips.dedup();
         info!("[WRTC] Discovered media bypass IPs: {:?}", bypass_ips);
+        status(format!("[WRTC] Discovered media bypass IPs: {:?}", bypass_ips));
 
         let wrtc_mode = self.server.wrtc_transport_mode();
         info!("[WRTC] Selected WebRTC transport mode: {:?}", wrtc_mode);
+        status(format!("[WRTC] Selected transport mode: {:?}", wrtc_mode));
 
         let audio_keepalive_ms = self.server.wrtc_media_keepalive_interval_ms.unwrap_or(20);
         let peer = WrtcPeer::create(
@@ -224,6 +227,7 @@ impl ClientTransport for WrtcTransport {
             .context("Failed to initialize WebRTC PeerConnection and DataChannel")?;
 
         info!("[WRTC] WebRTC Peer created. Starting server discovery...");
+        status("[WRTC] WebRTC Peer created. Starting server discovery...");
 
         let client_nonce = format!("{:016x}", rand::random::<u64>());
         let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
@@ -253,12 +257,14 @@ impl ClientTransport for WrtcTransport {
                         anet_common::wrtc::colibri::WrtcMode::Auto => (Some(peer.video_ssrc), "auto"),
                     };
                     info!("[WRTC] Sending anet_discover broadcast (nonce: {client_nonce}, mode: {c_mode_str}, video_ssrc: {c_video_ssrc:?})...");
+                    status(format!("[WRTC] Sending anet_discover broadcast (nonce: {client_nonce}, mode: {c_mode_str}, video_ssrc: {c_video_ssrc:?})..."));
                     let discover_broadcast = ColibriMessage::discover(None, client_nonce.clone(), c_video_ssrc, Some(c_mode_str.to_string()));
                     let _ = peer.send(discover_broadcast).await;
 
                     let current_occupants = xmpp.get_other_occupants();
                     for occupant in current_occupants {
                         info!("[WRTC] Sending anet_discover to occupant: {occupant}");
+                        status(format!("[WRTC] Sending anet_discover to occupant: {occupant}"));
                         let unicast_discover = ColibriMessage::discover(Some(occupant), client_nonce.clone(), c_video_ssrc, Some(c_mode_str.to_string()));
                         let _ = peer.send(unicast_discover).await;
                     }
@@ -267,6 +273,7 @@ impl ClientTransport for WrtcTransport {
                     if let Some(msg) = msg_opt {
                         if let WrtcMessage::Beacon { server_id, client_nonce: beacon_nonce, signature, video_ssrc, video_v2 } = msg.msg_payload {
                             info!("[WRTC] Received beacon from server: {server_id} (nonce match: {}, server_video_ssrc: {video_ssrc:?}, video_v2: {video_v2:?})", beacon_nonce == client_nonce);
+                            status(format!("[WRTC] Received beacon from server: {server_id} (nonce match: {}, server_video_ssrc: {video_ssrc:?}, video_v2: {video_v2:?})", beacon_nonce == client_nonce));
                             if beacon_nonce == client_nonce {
                                 if video_v2.unwrap_or(false) {
                                     peer.set_video_v2(true);
@@ -274,6 +281,7 @@ impl ClientTransport for WrtcTransport {
                                 if let Some(v_ssrc) = video_ssrc {
                                     peer.set_expected_peer_video_ssrc(v_ssrc);
                                     info!("[WRTC Client] Set expected server video SSRC: {v_ssrc}");
+                                    status(format!("[WRTC Client] Set expected server video SSRC: {v_ssrc}"));
 
                                     // ИНЖЕКТИРУЕМ SSRC СЕРВЕРА В REMOTE_DESCRIPTION
                                     peer.add_remote_video_ssrc(v_ssrc).await;
@@ -285,18 +293,22 @@ impl ClientTransport for WrtcTransport {
                                     match verify_beacon(pub_key, &client_nonce, &server_id, &signature) {
                                         Ok(true) => {
                                             info!("[WRTC] Server beacon signature verified successfully! Server ID: {server_id}");
+                                            status(format!("[WRTC] Server beacon signature verified successfully! Server ID: {server_id}"));
                                             verified_server_id = Some(server_id);
                                             break;
                                         }
                                         Ok(false) => {
                                             warn!("[WRTC] Server beacon signature verification FAILED! Check server_pub_key in client.toml vs server_signing_key in server.toml");
+                                            warn("[WRTC] Server beacon signature verification FAILED! Check server_pub_key in client.toml vs server_signing_key in server.toml");
                                         }
                                         Err(e) => {
                                             warn!("[WRTC] Error verifying server beacon: {e:#}");
+                                            warn(format!("[WRTC] Error verifying server beacon: {e:#}"));
                                         }
                                     }
                                 } else {
                                     info!("[WRTC] No server_pub_key configured, accepting server: {server_id}");
+                                    status(format!("[WRTC] No server_pub_key configured, accepting server: {server_id}"));
                                     verified_server_id = Some(server_id);
                                     break;
                                 }
@@ -316,6 +328,7 @@ impl ClientTransport for WrtcTransport {
         })?;
 
         info!("[WRTC] Starting ASTP authentication with server: {target_server_id}");
+        status(format!("[WRTC] Starting ASTP authentication with server: {target_server_id}"));
 
         let shared_peer = Arc::new(peer);
         let auth_channel = WrtcAuthChannel {
@@ -338,7 +351,7 @@ impl ClientTransport for WrtcTransport {
             "[WRTC] ASTP Authentication succeeded! Assigned VPN IP: {}",
             auth_response.ip
         );
-
+        status(format!("[WRTC] ASTP Authentication succeeded! Assigned VPN IP: {}", auth_response.ip));
         let my_client_tag = anet_common::wrtc::colibri::client_tag_from_ip(&auth_response.ip);
         info!(
             "[WRTC] Fake Video Track client tag: 0x{:04X} (derived from IP {})",
@@ -386,6 +399,7 @@ impl ClientTransport for WrtcTransport {
             || wrtc_mode == anet_common::wrtc::colibri::WrtcMode::Auto
         {
             info!("[P2P Direct] Initiating direct WebRTC P2P DataChannel with server {target_server_id}...");
+            status(format!("[P2P Direct] Initiating direct WebRTC P2P DataChannel with server {target_server_id}..."));
             let p2p_store = p2p_session_opt.clone();
             let peer_sig = shared_peer.clone();
             let target_srv = target_server_id.clone();
@@ -400,6 +414,7 @@ impl ClientTransport for WrtcTransport {
                             Ok(offer) => {
                                 if let Err(e) = p2p_arc.pc.set_local_description(offer.clone()).await {
                                     warn!("[P2P Direct] set_local_description error: {e}");
+                                    warn(format!("[P2P Direct] set_local_description error: {e}"));
                                     return;
                                 }
                                 let mut final_sdp = offer.sdp.clone();
@@ -423,12 +438,15 @@ impl ClientTransport for WrtcTransport {
                                 let offer_msg = ColibriMessage::p2p_offer(target_srv.clone(), final_sdp, vec![]);
                                 if let Err(e) = peer_sig.send(offer_msg).await {
                                     warn!("[P2P Direct] Failed to send anet_p2p_offer: {e}");
+                                    warn(format!("[P2P Direct] Send failed: {e}"));
                                 } else {
                                     info!("[P2P Direct] Sent anet_p2p_offer to server {target_srv}");
+                                    status(format!("[P2P Direct] Sent anet_p2p_offer to server {target_srv}"));
                                 }
                             }
                             Err(e) => {
                                 warn!("[P2P Direct] create_offer error: {e}");
+                                warn(format!("[P2P Direct] Create offer error: {e}"));
                             }
                         }
                     }
@@ -600,6 +618,7 @@ impl ClientTransport for WrtcTransport {
                                     }
                                     Err(e) => {
                                         warn!("[WRTC Client] wrap_packet error: {e}");
+                                        warn(format!("[WRTC Client] wrap_packet error: {e}"));
                                     }
                                 }
                             }
@@ -620,6 +639,7 @@ impl ClientTransport for WrtcTransport {
                                 let msg = ColibriMessage::astp_batch(target_srv_tx.clone(), b64);
                                 if let Err(e) = peer_tx.send(msg).await {
                                     warn!("[WRTC Client] Peer flush batch send error: {e}");
+                                    warn(format!("[WRTC Client] Peer send batch error: {e}"));
                                     break;
                                 }
                             }
@@ -629,11 +649,13 @@ impl ClientTransport for WrtcTransport {
                         let now = current_timestamp_secs();
                         if now.saturating_sub(last_pong_tx.load(Ordering::Relaxed)) > 45 {
                             warn!("[WRTC Client] Ping timeout (no pong from server for 45s). Reconnecting...");
+                            warn("[WRTC Client] Ping timeout (no pong from server for 45s). Reconnecting...");
                             break;
                         }
                         let ping_msg = ColibriMessage::ping(target_srv_tx.clone());
                         if let Err(e) = peer_tx.send(ping_msg).await {
                             warn!("[WRTC Client] Peer ping error: {e}");
+                            warn(format!("[WRTC Client] Peer ping error: {e}"));
                             break;
                         }
                     }
@@ -656,6 +678,7 @@ impl ClientTransport for WrtcTransport {
                         match msg.msg_payload {
                             WrtcMessage::P2pAnswer { sdp, .. } => {
                                 info!("[P2P Direct] Received anet_p2p_answer from server! Applying remote SDP...");
+                                status("[P2P Direct] Received anet_p2p_answer from server! Applying remote SDP...");
                                 let p2p_opt = {
                                     let guard = p2p_sig.lock().await;
                                     guard.clone()
@@ -666,6 +689,7 @@ impl ClientTransport for WrtcTransport {
                                             warn!("[P2P Direct] set_remote_description error: {e}");
                                         } else {
                                             info!("[P2P Direct] Applied remote answer successfully. Awaiting DataChannel open...");
+                                            status("[P2P Direct] Applied remote answer successfully. Awaiting DataChannel open...");
                                         }
                                     }
                                 }
@@ -682,11 +706,13 @@ impl ClientTransport for WrtcTransport {
                                             }
                                             Err(e) => {
                                                 warn!("[WRTC Client] Decrypt packet error: {e}");
+                                                warn(format!("[WRTC Client] Decrypt packet error: {e}"));
                                             }
                                         }
                                     }
                                     Err(e) => {
                                         warn!("[WRTC Client] Base64 decode error: {e}");
+                                        warn(format!("[WRTC Client] wrap_packet error: {e}"));
                                     }
                                 }
                             }
@@ -701,12 +727,14 @@ impl ClientTransport for WrtcTransport {
                                                 }
                                                 Err(e) => {
                                                     warn!("[WRTC Client] Decrypt batch packet error: {e}");
+                                                    warn(format!("[WRTC Client] Decrypt batch packet: {e}"));
                                                 }
                                             }
                                         }
                                     }
                                     Err(e) => {
                                         warn!("[WRTC Client] Base64 batch decode error: {e}");
+                                        warn(format!("[WRTC Client] Decrypt batch error: {e}"));
                                     }
                                 }
                             }
@@ -742,6 +770,7 @@ impl ClientTransport for WrtcTransport {
                                 }
                                 Err(e) => {
                                     warn!("[P2P Direct] Decrypt packet error: {e}");
+                                    warn(format!("[WRTC Client] Decrypt packet error: {e}"));
                                 }
                             }
                         }
@@ -788,6 +817,7 @@ impl ClientTransport for WrtcTransport {
                                             "[WRTC Client Video IN] First video frame decrypted from server (len: {} bytes, tag: 0x{:04X})",
                                             decrypted.len(), tag
                                         );
+                                        status(format!("[WRTC Client Video IN] First video frame decrypted from server (len: {} bytes, tag: 0x{:04X})", decrypted.len(), tag));
                                     }
                                     if decrypted.first() == Some(&VIDEO_BATCH_MARKER) {
                                         let packets = unpack_batch(&decrypted[1..]);
@@ -807,6 +837,7 @@ impl ClientTransport for WrtcTransport {
                                 }
                                 Err(e) => {
                                     warn!("[WRTC Media Video IN] Decrypt packet error: {e} (raw_astp len: {raw_len})");
+                                    warn(format!("[WRTC Media Video IN] Decrypt packet error: {e} (raw_astp len: {raw_len})"));
                                 }
                             }
                         }
@@ -824,7 +855,9 @@ impl ClientTransport for WrtcTransport {
             guard.as_ref().map(|p| p.is_open.load(Ordering::SeqCst)).unwrap_or(false)
         };
         let effective_mode = Some(shared_peer.effective_mode(p2p_open).to_string());
+
         info!("[WRTC] Active transport mode: {:?}", effective_mode.as_deref().unwrap_or("UNKNOWN"));
+        status(format!("[WRTC] Effective mode: {:?}", effective_mode.as_deref().unwrap_or("UNKNOWN")));
 
         let remote_ip = bypass_ips.first().copied();
         let xmpp_shutdown = Arc::clone(&xmpp_arc);
