@@ -233,7 +233,7 @@ impl StatisticsApi {
                         has_traffic_limit = true;
                     }
                 } else if let Some(ref group) = group_opt {
-                    allowed_sessions = group.sessions;
+                    allowed_sessions = group.sessions_limit;
                     if group.traffic_limit > 0 {
                         limit = group.traffic_limit;
                         has_traffic_limit = true;

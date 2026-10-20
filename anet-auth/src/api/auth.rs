@@ -9,8 +9,8 @@ use jsonwebtoken::{encode, EncodingKey, Header};
 use poem::Result;
 use poem_openapi::{payload::Json, OpenApi};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, IntoActiveModel, Set,
-    QueryFilter, TransactionTrait, QuerySelect
+    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, Set,
+    QueryFilter, QuerySelect,
 };
 use std::env;
 use uuid::Uuid;
