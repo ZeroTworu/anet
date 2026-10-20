@@ -528,7 +528,7 @@ mod tests {
 
         let ws_no_port = ServerConfig {
             name: None,
-            dsn: "wss://gm1.anet-project.org/socket".to_string(),
+            dsn: "wss://vpn.example.com/socket".to_string(),
             timeout_secs: 10,
             server_pub_key: None,
             ssh_user: None,
@@ -544,7 +544,7 @@ mod tests {
             wrtc_fallback_jvb_port: None,
             wrtc_mode: None,
         };
-        assert_eq!(ws_no_port.endpoint().unwrap(), "gm1.anet-project.org:443");
+        assert_eq!(ws_no_port.endpoint().unwrap(), "vpn.example.com:443");
     }
 
     #[test]

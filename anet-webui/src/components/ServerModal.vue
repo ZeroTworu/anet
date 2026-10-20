@@ -166,7 +166,7 @@ const close = () => {
           <v-text-field v-model="form.name" label="Название локации" variant="filled" class="mb-3" />
 
           <!-- Изменили поле DSN на "IP Адрес или Домен" -->
-          <v-text-field v-model="form.address" label="IP Адрес или Домен" placeholder="e.g. 64.188.118.201 или vpn.ziga.com" variant="filled" class="mb-3" />
+          <v-text-field v-model="form.address" label="IP Адрес или Домен" placeholder="e.g. 203.0.113.10 или vpn.example.com" variant="filled" class="mb-3" />
 
           <v-text-field v-model="form.public_key" label="Публичный ключ сервера" variant="filled" class="mb-3" />
           <v-text-field v-model="form.ssh_user" label="Пользователь SSH" variant="filled" class="mb-3" />

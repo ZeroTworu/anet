@@ -180,7 +180,7 @@ impl anet_client_core::traits::RouteManager for AndroidRouteManager {
         }
 
         if added_new {
-            // Коалесцируем параллельные DNS-ответы (например, 2ip.io + static.2ip.io) в одно обновление TUN
+            // Коалесцируем параллельные DNS-ответы (например, example.com + static.example.com) в одно обновление TUN
             tokio::time::sleep(std::time::Duration::from_millis(15)).await;
         }
 
@@ -268,7 +268,7 @@ impl AndroidCallbackTunFactory {
                 }
                 continue;
             }
-            // 3. Домен или Wildcard (например, "*.2ip.io", ".2ip.io", "2ip.io")
+            // 3. Домен или Wildcard (например, "*.example.com", ".example.com", "example.com")
             let clean = trimmed
                 .trim_start_matches('*')
                 .trim_start_matches('.');

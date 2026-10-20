@@ -15,8 +15,8 @@
 2. **Паразитный шум и ложные тревоги в логах**:
    - Периодические TCP-пробы к порту SSH/VNC/WS каждые 1–2 секунды приводили к постоянным разрывам полуоткрытых соединений. Логи сервера заполнялись предупреждениями вида:
      ```text
-     [WARN  anet_server::servers::ssh] [SSH] Connection 78.36.217.13:45768 stopped: Disconnected
-     [WARN  anet_server::servers::ssh] [SSH] Connection 78.36.217.13:45770 stopped: Disconnected
+     [WARN  anet_server::servers::ssh] [SSH] Connection 203.0.113.42:45768 stopped: Disconnected
+     [WARN  anet_server::servers::ssh] [SSH] Connection 203.0.113.42:45770 stopped: Disconnected
      ```
 3. **Зависимость от сетевого окружения**:
    - Внешний пинг до внешнего IP сервера не отражал состояние самого туннеля (шифрование, фрагментация MTU, очереди в ring-буферах).

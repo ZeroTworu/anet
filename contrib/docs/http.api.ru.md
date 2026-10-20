@@ -48,8 +48,8 @@
   [
     {
       "id": "5ca3580d-8488-457b-85e6-7013239747c4",
-      "name": "Germany Node 1",
-      "address": "64.188.118.201",
+      "name": "Europe Node 1",
+      "address": "203.0.113.10",
       "public_key": "ecfNEF2kYJ8kjyUqlI8HgBZaAnPBmsZVequuoxjZppk=",
       "quic_port": 4519,
       "ssh_port": 822,
@@ -76,13 +76,13 @@
 * **Тело запроса (JSON)**:
   ```json
   {
-    "name": "Netherlands Fast CDN",
-    "address": "144.31.186.196",
+    "name": "Europe Node 2",
+    "address": "198.51.100.25",
     "public_key": "dWAvFBO08zuG708zUbOt9dsqEVNH40p7Y4kmO/bqVks=",
     "quic_port": 4519,
     "ssh_port": 822,
     "vnc_port": 56678,
-    "websocket_url": "wss://144.31.186.196:8080/socket",
+    "websocket_url": "wss://198.51.100.25:8080/socket",
     "ahttp_url": "https://cdn.example.net/api/v2/telemetry",
     "wrtc_url": "wrtc://meet.jit.si/your-telemetry-room",
     "ssh_user": "hanyuu",
@@ -266,7 +266,7 @@
     "items": [
       {
         "id": "612fff22-67f9-4040-9f7b-0686e9cc0215",
-        "uid": "sup_2",
+        "uid": "user_01",
         "fingerprint": "xXXwHV0OQuEhDUWynlp0Xg==",
         "is_active": true,
         "created_at": "2026-08-30 13:26:08",
@@ -325,7 +325,7 @@
 * **Ответ (200 OK)**: `[ { "node_id": "uuid", "name": "Node 1", "rx_bytes": 1048576, "tx_bytes": 2097152 } ]`
 
 ### `GET /statistics/users` — Трафик по пользователям
-* **Ответ (200 OK)**: `[ { "user_id": "uuid", "uid": "sup_2", "fingerprint": "...", "rx_bytes": 100, "tx_bytes": 200 } ]`
+* **Ответ (200 OK)**: `[ { "user_id": "uuid", "uid": "user_01", "fingerprint": "...", "rx_bytes": 100, "tx_bytes": 200 } ]`
 
 ### `GET /statistics/active-connections` — Сессии в реальном времени
 Возвращает список клиентов, передававших трафик за последние 90 секунд.
@@ -334,9 +334,9 @@
   [
     {
       "user_id": "612fff22-67f9-4040-9f7b-0686e9cc0215",
-      "username": "sup_2",
+      "username": "user_01",
       "server_id": "5ca3580d-8488-457b-85e6-7013239747c4",
-      "server_name": "Germany Node 1",
+      "server_name": "Europe Node 1",
       "rx_bytes": 183536546,
       "tx_bytes": 916075957,
       "connection_count": 1,

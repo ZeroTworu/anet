@@ -67,11 +67,11 @@ route_for = []
 #    с иностранных IP.
 # 3. Банковские приложения: Если банк блокирует доступ при использовании VPN.
 #
-# Пример: exclude_route_for = ["192.168.0.0/16", "online.sberbank.ru"]
+# Пример: exclude_route_for = ["192.168.0.0/16", "intranet.example.com"]
 # Можно использовать доменные имена, они автоматом разрезолвятся в IP, но если сайт на домене использует CDN
 # CDN не разрезолвится (тут нет ИИшенки) и может работать кривовато.
 # По умолчанию: [] (Весь трафик идет через VPN)
-exclude_route_for = ["192.168.1.0/24", "www.ozon.ru"]
+exclude_route_for = ["192.168.1.0/24", "direct.example.com"]
 
 # -------------------------------------------------------------------------
 # Настройки DNS резолвера (для Split Tunneling)
@@ -132,8 +132,8 @@ rules_url = "http://127.0.0.1:3000/api/v1/routing/compiled-rules"
 # поддоменов или IP/CIDR-подсетей без изменения настроек на сервере.
 #
 # Поддерживаемые форматы записей в списках `direct`, `vpn`, `block`:
-# - Домены (включая все их поддомены): "gosuslugi.ru", "my.bank.ru"
-# - Wildcard-шаблоны: "*.local", "*.corp.company.ru"
+# - Домены (включая все их поддомены): "portal.example.com", "my.bank.example"
+# - Wildcard-шаблоны: "*.local", "*.corp.example.com"
 # - Одиночные IPv4/IPv6 адреса: "192.168.1.1", "93.184.216.34"
 # - Подсети CIDR: "192.168.0.0/16", "10.0.0.0/8"
 # -------------------------------------------------------------------------
@@ -261,7 +261,7 @@ timeout_secs = 8
 # 5. WebRTC (Ktalk SFU): скрытный транспорт поверх корпоративной ВКС Контур.Толк
 # [[servers]]
 # name = "Ktalk Node [WRTC]"
-# dsn = "wrtc://vc7x91a2.ktalk.ru/k8m2v9px7q1w"
+# dsn = "wrtc://example.ktalk.ru/example-room-id"
 # wrtc_mode = "media_video"              # Режим транспорта: "media_video" (Fake Video Track over DTLS-SRTP / JVB) | "p2p_direct" | "jvb_datachannel" | "ws" | "auto"
 # timeout_secs = 15
 # server_pub_key = "<BASE64_ED25519_PUBLIC_KEY>"

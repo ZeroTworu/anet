@@ -13,7 +13,7 @@
 
 ### 1.2. Базовая топология
 * **Топология сети:** Клиент-серверное соединение поверх топологии **SFU (Selective Forwarding Unit)**. Прямое соединение (P2P) между пирами не требуется; все участники взаимодействуют через медиамост JVB.
-* **Среда встречи (Rendezvous):** Клиенты и сервер подключаются в одну заранее подготовленную постоянную комнату с фиксированным коротким именем (например, `k8m2v9px7q1w`).
+* **Среда встречи (Rendezvous):** Клиенты и сервер подключаются в одну заранее подготовленную постоянную комнату с фиксированным коротким именем (например, `example-room-id`).
 * **Роли в парадигме ANet:**
   * `anet-server` выступает в роли дежурного участника ВКС, непрерывно присутствующего в комнате.
   * `anet-client` подключается к комнате по требованию, находит сервер посредством криптографического механизма Discovery и инициирует внутреннее рукопожатие ASTP.
@@ -28,7 +28,7 @@
 ```
 +-------------+                     +----------------------+
 | ANet Client |                     | Ktalk HTTP API       |
-|  or Server  |                     | (vc7x91a2.ktalk.ru)  |
+|  or Server  |                     | (example.ktalk.ru)   |
 +-------------+                     +----------------------+
        |                                       |
        | 1. POST /api/authorize/session        |
@@ -71,17 +71,17 @@
   ```json
   {
     "name": "Гость 4821",
-    "anonymousSecret": "GYJ0ELL13CY24UG",
+    "anonymousSecret": "EXAMPLE_ANONYMOUS_SECRET",
     "consentOnCreate": true
   }
   ```
 * **Ответ Ktalk API:**
   ```json
   {
-    "token": "3fzNXERAn22TEqOwvmGT",
+    "token": "example_session_token_abc123",
     "expiresAt": "2026-10-01T02:00:00Z",
     "expiresIn": 543740,
-    "anonymousId": "A56CBDE4BF1CE3D2C6C3782CCD15CD871A812D1CDCD46C9343C23870F2EE2F17"
+    "anonymousId": "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF"
   }
   ```
 
@@ -94,8 +94,8 @@
 * **Ответ Ktalk API:**
   ```json
   {
-    "roomName": "k8m2v9px7q1w",
-    "conferenceId": "k8m2v9px7q1w_a1b2c3d4e5f607182930415263748596a7b8c9d0e1f2a3b4c5d6e7f8091a2b3c",
+    "roomName": "example-room-id",
+    "conferenceId": "example-room-id_a1b2c3d4e5f607182930415263748596a7b8c9d0e1f2a3b4c5d6e7f8091a2b3c",
     "allowAnonymous": true
   }
   ```
@@ -161,7 +161,7 @@
 
 ### 3.3. Архитектура ICE-соединения с JVB и обход мобильного CGNAT
 1. **Топология "клиент-сервер" вместо P2P:**
-   * Медиамост JVB Контура всегда имеет **публичный белый IP-адрес** (например, `89.169.18.12:10000`, тип `host` в Jingle Offer).
+   * Медиамост JVB всегда имеет **публичный белый IP-адрес** (например, `203.0.113.12:10000`, тип `host` в Jingle Offer).
    * Клиент и сервер ANet слушают универсальный локальный сокет `0.0.0.0:0`, собирая хостовые кандидаты со всех сетевых интерфейсов.
    * При отправке первых пакетов ICE Connectivity Check клиент инициирует исходящий UDP-поток на белый адрес JVB. Любой сетевой экран (NAT домашнего роутера, CGNAT мобильных операторов Мегафон/МТС/Билайн) мгновенно открывает двустороннюю трансляцию портов (NAT hole punching), и статус WebRTC переходит в `Connected` за считанные миллисекунды.
 2. **Отключение встроенного STUN Gatherer:**
@@ -312,12 +312,12 @@ pub struct ColibriMessage {
 ```toml
 [[servers]]
 name = "Ktalk Node [WRTC]"
-dsn = "wrtc://vc7x91a2.ktalk.ru/k8m2v9px7q1w"
+dsn = "wrtc://example.ktalk.ru/example-room-id"
 timeout_secs = 15
 server_pub_key = "<BASE64_ED25519_PUBLIC_KEY>"
 wrtc_media_keepalive_interval_ms = 20 # Эмуляция Opus тишины (мс)
 wrtc_ping_interval_secs = 20          # Пинг сигнального WSS (сек)
-wrtc_fallback_jvb_ip = "89.169.19.7"  # Fallback IP медиасервера JVB
+wrtc_fallback_jvb_ip = "203.0.113.7"  # Fallback IP медиасервера JVB
 wrtc_fallback_jvb_port = 10004        # Fallback UDP порт JVB
 
 # Режим транспорта данных: "media_video" | "p2p_direct" | "jvb_datachannel" | "ws" | "auto"
@@ -327,10 +327,10 @@ wrtc_mode = "media_video"
 ### В `server.toml`:
 ```toml
 [server]
-wrtc_room_url = "wrtc://vc7x91a2.ktalk.ru/k8m2v9px7q1w"
+wrtc_room_url = "wrtc://example.ktalk.ru/example-room-id"
 wrtc_media_keepalive_interval_ms = 20 # Эмуляция Opus тишины (мс)
 wrtc_ping_interval_secs = 20          # Пинг сигнального WSS (сек)
-wrtc_fallback_jvb_ip = "89.169.19.7"  # Fallback IP медиасервера JVB
+wrtc_fallback_jvb_ip = "203.0.113.7"  # Fallback IP медиасервера JVB
 wrtc_fallback_jvb_port = 10004        # Fallback UDP порт JVB
 
 # Режим транспорта данных: "media_video" | "p2p_direct" | "jvb_datachannel" | "ws" | "auto"
@@ -500,7 +500,7 @@ let dc = pc.create_data_channel("anet-data", Some(dc_init)).await?;
 1. **Неработоспособность P2P Direct:** 
    * Публичные STUN-серверы (`stun.l.google.com` и др.) возвращают `STUN error: TransactionTimeOut` или фильтруются сетью.
    * Прямой обмен UDP-пакетами между клиентом и внешним сервером сбрасывается сотовым оператором из-за жесткого CGNAT.
-2. **Единственный гарантированный канал связи:** Весь туннельный трафик передается **строго через медиамост JVB (`89.169.16.x:10003` UDP)**, маскируясь под легитимный медиапоток видеоконференции (DTLS-SRTP).
+2. **Единственный гарантированный канал связи:** Весь туннельный трафик передается **строго через медиамост JVB (`203.0.113.x:10003` UDP)**, маскируясь под легитимный медиапоток видеоконференции (DTLS-SRTP).
 
 ---
 
