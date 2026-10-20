@@ -76,6 +76,45 @@ impl StatisticsApi {
             .and_hms_opt(now.hour(), minute, 0)
             .expect("valid bucket");
 
+        // Декларативная синхронизация сессий (Единый источник истины — отчёты живых нод):
+        // Обновляем снимок живых сессий этой ноды и приводим таблицу active_sessions в точное соответствие
+        // с суммой реальных подключений по всем живым нодам (без /session/start и /session/stop).
+        let live_totals = crate::api::api::update_node_live_sessions(
+            node_id,
+            req.0.active_session_counts.clone(),
+        );
+        if let (Ok(all_active_rows), Ok(all_users)) = (
+            crate::entities::active_sessions::Entity::find().all(&txn).await,
+            users::Entity::find().all(&txn).await,
+        ) {
+            let mut existing_by_user_id: HashMap<Uuid, crate::entities::active_sessions::Model> =
+                all_active_rows
+                    .into_iter()
+                    .map(|r| (r.user_id, r))
+                    .collect();
+
+            for user in all_users {
+                let expected = live_totals.get(&user.fingerprint).copied().unwrap_or(0);
+                if let Some(row) = existing_by_user_id.remove(&user.id) {
+                    if row.sessions != expected {
+                        let mut editable = row.into_active_model();
+                        editable.sessions = Set(expected);
+                        editable.updated_at = Set(now);
+                        let _ = editable.update(&txn).await;
+                    }
+                } else if expected > 0 {
+                    let new_sess = crate::entities::active_sessions::ActiveModel {
+                        id: Set(Uuid::new_v4()),
+                        user_id: Set(user.id),
+                        sessions: Set(expected),
+                        created_at: Set(now),
+                        updated_at: Set(now),
+                    };
+                    let _ = new_sess.insert(&txn).await;
+                }
+            }
+        }
+
         for sample in req.0.samples {
             if sample.fingerprint.is_empty() {
                 return TrafficReportResponse::BadRequest(Json("Empty fingerprint".to_string()));
@@ -179,22 +218,41 @@ impl StatisticsApi {
                     cycle_start = rate.date_end - chrono::Duration::days(duration_days);
                 }
 
-                // Определение лимита трафика
+                // Определение лимита трафика и лимита одновременных сессий
                 let mut limit: i64 = 0;
                 let mut has_traffic_limit = false;
+                let mut allowed_sessions: i32 = 0;
 
                 let rate_has_limits = rate_opt.as_ref().is_some_and(|r| r.sessions > 0 || r.traffic_limit > 0 || r.speed_limit > 0);
 
                 if rate_has_limits {
                     let rate = rate_opt.as_ref().unwrap();
+                    allowed_sessions = rate.sessions;
                     if rate.traffic_limit > 0 {
                         limit = rate.traffic_limit;
                         has_traffic_limit = true;
                     }
                 } else if let Some(ref group) = group_opt {
+                    allowed_sessions = group.sessions;
                     if group.traffic_limit > 0 {
                         limit = group.traffic_limit;
                         has_traffic_limit = true;
+                    }
+                }
+
+                // Межнодовое FIFO-вытеснение: если суммарно по всем нодам у ключа больше живых сессий,
+                // чем разрешено по тарифу/группе — отправляем disconnect_user на ноду с самой старой сессией.
+                if allowed_sessions > 0 {
+                    let live_count = live_totals.get(&sample.fingerprint).copied().unwrap_or(0);
+                    if live_count > allowed_sessions {
+                        let _ = crate::api::api::evict_oldest_session_for_user(
+                            &txn,
+                            usr_id,
+                            &sample.fingerprint,
+                            live_count,
+                            allowed_sessions,
+                        )
+                        .await;
                     }
                 }
 

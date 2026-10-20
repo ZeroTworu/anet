@@ -66,28 +66,28 @@ pub async fn run_heartbeat(config: ControlPlaneConfig, registry: Arc<ClientRegis
         }
 
         let samples = registry.traffic_snapshot();
-        if !samples.is_empty() {
-            let traffic_endpoint =
-                format!("{}/control/nodes/traffic", config.url.trim_end_matches('/'));
-            let report = NodeTrafficReport {
-                node_id: config.node_id.clone(),
-                boot_id: boot_id.clone(),
-                samples,
-            };
-            match client
-                .post(traffic_endpoint)
-                .header("X-Node-Token", &config.token)
-                .json(&report)
-                .send()
-                .await
-            {
-                Ok(response) if response.status().is_success() => {}
-                Ok(response) => warn!(
-                    "[ControlPlane] Traffic report rejected with status {}",
-                    response.status()
-                ),
-                Err(error) => warn!("[ControlPlane] Traffic report failed: {error}"),
-            }
+        let active_session_counts = registry.active_session_counts();
+        let traffic_endpoint =
+            format!("{}/control/nodes/traffic", config.url.trim_end_matches('/'));
+        let report = NodeTrafficReport {
+            node_id: config.node_id.clone(),
+            boot_id: boot_id.clone(),
+            samples,
+            active_session_counts,
+        };
+        match client
+            .post(traffic_endpoint)
+            .header("X-Node-Token", &config.token)
+            .json(&report)
+            .send()
+            .await
+        {
+            Ok(response) if response.status().is_success() => {}
+            Ok(response) => warn!(
+                "[ControlPlane] Traffic report rejected with status {}",
+                response.status()
+            ),
+            Err(error) => warn!("[ControlPlane] Traffic report failed: {error}"),
         }
 
         match client

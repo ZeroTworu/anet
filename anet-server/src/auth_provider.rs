@@ -4,7 +4,7 @@ use log::{error, info};
 use reqwest::Client as HttpClient;
 
 use anet_common::dto::{
-    BillingType, CheckAccessRequest, CheckAccessResponse, SessionEventRequest,
+    BillingType, CheckAccessRequest, CheckAccessResponse,
 };
 
 #[derive(Debug, Clone)]
@@ -134,39 +134,5 @@ impl AuthProvider {
             }
         }
         Err("Все сервера авторизации недоступны".into())
-    }
-
-    pub async fn report_session_start(&self, fingerprint: String) {
-        if self.auth_servers.is_empty() {
-            return;
-        }
-        let req_body = SessionEventRequest { fingerprint };
-        for server_url in &self.auth_servers {
-            let url = format!("{}/session/start", server_url);
-            let _ = self
-                .http_client
-                .post(&url)
-                .header("X-Auth-Key", &self.auth_token)
-                .json(&req_body)
-                .send()
-                .await;
-        }
-    }
-
-    pub async fn report_session_stop(&self, fingerprint: String) {
-        if self.auth_servers.is_empty() {
-            return;
-        }
-        let req_body = SessionEventRequest { fingerprint };
-        for server_url in &self.auth_servers {
-            let url = format!("{}/session/stop", server_url);
-            let _ = self
-                .http_client
-                .post(&url)
-                .header("X-Auth-Key", &self.auth_token)
-                .json(&req_body)
-                .send()
-                .await;
-        }
     }
 }

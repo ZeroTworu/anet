@@ -42,13 +42,7 @@ impl ANetServer {
         let sign_key = SigningKey::from_bytes(&sk_bytes.try_into().unwrap());
 
 
-        let a_prov = Arc::new(AuthProvider::new(
-            cfg_ref.authentication.allowed_clients.clone(),
-            cfg_ref.authentication.auth_servers.clone(),
-            cfg_ref.authentication.auth_server_token.clone(),
-        ));
-
-        let reg = Arc::new(ClientRegistry::new(pl, a_prov.clone()));
+        let reg = Arc::new(ClientRegistry::new(pl));
         let dh = Arc::new(DashMap::new());
 
         let a_prov = Arc::new(AuthProvider::new(

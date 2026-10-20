@@ -50,14 +50,6 @@ pub struct CheckAccessResponse {
     pub expires_at: Option<String>,
 }
 
-/// [ VPN Core Communication: Session Events ]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "poem", derive(poem_openapi::Object))]
-#[cfg_attr(feature = "poem", oai(rename = "SessionEventRequest"))]
-pub struct SessionEventRequest {
-    pub fingerprint: String,
-}
-
 /// Периодический отчёт фактического состояния ноды для control plane.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "poem", derive(poem_openapi::Object))]
@@ -109,9 +101,23 @@ pub struct TrafficUsageSample {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "poem", derive(poem_openapi::Object))]
+#[cfg_attr(feature = "poem", oai(rename = "NodeSessionCountItem"))]
+pub struct NodeSessionCountItem {
+    pub fingerprint: String,
+    pub count: u32,
+    /// Момент создания (Unix timestamp, сек) самой старой активной сессии этого ключа на ноде (для межнодового FIFO)
+    #[serde(default)]
+    pub oldest_created_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "poem", derive(poem_openapi::Object))]
 #[cfg_attr(feature = "poem", oai(rename = "NodeTrafficReport"))]
 pub struct NodeTrafficReport {
     pub node_id: String,
     pub boot_id: String,
     pub samples: Vec<TrafficUsageSample>,
+    /// Фактическое число живых сессий по каждому fingerprint на данной ноде для декларативной синхронизации active_sessions
+    #[serde(default)]
+    pub active_session_counts: Vec<NodeSessionCountItem>,
 }

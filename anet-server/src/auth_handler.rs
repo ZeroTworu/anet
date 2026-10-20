@@ -108,16 +108,13 @@ mod tests {
             vec![],
             String::new(),
         ));
-        let registry = Arc::new(ClientRegistry::new(
-            IpPool::new(
-                "10.0.0.0".parse().unwrap(),
-                "255.255.255.0".parse().unwrap(),
-                "10.0.0.1".parse().unwrap(),
-                "10.0.0.2".parse().unwrap(),
-                1400,
-            ),
-            auth_provider.clone(),
-        ));
+        let registry = Arc::new(ClientRegistry::new(IpPool::new(
+            "10.0.0.0".parse().unwrap(),
+            "255.255.255.0".parse().unwrap(),
+            "10.0.0.1".parse().unwrap(),
+            "10.0.0.2".parse().unwrap(),
+            1400,
+        )));
         let server = ServerAuthHandler::new(
             registry.clone(),
             Arc::new(DashMap::new()),
@@ -401,6 +398,11 @@ impl ServerAuthHandler {
         if !req.resume_session_id.is_empty() && resumed.is_none() {
             anyhow::bail!("Requested VPN session is not available for resume");
         }
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
         let (
             assigned_ip,
             session_id,
@@ -413,6 +415,7 @@ impl ServerAuthHandler {
             active_sessions,
             allowed_sessions,
             expires_at,
+            created_at,
         ) = if let Some(previous) = resumed {
             info!(
                 "[AUTH] Resuming logical session {} on a new transport",
@@ -430,8 +433,24 @@ impl ServerAuthHandler {
                 previous.active_sessions,
                 previous.allowed_sessions,
                 previous.expires_at.clone(),
+                previous.created_at,
             )
         } else {
+            // Если это новая сессия и у пользователя задан лимит сессий —
+            // до выделения IP вытесняем самую старую избыточную сессию на этой ноде (FIFO),
+            // чтобы при быстром реконнекте освободить слот и статический/пуловый IP.
+            if let Some(limit) = temp_info.allowed_sessions {
+                if limit > 0 {
+                    self.registry
+                        .evict_excess_sessions_for_fingerprint(
+                            &temp_info.client_fingerprint,
+                            limit as usize,
+                            "",
+                        )
+                        .await;
+                }
+            }
+
             let assigned_ip = if let Some(static_ip) = temp_info.static_ip {
                 info!(
                     "[AUTH] Assigned static IP {} to client {}",
@@ -456,6 +475,7 @@ impl ServerAuthHandler {
                 temp_info.active_sessions,
                 temp_info.allowed_sessions,
                 temp_info.expires_at.clone(),
+                now_secs,
             )
         };
 
@@ -481,16 +501,11 @@ impl ServerAuthHandler {
             expires_at: expires_at.clone(),
 
             // Инициализация сторожевого таймера:
-            last_activity: Arc::new(AtomicU64::new(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs()
-            )),
+            last_activity: Arc::new(AtomicU64::new(now_secs)),
+            created_at,
         });
 
         self.registry.pre_register_client(client_info.clone());
-        self.auth_provider.report_session_start(temp_info.client_fingerprint).await;
 
         let (netmask, gateway, mtu) = self.registry.get_network_params();
 
