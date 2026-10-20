@@ -73,6 +73,160 @@ pub fn cumulative_delta(previous: i64, current: i64) -> i64 {
     }
 }
 
+/// Декларативный in-memory реестр живых сессий по отчётам нод:
+/// `node_id -> (last_updated_instant, HashMap<fingerprint, (session_count, oldest_created_at)>)`
+struct NodeLiveSnapshot {
+    updated_at: std::time::Instant,
+    counts: HashMap<String, (u32, u64)>,
+}
+
+static LIVE_NODE_SESSIONS: std::sync::OnceLock<std::sync::Mutex<HashMap<Uuid, NodeLiveSnapshot>>> =
+    std::sync::OnceLock::new();
+
+const LIVE_NODE_TTL: std::time::Duration = std::time::Duration::from_secs(45);
+
+fn live_sessions_map() -> &'static std::sync::Mutex<HashMap<Uuid, NodeLiveSnapshot>> {
+    LIVE_NODE_SESSIONS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Обновляет снимок живых сессий от конкретной ноды и возвращает агрегированную сумму
+/// живых сессий по всем активным нодам (ноды, молчащие > 45с, автоматически исключаются).
+pub fn update_node_live_sessions(
+    node_id: Uuid,
+    node_counts: Vec<anet_common::dto::NodeSessionCountItem>,
+) -> HashMap<String, i32> {
+    let mut guard = live_sessions_map().lock().unwrap();
+    let now = std::time::Instant::now();
+    guard.retain(|_, snap| now.duration_since(snap.updated_at) <= LIVE_NODE_TTL);
+
+    let mut map = HashMap::with_capacity(node_counts.len());
+    for item in node_counts {
+        if item.count > 0 && !item.fingerprint.is_empty() {
+            map.insert(item.fingerprint, (item.count, item.oldest_created_at));
+        }
+    }
+    guard.insert(
+        node_id,
+        NodeLiveSnapshot {
+            updated_at: now,
+            counts: map,
+        },
+    );
+
+    let mut totals: HashMap<String, i32> = HashMap::new();
+    for snap in guard.values() {
+        for (fp, &(cnt, _)) in &snap.counts {
+            *totals.entry(fp.clone()).or_insert(0) += cnt as i32;
+        }
+    }
+    totals
+}
+
+/// Возвращает точное число живых сессий пользователя по декларативным отчётам живых нод,
+/// если хотя бы одна нода присылает телеметрию.
+pub fn get_live_sessions_for_fingerprint(fingerprint: &str) -> Option<i32> {
+    let mut guard = live_sessions_map().lock().unwrap();
+    let now = std::time::Instant::now();
+    guard.retain(|_, snap| now.duration_since(snap.updated_at) <= LIVE_NODE_TTL);
+    if guard.is_empty() {
+        return None;
+    }
+    let total: u32 = guard
+        .values()
+        .filter_map(|snap| snap.counts.get(fingerprint).map(|&(cnt, _)| cnt))
+        .sum();
+    Some(total as i32)
+}
+
+/// Находит ноду с самой старой активной сессией пользователя (по `oldest_created_at` из декларативных
+/// отчётов нод или `traffic_totals`) и ставит ей задачу `disconnect_user` (FIFO Eviction).
+pub async fn evict_oldest_session_for_user<C: sea_orm::ConnectionTrait>(
+    db: &C,
+    user_id: Uuid,
+    fingerprint: &str,
+    current_sessions: i32,
+    allowed_sessions: i32,
+) -> i32 {
+    let now = chrono::Utc::now().naive_utc();
+
+    // 1. Ищем ноду с минимальным oldest_created_at в декларативном реестре LIVE_NODE_SESSIONS
+    let mut target_node_id: Option<Uuid> = {
+        let guard = live_sessions_map().lock().unwrap();
+        guard
+            .iter()
+            .filter_map(|(node_id, snap)| {
+                snap.counts
+                    .get(fingerprint)
+                    .filter(|&&(cnt, _)| cnt > 0)
+                    .map(|&(_, oldest_ts)| (*node_id, oldest_ts))
+            })
+            .min_by_key(|&(_, oldest_ts)| if oldest_ts == 0 { u64::MAX } else { oldest_ts })
+            .map(|(node_id, _)| node_id)
+    };
+
+    // 2. Fallback: если в LIVE_NODE_SESSIONS ещё нет данных — ищем самую старую запись в traffic_totals за 90с
+    if target_node_id.is_none() {
+        let threshold = now - chrono::Duration::seconds(90);
+        target_node_id = crate::entities::traffic_totals::Entity::find()
+            .filter(crate::entities::traffic_totals::Column::Fingerprint.eq(fingerprint))
+            .filter(crate::entities::traffic_totals::Column::UpdatedAt.gte(threshold))
+            .order_by_asc(crate::entities::traffic_totals::Column::UpdatedAt)
+            .one(db)
+            .await
+            .ok()
+            .flatten()
+            .map(|row| row.server_id);
+    }
+
+    // 3. Если нашли конкретную ноду, ставим ей команду disconnect_user (если такой pending-команды ещё нет)
+    if let Some(server_id) = target_node_id {
+        let already_pending = crate::entities::node_commands::Entity::find()
+            .filter(crate::entities::node_commands::Column::ServerId.eq(server_id))
+            .filter(crate::entities::node_commands::Column::CommandType.eq("disconnect_user"))
+            .filter(crate::entities::node_commands::Column::TargetFingerprint.eq(Some(fingerprint.to_string())))
+            .filter(crate::entities::node_commands::Column::Status.eq("pending"))
+            .one(db)
+            .await
+            .ok()
+            .flatten()
+            .is_some();
+
+        if !already_pending {
+            let cmd = crate::entities::node_commands::ActiveModel {
+                id: sea_orm::Set(Uuid::new_v4()),
+                server_id: sea_orm::Set(server_id),
+                command_type: sea_orm::Set("disconnect_user".to_string()),
+                accepting_connections: sea_orm::Set(None),
+                target_fingerprint: sea_orm::Set(Some(fingerprint.to_string())),
+                status: sea_orm::Set("pending".to_string()),
+                created_at: sea_orm::Set(now),
+                started_at: sea_orm::Set(None),
+                completed_at: sea_orm::Set(None),
+                error: sea_orm::Set(None),
+            };
+            let _ = sea_orm::ActiveModelTrait::insert(cmd, db).await;
+            log::info!(
+                "[FIFO Eviction] Enqueued disconnect_user on oldest node {} for fingerprint {} (current={} > allowed={})",
+                server_id, fingerprint, current_sessions, allowed_sessions
+            );
+        }
+    }
+
+    let clamped = allowed_sessions.max(0);
+    if let Ok(Some(sess)) = crate::entities::active_sessions::Entity::find()
+        .filter(crate::entities::active_sessions::Column::UserId.eq(user_id))
+        .one(db)
+        .await
+    {
+        let mut editable: crate::entities::active_sessions::ActiveModel = sess.into();
+        editable.sessions = sea_orm::Set(clamped);
+        editable.updated_at = sea_orm::Set(now);
+        let _ = sea_orm::ActiveModelTrait::update(editable, db).await;
+    }
+
+    clamped
+}
+
 pub async fn user_pool_ids(db: &DatabaseConnection, user_id: Uuid) -> Vec<Uuid> {
     user_node_pools::Entity::find()
         .filter(user_node_pools::Column::UserId.eq(user_id))

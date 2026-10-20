@@ -7,7 +7,7 @@ use std::net::Ipv4Addr;
 // Реэкспортируем общие DTO-структуры из anet-common
 pub use anet_common::dto::{
     CheckAccessRequest, CheckAccessResponse, NodeCommand, NodeCommandResultRequest,
-    NodeHeartbeatRequest, NodeTrafficReport, SessionEventRequest,
+    NodeHeartbeatRequest, NodeSessionCountItem, NodeTrafficReport,
 };
 
 /// [ VPN Server Management Area ]
@@ -266,21 +266,6 @@ pub enum UpdateServerApiResult {
     NotFound(Json<String>),
     #[oai(status = 500)]
     Error(Json<String>),
-}
-
-#[derive(Object)]
-pub struct SessionEventRequestLocal {
-    pub fingerprint: String,
-}
-
-#[derive(ApiResponse)]
-pub enum SessionEventResponse {
-    #[oai(status = 200)]
-    Ok,
-    #[oai(status = 404)]
-    NotFound,
-    #[oai(status = 500)]
-    Error,
 }
 
 #[derive(Object)]

@@ -1,6 +1,6 @@
 use crate::api::dto::{
-   AuthTokens, CheckAccessRequest, CheckAccessResponse, Claims, LoginRequest,
-    LoginResponse, SessionEventRequest, SessionEventResponse,
+    AuthTokens, CheckAccessRequest, CheckAccessResponse, Claims, LoginRequest,
+    LoginResponse,
 };
 use crate::entities::{admins, sessions, users};
 use anet_common::dto::BillingType;
@@ -229,15 +229,18 @@ impl AuthApi {
             speed_limit = 0;
         }
 
-        // Подсчет активных сессий пользователя
-        let current_sessions = crate::entities::active_sessions::Entity::find()
+        // Подсчет активных сессий пользователя (с приоритетом декларативного live-состояния от нод)
+        let db_sessions = crate::entities::active_sessions::Entity::find()
             .filter(crate::entities::active_sessions::Column::UserId.eq(user.id))
             .one(&self.db)
             .await
             .ok()
             .flatten()
-            .map(|s| s.sessions)
+            .map(|s| s.sessions.max(0))
             .unwrap_or(0);
+
+        let current_sessions = crate::api::api::get_live_sessions_for_fingerprint(&user.fingerprint)
+            .unwrap_or(db_sessions);
 
         // Корректный подсчет израсходованного трафика:
         // Суммируем почасовые дельты из traffic_hourly strictly начиная с cycle_start
@@ -286,24 +289,6 @@ impl AuthApi {
                 }));
             }
 
-            // Проверка лимита сессий
-            if allowed_sessions > 0 && current_sessions >= allowed_sessions {
-                return Ok(Json(CheckAccessResponse {
-                    allowed: false,
-                    message: "Достигнут лимит одновременных подключений".into(),
-                    static_ip: None,
-                    user_id: None,
-                    speed_limit_kbps: None,
-                    billing_type: Some(billing_type),
-                    group_name,
-                    traffic_limit: None,
-                    traffic_consumed,
-                    active_sessions: Some(current_sessions),
-                    allowed_sessions: Some(allowed_sessions),
-                    expires_at,
-                }));
-            }
-
             // Проверка исчерпания трафика
             if max_traffic > 0 {
                 if let Some(total_bytes) = traffic_consumed {
@@ -327,7 +312,14 @@ impl AuthApi {
             }
         }
 
-        let reported_active = current_sessions + 1;
+        // Лимит сессий контролируется по модели FIFO:
+        // 1) При подключении к той же ноде сама нода в Phase III мгновенно вытесняет старую локальную сессию.
+        // 2) При подключении к другой ноде декларативный отчёт /control/nodes/traffic вытесняет самую старую сессию по oldest_created_at.
+        let reported_active = if allowed_sessions > 0 {
+            (current_sessions + 1).min(allowed_sessions)
+        } else {
+            current_sessions + 1
+        };
 
         Ok(Json(CheckAccessResponse {
             allowed: true,
@@ -343,103 +335,5 @@ impl AuthApi {
             allowed_sessions: Some(allowed_sessions),
             expires_at,
         }))
-    }
-
-    /// Старт сессии
-    #[oai(path = "/session/start", method = "post")]
-    async fn session_start(&self, req: Json<SessionEventRequest>) -> SessionEventResponse {
-        let txn = match self.db.begin().await {
-            Ok(t) => t,
-            Err(_) => return SessionEventResponse::Error,
-        };
-
-        let user = match users::Entity::find()
-            .filter(users::Column::Fingerprint.eq(&req.0.fingerprint))
-            .one(&txn)
-            .await
-        {
-            Ok(Some(u)) => u,
-            _ => {
-                let _ = txn.rollback().await;
-                return SessionEventResponse::NotFound;
-            }
-        };
-
-        let existing_session = crate::entities::active_sessions::Entity::find()
-            .filter(crate::entities::active_sessions::Column::UserId.eq(user.id))
-            .one(&txn)
-            .await
-            .unwrap_or(None);
-
-        match existing_session {
-            Some(sess) => {
-                let mut editable = sess.into_active_model();
-                editable.sessions = Set(editable.sessions.unwrap() + 1);
-                editable.updated_at = Set(chrono::Utc::now().naive_utc());
-                if editable.update(&txn).await.is_err() {
-                    let _ = txn.rollback().await;
-                    return SessionEventResponse::Error;
-                }
-            }
-            None => {
-                let new_sess = crate::entities::active_sessions::ActiveModel {
-                    id: Set(Uuid::new_v4()),
-                    user_id: Set(user.id),
-                    sessions: Set(1),
-                    created_at: Set(chrono::Utc::now().naive_utc()),
-                    updated_at: Set(chrono::Utc::now().naive_utc()),
-                };
-                if new_sess.insert(&txn).await.is_err() {
-                    let _ = txn.rollback().await;
-                    return SessionEventResponse::Error;
-                }
-            }
-        }
-        if txn.commit().await.is_err() {
-            return SessionEventResponse::Error;
-        }
-        SessionEventResponse::Ok
-    }
-
-    /// Стоп сессии
-    #[oai(path = "/session/stop", method = "post")]
-    async fn session_stop(&self, req: Json<SessionEventRequest>) -> SessionEventResponse {
-        let txn = match self.db.begin().await {
-            Ok(t) => t,
-            Err(_) => return SessionEventResponse::Error,
-        };
-
-        let user = match users::Entity::find()
-            .filter(users::Column::Fingerprint.eq(&req.0.fingerprint))
-            .one(&txn)
-            .await
-        {
-            Ok(Some(u)) => u,
-            _ => {
-                let _ = txn.rollback().await;
-                return SessionEventResponse::NotFound;
-            }
-        };
-
-        if let Ok(Some(sess)) = crate::entities::active_sessions::Entity::find()
-            .filter(crate::entities::active_sessions::Column::UserId.eq(user.id))
-            .one(&txn)
-            .await
-        {
-            let mut editable = sess.into_active_model();
-            let current = editable.sessions.unwrap();
-            if current > 0 {
-                editable.sessions = Set(current - 1);
-                editable.updated_at = Set(chrono::Utc::now().naive_utc());
-                if editable.update(&txn).await.is_err() {
-                    let _ = txn.rollback().await;
-                    return SessionEventResponse::Error;
-                }
-            }
-        }
-        if txn.commit().await.is_err() {
-            return SessionEventResponse::Error;
-        }
-        SessionEventResponse::Ok
     }
 }
