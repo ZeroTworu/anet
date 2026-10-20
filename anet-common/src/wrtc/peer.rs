@@ -1047,7 +1047,55 @@ impl WrtcPeer {
     }
 
     pub fn force_next_keyframe(&self) {
-        self.force_keyframe_remaining.store(8, Ordering::Relaxed);
+        self.force_keyframe_remaining.store(16, Ordering::Relaxed);
+        if let Some(ref track) = self.video_track {
+            let track_c = Arc::clone(track);
+            let video_seq_c = Arc::clone(&self.video_seq);
+            let video_ts_c = Arc::clone(&self.video_ts);
+            let video_v2_c = Arc::clone(&self.video_v2_enabled);
+            let v_pt = self.video_payload_type;
+            let v_ssrc = self.video_ssrc;
+            tokio::spawn(async move {
+                for _ in 0..4 {
+                    let frame_num = video_ts_c.fetch_add(1, Ordering::Relaxed);
+                    let seq = (frame_num & 0xFFFF) as u16;
+                    video_seq_c.store(seq.wrapping_add(1), Ordering::Relaxed);
+                    let pic_id = (frame_num & 0x7FFF) as u16;
+                    let ts = frame_num.wrapping_mul(300);
+
+                    let mut keepalive_payload = BytesMut::with_capacity(4 + VP8_KEYFRAME_HEADER.len());
+                    keepalive_payload.put_u8(0x90);
+                    keepalive_payload.put_u8(0x80);
+                    keepalive_payload.put_u8(0x80 | ((pic_id >> 8) as u8));
+                    keepalive_payload.put_u8((pic_id & 0xFF) as u8);
+                    if video_v2_c.load(Ordering::Relaxed) {
+                        keepalive_payload.put_slice(&VP8_KEYFRAME_1080P_HEADER);
+                    } else {
+                        keepalive_payload.put_slice(&VP8_KEYFRAME_HEADER);
+                    }
+
+                    let rtp_packet = RtpPacket {
+                        header: RtpHeader {
+                            version: 2,
+                            padding: false,
+                            extension: false,
+                            marker: true,
+                            payload_type: v_pt,
+                            sequence_number: seq,
+                            timestamp: ts,
+                            ssrc: v_ssrc,
+                            csrc: vec![],
+                            extension_profile: 0,
+                            extensions: vec![],
+                            extensions_padding: 0,
+                        },
+                        payload: keepalive_payload.freeze(),
+                    };
+                    let _ = track_c.write_rtp(rtp_packet).await;
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            });
+        }
     }
 
     pub fn effective_mode(&self, p2p_open: bool) -> &'static str {

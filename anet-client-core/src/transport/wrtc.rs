@@ -278,7 +278,7 @@ impl ClientTransport for WrtcTransport {
                                     // ИНЖЕКТИРУЕМ SSRC СЕРВЕРА В REMOTE_DESCRIPTION
                                     peer.add_remote_video_ssrc(v_ssrc).await;
 
-                                    let constraints = anet_common::wrtc::colibri::ReceiverVideoConstraints::new_all(2160);
+                                    let constraints = anet_common::wrtc::colibri::ReceiverVideoConstraints::for_endpoint(&server_id, 2160);
                                     let _ = peer.send_video_constraints(&constraints).await;
                                 }
                                 if let Some(pub_key) = server_pub_key {
@@ -760,15 +760,16 @@ impl ClientTransport for WrtcTransport {
             || wrtc_mode == anet_common::wrtc::colibri::WrtcMode::Auto {
             let first_rx_clone = first_client_rx.clone();
             let peer_reassert = shared_peer.clone();
+            let srv_ep_reassert = target_server_id.clone();
             tokio::spawn(async move {
                 for _ in 0..10 {
                     tokio::time::sleep(Duration::from_secs(2)).await;
                     if !first_rx_clone.load(Ordering::Relaxed) {
                         break;
                     }
-                    let constraints = anet_common::wrtc::colibri::ReceiverVideoConstraints::new_all(2160);
+                    let constraints = anet_common::wrtc::colibri::ReceiverVideoConstraints::for_endpoint(&srv_ep_reassert, 2160);
                     let _ = peer_reassert.send_video_constraints(&constraints).await;
-                    log::debug!("[WRTC Client] Periodic re-assertion of ReceiverVideoConstraints for all endpoints");
+                    log::debug!("[WRTC Client] Periodic re-assertion of ReceiverVideoConstraints for server endpoint {srv_ep_reassert}");
                 }
             });
         }
