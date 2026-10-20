@@ -231,6 +231,12 @@ impl DnsInterceptor {
                 }
             }
             RuleAction::Direct => {
+                if query_info.qtype != 1 {
+                    if let Some(resp) = self.build_nodata_dns_response(packet, &query_info) {
+                        return InterceptResult::Handled(resp);
+                    }
+                    return InterceptResult::Drop;
+                }
                 log::info!(
                     "[DNS] Domain '{}' matched DIRECT -> resolving for direct bypass",
                     query_info.qname
@@ -398,6 +404,37 @@ impl DnsInterceptor {
                 dns_response.extend_from_slice(&[0, 0, 0, 0]); // 0.0.0.0
             }
         }
+
+        build_ipv4_udp_dns_reply(original_packet, &dns_response)
+    }
+
+    /// Формирует синтетический пустой ответ NoError (NODATA, ANCOUNT=0) для фильтрации AAAA/HTTPS на Direct-доменах
+    fn build_nodata_dns_response(
+        &self,
+        original_packet: &[u8],
+        query: &DnsQueryInfo,
+    ) -> Option<Bytes> {
+        let ihl = ((original_packet[0] & 0x0F) * 4) as usize;
+        let mut dns_response = BytesMut::with_capacity(96);
+
+        // Transaction ID
+        dns_response.extend_from_slice(&query.transaction_id.to_be_bytes());
+        // Flags: QR=1, AA=1, RD=1, RA=1, RCODE=0 (NoError)
+        dns_response.extend_from_slice(&[0x81, 0x80]);
+        // Questions = 1, Answers = 0, Authority = 0, Additional = 0
+        dns_response.extend_from_slice(&[0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+
+        let orig_dns_payload = &original_packet[(ihl + 8)..];
+        let mut q_end = 12;
+        while q_end < orig_dns_payload.len() && orig_dns_payload[q_end] != 0 {
+            let label_len = orig_dns_payload[q_end] as usize;
+            q_end += 1 + label_len;
+        }
+        q_end += 1 + 4;
+        if q_end > orig_dns_payload.len() {
+            return None;
+        }
+        dns_response.extend_from_slice(&orig_dns_payload[12..q_end]);
 
         build_ipv4_udp_dns_reply(original_packet, &dns_response)
     }

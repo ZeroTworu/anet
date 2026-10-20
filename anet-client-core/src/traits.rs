@@ -20,6 +20,14 @@ pub trait RouteManager: Send + Sync {
     /// 3. Ресурсов, которые нужно исключить из VPN.
     async fn add_bypass_route(&self, target: IpAddr, prefix: u8) -> Result<()>;
 
+    /// Пакетное добавление маршрутов обхода (позволяет коалесцировать обновление TUN на Android)
+    async fn add_bypass_routes(&self, routes: &[(IpAddr, u8)]) -> Result<()> {
+        for &(target, prefix) in routes {
+            self.add_bypass_route(target, prefix).await?;
+        }
+        Ok(())
+    }
+
     /// Направить весь трафик в туннель
     async fn set_default_route(&self, gateway: &str, interface_name: &str) -> Result<()>;
 

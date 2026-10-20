@@ -140,15 +140,23 @@ impl AnetClient {
         let resolver = TokioAsyncResolver::tokio(resolver_config, ResolverOpts::default());
 
         for target in list {
-            if let Ok(net) = IpNet::from_str(target) {
+            let trimmed = target.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Ok(net) = IpNet::from_str(trimmed) {
                 result.push(net);
                 continue;
             }
-            if let Ok(ip) = IpAddr::from_str(target) {
+            if let Ok(ip) = IpAddr::from_str(trimmed) {
                 result.push(IpNet::from(ip));
                 continue;
             }
-            match resolver.lookup_ip(target).await {
+            let clean = trimmed.trim_start_matches('*').trim_start_matches('.');
+            if clean.is_empty() {
+                continue;
+            }
+            match resolver.lookup_ip(clean).await {
                 Ok(lookup) => {
                     for ip in lookup.iter() {
                         if ip.is_ipv4() {
@@ -156,7 +164,7 @@ impl AnetClient {
                         }
                     }
                 }
-                Err(e) => warn!("[Core] Failed to resolve {}: {}", target, e),
+                Err(e) => warn!("[Core] Failed to resolve {}: {}", clean, e),
             }
         }
 
@@ -663,11 +671,12 @@ impl AnetClient {
                             if let Some((reply_pkt, resolved_ips)) =
                                 interceptor_c.resolve_direct_dns_packet(&pkt_c, &dns_c).await
                             {
-                                for ip in &resolved_ips {
-                                    let prefix = if ip.is_ipv4() { 32 } else { 128 };
-                                    let _ = rm_c.add_bypass_route(*ip, prefix).await;
-                                }
                                 if !resolved_ips.is_empty() {
+                                    let routes: Vec<(IpAddr, u8)> = resolved_ips
+                                        .iter()
+                                        .map(|ip| (*ip, if ip.is_ipv4() { 32 } else { 128 }))
+                                        .collect();
+                                    let _ = rm_c.add_bypass_routes(&routes).await;
                                     log::info!(
                                         "[DNS/Direct] Added OS bypass routes for {:?}",
                                         resolved_ips
@@ -691,7 +700,13 @@ impl AnetClient {
                         .or_else(|| direct_ip_cache_tx.check(&dst_ip))
                         .or_else(|| rule_cache_tx.lookup_ip(dst_ip));
 
-                    if matches!(ip_action, Some(anet_filter_core::RuleAction::Block)) {
+                    if matches!(
+                        ip_action,
+                        Some(
+                            anet_filter_core::RuleAction::Block
+                                | anet_filter_core::RuleAction::Direct
+                        )
+                    ) {
                         return false;
                     }
                 }
@@ -832,11 +847,12 @@ impl AnetClient {
                                 if let Some((qname, resolved_ips)) = dns_interceptor_rx
                                     .inspect_dns_response(&packet, |domain| rule_cache_rx.lookup_domain(domain))
                                 {
-                                    for ip in &resolved_ips {
-                                        let prefix = if ip.is_ipv4() { 32 } else { 128 };
-                                        let _ = route_manager_rx.add_bypass_route(*ip, prefix).await;
-                                    }
                                     if !resolved_ips.is_empty() {
+                                        let routes: Vec<(IpAddr, u8)> = resolved_ips
+                                            .iter()
+                                            .map(|ip| (*ip, if ip.is_ipv4() { 32 } else { 128 }))
+                                            .collect();
+                                        let _ = route_manager_rx.add_bypass_routes(&routes).await;
                                         log::info!(
                                             "[DNS/Direct] Domain '{}' resolved via tunnel -> added OS bypass routes for {:?}",
                                             qname,

@@ -128,10 +128,7 @@ impl DomainTrie {
             if node.terminal_action == Some(RuleAction::Direct) {
                 let mut reversed = labels.clone();
                 reversed.reverse();
-                let domain = reversed.join(".");
-                if !result.contains(&domain) {
-                    result.push(domain);
-                }
+                result.push(reversed.join("."));
             }
 
             let c_start = node.children_start as usize;
@@ -226,10 +223,7 @@ impl ArchivedDomainTrie {
                 if rule_action == RuleAction::Direct {
                     let mut reversed = labels.clone();
                     reversed.reverse();
-                    let domain = reversed.join(".");
-                    if !result.contains(&domain) {
-                        result.push(domain);
-                    }
+                    result.push(reversed.join("."));
                 }
             }
 
