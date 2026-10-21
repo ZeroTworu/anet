@@ -302,6 +302,9 @@ impl ClientRegistry {
 
         for entry in self.clients_by_ip.iter() {
             let info = entry.value();
+            if !self.quic_router.contains_key(&info.assigned_ip) {
+                continue;
+            }
             if seen_sessions.insert(info.session_id.clone()) {
                 let item = stats
                     .entry(info.fingerprint.clone())
