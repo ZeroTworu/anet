@@ -423,6 +423,55 @@ impl ClientRegistry {
             client_info.assigned_ip, remote_addr
         );
 
+        // Если у этого же ключа и протокола висела приостановленная (suspended) сессия,
+        // которая не была возобновлена (клиент сделал полный новый handshake), закрываем её сразу,
+        // чтобы она не задваивала счётчик active_session_counts.
+        let stale_suspended: Vec<String> = self
+            .suspended_sessions
+            .iter()
+            .filter(|e| {
+                e.value().client_info.fingerprint == client_info.fingerprint
+                    && e.value().client_info.protocol == client_info.protocol
+                    && e.key() != &client_info.session_id
+            })
+            .map(|e| e.key().clone())
+            .collect();
+        for sid in stale_suspended {
+            if let Some((_, suspended)) = self.suspended_sessions.remove(&sid) {
+                if suspended.client_info.assigned_ip != client_info.assigned_ip {
+                    if let Ok(ip_addr) = suspended.client_info.assigned_ip.parse::<Ipv4Addr>() {
+                        self.ip_pool.release(ip_addr);
+                    }
+                    self.clear_shaper_limit(&suspended.client_info.assigned_ip);
+                }
+            }
+        }
+
+        // Если с этого же remote_addr (например, IP:0 за прокси в WS/AHTTP или тот же endpoint в WRTC/QUIC)
+        // тот же ключ делает новый handshake, вытесняем старую сессию сразу при регистрации.
+        if let Some((_, displaced)) = self.clients_by_addr.remove(&remote_addr) {
+            if displaced.session_id != client_info.session_id
+                && displaced.fingerprint == client_info.fingerprint
+            {
+                info!(
+                    "[Registry] Address {} reconnect for FP {}: displacing previous session {} (IP: {})",
+                    remote_addr, client_info.fingerprint, displaced.session_id, displaced.assigned_ip
+                );
+                self.quic_router.remove(&displaced.assigned_ip);
+                self.clients_by_prefix.remove(&displaced.nonce_prefix);
+                self.clients_by_ip.remove(&displaced.assigned_ip);
+                if displaced.assigned_ip != client_info.assigned_ip {
+                    self.clear_shaper_limit(&displaced.assigned_ip);
+                    if let Ok(ip_addr) = displaced.assigned_ip.parse::<Ipv4Addr>() {
+                        self.ip_pool.release(ip_addr);
+                    }
+                }
+            } else if displaced.session_id != client_info.session_id {
+                // Если по этому адресу (например, за общим NAT с port=0) был другой пользователь, не теряем его
+                self.clients_by_addr.insert(remote_addr, displaced);
+            }
+        }
+
         // Если на этом же виртуальном IP (например, static_ip) висела старая сессия,
         // очищаем её маршруты и записи перед регистрацией новой.
         if let Some((_, displaced)) = self.clients_by_ip.remove(&client_info.assigned_ip) {
@@ -462,17 +511,31 @@ impl ClientRegistry {
         );
     }
 
+    fn cleanup_traffic_totals_if_no_active_sessions(&self, fingerprint: &str, protocol: &str) {
+        let still_active = self.clients_by_ip.iter().any(|e| {
+            e.value().fingerprint == fingerprint && e.value().protocol == protocol
+        }) || self.suspended_sessions.iter().any(|e| {
+            e.value().client_info.fingerprint == fingerprint
+                && e.value().client_info.protocol == protocol
+        });
+        if !still_active {
+            let key = format!("{}#{}", fingerprint, protocol);
+            self.traffic_totals.remove(&key);
+        }
+    }
+
     pub async fn remove_client(&self, client_info: &ClientTransportInfo) {
         let client_ip = &client_info.assigned_ip;
         let remote_addr = **client_info.remote_addr.load();
 
+        self.suspended_sessions.remove(&client_info.session_id);
+
         // АТОМАРНАЯ ЗАЩИТА: удаляем роутер и записи реестра только если текущая сессия
         // по данному IP действительно совпадает с удаляемой (защита от гонки при реконнекте/перезахвате IP).
-        let is_current = if let Some(current) = self.clients_by_ip.get(client_ip) {
-            current.session_id == client_info.session_id
-        } else {
-            true
-        };
+        let is_current = self
+            .clients_by_ip
+            .get(client_ip)
+            .is_some_and(|current| current.session_id == client_info.session_id);
 
         if is_current {
             self.quic_router.remove(client_ip);
@@ -481,24 +544,25 @@ impl ClientRegistry {
             self.clients_by_ip.remove(client_ip);
             self.clear_shaper_limit(client_ip);
 
-            // Очищаем локальные счетчики трафика отключенной сессии во избежание утечки памяти
-            let key = format!("{}#{}", client_info.fingerprint, client_info.protocol);
-            self.traffic_totals.remove(&key);
+            // Очищаем локальные счетчики трафика только если у этого ключа+протокола больше нет живых сессий
+            self.cleanup_traffic_totals_if_no_active_sessions(
+                &client_info.fingerprint,
+                &client_info.protocol,
+            );
 
             if let Ok(ip_addr) = client_ip.parse::<Ipv4Addr>() {
                 self.ip_pool.release(ip_addr);
             }
+            info!("[Registry] Client {} removed.", client_ip);
         } else {
             info!(
-                "[Registry] Skip removing IP {} routes: session_id mismatch (already replaced by newer session)",
-                client_ip
+                "[Registry] Skip removing IP {} routes: session {} already removed or replaced",
+                client_ip, client_info.session_id
             );
         }
-
-        info!("[Registry] Client {} removed.", client_ip);
     }
 
-    /// Находит и мгновенно вытесняет предыдущую сессию того же устройства (по fingerprint и протоколу).
+    /// Находит и мгновенно вытесняет предыдущие сессии того же устройства (по fingerprint и протоколу).
     /// Используется при быстром реконнекте клиента для немедленного освобождения IP, закрытия старого роутера
     /// и предотвращения коллизий шифрования и остаточного интернет-трафика.
     /// Исключает текущую только что созданную сессию (по current_session_id), чтобы не вытеснять саму себя!
@@ -508,25 +572,28 @@ impl ClientRegistry {
         protocol: &str,
         current_session_id: &str,
     ) -> Option<Arc<ClientTransportInfo>> {
-        let existing = self
+        let existing_list: Vec<Arc<ClientTransportInfo>> = self
             .clients_by_ip
             .iter()
-            .find(|entry| {
+            .filter(|entry| {
                 entry.value().fingerprint == fingerprint
                     && entry.value().protocol == protocol
                     && entry.value().session_id != current_session_id
             })
-            .map(|entry| entry.value().clone());
+            .map(|entry| entry.value().clone())
+            .collect();
 
-        if let Some(ref old_client) = existing {
+        let mut last_evicted = None;
+        for old_client in existing_list {
             info!(
                 "[Registry] Device reconnect detected for fingerprint {} (proto: {}). Evicting previous session with IP {}.",
                 fingerprint, protocol, old_client.assigned_ip
             );
-            self.remove_client(old_client).await;
+            self.remove_client(&old_client).await;
+            last_evicted = Some(old_client);
         }
 
-        existing
+        last_evicted
     }
 
     /// FIFO-вытеснение на локальной ноде: если у данного `fingerprint` на этой ноде
@@ -578,25 +645,26 @@ impl ClientRegistry {
         let client_ip = client_info.assigned_ip.clone();
         let remote_addr = **client_info.remote_addr.load();
 
-        // АТОМАРНАЯ ЗАЩИТА: очищаем роутер и таблицы только если в них сейчас
-        // зарегистрирована именно ЭТА сессия, а не более новая при реконнекте.
-        let is_current = if let Some(current) = self.clients_by_ip.get(&client_ip) {
-            current.session_id == client_info.session_id
-        } else {
-            true
-        };
+        // АТОМАРНАЯ ЗАЩИТА: очищаем роутер и переводим сессию в suspended ТОЛЬКО если
+        // в таблице активных клиентов сейчас действительно числится именно ЭТА сессия,
+        // а не более новая (и она ещё не была вытеснена через remove_client).
+        let is_current = self
+            .clients_by_ip
+            .get(&client_ip)
+            .is_some_and(|current| current.session_id == client_info.session_id);
 
-        if is_current {
-            self.quic_router.remove(&client_ip);
-            self.clients_by_prefix.remove(&client_info.nonce_prefix);
-            self.clients_by_addr.remove(&remote_addr);
-            self.clients_by_ip.remove(&client_ip);
-        } else {
+        if !is_current {
             info!(
-                "[Registry] Skip suspending IP {} routes: session_id mismatch (already superseded)",
-                client_ip
+                "[Registry] Skip suspending IP {}: session {} already removed or superseded",
+                client_ip, client_info.session_id
             );
+            return;
         }
+
+        self.quic_router.remove(&client_ip);
+        self.clients_by_prefix.remove(&client_info.nonce_prefix);
+        self.clients_by_addr.remove(&remote_addr);
+        self.clients_by_ip.remove(&client_ip);
 
         // ПРИМЕЧАНИЕ: лимит скорости намеренно НЕ снимается — плановая
         // ротация WS-сессии ожидаемо резюмируется на том же assigned_ip, и
@@ -659,14 +727,21 @@ impl ClientRegistry {
     }
 
     async fn finish_suspended(&self, client_info: Arc<ClientTransportInfo>) {
-        if let Ok(ip_addr) = client_info.assigned_ip.parse::<Ipv4Addr>() {
-            self.ip_pool.release(ip_addr);
+        let ip_still_in_use = self
+            .clients_by_ip
+            .contains_key(&client_info.assigned_ip);
+        if !ip_still_in_use {
+            if let Ok(ip_addr) = client_info.assigned_ip.parse::<Ipv4Addr>() {
+                self.ip_pool.release(ip_addr);
+            }
+            self.clear_shaper_limit(&client_info.assigned_ip);
         }
-        self.clear_shaper_limit(&client_info.assigned_ip);
 
-        // Очищаем локальные счетчики трафика истекшей сессии
-        let key = format!("{}#{}", client_info.fingerprint, client_info.protocol);
-        self.traffic_totals.remove(&key);
+        // Очищаем локальные счетчики трафика только если у этого ключа+протокола больше нет живых сессий
+        self.cleanup_traffic_totals_if_no_active_sessions(
+            &client_info.fingerprint,
+            &client_info.protocol,
+        );
 
         info!(
             "[Registry] Suspended session {} expired",
