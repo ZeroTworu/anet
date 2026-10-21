@@ -107,6 +107,7 @@ pub struct NodeSessionCountItem {
     pub count: u32,
     /// Момент создания (Unix timestamp, сек) самой старой активной сессии этого ключа на ноде (для межнодового FIFO)
     #[serde(default)]
+    #[cfg_attr(feature = "poem", oai(default))]
     pub oldest_created_at: u64,
 }
 
@@ -119,5 +120,6 @@ pub struct NodeTrafficReport {
     pub samples: Vec<TrafficUsageSample>,
     /// Фактическое число живых сессий по каждому fingerprint на данной ноде для декларативной синхронизации active_sessions
     #[serde(default)]
+    #[cfg_attr(feature = "poem", oai(default))]
     pub active_session_counts: Vec<NodeSessionCountItem>,
 }

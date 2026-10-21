@@ -491,7 +491,15 @@ impl ServersApi {
         };
 
         match result {
-            Ok(_) => NodeHeartbeatResponse::Accepted,
+            Ok(_) => {
+                let live_totals = if req.0.active_connections == 0 {
+                    crate::api::api::update_node_live_sessions(node_id, Vec::new())
+                } else {
+                    crate::api::api::prune_stale_live_sessions().unwrap_or_default()
+                };
+                crate::api::api::sync_active_sessions_db(&self.db, &live_totals).await;
+                NodeHeartbeatResponse::Accepted
+            }
             Err(e) => NodeHeartbeatResponse::Error(Json(e.to_string())),
         }
     }

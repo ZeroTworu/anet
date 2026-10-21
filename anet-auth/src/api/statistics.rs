@@ -77,43 +77,30 @@ impl StatisticsApi {
             .expect("valid bucket");
 
         // Декларативная синхронизация сессий (Единый источник истины — отчёты живых нод):
-        // Обновляем снимок живых сессий этой ноды и приводим таблицу active_sessions в точное соответствие
-        // с суммой реальных подключений по всем живым нодам (без /session/start и /session/stop).
-        let live_totals = crate::api::api::update_node_live_sessions(
-            node_id,
-            req.0.active_session_counts.clone(),
-        );
-        if let (Ok(all_active_rows), Ok(all_users)) = (
-            crate::entities::active_sessions::Entity::find().all(&txn).await,
-            users::Entity::find().all(&txn).await,
-        ) {
-            let mut existing_by_user_id: HashMap<Uuid, crate::entities::active_sessions::Model> =
-                all_active_rows
-                    .into_iter()
-                    .map(|r| (r.user_id, r))
-                    .collect();
-
-            for user in all_users {
-                let expected = live_totals.get(&user.fingerprint).copied().unwrap_or(0);
-                if let Some(row) = existing_by_user_id.remove(&user.id) {
-                    if row.sessions != expected {
-                        let mut editable = row.into_active_model();
-                        editable.sessions = Set(expected);
-                        editable.updated_at = Set(now);
-                        let _ = editable.update(&txn).await;
+        // Если нода ещё работает на старом бинарнике (присылает samples без active_session_counts),
+        // автоматически формируем снимок живых сессий из активных сэмплов трафика этой ноды.
+        let effective_counts: Vec<anet_common::dto::NodeSessionCountItem> =
+            if req.0.active_session_counts.is_empty() && !req.0.samples.is_empty() {
+                let mut by_fp: HashMap<String, u32> = HashMap::new();
+                for s in &req.0.samples {
+                    if !s.fingerprint.is_empty() {
+                        *by_fp.entry(s.fingerprint.clone()).or_insert(0) += 1;
                     }
-                } else if expected > 0 {
-                    let new_sess = crate::entities::active_sessions::ActiveModel {
-                        id: Set(Uuid::new_v4()),
-                        user_id: Set(user.id),
-                        sessions: Set(expected),
-                        created_at: Set(now),
-                        updated_at: Set(now),
-                    };
-                    let _ = new_sess.insert(&txn).await;
                 }
-            }
-        }
+                by_fp
+                    .into_iter()
+                    .map(|(fingerprint, count)| anet_common::dto::NodeSessionCountItem {
+                        fingerprint,
+                        count,
+                        oldest_created_at: 0,
+                    })
+                    .collect()
+            } else {
+                req.0.active_session_counts.clone()
+            };
+
+        let live_totals = crate::api::api::update_node_live_sessions(node_id, effective_counts);
+        crate::api::api::sync_active_sessions_db(&txn, &live_totals).await;
 
         for sample in req.0.samples {
             if sample.fingerprint.is_empty() {
@@ -555,10 +542,22 @@ impl StatisticsApi {
                 continue;
             };
 
+            // Если от этой ноды есть свежий декларативный снимок и на ней у ключа 0 сессий — пропускаем
+            if let Some(node_live) = crate::api::api::get_live_node_sessions_for_fingerprint(
+                total.server_id,
+                &total.fingerprint,
+            ) {
+                if node_live <= 0 {
+                    continue;
+                }
+            }
+
             let max_allowed_connections =
                 if let Some(&count) = user_connection_limits.get(&user_id) {
                     count
                 } else {
+                    let live_opt =
+                        crate::api::api::get_live_sessions_for_fingerprint(&total.fingerprint);
                     let sessions_in_db = crate::entities::active_sessions::Entity::find()
                         .filter(crate::entities::active_sessions::Column::UserId.eq(user_id))
                         .one(&self.db)
@@ -567,7 +566,8 @@ impl StatisticsApi {
                         .map(|s| s.sessions)
                         .unwrap_or(1) as i32;
 
-                    let limit = sessions_in_db.max(1);
+                    let actual = live_opt.unwrap_or(sessions_in_db);
+                    let limit = actual.max(1);
                     user_connection_limits.insert(user_id, limit);
                     limit
                 };
@@ -594,6 +594,12 @@ impl StatisticsApi {
                 .map(|s| s.name)
                 .unwrap_or_else(|| "Unknown Server".to_string());
 
+            let node_conn_count = crate::api::api::get_live_node_sessions_for_fingerprint(
+                total.server_id,
+                &total.fingerprint,
+            )
+            .unwrap_or(max_allowed_connections);
+
             dtos.push(ActiveConnectionDto {
                 user_id,
                 username,
@@ -601,7 +607,7 @@ impl StatisticsApi {
                 server_name,
                 rx_bytes: total.rx_bytes.max(0) as i64,
                 tx_bytes: total.tx_bytes.max(0) as i64,
-                connection_count: max_allowed_connections,
+                connection_count: node_conn_count,
                 protocol: total.protocol.as_str().to_string(),
                 fingerprint: total.fingerprint, // <-- Передаем отпечаток
             });

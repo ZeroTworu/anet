@@ -138,6 +138,116 @@ pub fn get_live_sessions_for_fingerprint(fingerprint: &str) -> Option<i32> {
     Some(total as i32)
 }
 
+/// Возвращает точное число живых сессий пользователя на конкретной ноде `node_id`,
+/// если от этой ноды есть актуальный декларативный снимок (не старше 45с).
+pub fn get_live_node_sessions_for_fingerprint(node_id: Uuid, fingerprint: &str) -> Option<i32> {
+    let mut guard = live_sessions_map().lock().unwrap();
+    let now = std::time::Instant::now();
+    guard.retain(|_, snap| now.duration_since(snap.updated_at) <= LIVE_NODE_TTL);
+    let snap = guard.get(&node_id)?;
+    let cnt = snap.counts.get(fingerprint).map(|&(c, _)| c).unwrap_or(0);
+    Some(cnt as i32)
+}
+
+/// Очищает протухшие снимки нод (> 45с) и возвращает агрегированную карту живых сессий,
+/// если реестр `LIVE_NODE_SESSIONS` уже инициализирован хотя бы одной живой нодой.
+pub fn prune_stale_live_sessions() -> Option<HashMap<String, i32>> {
+    let mut guard = live_sessions_map().lock().unwrap();
+    let now = std::time::Instant::now();
+    guard.retain(|_, snap| now.duration_since(snap.updated_at) <= LIVE_NODE_TTL);
+    if guard.is_empty() {
+        return None;
+    }
+    let mut totals: HashMap<String, i32> = HashMap::new();
+    for snap in guard.values() {
+        for (fp, &(cnt, _)) in &snap.counts {
+            *totals.entry(fp.clone()).or_insert(0) += cnt as i32;
+        }
+    }
+    Some(totals)
+}
+
+/// Приводит таблицу `active_sessions` в БД в точное соответствие с декларативной картой `live_totals`.
+/// Для нод, которые ещё не успели прислать первый отчёт после рестарта `anet-auth`, учитывает
+/// свежие записи `traffic_totals` (за последние 45с), чтобы избежать просадки счётчика на холодном старте.
+pub async fn sync_active_sessions_db<C: sea_orm::ConnectionTrait>(
+    db: &C,
+    live_totals: &HashMap<String, i32>,
+) {
+    use sea_orm::{ActiveModelTrait, IntoActiveModel, Set};
+    let now = chrono::Utc::now().naive_utc();
+
+    let known_nodes: HashSet<Uuid> = {
+        let guard = live_sessions_map().lock().unwrap();
+        guard.keys().copied().collect()
+    };
+
+    let mut effective_totals = live_totals.clone();
+    let recent_threshold = now - chrono::Duration::seconds(45);
+    if let Ok(recent_totals) = crate::entities::traffic_totals::Entity::find()
+        .filter(crate::entities::traffic_totals::Column::UpdatedAt.gte(recent_threshold))
+        .all(db)
+        .await
+    {
+        for row in recent_totals {
+            if !known_nodes.contains(&row.server_id) && !row.fingerprint.is_empty() {
+                *effective_totals.entry(row.fingerprint).or_insert(0) += 1;
+            }
+        }
+    }
+
+    match (
+        crate::entities::active_sessions::Entity::find().all(db).await,
+        users::Entity::find().all(db).await,
+    ) {
+        (Ok(all_active_rows), Ok(all_users)) => {
+            let mut existing_by_user_id: HashMap<Uuid, crate::entities::active_sessions::Model> =
+                all_active_rows
+                    .into_iter()
+                    .map(|r| (r.user_id, r))
+                    .collect();
+
+            for user in all_users {
+                let expected = effective_totals.get(&user.fingerprint).copied().unwrap_or(0);
+                if let Some(row) = existing_by_user_id.remove(&user.id) {
+                    if row.sessions != expected {
+                        let mut editable = row.into_active_model();
+                        editable.sessions = Set(expected);
+                        editable.updated_at = Set(now);
+                        if let Err(e) = editable.update(db).await {
+                            log::warn!("[SessionsSync] Failed to update active_sessions for user {}: {}", user.id, e);
+                        }
+                    }
+                } else if expected > 0 {
+                    let new_sess = crate::entities::active_sessions::ActiveModel {
+                        id: Set(Uuid::new_v4()),
+                        user_id: Set(user.id),
+                        sessions: Set(expected),
+                        created_at: Set(now),
+                        updated_at: Set(now),
+                    };
+                    if let Err(e) = new_sess.insert(db).await {
+                        log::warn!("[SessionsSync] Failed to insert active_sessions for user {}: {}", user.id, e);
+                    }
+                }
+            }
+
+            // На случай осиротевших строк в active_sessions — обнуляем их
+            for (_, orphan_row) in existing_by_user_id {
+                if orphan_row.sessions != 0 {
+                    let mut editable = orphan_row.into_active_model();
+                    editable.sessions = Set(0);
+                    editable.updated_at = Set(now);
+                    let _ = editable.update(db).await;
+                }
+            }
+        }
+        (Err(e), _) | (_, Err(e)) => {
+            log::warn!("[SessionsSync] Failed to query active_sessions/users for sync: {}", e);
+        }
+    }
+}
+
 /// Находит ноду с самой старой активной сессией пользователя (по `oldest_created_at` из декларативных
 /// отчётов нод или `traffic_totals`) и ставит ей задачу `disconnect_user` (FIFO Eviction).
 pub async fn evict_oldest_session_for_user<C: sea_orm::ConnectionTrait>(
