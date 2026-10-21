@@ -14,7 +14,7 @@ use tokio::signal;
 
 fn format_banner_row(label: &str, value: &str) -> String {
     let prefix = format!("║                   {:<13}", label);
-    let total_content_width = 63;
+    let total_content_width: usize = 63;
     let prefix_len = prefix.chars().count() - 1; // excluding '║'
     let val_space = total_content_width.saturating_sub(prefix_len);
     let val_chars_count = value.chars().count();
