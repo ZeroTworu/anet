@@ -293,12 +293,19 @@ impl XmppSession {
                     Ok(Message::Ping(data)) => {
                         let _ = raw_ws_tx_clone.send(Message::Pong(data)).await;
                     }
-                    Ok(Message::Close(_)) | Err(_) => {
+                    Ok(Message::Close(frame)) => {
+                        log::warn!("[XMPP] WebSocket closed by server: {frame:?}");
+                        break;
+                    }
+                    Err(e) => {
+                        log::warn!("[XMPP] WebSocket read error: {e}");
                         break;
                     }
                     _ => {}
                 }
             }
+            log::warn!("[XMPP] Reader loop exited (WebSocket stream ended)");
+            let _ = write_tx_ack.try_send("__CLOSE__".to_string());
         });
 
         Ok(Self {

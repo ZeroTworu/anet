@@ -114,6 +114,7 @@ impl PeerConnectionEventHandler for PeerEvents {
             self.is_connected.store(false, Ordering::SeqCst);
             if state == RTCPeerConnectionState::Failed || state == RTCPeerConnectionState::Closed {
                 self.failed_notify.notify_waiters();
+                self.failed_notify.notify_one();
             }
         }
     }

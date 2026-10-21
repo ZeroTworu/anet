@@ -131,13 +131,17 @@ impl ClientTransport for WrtcTransport {
         let jingle_deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
 
         while tokio::time::Instant::now() < jingle_deadline {
-            if let Ok(Some(stanza)) =
-                tokio::time::timeout(Duration::from_millis(400), xmpp.recv_stanza()).await
-            {
-                if let Some(session) = parse_jingle_session(&stanza, fallback_ip, fallback_port) {
-                    parsed_session = Some(session);
-                    break;
+            match tokio::time::timeout(Duration::from_millis(400), xmpp.recv_stanza()).await {
+                Ok(Some(stanza)) => {
+                    if let Some(session) = parse_jingle_session(&stanza, fallback_ip, fallback_port) {
+                        parsed_session = Some(session);
+                        break;
+                    }
                 }
+                Ok(None) => {
+                    anyhow::bail!("XMPP WebSocket closed while waiting for Jicofo session-initiate");
+                }
+                Err(_) => {}
             }
         }
 
@@ -366,30 +370,74 @@ impl ClientTransport for WrtcTransport {
         let xmpp_arc = Arc::new(Mutex::new(xmpp));
         let xmpp_bg = Arc::clone(&xmpp_arc);
         let peer_xmpp = Arc::clone(&shared_peer);
+        let target_srv_xmpp = target_server_id.clone();
         let fb_ip_owned = fallback_ip.to_string();
         let xmpp_jingle_task = tokio::spawn(async move {
             loop {
-                let stanza_opt = {
+                let recv_res = {
                     let mut guard = xmpp_bg.lock().await;
-                    tokio::time::timeout(Duration::from_millis(250), guard.recv_stanza())
-                        .await
-                        .ok()
-                        .flatten()
+                    tokio::time::timeout(Duration::from_millis(250), guard.recv_stanza()).await
                 };
-                if let Some(stanza) = stanza_opt {
-                    if let Some(jingle) = parse_jingle_session(&stanza, &fb_ip_owned, fallback_port) {
-                        if jingle.action == "source-add" || jingle.action == "description-info" {
-                            let expected_srv_ssrc = peer_xmpp.expected_peer_video_ssrc.load(Ordering::Relaxed);
-                            for v_ssrc in jingle.video_sources {
-                                // На клиенте привязываем только видео-SSRC сервера, игнорируя SSRC других клиентов в комнате
-                                if expected_srv_ssrc == 0 || v_ssrc == expected_srv_ssrc {
-                                    peer_xmpp.add_remote_video_ssrc(v_ssrc).await;
+                match recv_res {
+                    Ok(Some(stanza)) => {
+                        for parsed in anet_common::wrtc::xmpp_xml::parse_xmpp_stanzas(
+                            &stanza,
+                            &fb_ip_owned,
+                            fallback_port,
+                        ) {
+                            match parsed {
+                                anet_common::wrtc::xmpp_xml::InboundXmpp::Jingle(jingle) => {
+                                    if jingle.action == "source-add"
+                                        || jingle.action == "description-info"
+                                        || jingle.action == "session-initiate"
+                                    {
+                                        let expected_srv_ssrc = peer_xmpp
+                                            .expected_peer_video_ssrc
+                                            .load(Ordering::Relaxed);
+                                        for v_ssrc in jingle.video_sources {
+                                            // На клиенте привязываем только видео-SSRC сервера, игнорируя SSRC других клиентов в комнате
+                                            if expected_srv_ssrc == 0 || v_ssrc == expected_srv_ssrc
+                                            {
+                                                peer_xmpp.add_remote_video_ssrc(v_ssrc).await;
+                                            }
+                                        }
+                                    }
                                 }
+                                anet_common::wrtc::xmpp_xml::InboundXmpp::Presence {
+                                    from,
+                                    is_unavailable: true,
+                                    ..
+                                } => {
+                                    if let Some(occupant_id) = from.split('/').nth(1) {
+                                        if occupant_id == target_srv_xmpp {
+                                            warn!(
+                                                "[WRTC Client] Server occupant {target_srv_xmpp} left the MUC room. Triggering immediate reconnect..."
+                                            );
+                                            warn(format!(
+                                                "[WRTC Client] Server {target_srv_xmpp} left room. Reconnecting..."
+                                            ));
+                                            peer_xmpp.failed_notify.notify_waiters();
+                                            peer_xmpp.failed_notify.notify_one();
+                                            return;
+                                        }
+                                    }
+                                }
+                                _ => {}
                             }
                         }
                     }
-                } else {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    Ok(None) => {
+                        warn!(
+                            "[WRTC Client] XMPP signaling WebSocket closed. Triggering reconnect..."
+                        );
+                        warn("[WRTC Client] XMPP signaling closed. Reconnecting...");
+                        peer_xmpp.failed_notify.notify_waiters();
+                        peer_xmpp.failed_notify.notify_one();
+                        return;
+                    }
+                    Err(_) => {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
                 }
             }
         });
@@ -658,6 +706,11 @@ impl ClientTransport for WrtcTransport {
                             warn(format!("[WRTC Client] Peer ping error: {e}"));
                             break;
                         }
+                    }
+                    _ = peer_tx.failed_notify.notified() => {
+                        warn!("[WRTC Client] WebRTC session or server signaling closed. Reconnecting...");
+                        warn("[WRTC Client] WebRTC session or server signaling closed. Reconnecting...");
+                        break;
                     }
                 }
             }

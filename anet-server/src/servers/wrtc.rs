@@ -244,49 +244,57 @@ pub async fn run_wrtc_server(
             let msg_opt = tokio::select! {
                 res = shared_peer.recv() => res,
                 stanza_opt = xmpp.recv_stanza() => {
-                    if let Some(stanza) = stanza_opt {
-                        for parsed in anet_common::wrtc::xmpp_xml::parse_xmpp_stanzas(&stanza, fallback_ip, fallback_port) {
-                            match parsed {
-                                anet_common::wrtc::xmpp_xml::InboundXmpp::Jingle(jingle) => {
-                                    if jingle.action == "source-add"
-                                        || jingle.action == "description-info"
-                                        || jingle.action == "session-initiate"
-                                    {
-                                        for v_ssrc in jingle.video_sources {
-                                            info!("[WRTC Server] Jingle stanza ({}) announced remote video SSRC: {v_ssrc}", jingle.action);
-                                            shared_peer.add_remote_video_ssrc(v_ssrc).await;
-                                        }
+                    let Some(stanza) = stanza_opt else {
+                        warn!("[WRTC Server] XMPP signaling WebSocket closed. Re-establishing server session...");
+                        break;
+                    };
+                    let mut self_removed = false;
+                    for parsed in anet_common::wrtc::xmpp_xml::parse_xmpp_stanzas(&stanza, fallback_ip, fallback_port) {
+                        match parsed {
+                            anet_common::wrtc::xmpp_xml::InboundXmpp::Jingle(jingle) => {
+                                if jingle.action == "source-add"
+                                    || jingle.action == "description-info"
+                                    || jingle.action == "session-initiate"
+                                {
+                                    for v_ssrc in jingle.video_sources {
+                                        info!("[WRTC Server] Jingle stanza ({}) announced remote video SSRC: {v_ssrc}", jingle.action);
+                                        shared_peer.add_remote_video_ssrc(v_ssrc).await;
                                     }
                                 }
-                                anet_common::wrtc::xmpp_xml::InboundXmpp::Presence { from, is_unavailable: true, .. } => {
-                                    if let Some(occupant_id) = from.split('/').nth(1) {
-                                        if occupant_id != srv_id && occupant_id != "focus" {
-                                            client_modes.remove(occupant_id);
-                                            client_video_endpoints.remove(occupant_id);
-                                            client_v2_endpoints.remove(occupant_id);
-                                            p2p_clients.remove(occupant_id);
-                                            if let Some((_, dead_client)) = clients_map.remove(occupant_id) {
-                                                info!(
-                                                    "[WRTC Server] Occupant {occupant_id} left MUC room. Removing session {} (IP: {}) immediately.",
-                                                    dead_client.session_id, dead_client.assigned_ip
-                                                );
-                                                let old_tag = anet_common::wrtc::colibri::client_tag_from_ip(&dead_client.assigned_ip);
-                                                clients_by_tag.remove(&old_tag);
-                                                client_video_warmed_up.remove(&old_tag);
-                                                reg_clone.remove_client(&dead_client).await;
-                                            }
-                                        }
-                                    }
-                                }
-                                _ => {}
                             }
+                            anet_common::wrtc::xmpp_xml::InboundXmpp::Presence { from, is_unavailable: true, .. } => {
+                                if let Some(occupant_id) = from.split('/').nth(1) {
+                                    if occupant_id == srv_id {
+                                        warn!("[WRTC Server] Server occupant {srv_id} was removed from MUC room. Re-establishing server session...");
+                                        self_removed = true;
+                                    } else if occupant_id != "focus" {
+                                        client_modes.remove(occupant_id);
+                                        client_video_endpoints.remove(occupant_id);
+                                        client_v2_endpoints.remove(occupant_id);
+                                        p2p_clients.remove(occupant_id);
+                                        if let Some((_, dead_client)) = clients_map.remove(occupant_id) {
+                                            info!(
+                                                "[WRTC Server] Occupant {occupant_id} left MUC room. Removing session {} (IP: {}) immediately.",
+                                                dead_client.session_id, dead_client.assigned_ip
+                                            );
+                                            let old_tag = anet_common::wrtc::colibri::client_tag_from_ip(&dead_client.assigned_ip);
+                                            clients_by_tag.remove(&old_tag);
+                                            client_video_warmed_up.remove(&old_tag);
+                                            reg_clone.remove_client(&dead_client).await;
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
                         }
+                    }
+                    if self_removed {
+                        break;
                     }
                     continue;
                 }
                 _ = shared_peer.failed_notify.notified() => {
-                    warn!("[WRTC Server] WebRTC PeerConnection failed/closed by JVB. Re-establishing server session in 3s...");
-                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    warn!("[WRTC Server] WebRTC PeerConnection failed/closed by JVB. Re-establishing server session...");
                     break;
                 }
             };
