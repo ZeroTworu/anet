@@ -40,6 +40,10 @@ pub const VIDEO_BATCH_MARKER: u8 = 0x00;
 /// Максимальный размер полезной нагрузки микро-батча для одного VP8 RTP пакета (без фрагментации UDP MTU 1500).
 pub const MAX_VIDEO_BATCH_BYTES: usize = 1300;
 
+/// Дополнительный оверхед инкапсуляции WebRTC Video поверх обычного туннеля (в байтах):
+/// 4B (VP8 Payload Descriptor) + 20B (VP8 Frame Header) + 2B (Client Tag) + ~34B (RTP Header + Extensions + SRTP Tag) = 60 байт.
+pub const WRTC_VIDEO_MTU_OVERHEAD: u16 = 60;
+
 /// Проверяет, начинается ли полезная нагрузка VP8 с валидного заголовка ANet (Keyframe 16p/1080p или Interframe).
 #[inline]
 pub fn is_valid_vp8_frame_header(data: &[u8]) -> bool {

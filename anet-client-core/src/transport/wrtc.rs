@@ -343,12 +343,20 @@ impl ClientTransport for WrtcTransport {
         let auth_handler = AuthHandler::new(&self.config, self.server.server_pub_key.as_deref())?;
         let (mut auth_response, shared_key) = auth_handler.authenticate(&auth_channel).await?;
 
-        if wrtc_mode == anet_common::wrtc::colibri::WrtcMode::MediaVideo || auth_response.mtu > 1340 {
+        if wrtc_mode == anet_common::wrtc::colibri::WrtcMode::MediaVideo
+            || wrtc_mode == anet_common::wrtc::colibri::WrtcMode::Auto
+        {
+            let server_mtu = auth_response.mtu;
+            let adjusted_mtu = server_mtu
+                .saturating_sub(anet_common::wrtc::colibri::WRTC_VIDEO_MTU_OVERHEAD)
+                .max(1200);
             info!(
-                "[WRTC] Setting safe TUN MTU {} (clamped from {}) for WebRTC DTLS-SRTP packetization",
-                1340, auth_response.mtu
+                "[WRTC] Adjusted TUN MTU to {} (server MTU {} - {}B WebRTC RTP/VP8 overhead)",
+                adjusted_mtu,
+                server_mtu,
+                anet_common::wrtc::colibri::WRTC_VIDEO_MTU_OVERHEAD
             );
-            auth_response.mtu = 1340;
+            auth_response.mtu = adjusted_mtu;
         }
 
         info!(
