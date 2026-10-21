@@ -12,7 +12,27 @@ use std::sync::Arc;
 use tokio::fs::read_to_string;
 use tokio::signal;
 
+fn format_banner_row(label: &str, value: &str) -> String {
+    let prefix = format!("║                   {:<13}", label);
+    let total_content_width = 63;
+    let prefix_len = prefix.chars().count() - 1; // excluding '║'
+    let val_space = total_content_width.saturating_sub(prefix_len);
+    let val_chars_count = value.chars().count();
+    if val_chars_count > val_space {
+        let truncated: String = value.chars().take(val_space.saturating_sub(3)).collect();
+        format!("{}{:<width$}║", prefix, format!("{}...", truncated), width = val_space)
+    } else {
+        let pad = val_space - val_chars_count;
+        format!("{}{}{}║", prefix, value, " ".repeat(pad))
+    }
+}
+
 fn generate_ascii_art(tag: &str, build_type: &str, commit_hash: &str, build_time: &str) -> String {
+    let row_version = format_banner_row("Version:", tag);
+    let row_build_type = format_banner_row("Build Type:", build_type);
+    let row_commit_hash = format_banner_row("Commit Hash:", commit_hash);
+    let row_build_time = format_banner_row("Build Time:", build_time);
+
     format!(
         r#"
                     ╔═══════════════════════════════════════════════════════════════╗
@@ -25,14 +45,14 @@ fn generate_ascii_art(tag: &str, build_type: &str, commit_hash: &str, build_time
                     ║                 ╚═╝  ╚═╝╚═╝  ╚═══╝╚══════╝   ╚═╝              ║
                     ╠═══════════════════════════════════════════════════════════════╣
                     ║                                                               ║
-                    ║                   Version:     {:<16}               ║
-                    ║                   Build Type:  {:<16}               ║
-                    ║                   Commit Hash: {:<16}               ║
-                    ║                   Build Time:  {:<19}            ║
+                    {}
+                    {}
+                    {}
+                    {}
                     ║                                                               ║
                     ╚═══════════════════════════════════════════════════════════════╝
 "#,
-        tag, build_type, commit_hash, build_time
+        row_version, row_build_type, row_commit_hash, row_build_time
     )
 }
 

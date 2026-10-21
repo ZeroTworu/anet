@@ -1109,9 +1109,30 @@ impl AnetClient {
             format!("{} / Безлимит", result.auth_response.active_sessions)
         };
 
+        let format_tariff_row = |label: &str, val: &str| -> String {
+            let left_part = format!("  {:<18}", label);
+            let prefix_len = left_part.chars().count();
+            let total_content_width = 71;
+            let val_space = total_content_width.saturating_sub(prefix_len);
+            let val_chars = val.chars().count();
+            if val_chars > val_space {
+                let truncated: String = val.chars().take(val_space.saturating_sub(3)).collect();
+                format!("             ║{}{:<width$}║", left_part, format!("{}...", truncated), width = val_space)
+            } else {
+                let pad = val_space - val_chars;
+                format!("             ║{}{}{}║", left_part, val, " ".repeat(pad))
+            }
+        };
+
         info!(
-            "\n╔═══════════════════════════════════════════════════════════════════════════════╗\n             ║                          ACCOUNT & TARIFF INFO                                ║\n             ╠═══════════════════════════════════════════════════════════════════════════════╣\n             ║  Тарификация:      {:<56} ║\n             ║  Группа:           {:<56} ║\n             ║  Сессии:           {:<56} ║\n             ║  Скорость:         {:<56} ║\n             ║  Трафик за период: {:<56} ║\n             ║  Лимит трафика:    {:<56} ║\n             ║  Действует до:     {:<56} ║\n             ╚═══════════════════════════════════════════════════════════════════════════════╝",
-            billing_str, group_str, sessions_str, speed_str, consumed_str, limit_str, expires_str,
+            "\n            ╔═══════════════════════════════════════════════════════════════════════╗\n             ║                         ACCOUNT & TARIFF INFO                         ║\n             ╠═══════════════════════════════════════════════════════════════════════╣\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n             ╚═══════════════════════════════════════════════════════════════════════╝",
+            format_tariff_row("Тарификация:", billing_str),
+            format_tariff_row("Группа:", group_str),
+            format_tariff_row("Сессии:", &sessions_str),
+            format_tariff_row("Скорость:", &speed_str),
+            format_tariff_row("Трафик за период:", &consumed_str),
+            format_tariff_row("Лимит трафика:", &limit_str),
+            format_tariff_row("Действует до:", expires_str),
         );
 
         status(format!(
