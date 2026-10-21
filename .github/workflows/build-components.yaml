@@ -15,6 +15,14 @@ on:
         required: false
       APPLE_TEAM_ID:
         required: false
+      SSH_HOST:
+        required: false
+      SSH_USER:
+        required: false
+      SSH_KEY:
+        required: false
+      SSH_PORT:
+        required: false
     outputs:
       server-artifact:
         value: ${{ jobs.build-linux-server.outputs.artifact }}
@@ -893,3 +901,121 @@ jobs:
 #        with:
 #          name: "anet-client-linux-gui-zst"
 #          path: "pkg_build/*.pkg.tar.zst"
+
+  deploy-beta-artifacts:
+    name: "Deploy Beta Artifacts to Server"
+    runs-on: "ubuntu-latest"
+    if: github.ref == 'refs/heads/master'
+    needs: [build-windows-client, create-installer, package-android-apk]
+    steps:
+      - uses: "actions/checkout@v4"
+
+      - name: "Download Windows CLI Artifact"
+        uses: "actions/download-artifact@v7"
+        with:
+          name: "anet-client-windows-cli"
+          path: "artifacts/windows-cli"
+
+      - name: "Download Windows GUI Artifact"
+        uses: "actions/download-artifact@v7"
+        with:
+          name: "anet-client-windows-gui"
+          path: "artifacts/windows-gui"
+
+      - name: "Download Windows GUI Debug Artifact"
+        uses: "actions/download-artifact@v7"
+        with:
+          name: "anet-gui-debug"
+          path: "artifacts/windows-gui-debug"
+
+      - name: "Download Windows Installer Artifact"
+        uses: "actions/download-artifact@v7"
+        with:
+          name: "anet-client-setup-windows"
+          path: "artifacts/windows-installer"
+
+      - name: "Download Android APK Artifact"
+        uses: "actions/download-artifact@v7"
+        with:
+          name: "anet-android-apk"
+          path: "artifacts/android-apk"
+
+      - name: "Prepare Beta Artifacts"
+        run: |
+          mkdir -p beta_upload
+          mkdir -p client_win_bundle
+
+          # 1. Бинарники для Windows
+          cp artifacts/windows-cli/anet-client.exe beta_upload/
+          cp artifacts/windows-gui/anet-gui.exe beta_upload/
+          cp artifacts/windows-gui-debug/anet-gui-debug.exe beta_upload/
+
+          # 2. Windows Setup Installer
+          INSTALLER_SRC=$(find artifacts/windows-installer -name '*.exe' | head -n 1)
+          if [ -n "$INSTALLER_SRC" ]; then
+            cp "$INSTALLER_SRC" beta_upload/ANET_VPN_Client_Setup_beta_x64.exe
+          else
+            echo "::warning::Windows installer executable not found!"
+          fi
+
+          # 3. Android APK
+          APK_SRC=$(find artifacts/android-apk -name '*.apk' | head -n 1)
+          if [ -n "$APK_SRC" ]; then
+            cp "$APK_SRC" beta_upload/anet-android-beta.apk
+          else
+            echo "::warning::Android APK file not found!"
+          fi
+
+          # 4. Формирование архива client-windows_beta.zip
+          cp artifacts/windows-cli/anet-client.exe client_win_bundle/
+          cp artifacts/windows-gui/anet-gui.exe client_win_bundle/
+          cp artifacts/windows-gui-debug/anet-gui-debug.exe client_win_bundle/
+          cp contrib/config/client.toml client_win_bundle/
+
+          # Скачиваем Wintun DLL для zip-бандла
+          cd client_win_bundle
+          curl -sLO "https://www.wintun.net/builds/wintun-0.14.1.zip"
+          unzip -q "wintun-0.14.1.zip"
+          cp "wintun/bin/amd64/wintun.dll" .
+          rm -rf "wintun" "wintun-0.14.1.zip"
+
+          # Скачиваем WinDivert для zip-бандла
+          WINDIVERT_VERSION="2.2.2"
+          curl -sLO "https://github.com/basil00/WinDivert/releases/download/v${WINDIVERT_VERSION}/WinDivert-${WINDIVERT_VERSION}-A.zip"
+          unzip -q "WinDivert-${WINDIVERT_VERSION}-A.zip" -d windivert_raw
+          cp "$(find windivert_raw -path '*x64/WinDivert.dll' | head -n1)" .
+          cp "$(find windivert_raw -path '*x64/WinDivert64.sys' | head -n1)" .
+          rm -rf windivert_raw "WinDivert-${WINDIVERT_VERSION}-A.zip"
+
+          # Упаковываем в zip
+          zip -r ../beta_upload/client-windows_beta.zip .
+          cd ..
+
+          echo "Files prepared for upload:"
+          ls -la beta_upload/
+
+      - name: "Upload Beta Artifacts via SCP"
+        uses: "appleboy/scp-action@v0.1.7"
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ secrets.SSH_PORT || 22 }}
+          source: "beta_upload/*"
+          target: "/opt/anet/download"
+          strip_components: 1
+          overwrite: true
+
+      - name: "Set permissions for Nginx"
+        uses: "appleboy/ssh-action@v1.0.3"
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ secrets.SSH_PORT || 22 }}
+          script: |
+            mkdir -p /opt/anet/download
+            chmod 755 /opt/anet/download
+            chmod 644 /opt/anet/download/*
+            echo "Beta artifacts permissions updated successfully."
+
