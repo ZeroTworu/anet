@@ -45,11 +45,16 @@ impl ANetServer {
         let reg = Arc::new(ClientRegistry::new(pl));
         let dh = Arc::new(DashMap::new());
 
-        let a_prov = Arc::new(AuthProvider::new(
-            cfg_ref.authentication.allowed_clients.clone(),
-            cfg_ref.authentication.auth_servers.clone(),
-            cfg_ref.authentication.auth_server_token.clone(),
-        ));
+        let node_id = (!cfg_ref.control_plane.node_id.trim().is_empty())
+            .then(|| cfg_ref.control_plane.node_id.trim().to_string());
+        let a_prov = Arc::new(
+            AuthProvider::new(
+                cfg_ref.authentication.allowed_clients.clone(),
+                cfg_ref.authentication.auth_servers.clone(),
+                cfg_ref.authentication.auth_server_token.clone(),
+            )
+            .with_node_id(node_id),
+        );
 
         let ac = ServerAuthHandler::new(
             reg.clone(), dh.clone(), a_prov, sign_key,

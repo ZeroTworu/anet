@@ -229,6 +229,22 @@ impl AuthApi {
             speed_limit = 0;
         }
 
+        // Если нода передала своё текущее фактическое число живых сессий для этого fingerprint —
+        // мгновенно обновляем снимок этой ноды в LIVE_NODE_SESSIONS перед проверкой лимита.
+        let requesting_node_id = req
+            .0
+            .node_id
+            .as_deref()
+            .and_then(|s| Uuid::parse_str(s).ok());
+        if let (Some(node_uuid), Some(node_cnt)) = (requesting_node_id, req.0.node_active_sessions)
+        {
+            crate::api::api::set_live_node_session_for_fingerprint(
+                node_uuid,
+                &user.fingerprint,
+                node_cnt,
+            );
+        }
+
         // Подсчет активных сессий пользователя (с приоритетом декларативного live-состояния от нод)
         let db_sessions = crate::entities::active_sessions::Entity::find()
             .filter(crate::entities::active_sessions::Column::UserId.eq(user.id))
@@ -310,16 +326,62 @@ impl AuthApi {
                     }
                 }
             }
+
+            // Проверка лимита одновременных подключений (allowed_sessions > 0; 0 = безлимит)
+            if allowed_sessions > 0 && current_sessions >= allowed_sessions {
+                return Ok(Json(CheckAccessResponse {
+                    allowed: false,
+                    message: "Достигнут лимит одновременных подключений".into(),
+                    static_ip: None,
+                    user_id: None,
+                    speed_limit_kbps: None,
+                    billing_type: Some(billing_type),
+                    group_name,
+                    traffic_limit: if max_traffic > 0 { Some(max_traffic) } else { None },
+                    traffic_consumed,
+                    active_sessions: Some(current_sessions),
+                    allowed_sessions: Some(allowed_sessions),
+                    expires_at,
+                }));
+            }
         }
 
-        // Лимит сессий контролируется по модели FIFO:
-        // 1) При подключении к той же ноде сама нода в Phase III мгновенно вытесняет старую локальную сессию.
-        // 2) При подключении к другой ноде декларативный отчёт /control/nodes/traffic вытесняет самую старую сессию по oldest_created_at.
-        let reported_active = if allowed_sessions > 0 {
-            (current_sessions + 1).min(allowed_sessions)
+        let reported_active = current_sessions + 1;
+
+        // Резервируем слот новой сессии в LIVE_NODE_SESSIONS и БД, чтобы параллельное подключение
+        // со второго устройства мгновенно увидело обновлённый счётчик до следующего heartbeat.
+        if let Some(node_uuid) = requesting_node_id {
+            let next_node_cnt = req
+                .0
+                .node_active_sessions
+                .map(|c| c + 1)
+                .unwrap_or(1);
+            crate::api::api::set_live_node_session_for_fingerprint(
+                node_uuid,
+                &user.fingerprint,
+                next_node_cnt,
+            );
+        }
+
+        if let Ok(Some(sess_row)) = crate::entities::active_sessions::Entity::find()
+            .filter(crate::entities::active_sessions::Column::UserId.eq(user.id))
+            .one(&self.db)
+            .await
+        {
+            let mut editable: crate::entities::active_sessions::ActiveModel = sess_row.into();
+            editable.sessions = Set(reported_active);
+            editable.updated_at = Set(now);
+            let _ = editable.update(&self.db).await;
         } else {
-            current_sessions + 1
-        };
+            let new_sess = crate::entities::active_sessions::ActiveModel {
+                id: Set(Uuid::new_v4()),
+                user_id: Set(user.id),
+                sessions: Set(reported_active),
+                created_at: Set(now),
+                updated_at: Set(now),
+            };
+            let _ = new_sess.insert(&self.db).await;
+        }
 
         Ok(Json(CheckAccessResponse {
             allowed: true,

@@ -205,41 +205,22 @@ impl StatisticsApi {
                     cycle_start = rate.date_end - chrono::Duration::days(duration_days);
                 }
 
-                // Определение лимита трафика и лимита одновременных сессий
+                // Определение лимита трафика
                 let mut limit: i64 = 0;
                 let mut has_traffic_limit = false;
-                let mut allowed_sessions: i32 = 0;
 
                 let rate_has_limits = rate_opt.as_ref().is_some_and(|r| r.sessions > 0 || r.traffic_limit > 0 || r.speed_limit > 0);
 
                 if rate_has_limits {
                     let rate = rate_opt.as_ref().unwrap();
-                    allowed_sessions = rate.sessions;
                     if rate.traffic_limit > 0 {
                         limit = rate.traffic_limit;
                         has_traffic_limit = true;
                     }
                 } else if let Some(ref group) = group_opt {
-                    allowed_sessions = group.sessions_limit;
                     if group.traffic_limit > 0 {
                         limit = group.traffic_limit;
                         has_traffic_limit = true;
-                    }
-                }
-
-                // Межнодовое FIFO-вытеснение: если суммарно по всем нодам у ключа больше живых сессий,
-                // чем разрешено по тарифу/группе — отправляем disconnect_user на ноду с самой старой сессией.
-                if allowed_sessions > 0 {
-                    let live_count = live_totals.get(&sample.fingerprint).copied().unwrap_or(0);
-                    if live_count > allowed_sessions {
-                        let _ = crate::api::api::evict_oldest_session_for_user(
-                            &txn,
-                            usr_id,
-                            &sample.fingerprint,
-                            live_count,
-                            allowed_sessions,
-                        )
-                        .await;
                     }
                 }
 

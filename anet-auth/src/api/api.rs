@@ -149,6 +149,29 @@ pub fn get_live_node_sessions_for_fingerprint(node_id: Uuid, fingerprint: &str) 
     Some(cnt as i32)
 }
 
+/// Точечно обновляет число живых сессий одного `fingerprint` на конкретной ноде `node_id`
+/// (используется при `/check_access` для мгновенной синхронизации до прихода периодического heartbeat).
+pub fn set_live_node_session_for_fingerprint(node_id: Uuid, fingerprint: &str, count: u32) {
+    if fingerprint.is_empty() {
+        return;
+    }
+    let mut guard = live_sessions_map().lock().unwrap();
+    let now = std::time::Instant::now();
+    guard.retain(|_, snap| now.duration_since(snap.updated_at) <= LIVE_NODE_TTL);
+    let snap = guard.entry(node_id).or_insert_with(|| NodeLiveSnapshot {
+        updated_at: now,
+        counts: HashMap::new(),
+    });
+    snap.updated_at = now;
+    if count == 0 {
+        snap.counts.remove(fingerprint);
+    } else {
+        let existing_oldest = snap.counts.get(fingerprint).map(|&(_, ts)| ts).unwrap_or(0);
+        snap.counts
+            .insert(fingerprint.to_string(), (count, existing_oldest));
+    }
+}
+
 /// Очищает протухшие снимки нод (> 45с) и возвращает агрегированную карту живых сессий,
 /// если реестр `LIVE_NODE_SESSIONS` уже инициализирован хотя бы одной живой нодой.
 pub fn prune_stale_live_sessions() -> Option<HashMap<String, i32>> {
@@ -246,95 +269,6 @@ pub async fn sync_active_sessions_db<C: sea_orm::ConnectionTrait>(
             log::warn!("[SessionsSync] Failed to query active_sessions/users for sync: {}", e);
         }
     }
-}
-
-/// Находит ноду с самой старой активной сессией пользователя (по `oldest_created_at` из декларативных
-/// отчётов нод или `traffic_totals`) и ставит ей задачу `disconnect_user` (FIFO Eviction).
-pub async fn evict_oldest_session_for_user<C: sea_orm::ConnectionTrait>(
-    db: &C,
-    user_id: Uuid,
-    fingerprint: &str,
-    current_sessions: i32,
-    allowed_sessions: i32,
-) -> i32 {
-    let now = chrono::Utc::now().naive_utc();
-
-    // 1. Ищем ноду с минимальным oldest_created_at в декларативном реестре LIVE_NODE_SESSIONS
-    let mut target_node_id: Option<Uuid> = {
-        let guard = live_sessions_map().lock().unwrap();
-        guard
-            .iter()
-            .filter_map(|(node_id, snap)| {
-                snap.counts
-                    .get(fingerprint)
-                    .filter(|&&(cnt, _)| cnt > 0)
-                    .map(|&(_, oldest_ts)| (*node_id, oldest_ts))
-            })
-            .min_by_key(|&(_, oldest_ts)| if oldest_ts == 0 { u64::MAX } else { oldest_ts })
-            .map(|(node_id, _)| node_id)
-    };
-
-    // 2. Fallback: если в LIVE_NODE_SESSIONS ещё нет данных — ищем самую старую запись в traffic_totals за 90с
-    if target_node_id.is_none() {
-        let threshold = now - chrono::Duration::seconds(90);
-        target_node_id = crate::entities::traffic_totals::Entity::find()
-            .filter(crate::entities::traffic_totals::Column::Fingerprint.eq(fingerprint))
-            .filter(crate::entities::traffic_totals::Column::UpdatedAt.gte(threshold))
-            .order_by_asc(crate::entities::traffic_totals::Column::UpdatedAt)
-            .one(db)
-            .await
-            .ok()
-            .flatten()
-            .map(|row| row.server_id);
-    }
-
-    // 3. Если нашли конкретную ноду, ставим ей команду disconnect_user (если такой pending-команды ещё нет)
-    if let Some(server_id) = target_node_id {
-        let already_pending = crate::entities::node_commands::Entity::find()
-            .filter(crate::entities::node_commands::Column::ServerId.eq(server_id))
-            .filter(crate::entities::node_commands::Column::CommandType.eq("disconnect_user"))
-            .filter(crate::entities::node_commands::Column::TargetFingerprint.eq(Some(fingerprint.to_string())))
-            .filter(crate::entities::node_commands::Column::Status.eq("pending"))
-            .one(db)
-            .await
-            .ok()
-            .flatten()
-            .is_some();
-
-        if !already_pending {
-            let cmd = crate::entities::node_commands::ActiveModel {
-                id: sea_orm::Set(Uuid::new_v4()),
-                server_id: sea_orm::Set(server_id),
-                command_type: sea_orm::Set("disconnect_user".to_string()),
-                accepting_connections: sea_orm::Set(None),
-                target_fingerprint: sea_orm::Set(Some(fingerprint.to_string())),
-                status: sea_orm::Set("pending".to_string()),
-                created_at: sea_orm::Set(now),
-                started_at: sea_orm::Set(None),
-                completed_at: sea_orm::Set(None),
-                error: sea_orm::Set(None),
-            };
-            let _ = sea_orm::ActiveModelTrait::insert(cmd, db).await;
-            log::info!(
-                "[FIFO Eviction] Enqueued disconnect_user on oldest node {} for fingerprint {} (current={} > allowed={})",
-                server_id, fingerprint, current_sessions, allowed_sessions
-            );
-        }
-    }
-
-    let clamped = allowed_sessions.max(0);
-    if let Ok(Some(sess)) = crate::entities::active_sessions::Entity::find()
-        .filter(crate::entities::active_sessions::Column::UserId.eq(user_id))
-        .one(db)
-        .await
-    {
-        let mut editable: crate::entities::active_sessions::ActiveModel = sess.into();
-        editable.sessions = sea_orm::Set(clamped);
-        editable.updated_at = sea_orm::Set(now);
-        let _ = sea_orm::ActiveModelTrait::update(editable, db).await;
-    }
-
-    clamped
 }
 
 pub async fn user_pool_ids(db: &DatabaseConnection, user_id: Uuid) -> Vec<Uuid> {

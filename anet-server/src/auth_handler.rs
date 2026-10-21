@@ -210,12 +210,12 @@ impl ServerAuthHandler {
                 Ok((Some(resp_bytes), None))
             }
             Some(Content::EncryptedAuthRequest(enc_req)) => {
-                let (resp_msg, client_info, auth_resp) = self
+                let (resp_msg, auth_tuple) = self
                     .handle_encrypted_auth(enc_req, remote_addr, protocol)
                     .await
                     .context("ASTP shared-key authentication failed")?;
                 let resp_bytes = self.encode_obfuscated_packet(resp_msg)?;
-                Ok((Some(resp_bytes), Some((client_info, auth_resp))))
+                Ok((Some(resp_bytes), auth_tuple))
             }
             _ => Err(anyhow!("Invalid payload message type")),
         }
@@ -279,7 +279,17 @@ impl ServerAuthHandler {
         } else if !self.registry.is_accepting_connections() {
             Err("Node is not accepting new connections".to_string())
         } else {
-            self.auth_provider.is_client_allowed(&client_fingerprint).await
+            // Очищаем мёртвые сессии данного ключа, от которых не было пакетов/зондов > 10 секунд
+            // (живые клиенты отправляют внутритуннельные ICMP-зонды каждые 2 секунды).
+            self.registry
+                .cleanup_inactive_for_fingerprint(&client_fingerprint, 10)
+                .await;
+            let local_active = self
+                .registry
+                .active_session_count_for_fingerprint(&client_fingerprint);
+            self.auth_provider
+                .is_client_allowed(&client_fingerprint, Some(local_active))
+                .await
         };
 
         match access {
@@ -369,7 +379,10 @@ impl ServerAuthHandler {
         enc_req: EncryptedAuthRequest,
         remote_addr: SocketAddr,
         protocol: &str,
-    ) -> Result<(AnetMessage, Arc<ClientTransportInfo>, AuthResponse)> {
+    ) -> Result<(
+        AnetMessage,
+        Option<(Arc<ClientTransportInfo>, AuthResponse)>,
+    )> {
         let temp_info = self
             .temp_dh_map
             .remove(&remote_addr)
@@ -436,18 +449,33 @@ impl ServerAuthHandler {
                 previous.created_at,
             )
         } else {
-            // Если это новая сессия и у пользователя задан лимит сессий —
-            // до выделения IP вытесняем самую старую избыточную сессию на этой ноде (FIFO),
-            // чтобы при быстром реконнекте освободить слот и статический/пуловый IP.
+            // Защита от гонки параллельных хендшейков на одной ноде:
+            // если у пользователя задан лимит сессий (limit > 0) и локальное число активных сессий
+            // уже достигло лимита — отклоняем новое подключение, не выбивая существующие сессии.
             if let Some(limit) = temp_info.allowed_sessions {
                 if limit > 0 {
-                    self.registry
-                        .evict_excess_sessions_for_fingerprint(
-                            &temp_info.client_fingerprint,
-                            limit as usize,
-                            "",
-                        )
-                        .await;
+                    let local_active = self
+                        .registry
+                        .active_session_count_for_fingerprint(&temp_info.client_fingerprint);
+                    if local_active >= limit as u32 {
+                        warn!(
+                            "[AUTH] Phase 3 denied for {}: session limit reached ({}/{}) for FP {}",
+                            remote_addr, local_active, limit, temp_info.client_fingerprint
+                        );
+                        let mut deny_msg = AnetMessage {
+                            content: Some(Content::AuthError(AuthDenyNotification {
+                                message: "Достигнут лимит одновременных подключений".to_string(),
+                            })),
+                            padding: vec![],
+                        };
+                        let wire_len =
+                            deny_msg.encoded_len() + NONCE_LEN + PROTO_PAD_FIELD_OVERHEAD;
+                        deny_msg.padding = generate_random_padding(calculate_padding_needed(
+                            wire_len,
+                            self.padding_step,
+                        ));
+                        return Ok((deny_msg, None));
+                    }
                 }
             }
 
@@ -503,6 +531,7 @@ impl ServerAuthHandler {
             // Инициализация сторожевого таймера:
             last_activity: Arc::new(AtomicU64::new(now_secs)),
             created_at,
+            quic_conn: arc_swap::ArcSwapOption::empty(),
         });
 
         self.registry.pre_register_client(client_info.clone());
@@ -564,6 +593,6 @@ impl ServerAuthHandler {
             self.padding_step,
         ));
 
-        Ok((outer_msg, client_info, response_payload))
+        Ok((outer_msg, Some((client_info, response_payload))))
     }
 }

@@ -114,7 +114,13 @@ pub async fn run_heartbeat(config: ControlPlaneConfig, registry: Arc<ClientRegis
             Err(error) => warn!("[ControlPlane] Command polling failed: {error}"),
         }
 
-        tokio::time::sleep(interval).await;
+        tokio::select! {
+            _ = tokio::time::sleep(interval) => {}
+            _ = registry.wait_state_changed() => {
+                // Коалесцируем быстрые изменения сессий (100 мс) перед внеочередной отправкой телеметрии
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
     }
 }
 

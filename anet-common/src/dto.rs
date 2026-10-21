@@ -24,6 +24,14 @@ pub enum BillingType {
 pub struct CheckAccessRequest {
     #[cfg_attr(feature = "poem", oai(validator(min_length = 10)))]
     pub fingerprint: String,
+    /// Опциональный UUID ноды, с которой выполняется проверка доступа
+    #[serde(default)]
+    #[cfg_attr(feature = "poem", oai(default))]
+    pub node_id: Option<String>,
+    /// Фактическое число живых сессий данного fingerprint на этой ноде в момент запроса
+    #[serde(default)]
+    #[cfg_attr(feature = "poem", oai(default))]
+    pub node_active_sessions: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
