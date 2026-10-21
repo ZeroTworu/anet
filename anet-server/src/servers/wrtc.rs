@@ -128,17 +128,30 @@ pub async fn run_wrtc_server(
 
         info!("[WRTC Server] Waiting for Jicofo session-initiate (client arrival)...");
         let mut parsed_session = None;
+        let idle_deadline = tokio::time::Instant::now() + Duration::from_secs(1800);
 
-        while let Some(stanza) = xmpp.recv_stanza().await {
-            if let Some(session) = parse_jingle_session(&stanza, fallback_ip, fallback_port) {
-                parsed_session = Some(session);
-                break;
+        loop {
+            match tokio::time::timeout_at(idle_deadline, xmpp.recv_stanza()).await {
+                Ok(Some(stanza)) => {
+                    if let Some(session) = parse_jingle_session(&stanza, fallback_ip, fallback_port) {
+                        parsed_session = Some(session);
+                        break;
+                    }
+                }
+                Ok(None) => {
+                    warn!("[WRTC Server] XMPP stream closed while waiting for session-initiate. Reconnecting in 2s...");
+                    break;
+                }
+                Err(_) => {
+                    info!("[WRTC Server] No client joined for 30m; rotating server room session...");
+                    break;
+                }
             }
         }
 
         let Some(session) = parsed_session else {
-            warn!("[WRTC Server] XMPP stream closed while waiting for session-initiate. Reconnecting in 3s...");
-            tokio::time::sleep(Duration::from_secs(3)).await;
+            xmpp.leave_room().await;
+            tokio::time::sleep(Duration::from_secs(2)).await;
             continue;
         };
 
@@ -156,8 +169,9 @@ pub async fn run_wrtc_server(
         {
             Ok(p) => p,
             Err(e) => {
-                warn!("[WRTC Server] Failed to initialize WebRTC Peer: {e:#}. Retrying in 5s...");
-                tokio::time::sleep(Duration::from_secs(5)).await;
+                warn!("[WRTC Server] Failed to initialize WebRTC Peer: {e:#}. Retrying in 3s...");
+                xmpp.leave_room().await;
+                tokio::time::sleep(Duration::from_secs(3)).await;
                 continue;
             }
         };
@@ -240,6 +254,9 @@ pub async fn run_wrtc_server(
             }
         });
 
+        let mut health_watchdog = tokio::time::interval(Duration::from_secs(2));
+        health_watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
         loop {
             let msg_opt = tokio::select! {
                 res = shared_peer.recv() => res,
@@ -258,7 +275,10 @@ pub async fn run_wrtc_server(
                                 {
                                     for v_ssrc in jingle.video_sources {
                                         info!("[WRTC Server] Jingle stanza ({}) announced remote video SSRC: {v_ssrc}", jingle.action);
-                                        shared_peer.add_remote_video_ssrc(v_ssrc).await;
+                                        let _ = tokio::time::timeout(
+                                            Duration::from_secs(5),
+                                            shared_peer.add_remote_video_ssrc(v_ssrc),
+                                        ).await;
                                     }
                                 }
                             }
@@ -297,6 +317,13 @@ pub async fn run_wrtc_server(
                     warn!("[WRTC Server] WebRTC PeerConnection failed/closed by JVB. Re-establishing server session...");
                     break;
                 }
+                _ = health_watchdog.tick() => {
+                    if let Some(reason) = shared_peer.check_dead_reason() {
+                        warn!("[WRTC Server] Watchdog detected dead session ({reason}). Re-establishing server session...");
+                        break;
+                    }
+                    continue;
+                }
             };
 
             let Some(msg) = msg_opt else {
@@ -333,7 +360,10 @@ pub async fn run_wrtc_server(
                             info!("[WRTC Server] Set expected client video SSRC: {c_v_ssrc} for {from_endpoint}");
 
                             // Привязываем видео SSRC клиента к выделенному Recvonly трансиверу
-                            shared_peer.add_remote_video_ssrc(c_v_ssrc).await;
+                            let _ = tokio::time::timeout(
+                                Duration::from_secs(5),
+                                shared_peer.add_remote_video_ssrc(c_v_ssrc),
+                            ).await;
 
                             client_video_endpoints.insert(from_endpoint.clone());
                             let constraints = anet_common::wrtc::colibri::ReceiverVideoConstraints::new_all(2160);
@@ -413,11 +443,13 @@ pub async fn run_wrtc_server(
 
                             if !client_found {
                                 let client_addr = endpoint_to_socket_addr(&from_endpoint);
-                                match auth_clone
-                                    .process_handshake_packet(Bytes::from(raw_bytes), client_addr, "wrtc")
-                                    .await
-                                {
-                                    Ok((response, result)) => {
+                                let hs_res = tokio::time::timeout(
+                                    Duration::from_secs(10),
+                                    auth_clone.process_handshake_packet(Bytes::from(raw_bytes), client_addr, "wrtc"),
+                                )
+                                .await;
+                                match hs_res {
+                                    Ok(Ok((response, result))) => {
                                         // 1. Сначала финализируем и регистрируем клиента, чтобы быть готовыми к приему трафика
                                         if let Some((client_info, _)) = result {
                                             let assigned_ip = client_info.assigned_ip.clone();
@@ -668,9 +700,12 @@ pub async fn run_wrtc_server(
                                             let _ = shared_peer.send(resp_msg).await;
                                         }
                                     }
-                                    Err(e) => {
+                                    Ok(Err(e)) => {
                                         // При опережающих пакетах трафика от TUN не забиваем лог warn-штормом
                                         log::debug!("[WRTC Server] Handshake packet processing error from {from_endpoint}: {e}");
+                                    }
+                                    Err(_) => {
+                                        warn!("[WRTC Server] Handshake processing timed out after 10s for {from_endpoint}");
                                     }
                                 }
                             }

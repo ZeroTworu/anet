@@ -20,6 +20,8 @@ pub struct XmppSession {
     pub discovered_stuns: Arc<Mutex<Vec<String>>>,
     write_tx: mpsc::Sender<String>,
     read_rx: mpsc::Receiver<String>,
+    writer_handle: tokio::task::JoinHandle<()>,
+    reader_handle: tokio::task::JoinHandle<()>,
 }
 
 impl XmppSession {
@@ -68,7 +70,12 @@ impl XmppSession {
 
         apply_ws_browser_headers(&mut request, profile, &origin)?;
 
-        let (ws_stream, response) = tokio_tungstenite::connect_async(request).await?;
+        let (ws_stream, response) = tokio::time::timeout(
+            Duration::from_secs(15),
+            tokio_tungstenite::connect_async(request),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("XMPP WebSocket TCP/TLS connect timed out after 15s"))??;
         log::info!("[XMPP] WebSocket connected (HTTP status: {:?})", response.status());
 
         let (mut ws_sink, mut ws_stream) = ws_stream.split();
@@ -179,6 +186,9 @@ impl XmppSession {
                     }
                 }
             }
+            if !joined {
+                anyhow::bail!("XMPP stream closed before MUC room join completed");
+            }
             Ok::<(), anyhow::Error>(())
         };
 
@@ -190,9 +200,15 @@ impl XmppSession {
         let (read_tx, read_rx) = mpsc::channel::<String>(128);
         let (raw_ws_tx, mut raw_ws_rx) = mpsc::channel::<Message>(32);
 
-        let ping_secs = if ping_interval_secs > 0 { ping_interval_secs } else { 20 };
+        let ping_secs = if ping_interval_secs > 0 {
+            ping_interval_secs.clamp(5, 25)
+        } else {
+            20
+        };
+        let read_timeout_dur = Duration::from_secs(ping_secs * 2 + 15);
+        let write_timeout_dur = Duration::from_secs(10);
 
-        tokio::spawn(async move {
+        let writer_handle = tokio::spawn(async move {
             let mut ping_interval = tokio::time::interval(Duration::from_secs(ping_secs));
             loop {
                 tokio::select! {
@@ -200,12 +216,19 @@ impl XmppSession {
                         match stanza_opt {
                             Some(stanza) => {
                                 if stanza == "__CLOSE__" {
-                                    let _ = ws_sink.close().await;
+                                    let _ = tokio::time::timeout(Duration::from_secs(2), ws_sink.close()).await;
                                     break;
                                 }
-                                if let Err(e) = ws_sink.send(Message::text(stanza)).await {
-                                    log::error!("[XMPP] Error sending stanza over WebSocket: {e}");
-                                    break;
+                                match tokio::time::timeout(write_timeout_dur, ws_sink.send(Message::text(stanza))).await {
+                                    Ok(Ok(())) => {}
+                                    Ok(Err(e)) => {
+                                        log::warn!("[XMPP] Error sending stanza over WebSocket: {e}");
+                                        break;
+                                    }
+                                    Err(_) => {
+                                        log::warn!("[XMPP] Timeout sending stanza over WebSocket");
+                                        break;
+                                    }
                                 }
                             }
                             None => break,
@@ -213,22 +236,39 @@ impl XmppSession {
                     }
                     raw_opt = raw_ws_rx.recv() => {
                         if let Some(msg) = raw_opt {
-                            if ws_sink.send(msg).await.is_err() { break; }
-                        } else { break; }
+                            if tokio::time::timeout(write_timeout_dur, ws_sink.send(msg)).await.map_or(true, |r| r.is_err()) {
+                                log::warn!("[XMPP] Failed or timed out sending raw WS control frame");
+                                break;
+                            }
+                        } else {
+                            break;
+                        }
                     }
                     _ = ping_interval.tick() => {
                         // 1. WebSocket keepalive
-                        if ws_sink.send(Message::Ping(bytes::Bytes::from_static(&[0x01, 0x02]))).await.is_err() {
+                        if tokio::time::timeout(
+                            write_timeout_dur,
+                            ws_sink.send(Message::Ping(bytes::Bytes::from_static(&[0x01, 0x02]))),
+                        )
+                        .await
+                        .map_or(true, |r| r.is_err())
+                        {
+                            log::warn!("[XMPP] Failed or timed out sending WebSocket keepalive ping");
                             break;
                         }
                         // 2. XMPP keepalive (предотвращает выселение Prosody по 120s c2s_timeout)
                         let ping_iq = XmppBuilder::ping("meet.jitsi", &format!("ping_{:08x}", rand::random::<u32>()));
-                        if ws_sink.send(Message::text(ping_iq)).await.is_err() {
+                        if tokio::time::timeout(write_timeout_dur, ws_sink.send(Message::text(ping_iq)))
+                            .await
+                            .map_or(true, |r| r.is_err())
+                        {
+                            log::warn!("[XMPP] Failed or timed out sending XMPP IQ ping");
                             break;
                         }
                     }
                 }
             }
+            log::warn!("[XMPP] Writer loop exited");
         });
 
         let write_tx_ack = write_tx.clone();
@@ -236,8 +276,21 @@ impl XmppSession {
         let discovered_stuns_bg = discovered_stuns.clone();
         let raw_ws_tx_clone = raw_ws_tx.clone();
 
-        tokio::spawn(async move {
-            while let Some(msg_res) = ws_stream.next().await {
+        let reader_handle = tokio::spawn(async move {
+            loop {
+                let msg_opt = match tokio::time::timeout(read_timeout_dur, ws_stream.next()).await {
+                    Ok(opt) => opt,
+                    Err(_) => {
+                        log::warn!(
+                            "[XMPP] WebSocket read timed out after {:?} without incoming frames (half-open connection)",
+                            read_timeout_dur
+                        );
+                        break;
+                    }
+                };
+                let Some(msg_res) = msg_opt else {
+                    break;
+                };
                 match msg_res {
                     Ok(Message::Text(text)) => {
                         let stanzas = parse_xmpp_stanzas(text.as_str(), "0.0.0.0", 0);
@@ -265,18 +318,18 @@ impl XmppSession {
                                     let disco_reply =
                                         XmppBuilder::disco_info_result(&from, &id, node.as_deref());
                                     log::info!("[XMPP OUT]: {disco_reply}");
-                                    let _ = write_tx_ack.send(disco_reply).await;
+                                    let _ = write_tx_ack.try_send(disco_reply);
                                 }
                                 InboundXmpp::Ping { id, from } => {
                                     let pong = XmppBuilder::iq_result(&from, &id);
                                     log::info!("[XMPP OUT]: {pong}");
-                                    let _ = write_tx_ack.send(pong).await;
+                                    let _ = write_tx_ack.try_send(pong);
                                 }
                                 InboundXmpp::Jingle(ref sess) => {
                                     if let Some(ref iq_id) = sess.iq_id {
                                         let ack = XmppBuilder::iq_result(&sess.from, iq_id);
                                         log::info!("[XMPP OUT]: {ack}");
-                                        let _ = write_tx_ack.send(ack).await;
+                                        let _ = write_tx_ack.try_send(ack);
                                     }
                                 }
                                 InboundXmpp::ExtdiscoServices(stuns) => {
@@ -291,7 +344,7 @@ impl XmppSession {
                         let _ = read_tx.try_send(text.to_string());
                     }
                     Ok(Message::Ping(data)) => {
-                        let _ = raw_ws_tx_clone.send(Message::Pong(data)).await;
+                        let _ = raw_ws_tx_clone.try_send(Message::Pong(data));
                     }
                     Ok(Message::Close(frame)) => {
                         log::warn!("[XMPP] WebSocket closed by server: {frame:?}");
@@ -317,6 +370,8 @@ impl XmppSession {
             discovered_stuns,
             write_tx,
             read_rx,
+            writer_handle,
+            reader_handle,
         })
     }
 
@@ -450,9 +505,27 @@ impl XmppSession {
             self.endpoint_id,
             leave_stanza
         );
-        let _ = self.write_tx.send(leave_stanza).await;
-        let _ = self.write_tx.send(XmppBuilder::close().to_string()).await;
-        let _ = self.write_tx.send("__CLOSE__".to_string()).await;
+        let _ = self.write_tx.try_send(leave_stanza);
+        let _ = self.write_tx.try_send(XmppBuilder::close().to_string());
+        let _ = self.write_tx.try_send("__CLOSE__".to_string());
         tokio::time::sleep(Duration::from_millis(60)).await;
+        self.reader_handle.abort();
+        self.writer_handle.abort();
     }
 }
+
+impl Drop for XmppSession {
+    fn drop(&mut self) {
+        let leave_stanza = XmppBuilder::muc_leave(&self.conference_id, &self.endpoint_id);
+        let _ = self.write_tx.try_send(leave_stanza);
+        let _ = self.write_tx.try_send(XmppBuilder::close().to_string());
+        let _ = self.write_tx.try_send("__CLOSE__".to_string());
+        self.reader_handle.abort();
+        let writer_abort = self.writer_handle.abort_handle();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            writer_abort.abort();
+        });
+    }
+}
+

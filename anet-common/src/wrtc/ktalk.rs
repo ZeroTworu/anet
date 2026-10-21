@@ -48,6 +48,8 @@ impl KtalkClient {
     pub fn new(profile: BrowserProfile) -> Self {
         Self {
             http: reqwest::Client::builder()
+                .connect_timeout( std::time::Duration::from_secs(10))
+                .timeout(std::time::Duration::from_secs(15))
                 .build()
                 .unwrap_or_default(),
             profile,

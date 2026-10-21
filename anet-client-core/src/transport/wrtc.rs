@@ -139,6 +139,7 @@ impl ClientTransport for WrtcTransport {
                     }
                 }
                 Ok(None) => {
+                    xmpp.leave_room().await;
                     anyhow::bail!("XMPP WebSocket closed while waiting for Jicofo session-initiate");
                 }
                 Err(_) => {}
@@ -146,6 +147,7 @@ impl ClientTransport for WrtcTransport {
         }
 
         let Some(session) = parsed_session else {
+            xmpp.leave_room().await;
             anyhow::bail!(
                 "Failed to receive Jicofo session-initiate within {timeout_secs}s (no server or bridge session in room)"
             );
@@ -219,7 +221,7 @@ impl ClientTransport for WrtcTransport {
         status(format!("[WRTC] Selected transport mode: {:?}", wrtc_mode));
 
         let audio_keepalive_ms = self.server.wrtc_media_keepalive_interval_ms.unwrap_or(20);
-        let peer = WrtcPeer::create(
+        let peer = match WrtcPeer::create(
             Some(&session),
             Some(&xmpp),
             fallback_ip,
@@ -228,7 +230,13 @@ impl ClientTransport for WrtcTransport {
             wrtc_mode,
         )
             .await
-            .context("Failed to initialize WebRTC PeerConnection and DataChannel")?;
+        {
+            Ok(p) => p,
+            Err(e) => {
+                xmpp.leave_room().await;
+                return Err(e).context("Failed to initialize WebRTC PeerConnection and DataChannel");
+            }
+        };
 
         info!("[WRTC] WebRTC Peer created. Starting server discovery...");
         status("[WRTC] WebRTC Peer created. Starting server discovery...");
@@ -325,11 +333,13 @@ impl ClientTransport for WrtcTransport {
             }
         }
 
-        let target_server_id = verified_server_id.ok_or_else(|| {
-            anyhow::anyhow!(
+        let Some(target_server_id) = verified_server_id else {
+            xmpp.leave_room().await;
+            let _ = peer.close().await;
+            anyhow::bail!(
                 "Server discovery in room '{room_name}' timed out after {timeout_secs}s"
-            )
-        })?;
+            );
+        };
 
         info!("[WRTC] Starting ASTP authentication with server: {target_server_id}");
         status(format!("[WRTC] Starting ASTP authentication with server: {target_server_id}"));
@@ -340,8 +350,22 @@ impl ClientTransport for WrtcTransport {
             target_server_id: target_server_id.clone(),
         };
 
-        let auth_handler = AuthHandler::new(&self.config, self.server.server_pub_key.as_deref())?;
-        let (mut auth_response, shared_key) = auth_handler.authenticate(&auth_channel).await?;
+        let auth_handler = match AuthHandler::new(&self.config, self.server.server_pub_key.as_deref()) {
+            Ok(h) => h,
+            Err(e) => {
+                xmpp.leave_room().await;
+                let _ = shared_peer.close().await;
+                return Err(e);
+            }
+        };
+        let (mut auth_response, shared_key) = match auth_handler.authenticate(&auth_channel).await {
+            Ok(res) => res,
+            Err(e) => {
+                xmpp.leave_room().await;
+                let _ = shared_peer.close().await;
+                return Err(e);
+            }
+        };
 
         if wrtc_mode == anet_common::wrtc::colibri::WrtcMode::MediaVideo
             || wrtc_mode == anet_common::wrtc::colibri::WrtcMode::Auto
@@ -557,6 +581,8 @@ impl ClientTransport for WrtcTransport {
         let first_client_rx_tx = first_client_rx.clone();
 
         let mut ping_interval = tokio::time::interval(Duration::from_secs(15));
+        let mut watchdog_interval = tokio::time::interval(Duration::from_secs(2));
+        watchdog_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut batch_interval = tokio::time::interval(Duration::from_millis(2));
         let last_pong = Arc::new(AtomicU64::new(current_timestamp_secs()));
         let last_pong_tx = last_pong.clone();
@@ -712,6 +738,13 @@ impl ClientTransport for WrtcTransport {
                         if let Err(e) = peer_tx.send(ping_msg).await {
                             warn!("[WRTC Client] Peer ping error: {e}");
                             warn(format!("[WRTC Client] Peer ping error: {e}"));
+                            break;
+                        }
+                    }
+                    _ = watchdog_interval.tick() => {
+                        if let Some(reason) = peer_tx.check_dead_reason() {
+                            warn!("[WRTC Client] Watchdog detected dead WebRTC session ({reason}). Reconnecting...");
+                            warn(format!("[WRTC Client] Watchdog detected dead session ({reason}). Reconnecting..."));
                             break;
                         }
                     }

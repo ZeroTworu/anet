@@ -89,6 +89,9 @@ pub fn strip_vp8_payload_descriptor(payload: Bytes) -> Option<Bytes> {
 struct PeerEvents {
     connected_tx: mpsc::Sender<()>,
     is_connected: Arc<AtomicBool>,
+    is_failed: Arc<AtomicBool>,
+    disconnected_at_ms: Arc<AtomicU64>,
+    start_instant: std::time::Instant,
     failed_notify: Arc<tokio::sync::Notify>,
     dc_is_open: Arc<AtomicBool>,
     dc_open_notify: Arc<tokio::sync::Notify>,
@@ -106,13 +109,24 @@ impl PeerConnectionEventHandler for PeerEvents {
         log::info!("[WRTC Media] WebRTC PeerConnection state: {state:?}");
         if state == RTCPeerConnectionState::Connected {
             self.is_connected.store(true, Ordering::SeqCst);
+            self.disconnected_at_ms.store(0, Ordering::SeqCst);
             let _ = self.connected_tx.try_send(());
         } else if state == RTCPeerConnectionState::Disconnected
             || state == RTCPeerConnectionState::Failed
             || state == RTCPeerConnectionState::Closed
         {
             self.is_connected.store(false, Ordering::SeqCst);
+            if state == RTCPeerConnectionState::Disconnected {
+                let now_ms = (self.start_instant.elapsed().as_millis() as u64).max(1);
+                let _ = self.disconnected_at_ms.compare_exchange(
+                    0,
+                    now_ms,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                );
+            }
             if state == RTCPeerConnectionState::Failed || state == RTCPeerConnectionState::Closed {
+                self.is_failed.store(true, Ordering::SeqCst);
                 self.failed_notify.notify_waiters();
                 self.failed_notify.notify_one();
             }
@@ -405,6 +419,8 @@ pub struct WrtcPeer {
     pub dc_is_open: Arc<AtomicBool>,
     pub has_ws: Arc<AtomicBool>,
     pub is_connected: Arc<AtomicBool>,
+    pub is_failed: Arc<AtomicBool>,
+    pub disconnected_at_ms: Arc<AtomicU64>,
     pub failed_notify: Arc<tokio::sync::Notify>,
     pub first_video_tx: Arc<AtomicBool>,
     pub start_instant: std::time::Instant,
@@ -429,6 +445,8 @@ impl WrtcPeer {
         let (raw_outgoing_tx, mut raw_outgoing_rx) = mpsc::channel::<String>(16384);
         let (connected_tx, _connected_rx) = mpsc::channel::<()>(1);
         let is_connected = Arc::new(AtomicBool::new(false));
+        let is_failed = Arc::new(AtomicBool::new(false));
+        let disconnected_at_ms = Arc::new(AtomicU64::new(0));
         let failed_notify = Arc::new(tokio::sync::Notify::new());
         let dc_is_open = Arc::new(AtomicBool::new(false));
         let first_video_rx = Arc::new(AtomicBool::new(true));
@@ -456,8 +474,16 @@ impl WrtcPeer {
                 let ws_url_c = ws_url.clone();
                 let in_tx_ws = incoming_tx.clone();
                 let has_ws_c = has_ws.clone();
+                let dc_open_ws = dc_is_open.clone();
+                let is_failed_ws = is_failed.clone();
+                let failed_notify_ws = failed_notify.clone();
                 tokio::spawn(async move {
-                    if let Ok((ws_stream, _)) = tokio_tungstenite::connect_async(&ws_url_c).await {
+                    let connect_res = tokio::time::timeout(
+                        Duration::from_secs(10),
+                        tokio_tungstenite::connect_async(&ws_url_c),
+                    )
+                    .await;
+                    if let Ok(Ok((ws_stream, _))) = connect_res {
                         has_ws_c.store(true, Ordering::SeqCst);
                         log::info!("[WRTC WS] Parallel Colibri-WS fallback connected");
                         let (mut ws_sink, mut ws_stream) = ws_stream.split();
@@ -465,12 +491,19 @@ impl WrtcPeer {
                         if has_video_flag {
                             let constraints = ReceiverVideoConstraints::new_all(2160);
                             if let Ok(json) = serde_json::to_string(&constraints) {
-                                let _ = ws_sink.send(tokio_tungstenite::tungstenite::Message::Text(json.into())).await;
+                                let _ = tokio::time::timeout(
+                                    Duration::from_secs(5),
+                                    ws_sink.send(tokio_tungstenite::tungstenite::Message::Text(json.into())),
+                                )
+                                .await;
                             }
                         }
 
                         let in_tx = in_tx_ws;
                         let has_ws_read = has_ws_c.clone();
+                        let dc_open_read = dc_open_ws.clone();
+                        let is_failed_read = is_failed_ws.clone();
+                        let failed_notify_read = failed_notify_ws.clone();
                         tokio::spawn(async move {
                             while let Some(msg_res) = ws_stream.next().await {
                                 match msg_res {
@@ -484,20 +517,49 @@ impl WrtcPeer {
                                             let _ = in_tx.send(c_msg).await;
                                         }
                                     }
-                                    Ok(tokio_tungstenite::tungstenite::Message::Close(_)) | Err(_) => {
-                                        has_ws_read.store(false, Ordering::SeqCst);
+                                    Ok(tokio_tungstenite::tungstenite::Message::Close(frame)) => {
+                                        log::warn!("[WRTC WS] Colibri-WS closed by JVB: {frame:?}");
+                                        break;
+                                    }
+                                    Err(e) => {
+                                        log::warn!("[WRTC WS] Colibri-WS read error: {e}");
                                         break;
                                     }
                                     _ => {}
                                 }
                             }
+                            has_ws_read.store(false, Ordering::SeqCst);
+                            if !dc_open_read.load(Ordering::SeqCst) {
+                                log::warn!("[WRTC WS] Colibri-WS reader ended and no SCTP DataChannel is open; marking peer failed");
+                                is_failed_read.store(true, Ordering::SeqCst);
+                                failed_notify_read.notify_waiters();
+                                failed_notify_read.notify_one();
+                            }
                         });
 
                         while let Some(json_text) = ws_fallback_rx.recv().await {
-                            if ws_sink.send(tokio_tungstenite::tungstenite::Message::Text(json_text.into())).await.is_err() {
+                            let send_res = tokio::time::timeout(
+                                Duration::from_secs(5),
+                                ws_sink.send(tokio_tungstenite::tungstenite::Message::Text(json_text.into())),
+                            )
+                            .await;
+                            if send_res.map_or(true, |r| r.is_err()) {
+                                log::warn!("[WRTC WS] Colibri-WS write failed or timed out");
                                 has_ws_c.store(false, Ordering::SeqCst);
+                                if !dc_open_ws.load(Ordering::SeqCst) {
+                                    is_failed_ws.store(true, Ordering::SeqCst);
+                                    failed_notify_ws.notify_waiters();
+                                    failed_notify_ws.notify_one();
+                                }
                                 break;
                             }
+                        }
+                    } else {
+                        log::warn!("[WRTC WS] Failed or timed out connecting to Colibri-WS: {ws_url_c}");
+                        if !dc_open_ws.load(Ordering::SeqCst) {
+                            is_failed_ws.store(true, Ordering::SeqCst);
+                            failed_notify_ws.notify_waiters();
+                            failed_notify_ws.notify_one();
                         }
                     }
                 });
@@ -579,6 +641,9 @@ impl WrtcPeer {
             let handler = Arc::new(PeerEvents {
                 connected_tx,
                 is_connected: is_connected.clone(),
+                is_failed: is_failed.clone(),
+                disconnected_at_ms: disconnected_at_ms.clone(),
+                start_instant,
                 failed_notify: failed_notify.clone(),
                 dc_is_open: dc_is_open.clone(),
                 dc_open_notify: dc_open_notify.clone(),
@@ -1029,6 +1094,8 @@ impl WrtcPeer {
             dc_is_open,
             has_ws,
             is_connected,
+            is_failed,
+            disconnected_at_ms,
             failed_notify,
             first_video_tx,
             start_instant,
@@ -1037,6 +1104,26 @@ impl WrtcPeer {
             force_keyframe_remaining,
             remote_sdp: Mutex::new(initial_remote_sdp),
         })
+    }
+
+    pub fn check_dead_reason(&self) -> Option<&'static str> {
+        if self.is_failed.load(Ordering::SeqCst) {
+            return Some("PeerConnection or Colibri-WS failed/closed");
+        }
+        let disc_ms = self.disconnected_at_ms.load(Ordering::SeqCst);
+        if disc_ms > 0 {
+            let now_ms = self.start_instant.elapsed().as_millis() as u64;
+            if now_ms.saturating_sub(disc_ms) >= 8_000 {
+                return Some("PeerConnection remained Disconnected for >= 8s");
+            }
+        }
+        if self.start_instant.elapsed() > Duration::from_secs(12)
+            && !self.has_ws.load(Ordering::SeqCst)
+            && !self.dc_is_open.load(Ordering::SeqCst)
+        {
+            return Some("Both Colibri-WS and DataChannel are closed");
+        }
+        None
     }
 
     pub fn set_video_v2(&self, enabled: bool) {
@@ -1300,7 +1387,7 @@ impl WrtcPeer {
 
     pub async fn close(&self) -> anyhow::Result<()> {
         if let Some(ref pc) = self.peer_connection {
-            let _ = pc.close().await;
+            let _ = tokio::time::timeout(Duration::from_secs(3), pc.close()).await;
         }
         Ok(())
     }
@@ -1310,7 +1397,7 @@ impl Drop for WrtcPeer {
     fn drop(&mut self) {
         if let Some(pc) = self.peer_connection.take() {
             tokio::spawn(async move {
-                let _ = pc.close().await;
+                let _ = tokio::time::timeout(Duration::from_secs(3), pc.close()).await;
             });
         }
     }
