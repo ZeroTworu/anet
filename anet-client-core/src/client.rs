@@ -1112,7 +1112,7 @@ impl AnetClient {
         let format_tariff_row = |label: &str, val: &str| -> String {
             let left_part = format!("  {:<18}", label);
             let prefix_len = left_part.chars().count();
-            let total_content_width = 71;
+            let total_content_width: usize = 71;
             let val_space = total_content_width.saturating_sub(prefix_len);
             let val_chars = val.chars().count();
             if val_chars > val_space {

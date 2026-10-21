@@ -372,7 +372,7 @@ impl ClientTransport for WrtcTransport {
         {
             let server_mtu = auth_response.mtu;
             let adjusted_mtu = server_mtu
-                .saturating_sub(anet_common::wrtc::colibri::WRTC_VIDEO_MTU_OVERHEAD)
+                .saturating_sub(i32::from(anet_common::wrtc::colibri::WRTC_VIDEO_MTU_OVERHEAD))
                 .max(1200);
             info!(
                 "[WRTC] Adjusted TUN MTU to {} (server MTU {} - {}B WebRTC RTP/VP8 overhead)",
