@@ -121,6 +121,7 @@ pub async fn run_quic_server(
                     return;
                 }
             };
+            client_info.set_quic_connection(conn.clone());
 
             let client_ip = client_info.assigned_ip.clone();
             info!("QUIC Connected. Routed IP: {}", client_ip);
@@ -179,8 +180,6 @@ pub async fn run_quic_server(
                     "[QUIC Node] Client disconnected and wiped: {}",
                     client_info.assigned_ip
                 );
-
-                conn.close(0u32.into(), b"Disconnected by admin");
 
                 r.remove_client(&client_info).await;
             } else {

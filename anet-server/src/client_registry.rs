@@ -47,6 +47,14 @@ pub struct ClientTransportInfo {
     pub last_activity: Arc<AtomicU64>,
     /// Момент создания логической сессии для честного вытеснения самой старой сессии (FIFO)
     pub created_at: u64,
+    /// Активное QUIC-соединение (для гарантированной отправки CONNECTION_CLOSE ДО удаления записи из clients_by_addr)
+    pub quic_conn: ArcSwapOption<quinn::Connection>,
+}
+
+impl ClientTransportInfo {
+    pub fn set_quic_connection(&self, conn: quinn::Connection) {
+        self.quic_conn.store(Some(Arc::new(conn)));
+    }
 }
 
 struct TrafficCounters {
@@ -93,6 +101,7 @@ mod tests {
             expires_at: None,
             last_activity: Arc::new(AtomicU64::new(current_timestamp_secs())),
             created_at: current_timestamp_secs(),
+            quic_conn: ArcSwapOption::empty(),
         })
     }
 
@@ -150,52 +159,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fifo_eviction_removes_oldest_session_when_limit_reached() {
+    async fn suspended_session_does_not_inflate_active_session_counts() {
         let registry = registry();
-        let mut c1 = (*client("sess-old", "fp-shared")).clone_for_test("10.0.0.3", [1, 0, 0, 1], 100);
-        let mut c2 = (*client("sess-new", "fp-shared")).clone_for_test("10.0.0.4", [1, 0, 0, 2], 200);
-        c1.allowed_sessions = Some(1);
-        c2.allowed_sessions = Some(1);
-        let c1 = Arc::new(c1);
-        let c2 = Arc::new(c2);
+        let client = client("sess-ws", "fp-ws");
+        let (router, _receiver) = mpsc::channel(1);
+        registry.pre_register_client(client.clone());
+        registry.finalize_client(&client.assigned_ip, router);
+        assert_eq!(registry.active_session_count_for_fingerprint("fp-ws"), 1);
 
-        registry.pre_register_client(c1.clone());
-        registry.pre_register_client(c2.clone());
-
-        // Если лимит 1, вытеснение для новой сессии "sess-incoming" при лимите 2 оставит только самую свежую ("sess-new")
-        let evicted = registry
-            .evict_excess_sessions_for_fingerprint("fp-shared", 2, "sess-incoming")
-            .await;
-        assert_eq!(evicted, 1);
-        assert!(!registry.is_session_active("sess-old"));
-        assert!(registry.is_session_active("sess-new"));
-    }
-}
-
-#[cfg(test)]
-impl ClientTransportInfo {
-    fn clone_for_test(&self, ip: &str, prefix: [u8; 4], created_at: u64) -> Self {
-        Self {
-            cipher: self.cipher.clone(),
-            sequence: Arc::new(AtomicU64::new(0)),
-            assigned_ip: ip.to_string(),
-            session_id: self.session_id.clone(),
-            nonce_prefix: prefix,
-            remote_addr: ArcSwap::new(self.remote_addr.load_full()),
-            fingerprint: self.fingerprint.clone(),
-            user_id: self.user_id.clone(),
-            protocol: self.protocol.clone(),
-            speed_limit_kbps: self.speed_limit_kbps,
-            billing_type: self.billing_type,
-            group_name: self.group_name.clone(),
-            traffic_limit: self.traffic_limit,
-            traffic_consumed: self.traffic_consumed,
-            active_sessions: self.active_sessions,
-            allowed_sessions: self.allowed_sessions,
-            expires_at: self.expires_at.clone(),
-            last_activity: Arc::new(AtomicU64::new(current_timestamp_secs())),
-            created_at,
-        }
+        registry.suspend_client(client);
+        assert_eq!(registry.active_session_count_for_fingerprint("fp-ws"), 0);
+        assert!(registry.active_session_counts().is_empty());
     }
 }
 
@@ -216,15 +190,8 @@ pub struct ClientRegistry {
     ip_pool: IpPool,
     accepting_connections: Arc<AtomicBool>,
     traffic_totals: Arc<DashMap<String, Arc<TrafficCounters>>>,
-    /// TUN-интерфейс появляется только после `TunManager::run()`, т.е. уже
-    /// после конструирования реестра — поэтому шейпер подключается
-    /// постфактум через `set_shaper`, а не передаётся в `new()`.
-    ///
-    /// Обёрнуто в Arc: сам ArcSwapOption НЕ реализует Clone (это lock-free
-    /// примитив, клонировать его напрямую некорректно), а весь остальной
-    /// ClientRegistry рассчитан на дешёвое derive(Clone) через клонирование
-    /// Arc-указателей у каждого поля — держим ту же конвенцию.
     shaper: Arc<ArcSwapOption<crate::shaper::Shaper>>,
+    state_changed: Arc<tokio::sync::Notify>,
 }
 
 impl ClientRegistry {
@@ -239,7 +206,12 @@ impl ClientRegistry {
             accepting_connections: Arc::new(AtomicBool::new(true)),
             traffic_totals: Arc::new(DashMap::new()),
             shaper: Arc::new(ArcSwapOption::empty()),
+            state_changed: Arc::new(tokio::sync::Notify::new()),
         }
+    }
+
+    pub async fn wait_state_changed(&self) {
+        self.state_changed.notified().await;
     }
 
     pub fn get_by_session(&self, session_id: &str) -> Option<Arc<ClientTransportInfo>> {
@@ -294,8 +266,8 @@ impl ClientRegistry {
         self.quic_router.len()
     }
 
-    /// Возвращает декларативный снимок живых логических сессий по каждому fingerprint на этой ноде
-    /// (включая сессии в окне короткого WebSocket-resume и время создания самой старой сессии для межнодового FIFO).
+    /// Возвращает декларативный снимок живых логических сессий по каждому fingerprint на этой ноде.
+    /// Учитываются только реально обслуживаемые (финализированные) сессии в `quic_router`.
     pub fn active_session_counts(&self) -> Vec<anet_common::dto::NodeSessionCountItem> {
         let mut stats: std::collections::HashMap<String, (u32, u64)> = std::collections::HashMap::new();
         let mut seen_sessions = std::collections::HashSet::new();
@@ -316,22 +288,6 @@ impl ClientRegistry {
             }
         }
 
-        let now = Instant::now();
-        for entry in self.suspended_sessions.iter() {
-            if entry.value().expires_at > now {
-                let info = &entry.value().client_info;
-                if seen_sessions.insert(info.session_id.clone()) {
-                    let item = stats
-                        .entry(info.fingerprint.clone())
-                        .or_insert((0, info.created_at));
-                    item.0 += 1;
-                    if info.created_at < item.1 {
-                        item.1 = info.created_at;
-                    }
-                }
-            }
-        }
-
         stats
             .into_iter()
             .map(|(fingerprint, (count, oldest_created_at))| {
@@ -344,6 +300,18 @@ impl ClientRegistry {
             .collect()
     }
 
+    /// Возвращает фактическое число живых (финализированных) сессий указанного `fingerprint` на этой ноде.
+    pub fn active_session_count_for_fingerprint(&self, fingerprint: &str) -> u32 {
+        let mut seen_sessions = std::collections::HashSet::new();
+        for entry in self.clients_by_ip.iter() {
+            let info = entry.value();
+            if info.fingerprint == fingerprint && self.quic_router.contains_key(&info.assigned_ip) {
+                seen_sessions.insert(info.session_id.clone());
+            }
+        }
+        seen_sessions.len() as u32
+    }
+
     pub fn is_accepting_connections(&self) -> bool {
         self.accepting_connections.load(Ordering::Acquire)
     }
@@ -353,6 +321,10 @@ impl ClientRegistry {
         // логические сессии продолжают работать и могут быть resumed.
         self.accepting_connections.store(accepting, Ordering::Release);
         info!("[ControlPlane] accepting_connections={accepting}");
+    }
+
+    pub fn touch_client(&self, client: &ClientTransportInfo) {
+        client.last_activity.store(current_timestamp_secs(), Ordering::Relaxed);
     }
 
     pub fn record_rx(&self, client: &ClientTransportInfo, bytes: usize, protocol: &str) {
@@ -377,6 +349,29 @@ impl ClientRegistry {
         for client in dead_clients {
             info!(
                 "[Registry] Client {} (FP: {}, proto: {}) inactive for >{}s. Evicting dead session.",
+                client.assigned_ip, client.fingerprint, client.protocol, timeout_secs
+            );
+            self.remove_client(&client).await;
+        }
+    }
+
+    /// Точечно проверяет и выселяет неактивные сессии конкретного `fingerprint`, молчащие дольше `timeout_secs`
+    pub async fn cleanup_inactive_for_fingerprint(&self, fingerprint: &str, timeout_secs: u64) {
+        let now = current_timestamp_secs();
+        let dead_clients: Vec<Arc<ClientTransportInfo>> = self
+            .clients_by_ip
+            .iter()
+            .filter(|entry| {
+                entry.value().fingerprint == fingerprint
+                    && now.saturating_sub(entry.value().last_activity.load(Ordering::Relaxed))
+                        > timeout_secs
+            })
+            .map(|entry| entry.value().clone())
+            .collect();
+
+        for client in dead_clients {
+            info!(
+                "[Registry] Client {} (FP: {}, proto: {}) inactive for >{}s before new handshake. Evicting dead session.",
                 client.assigned_ip, client.fingerprint, client.protocol, timeout_secs
             );
             self.remove_client(&client).await;
@@ -483,6 +478,9 @@ impl ClientRegistry {
                     "[Registry] IP {} was held by old session {} (FP: {}). Displacing old session.",
                     client_info.assigned_ip, displaced.session_id, displaced.fingerprint
                 );
+                if let Some(conn) = displaced.quic_conn.swap(None) {
+                    conn.close(0u32.into(), b"Disconnected by admin");
+                }
                 let displaced_addr = **displaced.remote_addr.load();
                 self.quic_router.remove(&displaced.assigned_ip);
                 self.clients_by_prefix.remove(&displaced.nonce_prefix);
@@ -507,6 +505,7 @@ impl ClientRegistry {
     pub fn finalize_client(&self, client_ip: &str, router_sender: StreamSender) {
         self.quic_router
             .insert(client_ip.to_string(), router_sender);
+        self.state_changed.notify_one();
         info!(
             "[Registry] Finalized client {}. Total active clients: {}",
             client_ip,
@@ -541,6 +540,12 @@ impl ClientRegistry {
             .is_some_and(|current| current.session_id == client_info.session_id);
 
         if is_current {
+            // ВАЖНО: закрываем QUIC-соединение ДО удаления записи из clients_by_addr,
+            // чтобы MultiKeyAnetUdpSocket::try_send смог зашифровать и отправить пакет CONNECTION_CLOSE клиенту.
+            if let Some(conn) = client_info.quic_conn.swap(None) {
+                conn.close(0u32.into(), b"Disconnected by admin");
+            }
+
             self.quic_router.remove(client_ip);
             self.clients_by_prefix.remove(&client_info.nonce_prefix);
             self.clients_by_addr.remove(&remote_addr);
@@ -556,6 +561,7 @@ impl ClientRegistry {
             if let Ok(ip_addr) = client_ip.parse::<Ipv4Addr>() {
                 self.ip_pool.release(ip_addr);
             }
+            self.state_changed.notify_one();
             info!("[Registry] Client {} removed.", client_ip);
         } else {
             info!(
@@ -599,51 +605,6 @@ impl ClientRegistry {
         last_evicted
     }
 
-    /// FIFO-вытеснение на локальной ноде: если у данного `fingerprint` на этой ноде
-    /// уже открыто `>= allowed_sessions` сессий (не считая `exclude_session_id`),
-    /// принудительно закрывает самые старые сессии так, чтобы освободить слот для новой.
-    pub async fn evict_excess_sessions_for_fingerprint(
-        &self,
-        fingerprint: &str,
-        allowed_sessions: usize,
-        exclude_session_id: &str,
-    ) -> usize {
-        if allowed_sessions == 0 {
-            return 0;
-        }
-
-        let mut existing: Vec<Arc<ClientTransportInfo>> = self
-            .clients_by_ip
-            .iter()
-            .filter(|entry| {
-                entry.value().fingerprint == fingerprint
-                    && entry.value().session_id != exclude_session_id
-            })
-            .map(|entry| entry.value().clone())
-            .collect();
-
-        if existing.len() < allowed_sessions {
-            return 0;
-        }
-
-        // Сортируем по времени создания (самые старые первыми; если время совпало — по менее свежей активности)
-        existing.sort_by_key(|c| (c.created_at, c.last_activity.load(Ordering::Relaxed)));
-
-        let to_evict_count = (existing.len() + 1).saturating_sub(allowed_sessions);
-        let mut evicted = 0;
-
-        for old_client in existing.into_iter().take(to_evict_count) {
-            info!(
-                "[Registry/FIFO] Session limit ({}) reached for FP {}. Evicting oldest local session {} (IP: {}, proto: {}).",
-                allowed_sessions, fingerprint, old_client.session_id, old_client.assigned_ip, old_client.protocol
-            );
-            self.remove_client(&old_client).await;
-            evicted += 1;
-        }
-
-        evicted
-    }
-
     pub fn suspend_client(&self, client_info: Arc<ClientTransportInfo>) {
         let client_ip = client_info.assigned_ip.clone();
         let remote_addr = **client_info.remote_addr.load();
@@ -679,6 +640,7 @@ impl ClientRegistry {
                 expires_at: Instant::now() + RESUME_WINDOW,
             },
         );
+        self.state_changed.notify_one();
         info!("[Registry] Session {} suspended for WS resume", client_ip);
     }
 

@@ -172,6 +172,7 @@ impl AsyncUdpSocket for MultiKeyAnetUdpSocket {
                                     raw_packet_mut,
                                 ) {
                                     Ok(quic_payload) => {
+                                        self.registry.touch_client(&client_info);
                                         // УРА! Это пакет для Quinn (данные туннеля)
                                         let buf = &mut bufs[i];
                                         let copy_len = quic_payload.len().min(buf.len());

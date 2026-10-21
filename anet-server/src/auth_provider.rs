@@ -35,6 +35,9 @@ pub struct AuthProvider {
     /// Токен доступа к внешним серверам
     auth_token: String,
 
+    /// Опциональный UUID ноды (из control_plane.node_id) для мгновенной синхронизации сессий при /check_access
+    node_id: Option<String>,
+
     /// HTTP клиент для запросов
     http_client: HttpClient,
 }
@@ -54,12 +57,22 @@ impl AuthProvider {
             allowed_clients,
             auth_servers,
             auth_token,
+            node_id: None,
             http_client,
         }
     }
 
+    pub fn with_node_id(mut self, node_id: Option<String>) -> Self {
+        self.node_id = node_id;
+        self
+    }
+
     /// Проверяет, разрешен ли доступ клиенту с данным fingerprint
-    pub async fn is_client_allowed(&self, fingerprint: &str) -> Result<AccessGrant, String> {
+    pub async fn is_client_allowed(
+        &self,
+        fingerprint: &str,
+        node_active_sessions: Option<u32>,
+    ) -> Result<AccessGrant, String> {
         // 1. Локальный список (VIP) — без ограничения скорости и тарифа.
         if self.allowed_clients.iter().any(|c| c == fingerprint) {
             return Ok(AccessGrant {
@@ -79,6 +92,8 @@ impl AuthProvider {
         // 2. Внешние сервера
         let req_body = CheckAccessRequest {
             fingerprint: fingerprint.to_string(),
+            node_id: self.node_id.clone(),
+            node_active_sessions,
         };
         info!("Auth servers: {:?}", self.auth_servers);
         for server_url in &self.auth_servers {
