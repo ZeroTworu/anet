@@ -371,7 +371,7 @@ pub struct AhttpConfig {
 impl Default for AhttpConfig {
     fn default() -> Self {
         Self {
-            pool_max_idle_per_host: 8,
+            pool_max_idle_per_host: 16,
             pool_idle_timeout_secs: 60,
             tcp_nodelay: true,
             timeout_secs: 10,
@@ -379,8 +379,8 @@ impl Default for AhttpConfig {
             auth_path: "/auth".to_string(),
             traffic_path: "/traffic".to_string(),
             coalesce_budget_bytes: 65536,
-            poll_timeout_ms: 15,
-            concurrency: 4,
+            poll_timeout_ms: 10,
+            concurrency: 8,
             reassembly_queue_max_size: 1024,
 
             http2_adaptive_window: true,

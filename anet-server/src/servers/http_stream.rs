@@ -228,20 +228,23 @@ async fn handle_http_connection(
                                 })
                             }).value().clone();
 
-                            // 1. Прием Uplink-трафика (Распаковка через окно упорядочивания)
+                            // 1. Прием Uplink-трафика (Батчевая распаковка через окно упорядочивания)
                             if !body.is_empty() {
                                 let mut cursor = std::io::Cursor::new(body);
-                                let mut to_forward: Vec<Bytes> = Vec::new();
+                                let mut unpacked_batch = Vec::with_capacity(64);
 
                                 while let Ok(Some(encrypted_packet)) = read_next_packet(&mut cursor).await {
                                     if let Ok((seq, decrypted)) = unwrap_packet_with_seq(&client_info.cipher, encrypted_packet) {
-                                        let ready_packets = {
-                                            let mut reassembler = session.reassembler.lock().unwrap();
-                                            reassembler.insert(seq, decrypted)
-                                        };
-                                        to_forward.extend(ready_packets);
+                                        unpacked_batch.push((seq, decrypted));
                                     }
                                 }
+
+                                let to_forward = if !unpacked_batch.is_empty() {
+                                    let mut reassembler = session.reassembler.lock().unwrap();
+                                    reassembler.insert_batch(unpacked_batch)
+                                } else {
+                                    Vec::new()
+                                };
 
                                 for packet in to_forward {
                                     let packet_len = packet.len();
@@ -265,42 +268,65 @@ async fn handle_http_connection(
                             // 2. Отдача Downlink-трафика
                             let mut body_buf = BytesMut::new();
                             let padding_step = config.stealth.padding_step;
+                            let timeout_duration = std::time::Duration::from_millis(config.ahttp.poll_timeout_ms);
+                            let deadline = tokio::time::Instant::now() + timeout_duration;
 
-                            if let Ok(mut rx_router) = session.rx_router.try_lock() {
-                                let timeout_duration = std::time::Duration::from_millis(config.ahttp.poll_timeout_ms);
+                            // Вместо try_lock(), который отбрасывал 31 из 32 параллельных запросов с пустым ответом,
+                            // ждем очереди на чтение из rx_router в пределах poll_timeout_ms.
+                            // Каждый запрос держит лок всего несколько микросекунд (только на выгребание сырых пакетов в Vec),
+                            // а шифрование и отправку в сокет делает уже БЕЗ удержания лока!
+                            let mut raw_downlink_packets = Vec::new();
+                            let mut raw_bytes_accum = 0usize;
 
-                                if let Ok(Some(packet)) = tokio::time::timeout(timeout_duration, rx_router.recv()).await {
-                                    if packet.len() >= 20 {
-                                        let seq = client_info.sequence.fetch_add(1, Ordering::Relaxed);
-                                        if let Ok(encrypted) = wrap_packet_padded(
-                                            &client_info.cipher,
-                                            &client_info.nonce_prefix,
-                                            seq,
-                                            packet,
-                                            padding_step
-                                        ) {
-                                            let framed = anet_common::stream_framing::frame_packet(encrypted);
-                                            body_buf.extend_from_slice(&framed);
+                            if let Ok(mut rx_router) = tokio::time::timeout_at(deadline, session.rx_router.lock()).await {
+                                // Сначала пробуем забрать пакет без ожидания, если очередь уже не пуста
+                                let first_pkt = match rx_router.try_recv() {
+                                    Ok(pkt) => Some(pkt),
+                                    Err(_) => {
+                                        match tokio::time::timeout_at(deadline, rx_router.recv()).await {
+                                            Ok(Some(pkt)) => Some(pkt),
+                                            _ => None,
                                         }
                                     }
+                                };
 
-                                    while let Ok(next_packet) = rx_router.try_recv() {
-                                        if next_packet.len() >= 20 {
-                                            let seq = client_info.sequence.fetch_add(1, Ordering::Relaxed);
-                                            if let Ok(encrypted) = wrap_packet_padded(
-                                                &client_info.cipher,
-                                                &client_info.nonce_prefix,
-                                                seq,
-                                                next_packet,
-                                                padding_step
-                                            ) {
-                                                let framed = anet_common::stream_framing::frame_packet(encrypted);
-                                                body_buf.extend_from_slice(&framed);
+                                if let Some(packet) = first_pkt {
+                                    if packet.len() >= 20 {
+                                        raw_bytes_accum += packet.len() + 40;
+                                        raw_downlink_packets.push(packet);
+                                    }
+
+                                    while raw_bytes_accum < config.ahttp.coalesce_budget_bytes {
+                                        match rx_router.try_recv() {
+                                            Ok(next_packet) => {
+                                                if next_packet.len() >= 20 {
+                                                    raw_bytes_accum += next_packet.len() + 40;
+                                                    raw_downlink_packets.push(next_packet);
+                                                }
                                             }
+                                            Err(_) => break,
                                         }
-                                        if body_buf.len() >= config.ahttp.coalesce_budget_bytes {
-                                            break;
-                                        }
+                                    }
+                                }
+                            } // <--- Лок rx_router освобождается мгновенно, следующий HTTP-воркер сразу берет следующий батч!
+
+                            if !raw_downlink_packets.is_empty() {
+                                body_buf.reserve(raw_bytes_accum + raw_downlink_packets.len() * (padding_step as usize + 32));
+                                // Резервируем диапазон sequence номеров атомарно на весь батч,
+                                // чтобы параллельные воркеры шифровали свои батчи со строго возрастающими seq
+                                let count = raw_downlink_packets.len() as u64;
+                                let base_seq = client_info.sequence.fetch_add(count, Ordering::Relaxed);
+
+                                for (idx, packet) in raw_downlink_packets.into_iter().enumerate() {
+                                    let seq = base_seq + idx as u64;
+                                    if let Ok(encrypted) = wrap_packet_padded(
+                                        &client_info.cipher,
+                                        &client_info.nonce_prefix,
+                                        seq,
+                                        packet,
+                                        padding_step,
+                                    ) {
+                                        anet_common::stream_framing::frame_packet_into(&mut body_buf, &encrypted);
                                     }
                                 }
                             }

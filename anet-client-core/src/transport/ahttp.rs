@@ -1,11 +1,11 @@
 use super::{ClientTransport, ConnectionResult};
 use crate::auth::{AuthChannel, AuthHandler};
 use crate::config::{CoreConfig, ServerConfig};
-use anet_common::consts::{CHANNEL_BUFFER_SIZE, MAX_PACKET_SIZE};
+use anet_common::consts::CHANNEL_BUFFER_SIZE;
 use anet_common::handshake_fragmentation::FragmentConfig;
 use anet_common::http_help::BrowserProfile;
 use anet_common::reassembly::ReassemblyQueue;
-use anet_common::stream_framing::{frame_packet, frame_packet_into, read_next_packet};
+use anet_common::stream_framing::{frame_packet_into, read_next_packet};
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
@@ -209,7 +209,7 @@ impl ClientTransport for AHttpTransport {
         let sequence = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let health_pause = Arc::new(AtomicBool::new(false));
 
-        let (client_stream, internal_router) = tokio::io::duplex(MAX_PACKET_SIZE * 10);
+        let (client_stream, internal_router) = tokio::io::duplex(4 * 1024 * 1024);
         let (mut tunnel_read, tunnel_write) = tokio::io::split(internal_router);
         let (tunnel_packet_tx, mut tunnel_packet_rx) = tokio::sync::mpsc::channel::<Bytes>(CHANNEL_BUFFER_SIZE);
 
@@ -236,22 +236,53 @@ impl ClientTransport for AHttpTransport {
             let traffic_url = format!("{}{}?session_id={}", base_url, config_ahttp.traffic_path, session_id);
             let mut batch_buf = BytesMut::with_capacity(config_ahttp.coalesce_budget_bytes);
             let poll_timeout = Duration::from_millis(config_ahttp.poll_timeout_ms);
+            let micro_coalesce = Duration::from_micros(500);
 
             loop {
-                let packet_opt = tokio::select! {
-                    pkt = tunnel_packet_rx.recv() => pkt,
+                // 1. Сначала ждем первый пакет ИЛИ таймаут пуллинга
+                let first_packet_opt = tokio::select! {
+                    pkt = tunnel_packet_rx.recv() => {
+                        match pkt {
+                            Some(p) => Some(p),
+                            None => break, // Канал закрыт
+                        }
+                    }
                     _ = tokio::time::sleep(poll_timeout) => None,
+                };
+
+                // 2. Если это холостой poll-таймаут, а ВСЕ слоты concurrency уже заняты в полете —
+                // не блокируемся в очереди за пермитом ради пустого запроса.
+                let permit = if first_packet_opt.is_none() {
+                    match concurrency_semaphore.clone().try_acquire_owned() {
+                        Ok(p) => p,
+                        Err(_) => continue,
+                    }
+                } else {
+                    // Для реального трафика захватываем пермит ДО выгребания очереди!
+                    // Пока мы ждем свободный HTTP-слот, пакеты копятся в tunnel_packet_rx
+                    // и затем уйдут одним полным 64 КБ батчем вместо десятков мелких по 1 пакету.
+                    match concurrency_semaphore.clone().acquire_owned().await {
+                        Ok(p) => p,
+                        Err(_) => break,
+                    }
                 };
 
                 let mut tx_pkts_count = 0;
 
-                if let Some(packet) = packet_opt {
+                // Если за время ожидания пермита (или после пробуждения) появились пакеты:
+                let first_pkt = match first_packet_opt {
+                    Some(p) => Some(p),
+                    None => tunnel_packet_rx.try_recv().ok(),
+                };
+
+                if let Some(packet) = first_pkt {
                     let seq = sequence.fetch_add(1, Ordering::Relaxed);
                     if let Ok(encrypted) = wrap_packet_padded(&cipher_ul, &nonce_prefix, seq, packet, padding_step) {
                         frame_packet_into(&mut batch_buf, &encrypted);
                         tx_pkts_count += 1;
                     }
 
+                    // Выгребаем все уже накопившиеся в канале пакеты
                     while batch_buf.len() < config_ahttp.coalesce_budget_bytes {
                         match tunnel_packet_rx.try_recv() {
                             Ok(p) => {
@@ -264,14 +295,43 @@ impl ClientTransport for AHttpTransport {
                             Err(_) => break,
                         }
                     }
+
+                    // Микро-коалесценция (до 0.5 мс): если слоты параллельности уже частично заняты
+                    // (идет активный поток), даем ядру/TUN еще полмиллисекунды досыпать пакеты в этот же батч,
+                    // чтобы не жечь все HTTP-воркеры на одиночные пакеты.
+                    if batch_buf.len() < config_ahttp.coalesce_budget_bytes / 2
+                        && concurrency_semaphore.available_permits() < config_ahttp.concurrency.saturating_sub(1)
+                    {
+                        let deadline = tokio::time::Instant::now() + micro_coalesce;
+                        while batch_buf.len() < config_ahttp.coalesce_budget_bytes {
+                            match tokio::time::timeout_at(deadline, tunnel_packet_rx.recv()).await {
+                                Ok(Some(p)) => {
+                                    let seq = sequence.fetch_add(1, Ordering::Relaxed);
+                                    if let Ok(enc) = wrap_packet_padded(&cipher_ul, &nonce_prefix, seq, p, padding_step) {
+                                        frame_packet_into(&mut batch_buf, &enc);
+                                        tx_pkts_count += 1;
+                                    }
+                                    while batch_buf.len() < config_ahttp.coalesce_budget_bytes {
+                                        match tunnel_packet_rx.try_recv() {
+                                            Ok(next_p) => {
+                                                let seq = sequence.fetch_add(1, Ordering::Relaxed);
+                                                if let Ok(enc) = wrap_packet_padded(&cipher_ul, &nonce_prefix, seq, next_p, padding_step) {
+                                                    frame_packet_into(&mut batch_buf, &enc);
+                                                    tx_pkts_count += 1;
+                                                }
+                                            }
+                                            Err(_) => break,
+                                        }
+                                    }
+                                }
+                                _ => break,
+                            }
+                        }
+                    }
                 }
 
                 let payload = batch_buf.split().freeze();
-
-                let permit = match concurrency_semaphore.clone().acquire_owned().await {
-                    Ok(p) => p,
-                    Err(_) => break,
-                };
+                batch_buf.reserve(config_ahttp.coalesce_budget_bytes);
 
                 let http_client_clone = http_client.clone();
                 let uplink_method_clone = uplink_method.clone();
@@ -311,22 +371,32 @@ impl ClientTransport for AHttpTransport {
                                     if !body.is_empty() {
                                         debug!("[AHTTP Client] <<< Received {} bytes", body.len());
                                         let mut cursor = std::io::Cursor::new(body);
-                                        let mut rx_pkts_count = 0;
+                                        let mut unpacked_batch = Vec::with_capacity(64);
 
+                                        // 1. Дешифруем все пакеты ответа БЕЗ удержания мьютексов
                                         while let Ok(Some(encrypted_packet)) = read_next_packet(&mut cursor).await {
                                             if let Ok((seq, decrypted)) = unwrap_packet_with_seq(&cipher_ul_clone, encrypted_packet) {
-                                                rx_pkts_count += 1;
+                                                unpacked_batch.push((seq, decrypted));
+                                            }
+                                        }
 
+                                        let rx_pkts_count = unpacked_batch.len();
+                                        if rx_pkts_count > 0 {
+                                            // 2. Один раз берем лок сборщика и вставляем весь батч
+                                            let ready_packets = {
                                                 let mut reassembler = rx_reassembler_clone.lock().await;
-                                                let mut tunnel_write_guard = tunnel_write_clone.lock().await;
+                                                reassembler.insert_batch(unpacked_batch)
+                                            };
 
-                                                let ready_packets = reassembler.insert(seq, decrypted);
+                                            // 3. Собираем готовые пакеты в единый буфер и пишем в туннель за ОДИН вызов write_all
+                                            if !ready_packets.is_empty() {
+                                                let mut out_buf = BytesMut::with_capacity(ready_packets.len() * 1500);
                                                 for packet in ready_packets {
-                                                    // Мягкая обработка BrokenPipe вместо unwrap()
-                                                    if tunnel_write_guard.write_all(&frame_packet(packet)).await.is_err() {
-                                                        warn!("[AHTTP Client] Tunnel stream closed, discarding remaining packets.");
-                                                        break;
-                                                    }
+                                                    frame_packet_into(&mut out_buf, &packet);
+                                                }
+                                                let mut tunnel_write_guard = tunnel_write_clone.lock().await;
+                                                if tunnel_write_guard.write_all(&out_buf).await.is_err() {
+                                                    warn!("[AHTTP Client] Tunnel stream closed, discarding remaining packets.");
                                                 }
                                             }
                                         }
