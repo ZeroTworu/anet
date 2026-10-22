@@ -1,6 +1,6 @@
 use crate::wrtc::colibri::{
     is_valid_vp8_frame_header, ColibriMessage, ReceiverVideoConstraints, WrtcMessage, WrtcMode,
-    VP8_INTERFRAME_HEADER, VP8_KEYFRAME_1080P_HEADER, VP8_KEYFRAME_HEADER,
+    VP8_ASTP_PREFIX_LEN, VP8_INTERFRAME_HEADER, VP8_KEYFRAME_1080P_HEADER, VP8_KEYFRAME_HEADER,
 };
 use crate::wrtc::jingle::{append_remote_video_ssrc_to_sdp, JingleSession};
 use bytes::{BufMut, Bytes, BytesMut};
@@ -30,7 +30,103 @@ use webrtc::peer_connection::{
     PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler,
     RTCPeerConnectionState,
 };
-use webrtc::runtime::TokioRuntime;
+use webrtc::runtime::{
+    AsyncInterval, AsyncTcpListener, AsyncTcpStream, AsyncUdpSocket, JoinHandle as WrtcJoinHandle,
+    Runtime as WrtcRuntime, TokioRuntime,
+};
+
+const WEBRTC_UDP_SOCKET_BUFFER_SIZE: usize = 4 * 1024 * 1024;
+
+#[derive(Debug, Default, Clone, Copy)]
+struct TunedTokioRuntime(TokioRuntime);
+
+impl WrtcRuntime for TunedTokioRuntime {
+    fn spawn(
+        &self,
+        future: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+    ) -> Box<dyn WrtcJoinHandle> {
+        self.0.spawn(future)
+    }
+
+    fn spawn_reactor(
+        &self,
+        reactor_pool_size: usize,
+        future: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+    ) -> Box<dyn WrtcJoinHandle> {
+        self.0.spawn_reactor(reactor_pool_size, future)
+    }
+
+    fn wrap_udp_socket(
+        &self,
+        sock: std::net::UdpSocket,
+    ) -> std::io::Result<Arc<dyn AsyncUdpSocket>> {
+        let sock_ref = socket2::SockRef::from(&sock);
+        let _ = sock_ref.set_recv_buffer_size(WEBRTC_UDP_SOCKET_BUFFER_SIZE);
+        let _ = sock_ref.set_send_buffer_size(WEBRTC_UDP_SOCKET_BUFFER_SIZE);
+        if let (Ok(rcv), Ok(snd)) = (sock_ref.recv_buffer_size(), sock_ref.send_buffer_size()) {
+            log::info!(
+                "[WRTC UDP] Tuned WebRTC UDP socket buffers: SO_RCVBUF={} KiB, SO_SNDBUF={} KiB",
+                rcv / 1024,
+                snd / 1024
+            );
+        }
+        self.0.wrap_udp_socket(sock)
+    }
+
+    fn wrap_tcp_listener(
+        &self,
+        listener: std::net::TcpListener,
+    ) -> std::io::Result<Arc<dyn AsyncTcpListener>> {
+        self.0.wrap_tcp_listener(listener)
+    }
+
+    fn connect_tcp<'a>(
+        &'a self,
+        remote_addr: std::net::SocketAddr,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = std::io::Result<Arc<dyn AsyncTcpStream>>> + Send + 'a>,
+    > {
+        self.0.connect_tcp(remote_addr)
+    }
+
+    fn resolve_host<'a>(
+        &'a self,
+        host: &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = std::io::Result<Vec<std::net::SocketAddr>>> + Send + 'a>,
+    > {
+        self.0.resolve_host(host)
+    }
+
+    fn now(&self) -> std::time::Instant {
+        self.0.now()
+    }
+
+    fn sleep(
+        &self,
+        duration: Duration,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>> {
+        self.0.sleep(duration)
+    }
+
+    fn interval(&self, period: Duration) -> Box<dyn AsyncInterval> {
+        self.0.interval(period)
+    }
+
+    fn block_on(&self, future: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + '_>>) {
+        self.0.block_on(future)
+    }
+
+    fn yield_now(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>> {
+        self.0.yield_now()
+    }
+
+    fn name(&self) -> &'static str {
+        self.0.name()
+    }
+}
 
 fn generate_random_ssrc() -> u32 {
     (rand::random::<u32>() & 0x7FFFFFFF) | 0x1000
@@ -345,9 +441,9 @@ pub async fn create_p2p_channel(stun_servers: &[String]) -> anyhow::Result<P2pSe
         .with_media_engine(media_engine)
         .with_interceptor_registry(registry)
         .with_handler(handler)
-        .with_runtime(Arc::new(TokioRuntime))
+        .with_runtime(Arc::new(TunedTokioRuntime(TokioRuntime)))
         .with_udp_addrs(vec!["0.0.0.0:0".to_string()])
-        .with_dedicated_reactor_pool_size(1)
+        .with_dedicated_reactor_pool_size(4)
         .build()
         .await?;
 
@@ -661,9 +757,9 @@ impl WrtcPeer {
                 .with_media_engine(media_engine)
                 .with_interceptor_registry(registry)
                 .with_handler(handler)
-                .with_runtime(Arc::new(TokioRuntime))
+                .with_runtime(Arc::new(TunedTokioRuntime(TokioRuntime)))
                 .with_udp_addrs(vec![bind_addr])
-                .with_dedicated_reactor_pool_size(2)
+                .with_dedicated_reactor_pool_size(4)
                 .build()
                 .await;
 
@@ -1272,14 +1368,35 @@ impl WrtcPeer {
     }
 
     pub async fn send_video_frame_tagged(&self, client_tag: u16, astp_data: &[u8]) -> anyhow::Result<()> {
+        let mut payload = BytesMut::with_capacity(VP8_ASTP_PREFIX_LEN + astp_data.len());
+        payload.put_bytes(0, VP8_ASTP_PREFIX_LEN);
+        payload.put_slice(astp_data);
+        self.send_video_frame_preallocated(client_tag, payload).await?;
+        Ok(())
+    }
+
+    /// Заполняет 26-байтный заголовок VP8 + Client Tag напрямую в начало преаллоцированного `BytesMut`
+    /// (созданного через `wrap_packet_slice_with_headroom`) и отправляет RTP-пакет без повторных аллокаций
+    /// и без `memcpy` зашифрованного ASTP-пейлоуда. Возвращает замороженный `Bytes` (срез `26..` содержит ASTP).
+    pub async fn send_video_frame_preallocated(
+        &self,
+        client_tag: u16,
+        mut payload: BytesMut,
+    ) -> anyhow::Result<Bytes> {
         let Some(ref track) = self.video_track else {
             anyhow::bail!("Video track not initialized");
         };
+        if payload.len() < VP8_ASTP_PREFIX_LEN {
+            anyhow::bail!("Preallocated VP8 buffer is shorter than VP8_ASTP_PREFIX_LEN");
+        }
 
         if self.first_video_tx.swap(false, Ordering::Relaxed) {
             log::info!(
                 "[WRTC Media Video OUT] First video frame transmitted (SSRC: {}, tag: 0x{:04X}, len: {} bytes, v2: {})",
-                self.video_ssrc, client_tag, astp_data.len(), self.video_v2_enabled.load(Ordering::Relaxed)
+                self.video_ssrc,
+                client_tag,
+                payload.len() - VP8_ASTP_PREFIX_LEN,
+                self.video_v2_enabled.load(Ordering::Relaxed)
             );
         }
 
@@ -1294,13 +1411,6 @@ impl WrtcPeer {
         let elapsed_ms = self.start_instant.elapsed().as_millis() as u64;
         self.last_video_tx_ms.store(elapsed_ms, Ordering::Relaxed);
 
-        let mut payload = BytesMut::with_capacity(4 + VP8_KEYFRAME_HEADER.len() + 2 + astp_data.len());
-
-        payload.put_u8(0x90);
-        payload.put_u8(0x80);
-        payload.put_u8(0x80 | ((pic_id >> 8) as u8));
-        payload.put_u8((pic_id & 0xFF) as u8);
-
         let force_kf = self
             .force_keyframe_remaining
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |rem| {
@@ -1313,8 +1423,6 @@ impl WrtcPeer {
             .is_ok();
 
         let vp8_hdr = if self.video_v2_enabled.load(Ordering::Relaxed) {
-            // Первые 8 кадров после старта/подключения клиента и каждый 32-й кадр — Keyframe 1080p
-            // (для мгновенного открытия keyframe-гейта SFU JVB), остальные 31/32 — легкие P-frame.
             if force_kf || (frame_num & 31) == 0 {
                 &VP8_KEYFRAME_1080P_HEADER
             } else {
@@ -1324,10 +1432,14 @@ impl WrtcPeer {
             &VP8_KEYFRAME_HEADER
         };
 
-        payload.put_slice(vp8_hdr);
-        payload.put_u16(client_tag);
-        payload.put_slice(astp_data);
+        payload[0] = 0x90;
+        payload[1] = 0x80;
+        payload[2] = 0x80 | ((pic_id >> 8) as u8);
+        payload[3] = (pic_id & 0xFF) as u8;
+        payload[4..24].copy_from_slice(vp8_hdr);
+        payload[24..26].copy_from_slice(&client_tag.to_be_bytes());
 
+        let frozen = payload.freeze();
         let rtp_packet = RtpPacket {
             header: RtpHeader {
                 version: 2,
@@ -1343,13 +1455,14 @@ impl WrtcPeer {
                 extensions: vec![],
                 extensions_padding: 0,
             },
-            payload: payload.freeze(),
+            payload: frozen.clone(),
         };
 
         track
             .write_rtp(rtp_packet)
             .await
-            .map_err(|e| anyhow::anyhow!("VP8 write_rtp error: {e}"))
+            .map_err(|e| anyhow::anyhow!("VP8 write_rtp error: {e}"))?;
+        Ok(frozen)
     }
 
     pub async fn send_video_constraints(&self, constraints: &ReceiverVideoConstraints) -> anyhow::Result<()> {

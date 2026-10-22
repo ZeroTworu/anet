@@ -49,6 +49,40 @@ pub fn wrap_packet_slice(
     Ok(final_packet.freeze())
 }
 
+/// Упаковывает и шифрует пакет в единый буфер `BytesMut` с зарезервированным префиксом `headroom` байт в начале.
+/// Позволяет `send_video_frame_preallocated` записать 26-байтный заголовок VP8 + Client Tag напрямую в начало
+/// буфера без повторной аллокации и без копирования (`memcpy`) зашифрованного пакета.
+#[inline]
+pub fn wrap_packet_slice_with_headroom(
+    cipher: &Cipher,
+    nonce_prefix: &[u8; NONCE_PREFIX_LEN],
+    sequence: u64,
+    payload: &[u8],
+    headroom: usize,
+) -> Result<BytesMut, EncryptionError> {
+    let payload_len = payload.len();
+
+    let mut nonce = [0u8; NONCE_LEN];
+    nonce[..NONCE_PREFIX_LEN].copy_from_slice(nonce_prefix);
+    nonce[NONCE_PREFIX_LEN..].copy_from_slice(&sequence.to_be_bytes());
+
+    let mut final_packet =
+        BytesMut::with_capacity(headroom + NONCE_LEN + 10 + payload_len + 16);
+    final_packet.put_bytes(0, headroom);
+    final_packet.put_slice(&nonce);
+    final_packet.put_u64(sequence);
+    final_packet.put_u16(payload_len as u16);
+    final_packet.put_slice(payload);
+
+    let tag = {
+        let plaintext = &mut final_packet[headroom + NONCE_LEN..];
+        cipher.encrypt_in_place_detached(&nonce, plaintext)?
+    };
+    final_packet.put_slice(&tag);
+
+    Ok(final_packet)
+}
+
 /// Applies the configured transport padding and encrypts an owned packet.
 #[inline]
 pub fn wrap_packet_padded(

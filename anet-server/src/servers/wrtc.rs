@@ -2,11 +2,14 @@ use crate::auth_handler::ServerAuthHandler;
 use crate::client_registry::{ClientRegistry, ClientTransportInfo};
 use crate::config::Config;
 use anet_common::http_help::BrowserProfile;
-use anet_common::transport::{unwrap_packet_bytes, wrap_packet_padded, wrap_packet_slice};
+use anet_common::transport::{
+    unwrap_packet_bytes, wrap_packet_padded, wrap_packet_slice_with_headroom,
+};
 use anet_common::wrtc::{
     batcher::{unpack_batch, PacketBatcher},
     colibri::{
         sign_beacon, ColibriMessage, WrtcMessage, MAX_VIDEO_BATCH_BYTES, VIDEO_BATCH_MARKER,
+        VP8_ASTP_PREFIX_LEN,
     },
     jingle::parse_jingle_session,
     ktalk::KtalkClient,
@@ -565,48 +568,49 @@ pub async fn run_wrtc_server(
                                                                             }
 
                                                                             let seq = c_info.sequence.fetch_add(1, Ordering::Relaxed);
-                                                                            let wrap_res = if count == 1 {
-                                                                                wrap_packet_slice(
-                                                                                    &c_info.cipher,
-                                                                                    &c_info.nonce_prefix,
-                                                                                    seq,
-                                                                                    &batch_buf[3..],
-                                                                                    0,
-                                                                                )
+                                                                            let payload_slice = if count == 1 {
+                                                                                &batch_buf[3..]
                                                                             } else {
-                                                                                wrap_packet_slice(
-                                                                                    &c_info.cipher,
-                                                                                    &c_info.nonce_prefix,
-                                                                                    seq,
-                                                                                    &batch_buf,
-                                                                                    0,
-                                                                                )
+                                                                                &batch_buf[..]
                                                                             };
-                                                                            if let Ok(enc_bytes) = wrap_res {
-                                                                                let _ = peer_downlink.send_video_frame_tagged(client_tag, &enc_bytes).await;
+                                                                            if let Ok(enc_buf) = wrap_packet_slice_with_headroom(
+                                                                                &c_info.cipher,
+                                                                                &c_info.nonce_prefix,
+                                                                                seq,
+                                                                                payload_slice,
+                                                                                VP8_ASTP_PREFIX_LEN,
+                                                                            ) {
+                                                                                let _ = peer_downlink
+                                                                                    .send_video_frame_preallocated(client_tag, enc_buf)
+                                                                                    .await;
                                                                             }
                                                                         } else {
-                                                                            // Одиночный пакет без stealth-паддинга
+                                                                            // Одиночный пакет без stealth-паддинга в едином преаллоцированном буфере VP8+ASTP
                                                                             let seq = c_info.sequence.fetch_add(1, Ordering::Relaxed);
-                                                                            if let Ok(enc_bytes) = wrap_packet_slice(
+                                                                            if let Ok(enc_buf) = wrap_packet_slice_with_headroom(
                                                                                 &c_info.cipher,
                                                                                 &c_info.nonce_prefix,
                                                                                 seq,
                                                                                 &packet,
-                                                                                0,
+                                                                                VP8_ASTP_PREFIX_LEN,
                                                                             ) {
-                                                                                if peer_downlink.send_video_frame_tagged(client_tag, &enc_bytes).await.is_ok() && !video_warmed_up {
-                                                                                    // До прогрева видео дублируем в WS батчер
-                                                                                    batcher.push(enc_bytes);
-                                                                                    if batcher.should_flush() {
-                                                                                        if let Some(batch_data) = batcher.flush() {
-                                                                                            let b64 = BASE64_STANDARD.encode(&batch_data);
-                                                                                            let msg = ColibriMessage::astp_batch(
-                                                                                                target_client_id.clone(),
-                                                                                                b64,
-                                                                                            );
-                                                                                            if peer_downlink.send(msg).await.is_err() {
-                                                                                                break;
+                                                                                if let Ok(frozen) = peer_downlink
+                                                                                    .send_video_frame_preallocated(client_tag, enc_buf)
+                                                                                    .await
+                                                                                {
+                                                                                    if !video_warmed_up {
+                                                                                        // До прогрева видео дублируем ASTP-срез в WS батчер без копирования
+                                                                                        batcher.push(frozen.slice(VP8_ASTP_PREFIX_LEN..));
+                                                                                        if batcher.should_flush() {
+                                                                                            if let Some(batch_data) = batcher.flush() {
+                                                                                                let b64 = BASE64_STANDARD.encode(&batch_data);
+                                                                                                let msg = ColibriMessage::astp_batch(
+                                                                                                    target_client_id.clone(),
+                                                                                                    b64,
+                                                                                                );
+                                                                                                if peer_downlink.send(msg).await.is_err() {
+                                                                                                    break;
+                                                                                                }
                                                                                             }
                                                                                         }
                                                                                     }

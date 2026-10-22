@@ -44,6 +44,10 @@ pub const MAX_VIDEO_BATCH_BYTES: usize = 1300;
 /// 4B (VP8 Payload Descriptor) + 20B (VP8 Frame Header) + 2B (Client Tag) + ~34B (RTP Header + Extensions + SRTP Tag) = 60 байт.
 pub const WRTC_VIDEO_MTU_OVERHEAD: u16 = 60;
 
+/// Размер префикса VP8 + Client Tag перед зашифрованным ASTP-кадром в RTP-пакете:
+/// 4B (VP8 Payload Descriptor) + 20B (VP8 Frame Header) + 2B (Client Tag) = 26 байт.
+pub const VP8_ASTP_PREFIX_LEN: usize = 4 + VP8_KEYFRAME_HEADER.len() + 2;
+
 /// Проверяет, начинается ли полезная нагрузка VP8 с валидного заголовка ANet (Keyframe 16p/1080p или Interframe).
 #[inline]
 pub fn is_valid_vp8_frame_header(data: &[u8]) -> bool {
