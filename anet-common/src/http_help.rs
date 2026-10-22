@@ -88,8 +88,8 @@ impl BrowserProfile {
     }
 
     /// Применяет браузерные заголовки к запросу `reqwest::RequestBuilder` (для `AHTTP` и `WRTC` REST).
-    /// Не переопределяет `Host` и `Connection`, позволяя `hyper`/`reqwest` корректно работать
-    /// как по HTTP/2 (`:authority` без `Connection`), так и по HTTP/1.1 (`Host` + `Connection: keep-alive`).
+    /// Не переопределяет `Host`, `Connection` и `Accept-Encoding`, позволяя `hyper`/`reqwest`
+    /// корректно управлять версией протокола (H1/H2) и декодированием тела ответа.
     pub fn apply_to_reqwest(
         &self,
         builder: reqwest::RequestBuilder,
@@ -99,7 +99,6 @@ impl BrowserProfile {
         let mut builder = builder
             .header(USER_AGENT, self.user_agent)
             .header(ACCEPT_LANGUAGE, self.accept_language)
-            .header(ACCEPT_ENCODING, self.accept_encoding)
             .header(CACHE_CONTROL, "no-cache")
             .header(PRAGMA, "no-cache")
             .header("Priority", "u=1, i")
