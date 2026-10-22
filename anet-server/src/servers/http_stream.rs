@@ -1,7 +1,7 @@
 use crate::client_registry::ClientRegistry;
 use crate::auth_handler::ServerAuthHandler;
 use crate::config::Config;
-use anet_common::consts::{CHANNEL_BUFFER_SIZE, MAX_PACKET_SIZE};
+use anet_common::consts::CHANNEL_BUFFER_SIZE;
 use anet_common::transport::wrap_packet_padded;
 use anet_common::reassembly::ReassemblyQueue;
 use anyhow::{Context, Result};
@@ -148,7 +148,7 @@ async fn handle_http_connection(
     auth_handler: ServerAuthHandler,
     sessions: Arc<DashMap<String, Arc<ServerSession>>>,
 ) -> Result<()> {
-    let mut buffer = BytesMut::with_capacity(MAX_PACKET_SIZE * 4);
+    let mut buffer = BytesMut::with_capacity(65536);
 
     // Чтение путей из конфигурационного файла [ahttp]
     let path_handshake = format!("{}{}", config.server.ahttp_path, config.ahttp.handshake_path);
@@ -156,11 +156,11 @@ async fn handle_http_connection(
     let path_traffic = format!("{}{}", config.server.ahttp_path, config.ahttp.traffic_path);
 
     loop {
-        // УВЕЛИЧЕН БУФЕР ЧТЕНИЯ: 64 КБ (размер окна TCP) вместо 8 КБ
-        let mut temp = [0u8; 65536];
-        let n = stream.read(&mut temp).await?;
-        if n == 0 { return Ok(()); }
-        buffer.extend_from_slice(&temp[..n]);
+        if buffer.is_empty() {
+            buffer.reserve(65536);
+            let n = stream.read_buf(&mut buffer).await?;
+            if n == 0 { return Ok(()); }
+        }
 
         let mut headers = [httparse::EMPTY_HEADER; 64];
         let mut req = Request::new(&mut headers);
@@ -179,14 +179,16 @@ async fn handle_http_connection(
                     }
                 }
 
-                while buffer.len() < header_len + content_length {
-                    let mut temp = [0u8; 65536];
-                    let n = stream.read(&mut temp).await?;
-                    if n == 0 { return Err(anyhow::anyhow!("Connection closed while reading body")); }
-                    buffer.extend_from_slice(&temp[..n]);
+                let total_expected = header_len + content_length;
+                if buffer.len() < total_expected {
+                    buffer.reserve(total_expected - buffer.len());
+                    while buffer.len() < total_expected {
+                        let n = stream.read_buf(&mut buffer).await?;
+                        if n == 0 { return Err(anyhow::anyhow!("Connection closed while reading body")); }
+                    }
                 }
 
-                let body = &buffer[header_len..header_len + content_length];
+                let body = &buffer[header_len..total_expected];
                 let base_path = path.split('?').next().unwrap_or(&path);
 
                 match base_path {
@@ -258,7 +260,6 @@ async fn handle_http_connection(
                                             warn!("[AHTTP] TUN queue full, dropping uplink packet");
                                         }
                                         Err(mpsc::error::TrySendError::Closed(_)) => {
-                                            // Если TUN мертв, нет смысла продолжать сессию
                                             break;
                                         }
                                     }
@@ -268,20 +269,28 @@ async fn handle_http_connection(
                             // 2. Отдача Downlink-трафика
                             let mut body_buf = BytesMut::new();
                             let padding_step = config.stealth.padding_step;
-                            let timeout_duration = std::time::Duration::from_millis(config.ahttp.poll_timeout_ms);
-                            let deadline = tokio::time::Instant::now() + timeout_duration;
+                            let coalesce_budget = config.ahttp.coalesce_budget_bytes;
+                            let is_heavy_uplink = content_length >= 8192;
 
-                            // Вместо try_lock(), который отбрасывал 31 из 32 параллельных запросов с пустым ответом,
-                            // ждем очереди на чтение из rx_router в пределах poll_timeout_ms.
-                            // Каждый запрос держит лок всего несколько микросекунд (только на выгребание сырых пакетов в Vec),
-                            // а шифрование и отправку в сокет делает уже БЕЗ удержания лока!
+                            // Для крупных Uplink-батчей (>= 8 КБ) НЕ блокируем ответ на poll_timeout_ms,
+                            // чтобы мгновенно освобождать слот клиента под следующий Upload-батч.
+                            // Для пустых poll-запросов и мелких пакетов (TCP ACK / ping) гарантируем
+                            // разумное окно ожидания (минимум 20 мс, даже если в старом конфиге стояло 2 мс).
+                            let timeout_duration = if is_heavy_uplink {
+                                std::time::Duration::from_millis(1)
+                            } else {
+                                std::time::Duration::from_millis(config.ahttp.poll_timeout_ms.max(20))
+                            };
+                            let deadline = tokio::time::Instant::now() + timeout_duration;
+                            let micro_coalesce = std::time::Duration::from_micros(500);
+
                             let mut raw_downlink_packets = Vec::new();
                             let mut raw_bytes_accum = 0usize;
 
                             if let Ok(mut rx_router) = tokio::time::timeout_at(deadline, session.rx_router.lock()).await {
-                                // Сначала пробуем забрать пакет без ожидания, если очередь уже не пуста
                                 let first_pkt = match rx_router.try_recv() {
                                     Ok(pkt) => Some(pkt),
+                                    Err(_) if is_heavy_uplink => None,
                                     Err(_) => {
                                         match tokio::time::timeout_at(deadline, rx_router.recv()).await {
                                             Ok(Some(pkt)) => Some(pkt),
@@ -296,7 +305,7 @@ async fn handle_http_connection(
                                         raw_downlink_packets.push(packet);
                                     }
 
-                                    while raw_bytes_accum < config.ahttp.coalesce_budget_bytes {
+                                    while raw_bytes_accum < coalesce_budget {
                                         match rx_router.try_recv() {
                                             Ok(next_packet) => {
                                                 if next_packet.len() >= 20 {
@@ -305,6 +314,35 @@ async fn handle_http_connection(
                                                 }
                                             }
                                             Err(_) => break,
+                                        }
+                                    }
+
+                                    // Микро-коалесценция (до 0.5 мс): когда первый пакет пачки из TUN
+                                    // разбудил воркер, даем TUN reader'у еще полмиллисекунды дочитать
+                                    // остальные пакеты всплеска, чтобы не закрывать HTTP-ответ с 1 пакетом (1.4 КБ).
+                                    if raw_bytes_accum < coalesce_budget / 2 {
+                                        let coalesce_deadline = tokio::time::Instant::now() + micro_coalesce;
+                                        while raw_bytes_accum < coalesce_budget {
+                                            match tokio::time::timeout_at(coalesce_deadline, rx_router.recv()).await {
+                                                Ok(Some(p)) => {
+                                                    if p.len() >= 20 {
+                                                        raw_bytes_accum += p.len() + 40;
+                                                        raw_downlink_packets.push(p);
+                                                    }
+                                                    while raw_bytes_accum < coalesce_budget {
+                                                        match rx_router.try_recv() {
+                                                            Ok(next_packet) => {
+                                                                if next_packet.len() >= 20 {
+                                                                    raw_bytes_accum += next_packet.len() + 40;
+                                                                    raw_downlink_packets.push(next_packet);
+                                                                }
+                                                            }
+                                                            Err(_) => break,
+                                                        }
+                                                    }
+                                                }
+                                                _ => break,
+                                            }
                                         }
                                     }
                                 }
@@ -353,13 +391,15 @@ async fn handle_http_connection(
                     }
                 }
 
-                let total_consumed = header_len + content_length;
-                let _ = buffer.split_to(total_consumed);
+                let _ = buffer.split_to(total_expected);
             }
             Ok(Status::Partial) => {
                 if buffer.len() > config.ahttp.max_header_bytes {
                     return Err(anyhow::anyhow!("HTTP header too large"));
                 }
+                buffer.reserve(8192);
+                let n = stream.read_buf(&mut buffer).await?;
+                if n == 0 { return Ok(()); }
                 continue;
             }
             Err(e) => return Err(e.into()),
