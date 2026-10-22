@@ -117,6 +117,9 @@ impl Default for NetworkConfig {
 #[serde(default)]
 pub struct ServerCoreConfig {
     pub quic_bind_to: String,
+    pub astpl_bind_to: String,
+    pub astpl_iface: Option<String>,
+    pub astpl_public_ip: Option<String>,
     pub ssh_bind_to: String,
     pub vnc_bind_to: String,
     pub websocket_bind_to: String,
@@ -136,6 +139,9 @@ impl Default for ServerCoreConfig {
     fn default() -> Self {
         Self {
             quic_bind_to: "0.0.0.0:8443".to_string(),
+            astpl_bind_to: String::new(),
+            astpl_iface: None,
+            astpl_public_ip: None,
             ssh_bind_to: "0.0.0.0:822".to_string(),
             vnc_bind_to: "0.0.0.0:5900".to_string(),
             websocket_bind_to: "0.0.0.0:8080".to_string(),

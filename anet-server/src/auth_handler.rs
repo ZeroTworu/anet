@@ -508,9 +508,11 @@ impl ServerAuthHandler {
         };
 
         let nonce_prefix = generate_unique_nonce_prefix(self.registry.clone());
+        let crypto_seed = crypto_utils::derive_astpl_seed(&temp_info.shared_key);
 
         let client_info = Arc::new(ClientTransportInfo {
             cipher: Arc::new(Cipher::new(&temp_info.shared_key)),
+            crypto_seed,
             sequence: Arc::new(AtomicU64::new(0)),
             assigned_ip: assigned_ip.clone(),
             session_id: session_id.clone(),
@@ -532,6 +534,9 @@ impl ServerAuthHandler {
             last_activity: Arc::new(AtomicU64::new(now_secs)),
             created_at,
             quic_conn: arc_swap::ArcSwapOption::empty(),
+            ebpf_synced_rx: AtomicU64::new(0),
+            ebpf_synced_tx: AtomicU64::new(0),
+            ebpf_last_seen_ns: AtomicU64::new(0),
         });
 
         self.registry.pre_register_client(client_info.clone());

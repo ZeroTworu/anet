@@ -47,3 +47,13 @@ pub fn generate_key_fingerprint(public_key: &VerifyingKey) -> String {
     let hash = hasher.finalize();
     BASE64_STANDARD.encode(&hash[..16])
 }
+
+/// Выводит 64-битный криптографический seed для потокового шифра ASTP-L (`Xoroshiro128+`)
+/// из 32-байтного сессионного ключа DH с доменным разделением SHA-256.
+pub fn derive_astpl_seed(shared_key: &[u8; 32]) -> u64 {
+    let mut hasher = Sha256::new();
+    hasher.update(b"ANET-ASTPL-SEED-v1");
+    hasher.update(shared_key);
+    let digest = hasher.finalize();
+    u64::from_le_bytes(digest[0..8].try_into().unwrap())
+}

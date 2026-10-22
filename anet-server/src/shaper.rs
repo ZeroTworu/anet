@@ -17,6 +17,7 @@ use aya::Ebpf;
 use log::{info, warn};
 use std::net::Ipv4Addr;
 use std::process::Stdio;
+use std::sync::Arc;
 use tokio::process::Command;
 use tokio::sync::Mutex;
 
@@ -26,8 +27,34 @@ use tokio::sync::Mutex;
 /// с запасом на джиттер ANet stealth-конфига.
 const MIN_BURST_BYTES: u64 = 65536;
 
+/// Снимает лимит `RLIMIT_MEMLOCK` для процесса перед созданием BPF-карт
+/// (необходимо на ядрах Linux < 5.11 и в контейнерах с жёстким `ulimit -l`).
+pub fn bump_memlock_rlimit() {
+    #[cfg(target_os = "linux")]
+    {
+        #[repr(C)]
+        struct Rlimit {
+            rlim_cur: u64,
+            rlim_max: u64,
+        }
+        const RLIMIT_MEMLOCK: i32 = 8;
+        const RLIM_INFINITY: u64 = !0u64;
+        unsafe extern "C" {
+            fn setrlimit(resource: i32, rlim: *const Rlimit) -> i32;
+        }
+        let rlim = Rlimit {
+            rlim_cur: RLIM_INFINITY,
+            rlim_max: RLIM_INFINITY,
+        };
+        let ret = unsafe { setrlimit(RLIMIT_MEMLOCK, &rlim) };
+        if ret != 0 {
+            warn!("[eBPF] Failed to bump RLIMIT_MEMLOCK (setrlimit returned {})", ret);
+        }
+    }
+}
+
 pub struct Shaper {
-    ebpf: Mutex<Ebpf>,
+    ebpf: Arc<Mutex<Ebpf>>,
     iface: String,
 }
 
@@ -37,6 +64,7 @@ impl Shaper {
     /// Требует `CAP_BPF` + `CAP_NET_ADMIN` (или root).
     pub async fn attach(iface: &str) -> Result<Self> {
         info!("Attaching shaper...");
+        bump_memlock_rlimit();
         let bytes = aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/anet-ebpf"));
         let mut ebpf = Ebpf::load(bytes).context("Failed to load embedded anet-ebpf object")?;
 
@@ -71,9 +99,13 @@ impl Shaper {
         info!("[Shaper] Attached tc_egress + xdp_ingress to '{}'", iface);
 
         Ok(Self {
-            ebpf: Mutex::new(ebpf),
+            ebpf: Arc::new(Mutex::new(ebpf)),
             iface: iface.to_string(),
         })
+    }
+
+    pub fn ebpf(&self) -> Arc<Mutex<Ebpf>> {
+        self.ebpf.clone()
     }
 
     async fn ensure_clsact(iface: &str) {
