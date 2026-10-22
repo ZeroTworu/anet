@@ -122,6 +122,7 @@ pub enum TransportMode {
     Websocket,
     Ahttp,
     Wrtc,
+    Astpl,
 }
 
 impl Default for TransportMode {
@@ -231,6 +232,7 @@ impl ServerConfig {
             Some("ws") | Some("wss") => Ok(TransportMode::Websocket),
             Some("http") | Some("https") => Ok(TransportMode::Ahttp),
             Some("wrtc") => Ok(TransportMode::Wrtc),
+            Some("astpl") => Ok(TransportMode::Astpl),
             Some(scheme) => anyhow::bail!("unsupported server DSN scheme '{scheme}'"),
             None => anyhow::bail!("server DSN '{}' has no scheme", self.dsn),
         }
@@ -274,6 +276,7 @@ impl ServerConfig {
             "ssh" => 22,
             "vnc" => 5900,
             "quic" => 443,
+            "astpl" => 8444,
             _ => 0,
         });
         anyhow::ensure!(port != 0, "server DSN '{}' has no port and unknown scheme", self.dsn);
@@ -292,6 +295,7 @@ impl ServerConfig {
                 TransportMode::Websocket => "WS",
                 TransportMode::Ahttp => "AHTTP",
                 TransportMode::Wrtc => "WRTC",
+                TransportMode::Astpl => "ASTPL",
             };
 
             format!("{}:{}", host, mode_str)

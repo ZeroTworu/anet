@@ -21,6 +21,8 @@ fn current_timestamp_secs() -> u64 {
 
 pub struct ClientTransportInfo {
     pub cipher: Arc<Cipher>,
+    /// 64-битный ключ-сид для потокового шифра `Xoroshiro128+` в транспорте ASTP-L
+    pub crypto_seed: u64,
     pub sequence: Arc<AtomicU64>,
     pub assigned_ip: String,
     pub session_id: String,
@@ -28,7 +30,7 @@ pub struct ClientTransportInfo {
     pub remote_addr: ArcSwap<SocketAddr>,
     pub fingerprint: String,
     pub user_id: Option<String>,
-    pub protocol: String, // "quic" | "ssh" | "vnc" | "ws"
+    pub protocol: String, // "quic" | "astpl" | "ssh" | "vnc" | "ws" | "ahttp" | "wrtc"
     /// Ограничение скорости в kbps, `None` = без ограничения. Применяется
     /// eBPF-шейпером на TUN-интерфейсе (см. `crate::shaper::Shaper`).
     pub speed_limit_kbps: Option<u32>,
@@ -51,6 +53,10 @@ pub struct ClientTransportInfo {
     pub quic_conn: ArcSwapOption<quinn::Connection>,
     /// Предкэшированные атомарные счётчики трафика (исключают format! и DashMap write-lock на каждый пакет)
     pub traffic_counters: std::sync::OnceLock<Arc<TrafficCounters>>,
+    /// Последние синхронизированные из BPF-карт счётчики для дельта-учёта трафика ASTP-L
+    pub ebpf_synced_rx: AtomicU64,
+    pub ebpf_synced_tx: AtomicU64,
+    pub ebpf_last_seen_ns: AtomicU64,
 }
 
 impl ClientTransportInfo {
@@ -85,6 +91,7 @@ mod tests {
     fn client(session_id: &str, fingerprint: &str) -> Arc<ClientTransportInfo> {
         Arc::new(ClientTransportInfo {
             cipher: Arc::new(Cipher::new(&[7u8; 32])),
+            crypto_seed: 0,
             sequence: Arc::new(AtomicU64::new(0)),
             assigned_ip: "10.0.0.3".to_string(),
             session_id: session_id.to_string(),
@@ -105,6 +112,9 @@ mod tests {
             created_at: current_timestamp_secs(),
             quic_conn: ArcSwapOption::empty(),
             traffic_counters: std::sync::OnceLock::new(),
+            ebpf_synced_rx: AtomicU64::new(0),
+            ebpf_synced_tx: AtomicU64::new(0),
+            ebpf_last_seen_ns: AtomicU64::new(0),
         })
     }
 
@@ -195,6 +205,7 @@ pub struct ClientRegistry {
     accepting_connections: Arc<AtomicBool>,
     traffic_totals: Arc<DashMap<String, Arc<TrafficCounters>>>,
     shaper: Arc<ArcSwapOption<crate::shaper::Shaper>>,
+    astpl_ebpf: Arc<ArcSwapOption<crate::servers::astpl::AstplEbpfManager>>,
     state_changed: Arc<tokio::sync::Notify>,
 }
 
@@ -211,6 +222,7 @@ impl ClientRegistry {
             accepting_connections: Arc::new(AtomicBool::new(true)),
             traffic_totals: Arc::new(DashMap::new()),
             shaper: Arc::new(ArcSwapOption::empty()),
+            astpl_ebpf: Arc::new(ArcSwapOption::empty()),
             state_changed: Arc::new(tokio::sync::Notify::new()),
         }
     }
@@ -228,6 +240,32 @@ impl ClientRegistry {
 
     pub fn set_shaper(&self, shaper: Arc<crate::shaper::Shaper>) {
         self.shaper.store(Some(shaper));
+    }
+
+    pub fn get_shaper(&self) -> Option<Arc<crate::shaper::Shaper>> {
+        self.shaper.load_full()
+    }
+
+    pub fn set_astpl_ebpf(&self, manager: Arc<crate::servers::astpl::AstplEbpfManager>) {
+        self.astpl_ebpf.store(Some(manager));
+    }
+
+    pub fn get_astpl_ebpf(&self) -> Option<Arc<crate::servers::astpl::AstplEbpfManager>> {
+        self.astpl_ebpf.load_full()
+    }
+
+    fn clear_astpl_session(&self, client_info: &ClientTransportInfo) {
+        if client_info.protocol != "astpl" {
+            return;
+        }
+        let Some(astpl_ebpf) = self.astpl_ebpf.load_full() else {
+            return;
+        };
+        let prefix = client_info.nonce_prefix;
+        let ip_opt = client_info.assigned_ip.parse::<Ipv4Addr>().ok();
+        tokio::spawn(async move {
+            astpl_ebpf.remove_session(prefix, ip_opt).await;
+        });
     }
 
     fn apply_shaper_limit(&self, client_info: &ClientTransportInfo) {
@@ -445,6 +483,7 @@ impl ClientRegistry {
             .collect();
         for sid in stale_suspended {
             if let Some((_, suspended)) = self.suspended_sessions.remove(&sid) {
+                self.clear_astpl_session(&suspended.client_info);
                 if suspended.client_info.assigned_ip != client_info.assigned_ip {
                     if let Ok(ip_addr) = suspended.client_info.assigned_ip.parse::<Ipv4Addr>() {
                         self.ip_pool.release(ip_addr);
@@ -470,6 +509,7 @@ impl ClientRegistry {
                 }
                 self.clients_by_prefix.remove(&displaced.nonce_prefix);
                 self.clients_by_ip.remove(&displaced.assigned_ip);
+                self.clear_astpl_session(&displaced);
                 if displaced.assigned_ip != client_info.assigned_ip {
                     self.clear_shaper_limit(&displaced.assigned_ip);
                     if let Ok(ip_addr) = displaced.assigned_ip.parse::<Ipv4Addr>() {
@@ -500,6 +540,7 @@ impl ClientRegistry {
                 }
                 self.clients_by_prefix.remove(&displaced.nonce_prefix);
                 self.clients_by_addr.remove(&displaced_addr);
+                self.clear_astpl_session(&displaced);
             }
         }
 
@@ -583,6 +624,7 @@ impl ClientRegistry {
             self.clients_by_addr.remove(&remote_addr);
             self.clients_by_ip.remove(client_ip);
             self.clear_shaper_limit(client_ip);
+            self.clear_astpl_session(client_info);
 
             // Очищаем локальные счетчики трафика только если у этого ключа+протокола больше нет живых сессий
             self.cleanup_traffic_totals_if_no_active_sessions(
@@ -693,6 +735,7 @@ impl ClientRegistry {
     }
 
     async fn finish_suspended(&self, client_info: Arc<ClientTransportInfo>) {
+        self.clear_astpl_session(&client_info);
         let ip_still_in_use = self
             .clients_by_ip
             .contains_key(&client_info.assigned_ip);
@@ -788,6 +831,53 @@ impl ClientRegistry {
                         .fetch_add(packet_len as u64, Ordering::Relaxed);
                 }
             }
+        }
+    }
+
+    /// Возвращает список активных ASTP-L сессий для синхронизации с BPF-картами.
+    pub fn astpl_sessions(&self) -> Vec<Arc<ClientTransportInfo>> {
+        self.clients_by_ip
+            .iter()
+            .filter(|entry| entry.value().protocol == "astpl")
+            .map(|entry| entry.value().clone())
+            .collect()
+    }
+
+    /// Синхронизирует счётчики трафика, метку последней активности и адрес роуминга
+    /// из ядерных BPF-карт (`ASTPL_INGRESS_MAP` / `ASTPL_EGRESS_MAP`) в Userspace-реестр.
+    pub fn sync_astpl_session_stats(
+        &self,
+        client_info: &Arc<ClientTransportInfo>,
+        bpf_rx_bytes: u64,
+        bpf_tx_bytes: u64,
+        bpf_last_seen_ns: u64,
+        kernel_addr: Option<SocketAddr>,
+    ) {
+        let prev_rx = client_info.ebpf_synced_rx.swap(bpf_rx_bytes, Ordering::Relaxed);
+        let delta_rx = bpf_rx_bytes.saturating_sub(prev_rx);
+        if delta_rx > 0 {
+            self.traffic_counters(client_info, "astpl")
+                .rx_bytes
+                .fetch_add(delta_rx, Ordering::Relaxed);
+        }
+
+        let prev_tx = client_info.ebpf_synced_tx.swap(bpf_tx_bytes, Ordering::Relaxed);
+        let delta_tx = bpf_tx_bytes.saturating_sub(prev_tx);
+        if delta_tx > 0 {
+            self.traffic_counters(client_info, "astpl")
+                .tx_bytes
+                .fetch_add(delta_tx, Ordering::Relaxed);
+        }
+
+        let prev_seen = client_info
+            .ebpf_last_seen_ns
+            .swap(bpf_last_seen_ns, Ordering::Relaxed);
+        if bpf_last_seen_ns > prev_seen || delta_rx > 0 {
+            self.touch_client(client_info);
+        }
+
+        if let Some(addr) = kernel_addr {
+            self.update_client_addr(client_info, addr);
         }
     }
 

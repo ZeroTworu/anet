@@ -4,7 +4,7 @@ use crate::client_registry::ClientRegistry;
 use crate::config::Config;
 use crate::ip_pool::IpPool;
 use crate::multikey_udp_socket::TempDHInfo;
-use crate::servers::{http_stream, quic, ssh, vnc, websocket, wrtc};
+use crate::servers::{astpl, http_stream, quic, ssh, vnc, websocket, wrtc};
 
 use anet_common::atun::TunManager;
 use anet_common::tun_params::TunParams;
@@ -66,21 +66,21 @@ impl ANetServer {
 
     pub async fn run(&mut self) -> Result<()> {
         let (tx_tun, mut rx_tun) = self.tun_manager.run().await?;
+        let actual_tun_iface = self
+            .tun_manager
+            .get_actual_name()
+            .unwrap_or(self.cfg.network.if_name.as_str())
+            .to_string();
 
         // eBPF-шейпер (per-user speed_limit) вешается на TUN только после
         // того, как интерфейс реально поднят — имя может отличаться от
         // запрошенного (`get_actual_name()`), если ОС его переименовала.
         if self.cfg.shaper.enabled {
-            let iface = self
-                .tun_manager
-                .get_actual_name()
-                .unwrap_or(self.cfg.network.if_name.as_str())
-                .to_string();
-            match crate::shaper::Shaper::attach(&iface).await {
+            match crate::shaper::Shaper::attach(&actual_tun_iface).await {
                 Ok(shaper) => self.registry.set_shaper(Arc::new(shaper)),
                 Err(e) => error!(
                     "[Shaper] Failed to attach eBPF shaper to '{}': {}. Speed limits will not be enforced.",
-                    iface, e
+                    actual_tun_iface, e
                 ),
             }
         }
@@ -91,11 +91,19 @@ impl ANetServer {
             crate::control_plane::run_heartbeat(control_config, control_registry).await;
         });
 
-        // 1. Дешифратор маршрутов: от ядра ОС к внутренним регистрам UDP/TCP транспорта
+        // 1. Дешифратор маршрутов: от ядра ОС к внутренним регистрам UDP/TCP транспорта.
+        // Также перехватывает внутритуннельные ICMP-зонды (dst = gateway 10.0.0.1), которые
+        // после XDP-декапсуляции ASTP-L были направлены ядром ОС в TUN-интерфейс.
         let rx_reg = self.registry.clone();
         tokio::spawn(async move {
             while let Some(packet) = rx_tun.recv().await {
                 if packet.len() < 20 { continue; }
+                if let Some(reply) = anet_common::icmp_probe::handle_in_tunnel_icmp_probe(&packet) {
+                    if let Some(dst_ip) = crate::utils::extract_ip_dst(&reply) {
+                        rx_reg.route_packet_to_client(&dst_ip.to_string(), reply).await;
+                    }
+                    continue;
+                }
                 if let Some(dst_ip) = crate::utils::extract_ip_dst(&packet) {
                     rx_reg.route_packet_to_ipv4(dst_ip, packet).await;
                 }
@@ -118,7 +126,7 @@ impl ANetServer {
         // Канал входящих пакетов от клиентов (все транспорты шлют сюда).
         // Перехватываем внутритуннельные ICMP Echo Request зонды в userspace
         // и мгновенно отправляем ICMP Echo Reply клиенту через registry.route_packet_to_client.
-        // Это гарантирует точный замер сквозного RTT на всех транспортах (WRTC/SSH/VNC/WS/AHTTP/QUIC)
+        // Это гарантирует точный замер сквозного RTT на всех транспортах (WRTC/SSH/VNC/WS/AHTTP/QUIC/ASTP-L)
         // без зависимости от ядра ОС сервера, iptables, rp_filter или совпадения IP TUN.
         let (client_pkt_tx, mut client_pkt_rx) =
             tokio::sync::mpsc::channel::<Bytes>(anet_common::consts::CHANNEL_BUFFER_SIZE);
@@ -150,6 +158,20 @@ impl ANetServer {
             handle_collection.push(tokio::spawn(async move {
                 if let Err(e) = quic::run_quic_server(c, rg, t_tx, auth).await {
                     error!("QUIC Interface execution halted: {}", e);
+                }
+            }));
+        }
+
+        if !self.cfg.server.astpl_bind_to.trim().is_empty() {
+            let t_tx = client_pkt_tx.clone();
+            let auth = self.auth_handler_core.clone();
+            let rg = self.registry.clone();
+            let c = self.cfg.clone();
+            let tun_if = actual_tun_iface.clone();
+
+            handle_collection.push(tokio::spawn(async move {
+                if let Err(e) = astpl::run_astpl_server(c, rg, t_tx, auth, tun_if).await {
+                    error!("ASTP-L Interface execution halted: {}", e);
                 }
             }));
         }
