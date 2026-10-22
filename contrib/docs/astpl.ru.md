@@ -178,23 +178,101 @@ impl Xoroshiro128Plus {
 
 В существующем крейте `anet-ebpf` (где уже находится `anet_shaper`) добавляются две программы: `astpl_xdp_ingress` (`#[xdp]`) и `astpl_tc_egress` (`#[classifier]`).
 
+### 5.0. Универсальная обёртка доступа к пакету (`ContextWrapper`) и `network-types`
+
+Чтобы не дублировать арифметику указателей и проверки границ для верификатора между `XdpContext` и `TcContext`, а также использовать готовые `#[repr(C)]` заголовки (`EthHdr`, `EtherType`, `Ipv4Hdr`, `IpProto`, `UdpHdr`) из крейта `network-types = "0.0.7"`, в `anet-ebpf` вводится `ContextWrapper`:
+
+```rust
+use core::mem;
+use aya_ebpf::programs::{TcContext, XdpContext};
+use network_types::{
+    eth::{EthHdr, EtherType},
+    ip::{IpProto, Ipv4Hdr},
+    udp::UdpHdr,
+};
+
+pub enum ContextWrapper<'a> {
+    Xdp(&'a XdpContext),
+    Tc(&'a TcContext),
+}
+
+impl<'a> ContextWrapper<'a> {
+    #[inline(always)]
+    pub fn data(&self) -> usize {
+        match self {
+            Self::Xdp(ctx) => ctx.data(),
+            Self::Tc(ctx) => ctx.data(),
+        }
+    }
+
+    #[inline(always)]
+    pub fn data_end(&self) -> usize {
+        match self {
+            Self::Xdp(ctx) => ctx.data_end(),
+            Self::Tc(ctx) => ctx.data_end(),
+        }
+    }
+
+    /// Безопасное получение константного указателя со строгой проверкой границ для BPF-верификатора
+    #[inline(always)]
+    pub fn ptr_at<T>(&self, offset: usize) -> Result<*const T, ()> {
+        let start = self.data();
+        let end = self.data_end();
+        let len = mem::size_of::<T>();
+
+        if start + offset + len > end {
+            return Err(());
+        }
+        Ok((start + offset) as *const T)
+    }
+
+    /// Безопасное получение мутабельного указателя со строгой проверкой границ для BPF-верификатора
+    #[inline(always)]
+    pub fn ptr_at_mut<T>(&self, offset: usize) -> Result<*mut T, ()> {
+        let start = self.data();
+        let end = self.data_end();
+        let len = mem::size_of::<T>();
+
+        if start + offset + len > end {
+            return Err(());
+        }
+        Ok((start + offset) as *mut T)
+    }
+
+    /// Невыровненное чтение (важно после 14-байтного EthHdr, где смещение L3/L4 кратно 2, но не 4 или 8)
+    #[inline(always)]
+    pub fn read_unaligned<T: Copy>(&self, offset: usize) -> Result<T, ()> {
+        let ptr = self.ptr_at::<T>(offset)?;
+        Ok(unsafe { core::ptr::read_unaligned(ptr) })
+    }
+
+    /// Невыровненная запись (для u32/u64 полей и блоков шифрования)
+    #[inline(always)]
+    pub fn write_unaligned<T: Copy>(&self, offset: usize, val: T) -> Result<(), ()> {
+        let ptr = self.ptr_at_mut::<T>(offset)?;
+        unsafe { core::ptr::write_unaligned(ptr, val) };
+        Ok(())
+    }
+}
+```
+
 ### 5.1. Ingress: Программа `XDP` (на физическом интерфейсе `eth0`)
 
-1. Получает `XdpContext`. Читает `data = ctx.data()` и `data_end = ctx.data_end()`.
-2. Проверяет наличие `Ethernet Header (14) + Outer IPv4 Header (20) + Outer UDP Header (8) + ASTP-L Seq (4) = 46 байт` (`data + 46 <= data_end`).
-3. Проверяет:
-   * `EthHdr.ether_type == 0x0800_u16.to_be()` (IPv4);
-   * `Ipv4Hdr.proto == 17` (UDP) и `Ipv4Hdr.ihl() == 5` (без IP-опций, 20 байт);
-   * `UdpHdr.dst_port == ASTPL_PORT.load()`.
+1. Получает `XdpContext` и оборачивает его в `let w = ContextWrapper::Xdp(&ctx);`.
+2. Проверяет наличие `EthHdr::LEN (14) + Ipv4Hdr::LEN (20) + UdpHdr::LEN (8) + ASTP-L Seq (4) = 46 байт`.
+3. Через `w.ptr_at::<EthHdr>(0)`, `w.ptr_at::<Ipv4Hdr>(EthHdr::LEN)` и `w.ptr_at::<UdpHdr>(EthHdr::LEN + Ipv4Hdr::LEN)` проверяет:
+   * `eth.ether_type == EtherType::Ipv4` (`0x0800_u16.to_be()`);
+   * `ipv4.proto == IpProto::Udp` (`17`) и `ipv4.ihl() == 5` (без IP-опций, 20 байт);
+   * `udp.dest == ASTPL_PORT.load()`.
    Если любая проверка не прошла — возвращает `XDP_PASS`.
-4. Читает 4 байта `Seq` сразу после UDP-заголовка (`offset 42..46`):
+4. Читает 4 байта `Seq` сразу после UDP-заголовка (`w.read_unaligned::<u32>(42)`):
    * Если `Seq == 0`, возвращает `XDP_PASS` (пакет идёт в Userspace `anet-server` для Handshake / Rekey).
-5. Формирует ключ `OuterEndpoint { src_ip: ip.src_addr, src_port: udp.src_port, _pad: 0 }` и ищет сессию через `ASTPL_INGRESS_MAP.get_ptr_mut(&key)`:
+5. Формирует ключ `OuterEndpoint { src_ip: ipv4.src_addr, src_port: udp.source, _pad: 0 }` и ищет сессию через `ASTPL_INGRESS_MAP.get_ptr_mut(&key)`:
    * Если записи нет — возвращает `XDP_DROP` (защита от DDoS и неавторизованных пакетов на уровне драйвера сетевой карты).
-6. Инициализирует `Xoroshiro128Plus::new(session.crypto_seed, u32::from_be(seq))` и расшифровывает payload (`data + 46 .. data_end`) прямо в буфере пакета (по 8 байт + хвост `1..7` байт).
-7. Проверяет, что расшифрованный внутренний пакет (`data + 46`) содержит минимум 20 байт (`data + 66 <= data_end`), является валидным IPv4 (`version == 4`) и его `inner_ip.src_addr == session.assigned_ip` (защита от IP-спуфинга внутри туннеля). Обновляет `session.rx_bytes` и `session.last_seen_ns`.
+6. Инициализирует `Xoroshiro128Plus::new(session.crypto_seed, u32::from_be(seq))` и расшифровывает payload (`data + 46 .. data_end`) прямо в буфере пакета (по 8 байт через `read_unaligned`/`write_unaligned` + хвост `1..7` байт).
+7. Проверяет, что расшифрованный внутренний пакет (`offset 46`) содержит минимум 20 байт (`w.ptr_at::<Ipv4Hdr>(46)`), является валидным IPv4 (`version == 4`) и его `inner_ip.src_addr == session.assigned_ip` (защита от IP-спуфинга внутри туннеля). Обновляет `session.rx_bytes` и `session.last_seen_ns`.
 8. **Декапсуляция на уровне XDP с сохранением L2-заголовка:**
-   * Копирует 14 байт оригинального `Ethernet Header` (`data .. data + 14`) на 32 байта вправо (`data + 32 .. data + 46`), прямо перед началом расшифрованного внутреннего IPv4-пакета.
+   * Читает 14 байт оригинального `EthHdr` (`let eth_hdr = w.read_unaligned::<EthHdr>(0)?;`) и записывает их на 32 байта вправо (`w.write_unaligned::<EthHdr>(32, eth_hdr)?;`), прямо перед началом расшифрованного внутреннего IPv4-пакета.
    * Вызывает `unsafe { aya_ebpf::helpers::bpf_xdp_adjust_head(ctx.ctx, 32) }` (сдвигает начало пакета на `20 (Outer IP) + 8 (UDP) + 4 (Seq) = 32` байта вправо).
    * Возвращает **`XDP_PASS`**.
    * **Результат:** Ядро Linux получает готовый стандартный Ethernet-кадр с расшифрованным внутренним IPv4-пакетом клиента и мгновенно маршрутизирует его через стандартный IP Forwarding / NAT в интернет без участия `tun0` и Userspace.
@@ -203,13 +281,13 @@ impl Xoroshiro128Plus {
 
 Когда ответный пакет из интернета маршрутизируется ядром в подсеть VPN (`10.0.0.0/24`), он попадает в `tun0` (сначала проходит через `anet_shaper`, а затем в `astpl_tc_egress`):
 
-1. Получает `TcContext`. Проверяет минимальную длину IPv4-пакета (`ctx.data() + 20 <= ctx.data_end()`).
-2. Читает `Inner Dst IP` (байты `16..20` заголовка IPv4).
+1. Получает `TcContext` и оборачивает его в `ContextWrapper::Tc(&ctx)`. Проверяет минимальную длину IPv4-пакета (`w.ptr_at::<Ipv4Hdr>(0)`).
+2. Читает `Inner Dst IP` (`inner_ip.dst_addr`).
 3. Ищет `Inner Dst IP` в `ASTPL_EGRESS_MAP.get_ptr_mut(&inner_dst_ip)`:
    * Если записи нет — возвращает `TC_ACT_OK` (пакет идёт обычным путём для классических клиентов Anet).
 4. **Линеаризация буфера `sk_buff` (КРИТИЧНО для TC):**
    * Вызывает **`ctx.pull_data(0)`** (`bpf_skb_pull_data`), чтобы подтянуть все нелинейные страницы (`paged frags`) пакета в линейную область `ctx.data()..ctx.data_end()`.
-   * Заново перечитывает `ctx.data()` и `ctx.data_end()`.
+   * Заново перечитывает `ctx.data()` и `ctx.data_end()` (все указатели до `pull_data` инвалидируются верификатором).
 5. Инкрементирует `routing.tx_seq` (если в результате переполнения получилось `0`, ставит `1`), обновляет `routing.tx_bytes` и `routing.last_seen_ns`.
 6. Инициализирует `Xoroshiro128Plus::new(routing.crypto_seed, routing.tx_seq)` и шифрует весь внутренний IPv4-пакет (`ctx.data() .. ctx.data_end()`) на месте (по 8 байт + хвост `1..7` байт).
 7. **Расширение заголовка (`adjust_room`):**
@@ -221,10 +299,10 @@ impl Xoroshiro128Plus {
      ctx.adjust_room(32, BPF_ADJ_ROOM_NET, flags)?;
      ```
    * Это раздвигает начало пакета ровно на **32 байта** (`Outer IPv4 (20) + Outer UDP (8) + ASTP-L Seq (4)`).
-8. Заново проверяет `ctx.data() + 32 <= ctx.data_end()` и записывает в новые 32 байта:
-   * **Outer IPv4 Header (20 байт):** `version_ihl = 0x45`, `tos = 0`, `tot_len = (ctx.len() as u16).to_be()`, `id = 0`, `frag_off = 0x4000u16.to_be()` (DF), `ttl = 64`, `proto = 17` (UDP), `src_addr = SERVER_IP.load()`, `dst_addr = routing.dst_ip`, и вычисляет IPv4 Header Checksum (компактной inline-функцией свертки 10 слов `u16`).
-   * **Outer UDP Header (8 байт):** `src_port = ASTPL_PORT.load()`, `dst_port = routing.dst_port`, `len = ((ctx.len() - 20) as u16).to_be()`, `check = 0` (для IPv4 UDP checksum `0` валиден по RFC 768 и не требует пересчёта по всему payload).
-   * **ASTP-L Seq (4 байта):** `routing.tx_seq.to_be()`.
+8. Заново проверяет границы через `ContextWrapper::Tc(&ctx)` и записывает в новые 32 байта:
+   * **Outer IPv4 Header (`Ipv4Hdr`, 20 байт):** `version_ihl = 0x45`, `tos = 0`, `tot_len = (ctx.len() as u16).to_be()`, `id = 0`, `frag_off = 0x4000u16.to_be()` (DF), `ttl = 64`, `proto = IpProto::Udp`, `src_addr = SERVER_IP.load()`, `dst_addr = routing.dst_ip`, и вычисляет IPv4 Header Checksum (компактной inline-функцией свертки 10 слов `u16`).
+   * **Outer UDP Header (`UdpHdr`, 8 байт):** `source = ASTPL_PORT.load()`, `dest = routing.dst_port`, `len = ((ctx.len() - 20) as u16).to_be()`, `check = 0` (для IPv4 UDP checksum `0` валиден по RFC 768 и не требует пересчёта по всему payload).
+   * **ASTP-L Seq (4 байта, offset 28):** `routing.tx_seq.to_be()`.
 9. **Отправка в физический интерфейс через подсистему соседей (ARP/Neighbour):**
    * Вызывает `unsafe { aya_ebpf::helpers::bpf_redirect_neigh(ETH_IFINDEX.load(), core::ptr::null_mut(), 0, 0) as i32 }`.
    * Хелпер `bpf_redirect_neigh` (доступен в Linux 5.10+) самостоятельно определяет L2 MAC-адреса (`src_mac` / `dst_mac` шлюза по таблице маршрутизации и ARP) и отправляет пакет напрямую в `eth0`, полностью минуя чтение из файлового дескриптора `tun0` в Userspace.
@@ -233,9 +311,25 @@ impl Xoroshiro128Plus {
 
 ## 6. Логика работы Userspace (`anet-server`)
 
-1. **Инициализация и сосуществование с `Shaper`:**
+1. **Подготовка окружения и сосуществование с `Shaper`:**
+   * **Снятие лимита `RLIMIT_MEMLOCK`:** Перед вызовом `EbpfLoader::new().load(...)` сервер снимает ограничение на блокировку памяти в RAM для BPF-карт (критично для ядер Linux 5.10–5.15 и systemd/Docker-окружений с малым дефолтным `ulimit -l`):
+     ```rust
+     unsafe {
+         let rlim = libc::rlimit {
+             rlim_cur: libc::RLIM_INFINITY,
+             rlim_max: libc::RLIM_INFINITY,
+         };
+         let _ = libc::setrlimit(libc::RLIMIT_MEMLOCK, &rlim);
+     }
+     ```
+   * **Pre-flight очистка старого XDP на физическом интерфейсе:** Поскольку физический интерфейс (`eth0`) в отличие от виртуального `tun0` не удаляется при аварийной остановке сервера (`SIGKILL`), перед привязкой `astpl_xdp_ingress` выполняется сброс возможного «залипшего» XDP-хука:
+     ```rust
+     let _ = std::process::Command::new("ip")
+         .args(["link", "set", "dev", &eth_iface, "xdp", "off"])
+         .status();
+     ```
    * При старте `anet-server` загружает единый eBPF-объект `anet-ebpf` через `EbpfLoader::new()` с установкой `ASTPL_PORT`, `SERVER_IP`, `ETH_IFINDEX`.
-   * Прикрепляет `astpl_xdp_ingress` к физическому интерфейсу (например, `eth0`) в режиме `XdpFlags::default()` (с fallback на `XdpFlags::SKB_MODE`, если драйвер VPS не поддерживает Native XDP).
+   * Прикрепляет `astpl_xdp_ingress` к физическому интерфейсу (например, `eth0`) в режиме `XdpFlags::default()` (с автоматическим fallback на `XdpFlags::SKB_MODE`, если драйвер VPS не поддерживает Native XDP).
    * На `tun0` добавляет `clsact` (`aya::programs::tc::qdisc_add_clsact`) и прикрепляет `anet_shaper` (с `priority: 10`) и `astpl_tc_egress` (с `priority: 20` через `TcAttachOptions::Netlink(NlOptions { priority: 20, ..Default::default() })`).
    * Для `tun0` рекомендуется отключить `GSO`/`TSO`/`GRO` через `ethtool -K` или `ioctl`, чтобы пакеты шифровались в пределах MTU без сегментации.
 2. **Обработка Handshake (`Seq == 0`):**
@@ -270,12 +364,14 @@ impl Xoroshiro128Plus {
 ## 8. Требования к реализации и окружению сборки
 
 1. **Версии крейтов в workspace:**
-   * Userspace (`anet-server`): `aya = "0.14.0"`, `aya-log = "0.3.0"`.
-   * Kernelspace (`anet-ebpf`): `aya-ebpf = "0.2.1"`, `aya-log-ebpf = "0.2.0"`, Rust `edition = "2024"`.
+   * Userspace (`anet-server`): `aya = "0.14.0"`, `aya-log = "0.3.0"`, `libc = "0.2"`.
+   * Kernelspace (`anet-ebpf`): `aya-ebpf = "0.2.1"`, `aya-log-ebpf = "0.2.0"`, `network-types = "0.0.7"`, Rust `edition = "2024"`.
    * Общие типы (`anet-ebpf-common`): `#![no_std]`, `aya = { version = "0.14.0", optional = true }`.
 2. **Строгие правила для BPF-верификатора (`anet-ebpf`):**
    * В Rust 2024 использовать `#[unsafe(no_mangle)]` и явные блоки `unsafe { ... }` внутри `unsafe fn`.
-   * Перед любым чтением или записью по указателю пакета (`data + offset`) выполнять явную проверку `if ptr + size > data_end { return ...; }`.
-   * После вызовов `ctx.pull_data(...)`, `ctx.adjust_room(...)` или `bpf_xdp_adjust_head(...)` все старые указатели на пакет считаются недействительными — обязательно заново получать `ctx.data()` и `ctx.data_end()`.
+   * Перед любым чтением или записью по указателю пакета (`data + offset`) выполнять явную проверку `if start + offset + len > end { return Err(()); }` через `ContextWrapper::ptr_at` / `ptr_at_mut`.
+   * Для чтения/записи многобайтовых полей после 14-байтного `EthHdr` и 8-байтных блоков шифрования использовать `read_unaligned` / `write_unaligned` во избежание невыровненного доступа.
+   * После вызовов `ctx.pull_data(...)`, `ctx.adjust_room(...)` или `bpf_xdp_adjust_head(...)` все старые указатели на пакет считаются недействительными — обязательно заново обращаться к `ContextWrapper` для чтения `ctx.data()` и `ctx.data_end()`.
    * Все циклы шифрования должны иметь жёсткую верхнюю границу итераций (`for _ in 0..MAX_BLOCKS`), а вспомогательные функции помечаться `#[inline(always)]`.
    * Не использовать динамические аллокации (`alloc`, `Vec`, `String`) и паникующие индексации срезов (`slice[i]`) в коде `anet-ebpf`.
+
