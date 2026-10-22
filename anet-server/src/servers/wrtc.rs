@@ -467,19 +467,23 @@ pub async fn run_wrtc_server(
                                                 }
                                             }
 
-                                            // 2. Вытесняем другую сессию с тем же fingerprint ТОЛЬКО если лимит сессий строго равен 1.
-                                            // Если тариф разрешает несколько устройств или безлимит (allowed_sessions == 0 / None / >1),
-                                            // параллельные сессии (например, ПК + Android под одним аккаунтом) работают одновременно!
-                                            if client_info.allowed_sessions == Some(1) {
-                                                if let Some(old) = reg_clone
-                                                    .evict_existing_device_session(&client_info.fingerprint, "wrtc", &client_info.session_id)
-                                                    .await
-                                                {
-                                                    let old_tag = anet_common::wrtc::colibri::client_tag_from_ip(&old.assigned_ip);
-                                                    clients_by_tag.remove(&old_tag);
-                                                    client_video_warmed_up.remove(&old_tag);
-                                                    clients_map.retain(|_, v| v.session_id != old.session_id);
-                                                }
+                                            // 2. Очищаем из локальных таблиц WRTC мёртвые сессии этого fingerprint,
+                                            // которые уже были удалены из ClientRegistry (например, по таймауту неактивности в Phase 1),
+                                            // не затрагивая живые параллельные сессии.
+                                            let stale_eps: Vec<(String, Arc<ClientTransportInfo>)> = clients_map
+                                                .iter()
+                                                .filter(|entry| {
+                                                    entry.value().fingerprint == client_info.fingerprint
+                                                        && entry.value().session_id != client_info.session_id
+                                                        && !reg_clone.is_session_active(&entry.value().session_id)
+                                                })
+                                                .map(|entry| (entry.key().clone(), entry.value().clone()))
+                                                .collect();
+                                            for (ep, stale) in stale_eps {
+                                                let old_tag = anet_common::wrtc::colibri::client_tag_from_ip(&stale.assigned_ip);
+                                                clients_by_tag.remove(&old_tag);
+                                                client_video_warmed_up.remove(&old_tag);
+                                                clients_map.remove(&ep);
                                             }
 
                                             let client_tag = anet_common::wrtc::colibri::client_tag_from_ip(&assigned_ip);

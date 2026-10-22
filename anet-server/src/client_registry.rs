@@ -557,15 +557,6 @@ impl ClientRegistry {
                 &client_info.fingerprint,
                 &client_info.protocol,
             );
-            // Очищаем локальные счетчики трафика только если больше нет активных сессий с этим fingerprint и протоколом
-            let still_has_same_fp = self.clients_by_ip.iter().any(|entry| {
-                entry.value().fingerprint == client_info.fingerprint
-                    && entry.value().protocol == client_info.protocol
-            });
-            if !still_has_same_fp {
-                let key = format!("{}#{}", client_info.fingerprint, client_info.protocol);
-                self.traffic_totals.remove(&key);
-            }
 
             if let Ok(ip_addr) = client_ip.parse::<Ipv4Addr>() {
                 self.ip_pool.release(ip_addr);
@@ -578,42 +569,6 @@ impl ClientRegistry {
                 client_ip, client_info.session_id
             );
         }
-
-        info!("[Registry] Client {} removed.", client_ip);
-    }
-
-    /// Находит и мгновенно вытесняет предыдущие сессии того же устройства (по fingerprint и протоколу).
-    /// Используется при быстром реконнекте клиента для немедленного освобождения IP, закрытия старого роутера
-    /// и предотвращения коллизий шифрования и остаточного интернет-трафика.
-    /// Исключает текущую только что созданную сессию (по current_session_id), чтобы не вытеснять саму себя!
-    pub async fn evict_existing_device_session(
-        &self,
-        fingerprint: &str,
-        protocol: &str,
-        current_session_id: &str,
-    ) -> Option<Arc<ClientTransportInfo>> {
-        let existing_list: Vec<Arc<ClientTransportInfo>> = self
-            .clients_by_ip
-            .iter()
-            .filter(|entry| {
-                entry.value().fingerprint == fingerprint
-                    && entry.value().protocol == protocol
-                    && entry.value().session_id != current_session_id
-            })
-            .map(|entry| entry.value().clone())
-            .collect();
-
-        let mut last_evicted = None;
-        for old_client in existing_list {
-            info!(
-                "[Registry] Device reconnect detected for fingerprint {} (proto: {}). Evicting previous session with IP {}.",
-                fingerprint, protocol, old_client.assigned_ip
-            );
-            self.remove_client(&old_client).await;
-            last_evicted = Some(old_client);
-        }
-
-        last_evicted
     }
 
     pub fn suspend_client(&self, client_info: Arc<ClientTransportInfo>) {
