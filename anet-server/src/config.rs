@@ -207,8 +207,8 @@ impl Default for AhttpServerConfig {
                                Content-Length: {}\r\n\
                                Connection: keep-alive\r\n\r\n".to_string(),
             reassembly_queue_max_size: 1024,
-            coalesce_budget_bytes: 65536,
-            poll_timeout_ms: 30
+            coalesce_budget_bytes: 131072,
+            poll_timeout_ms: 25,
         }
     }
 }

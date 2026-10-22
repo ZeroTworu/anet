@@ -1,7 +1,6 @@
 use super::{ClientTransport, ConnectionResult};
 use crate::auth::{AuthChannel, AuthHandler};
 use crate::config::{CoreConfig, ServerConfig};
-use anet_common::consts::CHANNEL_BUFFER_SIZE;
 use anet_common::handshake_fragmentation::FragmentConfig;
 use anet_common::http_help::BrowserProfile;
 use anet_common::reassembly::ReassemblyQueue;
@@ -153,43 +152,50 @@ impl ClientTransport for AHttpTransport {
         let resolved_addr = self.resolve_host(&target_host, port).await?;
         info!("[AHTTP] Initializing XHTTP engine to {} (Pinned IP: {})", base_url, resolved_addr);
 
-        let mut builder = Client::builder()
-            .resolve(&target_host, resolved_addr)
-            .danger_accept_invalid_certs(true)
-            .pool_max_idle_per_host(self.config.ahttp.pool_max_idle_per_host)
-            .pool_idle_timeout(Some(Duration::from_secs(self.config.ahttp.pool_idle_timeout_secs)))
-            .tcp_nodelay(self.config.ahttp.tcp_nodelay)
-            .timeout(Duration::from_secs(self.config.ahttp.timeout_secs))
-            .http2_adaptive_window(self.config.ahttp.http2_adaptive_window);
+        let build_http_client = || -> Result<Client> {
+            let mut builder = Client::builder()
+                .resolve(&target_host, resolved_addr)
+                .danger_accept_invalid_certs(true)
+                .pool_max_idle_per_host(self.config.ahttp.pool_max_idle_per_host.max(2))
+                .pool_idle_timeout(Some(Duration::from_secs(self.config.ahttp.pool_idle_timeout_secs)))
+                .tcp_nodelay(self.config.ahttp.tcp_nodelay)
+                .timeout(Duration::from_secs(self.config.ahttp.timeout_secs))
+                .http2_adaptive_window(self.config.ahttp.http2_adaptive_window);
 
-        if let Some(max_frame) = self.config.ahttp.http2_max_frame_size {
-            builder = builder.http2_max_frame_size(max_frame);
-        }
-
-        if let Some(max_header) = self.config.ahttp.http2_max_header_list_size {
-            builder = builder.http2_max_header_list_size(max_header);
-        }
-
-        if let Some(ka_interval) = self.config.ahttp.http2_keep_alive_interval_secs {
-            builder = builder.http2_keep_alive_interval(Some(Duration::from_secs(ka_interval)));
-
-            if let Some(ka_timeout) = self.config.ahttp.http2_keep_alive_timeout_secs {
-                builder = builder.http2_keep_alive_timeout(Duration::from_secs(ka_timeout));
+            if let Some(max_frame) = self.config.ahttp.http2_max_frame_size {
+                builder = builder.http2_max_frame_size(max_frame);
             }
 
-            builder = builder.http2_keep_alive_while_idle(self.config.ahttp.http2_keep_alive_while_idle);
-        }
+            if let Some(max_header) = self.config.ahttp.http2_max_header_list_size {
+                builder = builder.http2_max_header_list_size(max_header);
+            }
 
-        let http_client = match builder.build() {
-            Ok(http_client) => http_client,
-            Err(e) => bail!("Cannot build a HTTP client: {}", e),
+            if let Some(ka_interval) = self.config.ahttp.http2_keep_alive_interval_secs {
+                builder = builder.http2_keep_alive_interval(Some(Duration::from_secs(ka_interval)));
+
+                if let Some(ka_timeout) = self.config.ahttp.http2_keep_alive_timeout_secs {
+                    builder = builder.http2_keep_alive_timeout(Duration::from_secs(ka_timeout));
+                }
+
+                builder = builder.http2_keep_alive_while_idle(self.config.ahttp.http2_keep_alive_while_idle);
+            }
+
+            builder.build().map_err(|e| anyhow::anyhow!("Cannot build a HTTP client: {}", e))
         };
+
+        let pool_size = self.config.ahttp.concurrency.clamp(1, 12);
+        let mut client_pool_vec = Vec::with_capacity(pool_size);
+        for _ in 0..pool_size {
+            client_pool_vec.push(build_http_client()?);
+        }
+        let primary_http_client = client_pool_vec[0].clone();
+        let idle_clients = Arc::new(std::sync::Mutex::new(client_pool_vec));
 
         let origin = format!("{}://{}", scheme, target_host);
         let referer = format!("{}/", base_url);
 
         let auth_channel = AHttpAuthChannel {
-            client: http_client.clone(),
+            client: primary_http_client.clone(),
             base_url: base_url.clone(),
             origin: origin.clone(),
             referer: referer.clone(),
@@ -209,9 +215,11 @@ impl ClientTransport for AHttpTransport {
         let sequence = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let health_pause = Arc::new(AtomicBool::new(false));
 
-        let (client_stream, internal_router) = tokio::io::duplex(4 * 1024 * 1024);
+        // Умеренный размер буферов (512 КБ duplex + 128 пакетов канал) предотвращает
+        // 15-мегабайтный Bufferbloat и скачки пинга до 500+ мс при активной выгрузке (Upload).
+        let (client_stream, internal_router) = tokio::io::duplex(512 * 1024);
         let (mut tunnel_read, tunnel_write) = tokio::io::split(internal_router);
-        let (tunnel_packet_tx, mut tunnel_packet_rx) = tokio::sync::mpsc::channel::<Bytes>(CHANNEL_BUFFER_SIZE);
+        let (tunnel_packet_tx, mut tunnel_packet_rx) = tokio::sync::mpsc::channel::<Bytes>(128);
 
         let tunnel_reader_task = tokio::spawn(async move {
             while let Ok(Some(packet)) = read_next_packet(&mut tunnel_read).await {
@@ -230,27 +238,52 @@ impl ClientTransport for AHttpTransport {
         let rx_reassembler = Arc::new(Mutex::new(ReassemblyQueue::new(config_ahttp.reassembly_queue_max_size)));
         let concurrency_semaphore = Arc::new(tokio::sync::Semaphore::new(config_ahttp.concurrency));
         let tunnel_write_mutex = Arc::new(Mutex::new(tunnel_write));
+        let downlink_notify = Arc::new(tokio::sync::Notify::new());
+        let downlink_credits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
         tokio::spawn(async move {
-            info!("[AHTTP Client] Started Stateless Packet-Exchange Loop (Method: {})", uplink_method_str);
+            info!(
+                "[AHTTP Client] Started Stateless Packet-Exchange Loop (Method: {}, TCP Pool: {}, Concurrency: {})",
+                uplink_method_str, pool_size, config_ahttp.concurrency
+            );
             let traffic_url = format!("{}{}?session_id={}", base_url, config_ahttp.traffic_path, session_id);
-            let mut batch_buf = BytesMut::with_capacity(config_ahttp.coalesce_budget_bytes);
+            // В HTTP/2 стартовое окно потока/соединения (RFC 7540 / Nginx) равно 65535 байт.
+            // Ограничиваем один uplink-батч до 48 КБ (49152 байт), чтобы POST-запрос гарантированно
+            // уходил за один RTT без паузы на ожидание WINDOW_UPDATE от Nginx.
+            let uplink_budget_bytes = config_ahttp.coalesce_budget_bytes.min(49152);
+            let mut batch_buf = BytesMut::with_capacity(uplink_budget_bytes + 2048);
             let poll_timeout = Duration::from_millis(config_ahttp.poll_timeout_ms);
             let micro_coalesce = Duration::from_micros(500);
 
             loop {
-                // 1. Сначала ждем первый пакет ИЛИ таймаут пуллинга
-                let first_packet_opt = tokio::select! {
-                    pkt = tunnel_packet_rx.recv() => {
-                        match pkt {
-                            Some(p) => Some(p),
-                            None => break, // Канал закрыт
+                let has_poll_credit = downlink_credits.load(Ordering::Acquire) > 0
+                    && concurrency_semaphore.available_permits() > 0;
+
+                // 1. Ждем первый пакет, сигнал активного Downlink (self-clocking) ИЛИ таймаут пуллинга
+                let first_packet_opt = if has_poll_credit {
+                    let _ = downlink_credits.fetch_update(Ordering::AcqRel, Ordering::Acquire, |c| {
+                        Some(c.saturating_sub(1))
+                    });
+                    tunnel_packet_rx.try_recv().ok()
+                } else {
+                    tokio::select! {
+                        pkt = tunnel_packet_rx.recv() => {
+                            match pkt {
+                                Some(p) => Some(p),
+                                None => break, // Канал закрыт
+                            }
                         }
+                        _ = downlink_notify.notified() => {
+                            let _ = downlink_credits.fetch_update(Ordering::AcqRel, Ordering::Acquire, |c| {
+                                Some(c.saturating_sub(1))
+                            });
+                            tunnel_packet_rx.try_recv().ok()
+                        }
+                        _ = tokio::time::sleep(poll_timeout) => None,
                     }
-                    _ = tokio::time::sleep(poll_timeout) => None,
                 };
 
-                // 2. Если это холостой poll-таймаут, а ВСЕ слоты concurrency уже заняты в полете —
+                // 2. Если это холостой poll-таймаут, а свободных слотов concurrency нет —
                 // не блокируемся в очереди за пермитом ради пустого запроса.
                 let permit = if first_packet_opt.is_none() {
                     match concurrency_semaphore.clone().try_acquire_owned() {
@@ -259,8 +292,6 @@ impl ClientTransport for AHttpTransport {
                     }
                 } else {
                     // Для реального трафика захватываем пермит ДО выгребания очереди!
-                    // Пока мы ждем свободный HTTP-слот, пакеты копятся в tunnel_packet_rx
-                    // и затем уйдут одним полным 64 КБ батчем вместо десятков мелких по 1 пакету.
                     match concurrency_semaphore.clone().acquire_owned().await {
                         Ok(p) => p,
                         Err(_) => break,
@@ -269,7 +300,6 @@ impl ClientTransport for AHttpTransport {
 
                 let mut tx_pkts_count = 0;
 
-                // Если за время ожидания пермита (или после пробуждения) появились пакеты:
                 let first_pkt = match first_packet_opt {
                     Some(p) => Some(p),
                     None => tunnel_packet_rx.try_recv().ok(),
@@ -282,8 +312,8 @@ impl ClientTransport for AHttpTransport {
                         tx_pkts_count += 1;
                     }
 
-                    // Выгребаем все уже накопившиеся в канале пакеты
-                    while batch_buf.len() < config_ahttp.coalesce_budget_bytes {
+                    // Выгребаем все уже накопившиеся в канале пакеты, не превышая 48 КБ
+                    while batch_buf.len() + 1600 <= uplink_budget_bytes {
                         match tunnel_packet_rx.try_recv() {
                             Ok(p) => {
                                 let seq = sequence.fetch_add(1, Ordering::Relaxed);
@@ -296,14 +326,11 @@ impl ClientTransport for AHttpTransport {
                         }
                     }
 
-                    // Микро-коалесценция (до 0.5 мс): если слоты параллельности уже частично заняты
-                    // (идет активный поток), даем ядру/TUN еще полмиллисекунды досыпать пакеты в этот же батч,
-                    // чтобы не жечь все HTTP-воркеры на одиночные пакеты.
-                    if batch_buf.len() < config_ahttp.coalesce_budget_bytes / 2
-                        && concurrency_semaphore.available_permits() < config_ahttp.concurrency.saturating_sub(1)
-                    {
+                    // Микро-коалесценция (до 0.5 мс): даем ядру/TUN полмиллисекунды досыпать пакеты
+                    // текущей пачки, чтобы не отправлять одиночные пакеты отдельными HTTP-запросами.
+                    if batch_buf.len() < uplink_budget_bytes / 2 {
                         let deadline = tokio::time::Instant::now() + micro_coalesce;
-                        while batch_buf.len() < config_ahttp.coalesce_budget_bytes {
+                        while batch_buf.len() + 1600 <= uplink_budget_bytes {
                             match tokio::time::timeout_at(deadline, tunnel_packet_rx.recv()).await {
                                 Ok(Some(p)) => {
                                     let seq = sequence.fetch_add(1, Ordering::Relaxed);
@@ -311,7 +338,7 @@ impl ClientTransport for AHttpTransport {
                                         frame_packet_into(&mut batch_buf, &enc);
                                         tx_pkts_count += 1;
                                     }
-                                    while batch_buf.len() < config_ahttp.coalesce_budget_bytes {
+                                    while batch_buf.len() + 1600 <= uplink_budget_bytes {
                                         match tunnel_packet_rx.try_recv() {
                                             Ok(next_p) => {
                                                 let seq = sequence.fetch_add(1, Ordering::Relaxed);
@@ -331,9 +358,15 @@ impl ClientTransport for AHttpTransport {
                 }
 
                 let payload = batch_buf.split().freeze();
-                batch_buf.reserve(config_ahttp.coalesce_budget_bytes);
+                batch_buf.reserve(uplink_budget_bytes + 2048);
 
-                let http_client_clone = http_client.clone();
+                // Берем свободный HTTP-клиент из LIFO-стека (в простое используется 1 теплое соединение,
+                // под нагрузкой запросы изолируются по независимым TCP/TLS соединениям).
+                let worker_client = {
+                    let mut pool = idle_clients.lock().unwrap();
+                    pool.pop().unwrap_or_else(|| primary_http_client.clone())
+                };
+                let idle_clients_clone = idle_clients.clone();
                 let uplink_method_clone = uplink_method.clone();
                 let traffic_url_clone = traffic_url.clone();
                 let profile_ul_clone = profile_ul.clone();
@@ -342,10 +375,15 @@ impl ClientTransport for AHttpTransport {
                 let cipher_ul_clone = cipher_ul.clone();
                 let rx_reassembler_clone = rx_reassembler.clone();
                 let tunnel_write_clone = tunnel_write_mutex.clone();
+                let downlink_notify_clone = downlink_notify.clone();
+                let downlink_credits_clone = downlink_credits.clone();
+                let max_concurrency = config_ahttp.concurrency;
 
                 tokio::spawn(async move {
                     let mut success = false;
                     let mut attempts = 0;
+                    let mut rx_bytes_total = 0usize;
+                    let mut rx_pkts_total = 0usize;
 
                     if !payload.is_empty() {
                         debug!("[AHTTP Client] >>> Sending {} bytes ({} packets)", payload.len(), tx_pkts_count);
@@ -353,7 +391,7 @@ impl ClientTransport for AHttpTransport {
 
                     // Seamless Reconnect: Повторяем до 5 раз при обрывах со стороны CDN
                     while attempts < 5 {
-                        let req = http_client_clone
+                        let req = worker_client
                             .request(uplink_method_clone.clone(), &traffic_url_clone)
                             .header("Accept", "*/*");
                         let req = profile_ul_clone.apply_to_reqwest(
@@ -369,7 +407,8 @@ impl ClientTransport for AHttpTransport {
                             Ok(resp) if resp.status().is_success() => {
                                 if let Ok(body) = resp.bytes().await {
                                     if !body.is_empty() {
-                                        debug!("[AHTTP Client] <<< Received {} bytes", body.len());
+                                        rx_bytes_total = body.len();
+                                        debug!("[AHTTP Client] <<< Received {} bytes", rx_bytes_total);
                                         let mut cursor = std::io::Cursor::new(body);
                                         let mut unpacked_batch = Vec::with_capacity(64);
 
@@ -381,6 +420,7 @@ impl ClientTransport for AHttpTransport {
                                         }
 
                                         let rx_pkts_count = unpacked_batch.len();
+                                        rx_pkts_total = rx_pkts_count;
                                         if rx_pkts_count > 0 {
                                             // 2. Один раз берем лок сборщика и вставляем весь батч
                                             let ready_packets = {
@@ -408,7 +448,6 @@ impl ClientTransport for AHttpTransport {
                             }
                             Ok(resp) => {
                                 warn!("[AHTTP Client] CDN returned HTTP {}", resp.status());
-                                // При 401 или 404 сервер явно убил сессию, нет смысла ретраить этот же запрос
                                 if resp.status() == reqwest::StatusCode::UNAUTHORIZED || resp.status() == reqwest::StatusCode::NOT_FOUND {
                                     break;
                                 }
@@ -419,7 +458,6 @@ impl ClientTransport for AHttpTransport {
                         }
 
                         attempts += 1;
-                        // Ждем 50ms перед повторной отправкой (бесшовный реконнект)
                         tokio::time::sleep(Duration::from_millis(50)).await;
                     }
 
@@ -427,7 +465,28 @@ impl ClientTransport for AHttpTransport {
                         warn!("[AHTTP Client] Traffic exchange transaction failed after retries. Payload dropped.");
                     }
 
+                    // Возвращаем HTTP-клиент в LIFO-пул ДО освобождения пермита
+                    {
+                        let mut pool = idle_clients_clone.lock().unwrap();
+                        if pool.len() < max_concurrency {
+                            pool.push(worker_client);
+                        }
+                    }
                     drop(permit);
+
+                    // Downlink Self-Clocking: если сервер прислал данные, немедленно (без ожидания poll_timeout_ms)
+                    // будим диспетчер для отправки следующего запроса; при крупной пачке — удваиваем число активных
+                    // poll-запросов (по аналогии с TCP Slow Start) до заполнения всех слотов concurrency.
+                    if rx_pkts_total > 0 {
+                        if rx_bytes_total >= 8192 || rx_pkts_total >= 6 {
+                            let _ = downlink_credits_clone.fetch_update(Ordering::AcqRel, Ordering::Acquire, |c| {
+                                Some((c + 2).min(max_concurrency))
+                            });
+                        } else {
+                            let _ = downlink_credits_clone.fetch_max(1, Ordering::AcqRel);
+                        }
+                        downlink_notify_clone.notify_one();
+                    }
                 });
 
                 if tunnel_packet_rx.is_closed() { break; }
