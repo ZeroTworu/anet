@@ -163,8 +163,8 @@ block = []
 #
 # Возможные параметры каждого сервера:
 # 1. dsn: единый адрес с типом транспорта, например
-#    quic://host:4519, ssh://host:822, vnc://host:56678 или
-#    ws://host:8080/socket или wss://host:8080/socket.
+#    astpl://host:8444, quic://host:4519, ssh://host:822, vnc://host:56678,
+#    ws://host:8080/socket, wss://host:8080/socket или wrtc://host/room-id.
 # 2. timeout_secs: (Опционально) Время ожидания подключения в секундах, после которого
 #    нода считается упавшей и клиент переходит к следующей. По умолчанию: 10 секунд.
 # 4. server_pub_key: (Опционально) Переопределение публичного ключа для этого конкретного
@@ -263,26 +263,33 @@ handshake_path = "/handshake"
 auth_path = "/auth"
 traffic_path = "/traffic"
 
-# 1. Первая попытка: Сверхбыстрый и плавный UDP-транспорт (QUIC)
+# 1. Первая попытка: Сверхбыстрый UDP-транспорт ASTP-L (ядерный eBPF XDP/TC Data Plane + Xoroshiro128+)
+# Если порт в DSN не указан (`astpl://127.0.0.1`), по умолчанию используется порт 8444.
+[[servers]]
+name = "GM Primary [ASTP-L]"
+dsn = "astpl://127.0.0.1:8444"
+timeout_secs = 5
+
+# 2. Вторая попытка: Сверхбыстрый и плавный UDP-транспорт (QUIC)
 [[servers]]
 name = "GM Primary [QUIC]"
 dsn = "quic://127.0.0.1:4519"
 timeout_secs = 5 # Ждем максимум 5 секунд, если ТСПУ глушит UDP на старте — идем дальше
 
-# 2. Вторая попытка: Резервный TCP-транспорт (SSH) — пробиваем стандартные блокировки
+# 3. Третья попытка: Резервный TCP-транспорт (SSH) — пробиваем стандартные блокировки
 [[servers]]
 name = "GM Primary [SSH]"
 dsn = "ssh://127.0.0.1:822"
 ssh_user = "hanyuu"
 timeout_secs = 6
 
-# 3. Третья попытка: Маскировка под удаленный рабочий стол (VNC) — для самых жестких условий
+# 4. Четвертая попытка: Маскировка под удаленный рабочий стол (VNC) — для самых жестких условий
 [[servers]]
 name = "GM Primary [VNC]"
 dsn = "vnc://127.0.0.1:56678"
 timeout_secs = 8
 
-# 4. WebSocket: browser-like HTTP Upgrade и плановая ротация сессий.
+# 5. WebSocket: browser-like HTTP Upgrade и плановая ротация сессий.
 [[servers]]
 name = "GM Primary [WS]"
 dsn = "ws://127.0.0.1:8080/socket"
@@ -290,7 +297,7 @@ websocket_min_session_secs = 480
 websocket_max_session_secs = 1500
 timeout_secs = 8
 
-# 5. WebRTC (Ktalk SFU): скрытный транспорт поверх корпоративной ВКС Контур.Толк
+# 6. WebRTC (Ktalk SFU): скрытный транспорт поверх корпоративной ВКС Контур.Толк
 # [[servers]]
 # name = "Ktalk Node [WRTC]"
 # dsn = "wrtc://example.ktalk.ru/example-room-id"
