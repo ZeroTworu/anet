@@ -1,3 +1,4 @@
+use crate::config::WrtcConfig;
 use crate::http_help::BrowserProfile;
 use crate::wrtc::stealth::{apply_reqwest_browser_headers, generate_random_guest_name};
 use rand::Rng;
@@ -40,16 +41,20 @@ pub struct KtalkClient {
 
 impl Default for KtalkClient {
     fn default() -> Self {
-        Self::new(BrowserProfile::random())
+        Self::new(BrowserProfile::random(), &WrtcConfig::default())
     }
 }
 
 impl KtalkClient {
-    pub fn new(profile: BrowserProfile) -> Self {
+    pub fn new(profile: BrowserProfile, wrtc_cfg: &WrtcConfig) -> Self {
         Self {
             http: reqwest::Client::builder()
-                .connect_timeout( std::time::Duration::from_secs(10))
-                .timeout(std::time::Duration::from_secs(15))
+                .connect_timeout(std::time::Duration::from_secs(
+                    wrtc_cfg.http_connect_timeout_secs,
+                ))
+                .timeout(std::time::Duration::from_secs(
+                    wrtc_cfg.http_request_timeout_secs,
+                ))
                 .build()
                 .unwrap_or_default(),
             profile,

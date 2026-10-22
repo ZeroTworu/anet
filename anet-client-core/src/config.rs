@@ -1,4 +1,4 @@
-use anet_common::config::StealthConfig;
+use anet_common::config::{StealthConfig, WrtcConfig};
 use anet_common::quic_settings::QuicConfig;
 use serde::{Deserialize, Serialize};
 
@@ -433,6 +433,9 @@ pub struct CoreConfig {
 
     #[serde(default)]
     pub routing: RoutingConfig,
+
+    #[serde(default)]
+    pub wrtc: WrtcConfig,
 }
 
 impl CoreConfig {

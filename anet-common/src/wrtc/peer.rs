@@ -1,6 +1,18 @@
+use crate::config::WrtcConfig;
+use crate::consts::{
+    TAG_UNTAGGED, VP8_ASTP_PREFIX_LEN, VP8_INTERFRAME_HEADER, VP8_KEYFRAME_1080P_HEADER,
+    VP8_KEYFRAME_HEADER, WRTC_BURST_KEYFRAME_COUNT, WRTC_BURST_KEYFRAME_INTERVAL_MS,
+    WRTC_COLIBRI_CHANNEL_CAPACITY, WRTC_CONSTRAINTS_RETRY_ATTEMPTS,
+    WRTC_CONSTRAINTS_RETRY_INTERVAL_MS, WRTC_DC_SEND_MAX_RETRIES, WRTC_DC_SEND_RETRY_DELAY_MS,
+    WRTC_DEFAULT_MAX_VIDEO_HEIGHT, WRTC_ICE_GATHER_POLL_ATTEMPTS, WRTC_ICE_GATHER_POLL_INTERVAL_MS,
+    WRTC_INITIAL_FORCE_KEYFRAMES, WRTC_KEYFRAME_INTERVAL_MASK, WRTC_OPUS_CHANNELS,
+    WRTC_OPUS_CLOCK_RATE, WRTC_OPUS_PAYLOAD_TYPE, WRTC_OPUS_SILENCE_FRAME,
+    WRTC_P2P_CHANNEL_CAPACITY, WRTC_REASSERT_FORCE_KEYFRAMES, WRTC_VIDEO_CHANNEL_CAPACITY,
+    WRTC_VP8_CLOCK_RATE, WRTC_VP8_FALLBACK_PAYLOAD_TYPE, WRTC_VP8_PRIMARY_PAYLOAD_TYPE,
+    WRTC_VP8_RTP_TS_STEP, WRTC_WS_FALLBACK_CHANNEL_CAPACITY,
+};
 use crate::wrtc::colibri::{
     is_valid_vp8_frame_header, ColibriMessage, ReceiverVideoConstraints, WrtcMessage, WrtcMode,
-    VP8_ASTP_PREFIX_LEN, VP8_INTERFRAME_HEADER, VP8_KEYFRAME_1080P_HEADER, VP8_KEYFRAME_HEADER,
 };
 use crate::wrtc::jingle::{append_remote_video_ssrc_to_sdp, JingleSession};
 use bytes::{BufMut, Bytes, BytesMut};
@@ -35,17 +47,18 @@ use webrtc::runtime::{
     Runtime as WrtcRuntime, TokioRuntime,
 };
 
-const WEBRTC_UDP_SOCKET_BUFFER_SIZE: usize = 4 * 1024 * 1024;
-
 #[derive(Debug)]
-struct TunedTokioRuntime(TokioRuntime);
+struct TunedTokioRuntime {
+    inner: TokioRuntime,
+    udp_socket_buffer_size: usize,
+}
 
 impl WrtcRuntime for TunedTokioRuntime {
     fn spawn(
         &self,
         future: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
     ) -> Box<dyn WrtcJoinHandle> {
-        self.0.spawn(future)
+        self.inner.spawn(future)
     }
 
     fn spawn_reactor(
@@ -53,7 +66,7 @@ impl WrtcRuntime for TunedTokioRuntime {
         reactor_pool_size: usize,
         future: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
     ) -> Box<dyn WrtcJoinHandle> {
-        self.0.spawn_reactor(reactor_pool_size, future)
+        self.inner.spawn_reactor(reactor_pool_size, future)
     }
 
     fn wrap_udp_socket(
@@ -61,8 +74,8 @@ impl WrtcRuntime for TunedTokioRuntime {
         sock: std::net::UdpSocket,
     ) -> std::io::Result<Arc<dyn AsyncUdpSocket>> {
         let sock_ref = socket2::SockRef::from(&sock);
-        let _ = sock_ref.set_recv_buffer_size(WEBRTC_UDP_SOCKET_BUFFER_SIZE);
-        let _ = sock_ref.set_send_buffer_size(WEBRTC_UDP_SOCKET_BUFFER_SIZE);
+        let _ = sock_ref.set_recv_buffer_size(self.udp_socket_buffer_size);
+        let _ = sock_ref.set_send_buffer_size(self.udp_socket_buffer_size);
         if let (Ok(rcv), Ok(snd)) = (sock_ref.recv_buffer_size(), sock_ref.send_buffer_size()) {
             log::info!(
                 "[WRTC UDP] Tuned WebRTC UDP socket buffers: SO_RCVBUF={} KiB, SO_SNDBUF={} KiB",
@@ -70,14 +83,14 @@ impl WrtcRuntime for TunedTokioRuntime {
                 snd / 1024
             );
         }
-        self.0.wrap_udp_socket(sock)
+        self.inner.wrap_udp_socket(sock)
     }
 
     fn wrap_tcp_listener(
         &self,
         listener: std::net::TcpListener,
     ) -> std::io::Result<Arc<dyn AsyncTcpListener>> {
-        self.0.wrap_tcp_listener(listener)
+        self.inner.wrap_tcp_listener(listener)
     }
 
     fn connect_tcp<'a>(
@@ -86,7 +99,7 @@ impl WrtcRuntime for TunedTokioRuntime {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = std::io::Result<Arc<dyn AsyncTcpStream>>> + Send + 'a>,
     > {
-        self.0.connect_tcp(remote_addr)
+        self.inner.connect_tcp(remote_addr)
     }
 
     fn resolve_host<'a>(
@@ -95,36 +108,36 @@ impl WrtcRuntime for TunedTokioRuntime {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = std::io::Result<Vec<std::net::SocketAddr>>> + Send + 'a>,
     > {
-        self.0.resolve_host(host)
+        self.inner.resolve_host(host)
     }
 
     fn now(&self) -> std::time::Instant {
-        self.0.now()
+        self.inner.now()
     }
 
     fn sleep(
         &self,
         duration: Duration,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>> {
-        self.0.sleep(duration)
+        self.inner.sleep(duration)
     }
 
     fn interval(&self, period: Duration) -> Box<dyn AsyncInterval> {
-        self.0.interval(period)
+        self.inner.interval(period)
     }
 
     fn block_on(&self, future: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + '_>>) {
-        self.0.block_on(future)
+        self.inner.block_on(future)
     }
 
     fn yield_now(
         &self,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>> {
-        self.0.yield_now()
+        self.inner.yield_now()
     }
 
     fn name(&self) -> &'static str {
-        self.0.name()
+        self.inner.name()
     }
 }
 
@@ -389,7 +402,10 @@ impl P2pSession {
     }
 }
 
-pub async fn create_p2p_channel(stun_servers: &[String]) -> anyhow::Result<P2pSession> {
+pub async fn create_p2p_channel(
+    stun_servers: &[String],
+    wrtc_cfg: &WrtcConfig,
+) -> anyhow::Result<P2pSession> {
     let mut media_engine = MediaEngine::default();
     let registry = register_default_interceptors(Registry::new(), &mut media_engine)?;
 
@@ -419,13 +435,13 @@ pub async fn create_p2p_channel(stun_servers: &[String]) -> anyhow::Result<P2pSe
 
     let setting_engine = SettingEngineBuilder::new()
         .with_ice_timeouts(
-            Some(Duration::from_secs(10)),
-            Some(Duration::from_secs(25)),
-            Some(Duration::from_millis(2000)),
+            Some(Duration::from_millis(wrtc_cfg.ice_disconnected_timeout_ms)),
+            Some(Duration::from_millis(wrtc_cfg.ice_failed_timeout_ms)),
+            Some(Duration::from_millis(wrtc_cfg.ice_keepalive_interval_ms)),
         )
-        .with_sctp_max_receive_buffer_size(2 * 1024 * 1024)
-        .with_sctp_mtu(1280)
-        .with_receive_mtu(1500)
+        .with_sctp_max_receive_buffer_size(wrtc_cfg.sctp_max_receive_buffer_size)
+        .with_sctp_mtu(wrtc_cfg.sctp_mtu)
+        .with_receive_mtu(wrtc_cfg.receive_mtu)
         .build();
 
     let is_open = Arc::new(AtomicBool::new(false));
@@ -441,9 +457,12 @@ pub async fn create_p2p_channel(stun_servers: &[String]) -> anyhow::Result<P2pSe
         .with_media_engine(media_engine)
         .with_interceptor_registry(registry)
         .with_handler(handler)
-        .with_runtime(Arc::new(TunedTokioRuntime(TokioRuntime)))
+        .with_runtime(Arc::new(TunedTokioRuntime {
+            inner: TokioRuntime,
+            udp_socket_buffer_size: wrtc_cfg.udp_socket_buffer_size,
+        }))
         .with_udp_addrs(vec!["0.0.0.0:0".to_string()])
-        .with_dedicated_reactor_pool_size(4)
+        .with_dedicated_reactor_pool_size(wrtc_cfg.reactor_pool_size.max(1))
         .build()
         .await?;
 
@@ -459,7 +478,7 @@ pub async fn create_p2p_channel(stun_servers: &[String]) -> anyhow::Result<P2pSe
 
     let dc: Arc<dyn DataChannel> = pc.create_data_channel("anet-data", Some(dc_init)).await?;
 
-    let (incoming_tx, incoming_rx) = mpsc::channel::<Bytes>(1024);
+    let (incoming_tx, incoming_rx) = mpsc::channel::<Bytes>(WRTC_P2P_CHANNEL_CAPACITY);
     let in_tx = incoming_tx.clone();
 
     let is_open_c = is_open.clone();
@@ -524,6 +543,9 @@ pub struct WrtcPeer {
     pub video_v2_enabled: Arc<AtomicBool>,
     pub force_keyframe_remaining: Arc<AtomicU32>,
     pub remote_sdp: Mutex<String>,
+    pub watchdog_disconnected_timeout_ms: u64,
+    pub watchdog_channel_grace_secs: u64,
+    pub peer_close_timeout_secs: u64,
 }
 
 impl WrtcPeer {
@@ -534,11 +556,16 @@ impl WrtcPeer {
         fallback_port: u16,
         audio_keepalive_ms: u64,
         mode: WrtcMode,
+        wrtc_cfg: &WrtcConfig,
     ) -> anyhow::Result<Self> {
-        let (incoming_tx, incoming_rx) = mpsc::channel::<ColibriMessage>(16384);
-        let (video_incoming_tx, video_incoming_rx) = mpsc::channel::<Bytes>(32768);
-        let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<ColibriMessage>(16384);
-        let (raw_outgoing_tx, mut raw_outgoing_rx) = mpsc::channel::<String>(16384);
+        let (incoming_tx, incoming_rx) =
+            mpsc::channel::<ColibriMessage>(WRTC_COLIBRI_CHANNEL_CAPACITY);
+        let (video_incoming_tx, video_incoming_rx) =
+            mpsc::channel::<Bytes>(WRTC_VIDEO_CHANNEL_CAPACITY);
+        let (outgoing_tx, mut outgoing_rx) =
+            mpsc::channel::<ColibriMessage>(WRTC_COLIBRI_CHANNEL_CAPACITY);
+        let (raw_outgoing_tx, mut raw_outgoing_rx) =
+            mpsc::channel::<String>(WRTC_COLIBRI_CHANNEL_CAPACITY);
         let (connected_tx, _connected_rx) = mpsc::channel::<()>(1);
         let is_connected = Arc::new(AtomicBool::new(false));
         let is_failed = Arc::new(AtomicBool::new(false));
@@ -550,8 +577,11 @@ impl WrtcPeer {
 
         let local_ssrc = generate_random_ssrc();
         let local_video_ssrc = generate_random_ssrc();
-        let video_pt = session_opt.map(|s| s.video_payload_type).unwrap_or(100);
-        let has_video_flag = session_opt.map(|s| s.has_video).unwrap_or(false) || mode == WrtcMode::MediaVideo;
+        let video_pt = session_opt
+            .map(|s| s.video_payload_type)
+            .unwrap_or(WRTC_VP8_PRIMARY_PAYLOAD_TYPE);
+        let has_video_flag =
+            session_opt.map(|s| s.has_video).unwrap_or(false) || mode == WrtcMode::MediaVideo;
         let video_seq = Arc::new(AtomicU16::new(0));
         let video_ts = Arc::new(AtomicU32::new(0));
         let expected_peer_video_ssrc = Arc::new(AtomicU32::new(0));
@@ -559,10 +589,11 @@ impl WrtcPeer {
         let start_instant = std::time::Instant::now();
         let last_video_tx_ms = Arc::new(AtomicU64::new(0));
         let video_v2_enabled = Arc::new(AtomicBool::new(false));
-        let force_keyframe_remaining = Arc::new(AtomicU32::new(8));
+        let force_keyframe_remaining = Arc::new(AtomicU32::new(WRTC_INITIAL_FORCE_KEYFRAMES));
         let mut initial_remote_sdp = String::new();
 
-        let (ws_fallback_tx, mut ws_fallback_rx) = mpsc::channel::<String>(8192);
+        let (ws_fallback_tx, mut ws_fallback_rx) =
+            mpsc::channel::<String>(WRTC_WS_FALLBACK_CHANNEL_CAPACITY);
         let has_ws = Arc::new(AtomicBool::new(false));
 
         if let Some(session) = session_opt {
@@ -573,9 +604,11 @@ impl WrtcPeer {
                 let dc_open_ws = dc_is_open.clone();
                 let is_failed_ws = is_failed.clone();
                 let failed_notify_ws = failed_notify.clone();
+                let colibri_connect_timeout = wrtc_cfg.colibri_ws_connect_timeout_secs.max(1);
+                let ws_write_timeout = wrtc_cfg.ws_write_timeout_secs.max(1);
                 tokio::spawn(async move {
                     let connect_res = tokio::time::timeout(
-                        Duration::from_secs(10),
+                        Duration::from_secs(colibri_connect_timeout),
                         tokio_tungstenite::connect_async(&ws_url_c),
                     )
                     .await;
@@ -585,11 +618,14 @@ impl WrtcPeer {
                         let (mut ws_sink, mut ws_stream) = ws_stream.split();
 
                         if has_video_flag {
-                            let constraints = ReceiverVideoConstraints::new_all(2160);
+                            let constraints =
+                                ReceiverVideoConstraints::new_all(WRTC_DEFAULT_MAX_VIDEO_HEIGHT);
                             if let Ok(json) = serde_json::to_string(&constraints) {
                                 let _ = tokio::time::timeout(
-                                    Duration::from_secs(5),
-                                    ws_sink.send(tokio_tungstenite::tungstenite::Message::Text(json.into())),
+                                    Duration::from_secs(ws_write_timeout),
+                                    ws_sink.send(
+                                        tokio_tungstenite::tungstenite::Message::Text(json.into()),
+                                    ),
                                 )
                                 .await;
                             }
@@ -635,8 +671,10 @@ impl WrtcPeer {
 
                         while let Some(json_text) = ws_fallback_rx.recv().await {
                             let send_res = tokio::time::timeout(
-                                Duration::from_secs(5),
-                                ws_sink.send(tokio_tungstenite::tungstenite::Message::Text(json_text.into())),
+                                Duration::from_secs(ws_write_timeout),
+                                ws_sink.send(
+                                    tokio_tungstenite::tungstenite::Message::Text(json_text.into()),
+                                ),
                             )
                             .await;
                             if send_res.map_or(true, |r| r.is_err()) {
@@ -674,12 +712,12 @@ impl WrtcPeer {
             let audio_codec = RTCRtpCodecParameters {
                 rtp_codec: RTCRtpCodec {
                     mime_type: MIME_TYPE_OPUS.to_owned(),
-                    clock_rate: 48000,
-                    channels: 2,
+                    clock_rate: WRTC_OPUS_CLOCK_RATE,
+                    channels: WRTC_OPUS_CHANNELS,
                     sdp_fmtp_line: "".to_owned(),
                     rtcp_feedback: vec![],
                 },
-                payload_type: 111,
+                payload_type: WRTC_OPUS_PAYLOAD_TYPE,
                 ..Default::default()
             };
             media_engine.register_codec(audio_codec.clone(), RtpCodecKind::Audio)?;
@@ -687,7 +725,7 @@ impl WrtcPeer {
             let video_codec = RTCRtpCodecParameters {
                 rtp_codec: RTCRtpCodec {
                     mime_type: MIME_TYPE_VP8.to_owned(),
-                    clock_rate: 90000,
+                    clock_rate: WRTC_VP8_CLOCK_RATE,
                     channels: 0,
                     sdp_fmtp_line: "".to_owned(),
                     rtcp_feedback: vec![],
@@ -697,14 +735,14 @@ impl WrtcPeer {
             };
             media_engine.register_codec(video_codec.clone(), RtpCodecKind::Video)?;
 
-            if video_pt != 96 {
+            if video_pt != WRTC_VP8_FALLBACK_PAYLOAD_TYPE {
                 let mut fallback_vcodec = video_codec.clone();
-                fallback_vcodec.payload_type = 96;
+                fallback_vcodec.payload_type = WRTC_VP8_FALLBACK_PAYLOAD_TYPE;
                 let _ = media_engine.register_codec(fallback_vcodec, RtpCodecKind::Video);
             }
-            if video_pt != 100 {
+            if video_pt != WRTC_VP8_PRIMARY_PAYLOAD_TYPE {
                 let mut fallback_vcodec2 = video_codec.clone();
-                fallback_vcodec2.payload_type = 100;
+                fallback_vcodec2.payload_type = WRTC_VP8_PRIMARY_PAYLOAD_TYPE;
                 let _ = media_engine.register_codec(fallback_vcodec2, RtpCodecKind::Video);
             }
 
@@ -722,13 +760,13 @@ impl WrtcPeer {
             let setting_engine = SettingEngineBuilder::new()
                 .with_answering_dtls_role(RTCDtlsRole::Client)
                 .with_ice_timeouts(
-                    Some(Duration::from_secs(10)),
-                    Some(Duration::from_secs(25)),
-                    Some(Duration::from_millis(2000)),
+                    Some(Duration::from_millis(wrtc_cfg.ice_disconnected_timeout_ms)),
+                    Some(Duration::from_millis(wrtc_cfg.ice_failed_timeout_ms)),
+                    Some(Duration::from_millis(wrtc_cfg.ice_keepalive_interval_ms)),
                 )
-                .with_sctp_max_receive_buffer_size(4 * 1024 * 1024)
-                .with_sctp_mtu(1280)
-                .with_receive_mtu(1600)
+                .with_sctp_max_receive_buffer_size(wrtc_cfg.sctp_max_receive_buffer_size)
+                .with_sctp_mtu(wrtc_cfg.sctp_mtu)
+                .with_receive_mtu(wrtc_cfg.receive_mtu)
                 .build();
 
             let remote_dc: Arc<Mutex<Option<Arc<dyn DataChannel>>>> = Arc::new(Mutex::new(None));
@@ -757,9 +795,12 @@ impl WrtcPeer {
                 .with_media_engine(media_engine)
                 .with_interceptor_registry(registry)
                 .with_handler(handler)
-                .with_runtime(Arc::new(TunedTokioRuntime(TokioRuntime)))
+                .with_runtime(Arc::new(TunedTokioRuntime {
+                    inner: TokioRuntime,
+                    udp_socket_buffer_size: wrtc_cfg.udp_socket_buffer_size,
+                }))
                 .with_udp_addrs(vec![bind_addr])
-                .with_dedicated_reactor_pool_size(4)
+                .with_dedicated_reactor_pool_size(wrtc_cfg.reactor_pool_size.max(1))
                 .build()
                 .await;
 
@@ -828,7 +869,9 @@ impl WrtcPeer {
                                             dc_is_open_in.store(true, Ordering::SeqCst);
                                             dc_open_notify_in.notify_waiters();
                                             if has_video_flag {
-                                                let constraints = ReceiverVideoConstraints::new_all(2160);
+                                                let constraints = ReceiverVideoConstraints::new_all(
+                                                    WRTC_DEFAULT_MAX_VIDEO_HEIGHT,
+                                                );
                                                 if let Ok(json) = serde_json::to_string(&constraints) {
                                                     let _ = dc_in.send_text(&json).await;
                                                 }
@@ -873,14 +916,17 @@ impl WrtcPeer {
                             let _ = pc.set_local_description(answer.clone()).await;
 
                             let mut final_sdp = answer.sdp.clone();
-                            for _ in 0..50 {
+                            for _ in 0..WRTC_ICE_GATHER_POLL_ATTEMPTS {
                                 if let Some(desc) = pc.local_description().await {
                                     if desc.sdp.contains("a=candidate:") {
                                         final_sdp = desc.sdp;
                                         break;
                                     }
                                 }
-                                tokio::time::sleep(Duration::from_millis(30)).await;
+                                tokio::time::sleep(Duration::from_millis(
+                                    WRTC_ICE_GATHER_POLL_INTERVAL_MS,
+                                ))
+                                .await;
                             }
 
                             let local_params = crate::wrtc::jingle::parse_sdp_answer(&final_sdp);
@@ -961,7 +1007,7 @@ impl WrtcPeer {
                                     log::info!("[JVB DC OUT]: {json_str}");
                                 }
 
-                                for attempt in 0..3 {
+                                for attempt in 0..WRTC_DC_SEND_MAX_RETRIES {
                                     match dc_out.send_text(&json_str).await {
                                         Ok(_) => {
                                             sent = true;
@@ -975,8 +1021,11 @@ impl WrtcPeer {
                                                     break;
                                                 }
                                             }
-                                            if attempt < 2 {
-                                                tokio::time::sleep(Duration::from_millis(10)).await;
+                                            if attempt + 1 < WRTC_DC_SEND_MAX_RETRIES {
+                                                tokio::time::sleep(Duration::from_millis(
+                                                    WRTC_DC_SEND_RETRY_DELAY_MS,
+                                                ))
+                                                .await;
                                             }
                                         }
                                     }
@@ -1012,8 +1061,11 @@ impl WrtcPeer {
                             let ws_fallback_tx_bg = ws_fallback_tx_out.clone();
                             let json_str_bg = json_str.clone();
                             tokio::spawn(async move {
-                                for _ in 0..30 {
-                                    tokio::time::sleep(Duration::from_millis(100)).await;
+                                for _ in 0..WRTC_CONSTRAINTS_RETRY_ATTEMPTS {
+                                    tokio::time::sleep(Duration::from_millis(
+                                        WRTC_CONSTRAINTS_RETRY_INTERVAL_MS,
+                                    ))
+                                    .await;
                                     if dc_is_open_bg.load(Ordering::SeqCst) {
                                         if let Some(ref dc_out) = dc_opt_bg {
                                             if dc_out.send_text(&json_str_bg).await.is_ok() {
@@ -1049,13 +1101,15 @@ impl WrtcPeer {
                 } else {
                     20
                 };
-                let samples_per_packet = (48000 * interval_ms / 1000) as u32;
+                let samples_per_packet =
+                    (u64::from(WRTC_OPUS_CLOCK_RATE) * interval_ms / 1000) as u32;
                 let is_connected_a = Arc::clone(&is_connected);
+                let ice_failed_wait_ms = wrtc_cfg.ice_failed_timeout_ms;
 
                 tokio::spawn(async move {
                     let start = std::time::Instant::now();
                     while !is_connected_a.load(Ordering::SeqCst) {
-                        if start.elapsed() > Duration::from_secs(25) {
+                        if start.elapsed() > Duration::from_millis(ice_failed_wait_ms) {
                             return;
                         }
                         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1066,7 +1120,7 @@ impl WrtcPeer {
                     );
                     let mut interval = tokio::time::interval(Duration::from_millis(interval_ms));
                     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                    let silence_payload = Bytes::from_static(&[0xf8, 0xff, 0xfe]);
+                    let silence_payload = Bytes::from_static(&WRTC_OPUS_SILENCE_FRAME);
                     loop {
                         interval.tick().await;
                         let seq = seq_c.fetch_add(1, Ordering::Relaxed);
@@ -1077,7 +1131,7 @@ impl WrtcPeer {
                                 padding: false,
                                 extension: false,
                                 marker: false,
-                                payload_type: 111,
+                                payload_type: WRTC_OPUS_PAYLOAD_TYPE,
                                 sequence_number: seq,
                                 timestamp: ts,
                                 ssrc: local_ssrc,
@@ -1103,22 +1157,30 @@ impl WrtcPeer {
                 let v_pt = video_pt;
                 let v_ssrc = local_video_ssrc;
                 let is_connected_v = Arc::clone(&is_connected);
+                let video_keepalive_ms = wrtc_cfg.video_keepalive_interval_ms.max(100);
+                let video_idle_suppress_ms = (video_keepalive_ms * 4) / 5;
                 tokio::spawn(async move {
                     let start = std::time::Instant::now();
                     while !is_connected_v.load(Ordering::SeqCst) {
-                        if start.elapsed() > Duration::from_secs(25) {
+                        if start.elapsed() > Duration::from_millis(ice_failed_wait_ms) {
                             return;
                         }
                         tokio::time::sleep(Duration::from_millis(50)).await;
                     }
-                    log::info!("[WRTC Media] Starting VP8 video keepalive (interval: 1000ms)");
-                    let mut interval = tokio::time::interval(Duration::from_millis(1000));
+                    log::info!(
+                        "[WRTC Media] Starting VP8 video keepalive (interval: {}ms)",
+                        video_keepalive_ms
+                    );
+                    let mut interval =
+                        tokio::time::interval(Duration::from_millis(video_keepalive_ms));
                     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
                     loop {
                         interval.tick().await;
                         let elapsed_ms = start_instant_c.elapsed().as_millis() as u64;
-                        if elapsed_ms.saturating_sub(last_video_tx_c.load(Ordering::Relaxed)) < 800 {
+                        if elapsed_ms.saturating_sub(last_video_tx_c.load(Ordering::Relaxed))
+                            < video_idle_suppress_ms
+                        {
                             // Не инжектируем пустые кадры посреди активного потока данных
                             continue;
                         }
@@ -1127,7 +1189,7 @@ impl WrtcPeer {
                         let seq = (frame_num & 0xFFFF) as u16;
                         video_seq_c.store(seq.wrapping_add(1), Ordering::Relaxed);
                         let pic_id = (frame_num & 0x7FFF) as u16;
-                        let ts = frame_num.wrapping_mul(300);
+                        let ts = frame_num.wrapping_mul(WRTC_VP8_RTP_TS_STEP);
 
                         let mut keepalive_payload = BytesMut::with_capacity(4 + VP8_KEYFRAME_HEADER.len());
 
@@ -1199,6 +1261,12 @@ impl WrtcPeer {
             video_v2_enabled,
             force_keyframe_remaining,
             remote_sdp: Mutex::new(initial_remote_sdp),
+            watchdog_disconnected_timeout_ms: wrtc_cfg
+                .watchdog_disconnected_timeout_secs
+                .saturating_mul(1000)
+                .max(1000),
+            watchdog_channel_grace_secs: wrtc_cfg.watchdog_channel_grace_secs.max(1),
+            peer_close_timeout_secs: wrtc_cfg.peer_close_timeout_secs.max(1),
         })
     }
 
@@ -1209,11 +1277,11 @@ impl WrtcPeer {
         let disc_ms = self.disconnected_at_ms.load(Ordering::SeqCst);
         if disc_ms > 0 {
             let now_ms = self.start_instant.elapsed().as_millis() as u64;
-            if now_ms.saturating_sub(disc_ms) >= 8_000 {
-                return Some("PeerConnection remained Disconnected for >= 8s");
+            if now_ms.saturating_sub(disc_ms) >= self.watchdog_disconnected_timeout_ms {
+                return Some("PeerConnection remained Disconnected past watchdog timeout");
             }
         }
-        if self.start_instant.elapsed() > Duration::from_secs(12)
+        if self.start_instant.elapsed() > Duration::from_secs(self.watchdog_channel_grace_secs)
             && !self.has_ws.load(Ordering::SeqCst)
             && !self.dc_is_open.load(Ordering::SeqCst)
         {
@@ -1231,7 +1299,8 @@ impl WrtcPeer {
     }
 
     pub fn force_next_keyframe(&self) {
-        self.force_keyframe_remaining.store(16, Ordering::Relaxed);
+        self.force_keyframe_remaining
+            .store(WRTC_REASSERT_FORCE_KEYFRAMES, Ordering::Relaxed);
         if let Some(ref track) = self.video_track {
             let track_c = Arc::clone(track);
             let video_seq_c = Arc::clone(&self.video_seq);
@@ -1240,12 +1309,12 @@ impl WrtcPeer {
             let v_pt = self.video_payload_type;
             let v_ssrc = self.video_ssrc;
             tokio::spawn(async move {
-                for _ in 0..4 {
+                for _ in 0..WRTC_BURST_KEYFRAME_COUNT {
                     let frame_num = video_ts_c.fetch_add(1, Ordering::Relaxed);
                     let seq = (frame_num & 0xFFFF) as u16;
                     video_seq_c.store(seq.wrapping_add(1), Ordering::Relaxed);
                     let pic_id = (frame_num & 0x7FFF) as u16;
-                    let ts = frame_num.wrapping_mul(300);
+                    let ts = frame_num.wrapping_mul(WRTC_VP8_RTP_TS_STEP);
 
                     let mut keepalive_payload = BytesMut::with_capacity(4 + VP8_KEYFRAME_HEADER.len());
                     keepalive_payload.put_u8(0x90);
@@ -1276,7 +1345,7 @@ impl WrtcPeer {
                         payload: keepalive_payload.freeze(),
                     };
                     let _ = track_c.write_rtp(rtp_packet).await;
-                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    tokio::time::sleep(Duration::from_millis(WRTC_BURST_KEYFRAME_INTERVAL_MS)).await;
                 }
             });
         }
@@ -1364,7 +1433,7 @@ impl WrtcPeer {
     }
 
     pub async fn send_video_frame(&self, astp_data: &[u8]) -> anyhow::Result<()> {
-        self.send_video_frame_tagged(crate::wrtc::colibri::TAG_UNTAGGED, astp_data).await
+        self.send_video_frame_tagged(TAG_UNTAGGED, astp_data).await
     }
 
     pub async fn send_video_frame_tagged(&self, client_tag: u16, astp_data: &[u8]) -> anyhow::Result<()> {
@@ -1406,7 +1475,7 @@ impl WrtcPeer {
         let seq = (frame_num & 0xFFFF) as u16;
         self.video_seq.store(seq.wrapping_add(1), Ordering::Relaxed);
         let pic_id = (frame_num & 0x7FFF) as u16;
-        let ts = frame_num.wrapping_mul(300);
+        let ts = frame_num.wrapping_mul(WRTC_VP8_RTP_TS_STEP);
 
         let elapsed_ms = self.start_instant.elapsed().as_millis() as u64;
         self.last_video_tx_ms.store(elapsed_ms, Ordering::Relaxed);
@@ -1423,7 +1492,7 @@ impl WrtcPeer {
             .is_ok();
 
         let vp8_hdr = if self.video_v2_enabled.load(Ordering::Relaxed) {
-            if force_kf || (frame_num & 31) == 0 {
+            if force_kf || (frame_num & WRTC_KEYFRAME_INTERVAL_MASK) == 0 {
                 &VP8_KEYFRAME_1080P_HEADER
             } else {
                 &VP8_INTERFRAME_HEADER
@@ -1499,8 +1568,9 @@ impl WrtcPeer {
     }
 
     pub async fn close(&self) -> anyhow::Result<()> {
+        let close_secs = self.peer_close_timeout_secs;
         if let Some(ref pc) = self.peer_connection {
-            let _ = tokio::time::timeout(Duration::from_secs(3), pc.close()).await;
+            let _ = tokio::time::timeout(Duration::from_secs(close_secs), pc.close()).await;
         }
         Ok(())
     }
@@ -1508,9 +1578,10 @@ impl WrtcPeer {
 
 impl Drop for WrtcPeer {
     fn drop(&mut self) {
+        let close_secs = self.peer_close_timeout_secs;
         if let Some(pc) = self.peer_connection.take() {
             tokio::spawn(async move {
-                let _ = tokio::time::timeout(Duration::from_secs(3), pc.close()).await;
+                let _ = tokio::time::timeout(Duration::from_secs(close_secs), pc.close()).await;
             });
         }
     }

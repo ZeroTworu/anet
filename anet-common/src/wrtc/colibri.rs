@@ -1,52 +1,8 @@
+use crate::consts::{TAG_UNTAGGED, VP8_HEADER_TAIL_MAGIC};
 use anyhow::Context;
 use base64::prelude::*;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
-
-/// Минимальный валидный заголовок ключевого кадра VP8 (20 байт, 16x16, legacy).
-/// Позволяет мосту JVB / SFU успешно валидировать битовый поток VP8
-/// и форвардить пакеты подписчикам без отсечения по decode-timeout.
-pub const VP8_KEYFRAME_HEADER: [u8; 20] = [
-    0x30, 0x01, 0x00, 0x9d, 0x01, 0x2a, 0x10, 0x00,
-    0x10, 0x00, 0x00, 0x47, 0x08, 0x85, 0x85, 0x88,
-    0x99, 0x84, 0x88, 0xfc,
-];
-
-/// Валидный заголовок ключевого кадра VP8 с разрешением 1920x1080 (FullHD, 20 байт).
-/// Исключает занижение целевого битрейта в BitrateController JVB из-за 16x16 разрешения.
-pub const VP8_KEYFRAME_1080P_HEADER: [u8; 20] = [
-    0x30, 0x01, 0x00, 0x9d, 0x01, 0x2a, 0x80, 0x07,
-    0x38, 0x04, 0x00, 0x47, 0x08, 0x85, 0x85, 0x88,
-    0x99, 0x84, 0x88, 0xfc,
-];
-
-/// Валидный заголовок межкадрового пакета VP8 (P-frame / Interframe, bit 0 = 1, 20 байт).
-/// Предотвращает сброс Vp8FrameMap и пересоздание контекста проекции на каждом пакете в SFU JVB.
-pub const VP8_INTERFRAME_HEADER: [u8; 20] = [
-    0x31, 0x01, 0x00, 0x9d, 0x01, 0x2a, 0x80, 0x07,
-    0x38, 0x04, 0x00, 0x47, 0x08, 0x85, 0x85, 0x88,
-    0x99, 0x84, 0x88, 0xfc,
-];
-
-/// Общая 10-байтная сигнатура хвоста заголовка ANet VP8 (байты 10..20).
-pub const VP8_HEADER_TAIL_MAGIC: [u8; 10] = [
-    0x00, 0x47, 0x08, 0x85, 0x85, 0x88, 0x99, 0x84, 0x88, 0xfc,
-];
-
-/// Маркер микро-батча нескольких IP-пакетов внутри одного VP8 RTP кадра.
-/// Любой валидный IPv4 (0x4x) или IPv6 (0x6x) пакет гарантированно не начинается с 0x00.
-pub const VIDEO_BATCH_MARKER: u8 = 0x00;
-
-/// Максимальный размер полезной нагрузки микро-батча для одного VP8 RTP пакета (без фрагментации UDP MTU 1500).
-pub const MAX_VIDEO_BATCH_BYTES: usize = 1300;
-
-/// Дополнительный оверхед инкапсуляции WebRTC Video поверх обычного туннеля (в байтах):
-/// 4B (VP8 Payload Descriptor) + 20B (VP8 Frame Header) + 2B (Client Tag) + ~34B (RTP Header + Extensions + SRTP Tag) = 60 байт.
-pub const WRTC_VIDEO_MTU_OVERHEAD: u16 = 60;
-
-/// Размер префикса VP8 + Client Tag перед зашифрованным ASTP-кадром в RTP-пакете:
-/// 4B (VP8 Payload Descriptor) + 20B (VP8 Frame Header) + 2B (Client Tag) = 26 байт.
-pub const VP8_ASTP_PREFIX_LEN: usize = 4 + VP8_KEYFRAME_HEADER.len() + 2;
 
 /// Проверяет, начинается ли полезная нагрузка VP8 с валидного заголовка ANet (Keyframe 16p/1080p или Interframe).
 #[inline]
@@ -56,9 +12,6 @@ pub fn is_valid_vp8_frame_header(data: &[u8]) -> bool {
         && data[1..6] == [0x01, 0x00, 0x9d, 0x01, 0x2a]
         && data[10..20] == VP8_HEADER_TAIL_MAGIC
 }
-
-/// Зарезервированный тег для широковещательных или нетегированных кадров
-pub const TAG_UNTAGGED: u16 = 0x0000;
 
 /// Вычисляет уникальный 2-байтный тег клиента из строки с IPv4-адресом.
 /// Для подсетей /16–/24 младшие два байта гарантируют уникальность каждого клиента в пуле.

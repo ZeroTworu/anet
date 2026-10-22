@@ -1,6 +1,7 @@
-use serde::Deserialize;
+use crate::consts::WRTC_VIDEO_MTU_OVERHEAD;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct StealthConfig {
     /// Минимальная задержка джиттера (наносекунды)
@@ -31,3 +32,88 @@ impl Default for StealthConfig {
         }
     }
 }
+
+/// Тонкие настройки транспорта WebRTC (секции `[wrtc]` в `client.toml` и `server.toml`).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct WrtcConfig {
+    /// Таймаут установки TCP/TLS-соединения к HTTP API Контур.Толк (в секундах).
+    pub http_connect_timeout_secs: u64,
+    /// Общий таймаут выполнения HTTP-запросов авторизации и резолва комнаты (в секундах).
+    pub http_request_timeout_secs: u64,
+    /// Таймаут подключения и MUC-хендшейка сигналинга XMPP WebSocket (в секундах).
+    pub xmpp_handshake_timeout_secs: u64,
+    /// Таймаут отправки одного фрейма в WebSocket для Colibri-WS и XMPP-WS (в секундах).
+    pub ws_write_timeout_secs: u64,
+    /// Таймаут установки параллельного канала Colibri WebSocket до медиасервера JVB (в секундах).
+    pub colibri_ws_connect_timeout_secs: u64,
+
+    /// Размер системных буферов приёма и отправки (`SO_RCVBUF` / `SO_SNDBUF`) UDP-сокета WebRTC (в байтах).
+    pub udp_socket_buffer_size: usize,
+    /// Количество потоков выделенного реактора обработки пакетов `webrtc-rs`.
+    pub reactor_pool_size: usize,
+
+    /// Таймаут перехода ICE-агента в состояние `Disconnected` при отсутствии пакетов (в миллисекундах).
+    pub ice_disconnected_timeout_ms: u64,
+    /// Таймаут окончательного разрыва ICE-соединения `Failed` (в миллисекундах).
+    pub ice_failed_timeout_ms: u64,
+    /// Интервал отправки STUN Consent Freshness / ICE keepalive запросов (в миллисекундах).
+    pub ice_keepalive_interval_ms: u64,
+
+    /// Максимальный размер буфера приёма SCTP DataChannel (в байтах).
+    pub sctp_max_receive_buffer_size: u32,
+    /// MTU для SCTP-фреймов внутри DTLS (в байтах).
+    pub sctp_mtu: usize,
+    /// Максимальный размер буфера приёма входящих UDP/RTP-пакетов в движке WebRTC (в байтах).
+    pub receive_mtu: usize,
+
+    /// Суммарный сетевой оверхед инкапсуляции `media_video` (IPv4 + UDP + SRTP + RTP + VP8 + Tag + ASTP, в байтах),
+    /// вычитаемый из MTU сервера для предотвращения фрагментации и дропов на пограничных каналах с PMTU 1400.
+    pub video_mtu_overhead: u16,
+    /// Интервал отправки фоновых пустых ключевых кадров VP8 во время простоя туннеля (в миллисекундах).
+    pub video_keepalive_interval_ms: u64,
+
+    /// Время нахождения PeerConnection в состоянии `Disconnected` (в секундах),
+    /// после которого сторожевой таймер принудительно пересоздаёт сессию.
+    pub watchdog_disconnected_timeout_secs: u64,
+    /// Льготный период на старте сессии (в секундах) для открытия хотя бы одного сигнального канала (DataChannel или Colibri-WS).
+    pub watchdog_channel_grace_secs: u64,
+    /// Таймаут корректного закрытия `PeerConnection` при завершении сессии (в секундах).
+    pub peer_close_timeout_secs: u64,
+
+    /// Интервал отправки внутритуннельных `anet_ping` сообщений от клиента к серверу (в секундах).
+    pub tunnel_ping_interval_secs: u64,
+    /// Таймаут ожидания `anet_pong` от сервера до разрыва и переподключения клиента (в секундах).
+    pub tunnel_ping_timeout_secs: u64,
+    /// Время ожидания клиентов в пустой комнате Контур.Толк на сервере до плановой ротации сессии (в секундах).
+    pub server_idle_room_rotation_secs: u64,
+}
+
+impl Default for WrtcConfig {
+    fn default() -> Self {
+        Self {
+            http_connect_timeout_secs: 10,
+            http_request_timeout_secs: 15,
+            xmpp_handshake_timeout_secs: 15,
+            ws_write_timeout_secs: 5,
+            colibri_ws_connect_timeout_secs: 10,
+            udp_socket_buffer_size: 4 * 1024 * 1024,
+            reactor_pool_size: 4,
+            ice_disconnected_timeout_ms: 10_000,
+            ice_failed_timeout_ms: 25_000,
+            ice_keepalive_interval_ms: 2_000,
+            sctp_max_receive_buffer_size: 4 * 1024 * 1024,
+            sctp_mtu: 1280,
+            receive_mtu: 1600,
+            video_mtu_overhead: WRTC_VIDEO_MTU_OVERHEAD,
+            video_keepalive_interval_ms: 1000,
+            watchdog_disconnected_timeout_secs: 8,
+            watchdog_channel_grace_secs: 12,
+            peer_close_timeout_secs: 3,
+            tunnel_ping_interval_secs: 15,
+            tunnel_ping_timeout_secs: 45,
+            server_idle_room_rotation_secs: 1800,
+        }
+    }
+}
+

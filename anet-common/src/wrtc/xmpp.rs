@@ -1,3 +1,5 @@
+use crate::config::WrtcConfig;
+use crate::consts::{WRTC_XMPP_CHANNEL_CAPACITY, WRTC_XMPP_RAW_WS_CHANNEL_CAPACITY};
 use crate::http_help::BrowserProfile;
 use crate::wrtc::stealth::{apply_ws_browser_headers, generate_random_guest_name};
 use crate::wrtc::xmpp_xml::{escape_xml_attr, parse_xmpp_stanzas, InboundXmpp, XmppBuilder};
@@ -55,6 +57,7 @@ impl XmppSession {
         client_name_opt: Option<&str>,
         profile: &BrowserProfile,
         ping_interval_secs: u64,
+        wrtc_cfg: &WrtcConfig,
     ) -> anyhow::Result<Self> {
         let ws_url = format!(
             "wss://{domain}/jitsi/xmpp-websocket?room={conference_id}&sessionToken={session_token}"
@@ -70,12 +73,18 @@ impl XmppSession {
 
         apply_ws_browser_headers(&mut request, profile, &origin)?;
 
+        let handshake_timeout_secs = wrtc_cfg.xmpp_handshake_timeout_secs.max(1);
         let (ws_stream, response) = tokio::time::timeout(
-            Duration::from_secs(15),
+            Duration::from_secs(handshake_timeout_secs),
             tokio_tungstenite::connect_async(request),
         )
         .await
-        .map_err(|_| anyhow::anyhow!("XMPP WebSocket TCP/TLS connect timed out after 15s"))??;
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "XMPP WebSocket TCP/TLS connect timed out after {}s",
+                handshake_timeout_secs
+            )
+        })??;
         log::info!("[XMPP] WebSocket connected (HTTP status: {:?})", response.status());
 
         let (mut ws_sink, mut ws_stream) = ws_stream.split();
@@ -97,7 +106,7 @@ impl XmppSession {
             _ => generate_random_guest_name(),
         };
 
-        let timeout = Duration::from_secs(15);
+        let timeout = Duration::from_secs(handshake_timeout_secs);
         let occ_track = occupants.clone();
         let my_ep = endpoint_id.clone();
         let conf_muc = format!("{conference_id}@muc.meet.jitsi/");
@@ -194,19 +203,21 @@ impl XmppSession {
 
         tokio::time::timeout(timeout, handshake_fut)
             .await
-            .map_err(|_| anyhow::anyhow!("XMPP MUC handshake timed out after 15s"))??;
+            .map_err(|_| {
+                anyhow::anyhow!("XMPP MUC handshake timed out after {}s", handshake_timeout_secs)
+            })??;
 
-        let (write_tx, mut write_rx) = mpsc::channel::<String>(128);
-        let (read_tx, read_rx) = mpsc::channel::<String>(128);
-        let (raw_ws_tx, mut raw_ws_rx) = mpsc::channel::<Message>(32);
+        let (write_tx, mut write_rx) = mpsc::channel::<String>(WRTC_XMPP_CHANNEL_CAPACITY);
+        let (read_tx, read_rx) = mpsc::channel::<String>(WRTC_XMPP_CHANNEL_CAPACITY);
+        let (raw_ws_tx, mut raw_ws_rx) = mpsc::channel::<Message>(WRTC_XMPP_RAW_WS_CHANNEL_CAPACITY);
 
         let ping_secs = if ping_interval_secs > 0 {
             ping_interval_secs.clamp(5, 25)
         } else {
             20
         };
-        let read_timeout_dur = Duration::from_secs(ping_secs * 2 + 15);
-        let write_timeout_dur = Duration::from_secs(10);
+        let read_timeout_dur = Duration::from_secs(ping_secs * 2 + handshake_timeout_secs);
+        let write_timeout_dur = Duration::from_secs(wrtc_cfg.ws_write_timeout_secs.max(1));
 
         let writer_handle = tokio::spawn(async move {
             let mut ping_interval = tokio::time::interval(Duration::from_secs(ping_secs));

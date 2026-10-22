@@ -129,3 +129,36 @@ keep_alive_interval_seconds = 20
 # Автоматическое обновление скомпилированного кэша правил Smart DNS & AdBlock (rules.abc)
 rules_url = "{{RULES_URL}}"
 
+[wrtc]
+# Тайм-ауты сигнализации KTalk HTTP API и XMPP/Colibri WebSocket (в секундах)
+http_connect_timeout_secs = 10
+http_request_timeout_secs = 15
+xmpp_handshake_timeout_secs = 15
+ws_write_timeout_secs = 5
+colibri_ws_connect_timeout_secs = 10
+
+# Системные буферы UDP-сокета (4 MB) и пул потоков реактора WebRTC
+udp_socket_buffer_size = 4194304
+reactor_pool_size = 4
+
+# Тайм-ауты проверки связности ICE (в миллисекундах)
+ice_disconnected_timeout_ms = 10000
+ice_failed_timeout_ms = 25000
+ice_keepalive_interval_ms = 2000
+
+# Параметры буферов и MTU для SCTP (DataChannel) и RTP-приемника
+sctp_max_receive_buffer_size = 4194304
+sctp_mtu = 1280
+receive_mtu = 1600
+
+# Запас MTU под заголовки IPv4+UDP+SRTP+RTP+VP8+ASTP (110 байт) и интервал VP8 keep-alive (мс)
+video_mtu_overhead = 110
+video_keepalive_interval_ms = 1000
+
+# Сторожевые таймеры (watchdog) контроля состояния WebRTC и внутритуннельного тракта (в секундах)
+watchdog_disconnected_timeout_secs = 8
+watchdog_channel_grace_secs = 12
+peer_close_timeout_secs = 3
+tunnel_ping_interval_secs = 15
+tunnel_ping_timeout_secs = 45
+server_idle_room_rotation_secs = 1800

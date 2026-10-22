@@ -1,4 +1,4 @@
-use anet_common::config::StealthConfig;
+use anet_common::config::{StealthConfig, WrtcConfig};
 use anet_common::quic_settings::QuicConfig;
 use clap::Parser;
 use log::warn;
@@ -241,6 +241,9 @@ pub struct Config {
 
     #[serde(default)]
     pub ahttp: AhttpServerConfig,
+
+    #[serde(default)]
+    pub wrtc: WrtcConfig,
 }
 
 #[derive(Debug, Parser)]

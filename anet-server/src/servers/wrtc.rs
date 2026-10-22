@@ -1,16 +1,22 @@
 use crate::auth_handler::ServerAuthHandler;
 use crate::client_registry::{ClientRegistry, ClientTransportInfo};
 use crate::config::Config;
+use anet_common::consts::{
+    MAX_PACKET_SIZE, MAX_VIDEO_BATCH_BYTES, VIDEO_BATCH_MARKER, VP8_ASTP_PREFIX_LEN,
+    WRTC_BATCHER_MAX_BYTES, WRTC_BATCHER_MAX_DELAY_MS, WRTC_COLIBRI_CHANNEL_CAPACITY,
+    WRTC_DEFAULT_MAX_VIDEO_HEIGHT, WRTC_HANDSHAKE_PROCESS_TIMEOUT_SECS,
+    WRTC_ICE_GATHER_POLL_ATTEMPTS, WRTC_MIN_ASTP_VIDEO_FRAME_LEN, WRTC_MIN_IP_PACKET_LEN,
+    WRTC_MIN_TUN_MTU, WRTC_P2P_ICE_GATHER_POLL_INTERVAL_MS, WRTC_SDP_RENEGOTIATE_TIMEOUT_SECS,
+    WRTC_SERVER_RECONNECT_PAUSE_SECS, WRTC_SERVER_RETRY_DELAY_SECS, WRTC_VIDEO_BATCH_MAX_PACKETS,
+    WRTC_WATCHDOG_TICK_SECS,
+};
 use anet_common::http_help::BrowserProfile;
 use anet_common::transport::{
     unwrap_packet_bytes, wrap_packet_padded, wrap_packet_slice_with_headroom,
 };
 use anet_common::wrtc::{
     batcher::{unpack_batch, PacketBatcher},
-    colibri::{
-        sign_beacon, ColibriMessage, WrtcMessage, MAX_VIDEO_BATCH_BYTES, VIDEO_BATCH_MARKER,
-        VP8_ASTP_PREFIX_LEN,
-    },
+    colibri::{sign_beacon, ColibriMessage, WrtcMessage},
     jingle::parse_jingle_session,
     ktalk::KtalkClient,
     peer::{create_p2p_channel, P2pSession, WrtcPeer},
@@ -75,7 +81,7 @@ pub async fn run_wrtc_server(
         let browser_profile = BrowserProfile::random();
         let guest_name = generate_random_guest_name();
 
-        let ktalk = KtalkClient::new(browser_profile.clone());
+        let ktalk = KtalkClient::new(browser_profile.clone(), &config.wrtc);
         let anon_secret = KtalkClient::generate_anonymous_secret();
 
         let auth_res = match ktalk
@@ -84,8 +90,11 @@ pub async fn run_wrtc_server(
         {
             Ok(res) => res,
             Err(e) => {
-                warn!("[WRTC Server] Ktalk authorization failed: {e}. Retrying in 5s...");
-                tokio::time::sleep(Duration::from_secs(5)).await;
+                warn!(
+                    "[WRTC Server] Ktalk authorization failed: {e}. Retrying in {}s...",
+                    WRTC_SERVER_RETRY_DELAY_SECS
+                );
+                tokio::time::sleep(Duration::from_secs(WRTC_SERVER_RETRY_DELAY_SECS)).await;
                 continue;
             }
         };
@@ -93,8 +102,11 @@ pub async fn run_wrtc_server(
         let room_info = match ktalk.resolve_room(&domain, &room_name, &auth_res.token).await {
             Ok(info) => info,
             Err(e) => {
-                warn!("[WRTC Server] Resolving room failed: {e}. Retrying in 5s...");
-                tokio::time::sleep(Duration::from_secs(5)).await;
+                warn!(
+                    "[WRTC Server] Resolving room failed: {e}. Retrying in {}s...",
+                    WRTC_SERVER_RETRY_DELAY_SECS
+                );
+                tokio::time::sleep(Duration::from_secs(WRTC_SERVER_RETRY_DELAY_SECS)).await;
                 continue;
             }
         };
@@ -107,13 +119,17 @@ pub async fn run_wrtc_server(
             Some(&guest_name),
             &browser_profile,
             ping_secs,
+            &config.wrtc,
         )
             .await
         {
             Ok(session) => session,
             Err(e) => {
-                warn!("[WRTC Server] XMPP connection failed: {e}. Retrying in 5s...");
-                tokio::time::sleep(Duration::from_secs(5)).await;
+                warn!(
+                    "[WRTC Server] XMPP connection failed: {e}. Retrying in {}s...",
+                    WRTC_SERVER_RETRY_DELAY_SECS
+                );
+                tokio::time::sleep(Duration::from_secs(WRTC_SERVER_RETRY_DELAY_SECS)).await;
                 continue;
             }
         };
@@ -131,7 +147,8 @@ pub async fn run_wrtc_server(
 
         info!("[WRTC Server] Waiting for Jicofo session-initiate (client arrival)...");
         let mut parsed_session = None;
-        let idle_deadline = tokio::time::Instant::now() + Duration::from_secs(1800);
+        let idle_rotation_secs = config.wrtc.server_idle_room_rotation_secs.max(60);
+        let idle_deadline = tokio::time::Instant::now() + Duration::from_secs(idle_rotation_secs);
 
         loop {
             match tokio::time::timeout_at(idle_deadline, xmpp.recv_stanza()).await {
@@ -142,11 +159,17 @@ pub async fn run_wrtc_server(
                     }
                 }
                 Ok(None) => {
-                    warn!("[WRTC Server] XMPP stream closed while waiting for session-initiate. Reconnecting in 2s...");
+                    warn!(
+                        "[WRTC Server] XMPP stream closed while waiting for session-initiate. Reconnecting in {}s...",
+                        WRTC_SERVER_RECONNECT_PAUSE_SECS
+                    );
                     break;
                 }
                 Err(_) => {
-                    info!("[WRTC Server] No client joined for 30m; rotating server room session...");
+                    info!(
+                        "[WRTC Server] No client joined for {}s; rotating server room session...",
+                        idle_rotation_secs
+                    );
                     break;
                 }
             }
@@ -154,7 +177,7 @@ pub async fn run_wrtc_server(
 
         let Some(session) = parsed_session else {
             xmpp.leave_room().await;
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            tokio::time::sleep(Duration::from_secs(WRTC_SERVER_RECONNECT_PAUSE_SECS)).await;
             continue;
         };
 
@@ -167,14 +190,18 @@ pub async fn run_wrtc_server(
             fallback_port,
             audio_keepalive_ms,
             server_mode,
+            &config.wrtc,
         )
             .await
         {
             Ok(p) => p,
             Err(e) => {
-                warn!("[WRTC Server] Failed to initialize WebRTC Peer: {e:#}. Retrying in 3s...");
+                warn!(
+                    "[WRTC Server] Failed to initialize WebRTC Peer: {e:#}. Retrying in {}s...",
+                    WRTC_SERVER_RECONNECT_PAUSE_SECS
+                );
                 xmpp.leave_room().await;
-                tokio::time::sleep(Duration::from_secs(3)).await;
+                tokio::time::sleep(Duration::from_secs(WRTC_SERVER_RECONNECT_PAUSE_SECS)).await;
                 continue;
             }
         };
@@ -214,7 +241,7 @@ pub async fn run_wrtc_server(
             while let Some(first_frame) = peer_video_rx.recv_video_frame().await {
                 let mut current_frame = Some(first_frame);
                 while let Some(raw_frame) = current_frame.take() {
-                    if raw_frame.len() < 50 {
+                    if raw_frame.len() < WRTC_MIN_ASTP_VIDEO_FRAME_LEN {
                         // Слишком короткий для ASTP кадра (2B tag + 12B nonce + 20B IPv4 + 16B MAC)
                         current_frame = peer_video_rx.try_recv_video_frame();
                         continue;
@@ -257,7 +284,8 @@ pub async fn run_wrtc_server(
             }
         });
 
-        let mut health_watchdog = tokio::time::interval(Duration::from_secs(2));
+        let mut health_watchdog =
+            tokio::time::interval(Duration::from_secs(WRTC_WATCHDOG_TICK_SECS));
         health_watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
@@ -279,7 +307,7 @@ pub async fn run_wrtc_server(
                                     for v_ssrc in jingle.video_sources {
                                         info!("[WRTC Server] Jingle stanza ({}) announced remote video SSRC: {v_ssrc}", jingle.action);
                                         let _ = tokio::time::timeout(
-                                            Duration::from_secs(5),
+                                            Duration::from_secs(WRTC_SDP_RENEGOTIATE_TIMEOUT_SECS),
                                             shared_peer.add_remote_video_ssrc(v_ssrc),
                                         ).await;
                                     }
@@ -364,12 +392,15 @@ pub async fn run_wrtc_server(
 
                             // Привязываем видео SSRC клиента к выделенному Recvonly трансиверу
                             let _ = tokio::time::timeout(
-                                Duration::from_secs(5),
+                                Duration::from_secs(WRTC_SDP_RENEGOTIATE_TIMEOUT_SECS),
                                 shared_peer.add_remote_video_ssrc(c_v_ssrc),
                             ).await;
 
                             client_video_endpoints.insert(from_endpoint.clone());
-                            let constraints = anet_common::wrtc::colibri::ReceiverVideoConstraints::new_all(2160);
+                            let constraints =
+                                anet_common::wrtc::colibri::ReceiverVideoConstraints::new_all(
+                                    WRTC_DEFAULT_MAX_VIDEO_HEIGHT,
+                                );
                             let _ = shared_peer.send_video_constraints(&constraints).await;
                         }
                     }
@@ -447,7 +478,7 @@ pub async fn run_wrtc_server(
                             if !client_found {
                                 let client_addr = endpoint_to_socket_addr(&from_endpoint);
                                 let hs_res = tokio::time::timeout(
-                                    Duration::from_secs(10),
+                                    Duration::from_secs(WRTC_HANDSHAKE_PROCESS_TIMEOUT_SECS),
                                     auth_clone.process_handshake_packet(Bytes::from(raw_bytes), client_addr, "wrtc"),
                                 )
                                 .await;
@@ -495,7 +526,7 @@ pub async fn run_wrtc_server(
                                             shared_peer.force_next_keyframe();
 
                                             let (tx_router, mut rx_router) =
-                                                mpsc::channel::<Bytes>(16384);
+                                                mpsc::channel::<Bytes>(WRTC_COLIBRI_CHANNEL_CAPACITY);
                                             reg_clone.finalize_client(&assigned_ip, tx_router);
                                             clients_map
                                                 .insert(from_endpoint.clone(), client_info.clone());
@@ -509,12 +540,26 @@ pub async fn run_wrtc_server(
                                             let client_video_ep_dl = client_video_endpoints.clone();
                                             let client_v2_ep_dl = client_v2_endpoints.clone();
                                             let client_video_warmed_dl = client_video_warmed_up.clone();
+                                            let server_tun_mtu = config
+                                                .network
+                                                .mtu
+                                                .saturating_sub(config.wrtc.video_mtu_overhead)
+                                                .max(WRTC_MIN_TUN_MTU as u16)
+                                                as usize;
+                                            let max_video_batch_bytes = server_tun_mtu
+                                                .saturating_sub(30)
+                                                .min(MAX_VIDEO_BATCH_BYTES);
 
                                             tokio::spawn(async move {
-                                                let mut batcher = PacketBatcher::new(16384, 2);
-                                                let mut batch_interval = tokio::time::interval(Duration::from_millis(2));
+                                                let mut batcher = PacketBatcher::new(
+                                                    WRTC_BATCHER_MAX_BYTES,
+                                                    WRTC_BATCHER_MAX_DELAY_MS,
+                                                );
+                                                let mut batch_interval = tokio::time::interval(
+                                                    Duration::from_millis(WRTC_BATCHER_MAX_DELAY_MS),
+                                                );
                                                 batch_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                                                let mut batch_buf = BytesMut::with_capacity(2048);
+                                                let mut batch_buf = BytesMut::with_capacity(MAX_PACKET_SIZE);
                                                 let mut pending_packet: Option<Bytes> = None;
 
                                                 loop {
@@ -524,7 +569,7 @@ pub async fn run_wrtc_server(
                                                             let Some(mut packet) = packet_opt else { break; };
 
                                                             loop {
-                                                                if packet.len() >= 20 {
+                                                                if packet.len() >= WRTC_MIN_IP_PACKET_LEN {
                                                                     let client_pref_mode = client_modes_dl
                                                                         .get(&target_client_id)
                                                                         .map(|m| m.clone())
@@ -539,14 +584,14 @@ pub async fn run_wrtc_server(
                                                                         && has_video;
 
                                                                     if client_uses_video && is_v2 {
-                                                                        if video_warmed_up && packet.len() + 3 < MAX_VIDEO_BATCH_BYTES {
+                                                                        if video_warmed_up && packet.len() + 3 < max_video_batch_bytes {
                                                                             batch_buf.clear();
                                                                             batch_buf.put_u8(VIDEO_BATCH_MARKER);
                                                                             batch_buf.put_u16(packet.len() as u16);
                                                                             batch_buf.extend_from_slice(&packet);
                                                                             let mut count = 1usize;
 
-                                                                            while count < 16 {
+                                                                            while count < WRTC_VIDEO_BATCH_MAX_PACKETS {
                                                                                 let next_p = if let Some(p) = pending_packet.take() {
                                                                                     p
                                                                                 } else if let Ok(p) = rx_router.try_recv() {
@@ -554,10 +599,10 @@ pub async fn run_wrtc_server(
                                                                                 } else {
                                                                                     break;
                                                                                 };
-                                                                                if next_p.len() < 20 {
+                                                                                if next_p.len() < WRTC_MIN_IP_PACKET_LEN {
                                                                                     continue;
                                                                                 }
-                                                                                if batch_buf.len() + 2 + next_p.len() <= MAX_VIDEO_BATCH_BYTES {
+                                                                                if batch_buf.len() + 2 + next_p.len() <= max_video_batch_bytes {
                                                                                     batch_buf.put_u16(next_p.len() as u16);
                                                                                     batch_buf.extend_from_slice(&next_p);
                                                                                     count += 1;
@@ -768,9 +813,10 @@ pub async fn run_wrtc_server(
                     let reg_c = reg_clone.clone();
                     let client_ep = from_endpoint.clone();
                     let stun_servers = xmpp.get_stun_servers();
+                    let wrtc_cfg_p2p = config.wrtc.clone();
 
                     tokio::spawn(async move {
-                        match create_p2p_channel(&stun_servers).await {
+                        match create_p2p_channel(&stun_servers, &wrtc_cfg_p2p).await {
                             Ok(p2p) => {
                                 let p2p_arc = Arc::new(p2p);
                                 match RTCSessionDescription::offer(sdp) {
@@ -787,7 +833,7 @@ pub async fn run_wrtc_server(
                                                 }
 
                                                 let mut answer_sdp = answer.sdp.clone();
-                                                for _ in 0..50 {
+                                                for _ in 0..WRTC_ICE_GATHER_POLL_ATTEMPTS {
                                                     if let Some(desc) = p2p_arc.pc.local_description().await {
                                                         if desc.sdp.contains("a=candidate:") {
                                                             answer_sdp = desc.sdp;
@@ -796,7 +842,10 @@ pub async fn run_wrtc_server(
                                                             }
                                                         }
                                                     }
-                                                    tokio::time::sleep(Duration::from_millis(50)).await;
+                                                    tokio::time::sleep(Duration::from_millis(
+                                                        WRTC_P2P_ICE_GATHER_POLL_INTERVAL_MS,
+                                                    ))
+                                                    .await;
                                                 }
                                                 if answer_sdp.is_empty() {
                                                     if let Some(desc) = p2p_arc.pc.local_description().await {
@@ -873,7 +922,10 @@ pub async fn run_wrtc_server(
         client_video_endpoints.clear();
         client_v2_endpoints.clear();
 
-        info!("[WRTC Server] Pausing 2s before re-entering conference room...");
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        info!(
+            "[WRTC Server] Pausing {}s before re-entering conference room...",
+            WRTC_SERVER_RECONNECT_PAUSE_SECS
+        );
+        tokio::time::sleep(Duration::from_secs(WRTC_SERVER_RECONNECT_PAUSE_SECS)).await;
     }
 }
