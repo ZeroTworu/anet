@@ -864,7 +864,7 @@ impl ClientTransport for WrtcTransport {
                                 }
                                 Err(e) => {
                                     warn!("[P2P Direct] Decrypt packet error: {e}");
-                                    warn(format!("[WRTC Client] Decrypt packet error: {e}"));
+                                    warn(format!("[P2P Direct] Decrypt packet error: {e}"));
                                 }
                             }
                         }
