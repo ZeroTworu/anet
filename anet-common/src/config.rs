@@ -63,7 +63,7 @@ pub struct WrtcConfig {
     /// Максимальный размер буфера приёма SCTP DataChannel (в байтах).
     pub sctp_max_receive_buffer_size: u32,
     /// MTU для SCTP-фреймов внутри DTLS (в байтах).
-    pub sctp_mtu: usize,
+    pub sctp_mtu: u32,
     /// Максимальный размер буфера приёма входящих UDP/RTP-пакетов в движке WebRTC (в байтах).
     pub receive_mtu: usize,
 

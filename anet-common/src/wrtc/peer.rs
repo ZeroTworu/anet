@@ -440,7 +440,7 @@ pub async fn create_p2p_channel(
             Some(Duration::from_millis(wrtc_cfg.ice_keepalive_interval_ms)),
         )
         .with_sctp_max_receive_buffer_size(wrtc_cfg.sctp_max_receive_buffer_size)
-        .with_sctp_mtu(wrtc_cfg.sctp_mtu)
+        .with_sctp_mtu(wrtc_cfg.sctp_mtu as _)
         .with_receive_mtu(wrtc_cfg.receive_mtu)
         .build();
 
@@ -782,7 +782,7 @@ impl WrtcPeer {
                     Some(Duration::from_millis(wrtc_cfg.ice_keepalive_interval_ms)),
                 )
                 .with_sctp_max_receive_buffer_size(wrtc_cfg.sctp_max_receive_buffer_size)
-                .with_sctp_mtu(wrtc_cfg.sctp_mtu)
+                .with_sctp_mtu(wrtc_cfg.sctp_mtu as _)
                 .with_receive_mtu(wrtc_cfg.receive_mtu)
                 .build();
 
