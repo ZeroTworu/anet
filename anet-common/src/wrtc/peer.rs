@@ -37,7 +37,7 @@ use webrtc::runtime::{
 
 const WEBRTC_UDP_SOCKET_BUFFER_SIZE: usize = 4 * 1024 * 1024;
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug)]
 struct TunedTokioRuntime(TokioRuntime);
 
 impl WrtcRuntime for TunedTokioRuntime {
