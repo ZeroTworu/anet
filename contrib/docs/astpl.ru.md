@@ -2,12 +2,15 @@
 
 ## 1. Общее описание и архитектура
 
-**ASTP-L** — это гибридный транспортный протокол для VPN Anet, разделяющий жизненный цикл соединения на две фазы:
+**ASTP-L** — это гибридный транспортный протокол для VPN Anet, разделяющий жизненный цикл соединения на две фазы на **едином UDP-порту**:
 
-1. **Control Plane (Userspace):** Аутентификация, установка сессии (Handshake), обмен ключами (X25519 + ChaCha20-Poly1305), выделение IP-адреса, фоновая синхронизация статистики и периодическое обновление ключей (Rekeying). Выполняется стандартным Rust-сервером (`anet-server`) и клиентом (`anet-client` / `anet-client-core`).
-2. **Data Plane (Kernelspace — eBPF):** Сверхбыстрая маршрутизация, инкапсуляция, декапсуляция и потоковое шифрование полезной нагрузки (IPv4-пакетов) непосредственно в ядре Linux на стороне сервера (и, опционально, Linux-клиента), минуя копирование памяти в Userspace (`Zero-Copy`).
+1. **Control Plane (Userspace):** Аутентификация, установка сессии (4-фазный стелс-хендшейк ASTP с поддержкой UDP-фрагментации `DatagramReassembler`), обмен ключами (X25519 + HKDF-SHA256 + ChaCha20-Poly1305), выделение IP-адреса и фоновая синхронизация статистики. Выполняется стандартным Rust-сервером (`anet-server`) и клиентом (`anet-client` / `anet-client-core`).
+2. **Data Plane (Kernelspace — eBPF):** Сверхбыстрая маршрутизация, демультиплексирование по `nonce_prefix` за $O(1)$, бесшовный NAT Rebinding, инкапсуляция, декапсуляция и потоковое шифрование полезной нагрузки (IPv4-пакетов) непосредственно в ядре Linux на стороне сервера, минуя копирование памяти в Userspace (`Zero-Copy`).
 
-**Цель:** Достижение гигабитных скоростей маршрутизации трафика при минимальной нагрузке на CPU сервера и нулевом джиттере (Jitter), с сохранением совместимости с уже реализованным в проекте eBPF-шейпером (`anet-ebpf` / `anet-ebpf-common`).
+**Ключевые архитектурные возможности (унифицированные с QUIC-транспортом):**
+* **Единый UDP-порт для Handshake и Data Plane:** Сервер слушает один UDP-сокет (`astpl_bind_to`, например `0.0.0.0:8444`). XDP-программа в ядре за $O(1)$ отличает трафик активных сессий по 4-байтному `nonce_prefix` от пакетов первичного рукопожатия ASTP (Phase I / Phase III), прозрачно пропуская хендшейки в Userspace через `XDP_PASS`.
+* **Поддержка UDP-фрагментации хендшейка (`DatagramReassembler`):** Первые пакеты рукопожатия (до появления сессионного ключа в BPF-карте) могут дробиться клиентом на $N$ независимых UDP-фрагментов со случайными точками разреза и наносекундным джиттером (`[stealth] frag_enabled = true`). Поскольку их префиксы не зарегистрированы в `ASTPL_INGRESS_MAP`, XDP пропускает все фрагменты (`XDP_PASS`) в Userspace-сокет, где штатный `DatagramReassembler` собирает их даже при перестановке датаграмм в сети.
+* **Бесшовная миграция адреса клиента в ядре (Kernel NAT Rebinding):** При смене внешнего IP/порта клиента (переход Wi-Fi ↔ LTE или протухание NAT-таблицы) XDP-программа находит сессию по `nonce_prefix`, верифицирует инварианты расшифрованного IPv4-заголовка и **напрямую из ядра** обновляет внешний адрес клиента в `ASTPL_EGRESS_MAP` без пробуждения Userspace.
 
 ---
 
@@ -17,7 +20,11 @@
 
 ### 2.1. Формат пакета Data Plane (внешний)
 
-После успешного хендшейка все пакеты данных имеют следующую структуру (начиная с L2 на физическом интерфейсе):
+После успешного хендшейка обе стороны выводят из `shared_key` через HKDF-SHA256:
+* `nonce_prefix: [u8; 4]` (`u32`) — уникальный 4-байтный идентификатор маршрутизации сессии (аналогично QUIC-транспорту).
+* `crypto_seed: u64` — 64-битный секретный ключ инициализации генератора `Xoroshiro128+`.
+
+Все пакеты данных имеют следующую структуру (начиная с L2 на физическом интерфейсе):
 
 ```text
 +-----------------------------------------------------------------------+
@@ -27,15 +34,19 @@
 +-----------------------------------------------------------------------+
 | Outer UDP Header (8 байт)                                             |
 +-----------------------------------------------------------------------+
-| ASTP-L Header: Sequence Number / Nonce (4 байта, u32, Big-Endian)     |
+| ASTP-L Header (8 байт):                                               |
+|   - Nonce Prefix (4 байта, u32, Big-Endian) — ID сессии из HKDF       |
+|   - Sequence Number (4 байта, u32, Big-Endian) — счётчик пакета       |
 +-----------------------------------------------------------------------+
 | Encrypted Payload: Внутренний IPv4 пакет (от 20 до MTU байт)          |
 | Зашифрован потоковым шифром Xoroshiro128+ (XOR)                       |
 +-----------------------------------------------------------------------+
 ```
 
-* Суммарный размер инкапсуляции поверх внутреннего IPv4-пакета (Overhead): **`20 (Outer IPv4) + 8 (Outer UDP) + 4 (ASTP-L Seq) = 32 байта`**.
-* **Важно для управляющих пакетов (Control Plane):** Если первые 4 байта UDP-пакета равны `0x00000000` (`Seq == 0`), это пакет **Handshake / Rekey / Control**. Такие пакеты eBPF-программа **НЕ обрабатывает**, а возвращает `XDP_PASS`, пропуская их в стандартный сетевой стек ОС в `anet-server` (Userspace UDP Socket). Пакеты данных всегда начинаются с `Seq >= 1`.
+* Суммарный размер инкапсуляции поверх внутреннего IPv4-пакета (Overhead): **`20 (Outer IPv4) + 8 (Outer UDP) + 8 (ASTP-L Header) = 36 байт`**.
+* **Демультиплексирование Control Plane vs Data Plane:**
+  * Пакеты Handshake (Phase I / Phase III), в том числе нарезанные через `fragment_datagram`, не содержат зарегистрированного `nonce_prefix` в `ASTPL_INGRESS_MAP`. XDP-программа при промахе в `ASTPL_INGRESS_MAP` мгновенно возвращает `XDP_PASS`, доставляя пакет в Userspace (`anet-server`) на том же UDP-порту.
+  * Если в рамках установленной сессии требуется передать управляющий пакет в Userspace, используется зарезервированное значение `Seq == 0` (`XDP_PASS`). Пакеты данных всегда имеют `Seq >= 1`.
 
 ---
 
@@ -75,19 +86,10 @@ let mut ebpf = aya::EbpfLoader::new()
 
 ### 3.2. Таблица №1: `ASTPL_INGRESS_MAP` (`BPF_MAP_TYPE_HASH`)
 
-Используется `XDP`-программой на физическом интерфейсе (`eth0`) для верификации клиента, расшифровки входящего пакета и обновления его статистики.
+Используется `XDP`-программой на физическом интерфейсе (`eth0`) для $O(1)$ идентификации сессии по `nonce_prefix` (независимо от смены IP/порта клиента при NAT Rebinding), расшифровки входящего пакета и обновления его статистики.
 
-* **Key (`OuterEndpoint`, 8 байт):**
-  ```rust
-  #[repr(C)]
-  #[derive(Clone, Copy)]
-  pub struct OuterEndpoint {
-      pub src_ip: u32,   // Big-Endian (Network byte order)
-      pub src_port: u16, // Big-Endian (Network byte order)
-      pub _pad: u16,     // Явное выравнивание до 8 байт (всегда 0)
-  }
-  ```
-* **Value (`IngressSessionData`, 32 байта):**
+* **Key (`u32`, 4 байта):** `nonce_prefix` (первые 4 байта UDP payload в Big-Endian).
+* **Value (`IngressSessionData`, 40 байт):**
   ```rust
   #[repr(C)]
   #[derive(Clone, Copy)]
@@ -95,17 +97,20 @@ let mut ebpf = aya::EbpfLoader::new()
       pub crypto_seed: u64,   // 64-битный мастер-ключ сессии (RX/TX seed)
       pub rx_bytes: u64,      // Счётчик принятых байт (для синхронизации с ClientRegistry)
       pub last_seen_ns: u64,  // Таймстемп bpf_ktime_get_ns() последнего пакета
-      pub assigned_ip: u32,   // Внутренний VPN IP клиента (Big-Endian, для anti-spoofing проверки)
+      pub assigned_ip: u32,   // Внутренний VPN IP клиента (Big-Endian, для anti-spoofing и поиска в EGRESS_MAP)
       pub last_seq: u32,      // Последний принятый Seq
+      pub client_ip: u32,     // Текущий внешний IPv4 клиента (Big-Endian, отслеживание NAT Rebinding)
+      pub client_port: u16,   // Текущий внешний UDP-порт клиента (Big-Endian, отслеживание NAT Rebinding)
+      pub _pad: u16,          // Явное выравнивание до 40 байт (всегда 0)
   }
   ```
 
 ### 3.3. Таблица №2: `ASTPL_EGRESS_MAP` (`BPF_MAP_TYPE_HASH`)
 
-Используется `TC Egress`-программой на виртуальном интерфейсе (`tun0`), когда ответный пакет из интернета возвращается к клиенту.
+Используется `TC Egress`-программой на виртуальном интерфейсе (`tun0`), когда ответный пакет из интернета возвращается к клиенту, а также **обновляется напрямую из `XDP`** при обнаружении миграции адреса клиента (NAT Rebinding).
 
-* **Key (`u32`, 4 байта):** Внутренний IPv4-адрес назначения (`Inner Dst IP` — VPN IP клиента, Big-Endian).
-* **Value (`EgressRoutingData`, 32 байта):**
+* **Key (`u32`, 4 байта):** Внутренний IPv4-адрес назначения (`Inner Dst IP` — VPN IP клиента, Big-Endian, равен `assigned_ip`).
+* **Value (`EgressRoutingData`, 40 байт):**
   ```rust
   #[repr(C)]
   #[derive(Clone, Copy)]
@@ -113,14 +118,13 @@ let mut ebpf = aya::EbpfLoader::new()
       pub crypto_seed: u64,   // 64-битный мастер-ключ сессии
       pub tx_bytes: u64,      // Счётчик отправленных байт (для синхронизации с ClientRegistry)
       pub last_seen_ns: u64,  // Таймстемп bpf_ktime_get_ns()
-      pub dst_ip: u32,        // Реальный IP клиента в интернете (Big-Endian)
+      pub dst_ip: u32,        // Текущий внешний IPv4 клиента в интернете (Big-Endian, обновляется при роуминге)
+      pub nonce_prefix: u32,  // 4-байтный идентификатор сессии для заголовка ASTP-L (Big-Endian)
       pub tx_seq: u32,        // Счётчик исходящих пакетов (инкрементируется в eBPF, >= 1)
-      pub dst_port: u16,      // Реальный UDP-порт клиента (Big-Endian)
-      pub _pad: u16,          // Явное выравнивание (всегда 0)
+      pub dst_port: u16,      // Текущий внешний UDP-порт клиента (Big-Endian, обновляется при роуминге)
+      pub _pad: u16,          // Явное выравнивание до 40 байт (всегда 0)
   }
   ```
-
-*(Для поддержки NAT traversal / смены порта клиентом на лету без потери маршрута можно хранить общий `SessionState` в `Array`/`HashMap` по индексу сессии, либо синхронизировать `dst_ip`/`dst_port` между Ingress и Egress картами).*
 
 ---
 
@@ -259,21 +263,41 @@ impl<'a> ContextWrapper<'a> {
 ### 5.1. Ingress: Программа `XDP` (на физическом интерфейсе `eth0`)
 
 1. Получает `XdpContext` и оборачивает его в `let w = ContextWrapper::Xdp(&ctx);`.
-2. Проверяет наличие `EthHdr::LEN (14) + Ipv4Hdr::LEN (20) + UdpHdr::LEN (8) + ASTP-L Seq (4) = 46 байт`.
-3. Через `w.ptr_at::<EthHdr>(0)`, `w.ptr_at::<Ipv4Hdr>(EthHdr::LEN)` и `w.ptr_at::<UdpHdr>(EthHdr::LEN + Ipv4Hdr::LEN)` проверяет:
+2. Проверяет наличие `EthHdr::LEN (14) + Ipv4Hdr::LEN (20) + UdpHdr::LEN (8) + ASTP-L Header (8) = 50 байт`.
+3. Через `w.ptr_at::<EthHdr>(0)`, `w.ptr_at::<Ipv4Hdr>(14)` и `w.ptr_at::<UdpHdr>(34)` проверяет:
    * `eth.ether_type == EtherType::Ipv4` (`0x0800_u16.to_be()`);
    * `ipv4.proto == IpProto::Udp` (`17`) и `ipv4.ihl() == 5` (без IP-опций, 20 байт);
    * `udp.dest == ASTPL_PORT.load()`.
    Если любая проверка не прошла — возвращает `XDP_PASS`.
-4. Читает 4 байта `Seq` сразу после UDP-заголовка (`w.read_unaligned::<u32>(42)`):
-   * Если `Seq == 0`, возвращает `XDP_PASS` (пакет идёт в Userspace `anet-server` для Handshake / Rekey).
-5. Формирует ключ `OuterEndpoint { src_ip: ipv4.src_addr, src_port: udp.source, _pad: 0 }` и ищет сессию через `ASTPL_INGRESS_MAP.get_ptr_mut(&key)`:
-   * Если записи нет — возвращает `XDP_DROP` (защита от DDoS и неавторизованных пакетов на уровне драйвера сетевой карты).
-6. Инициализирует `Xoroshiro128Plus::new(session.crypto_seed, u32::from_be(seq))` и расшифровывает payload (`data + 46 .. data_end`) прямо в буфере пакета (по 8 байт через `read_unaligned`/`write_unaligned` + хвост `1..7` байт).
-7. Проверяет, что расшифрованный внутренний пакет (`offset 46`) содержит минимум 20 байт (`w.ptr_at::<Ipv4Hdr>(46)`), является валидным IPv4 (`version == 4`) и его `inner_ip.src_addr == session.assigned_ip` (защита от IP-спуфинга внутри туннеля). Обновляет `session.rx_bytes` и `session.last_seen_ns`.
-8. **Декапсуляция на уровне XDP с сохранением L2-заголовка:**
-   * Читает 14 байт оригинального `EthHdr` (`let eth_hdr = w.read_unaligned::<EthHdr>(0)?;`) и записывает их на 32 байта вправо (`w.write_unaligned::<EthHdr>(32, eth_hdr)?;`), прямо перед началом расшифрованного внутреннего IPv4-пакета.
-   * Вызывает `unsafe { aya_ebpf::helpers::bpf_xdp_adjust_head(ctx.ctx, 32) }` (сдвигает начало пакета на `20 (Outer IP) + 8 (UDP) + 4 (Seq) = 32` байта вправо).
+4. **Демультиплексирование по `nonce_prefix` за $O(1)$:**
+   * Читает `nonce_prefix = w.read_unaligned::<u32>(42)?` и `seq = w.read_unaligned::<u32>(46)?`.
+   * Ищет сессию через `ASTPL_INGRESS_MAP.get_ptr_mut(&nonce_prefix)`.
+   * **Если записи нет или `seq == 0`:** возвращает **`XDP_PASS`**. Благодаря этому пакеты первичного рукопожатия ASTP (Phase I / Phase III), включая UDP-фрагменты для `DatagramReassembler`, прозрачно проходят в Userspace UDP-сокет `anet-server` на этом же порту.
+5. **Дешифрование и верификация инвариантов внутреннего IPv4-заголовка:**
+   * Инициализирует `Xoroshiro128Plus::new(session.crypto_seed, u32::from_be(seq))` и расшифровывает payload (`data + 50 .. data_end`) прямо в буфере пакета (по 8 байт через `read_unaligned`/`write_unaligned` + хвост `1..7` байт).
+   * Проверяет внутренний IPv4-заголовок (`w.ptr_at::<Ipv4Hdr>(50)`):
+     1. `(inner_ip.version_ihl >> 4) == 4` (валидный IPv4).
+     2. `u16::from_be(inner_ip.tot_len) as usize == (ctx.data_end() - ctx.data()) - 50` (длина внутреннего IPv4-пакета строго равна длине UDP-payload минус 8 байт заголовка ASTP-L).
+     3. `inner_ip.src_addr == session.assigned_ip` (anti-spoofing проверка: источник внутри туннеля строго соответствует выданному клиенту VPN IP).
+   * *Защита от коллизий и подделок:* Если проверка инвариантов не прошла (например, 1 на $2^{32}$ случайная коллизия префикса фрагмента хендшейка с активным `nonce_prefix` или попытка спуфинга), XDP повторным прогоном `Xoroshiro128Plus::new(session.crypto_seed, u32::from_be(seq))` возвращает исходные байты на место и отдаёт `XDP_PASS` (или `XDP_DROP`, если источник уже известен как сессионный).
+6. **Бесшовная миграция адреса клиента (Kernel NAT Rebinding):**
+   * После успешной верификации внутреннего IPv4-заголовка проверяет, изменился ли внешний адрес или порт клиента:
+     ```rust
+     if outer_src_ip != session.client_ip || outer_src_port != session.client_port {
+         session.client_ip = outer_src_ip;
+         session.client_port = outer_src_port;
+         if let Some(egress_ptr) = ASTPL_EGRESS_MAP.get_ptr_mut(&session.assigned_ip) {
+             unsafe {
+                 (*egress_ptr).dst_ip = outer_src_ip;
+                 (*egress_ptr).dst_port = outer_src_port;
+             }
+         }
+     }
+     ```
+   * Обновляет `session.rx_bytes`, `session.last_seq` и `session.last_seen_ns`.
+7. **Декапсуляция на уровне XDP с сохранением L2-заголовка:**
+   * Читает 14 байт оригинального `EthHdr` (`let eth_hdr = w.read_unaligned::<EthHdr>(0)?;`) и записывает их на 36 байт вправо (`w.write_unaligned::<EthHdr>(36, eth_hdr)?;`), прямо перед началом расшифрованного внутреннего IPv4-пакета.
+   * Вызывает `unsafe { aya_ebpf::helpers::bpf_xdp_adjust_head(ctx.ctx, 36) }` (сдвигает начало пакета на `20 (Outer IP) + 8 (UDP) + 8 (ASTP-L Header) = 36` байт вправо).
    * Возвращает **`XDP_PASS`**.
    * **Результат:** Ядро Linux получает готовый стандартный Ethernet-кадр с расшифрованным внутренним IPv4-пакетом клиента и мгновенно маршрутизирует его через стандартный IP Forwarding / NAT в интернет без участия `tun0` и Userspace.
 
@@ -284,25 +308,26 @@ impl<'a> ContextWrapper<'a> {
 1. Получает `TcContext` и оборачивает его в `ContextWrapper::Tc(&ctx)`. Проверяет минимальную длину IPv4-пакета (`w.ptr_at::<Ipv4Hdr>(0)`).
 2. Читает `Inner Dst IP` (`inner_ip.dst_addr`).
 3. Ищет `Inner Dst IP` в `ASTPL_EGRESS_MAP.get_ptr_mut(&inner_dst_ip)`:
-   * Если записи нет — возвращает `TC_ACT_OK` (пакет идёт обычным путём для классических клиентов Anet).
+   * Если записи нет — возвращает `TC_ACT_OK` (пакет идёт обычным путём для классических QUIC/SSH/VNC клиентов Anet).
 4. **Линеаризация буфера `sk_buff` (КРИТИЧНО для TC):**
    * Вызывает **`ctx.pull_data(0)`** (`bpf_skb_pull_data`), чтобы подтянуть все нелинейные страницы (`paged frags`) пакета в линейную область `ctx.data()..ctx.data_end()`.
    * Заново перечитывает `ctx.data()` и `ctx.data_end()` (все указатели до `pull_data` инвалидируются верификатором).
 5. Инкрементирует `routing.tx_seq` (если в результате переполнения получилось `0`, ставит `1`), обновляет `routing.tx_bytes` и `routing.last_seen_ns`.
 6. Инициализирует `Xoroshiro128Plus::new(routing.crypto_seed, routing.tx_seq)` и шифрует весь внутренний IPv4-пакет (`ctx.data() .. ctx.data_end()`) на месте (по 8 байт + хвост `1..7` байт).
-7. **Расширение заголовка (`adjust_room`):**
+7. **Расширение заголовка (`adjust_room` на 36 байт):**
    * Вызывает метод `TcContext`:
      ```rust
      let flags = (BPF_F_ADJ_ROOM_FIXED_GSO
          | BPF_F_ADJ_ROOM_ENCAP_L3_IPV4
          | BPF_F_ADJ_ROOM_ENCAP_L4_UDP) as u64;
-     ctx.adjust_room(32, BPF_ADJ_ROOM_NET, flags)?;
+     ctx.adjust_room(36, BPF_ADJ_ROOM_NET, flags)?;
      ```
-   * Это раздвигает начало пакета ровно на **32 байта** (`Outer IPv4 (20) + Outer UDP (8) + ASTP-L Seq (4)`).
-8. Заново проверяет границы через `ContextWrapper::Tc(&ctx)` и записывает в новые 32 байта:
-   * **Outer IPv4 Header (`Ipv4Hdr`, 20 байт):** `version_ihl = 0x45`, `tos = 0`, `tot_len = (ctx.len() as u16).to_be()`, `id = 0`, `frag_off = 0x4000u16.to_be()` (DF), `ttl = 64`, `proto = IpProto::Udp`, `src_addr = SERVER_IP.load()`, `dst_addr = routing.dst_ip`, и вычисляет IPv4 Header Checksum (компактной inline-функцией свертки 10 слов `u16`).
-   * **Outer UDP Header (`UdpHdr`, 8 байт):** `source = ASTPL_PORT.load()`, `dest = routing.dst_port`, `len = ((ctx.len() - 20) as u16).to_be()`, `check = 0` (для IPv4 UDP checksum `0` валиден по RFC 768 и не требует пересчёта по всему payload).
-   * **ASTP-L Seq (4 байта, offset 28):** `routing.tx_seq.to_be()`.
+   * Это раздвигает начало пакета ровно на **36 байт** (`Outer IPv4 (20) + Outer UDP (8) + ASTP-L Header (8)`).
+8. Заново проверяет границы через `ContextWrapper::Tc(&ctx)` и записывает в новые 36 байт:
+   * **Outer IPv4 Header (`Ipv4Hdr`, 20 байт, offset 0):** `version_ihl = 0x45`, `tos = 0`, `tot_len = (ctx.len() as u16).to_be()`, `id = 0`, `frag_off = 0x4000u16.to_be()` (DF), `ttl = 64`, `proto = IpProto::Udp`, `src_addr = SERVER_IP.load()`, `dst_addr = routing.dst_ip`, и вычисляет IPv4 Header Checksum (компактной inline-функцией свертки 10 слов `u16`).
+   * **Outer UDP Header (`UdpHdr`, 8 байт, offset 20):** `source = ASTPL_PORT.load()`, `dest = routing.dst_port`, `len = ((ctx.len() - 20) as u16).to_be()`, `check = 0` (для IPv4 UDP checksum `0` валиден по RFC 768 и не требует пересчёта по всему payload).
+   * **ASTP-L Nonce Prefix (4 байта, offset 28):** `routing.nonce_prefix` (уже в Big-Endian).
+   * **ASTP-L Seq (4 байта, offset 32):** `routing.tx_seq.to_be()`.
 9. **Отправка в физический интерфейс через подсистему соседей (ARP/Neighbour):**
    * Вызывает `unsafe { aya_ebpf::helpers::bpf_redirect_neigh(ETH_IFINDEX.load(), core::ptr::null_mut(), 0, 0) as i32 }`.
    * Хелпер `bpf_redirect_neigh` (доступен в Linux 5.10+) самостоятельно определяет L2 MAC-адреса (`src_mac` / `dst_mac` шлюза по таблице маршрутизации и ARP) и отправляет пакет напрямую в `eth0`, полностью минуя чтение из файлового дескриптора `tun0` в Userspace.
@@ -332,14 +357,16 @@ impl<'a> ContextWrapper<'a> {
    * Прикрепляет `astpl_xdp_ingress` к физическому интерфейсу (например, `eth0`) в режиме `XdpFlags::default()` (с автоматическим fallback на `XdpFlags::SKB_MODE`, если драйвер VPS не поддерживает Native XDP).
    * На `tun0` добавляет `clsact` (`aya::programs::tc::qdisc_add_clsact`) и прикрепляет `anet_shaper` (с `priority: 10`) и `astpl_tc_egress` (с `priority: 20` через `TcAttachOptions::Netlink(NlOptions { priority: 20, ..Default::default() })`).
    * Для `tun0` рекомендуется отключить `GSO`/`TSO`/`GRO` через `ethtool -K` или `ioctl`, чтобы пакеты шифровались в пределах MTU без сегментации.
-2. **Обработка Handshake (`Seq == 0`):**
-   * Сервер слушает UDP-сокет на порту `ASTPL_PORT`. Поскольку `XDP` забирает все валидные пакеты с `Seq > 0`, в Userspace попадают только пакеты с `Seq == 0`.
-   * Выполняется существующий криптографический Handshake Anet (`AuthHandler`), клиенту выделяется IP из пула (`10.0.0.x`), и из общего секрета выводится `crypto_seed: u64`.
-   * Сервер записывает сессию в `ASTPL_INGRESS_MAP` и `ASTPL_EGRESS_MAP` и отправляет клиенту подтверждение хендшейка с `Seq = 0`.
-3. **Фоновая синхронизация с `ClientRegistry` и Rekeying:**
-   * Поскольку пакеты данных не проходят через Userspace, фоновая задача `anet-server` раз в `5–10` секунд читает `rx_bytes`, `tx_bytes` и `last_seen_ns` из BPF-карт и обновляет `ClientInfo` в `ClientRegistry` (чтобы `cleanup_inactive_clients` не удалял активные eBPF-сессии по таймауту, а в статистике отображался реальный трафик).
-   * При удалении неактивного клиента его ключи удаляются из `ASTPL_INGRESS_MAP` и `ASTPL_EGRESS_MAP`.
-   * Раз в `N` минут (или по объёму трафика) инициируется управляющий пакет с `Seq = 0` для смены `crypto_seed` (Rekeying) и атомарного обновления карт.
+2. **Обработка Handshake и `DatagramReassembler` на едином UDP-сокете:**
+   * Сервер слушает обычный `tokio::net::UdpSocket` на порту `ASTPL_PORT`. Поскольку `XDP` забирает все пакеты активных сессий по `nonce_prefix`, в Userspace попадают только пакеты с неизвестным префиксом (Phase I / Phase III хендшейка и их UDP-фрагменты) либо управляющие пакеты с `Seq == 0`.
+   * Если первый байт пакета имеет бит фрагментации (`(byte & 0x80) != 0`), пакет передаётся в `DatagramReassembler::push_fragment(remote_addr, data)` (полная совместимость с `[stealth] frag_enabled = true`).
+   * Выполняется стандартный 4-фазный криптографический Handshake Anet (`AuthHandler`), клиенту выделяется IP из пула (`10.0.0.x`), и из `shared_key` через HKDF-SHA256 выводятся:
+     * `nonce_prefix: u32` (4 байта идентификатора сессии, проверяется отсутствие коллизии в `ASTPL_INGRESS_MAP`);
+     * `crypto_seed: u64` (8 байт ключа для `Xoroshiro128+`).
+   * Сервер записывает сессию в `ASTPL_INGRESS_MAP` (по ключу `nonce_prefix`) и в `ASTPL_EGRESS_MAP` (по ключу `assigned_ip`) ДО или в момент отправки `AuthResponse` (Phase IV).
+3. **Фоновая синхронизация с `ClientRegistry` и NAT Rebinding:**
+   * Фоновая задача `anet-server` раз в `5–10` секунд читает `rx_bytes`, `tx_bytes`, `last_seen_ns`, а также актуальные `client_ip` / `client_port` из BPF-карт и синхронизирует их с `ClientInfo` в `ClientRegistry` (чтобы `cleanup_inactive_clients` не удалял активные eBPF-сессии по таймауту, а в статистике отображался реальный трафик и актуальный endpoint после NAT Rebinding).
+   * При удалении неактивного клиента его записи удаляются из `ASTPL_INGRESS_MAP` (по `nonce_prefix`) и `ASTPL_EGRESS_MAP` (по `assigned_ip`).
 
 ---
 
@@ -347,17 +374,18 @@ impl<'a> ContextWrapper<'a> {
 
 Клиент может работать на любой ОС (Windows, macOS, Android, iOS, Linux) полностью в Userspace без зависимости от eBPF:
 
-1. Выполняет Handshake с сервером, отправляя пакеты с префиксом `0x00000000` (`Seq = 0`).
-2. Получает от сервера настройки `TUN` и `crypto_seed: u64`.
+1. Выполняет стандартный 4-фазный Handshake ASTP с сервером на порту `ASTPL_PORT` (при включённом `frag_enabled = true` нарезая датаграммы Phase I и Phase III через `fragment_datagram` со случайным джиттером).
+2. Получает от сервера `AuthResponse` (настройки `TUN`) и выводит из `shared_key` через HKDF-SHA256 `nonce_prefix: [u8; 4]` и `crypto_seed: u64`.
 3. **Отправка (TX):**
    * Читает IPv4-пакет из локального `TUN`.
    * Увеличивает локальный `tx_seq: u32` (при переполнении в `0` ставит `1`).
    * Инициализирует `Xoroshiro128Plus::new(crypto_seed, tx_seq)` (с 2 раундами прогрева) и шифрует буфер (по 8 байт + хвост `1..7` байт).
-   * Дописывает в начало 4 байта `tx_seq.to_be_bytes()` и отправляет в UDP-сокет.
+   * Формирует 8-байтный заголовок `[nonce_prefix (4B)][tx_seq.to_be_bytes() (4B)]`, дописывает зашифрованный пакет и отправляет в UDP-сокет.
 4. **Приём (RX):**
-   * Читает датаграмму из UDP-сокета.
-   * Читает первые 4 байта (`seq`). Если `seq == 0` — передаёт пакет обработчику Control Plane (Rekey / Keepalive).
-   * Если `seq > 0` — инициализирует `Xoroshiro128Plus::new(crypto_seed, seq)`, расшифровывает остаток буфера и пишет чистый IPv4-пакет в локальный `TUN`.
+   * Читает датаграмму из UDP-сокета (не менее `8 + 20 = 28` байт).
+   * Сверяет первые 4 байта с `nonce_prefix` своей сессии и читает следующие 4 байта (`seq = u32::from_be_bytes(...)`).
+   * Если `seq == 0` — передаёт пакет обработчику Control Plane (Rekey / Keepalive).
+   * Если `seq > 0` — инициализирует `Xoroshiro128Plus::new(crypto_seed, seq)`, расшифровывает остаток буфера (`data[8..]`) и пишет чистый IPv4-пакет в локальный `TUN`.
 
 ---
 
