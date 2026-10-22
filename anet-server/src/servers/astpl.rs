@@ -12,7 +12,7 @@
 use crate::auth_handler::ServerAuthHandler;
 use crate::client_registry::{ClientRegistry, ClientTransportInfo};
 use crate::config::Config;
-use crate::shaper::bump_memlock_rlimit;
+use crate::shaper::{bump_memlock_rlimit, init_ebpf_logger};
 use anet_common::astpl::{unwrap_astpl_packet_in_place, wrap_astpl_packet, ASTPL_HEADER_LEN};
 use anet_common::consts::{CHANNEL_BUFFER_SIZE, MAX_PACKET_SIZE, MIN_HANDSHAKE_LEN};
 use anet_common::handshake_fragmentation::DatagramReassembler;
@@ -73,8 +73,9 @@ impl AstplEbpfManager {
             None => {
                 bump_memlock_rlimit();
                 let bytes = aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/anet-ebpf"));
-                let ebpf =
+                let mut ebpf =
                     Ebpf::load(bytes).context("Failed to load embedded anet-ebpf object")?;
+                init_ebpf_logger(&mut ebpf);
                 Arc::new(Mutex::new(ebpf))
             }
         };
@@ -319,8 +320,11 @@ impl AstplEbpfManager {
                 .ok()
                 .map(|ip| u32::from_ne_bytes(ip.octets()));
 
-            let mut rx_bytes = client_info.ebpf_synced_rx.load(Ordering::Relaxed);
+            let prev_rx = client_info.ebpf_synced_rx.load(Ordering::Relaxed);
+            let prev_tx = client_info.ebpf_synced_tx.load(Ordering::Relaxed);
+            let mut rx_bytes = prev_rx;
             let mut last_seen_ns = client_info.ebpf_last_seen_ns.load(Ordering::Relaxed);
+            let mut last_rx_seq = 0u32;
             let mut kernel_addr = None;
 
             if let Some(map) = ebpf.map_mut(ASTPL_INGRESS_MAP) {
@@ -328,6 +332,7 @@ impl AstplEbpfManager {
                     if let Ok(ing) = ingress_map.get(&prefix_key, 0) {
                         rx_bytes = ing.rx_bytes;
                         last_seen_ns = ing.last_seen_ns;
+                        last_rx_seq = ing.last_seq;
                         if ing.client_ip != 0 && ing.client_port != 0 {
                             kernel_addr = Some(SocketAddr::new(
                                 IpAddr::V4(Ipv4Addr::from(ing.client_ip.to_ne_bytes())),
@@ -338,15 +343,31 @@ impl AstplEbpfManager {
                 }
             }
 
-            let mut tx_bytes = client_info.ebpf_synced_tx.load(Ordering::Relaxed);
+            let mut tx_bytes = prev_tx;
+            let mut last_tx_seq = 0u32;
             if let Some(k) = ip_key {
                 if let Some(map) = ebpf.map_mut(ASTPL_EGRESS_MAP) {
                     if let Ok(egress_map) = AyaHashMap::<_, u32, EgressRoutingData>::try_from(map) {
                         if let Ok(eg) = egress_map.get(&k, 0) {
                             tx_bytes = eg.tx_bytes;
+                            last_tx_seq = eg.tx_seq;
                         }
                     }
                 }
+            }
+
+            if rx_bytes != prev_rx || tx_bytes != prev_tx {
+                info!(
+                    "[ASTP-L eBPF Stats] tun_ip={} | XDP rx={} B (+{} B, last_seq={}) | TC tx={} B (+{} B, tx_seq={}) | endpoint={:?}",
+                    client_info.assigned_ip,
+                    rx_bytes,
+                    rx_bytes.saturating_sub(prev_rx),
+                    last_rx_seq,
+                    tx_bytes,
+                    tx_bytes.saturating_sub(prev_tx),
+                    last_tx_seq,
+                    kernel_addr
+                );
             }
 
             registry.sync_astpl_session_stats(

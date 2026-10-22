@@ -4,7 +4,7 @@
 use aya_ebpf::{
     bindings::{xdp_action, TC_ACT_OK, TC_ACT_SHOT},
     helpers::{
-        bpf_ktime_get_ns, bpf_redirect_neigh, bpf_skb_adjust_room, bpf_skb_pull_data,
+        bpf_ktime_get_ns, bpf_redirect_neigh, bpf_skb_change_head, bpf_skb_pull_data,
         bpf_skb_set_tstamp, bpf_xdp_adjust_head,
     },
     macros::{classifier, map, xdp},
@@ -12,7 +12,7 @@ use aya_ebpf::{
     programs::{TcContext, XdpContext},
     EbpfContext,
 };
-use aya_log_ebpf::debug;
+use aya_log_ebpf::{debug, info, warn};
 
 use anet_ebpf_common::{
     AstplConfig, EdtState, EgressRoutingData, IngressSessionData, RateRule, TokenBucketState,
@@ -30,12 +30,6 @@ use ip::{
 /// (`aya_ebpf::bindings`) этот enum отсутствует, поэтому значение
 /// захардкожено — это стабильный UAPI ядра, он не меняется между релизами.
 const BPF_SKB_TSTAMP_DELIVERY_MONO: u32 = 1;
-
-/// Стабильные UAPI-константы ядра Linux (`include/uapi/linux/bpf.h`) для `bpf_skb_adjust_room`.
-const BPF_ADJ_ROOM_NET: u32 = 0;
-const BPF_F_ADJ_ROOM_FIXED_GSO: u64 = 1 << 0;
-const BPF_F_ADJ_ROOM_ENCAP_L3_IPV4: u64 = 1 << 1;
-const BPF_F_ADJ_ROOM_ENCAP_L4_UDP: u64 = 1 << 3;
 
 /// Идентификатор внутритуннельного ICMP-зонда ANet (`0x414E`, "AN") в сетевом порядке байт.
 const ANET_PROBE_IDENT_BE: u16 = 0x414Eu16.to_be();
@@ -219,21 +213,32 @@ pub fn astpl_tc_egress(ctx: TcContext) -> i32 {
 }
 
 fn try_astpl_tc_egress(ctx: &TcContext) -> Result<i32, ()> {
+    const OUTER_HEADERS_LEN: usize = EthHdr::LEN + ASTPL_ENCAP_LEN; // 14 + 36 = 50 байт
+
     let w_init = ContextWrapper::Tc(ctx);
     let inner_ip = w_init.read_unaligned::<Ipv4Hdr>(0)?;
     if inner_ip.version() != 4 {
         return Ok(TC_ACT_OK);
     }
 
-    // В `Ipv4Hdr` поле `dst_addr` лежит в сетевом порядке байт (Big-Endian),
+    // В `Ipv4Hdr` поля адресов лежат в сетевом порядке байт (Big-Endian),
     // как и ключ в `ASTPL_EGRESS_MAP`.
+    let inner_src_ip = inner_ip.src_addr;
     let inner_dst_ip = inner_ip.dst_addr;
+    let inner_proto = inner_ip.proto;
     let Some(routing_ptr) = ASTPL_EGRESS_MAP.get_ptr_mut(&inner_dst_ip) else {
         return Ok(TC_ACT_OK);
     };
 
     let cfg = load_astpl_config();
     if cfg.astpl_port_be == 0 || cfg.server_ip_be == 0 || cfg.eth_ifindex == 0 {
+        warn!(
+            ctx,
+            "[ASTP-L TC] missing config: port_be={}, ip_be={:i}, ifindex={}",
+            cfg.astpl_port_be,
+            u32::from_be(cfg.server_ip_be),
+            cfg.eth_ifindex
+        );
         return Ok(TC_ACT_OK);
     }
 
@@ -241,6 +246,7 @@ fn try_astpl_tc_egress(ctx: &TcContext) -> Result<i32, ()> {
     // чтобы все фрагменты страницы (paged frags) оказались в линейной области data..data_end.
     let pull_ret = unsafe { bpf_skb_pull_data(ctx.as_ptr() as *mut _, 0) };
     if pull_ret < 0 {
+        warn!(ctx, "[ASTP-L TC] bpf_skb_pull_data failed: ret={}", pull_ret);
         return Ok(TC_ACT_OK);
     }
 
@@ -272,31 +278,41 @@ fn try_astpl_tc_egress(ctx: &TcContext) -> Result<i32, ()> {
         )
     };
 
-    // Шифруем внутренний IPv4-пакет на месте (0 .. data_end)
+    // 1. Шифруем внутренний IPv4-пакет на месте (0 .. data_end) до сдвига начала буфера.
     xoroshiro_crypt_packet(&w_plain, 0, crypto_seed, tx_seq)?;
 
-    // Раздвигаем начало пакета на 36 байт под Outer IPv4 (20) + Outer UDP (8) + ASTP-L Header (8)
-    let flags =
-        BPF_F_ADJ_ROOM_FIXED_GSO | BPF_F_ADJ_ROOM_ENCAP_L3_IPV4 | BPF_F_ADJ_ROOM_ENCAP_L4_UDP;
-    let adj_ret = unsafe {
-        bpf_skb_adjust_room(
-            ctx.as_ptr() as *mut _,
-            ASTPL_ENCAP_LEN as i32,
-            BPF_ADJ_ROOM_NET,
-            flags,
-        )
-    };
-    if adj_ret < 0 {
+    // 2. Расширяем начало пакета на 50 байт:
+    //    `EthHdr (14) + Outer IPv4 (20) + Outer UDP (8) + ASTP-L Header (8)`.
+    //    КРИТИЧНО: В ядре Linux функция `__bpf_redirect_neigh` (`net/core/filter.c`)
+    //    проверяет `skb->mac_header < skb->network_header`, проверяет `!is_multicast_ether_addr(ethh->h_dest)`
+    //    и безусловно вызывает `skb_pull(skb, sizeof(struct ethhdr))` (срезая 14 байт) перед
+    //    `skb_reset_network_header(skb)` и вызовом `__bpf_redirect_neigh_v4`.
+    //    Хелпер `bpf_skb_change_head(ctx, 50, 0)` делает `__skb_push(skb, 50)`, обнуляет эти 50 байт
+    //    и вызывает `skb_reset_mac_header(skb)` (оставляя `skb->network_header` на старом месте `D`),
+    //    благодаря чему `skb->mac_header < skb->network_header` (`D - 50 < D`) всегда истинно,
+    //    а после `skb_pull(skb, 14)` внутри `__bpf_redirect_neigh` указатель `skb->data` и `skb->network_header`
+    //    встаёт ровно на смещение 14 (`outer_ip`).
+    let chg_ret =
+        unsafe { bpf_skb_change_head(ctx.as_ptr() as *mut _, OUTER_HEADERS_LEN as u32, 0) };
+    if chg_ret < 0 {
+        warn!(ctx, "[ASTP-L TC] bpf_skb_change_head(50) failed: ret={}", chg_ret);
         return Ok(TC_ACT_SHOT);
     }
 
-    // После bpf_skb_adjust_room старые указатели недействительны — создаём новую обёртку
+    // После bpf_skb_change_head старые указатели недействительны — создаём новую обёртку
     let w_encap = ContextWrapper::Tc(ctx);
-    let total_ip_len = w_encap.data_end().saturating_sub(w_encap.data());
-    if total_ip_len < ASTPL_ENCAP_LEN + Ipv4Hdr::LEN {
+    let total_frame_len = w_encap.data_end().saturating_sub(w_encap.data());
+    if total_frame_len < OUTER_HEADERS_LEN + Ipv4Hdr::LEN {
         return Ok(TC_ACT_SHOT);
     }
+    let total_ip_len = total_frame_len - EthHdr::LEN;
     let udp_total_len = total_ip_len - Ipv4Hdr::LEN;
+
+    let dummy_eth = EthHdr {
+        dst_addr: [0u8; 6], // unicast (bit 0 == 0), будет перезаписан подсистемой соседей в __bpf_redirect_neigh_v4
+        src_addr: [0u8; 6],
+        ether_type: ETH_P_IP_BE,
+    };
 
     let mut outer_ip = Ipv4Hdr {
         version_ihl: 0x45,
@@ -319,14 +335,34 @@ fn try_astpl_tc_egress(ctx: &TcContext) -> Result<i32, ()> {
         check: 0, // UDP checksum 0 валиден для IPv4 (RFC 768)
     };
 
-    w_encap.write_unaligned::<Ipv4Hdr>(0, outer_ip)?;
-    w_encap.write_unaligned::<UdpHdr>(Ipv4Hdr::LEN, outer_udp)?;
-    w_encap.write_unaligned::<u32>(Ipv4Hdr::LEN + UdpHdr::LEN, nonce_prefix)?;
-    w_encap.write_unaligned::<u32>(Ipv4Hdr::LEN + UdpHdr::LEN + 4, tx_seq.to_be())?;
+    w_encap.write_unaligned::<EthHdr>(0, dummy_eth)?;
+    w_encap.write_unaligned::<Ipv4Hdr>(EthHdr::LEN, outer_ip)?;
+    w_encap.write_unaligned::<UdpHdr>(EthHdr::LEN + Ipv4Hdr::LEN, outer_udp)?;
+    w_encap.write_unaligned::<u32>(EthHdr::LEN + Ipv4Hdr::LEN + UdpHdr::LEN, nonce_prefix)?;
+    w_encap.write_unaligned::<u32>(
+        EthHdr::LEN + Ipv4Hdr::LEN + UdpHdr::LEN + 4,
+        tx_seq.to_be(),
+    )?;
 
     // Отправляем зашифрованный UDP-пакет напрямую в физический интерфейс через подсистему соседей (ARP/Neighbour)
     let action =
         unsafe { bpf_redirect_neigh(cfg.eth_ifindex, core::ptr::null_mut(), 0, 0) as i32 };
+
+    if inner_proto == IPPROTO_ICMP || tx_seq <= 20 || (tx_seq & 0x3F) == 0 || action != 7 {
+        info!(
+            ctx,
+            "[ASTP-L TC] encap: tx_seq={}, proto={}, len={}, {:i} -> {:i} (udp {:i}:{}), action={}",
+            tx_seq,
+            inner_proto,
+            inner_len,
+            u32::from_be(inner_src_ip),
+            u32::from_be(inner_dst_ip),
+            u32::from_be(dst_ip),
+            u16::from_be(dst_port),
+            action
+        );
+    }
+
     Ok(action)
 }
 
@@ -413,6 +449,17 @@ fn try_astpl_xdp_ingress(ctx: &XdpContext) -> Result<u32, ()> {
         && inner_ip.src_addr == assigned_ip;
 
     if !valid_inner {
+        warn!(
+            ctx,
+            "[ASTP-L XDP] invalid inner IPv4: seq={}, ver={}, ihl={}, tot_len={}, inner_len={}, src={:i}, expected={:i}",
+            seq,
+            inner_ip.version(),
+            inner_ip.ihl(),
+            inner_tot_len,
+            inner_len,
+            u32::from_be(inner_ip.src_addr),
+            u32::from_be(assigned_ip)
+        );
         // При случайной коллизии префикса (1 на 2^32) или невалидном пакете откатываем XOR обратно
         // и передаём пакет в Userspace без повреждения исходных байт.
         let _ = xoroshiro_crypt_packet(&w, OUTER_HEADERS_LEN, crypto_seed, seq);
@@ -437,12 +484,19 @@ fn try_astpl_xdp_ingress(ctx: &XdpContext) -> Result<u32, ()> {
                 (*egress_ptr).dst_ip = outer_src_ip;
                 (*egress_ptr).dst_port = outer_src_port;
             }
+            info!(
+                ctx,
+                "[ASTP-L XDP] NAT rebinding for {:i} -> {:i}:{}",
+                u32::from_be(assigned_ip),
+                u32::from_be(outer_src_ip),
+                u16::from_be(outer_src_port)
+            );
         }
     }
 
     // 5. Если пакет является внутритуннельным ICMP Echo Request зондом ANet (`ident == 0x414E`),
     // возвращаем исходное шифрование и отдаём `XDP_PASS` в Userspace-сокет `anet-server`,
-    // чтобы сервер мгновенно сформировал Echo Reply independientemente от настроек IP/iptables на TUN.
+    // чтобы сервер мгновенно сформировал Echo Reply независимо от настроек IP/iptables на TUN.
     if inner_ip.proto == IPPROTO_ICMP
         && inner_ip.ihl() == 5
         && w.data() + OUTER_HEADERS_LEN + Ipv4Hdr::LEN + 8 <= w.data_end()
@@ -457,6 +511,12 @@ fn try_astpl_xdp_ingress(ctx: &XdpContext) -> Result<u32, ()> {
 
     // 6. Проверяем Token-Bucket шейпер для upload-трафика клиента (в `RATE_RULES` ключ — `u32::from_be(assigned_ip)`).
     if !check_upload_token_bucket(u32::from_be(assigned_ip), inner_tot_len as i64, now) {
+        warn!(
+            ctx,
+            "[ASTP-L XDP] dropped by upload token bucket: src={:i}, len={}",
+            u32::from_be(assigned_ip),
+            inner_tot_len
+        );
         return Ok(xdp_action::XDP_DROP);
     }
 
@@ -465,7 +525,20 @@ fn try_astpl_xdp_ingress(ctx: &XdpContext) -> Result<u32, ()> {
     w.write_unaligned::<EthHdr>(ASTPL_ENCAP_LEN, eth)?;
     let adj_ret = unsafe { bpf_xdp_adjust_head(ctx.as_ptr() as *mut _, ASTPL_ENCAP_LEN as i32) };
     if adj_ret < 0 {
+        warn!(ctx, "[ASTP-L XDP] bpf_xdp_adjust_head failed: ret={}", adj_ret);
         return Ok(xdp_action::XDP_DROP);
+    }
+
+    if inner_ip.proto == IPPROTO_ICMP || seq <= 20 || (seq & 0x3F) == 0 {
+        info!(
+            ctx,
+            "[ASTP-L XDP] decap: seq={}, proto={}, len={}, {:i} -> {:i}",
+            seq,
+            inner_ip.proto,
+            inner_tot_len,
+            u32::from_be(inner_ip.src_addr),
+            u32::from_be(inner_ip.dst_addr)
+        );
     }
 
     Ok(xdp_action::XDP_PASS)

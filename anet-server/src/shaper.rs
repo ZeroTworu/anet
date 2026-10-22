@@ -53,6 +53,38 @@ pub fn bump_memlock_rlimit() {
     }
 }
 
+/// Инициализирует `aya_log::EbpfLogger` и запускает фоновую задачу Tokio (`AsyncFd`)
+/// для асинхронного чтения кольцевого буфера логов из ядра (`aya_log_ebpf`).
+pub fn init_ebpf_logger(ebpf: &mut Ebpf) {
+    match aya_log::EbpfLogger::init(ebpf) {
+        Err(e) => {
+            warn!("[eBPF] Failed to initialize eBPF logger (non-fatal): {}", e);
+        }
+        Ok(logger) => {
+            match tokio::io::unix::AsyncFd::with_interest(
+                logger,
+                tokio::io::Interest::READABLE,
+            ) {
+                Ok(mut async_logger) => {
+                    tokio::task::spawn(async move {
+                        loop {
+                            let Ok(mut guard) = async_logger.readable_mut().await else {
+                                break;
+                            };
+                            guard.get_inner_mut().flush();
+                            guard.clear_ready();
+                        }
+                    });
+                    info!("[eBPF] Kernel eBPF logger initialized (AsyncFd reader active)");
+                }
+                Err(e) => {
+                    warn!("[eBPF] Failed to wrap EbpfLogger in AsyncFd: {}", e);
+                }
+            }
+        }
+    }
+}
+
 pub struct Shaper {
     ebpf: Arc<Mutex<Ebpf>>,
     iface: String,
@@ -67,6 +99,7 @@ impl Shaper {
         bump_memlock_rlimit();
         let bytes = aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/anet-ebpf"));
         let mut ebpf = Ebpf::load(bytes).context("Failed to load embedded anet-ebpf object")?;
+        init_ebpf_logger(&mut ebpf);
 
         Self::ensure_clsact(iface).await;
         Self::ensure_fq_qdisc(iface).await;
