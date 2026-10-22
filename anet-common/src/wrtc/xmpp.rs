@@ -1,7 +1,7 @@
 use crate::config::WrtcConfig;
 use crate::consts::{WRTC_XMPP_CHANNEL_CAPACITY, WRTC_XMPP_RAW_WS_CHANNEL_CAPACITY};
 use crate::http_help::BrowserProfile;
-use crate::wrtc::stealth::{apply_ws_browser_headers, generate_random_guest_name};
+use crate::wrtc::stealth::generate_random_guest_name;
 use crate::wrtc::xmpp_xml::{escape_xml_attr, parse_xmpp_stanzas, InboundXmpp, XmppBuilder};
 use futures::{SinkExt, StreamExt};
 use rand::Rng;
@@ -9,7 +9,6 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -18,6 +17,8 @@ pub struct XmppSession {
     pub conference_id: String,
     pub jid: String,
     pub client_name: String,
+    pub profile: BrowserProfile,
+    pub origin: String,
     pub occupants: Arc<Mutex<HashSet<String>>>,
     pub discovered_stuns: Arc<Mutex<Vec<String>>>,
     write_tx: mpsc::Sender<String>,
@@ -65,13 +66,11 @@ impl XmppSession {
         let origin = format!("https://{domain}");
         log::info!("[XMPP] Connecting to signaling WebSocket: {ws_url}");
 
-        let mut request = ws_url.as_str().into_client_request()?;
+        let mut request = profile.build_ws_request(&ws_url, Some(&origin))?;
         request.headers_mut().insert(
             "Sec-WebSocket-Protocol",
             HeaderValue::from_static("xmpp"),
         );
-
-        apply_ws_browser_headers(&mut request, profile, &origin)?;
 
         let handshake_timeout_secs = wrtc_cfg.xmpp_handshake_timeout_secs.max(1);
         let (ws_stream, response) = tokio::time::timeout(
@@ -377,6 +376,8 @@ impl XmppSession {
             conference_id: conference_id.to_string(),
             jid,
             client_name: effective_client_name,
+            profile: profile.clone(),
+            origin,
             occupants,
             discovered_stuns,
             write_tx,

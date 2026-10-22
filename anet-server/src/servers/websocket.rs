@@ -26,7 +26,10 @@ const MAX_WS_MESSAGE_SIZE: usize = 128 * 1024; // Увеличено для ко
 async fn upgrade(
     stream: TcpStream,
     expected_path: String,
-) -> Result<tokio_tungstenite::WebSocketStream<TcpStream>> {
+    fallback_addr: SocketAddr,
+) -> Result<(tokio_tungstenite::WebSocketStream<TcpStream>, SocketAddr)> {
+    let real_addr_out = Arc::new(std::sync::Mutex::new(fallback_addr));
+    let real_addr_cb = real_addr_out.clone();
     let callback = move |request: &Request,
                          mut response: Response|
                          -> std::result::Result<Response, ErrorResponse> {
@@ -34,6 +37,10 @@ async fn upgrade(
             let mut rejected = ErrorResponse::new(Some("Not Found".to_string()));
             *rejected.status_mut() = StatusCode::NOT_FOUND;
             return Err(rejected);
+        }
+        let extracted = anet_common::http_help::extract_real_ip(request.headers(), fallback_addr);
+        if let Ok(mut guard) = real_addr_cb.lock() {
+            *guard = extracted;
         }
         response
             .headers_mut()
@@ -46,7 +53,9 @@ async fn upgrade(
         .max_write_buffer_size(256 * 1024)
         .max_message_size(Some(MAX_WS_MESSAGE_SIZE))
         .max_frame_size(Some(MAX_WS_MESSAGE_SIZE));
-    Ok(accept_hdr_async_with_config(stream, callback, Some(ws_config)).await?)
+    let ws_stream = accept_hdr_async_with_config(stream, callback, Some(ws_config)).await?;
+    let real_addr = real_addr_out.lock().map(|g| *g).unwrap_or(fallback_addr);
+    Ok((ws_stream, real_addr))
 }
 
 async fn handle_session(
@@ -57,7 +66,8 @@ async fn handle_session(
     tun_tx: mpsc::Sender<Bytes>,
     auth_handler: ServerAuthHandler,
 ) -> Result<()> {
-    let mut socket = upgrade(stream, config.server.websocket_path.clone()).await?;
+    let (mut socket, remote_addr) =
+        upgrade(stream, config.server.websocket_path.clone(), remote_addr).await?;
     info!("ASTP[WebSocket] HTTP upgrade complete: {}", remote_addr);
 
     let mut handshake_phase = 1u8;

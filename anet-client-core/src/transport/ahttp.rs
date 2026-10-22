@@ -57,38 +57,11 @@ fn unwrap_packet_with_seq(cipher: &anet_common::encryption::Cipher, raw_packet: 
     Ok((seq, payload_bytes))
 }
 
-/// Нативно внедряет маскировку заголовков в запрос reqwest (API Fetch/XHR стиль)
-fn apply_stealth_headers(
-    builder: reqwest::RequestBuilder,
-    profile: &BrowserProfile,
-    host: &str,
-) -> reqwest::RequestBuilder {
-    let mut builder = builder
-        .header("Host", host)
-        .header("User-Agent", profile.user_agent)
-        .header("Accept", "*/*")
-        .header("Accept-Language", profile.accept_language)
-        .header("Accept-Encoding", "gzip, deflate, br")
-        .header("Connection", "keep-alive")
-        .header("Sec-Fetch-Dest", "empty")
-        .header("Sec-Fetch-Mode", "cors")
-        .header("Sec-Fetch-Site", "cross-site")
-        .header("Cache-Control", "no-cache")
-        .header("Pragma", "no-cache");
-
-    if let Some(index) = profile.chrome_profile {
-        use anet_common::http_help::{CHROME_BRANDS, CHROME_PLATFORMS};
-        builder = builder
-            .header("sec-ch-ua", CHROME_BRANDS[index])
-            .header("sec-ch-ua-mobile", "?0")
-            .header("sec-ch-ua-platform", CHROME_PLATFORMS[index]);
-    }
-    builder
-}
-
 struct AHttpAuthChannel {
     client: Client,
     base_url: String,
+    origin: String,
+    referer: String,
     profile: BrowserProfile,
     is_auth_phase: Mutex<bool>,
     pending_response: Mutex<Option<Bytes>>,
@@ -107,11 +80,10 @@ impl AuthChannel for AHttpAuthChannel {
             format!("{}{}", self.base_url, self.auth_path)
         };
 
-        let parsed_url = Url::parse(&req_path)?;
-        let host = parsed_url.host_str().unwrap_or("");
-
-        let mut req = self.client.post(&req_path);
-        req = apply_stealth_headers(req, &self.profile, host);
+        let req = self.client.post(&req_path).header("Accept", "*/*");
+        let req = self
+            .profile
+            .apply_to_reqwest(req, Some(&self.origin), Some(&self.referer));
 
         let resp = req.body(data.to_vec()).send().await?;
 
@@ -213,9 +185,14 @@ impl ClientTransport for AHttpTransport {
             Err(e) => bail!("Cannot build a HTTP client: {}", e),
         };
 
+        let origin = format!("{}://{}", scheme, target_host);
+        let referer = format!("{}/", base_url);
+
         let auth_channel = AHttpAuthChannel {
             client: http_client.clone(),
             base_url: base_url.clone(),
+            origin: origin.clone(),
+            referer: referer.clone(),
             profile: profile.clone(),
             is_auth_phase: Mutex::new(false),
             pending_response: Mutex::new(None),
@@ -245,7 +222,8 @@ impl ClientTransport for AHttpTransport {
         let padding_step = self.config.stealth.padding_step;
         let config_ahttp = self.config.ahttp.clone();
 
-        let host_ul = target_host.clone();
+        let origin_ul = origin;
+        let referer_ul = referer;
         let profile_ul = profile.clone();
         let cipher_ul = cipher.clone();
 
@@ -299,7 +277,8 @@ impl ClientTransport for AHttpTransport {
                 let uplink_method_clone = uplink_method.clone();
                 let traffic_url_clone = traffic_url.clone();
                 let profile_ul_clone = profile_ul.clone();
-                let host_ul_clone = host_ul.clone();
+                let origin_ul_clone = origin_ul.clone();
+                let referer_ul_clone = referer_ul.clone();
                 let cipher_ul_clone = cipher_ul.clone();
                 let rx_reassembler_clone = rx_reassembler.clone();
                 let tunnel_write_clone = tunnel_write_mutex.clone();
@@ -314,8 +293,14 @@ impl ClientTransport for AHttpTransport {
 
                     // Seamless Reconnect: Повторяем до 5 раз при обрывах со стороны CDN
                     while attempts < 5 {
-                        let mut req = http_client_clone.request(uplink_method_clone.clone(), &traffic_url_clone);
-                        req = apply_stealth_headers(req, &profile_ul_clone, &host_ul_clone);
+                        let req = http_client_clone
+                            .request(uplink_method_clone.clone(), &traffic_url_clone)
+                            .header("Accept", "*/*");
+                        let req = profile_ul_clone.apply_to_reqwest(
+                            req,
+                            Some(&origin_ul_clone),
+                            Some(&referer_ul_clone),
+                        );
 
                         // Передаем payload.clone() — zero-copy для Bytes
                         let res = req.body(reqwest::Body::from(payload.clone())).send().await;

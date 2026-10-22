@@ -21,17 +21,10 @@ use url::Url;
 use anet_common::stream_framing::read_next_packet;
 
 fn get_real_ip(req: &httparse::Request, fallback: SocketAddr) -> SocketAddr {
-    for header in req.headers.iter() {
-        if header.name.eq_ignore_ascii_case("x-real-ip") || header.name.eq_ignore_ascii_case("x-forwarded-for") {
-            if let Ok(ip_str) = std::str::from_utf8(header.value) {
-                let first_ip = ip_str.split(',').next().unwrap_or("").trim();
-                if let Ok(ip) = first_ip.parse::<std::net::IpAddr>() {
-                    return SocketAddr::new(ip, 0);
-                }
-            }
-        }
-    }
-    SocketAddr::new(fallback.ip(), 0)
+    anet_common::http_help::extract_real_ip_from_raw(
+        req.headers.iter().map(|h| (h.name, h.value)),
+        fallback,
+    )
 }
 
 /// Отправка базового ответа HTTP/1.1
@@ -46,6 +39,8 @@ async fn send_http_response(
         "HTTP/1.1 {} {}\r\n\
          Content-Type: {}\r\n\
          Content-Length: {}\r\n\
+         Cache-Control: no-cache, no-store\r\n\
+         X-Accel-Buffering: no\r\n\
          Connection: close\r\n\r\n",
         status_code, status_text, content_type, body.len()
     );

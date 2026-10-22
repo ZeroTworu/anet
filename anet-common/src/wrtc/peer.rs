@@ -599,6 +599,10 @@ impl WrtcPeer {
         if let Some(session) = session_opt {
             if let Some(ref ws_url) = session.transport.colibri_ws_url {
                 let ws_url_c = ws_url.clone();
+                let ws_profile = xmpp_opt
+                    .map(|x| x.profile.clone())
+                    .unwrap_or_else(crate::http_help::BrowserProfile::random);
+                let ws_origin = xmpp_opt.map(|x| x.origin.clone());
                 let in_tx_ws = incoming_tx.clone();
                 let has_ws_c = has_ws.clone();
                 let dc_open_ws = dc_is_open.clone();
@@ -607,11 +611,24 @@ impl WrtcPeer {
                 let colibri_connect_timeout = wrtc_cfg.colibri_ws_connect_timeout_secs.max(1);
                 let ws_write_timeout = wrtc_cfg.ws_write_timeout_secs.max(1);
                 tokio::spawn(async move {
-                    let connect_res = tokio::time::timeout(
-                        Duration::from_secs(colibri_connect_timeout),
-                        tokio_tungstenite::connect_async(&ws_url_c),
-                    )
-                    .await;
+                    let connect_res = match ws_profile.build_ws_request(&ws_url_c, ws_origin.as_deref()) {
+                        Ok(req) => {
+                            tokio::time::timeout(
+                                Duration::from_secs(colibri_connect_timeout),
+                                tokio_tungstenite::connect_async(req),
+                            )
+                            .await
+                        }
+                        Err(e) => {
+                            log::warn!("[WRTC WS] Failed to build Colibri-WS request: {e}");
+                            if !dc_open_ws.load(Ordering::SeqCst) {
+                                is_failed_ws.store(true, Ordering::SeqCst);
+                                failed_notify_ws.notify_waiters();
+                                failed_notify_ws.notify_one();
+                            }
+                            return;
+                        }
+                    };
                     if let Ok(Ok((ws_stream, _))) = connect_res {
                         has_ws_c.store(true, Ordering::SeqCst);
                         log::info!("[WRTC WS] Parallel Colibri-WS fallback connected");

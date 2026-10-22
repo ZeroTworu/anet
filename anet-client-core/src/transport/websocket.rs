@@ -3,15 +3,14 @@ use crate::auth::{AuthChannel, AuthDenyError, AuthHandler};
 use crate::config::{CoreConfig, ServerConfig};
 use anet_common::consts::{CHANNEL_BUFFER_SIZE, COALESCE_BUDGET_BYTES, MAX_PACKET_SIZE};
 use anet_common::handshake_fragmentation::FragmentConfig;
+use anet_common::http_help::BrowserProfile;
 use anet_common::stream_framing::{frame_packet, frame_packet_into, read_next_packet};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use futures::{SinkExt, StreamExt};
-use http::HeaderValue;
-use http::header::{ACCEPT_LANGUAGE, CACHE_CONTROL, ORIGIN, PRAGMA, USER_AGENT};
 use log::{debug, info, warn};
-use rand::{Rng, seq::SliceRandom};
+use rand::Rng;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,7 +22,6 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, frame::coding::CloseCode};
 use tokio_tungstenite::{
@@ -32,75 +30,7 @@ use tokio_tungstenite::{
 
 type ClientSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-const CHROME_USER_AGENTS: &[&str] = &[
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
-];
-const FIREFOX_USER_AGENTS: &[&str] = &[
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:153.0) Gecko/20100101 Firefox/153.0",
-    "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:152.0) Gecko/20100101 Firefox/152.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:151.0) Gecko/20100101 Firefox/151.0",
-];
-const CHROME_BRANDS: &[&str] = &[
-    "\"Google Chrome\";v=\"151\", \"Chromium\";v=\"151\", \"Not_A Brand\";v=\"24\"",
-    "\"Chromium\";v=\"150\", \"Not_A Brand\";v=\"24\", \"Google Chrome\";v=\"150\"",
-    "\"Not_A Brand\";v=\"24\", \"Google Chrome\";v=\"149\", \"Chromium\";v=\"149\"",
-];
-const CHROME_PLATFORMS: &[&str] = &["\"Windows\"", "\"Linux\"", "\"macOS\""];
-const SAFARI_USER_AGENTS: &[&str] = &[
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.5 Safari/605.1.15",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.4 Safari/605.1.15",
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.5 Mobile/15E148 Safari/604.1",
-];
-const ACCEPT_LANGUAGES: &[&str] = &[
-    "en-US,en;q=0.9",
-    "en-GB,en;q=0.9,en-US;q=0.8",
-    "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-];
 const MAX_WS_MESSAGE_SIZE: usize = 128 * 1024;
-
-#[derive(Clone)]
-struct BrowserProfile {
-    user_agent: &'static str,
-    accept_language: &'static str,
-    chrome_profile: Option<usize>,
-}
-
-impl BrowserProfile {
-    fn random() -> Self {
-        let mut rng = rand::rngs::OsRng;
-        let family = rng.gen_range(0..3);
-        let (user_agent, chrome_profile) = match family {
-            0 => {
-                let index = rng.gen_range(0..CHROME_USER_AGENTS.len());
-                (CHROME_USER_AGENTS[index], Some(index))
-            }
-            1 => (
-                FIREFOX_USER_AGENTS
-                    .choose(&mut rng)
-                    .copied()
-                    .unwrap_or(FIREFOX_USER_AGENTS[0]),
-                None,
-            ),
-            _ => (
-                SAFARI_USER_AGENTS
-                    .choose(&mut rng)
-                    .copied()
-                    .unwrap_or(SAFARI_USER_AGENTS[0]),
-                None,
-            ),
-        };
-        Self {
-            user_agent,
-            accept_language: ACCEPT_LANGUAGES
-                .choose(&mut rng)
-                .copied()
-                .unwrap_or(ACCEPT_LANGUAGES[0]),
-            chrome_profile,
-        }
-    }
-}
 
 struct WebSocketAuthChannel {
     socket: Mutex<ClientSocket>,
@@ -217,61 +147,14 @@ impl WebSocketTransport {
     }
 }
 
-fn browser_request(server: &ServerConfig, profile: &BrowserProfile) -> Result<http::Request<()>> {
-    let url = server.websocket_url()?;
-    let mut request = url.as_str().into_client_request()?;
-
-    request
-        .headers_mut()
-        .insert(USER_AGENT, HeaderValue::from_str(profile.user_agent)?);
-    request.headers_mut().insert(
-        ACCEPT_LANGUAGE,
-        HeaderValue::from_static(profile.accept_language),
-    );
-    request
-        .headers_mut()
-        .insert(CACHE_CONTROL, HeaderValue::from_static("no-cache"));
-    request
-        .headers_mut()
-        .insert(PRAGMA, HeaderValue::from_static("no-cache"));
-
-    let origin_scheme = if url.starts_with("wss://") {
-        "https"
-    } else {
-        "http"
-    };
-    let authority = request
-        .uri()
-        .authority()
-        .context("WebSocket URL has no authority")?
-        .to_string();
-    request.headers_mut().insert(
-        ORIGIN,
-        HeaderValue::from_str(&format!("{}://{}", origin_scheme, authority))?,
-    );
-
-    if let Some(index) = profile.chrome_profile {
-        request
-            .headers_mut()
-            .insert("sec-ch-ua", HeaderValue::from_static(CHROME_BRANDS[index]));
-        request
-            .headers_mut()
-            .insert("sec-ch-ua-mobile", HeaderValue::from_static("?0"));
-        request.headers_mut().insert(
-            "sec-ch-ua-platform",
-            HeaderValue::from_static(CHROME_PLATFORMS[index]),
-        );
-    }
-    Ok(request)
-}
-
 async fn connect_authenticated(
     config: &CoreConfig,
     server: &ServerConfig,
     profile: &BrowserProfile,
     resume_session_id: Option<String>,
 ) -> Result<(ClientSocket, anet_common::protocol::AuthResponse, [u8; 32], Option<IpAddr>)> {
-    let request = browser_request(server, profile)?;
+    let url = server.websocket_url()?;
+    let request = profile.build_ws_request(&url, None)?;
     let ws_config = WebSocketConfig::default()
         .read_buffer_size(64 * 1024)
         .write_buffer_size(64 * 1024)

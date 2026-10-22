@@ -1,6 +1,6 @@
 use crate::config::WrtcConfig;
 use crate::http_help::BrowserProfile;
-use crate::wrtc::stealth::{apply_reqwest_browser_headers, generate_random_guest_name};
+use crate::wrtc::stealth::generate_random_guest_name;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 
@@ -99,9 +99,12 @@ impl KtalkClient {
         let req = self
             .http
             .post(&url)
-            .header("Content-Type", "application/json");
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/plain, */*");
 
-        let req = apply_reqwest_browser_headers(req, &self.profile, Some(&origin), Some(&referer));
+        let req = self
+            .profile
+            .apply_to_reqwest(req, Some(&origin), Some(&referer));
 
         let resp = req.json(&body).send().await?;
 
@@ -130,9 +133,11 @@ impl KtalkClient {
             .http
             .get(&url)
             .header("Authorization", format!("Session {session_token}"))
-            .header("Accept", "application/json");
+            .header("Accept", "application/json, text/plain, */*");
 
-        let req = apply_reqwest_browser_headers(req, &self.profile, Some(&origin), Some(&referer));
+        let req = self
+            .profile
+            .apply_to_reqwest(req, Some(&origin), Some(&referer));
 
         let resp = req.send().await?;
 
