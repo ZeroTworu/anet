@@ -34,6 +34,7 @@ use anet_common::stream_framing::{frame_packet_into, read_next_packet};
 #[cfg(all(windows, feature = "per-app"))]
 use crate::config::PerAppMode;
 
+use crate::auth::AuthDenyError;
 use crate::config::{CoreConfig, ServerConfig};
 use crate::dns::{DnsManager, get_dns_manager};
 use crate::events::{AccountInfo, ClientState, account_info, client_state, err, status, warn};
@@ -263,6 +264,23 @@ impl AnetClient {
                 Err(e) => {
                     if self.stop_requested.load(Ordering::SeqCst) {
                         info!("[Core] Stop requested by user. Exiting connection loop.");
+                        break;
+                    }
+
+                    if let Some(auth_err) =
+                        should_abort_on_auth_deny(&e, config_clone.servers.len())
+                    {
+                        error!(
+                            "[Core] Authentication denied by server '{}': {}. Stopping connection loop.",
+                            server_name, auth_err.message
+                        );
+                        err(auth_err.message.clone());
+                        client_state(
+                            ClientState::Failed,
+                            format!("Auth error: {}", auth_err.message),
+                            Some(server_name.clone()),
+                        );
+                        self.stop_requested.store(true, Ordering::SeqCst);
                         break;
                     }
 
@@ -1319,3 +1337,170 @@ fn format_bytes(bytes: u64) -> String {
         format!("{:.2} GiB", b / GIB)
     }
 }
+
+fn should_abort_on_auth_deny(err: &anyhow::Error, server_count: usize) -> Option<&AuthDenyError> {
+    let auth_err = err.downcast_ref::<AuthDenyError>()?;
+    if !auth_err.is_node_transient() || server_count <= 1 {
+        Some(auth_err)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anet_common::consts::NONCE_LEN;
+    use anet_common::crypto_utils;
+    use anet_common::protocol::{
+        AuthDenyNotification, Message as AnetMessage, message::Content,
+    };
+    use async_trait::async_trait;
+    use base64::prelude::*;
+    use ed25519_dalek::SigningKey;
+    use prost::Message;
+    use std::sync::atomic::AtomicUsize;
+    use tokio::net::UdpSocket;
+    use tokio::sync::mpsc;
+
+    struct DummyRouteManager;
+
+    #[async_trait]
+    impl RouteManager for DummyRouteManager {
+        async fn backup_routes(&self) -> Result<()> {
+            Ok(())
+        }
+        async fn add_bypass_route(&self, _target: IpAddr, _prefix: u8) -> Result<()> {
+            Ok(())
+        }
+        async fn set_default_route(&self, _gateway: &str, _interface_name: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn add_specific_route(
+            &self,
+            _target: IpAddr,
+            _prefix: u8,
+            _gateway: &str,
+            _interface_name: &str,
+        ) -> Result<()> {
+            Ok(())
+        }
+        async fn restore_routes(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    struct DummyTunFactory;
+
+    #[async_trait]
+    impl TunFactory for DummyTunFactory {
+        async fn create_tun(
+            &self,
+            _auth: &AuthResponse,
+        ) -> Result<(mpsc::Sender<Bytes>, mpsc::Receiver<Bytes>, String)> {
+            let (tx, rx) = mpsc::channel(8);
+            Ok((tx, rx, "tun0".to_string()))
+        }
+    }
+
+    #[test]
+    fn test_should_abort_on_auth_deny_account_errors() {
+        let limit_err: anyhow::Error =
+            AuthDenyError::new("Достигнут лимит одновременных подключений").into();
+        assert!(should_abort_on_auth_deny(&limit_err, 1).is_some());
+        assert!(should_abort_on_auth_deny(&limit_err, 5).is_some());
+
+        let banned_err: anyhow::Error =
+            AuthDenyError::new("Учетная запись заблокирована").into();
+        assert!(should_abort_on_auth_deny(&banned_err, 3).is_some());
+    }
+
+    #[test]
+    fn test_should_abort_on_auth_deny_node_transient_errors() {
+        let drain_err: anyhow::Error =
+            AuthDenyError::new("Node is not accepting new connections").into();
+        // Если нода всего одна — останавливаемся, чтобы не крутиться в бесконечном цикле
+        assert!(should_abort_on_auth_deny(&drain_err, 1).is_some());
+        // Если нод несколько — разрешаем failover на следующую ноду
+        assert!(should_abort_on_auth_deny(&drain_err, 2).is_none());
+
+        let auth_down_err: anyhow::Error =
+            AuthDenyError::new("Все сервера авторизации недоступны").into();
+        assert!(should_abort_on_auth_deny(&auth_down_err, 1).is_some());
+        assert!(should_abort_on_auth_deny(&auth_down_err, 3).is_none());
+    }
+
+    #[test]
+    fn test_should_abort_on_auth_deny_ignores_network_errors() {
+        let net_err = anyhow::anyhow!("Connection handshake timed out");
+        assert!(should_abort_on_auth_deny(&net_err, 1).is_none());
+        assert!(should_abort_on_auth_deny(&net_err, 3).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_client_start_exits_loop_immediately_on_auth_error() {
+        let client_signing = SigningKey::from_bytes(&[33u8; 32]);
+        let server_signing = SigningKey::from_bytes(&[44u8; 32]);
+        let server_pub_bytes = server_signing.verifying_key().to_bytes().to_vec();
+
+        // Поднимаем локальный UDP-сокет, имитирующий QUIC-сервер, который отвечает AuthError
+        let server_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server_sock.local_addr().unwrap();
+        let packets_received = Arc::new(AtomicUsize::new(0));
+        let packets_received_clone = packets_received.clone();
+        let server_pub_clone = server_pub_bytes.clone();
+
+        let server_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 2048];
+            if let Ok((_len, peer_addr)) = server_sock.recv_from(&mut buf).await {
+                packets_received_clone.fetch_add(1, Ordering::SeqCst);
+                let deny_msg = AnetMessage {
+                    content: Some(Content::AuthError(AuthDenyNotification {
+                        message: "Достигнут лимит одновременных подключений".to_string(),
+                    })),
+                    padding: vec![],
+                };
+                let mut raw = Vec::new();
+                deny_msg.encode(&mut raw).unwrap();
+                let cipher = crypto_utils::create_handshake_cipher(&server_pub_clone);
+                let nonce = [9u8; NONCE_LEN];
+                let ct = cipher.encrypt(&nonce, Bytes::from(raw)).unwrap();
+                let mut pkt = BytesMut::with_capacity(NONCE_LEN + ct.len());
+                pkt.extend_from_slice(&nonce);
+                pkt.extend_from_slice(&ct);
+                let _ = server_sock.send_to(&pkt, peer_addr).await;
+            }
+        });
+
+        let mut cfg = CoreConfig::default();
+        cfg.keys.private_key = BASE64_STANDARD.encode(client_signing.to_bytes());
+        cfg.keys.server_pub_key = BASE64_STANDARD.encode(&server_pub_bytes);
+        cfg.servers = vec![
+            ServerConfig {
+                dsn: format!("quic://{}?name=Node1&timeout=5", server_addr),
+                ..Default::default()
+            },
+            ServerConfig {
+                dsn: format!("quic://{}?name=Node2&timeout=5", server_addr),
+                ..Default::default()
+            },
+        ];
+
+        let client = AnetClient::new(
+            cfg,
+            Box::new(DummyTunFactory),
+            Box::new(DummyRouteManager),
+        );
+
+        // Запускаем start() с жестким таймаутом 1.5с (если бы сработал sleep(2s) реконнекта или ретраи — тест бы упал по таймауту)
+        let res = tokio::time::timeout(Duration::from_millis(1500), client.start())
+            .await
+            .expect("client.start() must not enter reconnect sleep on fatal AuthError");
+        assert!(res.is_ok());
+        assert!(!client.is_running());
+        assert_eq!(packets_received.load(Ordering::SeqCst), 1);
+
+        let _ = server_task.await;
+    }
+}
+

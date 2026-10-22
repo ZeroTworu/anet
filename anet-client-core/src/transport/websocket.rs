@@ -1,5 +1,5 @@
 use super::{ClientTransport, ConnectionResult};
-use crate::auth::{AuthChannel, AuthHandler};
+use crate::auth::{AuthChannel, AuthDenyError, AuthHandler};
 use crate::config::{CoreConfig, ServerConfig};
 use anet_common::consts::{CHANNEL_BUFFER_SIZE, COALESCE_BUDGET_BYTES, MAX_PACKET_SIZE};
 use anet_common::handshake_fragmentation::FragmentConfig;
@@ -488,6 +488,13 @@ impl ClientTransport for WebSocketTransport {
                                 );
                             }
                             Ok(Err(error)) => {
+                                if error.downcast_ref::<AuthDenyError>().is_some() {
+                                    warn!(
+                                        "[WebSocket] Planned reconnect rejected by server: {}",
+                                        error
+                                    );
+                                    break;
+                                }
                                 warn!("[WebSocket] Planned reconnect attempt failed: {}", error)
                             }
                             Err(_) => warn!("[WebSocket] Planned reconnect attempt timed out"),

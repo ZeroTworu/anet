@@ -1,5 +1,5 @@
 use crate::config::CoreConfig;
-use crate::events::{status, warn, err as serr};
+use crate::events::{status, warn};
 use anet_common::consts::{MAX_PACKET_SIZE, NONCE_LEN, PROTO_PAD_FIELD_OVERHEAD};
 use anet_common::crypto_utils::{self, derive_shared_key, generate_key_fingerprint, sign_data};
 use anet_common::encryption::Cipher;
@@ -31,6 +31,32 @@ use x25519_dalek::{PublicKey, StaticSecret};
 const MAX_RETRIES: u32 = 10;
 const INITIAL_DELAY: u64 = 6;
 const MAX_DELAY: u64 = 60;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthDenyError {
+    pub message: String,
+}
+
+impl AuthDenyError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+
+    pub fn is_node_transient(&self) -> bool {
+        self.message.contains("Node is not accepting new connections")
+            || self.message.contains("Все сервера авторизации недоступны")
+    }
+}
+
+impl std::fmt::Display for AuthDenyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for AuthDenyError {}
 
 #[async_trait]
 pub trait AuthChannel: Send + Sync {
@@ -147,7 +173,7 @@ impl AuthHandler {
         let client_public_key = signing_key.verifying_key();
         let client_id = generate_key_fingerprint(&client_public_key);
 
-        // Если есть переопределенный ключ для сервера — берем его, иначе глобальный
+        // Если есть переопределенный ключ сервера — берем его, иначе глобальный
         let key_str = server_pub_key_override.unwrap_or(&cfg.keys.server_pub_key);
         if key_str.is_empty() {
             anyhow::bail!("Публичный ключ сервера (server_pub_key) не настроен!");
@@ -187,6 +213,9 @@ impl AuthHandler {
             match self.attempt_handshake(channel, delay).await {
                 Ok(result) => return Ok(result),
                 Err(e) => {
+                    if e.downcast_ref::<AuthDenyError>().is_some() {
+                        return Err(e);
+                    }
                     warn!(
                         "[AUTH] Handshake attempt {} failed: {}. Retrying...",
                         attempt, e
@@ -267,6 +296,9 @@ impl AuthHandler {
             match self.handle_phase_ii_response(&response_buf) {
                 Ok(key) => break key,
                 Err(e) => {
+                    if e.downcast_ref::<AuthDenyError>().is_some() {
+                        return Err(e);
+                    }
                     log::warn!("[AUTH] Ignored packet during Phase II (likely noise): {}", e);
                     continue;
                 }
@@ -317,8 +349,9 @@ impl AuthHandler {
             }
             // Если сервер прислал ошибку вместо ключей DH
             Some(Content::AuthError(err)) => {
-                serr(format!("[CORE AUTH] {}", err.message));
-                return Err(anyhow::anyhow!("{}", err.message));
+                warn!("[AUTH] Server rejected handshake in Phase II: {}", err.message);
+                warn(format!("[CORE AUTH] {}", err.message));
+                return Err(AuthDenyError::new(err.message).into());
             }
             _ => {
                 return Err(anyhow::anyhow!(
@@ -403,8 +436,9 @@ impl AuthHandler {
                     return Ok((auth_response, shared_key));
                 }
                 Some(Content::AuthError(err)) => {
-                    serr(format!("[CORE AUTH] {}", err.message));
-                    return Err(anyhow::anyhow!("{}", err.message));
+                    warn!("[AUTH] Server rejected authentication in Phase IV: {}", err.message);
+                    warn(format!("[CORE AUTH] {}", err.message));
+                    return Err(AuthDenyError::new(err.message).into());
                 }
                 _ => {
                     log::debug!("[AUTH] Ignored unexpected Phase IV content");
@@ -484,3 +518,159 @@ impl AuthHandler {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anet_common::protocol::{AuthDenyNotification, DhServerExchange};
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct MockAuthChannel {
+        responses: Mutex<VecDeque<Bytes>>,
+        send_count: AtomicUsize,
+    }
+
+    impl MockAuthChannel {
+        fn new(responses: Vec<Bytes>) -> Self {
+            Self {
+                responses: Mutex::new(VecDeque::from(responses)),
+                send_count: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl AuthChannel for MockAuthChannel {
+        async fn send(&self, _data: Bytes, _frag: &FragmentConfig) -> Result<()> {
+            self.send_count.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn recv(&self, _timeout: Duration) -> Result<Bytes> {
+            let mut q = self.responses.lock().await;
+            q.pop_front()
+                .ok_or_else(|| anyhow::anyhow!("No more mock responses"))
+        }
+    }
+
+    fn make_test_handler_and_server_key() -> (AuthHandler, SigningKey, Vec<u8>) {
+        let client_signing = SigningKey::from_bytes(&[11u8; 32]);
+        let server_signing = SigningKey::from_bytes(&[22u8; 32]);
+        let server_pub_bytes = server_signing.verifying_key().to_bytes().to_vec();
+
+        let mut cfg = CoreConfig::default();
+        cfg.keys.private_key = BASE64_STANDARD.encode(client_signing.to_bytes());
+        cfg.keys.server_pub_key = BASE64_STANDARD.encode(&server_pub_bytes);
+
+        let handler = AuthHandler::new(&cfg, None).expect("Failed to create AuthHandler");
+        (handler, server_signing, server_pub_bytes)
+    }
+
+    fn encrypt_handshake_msg(server_pub_bytes: &[u8], msg: &AnetMessage) -> Bytes {
+        let mut raw = Vec::new();
+        msg.encode(&mut raw).unwrap();
+        let cipher = crypto_utils::create_handshake_cipher(server_pub_bytes);
+        let nonce = [7u8; NONCE_LEN];
+        let ct = cipher.encrypt(&nonce, Bytes::from(raw)).unwrap();
+        let mut out = BytesMut::with_capacity(NONCE_LEN + ct.len());
+        out.put_slice(&nonce);
+        out.put(ct);
+        out.freeze()
+    }
+
+    #[test]
+    fn test_auth_deny_error_classification() {
+        let session_limit = AuthDenyError::new("Достигнут лимит одновременных подключений");
+        assert!(!session_limit.is_node_transient());
+
+        let banned = AuthDenyError::new("Учетная запись заблокирована");
+        assert!(!banned.is_node_transient());
+
+        let expired = AuthDenyError::new("Время действия подписки истекло");
+        assert!(!expired.is_node_transient());
+
+        let traffic = AuthDenyError::new("Лимит трафика на этот период исчерпан");
+        assert!(!traffic.is_node_transient());
+
+        let not_found = AuthDenyError::new("Not found");
+        assert!(!not_found.is_node_transient());
+
+        let draining = AuthDenyError::new("Node is not accepting new connections");
+        assert!(draining.is_node_transient());
+
+        let backends_down = AuthDenyError::new("Все сервера авторизации недоступны");
+        assert!(backends_down.is_node_transient());
+    }
+
+    #[tokio::test]
+    async fn test_phase_ii_auth_error_stops_immediately_without_retries() {
+        let (handler, _server_signing, server_pub_bytes) = make_test_handler_and_server_key();
+        let deny_msg = AnetMessage {
+            content: Some(Content::AuthError(AuthDenyNotification {
+                message: "Достигнут лимит одновременных подключений".to_string(),
+            })),
+            padding: vec![],
+        };
+        let pkt = encrypt_handshake_msg(&server_pub_bytes, &deny_msg);
+        let channel = MockAuthChannel::new(vec![pkt]);
+
+        let err = handler
+            .authenticate(&channel)
+            .await
+            .expect_err("Expected Phase II AuthError");
+
+        // Должна быть ровно 1 отправка (Phase I) без 10 повторов MAX_RETRIES
+        assert_eq!(channel.send_count.load(Ordering::SeqCst), 1);
+        let auth_err = err
+            .downcast_ref::<AuthDenyError>()
+            .expect("Error must downcast to AuthDenyError");
+        assert_eq!(
+            auth_err.message,
+            "Достигнут лимит одновременных подключений"
+        );
+        assert!(!auth_err.is_node_transient());
+    }
+
+    #[tokio::test]
+    async fn test_phase_iv_auth_error_stops_immediately_without_retries() {
+        let (handler, server_signing, server_pub_bytes) = make_test_handler_and_server_key();
+
+        let server_dh_secret = StaticSecret::random_from_rng(OsRng);
+        let server_dh_pub = PublicKey::from(&server_dh_secret);
+        let sig = sign_data(&server_signing, server_dh_pub.as_bytes());
+
+        let phase_ii_msg = AnetMessage {
+            content: Some(Content::DhServerExchange(DhServerExchange {
+                public_key: server_dh_pub.as_bytes().to_vec(),
+                server_signed_dh_key: sig,
+            })),
+            padding: vec![],
+        };
+        let pkt_ii = encrypt_handshake_msg(&server_pub_bytes, &phase_ii_msg);
+
+        let deny_msg = AnetMessage {
+            content: Some(Content::AuthError(AuthDenyNotification {
+                message: "Учетная запись заблокирована".to_string(),
+            })),
+            padding: vec![],
+        };
+        let pkt_iv = encrypt_handshake_msg(&server_pub_bytes, &deny_msg);
+
+        let channel = MockAuthChannel::new(vec![pkt_ii, pkt_iv]);
+
+        let err = handler
+            .authenticate(&channel)
+            .await
+            .expect_err("Expected Phase IV AuthError");
+
+        // Ровно 2 отправки (Phase I и Phase III) — цикл authenticate() не делает 10 ретраев
+        assert_eq!(channel.send_count.load(Ordering::SeqCst), 2);
+        let auth_err = err
+            .downcast_ref::<AuthDenyError>()
+            .expect("Error must downcast to AuthDenyError");
+        assert_eq!(auth_err.message, "Учетная запись заблокирована");
+        assert!(!auth_err.is_node_transient());
+    }
+}
+
