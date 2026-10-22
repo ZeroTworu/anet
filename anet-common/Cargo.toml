@@ -36,6 +36,7 @@ poem-openapi = { version = "5.1.12", features = ["uuid"], optional = true }
 base64 = "0.22.1"
 async-trait = "0.1.89"
 roxmltree = { workspace = true }
+socket2 = { workspace = true }
 
 
 [build-dependencies]

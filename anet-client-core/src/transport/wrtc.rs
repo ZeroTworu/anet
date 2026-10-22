@@ -6,11 +6,14 @@ use anet_common::encryption::Cipher;
 use anet_common::handshake_fragmentation::FragmentConfig;
 use anet_common::http_help::BrowserProfile;
 use anet_common::stream_framing::{frame_packet_into, read_next_packet};
-use anet_common::transport::{unwrap_packet_bytes, wrap_packet, wrap_packet_padded, wrap_packet_slice};
+use anet_common::transport::{
+    unwrap_packet_bytes, wrap_packet_padded, wrap_packet_slice, wrap_packet_slice_with_headroom,
+};
 use anet_common::wrtc::{
     batcher::{unpack_batch, PacketBatcher},
     colibri::{
         verify_beacon, ColibriMessage, WrtcMessage, MAX_VIDEO_BATCH_BYTES, VIDEO_BATCH_MARKER,
+        VP8_ASTP_PREFIX_LEN,
     },
     jingle::parse_jingle_session,
     ktalk::KtalkClient,
@@ -604,27 +607,29 @@ impl ClientTransport for WrtcTransport {
                     } => {
                         let Some(mut packet) = packet_opt else { break; };
 
-                        for _burst_idx in 0..16 {
+                        let p2p_opt = if wrtc_mode == anet_common::wrtc::colibri::WrtcMode::P2pDirect
+                            || wrtc_mode == anet_common::wrtc::colibri::WrtcMode::Auto
+                        {
+                            p2p_uplink.lock().await.clone()
+                        } else {
+                            None
+                        };
+                        let p2p_active = p2p_opt
+                            .as_ref()
+                            .map(|p| p.is_open.load(Ordering::SeqCst))
+                            .unwrap_or(false);
+                        let use_video = !p2p_active
+                            && (wrtc_mode == anet_common::wrtc::colibri::WrtcMode::MediaVideo
+                                || wrtc_mode == anet_common::wrtc::colibri::WrtcMode::Auto);
+
+                        for _burst_idx in 0..64 {
                             if packet.len() >= 20 {
-                                let p2p_opt = {
-                                    let guard = p2p_uplink.lock().await;
-                                    guard.clone()
-                                };
-                                let p2p_active = p2p_opt
-                                    .as_ref()
-                                    .map(|p| p.is_open.load(Ordering::SeqCst))
-                                    .unwrap_or(false);
-
-                                let use_video = !p2p_active
-                                    && (wrtc_mode == anet_common::wrtc::colibri::WrtcMode::MediaVideo
-                                        || wrtc_mode == anet_common::wrtc::colibri::WrtcMode::Auto);
-
                                 // Zero-delay micro-batching мелких пакетов (TCP ACK, DNS) в единый VP8 RTP кадр
                                 let is_v2 = peer_tx.is_video_v2();
                                 let video_warmed_up = !first_client_rx_tx.load(Ordering::Relaxed);
                                 let mut batched_payload = false;
 
-                                if use_video && is_v2 && video_warmed_up && (1 + 2 + packet.len() + 22 <= MAX_VIDEO_BATCH_BYTES) {
+                                if use_video && is_v2 && video_warmed_up && (packet.len() + 3 < MAX_VIDEO_BATCH_BYTES) {
                                     while let Ok(next_pkt) = tunnel_packet_rx.try_recv() {
                                         if next_pkt.len() < 20 {
                                             continue;
@@ -652,55 +657,95 @@ impl ClientTransport for WrtcTransport {
                                 }
 
                                 let seq = sequence_tx.fetch_add(1, Ordering::Relaxed);
-                                let enc_res = if batched_payload {
-                                    wrap_packet_slice(&cipher_tx, &nonce_prefix, seq, &video_batch_buf, 0)
-                                } else if use_video || p2p_active {
-                                    // Внутри уже зашифрованного DTLS-SRTP видеопотока отключаем лишний zero-padding
-                                    wrap_packet(&cipher_tx, &nonce_prefix, seq, packet, 0)
-                                } else {
-                                    wrap_packet_padded(&cipher_tx, &nonce_prefix, seq, packet, padding_step)
-                                };
 
-                                match enc_res {
-                                    Ok(enc_bytes) => {
-                                        let mut sent_p2p = false;
-                                        if let Some(p2p) = p2p_opt {
-                                            if p2p_active {
-                                                if p2p.send_packet(&enc_bytes).await.is_ok() {
-                                                    log::trace!("[P2P Direct OUT]");
-                                                    sent_p2p = true;
+                                if use_video {
+                                    let payload_slice: &[u8] = if batched_payload {
+                                        &video_batch_buf
+                                    } else {
+                                        &packet
+                                    };
+                                    match wrap_packet_slice_with_headroom(
+                                        &cipher_tx,
+                                        &nonce_prefix,
+                                        seq,
+                                        payload_slice,
+                                        VP8_ASTP_PREFIX_LEN,
+                                    ) {
+                                        Ok(enc_buf) => {
+                                            match peer_tx
+                                                .send_video_frame_preallocated(my_client_tag, enc_buf)
+                                                .await
+                                            {
+                                                Ok(frozen) => {
+                                                    // До получения первого входящего видеокадра от сервера дублируем ASTP-срез
+                                                    // в WS-батчер без копирования, чтобы не терять первые пакеты во время прогрева SFU.
+                                                    if !video_warmed_up {
+                                                        batcher.push(frozen.slice(VP8_ASTP_PREFIX_LEN..));
+                                                        if batcher.should_flush() {
+                                                            if let Some(batch_data) = batcher.flush() {
+                                                                let b64 = BASE64_STANDARD.encode(&batch_data);
+                                                                let msg = ColibriMessage::astp_batch(
+                                                                    target_srv_tx.clone(),
+                                                                    b64,
+                                                                );
+                                                                if let Err(e) = peer_tx.send(msg).await {
+                                                                    warn!("[WRTC Client] Peer send batch error: {e}");
+                                                                    return;
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    warn!("[WRTC Media Video OUT] send error: {e}");
                                                 }
                                             }
                                         }
-
-                                        if !sent_p2p && use_video {
-                                            if let Err(e) = peer_tx.send_video_frame_tagged(my_client_tag, &enc_bytes).await {
-                                                warn!("[WRTC Media Video OUT] send error: {e}");
-                                            }
-                                            // До получения первого входящего видеокадра от сервера дублируем отправку в WS-батчер,
-                                            // чтобы не терять первые пакеты (ICMP, TCP SYN) во время прогрева видеотрансивера SFU.
-                                            if video_warmed_up {
-                                                sent_p2p = true;
-                                            }
+                                        Err(e) => {
+                                            warn!("[WRTC Client] wrap_packet error: {e}");
+                                            warn(format!("[WRTC Client] wrap_packet error: {e}"));
                                         }
+                                    }
+                                } else {
+                                    let enc_res = if p2p_active {
+                                        wrap_packet_slice(&cipher_tx, &nonce_prefix, seq, &packet, 0)
+                                    } else {
+                                        wrap_packet_padded(&cipher_tx, &nonce_prefix, seq, packet, padding_step)
+                                    };
 
-                                        if !sent_p2p {
-                                            batcher.push(enc_bytes);
-                                            if batcher.should_flush() {
-                                                if let Some(batch_data) = batcher.flush() {
-                                                    let b64 = BASE64_STANDARD.encode(&batch_data);
-                                                    let msg = ColibriMessage::astp_batch(target_srv_tx.clone(), b64);
-                                                    if let Err(e) = peer_tx.send(msg).await {
-                                                        warn!("[WRTC Client] Peer send batch error: {e}");
-                                                        return;
+                                    match enc_res {
+                                        Ok(enc_bytes) => {
+                                            let mut sent_p2p = false;
+                                            if let Some(ref p2p) = p2p_opt {
+                                                if p2p_active {
+                                                    if p2p.send_packet(&enc_bytes).await.is_ok() {
+                                                        log::trace!("[P2P Direct OUT]");
+                                                        sent_p2p = true;
+                                                    }
+                                                }
+                                            }
+
+                                            if !sent_p2p {
+                                                batcher.push(enc_bytes);
+                                                if batcher.should_flush() {
+                                                    if let Some(batch_data) = batcher.flush() {
+                                                        let b64 = BASE64_STANDARD.encode(&batch_data);
+                                                        let msg = ColibriMessage::astp_batch(
+                                                            target_srv_tx.clone(),
+                                                            b64,
+                                                        );
+                                                        if let Err(e) = peer_tx.send(msg).await {
+                                                            warn!("[WRTC Client] Peer send batch error: {e}");
+                                                            return;
+                                                        }
                                                     }
                                                 }
                                             }
                                         }
-                                    }
-                                    Err(e) => {
-                                        warn!("[WRTC Client] wrap_packet error: {e}");
-                                        warn(format!("[WRTC Client] wrap_packet error: {e}"));
+                                        Err(e) => {
+                                            warn!("[WRTC Client] wrap_packet error: {e}");
+                                            warn(format!("[WRTC Client] wrap_packet error: {e}"));
+                                        }
                                     }
                                 }
                             }
