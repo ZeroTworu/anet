@@ -269,7 +269,7 @@ async fn handle_http_connection(
                             // 2. Отдача Downlink-трафика
                             let mut body_buf = BytesMut::new();
                             let padding_step = config.stealth.padding_step;
-                            let coalesce_budget = config.ahttp.coalesce_budget_bytes;
+                            let coalesce_budget = config.ahttp.coalesce_budget_bytes.min(65536);
                             let is_heavy_uplink = content_length >= 8192;
 
                             // Для крупных Uplink-батчей (>= 8 КБ) НЕ блокируем ответ на poll_timeout_ms,
@@ -282,7 +282,8 @@ async fn handle_http_connection(
                                 std::time::Duration::from_millis(config.ahttp.poll_timeout_ms.max(20))
                             };
                             let deadline = tokio::time::Instant::now() + timeout_duration;
-                            let micro_coalesce = std::time::Duration::from_micros(500);
+                            let max_coalesce_window = std::time::Duration::from_millis(4);
+                            let packet_gap_timeout = std::time::Duration::from_micros(1000);
 
                             let mut raw_downlink_packets = Vec::new();
                             let mut raw_bytes_accum = 0usize;
@@ -317,13 +318,19 @@ async fn handle_http_connection(
                                         }
                                     }
 
-                                    // Микро-коалесценция (до 0.5 мс): когда первый пакет пачки из TUN
-                                    // разбудил воркер, даем TUN reader'у еще полмиллисекунды дочитать
-                                    // остальные пакеты всплеска, чтобы не закрывать HTTP-ответ с 1 пакетом (1.4 КБ).
-                                    if raw_bytes_accum < coalesce_budget / 2 {
-                                        let coalesce_deadline = tokio::time::Instant::now() + micro_coalesce;
+                                    // Адаптивная коалесценция Downlink: пакеты из интернета (ens3 -> TUN)
+                                    // приходят с сетевым пейсингом (1 пакет каждые 150-300 мкс).
+                                    // Собираем пакеты до заполнения бюджета (или макс. 4 мс), но если новых
+                                    // пакетов нет дольше 1 мс (одиночный ping/DNS) — выходим сразу.
+                                    if raw_bytes_accum < coalesce_budget {
+                                        let burst_deadline = tokio::time::Instant::now() + max_coalesce_window;
                                         while raw_bytes_accum < coalesce_budget {
-                                            match tokio::time::timeout_at(coalesce_deadline, rx_router.recv()).await {
+                                            let now = tokio::time::Instant::now();
+                                            if now >= burst_deadline {
+                                                break;
+                                            }
+                                            let step_deadline = (now + packet_gap_timeout).min(burst_deadline);
+                                            match tokio::time::timeout_at(step_deadline, rx_router.recv()).await {
                                                 Ok(Some(p)) => {
                                                     if p.len() >= 20 {
                                                         raw_bytes_accum += p.len() + 40;

@@ -475,12 +475,12 @@ impl ClientTransport for AHttpTransport {
                     drop(permit);
 
                     // Downlink Self-Clocking: если сервер прислал данные, немедленно (без ожидания poll_timeout_ms)
-                    // будим диспетчер для отправки следующего запроса; при крупной пачке — удваиваем число активных
-                    // poll-запросов (по аналогии с TCP Slow Start) до заполнения всех слотов concurrency.
+                    // будим диспетчер для отправки следующего запроса; при получении полного пакета (>= 1300 байт)
+                    // или 2+ пакетов — агрессивно наращиваем число параллельных poll-запросов до max_concurrency.
                     if rx_pkts_total > 0 {
-                        if rx_bytes_total >= 8192 || rx_pkts_total >= 6 {
+                        if rx_bytes_total >= 1300 || rx_pkts_total >= 2 {
                             let _ = downlink_credits_clone.fetch_update(Ordering::AcqRel, Ordering::Acquire, |c| {
-                                Some((c + 2).min(max_concurrency))
+                                Some((c + 3).min(max_concurrency))
                             });
                         } else {
                             let _ = downlink_credits_clone.fetch_max(1, Ordering::AcqRel);
