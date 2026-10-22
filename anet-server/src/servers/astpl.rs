@@ -92,10 +92,11 @@ impl AstplEbpfManager {
                         .context("ASTPL_CONFIG map missing from anet-ebpf")?,
                 )?;
                 let astpl_cfg = AstplConfig {
-                    eth_ifindex,
-                    server_ip: u32::from_be_bytes(server_ip.octets()),
-                    server_port,
+                    astpl_port_be: server_port.to_be(),
                     _pad: 0,
+                    server_ip_be: u32::from_ne_bytes(server_ip.octets()),
+                    eth_ifindex,
+                    _pad2: 0,
                 };
                 cfg_map.insert(0, astpl_cfg, 0)?;
             }
@@ -180,31 +181,31 @@ impl AstplEbpfManager {
                 .ok_or_else(|| anyhow!("ASTP-L eBPF supports only IPv4 endpoints, got {}", v6))?,
         };
 
-        let prefix_key = u32::from_be_bytes(client_info.nonce_prefix);
-        let assigned_ip_host = u32::from_be_bytes(assigned_ipv4.octets());
-        let client_ip_host = u32::from_be_bytes(client_ipv4.octets());
-        let client_port_host = remote_addr.port();
+        let prefix_key = u32::from_ne_bytes(client_info.nonce_prefix);
+        let assigned_ip_be = u32::from_ne_bytes(assigned_ipv4.octets());
+        let client_ip_be = u32::from_ne_bytes(client_ipv4.octets());
+        let client_port_be = remote_addr.port().to_be();
 
         let ingress_val = IngressSessionData {
             crypto_seed: client_info.crypto_seed,
-            assigned_ip: assigned_ip_host,
-            client_ip: client_ip_host,
-            client_port: client_port_host,
-            _pad: [0u8; 6],
-            rx_packets: 0,
             rx_bytes: 0,
             last_seen_ns: 0,
+            assigned_ip: assigned_ip_be,
+            last_seq: 0,
+            client_ip: client_ip_be,
+            client_port: client_port_be,
+            _pad: 0,
         };
 
         let egress_val = EgressRoutingData {
             crypto_seed: client_info.crypto_seed,
-            dst_ip: client_ip_host,
-            nonce_prefix: prefix_key,
-            dst_port: client_port_host,
-            _pad: [0u8; 2],
-            tx_seq: 1,
-            tx_packets: 0,
             tx_bytes: 0,
+            last_seen_ns: 0,
+            dst_ip: client_ip_be,
+            nonce_prefix: prefix_key,
+            tx_seq: 1,
+            dst_port: client_port_be,
+            _pad: 0,
         };
 
         let mut ebpf = self.ebpf.lock().await;
@@ -220,12 +221,15 @@ impl AstplEbpfManager {
                 ebpf.map_mut(ASTPL_EGRESS_MAP)
                     .context("ASTPL_EGRESS_MAP missing")?,
             )?;
-            egress_map.insert(assigned_ip_host, egress_val, 0)?;
+            egress_map.insert(assigned_ip_be, egress_val, 0)?;
         }
 
         info!(
             "[ASTP-L eBPF] Session registered: prefix=0x{:08x}, tun_ip={}, endpoint={}:{}",
-            prefix_key, assigned_ipv4, client_ipv4, client_port_host
+            u32::from_be_bytes(client_info.nonce_prefix),
+            assigned_ipv4,
+            client_ipv4,
+            remote_addr.port()
         );
         Ok(())
     }
@@ -247,30 +251,30 @@ impl AstplEbpfManager {
             return;
         };
 
-        let prefix_key = u32::from_be_bytes(client_info.nonce_prefix);
-        let assigned_ip_host = u32::from_be_bytes(assigned_ipv4.octets());
-        let client_ip_host = u32::from_be_bytes(client_ipv4.octets());
-        let client_port_host = new_addr.port();
+        let prefix_key = u32::from_ne_bytes(client_info.nonce_prefix);
+        let assigned_ip_be = u32::from_ne_bytes(assigned_ipv4.octets());
+        let client_ip_be = u32::from_ne_bytes(client_ipv4.octets());
+        let client_port_be = new_addr.port().to_be();
 
         let mut ebpf = self.ebpf.lock().await;
-        if let Ok(map) = ebpf.map_mut(ASTPL_INGRESS_MAP) {
+        if let Some(map) = ebpf.map_mut(ASTPL_INGRESS_MAP) {
             if let Ok(mut ingress_map) = AyaHashMap::<_, u32, IngressSessionData>::try_from(map) {
                 if let Ok(mut data) = ingress_map.get(&prefix_key, 0) {
-                    if data.client_ip != client_ip_host || data.client_port != client_port_host {
-                        data.client_ip = client_ip_host;
-                        data.client_port = client_port_host;
+                    if data.client_ip != client_ip_be || data.client_port != client_port_be {
+                        data.client_ip = client_ip_be;
+                        data.client_port = client_port_be;
                         let _ = ingress_map.insert(prefix_key, data, 0);
                     }
                 }
             }
         }
-        if let Ok(map) = ebpf.map_mut(ASTPL_EGRESS_MAP) {
+        if let Some(map) = ebpf.map_mut(ASTPL_EGRESS_MAP) {
             if let Ok(mut egress_map) = AyaHashMap::<_, u32, EgressRoutingData>::try_from(map) {
-                if let Ok(mut data) = egress_map.get(&assigned_ip_host, 0) {
-                    if data.dst_ip != client_ip_host || data.dst_port != client_port_host {
-                        data.dst_ip = client_ip_host;
-                        data.dst_port = client_port_host;
-                        let _ = egress_map.insert(assigned_ip_host, data, 0);
+                if let Ok(mut data) = egress_map.get(&assigned_ip_be, 0) {
+                    if data.dst_ip != client_ip_be || data.dst_port != client_port_be {
+                        data.dst_ip = client_ip_be;
+                        data.dst_port = client_port_be;
+                        let _ = egress_map.insert(assigned_ip_be, data, 0);
                     }
                 }
             }
@@ -279,17 +283,17 @@ impl AstplEbpfManager {
 
     /// Удаляет сессию клиента из BPF-карт `ASTPL_INGRESS_MAP` и `ASTPL_EGRESS_MAP`.
     pub async fn remove_session(&self, nonce_prefix: [u8; 4], assigned_ip: Option<Ipv4Addr>) {
-        let prefix_key = u32::from_be_bytes(nonce_prefix);
+        let prefix_key = u32::from_ne_bytes(nonce_prefix);
         let mut ebpf = self.ebpf.lock().await;
 
-        if let Ok(map) = ebpf.map_mut(ASTPL_INGRESS_MAP) {
+        if let Some(map) = ebpf.map_mut(ASTPL_INGRESS_MAP) {
             if let Ok(mut ingress_map) = AyaHashMap::<_, u32, IngressSessionData>::try_from(map) {
                 let _ = ingress_map.remove(&prefix_key);
             }
         }
         if let Some(ip) = assigned_ip {
-            let ip_key = u32::from_be_bytes(ip.octets());
-            if let Ok(map) = ebpf.map_mut(ASTPL_EGRESS_MAP) {
+            let ip_key = u32::from_ne_bytes(ip.octets());
+            if let Some(map) = ebpf.map_mut(ASTPL_EGRESS_MAP) {
                 if let Ok(mut egress_map) = AyaHashMap::<_, u32, EgressRoutingData>::try_from(map) {
                     let _ = egress_map.remove(&ip_key);
                 }
@@ -308,12 +312,12 @@ impl AstplEbpfManager {
         let mut ebpf = self.ebpf.lock().await;
 
         for client_info in sessions {
-            let prefix_key = u32::from_be_bytes(client_info.nonce_prefix);
+            let prefix_key = u32::from_ne_bytes(client_info.nonce_prefix);
             let ip_key = client_info
                 .assigned_ip
                 .parse::<Ipv4Addr>()
                 .ok()
-                .map(|ip| u32::from_be_bytes(ip.octets()));
+                .map(|ip| u32::from_ne_bytes(ip.octets()));
 
             let mut rx_bytes = client_info.ebpf_synced_rx.load(Ordering::Relaxed);
             let mut last_seen_ns = client_info.ebpf_last_seen_ns.load(Ordering::Relaxed);
@@ -326,8 +330,8 @@ impl AstplEbpfManager {
                         last_seen_ns = ing.last_seen_ns;
                         if ing.client_ip != 0 && ing.client_port != 0 {
                             kernel_addr = Some(SocketAddr::new(
-                                IpAddr::V4(Ipv4Addr::from(ing.client_ip.to_be_bytes())),
-                                ing.client_port,
+                                IpAddr::V4(Ipv4Addr::from(ing.client_ip.to_ne_bytes())),
+                                u16::from_be(ing.client_port),
                             ));
                         }
                     }
@@ -564,9 +568,11 @@ pub async fn run_astpl_server(
             if let Ok(nonce_prefix) = recv_buf[..4].try_into() {
                 if let Some(client_info) = registry.get_by_prefix(&nonce_prefix) {
                     if client_info.protocol == "astpl" {
-                        if let Ok(inner_pkt) = unwrap_astpl_packet_in_place(
+                        let expected_ip = client_info.assigned_ip.parse::<Ipv4Addr>().ok();
+                        if let Ok((_prefix, seq, inner_pkt)) = unwrap_astpl_packet_in_place(
                             client_info.crypto_seed,
                             &mut recv_buf[..len],
+                            expected_ip,
                         ) {
                             let prev_addr = **client_info.remote_addr.load();
                             registry.update_client_addr(&client_info, remote_addr);
@@ -577,6 +583,11 @@ pub async fn run_astpl_server(
                                         ebpf_mgr.update_session_endpoint(&ci, remote_addr).await;
                                     });
                                 }
+                            }
+
+                            if seq == 0 {
+                                registry.touch_client(&client_info);
+                                continue;
                             }
 
                             // Обработка внутритуннельного ICMP Echo Request зонда (0x414E)
@@ -677,9 +688,9 @@ pub async fn run_astpl_server(
                                 let raw_seq = ci_writer.sequence.fetch_add(1, Ordering::Relaxed) as u32;
                                 let seq = (raw_seq | 0x8000_0000).max(1);
                                 let wrapped = wrap_astpl_packet(
-                                    ci_writer.crypto_seed,
                                     &ci_writer.nonce_prefix,
                                     seq,
+                                    ci_writer.crypto_seed,
                                     &inner_ip_pkt,
                                 );
                                 let dst = **ci_writer.remote_addr.load();

@@ -23,7 +23,7 @@ pub fn frame_packet(payload: Bytes) -> Bytes {
 /// В отличие от `frame_packet` не выделяет память на каждый пакет —
 /// используется для коалесценции нескольких пакетов в одну запись стрима.
 #[inline]
-pub fn frame_packet_into(buf: &mut BytesMut, payload: &Bytes) {
+pub fn frame_packet_into(buf: &mut BytesMut, payload: &[u8]) {
     buf.reserve(LENGTH_PREFIX_SIZE + payload.len());
     buf.put_u16(payload.len() as u16);
     buf.put_slice(payload);
