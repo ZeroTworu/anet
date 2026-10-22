@@ -21,7 +21,7 @@ use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::http::StatusCode;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
-const MAX_WS_MESSAGE_SIZE: usize = 128 * 1024; // Увеличено для коалесценции
+const MAX_WS_MESSAGE_SIZE: usize = 256 * 1024; // Увеличено для коалесценции
 
 async fn upgrade(
     stream: TcpStream,
@@ -48,9 +48,9 @@ async fn upgrade(
         Ok(response)
     };
     let ws_config = WebSocketConfig::default()
-        .read_buffer_size(64 * 1024)
-        .write_buffer_size(64 * 1024)
-        .max_write_buffer_size(256 * 1024)
+        .read_buffer_size(128 * 1024)
+        .write_buffer_size(128 * 1024)
+        .max_write_buffer_size(512 * 1024)
         .max_message_size(Some(MAX_WS_MESSAGE_SIZE))
         .max_frame_size(Some(MAX_WS_MESSAGE_SIZE));
     let ws_stream = accept_hdr_async_with_config(stream, callback, Some(ws_config)).await?;
@@ -101,7 +101,7 @@ async fn handle_session(
             let padding_step = config.stealth.padding_step;
             let mut ping_timer = Box::pin(tokio::time::sleep(random_ping_interval()));
 
-            let mut batch_buf = BytesMut::with_capacity(COALESCE_BUDGET_BYTES);
+            let mut batch_buf = BytesMut::with_capacity(COALESCE_BUDGET_BYTES + 2048);
 
             loop {
                 tokio::select! {
@@ -149,6 +149,7 @@ async fn handle_session(
                     packet = rx_router.recv() => {
                         let Some(mut raw) = packet else { break; };
                         batch_buf.clear();
+                        let coalesce_deadline = tokio::time::Instant::now() + Duration::from_micros(250);
 
                         loop {
                             if raw.len() >= 20 {
@@ -166,14 +167,28 @@ async fn handle_session(
                             if batch_buf.len() >= COALESCE_BUDGET_BYTES {
                                 break;
                             }
-                            raw = match rx_router.try_recv() {
-                                Ok(packet) => packet,
-                                Err(_) => break,
-                            };
+                            match rx_router.try_recv() {
+                                Ok(packet) => raw = packet,
+                                Err(mpsc::error::TryRecvError::Empty) => {
+                                    if batch_buf.len() < COALESCE_BUDGET_BYTES / 2
+                                        && tokio::time::Instant::now() < coalesce_deadline
+                                    {
+                                        match tokio::time::timeout_at(coalesce_deadline, rx_router.recv()).await {
+                                            Ok(Some(packet)) => raw = packet,
+                                            _ => break,
+                                        }
+                                    } else {
+                                        break;
+                                    }
+                                }
+                                Err(mpsc::error::TryRecvError::Disconnected) => break,
+                            }
                         }
 
                         if !batch_buf.is_empty() {
-                            if socket.feed(Message::Binary(batch_buf.clone().freeze())).await.is_err() {
+                            let out_bytes = batch_buf.split().freeze();
+                            batch_buf.reserve(COALESCE_BUDGET_BYTES);
+                            if socket.feed(Message::Binary(out_bytes)).await.is_err() {
                                 break;
                             }
                             if socket.flush().await.is_err() {

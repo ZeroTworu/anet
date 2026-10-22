@@ -1,10 +1,10 @@
 use super::{ClientTransport, ConnectionResult};
 use crate::auth::{AuthChannel, AuthDenyError, AuthHandler};
 use crate::config::{CoreConfig, ServerConfig};
-use anet_common::consts::{CHANNEL_BUFFER_SIZE, COALESCE_BUDGET_BYTES, MAX_PACKET_SIZE};
+use anet_common::consts::COALESCE_BUDGET_BYTES;
 use anet_common::handshake_fragmentation::FragmentConfig;
 use anet_common::http_help::BrowserProfile;
-use anet_common::stream_framing::{frame_packet, frame_packet_into, read_next_packet};
+use anet_common::stream_framing::{frame_packet_into, read_next_packet};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
@@ -30,7 +30,7 @@ use tokio_tungstenite::{
 
 type ClientSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-const MAX_WS_MESSAGE_SIZE: usize = 128 * 1024;
+const MAX_WS_MESSAGE_SIZE: usize = 256 * 1024;
 
 struct WebSocketAuthChannel {
     socket: Mutex<ClientSocket>,
@@ -156,9 +156,9 @@ async fn connect_authenticated(
     let url = server.websocket_url()?;
     let request = profile.build_ws_request(&url, None)?;
     let ws_config = WebSocketConfig::default()
-        .read_buffer_size(64 * 1024)
-        .write_buffer_size(64 * 1024)
-        .max_write_buffer_size(256 * 1024)
+        .read_buffer_size(128 * 1024)
+        .write_buffer_size(128 * 1024)
+        .max_write_buffer_size(512 * 1024)
         .max_message_size(Some(MAX_WS_MESSAGE_SIZE))
         .max_frame_size(Some(MAX_WS_MESSAGE_SIZE));
 
@@ -228,10 +228,12 @@ impl ClientTransport for WebSocketTransport {
         let health_pause = Arc::new(AtomicBool::new(false));
         let supervisor_health_pause = health_pause.clone();
 
-        let (client_stream, internal_router) = tokio::io::duplex(MAX_PACKET_SIZE * 10);
+        // 512 КБ буфер duplex: гарантирует, что входящий 64 КБ батч WebSocket никогда не заблокирует
+        // цикл select! при записи в TUN, но при этом не создаст bufferbloat.
+        let (client_stream, internal_router) = tokio::io::duplex(512 * 1024);
         let (mut tunnel_read, mut tunnel_write) = tokio::io::split(internal_router);
         let (tunnel_packet_tx, mut tunnel_packet_rx) =
-            tokio::sync::mpsc::channel::<Bytes>(CHANNEL_BUFFER_SIZE);
+            tokio::sync::mpsc::channel::<Bytes>(256);
 
         let tunnel_reader_task = tokio::spawn(async move {
             while let Ok(Some(packet)) = read_next_packet(&mut tunnel_read).await {
@@ -256,13 +258,15 @@ impl ClientTransport for WebSocketTransport {
                 let mut sequence = 0u64;
                 let mut rotation = Box::pin(tokio::time::sleep(session_lifetime(&server)));
 
-                let mut batch_buf = BytesMut::with_capacity(COALESCE_BUDGET_BYTES);
+                let mut batch_buf = BytesMut::with_capacity(COALESCE_BUDGET_BYTES + 2048);
+                let mut downlink_buf = BytesMut::with_capacity(COALESCE_BUDGET_BYTES + 2048);
 
                 loop {
                     tokio::select! {
                         packet = tunnel_packet_rx.recv() => {
                             let Some(mut raw) = packet else { break 'sessions; };
                             batch_buf.clear();
+                            let coalesce_deadline = tokio::time::Instant::now() + Duration::from_micros(250);
 
                             loop {
                                 if raw.len() >= 20 {
@@ -281,14 +285,28 @@ impl ClientTransport for WebSocketTransport {
                                 if batch_buf.len() >= COALESCE_BUDGET_BYTES {
                                     break;
                                 }
-                                raw = match tunnel_packet_rx.try_recv() {
-                                    Ok(packet) => packet,
-                                    Err(_) => break,
-                                };
+                                match tunnel_packet_rx.try_recv() {
+                                    Ok(packet) => raw = packet,
+                                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                                        if batch_buf.len() < COALESCE_BUDGET_BYTES / 2
+                                            && tokio::time::Instant::now() < coalesce_deadline
+                                        {
+                                            match tokio::time::timeout_at(coalesce_deadline, tunnel_packet_rx.recv()).await {
+                                                Ok(Some(packet)) => raw = packet,
+                                                _ => break,
+                                            }
+                                        } else {
+                                            break;
+                                        }
+                                    }
+                                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+                                }
                             }
 
                             if !batch_buf.is_empty() {
-                                if socket.feed(Message::Binary(batch_buf.clone().freeze())).await.is_err() {
+                                let out_bytes = batch_buf.split().freeze();
+                                batch_buf.reserve(COALESCE_BUDGET_BYTES);
+                                if socket.feed(Message::Binary(out_bytes)).await.is_err() {
                                     break 'sessions;
                                 }
                                 if socket.flush().await.is_err() {
@@ -299,14 +317,19 @@ impl ClientTransport for WebSocketTransport {
                         incoming = socket.next() => {
                             match incoming {
                                 Some(Ok(Message::Binary(data))) => {
+                                    downlink_buf.clear();
                                     let mut cursor = std::io::Cursor::new(data);
                                     while let Ok(Some(encrypted_packet)) = read_next_packet(&mut cursor).await {
                                         match anet_common::transport::unwrap_packet_bytes(&cipher, encrypted_packet) {
                                             Ok(packet) => {
-                                                let framed = frame_packet(packet);
-                                                if tunnel_write.write_all(&framed).await.is_err() { break 'sessions; }
+                                                frame_packet_into(&mut downlink_buf, &packet);
                                             }
                                             Err(error) => debug!("[WebSocket] Dropped invalid inbound packet: {error}"),
+                                        }
+                                    }
+                                    if !downlink_buf.is_empty() {
+                                        if tunnel_write.write_all(&downlink_buf).await.is_err() {
+                                            break 'sessions;
                                         }
                                     }
                                 }
