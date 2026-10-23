@@ -236,6 +236,7 @@ fn is_ipv4(base: usize, end: usize) -> bool {
     (first_byte >> 4) == IPV4_VERSION
 }
 
+#[inline(always)]
 pub fn parse_dst_ipv4(ctx: &TcContext) -> Option<u32> {
     let base = ctx.data();
     let end = ctx.data_end();
@@ -245,6 +246,7 @@ pub fn parse_dst_ipv4(ctx: &TcContext) -> Option<u32> {
     Some(unsafe { read_be32(base, IPV4_DST_OFFSET) })
 }
 
+#[inline(always)]
 pub fn parse_src_ipv4(ctx: &XdpContext) -> Option<u32> {
     let base = ctx.data();
     let end = ctx.data_end();

@@ -140,6 +140,7 @@ pub fn tc_egress(ctx: TcContext) -> i32 {
     }
 }
 
+#[inline(always)]
 fn try_tc_egress(ctx: &TcContext) -> Result<i32, ()> {
     let Some(dst_ip) = parse_dst_ipv4(ctx) else {
         return Ok(TC_ACT_OK);
@@ -212,6 +213,7 @@ pub fn astpl_tc_egress(ctx: TcContext) -> i32 {
     }
 }
 
+#[inline(always)]
 fn try_astpl_tc_egress(ctx: &TcContext) -> Result<i32, ()> {
     const OUTER_HEADERS_LEN: usize = EthHdr::LEN + ASTPL_ENCAP_LEN; // 14 + 36 = 50 байт
 
@@ -315,12 +317,6 @@ fn try_astpl_tc_egress(ctx: &TcContext) -> Result<i32, ()> {
     let total_ip_len = total_frame_len - EthHdr::LEN;
     let udp_total_len = total_ip_len - Ipv4Hdr::LEN;
 
-    let dummy_eth = EthHdr {
-        dst_addr: [0u8; 6], // unicast (bit 0 == 0), будет перезаписан подсистемой соседей в __bpf_redirect_neigh_v4
-        src_addr: [0u8; 6],
-        ether_type: ETH_P_IP_BE,
-    };
-
     let mut outer_ip = Ipv4Hdr {
         version_ihl: 0x45,
         tos: 0,
@@ -342,7 +338,9 @@ fn try_astpl_tc_egress(ctx: &TcContext) -> Result<i32, ()> {
         check: 0, // UDP checksum 0 валиден для IPv4 (RFC 768)
     };
 
-    w_encap.write_unaligned::<EthHdr>(0, dummy_eth)?;
+    // bpf_skb_change_head уже обнулил первые 50 байт (dst_mac = 00:00:00:00:00:00 unicast, src_mac = 0),
+    // поэтому записываем только 2-байтный EtherType (0x0800) на смещении 12 (без вызова memset в LLVM BPF).
+    w_encap.write_unaligned::<u16>(12, ETH_P_IP_BE)?;
     w_encap.write_unaligned::<Ipv4Hdr>(EthHdr::LEN, outer_ip)?;
     w_encap.write_unaligned::<UdpHdr>(EthHdr::LEN + Ipv4Hdr::LEN, outer_udp)?;
     w_encap.write_unaligned::<u32>(EthHdr::LEN + Ipv4Hdr::LEN + UdpHdr::LEN, nonce_prefix)?;
@@ -387,6 +385,7 @@ pub fn astpl_xdp_ingress(ctx: XdpContext) -> u32 {
     }
 }
 
+#[inline(always)]
 fn try_astpl_xdp_ingress(ctx: &XdpContext) -> Result<u32, ()> {
     let w = ContextWrapper::Xdp(ctx);
 
@@ -569,6 +568,7 @@ pub fn xdp_ingress(ctx: XdpContext) -> u32 {
     }
 }
 
+#[inline(always)]
 fn try_xdp_ingress(ctx: &XdpContext) -> Result<u32, ()> {
     let Some(src_ip) = parse_src_ipv4(ctx) else {
         return Ok(xdp_action::XDP_PASS);
