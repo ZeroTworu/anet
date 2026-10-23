@@ -65,6 +65,10 @@ pub struct AstplConfig {
     pub server_ip_be: u32,
     /// Индекс физического интерфейса (eth0) для `bpf_redirect_neigh`
     pub eth_ifindex: u32,
+    /// Собственный IPv4-адрес сервера на TUN-интерфейсе (`network.self_ip`, Big-Endian)
+    pub tun_ip_be: u32,
+    /// IPv4-адрес шлюза туннельной сети (`network.gateway`, Big-Endian)
+    pub tun_gw_be: u32,
     pub _pad2: u32,
 }
 

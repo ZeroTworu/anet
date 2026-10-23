@@ -97,6 +97,118 @@ pub fn wrap_astpl_packet(
     out.freeze()
 }
 
+/// Записывает заголовок ASTP-L и зашифрованный внутренний IPv4-пакет в переиспользуемый `Vec<u8>`,
+/// исключая аллокацию памяти на каждый исходящий пакет.
+#[inline]
+pub fn wrap_astpl_packet_into(
+    out: &mut Vec<u8>,
+    nonce_prefix: &[u8; 4],
+    seq: u32,
+    crypto_seed: u64,
+    inner_ipv4: &[u8],
+) {
+    let safe_seq = if seq == 0 { 1 } else { seq };
+    out.clear();
+    out.reserve(ASTPL_HEADER_LEN + inner_ipv4.len());
+    out.extend_from_slice(nonce_prefix);
+    out.extend_from_slice(&safe_seq.to_be_bytes());
+    out.extend_from_slice(inner_ipv4);
+
+    let mut rng = Xoroshiro128Plus::new(crypto_seed, safe_seq);
+    rng.apply_keystream(&mut out[ASTPL_HEADER_LEN..]);
+}
+
+/// Создаёт `tokio::net::UdpSocket` с увеличенными буферами `SO_RCVBUF` и `SO_SNDBUF` (цель 8 МБ,
+/// т.е. 16 МБ в удвоенном представлении ядра Linux).
+/// На Linux дополнительно вызывает `SO_RCVBUFFORCE` / `SO_SNDBUFFORCE` (при наличии `CAP_NET_ADMIN`),
+/// чтобы обойти дефолтный системный лимит `net.core.rmem_max = 212992` (~208 КБ), который вмещает
+/// всего ~92 UDP-пакета и приводит к дропам (`RcvbufErrors`) при микровсплесках из 1 Гбит/с eBPF-канала.
+pub fn bind_astpl_udp_socket(bind_addr: &str) -> Result<tokio::net::UdpSocket> {
+    const TARGET_BUF_SIZE: usize = 8 * 1024 * 1024;
+    let std_sock = std::net::UdpSocket::bind(bind_addr)?;
+    std_sock.set_nonblocking(true)?;
+
+    let sock_ref = socket2::SockRef::from(&std_sock);
+    for &size in &[
+        TARGET_BUF_SIZE,
+        4 * 1024 * 1024,
+        2 * 1024 * 1024,
+        1024 * 1024,
+    ] {
+        if sock_ref.set_recv_buffer_size(size).is_ok() {
+            break;
+        }
+    }
+    for &size in &[
+        TARGET_BUF_SIZE,
+        4 * 1024 * 1024,
+        2 * 1024 * 1024,
+        1024 * 1024,
+    ] {
+        if sock_ref.set_send_buffer_size(size).is_ok() {
+            break;
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        const SOL_SOCKET: i32 = 1;
+        const SO_SNDBUFFORCE: i32 = 32;
+        const SO_RCVBUFFORCE: i32 = 33;
+
+        unsafe extern "C" {
+            fn setsockopt(
+                fd: i32,
+                level: i32,
+                optname: i32,
+                optval: *const core::ffi::c_void,
+                optlen: u32,
+            ) -> i32;
+        }
+
+        let fd = std_sock.as_raw_fd();
+        let target_c: i32 = TARGET_BUF_SIZE as i32;
+        if sock_ref.recv_buffer_size().unwrap_or(0) < TARGET_BUF_SIZE {
+            unsafe {
+                let _ = setsockopt(
+                    fd,
+                    SOL_SOCKET,
+                    SO_RCVBUFFORCE,
+                    (&target_c as *const i32).cast(),
+                    core::mem::size_of::<i32>() as u32,
+                );
+            }
+        }
+        if sock_ref.send_buffer_size().unwrap_or(0) < TARGET_BUF_SIZE {
+            unsafe {
+                let _ = setsockopt(
+                    fd,
+                    SOL_SOCKET,
+                    SO_SNDBUFFORCE,
+                    (&target_c as *const i32).cast(),
+                    core::mem::size_of::<i32>() as u32,
+                );
+            }
+        }
+    }
+
+    let rcv_kb = sock_ref.recv_buffer_size().unwrap_or(0) / 1024;
+    let snd_kb = sock_ref.send_buffer_size().unwrap_or(0) / 1024;
+    let local_str = std_sock
+        .local_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|_| bind_addr.to_string());
+    log::info!(
+        "[ASTP-L UDP] Bound {} (SO_RCVBUF={} KB, SO_SNDBUF={} KB)",
+        local_str,
+        rcv_kb,
+        snd_kb
+    );
+
+    Ok(tokio::net::UdpSocket::from_std(std_sock)?)
+}
+
 /// Формирует управляющий пакет ASTP-L (`Seq == 0`), который пропускается XDP в Userspace.
 #[inline]
 pub fn wrap_astpl_control_packet(nonce_prefix: &[u8; 4], payload: &[u8]) -> Bytes {

@@ -645,7 +645,9 @@ impl AnetClient {
             });
         }
 
-        let (mut stream_reader, mut stream_writer) = io_split(result.vpn_stream);
+        let (stream_reader_raw, mut stream_writer) = io_split(result.vpn_stream);
+        let mut stream_reader =
+            tokio::io::BufReader::with_capacity(COALESCE_BUDGET_BYTES, stream_reader_raw);
 
         let tx_time = last_tx_time.clone();
         let tx_bytes = total_tx_bytes.clone();

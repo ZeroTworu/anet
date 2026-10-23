@@ -13,7 +13,9 @@ use crate::auth_handler::ServerAuthHandler;
 use crate::client_registry::{ClientRegistry, ClientTransportInfo};
 use crate::config::Config;
 use crate::shaper::{bump_memlock_rlimit, init_ebpf_logger};
-use anet_common::astpl::{unwrap_astpl_packet_in_place, wrap_astpl_packet, ASTPL_HEADER_LEN};
+use anet_common::astpl::{
+    bind_astpl_udp_socket, unwrap_astpl_packet_in_place, wrap_astpl_packet_into, ASTPL_HEADER_LEN,
+};
 use anet_common::consts::{CHANNEL_BUFFER_SIZE, MAX_PACKET_SIZE, MIN_HANDSHAKE_LEN};
 use anet_common::handshake_fragmentation::DatagramReassembler;
 use anet_ebpf_common::{
@@ -33,7 +35,6 @@ use std::process::Stdio;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::net::UdpSocket;
 use tokio::process::Command;
 use tokio::sync::{mpsc, Mutex};
 
@@ -61,10 +62,22 @@ impl AstplEbpfManager {
         let eth_ifindex = Self::read_ifindex(&eth_iface).await?;
         let server_ip = Self::resolve_server_ipv4(config, &eth_iface, bind_addr).await?;
         let server_port = bind_addr.port();
+        let tun_self_ip = config
+            .network
+            .self_ip
+            .trim()
+            .parse::<Ipv4Addr>()
+            .unwrap_or(Ipv4Addr::UNSPECIFIED);
+        let tun_gw_ip = config
+            .network
+            .gateway
+            .trim()
+            .parse::<Ipv4Addr>()
+            .unwrap_or(Ipv4Addr::UNSPECIFIED);
 
         info!(
-            "[ASTP-L eBPF] Initializing on external iface '{}' (ifindex={}, ip={}, port={}) <-> TUN '{}'",
-            eth_iface, eth_ifindex, server_ip, server_port, tun_iface
+            "[ASTP-L eBPF] Initializing on external iface '{}' (ifindex={}, ip={}, port={}) <-> TUN '{}' (self_ip={}, gw={})",
+            eth_iface, eth_ifindex, server_ip, server_port, tun_iface, tun_self_ip, tun_gw_ip
         );
 
         let shaper_attached = shared_ebpf.is_some();
@@ -97,6 +110,8 @@ impl AstplEbpfManager {
                     _pad: 0,
                     server_ip_be: u32::from_ne_bytes(server_ip.octets()),
                     eth_ifindex,
+                    tun_ip_be: u32::from_ne_bytes(tun_self_ip.octets()),
+                    tun_gw_be: u32::from_ne_bytes(tun_gw_ip.octets()),
                     _pad2: 0,
                 };
                 cfg_map.insert(0, astpl_cfg, 0)?;
@@ -733,8 +748,7 @@ pub async fn run_astpl_server(
 ) -> Result<()> {
     let bind_to = config.server.astpl_bind_to.trim();
     let socket = Arc::new(
-        UdpSocket::bind(bind_to)
-            .await
+        bind_astpl_udp_socket(bind_to)
             .with_context(|| format!("Failed to bind ASTP-L UDP socket on {}", bind_to))?,
     );
     let local_addr = socket.local_addr()?;
@@ -913,17 +927,19 @@ pub async fn run_astpl_server(
                         let ci_writer = client_info.clone();
                         let sock_writer = sock.clone();
                         tokio::spawn(async move {
+                            let mut wrap_buf = Vec::with_capacity(MAX_PACKET_SIZE);
                             while let Some(inner_ip_pkt) = rx_router.recv().await {
                                 let raw_seq = ci_writer.sequence.fetch_add(1, Ordering::Relaxed) as u32;
                                 let seq = (raw_seq | 0x8000_0000).max(1);
-                                let wrapped = wrap_astpl_packet(
+                                wrap_astpl_packet_into(
+                                    &mut wrap_buf,
                                     &ci_writer.nonce_prefix,
                                     seq,
                                     ci_writer.crypto_seed,
                                     &inner_ip_pkt,
                                 );
                                 let dst = **ci_writer.remote_addr.load();
-                                if let Err(e) = sock_writer.send_to(&wrapped, dst).await {
+                                if let Err(e) = sock_writer.send_to(&wrap_buf, dst).await {
                                     warn!(
                                         "[ASTP-L] UDP send_to error for {} ({}): {}",
                                         ci_writer.assigned_ip, dst, e
