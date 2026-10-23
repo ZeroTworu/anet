@@ -78,6 +78,47 @@ pub async fn read_next_packet<R: tokio::io::AsyncRead + tokio::io::AsyncReadExt 
     }
 }
 
+/// Читает ровно один IP-пакет из стрима в переиспользуемый `Vec<u8>`,
+/// исключая аллокацию памяти в куче на каждый пакет.
+/// Возвращает `Ok(true)`, если пакет прочитан в `out`, или `Ok(false)` при EOF.
+#[inline]
+pub async fn read_next_packet_into<R: tokio::io::AsyncRead + tokio::io::AsyncReadExt + Unpin>(
+    reader: &mut R,
+    out: &mut Vec<u8>,
+) -> io::Result<bool> {
+    loop {
+        let mut len_buf = [0u8; LENGTH_PREFIX_SIZE];
+
+        match reader.read_exact(&mut len_buf).await {
+            Ok(_) => {
+                let len = u16::from_be_bytes(len_buf) as usize;
+                if len == 0 {
+                    error!("Received packet with zero length prefix, skipping frame.");
+                    continue;
+                }
+                if len > MAX_PACKET_SIZE {
+                    error!(
+                        "Received oversized packet length: {}. Max allowed: {}",
+                        len, MAX_PACKET_SIZE
+                    );
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Oversized packet received",
+                    ));
+                }
+
+                out.resize(len, 0);
+                reader.read_exact(&mut out[..len]).await?;
+                return Ok(true);
+            }
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                return Ok(false);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

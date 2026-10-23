@@ -147,6 +147,7 @@ impl<'a> ContextWrapper<'a> {
 
 /// Бесцикловое вычисление контрольной суммы 20-байтного заголовка IPv4 (RFC 1071).
 /// Возвращает `u16` в сетевом порядке байт (Big-Endian), готовый для записи в `Ipv4Hdr::check`.
+#[allow(dead_code)]
 #[inline(always)]
 pub fn ipv4_header_checksum(hdr: &Ipv4Hdr) -> u16 {
     let w0 = u16::from_be_bytes([hdr.version_ihl, hdr.tos]) as u32;
@@ -172,6 +173,7 @@ pub fn ipv4_header_checksum(hdr: &Ipv4Hdr) -> u16 {
 /// записывает в поле `th->check` / `uh->check`, когда пакет находится в состоянии `CHECKSUM_PARTIAL`
 /// (например, после `virtio_net` RX `VIRTIO_NET_HDR_F_NEEDS_CSUM` или локальной генерации).
 /// Возвращает `u16` в сетевом порядке байт (Big-Endian) для прямого сравнения с полем `check` пакета.
+#[allow(dead_code)]
 #[inline(always)]
 pub fn ipv4_pseudo_csum_seed_be(
     src_addr_be: u32,
