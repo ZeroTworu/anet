@@ -11,6 +11,7 @@ type CryptoAlgorithm = ChaCha20Poly1305;
 #[derive(Clone)]
 pub struct Cipher {
     cipher: Arc<CryptoAlgorithm>,
+    raw_key: [u8; 32],
 }
 
 impl Cipher {
@@ -19,11 +20,18 @@ impl Cipher {
             panic!("Invalid key length for AES-256-GCM. Must be 32 bytes.");
         }
 
+        let mut raw_key = [0u8; 32];
+        raw_key.copy_from_slice(key);
         let key_generic: &Key<CryptoAlgorithm> = key.try_into().expect("Key must be 32 bytes");
 
         Self {
             cipher: Arc::new(CryptoAlgorithm::new(key_generic)),
+            raw_key,
         }
+    }
+
+    pub fn raw_key(&self) -> &[u8; 32] {
+        &self.raw_key
     }
 
     #[inline]

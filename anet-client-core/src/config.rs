@@ -122,6 +122,7 @@ pub enum TransportMode {
     Websocket,
     Ahttp,
     Wrtc,
+    Doh,
 }
 
 impl Default for TransportMode {
@@ -231,6 +232,7 @@ impl ServerConfig {
             Some("ws") | Some("wss") => Ok(TransportMode::Websocket),
             Some("http") | Some("https") => Ok(TransportMode::Ahttp),
             Some("wrtc") => Ok(TransportMode::Wrtc),
+            Some("doh") => Ok(TransportMode::Doh),
             Some(scheme) => anyhow::bail!("unsupported server DSN scheme '{scheme}'"),
             None => anyhow::bail!("server DSN '{}' has no scheme", self.dsn),
         }
@@ -269,7 +271,7 @@ impl ServerConfig {
 
         let scheme = uri.scheme_str().unwrap_or("").to_lowercase();
         let port = uri.port_u16().unwrap_or(match scheme.as_str() {
-            "https" | "wss" | "wrtc" => 443,
+            "https" | "wss" | "wrtc" | "doh" => 443,
             "http" | "ws" => 80,
             "ssh" => 22,
             "vnc" => 5900,
@@ -292,6 +294,7 @@ impl ServerConfig {
                 TransportMode::Websocket => "WS",
                 TransportMode::Ahttp => "AHTTP",
                 TransportMode::Wrtc => "WRTC",
+                TransportMode::Doh => "DOH",
             };
 
             format!("{}:{}", host, mode_str)
