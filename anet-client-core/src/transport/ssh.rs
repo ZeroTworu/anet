@@ -260,7 +260,7 @@ async fn read_tunnel_packets(
     mut tunnel_reader: tokio::io::ReadHalf<tokio::io::DuplexStream>,
     packet_tx: mpsc::Sender<Bytes>,
 ) -> Result<()> {
-    let mut frame_reader = anet_common::stream_framing::FrameReader::new();
+    let mut frame_reader = FrameReader::new();
     while let Some(packet) = frame_reader.read_next_packet(&mut tunnel_reader).await? {
         packet_tx
             .send(packet)

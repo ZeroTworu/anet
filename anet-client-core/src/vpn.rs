@@ -118,7 +118,7 @@ impl VpnHandler {
 
         // Task: QUIC -> TUN
         tokio::spawn(async move {
-            let mut frame_reader = anet_common::stream_framing::FrameReader::new();
+            let mut frame_reader = FrameReader::new();
             while let Ok(Some(packet)) = frame_reader.read_next_packet(&mut recv_stream).await {
                 if tx_from_quic.send(packet).await.is_err() {
                     break;

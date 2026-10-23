@@ -1231,8 +1231,9 @@ impl AnetClient {
         reconnect_signal.notified().await;
 
         let duration = session_start.elapsed();
-        let last_rx = last_rx_time.lock().unwrap().elapsed();
-        let last_tx = last_tx_time.lock().unwrap().elapsed();
+        let now_us = duration.as_micros() as u64;
+        let last_rx = Duration::from_micros(now_us.saturating_sub(last_rx_time.load(Ordering::Relaxed)));
+        let last_tx = Duration::from_micros(now_us.saturating_sub(last_tx_time.load(Ordering::Relaxed)));
         let rx_b = total_rx_bytes.load(Ordering::Relaxed);
         let rx_p = total_rx_packets.load(Ordering::Relaxed);
         let tx_b = total_tx_bytes.load(Ordering::Relaxed);
