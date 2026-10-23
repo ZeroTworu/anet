@@ -287,6 +287,7 @@ async fn handle_http_connection(
 
                             let mut raw_downlink_packets = Vec::new();
                             let mut raw_bytes_accum = 0usize;
+                            let mut base_seq = 0u64;
 
                             if let Ok(mut rx_router) = tokio::time::timeout_at(deadline, session.rx_router.lock()).await {
                                 let first_pkt = match rx_router.try_recv() {
@@ -353,14 +354,18 @@ async fn handle_http_connection(
                                         }
                                     }
                                 }
-                            } // <--- Лок rx_router освобождается мгновенно, следующий HTTP-воркер сразу берет следующий батч!
+
+                                // ВАЖНО: резервируем диапазон sequence номеров ВНУТРИ лока rx_router!
+                                // Это гарантирует, что следующий воркер, который возьмет лок на микросекунду позже,
+                                // никогда не получит меньший base_seq и не вызовет ложный разрыв в ReassemblyQueue.
+                                if !raw_downlink_packets.is_empty() {
+                                    let count = raw_downlink_packets.len() as u64;
+                                    base_seq = client_info.sequence.fetch_add(count, Ordering::Relaxed);
+                                }
+                            } // <--- Лок rx_router освобождается, а порядок base_seq уже строго зафиксирован!
 
                             if !raw_downlink_packets.is_empty() {
                                 body_buf.reserve(raw_bytes_accum + raw_downlink_packets.len() * (padding_step as usize + 32));
-                                // Резервируем диапазон sequence номеров атомарно на весь батч,
-                                // чтобы параллельные воркеры шифровали свои батчи со строго возрастающими seq
-                                let count = raw_downlink_packets.len() as u64;
-                                let base_seq = client_info.sequence.fetch_add(count, Ordering::Relaxed);
 
                                 for (idx, packet) in raw_downlink_packets.into_iter().enumerate() {
                                     let seq = base_seq + idx as u64;

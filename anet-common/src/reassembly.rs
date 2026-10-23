@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 use bytes::Bytes;
 
-const GAP_TIMEOUT: Duration = Duration::from_millis(30);
+const GAP_TIMEOUT: Duration = Duration::from_millis(250);
 
 pub struct ReassemblyQueue {
     next_seq: u64,
