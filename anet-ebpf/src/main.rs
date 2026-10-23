@@ -244,24 +244,48 @@ fn try_astpl_tc_egress(ctx: &TcContext) -> Result<i32, ()> {
         return Ok(TC_ACT_OK);
     }
 
-    // КРИТИЧНО для TC: линеаризуем буфер sk_buff перед in-place шифрованием,
-    // чтобы все фрагменты страницы (paged frags) оказались в линейной области data..data_end.
-    let pull_ret = unsafe { bpf_skb_pull_data(ctx.as_ptr() as *mut _, 0) };
+    // КРИТИЧНО: проверяем полную длину sk_buff (`ctx.len()`, включая paged frags/frag_list)
+    // и флаги GSO (`gso_segs`, `gso_size`) ДО вызова `bpf_skb_pull_data`.
+    // В ядре Linux `bpf_skb_pull_data(skb, 0)` подтягивает только `skb_headlen(skb)` (первый сегмент 1340 байт),
+    // из-за чего GRO/GSO-суперпакеты (2628+ байт) ранее имели `data_end - data == 1340`,
+    // инкапсулировались как UDP поверх `SKB_GSO_TCPV4` и отбрасывались ядром в `validate_xmit_skb` на `ens3`.
+    // Если пакет является GSO-суперпакетом или превышает MTU, возвращаем `TC_ACT_OK`:
+    // ядро в `validate_xmit_skb` на TUN само нарежет GSO на одиночные TCP-сегменты,
+    // досчитает `CHECKSUM_PARTIAL` и отправит их через userspace UDP-сокет `AstplServer`.
+    let skb_len = ctx.len();
+    let (gso_segs, gso_size) = unsafe {
+        let skb = ctx.as_ptr();
+        ((*skb).gso_segs, (*skb).gso_size)
+    };
+    if skb_len < Ipv4Hdr::LEN as u32 || skb_len > 1450 || gso_segs > 1 || gso_size > 0 {
+        if skb_len > 1450 || gso_segs > 1 || gso_size > 0 {
+            warn!(
+                ctx,
+                "[ASTP-L TC] GSO/jumbo skb (skb_len={}, gso_segs={}, gso_size={}) -> passing to TUN for segmentation",
+                skb_len,
+                gso_segs,
+                gso_size
+            );
+        }
+        return Ok(TC_ACT_OK);
+    }
+
+    // Линеаризуем ВСЕ `skb_len` байт пакета (передаём `skb_len`, а не `0`!),
+    // чтобы любые страничные фрагменты (`skb->data_len`) гарантированно оказались в `data..data_end`.
+    let pull_ret = unsafe { bpf_skb_pull_data(ctx.as_ptr() as *mut _, skb_len) };
     if pull_ret < 0 {
-        warn!(ctx, "[ASTP-L TC] bpf_skb_pull_data failed: ret={}", pull_ret);
+        warn!(
+            ctx,
+            "[ASTP-L TC] bpf_skb_pull_data({}) failed: ret={}", skb_len, pull_ret
+        );
         return Ok(TC_ACT_OK);
     }
 
     let w_plain = ContextWrapper::Tc(ctx);
     let inner_len = w_plain.data_end().saturating_sub(w_plain.data());
-    if inner_len < Ipv4Hdr::LEN || inner_len > 1500 {
-        if inner_len > 1500 {
-            warn!(
-                ctx,
-                "[ASTP-L TC] GSO packet len={} > 1500, passing to TUN for segmentation",
-                inner_len
-            );
-        }
+    let inner_ip_after = w_plain.read_unaligned::<Ipv4Hdr>(0)?;
+    let inner_tot_len = u16::from_be(inner_ip_after.tot_len) as usize;
+    if inner_len < Ipv4Hdr::LEN || inner_len > 1450 || inner_tot_len != inner_len {
         return Ok(TC_ACT_OK);
     }
 
@@ -322,7 +346,7 @@ fn try_astpl_tc_egress(ctx: &TcContext) -> Result<i32, ()> {
         tos: 0,
         tot_len: (total_ip_len as u16).to_be(),
         id: (tx_seq as u16).to_be(),
-        frag_off: 0x4000u16.to_be(), // Don't Fragment (DF)
+        frag_off: 0,
         ttl: 64,
         proto: IPPROTO_UDP,
         check: 0,
@@ -353,7 +377,7 @@ fn try_astpl_tc_egress(ctx: &TcContext) -> Result<i32, ()> {
     let action =
         unsafe { bpf_redirect_neigh(cfg.eth_ifindex, core::ptr::null_mut(), 0, 0) as i32 };
 
-    if inner_proto == IPPROTO_ICMP || tx_seq <= 20 || (tx_seq & 0x3F) == 0 || action != 7 {
+    if inner_proto == IPPROTO_ICMP || tx_seq <= 20 || (tx_seq & 0x3FF) == 0 || action != 7 {
         info!(
             ctx,
             "[ASTP-L TC] encap: tx_seq={}, proto={}, len={}, {:i} -> {:i} (udp {:i}:{}), action={}",
@@ -540,7 +564,7 @@ fn try_astpl_xdp_ingress(ctx: &XdpContext) -> Result<u32, ()> {
         return Ok(xdp_action::XDP_DROP);
     }
 
-    if inner_ip.proto == IPPROTO_ICMP || seq <= 20 || (seq & 0x3F) == 0 {
+    if inner_ip.proto == IPPROTO_ICMP || seq <= 20 || (seq & 0x3FF) == 0 {
         info!(
             ctx,
             "[ASTP-L XDP] decap: seq={}, proto={}, len={}, {:i} -> {:i}",
