@@ -8,6 +8,11 @@ fn main() {
         target
     );
 
+    println!("cargo:rerun-if-changed=../anet-ebpf/src");
+    println!("cargo:rerun-if-changed=../anet-ebpf/Cargo.toml");
+    println!("cargo:rerun-if-changed=../anet-ebpf-common/src");
+    println!("cargo:rerun-if-changed=../anet-ebpf-common/Cargo.toml");
+
     // Собираем встроенный eBPF-объект `anet-ebpf` в OUT_DIR, чтобы
     // `anet_server::shaper` мог включить его целиком через
     // `aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/anet-ebpf"))`.

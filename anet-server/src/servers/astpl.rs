@@ -80,7 +80,7 @@ impl AstplEbpfManager {
             }
         };
 
-        Self::configure_kernel_routing(&eth_iface).await;
+        Self::configure_kernel_routing(&eth_iface, tun_iface).await;
         Self::cleanup_stale_xdp(&eth_iface).await;
 
         {
@@ -481,13 +481,15 @@ impl AstplEbpfManager {
         ))
     }
 
-    async fn configure_kernel_routing(eth_iface: &str) {
+    async fn configure_kernel_routing(eth_iface: &str, tun_iface: &str) {
         // Для того чтобы декапсулированные в XDP на eth0 пакеты с src=10.0.0.x
-        // не отбрасывались ядром как martian source (rp_filter), отключаем rp_filter на eth_iface.
+        // не отбрасывались ядром как martian source (rp_filter), отключаем rp_filter на eth_iface и tun_iface.
         for key in [
             "net.ipv4.ip_forward=1".to_string(),
             "net.ipv4.conf.all.rp_filter=0".to_string(),
+            "net.ipv4.conf.default.rp_filter=0".to_string(),
             format!("net.ipv4.conf.{}.rp_filter=0", eth_iface),
+            format!("net.ipv4.conf.{}.rp_filter=0", tun_iface),
         ] {
             let _ = Command::new("sysctl")
                 .args(["-w", &key])
@@ -496,6 +498,15 @@ impl AstplEbpfManager {
                 .output()
                 .await;
         }
+
+        // Отключаем GRO/LRO на внешнем интерфейсе (best-effort), чтобы входящие TCP-сегменты
+        // не склеивались в GSO-суперпакеты (> MTU) перед попаданием в TC egress.
+        let _ = Command::new("ethtool")
+            .args(["-K", eth_iface, "gro", "off", "lro", "off"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .await;
     }
 
     async fn cleanup_stale_xdp(iface: &str) {
@@ -590,53 +601,65 @@ pub async fn run_astpl_server(
                 if let Some(client_info) = registry.get_by_prefix(&nonce_prefix) {
                     if client_info.protocol == "astpl" {
                         let expected_ip = client_info.assigned_ip.parse::<Ipv4Addr>().ok();
-                        if let Ok((_prefix, seq, inner_pkt)) = unwrap_astpl_packet_in_place(
+                        match unwrap_astpl_packet_in_place(
                             client_info.crypto_seed,
                             &mut recv_buf[..len],
                             expected_ip,
                         ) {
-                            let prev_addr = **client_info.remote_addr.load();
-                            registry.update_client_addr(&client_info, remote_addr);
-                            if prev_addr != remote_addr {
-                                if let Some(ebpf_mgr) = registry.get_astpl_ebpf() {
-                                    let ci = client_info.clone();
-                                    tokio::spawn(async move {
-                                        ebpf_mgr.update_session_endpoint(&ci, remote_addr).await;
-                                    });
+                            Ok((_prefix, seq, inner_pkt)) => {
+                                let prev_addr = **client_info.remote_addr.load();
+                                registry.update_client_addr(&client_info, remote_addr);
+                                if prev_addr != remote_addr {
+                                    if let Some(ebpf_mgr) = registry.get_astpl_ebpf() {
+                                        let ci = client_info.clone();
+                                        tokio::spawn(async move {
+                                            ebpf_mgr.update_session_endpoint(&ci, remote_addr).await;
+                                        });
+                                    }
                                 }
-                            }
 
-                            if seq == 0 {
-                                registry.touch_client(&client_info);
+                                if seq == 0 {
+                                    registry.touch_client(&client_info);
+                                    continue;
+                                }
+
+                                // Обработка внутритуннельного ICMP Echo Request зонда (0x414E)
+                                if let Some(reply) =
+                                    anet_common::icmp_probe::handle_in_tunnel_icmp_probe(inner_pkt)
+                                {
+                                    registry.touch_client(&client_info);
+                                    registry
+                                        .route_packet_to_client(&client_info.assigned_ip, reply)
+                                        .await;
+                                    continue;
+                                }
+
+                                let pkt_len = inner_pkt.len();
+                                let pkt_bytes = Bytes::copy_from_slice(inner_pkt);
+                                match tun_tx.try_send(pkt_bytes) {
+                                    Ok(_) => {
+                                        registry.record_rx(&client_info, pkt_len, "astpl");
+                                    }
+                                    Err(mpsc::error::TrySendError::Full(_)) => {
+                                        warn!(
+                                            "[ASTP-L] TUN channel full, dropping packet from {}",
+                                            client_info.assigned_ip
+                                        );
+                                    }
+                                    Err(mpsc::error::TrySendError::Closed(_)) => break,
+                                }
                                 continue;
                             }
-
-                            // Обработка внутритуннельного ICMP Echo Request зонда (0x414E)
-                            if let Some(reply) =
-                                anet_common::icmp_probe::handle_in_tunnel_icmp_probe(inner_pkt)
-                            {
-                                registry.touch_client(&client_info);
-                                registry
-                                    .route_packet_to_client(&client_info.assigned_ip, reply)
-                                    .await;
+                            Err(e) => {
+                                // Если пакет пришёл с известным nonce_prefix активной сессии,
+                                // но внутренний пакет не прошёл проверку (например, IPv6 или старый src_ip
+                                // от открытых до VPN сокетов клиента), не отправляем его в DatagramReassembler.
+                                debug!(
+                                    "[ASTP-L] Dropped non-IPv4/mismatched packet for session {} from {}: {}",
+                                    client_info.assigned_ip, remote_addr, e
+                                );
                                 continue;
                             }
-
-                            let pkt_len = inner_pkt.len();
-                            let pkt_bytes = Bytes::copy_from_slice(inner_pkt);
-                            match tun_tx.try_send(pkt_bytes) {
-                                Ok(_) => {
-                                    registry.record_rx(&client_info, pkt_len, "astpl");
-                                }
-                                Err(mpsc::error::TrySendError::Full(_)) => {
-                                    warn!(
-                                        "[ASTP-L] TUN channel full, dropping packet from {}",
-                                        client_info.assigned_ip
-                                    );
-                                }
-                                Err(mpsc::error::TrySendError::Closed(_)) => break,
-                            }
-                            continue;
                         }
                     }
                 }

@@ -57,12 +57,19 @@ impl ClientTransport for AstplTransport {
         let (client_stream, tunnel_stream) = tokio::io::duplex(256 * 1024);
         let (mut tunnel_read, mut tunnel_write) = tokio::io::split(tunnel_stream);
 
+        let assigned_ipv4: Option<std::net::Ipv4Addr> = auth_response.ip.parse().ok();
         let tx_socket = udp_socket.clone();
         let tx_task = tokio::spawn(async move {
             let mut tx_seq: u32 = 0;
             while let Ok(Some(packet)) = read_next_packet(&mut tunnel_read).await {
-                if packet.len() < 20 {
+                if packet.len() < 20 || (packet[0] >> 4) != 4 {
                     continue;
+                }
+                if let Some(expected_src) = assigned_ipv4 {
+                    let pkt_src = std::net::Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]);
+                    if pkt_src != expected_src {
+                        continue;
+                    }
                 }
                 tx_seq = tx_seq.wrapping_add(1);
                 if tx_seq == 0 {

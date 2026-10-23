@@ -252,7 +252,14 @@ fn try_astpl_tc_egress(ctx: &TcContext) -> Result<i32, ()> {
 
     let w_plain = ContextWrapper::Tc(ctx);
     let inner_len = w_plain.data_end().saturating_sub(w_plain.data());
-    if inner_len < Ipv4Hdr::LEN {
+    if inner_len < Ipv4Hdr::LEN || inner_len > 1500 {
+        if inner_len > 1500 {
+            warn!(
+                ctx,
+                "[ASTP-L TC] GSO packet len={} > 1500, passing to TUN for segmentation",
+                inner_len
+            );
+        }
         return Ok(TC_ACT_OK);
     }
 
@@ -428,9 +435,9 @@ fn try_astpl_xdp_ingress(ctx: &XdpContext) -> Result<u32, ()> {
         return Ok(xdp_action::XDP_PASS);
     }
 
-    let (crypto_seed, assigned_ip) = unsafe {
+    let (crypto_seed, assigned_ip, known_client_ip, known_client_port) = unsafe {
         let s = &*session_ptr;
-        (s.crypto_seed, s.assigned_ip)
+        (s.crypto_seed, s.assigned_ip, s.client_ip, s.client_port)
     };
 
     // 2. Расшифровываем внутренний IPv4-пакет на месте (offset 50 .. data_end)
@@ -460,7 +467,12 @@ fn try_astpl_xdp_ingress(ctx: &XdpContext) -> Result<u32, ()> {
             u32::from_be(inner_ip.src_addr),
             u32::from_be(assigned_ip)
         );
-        // При случайной коллизии префикса (1 на 2^32) или невалидном пакете откатываем XOR обратно
+        // Если пакет пришёл с уже известного IP:Port этой сессии (например, IPv6 в туннеле или
+        // пакет со старым LAN src_ip от открытого до VPN сокета), сразу отбрасываем его в XDP.
+        if outer_ip.src_addr == known_client_ip && outer_udp.source == known_client_port {
+            return Ok(xdp_action::XDP_DROP);
+        }
+        // При случайной коллизии префикса (1 на 2^32) с новым хендшейком откатываем XOR обратно
         // и передаём пакет в Userspace без повреждения исходных байт.
         let _ = xoroshiro_crypt_packet(&w, OUTER_HEADERS_LEN, crypto_seed, seq);
         return Ok(xdp_action::XDP_PASS);
