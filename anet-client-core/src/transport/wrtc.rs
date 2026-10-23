@@ -297,8 +297,8 @@ impl ClientTransport for WrtcTransport {
                     let (c_video_ssrc, c_mode_str) = match wrtc_mode {
                         anet_common::wrtc::colibri::WrtcMode::Ws => (None, "ws"),
                         anet_common::wrtc::colibri::WrtcMode::MediaVideo => (Some(peer.video_ssrc), "media_video"),
-                        anet_common::wrtc::colibri::WrtcMode::P2pDirect => (Some(peer.video_ssrc), "p2p_direct"),
-                        anet_common::wrtc::colibri::WrtcMode::JvbDatachannel => (Some(peer.video_ssrc), "jvb_datachannel"),
+                        anet_common::wrtc::colibri::WrtcMode::P2pDirect => (None, "p2p_direct"),
+                        anet_common::wrtc::colibri::WrtcMode::JvbDatachannel => (None, "jvb_datachannel"),
                         anet_common::wrtc::colibri::WrtcMode::Auto => (Some(peer.video_ssrc), "auto"),
                     };
                     info!("[WRTC] Sending anet_discover broadcast (nonce: {client_nonce}, mode: {c_mode_str}, video_ssrc: {c_video_ssrc:?})...");
@@ -323,19 +323,23 @@ impl ClientTransport for WrtcTransport {
                                 if video_v2.unwrap_or(false) {
                                     peer.set_video_v2(true);
                                 }
-                                if let Some(v_ssrc) = video_ssrc {
-                                    peer.set_expected_peer_video_ssrc(v_ssrc);
-                                    info!("[WRTC Client] Set expected server video SSRC: {v_ssrc}");
-                                    status(format!("[WRTC Client] Set expected server video SSRC: {v_ssrc}"));
+                                if wrtc_mode == anet_common::wrtc::colibri::WrtcMode::MediaVideo
+                                    || wrtc_mode == anet_common::wrtc::colibri::WrtcMode::Auto
+                                {
+                                    if let Some(v_ssrc) = video_ssrc {
+                                        peer.set_expected_peer_video_ssrc(v_ssrc);
+                                        info!("[WRTC Client] Set expected server video SSRC: {v_ssrc}");
+                                        status(format!("[WRTC Client] Set expected server video SSRC: {v_ssrc}"));
 
-                                    // ИНЖЕКТИРУЕМ SSRC СЕРВЕРА В REMOTE_DESCRIPTION
-                                    peer.add_remote_video_ssrc(v_ssrc).await;
+                                        // ИНЖЕКТИРУЕМ SSRC СЕРВЕРА В REMOTE_DESCRIPTION
+                                        peer.add_remote_video_ssrc(v_ssrc).await;
 
-                                    let constraints = anet_common::wrtc::colibri::ReceiverVideoConstraints::for_endpoint(
-                                        &server_id,
-                                        WRTC_DEFAULT_MAX_VIDEO_HEIGHT,
-                                    );
-                                    let _ = peer.send_video_constraints(&constraints).await;
+                                        let constraints = anet_common::wrtc::colibri::ReceiverVideoConstraints::for_endpoint(
+                                            &server_id,
+                                            WRTC_DEFAULT_MAX_VIDEO_HEIGHT,
+                                        );
+                                        let _ = peer.send_video_constraints(&constraints).await;
+                                    }
                                 }
                                 if let Some(pub_key) = server_pub_key {
                                     match verify_beacon(pub_key, &client_nonce, &server_id, &signature) {
@@ -526,7 +530,7 @@ impl ClientTransport for WrtcTransport {
             let wrtc_cfg_p2p = self.config.wrtc.clone();
 
             tokio::spawn(async move {
-                match create_p2p_channel(&stun_servers, &wrtc_cfg_p2p).await {
+                match create_p2p_channel(&stun_servers, &wrtc_cfg_p2p, &peer_sig.bind_addr).await {
                     Ok(p2p) => {
                         let p2p_arc = Arc::new(p2p);
                         *p2p_store.lock().await = Some(p2p_arc.clone());

@@ -221,6 +221,8 @@ pub async fn run_wrtc_server(
             Arc::new(DashSet::new());
         let client_v2_endpoints: Arc<DashSet<String>> =
             Arc::new(DashSet::new());
+        let known_client_video_ssrcs: Arc<DashSet<u32>> =
+            Arc::new(DashSet::new());
 
         let reg_clone = registry.clone();
         let auth_clone = auth_handler.clone();
@@ -312,11 +314,15 @@ pub async fn run_wrtc_server(
                                     || jingle.action == "session-initiate"
                                 {
                                     for v_ssrc in jingle.video_sources {
-                                        info!("[WRTC Server] Jingle stanza ({}) announced remote video SSRC: {v_ssrc}", jingle.action);
-                                        let _ = tokio::time::timeout(
-                                            Duration::from_secs(WRTC_SDP_RENEGOTIATE_TIMEOUT_SECS),
-                                            shared_peer.add_remote_video_ssrc(v_ssrc),
-                                        ).await;
+                                        if known_client_video_ssrcs.contains(&v_ssrc) {
+                                            info!("[WRTC Server] Jingle stanza ({}) announced authorized client video SSRC: {v_ssrc}", jingle.action);
+                                            let _ = tokio::time::timeout(
+                                                Duration::from_secs(WRTC_SDP_RENEGOTIATE_TIMEOUT_SECS),
+                                                shared_peer.add_remote_video_ssrc(v_ssrc),
+                                            ).await;
+                                        } else {
+                                            log::debug!("[WRTC Server] Ignoring Jingle ({}) SSRC {v_ssrc} from non-ANET room occupant", jingle.action);
+                                        }
                                     }
                                 }
                             }
@@ -393,7 +399,8 @@ pub async fn run_wrtc_server(
                     }
 
                     if let Some(c_v_ssrc) = video_ssrc {
-                        if pref_mode != "ws" {
+                        if matches!(pref_mode.as_str(), "media_video" | "auto") {
+                            known_client_video_ssrcs.insert(c_v_ssrc);
                             shared_peer.set_expected_peer_video_ssrc(c_v_ssrc);
                             info!("[WRTC Server] Set expected client video SSRC: {c_v_ssrc} for {from_endpoint}");
 
@@ -585,9 +592,25 @@ pub async fn run_wrtc_server(
                                                                     let is_v2 = client_v2_ep_dl.contains(&target_client_id);
                                                                     let video_warmed_up = client_video_warmed_dl.contains(&client_tag);
 
-                                                                    let client_uses_video = (srv_mode == anet_common::wrtc::colibri::WrtcMode::MediaVideo
-                                                                        || srv_mode == anet_common::wrtc::colibri::WrtcMode::Auto)
-                                                                        && client_pref_mode != "ws"
+                                                                    let p2p_session = if matches!(client_pref_mode.as_str(), "p2p_direct" | "auto") {
+                                                                        p2p_clients_dl
+                                                                            .get(&target_client_id)
+                                                                            .and_then(|entry| {
+                                                                                if entry.is_open.load(Ordering::SeqCst) {
+                                                                                    Some(entry.value().clone())
+                                                                                } else {
+                                                                                    None
+                                                                                }
+                                                                            })
+                                                                    } else {
+                                                                        None
+                                                                    };
+                                                                    let p2p_active = p2p_session.is_some();
+
+                                                                    let client_uses_video = !p2p_active
+                                                                        && (srv_mode == anet_common::wrtc::colibri::WrtcMode::MediaVideo
+                                                                            || srv_mode == anet_common::wrtc::colibri::WrtcMode::Auto)
+                                                                        && matches!(client_pref_mode.as_str(), "media_video" | "auto")
                                                                         && has_video;
 
                                                                     if client_uses_video && is_v2 {
@@ -608,7 +631,7 @@ pub async fn run_wrtc_server(
                                                                                 };
                                                                                 if next_p.len() < WRTC_MIN_IP_PACKET_LEN {
                                                                                     continue;
-                                                                                }
+                                                                                };
                                                                                 if batch_buf.len() + 2 + next_p.len() <= max_video_batch_bytes {
                                                                                     batch_buf.put_u16(next_p.len() as u16);
                                                                                     batch_buf.extend_from_slice(&next_p);
@@ -673,40 +696,37 @@ pub async fn run_wrtc_server(
                                                                         let seq = c_info
                                                                             .sequence
                                                                             .fetch_add(1, Ordering::Relaxed);
+                                                                        let effective_pad = if p2p_active { 0 } else { padding_step };
                                                                         if let Ok(encrypted) = wrap_packet_padded(
                                                                             &c_info.cipher,
                                                                             &c_info.nonce_prefix,
                                                                             seq,
                                                                             packet,
-                                                                            padding_step,
+                                                                            effective_pad,
                                                                         ) {
                                                                             let enc_bytes = Bytes::from(encrypted);
                                                                             let mut sent = false;
 
-                                                                            // 1. Проверяем режим MediaVideo (Fake Video Track over DTLS-SRTP / JVB)
-                                                                            if client_uses_video {
+                                                                            // 1. Приоритет №1: Прямой P2P DataChannel с клиентом (для p2p_direct и auto)
+                                                                            if let Some(ref p2p_entry) = p2p_session {
+                                                                                if p2p_entry.send_packet(&enc_bytes).await.is_ok() {
+                                                                                    sent = true;
+                                                                                }
+                                                                            }
+
+                                                                            // 2. Приоритет №2: Режим MediaVideo (Fake Video Track over DTLS-SRTP / JVB)
+                                                                            if !sent && client_uses_video {
                                                                                 if peer_downlink.send_video_frame_tagged(client_tag, &enc_bytes).await.is_ok() {
                                                                                     // До подтверждения приема видео от клиента дублируем в WS
                                                                                     if video_warmed_up {
                                                                                         sent = true;
                                                                                     }
                                                                                 } else {
-                                                                                    warn!("[WRTC Server Video OUT] send error to {target_client_id}, fallback to WS/P2P");
+                                                                                    warn!("[WRTC Server Video OUT] send error to {target_client_id}, fallback to WS");
                                                                                 }
                                                                             }
 
-                                                                            // 2. Проверяем P2P DataChannel с клиентом
-                                                                            if !sent {
-                                                                                if let Some(p2p_entry) = p2p_clients_dl.get(&target_client_id) {
-                                                                                    if p2p_entry.is_open.load(Ordering::SeqCst) {
-                                                                                        if p2p_entry.send_packet(&enc_bytes).await.is_ok() {
-                                                                                            sent = true;
-                                                                                        }
-                                                                                    }
-                                                                                }
-                                                                            }
-
-                                                                            // 3. Если Video и P2P не сработали (или клиент в WS режиме), шлем через батчер (Colibri-WS)
+                                                                            // 3. Если P2P и Video не сработали (или клиент в WS режиме), шлем через батчер (Colibri-WS)
                                                                             if !sent {
                                                                                 batcher.push(enc_bytes);
                                                                                 if batcher.should_flush() {
@@ -830,7 +850,7 @@ pub async fn run_wrtc_server(
                     let wrtc_cfg_p2p = config.wrtc.clone();
 
                     tokio::spawn(async move {
-                        match create_p2p_channel(&stun_servers, &wrtc_cfg_p2p).await {
+                        match create_p2p_channel(&stun_servers, &wrtc_cfg_p2p, &peer_c.bind_addr).await {
                             Ok(p2p) => {
                                 let p2p_arc = Arc::new(p2p);
                                 match RTCSessionDescription::offer(sdp) {
@@ -935,6 +955,7 @@ pub async fn run_wrtc_server(
         client_modes.clear();
         client_video_endpoints.clear();
         client_v2_endpoints.clear();
+        known_client_video_ssrcs.clear();
 
         info!(
             "[WRTC Server] Pausing {}s before re-entering conference room...",
