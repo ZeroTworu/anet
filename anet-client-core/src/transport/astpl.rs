@@ -40,7 +40,7 @@ impl ClientTransport for AstplTransport {
             .next()
             .ok_or_else(|| anyhow!("Invalid ASTP-L server address '{}'", addr_str))?;
 
-        let udp_socket = Arc::new(bind_astpl_udp_socket("0.0.0.0:0", true)?);
+        let udp_socket = Arc::new(bind_astpl_udp_socket("0.0.0.0:0", false)?);
         let channel = UdpAuthChannel::new(udp_socket.clone(), server_addr);
 
         let auth_handler = AuthHandler::new(&self.config, self.server.server_pub_key.as_deref())?;

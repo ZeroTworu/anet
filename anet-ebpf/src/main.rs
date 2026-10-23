@@ -9,7 +9,7 @@ use aya_ebpf::{
     programs::{TcContext, XdpContext},
     EbpfContext,
 };
-use aya_log_ebpf::{debug, info, warn};
+use aya_log_ebpf::{debug, info};
 
 use anet_ebpf_common::{
     AstplConfig, EdtState, EgressRoutingData, IngressSessionData, RateRule, TokenBucketState,
@@ -18,8 +18,8 @@ use anet_ebpf_common::{
 
 mod ip;
 use ip::{
-     parse_dst_ipv4, parse_src_ipv4, xoroshiro_crypt_packet, ContextWrapper, EthHdr, Ipv4Hdr,
-    UdpHdr, ETH_P_IP_BE, IPPROTO_ICMP, IPPROTO_UDP,
+    parse_dst_ipv4, parse_src_ipv4, xoroshiro_crypt_packet, ContextWrapper, EthHdr, Ipv4Hdr,
+    UdpHdr, ETH_P_IP_BE, IPPROTO_UDP,
 };
 
 /// `BPF_SKB_TSTAMP_DELIVERY_MONO` из `enum bpf_skb_tstamp_type` ядра
@@ -329,7 +329,7 @@ fn try_astpl_xdp_ingress(ctx: &XdpContext) -> Result<u32, ()> {
         && inner_ip.src_addr == assigned_ip;
 
     if !valid_inner {
-        warn!(
+        debug!(
             ctx,
             "[ASTP-L XDP] invalid inner IPv4: seq={}, ver={}, ihl={}, tot_len={}, inner_len={}, src={:i}, expected={:i}",
             seq,
@@ -389,18 +389,6 @@ fn try_astpl_xdp_ingress(ctx: &XdpContext) -> Result<u32, ()> {
     //   корректным `iif = anet-test`, а фильтрация спуфинга/мусора (`XDP_DROP`), учёт `rx_bytes`
     //   и мгновенный NAT Rebinding выполняются прямо в XDP на сетевой карте.
     let _ = xoroshiro_crypt_packet(&w, OUTER_HEADERS_LEN, crypto_seed, seq);
-
-    if inner_ip.proto == IPPROTO_ICMP || seq <= 20 || (seq & 0x3FF) == 0 {
-        info!(
-            ctx,
-            "[ASTP-L XDP] verified: seq={}, proto={}, len={}, {:i} -> {:i}",
-            seq,
-            inner_ip.proto,
-            inner_tot_len,
-            u32::from_be(inner_ip.src_addr),
-            u32::from_be(inner_ip.dst_addr)
-        );
-    }
 
     Ok(xdp_action::XDP_PASS)
 }

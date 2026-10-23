@@ -361,31 +361,17 @@ impl AstplEbpfManager {
             }
 
             let mut tx_bytes = prev_tx;
-            let mut last_tx_seq = 0u32;
             if let Some(k) = ip_key {
                 if let Some(map) = ebpf.map_mut(ASTPL_EGRESS_MAP) {
                     if let Ok(egress_map) = AyaHashMap::<_, u32, EgressRoutingData>::try_from(map) {
                         if let Ok(eg) = egress_map.get(&k, 0) {
                             tx_bytes = eg.tx_bytes;
-                            last_tx_seq = eg.tx_seq;
                         }
                     }
                 }
             }
 
-            if rx_bytes != prev_rx || tx_bytes != prev_tx {
-                info!(
-                    "[ASTP-L eBPF Stats] tun_ip={} | XDP rx={} B (+{} B, last_seq={}) | TC tx={} B (+{} B, tx_seq={}) | endpoint={:?}",
-                    client_info.assigned_ip,
-                    rx_bytes,
-                    rx_bytes.saturating_sub(prev_rx),
-                    last_rx_seq,
-                    tx_bytes,
-                    tx_bytes.saturating_sub(prev_tx),
-                    last_tx_seq,
-                    kernel_addr
-                );
-            }
+            let _ = last_rx_seq;
 
             registry.sync_astpl_session_stats(
                 &client_info,
@@ -500,9 +486,11 @@ impl AstplEbpfManager {
 
     async fn configure_kernel_routing(eth_iface: &str, tun_iface: &str) {
         // Отключаем rp_filter и send_redirects на eth_iface и tun_iface,
-        // а также включаем ip_forward.
+        // увеличиваем netdev_max_backlog для приёма пачек из TUN без потерь
+        // и включаем ip_forward.
         for key in [
             "net.ipv4.ip_forward=1".to_string(),
+            "net.core.netdev_max_backlog=16384".to_string(),
             "net.ipv4.conf.all.rp_filter=0".to_string(),
             "net.ipv4.conf.default.rp_filter=0".to_string(),
             format!("net.ipv4.conf.{}.rp_filter=0", eth_iface),
@@ -520,7 +508,12 @@ impl AstplEbpfManager {
                 .await;
         }
 
-        Self::restore_rx_offloads(eth_iface).await;
+        let _ = Command::new("ip")
+            .args(["link", "set", "dev", tun_iface, "txqueuelen", "4096"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .await;
     }
 
     /// Гарантирует, что стандартные RX-оффлоады (`rx-gro`, `rx-checksum`) на внешнем интерфейсе
