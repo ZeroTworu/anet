@@ -2,7 +2,7 @@
 #![no_main]
 
 use aya_ebpf::{
-    bindings::{xdp_action, TC_ACT_OK, TC_ACT_SHOT},
+    bindings::{__sk_buff, xdp_action, TC_ACT_OK, TC_ACT_SHOT},
     helpers::{
         bpf_ktime_get_ns, bpf_redirect_neigh, bpf_skb_change_head, bpf_skb_pull_data,
         bpf_skb_set_tstamp, bpf_xdp_adjust_head,
@@ -254,7 +254,7 @@ fn try_astpl_tc_egress(ctx: &TcContext) -> Result<i32, ()> {
     // досчитает `CHECKSUM_PARTIAL` и отправит их через userspace UDP-сокет `AstplServer`.
     let skb_len = ctx.len();
     let (gso_segs, gso_size) = unsafe {
-        let skb = ctx.as_ptr();
+        let skb = ctx.as_ptr() as *const __sk_buff;
         ((*skb).gso_segs, (*skb).gso_size)
     };
     if skb_len < Ipv4Hdr::LEN as u32 || skb_len > 1450 || gso_segs > 1 || gso_size > 0 {
