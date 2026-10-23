@@ -19,12 +19,24 @@ pub struct XmppSession {
     pub client_name: String,
     pub profile: BrowserProfile,
     pub origin: String,
+    pub remote_ip: Option<std::net::IpAddr>,
     pub occupants: Arc<Mutex<HashSet<String>>>,
     pub discovered_stuns: Arc<Mutex<Vec<String>>>,
     write_tx: mpsc::Sender<String>,
     read_rx: mpsc::Receiver<String>,
     writer_handle: tokio::task::JoinHandle<()>,
     reader_handle: tokio::task::JoinHandle<()>,
+}
+
+fn extract_ws_remote_ip(
+    stream: &tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+) -> Option<std::net::IpAddr> {
+    let tcp = match stream {
+        tokio_tungstenite::MaybeTlsStream::Plain(s) => s,
+        tokio_tungstenite::MaybeTlsStream::Rustls(s) => s.get_ref().0,
+        _ => return None,
+    };
+    tcp.peer_addr().ok().map(|a| a.ip())
 }
 
 impl XmppSession {
@@ -84,7 +96,12 @@ impl XmppSession {
                 handshake_timeout_secs
             )
         })??;
-        log::info!("[XMPP] WebSocket connected (HTTP status: {:?})", response.status());
+        let remote_ip = extract_ws_remote_ip(ws_stream.get_ref());
+        log::info!(
+            "[XMPP] WebSocket connected (HTTP status: {:?}, remote_ip: {:?})",
+            response.status(),
+            remote_ip
+        );
 
         let (mut ws_sink, mut ws_stream) = ws_stream.split();
 
@@ -378,6 +395,7 @@ impl XmppSession {
             client_name: effective_client_name,
             profile: profile.clone(),
             origin,
+            remote_ip,
             occupants,
             discovered_stuns,
             write_tx,

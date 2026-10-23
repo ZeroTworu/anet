@@ -195,10 +195,55 @@ pub fn strip_vp8_payload_descriptor(payload: Bytes) -> Option<Bytes> {
     Some(payload.slice(offset..))
 }
 
+/// Определяет локальный IPv4-адрес физического сетевого интерфейса до поднятия TUN,
+/// чтобы сокет WebRTC не захватывал виртуальный IP `172.112.x.x` после включения маршрута `0.0.0.0/1`.
+fn detect_physical_bind_addr(
+    session_opt: Option<&JingleSession>,
+    fallback_ip: &str,
+    fallback_port: u16,
+) -> String {
+    let (target_ip, target_port) = session_opt
+        .and_then(|s| {
+            s.transport
+                .candidates
+                .iter()
+                .find(|c| {
+                    !c.ip.is_empty()
+                        && c.ip != "0.0.0.0"
+                        && !c.ip.starts_with("127.")
+                        && !c.ip.starts_with("172.112.")
+                })
+                .map(|c| (c.ip.as_str(), c.port))
+        })
+        .unwrap_or((fallback_ip, fallback_port));
+
+    if let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") {
+        if sock.connect((target_ip, target_port.max(1))).is_ok() {
+            if let Ok(local_addr) = sock.local_addr() {
+                let ip = local_addr.ip();
+                let ip_str = ip.to_string();
+                if ip.is_ipv4()
+                    && !ip.is_loopback()
+                    && !ip.is_unspecified()
+                    && !ip_str.starts_with("172.112.")
+                {
+                    log::info!(
+                        "[WRTC Media] Pinned WebRTC UDP socket to physical interface IP: {ip_str}"
+                    );
+                    return format!("{ip_str}:0");
+                }
+            }
+        }
+    }
+    "0.0.0.0:0".to_string()
+}
+
 struct PeerEvents {
     connected_tx: mpsc::Sender<()>,
     is_connected: Arc<AtomicBool>,
     is_failed: Arc<AtomicBool>,
+    has_ws: Arc<AtomicBool>,
+    mode: WrtcMode,
     disconnected_at_ms: Arc<AtomicU64>,
     start_instant: std::time::Instant,
     failed_notify: Arc<tokio::sync::Notify>,
@@ -234,10 +279,21 @@ impl PeerConnectionEventHandler for PeerEvents {
                     Ordering::SeqCst,
                 );
             }
-            if state == RTCPeerConnectionState::Failed || state == RTCPeerConnectionState::Closed {
+            if state == RTCPeerConnectionState::Closed {
                 self.is_failed.store(true, Ordering::SeqCst);
                 self.failed_notify.notify_waiters();
                 self.failed_notify.notify_one();
+            } else if state == RTCPeerConnectionState::Failed {
+                if self.has_ws.load(Ordering::SeqCst) {
+                    log::warn!(
+                        "[WRTC Media] UDP PeerConnection entered Failed state, but Colibri-WS is active (mode={:?}). Continuing over Colibri-WS without tearing session.",
+                        self.mode
+                    );
+                } else {
+                    self.is_failed.store(true, Ordering::SeqCst);
+                    self.failed_notify.notify_waiters();
+                    self.failed_notify.notify_one();
+                }
             }
         }
     }
@@ -537,12 +593,14 @@ pub struct WrtcPeer {
     pub is_failed: Arc<AtomicBool>,
     pub disconnected_at_ms: Arc<AtomicU64>,
     pub failed_notify: Arc<tokio::sync::Notify>,
+    pub first_video_rx: Arc<AtomicBool>,
     pub first_video_tx: Arc<AtomicBool>,
     pub start_instant: std::time::Instant,
     pub last_video_tx_ms: Arc<AtomicU64>,
     pub video_v2_enabled: Arc<AtomicBool>,
     pub force_keyframe_remaining: Arc<AtomicU32>,
     pub remote_sdp: Mutex<String>,
+    pub colibri_ws_ip: Arc<std::sync::Mutex<Option<std::net::IpAddr>>>,
     pub watchdog_disconnected_timeout_ms: u64,
     pub watchdog_channel_grace_secs: u64,
     pub peer_close_timeout_secs: u64,
@@ -595,6 +653,8 @@ impl WrtcPeer {
         let (ws_fallback_tx, mut ws_fallback_rx) =
             mpsc::channel::<String>(WRTC_WS_FALLBACK_CHANNEL_CAPACITY);
         let has_ws = Arc::new(AtomicBool::new(false));
+        let colibri_ws_ip: Arc<std::sync::Mutex<Option<std::net::IpAddr>>> =
+            Arc::new(std::sync::Mutex::new(None));
 
         if let Some(session) = session_opt {
             if let Some(ref ws_url) = session.transport.colibri_ws_url {
@@ -605,6 +665,7 @@ impl WrtcPeer {
                 let ws_origin = xmpp_opt.map(|x| x.origin.clone());
                 let in_tx_ws = incoming_tx.clone();
                 let has_ws_c = has_ws.clone();
+                let colibri_ws_ip_c = colibri_ws_ip.clone();
                 let dc_open_ws = dc_is_open.clone();
                 let is_failed_ws = is_failed.clone();
                 let failed_notify_ws = failed_notify.clone();
@@ -630,8 +691,25 @@ impl WrtcPeer {
                         }
                     };
                     if let Ok(Ok((ws_stream, _))) = connect_res {
+                        let peer_ip = match ws_stream.get_ref() {
+                            tokio_tungstenite::MaybeTlsStream::Plain(s) => {
+                                s.peer_addr().ok().map(|a| a.ip())
+                            }
+                            tokio_tungstenite::MaybeTlsStream::Rustls(s) => {
+                                s.get_ref().0.peer_addr().ok().map(|a| a.ip())
+                            }
+                            _ => None,
+                        };
+                        if let Some(ip) = peer_ip {
+                            if let Ok(mut g) = colibri_ws_ip_c.lock() {
+                                *g = Some(ip);
+                            }
+                        }
                         has_ws_c.store(true, Ordering::SeqCst);
-                        log::info!("[WRTC WS] Parallel Colibri-WS fallback connected");
+                        log::info!(
+                            "[WRTC WS] Parallel Colibri-WS fallback connected (remote_ip: {:?})",
+                            peer_ip
+                        );
                         let (mut ws_sink, mut ws_stream) = ws_stream.split();
 
                         if has_video_flag {
@@ -768,7 +846,7 @@ impl WrtcPeer {
             // и блокировки мьютексов BWE/TWCC внутри webrtc-rs при высокоскоростном потоке.
             let registry = Registry::new();
 
-            let bind_addr = "0.0.0.0:0".to_string();
+            let bind_addr = detect_physical_bind_addr(session_opt, fallback_ip, fallback_port);
 
             let config = RTCConfigurationBuilder::new()
                 .with_ice_servers(vec![])
@@ -793,6 +871,8 @@ impl WrtcPeer {
                 connected_tx,
                 is_connected: is_connected.clone(),
                 is_failed: is_failed.clone(),
+                has_ws: has_ws.clone(),
+                mode,
                 disconnected_at_ms: disconnected_at_ms.clone(),
                 start_instant,
                 failed_notify: failed_notify.clone(),
@@ -802,7 +882,7 @@ impl WrtcPeer {
                 remote_dc: remote_dc.clone(),
                 video_incoming_tx,
                 expected_peer_video_ssrc: expected_peer_video_ssrc.clone(),
-                first_video_rx,
+                first_video_rx: first_video_rx.clone(),
                 local_video_ssrc,
             });
 
@@ -979,6 +1059,7 @@ impl WrtcPeer {
                 let dc_opt_out = data_channel_res.clone();
                 let remote_dc_out = remote_dc.clone();
                 let dc_is_open_out = dc_is_open.clone();
+                let is_connected_out = is_connected.clone();
                 let dc_open_notify_out = dc_open_notify.clone();
                 let has_ws_out = has_ws.clone();
                 let ws_fallback_tx_out = ws_fallback_tx.clone();
@@ -1014,7 +1095,9 @@ impl WrtcPeer {
                         };
 
                         let mut sent = false;
-                        if dc_is_open_out.load(Ordering::SeqCst) {
+                        // Используем SCTP DataChannel ТОЛЬКО когда живы и SCTP (dc_is_open), и UDP ICE (is_connected).
+                        // Если под БС UDP просел (Disconnected/Failed), мгновенно отправляем ping/constraints/батчи через живой Colibri-WS!
+                        if dc_is_open_out.load(Ordering::SeqCst) && is_connected_out.load(Ordering::SeqCst) {
                             if let Some(ref dc_out) = dc_opt_out {
                                 if is_batch {
                                     log::debug!("[JVB DC OUT Batch]");
@@ -1072,6 +1155,7 @@ impl WrtcPeer {
                             // Критично: отправка отложенных ограничений выполняется в фоне,
                             // чтобы не блокировать основной цикл отправки сообщений (discover, ping, auth)!
                             let dc_is_open_bg = dc_is_open_out.clone();
+                            let is_connected_bg = is_connected_out.clone();
                             let dc_opt_bg = dc_opt_out.clone();
                             let remote_dc_bg = remote_dc_out.clone();
                             let has_ws_bg = has_ws_out.clone();
@@ -1083,7 +1167,7 @@ impl WrtcPeer {
                                         WRTC_CONSTRAINTS_RETRY_INTERVAL_MS,
                                     ))
                                     .await;
-                                    if dc_is_open_bg.load(Ordering::SeqCst) {
+                                    if dc_is_open_bg.load(Ordering::SeqCst) && is_connected_bg.load(Ordering::SeqCst) {
                                         if let Some(ref dc_out) = dc_opt_bg {
                                             if dc_out.send_text(&json_str_bg).await.is_ok() {
                                                 log::info!("[WRTC Constraints] Sent delayed video constraints via DataChannel");
@@ -1272,12 +1356,14 @@ impl WrtcPeer {
             is_failed,
             disconnected_at_ms,
             failed_notify,
+            first_video_rx,
             first_video_tx,
             start_instant,
             last_video_tx_ms,
             video_v2_enabled,
             force_keyframe_remaining,
             remote_sdp: Mutex::new(initial_remote_sdp),
+            colibri_ws_ip,
             watchdog_disconnected_timeout_ms: wrtc_cfg
                 .watchdog_disconnected_timeout_secs
                 .saturating_mul(1000)
@@ -1287,22 +1373,30 @@ impl WrtcPeer {
         })
     }
 
+    pub fn colibri_ws_ip(&self) -> Option<std::net::IpAddr> {
+        self.colibri_ws_ip.lock().ok().and_then(|g| *g)
+    }
+
     pub fn check_dead_reason(&self) -> Option<&'static str> {
         if self.is_failed.load(Ordering::SeqCst) {
             return Some("PeerConnection or Colibri-WS failed/closed");
         }
-        let disc_ms = self.disconnected_at_ms.load(Ordering::SeqCst);
-        if disc_ms > 0 {
-            let now_ms = self.start_instant.elapsed().as_millis() as u64;
-            if now_ms.saturating_sub(disc_ms) >= self.watchdog_disconnected_timeout_ms {
-                return Some("PeerConnection remained Disconnected past watchdog timeout");
+        // Если активен TCP/TLS канал Colibri-WS (has_ws == true), проседание или блокировка
+        // UDP ICE (например, при активных Белых Списках оператора) НЕ должны рвать живую сессию!
+        if !self.has_ws.load(Ordering::SeqCst) {
+            let disc_ms = self.disconnected_at_ms.load(Ordering::SeqCst);
+            if disc_ms > 0 {
+                let now_ms = self.start_instant.elapsed().as_millis() as u64;
+                if now_ms.saturating_sub(disc_ms) >= self.watchdog_disconnected_timeout_ms {
+                    return Some("PeerConnection remained Disconnected past watchdog timeout (and no Colibri-WS active)");
+                }
             }
         }
         if self.start_instant.elapsed() > Duration::from_secs(self.watchdog_channel_grace_secs)
             && !self.has_ws.load(Ordering::SeqCst)
-            && !self.dc_is_open.load(Ordering::SeqCst)
+            && (!self.dc_is_open.load(Ordering::SeqCst) || !self.is_connected.load(Ordering::SeqCst))
         {
-            return Some("Both Colibri-WS and DataChannel are closed");
+            return Some("Both Colibri-WS and DataChannel are closed/disconnected");
         }
         None
     }
@@ -1395,7 +1489,14 @@ impl WrtcPeer {
     }
 
     pub async fn add_remote_video_ssrc(&self, ssrc: u32) {
-        if ssrc == 0 || ssrc == self.video_ssrc || ssrc == 10002 {
+        if self.mode == WrtcMode::Ws || ssrc == 0 || ssrc == self.video_ssrc || ssrc == 10002 {
+            return;
+        }
+        // Если входящий видеопоток от JVB уже активно идет (first_video_rx == false),
+        // не выполняем повторный SDP renegotiation (set_remote_description / set_local_description)
+        // после поднятия TUN-интерфейса, чтобы не сбить рабочую ICE/DTLS сессию!
+        if !self.first_video_rx.load(Ordering::Relaxed) {
+            self.force_next_keyframe();
             return;
         }
         let Some(ref pc) = self.peer_connection else {

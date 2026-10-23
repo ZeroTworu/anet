@@ -144,8 +144,17 @@ impl ClientTransport for AHttpTransport {
         }
 
         let mut uplink_method_str = "POST".to_string();
+        let mut dsn_cdn_mode = false;
+        let mut dsn_budget_override: Option<usize> = None;
+        let mut dsn_pool_override: Option<usize> = None;
         for (k, v) in dsn_url.query_pairs() {
-            if k == "method" { uplink_method_str = v.into_owned(); }
+            match k.as_ref() {
+                "method" => uplink_method_str = v.into_owned(),
+                "cdn" => dsn_cdn_mode = matches!(v.as_ref(), "1" | "true" | "yes"),
+                "budget" => dsn_budget_override = v.parse::<usize>().ok(),
+                "pool" => dsn_pool_override = v.parse::<usize>().ok(),
+                _ => {}
+            }
         }
         let uplink_method = Method::from_bytes(uplink_method_str.as_bytes()).unwrap_or(Method::POST);
 
@@ -161,6 +170,15 @@ impl ClientTransport for AHttpTransport {
                 .tcp_nodelay(self.config.ahttp.tcp_nodelay)
                 .timeout(Duration::from_secs(self.config.ahttp.timeout_secs))
                 .http2_adaptive_window(self.config.ahttp.http2_adaptive_window);
+
+            if !self.config.ahttp.http2_adaptive_window {
+                if let Some(stream_win) = self.config.ahttp.http2_initial_stream_window_size.or(if dsn_cdn_mode { Some(49152) } else { None }) {
+                    builder = builder.http2_initial_stream_window_size(stream_win);
+                }
+                if let Some(conn_win) = self.config.ahttp.http2_initial_connection_window_size.or(if dsn_cdn_mode { Some(49152) } else { None }) {
+                    builder = builder.http2_initial_connection_window_size(conn_win);
+                }
+            }
 
             if let Some(max_frame) = self.config.ahttp.http2_max_frame_size {
                 builder = builder.http2_max_frame_size(max_frame);
@@ -183,10 +201,17 @@ impl ClientTransport for AHttpTransport {
             builder.build().map_err(|e| anyhow::anyhow!("Cannot build a HTTP client: {}", e))
         };
 
-        // Компактный Round-Robin пул из 1..4 HTTP/2 клиентов:
+        // Компактный Round-Robin пул из постоянных HTTP/2 клиентов:
         // Все соединения равномерно прокачиваются фоновыми poll-запросами (не остывают и не теряют cwnd),
         // а внутри каждого соединения запросы мультиплексируются по HTTP/2 потокам.
-        let pool_size = self.config.ahttp.concurrency.clamp(1, 4);
+        let configured_pool = dsn_pool_override
+            .or(self.config.ahttp.tcp_pool_size)
+            .unwrap_or(4);
+        let pool_size = if configured_pool == 0 {
+            self.config.ahttp.concurrency.clamp(1, 4)
+        } else {
+            configured_pool.clamp(1, self.config.ahttp.concurrency.max(1))
+        };
         let mut client_pool_vec = Vec::with_capacity(pool_size);
         for _ in 0..pool_size {
             client_pool_vec.push(build_http_client()?);
@@ -245,15 +270,17 @@ impl ClientTransport for AHttpTransport {
         let downlink_credits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
         tokio::spawn(async move {
+            // Приоритет бюджета Uplink-батча: ?budget=... в DSN -> ?cdn=1 (49152 B) -> uplink_coalesce_budget_bytes -> coalesce_budget_bytes
+            let uplink_budget_bytes = dsn_budget_override
+                .or(if dsn_cdn_mode { Some(49152) } else { None })
+                .or(config_ahttp.uplink_coalesce_budget_bytes)
+                .unwrap_or(config_ahttp.coalesce_budget_bytes)
+                .max(2048);
             info!(
-                "[AHTTP Client] Started Stateless Packet-Exchange Loop (Method: {}, TCP Pool: {}, Concurrency: {})",
-                uplink_method_str, pool_size, config_ahttp.concurrency
+                "[AHTTP Client] Started Stateless Packet-Exchange Loop (Method: {}, TCP Pool: {}, Concurrency: {}, Uplink Budget: {} B)",
+                uplink_method_str, pool_size, config_ahttp.concurrency, uplink_budget_bytes
             );
             let traffic_url = format!("{}{}?session_id={}", base_url, config_ahttp.traffic_path, session_id);
-            // В HTTP/2 стартовое окно потока/соединения (RFC 7540 / Nginx) равно 65535 байт.
-            // Ограничиваем один uplink-батч до 48 КБ (49152 байт), чтобы POST-запрос гарантированно
-            // уходил за один RTT без паузы на ожидание WINDOW_UPDATE от Nginx.
-            let uplink_budget_bytes = config_ahttp.coalesce_budget_bytes.min(49152);
             let mut batch_buf = BytesMut::with_capacity(uplink_budget_bytes + 2048);
             let poll_timeout = Duration::from_millis(config_ahttp.poll_timeout_ms);
             let micro_coalesce = Duration::from_micros(500);
