@@ -40,66 +40,80 @@ enabled = true
 interval_minutes = 1
 
 [ahttp]
-# --- Параметры параллельности и коалесценции пакетов ---
-# В dsn ноды [[servers]] также поддерживаются query-параметры:
-#   ?cdn=1 (профиль под CDNVideo, батч 48 КБ), ?budget=49152, ?pool=4, ?method=POST
+# --- Параметры параллельности и коалесценции пакетов (оптимизировано для работы напрямую без CDN) ---
+# В dsn ноды [[servers]] также поддерживаются точечные query-параметры:
+#   ?cdn=1 (профиль для CDN, батч 48 КБ), ?budget=49152, ?pool=4, ?method=POST
 
-# Количество параллельно открываемых HTTP/2 запросов (потоков) в сторону сервера/CDN.
+# Количество параллельно открываемых HTTP/2 запросов (потоков)
 concurrency = 12
+# concurrency = 8 # для CDN
 
-# Количество постоянных независимых TCP/TLS соединений (HTTP/2 клиентов) в Round-Robin пуле.
+# Количество постоянных независимых TCP/TLS соединений (HTTP/2 клиентов) в Round-Robin пуле
 tcp_pool_size = 4
+# tcp_pool_size = 2 # для CDN
 
-# Максимальный размер пачки пакетов в байтах (общий бюджет коалесценции).
-coalesce_budget_bytes = 65536
+# Максимальный размер пачки пакетов в байтах (общий бюджет коалесценции: 128 КБ напрямую под серверный лимит)
+coalesce_budget_bytes = 131072
+# coalesce_budget_bytes = 65536 # для CDN
 
-# Опциональный отдельный лимит размера Uplink POST-батча (например, 49152 для CDNVideo).
-# Если закомментировано — используется coalesce_budget_bytes (или 49152 при ?cdn=1 в dsn).
-# uplink_coalesce_budget_bytes = 49152
+# Отдельный лимит размера Uplink POST-батча (напрямую не ограничиваем — используется coalesce_budget_bytes)
+# uplink_coalesce_budget_bytes = 49152 # для CDN (48 КБ, чтобы POST уходил за 1 RTT в стартовом окне HTTP/2 65535 Б)
 
-# Интервал фонового опроса сервера в миллисекундах (при активном скачивании работает self-clocking).
+# Интервал фонового опроса сервера в мс (при активном скачивании работает self-clocking без ожидания таймера)
 poll_timeout_ms = 5
+# poll_timeout_ms = 15 # для CDN (снижает фоновый RPS, чтобы не триггерить rate-limit на edge-нодах)
 
-# Максимальный размер очереди переупорядочивания пакетов (ReassemblyQueue) в пакетах.
-reassembly_queue_max_size = 1024
+# Максимальный размер скользящего окна переупорядочивания пакетов (ReassemblyQueue)
+reassembly_queue_max_size = 2048
+# reassembly_queue_max_size = 1024 # для CDN
 
 # --- Тонкая настройка HTTP/2 на уровне сетевого движка ---
 
-# Автоматическое динамическое расширение окна HTTP/2 (Adaptive Flow Control Window).
+# Автоматическое динамическое расширение окна HTTP/2 под BDP канала (Adaptive Flow Control Window)
 http2_adaptive_window = true
+# http2_adaptive_window = false # для CDN (при жёстком лимите окна на edge-узле CDNVideo)
 
 # Ручные окна потока и соединения HTTP/2 (применяются ТОЛЬКО если http2_adaptive_window = false)
-# http2_initial_stream_window_size = 49152
-# http2_initial_connection_window_size = 1048576
+# http2_initial_stream_window_size = 2097152     # без CDN (2 МБ, если http2_adaptive_window = false)
+# http2_initial_connection_window_size = 8388608 # без CDN (8 МБ, если http2_adaptive_window = false)
+# http2_initial_stream_window_size = 49152       # для CDN (48 КБ под окно CDNVideo)
+# http2_initial_connection_window_size = 49152   # для CDN (48 КБ под окно CDNVideo)
 
-# Максимальный размер одного HTTP/2 DATA-фрейма (в байтах).
+# Максимальный размер одного HTTP/2 DATA-фрейма (64 КБ напрямую снижает оверхед заголовков фреймов в 4 раза)
 http2_max_frame_size = 65536
+# http2_max_frame_size = 16384 # для CDN (стандартный RFC 7540 фрейм 16 КБ для строгих CDN)
 
-# Максимальный размер входящих HTTP-заголовков (в байтах).
+# Максимальный размер входящих HTTP-заголовков (в байтах)
 http2_max_header_list_size = 65536
+# http2_max_header_list_size = 16384 # для CDN
 
-# Период отправки фоновых Keep-Alive PING кадров HTTP/2 (в секундах).
+# Период отправки фоновых Keep-Alive PING кадров HTTP/2 (в секундах)
 http2_keep_alive_interval_secs = 20
+# http2_keep_alive_interval_secs = 15 # для CDN
 
-# Таймаут подтверждения (ACK) отправленного PING-кадра (в секундах).
+# Таймаут подтверждения (ACK) отправленного PING-кадра (в секундах)
 http2_keep_alive_timeout_secs = 10
+# http2_keep_alive_timeout_secs = 10 # для CDN
 
-# Отправлять ли PING-кадры, когда в туннеле нет активной передачи данных (Idle-режим).
+# Отправлять ли PING-кадры, когда в туннеле нет активной передачи данных (Idle-режим)
 http2_keep_alive_while_idle = true
 
 # --- Конфигурация пула соединений и путей ---
 
-# Максимальное количество удерживаемых открытыми (idle) сокетов на каждый клиент пула
+# Максимальное количество удерживаемых открытыми (idle) сокетов на каждый клиент пула (должно быть >= concurrency)
 pool_max_idle_per_host = 16
+# pool_max_idle_per_host = 8 # для CDN
 
 # Время простоя соединения в пуле перед его автоматическим закрытием (в секундах)
-pool_idle_timeout_secs = 60
+pool_idle_timeout_secs = 90
+# pool_idle_timeout_secs = 45 # для CDN
 
-# Отключение алгоритма Nagle (TCP_NODELAY) для снижения задержки
+# Отключение алгоритма Nagle (TCP_NODELAY) для мгновенной отправки фреймов
 tcp_nodelay = true
 
-# Тайм-аут на выполнение одного HTTP-запроса (в секундах)
+# Тайм-аут на выполнение одного HTTP-запроса обмена батчем (в секундах)
 timeout_secs = 10
+# timeout_secs = 15 # для CDN
 
 # Пути эндпоинтов (должны строго совпадать с настройками на сервере)
 handshake_path = "/handshake"
