@@ -25,7 +25,7 @@ route_for = {{ROUTE_FOR}}
 exclude_route_for = {{EXCLUDE_ROUTE_FOR}}
 
 # Список DNS-серверов, используемых при запуске для резолва доменов
-dns_server_list = ["1.1.1.1", "8.8.8.8"]
+dns_server_list = ["77.88.8.8", "77.88.8.1"]
 
 # Ссылка для скачивания авто-обновлений клиента
 update_url = "https://api.github.com/repos/ZeroTworu/anet/releases/latest"
