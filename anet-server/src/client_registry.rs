@@ -449,6 +449,9 @@ impl ClientRegistry {
 
     fn traffic_counters(&self, client: &ClientTransportInfo, protocol: &str) -> Arc<TrafficCounters> {
         let key = format!("{}#{}", client.fingerprint, protocol);
+        if let Some(existing) = self.traffic_totals.get(&key) {
+            return existing.value().clone();
+        }
         self.traffic_totals
             .entry(key)
             .or_insert_with(|| Arc::new(TrafficCounters {
@@ -817,8 +820,8 @@ impl ClientRegistry {
             self.route_packet_to_ipv4(ipv4, packet).await;
             return;
         }
-        let sender_opt = self.quic_router.get(dst_ip).map(|s| s.value().clone());
-        if let Some(sender) = sender_opt {
+        let sender = self.quic_router.get(dst_ip).map(|entry| entry.value().clone());
+        if let Some(sender) = sender {
             let packet_len = packet.len();
             if sender.send(packet).await.is_err() {
                 warn!("[Registry] Failed to route to {}: channel closed.", dst_ip);
@@ -861,13 +864,7 @@ impl ClientRegistry {
                 .fetch_add(delta_rx, Ordering::Relaxed);
         }
 
-        let prev_tx = client_info.ebpf_synced_tx.swap(bpf_tx_bytes, Ordering::Relaxed);
-        let delta_tx = bpf_tx_bytes.saturating_sub(prev_tx);
-        if delta_tx > 0 {
-            self.traffic_counters(client_info, "astpl")
-                .tx_bytes
-                .fetch_add(delta_tx, Ordering::Relaxed);
-        }
+        client_info.ebpf_synced_tx.store(bpf_tx_bytes, Ordering::Relaxed);
 
         let prev_seen = client_info
             .ebpf_last_seen_ns

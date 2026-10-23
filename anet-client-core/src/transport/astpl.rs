@@ -7,7 +7,7 @@ use anet_common::astpl::{
 };
 use anet_common::consts::MAX_PACKET_SIZE;
 use anet_common::crypto_utils::derive_astpl_seed;
-use anet_common::stream_framing::{frame_packet_into, read_next_packet};
+use anet_common::stream_framing::{frame_packet_into, read_next_packet_into};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use bytes::BytesMut;
@@ -66,8 +66,9 @@ impl ClientTransport for AstplTransport {
         let tx_socket = udp_socket.clone();
         let tx_task = tokio::spawn(async move {
             let mut tx_seq: u32 = 0;
+            let mut packet = Vec::with_capacity(MAX_PACKET_SIZE);
             let mut datagram = Vec::with_capacity(MAX_PACKET_SIZE);
-            while let Ok(Some(packet)) = read_next_packet(&mut tunnel_read).await {
+            while let Ok(true) = read_next_packet_into(&mut tunnel_read, &mut packet).await {
                 if packet.len() < 20 || (packet[0] >> 4) != 4 {
                     continue;
                 }

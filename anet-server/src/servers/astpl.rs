@@ -931,22 +931,46 @@ pub async fn run_astpl_server(
                         let sock_writer = sock.clone();
                         tokio::spawn(async move {
                             let mut wrap_buf = Vec::with_capacity(MAX_PACKET_SIZE);
-                            while let Some(inner_ip_pkt) = rx_router.recv().await {
-                                let raw_seq = ci_writer.sequence.fetch_add(1, Ordering::Relaxed) as u32;
-                                let seq = (raw_seq | 0x8000_0000).max(1);
-                                wrap_astpl_packet_into(
-                                    &mut wrap_buf,
-                                    &ci_writer.nonce_prefix,
-                                    seq,
-                                    ci_writer.crypto_seed,
-                                    &inner_ip_pkt,
-                                );
-                                let dst = **ci_writer.remote_addr.load();
-                                if let Err(e) = sock_writer.send_to(&wrap_buf, dst).await {
-                                    warn!(
-                                        "[ASTP-L] UDP send_to error for {} ({}): {}",
-                                        ci_writer.assigned_ip, dst, e
+                            while let Some(mut inner_ip_pkt) = rx_router.recv().await {
+                                loop {
+                                    let raw_seq =
+                                        ci_writer.sequence.fetch_add(1, Ordering::Relaxed) as u32;
+                                    let seq = raw_seq.wrapping_add(1).max(1);
+                                    wrap_astpl_packet_into(
+                                        &mut wrap_buf,
+                                        &ci_writer.nonce_prefix,
+                                        seq,
+                                        ci_writer.crypto_seed,
+                                        &inner_ip_pkt,
                                     );
+                                    let dst = **ci_writer.remote_addr.load();
+                                    match sock_writer.try_send_to(&wrap_buf, dst) {
+                                        Ok(_) => {}
+                                        Err(ref e)
+                                            if e.kind() == std::io::ErrorKind::WouldBlock =>
+                                        {
+                                            if let Err(e) =
+                                                sock_writer.send_to(&wrap_buf, dst).await
+                                            {
+                                                warn!(
+                                                    "[ASTP-L] UDP send_to error for {} ({}): {}",
+                                                    ci_writer.assigned_ip, dst, e
+                                                );
+                                                break;
+                                            }
+                                        }
+                                        Err(e) => {
+                                            warn!(
+                                                "[ASTP-L] UDP send_to error for {} ({}): {}",
+                                                ci_writer.assigned_ip, dst, e
+                                            );
+                                            break;
+                                        }
+                                    }
+                                    match rx_router.try_recv() {
+                                        Ok(next_pkt) => inner_ip_pkt = next_pkt,
+                                        Err(_) => break,
+                                    }
                                 }
                             }
                         });
