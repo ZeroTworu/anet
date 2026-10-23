@@ -161,6 +161,11 @@ impl AstplEbpfManager {
             }
         }
 
+        // Важно: в драйвере virtio_net вызов `virtnet_xdp_set` при `xdp.attach` пересчитывает
+        // `netdev_features_t` интерфейса (`netdev_update_features`), поэтому отключаем
+        // GRO/LRO повторно ПОСЛЕ прикрепления XDP-программы.
+        Self::disable_rx_coalescing_offloads(&eth_iface).await;
+
         Ok(Self {
             ebpf: ebpf_arc,
             eth_iface,
@@ -499,14 +504,194 @@ impl AstplEbpfManager {
                 .await;
         }
 
-        // Отключаем GRO/LRO на внешнем интерфейсе (best-effort), чтобы входящие TCP-сегменты
-        // не склеивались в GSO-суперпакеты (> MTU) перед попаданием в TC egress.
-        let _ = Command::new("ethtool")
-            .args(["-K", eth_iface, "gro", "off", "lro", "off"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .output()
-            .await;
+        Self::disable_rx_coalescing_offloads(eth_iface).await;
+    }
+
+    /// Отключает GRO/LRO (`rx-gro`, `rx-gro-hw`, `rx-gro-list`, `rx-lro`) на внешнем интерфейсе:
+    /// 1. Напрямую через ядерный `ioctl(SIOCETHTOOL, ETHTOOL_SFEATURES)` (не требует установленного пакета `ethtool`).
+    /// 2. Дублирует вызовом `ethtool -K` (если утилита установлена в системе).
+    /// Это гарантирует, что `napi_gro_receive` на `ens3` не склеивает входящие TCP-сегменты (Download)
+    /// в GSO-суперпакеты (`skb->len > MTU`, `CHECKSUM_PARTIAL`), и все пакеты проходят через ядерный TC fast-path.
+    async fn disable_rx_coalescing_offloads(eth_iface: &str) {
+        match Self::disable_gro_lro_via_ioctl(eth_iface) {
+            Ok(disabled) if !disabled.is_empty() => {
+                info!(
+                    "[ASTP-L eBPF] Disabled RX coalescing features on '{}' via SIOCETHTOOL: {}",
+                    eth_iface,
+                    disabled.join(", ")
+                );
+            }
+            Ok(_) => {
+                debug!(
+                    "[ASTP-L eBPF] SIOCETHTOOL on '{}' completed (no matching GRO/LRO features needed changes)",
+                    eth_iface
+                );
+            }
+            Err(e) => {
+                warn!(
+                    "[ASTP-L eBPF] SIOCETHTOOL GRO/LRO disable on '{}' failed: {}",
+                    eth_iface, e
+                );
+            }
+        }
+
+        for bin in ["ethtool", "/usr/sbin/ethtool", "/sbin/ethtool"] {
+            if let Ok(out) = Command::new(bin)
+                .args(["-K", eth_iface, "gro", "off", "lro", "off"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .output()
+                .await
+            {
+                if out.status.success() {
+                    break;
+                }
+            }
+        }
+    }
+
+    fn disable_gro_lro_via_ioctl(iface: &str) -> Result<Vec<String>> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+
+            const SIOCETHTOOL: usize = 0x8946;
+            const ETHTOOL_GSSET_INFO: u32 = 0x0000_0037;
+            const ETHTOOL_GSTRINGS: u32 = 0x0000_001b;
+            const ETHTOOL_SFEATURES: u32 = 0x0000_003b;
+            const ETH_SS_FEATURES: u32 = 4;
+            const ETH_GSTRING_LEN: usize = 32;
+            const MAX_FEATURES: usize = 256;
+            const MAX_FEATURE_BLOCKS: usize = (MAX_FEATURES + 31) / 32;
+            const IFNAMSIZ: usize = 16;
+
+            unsafe extern "C" {
+                fn ioctl(fd: i32, request: usize, arg: *mut core::ffi::c_void) -> i32;
+            }
+
+            #[repr(C)]
+            struct EthtoolSsetInfo {
+                cmd: u32,
+                reserved: u32,
+                sset_mask: u64,
+                data: u32,
+            }
+
+            #[repr(C)]
+            struct EthtoolGstrings {
+                cmd: u32,
+                string_set: u32,
+                len: u32,
+                data: [[u8; ETH_GSTRING_LEN]; MAX_FEATURES],
+            }
+
+            #[repr(C)]
+            #[derive(Clone, Copy, Default)]
+            struct EthtoolSetFeaturesBlock {
+                valid: u32,
+                requested: u32,
+            }
+
+            #[repr(C)]
+            struct EthtoolSfeatures {
+                cmd: u32,
+                size: u32,
+                features: [EthtoolSetFeaturesBlock; MAX_FEATURE_BLOCKS],
+            }
+
+            #[repr(C)]
+            struct Ifreq {
+                ifr_name: [u8; IFNAMSIZ],
+                ifr_data: *mut core::ffi::c_void,
+            }
+
+            let name_bytes = iface.as_bytes();
+            if name_bytes.is_empty() || name_bytes.len() >= IFNAMSIZ {
+                return Err(anyhow!("Invalid interface name '{}'", iface));
+            }
+
+            let mut ifr_name = [0u8; IFNAMSIZ];
+            ifr_name[..name_bytes.len()].copy_from_slice(name_bytes);
+
+            let sock =
+                std::net::UdpSocket::bind("0.0.0.0:0").context("UdpSocket::bind for SIOCETHTOOL")?;
+            let fd = sock.as_raw_fd();
+
+            // 1. Запрашиваем количество поддерживаемых фич (ETH_SS_FEATURES)
+            let mut sset_info = EthtoolSsetInfo {
+                cmd: ETHTOOL_GSSET_INFO,
+                reserved: 0,
+                sset_mask: 1u64 << ETH_SS_FEATURES,
+                data: 0,
+            };
+            let mut ifr = Ifreq {
+                ifr_name,
+                ifr_data: (&mut sset_info as *mut EthtoolSsetInfo).cast(),
+            };
+            if unsafe { ioctl(fd, SIOCETHTOOL, (&mut ifr as *mut Ifreq).cast()) } < 0 {
+                return Err(std::io::Error::last_os_error()).context("ioctl(ETHTOOL_GSSET_INFO)");
+            }
+
+            let n_features = (sset_info.data as usize).min(MAX_FEATURES);
+            if n_features == 0 {
+                return Ok(Vec::new());
+            }
+
+            // 2. Читаем строковые имена фич (ETHTOOL_GSTRINGS)
+            let mut gstrings = EthtoolGstrings {
+                cmd: ETHTOOL_GSTRINGS,
+                string_set: ETH_SS_FEATURES,
+                len: n_features as u32,
+                data: [[0u8; ETH_GSTRING_LEN]; MAX_FEATURES],
+            };
+            ifr.ifr_data = (&mut gstrings as *mut EthtoolGstrings).cast();
+            if unsafe { ioctl(fd, SIOCETHTOOL, (&mut ifr as *mut Ifreq).cast()) } < 0 {
+                return Err(std::io::Error::last_os_error()).context("ioctl(ETHTOOL_GSTRINGS)");
+            }
+
+            // 3. Формируем битовую маску отключения для rx-gro / rx-gro-hw / rx-gro-list / rx-lro
+            let n_blocks = (n_features + 31) / 32;
+            let mut sfeatures = EthtoolSfeatures {
+                cmd: ETHTOOL_SFEATURES,
+                size: n_blocks as u32,
+                features: [EthtoolSetFeaturesBlock::default(); MAX_FEATURE_BLOCKS],
+            };
+
+            let mut disabled_names = Vec::new();
+            for idx in 0..n_features {
+                let raw = &gstrings.data[idx];
+                let end = raw.iter().position(|&c| c == 0).unwrap_or(ETH_GSTRING_LEN);
+                let Ok(feat_name) = std::str::from_utf8(&raw[..end]) else {
+                    continue;
+                };
+                if matches!(
+                    feat_name,
+                    "rx-gro" | "rx-gro-hw" | "rx-gro-list" | "rx-lro"
+                ) {
+                    let block = idx / 32;
+                    let bit = 1u32 << (idx % 32);
+                    sfeatures.features[block].valid |= bit;
+                    sfeatures.features[block].requested &= !bit;
+                    disabled_names.push(feat_name.to_string());
+                }
+            }
+
+            if disabled_names.is_empty() {
+                return Ok(disabled_names);
+            }
+
+            ifr.ifr_data = (&mut sfeatures as *mut EthtoolSfeatures).cast();
+            if unsafe { ioctl(fd, SIOCETHTOOL, (&mut ifr as *mut Ifreq).cast()) } < 0 {
+                return Err(std::io::Error::last_os_error()).context("ioctl(ETHTOOL_SFEATURES)");
+            }
+
+            Ok(disabled_names)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = iface;
+            Ok(Vec::new())
+        }
     }
 
     async fn cleanup_stale_xdp(iface: &str) {
