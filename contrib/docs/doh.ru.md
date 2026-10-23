@@ -7,7 +7,7 @@
 ## 1. Введение и архитектурная концепция
 
 ### 1.1. Назначение
-Транспорт `doh` (`dsn = "doh://domain?resolver=https://..."`) — это транспорт "последней надежды" (Last Resort) для ANet VPN. Он спроектирован для работы в сетях с жесткими ограничениями связности и строгими правилами фильтрации, маскируя VPN-трафик под легитимные DNS-запросы к доверенным публичным DoH-резолверам (например, Yandex DNS `77.88.8.7` или AdGuard DNS) поверх зашифрованного HTTPS (TLS 1.3 / HTTP/2).
+Транспорт `doh` (`dsn = "doh://domain?resolver=https://...&resolver=https://...&arq=true"`) — это транспорт "последней надежды" (Last Resort) для ANet VPN. Он спроектирован для работы в сетях с жесткими ограничениями связности и строгими правилами фильтрации, маскируя VPN-трафик под легитимные DNS-запросы к доверенным публичным DoH-резолверам (например, Yandex DNS `77.88.8.7` или AdGuard DNS) поверх зашифрованного HTTPS (TLS 1.3 / HTTP/2).
 
 В отличие от прямых транспортов (QUIC, AHTTP, SSH, VNC, WebSocket), где клиент подключается непосредственно к IP-адресу VPN-сервера, в транспорте `doh` **клиент никогда не обращается к серверу ANet напрямую**:
 * **На стороне клиента:** `reqwest::Client` (HTTP/2) общается с пулом доверенных DoH-серверов.
@@ -139,6 +139,8 @@ TXT: [ "Base64_Chunk_1...", "Base64_Chunk_2...", "Base64_Chunk_3..." ]
 ## 6. Конфигурация
 
 ### 6.1. Настройка клиента (`client.toml`)
+Вся конфигурация транспорта инкапсулирована непосредственно в Query-параметрах `dsn` (по аналогии с AHTTP и WebRTC), что исключает необходимость добавления лишних полей в структуры `ServerConfig` и модель БД:
+
 ```toml
 [stealth]
 # Полиморфный TLS-отпечаток BoringSSL (Chrome / Firefox / Safari / Randomized)
@@ -148,20 +150,17 @@ tls_verify_peer = true
 
 [[servers]]
 name = "DoH Emergency Tunnel"
-# Базовый DSN с указанием авторитативной зоны
-dsn = "doh://t1.anet-vpn.com"
+# Формат DSN:
+# doh://<доменная_зона>?resolver=<url1>&resolver=<url2>&arq=<bool>&dup_hs=<bool>&hold_ms=<ms>
+#
+# Параметры Query:
+# - `resolver`: URL публичного DoH-резолвера (может повторяться несколько раз для пула)
+# - `arq`: включение микро-ARQ (Selective Repeat) при потерях на плече UDP:53 (по умолчанию true)
+# - `dup_hs`: дублирование чанков хендшейка через разные резолверы для быстрого RTT (по умолчанию true)
+# - `hold_ms`: желаемое время удержания long-poll запроса (по умолчанию 1200)
+dsn = "doh://t1.anet-vpn.com?resolver=https://77.88.8.7/dns-query&resolver=https://dns.adguard-dns.com/dns-query&arq=true&dup_hs=true"
 timeout_secs = 10
 server_pub_key = "<BASE64_ED25519_PUBLIC_KEY>"
-
-# Пул независимых публичных DoH-резолверов
-doh_resolvers = [
-    "https://77.88.8.7/dns-query",
-    "https://dns.adguard-dns.com/dns-query"
-]
-
-# Параметры надежности в нестабильных сетях
-doh_arq_enabled = true
-doh_duplicate_handshake = true
 ```
 
 ### 6.2. Настройка сервера (`server.toml`)
