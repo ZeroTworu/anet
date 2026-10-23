@@ -21,8 +21,9 @@ use anet_ebpf_common::{
 
 mod ip;
 use ip::{
-    ipv4_header_checksum, parse_dst_ipv4, parse_src_ipv4, xoroshiro_crypt_packet, ContextWrapper,
-    EthHdr, Ipv4Hdr, UdpHdr, ETH_P_IP_BE, IPPROTO_ICMP, IPPROTO_UDP,
+    ipv4_header_checksum, ipv4_pseudo_csum_seed_be, parse_dst_ipv4, parse_src_ipv4,
+    xoroshiro_crypt_packet, ContextWrapper, EthHdr, Ipv4Hdr, UdpHdr, ETH_P_IP_BE, IPPROTO_ICMP,
+    IPPROTO_TCP, IPPROTO_UDP,
 };
 
 /// `BPF_SKB_TSTAMP_DELIVERY_MONO` из `enum bpf_skb_tstamp_type` ядра
@@ -299,8 +300,36 @@ fn try_astpl_tc_egress(ctx: &TcContext) -> Result<i32, ()> {
     let inner_len = w_plain.data_end().saturating_sub(w_plain.data());
     let inner_ip_after = w_plain.read_unaligned::<Ipv4Hdr>(0)?;
     let inner_tot_len = u16::from_be(inner_ip_after.tot_len) as usize;
-    if inner_len < Ipv4Hdr::LEN || inner_len > 1450 || inner_tot_len != inner_len {
+    let ihl_bytes = (inner_ip_after.ihl() as usize) * 4;
+    if inner_len < Ipv4Hdr::LEN
+        || inner_len > 1450
+        || inner_tot_len != inner_len
+        || ihl_bytes < Ipv4Hdr::LEN
+        || ihl_bytes > inner_len
+    {
         return Ok(TC_ACT_OK);
+    }
+
+    // Проверяем, не находится ли внутренний TCP/UDP пакет в состоянии `CHECKSUM_PARTIAL`
+    // (например, из-за `VIRTIO_NET_HDR_F_NEEDS_CSUM` от гипервизора KVM/vhost-net при бурстах >45 Мбит/с).
+    // Если в поле L4 `check` записан только seed псевдозаголовка (`~csum_tcpudp_magic`),
+    // возвращаем `TC_ACT_OK`, чтобы ядро на выходе из `anet-test` вызвало `skb_checksum_help(skb)`
+    // и отправило пакет с финализированной контрольной суммой через быстрый userspace UDP-сокет.
+    let l4_len = (inner_tot_len - ihl_bytes) as u16;
+    if inner_proto == IPPROTO_TCP && ihl_bytes + 18 <= inner_len {
+        let tcp_check = w_plain.read_unaligned::<u16>(ihl_bytes + 16)?;
+        let pseudo_seed =
+            ipv4_pseudo_csum_seed_be(inner_src_ip, inner_dst_ip, IPPROTO_TCP, l4_len);
+        if tcp_check == pseudo_seed {
+            return Ok(TC_ACT_OK);
+        }
+    } else if inner_proto == IPPROTO_UDP && ihl_bytes + 8 <= inner_len {
+        let udp_check = w_plain.read_unaligned::<u16>(ihl_bytes + 6)?;
+        let pseudo_seed =
+            ipv4_pseudo_csum_seed_be(inner_src_ip, inner_dst_ip, IPPROTO_UDP, l4_len);
+        if udp_check != 0 && udp_check == pseudo_seed {
+            return Ok(TC_ACT_OK);
+        }
     }
 
     let now = unsafe { bpf_ktime_get_ns() };
@@ -541,17 +570,6 @@ fn try_astpl_xdp_ingress(ctx: &XdpContext) -> Result<u32, ()> {
                 u16::from_be(outer_src_port)
             );
         }
-    }
-
-    // 5a. Если пакет адресован собственному TUN IP сервера (`self_ip` 172.112.224.2 или `gateway` 172.112.224.1),
-    // откатываем XOR и отдаём `XDP_PASS` в Userspace UDP-сокет `anet-server`:
-    // если декапсулировать такой пакет прямо на внешнем интерфейсе (`ens3`), он попадёт в цепочку `INPUT`
-    // с `iifname = "ens3"` вместо `anet-test` и будет отброшен файрволом сервера.
-    if (cfg.tun_ip_be != 0 && inner_ip.dst_addr == cfg.tun_ip_be)
-        || (cfg.tun_gw_be != 0 && inner_ip.dst_addr == cfg.tun_gw_be)
-    {
-        let _ = xoroshiro_crypt_packet(&w, OUTER_HEADERS_LEN, crypto_seed, seq);
-        return Ok(xdp_action::XDP_PASS);
     }
 
     // 5b. Если пакет является внутритуннельным ICMP Echo Request зондом ANet (`ident == 0x414E`),

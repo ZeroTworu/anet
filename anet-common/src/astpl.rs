@@ -118,12 +118,11 @@ pub fn wrap_astpl_packet_into(
     rng.apply_keystream(&mut out[ASTPL_HEADER_LEN..]);
 }
 
-/// Создаёт `tokio::net::UdpSocket` с увеличенными буферами `SO_RCVBUF` и `SO_SNDBUF` (цель 8 МБ,
-/// т.е. 16 МБ в удвоенном представлении ядра Linux).
-/// На Linux дополнительно вызывает `SO_RCVBUFFORCE` / `SO_SNDBUFFORCE` (при наличии `CAP_NET_ADMIN`),
-/// чтобы обойти дефолтный системный лимит `net.core.rmem_max = 212992` (~208 КБ), который вмещает
-/// всего ~92 UDP-пакета и приводит к дропам (`RcvbufErrors`) при микровсплесках из 1 Гбит/с eBPF-канала.
-pub fn bind_astpl_udp_socket(bind_addr: &str) -> Result<tokio::net::UdpSocket> {
+/// Создаёт `tokio::net::UdpSocket` с увеличенным буфером приёма `SO_RCVBUF` (цель 8 МБ,
+/// т.е. 16 МБ в удвоенном представлении ядра Linux) и опционально `SO_SNDBUF` (для сервера).
+/// На клиенте `tune_send_buf = false` оставляет дефолтный `SO_SNDBUF` (~212 КБ), чтобы сохранить
+/// естественное обратное давление (backpressure) на TCP стек клиента и избежать микровсплесков Upload.
+pub fn bind_astpl_udp_socket(bind_addr: &str, tune_send_buf: bool) -> Result<tokio::net::UdpSocket> {
     const TARGET_BUF_SIZE: usize = 8 * 1024 * 1024;
     let std_sock = std::net::UdpSocket::bind(bind_addr)?;
     std_sock.set_nonblocking(true)?;
@@ -139,14 +138,16 @@ pub fn bind_astpl_udp_socket(bind_addr: &str) -> Result<tokio::net::UdpSocket> {
             break;
         }
     }
-    for &size in &[
-        TARGET_BUF_SIZE,
-        4 * 1024 * 1024,
-        2 * 1024 * 1024,
-        1024 * 1024,
-    ] {
-        if sock_ref.set_send_buffer_size(size).is_ok() {
-            break;
+    if tune_send_buf {
+        for &size in &[
+            TARGET_BUF_SIZE,
+            4 * 1024 * 1024,
+            2 * 1024 * 1024,
+            1024 * 1024,
+        ] {
+            if sock_ref.set_send_buffer_size(size).is_ok() {
+                break;
+            }
         }
     }
 
@@ -180,7 +181,7 @@ pub fn bind_astpl_udp_socket(bind_addr: &str) -> Result<tokio::net::UdpSocket> {
                 );
             }
         }
-        if sock_ref.send_buffer_size().unwrap_or(0) < TARGET_BUF_SIZE {
+        if tune_send_buf && sock_ref.send_buffer_size().unwrap_or(0) < TARGET_BUF_SIZE {
             unsafe {
                 let _ = setsockopt(
                     fd,

@@ -16,7 +16,7 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 use tokio::io::{AsyncWriteExt, BufReader};
 
-const DUPLEX_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+const DUPLEX_BUFFER_BYTES: usize = 256 * 1024;
 const STREAM_READ_BUF_BYTES: usize = 64 * 1024;
 const RX_BATCH_LIMIT: usize = 64;
 
@@ -40,7 +40,7 @@ impl ClientTransport for AstplTransport {
             .next()
             .ok_or_else(|| anyhow!("Invalid ASTP-L server address '{}'", addr_str))?;
 
-        let udp_socket = Arc::new(bind_astpl_udp_socket("0.0.0.0:0")?);
+        let udp_socket = Arc::new(bind_astpl_udp_socket("0.0.0.0:0", false)?);
         let channel = UdpAuthChannel::new(udp_socket.clone(), server_addr);
 
         let auth_handler = AuthHandler::new(&self.config, self.server.server_pub_key.as_deref())?;
