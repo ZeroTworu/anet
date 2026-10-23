@@ -150,11 +150,12 @@ async fn authenticate(
 }
 
 async fn receive_from_client(
-    mut reader: tokio::io::ReadHalf<TcpStream>,
+    reader: tokio::io::ReadHalf<TcpStream>,
     tun_tx: mpsc::Sender<Bytes>,
     client_info: Arc<ClientTransportInfo>,
     registry: Arc<ClientRegistry>,
 ) -> Result<()> {
+    let mut reader = tokio::io::BufReader::with_capacity(64 * 1024, reader);
     while let Some(encrypted) = read_cut_text(&mut reader, CLIENT_CUT_TEXT).await? {
         let packet =
             anet_common::transport::unwrap_packet_bytes_in_place(&client_info.cipher, encrypted)?;

@@ -4,7 +4,9 @@ use crate::config::{CoreConfig, ServerConfig};
 use crate::socket::AnetUdpSocket;
 use anet_common::consts::PADDING_MTU;
 use anet_common::encryption::Cipher;
-use anet_common::quic_settings::build_transport_config;
+use anet_common::quic_settings::{
+    QUIC_UDP_SOCKET_BUFFER_SIZE, build_transport_config, tune_udp_socket_buffers,
+};
 use anyhow::Result;
 use async_trait::async_trait;
 use log::info;
@@ -75,7 +77,9 @@ impl ClientTransport for QuicTransport {
             .to_socket_addrs()?
             .next()
             .ok_or_else(|| anyhow::anyhow!("Invalid server address"))?;
-        let udp_socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
+        let udp_socket = UdpSocket::bind("0.0.0.0:0").await?;
+        tune_udp_socket_buffers(&udp_socket, QUIC_UDP_SOCKET_BUFFER_SIZE);
+        let udp_socket = Arc::new(udp_socket);
         let channel = UdpAuthChannel::new(udp_socket.clone(), server_addr);
 
         // Передаем опциональный ключ сервера для переопределения

@@ -712,9 +712,11 @@ impl WrtcPeer {
                     if let Ok(Ok((ws_stream, _))) = connect_res {
                         let peer_ip = match ws_stream.get_ref() {
                             tokio_tungstenite::MaybeTlsStream::Plain(s) => {
+                                let _ = s.set_nodelay(true);
                                 s.peer_addr().ok().map(|a| a.ip())
                             }
                             tokio_tungstenite::MaybeTlsStream::Rustls(s) => {
+                                let _ = s.get_ref().0.set_nodelay(true);
                                 s.get_ref().0.peer_addr().ok().map(|a| a.ip())
                             }
                             _ => None,
@@ -786,9 +788,28 @@ impl WrtcPeer {
                         while let Some(json_text) = ws_fallback_rx.recv().await {
                             let send_res = tokio::time::timeout(
                                 Duration::from_secs(ws_write_timeout),
-                                ws_sink.send(
-                                    tokio_tungstenite::tungstenite::Message::Text(json_text.into()),
-                                ),
+                                async {
+                                    ws_sink
+                                        .feed(tokio_tungstenite::tungstenite::Message::Text(
+                                            json_text.into(),
+                                        ))
+                                        .await?;
+                                    for _ in 0..15 {
+                                        match ws_fallback_rx.try_recv() {
+                                            Ok(more_text) => {
+                                                ws_sink
+                                                    .feed(
+                                                        tokio_tungstenite::tungstenite::Message::Text(
+                                                            more_text.into(),
+                                                        ),
+                                                    )
+                                                    .await?;
+                                            }
+                                            Err(_) => break,
+                                        }
+                                    }
+                                    ws_sink.flush().await
+                                },
                             )
                             .await;
                             if send_res.map_or(true, |r| r.is_err()) {
@@ -1154,13 +1175,16 @@ impl WrtcPeer {
                             }
                         }
 
+                        let is_constraints = !is_astp && !is_batch && json_str.contains("ReceiverVideoConstraints");
+                        let constraints_copy = if is_constraints { Some(json_str.clone()) } else { None };
+
                         if !sent && has_ws_out.load(Ordering::SeqCst) {
                             if is_astp || is_batch {
                                 log::trace!("[JVB WS OUT ASTP]");
                             } else {
                                 log::info!("[JVB WS OUT]: {json_str}");
                             }
-                            if let Err(e) = ws_fallback_tx_out.try_send(json_str.clone()) {
+                            if let Err(e) = ws_fallback_tx_out.try_send(json_str) {
                                 match e {
                                     tokio::sync::mpsc::error::TrySendError::Full(_) => {
                                         log::warn!("[WRTC WS] Fallback queue full, frame dropped");
@@ -1172,7 +1196,7 @@ impl WrtcPeer {
                             }
                         }
 
-                        if !sent && json_str.contains("ReceiverVideoConstraints") {
+                        if !sent && is_constraints {
                             // Критично: отправка отложенных ограничений выполняется в фоне,
                             // чтобы не блокировать основной цикл отправки сообщений (discover, ping, auth)!
                             let dc_is_open_bg = dc_is_open_out.clone();
@@ -1181,7 +1205,7 @@ impl WrtcPeer {
                             let remote_dc_bg = remote_dc_out.clone();
                             let has_ws_bg = has_ws_out.clone();
                             let ws_fallback_tx_bg = ws_fallback_tx_out.clone();
-                            let json_str_bg = json_str.clone();
+                            let json_str_bg = constraints_copy.unwrap_or_default();
                             tokio::spawn(async move {
                                 for _ in 0..WRTC_CONSTRAINTS_RETRY_ATTEMPTS {
                                     tokio::time::sleep(Duration::from_millis(

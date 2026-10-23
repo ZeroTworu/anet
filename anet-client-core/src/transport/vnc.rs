@@ -1,9 +1,9 @@
 use super::{ClientTransport, ConnectionResult};
 use crate::auth::{AuthChannel, AuthHandler};
 use crate::config::{CoreConfig, ServerConfig};
-use anet_common::consts::{CRYPTO_COALESCE_BUDGET_BYTES, MAX_PACKET_SIZE, PADDING_MTU};
+use anet_common::consts::{COALESCE_BUDGET_BYTES, CRYPTO_COALESCE_BUDGET_BYTES, PADDING_MTU};
 use anet_common::handshake_fragmentation::{FragmentConfig, write_fragmented};
-use anet_common::stream_framing::{FrameReader, frame_packet};
+use anet_common::stream_framing::{FrameReader, frame_packet_into};
 use anet_common::vnc::{
     CLIENT_CUT_TEXT, RFB_VERSION, SECURITY_TYPE_NONE, SERVER_CUT_TEXT, encode_cut_text,
     read_cut_text,
@@ -20,9 +20,9 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::Mutex;
 
 const RFB_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_PENDING_JITTER_PACKETS: usize = 256;
@@ -91,7 +91,7 @@ impl ClientTransport for VncTransport {
 
         let stream = auth_channel.stream.into_inner();
         let (reader, writer) = tokio::io::split(stream);
-        let (client_stream, internal_stream) = tokio::io::duplex(MAX_PACKET_SIZE * 10);
+        let (client_stream, internal_stream) = tokio::io::duplex(512 * 1024);
         let (tunnel_reader, tunnel_writer) = tokio::io::split(internal_stream);
 
         let cipher = Arc::new(anet_common::encryption::Cipher::new(&shared_key));
@@ -105,12 +105,10 @@ impl ClientTransport for VncTransport {
 
         tokio::spawn(async move {
             let tunnel_start = std::time::Instant::now();
-            let (packet_tx, packet_rx) = mpsc::channel(anet_common::consts::CHANNEL_BUFFER_SIZE);
-            let mut tunnel_input = tokio::spawn(read_tunnel_packets(tunnel_reader, packet_tx));
             let mut inbound =
                 tokio::spawn(receive_from_server(reader, tunnel_writer, cipher.clone()));
             let mut outbound = tokio::spawn(send_to_server(
-                packet_rx,
+                tunnel_reader,
                 writer,
                 cipher,
                 sequence,
@@ -120,16 +118,11 @@ impl ClientTransport for VncTransport {
 
             #[derive(Debug)]
             enum FinishedWorker {
-                TunnelInput,
                 Inbound,
                 Outbound,
             }
 
             let (finished_worker, result) = tokio::select! {
-                result = &mut tunnel_input => (
-                    FinishedWorker::TunnelInput,
-                    flatten_worker_result("TUN reader", result),
-                ),
                 result = &mut inbound => (
                     FinishedWorker::Inbound,
                     flatten_worker_result("network reader", result),
@@ -140,10 +133,6 @@ impl ClientTransport for VncTransport {
                 ),
             };
 
-            if !matches!(finished_worker, FinishedWorker::TunnelInput) {
-                tunnel_input.abort();
-                let _ = tunnel_input.await;
-            }
             if !matches!(finished_worker, FinishedWorker::Inbound) {
                 inbound.abort();
                 let _ = inbound.await;
@@ -160,12 +149,8 @@ impl ClientTransport for VncTransport {
                         "[VNC] Tunnel closed: remote VNC server closed TCP connection (EOF / session limit reached). Duration: {:.1}s ({:.2} min)",
                         duration, duration / 60.0
                     ),
-                    FinishedWorker::TunnelInput => info!(
-                        "[VNC] Tunnel closed: client TUN stream closed. Duration: {:.1}s",
-                        duration
-                    ),
                     FinishedWorker::Outbound => info!(
-                        "[VNC] Tunnel closed: outbound packet queue closed. Duration: {:.1}s",
+                        "[VNC] Tunnel closed: client TUN stream or outbound packet queue closed. Duration: {:.1}s",
                         duration
                     ),
                 },
@@ -242,7 +227,7 @@ async fn read_server_init(stream: &mut TcpStream) -> Result<()> {
 }
 
 async fn send_to_server(
-    mut packet_rx: mpsc::Receiver<Bytes>,
+    mut tunnel_reader: tokio::io::ReadHalf<tokio::io::DuplexStream>,
     mut writer: tokio::io::WriteHalf<TcpStream>,
     cipher: Arc<anet_common::encryption::Cipher>,
     sequence: Arc<AtomicU64>,
@@ -253,6 +238,7 @@ async fn send_to_server(
     let jitter_enabled = stealth.max_jitter_ns > stealth.min_jitter_ns;
     let mut pending = FuturesUnordered::<BoxFuture<'static, Bytes>>::new();
     let mut input_open = true;
+    let mut frame_reader = FrameReader::new();
 
     let mut batch_buf = BytesMut::with_capacity(CRYPTO_COALESCE_BUDGET_BYTES);
     let mut pkt_count = 0u64;
@@ -261,14 +247,17 @@ async fn send_to_server(
 
     while input_open || !pending.is_empty() {
         let mut packet = if !jitter_enabled {
-            match packet_rx.recv().await {
+            match frame_reader.read_next_packet(&mut tunnel_reader).await? {
                 Some(packet) => packet,
                 None => break,
             }
         } else if pending.is_empty() {
-            match packet_rx.recv().await {
+            match frame_reader.read_next_packet(&mut tunnel_reader).await? {
                 Some(packet) => {
                     schedule_with_jitter(&mut pending, packet, &stealth, &mut rng);
+                    while let Some(next_pkt) = frame_reader.try_next_packet()? {
+                        schedule_with_jitter(&mut pending, next_pkt, &stealth, &mut rng);
+                    }
                     continue;
                 }
                 None => {
@@ -283,10 +272,13 @@ async fn send_to_server(
                 .expect("pending jitter queue is not empty")
         } else {
             tokio::select! {
-                packet = packet_rx.recv() => {
-                    match packet {
+                res = frame_reader.read_next_packet(&mut tunnel_reader) => {
+                    match res? {
                         Some(packet) => {
                             schedule_with_jitter(&mut pending, packet, &stealth, &mut rng);
+                            while let Some(next_pkt) = frame_reader.try_next_packet()? {
+                                schedule_with_jitter(&mut pending, next_pkt, &stealth, &mut rng);
+                            }
                             continue;
                         }
                         None => {
@@ -326,10 +318,17 @@ async fn send_to_server(
                 break;
             }
 
-            packet = match packet_rx.try_recv() {
-                Ok(p) => p,
-                Err(_) => break,
-            };
+            if !jitter_enabled {
+                match frame_reader.try_next_packet()? {
+                    Some(p) => packet = p,
+                    None => break,
+                }
+            } else {
+                match pending.next().now_or_never().flatten() {
+                    Some(p) => packet = p,
+                    None => break,
+                }
+            }
         }
 
         if !batch_buf.is_empty() {
@@ -358,20 +357,6 @@ fn flatten_worker_result(
     result.with_context(|| format!("VNC {worker} task failed"))?
 }
 
-async fn read_tunnel_packets(
-    mut tunnel_reader: tokio::io::ReadHalf<tokio::io::DuplexStream>,
-    packet_tx: mpsc::Sender<Bytes>,
-) -> Result<()> {
-    let mut frame_reader = FrameReader::new();
-    while let Some(packet) = frame_reader.read_next_packet(&mut tunnel_reader).await? {
-        packet_tx
-            .send(packet)
-            .await
-            .context("VNC packet queue closed")?;
-    }
-    Ok(())
-}
-
 fn schedule_with_jitter(
     pending: &mut FuturesUnordered<BoxFuture<'static, Bytes>>,
     packet: Bytes,
@@ -391,16 +376,19 @@ fn schedule_with_jitter(
 }
 
 async fn receive_from_server(
-    mut reader: tokio::io::ReadHalf<TcpStream>,
+    reader: tokio::io::ReadHalf<TcpStream>,
     mut tunnel_writer: tokio::io::WriteHalf<tokio::io::DuplexStream>,
     cipher: Arc<anet_common::encryption::Cipher>,
 ) -> Result<()> {
+    let mut reader = BufReader::with_capacity(64 * 1024, reader);
+    let mut write_buf = BytesMut::with_capacity(COALESCE_BUDGET_BYTES);
     let mut pkt_count = 0u64;
     let mut byte_count = 0u64;
     let start = std::time::Instant::now();
     let mut last_rx = start;
 
     while let Some(encrypted) = read_cut_text(&mut reader, SERVER_CUT_TEXT).await? {
+        write_buf.clear();
         pkt_count += 1;
         byte_count += encrypted.len() as u64;
         last_rx = std::time::Instant::now();
@@ -412,7 +400,30 @@ async fn receive_from_server(
                 return Err(e.into());
             }
         };
-        tunnel_writer.write_all(&frame_packet(packet)).await?;
+        frame_packet_into(&mut write_buf, &packet);
+
+        while !reader.buffer().is_empty() && write_buf.len() < COALESCE_BUDGET_BYTES {
+            match read_cut_text(&mut reader, SERVER_CUT_TEXT).await? {
+                Some(next_enc) => {
+                    pkt_count += 1;
+                    byte_count += next_enc.len() as u64;
+                    last_rx = std::time::Instant::now();
+                    let next_pkt = match anet_common::transport::unwrap_packet_bytes_in_place(
+                        &cipher, next_enc,
+                    ) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            warn!("[VNC/Rx] Failed to unwrap/decrypt frame #{pkt_count}: {e:#}");
+                            return Err(e.into());
+                        }
+                    };
+                    frame_packet_into(&mut write_buf, &next_pkt);
+                }
+                None => break,
+            }
+        }
+
+        tunnel_writer.write_all(&write_buf).await?;
     }
 
     info!(
