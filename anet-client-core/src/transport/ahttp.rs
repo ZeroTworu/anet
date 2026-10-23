@@ -183,13 +183,16 @@ impl ClientTransport for AHttpTransport {
             builder.build().map_err(|e| anyhow::anyhow!("Cannot build a HTTP client: {}", e))
         };
 
-        let pool_size = self.config.ahttp.concurrency.clamp(1, 12);
+        // Компактный Round-Robin пул из 1..4 HTTP/2 клиентов:
+        // Все соединения равномерно прокачиваются фоновыми poll-запросами (не остывают и не теряют cwnd),
+        // а внутри каждого соединения запросы мультиплексируются по HTTP/2 потокам.
+        let pool_size = self.config.ahttp.concurrency.clamp(1, 4);
         let mut client_pool_vec = Vec::with_capacity(pool_size);
         for _ in 0..pool_size {
             client_pool_vec.push(build_http_client()?);
         }
         let primary_http_client = client_pool_vec[0].clone();
-        let idle_clients = Arc::new(std::sync::Mutex::new(client_pool_vec));
+        let client_pool = Arc::new(client_pool_vec);
 
         let origin = format!("{}://{}", scheme, target_host);
         let referer = format!("{}/", base_url);
@@ -254,22 +257,23 @@ impl ClientTransport for AHttpTransport {
             let mut batch_buf = BytesMut::with_capacity(uplink_budget_bytes + 2048);
             let poll_timeout = Duration::from_millis(config_ahttp.poll_timeout_ms);
             let micro_coalesce = Duration::from_micros(500);
+            let mut rr_counter: usize = 0;
 
             loop {
                 let has_poll_credit = downlink_credits.load(Ordering::Acquire) > 0
                     && concurrency_semaphore.available_permits() > 0;
 
                 // 1. Ждем первый пакет, сигнал активного Downlink (self-clocking) ИЛИ таймаут пуллинга
-                let first_packet_opt = if has_poll_credit {
+                let (first_packet_opt, is_poll_wakeup) = if has_poll_credit {
                     let _ = downlink_credits.fetch_update(Ordering::AcqRel, Ordering::Acquire, |c| {
                         Some(c.saturating_sub(1))
                     });
-                    tunnel_packet_rx.try_recv().ok()
+                    (tunnel_packet_rx.try_recv().ok(), true)
                 } else {
                     tokio::select! {
                         pkt = tunnel_packet_rx.recv() => {
                             match pkt {
-                                Some(p) => Some(p),
+                                Some(p) => (Some(p), false),
                                 None => break, // Канал закрыт
                             }
                         }
@@ -277,9 +281,9 @@ impl ClientTransport for AHttpTransport {
                             let _ = downlink_credits.fetch_update(Ordering::AcqRel, Ordering::Acquire, |c| {
                                 Some(c.saturating_sub(1))
                             });
-                            tunnel_packet_rx.try_recv().ok()
+                            (tunnel_packet_rx.try_recv().ok(), true)
                         }
-                        _ = tokio::time::sleep(poll_timeout) => None,
+                        _ = tokio::time::sleep(poll_timeout) => (None, true),
                     }
                 };
 
@@ -326,9 +330,10 @@ impl ClientTransport for AHttpTransport {
                         }
                     }
 
-                    // Микро-коалесценция (до 0.5 мс): даем ядру/TUN полмиллисекунды досыпать пакеты
-                    // текущей пачки, чтобы не отправлять одиночные пакеты отдельными HTTP-запросами.
-                    if batch_buf.len() < uplink_budget_bytes / 2 {
+                    // Микро-коалесценция (до 0.5 мс) ТОЛЬКО для тяжелого Upload-трафика (>= 256 байт)
+                    // и когда это НЕ форсированный Downlink-опрос. Одиночные TCP ACK (52 байта)
+                    // и пинги уходят мгновенно (0 мкс), не задерживая раскрутку параллельных Download-слотов.
+                    if !is_poll_wakeup && batch_buf.len() >= 256 && batch_buf.len() < uplink_budget_bytes / 2 {
                         let deadline = tokio::time::Instant::now() + micro_coalesce;
                         while batch_buf.len() + 1600 <= uplink_budget_bytes {
                             match tokio::time::timeout_at(deadline, tunnel_packet_rx.recv()).await {
@@ -360,13 +365,8 @@ impl ClientTransport for AHttpTransport {
                 let payload = batch_buf.split().freeze();
                 batch_buf.reserve(uplink_budget_bytes + 2048);
 
-                // Берем свободный HTTP-клиент из LIFO-стека (в простое используется 1 теплое соединение,
-                // под нагрузкой запросы изолируются по независимым TCP/TLS соединениям).
-                let worker_client = {
-                    let mut pool = idle_clients.lock().unwrap();
-                    pool.pop().unwrap_or_else(|| primary_http_client.clone())
-                };
-                let idle_clients_clone = idle_clients.clone();
+                let worker_client = client_pool[rr_counter % pool_size].clone();
+                rr_counter = rr_counter.wrapping_add(1);
                 let uplink_method_clone = uplink_method.clone();
                 let traffic_url_clone = traffic_url.clone();
                 let profile_ul_clone = profile_ul.clone();
@@ -465,13 +465,6 @@ impl ClientTransport for AHttpTransport {
                         warn!("[AHTTP Client] Traffic exchange transaction failed after retries. Payload dropped.");
                     }
 
-                    // Возвращаем HTTP-клиент в LIFO-пул ДО освобождения пермита
-                    {
-                        let mut pool = idle_clients_clone.lock().unwrap();
-                        if pool.len() < max_concurrency {
-                            pool.push(worker_client);
-                        }
-                    }
                     drop(permit);
 
                     // Downlink Self-Clocking: если сервер прислал данные, немедленно (без ожидания poll_timeout_ms)
