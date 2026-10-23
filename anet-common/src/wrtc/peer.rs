@@ -77,7 +77,7 @@ impl WrtcRuntime for TunedTokioRuntime {
         let _ = sock_ref.set_recv_buffer_size(self.udp_socket_buffer_size);
         let _ = sock_ref.set_send_buffer_size(self.udp_socket_buffer_size);
         if let (Ok(rcv), Ok(snd)) = (sock_ref.recv_buffer_size(), sock_ref.send_buffer_size()) {
-            log::info!(
+            log::debug!(
                 "[WRTC UDP] Tuned WebRTC UDP socket buffers: SO_RCVBUF={} KiB, SO_SNDBUF={} KiB",
                 rcv / 1024,
                 snd / 1024
@@ -461,6 +461,7 @@ impl P2pSession {
 pub async fn create_p2p_channel(
     stun_servers: &[String],
     wrtc_cfg: &WrtcConfig,
+    bind_addr: &str,
 ) -> anyhow::Result<P2pSession> {
     let mut media_engine = MediaEngine::default();
     let registry = register_default_interceptors(Registry::new(), &mut media_engine)?;
@@ -507,6 +508,15 @@ pub async fn create_p2p_channel(
         is_open: is_open.clone(),
     });
 
+    let effective_bind_addr = if !bind_addr.is_empty() && bind_addr != "0.0.0.0:0" {
+        bind_addr.to_string()
+    } else {
+        detect_physical_bind_addr(None, "1.1.1.1", 443)
+    };
+    log::info!(
+        "[P2P Direct] Pinned P2P UDP socket to physical interface: {effective_bind_addr}"
+    );
+
     let pc_res = PeerConnectionBuilder::new()
         .with_configuration(config)
         .with_setting_engine(setting_engine)
@@ -517,7 +527,7 @@ pub async fn create_p2p_channel(
             inner: TokioRuntime,
             udp_socket_buffer_size: wrtc_cfg.udp_socket_buffer_size,
         }))
-        .with_udp_addrs(vec!["0.0.0.0:0".to_string()])
+        .with_udp_addrs(vec![effective_bind_addr])
         .with_dedicated_reactor_pool_size(wrtc_cfg.reactor_pool_size.max(1))
         .build()
         .await?;
@@ -601,6 +611,7 @@ pub struct WrtcPeer {
     pub force_keyframe_remaining: Arc<AtomicU32>,
     pub remote_sdp: Mutex<String>,
     pub colibri_ws_ip: Arc<std::sync::Mutex<Option<std::net::IpAddr>>>,
+    pub bind_addr: String,
     pub watchdog_disconnected_timeout_ms: u64,
     pub watchdog_channel_grace_secs: u64,
     pub peer_close_timeout_secs: u64,
@@ -800,6 +811,8 @@ impl WrtcPeer {
         let mut audio_track_opt = None;
         let mut video_track_opt = None;
 
+        let bind_addr = detect_physical_bind_addr(session_opt, fallback_ip, fallback_port);
+
         if let (Some(session), Some(xmpp)) = (session_opt, xmpp_opt) {
             log::info!("[WRTC Media] Initializing WebRTC PeerConnection with Audio (Opus) and Video (VP8)...");
 
@@ -846,7 +859,7 @@ impl WrtcPeer {
             // и блокировки мьютексов BWE/TWCC внутри webrtc-rs при высокоскоростном потоке.
             let registry = Registry::new();
 
-            let bind_addr = detect_physical_bind_addr(session_opt, fallback_ip, fallback_port);
+            let bind_addr = bind_addr.clone();
 
             let config = RTCConfigurationBuilder::new()
                 .with_ice_servers(vec![])
@@ -1097,12 +1110,17 @@ impl WrtcPeer {
                         let mut sent = false;
                         // Используем SCTP DataChannel ТОЛЬКО когда живы и SCTP (dc_is_open), и UDP ICE (is_connected).
                         // Если под БС UDP просел (Disconnected/Failed), мгновенно отправляем ping/constraints/батчи через живой Colibri-WS!
+                        let is_keepalive = json_str.contains("anet_ping")
+                            || json_str.contains("anet_pong");
+
                         if dc_is_open_out.load(Ordering::SeqCst) && is_connected_out.load(Ordering::SeqCst) {
                             if let Some(ref dc_out) = dc_opt_out {
                                 if is_batch {
                                     log::debug!("[JVB DC OUT Batch]");
                                 } else if is_astp {
                                     log::trace!("[JVB DC OUT ASTP]");
+                                } else if is_keepalive {
+                                    log::debug!("[JVB DC OUT]: {json_str}");
                                 } else {
                                     log::info!("[JVB DC OUT]: {json_str}");
                                 }
@@ -1136,6 +1154,8 @@ impl WrtcPeer {
                         if !sent && has_ws_out.load(Ordering::SeqCst) {
                             if is_astp || is_batch {
                                 log::trace!("[JVB WS OUT ASTP]");
+                            } else if is_keepalive {
+                                log::debug!("[JVB WS OUT]: {json_str}");
                             } else {
                                 log::info!("[JVB WS OUT]: {json_str}");
                             }
@@ -1364,6 +1384,7 @@ impl WrtcPeer {
             force_keyframe_remaining,
             remote_sdp: Mutex::new(initial_remote_sdp),
             colibri_ws_ip,
+            bind_addr,
             watchdog_disconnected_timeout_ms: wrtc_cfg
                 .watchdog_disconnected_timeout_secs
                 .saturating_mul(1000)

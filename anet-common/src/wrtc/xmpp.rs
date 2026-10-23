@@ -349,7 +349,7 @@ impl XmppSession {
                                 }
                                 InboundXmpp::Ping { id, from } => {
                                     let pong = XmppBuilder::iq_result(&from, &id);
-                                    log::info!("[XMPP OUT]: {pong}");
+                                    log::debug!("[XMPP OUT]: {pong}");
                                     let _ = write_tx_ack.try_send(pong);
                                 }
                                 InboundXmpp::Jingle(ref sess) => {
@@ -522,7 +522,14 @@ impl XmppSession {
     pub async fn recv_stanza(&mut self) -> Option<String> {
         let s = self.read_rx.recv().await;
         if let Some(ref text) = s {
-            log::info!("[XMPP IN]: {text}");
+            if text.contains("id=\"ping_")
+                || text.contains("id='ping_")
+                || text.contains("urn:xmpp:ping")
+            {
+                log::debug!("[XMPP IN]: {text}");
+            } else {
+                log::info!("[XMPP IN]: {text}");
+            }
         }
         s
     }
