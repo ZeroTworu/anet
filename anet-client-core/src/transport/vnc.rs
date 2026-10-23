@@ -3,7 +3,7 @@ use crate::auth::{AuthChannel, AuthHandler};
 use crate::config::{CoreConfig, ServerConfig};
 use anet_common::consts::{CRYPTO_COALESCE_BUDGET_BYTES, MAX_PACKET_SIZE, PADDING_MTU};
 use anet_common::handshake_fragmentation::{FragmentConfig, write_fragmented};
-use anet_common::stream_framing::{frame_packet, read_next_packet};
+use anet_common::stream_framing::{FrameReader, frame_packet};
 use anet_common::vnc::{
     CLIENT_CUT_TEXT, RFB_VERSION, SECURITY_TYPE_NONE, SERVER_CUT_TEXT, encode_cut_text,
     read_cut_text,
@@ -362,7 +362,8 @@ async fn read_tunnel_packets(
     mut tunnel_reader: tokio::io::ReadHalf<tokio::io::DuplexStream>,
     packet_tx: mpsc::Sender<Bytes>,
 ) -> Result<()> {
-    while let Some(packet) = read_next_packet(&mut tunnel_reader).await? {
+    let mut frame_reader = anet_common::stream_framing::FrameReader::new();
+    while let Some(packet) = frame_reader.read_next_packet(&mut tunnel_reader).await? {
         packet_tx
             .send(packet)
             .await

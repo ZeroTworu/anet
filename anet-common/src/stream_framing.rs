@@ -1,9 +1,101 @@
-use crate::consts::MAX_PACKET_SIZE;
-use bytes::{BufMut, Bytes, BytesMut};
+use crate::consts::{COALESCE_BUDGET_BYTES, MAX_PACKET_SIZE};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use log::error;
 use std::io;
+use tokio::io::AsyncReadExt;
 
 const LENGTH_PREFIX_SIZE: usize = 2; // u16 длина префикса
+
+/// Буферизованный декодер сегментов потока `[u16 length][payload]`.
+/// Читает из `AsyncRead` крупными блоками через `read_buf` в переиспользуемый `BytesMut`,
+/// исключая аллокацию `vec![0u8; len]` и двойной `.await` на каждый пакет.
+pub struct FrameReader {
+    buf: BytesMut,
+}
+
+impl Default for FrameReader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FrameReader {
+    #[inline]
+    pub fn new() -> Self {
+        Self::with_capacity(COALESCE_BUDGET_BYTES + MAX_PACKET_SIZE)
+    }
+
+    #[inline]
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            buf: BytesMut::with_capacity(capacity),
+        }
+    }
+
+    /// Пытается синхронно извлечь следующий уже полностью загруженный в буфер фрейм без I/O.
+    #[inline]
+    pub fn try_next_packet(&mut self) -> io::Result<Option<Bytes>> {
+        loop {
+            if self.buf.len() < LENGTH_PREFIX_SIZE {
+                return Ok(None);
+            }
+
+            let len = u16::from_be_bytes([self.buf[0], self.buf[1]]) as usize;
+            if len == 0 {
+                self.buf.advance(LENGTH_PREFIX_SIZE);
+                error!("Received packet with zero length prefix, skipping frame.");
+                continue;
+            }
+            if len > MAX_PACKET_SIZE {
+                error!(
+                    "Received oversized packet length: {}. Max allowed: {}",
+                    len, MAX_PACKET_SIZE
+                );
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Oversized packet received",
+                ));
+            }
+
+            if self.buf.len() < LENGTH_PREFIX_SIZE + len {
+                return Ok(None);
+            }
+
+            self.buf.advance(LENGTH_PREFIX_SIZE);
+            let pkt = self.buf.split_to(len).freeze();
+            return Ok(Some(pkt));
+        }
+    }
+
+    /// Читает следующий фрейм из `reader`, подгружая данные крупными порциями при необходимости.
+    #[inline]
+    pub async fn read_next_packet<R: tokio::io::AsyncRead + Unpin>(
+        &mut self,
+        reader: &mut R,
+    ) -> io::Result<Option<Bytes>> {
+        loop {
+            if let Some(pkt) = self.try_next_packet()? {
+                return Ok(Some(pkt));
+            }
+
+            if self.buf.capacity() < MAX_PACKET_SIZE + LENGTH_PREFIX_SIZE {
+                self.buf.reserve(COALESCE_BUDGET_BYTES);
+            }
+
+            let n = reader.read_buf(&mut self.buf).await?;
+            if n == 0 {
+                if self.buf.is_empty() {
+                    return Ok(None);
+                } else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "EOF in the middle of a framed packet",
+                    ));
+                }
+            }
+        }
+    }
+}
 
 /// Создает сегмент потока: [u16 length][payload]
 /// Используется в QUIC TX задаче.
@@ -64,10 +156,10 @@ pub async fn read_next_packet<R: tokio::io::AsyncRead + tokio::io::AsyncReadExt 
                 }
 
                 // 2. Считываем полный пакет данных
-                let mut buf = vec![0u8; len];
+                let mut buf = BytesMut::zeroed(len);
                 reader.read_exact(&mut buf).await?;
 
-                return Ok(Some(Bytes::from(buf)));
+                return Ok(Some(buf.freeze()));
             }
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
                 // EOF при чтении префикса
@@ -136,6 +228,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_frame_reader_coalesced_batch() {
+        let mut batch = BytesMut::new();
+        let p1 = Bytes::from_static(&[1, 2, 3, 4]);
+        let p2 = Bytes::from_static(&[5, 6, 7]);
+        frame_packet_into(&mut batch, &p1);
+        frame_packet_into(&mut batch, &p2);
+
+        let mut cursor = std::io::Cursor::new(batch.freeze());
+        let mut frame_reader = FrameReader::new();
+
+        let out1 = frame_reader.read_next_packet(&mut cursor).await.unwrap().unwrap();
+        assert_eq!(out1, p1);
+        // Второй пакет уже должен быть в буфере без дополнительного чтения из сокета
+        let out2 = frame_reader.try_next_packet().unwrap().unwrap();
+        assert_eq!(out2, p2);
+        assert!(frame_reader.read_next_packet(&mut cursor).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
     async fn test_zero_length_frame_is_skipped_not_eof() {
         // [len=0][len=3][3 байта] — нулевой фрейм должен быть пропущен,
         // а следующий пакет — прочитан (раньше тут возвращался Ok(None) => разрыв туннеля)
@@ -170,3 +281,4 @@ mod tests {
         assert_eq!(&framed[..], &buf[..]);
     }
 }
+
