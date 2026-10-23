@@ -82,6 +82,8 @@ fn load_astpl_config() -> AstplConfig {
             _pad: 0,
             server_ip_be: core::ptr::read_volatile(&SERVER_IP),
             eth_ifindex: core::ptr::read_volatile(&ETH_IFINDEX),
+            tun_ip_be: 0,
+            tun_gw_be: 0,
             _pad2: 0,
         }
     }
@@ -241,6 +243,18 @@ fn try_astpl_tc_egress(ctx: &TcContext) -> Result<i32, ()> {
             u32::from_be(cfg.server_ip_be),
             cfg.eth_ifindex
         );
+        return Ok(TC_ACT_OK);
+    }
+
+    // Локально сгенерированные на самом сервере пакеты (с исходным адресом `self_ip` 172.112.224.2
+    // или `gateway` 172.112.224.1, например `iperf3 -s -B 172.112.224.2`) поступают в `tc_egress`
+    // с незавершённой контрольной суммой `CHECKSUM_PARTIAL` (в поле TCP/UDP check записан только
+    // псевдозаголовок) и TSO/GSO. Пропускаем их через `TC_ACT_OK` в `validate_xmit_skb` на TUN,
+    // чтобы ядро штатно выполнило сегментацию и `skb_checksum_help`, после чего `anet-server`
+    // зашифрует и отправит готовые пакеты через UDP-сокет.
+    if (cfg.tun_ip_be != 0 && inner_src_ip == cfg.tun_ip_be)
+        || (cfg.tun_gw_be != 0 && inner_src_ip == cfg.tun_gw_be)
+    {
         return Ok(TC_ACT_OK);
     }
 
@@ -529,7 +543,18 @@ fn try_astpl_xdp_ingress(ctx: &XdpContext) -> Result<u32, ()> {
         }
     }
 
-    // 5. Если пакет является внутритуннельным ICMP Echo Request зондом ANet (`ident == 0x414E`),
+    // 5a. Если пакет адресован собственному TUN IP сервера (`self_ip` 172.112.224.2 или `gateway` 172.112.224.1),
+    // откатываем XOR и отдаём `XDP_PASS` в Userspace UDP-сокет `anet-server`:
+    // если декапсулировать такой пакет прямо на внешнем интерфейсе (`ens3`), он попадёт в цепочку `INPUT`
+    // с `iifname = "ens3"` вместо `anet-test` и будет отброшен файрволом сервера.
+    if (cfg.tun_ip_be != 0 && inner_ip.dst_addr == cfg.tun_ip_be)
+        || (cfg.tun_gw_be != 0 && inner_ip.dst_addr == cfg.tun_gw_be)
+    {
+        let _ = xoroshiro_crypt_packet(&w, OUTER_HEADERS_LEN, crypto_seed, seq);
+        return Ok(xdp_action::XDP_PASS);
+    }
+
+    // 5b. Если пакет является внутритуннельным ICMP Echo Request зондом ANet (`ident == 0x414E`),
     // возвращаем исходное шифрование и отдаём `XDP_PASS` в Userspace-сокет `anet-server`,
     // чтобы сервер мгновенно сформировал Echo Reply независимо от настроек IP/iptables на TUN.
     if inner_ip.proto == IPPROTO_ICMP

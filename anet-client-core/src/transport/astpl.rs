@@ -2,7 +2,8 @@ use super::{ClientTransport, ConnectionResult};
 use crate::auth::{AuthHandler, UdpAuthChannel};
 use crate::config::{CoreConfig, ServerConfig};
 use anet_common::astpl::{
-    unwrap_astpl_packet_in_place, wrap_astpl_packet, ASTPL_HEADER_LEN, ASTPL_MIN_PACKET_LEN,
+    bind_astpl_udp_socket, unwrap_astpl_packet_in_place, wrap_astpl_packet_into,
+    ASTPL_MIN_PACKET_LEN,
 };
 use anet_common::consts::MAX_PACKET_SIZE;
 use anet_common::crypto_utils::derive_astpl_seed;
@@ -13,8 +14,11 @@ use bytes::BytesMut;
 use log::{debug, info, warn};
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
-use tokio::net::UdpSocket;
+use tokio::io::{AsyncWriteExt, BufReader};
+
+const DUPLEX_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+const STREAM_READ_BUF_BYTES: usize = 64 * 1024;
+const RX_BATCH_LIMIT: usize = 64;
 
 pub struct AstplTransport {
     config: CoreConfig,
@@ -36,7 +40,7 @@ impl ClientTransport for AstplTransport {
             .next()
             .ok_or_else(|| anyhow!("Invalid ASTP-L server address '{}'", addr_str))?;
 
-        let udp_socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
+        let udp_socket = Arc::new(bind_astpl_udp_socket("0.0.0.0:0")?);
         let channel = UdpAuthChannel::new(udp_socket.clone(), server_addr);
 
         let auth_handler = AuthHandler::new(&self.config, self.server.server_pub_key.as_deref())?;
@@ -54,19 +58,22 @@ impl ClientTransport for AstplTransport {
             server_addr, auth_response.session_id, auth_response.ip
         );
 
-        let (client_stream, tunnel_stream) = tokio::io::duplex(256 * 1024);
-        let (mut tunnel_read, mut tunnel_write) = tokio::io::split(tunnel_stream);
+        let (client_stream, tunnel_stream) = tokio::io::duplex(DUPLEX_BUFFER_BYTES);
+        let (tunnel_read_raw, mut tunnel_write) = tokio::io::split(tunnel_stream);
+        let mut tunnel_read = BufReader::with_capacity(STREAM_READ_BUF_BYTES, tunnel_read_raw);
 
         let assigned_ipv4: Option<std::net::Ipv4Addr> = auth_response.ip.parse().ok();
         let tx_socket = udp_socket.clone();
         let tx_task = tokio::spawn(async move {
             let mut tx_seq: u32 = 0;
+            let mut datagram = Vec::with_capacity(MAX_PACKET_SIZE);
             while let Ok(Some(packet)) = read_next_packet(&mut tunnel_read).await {
                 if packet.len() < 20 || (packet[0] >> 4) != 4 {
                     continue;
                 }
                 if let Some(expected_src) = assigned_ipv4 {
-                    let pkt_src = std::net::Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]);
+                    let pkt_src =
+                        std::net::Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]);
                     if pkt_src != expected_src {
                         continue;
                     }
@@ -75,7 +82,7 @@ impl ClientTransport for AstplTransport {
                 if tx_seq == 0 {
                     tx_seq = 1;
                 }
-                let datagram = wrap_astpl_packet(&nonce_prefix, tx_seq, crypto_seed, &packet);
+                wrap_astpl_packet_into(&mut datagram, &nonce_prefix, tx_seq, crypto_seed, &packet);
                 if let Err(e) = tx_socket.send_to(&datagram, server_addr).await {
                     warn!("[ASTP-L/TX] UDP send_to {} failed: {}", server_addr, e);
                     break;
@@ -87,10 +94,10 @@ impl ClientTransport for AstplTransport {
         let rx_socket = udp_socket.clone();
         let rx_task = tokio::spawn(async move {
             let mut recv_buf = vec![0u8; MAX_PACKET_SIZE];
-            let mut frame_buf = BytesMut::with_capacity(MAX_PACKET_SIZE);
+            let mut frame_buf = BytesMut::with_capacity(RX_BATCH_LIMIT * 1600);
 
             loop {
-                let (len, remote) = match rx_socket.recv_from(&mut recv_buf).await {
+                let (first_len, first_remote) = match rx_socket.recv_from(&mut recv_buf).await {
                     Ok(res) => res,
                     Err(e) => {
                         warn!("[ASTP-L/RX] UDP recv_from failed: {}", e);
@@ -98,33 +105,50 @@ impl ClientTransport for AstplTransport {
                     }
                 };
 
-                if remote != server_addr || len < ASTPL_HEADER_LEN {
-                    continue;
-                }
+                frame_buf.clear();
 
-                if recv_buf[0..4] != nonce_prefix {
-                    continue;
-                }
+                let mut len = first_len;
+                let mut remote = first_remote;
+                let mut batched = 0usize;
 
-                if len < ASTPL_MIN_PACKET_LEN {
-                    // Управляющий пакет (Seq == 0) без полезной нагрузки
-                    continue;
-                }
-
-                match unwrap_astpl_packet_in_place(crypto_seed, &mut recv_buf[..len], None) {
-                    Ok((_, 0, _control_payload)) => {
-                        debug!("[ASTP-L/RX] Received control packet (Seq=0)");
-                    }
-                    Ok((_, _seq, inner_ipv4)) => {
-                        frame_buf.clear();
-                        frame_packet_into(&mut frame_buf, inner_ipv4);
-                        if tunnel_write.write_all(&frame_buf).await.is_err() {
-                            debug!("[ASTP-L/RX] Tunnel stream closed.");
-                            break;
+                loop {
+                    if remote == server_addr
+                        && len >= ASTPL_MIN_PACKET_LEN
+                        && recv_buf[0..4] == nonce_prefix
+                    {
+                        match unwrap_astpl_packet_in_place(crypto_seed, &mut recv_buf[..len], None)
+                        {
+                            Ok((_, 0, _control_payload)) => {
+                                debug!("[ASTP-L/RX] Received control packet (Seq=0)");
+                            }
+                            Ok((_, _seq, inner_ipv4)) => {
+                                frame_packet_into(&mut frame_buf, inner_ipv4);
+                            }
+                            Err(e) => {
+                                debug!("[ASTP-L/RX] Dropped invalid ASTP-L packet: {}", e);
+                            }
                         }
                     }
-                    Err(e) => {
-                        debug!("[ASTP-L/RX] Dropped invalid ASTP-L packet: {}", e);
+
+                    batched += 1;
+                    if batched >= RX_BATCH_LIMIT {
+                        break;
+                    }
+
+                    match rx_socket.try_recv_from(&mut recv_buf) {
+                        Ok((next_len, next_remote)) => {
+                            len = next_len;
+                            remote = next_remote;
+                        }
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(_) => break,
+                    }
+                }
+
+                if !frame_buf.is_empty() {
+                    if tunnel_write.write_all(&frame_buf).await.is_err() {
+                        debug!("[ASTP-L/RX] Tunnel stream closed.");
+                        break;
                     }
                 }
             }
