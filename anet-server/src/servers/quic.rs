@@ -145,7 +145,7 @@ pub async fn run_quic_server(
                 let ci_rx = client_info.clone();
                 let rx_registry = r.clone();
                 let mut reader_task = tokio::spawn(async move {
-                    let mut frame_reader = anet_common::stream_framing::FrameReader::new();
+                    let mut frame_reader = FrameReader::new();
                     while let Ok(Some(pkt)) = frame_reader.read_next_packet(&mut recv).await {
                         let packet_len = pkt.len();
 
