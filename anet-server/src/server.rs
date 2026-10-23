@@ -143,7 +143,11 @@ impl ANetServer {
                     }
                     continue;
                 }
-                let _ = tun_writer.try_send(packet);
+                if let Err(tokio::sync::mpsc::error::TrySendError::Full(pkt)) =
+                    tun_writer.try_send(packet)
+                {
+                    let _ = tun_writer.send(pkt).await;
+                }
             }
         });
 
@@ -163,7 +167,7 @@ impl ANetServer {
         }
 
         if !self.cfg.server.astpl_bind_to.trim().is_empty() {
-            let t_tx = client_pkt_tx.clone();
+            let t_tx = tx_tun.clone();
             let auth = self.auth_handler_core.clone();
             let rg = self.registry.clone();
             let c = self.cfg.clone();
