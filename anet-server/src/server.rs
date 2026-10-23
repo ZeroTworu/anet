@@ -4,7 +4,7 @@ use crate::client_registry::ClientRegistry;
 use crate::config::Config;
 use crate::ip_pool::IpPool;
 use crate::multikey_udp_socket::TempDHInfo;
-use crate::servers::{http_stream, quic, ssh, vnc, websocket, wrtc};
+use crate::servers::{http_stream, quic, ssh, vnc, websocket, wrtc, doh_dns};
 
 use anet_common::atun::TunManager;
 use anet_common::tun_params::TunParams;
@@ -216,6 +216,18 @@ impl ANetServer {
                     }
                 }));
             }
+        }
+
+        if !self.cfg.server.doh_bind_to.trim().is_empty() {
+            let c = self.cfg.clone();
+            let rg = self.registry.clone();
+            let tx = client_pkt_tx.clone();
+            let auth = self.auth_handler_core.clone();
+            handle_collection.push(tokio::spawn(async move {
+                if let Err(e) = doh_dns::run_doh_dns_server(c, rg, tx, auth).await {
+                    error!("Fatal error: [DoH-DNS] Server halted: {}", e);
+                }
+            }));
         }
 
         futures::future::join_all(handle_collection).await;

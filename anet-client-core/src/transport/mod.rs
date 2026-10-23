@@ -6,6 +6,7 @@ pub (crate) mod websocket;
 
 pub (crate) mod ahttp;
 pub (crate) mod wrtc;
+pub (crate) mod doh;
 
 use anet_common::protocol::AuthResponse;
 use anet_common::transport_trait::VpnStream;

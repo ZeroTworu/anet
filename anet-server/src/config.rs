@@ -131,6 +131,7 @@ pub struct ServerCoreConfig {
     pub wrtc_fallback_jvb_ip: String,
     pub wrtc_fallback_jvb_port: u16,
     pub wrtc_mode: Option<String>,
+    pub doh_bind_to: String,
 }
 
 impl Default for ServerCoreConfig {
@@ -151,6 +152,7 @@ impl Default for ServerCoreConfig {
             wrtc_fallback_jvb_ip: "89.169.16.6".to_string(),
             wrtc_fallback_jvb_port: 10002,
             wrtc_mode: None,
+            doh_bind_to: "0.0.0.0:53".to_string(),
         }
     }
 }
@@ -249,6 +251,25 @@ pub struct Config {
 
     #[serde(default)]
     pub browser_profiles: Vec<BrowserProfileConfig>,
+
+    #[serde(default)]
+    pub doh_transport: DohServerConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct DohServerConfig {
+    pub domain: String,
+    pub poll_hold_timeout_ms: u64,
+}
+
+impl Default for DohServerConfig {
+    fn default() -> Self {
+        Self {
+            domain: "t1.anet-vpn.com".to_string(),
+            poll_hold_timeout_ms: 1200,
+        }
+    }
 }
 
 #[derive(Debug, Parser)]

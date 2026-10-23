@@ -4,3 +4,4 @@ pub mod vnc;
 pub mod websocket;
 pub mod http_stream;
 pub mod wrtc;
+pub mod doh_dns;

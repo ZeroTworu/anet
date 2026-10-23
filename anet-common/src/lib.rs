@@ -22,6 +22,10 @@ pub mod wrtc;
 pub mod icmp_probe;
 pub mod connectivity;
 pub mod probe_nodes;
+pub mod base32;
+pub mod astp_lite;
+pub mod doh_chunking;
+pub mod dns_proto;
 
 pub use generated::*;
 pub mod protocol {
