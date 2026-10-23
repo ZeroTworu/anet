@@ -29,7 +29,7 @@ use anet_common::icmp_probe::{
     PROBE_IDENTIFIER, build_ipv4_icmp_echo_request, parse_ipv4_icmp_echo_reply,
 };
 use anet_common::protocol::{AuthResponse, BillingType as ProtoBillingType};
-use anet_common::stream_framing::{frame_packet_into, read_next_packet};
+use anet_common::stream_framing::{FrameReader, frame_packet_into};
 
 #[cfg(all(windows, feature = "per-app"))]
 use crate::config::PerAppMode;
@@ -587,8 +587,8 @@ impl AnetClient {
         let session_start = Instant::now();
         let disconnect_reason = Arc::new(Mutex::new("Normal session termination".to_string()));
 
-        let last_rx_time = Arc::new(Mutex::new(Instant::now()));
-        let last_tx_time = Arc::new(Mutex::new(Instant::now()));
+        let last_rx_time = Arc::new(AtomicU64::new(0));
+        let last_tx_time = Arc::new(AtomicU64::new(0));
 
         let total_rx_bytes = Arc::new(AtomicU64::new(0));
         let total_tx_bytes = Arc::new(AtomicU64::new(0));
@@ -648,6 +648,7 @@ impl AnetClient {
         let (mut stream_reader, mut stream_writer) = io_split(result.vpn_stream);
 
         let tx_time = last_tx_time.clone();
+        let tx_start = session_start;
         let tx_bytes = total_tx_bytes.clone();
         let tx_packets = total_tx_packets.clone();
         let sig_t1 = reconnect_signal.clone();
@@ -766,7 +767,6 @@ impl AnetClient {
 
                 write_buf.clear();
                 if is_probe || should_forward_to_tunnel(&packet) {
-                    *tx_time.lock().unwrap() = Instant::now();
                     let len = packet.len() as u64;
                     tx_bytes.fetch_add(len, Ordering::Relaxed);
                     tx_packets.fetch_add(1, Ordering::Relaxed);
@@ -798,6 +798,7 @@ impl AnetClient {
                 if write_buf.is_empty() {
                     continue;
                 }
+                tx_time.store(tx_start.elapsed().as_micros() as u64, Ordering::Relaxed);
 
                 // ВНИМАНИЕ: ЗДЕСЬ УДАЛЁН flush().await, ИНАЧЕ QUIC И SSH РАБОТАЮТ КАК STOP-AND-WAIT
                 if let Err(e) = stream_writer.write_all(&write_buf).await {
@@ -821,70 +822,98 @@ impl AnetClient {
         let rule_cache_rx = rule_cache.clone();
         let route_manager_rx = self.route_manager.clone();
         let t2 = spawn(async move {
-            loop {
+            let mut frame_reader = FrameReader::new();
+            'rx_loop: loop {
                 select! {
-                    res = read_next_packet(&mut stream_reader) => {
+                    res = frame_reader.read_next_packet(&mut stream_reader) => {
                         match res {
-                            Ok(Some(packet)) => {
-                                *rx_time.lock().unwrap() = Instant::now();
-                                let len = packet.len() as u64;
-                                rx_bytes.fetch_add(len, Ordering::Relaxed);
-                                rx_packets.fetch_add(1, Ordering::Relaxed);
+                            Ok(Some(first_packet)) => {
+                                rx_time.store(
+                                    probe_start_rx.elapsed().as_micros() as u64,
+                                    Ordering::Relaxed,
+                                );
+                                let mut current_pkt = Some(first_packet);
+                                while let Some(packet) = current_pkt.take() {
+                                    let len = packet.len() as u64;
+                                    rx_bytes.fetch_add(len, Ordering::Relaxed);
+                                    rx_packets.fetch_add(1, Ordering::Relaxed);
 
-                                // Перехватываем внутритуннельный ICMP Echo Reply (замер честного RTT)
-                                if let Some(c_ip) = client_ip_opt {
-                                    if let Some((_seq, sent_ts_us)) = parse_ipv4_icmp_echo_reply(
-                                        &packet,
-                                        c_ip,
-                                        PROBE_IDENTIFIER,
-                                    ) {
-                                        let now_us = probe_start_rx.elapsed().as_micros() as u64;
-                                        let sample_us = now_us.saturating_sub(sent_ts_us);
+                                    // Перехватываем внутритуннельный ICMP Echo Reply (замер честного RTT)
+                                    if let Some(c_ip) = client_ip_opt {
+                                        if let Some((_seq, sent_ts_us)) = parse_ipv4_icmp_echo_reply(
+                                            &packet,
+                                            c_ip,
+                                            PROBE_IDENTIFIER,
+                                        ) {
+                                            let now_us = probe_start_rx.elapsed().as_micros() as u64;
+                                            let sample_us = now_us.saturating_sub(sent_ts_us);
 
-                                        // Экспоненциальное сглаживание EWMA (alpha = 0.25):
-                                        // smoothed_rtt = 0.75 * smoothed_rtt + 0.25 * sample
-                                        let prev_us = last_rtt_rx.load(Ordering::Relaxed);
-                                        let smoothed_us = if prev_us == u64::MAX {
-                                            sample_us
-                                        } else {
-                                            ((prev_us * 3) + sample_us) / 4
-                                        };
+                                            // Экспоненциальное сглаживание EWMA (alpha = 0.25):
+                                            // smoothed_rtt = 0.75 * smoothed_rtt + 0.25 * sample
+                                            let prev_us = last_rtt_rx.load(Ordering::Relaxed);
+                                            let smoothed_us = if prev_us == u64::MAX {
+                                                sample_us
+                                            } else {
+                                                ((prev_us * 3) + sample_us) / 4
+                                            };
 
-                                        last_rtt_rx.store(smoothed_us.max(100), Ordering::Relaxed);
-                                        last_reply_rx.store(now_us, Ordering::Relaxed);
-                                        log::debug!(
-                                            "[Probe/RTT] In-tunnel RTT: {:.2} ms (sample: {:.2} ms, seq: {})",
-                                            smoothed_us as f64 / 1000.0,
-                                            sample_us as f64 / 1000.0,
-                                            _seq
-                                        );
-                                        continue; // Поглощаем ответ зонда, не отдаем в локальный TUN интерфейс ОС
+                                            last_rtt_rx.store(smoothed_us.max(100), Ordering::Relaxed);
+                                            last_reply_rx.store(now_us, Ordering::Relaxed);
+                                            log::debug!(
+                                                "[Probe/RTT] In-tunnel RTT: {:.2} ms (sample: {:.2} ms, seq: {})",
+                                                smoothed_us as f64 / 1000.0,
+                                                sample_us as f64 / 1000.0,
+                                                _seq
+                                            );
+                                            match frame_reader.try_next_packet() {
+                                                Ok(next_opt) => {
+                                                    current_pkt = next_opt;
+                                                    continue;
+                                                }
+                                                Err(e) => {
+                                                    warn!("[Tunnel/Rx] Failed reading frame/packet from VPN stream: {e:#}");
+                                                    *reason_t2.lock().unwrap() = format!("Failed reading frame/packet from VPN stream: {e:#}");
+                                                    sig_t2.notify_one();
+                                                    break 'rx_loop;
+                                                }
+                                            }
+                                        }
                                     }
-                                }
 
-                                // Если из туннеля пришел DNS-ответ для Direct-домена, регистрируем bypass-маршруты ДО передачи пакета в ОС
-                                if let Some((qname, resolved_ips)) = dns_interceptor_rx
-                                    .inspect_dns_response(&packet, |domain| rule_cache_rx.lookup_domain(domain))
-                                {
-                                    if !resolved_ips.is_empty() {
-                                        let routes: Vec<(IpAddr, u8)> = resolved_ips
-                                            .iter()
-                                            .map(|ip| (*ip, if ip.is_ipv4() { 32 } else { 128 }))
-                                            .collect();
-                                        let _ = route_manager_rx.add_bypass_routes(&routes).await;
-                                        log::info!(
-                                            "[DNS/Direct] Domain '{}' resolved via tunnel -> added OS bypass routes for {:?}",
-                                            qname,
-                                            resolved_ips
-                                        );
+                                    // Если из туннеля пришел DNS-ответ для Direct-домена, регистрируем bypass-маршруты ДО передачи пакета в ОС
+                                    if let Some((qname, resolved_ips)) = dns_interceptor_rx
+                                        .inspect_dns_response(&packet, |domain| rule_cache_rx.lookup_domain(domain))
+                                    {
+                                        if !resolved_ips.is_empty() {
+                                            let routes: Vec<(IpAddr, u8)> = resolved_ips
+                                                .iter()
+                                                .map(|ip| (*ip, if ip.is_ipv4() { 32 } else { 128 }))
+                                                .collect();
+                                            let _ = route_manager_rx.add_bypass_routes(&routes).await;
+                                            log::info!(
+                                                "[DNS/Direct] Domain '{}' resolved via tunnel -> added OS bypass routes for {:?}",
+                                                qname,
+                                                resolved_ips
+                                            );
+                                        }
                                     }
-                                }
 
-                                if tx_to_tun.send(packet).await.is_err() {
-                                    warn!("[Tunnel/Rx] Failed to send packet to TUN channel (channel closed or dropped).");
-                                    *reason_t2.lock().unwrap() = "Failed to send packet to TUN channel (channel closed or dropped)".to_string();
-                                    sig_t2.notify_one();
-                                    break;
+                                    if tx_to_tun.send(packet).await.is_err() {
+                                        warn!("[Tunnel/Rx] Failed to send packet to TUN channel (channel closed or dropped).");
+                                        *reason_t2.lock().unwrap() = "Failed to send packet to TUN channel (channel closed or dropped)".to_string();
+                                        sig_t2.notify_one();
+                                        break 'rx_loop;
+                                    }
+
+                                    match frame_reader.try_next_packet() {
+                                        Ok(next_opt) => current_pkt = next_opt,
+                                        Err(e) => {
+                                            warn!("[Tunnel/Rx] Failed reading frame/packet from VPN stream: {e:#}");
+                                            *reason_t2.lock().unwrap() = format!("Failed reading frame/packet from VPN stream: {e:#}");
+                                            sig_t2.notify_one();
+                                            break 'rx_loop;
+                                        }
+                                    }
                                 }
                             }
                             Ok(None) => {
@@ -966,6 +995,7 @@ impl AnetClient {
         let monitor_reconnect = reconnect_signal.clone();
         let rx_check = last_rx_time.clone();
         let tx_check = last_tx_time.clone();
+        let health_start = session_start;
         let quic_conn = result.connection.clone();
         let reason_health = disconnect_reason.clone();
 
@@ -982,8 +1012,9 @@ impl AnetClient {
                 }
 
                 if health_pause.as_ref().is_some_and(|pause| pause.load(Ordering::Acquire)) {
-                    *rx_check.lock().unwrap() = Instant::now();
-                    *tx_check.lock().unwrap() = Instant::now();
+                    let now_us = health_start.elapsed().as_micros() as u64;
+                    rx_check.store(now_us, Ordering::Relaxed);
+                    tx_check.store(now_us, Ordering::Relaxed);
                     continue;
                 }
 

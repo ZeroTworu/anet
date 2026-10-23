@@ -5,7 +5,7 @@ use crate::multikey_udp_socket::{HandshakeData, MultiKeyAnetUdpSocket};
 use anet_common::consts::{CHANNEL_BUFFER_SIZE, PADDING_MTU};
 use anet_common::jitter::bridge_with_jitter;
 use anet_common::quic_settings::build_transport_config;
-use anet_common::stream_framing::read_next_packet;
+use anet_common::stream_framing::FrameReader;
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use log::{error, info, warn};
@@ -145,7 +145,8 @@ pub async fn run_quic_server(
                 let ci_rx = client_info.clone();
                 let rx_registry = r.clone();
                 let mut reader_task = tokio::spawn(async move {
-                    while let Ok(Some(pkt)) = read_next_packet(&mut recv).await {
+                    let mut frame_reader = anet_common::stream_framing::FrameReader::new();
+                    while let Ok(Some(pkt)) = frame_reader.read_next_packet(&mut recv).await {
                         let packet_len = pkt.len();
 
                         // BACKPRESSURE ДЛЯ QUIC

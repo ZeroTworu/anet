@@ -250,7 +250,8 @@ impl ClientTransport for AHttpTransport {
         let (tunnel_packet_tx, mut tunnel_packet_rx) = tokio::sync::mpsc::channel::<Bytes>(128);
 
         let tunnel_reader_task = tokio::spawn(async move {
-            while let Ok(Some(packet)) = read_next_packet(&mut tunnel_read).await {
+            let mut frame_reader = anet_common::stream_framing::FrameReader::new();
+            while let Ok(Some(packet)) = frame_reader.read_next_packet(&mut tunnel_read).await {
                 if tunnel_packet_tx.send(packet).await.is_err() { break; }
             }
         });

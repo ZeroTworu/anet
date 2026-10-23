@@ -77,7 +77,7 @@ impl WrtcRuntime for TunedTokioRuntime {
         let _ = sock_ref.set_recv_buffer_size(self.udp_socket_buffer_size);
         let _ = sock_ref.set_send_buffer_size(self.udp_socket_buffer_size);
         if let (Ok(rcv), Ok(snd)) = (sock_ref.recv_buffer_size(), sock_ref.send_buffer_size()) {
-            log::debug!(
+            log::info!(
                 "[WRTC UDP] Tuned WebRTC UDP socket buffers: SO_RCVBUF={} KiB, SO_SNDBUF={} KiB",
                 rcv / 1024,
                 snd / 1024
@@ -455,6 +455,14 @@ impl P2pSession {
     pub async fn recv_packet(&self) -> Option<Bytes> {
         let mut rx = self.incoming_rx.lock().await;
         rx.recv().await
+    }
+
+    pub fn try_recv_packet(&self) -> Option<Bytes> {
+        if let Ok(mut rx) = self.incoming_rx.try_lock() {
+            rx.try_recv().ok()
+        } else {
+            None
+        }
     }
 }
 
@@ -1110,17 +1118,12 @@ impl WrtcPeer {
                         let mut sent = false;
                         // Используем SCTP DataChannel ТОЛЬКО когда живы и SCTP (dc_is_open), и UDP ICE (is_connected).
                         // Если под БС UDP просел (Disconnected/Failed), мгновенно отправляем ping/constraints/батчи через живой Colibri-WS!
-                        let is_keepalive = json_str.contains("anet_ping")
-                            || json_str.contains("anet_pong");
-
                         if dc_is_open_out.load(Ordering::SeqCst) && is_connected_out.load(Ordering::SeqCst) {
                             if let Some(ref dc_out) = dc_opt_out {
                                 if is_batch {
                                     log::debug!("[JVB DC OUT Batch]");
                                 } else if is_astp {
                                     log::trace!("[JVB DC OUT ASTP]");
-                                } else if is_keepalive {
-                                    log::debug!("[JVB DC OUT]: {json_str}");
                                 } else {
                                     log::info!("[JVB DC OUT]: {json_str}");
                                 }
@@ -1154,8 +1157,6 @@ impl WrtcPeer {
                         if !sent && has_ws_out.load(Ordering::SeqCst) {
                             if is_astp || is_batch {
                                 log::trace!("[JVB WS OUT ASTP]");
-                            } else if is_keepalive {
-                                log::debug!("[JVB WS OUT]: {json_str}");
                             } else {
                                 log::info!("[JVB WS OUT]: {json_str}");
                             }

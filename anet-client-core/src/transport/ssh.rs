@@ -2,7 +2,7 @@ use super::{ClientTransport, ConnectionResult};
 use crate::auth::{AuthHandler, StreamAuthChannel};
 use crate::config::{CoreConfig, ServerConfig};
 use anet_common::consts::{CHANNEL_BUFFER_SIZE, MAX_PACKET_SIZE};
-use anet_common::stream_framing::{frame_packet, read_next_packet};
+use anet_common::stream_framing::{FrameReader, frame_packet};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -260,7 +260,8 @@ async fn read_tunnel_packets(
     mut tunnel_reader: tokio::io::ReadHalf<tokio::io::DuplexStream>,
     packet_tx: mpsc::Sender<Bytes>,
 ) -> Result<()> {
-    while let Some(packet) = read_next_packet(&mut tunnel_reader).await? {
+    let mut frame_reader = anet_common::stream_framing::FrameReader::new();
+    while let Some(packet) = frame_reader.read_next_packet(&mut tunnel_reader).await? {
         packet_tx
             .send(packet)
             .await

@@ -12,7 +12,7 @@ use anet_common::consts::{
 };
 use anet_common::http_help::BrowserProfile;
 use anet_common::transport::{
-    unwrap_packet_bytes, wrap_packet_padded, wrap_packet_slice_with_headroom,
+    unwrap_packet_bytes, wrap_packet_padded, wrap_packet_slice, wrap_packet_slice_with_headroom,
 };
 use anet_common::wrtc::{
     batcher::{unpack_batch, PacketBatcher},
@@ -693,51 +693,98 @@ pub async fn run_wrtc_server(
                                                                             }
                                                                         }
                                                                     } else {
-                                                                        let seq = c_info
-                                                                            .sequence
-                                                                            .fetch_add(1, Ordering::Relaxed);
-                                                                        let effective_pad = if p2p_active { 0 } else { padding_step };
-                                                                        if let Ok(encrypted) = wrap_packet_padded(
-                                                                            &c_info.cipher,
-                                                                            &c_info.nonce_prefix,
-                                                                            seq,
-                                                                            packet,
-                                                                            effective_pad,
-                                                                        ) {
-                                                                            let enc_bytes = Bytes::from(encrypted);
-                                                                            let mut sent = false;
+                                                                        if p2p_active && packet.len() + 3 < max_video_batch_bytes {
+                                                                            batch_buf.clear();
+                                                                            batch_buf.put_u8(VIDEO_BATCH_MARKER);
+                                                                            batch_buf.put_u16(packet.len() as u16);
+                                                                            batch_buf.extend_from_slice(&packet);
+                                                                            let mut count = 1usize;
 
-                                                                            // 1. Приоритет №1: Прямой P2P DataChannel с клиентом (для p2p_direct и auto)
-                                                                            if let Some(ref p2p_entry) = p2p_session {
-                                                                                if p2p_entry.send_packet(&enc_bytes).await.is_ok() {
-                                                                                    sent = true;
+                                                                            while count < WRTC_VIDEO_BATCH_MAX_PACKETS {
+                                                                                let next_p = if let Some(p) = pending_packet.take() {
+                                                                                    p
+                                                                                } else if let Ok(p) = rx_router.try_recv() {
+                                                                                    p
+                                                                                } else {
+                                                                                    break;
+                                                                                };
+                                                                                if next_p.len() < WRTC_MIN_IP_PACKET_LEN {
+                                                                                    continue;
+                                                                                }
+                                                                                if batch_buf.len() + 2 + next_p.len() <= max_video_batch_bytes {
+                                                                                    batch_buf.put_u16(next_p.len() as u16);
+                                                                                    batch_buf.extend_from_slice(&next_p);
+                                                                                    count += 1;
+                                                                                } else {
+                                                                                    pending_packet = Some(next_p);
+                                                                                    break;
                                                                                 }
                                                                             }
 
-                                                                            // 2. Приоритет №2: Режим MediaVideo (Fake Video Track over DTLS-SRTP / JVB)
-                                                                            if !sent && client_uses_video {
-                                                                                if peer_downlink.send_video_frame_tagged(client_tag, &enc_bytes).await.is_ok() {
-                                                                                    // До подтверждения приема видео от клиента дублируем в WS
-                                                                                    if video_warmed_up {
+                                                                            let seq = c_info.sequence.fetch_add(1, Ordering::Relaxed);
+                                                                            let payload_slice = if count == 1 {
+                                                                                &batch_buf[3..]
+                                                                            } else {
+                                                                                &batch_buf[..]
+                                                                            };
+                                                                            if let Ok(enc_bytes) = wrap_packet_slice(
+                                                                                &c_info.cipher,
+                                                                                &c_info.nonce_prefix,
+                                                                                seq,
+                                                                                payload_slice,
+                                                                                0,
+                                                                            ) {
+                                                                                if let Some(ref p2p_entry) = p2p_session {
+                                                                                    let _ = p2p_entry.send_packet(&enc_bytes).await;
+                                                                                }
+                                                                            }
+                                                                        } else {
+                                                                            let seq = c_info
+                                                                                .sequence
+                                                                                .fetch_add(1, Ordering::Relaxed);
+                                                                            let effective_pad = if p2p_active { 0 } else { padding_step };
+                                                                            if let Ok(encrypted) = wrap_packet_padded(
+                                                                                &c_info.cipher,
+                                                                                &c_info.nonce_prefix,
+                                                                                seq,
+                                                                                packet,
+                                                                                effective_pad,
+                                                                            ) {
+                                                                                let enc_bytes = Bytes::from(encrypted);
+                                                                                let mut sent = false;
+
+                                                                                // 1. Приоритет №1: Прямой P2P DataChannel с клиентом (для p2p_direct и auto)
+                                                                                if let Some(ref p2p_entry) = p2p_session {
+                                                                                    if p2p_entry.send_packet(&enc_bytes).await.is_ok() {
                                                                                         sent = true;
                                                                                     }
-                                                                                } else {
-                                                                                    warn!("[WRTC Server Video OUT] send error to {target_client_id}, fallback to WS");
                                                                                 }
-                                                                            }
 
-                                                                            // 3. Если P2P и Video не сработали (или клиент в WS режиме), шлем через батчер (Colibri-WS)
-                                                                            if !sent {
-                                                                                batcher.push(enc_bytes);
-                                                                                if batcher.should_flush() {
-                                                                                    if let Some(batch_data) = batcher.flush() {
-                                                                                        let b64 = BASE64_STANDARD.encode(&batch_data);
-                                                                                        let msg = ColibriMessage::astp_batch(
-                                                                                            target_client_id.clone(),
-                                                                                            b64,
-                                                                                        );
-                                                                                        if peer_downlink.send(msg).await.is_err() {
-                                                                                            break;
+                                                                                // 2. Приоритет №2: Режим MediaVideo (Fake Video Track over DTLS-SRTP / JVB)
+                                                                                if !sent && client_uses_video {
+                                                                                    if peer_downlink.send_video_frame_tagged(client_tag, &enc_bytes).await.is_ok() {
+                                                                                        // До подтверждения приема видео от клиента дублируем в WS
+                                                                                        if video_warmed_up {
+                                                                                            sent = true;
+                                                                                        }
+                                                                                    } else {
+                                                                                        warn!("[WRTC Server Video OUT] send error to {target_client_id}, fallback to WS");
+                                                                                    }
+                                                                                }
+
+                                                                                // 3. Если P2P и Video не сработали (или клиент в WS режиме), шлем через батчер (Colibri-WS)
+                                                                                if !sent {
+                                                                                    batcher.push(enc_bytes);
+                                                                                    if batcher.should_flush() {
+                                                                                        if let Some(batch_data) = batcher.flush() {
+                                                                                            let b64 = BASE64_STANDARD.encode(&batch_data);
+                                                                                            let msg = ColibriMessage::astp_batch(
+                                                                                                target_client_id.clone(),
+                                                                                                b64,
+                                                                                            );
+                                                                                            if peer_downlink.send(msg).await.is_err() {
+                                                                                                break;
+                                                                                            }
                                                                                         }
                                                                                     }
                                                                                 }
@@ -900,22 +947,38 @@ pub async fn run_wrtc_server(
                                                 let p2p_read = p2p_arc.clone();
                                                 let client_id_read = client_ep.clone();
                                                 tokio::spawn(async move {
-                                                    while let Some(raw_bytes) = p2p_read.recv_packet().await {
-                                                        if let Some(c_info) = clients_map_c.get(&client_id_read) {
-                                                            if reg_c.get_by_session(&c_info.session_id).is_some() {
-                                                                match unwrap_packet_bytes(&c_info.cipher, raw_bytes) {
-                                                                    Ok(packet) => {
-                                                                        let packet_len = packet.len();
-                                                                        if tun_tx_c.try_send(packet).is_ok() {
-                                                                            reg_c.record_rx(&c_info, packet_len, "wrtc");
-                                                                            log::trace!("[P2P Direct IN] {} bytes from {}", packet_len, c_info.assigned_ip);
+                                                    while let Some(first_bytes) = p2p_read.recv_packet().await {
+                                                        let mut current_raw = Some(first_bytes);
+                                                        while let Some(raw_bytes) = current_raw.take() {
+                                                            if let Some(c_info) = clients_map_c.get(&client_id_read) {
+                                                                if reg_c.get_by_session(&c_info.session_id).is_some() {
+                                                                    match unwrap_packet_bytes(&c_info.cipher, raw_bytes) {
+                                                                        Ok(decrypted) => {
+                                                                            if decrypted.first() == Some(&VIDEO_BATCH_MARKER) {
+                                                                                let packets = unpack_batch(&decrypted[1..]);
+                                                                                for pkt in packets {
+                                                                                    if pkt.len() >= WRTC_MIN_IP_PACKET_LEN {
+                                                                                        let pkt_len = pkt.len();
+                                                                                        if tun_tx_c.try_send(pkt).is_ok() {
+                                                                                            reg_c.record_rx(&c_info, pkt_len, "wrtc");
+                                                                                        }
+                                                                                    }
+                                                                                }
+                                                                            } else if decrypted.len() >= WRTC_MIN_IP_PACKET_LEN {
+                                                                                let packet_len = decrypted.len();
+                                                                                if tun_tx_c.try_send(decrypted).is_ok() {
+                                                                                    reg_c.record_rx(&c_info, packet_len, "wrtc");
+                                                                                    log::trace!("[P2P Direct IN] {} bytes from {}", packet_len, c_info.assigned_ip);
+                                                                                }
+                                                                            }
                                                                         }
-                                                                    }
-                                                                    Err(e) => {
-                                                                        log::debug!("[P2P Direct] Decrypt error from {client_id_read}: {e}");
+                                                                        Err(e) => {
+                                                                            log::debug!("[P2P Direct] Decrypt error from {client_id_read}: {e}");
+                                                                        }
                                                                     }
                                                                 }
                                                             }
+                                                            current_raw = p2p_read.try_recv_packet();
                                                         }
                                                     }
                                                     log::info!("[P2P Direct] Receiver loop stopped for {client_id_read}");

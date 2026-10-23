@@ -14,7 +14,7 @@ use anet_common::consts::{
 use anet_common::encryption::Cipher;
 use anet_common::handshake_fragmentation::FragmentConfig;
 use anet_common::http_help::BrowserProfile;
-use anet_common::stream_framing::{frame_packet_into, read_next_packet};
+use anet_common::stream_framing::{FrameReader, frame_packet_into};
 use anet_common::transport::{
     unwrap_packet_bytes, wrap_packet_padded, wrap_packet_slice, wrap_packet_slice_with_headroom,
 };
@@ -591,7 +591,8 @@ impl ClientTransport for WrtcTransport {
             tokio::sync::mpsc::channel::<Bytes>(WRTC_VIDEO_CHANNEL_CAPACITY);
 
         let tunnel_reader_task = tokio::spawn(async move {
-            while let Ok(Some(packet)) = read_next_packet(&mut tunnel_read).await {
+            let mut frame_reader = FrameReader::new();
+            while let Ok(Some(packet)) = frame_reader.read_next_packet(&mut tunnel_read).await {
                 if tunnel_packet_tx.send(packet).await.is_err() {
                     break;
                 }
@@ -677,15 +678,19 @@ impl ClientTransport for WrtcTransport {
                         for _burst_idx in 0..WRTC_UPLINK_BURST_MAX_PACKETS {
                             if packet.len() >= WRTC_MIN_IP_PACKET_LEN {
                                 // Zero-delay micro-batching мелких пакетов (TCP ACK, DNS) в единый VP8 RTP кадр
-                                let is_v2 = peer_tx.is_video_v2();
-                                let last_v_rx = last_video_rx_tx.load(Ordering::Relaxed);
-                                let video_warmed_up = !first_client_rx_tx.load(Ordering::Relaxed)
-                                    && peer_tx.is_connected.load(Ordering::Relaxed)
-                                    && (last_v_rx > 0
-                                        && current_timestamp_secs().saturating_sub(last_v_rx) <= 5);
+                                let mut batch_capable = p2p_active;
+                                if use_video {
+                                    let is_v2 = peer_tx.is_video_v2();
+                                    let last_v_rx = last_video_rx_tx.load(Ordering::Relaxed);
+                                    let video_warmed_up = !first_client_rx_tx.load(Ordering::Relaxed)
+                                        && peer_tx.is_connected.load(Ordering::Relaxed)
+                                        && (last_v_rx > 0
+                                            && current_timestamp_secs().saturating_sub(last_v_rx) <= 5);
+                                    batch_capable = is_v2 && video_warmed_up;
+                                }
                                 let mut batched_payload = false;
 
-                                if use_video && is_v2 && video_warmed_up && (packet.len() + 3 < max_video_batch_bytes) {
+                                if batch_capable && (packet.len() + 3 < max_video_batch_bytes) {
                                     while let Ok(next_pkt) = tunnel_packet_rx.try_recv() {
                                         if next_pkt.len() < WRTC_MIN_IP_PACKET_LEN {
                                             continue;
@@ -715,6 +720,11 @@ impl ClientTransport for WrtcTransport {
                                 let seq = sequence_tx.fetch_add(1, Ordering::Relaxed);
 
                                 if use_video {
+                                    let last_v_rx = last_video_rx_tx.load(Ordering::Relaxed);
+                                    let video_warmed_up = !first_client_rx_tx.load(Ordering::Relaxed)
+                                        && peer_tx.is_connected.load(Ordering::Relaxed)
+                                        && (last_v_rx > 0
+                                            && current_timestamp_secs().saturating_sub(last_v_rx) <= 5);
                                     let payload_slice: &[u8] = if batched_payload {
                                         &video_batch_buf
                                     } else {
@@ -764,7 +774,12 @@ impl ClientTransport for WrtcTransport {
                                     }
                                 } else {
                                     let enc_res = if p2p_active {
-                                        wrap_packet_slice(&cipher_tx, &nonce_prefix, seq, &packet, 0)
+                                        let payload_slice: &[u8] = if batched_payload {
+                                            &video_batch_buf
+                                        } else {
+                                            &packet
+                                        };
+                                        wrap_packet_slice(&cipher_tx, &nonce_prefix, seq, payload_slice, 0)
                                     } else {
                                         wrap_packet_padded(&cipher_tx, &nonce_prefix, seq, packet, padding_step)
                                     };
@@ -963,16 +978,33 @@ impl ClientTransport for WrtcTransport {
 
                 if let Some(p2p) = p2p_opt {
                     if p2p.is_open.load(Ordering::SeqCst) {
-                        while let Some(raw_bytes) = p2p.recv_packet().await {
-                            match unwrap_packet_bytes(&cipher_p2p, raw_bytes) {
-                                Ok(packet) => {
-                                    log::trace!("[P2P Direct IN] Decrypted packet ({} bytes)", packet.len());
-                                    let _ = tun_inject_p2p.send(packet).await;
+                        'p2p_outer: while let Some(first_bytes) = p2p.recv_packet().await {
+                            let mut current_raw = Some(first_bytes);
+                            while let Some(raw_bytes) = current_raw.take() {
+                                match unwrap_packet_bytes(&cipher_p2p, raw_bytes) {
+                                    Ok(decrypted) => {
+                                        if decrypted.first() == Some(&VIDEO_BATCH_MARKER) {
+                                            let packets = unpack_batch(&decrypted[1..]);
+                                            for pkt in packets {
+                                                if pkt.len() >= WRTC_MIN_IP_PACKET_LEN {
+                                                    if tun_inject_p2p.send(pkt).await.is_err() {
+                                                        break 'p2p_outer;
+                                                    }
+                                                }
+                                            }
+                                        } else if decrypted.len() >= WRTC_MIN_IP_PACKET_LEN {
+                                            log::trace!("[P2P Direct IN] Decrypted packet ({} bytes)", decrypted.len());
+                                            if tun_inject_p2p.send(decrypted).await.is_err() {
+                                                break 'p2p_outer;
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!("[P2P Direct] Decrypt packet error: {e}");
+                                        warn(format!("[P2P Direct] Decrypt packet error: {e}"));
+                                    }
                                 }
-                                Err(e) => {
-                                    warn!("[P2P Direct] Decrypt packet error: {e}");
-                                    warn(format!("[P2P Direct] Decrypt packet error: {e}"));
-                                }
+                                current_raw = p2p.try_recv_packet();
                             }
                         }
                         break;

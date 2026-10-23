@@ -6,7 +6,7 @@ use anet_common::encryption::Cipher;
 use anet_common::jitter::bridge_with_jitter;
 use anet_common::protocol::AuthResponse;
 use anet_common::quic_settings::build_transport_config;
-use anet_common::stream_framing::read_next_packet;
+use anet_common::stream_framing::FrameReader;
 use anyhow::Result;
 use log::{error, info};
 use quinn::{ClientConfig, Connection, Endpoint, EndpointConfig, TokioRuntime};
@@ -118,14 +118,10 @@ impl VpnHandler {
 
         // Task: QUIC -> TUN
         tokio::spawn(async move {
-            loop {
-                match read_next_packet(&mut recv_stream).await {
-                    Ok(Some(packet)) => {
-                        if tx_from_quic.send(packet).await.is_err() {
-                            break;
-                        }
-                    }
-                    _ => break,
+            let mut frame_reader = anet_common::stream_framing::FrameReader::new();
+            while let Ok(Some(packet)) = frame_reader.read_next_packet(&mut recv_stream).await {
+                if tx_from_quic.send(packet).await.is_err() {
+                    break;
                 }
             }
             info!("[Core] QUIC RX finished.");
