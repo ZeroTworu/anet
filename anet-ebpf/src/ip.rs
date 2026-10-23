@@ -17,6 +17,7 @@ const IPV4_DST_OFFSET: usize = 16;
 
 pub const ETH_P_IP_BE: u16 = 0x0800u16.to_be();
 pub const IPPROTO_ICMP: u8 = 1;
+pub const IPPROTO_TCP: u8 = 6;
 pub const IPPROTO_UDP: u8 = 17;
 
 /// Максимальное число 8-байтных блоков шифрования (200 * 8 = 1600 байт > стандартного MTU).
@@ -165,6 +166,30 @@ pub fn ipv4_header_checksum(hdr: &Ipv4Hdr) -> u16 {
     sum = (sum & 0xFFFF) + (sum >> 16);
     sum = (sum & 0xFFFF) + (sum >> 16);
     (!(sum as u16)).to_be()
+}
+
+/// Вычисляет 16-битный seed псевдозаголовка IPv4 (`~csum_tcpudp_magic`), который ядро Linux
+/// записывает в поле `th->check` / `uh->check`, когда пакет находится в состоянии `CHECKSUM_PARTIAL`
+/// (например, после `virtio_net` RX `VIRTIO_NET_HDR_F_NEEDS_CSUM` или локальной генерации).
+/// Возвращает `u16` в сетевом порядке байт (Big-Endian) для прямого сравнения с полем `check` пакета.
+#[inline(always)]
+pub fn ipv4_pseudo_csum_seed_be(
+    src_addr_be: u32,
+    dst_addr_be: u32,
+    proto: u8,
+    l4_len: u16,
+) -> u16 {
+    let src = u32::from_be(src_addr_be);
+    let dst = u32::from_be(dst_addr_be);
+    let mut sum = ((src >> 16) & 0xFFFF)
+        + (src & 0xFFFF)
+        + ((dst >> 16) & 0xFFFF)
+        + (dst & 0xFFFF)
+        + (proto as u32)
+        + (l4_len as u32);
+    sum = (sum & 0xFFFF) + (sum >> 16);
+    sum = (sum & 0xFFFF) + (sum >> 16);
+    (sum as u16).to_be()
 }
 
 /// Шифрует или расшифровывает полезную нагрузку пакета в памяти (`payload_offset .. data_end`)

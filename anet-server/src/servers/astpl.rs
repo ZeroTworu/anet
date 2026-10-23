@@ -552,7 +552,7 @@ impl AstplEbpfManager {
 
         for bin in ["ethtool", "/usr/sbin/ethtool", "/sbin/ethtool"] {
             if let Ok(out) = Command::new(bin)
-                .args(["-K", eth_iface, "gro", "off", "lro", "off"])
+                .args(["-K", eth_iface, "gro", "off", "lro", "off", "rx", "off"])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .output()
@@ -664,7 +664,10 @@ impl AstplEbpfManager {
                 return Err(std::io::Error::last_os_error()).context("ioctl(ETHTOOL_GSTRINGS)");
             }
 
-            // 3. Формируем битовую маску отключения для rx-gro / rx-gro-hw / rx-gro-list / rx-lro
+            // 3. Формируем битовую маску отключения для rx-gro / rx-gro-hw / rx-gro-list / rx-lro / rx-checksum.
+            // В драйвере virtio_net отключение `rx-checksum` (NETIF_F_RXCSUM) снимает флаг
+            // `VIRTIO_NET_F_GUEST_CSUM` через `virtnet_set_guest_offloads`, заставляя гипервизор KVM
+            // финализировать TCP/UDP-контрольные суммы до передачи пакетов в гостевую ОС (вместо `VIRTIO_NET_HDR_F_NEEDS_CSUM`).
             let n_blocks = (n_features + 31) / 32;
             let mut sfeatures = EthtoolSfeatures {
                 cmd: ETHTOOL_SFEATURES,
@@ -681,7 +684,7 @@ impl AstplEbpfManager {
                 };
                 if matches!(
                     feat_name,
-                    "rx-gro" | "rx-gro-hw" | "rx-gro-list" | "rx-lro"
+                    "rx-gro" | "rx-gro-hw" | "rx-gro-list" | "rx-lro" | "rx-checksum"
                 ) {
                     let block = idx / 32;
                     let bit = 1u32 << (idx % 32);
@@ -748,7 +751,7 @@ pub async fn run_astpl_server(
 ) -> Result<()> {
     let bind_to = config.server.astpl_bind_to.trim();
     let socket = Arc::new(
-        bind_astpl_udp_socket(bind_to)
+        bind_astpl_udp_socket(bind_to, true)
             .with_context(|| format!("Failed to bind ASTP-L UDP socket on {}", bind_to))?,
     );
     let local_addr = socket.local_addr()?;
