@@ -159,34 +159,36 @@
    * `http://jabber.org/protocol/disco#info` -> ответ со списком поддерживаемых фичей Jitsi Meet (jingle, colibri, audio/video).
    * `urn:xmpp:jingle:1` (акты `session-` и `source-`) -> немедленный ACK `<iq type="result"/>`.
 
-### 3.3. Архитектура ICE-соединения с JVB и обход мобильного CGNAT
-1. **Топология "клиент-сервер" вместо P2P:**
+### 3.3. Архитектура ICE-соединения с JVB, привязка к физическому интерфейсу и обход CGNAT
+1. **Топология «клиент-сервер» через SFU вместо P2P:**
    * Медиамост JVB всегда имеет **публичный белый IP-адрес** (например, `203.0.113.12:10000`, тип `host` в Jingle Offer).
-   * Клиент и сервер ANet слушают универсальный локальный сокет `0.0.0.0:0`, собирая хостовые кандидаты со всех сетевых интерфейсов.
-   * При отправке первых пакетов ICE Connectivity Check клиент инициирует исходящий UDP-поток на белый адрес JVB. Любой сетевой экран (NAT домашнего роутера, CGNAT мобильных операторов Мегафон/МТС/Билайн) мгновенно открывает двустороннюю трансляцию портов (NAT hole punching), и статус WebRTC переходит в `Connected` за считанные миллисекунды.
-2. **Отключение встроенного STUN Gatherer:**
+   * При отправке первых пакетов ICE Connectivity Check клиент инициирует исходящий UDP-поток на белый адрес JVB. Любой сетевой экран (NAT домашнего роутера, CGNAT мобильных операторов) мгновенно открывает двустороннюю трансляцию портов (NAT hole punching), и статус WebRTC переходит в `Connected` за считанные миллисекунды.
+2. **Строгая привязка UDP-сокета WebRTC к физическому сетевому адаптеру (`detect_physical_bind_addr`):**
+   * Привязка к универсальному адресу `0.0.0.0:0` опасна тем, что после поднятия TUN-интерфейса (`172.112.x.x`) с маршрутом `0.0.0.0/0` стек `webrtc-rs` начинает собирать локальные кандидаты со всех интерфейсов ОС, включая сам виртуальный адаптер TUN, и при переоценке путей пытается слать STUN/RTP пакеты с IP туннеля в самого себя.
+   * Поэтому ещё **до создания TUN-интерфейса** функция `detect_physical_bind_addr()` открывает пробный `std::net::UdpSocket` к IP медиамоста JVB (или к `1.1.1.1:80`), определяет точный локальный IPv4-адрес физического интерфейса (например, `192.168.1.x:0`) и передаёт его в `PeerConnectionBuilder::with_udp_addrs(vec![bind_addr])`.
+3. **Отключение встроенного STUN Gatherer:**
    * В текущей архитектуре библиотеки `rtc` (v0.21.0) внутренний `stun_gatherer` отправляет запросы с того же сокета, который слушает `rtc_ice::agent`.
-   * Ответы публичных STUN-серверов Контура соответствуют стандарту RFC 5389 (`XOR-MAPPED-ADDRESS`), но не содержат специфичных для ICE атрибутов связности (`USERNAME`). Из-за этого ICE-агент ошибочно классифицирует их как поврежденные проверки связности (`discard message ..., attribute not found`) и вызывает ложный таймаут `TransactionTimeOut`.
-   * Для предотвращения предупреждений и таймаутов `PeerConnection` конфигурируется с `with_ice_servers(vec![])`. Прямого обмена с JVB достаточно для 100% надежного соединения.
-3. **Обнаружение сервисов XEP-0215 (`extdisco:2`) и маршрутизация:**
-   * Узлы продолжают запрашивать доступные STUN/TURN сервисы Контура по протоколу XEP-0215 для актуализации инфраструктурных адресов.
-   * Все обнаруженные IP-адреса хостов Ktalk автоматически добавляются в список системных исключений `bypass_ips`.
+   * Ответы публичных STUN-серверов ВКС соответствуют стандарту RFC 5389 (`XOR-MAPPED-ADDRESS`), но не содержат специфичных для ICE атрибутов связности (`USERNAME`). Из-за этого ICE-агент ошибочно классифицирует их как поврежденные проверки связности (`discard message ..., attribute not found`) и вызывает ложный таймаут `TransactionTimeOut`.
+   * Для предотвращения предупреждений и таймаутов `PeerConnection` конфигурируется с `with_ice_servers(vec![])`. Прямого обмена с JVB достаточно для надежного соединения.
+4. **Обнаружение сервисов XEP-0215 (`extdisco:2`) и маршрутизация:**
+   * Узлы запрашивают доступные STUN/TURN сервисы по протоколу XEP-0215 для актуализации инфраструктурных адресов и построения прямого P2P-канала (в режиме `p2p_direct`).
 
-### 3.4. Разделение каналов: Colibri-WS и WebRTC Keepalive
-1. **Основной транспорт данных (Colibri-WS):**
+### 3.4. Разделение каналов: Colibri-WS и WebRTC Media Plane
+1. **Канал управления и резервной передачи данных (Colibri-WS over TCP/443):**
    * Из входящего Jingle Offer извлекается тег `<web-socket xmlns="http://jitsi.org/protocol/colibri" url="..."/>`.
-   * Клиент и сервер подключаются к указанному URL с браузерными заголовками. Через этот сокет передаются `EndpointMessage` с протоколами Discovery и ASTP.
-2. **Фоновый WebRTC Media Keepalive (Opus silence):**
-   * Для предотвращения перевода эндпоинта мостом JVB в состояние `inactive` (что приводит к блокировке доставки `EndpointMessage`) поднимается минимальный `RTCPeerConnection` с родными STUN-серверами Ktalk.
-   * Регистрируется фиктивный Opus-аудиотрек (48000 Hz, 2 channels).
-   * Запускается фоновый таймер отправки 3-байтового фрейма тишины Opus (`0xf8, 0xff, 0xfe`) каждые 20 мс (`wrtc_media_keepalive_interval_ms`).
-   * После завершения ICE/DTLS хэндшейка статус PeerConnection переходит в `Connected`.
+   * Клиент и сервер подключаются к указанному URL с браузерными заголовками. Через этот сокет передаются `EndpointMessage` с протоколами Discovery, ASTP и (в режиме `ws` или при блокировке UDP) батчи пакетов `AstpBatch`.
+2. **Медиаканал WebRTC (Opus Keepalive + Fake Video Track VP8):**
+   * Для предотвращения перевода эндпоинта мостом JVB в состояние `inactive` поднимается `RTCPeerConnection` с аудио-дорожкой Opus (48000 Hz, 2 channels) и видео-дорожкой VP8 (90000 Hz).
+   * Фоновый таймер отправляет 3-байтовый фрейм тишины Opus (`0xf8, 0xff, 0xfe`) каждые 20 мс (`wrtc_media_keepalive_interval_ms`) и фоновый видео-keyframe раз в секунду при отсутствии трафика.
 
-### 3.5. Автоматическое определение Bypass IP (Split Tunneling)
-Чтобы туннель ANet не перехватил собственный медиатрафик и не создал петлю маршрутизации, модуль WebRTC при старте извлекает IP-адреса из:
-* Host/srflx кандидатов Jingle Offer;
-* Доменного имени Colibri WebSocket.
-Список обнаруженных адресов (`Discovered media bypass IPs: [...]`) передается в ядро клиента и автоматически добавляется в исключения системного шлюза/маршрутизации.
+### 3.5. Гарантированное определение Bypass IP (защита от петли маршрутизации)
+Чтобы туннель не перехватил собственный сигнальный или медиатрафик после поднятия маршрутов `0.0.0.0/0`, модуль WebRTC собирает `bypass_ips` сразу из нескольких независимых источников:
+* **Фактические `peer_addr()` уже открытых TCP/TLS сокетов:** напрямую из дескрипторов установленного соединения `XmppSession` (`xmpp.remote_ip`) и сокета `Colibri-WS` (`peer.colibri_ws_ip()`). Это гарантирует, что даже если в условиях «Белых Списков» (БС) DNS-резолв вернёт ошибку или другой IP из пула Round-Robin, реальные IP текущих WebSocket-соединений всегда будут добавлены в таблицу маршрутизации в обход TUN;
+* Все IP-адреса сигнального домена (`domain:443`) и хоста `colibri-ws`;
+* Все `host`/`srflx` кандидаты из Jingle Offer и резервный IP JVB (`wrtc_fallback_jvb_ip`);
+* Обнаруженные STUN/TURN серверы из ответа XEP-0215 (`extdisco`).
+
+Список обнаруженных адресов (`Discovered media bypass IPs: [...]`) передается в ядро клиента и автоматически регистрируется в `RouteManager` до активации туннеля.
 
 ---
 
@@ -201,6 +203,8 @@ pub enum ColibriClass {
     EndpointMessage,
     #[serde(rename = "DominantSpeakerEndpointChangeEvent")]
     DominantSpeaker,
+    #[serde(rename = "ServerHello")]
+    ServerHello,
     #[serde(other)]
     Unknown,
 }
@@ -209,12 +213,22 @@ pub enum ColibriClass {
 #[serde(tag = "type")]
 pub enum WrtcMessage {
     #[serde(rename = "anet_discover")]
-    Discover { client_nonce: String },
+    Discover {
+        client_nonce: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        video_ssrc: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        mode: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        video_v2: Option<bool>,
+    },
     #[serde(rename = "anet_beacon")]
     Beacon {
         server_id: String,
         client_nonce: String,
         signature: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        video_ssrc: Option<u32>,
     },
     #[serde(rename = "anet_ping")]
     Ping,
@@ -222,6 +236,12 @@ pub enum WrtcMessage {
     Pong,
     #[serde(rename = "astp")]
     Astp { data: String },
+    #[serde(rename = "astp_batch")]
+    AstpBatch { data: String },
+    #[serde(rename = "anet_p2p_offer")]
+    P2pOffer { sdp: String, candidates: Vec<String> },
+    #[serde(rename = "anet_p2p_answer")]
+    P2pAnswer { sdp: String, candidates: Vec<String> },
     #[serde(other)]
     Unknown,
 }
@@ -230,7 +250,9 @@ pub enum WrtcMessage {
 pub struct ColibriMessage {
     #[serde(rename = "colibriClass")]
     pub colibri_class: ColibriClass,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub to: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub from: Option<String>,
     #[serde(rename = "msgPayload")]
     pub msg_payload: WrtcMessage,
@@ -322,6 +344,26 @@ wrtc_fallback_jvb_port = 10004        # Fallback UDP порт JVB
 
 # Режим транспорта данных: "media_video" | "p2p_direct" | "jvb_datachannel" | "ws" | "auto"
 wrtc_mode = "media_video"
+
+# Глобальная секция тонкой настройки WebRTC (опционально)
+[wrtc]
+http_timeout_secs = 10
+xmpp_handshake_timeout_secs = 15
+colibri_ws_connect_timeout_secs = 10
+ws_write_timeout_secs = 5
+ice_disconnected_timeout_ms = 10000
+ice_failed_timeout_ms = 25000
+ice_keepalive_interval_ms = 2000
+sdp_renegotiate_timeout_secs = 5
+watchdog_disconnected_timeout_secs = 8
+watchdog_channel_grace_secs = 12
+peer_close_timeout_secs = 3
+tunnel_ping_interval_secs = 10
+tunnel_ping_timeout_secs = 30
+video_keepalive_interval_ms = 1000
+video_mtu_overhead = 60
+udp_socket_buffer_size = 4194304
+reactor_pool_size = 4
 ```
 
 ### В `server.toml`:
@@ -334,7 +376,7 @@ wrtc_fallback_jvb_ip = "203.0.113.7"  # Fallback IP медиасервера JVB
 wrtc_fallback_jvb_port = 10004        # Fallback UDP порт JVB
 
 # Режим транспорта данных: "media_video" | "p2p_direct" | "jvb_datachannel" | "ws" | "auto"
-wrtc_mode = "jvb_datachannel"
+wrtc_mode = "media_video"
 
 [crypto]
 server_signing_key = "<BASE64_ED25519_PRIVATE_KEY>"
@@ -669,6 +711,37 @@ ANet Client                        JVB / Prosody                      ANet Serve
   # Режим транспорта: "media_video" | "p2p_direct" | "jvb_datachannel" | "ws" | "auto"
   wrtc_mode = "media_video"
   ```
-* В режиме `auto` клиент пытается поднять P2P Direct; при недоступности STUN/P2P автоматически переходит на `media_video` (через мост JVB), гарантируя стабильное соединение даже в условиях нестабильной сотовой сети и сложного NAT.
+* В режиме `auto` клиент пытается поднять P2P Direct; при недоступности STUN/P2P автоматически переходит на `media_video` (через мост JVB), а при блокировке UDP — прозрачно работает поверх `Colibri-WS`.
+
+---
+
+## 9. Устойчивость в условиях активных «Белых Списков» (БС) и блокировки UDP
+
+При включении оператором связи режима «Белых Списков» (БС) TCP-соединения на порт `443` к инфраструктуре ВКС (`XMPP` и `Colibri-WS`) проходят штатно, тогда как нестандартные UDP-порты медиамостов JVB (`10000–10010`) или STUN (`34788`) могут полностью блокироваться или отбрасываться ТСПУ спустя несколько секунд после начала передачи.
+
+Для обеспечения непрерывной работы без обрывов каждые 15–30 секунд в `wrtc` реализованы четыре защитных механизма:
+
+### 9.1. Изоляция жизнеспособности `Colibri-WS` от состояния UDP ICE (`has_ws == true`)
+* В базовой реализации WebRTC отсутствие входящих STUN Binding Response по UDP переводит `PeerConnection` в состояние `Disconnected` через `10 с` (`ice_disconnected_timeout_ms`), после чего через `8 с` (`watchdog_disconnected_timeout_secs`, суммарно **18 с**) срабатывает сторожевой таймер, либо через **25 с** (`ice_failed_timeout_ms`) — переход в `Failed`.
+* В `WrtcPeer::check_dead_reason()` и обработчике `on_connection_state_change()`:
+  * Если активен TCP/TLS канал `Colibri-WS` (`has_ws == true`), переход UDP `PeerConnection` в состояние `Disconnected` или `Failed` **не считается фатальным отказом** и не вызывает разрыв туннеля.
+  * Сессия перезапускается только в том случае, если одновременно недоступны и `Colibri-WS`, и `SCTP DataChannel`.
+
+### 9.2. Мгновенное переключение управляющих сообщений при проседании UDP (`dc_is_open && is_connected`)
+* Если `SCTP DataChannel` был открыт в начале сессии, но затем UDP-поток был заблокирован фильтрами оператора, флаг `dc_is_open` может оставаться `true` до истечения SCTP RTO, из-за чего отправка `anet_ping` и `ReceiverVideoConstraints` зависала бы в мёртвом SCTP-буфере.
+* В цикле отправки `WrtcPeer` использование `DataChannel` разрешено только при одновременном выполнении `dc_is_open && is_connected`. Как только UDP ICE теряет связность (`is_connected == false`), все пакеты управления и `AstpBatch` без задержек маршрутизируются через живой `Colibri-WS`.
+
+### 9.3. Двусторонний самовосстанавливающийся фоллбэк `MediaVideo` $\leftrightarrow$ `Colibri-WS`
+Даже если в конфиге жёстко задан `wrtc_mode = "media_video"` (или `"auto"`), транспорт автоматически адаптируется к блокировке UDP в любом направлении:
+1. **На стороне клиента:**
+   * Признак прогретого видеоканала (`video_warmed_up`) требует одновременного выполнения трёх условий: получен хотя бы один видеокадр от сервера (`!first_client_rx`), активно UDP ICE-соединение (`peer.is_connected == true`) и с момента последнего входящего UDP-видеокадра прошло не более **5 секунд**.
+   * Если UDP заблокирован со старта или обрывается посреди сессии, `video_warmed_up` становится `false`, и клиент автоматически дублирует/направляет исходящие пакеты в `PacketBatcher` поверх `Colibri-WS` (`WrtcMessage::AstpBatch`).
+2. **На стороне сервера (защита от асимметричной блокировки UDP):**
+   * При получении от клиента любого пакета `WrtcMessage::AstpBatch` по `Colibri-WS` сервер фиксирует метку времени `client_last_ws_batch_ms` и немедленно сбрасывает флаг `client_video_warmed_up` для данного `client_tag`.
+   * Пока от клиента приходят `AstpBatch` (и в течение 500 мс после последнего батча), сервер также отдаёт весь Downlink-трафик этому клиенту через `Colibri-WS` (`AstpBatch`), что гарантирует двустороннюю связность даже при односторонней фильтрации UDP-пакетов.
+
+### 9.4. Подавление лишнего SDP Renegotiation после старта туннеля
+* При приходе фоновых станз Jingle (`source-add`, `description-info`) метод `WrtcPeer::add_remote_video_ssrc()` пропускает вызов `set_remote_description` / `set_local_description`, если активен режим `ws` либо если входящий видеопоток от JVB уже успешно принимается (`!first_video_rx`), ограничиваясь запросом ключевого кадра (`force_next_keyframe()`). Это исключает сброс рабочей DTLS/ICE сессии после активации маршрутов TUN.
+
 
 
