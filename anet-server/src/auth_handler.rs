@@ -532,6 +532,7 @@ impl ServerAuthHandler {
             last_activity: Arc::new(AtomicU64::new(now_secs)),
             created_at,
             quic_conn: arc_swap::ArcSwapOption::empty(),
+            traffic_counters: std::sync::OnceLock::new(),
         });
 
         self.registry.pre_register_client(client_info.clone());

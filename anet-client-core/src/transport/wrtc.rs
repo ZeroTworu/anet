@@ -408,6 +408,7 @@ impl ClientTransport for WrtcTransport {
         };
 
         if wrtc_mode == anet_common::wrtc::colibri::WrtcMode::MediaVideo
+            || wrtc_mode == anet_common::wrtc::colibri::WrtcMode::P2pDirect
             || wrtc_mode == anet_common::wrtc::colibri::WrtcMode::Auto
         {
             let server_mtu = auth_response.mtu;
@@ -416,7 +417,7 @@ impl ClientTransport for WrtcTransport {
                 .saturating_sub(video_overhead)
                 .max(WRTC_MIN_TUN_MTU);
             info!(
-                "[WRTC] Adjusted TUN MTU to {} (server MTU {} - {}B WebRTC RTP/VP8 overhead)",
+                "[WRTC] Adjusted TUN MTU to {} (server MTU {} - {}B WebRTC RTP/SCTP overhead)",
                 adjusted_mtu,
                 server_mtu,
                 self.config.wrtc.video_mtu_overhead
@@ -587,17 +588,6 @@ impl ClientTransport for WrtcTransport {
 
         let (client_stream, internal_router) = tokio::io::duplex(WRTC_DUPLEX_BUFFER_SIZE);
         let (mut tunnel_read, mut tunnel_write) = tokio::io::split(internal_router);
-        let (tunnel_packet_tx, mut tunnel_packet_rx) =
-            tokio::sync::mpsc::channel::<Bytes>(WRTC_VIDEO_CHANNEL_CAPACITY);
-
-        let tunnel_reader_task = tokio::spawn(async move {
-            let mut frame_reader = FrameReader::new();
-            while let Ok(Some(packet)) = frame_reader.read_next_packet(&mut tunnel_read).await {
-                if tunnel_packet_tx.send(packet).await.is_err() {
-                    break;
-                }
-            }
-        });
 
         let (tun_inject_tx, mut tun_inject_rx) =
             tokio::sync::mpsc::channel::<Bytes>(WRTC_VIDEO_CHANNEL_CAPACITY);
@@ -645,8 +635,10 @@ impl ClientTransport for WrtcTransport {
         let mut batcher = PacketBatcher::new(WRTC_BATCHER_MAX_BYTES, WRTC_BATCHER_MAX_DELAY_MS);
 
         tokio::spawn(async move {
+            let mut frame_reader = FrameReader::new();
             let mut pending_packet: Option<Bytes> = None;
             let mut video_batch_buf = BytesMut::with_capacity(max_video_batch_bytes + 64);
+            let mut cached_p2p: Option<Arc<P2pSession>> = None;
 
             loop {
                 tokio::select! {
@@ -655,21 +647,21 @@ impl ClientTransport for WrtcTransport {
                         if let Some(p) = pending_packet.take() {
                             Some(p)
                         } else {
-                            tunnel_packet_rx.recv().await
+                            frame_reader.read_next_packet(&mut tunnel_read).await.ok().flatten()
                         }
                     } => {
                         let Some(mut packet) = packet_opt else { break; };
 
-                        let p2p_opt = if wrtc_mode == anet_common::wrtc::colibri::WrtcMode::P2pDirect
+                        if wrtc_mode == anet_common::wrtc::colibri::WrtcMode::P2pDirect
                             || wrtc_mode == anet_common::wrtc::colibri::WrtcMode::Auto
                         {
-                            p2p_uplink.lock().await.clone()
-                        } else {
-                            None
-                        };
-                        let p2p_active = p2p_opt
+                            if cached_p2p.is_none() {
+                                cached_p2p = p2p_uplink.lock().await.clone();
+                            }
+                        }
+                        let p2p_active = cached_p2p
                             .as_ref()
-                            .map(|p| p.is_open.load(Ordering::SeqCst))
+                            .map(|p| p.is_open.load(Ordering::Relaxed))
                             .unwrap_or(false);
                         let use_video = !p2p_active
                             && (wrtc_mode == anet_common::wrtc::colibri::WrtcMode::MediaVideo
@@ -691,7 +683,7 @@ impl ClientTransport for WrtcTransport {
                                 let mut batched_payload = false;
 
                                 if batch_capable && (packet.len() + 3 < max_video_batch_bytes) {
-                                    while let Ok(next_pkt) = tunnel_packet_rx.try_recv() {
+                                    while let Ok(Some(next_pkt)) = frame_reader.try_next_packet() {
                                         if next_pkt.len() < WRTC_MIN_IP_PACKET_LEN {
                                             continue;
                                         }
@@ -787,7 +779,7 @@ impl ClientTransport for WrtcTransport {
                                     match enc_res {
                                         Ok(enc_bytes) => {
                                             let mut sent_p2p = false;
-                                            if let Some(ref p2p) = p2p_opt {
+                                            if let Some(ref p2p) = cached_p2p {
                                                 if p2p_active {
                                                     if p2p.send_packet(&enc_bytes).await.is_ok() {
                                                         log::trace!("[P2P Direct OUT]");
@@ -823,10 +815,26 @@ impl ClientTransport for WrtcTransport {
 
                             if let Some(next_p) = pending_packet.take() {
                                 packet = next_p;
-                            } else if let Ok(next_p) = tunnel_packet_rx.try_recv() {
+                            } else if let Ok(Some(next_p)) = frame_reader.try_next_packet() {
                                 packet = next_p;
                             } else {
                                 break;
+                            }
+                        }
+
+                        // Сбрасываем накопленный в этом бурсте батч сразу после осушения буфера,
+                        // не дожидаясь 3-миллисекундного таймера batch_interval!
+                        if !batcher.is_empty() && pending_packet.is_none() {
+                            if let Some(batch_data) = batcher.flush() {
+                                let b64 = BASE64_STANDARD.encode(&batch_data);
+                                let msg = ColibriMessage::astp_batch(
+                                    target_srv_tx.clone(),
+                                    b64,
+                                );
+                                if let Err(e) = peer_tx.send(msg).await {
+                                    warn!("[WRTC Client] Peer send batch error: {e}");
+                                    return;
+                                }
                             }
                         }
                     }
@@ -877,7 +885,6 @@ impl ClientTransport for WrtcTransport {
                     }
                 }
             }
-            tunnel_reader_task.abort();
             tunnel_writer_task.abort();
         });
 

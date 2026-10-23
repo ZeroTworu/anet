@@ -49,6 +49,8 @@ pub struct ClientTransportInfo {
     pub created_at: u64,
     /// Активное QUIC-соединение (для гарантированной отправки CONNECTION_CLOSE ДО удаления записи из clients_by_addr)
     pub quic_conn: ArcSwapOption<quinn::Connection>,
+    /// Предкэшированные атомарные счётчики трафика (исключают format! и DashMap write-lock на каждый пакет)
+    pub traffic_counters: std::sync::OnceLock<Arc<TrafficCounters>>,
 }
 
 impl ClientTransportInfo {
@@ -57,7 +59,7 @@ impl ClientTransportInfo {
     }
 }
 
-struct TrafficCounters {
+pub struct TrafficCounters {
     user_id: Option<String>,
     fingerprint: String,
     protocol: String,
@@ -102,6 +104,7 @@ mod tests {
             last_activity: Arc::new(AtomicU64::new(current_timestamp_secs())),
             created_at: current_timestamp_secs(),
             quic_conn: ArcSwapOption::empty(),
+            traffic_counters: std::sync::OnceLock::new(),
         })
     }
 
@@ -186,6 +189,7 @@ pub struct ClientRegistry {
     clients_by_addr: Arc<DashMap<SocketAddr, Arc<ClientTransportInfo>>>,
     clients_by_ip: Arc<DashMap<String, Arc<ClientTransportInfo>>>,
     quic_router: Arc<DashMap<String, StreamSender>>,
+    ipv4_router: Arc<DashMap<Ipv4Addr, (StreamSender, Option<Arc<TrafficCounters>>)>>,
     suspended_sessions: Arc<DashMap<String, SuspendedSession>>,
     ip_pool: IpPool,
     accepting_connections: Arc<AtomicBool>,
@@ -201,6 +205,7 @@ impl ClientRegistry {
             clients_by_addr: Arc::new(DashMap::new()),
             clients_by_ip: Arc::new(DashMap::new()),
             quic_router: Arc::new(DashMap::new()),
+            ipv4_router: Arc::new(DashMap::new()),
             suspended_sessions: Arc::new(DashMap::new()),
             ip_pool,
             accepting_connections: Arc::new(AtomicBool::new(true)),
@@ -329,9 +334,13 @@ impl ClientRegistry {
 
     pub fn record_rx(&self, client: &ClientTransportInfo, bytes: usize, protocol: &str) {
         client.last_activity.store(current_timestamp_secs(), Ordering::Relaxed);
-        self.traffic_counters(client, protocol)
-            .rx_bytes
-            .fetch_add(bytes as u64, Ordering::Relaxed);
+        if let Some(counters) = client.traffic_counters.get() {
+            counters.rx_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+        } else {
+            self.traffic_counters(client, protocol)
+                .rx_bytes
+                .fetch_add(bytes as u64, Ordering::Relaxed);
+        }
     }
 
     /// Проверяет и выселяет сессии, от которых не было входящих пакетов дольше timeout_secs
@@ -456,6 +465,9 @@ impl ClientRegistry {
                     remote_addr, client_info.fingerprint, displaced.session_id, displaced.assigned_ip
                 );
                 self.quic_router.remove(&displaced.assigned_ip);
+                if let Ok(ip_addr) = displaced.assigned_ip.parse::<Ipv4Addr>() {
+                    self.ipv4_router.remove(&ip_addr);
+                }
                 self.clients_by_prefix.remove(&displaced.nonce_prefix);
                 self.clients_by_ip.remove(&displaced.assigned_ip);
                 if displaced.assigned_ip != client_info.assigned_ip {
@@ -483,10 +495,16 @@ impl ClientRegistry {
                 }
                 let displaced_addr = **displaced.remote_addr.load();
                 self.quic_router.remove(&displaced.assigned_ip);
+                if let Ok(ip_addr) = displaced.assigned_ip.parse::<Ipv4Addr>() {
+                    self.ipv4_router.remove(&ip_addr);
+                }
                 self.clients_by_prefix.remove(&displaced.nonce_prefix);
                 self.clients_by_addr.remove(&displaced_addr);
             }
         }
+
+        let counters = self.traffic_counters(&client_info, &client_info.protocol);
+        let _ = client_info.traffic_counters.set(counters);
 
         self.clients_by_prefix
             .insert(client_info.nonce_prefix, client_info.clone());
@@ -503,6 +521,17 @@ impl ClientRegistry {
     }
 
     pub fn finalize_client(&self, client_ip: &str, router_sender: StreamSender) {
+        if let Ok(ipv4) = client_ip.parse::<Ipv4Addr>() {
+            let counters = self.clients_by_ip.get(client_ip).map(|client| {
+                client
+                    .traffic_counters
+                    .get()
+                    .cloned()
+                    .unwrap_or_else(|| self.traffic_counters(&client, &client.protocol))
+            });
+            self.ipv4_router
+                .insert(ipv4, (router_sender.clone(), counters));
+        }
         self.quic_router
             .insert(client_ip.to_string(), router_sender);
         self.state_changed.notify_one();
@@ -547,6 +576,9 @@ impl ClientRegistry {
             }
 
             self.quic_router.remove(client_ip);
+            if let Ok(ip_addr) = client_ip.parse::<Ipv4Addr>() {
+                self.ipv4_router.remove(&ip_addr);
+            }
             self.clients_by_prefix.remove(&client_info.nonce_prefix);
             self.clients_by_addr.remove(&remote_addr);
             self.clients_by_ip.remove(client_ip);
@@ -592,6 +624,9 @@ impl ClientRegistry {
         }
 
         self.quic_router.remove(&client_ip);
+        if let Ok(ip_addr) = client_ip.parse::<Ipv4Addr>() {
+            self.ipv4_router.remove(&ip_addr);
+        }
         self.clients_by_prefix.remove(&client_info.nonce_prefix);
         self.clients_by_addr.remove(&remote_addr);
         self.clients_by_ip.remove(&client_ip);
@@ -719,16 +754,39 @@ impl ClientRegistry {
         }
     }
 
+    pub async fn route_packet_to_ipv4(&self, dst_ip: Ipv4Addr, packet: Bytes) {
+        let route = self
+            .ipv4_router
+            .get(&dst_ip)
+            .map(|entry| (entry.value().0.clone(), entry.value().1.clone()));
+        if let Some((sender, counters)) = route {
+            let packet_len = packet.len();
+            if sender.send(packet).await.is_err() {
+                warn!("[Registry] Failed to route to {}: channel closed.", dst_ip);
+            } else if let Some(counters) = counters {
+                counters.tx_bytes.fetch_add(packet_len as u64, Ordering::Relaxed);
+            }
+        }
+    }
+
     pub async fn route_packet_to_client(&self, dst_ip: &str, packet: Bytes) {
-        if let Some(sender) = self.quic_router.get(dst_ip) {
+        if let Ok(ipv4) = dst_ip.parse::<Ipv4Addr>() {
+            self.route_packet_to_ipv4(ipv4, packet).await;
+            return;
+        }
+        let sender_opt = self.quic_router.get(dst_ip).map(|s| s.value().clone());
+        if let Some(sender) = sender_opt {
             let packet_len = packet.len();
             if sender.send(packet).await.is_err() {
                 warn!("[Registry] Failed to route to {}: channel closed.", dst_ip);
             } else if let Some(client) = self.clients_by_ip.get(dst_ip) {
-                // Извлекаем сохраненный протокол сессии из транспортной структуры
-                self.traffic_counters(&client, &client.protocol)
-                    .tx_bytes
-                    .fetch_add(packet_len as u64, Ordering::Relaxed);
+                if let Some(counters) = client.traffic_counters.get() {
+                    counters.tx_bytes.fetch_add(packet_len as u64, Ordering::Relaxed);
+                } else {
+                    self.traffic_counters(&client, &client.protocol)
+                        .tx_bytes
+                        .fetch_add(packet_len as u64, Ordering::Relaxed);
+                }
             }
         }
     }

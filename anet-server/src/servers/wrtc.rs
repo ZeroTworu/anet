@@ -613,7 +613,7 @@ pub async fn run_wrtc_server(
                                                                         && matches!(client_pref_mode.as_str(), "media_video" | "auto")
                                                                         && has_video;
 
-                                                                    if client_uses_video && is_v2 {
+                                                                    if client_uses_video && is_v2 && packet.len() <= server_tun_mtu {
                                                                         if video_warmed_up && packet.len() + 3 < max_video_batch_bytes {
                                                                             batch_buf.clear();
                                                                             batch_buf.put_u8(VIDEO_BATCH_MARKER);
@@ -739,10 +739,11 @@ pub async fn run_wrtc_server(
                                                                                 }
                                                                             }
                                                                         } else {
+                                                                            let pkt_len = packet.len();
                                                                             let seq = c_info
                                                                                 .sequence
                                                                                 .fetch_add(1, Ordering::Relaxed);
-                                                                            let effective_pad = if p2p_active { 0 } else { padding_step };
+                                                                            let effective_pad = if p2p_active || client_uses_video { 0 } else { padding_step };
                                                                             if let Ok(encrypted) = wrap_packet_padded(
                                                                                 &c_info.cipher,
                                                                                 &c_info.nonce_prefix,
@@ -755,13 +756,13 @@ pub async fn run_wrtc_server(
 
                                                                                 // 1. Приоритет №1: Прямой P2P DataChannel с клиентом (для p2p_direct и auto)
                                                                                 if let Some(ref p2p_entry) = p2p_session {
-                                                                                    if p2p_entry.send_packet(&enc_bytes).await.is_ok() {
+                                                                                    if pkt_len <= server_tun_mtu && p2p_entry.send_packet(&enc_bytes).await.is_ok() {
                                                                                         sent = true;
                                                                                     }
                                                                                 }
 
-                                                                                // 2. Приоритет №2: Режим MediaVideo (Fake Video Track over DTLS-SRTP / JVB)
-                                                                                if !sent && client_uses_video {
+                                                                                // 2. Приоритет №2: Режим MediaVideo (Fake Video Track over DTLS-SRTP / JVB), только если пакет помещается в PMTU
+                                                                                if !sent && client_uses_video && pkt_len <= server_tun_mtu {
                                                                                     if peer_downlink.send_video_frame_tagged(client_tag, &enc_bytes).await.is_ok() {
                                                                                         // До подтверждения приема видео от клиента дублируем в WS
                                                                                         if video_warmed_up {
@@ -772,7 +773,7 @@ pub async fn run_wrtc_server(
                                                                                     }
                                                                                 }
 
-                                                                                // 3. Если P2P и Video не сработали (или клиент в WS режиме), шлем через батчер (Colibri-WS)
+                                                                                // 3. Если P2P и Video не сработали (или пакет > server_tun_mtu / клиент в WS режиме), шлем через батчер (Colibri-WS)
                                                                                 if !sent {
                                                                                     batcher.push(enc_bytes);
                                                                                     if batcher.should_flush() {
@@ -799,6 +800,21 @@ pub async fn run_wrtc_server(
                                                                     packet = next_p;
                                                                 } else {
                                                                     break;
+                                                                }
+                                                            }
+
+                                                            // Немедленно отправляем накопленный батч по окончании текущего бурста из rx_router,
+                                                            // не дожидаясь срабатывания 3-миллисекундного таймера batch_interval!
+                                                            if !batcher.is_empty() {
+                                                                if let Some(batch_data) = batcher.flush() {
+                                                                    let b64 = BASE64_STANDARD.encode(&batch_data);
+                                                                    let msg = ColibriMessage::astp_batch(
+                                                                        target_client_id.clone(),
+                                                                        b64,
+                                                                    );
+                                                                    if peer_downlink.send(msg).await.is_err() {
+                                                                        break;
+                                                                    }
                                                                 }
                                                             }
                                                         }

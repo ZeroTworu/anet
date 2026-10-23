@@ -157,3 +157,19 @@ pub fn build_transport_config(cfg: &QuicConfig, mtu: u16) -> Result<TransportCon
 
     Ok(config)
 }
+
+pub const QUIC_UDP_SOCKET_BUFFER_SIZE: usize = 4 * 1024 * 1024;
+
+pub fn tune_udp_socket_buffers(sock: &tokio::net::UdpSocket, buffer_size: usize) {
+    let sock_ref = socket2::SockRef::from(sock);
+    let _ = sock_ref.set_recv_buffer_size(buffer_size);
+    let _ = sock_ref.set_send_buffer_size(buffer_size);
+    if let (Ok(rcv), Ok(snd)) = (sock_ref.recv_buffer_size(), sock_ref.send_buffer_size()) {
+        info!(
+            "[QUIC UDP] Tuned UDP socket buffers: SO_RCVBUF={} KiB, SO_SNDBUF={} KiB",
+            rcv / 1024,
+            snd / 1024
+        );
+    }
+}
+

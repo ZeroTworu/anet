@@ -1,25 +1,33 @@
 use super::{ClientTransport, ConnectionResult};
 use crate::auth::{AuthHandler, StreamAuthChannel};
 use crate::config::{CoreConfig, ServerConfig};
-use anet_common::consts::{CHANNEL_BUFFER_SIZE, MAX_PACKET_SIZE};
-use anet_common::stream_framing::{FrameReader, frame_packet};
+use anet_common::consts::{
+    CHANNEL_BUFFER_SIZE, COALESCE_BUDGET_BYTES, CRYPTO_COALESCE_BUDGET_BYTES, PADDING_MTU,
+};
+use anet_common::padding_utils::calculate_padding_needed;
+use anet_common::stream_framing::{FrameReader, frame_packet_into};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use bytes::Bytes;
-use log::{debug, info, warn};
+use bytes::{Bytes, BytesMut};
+use futures::future::BoxFuture;
+use futures::stream::FuturesUnordered;
+use futures::{FutureExt, StreamExt};
+use log::{info, warn};
+use rand::{Rng, SeedableRng, rngs::StdRng};
 use russh::client::Handler;
 use std::future::ready;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::Mutex;
 
 const SSH_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const SSH_CHANNEL_WINDOW_SIZE: u32 = 4 * 1024 * 1024;
 const SSH_MAX_PACKET_SIZE: u32 = 32 * 1024;
+const MAX_PENDING_JITTER_PACKETS: usize = 256;
 
 struct ClientHandler;
 
@@ -100,7 +108,7 @@ impl ClientTransport for SshTransport {
             .map_err(|_| anyhow::anyhow!("SSH authentication stream is still shared"))?
             .into_inner();
         let (reader, writer) = tokio::io::split(stream);
-        let (client_stream, internal_stream) = tokio::io::duplex(MAX_PACKET_SIZE * 10);
+        let (client_stream, internal_stream) = tokio::io::duplex(512 * 1024);
         let (tunnel_reader, tunnel_writer) = tokio::io::split(internal_stream);
 
         let cipher = Arc::new(anet_common::encryption::Cipher::new(&shared_key));
@@ -117,49 +125,23 @@ impl ClientTransport for SshTransport {
         tokio::spawn(async move {
             let tunnel_start = std::time::Instant::now();
             let _session_guard = ssh_session;
-            let (packet_tx, packet_rx) = mpsc::channel(CHANNEL_BUFFER_SIZE);
-            let (network_tx, mut network_rx) = mpsc::channel(CHANNEL_BUFFER_SIZE);
-            let mut tunnel_input = tokio::spawn(read_tunnel_packets(tunnel_reader, packet_tx));
-            let mut outbound = tokio::spawn(anet_common::jitter::bridge_crypto_stream_with_jitter(
-                packet_rx,
+            let mut outbound = tokio::spawn(send_to_server(
+                tunnel_reader,
                 writer,
                 stealth,
                 cipher.clone(),
                 sequence,
                 nonce_prefix,
             ));
-            let mut inbound = tokio::spawn(anet_common::jitter::receive_crypto_stream(
-                reader, network_tx, cipher,
-            ));
-            let mut tunnel_output = tokio::spawn(async move {
-                let mut tunnel_writer = tunnel_writer;
-                let mut count = 0u64;
-                while let Some(packet) = network_rx.recv().await {
-                    count += 1;
-                    tunnel_writer.write_all(&frame_packet(packet)).await?;
-                }
-                tunnel_writer.shutdown().await?;
-                debug!("[SSH/TunnelOutput] Tunnel writer finished after {count} packets");
-                Result::<()>::Ok(())
-            });
+            let mut inbound = tokio::spawn(receive_from_server(reader, tunnel_writer, cipher));
 
-            // `select!` уже забирает результат одной из задач. Её JoinHandle
-            // нельзя повторно poll-ить через `.await`: Tokio завершает процесс
-            // с "JoinHandle polled after completion". Запоминаем победителя,
-            // отменяем только остальные задачи и ждём только их.
             #[derive(Debug)]
             enum FinishedWorker {
-                TunnelInput,
                 Outbound,
                 Inbound,
-                TunnelOutput,
             }
 
             let (finished_worker, result) = tokio::select! {
-                result = &mut tunnel_input => (
-                    FinishedWorker::TunnelInput,
-                    flatten_worker_result("TUN reader", result),
-                ),
                 result = &mut outbound => (
                     FinishedWorker::Outbound,
                     flatten_worker_result("network writer", result),
@@ -168,16 +150,8 @@ impl ClientTransport for SshTransport {
                     FinishedWorker::Inbound,
                     flatten_worker_result("network reader", result),
                 ),
-                result = &mut tunnel_output => (
-                    FinishedWorker::TunnelOutput,
-                    flatten_worker_result("TUN writer", result),
-                ),
             };
 
-            if !matches!(finished_worker, FinishedWorker::TunnelInput) {
-                tunnel_input.abort();
-                let _ = tunnel_input.await;
-            }
             if !matches!(finished_worker, FinishedWorker::Outbound) {
                 outbound.abort();
                 let _ = outbound.await;
@@ -185,10 +159,6 @@ impl ClientTransport for SshTransport {
             if !matches!(finished_worker, FinishedWorker::Inbound) {
                 inbound.abort();
                 let _ = inbound.await;
-            }
-            if !matches!(finished_worker, FinishedWorker::TunnelOutput) {
-                tunnel_output.abort();
-                let _ = tunnel_output.await;
             }
 
             let duration = tunnel_start.elapsed().as_secs_f64();
@@ -198,16 +168,8 @@ impl ClientTransport for SshTransport {
                         "[SSH] Tunnel closed: remote SSH server closed channel/connection (EOF / session limit or idle timeout). Duration: {:.1}s ({:.2} min)",
                         duration, duration / 60.0
                     ),
-                    FinishedWorker::TunnelInput => info!(
-                        "[SSH] Tunnel closed: client TUN stream closed. Duration: {:.1}s",
-                        duration
-                    ),
                     FinishedWorker::Outbound => info!(
-                        "[SSH] Tunnel closed: outbound network queue closed. Duration: {:.1}s",
-                        duration
-                    ),
-                    FinishedWorker::TunnelOutput => info!(
-                        "[SSH] Tunnel closed: TUN writer closed. Duration: {:.1}s",
+                        "[SSH] Tunnel closed: client TUN stream or outbound network queue closed. Duration: {:.1}s",
                         duration
                     ),
                 },
@@ -220,20 +182,11 @@ impl ClientTransport for SshTransport {
 
         Ok(ConnectionResult {
             auth_response,
-            // `client_stream` — это одна половина tokio::io::duplex(), уже
-            // реализующая VpnStream (AsyncRead + AsyncWrite + Unpin + Send +
-            // Sync) сама по себе. Оборачивание в Arc<Mutex<>> здесь не давало
-            // никакой реальной защиты (сравни с websocket.rs/ahttp.rs/quic.rs,
-            // которые отдают такой же duplex-стрим без обёртки), а
-            // MutexVpnStream::poll_read/poll_write при этом на каждый вызов
-            // аллоцировал новый Box::pin(lock()) вместо переиспользования
-            // pending-future — под нагрузкой это чистый малловый оверхед на
-            // хот-пути.
             vpn_stream: Box::new(client_stream),
             endpoint: None,
             connection: None,
             health_pause: None,
-            remote_ip: Some(address.ip()), // Передаем IP в bypass
+            remote_ip: Some(address.ip()),
             bypass_ips: Vec::new(),
             effective_mode: None,
             shutdown_hook: None,
@@ -256,16 +209,165 @@ fn flatten_worker_result(
     result.with_context(|| format!("SSH {worker} task failed"))?
 }
 
-async fn read_tunnel_packets(
+async fn send_to_server<W>(
     mut tunnel_reader: tokio::io::ReadHalf<tokio::io::DuplexStream>,
-    packet_tx: mpsc::Sender<Bytes>,
-) -> Result<()> {
+    mut writer: W,
+    stealth: anet_common::config::StealthConfig,
+    cipher: Arc<anet_common::encryption::Cipher>,
+    sequence: Arc<AtomicU64>,
+    nonce_prefix: [u8; 4],
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let padding_step = stealth.padding_step;
+    let jitter_enabled = stealth.max_jitter_ns > stealth.min_jitter_ns;
+    let mut rng = StdRng::from_entropy();
+    let mut pending = FuturesUnordered::<BoxFuture<'static, Bytes>>::new();
+    let mut input_open = true;
     let mut frame_reader = FrameReader::new();
-    while let Some(packet) = frame_reader.read_next_packet(&mut tunnel_reader).await? {
-        packet_tx
-            .send(packet)
-            .await
-            .context("SSH packet queue closed")?;
+    let mut buf = BytesMut::with_capacity(CRYPTO_COALESCE_BUDGET_BYTES);
+
+    let encrypt_into = |packet: Bytes, buf: &mut BytesMut| -> Result<()> {
+        let seq = sequence.fetch_add(1, Ordering::Relaxed);
+        let total_len = packet.len() + 38;
+        let pad = calculate_padding_needed(total_len, padding_step);
+        let safe_pad = if total_len + usize::from(pad) > PADDING_MTU {
+            0
+        } else {
+            pad
+        };
+        let encrypted =
+            anet_common::transport::wrap_packet(&cipher, &nonce_prefix, seq, packet, safe_pad)?;
+        frame_packet_into(buf, &encrypted);
+        Ok(())
+    };
+
+    while input_open || !pending.is_empty() {
+        let mut packet = if !jitter_enabled {
+            match frame_reader.read_next_packet(&mut tunnel_reader).await? {
+                Some(packet) => packet,
+                None => break,
+            }
+        } else if pending.is_empty() {
+            match frame_reader.read_next_packet(&mut tunnel_reader).await? {
+                Some(packet) => {
+                    schedule_with_jitter(&mut pending, packet, &stealth, &mut rng);
+                    while let Some(next_pkt) = frame_reader.try_next_packet()? {
+                        schedule_with_jitter(&mut pending, next_pkt, &stealth, &mut rng);
+                    }
+                    continue;
+                }
+                None => {
+                    input_open = false;
+                    continue;
+                }
+            }
+        } else if !input_open || pending.len() >= MAX_PENDING_JITTER_PACKETS {
+            pending.next().await.expect("pending jitter queue is not empty")
+        } else {
+            tokio::select! {
+                res = frame_reader.read_next_packet(&mut tunnel_reader) => {
+                    match res? {
+                        Some(packet) => {
+                            schedule_with_jitter(&mut pending, packet, &stealth, &mut rng);
+                            while let Some(next_pkt) = frame_reader.try_next_packet()? {
+                                schedule_with_jitter(&mut pending, next_pkt, &stealth, &mut rng);
+                            }
+                            continue;
+                        }
+                        None => {
+                            input_open = false;
+                            continue;
+                        }
+                    }
+                }
+                packet = pending.next() => packet.expect("pending jitter queue is not empty"),
+            }
+        };
+
+        buf.clear();
+
+        loop {
+            if packet.len() >= 20 {
+                encrypt_into(packet, &mut buf)?;
+            }
+
+            if buf.len() >= CRYPTO_COALESCE_BUDGET_BYTES {
+                break;
+            }
+
+            if !jitter_enabled {
+                match frame_reader.try_next_packet()? {
+                    Some(p) => packet = p,
+                    None => break,
+                }
+            } else {
+                match pending.next().now_or_never().flatten() {
+                    Some(p) => packet = p,
+                    None => break,
+                }
+            }
+        }
+
+        if !buf.is_empty() {
+            writer.write_all(&buf).await?;
+        }
     }
+
+    writer.shutdown().await?;
     Ok(())
 }
+
+async fn receive_from_server<R>(
+    mut reader: R,
+    mut tunnel_writer: tokio::io::WriteHalf<tokio::io::DuplexStream>,
+    cipher: Arc<anet_common::encryption::Cipher>,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    let mut frame_reader = FrameReader::new();
+    let mut write_buf = BytesMut::with_capacity(COALESCE_BUDGET_BYTES);
+
+    while let Some(encrypted) = frame_reader.read_next_packet(&mut reader).await? {
+        write_buf.clear();
+        let packet = anet_common::transport::unwrap_packet_bytes_in_place(&cipher, encrypted)?;
+        frame_packet_into(&mut write_buf, &packet);
+
+        while write_buf.len() < COALESCE_BUDGET_BYTES {
+            match frame_reader.try_next_packet()? {
+                Some(next_enc) => {
+                    let next_pkt =
+                        anet_common::transport::unwrap_packet_bytes_in_place(&cipher, next_enc)?;
+                    frame_packet_into(&mut write_buf, &next_pkt);
+                }
+                None => break,
+            }
+        }
+
+        tunnel_writer.write_all(&write_buf).await?;
+    }
+
+    tunnel_writer.shutdown().await?;
+    Ok(())
+}
+
+fn schedule_with_jitter(
+    pending: &mut FuturesUnordered<BoxFuture<'static, Bytes>>,
+    packet: Bytes,
+    stealth: &anet_common::config::StealthConfig,
+    rng: &mut StdRng,
+) {
+    let delay = rng.gen_range(stealth.min_jitter_ns..=stealth.max_jitter_ns);
+    pending.push(
+        async move {
+            if delay > 0 {
+                tokio::time::sleep(Duration::from_nanos(delay)).await;
+            }
+            packet
+        }
+        .boxed(),
+    );
+}
+

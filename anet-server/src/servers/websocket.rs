@@ -2,7 +2,6 @@ use crate::auth_handler::ServerAuthHandler;
 use crate::client_registry::ClientRegistry;
 use crate::config::Config;
 use anet_common::consts::{CHANNEL_BUFFER_SIZE, COALESCE_BUDGET_BYTES};
-use anet_common::stream_framing::read_next_packet;
 use anyhow::{Context, Result};
 use bytes::{Bytes, BytesMut};
 use futures::{SinkExt, StreamExt};
@@ -108,10 +107,20 @@ async fn handle_session(
                     incoming = socket.next() => {
                         match incoming {
                             Some(Ok(Message::Binary(data))) => {
-                                // РАСПАКОВКА БАТЧА: Читаем все пакеты из одного Message
-                                let mut cursor = std::io::Cursor::new(data);
-                                while let Ok(Some(encrypted_packet)) = read_next_packet(&mut cursor).await {
-                                    match anet_common::transport::unwrap_packet_bytes(&cipher, encrypted_packet) {
+                                // РАСПАКОВКА БАТЧА: Читаем все пакеты из одного Message напрямую по срезам без Cursor и лишних аллокаций
+                                let mut offset = 0usize;
+                                while offset + 2 <= data.len() {
+                                    let len = u16::from_be_bytes([data[offset], data[offset + 1]]) as usize;
+                                    offset += 2;
+                                    if len == 0 {
+                                        continue;
+                                    }
+                                    if offset + len > data.len() {
+                                        break;
+                                    }
+                                    let encrypted_slice = &data[offset..offset + len];
+                                    offset += len;
+                                    match anet_common::transport::unwrap_packet(&cipher, encrypted_slice) {
                                         Ok(packet) => {
                                             let packet_len = packet.len();
 
@@ -149,7 +158,6 @@ async fn handle_session(
                     packet = rx_router.recv() => {
                         let Some(mut raw) = packet else { break; };
                         batch_buf.clear();
-                        let coalesce_deadline = tokio::time::Instant::now() + Duration::from_micros(250);
 
                         loop {
                             if raw.len() >= 20 {
@@ -169,19 +177,7 @@ async fn handle_session(
                             }
                             match rx_router.try_recv() {
                                 Ok(packet) => raw = packet,
-                                Err(mpsc::error::TryRecvError::Empty) => {
-                                    if batch_buf.len() < COALESCE_BUDGET_BYTES / 2
-                                        && tokio::time::Instant::now() < coalesce_deadline
-                                    {
-                                        match tokio::time::timeout_at(coalesce_deadline, rx_router.recv()).await {
-                                            Ok(Some(packet)) => raw = packet,
-                                            _ => break,
-                                        }
-                                    } else {
-                                        break;
-                                    }
-                                }
-                                Err(mpsc::error::TryRecvError::Disconnected) => break,
+                                Err(_) => break,
                             }
                         }
 

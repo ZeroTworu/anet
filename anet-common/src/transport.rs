@@ -2,7 +2,7 @@ use crate::consts::{NONCE_LEN, NONCE_PREFIX_LEN, PADDING_MTU, TRANSPORT_ENVELOPE
 use crate::encryption::{Cipher, EncryptionError};
 use crate::padding_utils::calculate_padding_needed;
 use anyhow::{Result, anyhow};
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 
 /// Упаковывает и шифрует QUIC-пакет с новым протоколом
 pub fn wrap_packet(
@@ -102,31 +102,28 @@ pub fn wrap_packet_padded(
     wrap_packet_slice(cipher, nonce_prefix, sequence, &payload, padding)
 }
 
-/// Расшифровывает пакет, полученный от сервера
+/// Расшифровывает пакет, полученный от сервера (одна аллокация + decrypt_in_place)
 pub fn unwrap_packet(cipher: &Cipher, raw_packet: &[u8]) -> Result<Bytes> {
-    if raw_packet.len() < NONCE_LEN + 1 {
-        // Nonce + минимум 1 байт payload
+    if raw_packet.len() < NONCE_LEN + 10 + 16 {
         return Err(anyhow!("Packet too short"));
     }
 
-    // Извлекаем nonce и зашифрованные данные
     let (nonce, ciphertext) = raw_packet.split_at(NONCE_LEN);
+    let mut buf = BytesMut::from(ciphertext);
+    cipher.decrypt_in_place(nonce, &mut buf)?;
 
-    // Расшифровываем
-    let mut plaintext = cipher.decrypt(nonce, Bytes::copy_from_slice(ciphertext))?;
-
-    if plaintext.len() < 10 {
+    let plaintext_len = buf.len() - 16;
+    if plaintext_len < 10 {
         return Err(anyhow!("Payload too short"));
     }
 
-    let _seq = plaintext.get_u64();
-    let data_len = plaintext.get_u16() as usize; // Читаем длину
-
-    if data_len > plaintext.remaining() {
+    let data_len = u16::from_be_bytes([buf[8], buf[9]]) as usize;
+    if 10 + data_len > plaintext_len {
         return Err(anyhow!("Malformed packet length"));
     }
-    // Обрезаем паддинг
-    Ok(plaintext.copy_to_bytes(data_len))
+
+    buf.truncate(10 + data_len);
+    Ok(buf.freeze().slice(10..10 + data_len))
 }
 
 /// Расшифровывает пакет на месте (без выделения памяти).

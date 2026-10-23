@@ -78,8 +78,8 @@ impl FrameReader {
                 return Ok(Some(pkt));
             }
 
-            if self.buf.capacity() < MAX_PACKET_SIZE + LENGTH_PREFIX_SIZE {
-                self.buf.reserve(COALESCE_BUDGET_BYTES);
+            if self.buf.capacity().saturating_sub(self.buf.len()) < COALESCE_BUDGET_BYTES {
+                self.buf.reserve(COALESCE_BUDGET_BYTES + MAX_PACKET_SIZE);
             }
 
             let n = reader.read_buf(&mut self.buf).await?;
