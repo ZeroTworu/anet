@@ -3,7 +3,7 @@
 
 use aya_ebpf::{
     bindings::{xdp_action, TC_ACT_OK, TC_ACT_SHOT},
-    helpers::{bpf_ktime_get_ns, bpf_skb_set_tstamp, bpf_xdp_adjust_head},
+    helpers::{bpf_ktime_get_ns, bpf_skb_set_tstamp},
     macros::{classifier, map, xdp},
     maps::HashMap,
     programs::{TcContext, XdpContext},
@@ -27,9 +27,6 @@ use ip::{
 /// (`aya_ebpf::bindings`) этот enum отсутствует, поэтому значение
 /// захардкожено — это стабильный UAPI ядра, он не меняется между релизами.
 const BPF_SKB_TSTAMP_DELIVERY_MONO: u32 = 1;
-
-/// Идентификатор внутритуннельного ICMP-зонда ANet (`0x414E`, "AN") в сетевом порядке байт.
-const ANET_PROBE_IDENT_BE: u16 = 0x414Eu16.to_be();
 
 /// Глобальные константы для `override_global` / `set_global` (резервный источник конфигурации).
 #[unsafe(no_mangle)]
@@ -382,45 +379,21 @@ fn try_astpl_xdp_ingress(ctx: &XdpContext) -> Result<u32, ()> {
         }
     }
 
-    // 5b. Если пакет является внутритуннельным ICMP Echo Request зондом ANet (`ident == 0x414E`),
-    // возвращаем исходное шифрование и отдаём `XDP_PASS` в Userspace-сокет `anet-server`,
-    // чтобы сервер мгновенно сформировал Echo Reply независимо от настроек IP/iptables на TUN.
-    if inner_ip.proto == IPPROTO_ICMP
-        && inner_ip.ihl() == 5
-        && w.data() + OUTER_HEADERS_LEN + Ipv4Hdr::LEN + 8 <= w.data_end()
-    {
-        let icmp_type = w.read_unaligned::<u8>(OUTER_HEADERS_LEN + Ipv4Hdr::LEN)?;
-        let icmp_ident = w.read_unaligned::<u16>(OUTER_HEADERS_LEN + Ipv4Hdr::LEN + 4)?;
-        if icmp_type == 8 && icmp_ident == ANET_PROBE_IDENT_BE {
-            let _ = xoroshiro_crypt_packet(&w, OUTER_HEADERS_LEN, crypto_seed, seq);
-            return Ok(xdp_action::XDP_PASS);
-        }
-    }
-
-    // 6. Проверяем Token-Bucket шейпер для upload-трафика клиента (в `RATE_RULES` ключ — `u32::from_be(assigned_ip)`).
-    if !check_upload_token_bucket(u32::from_be(assigned_ip), inner_tot_len as i64, now) {
-        warn!(
-            ctx,
-            "[ASTP-L XDP] dropped by upload token bucket: src={:i}, len={}",
-            u32::from_be(assigned_ip),
-            inner_tot_len
-        );
-        return Ok(xdp_action::XDP_DROP);
-    }
-
-    // 7. Декапсуляция на месте: копируем L2 Ethernet-заголовок на 36 байт вправо
-    // и сдвигаем указатель начала пакета через `bpf_xdp_adjust_head(ctx, 36)`.
-    w.write_unaligned::<EthHdr>(ASTPL_ENCAP_LEN, eth)?;
-    let adj_ret = unsafe { bpf_xdp_adjust_head(ctx.as_ptr() as *mut _, ASTPL_ENCAP_LEN as i32) };
-    if adj_ret < 0 {
-        warn!(ctx, "[ASTP-L XDP] bpf_xdp_adjust_head failed: ret={}", adj_ret);
-        return Ok(xdp_action::XDP_DROP);
-    }
+    // 5. Откатываем XOR обратно и передаём проверенный пакет через `XDP_PASS` в батчированный
+    // 16 МБ UDP-сокет `anet-server` -> `TunManager` (`anet-test`):
+    // - В драйвере `virtio_net` (KVM) прямой сдвиг `bpf_xdp_adjust_head(ctx, 36)` в `XdpMode::Driver`
+    //   оставляет метаданные `virtio_net_hdr` от внешнего UDP-пакета (`truesize = PAGE_SIZE`, `csum`)
+    //   и инжектирует пакет с `iif = ens3` (`in_dev == out_dev == ens3`), что вызывает `RTCF_DOREDIRECT`
+    //   (шторм ICMP Redirect) и сброс `cwnd` при транзитном Upload.
+    // - При инжекции через `anet-test` пакет входит в стек маршрутизации ядра с чистым `skb` и
+    //   корректным `iif = anet-test`, а фильтрация спуфинга/мусора (`XDP_DROP`), учёт `rx_bytes`
+    //   и мгновенный NAT Rebinding выполняются прямо в XDP на сетевой карте.
+    let _ = xoroshiro_crypt_packet(&w, OUTER_HEADERS_LEN, crypto_seed, seq);
 
     if inner_ip.proto == IPPROTO_ICMP || seq <= 20 || (seq & 0x3FF) == 0 {
         info!(
             ctx,
-            "[ASTP-L XDP] decap: seq={}, proto={}, len={}, {:i} -> {:i}",
+            "[ASTP-L XDP] verified: seq={}, proto={}, len={}, {:i} -> {:i}",
             seq,
             inner_ip.proto,
             inner_tot_len,

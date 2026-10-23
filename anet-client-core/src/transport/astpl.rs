@@ -40,7 +40,7 @@ impl ClientTransport for AstplTransport {
             .next()
             .ok_or_else(|| anyhow!("Invalid ASTP-L server address '{}'", addr_str))?;
 
-        let udp_socket = Arc::new(bind_astpl_udp_socket("0.0.0.0:0", false)?);
+        let udp_socket = Arc::new(bind_astpl_udp_socket("0.0.0.0:0", true)?);
         let channel = UdpAuthChannel::new(udp_socket.clone(), server_addr);
 
         let auth_handler = AuthHandler::new(&self.config, self.server.server_pub_key.as_deref())?;
@@ -84,9 +84,18 @@ impl ClientTransport for AstplTransport {
                     tx_seq = 1;
                 }
                 wrap_astpl_packet_into(&mut datagram, &nonce_prefix, tx_seq, crypto_seed, &packet);
-                if let Err(e) = tx_socket.send_to(&datagram, server_addr).await {
-                    warn!("[ASTP-L/TX] UDP send_to {} failed: {}", server_addr, e);
-                    break;
+                match tx_socket.try_send_to(&datagram, server_addr) {
+                    Ok(_) => {}
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if let Err(e) = tx_socket.send_to(&datagram, server_addr).await {
+                            warn!("[ASTP-L/TX] UDP send_to {} failed: {}", server_addr, e);
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        warn!("[ASTP-L/TX] UDP send_to {} failed: {}", server_addr, e);
+                        break;
+                    }
                 }
             }
             debug!("[ASTP-L/TX] Uplink task finished.");

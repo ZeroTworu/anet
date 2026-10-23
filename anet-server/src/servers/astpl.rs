@@ -176,10 +176,7 @@ impl AstplEbpfManager {
             }
         }
 
-        // Важно: в драйвере virtio_net вызов `virtnet_xdp_set` при `xdp.attach` пересчитывает
-        // `netdev_features_t` интерфейса (`netdev_update_features`), поэтому отключаем
-        // GRO/LRO повторно ПОСЛЕ прикрепления XDP-программы.
-        Self::disable_rx_coalescing_offloads(&eth_iface).await;
+        Self::restore_rx_offloads(&eth_iface).await;
 
         Ok(Self {
             ebpf: ebpf_arc,
@@ -502,14 +499,18 @@ impl AstplEbpfManager {
     }
 
     async fn configure_kernel_routing(eth_iface: &str, tun_iface: &str) {
-        // Для того чтобы декапсулированные в XDP на eth0 пакеты с src=10.0.0.x
-        // не отбрасывались ядром как martian source (rp_filter), отключаем rp_filter на eth_iface и tun_iface.
+        // Отключаем rp_filter и send_redirects на eth_iface и tun_iface,
+        // а также включаем ip_forward.
         for key in [
             "net.ipv4.ip_forward=1".to_string(),
             "net.ipv4.conf.all.rp_filter=0".to_string(),
             "net.ipv4.conf.default.rp_filter=0".to_string(),
             format!("net.ipv4.conf.{}.rp_filter=0", eth_iface),
             format!("net.ipv4.conf.{}.rp_filter=0", tun_iface),
+            "net.ipv4.conf.all.send_redirects=0".to_string(),
+            "net.ipv4.conf.default.send_redirects=0".to_string(),
+            format!("net.ipv4.conf.{}.send_redirects=0", eth_iface),
+            format!("net.ipv4.conf.{}.send_redirects=0", tun_iface),
         ] {
             let _ = Command::new("sysctl")
                 .args(["-w", &key])
@@ -519,32 +520,24 @@ impl AstplEbpfManager {
                 .await;
         }
 
-        Self::disable_rx_coalescing_offloads(eth_iface).await;
+        Self::restore_rx_offloads(eth_iface).await;
     }
 
-    /// Отключает GRO/LRO (`rx-gro`, `rx-gro-hw`, `rx-gro-list`, `rx-lro`) на внешнем интерфейсе:
-    /// 1. Напрямую через ядерный `ioctl(SIOCETHTOOL, ETHTOOL_SFEATURES)` (не требует установленного пакета `ethtool`).
-    /// 2. Дублирует вызовом `ethtool -K` (если утилита установлена в системе).
-    /// Это гарантирует, что `napi_gro_receive` на `ens3` не склеивает входящие TCP-сегменты (Download)
-    /// в GSO-суперпакеты (`skb->len > MTU`, `CHECKSUM_PARTIAL`), и все пакеты проходят через ядерный TC fast-path.
-    async fn disable_rx_coalescing_offloads(eth_iface: &str) {
-        match Self::disable_gro_lro_via_ioctl(eth_iface) {
-            Ok(disabled) if !disabled.is_empty() => {
+    /// Гарантирует, что стандартные RX-оффлоады (`rx-gro`, `rx-checksum`) на внешнем интерфейсе
+    /// включены (восстанавливает их, если они были отключены предыдущим запуском).
+    async fn restore_rx_offloads(eth_iface: &str) {
+        match Self::set_rx_offloads_via_ioctl(eth_iface, true) {
+            Ok(enabled) if !enabled.is_empty() => {
                 info!(
-                    "[ASTP-L eBPF] Disabled RX coalescing features on '{}' via SIOCETHTOOL: {}",
+                    "[ASTP-L eBPF] Restored RX offload features on '{}' via SIOCETHTOOL: {}",
                     eth_iface,
-                    disabled.join(", ")
+                    enabled.join(", ")
                 );
             }
-            Ok(_) => {
-                debug!(
-                    "[ASTP-L eBPF] SIOCETHTOOL on '{}' completed (no matching GRO/LRO features needed changes)",
-                    eth_iface
-                );
-            }
+            Ok(_) => {}
             Err(e) => {
-                warn!(
-                    "[ASTP-L eBPF] SIOCETHTOOL GRO/LRO disable on '{}' failed: {}",
+                debug!(
+                    "[ASTP-L eBPF] SIOCETHTOOL RX offload restore on '{}': {}",
                     eth_iface, e
                 );
             }
@@ -552,7 +545,7 @@ impl AstplEbpfManager {
 
         for bin in ["ethtool", "/usr/sbin/ethtool", "/sbin/ethtool"] {
             if let Ok(out) = Command::new(bin)
-                .args(["-K", eth_iface, "gro", "off", "lro", "off", "rx", "off"])
+                .args(["-K", eth_iface, "gro", "on", "rx", "on"])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .output()
@@ -565,7 +558,7 @@ impl AstplEbpfManager {
         }
     }
 
-    fn disable_gro_lro_via_ioctl(iface: &str) -> Result<Vec<String>> {
+    fn set_rx_offloads_via_ioctl(iface: &str, enable: bool) -> Result<Vec<String>> {
         #[cfg(target_os = "linux")]
         {
             use std::os::fd::AsRawFd;
@@ -632,7 +625,6 @@ impl AstplEbpfManager {
                 std::net::UdpSocket::bind("0.0.0.0:0").context("UdpSocket::bind for SIOCETHTOOL")?;
             let fd = sock.as_raw_fd();
 
-            // 1. Запрашиваем количество поддерживаемых фич (ETH_SS_FEATURES)
             let mut sset_info = EthtoolSsetInfo {
                 cmd: ETHTOOL_GSSET_INFO,
                 reserved: 0,
@@ -652,7 +644,6 @@ impl AstplEbpfManager {
                 return Ok(Vec::new());
             }
 
-            // 2. Читаем строковые имена фич (ETHTOOL_GSTRINGS)
             let mut gstrings = EthtoolGstrings {
                 cmd: ETHTOOL_GSTRINGS,
                 string_set: ETH_SS_FEATURES,
@@ -664,10 +655,6 @@ impl AstplEbpfManager {
                 return Err(std::io::Error::last_os_error()).context("ioctl(ETHTOOL_GSTRINGS)");
             }
 
-            // 3. Формируем битовую маску отключения для rx-gro / rx-gro-hw / rx-gro-list / rx-lro / rx-checksum.
-            // В драйвере virtio_net отключение `rx-checksum` (NETIF_F_RXCSUM) снимает флаг
-            // `VIRTIO_NET_F_GUEST_CSUM` через `virtnet_set_guest_offloads`, заставляя гипервизор KVM
-            // финализировать TCP/UDP-контрольные суммы до передачи пакетов в гостевую ОС (вместо `VIRTIO_NET_HDR_F_NEEDS_CSUM`).
             let n_blocks = (n_features + 31) / 32;
             let mut sfeatures = EthtoolSfeatures {
                 cmd: ETHTOOL_SFEATURES,
@@ -675,27 +662,28 @@ impl AstplEbpfManager {
                 features: [EthtoolSetFeaturesBlock::default(); MAX_FEATURE_BLOCKS],
             };
 
-            let mut disabled_names = Vec::new();
+            let mut changed_names = Vec::new();
             for idx in 0..n_features {
                 let raw = &gstrings.data[idx];
                 let end = raw.iter().position(|&c| c == 0).unwrap_or(ETH_GSTRING_LEN);
                 let Ok(feat_name) = std::str::from_utf8(&raw[..end]) else {
                     continue;
                 };
-                if matches!(
-                    feat_name,
-                    "rx-gro" | "rx-gro-hw" | "rx-gro-list" | "rx-lro" | "rx-checksum"
-                ) {
+                if matches!(feat_name, "rx-gro" | "rx-checksum") {
                     let block = idx / 32;
                     let bit = 1u32 << (idx % 32);
                     sfeatures.features[block].valid |= bit;
-                    sfeatures.features[block].requested &= !bit;
-                    disabled_names.push(feat_name.to_string());
+                    if enable {
+                        sfeatures.features[block].requested |= bit;
+                    } else {
+                        sfeatures.features[block].requested &= !bit;
+                    }
+                    changed_names.push(feat_name.to_string());
                 }
             }
 
-            if disabled_names.is_empty() {
-                return Ok(disabled_names);
+            if changed_names.is_empty() {
+                return Ok(changed_names);
             }
 
             ifr.ifr_data = (&mut sfeatures as *mut EthtoolSfeatures).cast();
@@ -703,11 +691,11 @@ impl AstplEbpfManager {
                 return Err(std::io::Error::last_os_error()).context("ioctl(ETHTOOL_SFEATURES)");
             }
 
-            Ok(disabled_names)
+            Ok(changed_names)
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = iface;
+            let _ = (iface, enable);
             Ok(Vec::new())
         }
     }
@@ -749,6 +737,7 @@ pub async fn run_astpl_server(
     auth_handler: ServerAuthHandler,
     tun_iface: String,
 ) -> Result<()> {
+    const SERVER_RX_BATCH_LIMIT: usize = 64;
     let bind_to = config.server.astpl_bind_to.trim();
     let socket = Arc::new(
         bind_astpl_udp_socket(bind_to, true)
@@ -758,7 +747,7 @@ pub async fn run_astpl_server(
     info!("Starting ASTP-L [eBPF XDP/TC + UDP Auth] Server on {}", local_addr);
 
     let shared_ebpf = registry.get_shaper().map(|s| s.ebpf());
-    match AstplEbpfManager::attach(&config, &tun_iface, local_addr, shared_ebpf).await {
+    let ebpf_active = match AstplEbpfManager::attach(&config, &tun_iface, local_addr, shared_ebpf).await {
         Ok(manager) => {
             let manager_arc = Arc::new(manager);
             registry.set_astpl_ebpf(manager_arc.clone());
@@ -771,219 +760,261 @@ pub async fn run_astpl_server(
                     sync_mgr.sync_with_registry(&sync_reg).await;
                 }
             });
+            true
         }
         Err(e) => {
             warn!(
                 "[ASTP-L] Failed to attach eBPF fast-path ({}). Operating in Userspace UDP fallback mode.",
                 e
             );
+            false
         }
-    }
+    };
 
     let reassemblers: Arc<DashMap<SocketAddr, (Instant, DatagramReassembler)>> =
         Arc::new(DashMap::new());
     let mut recv_buf = vec![0u8; MAX_PACKET_SIZE];
 
-    loop {
-        let (len, remote_addr) = match socket.recv_from(&mut recv_buf).await {
+    'outer: loop {
+        let (first_len, first_remote) = match socket.recv_from(&mut recv_buf).await {
             Ok(res) => res,
             Err(e) => {
                 warn!("[ASTP-L] UDP recv_from error: {}", e);
                 continue;
             }
         };
-        if len == 0 {
-            continue;
-        }
 
-        // 1. Проверяем, принадлежит ли пакет уже авторизованной ASTP-L сессии
-        //    (попадает сюда при `seq == 0` control-пакетах или в режиме Userspace fallback).
-        if len >= ASTPL_HEADER_LEN {
-            if let Ok(nonce_prefix) = recv_buf[..4].try_into() {
-                if let Some(client_info) = registry.get_by_prefix(&nonce_prefix) {
-                    if client_info.protocol == "astpl" {
-                        let expected_ip = client_info.assigned_ip.parse::<Ipv4Addr>().ok();
-                        match unwrap_astpl_packet_in_place(
-                            client_info.crypto_seed,
-                            &mut recv_buf[..len],
-                            expected_ip,
-                        ) {
-                            Ok((_prefix, seq, inner_pkt)) => {
-                                let prev_addr = **client_info.remote_addr.load();
-                                registry.update_client_addr(&client_info, remote_addr);
-                                if prev_addr != remote_addr {
-                                    if let Some(ebpf_mgr) = registry.get_astpl_ebpf() {
-                                        let ci = client_info.clone();
-                                        tokio::spawn(async move {
-                                            ebpf_mgr.update_session_endpoint(&ci, remote_addr).await;
-                                        });
-                                    }
-                                }
+        let mut len = first_len;
+        let mut remote_addr = first_remote;
+        let mut batched = 0usize;
 
-                                if seq == 0 {
-                                    registry.touch_client(&client_info);
-                                    continue;
-                                }
+        loop {
+            if len > 0 {
+                let mut handled_data = false;
 
-                                // Обработка внутритуннельного ICMP Echo Request зонда (0x414E)
-                                if let Some(reply) =
-                                    anet_common::icmp_probe::handle_in_tunnel_icmp_probe(inner_pkt)
-                                {
-                                    registry.touch_client(&client_info);
-                                    registry
-                                        .route_packet_to_client(&client_info.assigned_ip, reply)
-                                        .await;
-                                    continue;
-                                }
-
-                                let pkt_len = inner_pkt.len();
-                                let pkt_bytes = Bytes::copy_from_slice(inner_pkt);
-                                match tun_tx.try_send(pkt_bytes) {
-                                    Ok(_) => {
-                                        registry.record_rx(&client_info, pkt_len, "astpl");
-                                    }
-                                    Err(mpsc::error::TrySendError::Full(_)) => {
-                                        warn!(
-                                            "[ASTP-L] TUN channel full, dropping packet from {}",
-                                            client_info.assigned_ip
-                                        );
-                                    }
-                                    Err(mpsc::error::TrySendError::Closed(_)) => break,
-                                }
-                                continue;
-                            }
-                            Err(e) => {
-                                // Если пакет пришёл с известным nonce_prefix активной сессии,
-                                // но внутренний пакет не прошёл проверку (например, IPv6 или старый src_ip
-                                // от открытых до VPN сокетов клиента), не отправляем его в DatagramReassembler.
-                                debug!(
-                                    "[ASTP-L] Dropped non-IPv4/mismatched packet for session {} from {}: {}",
-                                    client_info.assigned_ip, remote_addr, e
-                                );
-                                continue;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // 2. Пакет не принадлежит активной сессии — собираем фрагменты хендшейка через DatagramReassembler
-        let complete: Option<Vec<u8>> = {
-            let mut entry = reassemblers
-                .entry(remote_addr)
-                .and_modify(|(ts, reassembler)| {
-                    if ts.elapsed() > REASSEMBLY_TIMEOUT {
-                        *reassembler = DatagramReassembler::new();
-                    }
-                    *ts = Instant::now();
-                })
-                .or_insert_with(|| (Instant::now(), DatagramReassembler::new()));
-
-            entry.1.feed(&recv_buf[..len])
-        };
-
-        debug!("[ASTP-L] Reassembling handshake fragment from {}", remote_addr);
-        let Some(complete) = complete else {
-            continue;
-        };
-        reassemblers.remove(&remote_addr);
-
-        if complete.len() < MIN_HANDSHAKE_LEN {
-            warn!(
-                "[ASTP-L] Reassembled handshake too short from {} ({} bytes), dropping",
-                remote_addr,
-                complete.len()
-            );
-            continue;
-        }
-
-        let packet_copy = Bytes::from(complete);
-        let handler = auth_handler.clone();
-        let sock = socket.clone();
-        let reg = registry.clone();
-
-        tokio::spawn(async move {
-            match handler
-                .process_handshake_packet(packet_copy, remote_addr, "astpl")
-                .await
-            {
-                Ok((Some(resp_bytes), auth_tuple)) => {
-                    if let Some((client_info, _auth_resp)) = auth_tuple {
-                        // Запускаем задачу отправки пакетов из userspace (для ICMP-ответов и Userspace fallback).
-                        // Используем старший бит seq (0x8000_0000), чтобы последовательности не пересекались с ядерным tx_seq.
-                        let (tx_router, mut rx_router) =
-                            mpsc::channel::<Bytes>(CHANNEL_BUFFER_SIZE);
-                        reg.finalize_client(&client_info.assigned_ip, tx_router);
-
-                        // Регистрируем сессию в ядерных BPF-картах ДО отправки AuthResponse клиенту,
-                        // чтобы первый же пакет данных клиента гарантированно попал в XDP fast-path.
-                        if let Some(ebpf_mgr) = reg.get_astpl_ebpf() {
-                            if let Err(e) = ebpf_mgr.register_session(&client_info).await {
-                                error!(
-                                    "[ASTP-L eBPF] Failed to populate BPF maps for {}: {}",
-                                    client_info.assigned_ip, e
-                                );
-                            }
-                        }
-
-                        let ci_writer = client_info.clone();
-                        let sock_writer = sock.clone();
-                        tokio::spawn(async move {
-                            let mut wrap_buf = Vec::with_capacity(MAX_PACKET_SIZE);
-                            while let Some(mut inner_ip_pkt) = rx_router.recv().await {
-                                loop {
-                                    let raw_seq =
-                                        ci_writer.sequence.fetch_add(1, Ordering::Relaxed) as u32;
-                                    let seq = raw_seq.wrapping_add(1).max(1);
-                                    wrap_astpl_packet_into(
-                                        &mut wrap_buf,
-                                        &ci_writer.nonce_prefix,
-                                        seq,
-                                        ci_writer.crypto_seed,
-                                        &inner_ip_pkt,
-                                    );
-                                    let dst = **ci_writer.remote_addr.load();
-                                    match sock_writer.try_send_to(&wrap_buf, dst) {
-                                        Ok(_) => {}
-                                        Err(ref e)
-                                            if e.kind() == std::io::ErrorKind::WouldBlock =>
-                                        {
-                                            if let Err(e) =
-                                                sock_writer.send_to(&wrap_buf, dst).await
-                                            {
-                                                warn!(
-                                                    "[ASTP-L] UDP send_to error for {} ({}): {}",
-                                                    ci_writer.assigned_ip, dst, e
-                                                );
-                                                break;
+                // 1. Проверяем, принадлежит ли пакет уже авторизованной ASTP-L сессии
+                if len >= ASTPL_HEADER_LEN {
+                    if let Ok(nonce_prefix) = recv_buf[..4].try_into() {
+                        if let Some(client_info) = registry.get_by_prefix(&nonce_prefix) {
+                            if client_info.protocol == "astpl" {
+                                handled_data = true;
+                                let expected_ip = client_info.assigned_ip.parse::<Ipv4Addr>().ok();
+                                match unwrap_astpl_packet_in_place(
+                                    client_info.crypto_seed,
+                                    &mut recv_buf[..len],
+                                    expected_ip,
+                                ) {
+                                    Ok((_prefix, seq, inner_pkt)) => {
+                                        let prev_addr = **client_info.remote_addr.load();
+                                        if prev_addr != remote_addr {
+                                            registry.update_client_addr(&client_info, remote_addr);
+                                            if let Some(ebpf_mgr) = registry.get_astpl_ebpf() {
+                                                let ci = client_info.clone();
+                                                tokio::spawn(async move {
+                                                    ebpf_mgr
+                                                        .update_session_endpoint(&ci, remote_addr)
+                                                        .await;
+                                                });
                                             }
                                         }
-                                        Err(e) => {
-                                            warn!(
-                                                "[ASTP-L] UDP send_to error for {} ({}): {}",
-                                                ci_writer.assigned_ip, dst, e
-                                            );
-                                            break;
+
+                                        if seq == 0 {
+                                            registry.touch_client(&client_info);
+                                        } else if let Some(reply) =
+                                            anet_common::icmp_probe::handle_in_tunnel_icmp_probe(
+                                                inner_pkt,
+                                            )
+                                        {
+                                            registry.touch_client(&client_info);
+                                            registry
+                                                .route_packet_to_client(
+                                                    &client_info.assigned_ip,
+                                                    reply,
+                                                )
+                                                .await;
+                                        } else {
+                                            let pkt_len = inner_pkt.len();
+                                            let pkt_bytes = Bytes::copy_from_slice(inner_pkt);
+                                            match tun_tx.try_send(pkt_bytes) {
+                                                Ok(_) => {
+                                                    if !ebpf_active {
+                                                        registry.record_rx(
+                                                            &client_info,
+                                                            pkt_len,
+                                                            "astpl",
+                                                        );
+                                                    }
+                                                }
+                                                Err(mpsc::error::TrySendError::Full(pkt_bytes)) => {
+                                                    if tun_tx.send(pkt_bytes).await.is_err() {
+                                                        break 'outer;
+                                                    }
+                                                    if !ebpf_active {
+                                                        registry.record_rx(
+                                                            &client_info,
+                                                            pkt_len,
+                                                            "astpl",
+                                                        );
+                                                    }
+                                                }
+                                                Err(mpsc::error::TrySendError::Closed(_)) => {
+                                                    break 'outer;
+                                                }
+                                            }
                                         }
                                     }
-                                    match rx_router.try_recv() {
-                                        Ok(next_pkt) => inner_ip_pkt = next_pkt,
-                                        Err(_) => break,
+                                    Err(e) => {
+                                        debug!(
+                                            "[ASTP-L] Dropped non-IPv4/mismatched packet for session {} from {}: {}",
+                                            client_info.assigned_ip, remote_addr, e
+                                        );
                                     }
                                 }
                             }
-                        });
+                        }
                     }
-
-                    let _ = sock.send_to(&resp_bytes, remote_addr).await;
                 }
-                Ok((None, _)) => {}
-                Err(e) => {
-                    warn!("[ASTP-L Handshake fail] {}: {}", remote_addr, e);
+
+                if !handled_data {
+                    // 2. Пакет не принадлежит активной сессии — собираем фрагменты хендшейка через DatagramReassembler
+                    let complete: Option<Vec<u8>> = {
+                        let mut entry = reassemblers
+                            .entry(remote_addr)
+                            .and_modify(|(ts, reassembler)| {
+                                if ts.elapsed() > REASSEMBLY_TIMEOUT {
+                                    *reassembler = DatagramReassembler::new();
+                                }
+                                *ts = Instant::now();
+                            })
+                            .or_insert_with(|| (Instant::now(), DatagramReassembler::new()));
+
+                        entry.1.feed(&recv_buf[..len])
+                    };
+
+                    debug!("[ASTP-L] Reassembling handshake fragment from {}", remote_addr);
+                    if let Some(complete) = complete {
+                        reassemblers.remove(&remote_addr);
+
+                        if complete.len() < MIN_HANDSHAKE_LEN {
+                            warn!(
+                                "[ASTP-L] Reassembled handshake too short from {} ({} bytes), dropping",
+                                remote_addr,
+                                complete.len()
+                            );
+                        } else {
+                            let packet_copy = Bytes::from(complete);
+                            let handler = auth_handler.clone();
+                            let sock = socket.clone();
+                            let reg = registry.clone();
+
+                            tokio::spawn(async move {
+                                match handler
+                                    .process_handshake_packet(packet_copy, remote_addr, "astpl")
+                                    .await
+                                {
+                                    Ok((Some(resp_bytes), auth_tuple)) => {
+                                        if let Some((client_info, _auth_resp)) = auth_tuple {
+                                            let (tx_router, mut rx_router) =
+                                                mpsc::channel::<Bytes>(CHANNEL_BUFFER_SIZE);
+                                            reg.finalize_client(&client_info.assigned_ip, tx_router);
+
+                                            if let Some(ebpf_mgr) = reg.get_astpl_ebpf() {
+                                                if let Err(e) =
+                                                    ebpf_mgr.register_session(&client_info).await
+                                                {
+                                                    error!(
+                                                        "[ASTP-L eBPF] Failed to populate BPF maps for {}: {}",
+                                                        client_info.assigned_ip, e
+                                                    );
+                                                }
+                                            }
+
+                                            let ci_writer = client_info.clone();
+                                            let sock_writer = sock.clone();
+                                            tokio::spawn(async move {
+                                                let mut wrap_buf =
+                                                    Vec::with_capacity(MAX_PACKET_SIZE);
+                                                while let Some(mut inner_ip_pkt) =
+                                                    rx_router.recv().await
+                                                {
+                                                    loop {
+                                                        let raw_seq = ci_writer
+                                                            .sequence
+                                                            .fetch_add(1, Ordering::Relaxed)
+                                                            as u32;
+                                                        let seq = raw_seq.wrapping_add(1).max(1);
+                                                        wrap_astpl_packet_into(
+                                                            &mut wrap_buf,
+                                                            &ci_writer.nonce_prefix,
+                                                            seq,
+                                                            ci_writer.crypto_seed,
+                                                            &inner_ip_pkt,
+                                                        );
+                                                        let dst = **ci_writer.remote_addr.load();
+                                                        match sock_writer
+                                                            .try_send_to(&wrap_buf, dst)
+                                                        {
+                                                            Ok(_) => {}
+                                                            Err(ref e)
+                                                                if e.kind()
+                                                                    == std::io::ErrorKind::WouldBlock =>
+                                                            {
+                                                                if let Err(e) = sock_writer
+                                                                    .send_to(&wrap_buf, dst)
+                                                                    .await
+                                                                {
+                                                                    warn!(
+                                                                        "[ASTP-L] UDP send_to error for {} ({}): {}",
+                                                                        ci_writer.assigned_ip,
+                                                                        dst,
+                                                                        e
+                                                                    );
+                                                                    break;
+                                                                }
+                                                            }
+                                                            Err(e) => {
+                                                                warn!(
+                                                                    "[ASTP-L] UDP send_to error for {} ({}): {}",
+                                                                    ci_writer.assigned_ip, dst, e
+                                                                );
+                                                                break;
+                                                            }
+                                                        }
+                                                        match rx_router.try_recv() {
+                                                            Ok(next_pkt) => inner_ip_pkt = next_pkt,
+                                                            Err(_) => break,
+                                                        }
+                                                    }
+                                                }
+                                            });
+                                        }
+
+                                        let _ = sock.send_to(&resp_bytes, remote_addr).await;
+                                    }
+                                    Ok((None, _)) => {}
+                                    Err(e) => {
+                                        warn!("[ASTP-L Handshake fail] {}: {}", remote_addr, e);
+                                    }
+                                }
+                            });
+                        }
+                    }
                 }
             }
-        });
+
+            batched += 1;
+            if batched >= SERVER_RX_BATCH_LIMIT {
+                break;
+            }
+            match socket.try_recv_from(&mut recv_buf) {
+                Ok((next_len, next_remote)) => {
+                    len = next_len;
+                    remote_addr = next_remote;
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(_) => break,
+            }
+        }
     }
 
     Ok(())
