@@ -237,6 +237,8 @@ pub async fn run_wrtc_server(
 
         let client_video_warmed_up: Arc<DashSet<u16>> = Arc::new(DashSet::new());
         let client_video_warmed_rx = client_video_warmed_up.clone();
+        let client_last_ws_batch_ms: Arc<DashMap<u16, u64>> = Arc::new(DashMap::new());
+        let client_last_ws_batch_rx = client_last_ws_batch_ms.clone();
         let video_uplink_task = tokio::spawn(async move {
             while let Some(first_frame) = peer_video_rx.recv_video_frame().await {
                 let mut current_frame = Some(first_frame);
@@ -254,7 +256,12 @@ pub async fn run_wrtc_server(
 
                     let raw_astp = raw_frame.slice(2..);
                     if let Ok(decrypted) = unwrap_packet_bytes(&client_info.cipher, raw_astp) {
-                        if client_video_warmed_rx.insert(client_tag) {
+                        let now_ms = peer_video_rx.start_instant.elapsed().as_millis() as u64;
+                        let ws_batch_recent = client_last_ws_batch_rx
+                            .get(&client_tag)
+                            .map(|ts| now_ms.saturating_sub(*ts) < 500)
+                            .unwrap_or(false);
+                        if !ws_batch_recent && client_video_warmed_rx.insert(client_tag) {
                             peer_video_rx.force_next_keyframe();
                             info!(
                                 "[WRTC Server Video IN] First video frame decrypted from client {} (len: {} bytes, tag: 0x{:04X})",
@@ -774,6 +781,13 @@ pub async fn run_wrtc_server(
                             let packets = unpack_batch(&raw_bytes);
                             if let Some(client_info) = clients_map.get(&from_endpoint) {
                                 if reg_clone.get_by_session(&client_info.session_id).is_some() {
+                                    let c_tag = anet_common::wrtc::colibri::client_tag_from_ip(
+                                        &client_info.assigned_ip,
+                                    );
+                                    let now_ms =
+                                        shared_peer.start_instant.elapsed().as_millis() as u64;
+                                    client_last_ws_batch_ms.insert(c_tag, now_ms);
+                                    client_video_warmed_up.remove(&c_tag);
                                     for enc_pkt in packets {
                                         match unwrap_packet_bytes(
                                             &client_info.cipher,

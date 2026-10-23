@@ -168,6 +168,23 @@ impl ClientTransport for WrtcTransport {
 
         let mut bypass_ips: Vec<std::net::IpAddr> = Vec::new();
 
+        if let Some(ip) = xmpp.remote_ip {
+            if !ip.is_loopback() {
+                bypass_ips.push(ip);
+            }
+        }
+        if let Ok(ip) = domain.parse::<std::net::IpAddr>() {
+            if !ip.is_loopback() {
+                bypass_ips.push(ip);
+            }
+        } else if let Ok(resolved) = tokio::net::lookup_host((domain.as_str(), 443)).await {
+            for addr in resolved {
+                if !addr.ip().is_loopback() {
+                    bypass_ips.push(addr.ip());
+                }
+            }
+        }
+
         if let Some(ref ws_url) = session.transport.colibri_ws_url {
             if let Ok(uri) = ws_url.parse::<http::Uri>() {
                 if let Some(host) = uri.host() {
@@ -606,6 +623,8 @@ impl ClientTransport for WrtcTransport {
         let p2p_uplink = p2p_session_opt.clone();
         let first_client_rx = Arc::new(AtomicBool::new(true));
         let first_client_rx_tx = first_client_rx.clone();
+        let last_video_rx_secs = Arc::new(AtomicU64::new(0));
+        let last_video_rx_tx = last_video_rx_secs.clone();
 
         let tunnel_ping_interval_secs = self.config.wrtc.tunnel_ping_interval_secs.max(1);
         let tunnel_ping_timeout_secs = self.config.wrtc.tunnel_ping_timeout_secs.max(5);
@@ -655,7 +674,11 @@ impl ClientTransport for WrtcTransport {
                             if packet.len() >= WRTC_MIN_IP_PACKET_LEN {
                                 // Zero-delay micro-batching мелких пакетов (TCP ACK, DNS) в единый VP8 RTP кадр
                                 let is_v2 = peer_tx.is_video_v2();
-                                let video_warmed_up = !first_client_rx_tx.load(Ordering::Relaxed);
+                                let last_v_rx = last_video_rx_tx.load(Ordering::Relaxed);
+                                let video_warmed_up = !first_client_rx_tx.load(Ordering::Relaxed)
+                                    && peer_tx.is_connected.load(Ordering::Relaxed)
+                                    && (last_v_rx > 0
+                                        && current_timestamp_secs().saturating_sub(last_v_rx) <= 5);
                                 let mut batched_payload = false;
 
                                 if use_video && is_v2 && video_warmed_up && (packet.len() + 3 < max_video_batch_bytes) {
@@ -992,6 +1015,7 @@ impl ClientTransport for WrtcTransport {
                             let raw_len = raw_astp.len();
                             match unwrap_packet_bytes(&cipher_video, raw_astp) {
                                 Ok(decrypted) => {
+                                    last_video_rx_secs.store(current_timestamp_secs(), Ordering::Relaxed);
                                     if first_client_rx.swap(false, Ordering::Relaxed) {
                                         info!(
                                             "[WRTC Client Video IN] First video frame decrypted from server (len: {} bytes, tag: 0x{:04X})",
@@ -1039,6 +1063,11 @@ impl ClientTransport for WrtcTransport {
         info!("[WRTC] Active transport mode: {:?}", effective_mode.as_deref().unwrap_or("UNKNOWN"));
         status(format!("[WRTC] Effective mode: {:?}", effective_mode.as_deref().unwrap_or("UNKNOWN")));
 
+        if let Some(ws_ip) = shared_peer.colibri_ws_ip() {
+            if !ws_ip.is_loopback() && !bypass_ips.contains(&ws_ip) {
+                bypass_ips.push(ws_ip);
+            }
+        }
         let remote_ip = bypass_ips.first().copied();
         let xmpp_shutdown = Arc::clone(&xmpp_arc);
         let peer_shutdown = Arc::clone(&shared_peer);

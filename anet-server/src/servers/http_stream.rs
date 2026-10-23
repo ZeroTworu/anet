@@ -269,7 +269,7 @@ async fn handle_http_connection(
                             // 2. Отдача Downlink-трафика
                             let mut body_buf = BytesMut::new();
                             let padding_step = config.stealth.padding_step;
-                            let coalesce_budget = config.ahttp.coalesce_budget_bytes.min(65536);
+                            let coalesce_budget = config.ahttp.coalesce_budget_bytes.max(4096);
                             let is_heavy_uplink = content_length >= 8192;
 
                             // Для крупных Uplink-батчей (>= 8 КБ) НЕ блокируем ответ на poll_timeout_ms,
