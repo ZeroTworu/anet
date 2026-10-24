@@ -16,7 +16,6 @@ export type Server = {
     wrtc_url: string | null
     wrtc_mode: string | null
     doh_url: string | null
-    doh_mode: string | null
 }
 
 export type NodeRuntime = {
@@ -65,5 +64,4 @@ export type CreateServerRequest = {
     wrtc_url?: string | null
     wrtc_mode?: string | null
     doh_url?: string | null
-    doh_mode?: string | null
 }

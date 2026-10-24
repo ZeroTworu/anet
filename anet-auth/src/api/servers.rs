@@ -139,7 +139,6 @@ impl ServersApi {
             wrtc_url: Set(req.0.wrtc_url.clone()),
             wrtc_mode: Set(req.0.wrtc_mode.clone()),
             doh_url: Set(req.0.doh_url.clone()),
-            doh_mode: Set(req.0.doh_mode.clone()),
             ssh_user: Set(req.0.ssh_user.clone()),
             is_active: Set(req.0.is_active.unwrap_or(true)),
             control_token_hash: Set(None),
@@ -161,7 +160,6 @@ impl ServersApi {
                 wrtc_url: saved.wrtc_url,
                 wrtc_mode: saved.wrtc_mode,
                 doh_url: saved.doh_url,
-                doh_mode: saved.doh_mode,
                 ssh_user: saved.ssh_user,
                 is_active: saved.is_active,
                 has_control_credential: saved.control_token_hash.is_some(),
@@ -255,10 +253,6 @@ impl ServersApi {
             active_model.doh_url = Set(doh_url);
             changed = true;
         }
-        if let Some(doh_mode) = req.0.doh_mode {
-            active_model.doh_mode = Set(doh_mode);
-            changed = true;
-        }
 
         if changed {
             active_model.updated_at = Set(Utc::now().naive_utc());
@@ -276,7 +270,6 @@ impl ServersApi {
                     wrtc_url: saved.wrtc_url,
                     wrtc_mode: saved.wrtc_mode,
                     doh_url: saved.doh_url,
-                    doh_mode: saved.doh_mode,
                     ssh_user: saved.ssh_user,
                     is_active: saved.is_active,
                     has_control_credential: saved.control_token_hash.is_some(),
@@ -298,7 +291,6 @@ impl ServersApi {
                 wrtc_url: server_model.wrtc_url,
                 wrtc_mode: server_model.wrtc_mode,
                 doh_url: server_model.doh_url,
-                doh_mode: server_model.doh_mode,
                 ssh_user: server_model.ssh_user,
                 is_active: server_model.is_active,
                 has_control_credential: server_model.control_token_hash.is_some(),
@@ -354,7 +346,6 @@ impl ServersApi {
                         wrtc_url: s.wrtc_url,
                         wrtc_mode: s.wrtc_mode,
                         doh_url: s.doh_url,
-                        doh_mode: s.doh_mode,
                         ssh_user: s.ssh_user,
                         is_active: s.is_active,
                         has_control_credential: s.control_token_hash.is_some(),

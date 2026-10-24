@@ -4,6 +4,12 @@ import { CreatePool, UpdatePool } from '@/api/pools'
 import type { NodePool, ProtocolType, SaveNodePoolRequest } from '@/models/pool'
 import type { Server } from '@/models/server'
 import { useAppMessage } from '@/composables/useAppMessage'
+import {
+  DEFAULT_DOH_RESOLVERS,
+  PRESET_DOH_RESOLVERS,
+  parseDohDsn,
+  buildDohDsn,
+} from '@/utils/doh'
 
 const show = defineModel<boolean>()
 
@@ -19,7 +25,25 @@ const emit = defineEmits<{
 
 const message = useAppMessage()
 
-const form = ref<SaveNodePoolRequest>({
+type PoolMemberFormItem = {
+  server_id: string
+  protocol: ProtocolType
+  port_or_url: string
+  wrtc_mode: string
+  weight: number
+  doh_domain: string
+  doh_resolvers: string[]
+  doh_arq: boolean
+  doh_dup_hs: boolean
+  doh_hold_ms: number
+}
+
+const form = ref<{
+  name: string
+  strategy: 'weighted' | 'least_connections'
+  is_active: boolean
+  members: PoolMemberFormItem[]
+}>({
   name: '',
   strategy: 'weighted',
   is_active: true,
@@ -51,14 +75,9 @@ const wrtcModeOptions = [
   { title: 'Auto (Автоматический выбор)', value: 'auto' },
 ]
 
-const dohModeOptions = [
-  { title: 'Authoritative (прямые ASTP-L DNS-запросы к NS)', value: 'authoritative' },
-  { title: 'Recursive (через публичный DoH-резолвер)', value: 'recursive' },
-]
-
 const getEndpointPlaceholder = (protocol: ProtocolType) => {
   if (protocol === 'doh') {
-    return 'doh://ns1.anet.internal?resolver=https://77.88.8.7/dns-query'
+    return 't1.anet-project.org'
   }
   if (protocol === 'ahttp' || protocol === 'ws' || protocol === 'wrtc') {
     return 'URL (напр. cdn / room / tunnel)'
@@ -68,6 +87,42 @@ const getEndpointPlaceholder = (protocol: ProtocolType) => {
 
 const serverById = computed(() => new Map(props.servers.map(server => [server.id, server])))
 
+const syncMemberDohDsn = (member: PoolMemberFormItem) => {
+  if (member.protocol !== 'doh') return
+  // Если пользователь вставил полный URL с ?resolver=..., распарсим его
+  if (member.doh_domain.includes('?') || member.doh_domain.includes('://')) {
+    const parsed = parseDohDsn(member.doh_domain)
+    member.doh_domain = parsed.domain
+    if (member.doh_domain.includes('?')) {
+      member.doh_resolvers = parsed.resolvers
+      member.doh_arq = parsed.arq
+      member.doh_dup_hs = parsed.dup_hs
+      member.doh_hold_ms = parsed.hold_ms
+    }
+  }
+  member.port_or_url = buildDohDsn({
+    domain: member.doh_domain,
+    resolvers: member.doh_resolvers,
+    arq: member.doh_arq,
+    dup_hs: member.doh_dup_hs,
+    hold_ms: member.doh_hold_ms,
+  })
+}
+
+const onMemberProtocolChange = (member: PoolMemberFormItem) => {
+  if (member.protocol === 'doh') {
+    const serverDohUrl = serverById.value.get(member.server_id)?.doh_url || ''
+    const rawSource = member.port_or_url || serverDohUrl
+    const parsed = parseDohDsn(rawSource)
+    member.doh_domain = parsed.domain
+    member.doh_resolvers = parsed.resolvers
+    member.doh_arq = parsed.arq
+    member.doh_dup_hs = parsed.dup_hs
+    member.doh_hold_ms = parsed.hold_ms
+    syncMemberDohDsn(member)
+  }
+}
+
 watch(
     () => props.pool,
     (newVal) => {
@@ -76,14 +131,27 @@ watch(
           name: newVal.name,
           strategy: newVal.strategy,
           is_active: newVal.is_active,
-          members: newVal.members.map(member => ({
-            server_id: member.server_id,
-            protocol: member.protocol || 'quic',
-            port_or_url: member.port_or_url || '',
-            wrtc_mode: member.wrtc_mode || 'media_video',
-            doh_mode: member.doh_mode || 'authoritative',
-            weight: member.weight || 1,
-          })),
+          members: newVal.members.map(member => {
+            const proto = member.protocol || 'quic'
+            const serverDohUrl = serverById.value.get(member.server_id)?.doh_url || ''
+            const parsedDoh = parseDohDsn(proto === 'doh' ? (member.port_or_url || serverDohUrl) : '')
+            const item: PoolMemberFormItem = {
+              server_id: member.server_id,
+              protocol: proto,
+              port_or_url: member.port_or_url || '',
+              wrtc_mode: member.wrtc_mode || 'media_video',
+              weight: member.weight || 1,
+              doh_domain: parsedDoh.domain,
+              doh_resolvers: parsedDoh.resolvers,
+              doh_arq: parsedDoh.arq,
+              doh_dup_hs: parsedDoh.dup_hs,
+              doh_hold_ms: parsedDoh.hold_ms,
+            }
+            if (proto === 'doh') {
+              syncMemberDohDsn(item)
+            }
+            return item
+          }),
         }
       } else {
         form.value = { name: '', strategy: 'weighted', is_active: true, members: [] }
@@ -93,13 +161,19 @@ watch(
 )
 
 const addNode = (serverId: string) => {
+  const srv = serverById.value.get(serverId)
+  const parsedDoh = parseDohDsn(srv?.doh_url)
   form.value.members.push({
     server_id: serverId,
     protocol: 'quic',
     port_or_url: '',
     wrtc_mode: 'media_video',
-    doh_mode: 'authoritative',
     weight: 1,
+    doh_domain: parsedDoh.domain,
+    doh_resolvers: [...DEFAULT_DOH_RESOLVERS],
+    doh_arq: true,
+    doh_dup_hs: true,
+    doh_hold_ms: 1200,
   })
 }
 
@@ -117,6 +191,9 @@ const save = async () => {
       return
     }
     seen.add(key)
+    if (m.protocol === 'doh') {
+      syncMemberDohDsn(m)
+    }
   }
 
   loading.value = true
@@ -130,7 +207,6 @@ const save = async () => {
         protocol: m.protocol,
         port_or_url: m.port_or_url?.trim() || null,
         wrtc_mode: m.protocol === 'wrtc' ? (m.wrtc_mode || 'media_video') : null,
-        doh_mode: m.protocol === 'doh' ? (m.doh_mode || 'authoritative') : null,
         weight: m.weight || 1,
       })),
     }
@@ -228,10 +304,22 @@ const close = () => {
                       density="compact"
                       variant="outlined"
                       hide-details
+                      @update:model-value="onMemberProtocolChange(member)"
                   />
                 </v-col>
                 <v-col cols="12" sm="5">
                   <v-text-field
+                      v-if="member.protocol === 'doh'"
+                      v-model="member.doh_domain"
+                      label="Доменная зона DoH (NS)"
+                      placeholder="t1.anet-project.org"
+                      density="compact"
+                      variant="outlined"
+                      hide-details
+                      @update:model-value="syncMemberDohDsn(member)"
+                  />
+                  <v-text-field
+                      v-else
                       v-model="member.port_or_url"
                       label="Порт или URL"
                       :placeholder="getEndpointPlaceholder(member.protocol)"
@@ -264,18 +352,62 @@ const close = () => {
                       hide-details
                   />
                 </v-col>
-                <v-col v-if="member.protocol === 'doh'" cols="12" class="mt-2">
-                  <v-select
-                      v-model="member.doh_mode"
-                      :items="dohModeOptions"
-                      item-title="title"
-                      item-value="value"
-                      label="Режим DoH (doh_mode)"
-                      density="compact"
-                      variant="outlined"
-                      hide-details
-                  />
-                </v-col>
+
+                <template v-if="member.protocol === 'doh'">
+                  <v-col cols="12" class="mt-2">
+                    <v-combobox
+                        v-model="member.doh_resolvers"
+                        :items="PRESET_DOH_RESOLVERS"
+                        label="Публичные DoH-резолверы (?resolver=...)"
+                        placeholder="Введите URL резолвера и нажмите Enter"
+                        multiple
+                        chips
+                        closable-chips
+                        density="compact"
+                        variant="outlined"
+                        hide-details
+                        @update:model-value="syncMemberDohDsn(member)"
+                    />
+                  </v-col>
+                  <v-col cols="12" sm="4" class="mt-2">
+                    <v-checkbox
+                        v-model="member.doh_arq"
+                        label="ARQ (Selective Repeat)"
+                        density="compact"
+                        color="primary"
+                        hide-details
+                        @update:model-value="syncMemberDohDsn(member)"
+                    />
+                  </v-col>
+                  <v-col cols="12" sm="4" class="mt-2">
+                    <v-checkbox
+                        v-model="member.doh_dup_hs"
+                        label="Дублировать Handshake (dup_hs)"
+                        density="compact"
+                        color="primary"
+                        hide-details
+                        @update:model-value="syncMemberDohDsn(member)"
+                    />
+                  </v-col>
+                  <v-col cols="12" sm="4" class="mt-2">
+                    <v-text-field
+                        v-model.number="member.doh_hold_ms"
+                        type="number"
+                        label="Long-poll (hold_ms)"
+                        min="100"
+                        max="5000"
+                        density="compact"
+                        variant="outlined"
+                        hide-details
+                        @update:model-value="syncMemberDohDsn(member)"
+                    />
+                  </v-col>
+                  <v-col v-if="member.port_or_url" cols="12" class="mt-1">
+                    <div class="text-caption text-medium-emphasis text-truncate">
+                      DSN: <code>{{ member.port_or_url }}</code>
+                    </div>
+                  </v-col>
+                </template>
               </v-row>
             </v-sheet>
           </div>

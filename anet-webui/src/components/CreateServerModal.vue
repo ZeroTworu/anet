@@ -2,8 +2,13 @@
 import { ref } from 'vue'
 import { CreateServer } from '@/api/servers'
 import type { CreateServerRequest } from '@/models/server'
+import {
+  DEFAULT_DOH_RESOLVERS,
+  PRESET_DOH_RESOLVERS,
+  parseDohDsn,
+  buildDohDsn,
+} from '@/utils/doh'
 
-// Используем дефолтный v-model для управления видимостью окна
 const show = defineModel<boolean>()
 
 const emit = defineEmits<{
@@ -13,10 +18,9 @@ const emit = defineEmits<{
 
 const loading = ref(false)
 
-// Функция для сброса формы к значениям по умолчанию
 const defaultForm = (): CreateServerRequest => ({
   name: '',
-  address: '127.0.0.1', // Заменили dsn на address
+  address: '127.0.0.1',
   public_key: '',
   ssh_user: 'hanyuu',
   is_active: true,
@@ -27,8 +31,7 @@ const defaultForm = (): CreateServerRequest => ({
   ahttp_url: 'https://your-cdn.some-host.net/api/v2/telemetry',
   wrtc_url: 'wrtc://meet.jit.si/your-telemetry-room',
   wrtc_mode: 'media_video',
-  doh_url: 'doh://ns1.anet.internal?resolver=https://77.88.8.7/dns-query',
-  doh_mode: 'authoritative',
+  doh_url: '',
 })
 
 const wrtcModeOptions = [
@@ -39,20 +42,47 @@ const wrtcModeOptions = [
   { title: 'Auto (Автоматический выбор)', value: 'auto' },
 ]
 
-const dohModeOptions = [
-  { title: 'Authoritative (прямые ASTP-L DNS-запросы к NS)', value: 'authoritative' },
-  { title: 'Recursive (через публичный DoH-резолвер)', value: 'recursive' },
-]
-
 const form = ref<CreateServerRequest>(defaultForm())
 
+const dohDomain = ref('')
+const dohResolvers = ref<string[]>([...DEFAULT_DOH_RESOLVERS])
+const dohArq = ref(true)
+const dohDupHs = ref(true)
+const dohHoldMs = ref(1200)
+
+const syncDohUrl = () => {
+  if (dohDomain.value.includes('?') || dohDomain.value.includes('://')) {
+    const parsed = parseDohDsn(dohDomain.value)
+    dohDomain.value = parsed.domain
+    if (parsed.resolvers.length > 0) {
+      dohResolvers.value = parsed.resolvers
+    }
+    dohArq.value = parsed.arq
+    dohDupHs.value = parsed.dup_hs
+    dohHoldMs.value = parsed.hold_ms
+  }
+  form.value.doh_url = buildDohDsn({
+    domain: dohDomain.value,
+    resolvers: dohResolvers.value,
+    arq: dohArq.value,
+    dup_hs: dohDupHs.value,
+    hold_ms: dohHoldMs.value,
+  })
+}
+
 const handleCreate = async () => {
+  syncDohUrl()
   loading.value = true
   try {
     await CreateServer(form.value)
-    form.value = defaultForm() // Сбрасываем форму после успеха
-    emit('created')            // Сообщаем родителю, что надо обновить список
-    show.value = false         // Закрываем модалку
+    form.value = defaultForm()
+    dohDomain.value = ''
+    dohResolvers.value = [...DEFAULT_DOH_RESOLVERS]
+    dohArq.value = true
+    dohDupHs.value = true
+    dohHoldMs.value = 1200
+    emit('created')
+    show.value = false
   } catch (error: any) {
     console.error('Ошибка при создании сервера:', error)
     if (error.response?.data) {
@@ -73,7 +103,6 @@ const close = () => {
 
 <template>
   <v-dialog v-model="show" @update:model-value="close" max-width="650px">
-    <!-- Обертка v-card задаст правильный фон и структуру модального окна -->
     <v-card>
       <v-card-title class="text-h6 pb-4">
         Добавить физический сервер
@@ -89,7 +118,6 @@ const close = () => {
               class="mb-3"
           />
 
-          <!-- Изменили поле DSN на "IP Адрес или Домен" -->
           <v-text-field
               v-model="form.address"
               label="IP Адрес или Домен"
@@ -106,7 +134,6 @@ const close = () => {
               class="mb-3"
           />
 
-          <!-- Размещаем порты side-by-side с числовой валидацией -->
           <v-row class="mb-1">
             <v-col cols="12" sm="4">
               <v-text-field
@@ -173,23 +200,68 @@ const close = () => {
           />
 
           <v-text-field
-              v-model="form.doh_url"
-              label="DoH URL / Domain (DNS-over-HTTPS)"
-              placeholder="doh://ns1.anet.internal?resolver=https://77.88.8.7/dns-query"
+              v-model="dohDomain"
+              label="DoH Доменная зона (DNS-over-HTTPS)"
+              placeholder="t1.anet-project.org"
               variant="filled"
               class="mb-3"
+              @update:model-value="syncDohUrl"
           />
 
-          <v-select
-              v-if="form.doh_url"
-              v-model="form.doh_mode"
-              :items="dohModeOptions"
-              item-title="title"
-              item-value="value"
-              label="Режим DoH (doh_mode)"
-              variant="filled"
-              class="mb-3"
-          />
+          <v-sheet v-if="dohDomain.trim()" color="surface-variant" rounded="lg" border class="pa-3 mb-3">
+            <v-combobox
+                v-model="dohResolvers"
+                :items="PRESET_DOH_RESOLVERS"
+                label="Публичные DoH-резолверы (?resolver=...)"
+                placeholder="Введите URL резолвера и нажмите Enter"
+                multiple
+                chips
+                closable-chips
+                density="compact"
+                variant="outlined"
+                hide-details
+                class="mb-2"
+                @update:model-value="syncDohUrl"
+            />
+            <v-row dense align="center">
+              <v-col cols="12" sm="4">
+                <v-checkbox
+                    v-model="dohArq"
+                    label="ARQ (Selective Repeat)"
+                    density="compact"
+                    color="primary"
+                    hide-details
+                    @update:model-value="syncDohUrl"
+                />
+              </v-col>
+              <v-col cols="12" sm="4">
+                <v-checkbox
+                    v-model="dohDupHs"
+                    label="Дублировать Handshake"
+                    density="compact"
+                    color="primary"
+                    hide-details
+                    @update:model-value="syncDohUrl"
+                />
+              </v-col>
+              <v-col cols="12" sm="4">
+                <v-text-field
+                    v-model.number="dohHoldMs"
+                    type="number"
+                    label="Long-poll (hold_ms)"
+                    min="100"
+                    max="5000"
+                    density="compact"
+                    variant="outlined"
+                    hide-details
+                    @update:model-value="syncDohUrl"
+                />
+              </v-col>
+            </v-row>
+            <div v-if="form.doh_url" class="text-caption text-medium-emphasis text-truncate mt-2">
+              DSN: <code>{{ form.doh_url }}</code>
+            </div>
+          </v-sheet>
 
           <v-text-field
               v-model="form.ssh_user"

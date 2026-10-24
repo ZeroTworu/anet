@@ -906,17 +906,6 @@ impl UsersApi {
                                     String::new()
                                 };
 
-                                let doh_mode_line = if member.protocol == ProtocolType::Doh {
-                                    let mode = member
-                                        .doh_mode
-                                        .as_deref()
-                                        .or_else(|| server.doh_mode.as_deref())
-                                        .unwrap_or("authoritative");
-                                    format!("doh_mode = \"{}\"\n", mode)
-                                } else {
-                                    String::new()
-                                };
-
                                 let display_name = format!(
                                     "{} [{}]",
                                     server.name.trim(),
@@ -924,8 +913,8 @@ impl UsersApi {
                                 );
 
                                 toml_str.push_str(&format!(
-                                    "[[servers]]\nname = \"{}\"\ndsn = \"{}\"\n{}{}{}timeout_secs = 8\nserver_pub_key = \"{}\"\ngroup_name = \"{}\"\ngroup_id = \"{}\"\nweight = {}\n\n",
-                                    display_name, dsn, ssh_user, wrtc_mode_line, doh_mode_line, server.public_key, pool_name, pool_id, weight
+                                    "[[servers]]\nname = \"{}\"\ndsn = \"{}\"\n{}{}timeout_secs = 8\nserver_pub_key = \"{}\"\ngroup_name = \"{}\"\ngroup_id = \"{}\"\nweight = {}\n\n",
+                                    display_name, dsn, ssh_user, wrtc_mode_line, server.public_key, pool_name, pool_id, weight
                                 ));
                             }
                         }
@@ -1056,9 +1045,7 @@ impl UsersApi {
 
                 if let Some(ref doh) = server.doh_url {
                     if !doh.trim().is_empty() {
-                        let mode = server.doh_mode.as_deref().unwrap_or("authoritative");
-                        let doh_extra = format!("doh_mode = \"{}\"\n", mode);
-                        write_server_block("doh", doh, &doh_extra);
+                        write_server_block("doh", doh, "");
                     }
                 }
 

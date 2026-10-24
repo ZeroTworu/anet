@@ -3,8 +3,13 @@ import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { useAppMessage } from '@/composables/useAppMessage'
 import { GetNodeCommandStatus, RotateNodeCredential, SetNodeAdmission, UpdateServer } from '@/api/servers'
 import type { Server } from '@/models/server'
+import {
+  DEFAULT_DOH_RESOLVERS,
+  PRESET_DOH_RESOLVERS,
+  parseDohDsn,
+  buildDohDsn,
+} from '@/utils/doh'
 
-// ИСПРАВЛЕНО: Убрано 'show', теперь ловит дефолтный v-model из родителя
 const show = defineModel<boolean>()
 
 const props = defineProps<{
@@ -18,7 +23,7 @@ const emit = defineEmits<{
 
 const form = ref({
   name: '',
-  address: '', // Заменили dsn на address
+  address: '',
   public_key: '',
   ssh_user: '',
   is_active: true,
@@ -30,8 +35,33 @@ const form = ref({
   wrtc_url: '',
   wrtc_mode: 'media_video',
   doh_url: '',
-  doh_mode: 'authoritative',
 })
+
+const dohDomain = ref('')
+const dohResolvers = ref<string[]>([...DEFAULT_DOH_RESOLVERS])
+const dohArq = ref(true)
+const dohDupHs = ref(true)
+const dohHoldMs = ref(1200)
+
+const syncDohUrl = () => {
+  if (dohDomain.value.includes('?') || dohDomain.value.includes('://')) {
+    const parsed = parseDohDsn(dohDomain.value)
+    dohDomain.value = parsed.domain
+    if (parsed.resolvers.length > 0) {
+      dohResolvers.value = parsed.resolvers
+    }
+    dohArq.value = parsed.arq
+    dohDupHs.value = parsed.dup_hs
+    dohHoldMs.value = parsed.hold_ms
+  }
+  form.value.doh_url = buildDohDsn({
+    domain: dohDomain.value,
+    resolvers: dohResolvers.value,
+    arq: dohArq.value,
+    dup_hs: dohDupHs.value,
+    hold_ms: dohHoldMs.value,
+  })
+}
 
 const wrtcModeOptions = [
   { title: 'Media Video (Fake Video Track over DTLS-SRTP / JVB) - 4K/Макс. скорость', value: 'media_video' },
@@ -39,11 +69,6 @@ const wrtcModeOptions = [
   { title: 'JVB DataChannel (Colibri SCTP DataChannel)', value: 'jvb_datachannel' },
   { title: 'WebSocket (Colibri-WS Fallback)', value: 'ws' },
   { title: 'Auto (Автоматический выбор)', value: 'auto' },
-]
-
-const dohModeOptions = [
-  { title: 'Authoritative (прямые ASTP-L DNS-запросы к NS)', value: 'authoritative' },
-  { title: 'Recursive (через публичный DoH-резолвер)', value: 'recursive' },
 ]
 
 const loading = ref(false)
@@ -117,9 +142,16 @@ watch(
     () => props.server,
     (val) => {
       if (val) {
+        const parsedDoh = parseDohDsn(val.doh_url)
+        dohDomain.value = parsedDoh.domain
+        dohResolvers.value = parsedDoh.resolvers
+        dohArq.value = parsedDoh.arq
+        dohDupHs.value = parsedDoh.dup_hs
+        dohHoldMs.value = parsedDoh.hold_ms
+
         form.value = {
           name: val.name,
-          address: val.address, // Заменили dsn на address
+          address: val.address,
           public_key: val.public_key,
           ssh_user: val.ssh_user || '',
           is_active: val.is_active,
@@ -131,8 +163,8 @@ watch(
           wrtc_url: val.wrtc_url || '',
           wrtc_mode: val.wrtc_mode || 'media_video',
           doh_url: val.doh_url || '',
-          doh_mode: val.doh_mode || 'authoritative',
         }
+        syncDohUrl()
       }
     },
     { immediate: true }
@@ -140,6 +172,7 @@ watch(
 
 const save = async () => {
   if (!props.server) return
+  syncDohUrl()
   loading.value = true
   try {
     await UpdateServer(props.server.id, form.value)
@@ -174,13 +207,11 @@ const close = () => {
         <v-form>
           <v-text-field v-model="form.name" label="Название локации" variant="filled" class="mb-3" />
 
-          <!-- Изменили поле DSN на "IP Адрес или Домен" -->
           <v-text-field v-model="form.address" label="IP Адрес или Домен" placeholder="e.g. 203.0.113.10 или vpn.example.com" variant="filled" class="mb-3" />
 
           <v-text-field v-model="form.public_key" label="Публичный ключ сервера" variant="filled" class="mb-3" />
           <v-text-field v-model="form.ssh_user" label="Пользователь SSH" variant="filled" class="mb-3" />
 
-          <!-- Размещаем порты side-by-side -->
           <v-row class="mb-1">
             <v-col cols="12" sm="4">
               <v-text-field
@@ -247,23 +278,68 @@ const close = () => {
           />
 
           <v-text-field
-              v-model="form.doh_url"
-              label="DoH URL / Domain (DNS-over-HTTPS)"
-              placeholder="doh://ns1.anet.internal?resolver=https://77.88.8.7/dns-query"
+              v-model="dohDomain"
+              label="DoH Доменная зона (DNS-over-HTTPS)"
+              placeholder="t1.anet-project.org"
               variant="filled"
               class="mb-3"
+              @update:model-value="syncDohUrl"
           />
 
-          <v-select
-              v-if="form.doh_url"
-              v-model="form.doh_mode"
-              :items="dohModeOptions"
-              item-title="title"
-              item-value="value"
-              label="Режим DoH (doh_mode)"
-              variant="filled"
-              class="mb-3"
-          />
+          <v-sheet v-if="dohDomain.trim()" color="surface-variant" rounded="lg" border class="pa-3 mb-3">
+            <v-combobox
+                v-model="dohResolvers"
+                :items="PRESET_DOH_RESOLVERS"
+                label="Публичные DoH-резолверы (?resolver=...)"
+                placeholder="Введите URL резолвера и нажмите Enter"
+                multiple
+                chips
+                closable-chips
+                density="compact"
+                variant="outlined"
+                hide-details
+                class="mb-2"
+                @update:model-value="syncDohUrl"
+            />
+            <v-row dense align="center">
+              <v-col cols="12" sm="4">
+                <v-checkbox
+                    v-model="dohArq"
+                    label="ARQ (Selective Repeat)"
+                    density="compact"
+                    color="primary"
+                    hide-details
+                    @update:model-value="syncDohUrl"
+                />
+              </v-col>
+              <v-col cols="12" sm="4">
+                <v-checkbox
+                    v-model="dohDupHs"
+                    label="Дублировать Handshake"
+                    density="compact"
+                    color="primary"
+                    hide-details
+                    @update:model-value="syncDohUrl"
+                />
+              </v-col>
+              <v-col cols="12" sm="4">
+                <v-text-field
+                    v-model.number="dohHoldMs"
+                    type="number"
+                    label="Long-poll (hold_ms)"
+                    min="100"
+                    max="5000"
+                    density="compact"
+                    variant="outlined"
+                    hide-details
+                    @update:model-value="syncDohUrl"
+                />
+              </v-col>
+            </v-row>
+            <div v-if="form.doh_url" class="text-caption text-medium-emphasis text-truncate mt-2">
+              DSN: <code>{{ form.doh_url }}</code>
+            </div>
+          </v-sheet>
 
           <v-switch v-model="form.is_active" label="Статус (ВКЛ / ВЫКЛ)" color="success" class="mb-4" />
 

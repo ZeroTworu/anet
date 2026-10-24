@@ -25,7 +25,6 @@ pub struct ServerDto {
     pub wrtc_url: Option<String>,
     pub wrtc_mode: Option<String>,
     pub doh_url: Option<String>,
-    pub doh_mode: Option<String>,
     pub ssh_user: Option<String>,
     pub is_active: bool,
     pub has_control_credential: bool,
@@ -227,7 +226,6 @@ pub struct CreateServerRequest {
     pub wrtc_url: Option<String>,
     pub wrtc_mode: Option<String>,
     pub doh_url: Option<String>,
-    pub doh_mode: Option<String>,
     pub ssh_user: Option<String>,
     pub is_active: Option<bool>,
 }
@@ -255,7 +253,6 @@ pub struct UpdateServerRequest {
     pub wrtc_url: Option<Option<String>>,
     pub wrtc_mode: Option<Option<String>>,
     pub doh_url: Option<Option<String>>,
-    pub doh_mode: Option<Option<String>>,
     pub ssh_user: Option<Option<String>>,
     pub is_active: Option<bool>,
 }
@@ -480,8 +477,6 @@ pub struct NodePoolMemberDto {
     pub port_or_url: Option<String>,
     #[oai(default)]
     pub wrtc_mode: Option<String>,
-    #[oai(default)]
-    pub doh_mode: Option<String>,
     #[oai(default = "default_member_weight")]
     pub weight: i32,
 }

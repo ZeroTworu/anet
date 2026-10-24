@@ -159,7 +159,6 @@ impl PoolsApi {
                 protocol: Set(member.protocol),
                 port_or_url: Set(member.port_or_url.clone()),
                 wrtc_mode: Set(member.wrtc_mode.clone()),
-                doh_mode: Set(member.doh_mode.clone()),
                 weight: Set(member.weight),
             })
                 .insert(&txn)
@@ -222,7 +221,6 @@ impl PoolsApi {
                 protocol: Set(member.protocol),
                 port_or_url: Set(member.port_or_url.clone()),
                 wrtc_mode: Set(member.wrtc_mode.clone()),
-                doh_mode: Set(member.doh_mode.clone()),
                 weight: Set(member.weight),
             })
                 .insert(&txn)

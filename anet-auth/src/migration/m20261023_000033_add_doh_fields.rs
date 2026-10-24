@@ -10,17 +10,7 @@ impl MigrationTrait for Migration {
             .alter_table(
                 Table::alter()
                     .table(Alias::new("servers"))
-                    .add_column(ColumnDef::new(Alias::new("doh_url")).text().null())
-                    .add_column(ColumnDef::new(Alias::new("doh_mode")).text().null())
-                    .to_owned(),
-            )
-            .await?;
-
-        manager
-            .alter_table(
-                Table::alter()
-                    .table(Alias::new("node_pool_members"))
-                    .add_column(ColumnDef::new(Alias::new("doh_mode")).text().null())
+                    .add_column_if_not_exists(ColumnDef::new(Alias::new("doh_url")).text().null())
                     .to_owned(),
             )
             .await
@@ -30,17 +20,7 @@ impl MigrationTrait for Migration {
         manager
             .alter_table(
                 Table::alter()
-                    .table(Alias::new("node_pool_members"))
-                    .drop_column(Alias::new("doh_mode"))
-                    .to_owned(),
-            )
-            .await?;
-
-        manager
-            .alter_table(
-                Table::alter()
                     .table(Alias::new("servers"))
-                    .drop_column(Alias::new("doh_mode"))
                     .drop_column(Alias::new("doh_url"))
                     .to_owned(),
             )

@@ -5,7 +5,6 @@ export type NodePoolMember = {
   protocol: ProtocolType
   port_or_url?: string | null
   wrtc_mode?: string | null
-  doh_mode?: string | null
   weight: number
 }
 
