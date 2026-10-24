@@ -310,53 +310,37 @@ impl<'a> ContextWrapper<'a> {
 3. Ищет `Inner Dst IP` в `ASTPL_EGRESS_MAP.get_ptr_mut(&inner_dst_ip)`:
    * Если записи нет — возвращает `TC_ACT_OK` (пакет идёт обычным путём для классических QUIC/SSH/VNC клиентов Anet).
 4. **Линеаризация буфера `sk_buff` (КРИТИЧНО для TC):**
-   * Вызывает **`ctx.pull_data(0)`** (`bpf_skb_pull_data`), чтобы подтянуть все нелинейные страницы (`paged frags`) пакета в линейную область `ctx.data()..ctx.data_end()`.
-   * Заново перечитывает `ctx.data()` и `ctx.data_end()` (все указатели до `pull_data` инвалидируются верификатором).
-5. Инкрементирует `routing.tx_seq` (если в результате переполнения получилось `0`, ставит `1`), обновляет `routing.tx_bytes` и `routing.last_seen_ns`.
-6. Инициализирует `Xoroshiro128Plus::new(routing.crypto_seed, routing.tx_seq)` и шифрует весь внутренний IPv4-пакет (`ctx.data() .. ctx.data_end()`) на месте (по 8 байт + хвост `1..7` байт).
-7. **Расширение заголовка (`adjust_room` на 36 байт):**
-   * Вызывает метод `TcContext`:
-     ```rust
-     let flags = (BPF_F_ADJ_ROOM_FIXED_GSO
-         | BPF_F_ADJ_ROOM_ENCAP_L3_IPV4
-         | BPF_F_ADJ_ROOM_ENCAP_L4_UDP) as u64;
-     ctx.adjust_room(36, BPF_ADJ_ROOM_NET, flags)?;
-     ```
-   * Это раздвигает начало пакета ровно на **36 байт** (`Outer IPv4 (20) + Outer UDP (8) + ASTP-L Header (8)`).
-8. Заново проверяет границы через `ContextWrapper::Tc(&ctx)` и записывает в новые 36 байт:
-   * **Outer IPv4 Header (`Ipv4Hdr`, 20 байт, offset 0):** `version_ihl = 0x45`, `tos = 0`, `tot_len = (ctx.len() as u16).to_be()`, `id = 0`, `frag_off = 0x4000u16.to_be()` (DF), `ttl = 64`, `proto = IpProto::Udp`, `src_addr = SERVER_IP.load()`, `dst_addr = routing.dst_ip`, и вычисляет IPv4 Header Checksum (компактной inline-функцией свертки 10 слов `u16`).
-   * **Outer UDP Header (`UdpHdr`, 8 байт, offset 20):** `source = ASTPL_PORT.load()`, `dest = routing.dst_port`, `len = ((ctx.len() - 20) as u16).to_be()`, `check = 0` (для IPv4 UDP checksum `0` валиден по RFC 768 и не требует пересчёта по всему payload).
-   * **ASTP-L Nonce Prefix (4 байта, offset 28):** `routing.nonce_prefix` (уже в Big-Endian).
-   * **ASTP-L Seq (4 байта, offset 32):** `routing.tx_seq.to_be()`.
-9. **Отправка в физический интерфейс через подсистему соседей (ARP/Neighbour):**
+   * Для одиночных пакетов (до 1450 байт) вызывает **`bpf_skb_pull_data(skb_len)`**, подтягивая все нелинейные страницы (`paged frags`) пакета в линейную область `ctx.data()..ctx.data_end()`.
+   * GSO-суперпакеты (> 1450 байт) и локальный трафик сервера пропускаются через `TC_ACT_OK` в `validate_xmit_skb` на TUN для сегментации.
+5. **Финализация контрольной суммы L4 (`CHECKSUM_PARTIAL`) в ядре Linux 6.x:**
+   * Гипервизор KVM (`virtio_net`) при транзитном Download оставляет в TCP/UDP поле `check` только seed псевдозаголовка.
+   * Программа `astpl_tc_egress` вычисляет сумму L4 по RFC 1071 прямо в ядре через `finalize_l4_checksum` и записывает честную контрольную сумму **до** шифрования.
+6. Инкрементирует `routing.tx_seq` (если в результате переполнения получилось `0`, ставит `1`), обновляет `routing.tx_bytes` и `routing.last_seen_ns`.
+7. Инициализирует `Xoroshiro128Plus::new(routing.crypto_seed, routing.tx_seq)` и шифрует весь внутренний IPv4-пакет (`ctx.data() .. ctx.data_end()`) на месте (по 8 байт + хвост `1..7` байт).
+8. **Расширение заголовка (`bpf_skb_change_head` на 50 байт):**
+   * Вызывает `bpf_skb_change_head(ctx, 50, 0)`:
+     `EthHdr (14) + Outer IPv4 (20) + Outer UDP (8) + ASTP-L Header (8)`.
+   * В ядре Linux 6.x `bpf_skb_change_head` обнуляет 50 байт и оставляет `skb->mac_header < skb->network_header`, что идеально подходит для `__bpf_redirect_neigh`.
+9. Заново проверяет границы через `ContextWrapper::Tc(&ctx)` и записывает в новые 50 байт:
+   * **EtherType (2 байта, offset 12):** `0x0800` (IPv4).
+   * **Outer IPv4 Header (`Ipv4Hdr`, 20 байт, offset 14):** `version_ihl = 0x45`, `tos = 0`, `tot_len = (total_ip_len as u16).to_be()`, `id = (tx_seq as u16).to_be()`, `frag_off = 0`, `ttl = 64`, `proto = IPPROTO_UDP`, `src_addr = SERVER_IP`, `dst_addr = routing.dst_ip`, и вычисляет IPv4 Header Checksum.
+   * **Outer UDP Header (`UdpHdr`, 8 байт, offset 34):** `source = ASTPL_PORT`, `dest = routing.dst_port`, `len = (udp_total_len as u16).to_be()`, `check = 0` (RFC 768).
+   * **ASTP-L Nonce Prefix (4 байта, offset 42):** `routing.nonce_prefix` (в Big-Endian).
+   * **ASTP-L Seq (4 байта, offset 46):** `routing.tx_seq.to_be()`.
+10. **Отправка в физический интерфейс через подсистему соседей (ARP/Neighbour):**
    * Вызывает `unsafe { aya_ebpf::helpers::bpf_redirect_neigh(ETH_IFINDEX.load(), core::ptr::null_mut(), 0, 0) as i32 }`.
-   * Хелпер `bpf_redirect_neigh` (доступен в Linux 5.10+) самостоятельно определяет L2 MAC-адреса (`src_mac` / `dst_mac` шлюза по таблице маршрутизации и ARP) и отправляет пакет напрямую в `eth0`, полностью минуя чтение из файлового дескриптора `tun0` в Userspace.
+   * Хелпер `bpf_redirect_neigh` самостоятельно определяет L2 MAC-адреса и отправляет зашифрованный пакет напрямую в `eth0`, полностью минуя чтение из `tun0` в Userspace.
 
 ---
 
 ## 6. Логика работы Userspace (`anet-server`)
 
-1. **Подготовка окружения и сосуществование с `Shaper`:**
-   * **Снятие лимита `RLIMIT_MEMLOCK`:** Перед вызовом `EbpfLoader::new().load(...)` сервер снимает ограничение на блокировку памяти в RAM для BPF-карт (критично для ядер Linux 5.10–5.15 и systemd/Docker-окружений с малым дефолтным `ulimit -l`):
-     ```rust
-     unsafe {
-         let rlim = libc::rlimit {
-             rlim_cur: libc::RLIM_INFINITY,
-             rlim_max: libc::RLIM_INFINITY,
-         };
-         let _ = libc::setrlimit(libc::RLIMIT_MEMLOCK, &rlim);
-     }
-     ```
-   * **Pre-flight очистка старого XDP на физическом интерфейсе:** Поскольку физический интерфейс (`eth0`) в отличие от виртуального `tun0` не удаляется при аварийной остановке сервера (`SIGKILL`), перед привязкой `astpl_xdp_ingress` выполняется сброс возможного «залипшего» XDP-хука:
-     ```rust
-     let _ = std::process::Command::new("ip")
-         .args(["link", "set", "dev", &eth_iface, "xdp", "off"])
-         .status();
-     ```
-   * При старте `anet-server` загружает единый eBPF-объект `anet-ebpf` через `EbpfLoader::new()` с установкой `ASTPL_PORT`, `SERVER_IP`, `ETH_IFINDEX`.
-   * Прикрепляет `astpl_xdp_ingress` к физическому интерфейсу (например, `eth0`) в режиме `XdpFlags::default()` (с автоматическим fallback на `XdpFlags::SKB_MODE`, если драйвер VPS не поддерживает Native XDP).
-   * На `tun0` добавляет `clsact` (`aya::programs::tc::qdisc_add_clsact`) и прикрепляет `anet_shaper` (с `priority: 10`) и `astpl_tc_egress` (с `priority: 20` через `TcAttachOptions::Netlink(NlOptions { priority: 20, ..Default::default() })`).
-   * Для `tun0` рекомендуется отключить `GSO`/`TSO`/`GRO` через `ethtool -K` или `ioctl`, чтобы пакеты шифровались в пределах MTU без сегментации.
+1. **Подготовка окружения (Linux 6.x):**
+   * Снятие лимита `RLIMIT_MEMLOCK` для BPF-карт.
+   * Pre-flight очистка старого XDP на физическом интерфейсе (`ip link set dev <eth> xdp off`).
+   * При старте `anet-server` загружает единый eBPF-объект `anet-ebpf`, инициализирует `ASTPL_CONFIG` (порт, server IP, ifindex внешнего интерфейса).
+   * Прикрепляет `astpl_xdp_ingress` к физическому интерфейсу (`ens3` / `eth0`) в режиме `XdpMode::Driver` (Native XDP).
+   * Прикрепляет `astpl_tc_egress` к `tun0` в цепочку `clsact egress`.
 2. **Обработка Handshake и `DatagramReassembler` на едином UDP-сокете:**
    * Сервер слушает обычный `tokio::net::UdpSocket` на порту `ASTPL_PORT`. Поскольку `XDP` забирает все пакеты активных сессий по `nonce_prefix`, в Userspace попадают только пакеты с неизвестным префиксом (Phase I / Phase III хендшейка и их UDP-фрагменты) либо управляющие пакеты с `Seq == 0`.
    * Если первый байт пакета имеет бит фрагментации (`(byte & 0x80) != 0`), пакет передаётся в `DatagramReassembler::push_fragment(remote_addr, data)` (полная совместимость с `[stealth] frag_enabled = true`).
