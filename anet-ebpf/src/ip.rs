@@ -15,7 +15,7 @@ const IPV4_HEADER_MIN_LEN: usize = 20;
 const IPV4_SRC_OFFSET: usize = 12;
 const IPV4_DST_OFFSET: usize = 16;
 
-pub const ETH_P_IP_BE: u16 = 0x0800u16.to_be();
+#[allow(dead_code)]
 pub const IPPROTO_ICMP: u8 = 1;
 pub const IPPROTO_TCP: u8 = 6;
 pub const IPPROTO_UDP: u8 = 17;
@@ -201,34 +201,42 @@ pub fn ipv4_pseudo_csum_seed_be(
 pub fn finalize_l4_checksum(
     w: &ContextWrapper<'_>,
     l4_offset: usize,
-    l4_len: usize,
-    pseudo_seed_be: u16,
+    _l4_len: usize,
+    _pseudo_seed_be: u16,
     is_udp: bool,
 ) -> Result<(), ()> {
-    let start = w.data();
-    let end = w.data_end();
-    if start + l4_offset > end || start + l4_offset + l4_len > end {
+    let check_offset = if is_udp {
+        l4_offset + 6 // UDP checksum offset
+    } else {
+        l4_offset + 16 // TCP checksum offset
+    };
+
+    // Изолируем начальное смещение от предыдущих предположений LLVM,
+    // но оставляем верификатору явный верхний предел (IHL <= 60 байт).
+    let mut off = core::hint::black_box(l4_offset);
+    if off > 60 {
         return Err(());
     }
 
-    let mut sum = u16::from_be(pseudo_seed_be) as u32;
-    let mut off = l4_offset;
-    let l4_end_off = l4_offset + l4_len;
+    // В состоянии CHECKSUM_PARTIAL поле `check` в заголовке L4 уже содержит
+    // seed псевдозаголовка (~csum_tcpudp_magic), который будет учтён при чтении
+    // 16-битных слов заголовка в цикле ниже (начинаем с sum = 0).
+    let mut sum = 0u32;
 
-    // Складываем 16-битные слова заголовка и полезной нагрузки L4.
+    // Складываем 16-битные слова заголовка и полезной нагрузки L4 до конца пакета.
     // Максимум 1500 / 2 = 750 итераций; константная граница 800 гарантирует прохождение BPF-верификатора.
     for _ in 0..800 {
-        if off >= l4_end_off || start + off + 2 > end {
+        let Ok(ptr) = w.ptr_at::<u16>(off) else {
             break;
-        }
-        let word = u16::from_be(w.read_unaligned::<u16>(off)?);
+        };
+        let word = u16::from_be(unsafe { core::ptr::read_unaligned(ptr) });
         sum += word as u32;
         off += 2;
     }
 
     // Нечётный хвостовой байт (padding нулём справа по RFC 1071)
-    if off < l4_end_off && start + off + 1 <= end {
-        let b = w.read_unaligned::<u8>(off)?;
+    if let Ok(ptr) = w.ptr_at::<u8>(off) {
+        let b = unsafe { core::ptr::read_unaligned(ptr) };
         sum += (b as u32) << 8;
     }
 
@@ -241,15 +249,7 @@ pub fn finalize_l4_checksum(
         final_check = 0xFFFF;
     }
 
-    let check_offset = if is_udp {
-        l4_offset + 6 // UDP checksum offset
-    } else {
-        l4_offset + 16 // TCP checksum offset
-    };
-
-    if start + check_offset + 2 <= end {
-        w.write_unaligned::<u16>(check_offset, final_check.to_be())?;
-    }
+    w.write_unaligned::<u16>(check_offset, final_check.to_be())?;
     Ok(())
 }
 
@@ -271,28 +271,28 @@ pub fn xoroshiro_crypt_packet(
     let payload_len = end - (start + payload_offset);
 
     let mut rng = Xoroshiro128Plus::new(seed, seq);
-    let mut off = payload_offset;
+    let mut off = core::hint::black_box(payload_offset);
+    if off > 64 {
+        return Err(());
+    }
 
     for _ in 0..MAX_CRYPT_BLOCKS {
-        if start + off + 8 > end {
+        let Ok(ptr) = w.ptr_at_mut::<u64>(off) else {
             break;
-        }
-        let block = u64::from_le(w.read_unaligned::<u64>(off)?);
+        };
+        let block = u64::from_le(unsafe { core::ptr::read_unaligned(ptr) });
         let masked = (block ^ rng.next_u64()).to_le();
-        w.write_unaligned::<u64>(off, masked)?;
+        unsafe { core::ptr::write_unaligned(ptr, masked) };
         off += 8;
     }
 
-    if start + off < end {
-        let tail_mask = rng.next_u64().to_le_bytes();
-        for i in 0..7usize {
-            let byte_off = off + i;
-            if start + byte_off + 1 > end {
-                break;
-            }
-            let b = w.read_unaligned::<u8>(byte_off)?;
-            w.write_unaligned::<u8>(byte_off, b ^ tail_mask[i])?;
-        }
+    let tail_mask = rng.next_u64().to_le_bytes();
+    for i in 0..7usize {
+        let Ok(ptr) = w.ptr_at_mut::<u8>(off + i) else {
+            break;
+        };
+        let b = unsafe { core::ptr::read_unaligned(ptr) };
+        unsafe { core::ptr::write_unaligned(ptr, b ^ tail_mask[i]) };
     }
 
     Ok(payload_len)
