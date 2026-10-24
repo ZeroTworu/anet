@@ -31,6 +31,7 @@ pub mod m20260929_000028_add_wrtc_url_to_servers;
 pub mod m20261002_000029_add_wrtc_mode;
 pub mod m20261023_000032_add_doh_to_protocol_type;
 pub mod m20261023_000033_add_doh_fields;
+pub mod m20261024_000034_create_doh_resolvers;
 
 use sea_orm_migration::prelude::*;
 
@@ -73,6 +74,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261019_000031_add_provider_action_and_items_table::Migration),
             Box::new(m20261023_000032_add_doh_to_protocol_type::Migration),
             Box::new(m20261023_000033_add_doh_fields::Migration),
+            Box::new(m20261024_000034_create_doh_resolvers::Migration),
         ]
     }
 }

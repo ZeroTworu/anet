@@ -5,6 +5,7 @@ import { GetServers } from '@/api/servers'
 import type { NodePool } from '@/models/pool'
 import type { Server } from '@/models/server'
 import PoolModal from '@/components/PoolModal.vue'
+import DohResolversModal from '@/components/DohResolversModal.vue'
 
 const pools = ref<NodePool[]>([])
 const servers = ref<Server[]>([])
@@ -12,6 +13,7 @@ const loading = ref(false)
 const searchQuery = ref('')
 
 const showEditor = ref(false)
+const showResolversModal = ref(false)
 const selectedPool = ref<NodePool | null>(null)
 
 const serverById = computed(() => new Map(servers.value.map(server => [server.id, server])))
@@ -76,6 +78,9 @@ onMounted(load)
             single-line
             style="width: 280px"
         />
+        <v-btn variant="tonal" color="primary" prepend-icon="mdi-dns" @click="showResolversModal = true">
+          DoH Резолверы
+        </v-btn>
         <v-btn color="primary" @click="openCreate">Создать пул</v-btn>
       </div>
     </div>
@@ -139,6 +144,8 @@ onMounted(load)
         :servers="servers"
         @saved="load"
     />
+
+    <DohResolversModal v-model="showResolversModal" />
   </v-container>
 </template>
 

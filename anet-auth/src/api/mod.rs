@@ -2,6 +2,7 @@ pub mod api;
 pub mod auth;
 pub mod compiled_rules;
 pub mod custom_overrides;
+pub mod doh_resolvers;
 pub mod dto;
 pub mod groups;
 pub mod pools;
@@ -32,6 +33,7 @@ pub fn get_api(
         statistics::StatisticsApi { db: db.clone() },
         compiled_rules::CompiledRulesApi { db: db.clone() },
         rule_providers::RuleProvidersApi { db: db.clone() },
-        custom_overrides::CustomOverridesApi { db },
+        custom_overrides::CustomOverridesApi { db: db.clone() },
+        doh_resolvers::DohResolversApi { db },
     )
 }

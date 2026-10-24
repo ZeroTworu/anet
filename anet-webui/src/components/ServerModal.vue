@@ -1,16 +1,22 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useAppMessage } from '@/composables/useAppMessage'
 import { GetNodeCommandStatus, RotateNodeCredential, SetNodeAdmission, UpdateServer } from '@/api/servers'
 import type { Server } from '@/models/server'
 import {
-  DEFAULT_DOH_RESOLVERS,
-  PRESET_DOH_RESOLVERS,
+  useDohResolvers,
   parseDohDsn,
   buildDohDsn,
 } from '@/utils/doh'
+import DohResolversModal from '@/components/DohResolversModal.vue'
 
 const show = defineModel<boolean>()
+const showResolversModal = ref(false)
+const { presetResolvers, defaultResolvers, ensureLoaded } = useDohResolvers()
+
+onMounted(() => {
+  ensureLoaded()
+})
 
 const props = defineProps<{
   server: Server | null
@@ -38,7 +44,7 @@ const form = ref({
 })
 
 const dohDomain = ref('')
-const dohResolvers = ref<string[]>([...DEFAULT_DOH_RESOLVERS])
+const dohResolvers = ref<string[]>([...defaultResolvers.value])
 const dohArq = ref(true)
 const dohDupHs = ref(true)
 const dohHoldMs = ref(1200)
@@ -287,11 +293,22 @@ const close = () => {
           />
 
           <v-sheet v-if="dohDomain.trim()" color="surface-variant" rounded="lg" border class="pa-3 mb-3">
+            <div class="d-flex justify-space-between align-center mb-1">
+              <span class="text-caption text-medium-emphasis">Публичные DoH-резолверы (?resolver=...)</span>
+              <v-btn
+                  size="x-small"
+                  variant="tonal"
+                  color="primary"
+                  prepend-icon="mdi-database-cog-outline"
+                  @click="showResolversModal = true"
+              >
+                Настроить список в БД
+              </v-btn>
+            </div>
             <v-combobox
                 v-model="dohResolvers"
-                :items="PRESET_DOH_RESOLVERS"
-                label="Публичные DoH-резолверы (?resolver=...)"
-                placeholder="Введите URL резолвера и нажмите Enter"
+                :items="presetResolvers"
+                placeholder="Выберите из БД или введите URL и нажмите Enter"
                 multiple
                 chips
                 closable-chips
@@ -412,6 +429,8 @@ const close = () => {
       </v-card-actions>
     </v-card>
   </v-dialog>
+
+  <DohResolversModal v-model="showResolversModal" />
 
   <!-- Модалка выдачи нового Credential -->
   <v-dialog

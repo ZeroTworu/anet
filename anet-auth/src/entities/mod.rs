@@ -23,4 +23,5 @@ pub use protocol_type::ProtocolType;
 pub mod rule_providers;
 pub mod rule_provider_items;
 pub mod admin_custom_overrides;
+pub mod doh_resolvers;
 

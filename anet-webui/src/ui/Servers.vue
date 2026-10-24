@@ -4,6 +4,7 @@ import { GetServers } from '@/api/servers'
 import type { Server } from '@/models/server'
 import ServerModal from '@/components/ServerModal.vue'
 import CreateServerModal from '@/components/CreateServerModal.vue'
+import DohResolversModal from '@/components/DohResolversModal.vue'
 
 const data = ref<Server[]>([])
 const loading = ref(false)
@@ -12,6 +13,7 @@ const searchQuery = ref('')
 // Управление модалками
 const showCreateModal = ref(false)
 const showEditModal = ref(false)
+const showResolversModal = ref(false)
 const selectedServer = ref<Server | null>(null)
 
 let refreshTimer: number | undefined
@@ -82,6 +84,9 @@ onBeforeUnmount(() => {
             single-line
             style="width: 280px"
         />
+        <v-btn variant="tonal" color="primary" prepend-icon="mdi-dns" @click="showResolversModal = true">
+          DoH Резолверы
+        </v-btn>
         <v-btn color="primary" @click="showCreateModal = true"> Add Server </v-btn>
       </div>
     </div>
@@ -160,6 +165,8 @@ onBeforeUnmount(() => {
         @updated="loadServers"
         @close="closeEditModal"
     />
+
+    <DohResolversModal v-model="showResolversModal" />
   </v-container>
 </template>
 

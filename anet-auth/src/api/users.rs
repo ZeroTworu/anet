@@ -775,6 +775,9 @@ impl UsersApi {
                         let server_map: std::collections::HashMap<Uuid, servers::Model> =
                             pool_servers.into_iter().map(|s| (s.id, s)).collect();
 
+                        let default_doh_resolvers =
+                            crate::api::doh_resolvers::get_default_doh_resolver_urls(&self.db).await;
+
                         let mut toml_str = String::new();
                         let mut fallback_key = String::new();
                         let mut emitted: std::collections::HashSet<(Uuid, Uuid, ProtocolType, String)> =
@@ -869,10 +872,13 @@ impl UsersApi {
                                 continue;
                             };
 
-                            let dsn = if port_or_url.contains("://") {
+                            let dsn = if proto_str == "doh" {
+                                crate::api::doh_resolvers::ensure_doh_dsn_has_resolvers(
+                                    &port_or_url,
+                                    &default_doh_resolvers,
+                                )
+                            } else if port_or_url.contains("://") {
                                 port_or_url
-                            } else if proto_str == "doh" {
-                                format!("doh://{}", port_or_url)
                             } else {
                                 format!("{}://{}:{}", proto_str, server.address, port_or_url)
                             };
@@ -976,6 +982,9 @@ impl UsersApi {
                 ));
             }
 
+            let default_doh_resolvers =
+                crate::api::doh_resolvers::get_default_doh_resolver_urls(&self.db).await;
+
             let mut servers_toml = String::new();
             servers_toml.push_str(
                 "\n# =========================================================================\n",
@@ -1007,10 +1016,13 @@ impl UsersApi {
                     .unwrap_or_default();
 
                 let mut write_server_block = |protocol: &str, port_or_url: &str, extra_lines: &str| {
-                    let dsn = if port_or_url.contains("://") {
+                    let dsn = if protocol == "doh" {
+                        crate::api::doh_resolvers::ensure_doh_dsn_has_resolvers(
+                            port_or_url,
+                            &default_doh_resolvers,
+                        )
+                    } else if port_or_url.contains("://") {
                         port_or_url.to_string()
-                    } else if protocol == "doh" {
-                        format!("doh://{}", port_or_url)
                     } else {
                         format!("{}://{}:{}", protocol, server.address, port_or_url)
                     };

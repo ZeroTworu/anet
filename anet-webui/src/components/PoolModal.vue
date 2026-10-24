@@ -1,17 +1,23 @@
 <script setup lang="ts">
-import { ref, computed, watch } from 'vue'
+import { ref, computed, watch, onMounted } from 'vue'
 import { CreatePool, UpdatePool } from '@/api/pools'
 import type { NodePool, ProtocolType, SaveNodePoolRequest } from '@/models/pool'
 import type { Server } from '@/models/server'
 import { useAppMessage } from '@/composables/useAppMessage'
 import {
-  DEFAULT_DOH_RESOLVERS,
-  PRESET_DOH_RESOLVERS,
+  useDohResolvers,
   parseDohDsn,
   buildDohDsn,
 } from '@/utils/doh'
+import DohResolversModal from '@/components/DohResolversModal.vue'
 
 const show = defineModel<boolean>()
+const showResolversModal = ref(false)
+const { presetResolvers, defaultResolvers, ensureLoaded } = useDohResolvers()
+
+onMounted(() => {
+  ensureLoaded()
+})
 
 const props = defineProps<{
   pool: NodePool | null
@@ -170,7 +176,7 @@ const addNode = (serverId: string) => {
     wrtc_mode: 'media_video',
     weight: 1,
     doh_domain: parsedDoh.domain,
-    doh_resolvers: [...DEFAULT_DOH_RESOLVERS],
+    doh_resolvers: [...defaultResolvers.value],
     doh_arq: true,
     doh_dup_hs: true,
     doh_hold_ms: 1200,
@@ -355,11 +361,22 @@ const close = () => {
 
                 <template v-if="member.protocol === 'doh'">
                   <v-col cols="12" class="mt-2">
+                    <div class="d-flex justify-space-between align-center mb-1">
+                      <span class="text-caption text-medium-emphasis">Публичные DoH-резолверы (?resolver=...)</span>
+                      <v-btn
+                          size="x-small"
+                          variant="tonal"
+                          color="primary"
+                          prepend-icon="mdi-database-cog-outline"
+                          @click="showResolversModal = true"
+                      >
+                        Настроить список в БД
+                      </v-btn>
+                    </div>
                     <v-combobox
                         v-model="member.doh_resolvers"
-                        :items="PRESET_DOH_RESOLVERS"
-                        label="Публичные DoH-резолверы (?resolver=...)"
-                        placeholder="Введите URL резолвера и нажмите Enter"
+                        :items="presetResolvers"
+                        placeholder="Выберите из БД или введите URL и нажмите Enter"
                         multiple
                         chips
                         closable-chips
@@ -438,4 +455,6 @@ const close = () => {
       </v-card-actions>
     </v-card>
   </v-dialog>
+
+  <DohResolversModal v-model="showResolversModal" />
 </template>

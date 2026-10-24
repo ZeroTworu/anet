@@ -1,3 +1,7 @@
+import { computed, ref } from 'vue'
+import { GetDohResolvers } from '@/api/doh-resolvers'
+import type { DohResolver } from '@/models/doh-resolver'
+
 export interface DohConfigParams {
   domain: string
   resolvers: string[]
@@ -6,12 +10,12 @@ export interface DohConfigParams {
   hold_ms: number
 }
 
-export const DEFAULT_DOH_RESOLVERS = [
+export const FALLBACK_DEFAULT_DOH_RESOLVERS = [
   'https://77.88.8.7/dns-query',
   'https://dns.adguard-dns.com/dns-query',
 ]
 
-export const PRESET_DOH_RESOLVERS = [
+export const FALLBACK_PRESET_DOH_RESOLVERS = [
   'https://77.88.8.7/dns-query',
   'https://dns.adguard-dns.com/dns-query',
   'https://common.dot.dns.yandex.net/dns-query',
@@ -20,12 +24,61 @@ export const PRESET_DOH_RESOLVERS = [
   'https://9.9.9.9/dns-query',
 ]
 
+const dohResolversList = ref<DohResolver[]>([])
+const dohResolversLoaded = ref(false)
+const dohResolversLoading = ref(false)
+
+export const presetDohResolvers = computed<string[]>(() => {
+  const active = dohResolversList.value.filter(r => r.is_active).map(r => r.url)
+  return active.length > 0 ? active : FALLBACK_PRESET_DOH_RESOLVERS
+})
+
+export const defaultDohResolvers = computed<string[]>(() => {
+  const active = dohResolversList.value.filter(r => r.is_active)
+  const defaults = active.filter(r => r.is_default).map(r => r.url)
+  if (defaults.length > 0) return defaults
+  if (active.length > 0) return active.map(r => r.url)
+  return FALLBACK_DEFAULT_DOH_RESOLVERS
+})
+
+export async function loadDohResolvers(force = false): Promise<DohResolver[]> {
+  if (dohResolversLoaded.value && !force) {
+    return dohResolversList.value
+  }
+  if (dohResolversLoading.value) {
+    return dohResolversList.value
+  }
+  dohResolversLoading.value = true
+  try {
+    dohResolversList.value = await GetDohResolvers()
+    dohResolversLoaded.value = true
+  } catch (err) {
+    console.warn('Не удалось загрузить список DoH-резолверов из БД:', err)
+  } finally {
+    dohResolversLoading.value = false
+  }
+  return dohResolversList.value
+}
+
+export function useDohResolvers() {
+  return {
+    resolvers: dohResolversList,
+    loading: dohResolversLoading,
+    loaded: dohResolversLoaded,
+    presetResolvers: presetDohResolvers,
+    defaultResolvers: defaultDohResolvers,
+    reloadResolvers: () => loadDohResolvers(true),
+    ensureLoaded: () => loadDohResolvers(false),
+  }
+}
+
 export function parseDohDsn(raw: string | null | undefined): DohConfigParams {
+  const fallback = defaultDohResolvers.value
   const trimmed = (raw || '').trim()
   if (!trimmed) {
     return {
       domain: '',
-      resolvers: [...DEFAULT_DOH_RESOLVERS],
+      resolvers: [...fallback],
       arq: true,
       dup_hs: true,
       hold_ms: 1200,
@@ -45,7 +98,7 @@ export function parseDohDsn(raw: string | null | undefined): DohConfigParams {
 
   return {
     domain: hostPart,
-    resolvers: resolvers.length > 0 ? resolvers : [...DEFAULT_DOH_RESOLVERS],
+    resolvers: resolvers.length > 0 ? resolvers : [...fallback],
     arq: arqParam !== null ? arqParam !== 'false' && arqParam !== '0' : true,
     dup_hs: dupHsParam !== null ? dupHsParam !== 'false' && dupHsParam !== '0' : true,
     hold_ms: holdMsParam !== null && !Number.isNaN(Number(holdMsParam)) ? Number(holdMsParam) : 1200,
