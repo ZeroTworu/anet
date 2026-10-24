@@ -109,7 +109,7 @@ onMounted(() => {
           subtitle="Управление учетными записями пользователей"
       >
         <template #title>
-          <h1 class="text-h5 font-weight-bold">ANet VPN Clients</h1>
+          <h1 class="text-h5 font-weight-bold">ANet Clients</h1>
         </template>
       </v-list-item>
       <div class="d-flex align-center flex-wrap flex-sm-nowrap ga-3">

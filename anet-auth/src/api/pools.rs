@@ -38,12 +38,18 @@ fn validate_pool_request(req: &SaveNodePoolRequest) -> std::result::Result<(), S
             if member.protocol == crate::entities::ProtocolType::Ws
                 || member.protocol == crate::entities::ProtocolType::Ahttp
                 || member.protocol == crate::entities::ProtocolType::Wrtc
+                || member.protocol == crate::entities::ProtocolType::Doh
             {
                 if !url_str.trim().is_empty() {
                     if !url_str.is_ascii() {
                         return Err(format!("URL '{}' содержит недопустимые (не латинские) символы", url_str));
                     }
-                    let parsed = url_str.parse::<poem::http::Uri>().map_err(|e| format!("Некорректный URL '{}': {}", url_str, e))?;
+                    let check_str = if member.protocol == crate::entities::ProtocolType::Doh && !url_str.contains("://") {
+                        format!("doh://{}", url_str.trim())
+                    } else {
+                        url_str.trim().to_string()
+                    };
+                    let parsed = check_str.parse::<poem::http::Uri>().map_err(|e| format!("Некорректный URL '{}': {}", url_str, e))?;
                     let scheme = parsed.scheme_str().unwrap_or("");
                     if member.protocol == crate::entities::ProtocolType::Ws {
                         if scheme != "ws" && scheme != "wss" {
@@ -63,6 +69,13 @@ fn validate_pool_request(req: &SaveNodePoolRequest) -> std::result::Result<(), S
                         let path = parsed.path().trim_start_matches('/');
                         if path.is_empty() {
                             return Err(format!("WRTC URL '{}' не содержит имя комнаты (room)", url_str));
+                        }
+                    } else if member.protocol == crate::entities::ProtocolType::Doh {
+                        if scheme != "doh" && scheme != "https" {
+                            return Err(format!("Неподдерживаемый протокол '{}' для DoH URL. Ожидается doh:// или https://", scheme));
+                        }
+                        if parsed.host().is_none() {
+                            return Err(format!("DoH URL '{}' не содержит доменную зону (хост)", url_str));
                         }
                     }
                 }
@@ -146,6 +159,7 @@ impl PoolsApi {
                 protocol: Set(member.protocol),
                 port_or_url: Set(member.port_or_url.clone()),
                 wrtc_mode: Set(member.wrtc_mode.clone()),
+                doh_mode: Set(member.doh_mode.clone()),
                 weight: Set(member.weight),
             })
                 .insert(&txn)
@@ -208,6 +222,7 @@ impl PoolsApi {
                 protocol: Set(member.protocol),
                 port_or_url: Set(member.port_or_url.clone()),
                 wrtc_mode: Set(member.wrtc_mode.clone()),
+                doh_mode: Set(member.doh_mode.clone()),
                 weight: Set(member.weight),
             })
                 .insert(&txn)

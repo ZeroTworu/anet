@@ -36,6 +36,7 @@ const strategyOptions = [
 const protocolOptions: { title: string; value: ProtocolType }[] = [
   { title: 'QUIC', value: 'quic' },
   { title: 'WRTC / Jitsi WebRTC', value: 'wrtc' },
+  { title: 'DoH (DNS-over-HTTPS)', value: 'doh' },
   { title: 'AHTTP / HTTP(S)', value: 'ahttp' },
   { title: 'WebSocket (WS/WSS)', value: 'ws' },
   { title: 'SSH', value: 'ssh' },
@@ -49,6 +50,21 @@ const wrtcModeOptions = [
   { title: 'WebSocket (Colibri-WS Fallback)', value: 'ws' },
   { title: 'Auto (Автоматический выбор)', value: 'auto' },
 ]
+
+const dohModeOptions = [
+  { title: 'Authoritative (прямые ASTP-L DNS-запросы к NS)', value: 'authoritative' },
+  { title: 'Recursive (через публичный DoH-резолвер)', value: 'recursive' },
+]
+
+const getEndpointPlaceholder = (protocol: ProtocolType) => {
+  if (protocol === 'doh') {
+    return 'doh://ns1.anet.internal?resolver=https://77.88.8.7/dns-query'
+  }
+  if (protocol === 'ahttp' || protocol === 'ws' || protocol === 'wrtc') {
+    return 'URL (напр. cdn / room / tunnel)'
+  }
+  return 'Порт (напр. 443)'
+}
 
 const serverById = computed(() => new Map(props.servers.map(server => [server.id, server])))
 
@@ -65,6 +81,7 @@ watch(
             protocol: member.protocol || 'quic',
             port_or_url: member.port_or_url || '',
             wrtc_mode: member.wrtc_mode || 'media_video',
+            doh_mode: member.doh_mode || 'authoritative',
             weight: member.weight || 1,
           })),
         }
@@ -81,6 +98,7 @@ const addNode = (serverId: string) => {
     protocol: 'quic',
     port_or_url: '',
     wrtc_mode: 'media_video',
+    doh_mode: 'authoritative',
     weight: 1,
   })
 }
@@ -112,6 +130,7 @@ const save = async () => {
         protocol: m.protocol,
         port_or_url: m.port_or_url?.trim() || null,
         wrtc_mode: m.protocol === 'wrtc' ? (m.wrtc_mode || 'media_video') : null,
+        doh_mode: m.protocol === 'doh' ? (m.doh_mode || 'authoritative') : null,
         weight: m.weight || 1,
       })),
     }
@@ -215,7 +234,7 @@ const close = () => {
                   <v-text-field
                       v-model="member.port_or_url"
                       label="Порт или URL"
-                      :placeholder="member.protocol === 'ahttp' || member.protocol === 'ws' || member.protocol === 'wrtc' ? 'URL (напр. cdn / room / tunnel)' : 'Порт (напр. 443)'"
+                      :placeholder="getEndpointPlaceholder(member.protocol)"
                       density="compact"
                       variant="outlined"
                       hide-details
@@ -240,6 +259,18 @@ const close = () => {
                       item-title="title"
                       item-value="value"
                       label="Режим WRTC (wrtc_mode)"
+                      density="compact"
+                      variant="outlined"
+                      hide-details
+                  />
+                </v-col>
+                <v-col v-if="member.protocol === 'doh'" cols="12" class="mt-2">
+                  <v-select
+                      v-model="member.doh_mode"
+                      :items="dohModeOptions"
+                      item-title="title"
+                      item-value="value"
+                      label="Режим DoH (doh_mode)"
                       density="compact"
                       variant="outlined"
                       hide-details

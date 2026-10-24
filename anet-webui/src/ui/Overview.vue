@@ -61,7 +61,7 @@ onBeforeUnmount(() => { if (refreshTimer !== undefined) clearInterval(refreshTim
 <template>
   <main class="overview-page">
     <div class="d-flex align-center justify-space-between hero">
-      <div><h1>Infrastructure overview</h1><p>Состояние control plane и VPN-узлов в реальном времени</p></div>
+      <div><h1>Infrastructure overview</h1><p>Состояние control plane и сетевых узлов в реальном времени</p></div>
       <v-btn :loading="loading" @click="load">Обновить</v-btn>
     </div>
     <v-alert v-if="error" type="error" closable class="error-alert" @click:close="error = null">{{ error }}</v-alert>

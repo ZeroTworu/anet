@@ -1,11 +1,11 @@
-// DTO пула, общий для редактора UI и resolver панели.
-export type ProtocolType = 'quic' | 'ssh' | 'vnc' | 'ws' | 'ahttp' | 'wrtc'
+export type ProtocolType = 'quic' | 'ssh' | 'vnc' | 'ws' | 'ahttp' | 'wrtc' | 'doh'
 
 export type NodePoolMember = {
   server_id: string
   protocol: ProtocolType
   port_or_url?: string | null
   wrtc_mode?: string | null
+  doh_mode?: string | null
   weight: number
 }
 

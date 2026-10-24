@@ -265,7 +265,7 @@ const onConnectionRowClick = (_event: any, row: { item: ActiveConnection }) => {
 
 // Отключить принудительно (Disconnect)
 const disconnectConnection = async (item: ActiveConnection) => {
-  if (!confirm(`Принудительно разорвать VPN-сессию пользователя «${item.username}» на сервере «${item.server_name}»?`)) return
+  if (!confirm(`Принудительно разорвать сессию пользователя «${item.username}» на сервере «${item.server_name}»?`)) return
   try {
     // ВЫЗОВ POST МЕТОДА С ПЕРЕДАЧЕЙ СЕРВЕРНЫХ ID И FINGERPRINT В ТЕЛЕ ЗАПРОСА
     await api<void>(`/statistics/active-connections/disconnect`, {
@@ -355,7 +355,7 @@ const connectionHeaders = [
     <div class="d-flex justify-space-between align-center flex-wrap ga-4 mb-6">
       <v-list-item
           class="px-0"
-          subtitle="Полезный трафик внутри VPN-туннеля"
+          subtitle="Полезный трафик внутри туннеля"
       >
         <template #title>
           <h1 class="text-h5 font-weight-bold">Traffic</h1>
@@ -420,6 +420,7 @@ const connectionHeaders = [
               <v-btn value="vnc">VNC</v-btn>
               <v-btn value="ahttp">AHTTP</v-btn>
               <v-btn value="wrtc">WRTC</v-btn>
+              <v-btn value="doh">DoH</v-btn>
             </v-btn-toggle>
 
             <v-btn-toggle

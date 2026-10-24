@@ -29,6 +29,8 @@ pub mod m20260909_000026_link_server_groups_and_add_protocols;
 pub mod m20260929_000027_add_wrtc_to_protocol_type;
 pub mod m20260929_000028_add_wrtc_url_to_servers;
 pub mod m20261002_000029_add_wrtc_mode;
+pub mod m20261023_000032_add_doh_to_protocol_type;
+pub mod m20261023_000033_add_doh_fields;
 
 use sea_orm_migration::prelude::*;
 
@@ -69,6 +71,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20261002_000029_add_wrtc_mode::Migration),
             Box::new(m20261018_000030_create_rule_providers_and_custom_overrides::Migration),
             Box::new(m20261019_000031_add_provider_action_and_items_table::Migration),
+            Box::new(m20261023_000032_add_doh_to_protocol_type::Migration),
+            Box::new(m20261023_000033_add_doh_fields::Migration),
         ]
     }
 }

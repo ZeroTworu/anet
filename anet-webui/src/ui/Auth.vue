@@ -7,7 +7,7 @@
           A
         </v-avatar>
         <h1 class="text-h5 font-weight-bold text-primary" style="font-family: monospace; letter-spacing: 1.5px; text-transform: uppercase;">
-          ANet VPN
+          ANet
         </h1>
         <p class="text-caption text-medium-emphasis mt-1">
           Control Plane Management Panel

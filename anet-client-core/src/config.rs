@@ -194,6 +194,9 @@ pub struct ServerConfig {
     /// WebRTC Data Transport mode: "auto" | "p2p_direct" | "jvb_datachannel" | "ws" | "media_video"
     #[serde(default)]
     pub wrtc_mode: Option<String>,
+    /// DoH Transport mode: "authoritative" | "recursive"
+    #[serde(default)]
+    pub doh_mode: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -215,6 +218,7 @@ impl Default for ServerConfig {
             wrtc_fallback_jvb_ip: None,
             wrtc_fallback_jvb_port: None,
             wrtc_mode: None,
+            doh_mode: None,
         }
     }
 }
@@ -521,6 +525,7 @@ mod tests {
             wrtc_fallback_jvb_ip: None,
             wrtc_fallback_jvb_port: None,
             wrtc_mode: None,
+            doh_mode: None,
         };
         assert_eq!(server.mode().unwrap(), TransportMode::Quic);
         assert_eq!(server.endpoint().unwrap(), "vpn.example.com:4519");
@@ -549,6 +554,7 @@ mod tests {
             wrtc_fallback_jvb_ip: None,
             wrtc_fallback_jvb_port: None,
             wrtc_mode: None,
+            doh_mode: None,
         };
         assert_eq!(ws_no_port.endpoint().unwrap(), "vpn.example.com:443");
     }
