@@ -14,13 +14,12 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
 use bytes::{Bytes, BytesMut};
 use log::{debug, info, warn};
-use reqwest::Client;
+use reqwest::{Client, Url};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
-use url::Url;
 
 struct DohAuthChannel {
     client: Client,
@@ -272,12 +271,13 @@ impl ClientTransport for DohTransport {
 
             tokio::spawn(async move {
                 info!("[DoH TX] Uplink dispatcher loop active");
-                while let Some(mut packet) = tunnel_packet_rx.recv().await {
+                while let Some(packet) = tunnel_packet_rx.recv().await {
                     let seq = sequence.fetch_add(1, Ordering::Relaxed);
                     // ASTP-L: 0-byte overhead ChaCha20 encryption
-                    cipher.apply_keystream(seq, session_id, &mut packet);
+                    let mut packet_buf = packet.to_vec();
+                    cipher.apply_keystream(seq, session_id, &mut packet_buf);
 
-                    let chunks = split_into_chunks(session_id, seq, &packet, max_payload);
+                    let chunks = split_into_chunks(session_id, seq, &packet_buf, max_payload);
                     for chunk in chunks {
                         let b32_str = base32::encode(&chunk);
                         let labels = base32::split_into_labels(&b32_str, 63);
