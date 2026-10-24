@@ -857,6 +857,12 @@ impl UsersApi {
                                     });
                                     ("wrtc", url)
                                 }
+                                ProtocolType::Doh => {
+                                    let url = custom_endpoint.map(|s| s.to_string()).or_else(|| {
+                                        server.doh_url.clone().filter(|u| !u.trim().is_empty())
+                                    });
+                                    ("doh", url)
+                                }
                             };
 
                             let Some(port_or_url) = port_or_url else {
@@ -865,6 +871,8 @@ impl UsersApi {
 
                             let dsn = if port_or_url.contains("://") {
                                 port_or_url
+                            } else if proto_str == "doh" {
+                                format!("doh://{}", port_or_url)
                             } else {
                                 format!("{}://{}:{}", proto_str, server.address, port_or_url)
                             };
@@ -898,6 +906,17 @@ impl UsersApi {
                                     String::new()
                                 };
 
+                                let doh_mode_line = if member.protocol == ProtocolType::Doh {
+                                    let mode = member
+                                        .doh_mode
+                                        .as_deref()
+                                        .or_else(|| server.doh_mode.as_deref())
+                                        .unwrap_or("authoritative");
+                                    format!("doh_mode = \"{}\"\n", mode)
+                                } else {
+                                    String::new()
+                                };
+
                                 let display_name = format!(
                                     "{} [{}]",
                                     server.name.trim(),
@@ -905,8 +924,8 @@ impl UsersApi {
                                 );
 
                                 toml_str.push_str(&format!(
-                                    "[[servers]]\nname = \"{}\"\ndsn = \"{}\"\n{}{}timeout_secs = 8\nserver_pub_key = \"{}\"\ngroup_name = \"{}\"\ngroup_id = \"{}\"\nweight = {}\n\n",
-                                    display_name, dsn, ssh_user, wrtc_mode_line, server.public_key, pool_name, pool_id, weight
+                                    "[[servers]]\nname = \"{}\"\ndsn = \"{}\"\n{}{}{}timeout_secs = 8\nserver_pub_key = \"{}\"\ngroup_name = \"{}\"\ngroup_id = \"{}\"\nweight = {}\n\n",
+                                    display_name, dsn, ssh_user, wrtc_mode_line, doh_mode_line, server.public_key, pool_name, pool_id, weight
                                 ));
                             }
                         }
@@ -1001,6 +1020,8 @@ impl UsersApi {
                 let mut write_server_block = |protocol: &str, port_or_url: &str, extra_lines: &str| {
                     let dsn = if port_or_url.contains("://") {
                         port_or_url.to_string()
+                    } else if protocol == "doh" {
+                        format!("doh://{}", port_or_url)
                     } else {
                         format!("{}://{}:{}", protocol, server.address, port_or_url)
                     };
@@ -1030,6 +1051,14 @@ impl UsersApi {
                         let mode = server.wrtc_mode.as_deref().unwrap_or("media_video");
                         let wrtc_extra = format!("wrtc_mode = \"{}\"\n", mode);
                         write_server_block("wrtc", wrtc, &wrtc_extra);
+                    }
+                }
+
+                if let Some(ref doh) = server.doh_url {
+                    if !doh.trim().is_empty() {
+                        let mode = server.doh_mode.as_deref().unwrap_or("authoritative");
+                        let doh_extra = format!("doh_mode = \"{}\"\n", mode);
+                        write_server_block("doh", doh, &doh_extra);
                     }
                 }
 

@@ -21,6 +21,7 @@ fn validate_server_urls(
     websocket_url: &Option<String>,
     ahttp_url: &Option<String>,
     wrtc_url: &Option<String>,
+    doh_url: &Option<String>,
 ) -> Result<(), String> {
     if !address.is_empty() {
         if !address.is_ascii() {
@@ -77,6 +78,27 @@ fn validate_server_urls(
             }
         }
     }
+
+    if let Some(doh) = doh_url {
+        if !doh.trim().is_empty() {
+            if !doh.is_ascii() {
+                return Err(format!("DoH URL '{}' содержит недопустимые (не латинские) символы", doh));
+            }
+            let check_str = if doh.contains("://") {
+                doh.trim().to_string()
+            } else {
+                format!("doh://{}", doh.trim())
+            };
+            let parsed = check_str.parse::<poem::http::Uri>().map_err(|e| format!("Некорректный DoH URL '{}': {}", doh, e))?;
+            let scheme = parsed.scheme_str().unwrap_or("");
+            if scheme != "doh" && scheme != "https" {
+                return Err(format!("Неподдерживаемый протокол '{}' для DoH URL. Ожидается doh:// или https://", scheme));
+            }
+            if parsed.host().is_none() {
+                return Err(format!("DoH URL '{}' не содержит доменную зону (хост)", doh));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -96,7 +118,7 @@ impl ServersApi {
             ));
         }
 
-        if let Err(err) = validate_server_urls(&req.0.address, &req.0.websocket_url, &req.0.ahttp_url, &req.0.wrtc_url) {
+        if let Err(err) = validate_server_urls(&req.0.address, &req.0.websocket_url, &req.0.ahttp_url, &req.0.wrtc_url, &req.0.doh_url) {
             return Err(poem::Error::from_string(
                 err,
                 poem::http::StatusCode::BAD_REQUEST,
@@ -116,6 +138,8 @@ impl ServersApi {
             ahttp_url: Set(req.0.ahttp_url.clone()),
             wrtc_url: Set(req.0.wrtc_url.clone()),
             wrtc_mode: Set(req.0.wrtc_mode.clone()),
+            doh_url: Set(req.0.doh_url.clone()),
+            doh_mode: Set(req.0.doh_mode.clone()),
             ssh_user: Set(req.0.ssh_user.clone()),
             is_active: Set(req.0.is_active.unwrap_or(true)),
             control_token_hash: Set(None),
@@ -136,6 +160,8 @@ impl ServersApi {
                 ahttp_url: saved.ahttp_url,
                 wrtc_url: saved.wrtc_url,
                 wrtc_mode: saved.wrtc_mode,
+                doh_url: saved.doh_url,
+                doh_mode: saved.doh_mode,
                 ssh_user: saved.ssh_user,
                 is_active: saved.is_active,
                 has_control_credential: saved.control_token_hash.is_some(),
@@ -161,7 +187,8 @@ impl ServersApi {
         let ws_url = req.0.websocket_url.clone().flatten();
         let ahttp_url = req.0.ahttp_url.clone().flatten();
         let wrtc_url = req.0.wrtc_url.clone().flatten();
-        if let Err(err) = validate_server_urls(&addr, &ws_url, &ahttp_url, &wrtc_url) {
+        let doh_url = req.0.doh_url.clone().flatten();
+        if let Err(err) = validate_server_urls(&addr, &ws_url, &ahttp_url, &wrtc_url, &doh_url) {
             return crate::api::dto::UpdateServerApiResult::BadRequest(Json(err));
         }
 
@@ -224,6 +251,14 @@ impl ServersApi {
             active_model.wrtc_mode = Set(wrtc_mode);
             changed = true;
         }
+        if let Some(doh_url) = req.0.doh_url {
+            active_model.doh_url = Set(doh_url);
+            changed = true;
+        }
+        if let Some(doh_mode) = req.0.doh_mode {
+            active_model.doh_mode = Set(doh_mode);
+            changed = true;
+        }
 
         if changed {
             active_model.updated_at = Set(Utc::now().naive_utc());
@@ -240,6 +275,8 @@ impl ServersApi {
                     ahttp_url: saved.ahttp_url,
                     wrtc_url: saved.wrtc_url,
                     wrtc_mode: saved.wrtc_mode,
+                    doh_url: saved.doh_url,
+                    doh_mode: saved.doh_mode,
                     ssh_user: saved.ssh_user,
                     is_active: saved.is_active,
                     has_control_credential: saved.control_token_hash.is_some(),
@@ -260,6 +297,8 @@ impl ServersApi {
                 ahttp_url: server_model.ahttp_url,
                 wrtc_url: server_model.wrtc_url,
                 wrtc_mode: server_model.wrtc_mode,
+                doh_url: server_model.doh_url,
+                doh_mode: server_model.doh_mode,
                 ssh_user: server_model.ssh_user,
                 is_active: server_model.is_active,
                 has_control_credential: server_model.control_token_hash.is_some(),
@@ -314,6 +353,8 @@ impl ServersApi {
                         ahttp_url: s.ahttp_url,
                         wrtc_url: s.wrtc_url,
                         wrtc_mode: s.wrtc_mode,
+                        doh_url: s.doh_url,
+                        doh_mode: s.doh_mode,
                         ssh_user: s.ssh_user,
                         is_active: s.is_active,
                         has_control_credential: s.control_token_hash.is_some(),

@@ -203,6 +203,9 @@ pub struct ServerConfig {
     /// WebRTC Data Transport mode: "auto" | "p2p_direct" | "jvb_datachannel" | "ws" | "media_video"
     #[serde(default)]
     pub wrtc_mode: Option<String>,
+    /// DoH Transport mode: "authoritative" | "recursive"
+    #[serde(default)]
+    pub doh_mode: Option<String>,
 
     /// Опциональное переопределение TLS-отпечатка для конкретного сервера:
     /// "auto" | "chrome" | "firefox" | "safari" | "randomized"
@@ -242,6 +245,7 @@ impl Default for ServerConfig {
             wrtc_fallback_jvb_ip: None,
             wrtc_fallback_jvb_port: None,
             wrtc_mode: None,
+            doh_mode: None,
             tls_fingerprint: None,
             tls_verify_peer: None,
             tls_pin_sha256: None,
@@ -638,6 +642,21 @@ mod tests {
     fn dsn_selects_transport_and_endpoint() {
         let server = ServerConfig {
             dsn: "quic://vpn.example.com:4519".to_string(),
+            timeout_secs: 10,
+            server_pub_key: None,
+            ssh_user: None,
+            group_name: None,
+            group_id: None,
+            weight: None,
+            weigth: None,
+            websocket_min_session_secs: 480,
+            websocket_max_session_secs: 1500,
+            wrtc_media_keepalive_interval_ms: None,
+            wrtc_ping_interval_secs: None,
+            wrtc_fallback_jvb_ip: None,
+            wrtc_fallback_jvb_port: None,
+            wrtc_mode: None,
+            doh_mode: None,
             ..Default::default()
         };
         assert_eq!(server.mode().unwrap(), TransportMode::Quic);
@@ -652,6 +671,21 @@ mod tests {
 
         let ws_no_port = ServerConfig {
             dsn: "wss://vpn.example.com/socket".to_string(),
+            timeout_secs: 10,
+            server_pub_key: None,
+            ssh_user: None,
+            group_name: None,
+            group_id: None,
+            weight: None,
+            weigth: None,
+            websocket_min_session_secs: 480,
+            websocket_max_session_secs: 1500,
+            wrtc_media_keepalive_interval_ms: None,
+            wrtc_ping_interval_secs: None,
+            wrtc_fallback_jvb_ip: None,
+            wrtc_fallback_jvb_port: None,
+            wrtc_mode: None,
+            doh_mode: None,
             ..Default::default()
         };
         assert_eq!(ws_no_port.endpoint().unwrap(), "vpn.example.com:443");

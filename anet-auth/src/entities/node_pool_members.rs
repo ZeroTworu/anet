@@ -16,6 +16,7 @@ pub struct Model {
     pub weight: i32,
     pub port_or_url: Option<String>,
     pub wrtc_mode: Option<String>,
+    pub doh_mode: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

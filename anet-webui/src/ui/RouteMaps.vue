@@ -717,8 +717,8 @@ onMounted(() => {
                 v-model="providerForm.action"
                 :items="[
                   { title: 'Заблокировать (BLOCK — AdBlock 0.0.0.0)', value: 'block' },
-                  { title: 'В обход VPN (DIRECT — Split Tunneling)', value: 'direct' },
-                  { title: 'В туннель VPN (PROXY)', value: 'proxy' },
+                  { title: 'В обход туннеля (DIRECT — Split Tunneling)', value: 'direct' },
+                  { title: 'В туннель (PROXY)', value: 'proxy' },
                 ]"
                 label="Действие для списка (Action)"
                 variant="outlined"
@@ -874,7 +874,7 @@ onMounted(() => {
                 v-model="overrideForm.category"
                 :items="[
                   { title: 'Заблокировать (custom_block)', value: 'block' },
-                  { title: 'В обход VPN (custom_direct)', value: 'direct' },
+                  { title: 'В обход туннеля (custom_direct)', value: 'direct' },
                   { title: 'В туннель (custom_proxy)', value: 'proxy' },
                 ]"
                 label="Действие"

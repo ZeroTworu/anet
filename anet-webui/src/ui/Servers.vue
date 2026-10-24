@@ -68,7 +68,7 @@ onBeforeUnmount(() => {
   <v-container max-width="1400" class="servers-page">
     <div class="d-flex justify-space-between align-center flex-wrap ga-4 mb-5">
       <div>
-        <h2 class="text-h6 font-weight-bold ma-0">VPN Nodes (Servers)</h2>
+        <h2 class="text-h6 font-weight-bold ma-0">Nodes (Servers)</h2>
         <span class="text-caption text-medium-emphasis">Управление физическими серверами и нодами доступа</span>
       </div>
       <div class="d-flex align-center ga-3">

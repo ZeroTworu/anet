@@ -34,7 +34,7 @@ const oppositeAction = computed<'tunnel' | 'direct'>(() =>
 )
 
 const actionOptions = [
-  { title: 'Tunnel by default (Все в VPN)', value: 'tunnel' },
+  { title: 'Tunnel by default (Все в туннель)', value: 'tunnel' },
   { title: 'Direct by default (Все напрямую)', value: 'direct' },
 ]
 
@@ -46,8 +46,8 @@ const kindOptions: { title: string; value: RouteRuleMatchType }[] = [
 ]
 
 const ruleActionOptions = computed<{ title: string; value: RouteRuleAction }[]>(() => [
-  { title: 'DIRECT (В обход VPN)', value: 'direct' },
-  { title: 'TUNNEL (В VPN)', value: 'tunnel' },
+  { title: 'DIRECT (В обход туннеля)', value: 'direct' },
+  { title: 'TUNNEL (В туннель)', value: 'tunnel' },
   { title: 'BLOCK (AdBlock / 0.0.0.0)', value: 'block' },
 ])
 

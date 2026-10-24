@@ -29,6 +29,8 @@ const form = ref({
   ahttp_url: '',
   wrtc_url: '',
   wrtc_mode: 'media_video',
+  doh_url: '',
+  doh_mode: 'authoritative',
 })
 
 const wrtcModeOptions = [
@@ -37,6 +39,11 @@ const wrtcModeOptions = [
   { title: 'JVB DataChannel (Colibri SCTP DataChannel)', value: 'jvb_datachannel' },
   { title: 'WebSocket (Colibri-WS Fallback)', value: 'ws' },
   { title: 'Auto (Автоматический выбор)', value: 'auto' },
+]
+
+const dohModeOptions = [
+  { title: 'Authoritative (прямые ASTP-L DNS-запросы к NS)', value: 'authoritative' },
+  { title: 'Recursive (через публичный DoH-резолвер)', value: 'recursive' },
 ]
 
 const loading = ref(false)
@@ -123,6 +130,8 @@ watch(
           ahttp_url: val.ahttp_url || '',
           wrtc_url: val.wrtc_url || '',
           wrtc_mode: val.wrtc_mode || 'media_video',
+          doh_url: val.doh_url || '',
+          doh_mode: val.doh_mode || 'authoritative',
         }
       }
     },
@@ -233,6 +242,25 @@ const close = () => {
               item-title="title"
               item-value="value"
               label="Режим WRTC (wrtc_mode)"
+              variant="filled"
+              class="mb-3"
+          />
+
+          <v-text-field
+              v-model="form.doh_url"
+              label="DoH URL / Domain (DNS-over-HTTPS)"
+              placeholder="doh://ns1.anet.internal?resolver=https://77.88.8.7/dns-query"
+              variant="filled"
+              class="mb-3"
+          />
+
+          <v-select
+              v-if="form.doh_url"
+              v-model="form.doh_mode"
+              :items="dohModeOptions"
+              item-title="title"
+              item-value="value"
+              label="Режим DoH (doh_mode)"
               variant="filled"
               class="mb-3"
           />

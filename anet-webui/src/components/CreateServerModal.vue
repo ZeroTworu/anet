@@ -27,6 +27,8 @@ const defaultForm = (): CreateServerRequest => ({
   ahttp_url: 'https://your-cdn.some-host.net/api/v2/telemetry',
   wrtc_url: 'wrtc://meet.jit.si/your-telemetry-room',
   wrtc_mode: 'media_video',
+  doh_url: 'doh://ns1.anet.internal?resolver=https://77.88.8.7/dns-query',
+  doh_mode: 'authoritative',
 })
 
 const wrtcModeOptions = [
@@ -35,6 +37,11 @@ const wrtcModeOptions = [
   { title: 'JVB DataChannel (Colibri SCTP DataChannel)', value: 'jvb_datachannel' },
   { title: 'WebSocket (Colibri-WS Fallback)', value: 'ws' },
   { title: 'Auto (Автоматический выбор)', value: 'auto' },
+]
+
+const dohModeOptions = [
+  { title: 'Authoritative (прямые ASTP-L DNS-запросы к NS)', value: 'authoritative' },
+  { title: 'Recursive (через публичный DoH-резолвер)', value: 'recursive' },
 ]
 
 const form = ref<CreateServerRequest>(defaultForm())
@@ -161,6 +168,25 @@ const close = () => {
               item-title="title"
               item-value="value"
               label="Режим WRTC (wrtc_mode)"
+              variant="filled"
+              class="mb-3"
+          />
+
+          <v-text-field
+              v-model="form.doh_url"
+              label="DoH URL / Domain (DNS-over-HTTPS)"
+              placeholder="doh://ns1.anet.internal?resolver=https://77.88.8.7/dns-query"
+              variant="filled"
+              class="mb-3"
+          />
+
+          <v-select
+              v-if="form.doh_url"
+              v-model="form.doh_mode"
+              :items="dohModeOptions"
+              item-title="title"
+              item-value="value"
+              label="Режим DoH (doh_mode)"
               variant="filled"
               class="mb-3"
           />
