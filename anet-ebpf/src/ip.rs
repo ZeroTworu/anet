@@ -1,10 +1,4 @@
-//! Разбор голых IPv4-пакетов на TUN-интерфейсе.
-//!
-//! TUN без PI-заголовка (то же допущение, что уже используется в
-//! `anet-server::utils::extract_ip_dst` на стороне userspace: version-nibble
-//! в самом первом байте, без Ethernet/PI-префикса). Поддерживаем только
-//! IPv4 — как и весь остальной ANet (`IpPool`, `TunParams` и т.д. — только
-//! `Ipv4Addr`).
+//! Разбор и криптографическая обработка IPv4-пакетов в ядре (XDP / TC).
 
 use core::mem;
 use anet_ebpf_common::Xoroshiro128Plus;
@@ -15,14 +9,15 @@ const IPV4_HEADER_MIN_LEN: usize = 20;
 const IPV4_SRC_OFFSET: usize = 12;
 const IPV4_DST_OFFSET: usize = 16;
 
+pub const ETH_P_IP_BE: u16 = 0x0800u16.to_be();
 #[allow(dead_code)]
 pub const IPPROTO_ICMP: u8 = 1;
 pub const IPPROTO_TCP: u8 = 6;
 pub const IPPROTO_UDP: u8 = 17;
 
-/// Максимальное число 8-байтных блоков шифрования (200 * 8 = 1600 байт > стандартного MTU).
+/// Максимальное число 8-байтных блоков для пакета до 1450 байт (182 * 8 = 1456 байт).
 /// Константная верхняя граница гарантирует быстрое доказательство конечности цикла BPF-верификатором.
-pub const MAX_CRYPT_BLOCKS: usize = 200;
+pub const MAX_CRYPT_BLOCKS: usize = 182;
 
 /// Заголовок Ethernet II (14 байт).
 #[repr(C)]
@@ -155,24 +150,26 @@ pub fn ipv4_header_checksum(hdr: &Ipv4Hdr) -> u16 {
     let w2 = u16::from_be(hdr.id) as u32;
     let w3 = u16::from_be(hdr.frag_off) as u32;
     let w4 = u16::from_be_bytes([hdr.ttl, hdr.proto]) as u32;
-    // w5 (check) = 0
     let src = u32::from_be(hdr.src_addr);
-    let w6 = (src >> 16) & 0xFFFF;
-    let w7 = src & 0xFFFF;
     let dst = u32::from_be(hdr.dst_addr);
-    let w8 = (dst >> 16) & 0xFFFF;
-    let w9 = dst & 0xFFFF;
 
-    let mut sum = w0 + w1 + w2 + w3 + w4 + w6 + w7 + w8 + w9;
+    let mut sum = w0
+        + w1
+        + w2
+        + w3
+        + w4
+        + (src >> 16)
+        + (src & 0xFFFF)
+        + (dst >> 16)
+        + (dst & 0xFFFF);
     sum = (sum & 0xFFFF) + (sum >> 16);
     sum = (sum & 0xFFFF) + (sum >> 16);
     (!(sum as u16)).to_be()
 }
 
 /// Вычисляет 16-битный seed псевдозаголовка IPv4 (`~csum_tcpudp_magic`), который ядро Linux
-/// записывает в поле `th->check` / `uh->check`, когда пакет находится в состоянии `CHECKSUM_PARTIAL`
-/// (например, после `virtio_net` RX `VIRTIO_NET_HDR_F_NEEDS_CSUM` или локальной генерации).
-/// Возвращает `u16` в сетевом порядке байт (Big-Endian) для прямого сравнения с полем `check` пакета.
+/// записывает в поле `th->check` / `uh->check`, когда пакет находится в состоянии `CHECKSUM_PARTIAL`.
+/// Возвращает `u16` в нативном представлении сетевого порядка байт для прямого сравнения с полем `check`.
 #[allow(dead_code)]
 #[inline(always)]
 pub fn ipv4_pseudo_csum_seed_be(
@@ -181,22 +178,22 @@ pub fn ipv4_pseudo_csum_seed_be(
     proto: u8,
     l4_len: u16,
 ) -> u16 {
-    let src = u32::from_be(src_addr_be);
-    let dst = u32::from_be(dst_addr_be);
-    let mut sum = ((src >> 16) & 0xFFFF)
-        + (src & 0xFFFF)
-        + ((dst >> 16) & 0xFFFF)
-        + (dst & 0xFFFF)
-        + (proto as u32)
-        + (l4_len as u32);
+    // По свойству RFC 1071 складываем 16-битные половинки напрямую в нативном порядке байт
+    let mut sum = (src_addr_be & 0xFFFF)
+        + (src_addr_be >> 16)
+        + (dst_addr_be & 0xFFFF)
+        + (dst_addr_be >> 16)
+        + ((proto as u32) << 8)
+        + (l4_len.to_be() as u32);
     sum = (sum & 0xFFFF) + (sum >> 16);
     sum = (sum & 0xFFFF) + (sum >> 16);
-    (sum as u16).to_be()
+    sum as u16
 }
 
 /// Вычисляет и финализирует контрольную сумму TCP/UDP (RFC 1071 / RFC 793) в пакете,
 /// если она находится в состоянии `CHECKSUM_PARTIAL` (в поле `check` записан только seed псевдозаголовка).
-/// Записывает готовую контрольную сумму в сетевом порядке байт (Big-Endian) в поле `check` заголовка L4.
+/// Использует 64-битное суммирование (по 8 байт за итерацию) + разложение хвоста `4 + 2 + 1` байт
+/// без инструкций перестановки байт (`bswap`) внутри цикла.
 #[inline(always)]
 pub fn finalize_l4_checksum(
     w: &ContextWrapper<'_>,
@@ -212,7 +209,7 @@ pub fn finalize_l4_checksum(
     };
 
     // Изолируем начальное смещение от предыдущих предположений LLVM,
-    // но оставляем верификатору явный верхний предел (IHL <= 60 байт).
+    // оставляя верификатору явный верхний предел (IHL <= 60 байт).
     let mut off = core::hint::black_box(l4_offset);
     if off > 60 {
         return Err(());
@@ -220,41 +217,54 @@ pub fn finalize_l4_checksum(
 
     // В состоянии CHECKSUM_PARTIAL поле `check` в заголовке L4 уже содержит
     // seed псевдозаголовка (~csum_tcpudp_magic), который будет учтён при чтении
-    // 16-битных слов заголовка в цикле ниже (начинаем с sum = 0).
-    let mut sum = 0u32;
+    // слов заголовка ниже (начинаем с sum = 0).
+    let mut sum = 0u64;
 
-    // Складываем 16-битные слова заголовка и полезной нагрузки L4 до конца пакета.
-    // Максимум 1500 / 2 = 750 итераций; константная граница 800 гарантирует прохождение BPF-верификатора.
-    for _ in 0..800 {
-        let Ok(ptr) = w.ptr_at::<u16>(off) else {
+    // 1. Основной цикл по 8 байт (u64): максимум 182 итерации для пакетов до 1450 байт.
+    for _ in 0..MAX_CRYPT_BLOCKS {
+        let Ok(ptr) = w.ptr_at::<u64>(off) else {
             break;
         };
-        let word = u16::from_be(unsafe { core::ptr::read_unaligned(ptr) });
-        sum += word as u32;
+        let val = unsafe { core::ptr::read_unaligned(ptr) };
+        sum += (val & 0xFFFF_FFFF) + (val >> 32);
+        off += 8;
+    }
+
+    // 2. Разложение хвоста (0..7 байт) за 3 линейных шага: 4 + 2 + 1 байт.
+    if let Ok(ptr) = w.ptr_at::<u32>(off) {
+        let val = unsafe { core::ptr::read_unaligned(ptr) };
+        sum += val as u64;
+        off += 4;
+    }
+    if let Ok(ptr) = w.ptr_at::<u16>(off) {
+        let val = unsafe { core::ptr::read_unaligned(ptr) };
+        sum += val as u64;
         off += 2;
     }
-
-    // Нечётный хвостовой байт (padding нулём справа по RFC 1071)
     if let Ok(ptr) = w.ptr_at::<u8>(off) {
         let b = unsafe { core::ptr::read_unaligned(ptr) };
-        sum += (b as u32) << 8;
+        // На Little-Endian нечётный байт на чётном смещении [b, 0] лежит в младших 8 битах u16
+        sum += b as u64;
     }
 
-    // Сворачиваем 32-битную сумму в 16 бит
-    sum = (sum & 0xFFFF) + (sum >> 16);
-    sum = (sum & 0xFFFF) + (sum >> 16);
+    // 3. Сворачиваем 64-битную сумму в 16 бит (в нативном представлении сетевого порядка байт)
+    sum = (sum & 0xFFFF_FFFF) + (sum >> 32);
+    sum = (sum & 0xFFFF_FFFF) + (sum >> 32);
+    let mut sum32 = sum as u32;
+    sum32 = (sum32 & 0xFFFF) + (sum32 >> 16);
+    sum32 = (sum32 & 0xFFFF) + (sum32 >> 16);
 
-    let mut final_check = !(sum as u16);
+    let mut final_check = !(sum32 as u16);
     if is_udp && final_check == 0 {
         final_check = 0xFFFF;
     }
 
-    w.write_unaligned::<u16>(check_offset, final_check.to_be())?;
+    w.write_unaligned::<u16>(check_offset, final_check)?;
     Ok(())
 }
 
 /// Шифрует или расшифровывает полезную нагрузку пакета в памяти (`payload_offset .. data_end`)
-/// потоковым шифром `Xoroshiro128+` блоками по 8 байт + хвост `1..7` байт.
+/// потоковым шифром `Xoroshiro128+` блоками по 8 байт + разложение хвоста `4 + 2 + 1` байт.
 /// Возвращает длину обработанной полезной нагрузки в байтах.
 #[inline(always)]
 pub fn xoroshiro_crypt_packet(
@@ -276,6 +286,7 @@ pub fn xoroshiro_crypt_packet(
         return Err(());
     }
 
+    // 1. Основной цикл по 8 байт (u64)
     for _ in 0..MAX_CRYPT_BLOCKS {
         let Ok(ptr) = w.ptr_at_mut::<u64>(off) else {
             break;
@@ -286,13 +297,23 @@ pub fn xoroshiro_crypt_packet(
         off += 8;
     }
 
-    let tail_mask = rng.next_u64().to_le_bytes();
-    for i in 0..7usize {
-        let Ok(ptr) = w.ptr_at_mut::<u8>(off + i) else {
-            break;
-        };
-        let b = unsafe { core::ptr::read_unaligned(ptr) };
-        unsafe { core::ptr::write_unaligned(ptr, b ^ tail_mask[i]) };
+    // 2. Разложение хвоста (0..7 байт) по разрядам 4 + 2 + 1 байт без цикла и без стека
+    let mut tail_mask = rng.next_u64();
+    if let Ok(ptr) = w.ptr_at_mut::<u32>(off) {
+        let v = u32::from_le(unsafe { core::ptr::read_unaligned(ptr) });
+        unsafe { core::ptr::write_unaligned(ptr, (v ^ (tail_mask as u32)).to_le()) };
+        off += 4;
+        tail_mask >>= 32;
+    }
+    if let Ok(ptr) = w.ptr_at_mut::<u16>(off) {
+        let v = u16::from_le(unsafe { core::ptr::read_unaligned(ptr) });
+        unsafe { core::ptr::write_unaligned(ptr, (v ^ (tail_mask as u16)).to_le()) };
+        off += 2;
+        tail_mask >>= 16;
+    }
+    if let Ok(ptr) = w.ptr_at_mut::<u8>(off) {
+        let v = unsafe { core::ptr::read_unaligned(ptr) };
+        unsafe { core::ptr::write_unaligned(ptr, v ^ (tail_mask as u8)) };
     }
 
     Ok(payload_len)
@@ -300,9 +321,6 @@ pub fn xoroshiro_crypt_packet(
 
 #[inline(always)]
 unsafe fn read_be32(base: usize, offset: usize) -> u32 {
-    // Rust 2024: unsafe fn больше не даёт implicit-unsafe своему телу —
-    // разыменование и арифметику над сырым указателем нужно оборачивать явно,
-    // даже находясь уже внутри unsafe fn.
     unsafe {
         let ptr = (base + offset) as *const u8;
         let b0 = *ptr as u32;

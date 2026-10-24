@@ -16,7 +16,7 @@ use aya_log_ebpf::{debug, info};
 
 use anet_ebpf_common::{
     AstplConfig, EdtState, EgressRoutingData, IngressSessionData, RateRule, TokenBucketState,
-    ASTPL_ENCAP_LEN,
+    Xoroshiro128Plus, ASTPL_ENCAP_LEN,
 };
 
 mod ip;
@@ -27,9 +27,7 @@ use ip::{
 };
 
 /// `BPF_SKB_TSTAMP_DELIVERY_MONO` из `enum bpf_skb_tstamp_type` ядра
-/// (include/uapi/linux/bpf.h). В сгенерированных биндингах aya-ebpf 0.1.1
-/// (`aya_ebpf::bindings`) этот enum отсутствует, поэтому значение
-/// захардкожено — это стабильный UAPI ядра, он не меняется между релизами.
+/// (include/uapi/linux/bpf.h).
 const BPF_SKB_TSTAMP_DELIVERY_MONO: u32 = 1;
 
 /// Глобальные константы для `override_global` / `set_global` (резервный источник конфигурации).
@@ -41,8 +39,7 @@ static SERVER_IP: u32 = 0;
 static ETH_IFINDEX: u32 = 0;
 
 /// Правила ограничения скорости. Ключ — IPv4 клиента внутри туннельной сети
-/// (`assigned_ip`) в сетевом (big-endian) порядке байт. Заполняется/чистится
-/// из `anet-server::shaper::Shaper` по мере жизни клиентских сессий.
+/// (`assigned_ip`) в сетевом (big-endian) порядке байт.
 #[map(name = "RATE_RULES")]
 static RATE_RULES: HashMap<u32, RateRule> = HashMap::with_max_entries(4096, 0);
 
@@ -59,7 +56,7 @@ static TB_STATE: HashMap<u32, TokenBucketState> = HashMap::with_max_entries(4096
 static ASTPL_CONFIG: HashMap<u32, AstplConfig> = HashMap::with_max_entries(1, 0);
 
 /// Таблица входящих сессий ASTP-L для XDP на физическом интерфейсе (`eth0`).
-/// Ключ — `nonce_prefix: u32` (Big-Endian, первые 4 байта UDP payload).
+/// Ключ — `nonce_prefix: u32` (первые 4 байта UDP payload).
 #[map(name = "ASTPL_INGRESS_MAP")]
 static ASTPL_INGRESS_MAP: HashMap<u32, IngressSessionData> = HashMap::with_max_entries(4096, 0);
 
@@ -88,7 +85,6 @@ fn load_astpl_config() -> AstplConfig {
 }
 
 /// Проверка Token Bucket для upload-трафика клиента (`src_ip` в Big-Endian).
-/// Возвращает `true`, если пакет разрешён, или `false`, если превышен лимит скорости.
 #[inline(always)]
 fn check_upload_token_bucket(src_ip: u32, packet_len: i64, now: u64) -> bool {
     let Some(rule) = (unsafe { RATE_RULES.get(&src_ip) }) else {
@@ -124,14 +120,7 @@ fn check_upload_token_bucket(src_ip: u32, packet_len: i64, now: u64) -> bool {
     allowed
 }
 
-/// EDT egress classifier. Вешается на `clsact egress` TUN-интерфейса сервера
-/// (см. `anet-server::shaper::Shaper::attach`). TUN-egress — это пакеты,
-/// которые ядро отдаёт обратно клиенту, т.е. download с его точки зрения.
-///
-/// Реализация без потерь: считаем момент, когда пакет МОЖЕТ уйти (Earliest
-/// Departure Time), пишем его в `skb->tstamp` — фактическую задержку и
-/// порядок отправки берёт на себя qdisc `fq`, который ОБЯЗАН стоять как root
-/// qdisc интерфейса, иначе `tstamp` тихо игнорируется и пакет уйдёт сразу.
+/// EDT egress classifier. Вешается на `clsact egress` TUN-интерфейса сервера.
 #[classifier]
 pub fn tc_egress(ctx: TcContext) -> i32 {
     match try_tc_egress(&ctx) {
@@ -157,14 +146,9 @@ fn try_tc_egress(ctx: &TcContext) -> Result<i32, ()> {
                 None => now,
             };
 
-            // 10^9 * packet_len (максимум ~65535) = ~6.5 * 10^13, что с запасом
-            // укладывается в u64 (предел u64: 1.84 * 10^19). 128-битная арифметика не требуется.
             let cost_ns = (1_000_000_000u64 * packet_len) / rule.rate_bytes_per_sec;
             let next_departure = scheduled_from.saturating_add(cost_ns);
 
-            // Ограничиваем глубину виртуального буфера очереди размером burst_bytes.
-            // Если время отправки пакета (next_departure) выходит за пределы горизонта планирования
-            // (horizon), это сигнализирует о переполнении буфера шейпера.
             let safe_burst = rule.burst_bytes.max(1).min(1_000_000_000);
             let max_horizon_ns = (1_000_000_000u64 * safe_burst) / rule.rate_bytes_per_sec;
             let horizon = now.saturating_add(max_horizon_ns.max(cost_ns));
@@ -180,8 +164,6 @@ fn try_tc_egress(ctx: &TcContext) -> Result<i32, ()> {
                 0,
             );
 
-            // ВНИМАНИЕ: bpf_skb_set_tstamp — helper, появившийся в Linux 5.18
-            // (BPF_FUNC_skb_set_tstamp).
             unsafe {
                 let _ = bpf_skb_set_tstamp(
                     ctx.as_ptr() as *mut _,
@@ -197,14 +179,10 @@ fn try_tc_egress(ctx: &TcContext) -> Result<i32, ()> {
         }
     }
 
-    // Если клиент подключён по протоколу ASTP-L и его маршрут присутствует в ASTPL_EGRESS_MAP,
-    // сразу выполняем инкапсуляцию и редирект в физический интерфейс.
     try_astpl_tc_egress(ctx)
 }
 
 /// Программа TC Classifier для инкапсуляции исходящих пакетов ASTP-L на `tun0`.
-/// Может прикрепляться как самостоятельно (`astpl_tc_egress`), так и вызываться
-/// из цепочки `tc_egress` при совместной работе с `Shaper`.
 #[classifier]
 pub fn astpl_tc_egress(ctx: TcContext) -> i32 {
     match try_astpl_tc_egress(&ctx) {
@@ -223,8 +201,6 @@ fn try_astpl_tc_egress(ctx: &TcContext) -> Result<i32, ()> {
         return Ok(TC_ACT_OK);
     }
 
-    // В `Ipv4Hdr` поля адресов лежат в сетевом порядке байт (Big-Endian),
-    // как и ключ в `ASTPL_EGRESS_MAP`.
     let inner_src_ip = inner_ip.src_addr;
     let inner_dst_ip = inner_ip.dst_addr;
     let inner_proto = inner_ip.proto;
@@ -237,17 +213,13 @@ fn try_astpl_tc_egress(ctx: &TcContext) -> Result<i32, ()> {
         return Ok(TC_ACT_OK);
     }
 
-    // Локально сгенерированные на самом сервере пакеты (с исходным адресом `self_ip` или `gateway`,
-    // например `iperf3 -s -B 172.112.224.2`) пропускаем в Userspace через `TC_ACT_OK`.
+    // Локально сгенерированные на самом сервере пакеты пропускаем в Userspace через `TC_ACT_OK`.
     if (cfg.tun_ip_be != 0 && inner_src_ip == cfg.tun_ip_be)
         || (cfg.tun_gw_be != 0 && inner_src_ip == cfg.tun_gw_be)
     {
         return Ok(TC_ACT_OK);
     }
 
-    // Проверяем длину sk_buff и флаги GSO ДО вызова pull_data.
-    // Если пакет является редким GSO-суперпакетом (> 1450 байт), пропускаем его в `validate_xmit_skb`
-    // на TUN-интерфейсе для нарезки и userspace-отправки через `sock_writer`.
     let skb_len = ctx.len();
     let (gso_segs, gso_size) = unsafe {
         let skb = ctx.as_ptr() as *const __sk_buff;
@@ -257,8 +229,7 @@ fn try_astpl_tc_egress(ctx: &TcContext) -> Result<i32, ()> {
         return Ok(TC_ACT_OK);
     }
 
-    // Линеаризуем ВСЕ `skb_len` байт пакета, чтобы страничные фрагменты (`skb->data_len`)
-    // гарантированно оказались в `data..data_end` для доступа BPF-верификатора.
+    // Линеаризуем `skb_len` байт пакета для доступа BPF-верификатора.
     let pull_ret = unsafe { bpf_skb_pull_data(ctx.as_ptr() as *mut _, skb_len) };
     if pull_ret < 0 {
         return Ok(TC_ACT_OK);
@@ -278,9 +249,7 @@ fn try_astpl_tc_egress(ctx: &TcContext) -> Result<i32, ()> {
         return Ok(TC_ACT_OK);
     }
 
-    // КРИТИЧНО: Финализируем контрольную сумму TCP/UDP, если пакет находится в состоянии `CHECKSUM_PARTIAL`.
-    // Гипервизор KVM (virtio_net) при транзитном Download записывает в поле `check` только seed псевдозаголовка.
-    // Вычисляем и финализируем контрольную сумму L4 прямо здесь, ДО шифрования!
+    // Финализируем контрольную сумму TCP/UDP, если пакет находится в состоянии `CHECKSUM_PARTIAL`.
     let l4_len = inner_tot_len.saturating_sub(ihl_bytes);
     if inner_proto == IPPROTO_TCP && ihl_bytes + 20 <= inner_len && l4_len >= 20 {
         let tcp_check = w_plain.read_unaligned::<u16>(ihl_bytes + 16)?;
@@ -325,15 +294,12 @@ fn try_astpl_tc_egress(ctx: &TcContext) -> Result<i32, ()> {
 
     // 2. Расширяем начало пакета на 50 байт:
     //    `EthHdr (14) + Outer IPv4 (20) + Outer UDP (8) + ASTP-L Header (8)`.
-    //    В ядре Linux `bpf_skb_change_head(ctx, 50, 0)` делает push заголовка,
-    //    обнуляет 50 байт и оставляет mac_header < network_header для `__bpf_redirect_neigh`.
     let chg_ret =
         unsafe { bpf_skb_change_head(ctx.as_ptr() as *mut _, OUTER_HEADERS_LEN as u32, 0) };
     if chg_ret < 0 {
         return Ok(TC_ACT_SHOT);
     }
 
-    // После bpf_skb_change_head старые указатели недействительны — создаём новую обёртку
     let w_encap = ContextWrapper::Tc(ctx);
     let total_frame_len = w_encap.data_end().saturating_sub(w_encap.data());
     if total_frame_len < OUTER_HEADERS_LEN + Ipv4Hdr::LEN {
@@ -361,33 +327,26 @@ fn try_astpl_tc_egress(ctx: &TcContext) -> Result<i32, ()> {
         source: cfg.astpl_port_be,
         dest: dst_port,
         len: (udp_total_len as u16).to_be(),
-        check: 0, // UDP checksum 0 валиден для IPv4 (RFC 768)
+        check: 0,
     };
 
-    // Записываем EtherType (0x0800 IPv4) на смещении 12 и внешние L3/L4/ASTP-L заголовки
+    // Упаковываем 8-байтный заголовок ASTP-L [nonce_prefix (4B)][tx_seq_be (4B)] в одно 64-битное слово
+    let astpl_hdr_u64 = (nonce_prefix as u64) | ((tx_seq.to_be() as u64) << 32);
+
     w_encap.write_unaligned::<u16>(12, ETH_P_IP_BE)?;
     w_encap.write_unaligned::<Ipv4Hdr>(EthHdr::LEN, outer_ip)?;
     w_encap.write_unaligned::<UdpHdr>(EthHdr::LEN + Ipv4Hdr::LEN, outer_udp)?;
-    w_encap.write_unaligned::<u32>(EthHdr::LEN + Ipv4Hdr::LEN + UdpHdr::LEN, nonce_prefix)?;
-    w_encap.write_unaligned::<u32>(
-        EthHdr::LEN + Ipv4Hdr::LEN + UdpHdr::LEN + 4,
-        tx_seq.to_be(),
-    )?;
+    w_encap.write_unaligned::<u64>(EthHdr::LEN + Ipv4Hdr::LEN + UdpHdr::LEN, astpl_hdr_u64)?;
 
-    // 3. Отправляем зашифрованный UDP-пакет напрямую в физический интерфейс через подсистему соседей (ARP/Neighbour)
-    //    Минуя чтение из TUN-дескриптора, очередь Tokio и Userspace sendto!
+    // 3. Отправляем зашифрованный UDP-пакет напрямую в физический интерфейс через подсистему соседей
     let action =
         unsafe { bpf_redirect_neigh(cfg.eth_ifindex, core::ptr::null_mut(), 0, 0) as i32 };
 
     Ok(action)
 }
 
-/// Программа XDP для декапсуляции входящих пакетов ASTP-L на физическом интерфейсе (`eth0`).
-/// Выполняет:
-/// 1. Демультиплексирование по 4-байтному `nonce_prefix` за O(1) (промах -> `XDP_PASS` в Userspace для Handshake / `DatagramReassembler`).
-/// 2. Дешифрование `Xoroshiro128+` на месте и проверку инвариантов внутреннего IPv4-заголовка.
-/// 3. Ядерный NAT Rebinding (обновление внешнего IP:Port клиента в `ASTPL_EGRESS_MAP` без участия Userspace).
-/// 4. Декапсуляцию со сдвигом L2-заголовка (`bpf_xdp_adjust_head` на 36 байт) и передачу пакета в IP Forwarding ядра.
+/// Программа XDP для быстрой верификации, фильтрации спуфинга, учёта трафика
+/// и мгновенного ядерного NAT Rebinding входящих пакетов ASTP-L на физическом интерфейсе (`eth0`).
 #[xdp]
 pub fn astpl_xdp_ingress(ctx: XdpContext) -> u32 {
     match try_astpl_xdp_ingress(&ctx) {
@@ -400,8 +359,6 @@ pub fn astpl_xdp_ingress(ctx: XdpContext) -> u32 {
 fn try_astpl_xdp_ingress(ctx: &XdpContext) -> Result<u32, ()> {
     let w = ContextWrapper::Xdp(ctx);
 
-    // Минимальный размер кадра ASTP-L Data Plane:
-    // Eth (14) + Outer IPv4 (20) + Outer UDP (8) + ASTP-L Header (8) + Inner IPv4 (20) = 70 байт
     const OUTER_HEADERS_LEN: usize = EthHdr::LEN + ASTPL_ENCAP_LEN; // 14 + 36 = 50 байт
     const MIN_ASTPL_FRAME_LEN: usize = OUTER_HEADERS_LEN + Ipv4Hdr::LEN; // 70 байт
 
@@ -429,15 +386,13 @@ fn try_astpl_xdp_ingress(ctx: &XdpContext) -> Result<u32, ()> {
         return Ok(xdp_action::XDP_PASS);
     }
 
-    // Читаем 8-байтный заголовок ASTP-L: [nonce_prefix: u32 (BE)][seq: u32 (BE)]
+    // Читаем 8-байтный заголовок ASTP-L за одно 64-битное чтение: [nonce_prefix: u32][seq_be: u32]
     let astpl_offset = EthHdr::LEN + Ipv4Hdr::LEN + UdpHdr::LEN; // 42
-    let nonce_prefix = w.read_unaligned::<u32>(astpl_offset)?;
-    let seq_be = w.read_unaligned::<u32>(astpl_offset + 4)?;
-    let seq = u32::from_be(seq_be);
+    let astpl_hdr = w.read_unaligned::<u64>(astpl_offset)?;
+    let nonce_prefix = astpl_hdr as u32;
+    let seq = u32::from_be((astpl_hdr >> 32) as u32);
 
     // 1. Демультиплексирование Control Plane vs Data Plane за O(1):
-    // Если `nonce_prefix` не найден в карте или `seq == 0` — это пакет Handshake (Phase I / Phase III),
-    // UDP-фрагмент для `DatagramReassembler` или управляющий пакет сессии. Пропускаем в Userspace.
     let Some(session_ptr) = ASTPL_INGRESS_MAP.get_ptr_mut(&nonce_prefix) else {
         return Ok(xdp_action::XDP_PASS);
     };
@@ -450,41 +405,43 @@ fn try_astpl_xdp_ingress(ctx: &XdpContext) -> Result<u32, ()> {
         (s.crypto_seed, s.assigned_ip, s.client_ip, s.client_port)
     };
 
-    // 2. Расшифровываем внутренний IPv4-пакет на месте (offset 50 .. data_end)
-    let inner_len = xoroshiro_crypt_packet(&w, OUTER_HEADERS_LEN, crypto_seed, seq)?;
+    // 2. Расшифровываем только первые 16 байт внутреннего IPv4-заголовка прямо в регистрах
+    //    (без цикла по всему пакету и без модификации пакета в памяти):
+    let inner_len = w.data_end().saturating_sub(w.data() + OUTER_HEADERS_LEN);
+    let mut rng = Xoroshiro128Plus::new(crypto_seed, seq);
+    let b0 = (u64::from_le(w.read_unaligned::<u64>(OUTER_HEADERS_LEN)?) ^ rng.next_u64())
+        .to_le_bytes();
+    let b1 = (u64::from_le(w.read_unaligned::<u64>(OUTER_HEADERS_LEN + 8)?) ^ rng.next_u64())
+        .to_le_bytes();
+
+    let version_ihl = b0[0];
+    let inner_version = version_ihl >> 4;
+    let inner_ihl = version_ihl & 0x0F;
+    let inner_tot_len = u16::from_be_bytes([b0[2], b0[3]]) as usize;
+    let inner_src_addr = u32::from_ne_bytes([b1[4], b1[5], b1[6], b1[7]]);
 
     // 3. Проверяем криптографические инварианты расшифрованного внутреннего IPv4-заголовка:
-    // - версия IPv4 == 4 и IHL >= 5
-    // - полная длина внутреннего IPv4-пакета (tot_len) соответствует реальному размеру payload
-    // - внутренний адрес источника строго равен выданному клиенту VPN IP (anti-spoofing)
-    let inner_ip = w.read_unaligned::<Ipv4Hdr>(OUTER_HEADERS_LEN)?;
-    let inner_tot_len = u16::from_be(inner_ip.tot_len) as usize;
-    let valid_inner = inner_ip.version() == 4
-        && inner_ip.ihl() >= 5
+    let valid_inner = inner_version == 4
+        && inner_ihl >= 5
         && inner_tot_len >= Ipv4Hdr::LEN
         && inner_tot_len <= inner_len
-        && inner_ip.src_addr == assigned_ip;
+        && inner_src_addr == assigned_ip;
 
     if !valid_inner {
-        debug!(
-            ctx,
-            "[ASTP-L XDP] invalid inner IPv4: seq={}, ver={}, ihl={}, tot_len={}, inner_len={}, src={:i}, expected={:i}",
-            seq,
-            inner_ip.version(),
-            inner_ip.ihl(),
-            inner_tot_len,
-            inner_len,
-            u32::from_be(inner_ip.src_addr),
-            u32::from_be(assigned_ip)
-        );
-        // Если пакет пришёл с уже известного IP:Port этой сессии (например, IPv6 в туннеле или
-        // пакет со старым LAN src_ip от открытого до VPN сокета), сразу отбрасываем его в XDP.
+        // debug!(
+        //     ctx,
+        //     "[ASTP-L XDP] invalid inner IPv4: seq={}, ver={}, ihl={}, tot_len={}, inner_len={}, src={:i}, expected={:i}",
+        //     seq,
+        //     inner_version,
+        //     inner_ihl,
+        //     inner_tot_len,
+        //     inner_len,
+        //     u32::from_be(inner_src_addr),
+        //     u32::from_be(assigned_ip)
+        // );
         if outer_ip.src_addr == known_client_ip && outer_udp.source == known_client_port {
             return Ok(xdp_action::XDP_DROP);
         }
-        // При случайной коллизии префикса (1 на 2^32) с новым хендшейком откатываем XOR обратно
-        // и передаём пакет в Userspace без повреждения исходных байт.
-        let _ = xoroshiro_crypt_packet(&w, OUTER_HEADERS_LEN, crypto_seed, seq);
         return Ok(xdp_action::XDP_PASS);
     }
 
@@ -516,25 +473,12 @@ fn try_astpl_xdp_ingress(ctx: &XdpContext) -> Result<u32, ()> {
         }
     }
 
-    // 5. Откатываем XOR обратно и передаём проверенный пакет через `XDP_PASS` в батчированный
-    // 16 МБ UDP-сокет `anet-server` -> `TunManager` (`anet-test`):
-    // - В драйвере `virtio_net` (KVM) прямой сдвиг `bpf_xdp_adjust_head(ctx, 36)` в `XdpMode::Driver`
-    //   оставляет метаданные `virtio_net_hdr` от внешнего UDP-пакета (`truesize = PAGE_SIZE`, `csum`)
-    //   и инжектирует пакет с `iif = ens3` (`in_dev == out_dev == ens3`), что вызывает `RTCF_DOREDIRECT`
-    //   (шторм ICMP Redirect) и сброс `cwnd` при транзитном Upload.
-    // - При инжекции через `anet-test` пакет входит в стек маршрутизации ядра с чистым `skb` и
-    //   корректным `iif = anet-test`, а фильтрация спуфинга/мусора (`XDP_DROP`), учёт `rx_bytes`
-    //   и мгновенный NAT Rebinding выполняются прямо в XDP на сетевой карте.
-    let _ = xoroshiro_crypt_packet(&w, OUTER_HEADERS_LEN, crypto_seed, seq);
-
+    // 5. Пакет в памяти не модифицировался — сразу передаём его через `XDP_PASS`
+    //    в батчированный UDP-сокет `anet-server` -> `TunManager` (`anet-test`).
     Ok(xdp_action::XDP_PASS)
 }
 
-/// Token-Bucket ingress. Вешается в SKB(generic)-режиме — TUN не
-/// поддерживает native/driver XDP. TUN-ingress — это пакеты, которые сам
-/// `anet-server` записывает в устройство после расшифровки клиентского
-/// трафика (путь клиент -> сервер -> интернет), т.е. upload с точки зрения
-/// клиента. Лишнее дропается: TCP отправителя сам снизит окно перегрузки.
+/// Token-Bucket ingress на TUN-интерфейсе.
 #[xdp]
 pub fn xdp_ingress(ctx: XdpContext) -> u32 {
     match try_xdp_ingress(&ctx) {
@@ -558,7 +502,7 @@ fn try_xdp_ingress(ctx: &XdpContext) -> Result<u32, ()> {
         xdp_action::XDP_DROP
     };
 
-    debug!(ctx, "xdp_ingress: src={:i}, action={}", src_ip, action);
+    //debug!(ctx, "xdp_ingress: src={:i}, action={}", src_ip, action);
 
     Ok(action)
 }
