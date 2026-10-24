@@ -221,7 +221,8 @@ async fn receive_from_client<R>(
 where
     R: AsyncRead + Unpin,
 {
-    while let Some(encrypted) = read_next_packet(&mut reader).await? {
+    let mut frame_reader = anet_common::stream_framing::FrameReader::new();
+    while let Some(encrypted) = frame_reader.read_next_packet(&mut reader).await? {
         let packet =
             anet_common::transport::unwrap_packet_bytes_in_place(&client_info.cipher, encrypted)?;
         let packet_len = packet.len();

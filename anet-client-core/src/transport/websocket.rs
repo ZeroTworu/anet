@@ -4,7 +4,7 @@ use crate::config::{CoreConfig, ServerConfig};
 use anet_common::consts::COALESCE_BUDGET_BYTES;
 use anet_common::handshake_fragmentation::FragmentConfig;
 use anet_common::http_help::BrowserProfile;
-use anet_common::stream_framing::{frame_packet_into, read_next_packet};
+use anet_common::stream_framing::{FrameReader, frame_packet_into};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
@@ -232,21 +232,12 @@ impl ClientTransport for WebSocketTransport {
         // цикл select! при записи в TUN, но при этом не создаст bufferbloat.
         let (client_stream, internal_router) = tokio::io::duplex(512 * 1024);
         let (mut tunnel_read, mut tunnel_write) = tokio::io::split(internal_router);
-        let (tunnel_packet_tx, mut tunnel_packet_rx) =
-            tokio::sync::mpsc::channel::<Bytes>(256);
-
-        let tunnel_reader_task = tokio::spawn(async move {
-            while let Ok(Some(packet)) = read_next_packet(&mut tunnel_read).await {
-                if tunnel_packet_tx.send(packet).await.is_err() {
-                    break;
-                }
-            }
-        });
 
         tokio::spawn(async move {
             let mut socket = initial_socket;
             let mut key = initial_key;
             let mut current_response = initial_response;
+            let mut frame_reader = FrameReader::new();
 
             'sessions: loop {
                 let cipher = anet_common::encryption::Cipher::new(&key);
@@ -263,10 +254,12 @@ impl ClientTransport for WebSocketTransport {
 
                 loop {
                     tokio::select! {
-                        packet = tunnel_packet_rx.recv() => {
-                            let Some(mut raw) = packet else { break 'sessions; };
+                        pkt_res = frame_reader.read_next_packet(&mut tunnel_read) => {
+                            let mut raw = match pkt_res {
+                                Ok(Some(pkt)) => pkt,
+                                _ => break 'sessions,
+                            };
                             batch_buf.clear();
-                            let coalesce_deadline = tokio::time::Instant::now() + Duration::from_micros(250);
 
                             loop {
                                 if raw.len() >= 20 {
@@ -285,21 +278,10 @@ impl ClientTransport for WebSocketTransport {
                                 if batch_buf.len() >= COALESCE_BUDGET_BYTES {
                                     break;
                                 }
-                                match tunnel_packet_rx.try_recv() {
-                                    Ok(packet) => raw = packet,
-                                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
-                                        if batch_buf.len() < COALESCE_BUDGET_BYTES / 2
-                                            && tokio::time::Instant::now() < coalesce_deadline
-                                        {
-                                            match tokio::time::timeout_at(coalesce_deadline, tunnel_packet_rx.recv()).await {
-                                                Ok(Some(packet)) => raw = packet,
-                                                _ => break,
-                                            }
-                                        } else {
-                                            break;
-                                        }
-                                    }
-                                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+                                match frame_reader.try_next_packet() {
+                                    Ok(Some(packet)) => raw = packet,
+                                    Ok(None) => break,
+                                    Err(_) => break 'sessions,
                                 }
                             }
 
@@ -318,9 +300,19 @@ impl ClientTransport for WebSocketTransport {
                             match incoming {
                                 Some(Ok(Message::Binary(data))) => {
                                     downlink_buf.clear();
-                                    let mut cursor = std::io::Cursor::new(data);
-                                    while let Ok(Some(encrypted_packet)) = read_next_packet(&mut cursor).await {
-                                        match anet_common::transport::unwrap_packet_bytes(&cipher, encrypted_packet) {
+                                    let mut offset = 0usize;
+                                    while offset + 2 <= data.len() {
+                                        let len = u16::from_be_bytes([data[offset], data[offset + 1]]) as usize;
+                                        offset += 2;
+                                        if len == 0 {
+                                            continue;
+                                        }
+                                        if offset + len > data.len() {
+                                            break;
+                                        }
+                                        let encrypted_slice = &data[offset..offset + len];
+                                        offset += len;
+                                        match anet_common::transport::unwrap_packet(&cipher, encrypted_slice) {
                                             Ok(packet) => {
                                                 frame_packet_into(&mut downlink_buf, &packet);
                                             }
@@ -421,8 +413,6 @@ impl ClientTransport for WebSocketTransport {
                 }
             }
             close_browser_session(&mut socket).await;
-            tunnel_reader_task.abort();
-            let _ = tunnel_reader_task.await;
             info!("[WebSocket] Transport supervisor stopped");
         });
 

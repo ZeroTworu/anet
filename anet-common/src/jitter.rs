@@ -240,7 +240,8 @@ where
     let start = std::time::Instant::now();
     let mut last_pkt = start;
 
-    while let Some(encrypted) = crate::stream_framing::read_next_packet(&mut reader).await? {
+    let mut frame_reader = crate::stream_framing::FrameReader::new();
+    while let Some(encrypted) = frame_reader.read_next_packet(&mut reader).await? {
         pkt_count += 1;
         byte_count += encrypted.len() as u64;
         last_pkt = std::time::Instant::now();

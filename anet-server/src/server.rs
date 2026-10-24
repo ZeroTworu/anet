@@ -97,7 +97,7 @@ impl ANetServer {
             while let Some(packet) = rx_tun.recv().await {
                 if packet.len() < 20 { continue; }
                 if let Some(dst_ip) = crate::utils::extract_ip_dst(&packet) {
-                    rx_reg.route_packet_to_client(&dst_ip.to_string(), packet).await;
+                    rx_reg.route_packet_to_ipv4(dst_ip, packet).await;
                 }
             }
         });
@@ -130,7 +130,7 @@ impl ANetServer {
                 if let Some(reply) = anet_common::icmp_probe::handle_in_tunnel_icmp_probe(&packet) {
                     if let Some(dst_ip) = crate::utils::extract_ip_dst(&reply) {
                         probe_registry
-                            .route_packet_to_client(&dst_ip.to_string(), reply)
+                            .route_packet_to_ipv4(dst_ip, reply)
                             .await;
                     }
                     continue;

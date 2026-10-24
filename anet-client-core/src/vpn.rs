@@ -5,8 +5,10 @@ use anet_common::consts::CHANNEL_BUFFER_SIZE;
 use anet_common::encryption::Cipher;
 use anet_common::jitter::bridge_with_jitter;
 use anet_common::protocol::AuthResponse;
-use anet_common::quic_settings::build_transport_config;
-use anet_common::stream_framing::read_next_packet;
+use anet_common::quic_settings::{
+    QUIC_UDP_SOCKET_BUFFER_SIZE, build_transport_config, tune_udp_socket_buffers,
+};
+use anet_common::stream_framing::FrameReader;
 use anyhow::Result;
 use log::{error, info};
 use quinn::{ClientConfig, Connection, Endpoint, EndpointConfig, TokioRuntime};
@@ -48,7 +50,9 @@ impl VpnHandler {
             .ok_or_else(|| anyhow::anyhow!("No servers defined in [[servers]]"))?
             .endpoint()?;
         let server_addr: SocketAddr = addr_str.to_socket_addrs()?.next().ok_or(anyhow::anyhow!("Invalid server address"))?;
-        let real_socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
+        let udp_socket = UdpSocket::bind("0.0.0.0:0").await?;
+        tune_udp_socket_buffers(&udp_socket, QUIC_UDP_SOCKET_BUFFER_SIZE);
+        let real_socket = Arc::new(udp_socket);
         let cipher = Arc::new(Cipher::new(&shared_key));
         let nonce_prefix: [u8; 4] = auth_response.nonce_prefix.as_slice().try_into()?;
 
@@ -118,14 +122,10 @@ impl VpnHandler {
 
         // Task: QUIC -> TUN
         tokio::spawn(async move {
-            loop {
-                match read_next_packet(&mut recv_stream).await {
-                    Ok(Some(packet)) => {
-                        if tx_from_quic.send(packet).await.is_err() {
-                            break;
-                        }
-                    }
-                    _ => break,
+            let mut frame_reader = FrameReader::new();
+            while let Ok(Some(packet)) = frame_reader.read_next_packet(&mut recv_stream).await {
+                if tx_from_quic.send(packet).await.is_err() {
+                    break;
                 }
             }
             info!("[Core] QUIC RX finished.");

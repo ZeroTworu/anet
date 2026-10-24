@@ -4,8 +4,10 @@ use crate::config::Config;
 use crate::multikey_udp_socket::{HandshakeData, MultiKeyAnetUdpSocket};
 use anet_common::consts::{CHANNEL_BUFFER_SIZE, PADDING_MTU};
 use anet_common::jitter::bridge_with_jitter;
-use anet_common::quic_settings::build_transport_config;
-use anet_common::stream_framing::read_next_packet;
+use anet_common::quic_settings::{
+    QUIC_UDP_SOCKET_BUFFER_SIZE, build_transport_config, tune_udp_socket_buffers,
+};
+use anet_common::stream_framing::FrameReader;
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use log::{error, info, warn};
@@ -72,7 +74,9 @@ pub async fn run_quic_server(
 ) -> Result<()> {
     let bind_to = &config.server.quic_bind_to;
     let s_cfg = build_quinn_config(&config)?;
-    let real_socket = Arc::new(UdpSocket::bind(bind_to).await?);
+    let udp_socket = UdpSocket::bind(bind_to).await?;
+    tune_udp_socket_buffers(&udp_socket, QUIC_UDP_SOCKET_BUFFER_SIZE);
+    let real_socket = Arc::new(udp_socket);
 
     let (tx_auth, rx_auth) = mpsc::channel::<HandshakeData>(CHANNEL_BUFFER_SIZE);
 
@@ -145,7 +149,8 @@ pub async fn run_quic_server(
                 let ci_rx = client_info.clone();
                 let rx_registry = r.clone();
                 let mut reader_task = tokio::spawn(async move {
-                    while let Ok(Some(pkt)) = read_next_packet(&mut recv).await {
+                    let mut frame_reader = FrameReader::new();
+                    while let Ok(Some(pkt)) = frame_reader.read_next_packet(&mut recv).await {
                         let packet_len = pkt.len();
 
                         // BACKPRESSURE ДЛЯ QUIC
