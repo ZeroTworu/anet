@@ -644,8 +644,35 @@ impl ClientTransport for WrtcTransport {
         let mut batcher = PacketBatcher::new(WRTC_BATCHER_MAX_BYTES, WRTC_BATCHER_MAX_DELAY_MS);
 
         tokio::spawn(async move {
+            const VIDEO_WARMUP_PAYLOAD: [u8; 16] = [
+                VIDEO_BATCH_MARKER,
+                0xFF,
+                0xFF,
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            ];
             let mut pending_packet: Option<Bytes> = None;
             let mut video_batch_buf = BytesMut::with_capacity(max_video_batch_bytes + 64);
+
+            if (wrtc_mode == anet_common::wrtc::colibri::WrtcMode::MediaVideo
+                || wrtc_mode == anet_common::wrtc::colibri::WrtcMode::Auto)
+                && peer_tx.is_video_v2()
+            {
+                peer_tx.force_next_keyframe();
+                for _ in 0..3 {
+                    let seq = sequence_tx.fetch_add(1, Ordering::Relaxed);
+                    if let Ok(enc_buf) = wrap_packet_slice_with_headroom(
+                        &cipher_tx,
+                        &nonce_prefix,
+                        seq,
+                        &VIDEO_WARMUP_PAYLOAD,
+                        VP8_ASTP_PREFIX_LEN,
+                    ) {
+                        let _ = peer_tx
+                            .send_video_frame_preallocated(my_client_tag, enc_buf)
+                            .await;
+                    }
+                }
+            }
 
             loop {
                 tokio::select! {
@@ -853,6 +880,24 @@ impl ClientTransport for WrtcTransport {
                             warn!("[WRTC Client] Watchdog detected dead WebRTC session ({reason}). Reconnecting...");
                             warn(format!("[WRTC Client] Watchdog detected dead session ({reason}). Reconnecting..."));
                             break;
+                        }
+                        if (wrtc_mode == anet_common::wrtc::colibri::WrtcMode::MediaVideo
+                            || wrtc_mode == anet_common::wrtc::colibri::WrtcMode::Auto)
+                            && peer_tx.is_video_v2()
+                            && peer_tx.is_connected.load(Ordering::Relaxed)
+                        {
+                            let seq = sequence_tx.fetch_add(1, Ordering::Relaxed);
+                            if let Ok(enc_buf) = wrap_packet_slice_with_headroom(
+                                &cipher_tx,
+                                &nonce_prefix,
+                                seq,
+                                &VIDEO_WARMUP_PAYLOAD,
+                                VP8_ASTP_PREFIX_LEN,
+                            ) {
+                                let _ = peer_tx
+                                    .send_video_frame_preallocated(my_client_tag, enc_buf)
+                                    .await;
+                            }
                         }
                     }
                     _ = peer_tx.failed_notify.notified() => {

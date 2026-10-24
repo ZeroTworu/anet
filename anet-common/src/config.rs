@@ -95,7 +95,7 @@ impl Default for WrtcConfig {
             http_connect_timeout_secs: 10,
             http_request_timeout_secs: 15,
             xmpp_handshake_timeout_secs: 15,
-            ws_write_timeout_secs: 5,
+            ws_write_timeout_secs: 15,
             colibri_ws_connect_timeout_secs: 10,
             udp_socket_buffer_size: 4 * 1024 * 1024,
             reactor_pool_size: 4,

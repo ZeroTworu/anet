@@ -117,7 +117,7 @@ pub const WRTC_XMPP_RAW_WS_CHANNEL_CAPACITY: usize = 32;
 pub const WRTC_DUPLEX_BUFFER_SIZE: usize = 4 * 1024 * 1024;
 
 /// Параметры микро-батчирования и коалесценции пакетов в WebRTC.
-pub const WRTC_BATCHER_MAX_BYTES: usize = 16384;
+pub const WRTC_BATCHER_MAX_BYTES: usize = 4096;
 pub const WRTC_BATCHER_MAX_DELAY_MS: u64 = 2;
 pub const WRTC_VIDEO_BATCH_MAX_PACKETS: usize = 16;
 pub const WRTC_UPLINK_BURST_MAX_PACKETS: usize = 64;

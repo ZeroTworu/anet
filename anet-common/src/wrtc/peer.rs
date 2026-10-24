@@ -683,124 +683,186 @@ impl WrtcPeer {
                 let colibri_connect_timeout = wrtc_cfg.colibri_ws_connect_timeout_secs.max(1);
                 let ws_write_timeout = wrtc_cfg.ws_write_timeout_secs.max(1);
                 tokio::spawn(async move {
-                    let connect_res = match ws_profile.build_ws_request(&ws_url_c, ws_origin.as_deref()) {
-                        Ok(req) => {
-                            tokio::time::timeout(
-                                Duration::from_secs(colibri_connect_timeout),
-                                tokio_tungstenite::connect_async(req),
-                            )
-                            .await
-                        }
-                        Err(e) => {
-                            log::warn!("[WRTC WS] Failed to build Colibri-WS request: {e}");
-                            if !dc_open_ws.load(Ordering::SeqCst) {
-                                is_failed_ws.store(true, Ordering::SeqCst);
-                                failed_notify_ws.notify_waiters();
-                                failed_notify_ws.notify_one();
-                            }
-                            return;
-                        }
-                    };
-                    if let Ok(Ok((ws_stream, _))) = connect_res {
-                        let peer_ip = match ws_stream.get_ref() {
-                            tokio_tungstenite::MaybeTlsStream::Plain(s) => {
-                                s.peer_addr().ok().map(|a| a.ip())
-                            }
-                            tokio_tungstenite::MaybeTlsStream::Rustls(s) => {
-                                s.get_ref().0.peer_addr().ok().map(|a| a.ip())
-                            }
-                            _ => None,
-                        };
-                        if let Some(ip) = peer_ip {
-                            if let Ok(mut g) = colibri_ws_ip_c.lock() {
-                                *g = Some(ip);
-                            }
-                        }
-                        has_ws_c.store(true, Ordering::SeqCst);
-                        log::info!(
-                            "[WRTC WS] Parallel Colibri-WS fallback connected (remote_ip: {:?})",
-                            peer_ip
-                        );
-                        let (mut ws_sink, mut ws_stream) = ws_stream.split();
-
-                        if has_video_flag {
-                            let constraints =
-                                ReceiverVideoConstraints::new_all(WRTC_DEFAULT_MAX_VIDEO_HEIGHT);
-                            if let Ok(json) = serde_json::to_string(&constraints) {
-                                let _ = tokio::time::timeout(
-                                    Duration::from_secs(ws_write_timeout),
-                                    ws_sink.send(
-                                        tokio_tungstenite::tungstenite::Message::Text(json.into()),
-                                    ),
+                    let mut reconnect_attempts = 0u32;
+                    loop {
+                        let connect_res = match ws_profile.build_ws_request(&ws_url_c, ws_origin.as_deref()) {
+                            Ok(req) => {
+                                tokio::time::timeout(
+                                    Duration::from_secs(colibri_connect_timeout),
+                                    tokio_tungstenite::connect_async(req),
                                 )
-                                .await;
+                                .await
                             }
-                        }
-
-                        let in_tx = in_tx_ws;
-                        let has_ws_read = has_ws_c.clone();
-                        let dc_open_read = dc_open_ws.clone();
-                        let is_failed_read = is_failed_ws.clone();
-                        let failed_notify_read = failed_notify_ws.clone();
-                        tokio::spawn(async move {
-                            while let Some(msg_res) = ws_stream.next().await {
-                                match msg_res {
-                                    Ok(tokio_tungstenite::tungstenite::Message::Text(text)) => {
-                                        if let Ok(c_msg) = serde_json::from_str::<ColibriMessage>(&text) {
-                                            let _ = in_tx.send(c_msg).await;
-                                        }
-                                    }
-                                    Ok(tokio_tungstenite::tungstenite::Message::Binary(bin)) => {
-                                        if let Ok(c_msg) = serde_json::from_slice::<ColibriMessage>(&bin) {
-                                            let _ = in_tx.send(c_msg).await;
-                                        }
-                                    }
-                                    Ok(tokio_tungstenite::tungstenite::Message::Close(frame)) => {
-                                        log::warn!("[WRTC WS] Colibri-WS closed by JVB: {frame:?}");
-                                        break;
-                                    }
-                                    Err(e) => {
-                                        log::warn!("[WRTC WS] Colibri-WS read error: {e}");
-                                        break;
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            has_ws_read.store(false, Ordering::SeqCst);
-                            if !dc_open_read.load(Ordering::SeqCst) {
-                                log::warn!("[WRTC WS] Colibri-WS reader ended and no SCTP DataChannel is open; marking peer failed");
-                                is_failed_read.store(true, Ordering::SeqCst);
-                                failed_notify_read.notify_waiters();
-                                failed_notify_read.notify_one();
-                            }
-                        });
-
-                        while let Some(json_text) = ws_fallback_rx.recv().await {
-                            let send_res = tokio::time::timeout(
-                                Duration::from_secs(ws_write_timeout),
-                                ws_sink.send(
-                                    tokio_tungstenite::tungstenite::Message::Text(json_text.into()),
-                                ),
-                            )
-                            .await;
-                            if send_res.map_or(true, |r| r.is_err()) {
-                                log::warn!("[WRTC WS] Colibri-WS write failed or timed out");
-                                has_ws_c.store(false, Ordering::SeqCst);
+                            Err(e) => {
+                                log::warn!("[WRTC WS] Failed to build Colibri-WS request: {e}");
                                 if !dc_open_ws.load(Ordering::SeqCst) {
                                     is_failed_ws.store(true, Ordering::SeqCst);
                                     failed_notify_ws.notify_waiters();
                                     failed_notify_ws.notify_one();
                                 }
+                                return;
+                            }
+                        };
+
+                        if let Ok(Ok((mut ws_stream, _))) = connect_res {
+                            reconnect_attempts = 0;
+                            let peer_ip = match ws_stream.get_ref() {
+                                tokio_tungstenite::MaybeTlsStream::Plain(s) => {
+                                    let _ = s.set_nodelay(true);
+                                    s.peer_addr().ok().map(|a| a.ip())
+                                }
+                                tokio_tungstenite::MaybeTlsStream::Rustls(s) => {
+                                    let _ = s.get_ref().0.set_nodelay(true);
+                                    s.get_ref().0.peer_addr().ok().map(|a| a.ip())
+                                }
+                                _ => None,
+                            };
+                            if let Some(ip) = peer_ip {
+                                if let Ok(mut g) = colibri_ws_ip_c.lock() {
+                                    *g = Some(ip);
+                                }
+                            }
+                            has_ws_c.store(true, Ordering::SeqCst);
+                            log::info!(
+                                "[WRTC WS] Parallel Colibri-WS fallback connected (remote_ip: {:?})",
+                                peer_ip
+                            );
+
+                            if has_video_flag {
+                                let constraints =
+                                    ReceiverVideoConstraints::new_all(WRTC_DEFAULT_MAX_VIDEO_HEIGHT);
+                                if let Ok(json) = serde_json::to_string(&constraints) {
+                                    let _ = tokio::time::timeout(
+                                        Duration::from_secs(ws_write_timeout),
+                                        ws_stream.send(
+                                            tokio_tungstenite::tungstenite::Message::Text(json.into()),
+                                        ),
+                                    )
+                                    .await;
+                                }
+                            }
+
+                            let mut ws_ping_interval = tokio::time::interval(Duration::from_secs(15));
+                            ws_ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                            let mut channel_closed = false;
+
+                            loop {
+                                tokio::select! {
+                                    msg_opt = ws_stream.next() => {
+                                        match msg_opt {
+                                            Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) => {
+                                                if let Ok(c_msg) = serde_json::from_str::<ColibriMessage>(&text) {
+                                                    let _ = in_tx_ws.send(c_msg).await;
+                                                }
+                                            }
+                                            Some(Ok(tokio_tungstenite::tungstenite::Message::Binary(bin))) => {
+                                                if let Ok(c_msg) = serde_json::from_slice::<ColibriMessage>(&bin) {
+                                                    let _ = in_tx_ws.send(c_msg).await;
+                                                }
+                                            }
+                                            Some(Ok(tokio_tungstenite::tungstenite::Message::Ping(data))) => {
+                                                let pong_res = tokio::time::timeout(
+                                                    Duration::from_secs(ws_write_timeout),
+                                                    ws_stream.send(tokio_tungstenite::tungstenite::Message::Pong(data)),
+                                                )
+                                                .await;
+                                                if pong_res.map_or(true, |r| r.is_err()) {
+                                                    log::warn!("[WRTC WS] Colibri-WS pong write failed or timed out");
+                                                    break;
+                                                }
+                                            }
+                                            Some(Ok(tokio_tungstenite::tungstenite::Message::Close(frame))) => {
+                                                log::warn!("[WRTC WS] Colibri-WS closed by JVB: {frame:?}");
+                                                break;
+                                            }
+                                            Some(Err(e)) => {
+                                                log::warn!("[WRTC WS] Colibri-WS read error: {e}");
+                                                break;
+                                            }
+                                            None => {
+                                                log::warn!("[WRTC WS] Colibri-WS stream ended");
+                                                break;
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                    json_opt = ws_fallback_rx.recv() => {
+                                        let Some(json_text) = json_opt else {
+                                            channel_closed = true;
+                                            break;
+                                        };
+                                        let send_res = tokio::time::timeout(
+                                            Duration::from_secs(ws_write_timeout),
+                                            async {
+                                                ws_stream
+                                                    .feed(tokio_tungstenite::tungstenite::Message::Text(
+                                                        json_text.into(),
+                                                    ))
+                                                    .await?;
+                                                for _ in 0..15 {
+                                                    match ws_fallback_rx.try_recv() {
+                                                        Ok(more_text) => {
+                                                            ws_stream
+                                                                .feed(
+                                                                    tokio_tungstenite::tungstenite::Message::Text(
+                                                                        more_text.into(),
+                                                                    ),
+                                                                )
+                                                                .await?;
+                                                        }
+                                                        Err(_) => break,
+                                                    }
+                                                }
+                                                ws_stream.flush().await
+                                            },
+                                        )
+                                        .await;
+                                        if send_res.map_or(true, |r| r.is_err()) {
+                                            log::warn!("[WRTC WS] Colibri-WS write failed or timed out");
+                                            break;
+                                        }
+                                    }
+                                    _ = ws_ping_interval.tick() => {
+                                        let ping_res = tokio::time::timeout(
+                                            Duration::from_secs(ws_write_timeout),
+                                            ws_stream.send(
+                                                tokio_tungstenite::tungstenite::Message::Ping(Vec::new().into()),
+                                            ),
+                                        )
+                                        .await;
+                                        if ping_res.map_or(true, |r| r.is_err()) {
+                                            log::warn!("[WRTC WS] Colibri-WS keepalive ping failed or timed out");
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+
+                            has_ws_c.store(false, Ordering::SeqCst);
+                            if channel_closed || is_failed_ws.load(Ordering::SeqCst) {
                                 break;
                             }
+                        } else {
+                            log::warn!("[WRTC WS] Failed or timed out connecting to Colibri-WS: {ws_url_c}");
                         }
-                    } else {
-                        log::warn!("[WRTC WS] Failed or timed out connecting to Colibri-WS: {ws_url_c}");
-                        if !dc_open_ws.load(Ordering::SeqCst) {
-                            is_failed_ws.store(true, Ordering::SeqCst);
-                            failed_notify_ws.notify_waiters();
-                            failed_notify_ws.notify_one();
+
+                        reconnect_attempts += 1;
+                        if reconnect_attempts > 5 || is_failed_ws.load(Ordering::SeqCst) {
+                            if !dc_open_ws.load(Ordering::SeqCst) {
+                                log::warn!(
+                                    "[WRTC WS] Colibri-WS reconnect attempts exhausted ({reconnect_attempts}) and no SCTP DataChannel is open; marking peer failed"
+                                );
+                                is_failed_ws.store(true, Ordering::SeqCst);
+                                failed_notify_ws.notify_waiters();
+                                failed_notify_ws.notify_one();
+                            }
+                            break;
                         }
+
+                        log::info!(
+                            "[WRTC WS] Reconnecting Colibri-WS in 500ms (attempt {reconnect_attempts}/5)..."
+                        );
+                        tokio::time::sleep(Duration::from_millis(500)).await;
                     }
                 });
             }
@@ -1511,13 +1573,6 @@ impl WrtcPeer {
 
     pub async fn add_remote_video_ssrc(&self, ssrc: u32) {
         if self.mode == WrtcMode::Ws || ssrc == 0 || ssrc == self.video_ssrc || ssrc == 10002 {
-            return;
-        }
-        // Если входящий видеопоток от JVB уже активно идет (first_video_rx == false),
-        // не выполняем повторный SDP renegotiation (set_remote_description / set_local_description)
-        // после поднятия TUN-интерфейса, чтобы не сбить рабочую ICE/DTLS сессию!
-        if !self.first_video_rx.load(Ordering::Relaxed) {
-            self.force_next_keyframe();
             return;
         }
         let Some(ref pc) = self.peer_connection else {

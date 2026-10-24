@@ -239,8 +239,8 @@ pub async fn run_wrtc_server(
 
         let client_video_warmed_up: Arc<DashSet<u16>> = Arc::new(DashSet::new());
         let client_video_warmed_rx = client_video_warmed_up.clone();
-        let client_last_ws_batch_ms: Arc<DashMap<u16, u64>> = Arc::new(DashMap::new());
-        let client_last_ws_batch_rx = client_last_ws_batch_ms.clone();
+        let client_last_video_rx_ms: Arc<DashMap<u16, u64>> = Arc::new(DashMap::new());
+        let client_last_video_rx_rx = client_last_video_rx_ms.clone();
         let video_uplink_task = tokio::spawn(async move {
             while let Some(first_frame) = peer_video_rx.recv_video_frame().await {
                 let mut current_frame = Some(first_frame);
@@ -259,11 +259,8 @@ pub async fn run_wrtc_server(
                     let raw_astp = raw_frame.slice(2..);
                     if let Ok(decrypted) = unwrap_packet_bytes(&client_info.cipher, raw_astp) {
                         let now_ms = peer_video_rx.start_instant.elapsed().as_millis() as u64;
-                        let ws_batch_recent = client_last_ws_batch_rx
-                            .get(&client_tag)
-                            .map(|ts| now_ms.saturating_sub(*ts) < 500)
-                            .unwrap_or(false);
-                        if !ws_batch_recent && client_video_warmed_rx.insert(client_tag) {
+                        client_last_video_rx_rx.insert(client_tag, now_ms);
+                        if client_video_warmed_rx.insert(client_tag) {
                             peer_video_rx.force_next_keyframe();
                             info!(
                                 "[WRTC Server Video IN] First video frame decrypted from client {} (len: {} bytes, tag: 0x{:04X})",
@@ -275,13 +272,15 @@ pub async fn run_wrtc_server(
                         if decrypted.first() == Some(&VIDEO_BATCH_MARKER) {
                             for sub_pkt in unpack_batch(&decrypted[1..]) {
                                 let pkt_len = sub_pkt.len();
-                                if tun_clone_video.try_send(sub_pkt).is_ok() {
-                                    reg_clone_video.record_rx(client_info.value(), pkt_len, "wrtc_video");
-                                } else {
-                                    break;
+                                if pkt_len >= WRTC_MIN_IP_PACKET_LEN {
+                                    if tun_clone_video.try_send(sub_pkt).is_ok() {
+                                        reg_clone_video.record_rx(client_info.value(), pkt_len, "wrtc_video");
+                                    } else {
+                                        break;
+                                    }
                                 }
                             }
-                        } else {
+                        } else if decrypted.len() >= WRTC_MIN_IP_PACKET_LEN {
                             let packet_len = decrypted.len();
                             if tun_clone_video.try_send(decrypted).is_ok() {
                                 reg_clone_video.record_rx(client_info.value(), packet_len, "wrtc_video");
@@ -565,6 +564,12 @@ pub async fn run_wrtc_server(
                                                 .min(MAX_VIDEO_BATCH_BYTES);
 
                                             tokio::spawn(async move {
+                                                const VIDEO_WARMUP_PAYLOAD: [u8; 16] = [
+                                                    VIDEO_BATCH_MARKER,
+                                                    0xFF,
+                                                    0xFF,
+                                                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                                                ];
                                                 let mut batcher = PacketBatcher::new(
                                                     WRTC_BATCHER_MAX_BYTES,
                                                     WRTC_BATCHER_MAX_DELAY_MS,
@@ -573,8 +578,34 @@ pub async fn run_wrtc_server(
                                                     Duration::from_millis(WRTC_BATCHER_MAX_DELAY_MS),
                                                 );
                                                 batch_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                                                let mut warmup_probe_interval = tokio::time::interval(
+                                                    Duration::from_secs(2),
+                                                );
+                                                warmup_probe_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                                                 let mut batch_buf = BytesMut::with_capacity(MAX_PACKET_SIZE);
                                                 let mut pending_packet: Option<Bytes> = None;
+
+                                                if (srv_mode == anet_common::wrtc::colibri::WrtcMode::MediaVideo
+                                                    || srv_mode == anet_common::wrtc::colibri::WrtcMode::Auto)
+                                                    && client_video_ep_dl.contains(&target_client_id)
+                                                    && client_v2_ep_dl.contains(&target_client_id)
+                                                {
+                                                    peer_downlink.force_next_keyframe();
+                                                    for _ in 0..3 {
+                                                        let seq = c_info.sequence.fetch_add(1, Ordering::Relaxed);
+                                                        if let Ok(enc_buf) = wrap_packet_slice_with_headroom(
+                                                            &c_info.cipher,
+                                                            &c_info.nonce_prefix,
+                                                            seq,
+                                                            &VIDEO_WARMUP_PAYLOAD,
+                                                            VP8_ASTP_PREFIX_LEN,
+                                                        ) {
+                                                            let _ = peer_downlink
+                                                                .send_video_frame_preallocated(client_tag, enc_buf)
+                                                                .await;
+                                                        }
+                                                    }
+                                                }
 
                                                 loop {
                                                     tokio::select! {
@@ -767,6 +798,33 @@ pub async fn run_wrtc_server(
                                                                 }
                                                             }
                                                         }
+                                                        _ = warmup_probe_interval.tick() => {
+                                                            let client_pref_mode = client_modes_dl
+                                                                .get(&target_client_id)
+                                                                .map(|m| m.clone())
+                                                                .unwrap_or_else(|| "auto".to_string());
+                                                            let has_video = client_video_ep_dl.contains(&target_client_id);
+                                                            let is_v2 = client_v2_ep_dl.contains(&target_client_id);
+                                                            if (srv_mode == anet_common::wrtc::colibri::WrtcMode::MediaVideo
+                                                                || srv_mode == anet_common::wrtc::colibri::WrtcMode::Auto)
+                                                                && matches!(client_pref_mode.as_str(), "media_video" | "auto")
+                                                                && has_video
+                                                                && is_v2
+                                                            {
+                                                                let seq = c_info.sequence.fetch_add(1, Ordering::Relaxed);
+                                                                if let Ok(enc_buf) = wrap_packet_slice_with_headroom(
+                                                                    &c_info.cipher,
+                                                                    &c_info.nonce_prefix,
+                                                                    seq,
+                                                                    &VIDEO_WARMUP_PAYLOAD,
+                                                                    VP8_ASTP_PREFIX_LEN,
+                                                                ) {
+                                                                    let _ = peer_downlink
+                                                                        .send_video_frame_preallocated(client_tag, enc_buf)
+                                                                        .await;
+                                                                }
+                                                            }
+                                                        }
                                                     }
                                                 }
                                             });
@@ -806,27 +864,32 @@ pub async fn run_wrtc_server(
                                     );
                                     let now_ms =
                                         shared_peer.start_instant.elapsed().as_millis() as u64;
-                                    client_last_ws_batch_ms.insert(c_tag, now_ms);
-                                    client_video_warmed_up.remove(&c_tag);
-                                    for enc_pkt in packets {
-                                        match unwrap_packet_bytes(
-                                            &client_info.cipher,
-                                            enc_pkt,
-                                        ) {
-                                            Ok(packet) => {
-                                                let packet_len = packet.len();
-                                                match tun_clone.try_send(packet) {
-                                                    Ok(_) => {
-                                                        reg_clone.record_rx(&client_info, packet_len, "wrtc");
-                                                    }
-                                                    Err(e) => {
-                                                        warn!("[WRTC Server] TUN queue error for {}: {e}", client_info.assigned_ip);
-                                                        break;
+                                    let video_active = client_last_video_rx_ms
+                                        .get(&c_tag)
+                                        .map(|ts| now_ms.saturating_sub(*ts) <= 4000)
+                                        .unwrap_or(false);
+                                    if !video_active {
+                                        client_video_warmed_up.remove(&c_tag);
+                                        for enc_pkt in packets {
+                                            match unwrap_packet_bytes(
+                                                &client_info.cipher,
+                                                enc_pkt,
+                                            ) {
+                                                Ok(packet) => {
+                                                    let packet_len = packet.len();
+                                                    match tun_clone.try_send(packet) {
+                                                        Ok(_) => {
+                                                            reg_clone.record_rx(&client_info, packet_len, "wrtc");
+                                                        }
+                                                        Err(e) => {
+                                                            warn!("[WRTC Server] TUN queue error for {}: {e}", client_info.assigned_ip);
+                                                            break;
+                                                        }
                                                     }
                                                 }
-                                            }
-                                            Err(e) => {
-                                                warn!("[WRTC Server] Decrypt batch packet failed for {from_endpoint}: {e}");
+                                                Err(e) => {
+                                                    warn!("[WRTC Server] Decrypt batch packet failed for {from_endpoint}: {e}");
+                                                }
                                             }
                                         }
                                     }

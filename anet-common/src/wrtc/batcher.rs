@@ -78,7 +78,7 @@ pub fn unpack_batch(data: &[u8]) -> Vec<Bytes> {
     while offset + 2 <= data.len() {
         let len = u16::from_be_bytes([data[offset], data[offset + 1]]) as usize;
         offset += 2;
-        if offset + len <= data.len() {
+        if len > 0 && offset + len <= data.len() {
             packets.push(Bytes::copy_from_slice(&data[offset..offset + len]));
             offset += len;
         } else {
