@@ -225,7 +225,7 @@ impl ANetServer {
             let auth = self.auth_handler_core.clone();
             handle_collection.push(tokio::spawn(async move {
                 if let Err(e) = doh_dns::run_doh_dns_server(c, rg, tx, auth).await {
-                    error!("Fatal error: [DoH-DNS] Server halted: {}", e);
+                    error!("Fatal error: [DoH-DNS] Server halted: {:#}", e);
                 }
             }));
         }

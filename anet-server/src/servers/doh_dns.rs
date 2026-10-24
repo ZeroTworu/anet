@@ -6,7 +6,7 @@ use anet_common::base32;
 use anet_common::consts::CHANNEL_BUFFER_SIZE;
 use anet_common::dns_proto::{build_dns_txt_response, parse_dns_query};
 use anet_common::doh_chunking::DohReassemblyQueue;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
 use bytes::Bytes;
@@ -24,13 +24,30 @@ struct DohClientSession {
     cipher: Arc<AstpLiteCipher>,
 }
 
+/// Определяет основной внешний IPv4-адрес сервера через таблицу маршрутизации ядра (без отправки пакетов).
+fn detect_primary_ipv4() -> Option<std::net::IpAddr> {
+    let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    sock.connect("1.1.1.1:53").ok()?;
+    let ip = sock.local_addr().ok()?.ip();
+    if ip.is_unspecified() || ip.is_loopback() {
+        None
+    } else {
+        Some(ip)
+    }
+}
+
 pub async fn run_doh_dns_server(
     config: Arc<Config>,
     registry: Arc<ClientRegistry>,
     tun_tx: mpsc::Sender<Bytes>,
     auth_handler: ServerAuthHandler,
 ) -> Result<()> {
-    let bind_to = &config.server.doh_bind_to;
+    let raw_bind = config.server.doh_bind_to.trim();
+    let bind_to = if !raw_bind.contains(':') {
+        format!("0.0.0.0:{}", raw_bind)
+    } else {
+        raw_bind.to_string()
+    };
     let domain_zone = config
         .doh_transport
         .domain
@@ -43,7 +60,49 @@ pub async fn run_doh_dns_server(
         bind_to, domain_zone, poll_hold_timeout_ms
     );
 
-    let socket = Arc::new(UdpSocket::bind(bind_to).await.context("Failed to bind UDP 53 for DoH DNS")?);
+    let socket = match UdpSocket::bind(&bind_to).await {
+        Ok(s) => Arc::new(s),
+        Err(e) => {
+            // На Linux (Ubuntu/Debian) systemd-resolved слушает 127.0.0.53:53, из-за чего
+            // бинд на wildcard 0.0.0.0:53 падает с EADDRINUSE (os error 98), хотя внешний
+            // интерфейс свободен. Попробуем автоматически забиндиться на основной внешний IPv4.
+            let mut fallback_socket = None;
+            if e.kind() == std::io::ErrorKind::AddrInUse && bind_to.starts_with("0.0.0.0:") {
+                if let Some(port_str) = bind_to.strip_prefix("0.0.0.0:") {
+                    if let Ok(port) = port_str.parse::<u16>() {
+                        if let Some(primary_ip) = detect_primary_ipv4() {
+                            let fallback_addr = SocketAddr::new(primary_ip, port);
+                            match UdpSocket::bind(fallback_addr).await {
+                                Ok(s) => {
+                                    warn!(
+                                        "[DoH-DNS] Could not bind wildcard {} ({}) — likely systemd-resolved occupying 127.0.0.53:{}. Automatically bound to primary interface {} instead.",
+                                        bind_to, e, port, fallback_addr
+                                    );
+                                    fallback_socket = Some(Arc::new(s));
+                                }
+                                Err(fallback_err) => {
+                                    warn!(
+                                        "[DoH-DNS] Fallback bind to primary interface {} also failed: {}",
+                                        fallback_addr, fallback_err
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            match fallback_socket {
+                Some(s) => s,
+                None => {
+                    return Err(anyhow::Error::new(e).context(format!(
+                        "Failed to bind UDP {} for DoH DNS (hint: check if systemd-resolved/dnsmasq occupies port 53 via `ss -ulpn | grep :53`, or set `doh_bind_to = \"<SERVER_PUBLIC_IP>:53\"`)",
+                        bind_to
+                    )));
+                }
+            }
+        }
+    };
 
     let active_sessions: Arc<DashMap<u32, Arc<DohClientSession>>> = Arc::new(DashMap::new());
     let reassembler: Arc<Mutex<DohReassemblyQueue>> =
