@@ -579,14 +579,22 @@ impl ServerAuthHandler {
             DtoBillingType::GroupAndIndividual => ProtoBillingType::GroupAndIndividual,
         };
 
+        let is_doh = protocol == "doh";
+        let effective_mtu = if is_doh { mtu.min(800) } else { mtu };
+        let quic_cert_bytes = if is_doh {
+            b"doh".to_vec()
+        } else {
+            self.quic_cert_pem.as_bytes().to_vec()
+        };
+
         let response_payload = AuthResponse {
             ip: assigned_ip,
             netmask: netmask.to_string(),
             gateway: gateway.to_string(),
-            mtu: mtu as i32,
+            mtu: effective_mtu as i32,
             session_id,
             nonce_prefix: nonce_prefix.to_vec(),
-            quic_cert: self.quic_cert_pem.as_bytes().to_vec(),
+            quic_cert: quic_cert_bytes,
             billing_type: pb_billing as i32,
             group_name,
             traffic_limit,
@@ -601,10 +609,12 @@ impl ServerAuthHandler {
             content: Some(Content::AuthResponse(response_payload.clone())),
             padding: vec![],
         };
-        inner_msg.padding = generate_random_padding(calculate_padding_needed(
-            inner_msg.encoded_len() + PROTO_PAD_FIELD_OVERHEAD,
-            self.padding_step,
-        ));
+        if !is_doh {
+            inner_msg.padding = generate_random_padding(calculate_padding_needed(
+                inner_msg.encoded_len() + PROTO_PAD_FIELD_OVERHEAD,
+                self.padding_step,
+            ));
+        }
 
         let mut raw_resp = Vec::new();
         inner_msg.encode(&mut raw_resp)?;
@@ -621,10 +631,12 @@ impl ServerAuthHandler {
             })),
             padding: vec![],
         };
-        outer_msg.padding = generate_random_padding(calculate_padding_needed(
-            outer_msg.encoded_len() + NONCE_LEN + PROTO_PAD_FIELD_OVERHEAD,
-            self.padding_step,
-        ));
+        if !is_doh {
+            outer_msg.padding = generate_random_padding(calculate_padding_needed(
+                outer_msg.encoded_len() + NONCE_LEN + PROTO_PAD_FIELD_OVERHEAD,
+                self.padding_step,
+            ));
+        }
 
         Ok((outer_msg, Some((client_info, response_payload))))
     }

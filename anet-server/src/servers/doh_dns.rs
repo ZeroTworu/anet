@@ -110,18 +110,21 @@ pub async fn run_doh_dns_server(
     let handshake_reassembler: Arc<Mutex<DohReassemblyQueue>> =
         Arc::new(Mutex::new(DohReassemblyQueue::new(Duration::from_secs(15))));
     let temp_handshake_responses: Arc<DashMap<u32, (String, Instant)>> = Arc::new(DashMap::new());
+    let phase_handshake_responses: Arc<DashMap<(u32, u32), (String, Instant)>> = Arc::new(DashMap::new());
 
     // Background garbage collector for incomplete packets and handshake state
     {
         let reassembler = reassembler.clone();
         let handshake_reassembler = handshake_reassembler.clone();
         let temp_responses = temp_handshake_responses.clone();
+        let phase_responses = phase_handshake_responses.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(10)).await;
                 reassembler.lock().await.cleanup();
                 handshake_reassembler.lock().await.cleanup();
                 temp_responses.retain(|_, (_, created)| created.elapsed() < Duration::from_secs(30));
+                phase_responses.retain(|_, (_, created)| created.elapsed() < Duration::from_secs(30));
             }
         });
     }
@@ -148,6 +151,7 @@ pub async fn run_doh_dns_server(
         let reassembler = reassembler.clone();
         let handshake_reassembler = handshake_reassembler.clone();
         let temp_handshake_responses = temp_handshake_responses.clone();
+        let phase_handshake_responses = phase_handshake_responses.clone();
 
         tokio::spawn(async move {
             if let Err(e) = handle_dns_datagram(
@@ -164,6 +168,7 @@ pub async fn run_doh_dns_server(
                 reassembler,
                 handshake_reassembler,
                 temp_handshake_responses,
+                phase_handshake_responses,
             )
             .await
             {
@@ -187,6 +192,7 @@ async fn handle_dns_datagram(
     reassembler: Arc<Mutex<DohReassemblyQueue>>,
     handshake_reassembler: Arc<Mutex<DohReassemblyQueue>>,
     temp_handshake_responses: Arc<DashMap<u32, (String, Instant)>>,
+    phase_handshake_responses: Arc<DashMap<(u32, u32), (String, Instant)>>,
 ) -> Result<()> {
     let parsed_q = match parse_dns_query(&raw_query) {
         Some(q) => q,
@@ -297,12 +303,40 @@ async fn handle_dns_datagram(
             let b32_str = base32::join_labels(parts[4]);
 
             if let Ok(chunk_raw) = base32::decode(&b32_str) {
+                if let Ok(hdr) = anet_common::doh_chunking::DohChunkHeader::decode(&chunk_raw) {
+                    // If this handshake phase was already processed (e.g. duplicate query via dup_hs),
+                    // return the cached response immediately without regenerating DH keys.
+                    if let Some(cached) = phase_handshake_responses.get(&(temp_session_id, hdr.sequence)) {
+                        let dns_resp = build_dns_txt_response(&raw_query, &parsed_q, Some(cached.0.as_bytes()), 0);
+                        let _ = socket.send_to(&dns_resp, remote_addr).await;
+                        return Ok(());
+                    }
+                    // Clear previous phase response from poll slot when a new phase starts
+                    if hdr.sequence > 0 && hdr.chunk_index == 0 {
+                        temp_handshake_responses.remove(&temp_session_id);
+                    }
+                }
+
                 let assembled_opt = {
                     let mut reasm = handshake_reassembler.lock().await;
                     reasm.feed(&chunk_raw)?
                 };
 
-                if let Some((_sid, _seq, full_handshake)) = assembled_opt {
+                if let Some((_sid, seq, full_handshake)) = assembled_opt {
+                    if let Some(cached) = phase_handshake_responses.get(&(temp_session_id, seq)) {
+                        let dns_resp = build_dns_txt_response(&raw_query, &parsed_q, Some(cached.0.as_bytes()), 0);
+                        let _ = socket.send_to(&dns_resp, remote_addr).await;
+                        return Ok(());
+                    }
+
+                    info!(
+                        "[DoH-DNS] Handshake phase {} packet reassembled (sid={:08x}, len={} bytes, resolver={})",
+                        seq,
+                        temp_session_id,
+                        full_handshake.len(),
+                        remote_addr
+                    );
+
                     let hs_addr = SocketAddr::from((
                         [
                             127,
@@ -318,7 +352,9 @@ async fn handle_dns_datagram(
 
                     if let Some(resp) = response_opt {
                         let b64 = BASE64_STANDARD.encode(&resp);
-                        temp_handshake_responses.insert(temp_session_id, (b64.clone(), Instant::now()));
+                        let now = Instant::now();
+                        phase_handshake_responses.insert((temp_session_id, seq), (b64.clone(), now));
+                        temp_handshake_responses.insert(temp_session_id, (b64.clone(), now));
 
                         let dns_resp = build_dns_txt_response(&raw_query, &parsed_q, Some(b64.as_bytes()), 0);
                         let _ = socket.send_to(&dns_resp, remote_addr).await;

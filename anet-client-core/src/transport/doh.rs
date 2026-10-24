@@ -27,6 +27,7 @@ struct DohAuthChannel {
     resolver_idx: AtomicUsize,
     domain_zone: String,
     temp_session_id: u32,
+    hs_seq: AtomicU32,
     max_payload: usize,
     pending_response: Mutex<Option<Bytes>>,
     dup_hs: bool,
@@ -35,7 +36,9 @@ struct DohAuthChannel {
 #[async_trait]
 impl AuthChannel for DohAuthChannel {
     async fn send(&self, data: Bytes, _frag: &FragmentConfig) -> Result<()> {
-        let chunks = split_into_chunks(self.temp_session_id, 0, &data, self.max_payload);
+        *self.pending_response.lock().await = None;
+        let seq = self.hs_seq.fetch_add(1, Ordering::Relaxed);
+        let chunks = split_into_chunks(self.temp_session_id, seq, &data, self.max_payload);
         if chunks.is_empty() {
             bail!("Empty handshake payload");
         }
@@ -68,9 +71,11 @@ impl AuthChannel for DohAuthChannel {
                 Ok(res) if res.status().is_success() => {
                     if let Ok(body) = res.bytes().await {
                         if let Some(txt_data) = parse_dns_txt_response(&body) {
-                            if let Ok(decoded) = BASE64_STANDARD.decode(&txt_data) {
-                                if !decoded.is_empty() {
-                                    *self.pending_response.lock().await = Some(Bytes::from(decoded));
+                            if txt_data != b"ACK" && txt_data != b"OK" {
+                                if let Ok(decoded) = BASE64_STANDARD.decode(&txt_data) {
+                                    if !decoded.is_empty() {
+                                        *self.pending_response.lock().await = Some(Bytes::from(decoded));
+                                    }
                                 }
                             }
                         }
@@ -139,9 +144,11 @@ impl AuthChannel for DohAuthChannel {
                 if res.status().is_success() {
                     if let Ok(body) = res.bytes().await {
                         if let Some(txt_data) = parse_dns_txt_response(&body) {
-                            if let Ok(decoded) = BASE64_STANDARD.decode(&txt_data) {
-                                if !decoded.is_empty() {
-                                    return Ok(Bytes::from(decoded));
+                            if txt_data != b"ACK" && txt_data != b"OK" {
+                                if let Ok(decoded) = BASE64_STANDARD.decode(&txt_data) {
+                                    if !decoded.is_empty() {
+                                        return Ok(Bytes::from(decoded));
+                                    }
                                 }
                             }
                         }
@@ -212,6 +219,8 @@ impl ClientTransport for DohTransport {
             .context("Failed to build HTTP/2 client for DoH")?;
 
         let max_payload = calculate_max_chunk_payload(&domain_zone);
+        // Reserve space for "hs.<8_hex>.<idx>.<total>." (~18 chars => ~12 raw bytes) so FQDN stays <= 253 chars
+        let hs_max_payload = max_payload.saturating_sub(24).max(32);
         let temp_session_id = rand::random::<u32>() | 0x80000000;
 
         let auth_channel = DohAuthChannel {
@@ -220,7 +229,8 @@ impl ClientTransport for DohTransport {
             resolver_idx: AtomicUsize::new(0),
             domain_zone: domain_zone.clone(),
             temp_session_id,
-            max_payload,
+            hs_seq: AtomicU32::new(0),
+            max_payload: hs_max_payload,
             pending_response: Mutex::new(None),
             dup_hs,
         };
@@ -237,6 +247,30 @@ impl ClientTransport for DohTransport {
         let session_id = u32::from_be_bytes(nonce_prefix_bytes);
 
         info!("[DoH] Authenticated successfully. Assigned session ID: {:08x}", session_id);
+
+        // Collect all DoH resolver IPs into bypass_ips so DoH HTTPS requests never loop back into the TUN interface
+        let mut bypass_ips = Vec::new();
+        for res_url in &resolvers {
+            if let Ok(parsed) = Url::parse(res_url) {
+                if let Some(host) = parsed.host_str() {
+                    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+                        if !bypass_ips.contains(&ip) {
+                            bypass_ips.push(ip);
+                        }
+                    } else {
+                        let port = parsed.port_or_known_default().unwrap_or(443);
+                        if let Ok(addrs) = tokio::net::lookup_host((host, port)).await {
+                            for addr in addrs {
+                                let ip = addr.ip();
+                                if !bypass_ips.contains(&ip) {
+                                    bypass_ips.push(ip);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         let cipher = Arc::new(AstpLiteCipher::new(&shared_key));
         let sequence = Arc::new(AtomicU32::new(1));
@@ -388,7 +422,7 @@ impl ClientTransport for DohTransport {
             connection: None,
             health_pause: Some(health_pause),
             remote_ip: None,
-            bypass_ips: Vec::new(),
+            bypass_ips,
             effective_mode: None,
             shutdown_hook: None,
         })
