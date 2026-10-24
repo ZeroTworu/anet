@@ -864,12 +864,18 @@ impl ClientRegistry {
                 .fetch_add(delta_rx, Ordering::Relaxed);
         }
 
-        client_info.ebpf_synced_tx.store(bpf_tx_bytes, Ordering::Relaxed);
+        let prev_tx = client_info.ebpf_synced_tx.swap(bpf_tx_bytes, Ordering::Relaxed);
+        let delta_tx = bpf_tx_bytes.saturating_sub(prev_tx);
+        if delta_tx > 0 {
+            self.traffic_counters(client_info, "astpl")
+                .tx_bytes
+                .fetch_add(delta_tx, Ordering::Relaxed);
+        }
 
         let prev_seen = client_info
             .ebpf_last_seen_ns
             .swap(bpf_last_seen_ns, Ordering::Relaxed);
-        if bpf_last_seen_ns > prev_seen || delta_rx > 0 {
+        if bpf_last_seen_ns > prev_seen || delta_rx > 0 || delta_tx > 0 {
             self.touch_client(client_info);
         }
 

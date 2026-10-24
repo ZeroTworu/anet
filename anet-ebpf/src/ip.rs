@@ -194,6 +194,63 @@ pub fn ipv4_pseudo_csum_seed_be(
     (sum as u16).to_be()
 }
 
+/// Вычисляет и финализирует контрольную сумму TCP/UDP (RFC 1071 / RFC 793) в пакете,
+/// если она находится в состоянии `CHECKSUM_PARTIAL` (в поле `check` записан только seed псевдозаголовка).
+/// Записывает готовую контрольную сумму в сетевом порядке байт (Big-Endian) в поле `check` заголовка L4.
+#[inline(always)]
+pub fn finalize_l4_checksum(
+    w: &ContextWrapper<'_>,
+    l4_offset: usize,
+    l4_len: usize,
+    pseudo_seed_be: u16,
+    is_udp: bool,
+) -> Result<(), ()> {
+    let start = w.data();
+    let end = w.data_end();
+    if start + l4_offset + l4_len > end {
+        return Err(());
+    }
+
+    let mut sum = u16::from_be(pseudo_seed_be) as u32;
+    let mut off = l4_offset;
+    let l4_end = l4_offset + l4_len;
+
+    // Складываем 16-битные слова заголовка и полезной нагрузки L4.
+    // Максимум 1500 / 2 = 750 итераций; константная граница 800 гарантирует прохождение BPF-верификатора.
+    for _ in 0..800 {
+        if off + 2 > l4_end {
+            break;
+        }
+        let word = u16::from_be(w.read_unaligned::<u16>(off)?);
+        sum += word as u32;
+        off += 2;
+    }
+
+    // Нечётный хвостовой байт (padding нулём справа по RFC 1071)
+    if off < l4_end {
+        let b = w.read_unaligned::<u8>(off)?;
+        sum += (b as u32) << 8;
+    }
+
+    // Сворачиваем 32-битную сумму в 16 бит
+    sum = (sum & 0xFFFF) + (sum >> 16);
+    sum = (sum & 0xFFFF) + (sum >> 16);
+
+    let mut final_check = !(sum as u16);
+    if is_udp && final_check == 0 {
+        final_check = 0xFFFF;
+    }
+
+    let check_offset = if is_udp {
+        l4_offset + 6 // UDP checksum offset
+    } else {
+        l4_offset + 16 // TCP checksum offset
+    };
+
+    w.write_unaligned::<u16>(check_offset, final_check.to_be())?;
+    Ok(())
+}
+
 /// Шифрует или расшифровывает полезную нагрузку пакета в памяти (`payload_offset .. data_end`)
 /// потоковым шифром `Xoroshiro128+` блоками по 8 байт + хвост `1..7` байт.
 /// Возвращает длину обработанной полезной нагрузки в байтах.

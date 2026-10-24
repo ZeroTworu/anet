@@ -2,8 +2,11 @@
 #![no_main]
 
 use aya_ebpf::{
-    bindings::{xdp_action, TC_ACT_OK, TC_ACT_SHOT},
-    helpers::{bpf_ktime_get_ns, bpf_skb_set_tstamp},
+    bindings::{__sk_buff, xdp_action, TC_ACT_OK, TC_ACT_SHOT},
+    helpers::{
+        bpf_ktime_get_ns, bpf_redirect_neigh, bpf_skb_change_head, bpf_skb_pull_data,
+        bpf_skb_set_tstamp,
+    },
     macros::{classifier, map, xdp},
     maps::HashMap,
     programs::{TcContext, XdpContext},
@@ -18,8 +21,9 @@ use anet_ebpf_common::{
 
 mod ip;
 use ip::{
-    parse_dst_ipv4, parse_src_ipv4, xoroshiro_crypt_packet, ContextWrapper, EthHdr, Ipv4Hdr,
-    UdpHdr, ETH_P_IP_BE, IPPROTO_UDP,
+    finalize_l4_checksum, ipv4_header_checksum, ipv4_pseudo_csum_seed_be, parse_dst_ipv4,
+    parse_src_ipv4, xoroshiro_crypt_packet, ContextWrapper, EthHdr, Ipv4Hdr, UdpHdr, ETH_P_IP_BE,
+    IPPROTO_TCP, IPPROTO_UDP,
 };
 
 /// `BPF_SKB_TSTAMP_DELIVERY_MONO` из `enum bpf_skb_tstamp_type` ядра
@@ -211,6 +215,8 @@ pub fn astpl_tc_egress(ctx: TcContext) -> i32 {
 
 #[inline(always)]
 fn try_astpl_tc_egress(ctx: &TcContext) -> Result<i32, ()> {
+    const OUTER_HEADERS_LEN: usize = EthHdr::LEN + ASTPL_ENCAP_LEN; // 14 + 36 = 50 байт
+
     let w_init = ContextWrapper::Tc(ctx);
     let inner_ip = w_init.read_unaligned::<Ipv4Hdr>(0)?;
     if inner_ip.version() != 4 {
@@ -219,30 +225,161 @@ fn try_astpl_tc_egress(ctx: &TcContext) -> Result<i32, ()> {
 
     // В `Ipv4Hdr` поля адресов лежат в сетевом порядке байт (Big-Endian),
     // как и ключ в `ASTPL_EGRESS_MAP`.
+    let inner_src_ip = inner_ip.src_addr;
     let inner_dst_ip = inner_ip.dst_addr;
+    let inner_proto = inner_ip.proto;
     let Some(routing_ptr) = ASTPL_EGRESS_MAP.get_ptr_mut(&inner_dst_ip) else {
         return Ok(TC_ACT_OK);
     };
 
-    let skb_len = ctx.len() as u64;
+    let cfg = load_astpl_config();
+    if cfg.astpl_port_be == 0 || cfg.server_ip_be == 0 || cfg.eth_ifindex == 0 {
+        return Ok(TC_ACT_OK);
+    }
+
+    // Локально сгенерированные на самом сервере пакеты (с исходным адресом `self_ip` или `gateway`,
+    // например `iperf3 -s -B 172.112.224.2`) пропускаем в Userspace через `TC_ACT_OK`.
+    if (cfg.tun_ip_be != 0 && inner_src_ip == cfg.tun_ip_be)
+        || (cfg.tun_gw_be != 0 && inner_src_ip == cfg.tun_gw_be)
+    {
+        return Ok(TC_ACT_OK);
+    }
+
+    // Проверяем длину sk_buff и флаги GSO ДО вызова pull_data.
+    // Если пакет является редким GSO-суперпакетом (> 1450 байт), пропускаем его в `validate_xmit_skb`
+    // на TUN-интерфейсе для нарезки и userspace-отправки через `sock_writer`.
+    let skb_len = ctx.len();
+    let (gso_segs, gso_size) = unsafe {
+        let skb = ctx.as_ptr() as *const __sk_buff;
+        ((*skb).gso_segs, (*skb).gso_size)
+    };
+    if skb_len < Ipv4Hdr::LEN as u32 || skb_len > 1450 || gso_segs > 1 || gso_size > 0 {
+        return Ok(TC_ACT_OK);
+    }
+
+    // Линеаризуем ВСЕ `skb_len` байт пакета, чтобы страничные фрагменты (`skb->data_len`)
+    // гарантированно оказались в `data..data_end` для доступа BPF-верификатора.
+    let pull_ret = unsafe { bpf_skb_pull_data(ctx.as_ptr() as *mut _, skb_len) };
+    if pull_ret < 0 {
+        return Ok(TC_ACT_OK);
+    }
+
+    let w_plain = ContextWrapper::Tc(ctx);
+    let inner_len = w_plain.data_end().saturating_sub(w_plain.data());
+    let inner_ip_after = w_plain.read_unaligned::<Ipv4Hdr>(0)?;
+    let inner_tot_len = u16::from_be(inner_ip_after.tot_len) as usize;
+    let ihl_bytes = (inner_ip_after.ihl() as usize) * 4;
+    if inner_len < Ipv4Hdr::LEN
+        || inner_len > 1450
+        || inner_tot_len != inner_len
+        || ihl_bytes < Ipv4Hdr::LEN
+        || ihl_bytes > inner_len
+    {
+        return Ok(TC_ACT_OK);
+    }
+
+    // КРИТИЧНО: Финализируем контрольную сумму TCP/UDP, если пакет находится в состоянии `CHECKSUM_PARTIAL`.
+    // Гипервизор KVM (virtio_net) при транзитном Download записывает в поле `check` только seed псевдозаголовка.
+    // Вычисляем и финализируем контрольную сумму L4 прямо здесь, ДО шифрования!
+    let l4_len = inner_tot_len.saturating_sub(ihl_bytes);
+    if inner_proto == IPPROTO_TCP && ihl_bytes + 20 <= inner_len && l4_len >= 20 {
+        let tcp_check = w_plain.read_unaligned::<u16>(ihl_bytes + 16)?;
+        let pseudo_seed =
+            ipv4_pseudo_csum_seed_be(inner_src_ip, inner_dst_ip, IPPROTO_TCP, l4_len as u16);
+        if tcp_check == pseudo_seed {
+            let _ = finalize_l4_checksum(&w_plain, ihl_bytes, l4_len, pseudo_seed, false);
+        }
+    } else if inner_proto == IPPROTO_UDP && ihl_bytes + 8 <= inner_len && l4_len >= 8 {
+        let udp_check = w_plain.read_unaligned::<u16>(ihl_bytes + 6)?;
+        let pseudo_seed =
+            ipv4_pseudo_csum_seed_be(inner_src_ip, inner_dst_ip, IPPROTO_UDP, l4_len as u16);
+        if udp_check != 0 && udp_check == pseudo_seed {
+            let _ = finalize_l4_checksum(&w_plain, ihl_bytes, l4_len, pseudo_seed, true);
+        }
+    }
+
     let now = unsafe { bpf_ktime_get_ns() };
-    unsafe {
+    let (crypto_seed, dst_ip, dst_port, nonce_prefix, tx_seq) = unsafe {
         let routing = &mut *routing_ptr;
+        if routing.dst_ip == 0 || routing.dst_port == 0 {
+            return Ok(TC_ACT_OK);
+        }
         let mut next_seq = routing.tx_seq.wrapping_add(1);
         if next_seq == 0 {
             next_seq = 1;
         }
         routing.tx_seq = next_seq;
-        routing.tx_bytes = routing.tx_bytes.saturating_add(skb_len);
+        routing.tx_bytes = routing.tx_bytes.saturating_add(inner_len as u64);
         routing.last_seen_ns = now;
+        (
+            routing.crypto_seed,
+            routing.dst_ip,
+            routing.dst_port,
+            routing.nonce_prefix,
+            next_seq,
+        )
+    };
+
+    // 1. Шифруем внутренний IPv4-пакет на месте (0 .. data_end) потоковым шифром Xoroshiro128+
+    xoroshiro_crypt_packet(&w_plain, 0, crypto_seed, tx_seq)?;
+
+    // 2. Расширяем начало пакета на 50 байт:
+    //    `EthHdr (14) + Outer IPv4 (20) + Outer UDP (8) + ASTP-L Header (8)`.
+    //    В ядре Linux `bpf_skb_change_head(ctx, 50, 0)` делает push заголовка,
+    //    обнуляет 50 байт и оставляет mac_header < network_header для `__bpf_redirect_neigh`.
+    let chg_ret =
+        unsafe { bpf_skb_change_head(ctx.as_ptr() as *mut _, OUTER_HEADERS_LEN as u32, 0) };
+    if chg_ret < 0 {
+        return Ok(TC_ACT_SHOT);
     }
 
-    // Возвращаем `TC_ACT_OK`, чтобы пакет в `__dev_queue_xmit` на TUN-интерфейсе прошёл:
-    // 1. Корневой `fq` qdisc (обеспечивающий точный EDT-пейсинг `bpf_skb_set_tstamp` при включённом `Shaper`).
-    // 2. Ядерный `validate_xmit_skb` (`skb_gso_segment` для нарезки GSO-суперпакетов + `skb_checksum_help`
-    //    для финализации `CHECKSUM_PARTIAL` от гипервизора KVM/virtio_net до шифрования).
-    // 3. Строго упорядоченную (без гонок между двумя путями) отправку через `sock_writer` с 16 МБ буфером.
-    Ok(TC_ACT_OK)
+    // После bpf_skb_change_head старые указатели недействительны — создаём новую обёртку
+    let w_encap = ContextWrapper::Tc(ctx);
+    let total_frame_len = w_encap.data_end().saturating_sub(w_encap.data());
+    if total_frame_len < OUTER_HEADERS_LEN + Ipv4Hdr::LEN {
+        return Ok(TC_ACT_SHOT);
+    }
+
+    let total_ip_len = total_frame_len - EthHdr::LEN;
+    let udp_total_len = total_ip_len - Ipv4Hdr::LEN;
+
+    let mut outer_ip = Ipv4Hdr {
+        version_ihl: 0x45,
+        tos: 0,
+        tot_len: (total_ip_len as u16).to_be(),
+        id: (tx_seq as u16).to_be(),
+        frag_off: 0,
+        ttl: 64,
+        proto: IPPROTO_UDP,
+        check: 0,
+        src_addr: cfg.server_ip_be,
+        dst_addr: dst_ip,
+    };
+    outer_ip.check = ipv4_header_checksum(&outer_ip);
+
+    let outer_udp = UdpHdr {
+        source: cfg.astpl_port_be,
+        dest: dst_port,
+        len: (udp_total_len as u16).to_be(),
+        check: 0, // UDP checksum 0 валиден для IPv4 (RFC 768)
+    };
+
+    // Записываем EtherType (0x0800 IPv4) на смещении 12 и внешние L3/L4/ASTP-L заголовки
+    w_encap.write_unaligned::<u16>(12, ETH_P_IP_BE)?;
+    w_encap.write_unaligned::<Ipv4Hdr>(EthHdr::LEN, outer_ip)?;
+    w_encap.write_unaligned::<UdpHdr>(EthHdr::LEN + Ipv4Hdr::LEN, outer_udp)?;
+    w_encap.write_unaligned::<u32>(EthHdr::LEN + Ipv4Hdr::LEN + UdpHdr::LEN, nonce_prefix)?;
+    w_encap.write_unaligned::<u32>(
+        EthHdr::LEN + Ipv4Hdr::LEN + UdpHdr::LEN + 4,
+        tx_seq.to_be(),
+    )?;
+
+    // 3. Отправляем зашифрованный UDP-пакет напрямую в физический интерфейс через подсистему соседей (ARP/Neighbour)
+    //    Минуя чтение из TUN-дескриптора, очередь Tokio и Userspace sendto!
+    let action =
+        unsafe { bpf_redirect_neigh(cfg.eth_ifindex, core::ptr::null_mut(), 0, 0) as i32 };
+
+    Ok(action)
 }
 
 /// Программа XDP для декапсуляции входящих пакетов ASTP-L на физическом интерфейсе (`eth0`).
