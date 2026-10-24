@@ -207,18 +207,18 @@ pub fn finalize_l4_checksum(
 ) -> Result<(), ()> {
     let start = w.data();
     let end = w.data_end();
-    if start + l4_offset + l4_len > end {
+    if start + l4_offset > end || start + l4_offset + l4_len > end {
         return Err(());
     }
 
     let mut sum = u16::from_be(pseudo_seed_be) as u32;
     let mut off = l4_offset;
-    let l4_end = l4_offset + l4_len;
+    let l4_end_off = l4_offset + l4_len;
 
     // Складываем 16-битные слова заголовка и полезной нагрузки L4.
     // Максимум 1500 / 2 = 750 итераций; константная граница 800 гарантирует прохождение BPF-верификатора.
     for _ in 0..800 {
-        if off + 2 > l4_end {
+        if off >= l4_end_off || start + off + 2 > end {
             break;
         }
         let word = u16::from_be(w.read_unaligned::<u16>(off)?);
@@ -227,7 +227,7 @@ pub fn finalize_l4_checksum(
     }
 
     // Нечётный хвостовой байт (padding нулём справа по RFC 1071)
-    if off < l4_end {
+    if off < l4_end_off && start + off + 1 <= end {
         let b = w.read_unaligned::<u8>(off)?;
         sum += (b as u32) << 8;
     }
@@ -247,7 +247,9 @@ pub fn finalize_l4_checksum(
         l4_offset + 16 // TCP checksum offset
     };
 
-    w.write_unaligned::<u16>(check_offset, final_check.to_be())?;
+    if start + check_offset + 2 <= end {
+        w.write_unaligned::<u16>(check_offset, final_check.to_be())?;
+    }
     Ok(())
 }
 
