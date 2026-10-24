@@ -11,7 +11,7 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
 use bytes::Bytes;
 use dashmap::DashMap;
-use log::{debug, error, info, warn};
+use log::{debug, info, warn};
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -198,13 +198,14 @@ async fn handle_dns_datagram(
                     }
                 }
 
-                if let Some(mut packet) = packet_opt {
+                if let Some(packet) = packet_opt {
                     let seq = client_info.sequence.fetch_add(1, Ordering::Relaxed) as u32;
-                    session.cipher.apply_keystream(seq, session_id, &mut packet);
+                    let mut packet_buf = packet.to_vec();
+                    session.cipher.apply_keystream(seq, session_id, &mut packet_buf);
 
-                    let mut downlink_bytes = Vec::with_capacity(4 + packet.len());
+                    let mut downlink_bytes = Vec::with_capacity(4 + packet_buf.len());
                     downlink_bytes.extend_from_slice(&seq.to_be_bytes());
-                    downlink_bytes.extend_from_slice(&packet);
+                    downlink_bytes.extend_from_slice(&packet_buf);
 
                     let b64 = BASE64_STANDARD.encode(&downlink_bytes);
                     let resp = build_dns_txt_response(&raw_query, &parsed_q, Some(b64.as_bytes()), 0);
@@ -243,8 +244,17 @@ async fn handle_dns_datagram(
                 };
 
                 if let Some((_sid, _seq, full_handshake)) = assembled_opt {
+                    let hs_addr = SocketAddr::from((
+                        [
+                            127,
+                            254,
+                            ((temp_session_id >> 16) & 0xFF) as u8,
+                            ((temp_session_id >> 8) & 0xFF) as u8,
+                        ],
+                        (temp_session_id & 0xFFFF) as u16,
+                    ));
                     let (response_opt, _authenticated) = auth_handler
-                        .process_handshake_packet(full_handshake, remote_addr, "doh")
+                        .process_handshake_packet(full_handshake, hs_addr, "doh")
                         .await?;
 
                     if let Some(resp) = response_opt {
