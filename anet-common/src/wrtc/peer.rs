@@ -15,6 +15,7 @@ use crate::wrtc::colibri::{
     is_valid_vp8_frame_header, ColibriMessage, ReceiverVideoConstraints, WrtcMessage, WrtcMode,
 };
 use crate::wrtc::jingle::{append_remote_video_ssrc_to_sdp, JingleSession};
+use crate::wrtc::turns_proxy::{spawn_turns_udp_proxy, TurnsProxyHandle};
 use crate::wrtc::xmpp_xml::XmppIceServer;
 use bytes::{BufMut, Bytes, BytesMut};
 use futures::{SinkExt, StreamExt};
@@ -45,8 +46,58 @@ use webrtc::peer_connection::{
 };
 use webrtc::runtime::{
     AsyncInterval, AsyncTcpListener, AsyncTcpStream, AsyncUdpSocket, JoinHandle as WrtcJoinHandle,
-    Runtime as WrtcRuntime, TokioRuntime,
+    RecvMeta, Runtime as WrtcRuntime, TokioRuntime, Transmit,
 };
+
+#[derive(Debug)]
+struct HybridAsyncUdpSocket {
+    primary: Arc<dyn AsyncUdpSocket>,
+    loopback: Option<Arc<dyn AsyncUdpSocket>>,
+}
+
+impl AsyncUdpSocket for HybridAsyncUdpSocket {
+    fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
+        self.primary.local_addr()
+    }
+
+    fn poll_send(
+        &self,
+        cx: &mut std::task::Context<'_>,
+        transmit: &Transmit<'_>,
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        if transmit.destination.ip().is_loopback() {
+            if let Some(ref lo) = self.loopback {
+                return lo.poll_send(cx, transmit);
+            }
+        }
+        self.primary.poll_send(cx, transmit)
+    }
+
+    fn poll_recv(
+        &self,
+        cx: &mut std::task::Context<'_>,
+        bufs: &mut [std::io::IoSliceMut<'_>],
+        meta: &mut [RecvMeta],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        if let std::task::Poll::Ready(res) = self.primary.poll_recv(cx, bufs, meta) {
+            return std::task::Poll::Ready(res);
+        }
+        if let Some(ref lo) = self.loopback {
+            if let std::task::Poll::Ready(res) = lo.poll_recv(cx, bufs, meta) {
+                return std::task::Poll::Ready(res);
+            }
+        }
+        std::task::Poll::Pending
+    }
+
+    fn max_gso_segments(&self) -> usize {
+        1
+    }
+
+    fn max_gro_segments(&self) -> usize {
+        self.primary.max_gro_segments()
+    }
+}
 
 #[derive(Debug)]
 struct TunedTokioRuntime {
@@ -84,7 +135,24 @@ impl WrtcRuntime for TunedTokioRuntime {
                 snd / 1024
             );
         }
-        self.inner.wrap_udp_socket(sock)
+        let primary = self.inner.wrap_udp_socket(sock)?;
+        let need_loopback = primary
+            .local_addr()
+            .map(|a| a.is_ipv4() && !a.ip().is_loopback())
+            .unwrap_or(false);
+        let loopback = if need_loopback {
+            if let Ok(lo_std) = std::net::UdpSocket::bind("127.0.0.1:0") {
+                let lo_ref = socket2::SockRef::from(&lo_std);
+                let _ = lo_ref.set_recv_buffer_size(self.udp_socket_buffer_size);
+                let _ = lo_ref.set_send_buffer_size(self.udp_socket_buffer_size);
+                self.inner.wrap_udp_socket(lo_std).ok()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        Ok(Arc::new(HybridAsyncUdpSocket { primary, loopback }))
     }
 
     fn wrap_tcp_listener(
@@ -439,6 +507,7 @@ pub struct P2pSession {
     pub is_open: Arc<AtomicBool>,
     pub open_notify: Arc<tokio::sync::Notify>,
     pub incoming_rx: Mutex<mpsc::Receiver<Bytes>>,
+    pub turns_proxies: Vec<TurnsProxyHandle>,
 }
 
 impl P2pSession {
@@ -467,60 +536,149 @@ impl P2pSession {
     }
 }
 
+struct IceTierEntry {
+    label: &'static str,
+    servers: Vec<RTCIceServer>,
+    display_urls: Vec<String>,
+    has_turn: bool,
+}
+
 fn build_ice_server_tiers(
     discovered: &[XmppIceServer],
-) -> Vec<(&'static str, Vec<RTCIceServer>, bool)> {
-    let filter_tier = |include_turn: bool, include_tcp_tls: bool| -> (Vec<RTCIceServer>, bool) {
+    wrtc_cfg: &WrtcConfig,
+) -> (Vec<IceTierEntry>, Vec<TurnsProxyHandle>) {
+    let mut proxies: Vec<TurnsProxyHandle> = Vec::new();
+    let connect_timeout = Duration::from_secs(wrtc_cfg.http_connect_timeout_secs.max(5));
+
+    // Для каждого TURNS / TURN-TCP сервера из extdisco поднимаем локальный мост
+    // UDP (127.0.0.1:0) <-> TURNS (TLS 1.3 TCP:443), чтобы движок webrtc-rs (поддерживающий
+    // только UDP-сокеты в RTCTurnRelayer) мог полноценно аллоцировать релеи и гнать
+    // ChannelData через TLS 1.3 TCP:443 (bst-talk-stun7.ktalk.host:443, dtl-talk-stun5.ktalk.host:443).
+    let mut proxy_by_idx: Vec<Option<(String, String)>> = Vec::with_capacity(discovered.len());
+    for s in discovered {
+        if s.is_turn && s.is_tcp_or_tls {
+            let use_tls = s
+                .urls
+                .iter()
+                .any(|u| u.starts_with("turns:") || u.starts_with("stuns:"));
+            let remote_url = s
+                .urls
+                .first()
+                .cloned()
+                .unwrap_or_else(|| format!("turns:{}:{}", s.host, s.port));
+            match spawn_turns_udp_proxy(
+                s.host.clone(),
+                s.port,
+                use_tls,
+                remote_url.clone(),
+                connect_timeout,
+                wrtc_cfg.udp_socket_buffer_size,
+            ) {
+                Ok(handle) => {
+                    let local_url = handle.local_turn_url.clone();
+                    let disp = format!("{remote_url} (via {local_url})");
+                    proxies.push(handle);
+                    proxy_by_idx.push(Some((local_url, disp)));
+                }
+                Err(e) => {
+                    log::warn!(
+                        "[WRTC TURNS Proxy] Failed to spawn local UDP bridge for {remote_url}: {e}"
+                    );
+                    proxy_by_idx.push(None);
+                }
+            }
+        } else {
+            proxy_by_idx.push(None);
+        }
+    }
+
+    let filter_tier = |include_turn: bool, include_tcp_tls: bool| -> (Vec<RTCIceServer>, Vec<String>, bool) {
         let mut list = Vec::new();
+        let mut display_urls = Vec::new();
         let mut has_turn = false;
-        for s in discovered {
+        for (idx, s) in discovered.iter().enumerate() {
             if !include_turn && s.is_turn {
                 continue;
             }
-            if !include_tcp_tls && s.is_tcp_or_tls {
+            if s.is_tcp_or_tls {
+                if include_turn && s.is_turn {
+                    // В Tier 0 передаем локальный UDP->TURNS(TLS:443) мост
+                    if include_tcp_tls {
+                        if let Some((ref local_url, ref disp)) = proxy_by_idx[idx] {
+                            has_turn = true;
+                            list.push(RTCIceServer {
+                                urls: vec![local_url.clone()],
+                                username: s.username.clone(),
+                                credential: s.credential.clone(),
+                            });
+                            display_urls.push(disp.clone());
+                        }
+                    }
+                    // Кроме того, coturn-узлы Контура (bst-talk-stun7 / dtl-talk-stun5 в AS49675)
+                    // принимают прямой UDP TURN на порту 34788 с теми же credentials:
+                    if s.port == 443 && s.host.ends_with(".ktalk.host") {
+                        let udp_ktalk_turn = format!("turn:{}:34788", s.host);
+                        has_turn = true;
+                        list.push(RTCIceServer {
+                            urls: vec![udp_ktalk_turn.clone()],
+                            username: s.username.clone(),
+                            credential: s.credential.clone(),
+                        });
+                        display_urls.push(udp_ktalk_turn);
+                    }
+                }
                 continue;
             }
             if s.is_turn {
                 has_turn = true;
             }
+            display_urls.extend(s.urls.iter().cloned());
             list.push(RTCIceServer {
                 urls: s.urls.clone(),
                 username: s.username.clone(),
                 credential: s.credential.clone(),
             });
         }
-        (list, has_turn)
+        (list, display_urls, has_turn)
     };
 
-    let mut tiers: Vec<(&'static str, Vec<RTCIceServer>, bool)> = Vec::with_capacity(4);
+    let mut tiers: Vec<IceTierEntry> = Vec::with_capacity(4);
     for (tier_label, inc_turn, inc_tcp) in [
         ("Tier 0: STUN + TURN + TURNS", true, true),
         ("Tier 1: UDP STUN + UDP TURN", true, false),
         ("Tier 2: STUN", false, false),
     ] {
-        let (list, has_turn) = filter_tier(inc_turn, inc_tcp);
+        let (list, display_urls, has_turn) = filter_tier(inc_turn, inc_tcp);
         if !list.is_empty() {
             let urls_flat: Vec<&str> = list
                 .iter()
                 .flat_map(|i| i.urls.iter().map(|u| u.as_str()))
                 .collect();
-            let already_present =
-                tiers
+            let already_present = tiers.iter().any(|existing| {
+                let ex_urls: Vec<&str> = existing
+                    .servers
                     .iter()
-                    .any(|(_, existing, _): &(&'static str, Vec<RTCIceServer>, bool)| {
-                        let ex_urls: Vec<&str> = existing
-                            .iter()
-                            .flat_map(|i| i.urls.iter().map(|u| u.as_str()))
-                            .collect();
-                        ex_urls == urls_flat
-                    });
+                    .flat_map(|i| i.urls.iter().map(|u| u.as_str()))
+                    .collect();
+                ex_urls == urls_flat
+            });
             if !already_present {
-                tiers.push((tier_label, list, has_turn));
+                tiers.push(IceTierEntry {
+                    label: tier_label,
+                    servers: list,
+                    display_urls,
+                    has_turn,
+                });
             }
         }
     }
-    tiers.push(("Tier 3: host", Vec::new(), false));
-    tiers
+    tiers.push(IceTierEntry {
+        label: "Tier 3: host",
+        servers: Vec::new(),
+        display_urls: Vec::new(),
+        has_turn: false,
+    });
+    (tiers, proxies)
 }
 
 pub async fn create_p2p_channel(
@@ -540,21 +698,19 @@ pub async fn create_p2p_channel(
         "[P2P Direct] Pinned P2P UDP socket to physical interface: {effective_bind_addr}"
     );
 
-    let tiers = build_ice_server_tiers(ice_servers_info);
+    let (tiers, turns_proxies) = build_ice_server_tiers(ice_servers_info, wrtc_cfg);
     let mut last_err = None;
     let mut built_pc = None;
 
-    for (tier_label, ice_servers, tier_has_turn) in tiers {
+    for tier in tiers {
+        let tier_label = tier.label;
+        let tier_has_turn = tier.has_turn;
+        let tier_urls = tier.display_urls;
         let mut media_engine = MediaEngine::default();
         let registry = register_default_interceptors(Registry::new(), &mut media_engine)?;
 
-        let tier_urls: Vec<String> = ice_servers
-            .iter()
-            .flat_map(|s| s.urls.clone())
-            .collect();
-
         let config = RTCConfigurationBuilder::new()
-            .with_ice_servers(ice_servers)
+            .with_ice_servers(tier.servers)
             .build();
 
         let setting_engine = SettingEngineBuilder::new()
@@ -563,6 +719,9 @@ pub async fn create_p2p_channel(
                 Some(Duration::from_millis(wrtc_cfg.ice_failed_timeout_ms)),
                 Some(Duration::from_millis(wrtc_cfg.ice_keepalive_interval_ms)),
             )
+            .with_turn_allocation_refresh_interval_cap(Duration::from_secs(
+                wrtc_cfg.turn_refresh_interval_secs.max(10),
+            ))
             .with_sctp_max_receive_buffer_size(wrtc_cfg.sctp_max_receive_buffer_size)
             .with_sctp_mtu(wrtc_cfg.sctp_mtu.min(1200) as _)
             .with_receive_mtu(wrtc_cfg.receive_mtu)
@@ -655,6 +814,7 @@ pub async fn create_p2p_channel(
         is_open,
         open_notify,
         incoming_rx: Mutex::new(incoming_rx),
+        turns_proxies,
     })
 }
 
@@ -692,6 +852,7 @@ pub struct WrtcPeer {
     pub bind_addr: String,
     pub ice_tier_summary: String,
     pub local_candidates_summary: Vec<String>,
+    pub turns_proxies: Vec<TurnsProxyHandle>,
     pub watchdog_disconnected_timeout_ms: u64,
     pub watchdog_channel_grace_secs: u64,
     pub peer_close_timeout_secs: u64,
@@ -964,6 +1125,7 @@ impl WrtcPeer {
 
         let mut ice_tier_summary = "Tier 3: host".to_string();
         let mut local_candidates_summary: Vec<String> = Vec::new();
+        let mut turns_proxies: Vec<TurnsProxyHandle> = Vec::new();
 
         if let (Some(session), Some(xmpp)) = (session_opt, xmpp_opt) {
             log::info!("[WRTC Media] Initializing WebRTC PeerConnection with Audio (Opus) and Video (VP8)...");
@@ -996,11 +1158,15 @@ impl WrtcPeer {
             let dc_open_notify = Arc::new(tokio::sync::Notify::new());
 
             let discovered_ice = xmpp.get_ice_servers();
-            let tiers = build_ice_server_tiers(&discovered_ice);
+            let (tiers, built_proxies) = build_ice_server_tiers(&discovered_ice, wrtc_cfg);
+            turns_proxies = built_proxies;
             let mut built_pc = None;
             let mut has_turn_configured = false;
 
-            for (tier_label, ice_servers, tier_has_turn) in tiers {
+            for tier in tiers {
+                let tier_label = tier.label;
+                let tier_has_turn = tier.has_turn;
+                let tier_urls = tier.display_urls;
                 let mut media_engine = MediaEngine::default();
                 media_engine.register_codec(audio_codec.clone(), RtpCodecKind::Audio)?;
                 media_engine.register_codec(video_codec.clone(), RtpCodecKind::Video)?;
@@ -1021,13 +1187,8 @@ impl WrtcPeer {
                 // и блокировки мьютексов BWE/TWCC внутри webrtc-rs при высокоскоростном потоке.
                 let registry = Registry::new();
 
-                let tier_urls: Vec<String> = ice_servers
-                    .iter()
-                    .flat_map(|s| s.urls.clone())
-                    .collect();
-
                 let config = RTCConfigurationBuilder::new()
-                    .with_ice_servers(ice_servers)
+                    .with_ice_servers(tier.servers)
                     .build();
 
                 let setting_engine = SettingEngineBuilder::new()
@@ -1037,6 +1198,9 @@ impl WrtcPeer {
                         Some(Duration::from_millis(wrtc_cfg.ice_failed_timeout_ms)),
                         Some(Duration::from_millis(wrtc_cfg.ice_keepalive_interval_ms)),
                     )
+                    .with_turn_allocation_refresh_interval_cap(Duration::from_secs(
+                        wrtc_cfg.turn_refresh_interval_secs.max(10),
+                    ))
                     .with_sctp_max_receive_buffer_size(wrtc_cfg.sctp_max_receive_buffer_size)
                     .with_sctp_mtu(wrtc_cfg.sctp_mtu.min(1200) as _)
                     .with_receive_mtu(wrtc_cfg.receive_mtu)
@@ -1589,6 +1753,7 @@ impl WrtcPeer {
             bind_addr,
             ice_tier_summary,
             local_candidates_summary,
+            turns_proxies,
             watchdog_disconnected_timeout_ms: wrtc_cfg
                 .watchdog_disconnected_timeout_secs
                 .saturating_mul(1000)

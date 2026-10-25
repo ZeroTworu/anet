@@ -59,6 +59,8 @@ pub struct WrtcConfig {
     pub ice_failed_timeout_ms: u64,
     /// Интервал отправки STUN Consent Freshness / ICE keepalive запросов (в миллисекундах).
     pub ice_keepalive_interval_ms: u64,
+    /// Максимальный интервал проактивного обновления TURN-аллокации и учётных данных (Refresh) (в секундах).
+    pub turn_refresh_interval_secs: u64,
 
     /// Максимальный размер буфера приёма SCTP DataChannel (в байтах).
     pub sctp_max_receive_buffer_size: u32,
@@ -102,6 +104,7 @@ impl Default for WrtcConfig {
             ice_disconnected_timeout_ms: 10_000,
             ice_failed_timeout_ms: 25_000,
             ice_keepalive_interval_ms: 2_000,
+            turn_refresh_interval_secs: 90,
             sctp_max_receive_buffer_size: 8 * 1024 * 1024,
             sctp_mtu: 1200,
             receive_mtu: 1600,

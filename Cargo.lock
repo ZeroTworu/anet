@@ -473,11 +473,13 @@ dependencies = [
  "reqwest",
  "roxmltree",
  "rtc",
+ "rustls",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "socket2 0.5.10",
  "tokio",
+ "tokio-rustls",
  "tokio-tungstenite",
  "tun",
  "webrtc",
@@ -8213,8 +8215,6 @@ dependencies = [
 [[package]]
 name = "rtc-turn"
 version = "0.21.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7b78c4f1b2af74058fb0210537cc3ff7f84e6babbc3baf5f392a41e93f103a73"
 dependencies = [
  "bytes",
  "log",

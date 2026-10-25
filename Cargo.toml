@@ -82,3 +82,6 @@ incremental = false
 [profile.release.package."*"]
 opt-level = 3
 
+[patch.crates-io]
+rtc-turn = { path = "patches/rtc-turn" }
+

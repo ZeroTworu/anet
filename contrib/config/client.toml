@@ -556,6 +556,11 @@ ice_failed_timeout_ms = 25000
 # Интервал отправки проверочных STUN Binding Request (ICE keep-alive) (мс).
 ice_keepalive_interval_ms = 2000
 
+# Интервал проактивного обновления TURN/TURNS-аллокации (Refresh) и nonce (сек).
+# Упреждает истечение 10-минутного окна жизни NONCE (438 Stale Nonce) на coturn
+# и удерживает открытой NAT/TLS-сессию релея.
+turn_refresh_interval_secs = 90
+
 # Максимальный размер приемного буфера SCTP (для транспорта `dc` / DataChannel) (в байтах).
 sctp_max_receive_buffer_size = 8388608
 

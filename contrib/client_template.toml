@@ -163,10 +163,11 @@ colibri_ws_connect_timeout_secs = 10
 udp_socket_buffer_size = 8388608
 reactor_pool_size = 4
 
-# Тайм-ауты проверки связности ICE (в миллисекундах)
+# Тайм-ауты проверки связности ICE (в миллисекундах) и интервал обновления TURN/TURNS-аллокации (в секундах)
 ice_disconnected_timeout_ms = 10000
 ice_failed_timeout_ms = 25000
 ice_keepalive_interval_ms = 2000
+turn_refresh_interval_secs = 90
 
 # Параметры буферов и MTU для SCTP (DataChannel) и RTP-приемника
 sctp_max_receive_buffer_size = 8388608

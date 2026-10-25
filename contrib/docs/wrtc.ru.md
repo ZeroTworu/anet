@@ -354,6 +354,7 @@ ws_write_timeout_secs = 5
 ice_disconnected_timeout_ms = 10000
 ice_failed_timeout_ms = 25000
 ice_keepalive_interval_ms = 2000
+turn_refresh_interval_secs = 90
 sdp_renegotiate_timeout_secs = 5
 watchdog_disconnected_timeout_secs = 8
 watchdog_channel_grace_secs = 12
