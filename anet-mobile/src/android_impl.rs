@@ -62,15 +62,15 @@ impl ActiveTunSession {
         let include_str = AndroidCallbackTunFactory::ipnet_list_to_string(&self.include_nets);
         let exclude_str = AndroidCallbackTunFactory::ipnet_list_to_string(&exclude_nets);
 
-        let fallback_str = if self.include_nets.is_empty() && !self.user_excludes.is_empty() {
-            let fallback_nets =
-                AndroidCallbackTunFactory::calculate_fallback_routes(&self.user_excludes);
-            AndroidCallbackTunFactory::ipnet_list_to_string(&fallback_nets)
-        } else if self.include_nets.is_empty()
+        let fallback_str = if self.include_nets.is_empty()
             && !exclude_nets.is_empty()
             && exclude_nets.len() <= 256
         {
             let fallback_nets = AndroidCallbackTunFactory::calculate_fallback_routes(&exclude_nets);
+            AndroidCallbackTunFactory::ipnet_list_to_string(&fallback_nets)
+        } else if self.include_nets.is_empty() && !self.user_excludes.is_empty() {
+            let fallback_nets =
+                AndroidCallbackTunFactory::calculate_fallback_routes(&self.user_excludes);
             AndroidCallbackTunFactory::ipnet_list_to_string(&fallback_nets)
         } else {
             String::new()
@@ -566,11 +566,11 @@ impl TunFactory for AndroidCallbackTunFactory {
         let include_str = Self::ipnet_list_to_string(&include_nets);
         let exclude_str = Self::ipnet_list_to_string(&exclude_nets);
 
-        let fallback_str = if include_nets.is_empty() && !user_excludes.is_empty() {
-            let fallback_nets = Self::calculate_fallback_routes(&user_excludes);
-            Self::ipnet_list_to_string(&fallback_nets)
-        } else if include_nets.is_empty() && !exclude_nets.is_empty() && exclude_nets.len() <= 256 {
+        let fallback_str = if include_nets.is_empty() && !exclude_nets.is_empty() && exclude_nets.len() <= 256 {
             let fallback_nets = Self::calculate_fallback_routes(&exclude_nets);
+            Self::ipnet_list_to_string(&fallback_nets)
+        } else if include_nets.is_empty() && !user_excludes.is_empty() {
+            let fallback_nets = Self::calculate_fallback_routes(&user_excludes);
             Self::ipnet_list_to_string(&fallback_nets)
         } else {
             String::new()
