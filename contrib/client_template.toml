@@ -240,8 +240,6 @@ timeout_ms = 2500
 global_targets = [
     "https://www.google.com/generate_204",
     "https://connectivitycheck.gstatic.com/generate_204",
-    "https://captive.apple.com/hotspot-detect.html",
-    "https://www.msftconnecttest.com/connecttest.txt",
     "https://store.steampowered.com/favicon.ico",
 ]
 
@@ -250,7 +248,6 @@ domestic_targets = [
     "https://ya.ru",
     "https://vk.com",
     "https://www.gosuslugi.ru",
-    "https://mail.ru",
-    "https://www.sberbank.ru",
 ]
+
 

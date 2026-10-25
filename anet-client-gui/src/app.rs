@@ -291,23 +291,29 @@ impl ANetApp {
 
             server_config_banner: None,
             storage_key,
-            is_fetching_server_config: false,       
+            is_fetching_server_config: false,
 
-           
-           
-        
+
+
+
         };
-
-        // 0. Запускаем фоновый монитор связности сразу при старте GUI (работает и без VPN, и с VPN)
-        app.rt.spawn(async move {
-            ConnectivityMonitor::ensure_started(ConnectivityConfig::default());
-        });
 
         // 1. Загружаем активную конфигурацию (Server Config с оверлеями или пользовательский .toml)
         let config_to_load: Option<ConfigEntry> = {
             let settings = lock_ignore_poison(&app.settings);
             settings.get_active_config_with_overrides(&storage_key)
         };
+        let initial_conn_cfg = config_to_load
+            .as_ref()
+            .map(|c| ConnectivityConfig::from_toml_str(&c.content))
+            .unwrap_or_default();
+
+        // 0. Запускаем фоновый монитор связности сразу при старте GUI с параметрами активного конфига
+        app.rt.spawn(async move {
+            ConnectivityMonitor::ensure_started(initial_conn_cfg);
+        });
+        app.connectivity_snapshot = ConnectivityMonitor::get_last_snapshot();
+
         if let Some(config) = config_to_load {
             app.load_config_from_content(&config.id, &config.content, &config.name, false);
         }
@@ -470,6 +476,7 @@ impl ANetApp {
                             let mut settings = lock_ignore_poison(&settings_arc);
                             settings.cached_server_config = Some(bundle);
                             let mut core_cfg: CoreConfig = toml::from_str(&content).unwrap();
+                            core_cfg.connectivity.apply_toml_fallbacks(&content);
                             if core_cfg.main.get_config_url().is_none() {
                                 core_cfg.main.config_url = Some(url.clone());
                             }
@@ -490,6 +497,7 @@ impl ANetApp {
                         };
 
                         if is_server_active {
+                            ConnectivityMonitor::ensure_started(merged_cfg.connectivity.clone());
                             let tun = Box::new(
                                 DesktopTunFactory::new(
                                     merged_cfg.main.tun_name.clone(),
@@ -682,10 +690,18 @@ impl ANetApp {
         match toml::from_str::<CoreConfig>(content) {
             Ok(mut cfg) => {
 
-          
+
 
         // Загружаем [routing.overrides] из конфига:
         self.routing_overrides = cfg.routing.overrides.clone();
+
+                cfg.connectivity.apply_toml_fallbacks(content);
+                let conn_cfg = cfg.connectivity.clone();
+                self.connectivity_snapshot.global_total = conn_cfg.global_targets.len();
+                self.connectivity_snapshot.domestic_total = conn_cfg.domestic_targets.len();
+                self.rt.spawn(async move {
+                    ConnectivityMonitor::ensure_started(conn_cfg);
+                });
 
                 if cfg.main.get_config_url().is_none() {
                     let fallback_url = if id == SERVER_CONFIG_ID {

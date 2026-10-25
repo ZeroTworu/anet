@@ -155,7 +155,7 @@ pub struct ConnectivitySnapshot {
 impl Default for ConnectivitySnapshot {
     fn default() -> Self {
         let condition = NetworkCondition::Offline;
-        let (title, subtitle) = condition.describe(0, 0, 0, 0);
+        let (title, subtitle) = condition.describe(0, 3, 0, 3);
         Self {
             condition,
             pulse_color: condition.pulse_color(),
@@ -165,9 +165,9 @@ impl Default for ConnectivitySnapshot {
             global_rtt_ms: None,
             domestic_rtt_ms: None,
             global_ok: 0,
-            global_total: 0,
+            global_total: 3,
             domestic_ok: 0,
-            domestic_total: 0,
+            domestic_total: 3,
             title,
             subtitle,
             updated_at_ms: now_unix_ms(),
@@ -293,6 +293,7 @@ impl ConnectivityProber {
             .connect_timeout(timeout)
             .redirect(reqwest::redirect::Policy::none())
             .pool_max_idle_per_host(0)
+            .danger_accept_invalid_certs(true)
             .user_agent("Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/126.0.0.0")
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());

@@ -43,8 +43,31 @@ impl ConnectivityMonitor {
     pub fn ensure_started(config: ConnectivityConfig) {
         let monitor = Self::global();
         let enabled = config.enabled;
+        let global_total = config.global_targets.len();
+        let domestic_total = config.domestic_targets.len();
+
+        let config_changed = {
+            let mut guard = monitor.config.lock().unwrap();
+            let changed = *guard != config;
+            *guard = config;
+            changed
+        };
+
         {
-            *monitor.config.lock().unwrap() = config;
+            let mut snap_guard = monitor.last_snapshot.lock().unwrap();
+            if let Some(ref mut snap) = *snap_guard {
+                if snap.global_total != global_total || snap.domestic_total != domestic_total {
+                    snap.global_total = global_total;
+                    snap.domestic_total = domestic_total;
+                    snap.global_ok = snap.global_ok.min(global_total);
+                    snap.domestic_ok = snap.domestic_ok.min(domestic_total);
+                }
+            } else {
+                let mut init_snap = ConnectivitySnapshot::default();
+                init_snap.global_total = global_total;
+                init_snap.domestic_total = domestic_total;
+                *snap_guard = Some(init_snap);
+            }
         }
 
         if !enabled {
@@ -64,7 +87,7 @@ impl ConnectivityMonitor {
             } else {
                 monitor.task_running.store(false, Ordering::SeqCst);
             }
-        } else {
+        } else if config_changed {
             monitor.wake_notify.notify_one();
         }
     }
@@ -99,21 +122,61 @@ impl ConnectivityMonitor {
         }
     }
 
-    /// Принудительно пробуждает фоновый воркер для немедленной проверки контрольных точек.
+    /// Принудительно пробуждает фоновый воркер для немедленной проверки контрольных точек
+    /// и сразу отправляет промежуточный снимок в UI для визуального отклика.
     pub fn trigger_check_now() {
         let monitor = Self::global();
-        monitor.wake_notify.notify_one();
+        let (global_total, domestic_total) = {
+            let cfg = monitor.config.lock().unwrap();
+            (cfg.global_targets.len(), cfg.domestic_targets.len())
+        };
+
+        let checking_snap = {
+            let mut guard = monitor.last_snapshot.lock().unwrap();
+            let mut snap = guard.clone().unwrap_or_default();
+            snap.global_total = global_total;
+            snap.domestic_total = domestic_total;
+            snap.title = "Сверяем показания приборов…".to_string();
+            snap.subtitle = "Опрашиваем контрольные точки маршрутизации…".to_string();
+            *guard = Some(snap.clone());
+            snap
+        };
+        emit(AnetEvent::ConnectivityUpdated(checking_snap));
+
+        if monitor
+            .task_running
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            let monitor_clone = monitor.clone();
+            if tokio::runtime::Handle::try_current().is_ok() {
+                tokio::spawn(async move {
+                    monitor_clone.run_loop().await;
+                });
+            } else {
+                monitor.task_running.store(false, Ordering::SeqCst);
+            }
+        } else {
+            monitor.wake_notify.notify_one();
+        }
     }
 
     /// Возвращает последний вычисленный снимок состояния сети.
     pub fn get_last_snapshot() -> ConnectivitySnapshot {
         let monitor = Self::global();
-        monitor
+        let (global_total, domestic_total) = {
+            let cfg = monitor.config.lock().unwrap();
+            (cfg.global_targets.len(), cfg.domestic_targets.len())
+        };
+        let mut snap = monitor
             .last_snapshot
             .lock()
             .unwrap()
             .clone()
-            .unwrap_or_default()
+            .unwrap_or_default();
+        snap.global_total = global_total;
+        snap.domestic_total = domestic_total;
+        snap
     }
 
     fn current_tunnel_rtt(&self) -> Option<u64> {
@@ -144,7 +207,14 @@ impl ConnectivityMonitor {
                 None
             };
 
-            let snapshot = prober.probe_once(vpn_on, tunnel_rtt).await;
+            let snapshot = tokio::select! {
+                res = prober.probe_once(vpn_on, tunnel_rtt) => res,
+                _ = self.wake_notify.notified() => {
+                    // Внеочередное пробуждение (смена конфига, переключение VPN или ручной клик "Перепроверить")
+                    // немедленно перезапускает опрос с актуальными параметрами.
+                    continue;
+                }
+            };
 
             // Если во время HTTP-опроса статус VPN успел измениться, пересчитываем актуальный флаг
             let vpn_now = self.vpn_connected.load(Ordering::Relaxed);
@@ -183,3 +253,4 @@ impl ConnectivityMonitor {
         }
     }
 }
+

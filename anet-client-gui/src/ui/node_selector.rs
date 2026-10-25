@@ -44,9 +44,9 @@ pub fn render_node_selector(app: &mut ANetApp, ui: &mut egui::Ui, state: Connect
         return;
     }
 
-    ui.add_space(10.0);
+    ui.add_space(3.0);
     ui.vertical_centered(|ui| {
-        let sub_label_size = 8.0;
+        let sub_label_size = 8.5;
         let header_text = if state == ConnectionState::Disconnected {
             "Подключение к:"
         } else {
@@ -58,11 +58,11 @@ pub fn render_node_selector(app: &mut ANetApp, ui: &mut egui::Ui, state: Connect
                 .color(if state == ConnectionState::Disconnected { Colors::GREY } else { Colors::IVORY })
                 .family(egui::FontFamily::Name("Inter-V".into()))
         );
-        ui.add_space(7.0);
+        ui.add_space(4.0);
 
         const NODE_WIDTH: f32 = 266.0;
-        const NODE_HEIGHT: f32 = 36.0;
-        const NODE_RADIUS: u8 = 18;
+        const NODE_HEIGHT: f32 = 34.0;
+        const NODE_RADIUS: u8 = 17;
         const ITEM_HEIGHT: f32 = 34.0;
 
         let orange = egui::Color32::from_rgb(235, 140, 52);
@@ -86,6 +86,9 @@ pub fn render_node_selector(app: &mut ANetApp, ui: &mut egui::Ui, state: Connect
                 egui::Sense::hover()
             }
         );
+        if state == ConnectionState::Disconnected {
+            response.clone().on_hover_cursor(egui::CursorIcon::PointingHand);
+        }
 
         if state != ConnectionState::Disconnected {
             app.node_popup_open = false;
@@ -143,8 +146,16 @@ pub fn render_node_selector(app: &mut ANetApp, ui: &mut egui::Ui, state: Connect
         }
 
         if state == ConnectionState::Disconnected && popup_open {
-            let popup_height = 12.0 + (server_names.len() as f32) * ITEM_HEIGHT;
-            let popup_pos = egui::pos2(rect.left(), rect.bottom() + 6.0);
+            let max_visible_items = 6.0_f32;
+            let visible_count = (server_names.len() as f32).min(max_visible_items);
+            let popup_height = 12.0 + visible_count * ITEM_HEIGHT;
+            let screen_bottom = ui.ctx().content_rect().bottom();
+            let popup_y = if rect.bottom() + 6.0 + popup_height > screen_bottom - 10.0 {
+                (rect.top() - 6.0 - popup_height).max(44.0)
+            } else {
+                rect.bottom() + 6.0
+            };
+            let popup_pos = egui::pos2(rect.left(), popup_y);
             let popup_area_id = egui::Id::new("node_selection_popup");
 
             egui::Area::new(popup_area_id)
@@ -161,60 +172,64 @@ pub fn render_node_selector(app: &mut ANetApp, ui: &mut egui::Ui, state: Connect
                         .corner_radius(egui::CornerRadius::same(14))
                         .inner_margin(egui::Margin::symmetric(6, 6))
                         .show(popup_ui, |popup_ui| {
-                            for (id, name) in &server_names {
-                                let selected = id == &selected_server_name;
-                                let (item_rect, item_response) = popup_ui.allocate_exact_size(
-                                    egui::vec2(NODE_WIDTH - 12.0, ITEM_HEIGHT),
-                                    egui::Sense::click()
-                                );
+                            egui::ScrollArea::vertical()
+                                .max_height(visible_count * ITEM_HEIGHT)
+                                .show(popup_ui, |popup_ui| {
+                                    for (id, name) in &server_names {
+                                        let selected = id == &selected_server_name;
+                                        let (item_rect, item_response) = popup_ui.allocate_exact_size(
+                                            egui::vec2(NODE_WIDTH - 12.0, ITEM_HEIGHT),
+                                            egui::Sense::click()
+                                        );
 
-                                if item_response.hovered() {
-                                    popup_ui.painter().rect_filled(
-                                        item_rect,
-                                        egui::CornerRadius::same(9),
-                                        hover_bg
-                                    );
-                                }
+                                        if item_response.hovered() {
+                                            popup_ui.painter().rect_filled(
+                                                item_rect,
+                                                egui::CornerRadius::same(9),
+                                                hover_bg
+                                            );
+                                        }
 
-                                if selected {
-                                    popup_ui.painter().circle_filled(
-                                        egui::pos2(item_rect.left() + 13.0, item_rect.center().y),
-                                        4.0,
-                                        orange
-                                    );
-                                }
+                                        if selected {
+                                            popup_ui.painter().circle_filled(
+                                                egui::pos2(item_rect.left() + 13.0, item_rect.center().y),
+                                                4.0,
+                                                orange
+                                            );
+                                        }
 
-                                popup_ui.painter().text(
-                                    egui::pos2(item_rect.left() + 25.0, item_rect.center().y),
-                                    egui::Align2::LEFT_CENTER,
-                                    name,
-                                    egui::FontId::new(13.0, egui::FontFamily::Name("Inter-V".into())),
-                                    if selected { text } else { muted }
-                                );
+                                        popup_ui.painter().text(
+                                            egui::pos2(item_rect.left() + 25.0, item_rect.center().y),
+                                            egui::Align2::LEFT_CENTER,
+                                            name,
+                                            egui::FontId::new(13.0, egui::FontFamily::Name("Inter-V".into())),
+                                            if selected { text } else { muted }
+                                        );
 
-                                if item_response.clicked() {
-                                    app.node_popup_open = false;
-                                    let selected_id = id.clone();
-                                    {
-                                        let mut settings = lock_ignore_poison(&app.settings);
-                                        if let Some(active_cfg) = settings.get_active_config_with_overrides(&app.storage_key) {
-                                            settings.selected_servers.insert(active_cfg.id.clone(), selected_id);
-                                            settings.save();
+                                        if item_response.clicked() {
+                                            app.node_popup_open = false;
+                                            let selected_id = id.clone();
+                                            {
+                                                let mut settings = lock_ignore_poison(&app.settings);
+                                                if let Some(active_cfg) = settings.get_active_config_with_overrides(&app.storage_key) {
+                                                    settings.selected_servers.insert(active_cfg.id.clone(), selected_id);
+                                                    settings.save();
+                                                }
+                                            }
+
+                                            let active_cfg_data: Option<(String, String, String)> = {
+                                                let settings = lock_ignore_poison(&app.settings);
+                                                settings.get_active_config_with_overrides(&app.storage_key).map(|cfg| {
+                                                    (cfg.id.clone(), cfg.content.clone(), cfg.name.clone())
+                                                })
+                                            };
+
+                                            if let Some((id, content, name)) = active_cfg_data {
+                                                app.load_config_from_content(&id, &content, &name, false);
+                                            }
                                         }
                                     }
-
-                                    let active_cfg_data: Option<(String, String, String)> = {
-                                        let settings = lock_ignore_poison(&app.settings);
-                                        settings.get_active_config_with_overrides(&app.storage_key).map(|cfg| {
-                                            (cfg.id.clone(), cfg.content.clone(), cfg.name.clone())
-                                        })
-                                    };
-
-                                    if let Some((id, content, name)) = active_cfg_data {
-                                        app.load_config_from_content(&id, &content, &name, false);
-                                    }
-                                }
-                            }
+                                });
                         });
                 });
         }

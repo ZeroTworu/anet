@@ -607,21 +607,19 @@ pub extern "system" fn Java_org_alco_anet_MainActivity_startConnectivityMonitor(
         .unwrap_or_default();
 
     let connectivity_cfg = if !config_toml.trim().is_empty() {
-        toml::from_str::<CoreConfig>(&config_toml)
-            .map(|c| c.connectivity)
-            .unwrap_or_default()
+        anet_client_core::config::ConnectivityConfig::from_toml_str(&config_toml)
     } else {
         anet_client_core::config::ConnectivityConfig::default()
     };
 
     let rt = get_or_init_runtime_handle();
     rt.spawn(async move {
-        let initial =
-            anet_client_core::connectivity_monitor::ConnectivityMonitor::get_last_snapshot();
-        events::emit(AnetEvent::ConnectivityUpdated(initial));
         anet_client_core::connectivity_monitor::ConnectivityMonitor::ensure_started(
             connectivity_cfg,
         );
+        let initial =
+            anet_client_core::connectivity_monitor::ConnectivityMonitor::get_last_snapshot();
+        events::emit(AnetEvent::ConnectivityUpdated(initial));
     });
 }
 
@@ -819,7 +817,10 @@ pub extern "system" fn Java_org_alco_anet_ANetVpnService_connectVpn(
     };
 
     let mut config: CoreConfig = match toml::from_str(&config_toml) {
-        Ok(c) => c,
+        Ok(mut c) => {
+            c.connectivity.apply_toml_fallbacks(&config_toml);
+            c
+        }
         Err(e) => {
             error!("Failed to parse TOML config: {}", e);
             status(format!("Failed to parse TOML config: {}", e));

@@ -11,7 +11,7 @@ pub fn render_tariff_card(app: &ANetApp, ui: &mut egui::Ui) {
         .fill(Colors::CONSOLE_BG)
         .stroke(egui::Stroke::new(1.0, Colors::BORDER))
         .corner_radius(egui::CornerRadius::same(10))
-        .inner_margin(egui::Margin::symmetric(10, 10))
+        .inner_margin(egui::Margin::symmetric(10, 7))
         .outer_margin(egui::Margin::symmetric(0, 0))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -54,7 +54,7 @@ pub fn render_tariff_card(app: &ANetApp, ui: &mut egui::Ui) {
                     });
                 });
 
-                ui.add_space(6.0);
+                ui.add_space(4.0);
 
                 let (sep_rect, _) = ui.allocate_exact_size(
                     egui::vec2(ui.available_width(), 1.0),
@@ -65,7 +65,7 @@ pub fn render_tariff_card(app: &ANetApp, ui: &mut egui::Ui) {
                     egui::Stroke::new(1.0, Colors::BORDER),
                 );
 
-                ui.add_space(6.0);
+                ui.add_space(4.0);
 
                 ui.columns(3, |cols| {
                     cols[0].vertical(|ui| {

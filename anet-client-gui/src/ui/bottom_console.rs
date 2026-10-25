@@ -23,8 +23,8 @@ pub fn render_bottom_console(app: &mut ANetApp, ctx: &egui::Context) {
 
     egui::TopBottomPanel::bottom("stalker_console")
         .resizable(false)
-        .min_height(310.0)
-        .default_height(310.0)
+        .min_height(286.0)
+        .default_height(288.0)
         .show_separator_line(false)
         .frame(panel_frame)
         .show(ctx, |ui| {
@@ -32,8 +32,8 @@ pub fn render_bottom_console(app: &mut ANetApp, ctx: &egui::Context) {
                 .fill(Colors::DARK)
                 .stroke(Stroke::new(1.0, border_color))
                 .corner_radius(CornerRadius::same(14))
-                .outer_margin(egui::Margin::same(8))
-                .inner_margin(egui::Margin::same(10))
+                .outer_margin(egui::Margin::symmetric(8, 6))
+                .inner_margin(egui::Margin::symmetric(10, 8))
                 .show(ui, |ui| {
                     ui.vertical(|ui| {
                         // 1. Актуализируем строку последнего лог-события
@@ -42,17 +42,17 @@ pub fn render_bottom_console(app: &mut ANetApp, ctx: &egui::Context) {
                         // 2. Верхняя полоса: статус лога + кнопка VIEW LOG →
                         render_log_header_row(app, ui);
 
-                        ui.add_space(6.0);
+                        ui.add_space(5.0);
 
-                        // 3. Уровень 1 — Щит диагностики состояния сети + 10-сегментная шкала маршрутов
+                        // 3. Уровень 1 — Щит диагностики состояния сети + сегментная шкала маршрутов
                         render_connectivity_shield_card(app, ui);
 
-                        ui.add_space(6.0);
+                        ui.add_space(5.0);
 
                         // 4. Уровень 2 — Линейный индикатор пульса (RTT мс + бегущая ЭКГ-волна)
                         render_pulse_line_card(app, ui, ctx);
 
-                        ui.add_space(6.0);
+                        ui.add_space(5.0);
 
                         // 5. Уровень 3 — Карточка скорости и трафика за сессию с двойным sparkline-графиком
                         render_speed_sparkline_card(app, ui);
@@ -153,11 +153,14 @@ fn pulse_palette(color: PulseColor) -> (Color32, Color32, Color32) {
     }
 }
 
-/// Уровень 1: Виджет «Щит диагностики сети» с 10-сегментным индикатором маршрутов РФ / Мир
+/// Уровень 1: Виджет «Щит диагностики сети» с динамическим сегментным индикатором маршрутов РФ / Мир
 fn render_connectivity_shield_card(app: &mut ANetApp, ui: &mut egui::Ui) {
-    let snap = &app.connectivity_snapshot;
+    let snap = app.connectivity_snapshot.clone();
     let (accent, stroke_col, bg_col) = pulse_palette(snap.pulse_color);
     let text_sub = Color32::from_rgb(168, 176, 190);
+    let is_checking = snap.title.starts_with("Сверяем");
+
+    let mut trigger_manual_recheck = false;
 
     egui::Frame::NONE
         .fill(bg_col)
@@ -189,17 +192,25 @@ fn render_connectivity_shield_card(app: &mut ANetApp, ui: &mut egui::Ui) {
                         if refresh_resp.hovered() {
                             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                         }
-                        let refresh_bg = if refresh_resp.hovered() {
-                            Color32::from_rgba_unmultiplied(255, 255, 255, 28)
+                        let refresh_bg = if is_checking || refresh_resp.hovered() {
+                            Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 48)
                         } else {
                             Color32::from_rgba_unmultiplied(255, 255, 255, 14)
                         };
                         ui.painter()
                             .rect_filled(refresh_rect, CornerRadius::same(5), refresh_bg);
+                        if is_checking {
+                            ui.painter().rect_stroke(
+                                refresh_rect,
+                                CornerRadius::same(5),
+                                Stroke::new(1.0, accent),
+                                egui::StrokeKind::Inside,
+                            );
+                        }
                         ui.painter().text(
                             refresh_rect.center(),
                             egui::Align2::CENTER_CENTER,
-                            "↻",
+                            if is_checking { "…" } else { "↻" },
                             egui::FontId::proportional(11.5),
                             accent,
                         );
@@ -207,17 +218,20 @@ fn render_connectivity_shield_card(app: &mut ANetApp, ui: &mut egui::Ui) {
                             .on_hover_text("Проверить маршруты сейчас")
                             .clicked()
                         {
-                            ConnectivityMonitor::trigger_check_now();
+                            trigger_manual_recheck = true;
                         }
 
                         ui.add_space(4.0);
 
-                        // Плашка РФ X/Y • Мир A/B
-                        let dom_tot = snap.domestic_total.max(5);
-                        let glob_tot = snap.global_total.max(5);
+                        // Плашка РФ X/Y • Мир A/B (строго по количеству точек из активного конфига)
+                        let dom_tot = snap.domestic_total.max(1);
+                        let glob_tot = snap.global_total.max(1);
                         let routes_badge = format!(
                             "РФ {}/{} • Мир {}/{}",
-                            snap.domestic_ok, dom_tot, snap.global_ok, glob_tot
+                            snap.domestic_ok.min(dom_tot),
+                            dom_tot,
+                            snap.global_ok.min(glob_tot),
+                            glob_tot
                         );
                         egui::Frame::NONE
                             .fill(Color32::from_rgba_unmultiplied(15, 20, 28, 175))
@@ -253,9 +267,9 @@ fn render_connectivity_shield_card(app: &mut ANetApp, ui: &mut egui::Ui) {
 
                 ui.add_space(5.0);
 
-                // 10-сегментная шкала контрольных точек (5 РФ + 5 Мир)
-                let dom_total = snap.domestic_total.max(5);
-                let glob_total = snap.global_total.max(5);
+                // Сегментная шкала контрольных точек (по числу РФ + Мир из конфига)
+                let dom_total = snap.domestic_total.max(1);
+                let glob_total = snap.global_total.max(1);
                 let total_segments = (dom_total + glob_total).max(1);
                 let bar_height = 4.0;
                 let (bar_rect, _) = ui.allocate_exact_size(
@@ -299,6 +313,15 @@ fn render_connectivity_shield_card(app: &mut ANetApp, ui: &mut egui::Ui) {
                 }
             });
         });
+
+    if trigger_manual_recheck {
+        app.log("Внеочередная проверка контрольных точек связности...");
+        app.show_toast("Проверка маршрутов...");
+        let rt_handle = app.rt.handle().clone();
+        rt_handle.spawn(async move {
+            ConnectivityMonitor::trigger_check_now();
+        });
+    }
 }
 
 fn draw_shield_icon(painter: &egui::Painter, rect: Rect, color: Color32, pulse: PulseColor) {

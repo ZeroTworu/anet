@@ -157,7 +157,7 @@ impl Default for WrtcConfig {
 }
 
 /// Настройки фоновой диагностики сетевой связности и индикатора пульса (секция `[connectivity]`).
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ConnectivityConfig {
     /// Включить фоновый мониторинг состояния сети и контрольных точек (`true` / `false`).
@@ -190,18 +190,103 @@ impl Default for ConnectivityConfig {
             global_targets: vec![
                 "https://www.google.com/generate_204".to_string(),
                 "https://connectivitycheck.gstatic.com/generate_204".to_string(),
-                "https://captive.apple.com/hotspot-detect.html".to_string(),
-                "https://www.msftconnecttest.com/connecttest.txt".to_string(),
                 "https://store.steampowered.com/favicon.ico".to_string(),
             ],
             domestic_targets: vec![
                 "https://ya.ru".to_string(),
                 "https://vk.com".to_string(),
                 "https://www.gosuslugi.ru".to_string(),
-                "https://mail.ru".to_string(),
-                "https://www.sberbank.ru".to_string(),
             ],
         }
     }
 }
+
+impl ConnectivityConfig {
+    /// Извлекает `ConnectivityConfig` из произвольной строки TOML.
+    /// Поддерживает как штатную секцию `[connectivity]`, так и резервный поиск `global_targets` / `domestic_targets`,
+    /// если они случайно оказались в корне, в `[main]`, `[wrtc]`, `[routing]` или после `[[servers]]`.
+    pub fn from_toml_str(raw_toml: &str) -> Self {
+        let mut cfg = Self::default();
+        cfg.apply_toml_fallbacks(raw_toml);
+        cfg
+    }
+
+    pub fn apply_toml_fallbacks(&mut self, raw_toml: &str) {
+        let Ok(root_val) = toml::from_str::<toml::Value>(raw_toml) else {
+            return;
+        };
+        let Some(root_table) = root_val.as_table() else {
+            return;
+        };
+
+        let mut has_explicit_global = false;
+        let mut has_explicit_domestic = false;
+
+        if let Some(conn_val) = root_table.get("connectivity") {
+            if let Some(conn_table) = conn_val.as_table() {
+                has_explicit_global = conn_table.contains_key("global_targets");
+                has_explicit_domestic = conn_table.contains_key("domestic_targets");
+            }
+            if let Ok(parsed) = conn_val.clone().try_into::<ConnectivityConfig>() {
+                *self = parsed;
+            }
+        }
+
+        if !has_explicit_global {
+            if let Some(targets) = find_string_array_in_toml(root_table, "global_targets") {
+                if !targets.is_empty() {
+                    self.global_targets = targets;
+                }
+            }
+        }
+
+        if !has_explicit_domestic {
+            if let Some(targets) = find_string_array_in_toml(root_table, "domestic_targets") {
+                if !targets.is_empty() {
+                    self.domestic_targets = targets;
+                }
+            }
+        }
+    }
+}
+
+fn extract_non_empty_string_vec(val: &toml::Value) -> Option<Vec<String>> {
+    let arr = val.as_array()?;
+    let vec: Vec<String> = arr
+        .iter()
+        .filter_map(|v| v.as_str().map(str::trim))
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+        .collect();
+    if vec.is_empty() { None } else { Some(vec) }
+}
+
+fn find_string_array_in_toml(
+    root: &toml::map::Map<String, toml::Value>,
+    key: &str,
+) -> Option<Vec<String>> {
+    if let Some(v) = root.get(key).and_then(extract_non_empty_string_vec) {
+        return Some(v);
+    }
+    for (section_name, section_val) in root {
+        if section_name == "connectivity" {
+            continue;
+        }
+        if let Some(table) = section_val.as_table() {
+            if let Some(v) = table.get(key).and_then(extract_non_empty_string_vec) {
+                return Some(v);
+            }
+        } else if let Some(arr) = section_val.as_array() {
+            for item in arr.iter().rev() {
+                if let Some(table) = item.as_table() {
+                    if let Some(v) = table.get(key).and_then(extract_non_empty_string_vec) {
+                        return Some(v);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 

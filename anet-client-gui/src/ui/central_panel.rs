@@ -24,8 +24,8 @@ pub fn render_central_panel(app: &mut ANetApp, ctx: &egui::Context) {
     let main_frame = egui::Frame::NONE.fill(Colors::DARK).inner_margin(egui::Margin {
         left: 10,
         right: 10,
-        top: 20,
-        bottom: 20,
+        top: 8,
+        bottom: 6,
     });
 
     egui::CentralPanel::default()
@@ -40,7 +40,7 @@ pub fn render_central_panel(app: &mut ANetApp, ctx: &egui::Context) {
 
                 // Кнопка Update
                 ui.allocate_ui_with_layout(
-                    egui::vec2(button_col_width, 42.0),
+                    egui::vec2(button_col_width, 38.0),
                     egui::Layout::top_down(egui::Align::Center),
                     |ui| {
                         let anim_id = ui.id().with("update_btn_color");
@@ -79,7 +79,7 @@ pub fn render_central_panel(app: &mut ANetApp, ctx: &egui::Context) {
                             app.check_for_updates();
                         }
 
-                        ui.add_space(2.0);
+                        ui.add_space(1.0);
                         ui.label(RichText::new("UPDATE").size(label_size).color(Colors::GREY));
                     }
                 );
@@ -91,11 +91,11 @@ pub fn render_central_panel(app: &mut ANetApp, ctx: &egui::Context) {
 
                 // Логотип ANet VPN
                 ui.allocate_ui_with_layout(
-                    egui::vec2(center_width, 42.0),
+                    egui::vec2(center_width, 38.0),
                     egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
                     |ui| {
                         let mut job = LayoutJob::default();
-                        let font_id = egui::FontId::new(24.0, egui::FontFamily::Name("Inter-V".into()));
+                        let font_id = egui::FontId::new(22.0, egui::FontFamily::Name("Inter-V".into()));
 
                         job.append("ANET ", 0.0, TextFormat {
                             font_id: font_id.clone(),
@@ -115,7 +115,7 @@ pub fn render_central_panel(app: &mut ANetApp, ctx: &egui::Context) {
 
                 // Кнопка Settings
                 ui.allocate_ui_with_layout(
-                    egui::vec2(button_col_width, 42.0),
+                    egui::vec2(button_col_width, 38.0),
                     egui::Layout::top_down(egui::Align::Center),
                     |ui| {
                         let anim_id = ui.id().with("settings_gear_btn_color");
@@ -159,22 +159,22 @@ pub fn render_central_panel(app: &mut ANetApp, ctx: &egui::Context) {
                             }
                         }
 
-                        ui.add_space(2.0);
+                        ui.add_space(1.0);
                         ui.label(RichText::new("SETTINGS").size(label_size).color(Colors::GREY));                            
                     } 
                 );
             });
 
             // Карточка тарифа
-            ui.add_space(6.0);
+            ui.add_space(4.0);
             render_tariff_card(app, ui);
 
-            ui.add_space(10.0);
+            ui.add_space(6.0);
 
             // Большая круглая кнопка подключения
             render_connect_button(app, ui, ctx, state);
 
-            ui.add_space(10.0);
+            ui.add_space(4.0);
 
             // Имя текущего конфига или статус ошибки
             ui.vertical_centered(|ui| {
@@ -186,7 +186,7 @@ pub fn render_central_panel(app: &mut ANetApp, ctx: &egui::Context) {
                 if lock_ignore_poison(&app.shared).client.is_none() && app.config_err.is_none() {
                     ui.label(
                         egui::RichText::new("(Выберите конфиг в настройках или добавьте новый)")
-                            .size(13.0)
+                            .size(12.0)
                             .strong()
                             .color(egui::Color32::from_gray(100))
                     );
@@ -196,7 +196,7 @@ pub fn render_central_panel(app: &mut ANetApp, ctx: &egui::Context) {
             // Выпадающий список выбора ноды
             render_node_selector(app, ui, state);
 
-            ui.add_space(8.0);
+            ui.add_space(4.0);
         });
 }
 
