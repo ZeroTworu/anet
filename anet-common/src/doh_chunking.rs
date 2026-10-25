@@ -101,9 +101,10 @@ struct PartialPacket {
     created_at: Instant,
 }
 
-/// Reassembly queue for multi-chunk DNS packets with selective repeat tracking.
+/// Reassembly queue for multi-chunk DNS packets with selective repeat tracking and deduplication.
 pub struct DohReassemblyQueue {
     packets: HashMap<(u32, u32), PartialPacket>,
+    completed: HashMap<(u32, u32), Instant>,
     timeout: Duration,
 }
 
@@ -111,6 +112,7 @@ impl DohReassemblyQueue {
     pub fn new(timeout: Duration) -> Self {
         Self {
             packets: HashMap::new(),
+            completed: HashMap::new(),
             timeout,
         }
     }
@@ -119,9 +121,15 @@ impl DohReassemblyQueue {
     /// Returns `Some((session_id, sequence, full_payload))` if the packet is now fully assembled.
     pub fn feed(&mut self, chunk_raw: &[u8]) -> anyhow::Result<Option<(u32, u32, Bytes)>> {
         let header = DohChunkHeader::decode(chunk_raw)?;
+        let key = (header.session_id, header.sequence);
+
+        // Ignore duplicate chunks for packets that were already reassembled recently
+        if self.completed.contains_key(&key) {
+            return Ok(None);
+        }
+
         let payload = Bytes::copy_from_slice(&chunk_raw[DOH_HEADER_LEN..]);
 
-        let key = (header.session_id, header.sequence);
         let entry = self.packets.entry(key).or_insert_with(|| PartialPacket {
             total_chunks: header.total_chunks,
             received_count: 0,
@@ -137,6 +145,7 @@ impl DohReassemblyQueue {
 
         if entry.received_count == entry.total_chunks {
             let completed = self.packets.remove(&key).unwrap();
+            self.completed.insert(key, Instant::now());
             let mut assembled = BytesMut::new();
             for chunk_opt in completed.chunks {
                 if let Some(c) = chunk_opt {
@@ -149,11 +158,12 @@ impl DohReassemblyQueue {
         Ok(None)
     }
 
-    /// Garbage-collects incomplete packets older than the configured timeout.
+    /// Garbage-collects incomplete packets and completed deduplication entries older than the configured timeout.
     pub fn cleanup(&mut self) {
         let now = Instant::now();
         let timeout = self.timeout;
         self.packets.retain(|_, v| now.duration_since(v.created_at) <= timeout);
+        self.completed.retain(|_, created_at| now.duration_since(*created_at) <= timeout);
     }
 
     /// Returns a list of missing chunk indices for a specific in-progress packet (used for Selective Repeat ARQ).
@@ -202,5 +212,9 @@ mod tests {
         assert_eq!(sid, session_id);
         assert_eq!(seq, sequence);
         assert_eq!(full.as_ref(), payload.as_slice());
+
+        // Feeding duplicate chunks after completion must be ignored
+        assert!(queue.feed(&chunks[1]).unwrap().is_none());
+        assert!(queue.feed(&chunks[0]).unwrap().is_none());
     }
 }

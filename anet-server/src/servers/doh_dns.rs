@@ -1,5 +1,5 @@
 use crate::auth_handler::ServerAuthHandler;
-use crate::client_registry::ClientRegistry;
+use crate::client_registry::{ClientRegistry, ClientTransportInfo};
 use crate::config::Config;
 use anet_common::astp_lite::AstpLiteCipher;
 use anet_common::base32;
@@ -12,6 +12,7 @@ use base64::Engine;
 use bytes::Bytes;
 use dashmap::DashMap;
 use log::{debug, info, warn};
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -19,9 +20,370 @@ use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Mutex};
 
+const DOH_TCP_MAX_MSS: u16 = 460;
+const MAX_SINGLE_DOWNLINK_PKT: usize = 500;
+const DOWNLINK_FRAG_DATA_LEN: usize = 460;
+const CODEL_MAX_SOJOURN: Duration = Duration::from_millis(600);
+const MAX_BULK_QUEUE_LEN: usize = 64;
+const MAX_PRIO_QUEUE_LEN: usize = 128;
+
+struct DohRxState {
+    rx_router: mpsc::Receiver<Bytes>,
+    pending_frags: VecDeque<Bytes>,
+    prio_queue: VecDeque<(Bytes, Instant)>,
+    bulk_queue: VecDeque<(Bytes, Instant)>,
+    next_frag_id: u16,
+}
+
 struct DohClientSession {
-    rx_router: Arc<Mutex<mpsc::Receiver<Bytes>>>,
+    rx_state: Mutex<DohRxState>,
     cipher: Arc<AstpLiteCipher>,
+}
+
+fn create_doh_session(
+    registry: &ClientRegistry,
+    client_info: &ClientTransportInfo,
+) -> Arc<DohClientSession> {
+    let (tx_router, rx_router) = mpsc::channel::<Bytes>(CHANNEL_BUFFER_SIZE);
+    registry.finalize_client(&client_info.assigned_ip, tx_router);
+    let cipher = Arc::new(AstpLiteCipher::new(client_info.cipher.raw_key()));
+    Arc::new(DohClientSession {
+        rx_state: Mutex::new(DohRxState {
+            rx_router,
+            pending_frags: VecDeque::new(),
+            prio_queue: VecDeque::new(),
+            bulk_queue: VecDeque::new(),
+            next_frag_id: 1,
+        }),
+        cipher,
+    })
+}
+
+/// Returns true if the IP packet is latency-sensitive (ICMP ping/probe, DNS port 53, or small TCP SYN/ACK/control).
+fn is_priority_packet(pkt: &[u8]) -> bool {
+    if pkt.len() < 20 {
+        return true;
+    }
+    let version = pkt[0] >> 4;
+    if version == 4 {
+        let ihl = ((pkt[0] & 0x0F) as usize) * 4;
+        let proto = pkt[9];
+        // ICMPv4
+        if proto == 1 {
+            return true;
+        }
+        // UDP DNS (src or dst port 53)
+        if proto == 17 && pkt.len() >= ihl + 4 {
+            let src_port = u16::from_be_bytes([pkt[ihl], pkt[ihl + 1]]);
+            let dst_port = u16::from_be_bytes([pkt[ihl + 2], pkt[ihl + 3]]);
+            if src_port == 53 || dst_port == 53 {
+                return true;
+            }
+        }
+        // Small TCP control packets (SYN, ACK, FIN, RST)
+        if proto == 6 && pkt.len() <= 100 {
+            return true;
+        }
+    } else if version == 6 && pkt.len() >= 40 {
+        let next_hdr = pkt[6];
+        // ICMPv6
+        if next_hdr == 58 {
+            return true;
+        }
+        if next_hdr == 17 && pkt.len() >= 44 {
+            let src_port = u16::from_be_bytes([pkt[40], pkt[41]]);
+            let dst_port = u16::from_be_bytes([pkt[42], pkt[43]]);
+            if src_port == 53 || dst_port == 53 {
+                return true;
+            }
+        }
+        if next_hdr == 6 && pkt.len() <= 120 {
+            return true;
+        }
+    }
+    false
+}
+
+/// Clamps TCP MSS option on IPv4/IPv6 SYN / SYN-ACK packets so TCP segments fit cleanly inside single DoH DNS responses.
+fn clamp_tcp_mss(pkt: &mut [u8], max_mss: u16) {
+    if pkt.len() < 40 {
+        return;
+    }
+    let version = pkt[0] >> 4;
+    let tcp_start = if version == 4 {
+        let ihl = ((pkt[0] & 0x0F) as usize) * 4;
+        if ihl < 20 || pkt[9] != 6 {
+            return;
+        }
+        let frag_off = u16::from_be_bytes([pkt[6], pkt[7]]) & 0x1FFF;
+        if frag_off != 0 {
+            return;
+        }
+        ihl
+    } else if version == 6 {
+        if pkt.len() < 60 || pkt[6] != 6 {
+            return;
+        }
+        40
+    } else {
+        return;
+    };
+
+    if pkt.len() < tcp_start + 20 {
+        return;
+    }
+    let flags = pkt[tcp_start + 13];
+    // Only inspect SYN packets (SYN=0x02, not RST=0x04)
+    if (flags & 0x02) == 0 || (flags & 0x04) != 0 {
+        return;
+    }
+    let doff = ((pkt[tcp_start + 12] >> 4) as usize) * 4;
+    if doff <= 20 || pkt.len() < tcp_start + doff {
+        return;
+    }
+
+    let opts_end = tcp_start + doff;
+    let mut idx = tcp_start + 20;
+    let mut modified = false;
+
+    while idx < opts_end {
+        let kind = pkt[idx];
+        if kind == 0 {
+            break;
+        }
+        if kind == 1 {
+            idx += 1;
+            continue;
+        }
+        if idx + 1 >= opts_end {
+            break;
+        }
+        let opt_len = pkt[idx + 1] as usize;
+        if opt_len < 2 || idx + opt_len > opts_end {
+            break;
+        }
+        if kind == 2 && opt_len == 4 {
+            let old_mss = u16::from_be_bytes([pkt[idx + 2], pkt[idx + 3]]);
+            if old_mss > max_mss {
+                let new_bytes = max_mss.to_be_bytes();
+                pkt[idx + 2] = new_bytes[0];
+                pkt[idx + 3] = new_bytes[1];
+                modified = true;
+            }
+            break;
+        }
+        idx += opt_len;
+    }
+
+    if !modified {
+        return;
+    }
+
+    // Recompute TCP checksum
+    pkt[tcp_start + 16] = 0;
+    pkt[tcp_start + 17] = 0;
+    let tcp_len = pkt.len() - tcp_start;
+    let mut sum: u32 = 0;
+
+    if version == 4 {
+        for i in (12..20).step_by(2) {
+            sum += u16::from_be_bytes([pkt[i], pkt[i + 1]]) as u32;
+        }
+        sum += 6u32;
+        sum += tcp_len as u32;
+    } else {
+        for i in (8..40).step_by(2) {
+            sum += u16::from_be_bytes([pkt[i], pkt[i + 1]]) as u32;
+        }
+        sum += 6u32;
+        sum += tcp_len as u32;
+    }
+
+    let tcp_slice = &pkt[tcp_start..];
+    let mut i = 0;
+    while i + 1 < tcp_slice.len() {
+        sum += u16::from_be_bytes([tcp_slice[i], tcp_slice[i + 1]]) as u32;
+        i += 2;
+    }
+    if i < tcp_slice.len() {
+        sum += (tcp_slice[i] as u32) << 8;
+    }
+
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    let csum = !(sum as u16);
+    let csum_bytes = csum.to_be_bytes();
+    pkt[tcp_start + 16] = csum_bytes[0];
+    pkt[tcp_start + 17] = csum_bytes[1];
+}
+
+fn enqueue_classified_packet(state: &mut DohRxState, raw_pkt: Bytes, now: Instant) {
+    let mut vec = raw_pkt.to_vec();
+    clamp_tcp_mss(&mut vec, DOH_TCP_MAX_MSS);
+    let pkt = Bytes::from(vec);
+
+    if is_priority_packet(&pkt) {
+        if state.prio_queue.len() >= MAX_PRIO_QUEUE_LEN {
+            state.prio_queue.pop_front();
+        }
+        state.prio_queue.push_back((pkt, now));
+    } else {
+        while let Some((_, ts)) = state.bulk_queue.front() {
+            if now.duration_since(*ts) > CODEL_MAX_SOJOURN {
+                state.bulk_queue.pop_front();
+            } else {
+                break;
+            }
+        }
+        if state.bulk_queue.len() >= MAX_BULK_QUEUE_LEN {
+            state.bulk_queue.pop_front();
+        }
+        state.bulk_queue.push_back((pkt, now));
+    }
+}
+
+fn drain_channel_into_queues(state: &mut DohRxState) {
+    let now = Instant::now();
+    while let Ok(pkt) = state.rx_router.try_recv() {
+        enqueue_classified_packet(state, pkt, now);
+    }
+    while let Some((_, ts)) = state.bulk_queue.front() {
+        if now.duration_since(*ts) > CODEL_MAX_SOJOURN {
+            state.bulk_queue.pop_front();
+        } else {
+            break;
+        }
+    }
+}
+
+fn pop_next_packet(state: &mut DohRxState) -> Option<(Bytes, bool)> {
+    let now = Instant::now();
+    if let Some((pkt, _)) = state.prio_queue.pop_front() {
+        return Some((pkt, true));
+    }
+    while let Some((pkt, ts)) = state.bulk_queue.pop_front() {
+        if now.duration_since(ts) <= CODEL_MAX_SOJOURN {
+            return Some((pkt, false));
+        }
+    }
+    None
+}
+
+async fn pop_downlink_payload(
+    session: &DohClientSession,
+    client_info: &ClientTransportInfo,
+    session_id: u32,
+    max_raw_bytes: usize,
+    wait_timeout: Duration,
+) -> Option<String> {
+    let lock_deadline = tokio::time::Instant::now() + Duration::from_millis(200);
+    let mut state = tokio::time::timeout_at(lock_deadline, session.rx_state.lock())
+        .await
+        .ok()?;
+
+    drain_channel_into_queues(&mut state);
+
+    if state.pending_frags.is_empty()
+        && state.prio_queue.is_empty()
+        && state.bulk_queue.is_empty()
+        && !wait_timeout.is_zero()
+    {
+        let wait_deadline = tokio::time::Instant::now() + wait_timeout;
+        if let Ok(Some(pkt)) = tokio::time::timeout_at(wait_deadline, state.rx_router.recv()).await
+        {
+            enqueue_classified_packet(&mut state, pkt, Instant::now());
+            drain_channel_into_queues(&mut state);
+        }
+    }
+
+    let mut packet_buf: Vec<u8> = Vec::new();
+
+    // 1. If there is a pending fragment of a large packet, send it immediately as a 0x01 frame
+    if let Some(frag_frame) = state.pending_frags.pop_front() {
+        packet_buf = frag_frame.to_vec();
+    } else if let Some((first_pkt, _is_prio)) = pop_next_packet(&mut state) {
+        if first_pkt.len() > MAX_SINGLE_DOWNLINK_PKT {
+            // Split oversized packet into <= 460B fragments with 0x01 header:
+            // [0x01, pkt_id_be16, frag_idx: u8, total_frags: u8, data...]
+            let pkt_id = state.next_frag_id;
+            state.next_frag_id = state.next_frag_id.wrapping_add(1);
+            let total_frags =
+                ((first_pkt.len() + DOWNLINK_FRAG_DATA_LEN - 1) / DOWNLINK_FRAG_DATA_LEN).min(16);
+            for idx in 0..total_frags {
+                let start = idx * DOWNLINK_FRAG_DATA_LEN;
+                let end = (start + DOWNLINK_FRAG_DATA_LEN).min(first_pkt.len());
+                let mut fbuf = Vec::with_capacity(5 + (end - start));
+                fbuf.push(0x01);
+                fbuf.extend_from_slice(&pkt_id.to_be_bytes());
+                fbuf.push(idx as u8);
+                fbuf.push(total_frags as u8);
+                fbuf.extend_from_slice(&first_pkt[start..end]);
+                if idx == 0 {
+                    packet_buf = fbuf;
+                } else {
+                    state.pending_frags.push_back(Bytes::from(fbuf));
+                }
+            }
+        } else {
+            // Normal packet (<= 500B): try batching additional packets that fit strictly within max_raw_bytes
+            let mut packets: Vec<Bytes> = Vec::with_capacity(8);
+            let mut total_raw = first_pkt.len();
+            packets.push(first_pkt);
+
+            while packets.len() < 12 {
+                let Some((next_pkt, next_is_prio)) = pop_next_packet(&mut state) else {
+                    break;
+                };
+                let needed = if packets.len() == 1 {
+                    1 + 2 + total_raw + 2 + next_pkt.len()
+                } else {
+                    total_raw + 2 + next_pkt.len()
+                };
+
+                if next_pkt.len() <= MAX_SINGLE_DOWNLINK_PKT && needed <= max_raw_bytes {
+                    total_raw = needed;
+                    packets.push(next_pkt);
+                } else {
+                    // Put back at the front so it is never lost and never exceeds max_raw_bytes!
+                    if next_is_prio {
+                        state.prio_queue.push_front((next_pkt, Instant::now()));
+                    } else {
+                        state.bulk_queue.push_front((next_pkt, Instant::now()));
+                    }
+                    break;
+                }
+            }
+
+            if packets.len() == 1 {
+                packet_buf = packets[0].to_vec();
+            } else {
+                packet_buf = Vec::with_capacity(total_raw);
+                packet_buf.push(0x00); // Batch marker
+                for pkt in &packets {
+                    packet_buf.extend_from_slice(&(pkt.len() as u16).to_be_bytes());
+                    packet_buf.extend_from_slice(pkt);
+                }
+            }
+        }
+    }
+
+    drop(state);
+
+    if packet_buf.is_empty() {
+        return None;
+    }
+
+    let seq = client_info.sequence.fetch_add(1, Ordering::Relaxed) as u32;
+    session
+        .cipher
+        .apply_keystream(seq, session_id, &mut packet_buf);
+
+    let mut downlink_bytes = Vec::with_capacity(4 + packet_buf.len());
+    downlink_bytes.extend_from_slice(&seq.to_be_bytes());
+    downlink_bytes.extend_from_slice(&packet_buf);
+
+    Some(BASE64_STANDARD.encode(&downlink_bytes))
 }
 
 /// Определяет основной внешний IPv4-адрес сервера через таблицу маршрутизации ядра (без отправки пакетов).
@@ -63,9 +425,6 @@ pub async fn run_doh_dns_server(
     let socket = match UdpSocket::bind(&bind_to).await {
         Ok(s) => Arc::new(s),
         Err(e) => {
-            // На Linux (Ubuntu/Debian) systemd-resolved слушает 127.0.0.53:53, из-за чего
-            // бинд на wildcard 0.0.0.0:53 падает с EADDRINUSE (os error 98), хотя внешний
-            // интерфейс свободен. Попробуем автоматически забиндиться на основной внешний IPv4.
             let mut fallback_socket = None;
             if e.kind() == std::io::ErrorKind::AddrInUse && bind_to.starts_with("0.0.0.0:") {
                 if let Some(port_str) = bind_to.strip_prefix("0.0.0.0:") {
@@ -110,7 +469,8 @@ pub async fn run_doh_dns_server(
     let handshake_reassembler: Arc<Mutex<DohReassemblyQueue>> =
         Arc::new(Mutex::new(DohReassemblyQueue::new(Duration::from_secs(15))));
     let temp_handshake_responses: Arc<DashMap<u32, (String, Instant)>> = Arc::new(DashMap::new());
-    let phase_handshake_responses: Arc<DashMap<(u32, u32), (String, Instant)>> = Arc::new(DashMap::new());
+    let phase_handshake_responses: Arc<DashMap<(u32, u32), (String, Instant)>> =
+        Arc::new(DashMap::new());
 
     // Background garbage collector for incomplete packets and handshake state
     {
@@ -124,7 +484,8 @@ pub async fn run_doh_dns_server(
                 reassembler.lock().await.cleanup();
                 handshake_reassembler.lock().await.cleanup();
                 temp_responses.retain(|_, (_, created)| created.elapsed() < Duration::from_secs(30));
-                phase_responses.retain(|_, (_, created)| created.elapsed() < Duration::from_secs(30));
+                phase_responses
+                    .retain(|_, (_, created)| created.elapsed() < Duration::from_secs(30));
             }
         });
     }
@@ -201,7 +562,6 @@ async fn handle_dns_datagram(
 
     // Validate domain zone suffix
     if !parsed_q.qname.ends_with(&domain_zone) {
-        // Query not for our domain: return empty response
         let resp = build_dns_txt_response(&raw_query, &parsed_q, None, 0);
         let _ = socket.send_to(&resp, remote_addr).await;
         return Ok(());
@@ -244,96 +604,32 @@ async fn handle_dns_datagram(
 
                 let session = active_sessions
                     .entry(session_id)
-                    .or_insert_with(|| {
-                        let (tx_router, rx_router) = mpsc::channel::<Bytes>(CHANNEL_BUFFER_SIZE);
-                        registry.finalize_client(&client_info.assigned_ip, tx_router);
-                        let cipher = Arc::new(AstpLiteCipher::new(client_info.cipher.raw_key()));
-                        Arc::new(DohClientSession {
-                            rx_router: Arc::new(Mutex::new(rx_router)),
-                            cipher,
-                        })
-                    })
+                    .or_insert_with(|| create_doh_session(&registry, &client_info))
                     .value()
                     .clone();
 
-                let effective_hold_ms = poll_hold_timeout_ms.min(350);
-                let deadline = tokio::time::Instant::now() + Duration::from_millis(effective_hold_ms);
-                let lock_deadline = tokio::time::Instant::now() + Duration::from_millis(80);
-                let mut packets: Vec<Bytes> = Vec::new();
-                let mut total_raw_bytes: usize = 0;
-                const MAX_BATCH_RAW_BYTES: usize = 650;
-
-                if let Ok(mut rx_router) = tokio::time::timeout_at(lock_deadline, session.rx_router.lock()).await {
-                    let first_pkt = match rx_router.try_recv() {
-                        Ok(p) => Some(p),
-                        Err(_) => {
-                            match tokio::time::timeout_at(deadline, rx_router.recv()).await {
-                                Ok(Some(p)) => Some(p),
-                                _ => None,
-                            }
-                        }
-                    };
-
-                    if let Some(first) = first_pkt {
-                        total_raw_bytes += first.len();
-                        packets.push(first);
-
-                        while packets.len() < 16 {
-                            match rx_router.try_recv() {
-                                Ok(next_pkt) => {
-                                    if total_raw_bytes + 2 + next_pkt.len() <= MAX_BATCH_RAW_BYTES {
-                                        total_raw_bytes += 2 + next_pkt.len();
-                                        packets.push(next_pkt);
-                                    } else {
-                                        // Put back is not supported on mpsc::Receiver; encrypt and send next_pkt on next poll?
-                                        // Wait: mpsc::Receiver::try_recv consumes next_pkt! So we must include next_pkt if popped,
-                                        // or stop before popping if total_raw_bytes is already near MAX_BATCH_RAW_BYTES.
-                                        packets.push(next_pkt);
-                                        break;
-                                    }
-                                }
-                                Err(_) => break,
-                            }
-                            if total_raw_bytes >= 500 {
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                if !packets.is_empty() {
-                    let seq = client_info.sequence.fetch_add(1, Ordering::Relaxed) as u32;
-                    let mut packet_buf = if packets.len() == 1 {
-                        packets[0].to_vec()
-                    } else {
-                        let mut buf = Vec::with_capacity(1 + total_raw_bytes + packets.len() * 2);
-                        buf.push(0x00); // Batch marker (valid IPv4/IPv6 packets start with 0x4x or 0x6x)
-                        for pkt in &packets {
-                            let len_u16 = (pkt.len() as u16).to_be_bytes();
-                            buf.extend_from_slice(&len_u16);
-                            buf.extend_from_slice(pkt);
-                        }
-                        buf
-                    };
-                    session.cipher.apply_keystream(seq, session_id, &mut packet_buf);
-
-                    let mut downlink_bytes = Vec::with_capacity(4 + packet_buf.len());
-                    downlink_bytes.extend_from_slice(&seq.to_be_bytes());
-                    downlink_bytes.extend_from_slice(&packet_buf);
-
-                    let b64 = BASE64_STANDARD.encode(&downlink_bytes);
-                    let resp = build_dns_txt_response(&raw_query, &parsed_q, Some(b64.as_bytes()), 0);
+                let effective_hold_ms = poll_hold_timeout_ms.min(45);
+                if let Some(b64) = pop_downlink_payload(
+                    &session,
+                    &client_info,
+                    session_id,
+                    700,
+                    Duration::from_millis(effective_hold_ms),
+                )
+                .await
+                {
+                    let resp =
+                        build_dns_txt_response(&raw_query, &parsed_q, Some(b64.as_bytes()), 0);
                     let _ = socket.send_to(&resp, remote_addr).await;
                     return Ok(());
                 } else {
-                    // Empty poll answer
                     let resp = build_dns_txt_response(&raw_query, &parsed_q, None, 0);
                     let _ = socket.send_to(&resp, remote_addr).await;
                     return Ok(());
                 }
             } else if let Some(saved) = temp_handshake_responses.get(&session_id) {
-                // Handshake poll
-                let resp = build_dns_txt_response(&raw_query, &parsed_q, Some(saved.0.as_bytes()), 0);
+                let resp =
+                    build_dns_txt_response(&raw_query, &parsed_q, Some(saved.0.as_bytes()), 0);
                 let _ = socket.send_to(&resp, remote_addr).await;
                 return Ok(());
             } else {
@@ -353,14 +649,18 @@ async fn handle_dns_datagram(
 
             if let Ok(chunk_raw) = base32::decode(&b32_str) {
                 if let Ok(hdr) = anet_common::doh_chunking::DohChunkHeader::decode(&chunk_raw) {
-                    // If this handshake phase was already processed (e.g. duplicate query via dup_hs),
-                    // return the cached response immediately without regenerating DH keys.
-                    if let Some(cached) = phase_handshake_responses.get(&(temp_session_id, hdr.sequence)) {
-                        let dns_resp = build_dns_txt_response(&raw_query, &parsed_q, Some(cached.0.as_bytes()), 0);
+                    if let Some(cached) =
+                        phase_handshake_responses.get(&(temp_session_id, hdr.sequence))
+                    {
+                        let dns_resp = build_dns_txt_response(
+                            &raw_query,
+                            &parsed_q,
+                            Some(cached.0.as_bytes()),
+                            0,
+                        );
                         let _ = socket.send_to(&dns_resp, remote_addr).await;
                         return Ok(());
                     }
-                    // Clear previous phase response from poll slot when a new phase starts
                     if hdr.sequence > 0 && hdr.chunk_index == 0 {
                         temp_handshake_responses.remove(&temp_session_id);
                     }
@@ -373,7 +673,12 @@ async fn handle_dns_datagram(
 
                 if let Some((_sid, seq, full_handshake)) = assembled_opt {
                     if let Some(cached) = phase_handshake_responses.get(&(temp_session_id, seq)) {
-                        let dns_resp = build_dns_txt_response(&raw_query, &parsed_q, Some(cached.0.as_bytes()), 0);
+                        let dns_resp = build_dns_txt_response(
+                            &raw_query,
+                            &parsed_q,
+                            Some(cached.0.as_bytes()),
+                            0,
+                        );
                         let _ = socket.send_to(&dns_resp, remote_addr).await;
                         return Ok(());
                     }
@@ -401,30 +706,29 @@ async fn handle_dns_datagram(
 
                     if let Some((client_info, _)) = authenticated {
                         let session_id = u32::from_be_bytes(client_info.nonce_prefix);
-                        active_sessions.entry(session_id).or_insert_with(|| {
-                            let (tx_router, rx_router) = mpsc::channel::<Bytes>(CHANNEL_BUFFER_SIZE);
-                            registry.finalize_client(&client_info.assigned_ip, tx_router);
-                            let cipher = Arc::new(AstpLiteCipher::new(client_info.cipher.raw_key()));
-                            Arc::new(DohClientSession {
-                                rx_router: Arc::new(Mutex::new(rx_router)),
-                                cipher,
-                            })
-                        });
+                        active_sessions
+                            .entry(session_id)
+                            .or_insert_with(|| create_doh_session(&registry, &client_info));
                     }
 
                     if let Some(resp) = response_opt {
                         let b64 = BASE64_STANDARD.encode(&resp);
                         let now = Instant::now();
-                        phase_handshake_responses.insert((temp_session_id, seq), (b64.clone(), now));
+                        phase_handshake_responses
+                            .insert((temp_session_id, seq), (b64.clone(), now));
                         temp_handshake_responses.insert(temp_session_id, (b64.clone(), now));
 
-                        let dns_resp = build_dns_txt_response(&raw_query, &parsed_q, Some(b64.as_bytes()), 0);
+                        let dns_resp = build_dns_txt_response(
+                            &raw_query,
+                            &parsed_q,
+                            Some(b64.as_bytes()),
+                            0,
+                        );
                         let _ = socket.send_to(&dns_resp, remote_addr).await;
                         return Ok(());
                     }
                 }
 
-                // Chunk acknowledged
                 let dns_resp = build_dns_txt_response(&raw_query, &parsed_q, Some(b"ACK"), 0);
                 let _ = socket.send_to(&dns_resp, remote_addr).await;
                 return Ok(());
@@ -444,37 +748,77 @@ async fn handle_dns_datagram(
                 return Ok(());
             }
         };
-        if registry.get_by_prefix(&hdr.session_id.to_be_bytes()).is_none() {
+        let prefix_bytes = hdr.session_id.to_be_bytes();
+        let Some(client_info) = registry.get_by_prefix(&prefix_bytes) else {
             let resp = build_dns_txt_response(&raw_query, &parsed_q, None, 0);
             let _ = socket.send_to(&resp, remote_addr).await;
             return Ok(());
-        }
+        };
+
+        let session = active_sessions
+            .entry(hdr.session_id)
+            .or_insert_with(|| create_doh_session(&registry, &client_info))
+            .value()
+            .clone();
 
         let assembled_opt = {
             let mut reasm = reassembler.lock().await;
             reasm.feed(&chunk_raw)?
         };
 
+        let mut completed_uplink = false;
         if let Some((session_id, seq, full_payload)) = assembled_opt {
-            let prefix_bytes = session_id.to_be_bytes();
-            if let Some(client_info) = registry.get_by_prefix(&prefix_bytes) {
-                client_info.last_activity.store(
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs(),
-                    Ordering::Relaxed,
-                );
+            completed_uplink = true;
+            client_info.last_activity.store(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                Ordering::Relaxed,
+            );
 
-                let cipher = AstpLiteCipher::new(client_info.cipher.raw_key());
-                let mut decrypted = full_payload.to_vec();
-                cipher.apply_keystream(seq, session_id, &mut decrypted);
+            let mut decrypted = full_payload.to_vec();
+            session.cipher.apply_keystream(seq, session_id, &mut decrypted);
 
+            if decrypted.first() == Some(&0x00) {
+                // Unpack batched uplink packets: [0x00, len_be16, pkt1, len_be16, pkt2, ...]
+                let mut pos = 1;
+                while pos + 2 <= decrypted.len() {
+                    let pkt_len = u16::from_be_bytes([decrypted[pos], decrypted[pos + 1]]) as usize;
+                    pos += 2;
+                    if pos + pkt_len <= decrypted.len() {
+                        let mut single_pkt = decrypted[pos..pos + pkt_len].to_vec();
+                        clamp_tcp_mss(&mut single_pkt, DOH_TCP_MAX_MSS);
+                        if tun_tx.try_send(Bytes::from(single_pkt)).is_ok() {
+                            registry.record_rx(&client_info, pkt_len, "doh");
+                        }
+                        pos += pkt_len;
+                    } else {
+                        break;
+                    }
+                }
+            } else if !decrypted.is_empty() {
                 let packet_len = decrypted.len();
+                clamp_tcp_mss(&mut decrypted, DOH_TCP_MAX_MSS);
                 if tun_tx.try_send(Bytes::from(decrypted)).is_ok() {
                     registry.record_rx(&client_info, packet_len, "doh");
                 }
             }
+        }
+
+        // Piggyback ready downlink packets (or quick replies such as in-tunnel ICMP Echo Reply)
+        // directly in the TXT response of the uplink query (capped at 510 raw bytes so UDP DNS <= 994B).
+        let piggyback_wait = if completed_uplink {
+            Duration::from_millis(3)
+        } else {
+            Duration::ZERO
+        };
+        if let Some(b64) =
+            pop_downlink_payload(&session, &client_info, hdr.session_id, 510, piggyback_wait).await
+        {
+            let resp = build_dns_txt_response(&raw_query, &parsed_q, Some(b64.as_bytes()), 0);
+            let _ = socket.send_to(&resp, remote_addr).await;
+            return Ok(());
         }
 
         let resp = build_dns_txt_response(&raw_query, &parsed_q, Some(b"OK"), 0);
