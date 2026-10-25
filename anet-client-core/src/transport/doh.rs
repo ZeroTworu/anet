@@ -15,16 +15,151 @@ use base64::Engine;
 use bytes::{Bytes, BytesMut};
 use log::{debug, info, warn};
 use reqwest::{Client, Url};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
+
+const RESOLVER_COOLDOWN_MS: u64 = 2_000;
+
+fn now_epoch_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+struct ResolverPool {
+    urls: Vec<String>,
+    cooldown_until_ms: Vec<AtomicU64>,
+    cursor: AtomicUsize,
+}
+
+impl ResolverPool {
+    fn new(urls: Vec<String>) -> Self {
+        let cooldown_until_ms = urls.iter().map(|_| AtomicU64::new(0)).collect();
+        Self {
+            urls,
+            cooldown_until_ms,
+            cursor: AtomicUsize::new(0),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.urls.len()
+    }
+
+    /// Selects the next healthy resolver (skipping resolvers currently in cooldown).
+    fn next_healthy(&self) -> (usize, &str) {
+        let n = self.urls.len();
+        let now = now_epoch_ms();
+        let start = self.cursor.fetch_add(1, Ordering::Relaxed);
+
+        for offset in 0..n {
+            let idx = (start + offset) % n;
+            let until = self.cooldown_until_ms[idx].load(Ordering::Relaxed);
+            if now >= until {
+                return (idx, &self.urls[idx]);
+            }
+        }
+
+        // All resolvers are in cooldown: pick the one whose cooldown expires soonest
+        let mut best_idx = start % n;
+        let mut best_until = u64::MAX;
+        for idx in 0..n {
+            let until = self.cooldown_until_ms[idx].load(Ordering::Relaxed);
+            if until < best_until {
+                best_until = until;
+                best_idx = idx;
+            }
+        }
+        (best_idx, &self.urls[best_idx])
+    }
+
+    fn mark_failed(&self, idx: usize) {
+        let until = now_epoch_ms() + RESOLVER_COOLDOWN_MS;
+        self.cooldown_until_ms[idx].store(until, Ordering::Relaxed);
+    }
+
+    fn mark_success(&self, idx: usize) {
+        self.cooldown_until_ms[idx].store(0, Ordering::Relaxed);
+    }
+
+    /// Sends a DoH DNS wire query, checking DNS RCODE and automatically retrying on alternative healthy resolvers if one fails.
+    async fn send_query_reliable(&self, client: &Client, query_bytes: &[u8]) -> Result<Bytes> {
+        let max_attempts = self.urls.len().max(2);
+        let mut last_err = None;
+
+        for _ in 0..max_attempts {
+            let (idx, resolver_url) = self.next_healthy();
+            let req = client
+                .post(resolver_url)
+                .header("Content-Type", "application/dns-message")
+                .header("Accept", "application/dns-message")
+                .body(query_bytes.to_vec());
+
+            match req.send().await {
+                Ok(res) if res.status().is_success() => {
+                    match res.bytes().await {
+                        Ok(body) => {
+                            if body.len() >= 12 {
+                                let rcode = u16::from_be_bytes([body[2], body[3]]) & 0x000F;
+                                if rcode == 0 {
+                                    self.mark_success(idx);
+                                    return Ok(body);
+                                } else {
+                                    self.mark_failed(idx);
+                                    debug!(
+                                        "[DoH] Resolver {} returned DNS RCODE {} (cooldown {}s)",
+                                        resolver_url,
+                                        rcode,
+                                        RESOLVER_COOLDOWN_MS / 1000
+                                    );
+                                    last_err = Some(anyhow::anyhow!("Resolver {} DNS RCODE {}", resolver_url, rcode));
+                                }
+                            } else {
+                                self.mark_failed(idx);
+                                last_err = Some(anyhow::anyhow!("Resolver {} short DNS body", resolver_url));
+                            }
+                        }
+                        Err(e) => {
+                            self.mark_failed(idx);
+                            debug!("[DoH] Resolver {} body read error (cooldown {}s): {}", resolver_url, RESOLVER_COOLDOWN_MS / 1000, e);
+                            last_err = Some(anyhow::Error::from(e));
+                        }
+                    }
+                }
+                Ok(res) => {
+                    self.mark_failed(idx);
+                    debug!(
+                        "[DoH] Resolver {} returned HTTP {} (cooldown {}s)",
+                        resolver_url,
+                        res.status(),
+                        RESOLVER_COOLDOWN_MS / 1000
+                    );
+                    last_err = Some(anyhow::anyhow!("Resolver {} HTTP {}", resolver_url, res.status()));
+                }
+                Err(e) => {
+                    self.mark_failed(idx);
+                    debug!(
+                        "[DoH] Resolver {} failed (cooldown {}s): {}",
+                        resolver_url,
+                        RESOLVER_COOLDOWN_MS / 1000,
+                        e
+                    );
+                    last_err = Some(anyhow::Error::from(e));
+                }
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("All DoH resolvers failed")))
+    }
+}
 
 struct DohAuthChannel {
     client: Client,
-    resolvers: Vec<String>,
-    resolver_idx: AtomicUsize,
+    pool: Arc<ResolverPool>,
     domain_zone: String,
     temp_session_id: u32,
     hs_seq: AtomicU32,
@@ -54,60 +189,38 @@ impl AuthChannel for DohAuthChannel {
 
             let query_bytes = build_doh_query(&qname, rand::random::<u16>());
 
-            let resolver_url = {
-                let current = self.resolver_idx.fetch_add(1, Ordering::Relaxed);
-                self.resolvers[current % self.resolvers.len()].clone()
-            };
-
-            let req = self
-                .client
-                .post(&resolver_url)
-                .header("Content-Type", "application/dns-message")
-                .header("Accept", "application/dns-message")
-                .body(query_bytes.clone());
-
-            let resp = req.send().await;
-            match resp {
-                Ok(res) if res.status().is_success() => {
-                    if let Ok(body) = res.bytes().await {
-                        if let Some(txt_data) = parse_dns_txt_response(&body) {
-                            if txt_data != b"ACK" && txt_data != b"OK" {
-                                if let Ok(decoded) = BASE64_STANDARD.decode(&txt_data) {
-                                    if !decoded.is_empty() {
-                                        *self.pending_response.lock().await = Some(Bytes::from(decoded));
-                                    }
+            match self.pool.send_query_reliable(&self.client, &query_bytes).await {
+                Ok(body) => {
+                    if let Some(txt_data) = parse_dns_txt_response(&body) {
+                        if txt_data != b"ACK" && txt_data != b"OK" {
+                            if let Ok(decoded) = BASE64_STANDARD.decode(&txt_data) {
+                                if !decoded.is_empty() {
+                                    *self.pending_response.lock().await = Some(Bytes::from(decoded));
                                 }
                             }
                         }
                     }
                 }
-                Ok(res) => {
-                    warn!("[DoH Auth] Resolver {} returned status {}", resolver_url, res.status());
-                }
                 Err(e) => {
-                    warn!("[DoH Auth] Failed sending handshake query to {}: {}", resolver_url, e);
+                    warn!("[DoH Auth] All resolvers failed for handshake chunk {}/{}: {}", idx + 1, total, e);
                 }
             }
 
-            // If duplicate handshake is enabled and there are multiple resolvers, duplicate the query
-            if self.dup_hs && self.resolvers.len() > 1 && self.pending_response.lock().await.is_none() {
-                let alt_resolver = {
-                    let current = self.resolver_idx.fetch_add(1, Ordering::Relaxed);
-                    self.resolvers[current % self.resolvers.len()].clone()
-                };
-                if alt_resolver != resolver_url {
-                    let alt_client = self.client.clone();
-                    let alt_query = query_bytes.clone();
-                    tokio::spawn(async move {
-                        let _ = alt_client
-                            .post(&alt_resolver)
-                            .header("Content-Type", "application/dns-message")
-                            .header("Accept", "application/dns-message")
-                            .body(alt_query)
-                            .send()
-                            .await;
-                    });
-                }
+            // If duplicate handshake is enabled and there are multiple resolvers, send a backup copy via another healthy resolver
+            if self.dup_hs && self.pool.len() > 1 && self.pending_response.lock().await.is_none() {
+                let (_, alt_resolver_str) = self.pool.next_healthy();
+                let alt_resolver = alt_resolver_str.to_string();
+                let alt_client = self.client.clone();
+                let alt_query = query_bytes.clone();
+                tokio::spawn(async move {
+                    let _ = alt_client
+                        .post(&alt_resolver)
+                        .header("Content-Type", "application/dns-message")
+                        .header("Accept", "application/dns-message")
+                        .body(alt_query)
+                        .send()
+                        .await;
+                });
             }
         }
 
@@ -128,35 +241,19 @@ impl AuthChannel for DohAuthChannel {
             let qname = format!("poll.{:08x}.{:08x}.{}", self.temp_session_id, nonce, self.domain_zone);
             let query_bytes = build_doh_query(&qname, rand::random::<u16>());
 
-            let resolver_url = {
-                let current = self.resolver_idx.fetch_add(1, Ordering::Relaxed);
-                self.resolvers[current % self.resolvers.len()].clone()
-            };
-
-            let req = self
-                .client
-                .post(&resolver_url)
-                .header("Content-Type", "application/dns-message")
-                .header("Accept", "application/dns-message")
-                .body(query_bytes);
-
-            if let Ok(res) = req.send().await {
-                if res.status().is_success() {
-                    if let Ok(body) = res.bytes().await {
-                        if let Some(txt_data) = parse_dns_txt_response(&body) {
-                            if txt_data != b"ACK" && txt_data != b"OK" {
-                                if let Ok(decoded) = BASE64_STANDARD.decode(&txt_data) {
-                                    if !decoded.is_empty() {
-                                        return Ok(Bytes::from(decoded));
-                                    }
-                                }
+            if let Ok(body) = self.pool.send_query_reliable(&self.client, &query_bytes).await {
+                if let Some(txt_data) = parse_dns_txt_response(&body) {
+                    if txt_data != b"ACK" && txt_data != b"OK" {
+                        if let Ok(decoded) = BASE64_STANDARD.decode(&txt_data) {
+                            if !decoded.is_empty() {
+                                return Ok(Bytes::from(decoded));
                             }
                         }
                     }
                 }
             }
 
-            tokio::time::sleep(Duration::from_millis(60)).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
         bail!("Handshake receive timed out over DoH")
@@ -209,24 +306,36 @@ impl ClientTransport for DohTransport {
             hold_ms
         );
 
-        let http_client = Client::builder()
+        let tx_http_client = Client::builder()
+            .pool_max_idle_per_host(32)
+            .pool_idle_timeout(Some(Duration::from_secs(60)))
+            .tcp_nodelay(true)
+            .connect_timeout(Duration::from_millis(1200))
+            .timeout(Duration::from_millis(2500))
+            .http2_adaptive_window(true)
+            .build()
+            .context("Failed to build TX HTTP/2 client for DoH")?;
+
+        let rx_http_client = Client::builder()
             .pool_max_idle_per_host(16)
             .pool_idle_timeout(Some(Duration::from_secs(60)))
             .tcp_nodelay(true)
-            .timeout(Duration::from_millis(hold_ms + 1500))
+            .connect_timeout(Duration::from_millis(1200))
+            .timeout(Duration::from_millis(hold_ms.min(800) + 1200))
             .http2_adaptive_window(true)
             .build()
-            .context("Failed to build HTTP/2 client for DoH")?;
+            .context("Failed to build RX HTTP/2 client for DoH")?;
 
         let max_payload = calculate_max_chunk_payload(&domain_zone);
         // Reserve space for "hs.<8_hex>.<idx>.<total>." (~18 chars => ~12 raw bytes) so FQDN stays <= 253 chars
         let hs_max_payload = max_payload.saturating_sub(24).max(32);
         let temp_session_id = rand::random::<u32>() | 0x80000000;
 
+        let resolver_pool = Arc::new(ResolverPool::new(resolvers.clone()));
+
         let auth_channel = DohAuthChannel {
-            client: http_client.clone(),
-            resolvers: resolvers.clone(),
-            resolver_idx: AtomicUsize::new(0),
+            client: tx_http_client.clone(),
+            pool: resolver_pool.clone(),
             domain_zone: domain_zone.clone(),
             temp_session_id,
             hs_seq: AtomicU32::new(0),
@@ -290,18 +399,15 @@ impl ClientTransport for DohTransport {
         });
 
         let tunnel_write_mutex = Arc::new(Mutex::new(tunnel_write));
-        let resolvers_arc = Arc::new(resolvers);
-        let resolver_idx_tx = Arc::new(AtomicUsize::new(0));
-        let resolver_idx_rx = Arc::new(AtomicUsize::new(0));
 
-        // 1. Uplink Loop: Sends outgoing IP packets from TUN via chunked DoH queries
+        // 1. Uplink Loop: Sends outgoing IP packets from TUN via chunked DoH queries with retry and bounded concurrency
         {
-            let http_client = http_client.clone();
+            let http_client = tx_http_client.clone();
             let cipher = cipher.clone();
             let sequence = sequence.clone();
             let domain_zone = domain_zone.clone();
-            let resolvers = resolvers_arc.clone();
-            let resolver_idx = resolver_idx_tx.clone();
+            let pool = resolver_pool.clone();
+            let tx_sem = Arc::new(Semaphore::new(24));
 
             tokio::spawn(async move {
                 info!("[DoH TX] Uplink dispatcher loop active");
@@ -318,21 +424,17 @@ impl ClientTransport for DohTransport {
                         let qname = format!("{}.{}", labels, domain_zone);
                         let query_bytes = build_doh_query(&qname, rand::random::<u16>());
 
-                        let resolver_url = {
-                            let idx = resolver_idx.fetch_add(1, Ordering::Relaxed);
-                            resolvers[idx % resolvers.len()].clone()
+                        let client = http_client.clone();
+                        let pool_clone = pool.clone();
+                        let permit = match tx_sem.clone().acquire_owned().await {
+                            Ok(p) => p,
+                            Err(_) => break,
                         };
 
-                        let client = http_client.clone();
                         tokio::spawn(async move {
-                            let req = client
-                                .post(&resolver_url)
-                                .header("Content-Type", "application/dns-message")
-                                .header("Accept", "application/dns-message")
-                                .body(query_bytes);
-
-                            if let Err(e) = req.send().await {
-                                debug!("[DoH TX] Uplink chunk POST error to {}: {}", resolver_url, e);
+                            let _permit = permit;
+                            if let Err(e) = pool_clone.send_query_reliable(&client, &query_bytes).await {
+                                debug!("[DoH TX] Uplink chunk failed across all resolvers: {}", e);
                             }
                         });
                     }
@@ -342,15 +444,14 @@ impl ClientTransport for DohTransport {
             });
         }
 
-        // 2. Downlink Poller: Keeps 2 concurrent long-poll queries active for low-latency inbound traffic
+        // 2. Downlink Poller: Keeps 4 concurrent long-poll queries active on dedicated HTTP client
         {
-            let poll_concurrency = 2;
+            let poll_concurrency = 4;
             for worker_id in 0..poll_concurrency {
-                let http_client = http_client.clone();
+                let http_client = rx_http_client.clone();
                 let cipher = cipher.clone();
                 let domain_zone = domain_zone.clone();
-                let resolvers = resolvers_arc.clone();
-                let resolver_idx = resolver_idx_rx.clone();
+                let pool = resolver_pool.clone();
                 let tunnel_write = tunnel_write_mutex.clone();
 
                 tokio::spawn(async move {
@@ -362,31 +463,41 @@ impl ClientTransport for DohTransport {
                         let qname = format!("poll.{:08x}.{}.{}", session_id, nonce_hex, domain_zone);
                         let query_bytes = build_doh_query(&qname, rand::random::<u16>());
 
-                        let resolver_url = {
-                            let idx = resolver_idx.fetch_add(1, Ordering::Relaxed);
-                            resolvers[idx % resolvers.len()].clone()
-                        };
-
-                        let req = http_client
-                            .post(&resolver_url)
-                            .header("Content-Type", "application/dns-message")
-                            .header("Accept", "application/dns-message")
-                            .body(query_bytes);
-
-                        match req.send().await {
-                            Ok(res) if res.status().is_success() => {
+                        match pool.send_query_reliable(&http_client, &query_bytes).await {
+                            Ok(body) => {
                                 backoff_ms = 10;
-                                if let Ok(body) = res.bytes().await {
-                                    if let Some(txt_data) = parse_dns_txt_response(&body) {
-                                        if let Ok(mut raw_payload) = BASE64_STANDARD.decode(&txt_data) {
-                                            if raw_payload.len() >= 4 {
-                                                let seq = u32::from_be_bytes(raw_payload[0..4].try_into().unwrap());
-                                                let ciphertext = &mut raw_payload[4..];
-                                                cipher.apply_keystream(seq, session_id, ciphertext);
+                                if let Some(txt_data) = parse_dns_txt_response(&body) {
+                                    if let Ok(mut raw_payload) = BASE64_STANDARD.decode(&txt_data) {
+                                        if raw_payload.len() >= 4 {
+                                            let seq = u32::from_be_bytes(raw_payload[0..4].try_into().unwrap());
+                                            let ciphertext = &mut raw_payload[4..];
+                                            cipher.apply_keystream(seq, session_id, ciphertext);
 
-                                                let mut out_buf = BytesMut::with_capacity(ciphertext.len() + 8);
+                                            let mut out_buf = BytesMut::with_capacity(ciphertext.len() + 16);
+                                            if ciphertext.first() == Some(&0x00) {
+                                                // Unpack batched packets: [0x00, len_be16, pkt1, len_be16, pkt2, ...]
+                                                let mut pos = 1;
+                                                while pos + 2 <= ciphertext.len() {
+                                                    let pkt_len = u16::from_be_bytes([
+                                                        ciphertext[pos],
+                                                        ciphertext[pos + 1],
+                                                    ]) as usize;
+                                                    pos += 2;
+                                                    if pos + pkt_len <= ciphertext.len() {
+                                                        frame_packet_into(
+                                                            &mut out_buf,
+                                                            &ciphertext[pos..pos + pkt_len],
+                                                        );
+                                                        pos += pkt_len;
+                                                    } else {
+                                                        break;
+                                                    }
+                                                }
+                                            } else {
                                                 frame_packet_into(&mut out_buf, ciphertext);
+                                            }
 
+                                            if !out_buf.is_empty() {
                                                 let mut guard = tunnel_write.lock().await;
                                                 if guard.write_all(&out_buf).await.is_err() {
                                                     warn!("[DoH RX] Tunnel stream closed; exiting poller.");
@@ -397,15 +508,10 @@ impl ClientTransport for DohTransport {
                                     }
                                 }
                             }
-                            Ok(res) => {
-                                debug!("[DoH RX-{}] Resolver HTTP {}", worker_id, res.status());
-                                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-                                backoff_ms = (backoff_ms * 2).min(500);
-                            }
                             Err(e) => {
                                 debug!("[DoH RX-{}] Poll request failed: {}", worker_id, e);
                                 tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-                                backoff_ms = (backoff_ms * 2).min(500);
+                                backoff_ms = (backoff_ms * 2).min(400);
                             }
                         }
                     }

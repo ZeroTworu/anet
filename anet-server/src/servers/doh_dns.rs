@@ -212,6 +212,13 @@ async fn handle_dns_datagram(
         .trim_end_matches(&domain_zone)
         .trim_end_matches('.');
 
+    // Filter out QNAME-minimization probes: non-TXT queries (A, NS, SOA) or empty zone apex
+    if parsed_q.qtype != anet_common::dns_proto::DNS_QTYPE_TXT || prefix.is_empty() {
+        let resp = build_dns_txt_response(&raw_query, &parsed_q, None, 0);
+        let _ = socket.send_to(&resp, remote_addr).await;
+        return Ok(());
+    }
+
     // Case 1: Downlink Long-Poll query ("poll.<session_id_hex>.<nonce_hex>")
     if prefix.starts_with("poll.") {
         let parts: Vec<&str> = prefix.split('.').collect();
@@ -249,23 +256,65 @@ async fn handle_dns_datagram(
                     .value()
                     .clone();
 
-                let deadline = tokio::time::Instant::now() + Duration::from_millis(poll_hold_timeout_ms);
-                let mut packet_opt = None;
+                let effective_hold_ms = poll_hold_timeout_ms.min(350);
+                let deadline = tokio::time::Instant::now() + Duration::from_millis(effective_hold_ms);
+                let lock_deadline = tokio::time::Instant::now() + Duration::from_millis(80);
+                let mut packets: Vec<Bytes> = Vec::new();
+                let mut total_raw_bytes: usize = 0;
+                const MAX_BATCH_RAW_BYTES: usize = 650;
 
-                if let Ok(mut rx_router) = tokio::time::timeout_at(deadline, session.rx_router.lock()).await {
-                    match rx_router.try_recv() {
-                        Ok(p) => packet_opt = Some(p),
+                if let Ok(mut rx_router) = tokio::time::timeout_at(lock_deadline, session.rx_router.lock()).await {
+                    let first_pkt = match rx_router.try_recv() {
+                        Ok(p) => Some(p),
                         Err(_) => {
-                            if let Ok(Some(p)) = tokio::time::timeout_at(deadline, rx_router.recv()).await {
-                                packet_opt = Some(p);
+                            match tokio::time::timeout_at(deadline, rx_router.recv()).await {
+                                Ok(Some(p)) => Some(p),
+                                _ => None,
+                            }
+                        }
+                    };
+
+                    if let Some(first) = first_pkt {
+                        total_raw_bytes += first.len();
+                        packets.push(first);
+
+                        while packets.len() < 16 {
+                            match rx_router.try_recv() {
+                                Ok(next_pkt) => {
+                                    if total_raw_bytes + 2 + next_pkt.len() <= MAX_BATCH_RAW_BYTES {
+                                        total_raw_bytes += 2 + next_pkt.len();
+                                        packets.push(next_pkt);
+                                    } else {
+                                        // Put back is not supported on mpsc::Receiver; encrypt and send next_pkt on next poll?
+                                        // Wait: mpsc::Receiver::try_recv consumes next_pkt! So we must include next_pkt if popped,
+                                        // or stop before popping if total_raw_bytes is already near MAX_BATCH_RAW_BYTES.
+                                        packets.push(next_pkt);
+                                        break;
+                                    }
+                                }
+                                Err(_) => break,
+                            }
+                            if total_raw_bytes >= 500 {
+                                break;
                             }
                         }
                     }
                 }
 
-                if let Some(packet) = packet_opt {
+                if !packets.is_empty() {
                     let seq = client_info.sequence.fetch_add(1, Ordering::Relaxed) as u32;
-                    let mut packet_buf = packet.to_vec();
+                    let mut packet_buf = if packets.len() == 1 {
+                        packets[0].to_vec()
+                    } else {
+                        let mut buf = Vec::with_capacity(1 + total_raw_bytes + packets.len() * 2);
+                        buf.push(0x00); // Batch marker (valid IPv4/IPv6 packets start with 0x4x or 0x6x)
+                        for pkt in &packets {
+                            let len_u16 = (pkt.len() as u16).to_be_bytes();
+                            buf.extend_from_slice(&len_u16);
+                            buf.extend_from_slice(pkt);
+                        }
+                        buf
+                    };
                     session.cipher.apply_keystream(seq, session_id, &mut packet_buf);
 
                     let mut downlink_bytes = Vec::with_capacity(4 + packet_buf.len());
@@ -346,9 +395,22 @@ async fn handle_dns_datagram(
                         ],
                         (temp_session_id & 0xFFFF) as u16,
                     ));
-                    let (response_opt, _authenticated) = auth_handler
+                    let (response_opt, authenticated) = auth_handler
                         .process_handshake_packet(full_handshake, hs_addr, "doh")
                         .await?;
+
+                    if let Some((client_info, _)) = authenticated {
+                        let session_id = u32::from_be_bytes(client_info.nonce_prefix);
+                        active_sessions.entry(session_id).or_insert_with(|| {
+                            let (tx_router, rx_router) = mpsc::channel::<Bytes>(CHANNEL_BUFFER_SIZE);
+                            registry.finalize_client(&client_info.assigned_ip, tx_router);
+                            let cipher = Arc::new(AstpLiteCipher::new(client_info.cipher.raw_key()));
+                            Arc::new(DohClientSession {
+                                rx_router: Arc::new(Mutex::new(rx_router)),
+                                cipher,
+                            })
+                        });
+                    }
 
                     if let Some(resp) = response_opt {
                         let b64 = BASE64_STANDARD.encode(&resp);
@@ -373,6 +435,21 @@ async fn handle_dns_datagram(
     // Case 3: Data Uplink chunk ("<base32_chunk_labels>")
     let b32_str = base32::join_labels(prefix);
     if let Ok(chunk_raw) = base32::decode(&b32_str) {
+        // Filter out intermediate QNAME-minimization suffixes whose session_id does not belong to an active client
+        let hdr = match anet_common::doh_chunking::DohChunkHeader::decode(&chunk_raw) {
+            Ok(h) => h,
+            Err(_) => {
+                let resp = build_dns_txt_response(&raw_query, &parsed_q, None, 0);
+                let _ = socket.send_to(&resp, remote_addr).await;
+                return Ok(());
+            }
+        };
+        if registry.get_by_prefix(&hdr.session_id.to_be_bytes()).is_none() {
+            let resp = build_dns_txt_response(&raw_query, &parsed_q, None, 0);
+            let _ = socket.send_to(&resp, remote_addr).await;
+            return Ok(());
+        }
+
         let assembled_opt = {
             let mut reasm = reassembler.lock().await;
             reasm.feed(&chunk_raw)?
