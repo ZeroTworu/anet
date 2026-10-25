@@ -75,7 +75,7 @@ impl ReceiverVideoConstraints {
         Self {
             colibri_class: "ReceiverVideoConstraints".to_string(),
             last_n: -1,
-            default_constraints: VideoConstraint { max_height },
+            default_constraints: VideoConstraint { max_height: 0 },
             selected_endpoints: Some(endpoints.to_vec()),
             on_stage_endpoints: Some(endpoints.to_vec()),
             constraints: Some(map),

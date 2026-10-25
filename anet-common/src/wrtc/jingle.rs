@@ -155,7 +155,7 @@ impl JingleSession {
             String::new()
         };
 
-        let mut sdp = format!(
+        let sdp = format!(
             "v=0\r\n\
              o=- 123456789 2 IN IP4 0.0.0.0\r\n\
              s=-\r\n\
@@ -180,14 +180,6 @@ impl JingleSession {
              {video_section}\
              {data_section}"
         );
-
-        if include_video {
-            for &v_ssrc in &self.video_sources {
-                if v_ssrc != 0 && v_ssrc != primary_video_ssrc {
-                    sdp = append_remote_video_ssrc_to_sdp(&sdp, v_ssrc, self.video_payload_type);
-                }
-            }
-        }
 
         sdp
     }

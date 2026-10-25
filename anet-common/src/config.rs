@@ -103,7 +103,7 @@ impl Default for WrtcConfig {
             ice_failed_timeout_ms: 25_000,
             ice_keepalive_interval_ms: 2_000,
             sctp_max_receive_buffer_size: 4 * 1024 * 1024,
-            sctp_mtu: 1360,
+            sctp_mtu: 1200,
             receive_mtu: 1600,
             video_mtu_overhead: WRTC_VIDEO_MTU_OVERHEAD,
             video_keepalive_interval_ms: 1000,

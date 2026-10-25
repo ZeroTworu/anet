@@ -4,7 +4,7 @@ use crate::consts::{
     VP8_KEYFRAME_HEADER, WRTC_BURST_KEYFRAME_COUNT, WRTC_BURST_KEYFRAME_INTERVAL_MS,
     WRTC_COLIBRI_CHANNEL_CAPACITY, WRTC_CONSTRAINTS_RETRY_ATTEMPTS,
     WRTC_CONSTRAINTS_RETRY_INTERVAL_MS, WRTC_DC_SEND_MAX_RETRIES, WRTC_DC_SEND_RETRY_DELAY_MS,
-    WRTC_DEFAULT_MAX_VIDEO_HEIGHT, WRTC_ICE_GATHER_POLL_ATTEMPTS, WRTC_ICE_GATHER_POLL_INTERVAL_MS,
+    WRTC_ICE_GATHER_POLL_ATTEMPTS, WRTC_ICE_GATHER_POLL_INTERVAL_MS,
     WRTC_INITIAL_FORCE_KEYFRAMES, WRTC_KEYFRAME_INTERVAL_MASK, WRTC_OPUS_CHANNELS,
     WRTC_OPUS_CLOCK_RATE, WRTC_OPUS_PAYLOAD_TYPE, WRTC_OPUS_SILENCE_FRAME,
     WRTC_P2P_CHANNEL_CAPACITY, WRTC_REASSERT_FORCE_KEYFRAMES, WRTC_VIDEO_CHANNEL_CAPACITY,
@@ -505,7 +505,7 @@ pub async fn create_p2p_channel(
             Some(Duration::from_millis(wrtc_cfg.ice_keepalive_interval_ms)),
         )
         .with_sctp_max_receive_buffer_size(wrtc_cfg.sctp_max_receive_buffer_size)
-        .with_sctp_mtu(wrtc_cfg.sctp_mtu as _)
+        .with_sctp_mtu(wrtc_cfg.sctp_mtu.min(1200) as _)
         .with_receive_mtu(wrtc_cfg.receive_mtu)
         .build();
 
@@ -619,6 +619,7 @@ pub struct WrtcPeer {
     pub force_keyframe_remaining: Arc<AtomicU32>,
     pub remote_sdp: Mutex<String>,
     pub colibri_ws_ip: Arc<std::sync::Mutex<Option<std::net::IpAddr>>>,
+    pub active_video_constraints: Arc<std::sync::Mutex<Option<ReceiverVideoConstraints>>>,
     pub bind_addr: String,
     pub watchdog_disconnected_timeout_ms: u64,
     pub watchdog_channel_grace_secs: u64,
@@ -674,6 +675,8 @@ impl WrtcPeer {
         let has_ws = Arc::new(AtomicBool::new(false));
         let colibri_ws_ip: Arc<std::sync::Mutex<Option<std::net::IpAddr>>> =
             Arc::new(std::sync::Mutex::new(None));
+        let active_video_constraints: Arc<std::sync::Mutex<Option<ReceiverVideoConstraints>>> =
+            Arc::new(std::sync::Mutex::new(None));
 
         if let Some(session) = session_opt {
             if let Some(ref ws_url) = session.transport.colibri_ws_url {
@@ -685,6 +688,7 @@ impl WrtcPeer {
                 let in_tx_ws = incoming_tx.clone();
                 let has_ws_c = has_ws.clone();
                 let colibri_ws_ip_c = colibri_ws_ip.clone();
+                let active_constraints_ws = active_video_constraints.clone();
                 let dc_open_ws = dc_is_open.clone();
                 let is_failed_ws = is_failed.clone();
                 let failed_notify_ws = failed_notify.clone();
@@ -737,16 +741,20 @@ impl WrtcPeer {
                             );
 
                             if has_video_flag {
-                                let constraints =
-                                    ReceiverVideoConstraints::new_all(WRTC_DEFAULT_MAX_VIDEO_HEIGHT);
-                                if let Ok(json) = serde_json::to_string(&constraints) {
-                                    let _ = tokio::time::timeout(
-                                        Duration::from_secs(ws_write_timeout),
-                                        ws_stream.send(
-                                            tokio_tungstenite::tungstenite::Message::Text(json.into()),
-                                        ),
-                                    )
-                                    .await;
+                                let saved_constraints = active_constraints_ws
+                                    .lock()
+                                    .ok()
+                                    .and_then(|g| g.clone());
+                                if let Some(constraints) = saved_constraints {
+                                    if let Ok(json) = serde_json::to_string(&constraints) {
+                                        let _ = tokio::time::timeout(
+                                            Duration::from_secs(ws_write_timeout),
+                                            ws_stream.send(
+                                                tokio_tungstenite::tungstenite::Message::Text(json.into()),
+                                            ),
+                                        )
+                                        .await;
+                                    }
                                 }
                             }
 
@@ -943,7 +951,7 @@ impl WrtcPeer {
                     Some(Duration::from_millis(wrtc_cfg.ice_keepalive_interval_ms)),
                 )
                 .with_sctp_max_receive_buffer_size(wrtc_cfg.sctp_max_receive_buffer_size)
-                .with_sctp_mtu(wrtc_cfg.sctp_mtu as _)
+                .with_sctp_mtu(wrtc_cfg.sctp_mtu.min(1200) as _)
                 .with_receive_mtu(wrtc_cfg.receive_mtu)
                 .build();
 
@@ -1040,6 +1048,7 @@ impl WrtcPeer {
                             let dc_open_notify_in = dc_open_notify.clone();
                             let dc_in = Arc::clone(&dc);
                             let in_tx = incoming_tx.clone();
+                            let active_constraints_dc = active_video_constraints.clone();
 
                             tokio::spawn(async move {
                                 while let Some(event) = dc_in.poll().await {
@@ -1049,11 +1058,14 @@ impl WrtcPeer {
                                             dc_is_open_in.store(true, Ordering::SeqCst);
                                             dc_open_notify_in.notify_waiters();
                                             if has_video_flag {
-                                                let constraints = ReceiverVideoConstraints::new_all(
-                                                    WRTC_DEFAULT_MAX_VIDEO_HEIGHT,
-                                                );
-                                                if let Ok(json) = serde_json::to_string(&constraints) {
-                                                    let _ = dc_in.send_text(&json).await;
+                                                let saved_constraints = active_constraints_dc
+                                                    .lock()
+                                                    .ok()
+                                                    .and_then(|g| g.clone());
+                                                if let Some(constraints) = saved_constraints {
+                                                    if let Ok(json) = serde_json::to_string(&constraints) {
+                                                        let _ = dc_in.send_text(&json).await;
+                                                    }
                                                 }
                                             }
                                         }
@@ -1450,6 +1462,7 @@ impl WrtcPeer {
             force_keyframe_remaining,
             remote_sdp: Mutex::new(initial_remote_sdp),
             colibri_ws_ip,
+            active_video_constraints,
             bind_addr,
             watchdog_disconnected_timeout_ms: wrtc_cfg
                 .watchdog_disconnected_timeout_secs
@@ -1733,6 +1746,9 @@ impl WrtcPeer {
     }
 
     pub async fn send_video_constraints(&self, constraints: &ReceiverVideoConstraints) -> anyhow::Result<()> {
+        if let Ok(mut g) = self.active_video_constraints.lock() {
+            *g = Some(constraints.clone());
+        }
         let json = serde_json::to_string(constraints)?;
         self.raw_outgoing_tx
             .send(json)

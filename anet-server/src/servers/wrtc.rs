@@ -273,6 +273,25 @@ pub async fn run_wrtc_server(
                             for sub_pkt in unpack_batch(&decrypted[1..]) {
                                 let pkt_len = sub_pkt.len();
                                 if pkt_len >= WRTC_MIN_IP_PACKET_LEN {
+                                    if let Some(reply) =
+                                        anet_common::icmp_probe::handle_in_tunnel_icmp_probe(&sub_pkt)
+                                    {
+                                        let seq = client_info
+                                            .sequence
+                                            .fetch_add(1, Ordering::Relaxed);
+                                        if let Ok(enc_buf) = wrap_packet_slice_with_headroom(
+                                            &client_info.cipher,
+                                            &client_info.nonce_prefix,
+                                            seq,
+                                            &reply,
+                                            VP8_ASTP_PREFIX_LEN,
+                                        ) {
+                                            let _ = peer_video_rx
+                                                .send_video_frame_preallocated(client_tag, enc_buf)
+                                                .await;
+                                        }
+                                        continue;
+                                    }
                                     if tun_clone_video.try_send(sub_pkt).is_ok() {
                                         reg_clone_video.record_rx(client_info.value(), pkt_len, "wrtc_video");
                                     } else {
@@ -281,9 +300,28 @@ pub async fn run_wrtc_server(
                                 }
                             }
                         } else if decrypted.len() >= WRTC_MIN_IP_PACKET_LEN {
-                            let packet_len = decrypted.len();
-                            if tun_clone_video.try_send(decrypted).is_ok() {
-                                reg_clone_video.record_rx(client_info.value(), packet_len, "wrtc_video");
+                            if let Some(reply) =
+                                anet_common::icmp_probe::handle_in_tunnel_icmp_probe(&decrypted)
+                            {
+                                let seq = client_info
+                                    .sequence
+                                    .fetch_add(1, Ordering::Relaxed);
+                                if let Ok(enc_buf) = wrap_packet_slice_with_headroom(
+                                    &client_info.cipher,
+                                    &client_info.nonce_prefix,
+                                    seq,
+                                    &reply,
+                                    VP8_ASTP_PREFIX_LEN,
+                                ) {
+                                    let _ = peer_video_rx
+                                        .send_video_frame_preallocated(client_tag, enc_buf)
+                                        .await;
+                                }
+                            } else {
+                                let packet_len = decrypted.len();
+                                if tun_clone_video.try_send(decrypted).is_ok() {
+                                    reg_clone_video.record_rx(client_info.value(), packet_len, "wrtc_video");
+                                }
                             }
                         }
                     }
@@ -332,9 +370,20 @@ pub async fn run_wrtc_server(
                                         self_removed = true;
                                     } else if occupant_id != "focus" {
                                         client_modes.remove(occupant_id);
-                                        client_video_endpoints.remove(occupant_id);
+                                        let removed_video_ep = client_video_endpoints.remove(occupant_id).is_some();
                                         client_v2_endpoints.remove(occupant_id);
                                         p2p_clients.remove(occupant_id);
+                                        if removed_video_ep {
+                                            let video_eps: Vec<String> = client_video_endpoints
+                                                .iter()
+                                                .map(|e| e.key().clone())
+                                                .collect();
+                                            let constraints = anet_common::wrtc::colibri::ReceiverVideoConstraints::for_endpoints(
+                                                &video_eps,
+                                                WRTC_DEFAULT_MAX_VIDEO_HEIGHT,
+                                            );
+                                            let _ = shared_peer.send_video_constraints(&constraints).await;
+                                        }
                                         if let Some((_, dead_client)) = clients_map.remove(occupant_id) {
                                             info!(
                                                 "[WRTC Server] Occupant {occupant_id} left MUC room. Removing session {} (IP: {}) immediately.",
@@ -410,8 +459,13 @@ pub async fn run_wrtc_server(
                             ).await;
 
                             client_video_endpoints.insert(from_endpoint.clone());
+                            let video_eps: Vec<String> = client_video_endpoints
+                                .iter()
+                                .map(|e| e.key().clone())
+                                .collect();
                             let constraints =
-                                anet_common::wrtc::colibri::ReceiverVideoConstraints::new_all(
+                                anet_common::wrtc::colibri::ReceiverVideoConstraints::for_endpoints(
+                                    &video_eps,
                                     WRTC_DEFAULT_MAX_VIDEO_HEIGHT,
                                 );
                             let _ = shared_peer.send_video_constraints(&constraints).await;
@@ -466,14 +520,36 @@ pub async fn run_wrtc_server(
                                         Bytes::from(raw_bytes.clone()),
                                     ) {
                                         Ok(packet) => {
-                                            let packet_len = packet.len();
-                                            match tun_clone.try_send(packet) {
-                                                Ok(_) => {
-                                                    reg_clone.record_rx(&client_info, packet_len, "wrtc");
-                                                    log::debug!("[WRTC Server] Injected {} bytes into TUN for {}", packet_len, client_info.assigned_ip);
+                                            if let Some(reply) =
+                                                anet_common::icmp_probe::handle_in_tunnel_icmp_probe(&packet)
+                                            {
+                                                let seq = client_info
+                                                    .sequence
+                                                    .fetch_add(1, Ordering::Relaxed);
+                                                if let Ok(enc_reply) = wrap_packet_slice(
+                                                    &client_info.cipher,
+                                                    &client_info.nonce_prefix,
+                                                    seq,
+                                                    &reply,
+                                                    0,
+                                                ) {
+                                                    let b64 = BASE64_STANDARD.encode(&enc_reply);
+                                                    let msg = ColibriMessage::astp(
+                                                        from_endpoint.clone(),
+                                                        b64,
+                                                    );
+                                                    let _ = shared_peer.send(msg).await;
                                                 }
-                                                Err(e) => {
-                                                    warn!("[WRTC Server] TUN queue error for {}: {e}", client_info.assigned_ip);
+                                            } else {
+                                                let packet_len = packet.len();
+                                                match tun_clone.try_send(packet) {
+                                                    Ok(_) => {
+                                                        reg_clone.record_rx(&client_info, packet_len, "wrtc");
+                                                        log::debug!("[WRTC Server] Injected {} bytes into TUN for {}", packet_len, client_info.assigned_ip);
+                                                    }
+                                                    Err(e) => {
+                                                        warn!("[WRTC Server] TUN queue error for {}: {e}", client_info.assigned_ip);
+                                                    }
                                                 }
                                             }
                                         }
@@ -939,6 +1015,28 @@ pub async fn run_wrtc_server(
                                                 enc_pkt,
                                             ) {
                                                 Ok(packet) => {
+                                                    if let Some(reply) =
+                                                        anet_common::icmp_probe::handle_in_tunnel_icmp_probe(&packet)
+                                                    {
+                                                        let seq = client_info
+                                                            .sequence
+                                                            .fetch_add(1, Ordering::Relaxed);
+                                                        if let Ok(enc_reply) = wrap_packet_slice(
+                                                            &client_info.cipher,
+                                                            &client_info.nonce_prefix,
+                                                            seq,
+                                                            &reply,
+                                                            0,
+                                                        ) {
+                                                            let b64 = BASE64_STANDARD.encode(&enc_reply);
+                                                            let msg = ColibriMessage::astp(
+                                                                from_endpoint.clone(),
+                                                                b64,
+                                                            );
+                                                            let _ = shared_peer.send(msg).await;
+                                                        }
+                                                        continue;
+                                                    }
                                                     let packet_len = packet.len();
                                                     match tun_clone.try_send(packet) {
                                                         Ok(_) => {
@@ -1037,6 +1135,23 @@ pub async fn run_wrtc_server(
                                                                                 let packets = unpack_batch(&decrypted[1..]);
                                                                                 for pkt in packets {
                                                                                     if pkt.len() >= WRTC_MIN_IP_PACKET_LEN {
+                                                                                        if let Some(reply) =
+                                                                                            anet_common::icmp_probe::handle_in_tunnel_icmp_probe(&pkt)
+                                                                                        {
+                                                                                            let seq = c_info
+                                                                                                .sequence
+                                                                                                .fetch_add(1, Ordering::Relaxed);
+                                                                                            if let Ok(enc_reply) = wrap_packet_slice(
+                                                                                                &c_info.cipher,
+                                                                                                &c_info.nonce_prefix,
+                                                                                                seq,
+                                                                                                &reply,
+                                                                                                0,
+                                                                                            ) {
+                                                                                                let _ = p2p_read.send_packet(&enc_reply).await;
+                                                                                            }
+                                                                                            continue;
+                                                                                        }
                                                                                         let pkt_len = pkt.len();
                                                                                         if tun_tx_c.try_send(pkt).is_ok() {
                                                                                             reg_c.record_rx(&c_info, pkt_len, "wrtc");
@@ -1044,10 +1159,27 @@ pub async fn run_wrtc_server(
                                                                                     }
                                                                                 }
                                                                             } else if decrypted.len() >= WRTC_MIN_IP_PACKET_LEN {
-                                                                                let packet_len = decrypted.len();
-                                                                                if tun_tx_c.try_send(decrypted).is_ok() {
-                                                                                    reg_c.record_rx(&c_info, packet_len, "wrtc");
-                                                                                    log::trace!("[P2P Direct IN] {} bytes from {}", packet_len, c_info.assigned_ip);
+                                                                                if let Some(reply) =
+                                                                                    anet_common::icmp_probe::handle_in_tunnel_icmp_probe(&decrypted)
+                                                                                {
+                                                                                    let seq = c_info
+                                                                                        .sequence
+                                                                                        .fetch_add(1, Ordering::Relaxed);
+                                                                                    if let Ok(enc_reply) = wrap_packet_slice(
+                                                                                        &c_info.cipher,
+                                                                                        &c_info.nonce_prefix,
+                                                                                        seq,
+                                                                                        &reply,
+                                                                                        0,
+                                                                                    ) {
+                                                                                        let _ = p2p_read.send_packet(&enc_reply).await;
+                                                                                    }
+                                                                                } else {
+                                                                                    let packet_len = decrypted.len();
+                                                                                    if tun_tx_c.try_send(decrypted).is_ok() {
+                                                                                        reg_c.record_rx(&c_info, packet_len, "wrtc");
+                                                                                        log::trace!("[P2P Direct IN] {} bytes from {}", packet_len, c_info.assigned_ip);
+                                                                                    }
                                                                                 }
                                                                             }
                                                                         }

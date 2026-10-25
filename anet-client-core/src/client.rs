@@ -774,6 +774,13 @@ impl AnetClient {
                 }
 
                 while write_buf.len() < COALESCE_BUDGET_BYTES {
+                    if let Ok(p) = rx_probe.try_recv() {
+                        let len = p.len() as u64;
+                        tx_bytes.fetch_add(len, Ordering::Relaxed);
+                        tx_packets.fetch_add(1, Ordering::Relaxed);
+                        frame_packet_into(&mut write_buf, &p);
+                        continue;
+                    }
                     match rx_from_tun.try_recv() {
                         Ok(p) => {
                             if should_forward_to_tunnel(&p) {
@@ -783,15 +790,7 @@ impl AnetClient {
                                 frame_packet_into(&mut write_buf, &p);
                             }
                         }
-                        Err(_) => {
-                            if let Ok(p) = rx_probe.try_recv() {
-                                let len = p.len() as u64;
-                                tx_bytes.fetch_add(len, Ordering::Relaxed);
-                                tx_packets.fetch_add(1, Ordering::Relaxed);
-                                frame_packet_into(&mut write_buf, &p);
-                            }
-                            break;
-                        }
+                        Err(_) => break,
                     }
                 }
 
@@ -828,10 +827,8 @@ impl AnetClient {
                     res = frame_reader.read_next_packet(&mut stream_reader) => {
                         match res {
                             Ok(Some(first_packet)) => {
-                                rx_time.store(
-                                    probe_start_rx.elapsed().as_micros() as u64,
-                                    Ordering::Relaxed,
-                                );
+                                let batch_rx_us = probe_start_rx.elapsed().as_micros() as u64;
+                                rx_time.store(batch_rx_us, Ordering::Relaxed);
                                 let mut current_pkt = Some(first_packet);
                                 while let Some(packet) = current_pkt.take() {
                                     let len = packet.len() as u64;
@@ -845,8 +842,7 @@ impl AnetClient {
                                             c_ip,
                                             PROBE_IDENTIFIER,
                                         ) {
-                                            let now_us = probe_start_rx.elapsed().as_micros() as u64;
-                                            let sample_us = now_us.saturating_sub(sent_ts_us);
+                                            let sample_us = batch_rx_us.saturating_sub(sent_ts_us);
 
                                             // Экспоненциальное сглаживание EWMA (alpha = 0.25):
                                             // smoothed_rtt = 0.75 * smoothed_rtt + 0.25 * sample
@@ -858,7 +854,7 @@ impl AnetClient {
                                             };
 
                                             last_rtt_rx.store(smoothed_us.max(100), Ordering::Relaxed);
-                                            last_reply_rx.store(now_us, Ordering::Relaxed);
+                                            last_reply_rx.store(batch_rx_us, Ordering::Relaxed);
                                             log::debug!(
                                                 "[Probe/RTT] In-tunnel RTT: {:.2} ms (sample: {:.2} ms, seq: {})",
                                                 smoothed_us as f64 / 1000.0,
