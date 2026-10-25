@@ -994,10 +994,17 @@ impl AnetClient {
         let health_start = session_start;
         let quic_conn = result.connection.clone();
         let reason_health = disconnect_reason.clone();
+        let tx_probe_health = tx_probe.clone();
 
         let health_pause = result.health_pause.clone();
         let health_task = tokio::spawn(async move {
             let check_interval = Duration::from_secs(3);
+            let has_probes = client_ip_opt.is_some() && gateway_ip_opt.is_some();
+            let mut is_initial_phase = true;
+            let mut stalled_counter: u32 = 0;
+            let mut probe_seq: u16 = 50000;
+            let mut last_wall_clock = std::time::SystemTime::now();
+            let mut last_mono_instant = Instant::now();
 
             loop {
                 tokio::select! {
@@ -1007,10 +1014,19 @@ impl AnetClient {
                     }
                 }
 
+                let now_wall = std::time::SystemTime::now();
+                let wall_elapsed = now_wall
+                    .duration_since(last_wall_clock)
+                    .unwrap_or(check_interval);
+                let mono_elapsed = last_mono_instant.elapsed();
+                last_wall_clock = now_wall;
+                last_mono_instant = Instant::now();
+
                 if health_pause.as_ref().is_some_and(|pause| pause.load(Ordering::Acquire)) {
                     let now_us = health_start.elapsed().as_micros() as u64;
                     rx_check.store(now_us, Ordering::Relaxed);
                     tx_check.store(now_us, Ordering::Relaxed);
+                    stalled_counter = 0;
                     continue;
                 }
 
@@ -1025,6 +1041,145 @@ impl AnetClient {
                         client_state(ClientState::Reconnecting, format!("Connection closed: {reason:?}"), None);
                         monitor_reconnect.notify_one();
                         break;
+                    }
+                }
+
+                // 1. Детектор выхода из глубокого сна ОС (Suspend-to-RAM / Android Doze Mode).
+                // В спящем режиме CLOCK_MONOTONIC (Instant) останавливается или таймер замораживается,
+                // поэтому wall_elapsed оказывается значительно больше интервала проверки (3 сек).
+                if wall_elapsed > mono_elapsed + Duration::from_secs(8)
+                    || wall_elapsed > Duration::from_secs(15)
+                {
+                    info!(
+                        "[Health] System wakeup / Doze pause detected (wall={:.1}s, mono={:.1}s). Probing tunnel liveness...",
+                        wall_elapsed.as_secs_f64(),
+                        mono_elapsed.as_secs_f64()
+                    );
+                    status("[Health] Wakeup from sleep detected, verifying tunnel...");
+
+                    let baseline_rx = rx_check.load(Ordering::Relaxed);
+                    if let (Some(c_ip), Some(gw_ip)) = (client_ip_opt, gateway_ip_opt) {
+                        for _ in 0..2 {
+                            probe_seq = probe_seq.wrapping_add(1);
+                            let now_us = health_start.elapsed().as_micros() as u64;
+                            let pkt = build_ipv4_icmp_echo_request(
+                                c_ip,
+                                gw_ip,
+                                PROBE_IDENTIFIER,
+                                probe_seq,
+                                now_us,
+                            );
+                            let _ = tx_probe_health.try_send(pkt);
+                        }
+                    }
+
+                    let mut alive = false;
+                    for _ in 0..16 {
+                        tokio::select! {
+                            _ = sleep(Duration::from_millis(250)) => {}
+                            _ = monitor_shutdown.notified() => return,
+                        }
+                        if rx_check.load(Ordering::Relaxed) > baseline_rx {
+                            alive = true;
+                            break;
+                        }
+                    }
+
+                    last_wall_clock = std::time::SystemTime::now();
+                    last_mono_instant = Instant::now();
+
+                    if !alive {
+                        warn!(
+                            "[Health] Tunnel unresponsive after system sleep/Doze wakeup (no RX within 4s). Triggering immediate reconnect..."
+                        );
+                        status("[Health] Tunnel dead after sleep. Reconnecting...");
+                        *reason_health.lock().unwrap() =
+                            "Tunnel unresponsive after system sleep/Doze wakeup".to_string();
+                        client_state(
+                            ClientState::Reconnecting,
+                            "Tunnel unresponsive after sleep; reconnecting".to_string(),
+                            None,
+                        );
+                        monitor_reconnect.notify_one();
+                        break;
+                    } else {
+                        info!("[Health] Tunnel confirmed alive after wakeup.");
+                        stalled_counter = 0;
+                        continue;
+                    }
+                }
+
+                // 2. Универсальный сторожевой таймер трафика для ВСЕХ транспортов (QUIC, SSH, VNC, AHTTP, DoH, ASTP-L, WRTC)
+                let now_us = health_start.elapsed().as_micros() as u64;
+                let last_rx_us = rx_check.load(Ordering::Relaxed);
+                let last_tx_us = tx_check.load(Ordering::Relaxed);
+                let elapsed_rx = Duration::from_micros(now_us.saturating_sub(last_rx_us));
+                let elapsed_tx = Duration::from_micros(now_us.saturating_sub(last_tx_us));
+
+                if is_initial_phase {
+                    if elapsed_rx > Duration::from_secs(12)
+                        && (elapsed_tx < Duration::from_secs(5) || has_probes)
+                    {
+                        warn!(
+                            "[Health] Connection established, but payload traffic is blocked (no RX for {:.1}s)!",
+                            elapsed_rx.as_secs_f64()
+                        );
+                        status("[Health] Payload traffic blocked (no response). Reconnecting...");
+                        *reason_health.lock().unwrap() =
+                            "Connection established, but payload traffic is blocked (0 RX in 12s)"
+                                .to_string();
+                        client_state(
+                            ClientState::Reconnecting,
+                            "Payload traffic blocked; reconnecting".to_string(),
+                            None,
+                        );
+                        monitor_reconnect.notify_one();
+                        break;
+                    }
+                    if last_rx_us > 0 || now_us >= 12_000_000 {
+                        is_initial_phase = false;
+                    }
+                } else {
+                    // Поскольку tx_probe отправляет ICMP Echo Request каждые 2 секунды (или идёт пользовательский TX),
+                    // отсутствие любого RX дольше 15 секунд означает отвал NAT/сессии ("чёрную дыру").
+                    if (elapsed_tx < Duration::from_secs(6) || has_probes)
+                        && elapsed_rx > Duration::from_secs(15)
+                    {
+                        stalled_counter += 1;
+                        if stalled_counter == 1 {
+                            if let (Some(c_ip), Some(gw_ip)) = (client_ip_opt, gateway_ip_opt) {
+                                probe_seq = probe_seq.wrapping_add(1);
+                                let pkt = build_ipv4_icmp_echo_request(
+                                    c_ip,
+                                    gw_ip,
+                                    PROBE_IDENTIFIER,
+                                    probe_seq,
+                                    now_us,
+                                );
+                                let _ = tx_probe_health.try_send(pkt);
+                            }
+                        }
+                        if stalled_counter >= 2 {
+                            warn!(
+                                "[Health] Dead connection detected: active TX/probes (last TX {:.1}s ago), but no RX for {:.1}s. Triggering reconnect...",
+                                elapsed_tx.as_secs_f64(),
+                                elapsed_rx.as_secs_f64()
+                            );
+                            status("[Health] Connection stalled (no response). Reconnecting...");
+                            *reason_health.lock().unwrap() = format!(
+                                "Dead connection: no RX for {:.1}s despite active TX/probes",
+                                elapsed_rx.as_secs_f64()
+                            );
+                            client_state(
+                                ClientState::Reconnecting,
+                                "Connection stalled; reconnecting".to_string(),
+                                None,
+                            );
+                            monitor_reconnect.notify_one();
+                            break;
+                        }
+                    } else {
+                        stalled_counter = 0;
                     }
                 }
             }
