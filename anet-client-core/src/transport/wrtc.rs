@@ -218,19 +218,38 @@ impl ClientTransport for WrtcTransport {
             }
         }
 
+        let mut extdisco_bypass_log: Vec<String> = Vec::new();
         for ice in xmpp.get_ice_servers() {
+            let mut host_ips = Vec::new();
             if let Ok(ip) = ice.host.parse::<std::net::IpAddr>() {
                 if !ip.is_loopback() {
                     bypass_ips.push(ip);
+                    host_ips.push(ip);
                 }
             } else if let Ok(resolved) = tokio::net::lookup_host((ice.host.as_str(), ice.port)).await {
                 for addr in resolved {
                     if !addr.ip().is_loopback() {
                         bypass_ips.push(addr.ip());
+                        host_ips.push(addr.ip());
                     }
                 }
             }
+            let proto_tag = ice
+                .urls
+                .first()
+                .map(|u| u.as_str())
+                .unwrap_or(ice.host.as_str());
+            extdisco_bypass_log.push(format!("{proto_tag} -> {host_ips:?}"));
         }
+
+        info!(
+            "[WRTC] Resolved extdisco STUN/TURN/TURNS hosts for TUN bypass: {:?}",
+            extdisco_bypass_log
+        );
+        status(format!(
+            "[WRTC] Resolved extdisco STUN/TURN/TURNS bypass: {:?}",
+            extdisco_bypass_log
+        ));
 
         bypass_ips.sort_unstable();
         bypass_ips.dedup();
@@ -259,6 +278,15 @@ impl ClientTransport for WrtcTransport {
                 return Err(e).context("Failed to initialize WebRTC PeerConnection and DataChannel");
             }
         };
+
+        info!(
+            "[WRTC] WebRTC Peer ICE configuration: {} | Local candidates: {:?}",
+            peer.ice_tier_summary, peer.local_candidates_summary
+        );
+        status(format!(
+            "[WRTC] ICE config: {} | Local candidates: {:?}",
+            peer.ice_tier_summary, peer.local_candidates_summary
+        ));
 
         info!("[WRTC] WebRTC Peer created. Starting server discovery...");
         status("[WRTC] WebRTC Peer created. Starting server discovery...");

@@ -467,7 +467,9 @@ impl P2pSession {
     }
 }
 
-fn build_ice_server_tiers(discovered: &[XmppIceServer]) -> Vec<(Vec<RTCIceServer>, bool)> {
+fn build_ice_server_tiers(
+    discovered: &[XmppIceServer],
+) -> Vec<(&'static str, Vec<RTCIceServer>, bool)> {
     let filter_tier = |include_turn: bool, include_tcp_tls: bool| -> (Vec<RTCIceServer>, bool) {
         let mut list = Vec::new();
         let mut has_turn = false;
@@ -490,27 +492,34 @@ fn build_ice_server_tiers(discovered: &[XmppIceServer]) -> Vec<(Vec<RTCIceServer
         (list, has_turn)
     };
 
-    let mut tiers = Vec::with_capacity(4);
-    for (inc_turn, inc_tcp) in [(true, true), (true, false), (false, false)] {
+    let mut tiers: Vec<(&'static str, Vec<RTCIceServer>, bool)> = Vec::with_capacity(4);
+    for (tier_label, inc_turn, inc_tcp) in [
+        ("Tier 0: STUN + TURN + TURNS", true, true),
+        ("Tier 1: UDP STUN + UDP TURN", true, false),
+        ("Tier 2: STUN", false, false),
+    ] {
         let (list, has_turn) = filter_tier(inc_turn, inc_tcp);
         if !list.is_empty() {
             let urls_flat: Vec<&str> = list
                 .iter()
                 .flat_map(|i| i.urls.iter().map(|u| u.as_str()))
                 .collect();
-            let already_present = tiers.iter().any(|(existing, _): &(Vec<RTCIceServer>, bool)| {
-                let ex_urls: Vec<&str> = existing
+            let already_present =
+                tiers
                     .iter()
-                    .flat_map(|i| i.urls.iter().map(|u| u.as_str()))
-                    .collect();
-                ex_urls == urls_flat
-            });
+                    .any(|(_, existing, _): &(&'static str, Vec<RTCIceServer>, bool)| {
+                        let ex_urls: Vec<&str> = existing
+                            .iter()
+                            .flat_map(|i| i.urls.iter().map(|u| u.as_str()))
+                            .collect();
+                        ex_urls == urls_flat
+                    });
             if !already_present {
-                tiers.push((list, has_turn));
+                tiers.push((tier_label, list, has_turn));
             }
         }
     }
-    tiers.push((Vec::new(), false));
+    tiers.push(("Tier 3: host", Vec::new(), false));
     tiers
 }
 
@@ -535,9 +544,14 @@ pub async fn create_p2p_channel(
     let mut last_err = None;
     let mut built_pc = None;
 
-    for (tier_idx, (ice_servers, _)) in tiers.into_iter().enumerate() {
+    for (tier_label, ice_servers, tier_has_turn) in tiers {
         let mut media_engine = MediaEngine::default();
         let registry = register_default_interceptors(Registry::new(), &mut media_engine)?;
+
+        let tier_urls: Vec<String> = ice_servers
+            .iter()
+            .flat_map(|s| s.urls.clone())
+            .collect();
 
         let config = RTCConfigurationBuilder::new()
             .with_ice_servers(ice_servers)
@@ -574,12 +588,16 @@ pub async fn create_p2p_channel(
             .await
         {
             Ok(pc_res) => {
+                log::info!(
+                    "[P2P Direct] PeerConnection built with {tier_label} (TURN={tier_has_turn}): {:?}",
+                    tier_urls
+                );
                 built_pc = Some(pc_res);
                 break;
             }
             Err(e) => {
-                log::debug!(
-                    "[P2P Direct] ICE configuration tier {tier_idx} rejected by engine ({e}), trying fallback tier..."
+                log::info!(
+                    "[P2P Direct] ICE {tier_label} rejected by engine ({e}), falling back to next tier..."
                 );
                 last_err = Some(e);
             }
@@ -672,6 +690,8 @@ pub struct WrtcPeer {
     pub colibri_ws_ip: Arc<std::sync::Mutex<Option<std::net::IpAddr>>>,
     pub active_video_constraints: Arc<std::sync::Mutex<Option<ReceiverVideoConstraints>>>,
     pub bind_addr: String,
+    pub ice_tier_summary: String,
+    pub local_candidates_summary: Vec<String>,
     pub watchdog_disconnected_timeout_ms: u64,
     pub watchdog_channel_grace_secs: u64,
     pub peer_close_timeout_secs: u64,
@@ -942,6 +962,9 @@ impl WrtcPeer {
 
         let bind_addr = detect_physical_bind_addr(session_opt, fallback_ip, fallback_port);
 
+        let mut ice_tier_summary = "Tier 3: host".to_string();
+        let mut local_candidates_summary: Vec<String> = Vec::new();
+
         if let (Some(session), Some(xmpp)) = (session_opt, xmpp_opt) {
             log::info!("[WRTC Media] Initializing WebRTC PeerConnection with Audio (Opus) and Video (VP8)...");
 
@@ -977,7 +1000,7 @@ impl WrtcPeer {
             let mut built_pc = None;
             let mut has_turn_configured = false;
 
-            for (tier_idx, (ice_servers, tier_has_turn)) in tiers.into_iter().enumerate() {
+            for (tier_label, ice_servers, tier_has_turn) in tiers {
                 let mut media_engine = MediaEngine::default();
                 media_engine.register_codec(audio_codec.clone(), RtpCodecKind::Audio)?;
                 media_engine.register_codec(video_codec.clone(), RtpCodecKind::Video)?;
@@ -1055,16 +1078,17 @@ impl WrtcPeer {
                 {
                     Ok(pc_impl) => {
                         log::info!(
-                            "[WRTC Media] PeerConnection built with ICE tier {tier_idx} (TURN={tier_has_turn}): {:?}",
+                            "[WRTC Media] PeerConnection built with {tier_label} (TURN={tier_has_turn}): {:?}",
                             tier_urls
                         );
+                        ice_tier_summary = format!("{tier_label} {:?}", tier_urls);
                         has_turn_configured = tier_has_turn;
                         built_pc = Some(pc_impl);
                         break;
                     }
                     Err(e) => {
-                        log::debug!(
-                            "[WRTC Media] ICE configuration tier {tier_idx} rejected by engine ({e}), trying fallback tier..."
+                        log::info!(
+                            "[WRTC Media] ICE {tier_label} rejected by engine ({e}), falling back to next tier..."
                         );
                     }
                 }
@@ -1228,6 +1252,7 @@ impl WrtcPeer {
                                 local_params.candidates.len(),
                                 cand_summary
                             );
+                            local_candidates_summary = cand_summary;
 
                             let _ = xmpp
                                 .accept_session(
@@ -1562,6 +1587,8 @@ impl WrtcPeer {
             colibri_ws_ip,
             active_video_constraints,
             bind_addr,
+            ice_tier_summary,
+            local_candidates_summary,
             watchdog_disconnected_timeout_ms: wrtc_cfg
                 .watchdog_disconnected_timeout_secs
                 .saturating_mul(1000)

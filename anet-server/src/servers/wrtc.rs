@@ -206,6 +206,10 @@ pub async fn run_wrtc_server(
             }
         };
 
+        info!(
+            "[WRTC Server] WebRTC Peer ICE configuration: {} | Local candidates: {:?}",
+            peer.ice_tier_summary, peer.local_candidates_summary
+        );
         info!("[WRTC Server] WebRTC connection active. Waiting for clients...");
 
         let shared_peer = Arc::new(peer);
