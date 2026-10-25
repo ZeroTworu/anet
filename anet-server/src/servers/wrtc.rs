@@ -1070,11 +1070,11 @@ pub async fn run_wrtc_server(
                     let clients_map_c = clients_map.clone();
                     let reg_c = reg_clone.clone();
                     let client_ep = from_endpoint.clone();
-                    let stun_servers = xmpp.get_stun_servers();
+                    let ice_servers = xmpp.get_ice_servers();
                     let wrtc_cfg_p2p = config.wrtc.clone();
 
                     tokio::spawn(async move {
-                        match create_p2p_channel(&stun_servers, &wrtc_cfg_p2p, &peer_c.bind_addr).await {
+                        match create_p2p_channel(&ice_servers, &wrtc_cfg_p2p, &peer_c.bind_addr).await {
                             Ok(p2p) => {
                                 let p2p_arc = Arc::new(p2p);
                                 match RTCSessionDescription::offer(sdp) {
@@ -1095,7 +1095,7 @@ pub async fn run_wrtc_server(
                                                     if let Some(desc) = p2p_arc.pc.local_description().await {
                                                         if desc.sdp.contains("a=candidate:") {
                                                             answer_sdp = desc.sdp;
-                                                            if answer_sdp.contains("typ srflx") {
+                                                            if answer_sdp.contains("typ srflx") || answer_sdp.contains("typ relay") {
                                                                 break;
                                                             }
                                                         }

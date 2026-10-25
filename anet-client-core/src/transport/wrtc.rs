@@ -218,21 +218,12 @@ impl ClientTransport for WrtcTransport {
             }
         }
 
-        for stun_url in xmpp.get_stun_servers() {
-            let clean = stun_url
-                .trim_start_matches("stun:")
-                .trim_start_matches("turn:")
-                .trim_start_matches("turns:");
-            let (host, port) = if let Some((h, p)) = clean.split_once(':') {
-                (h, p.parse::<u16>().unwrap_or(3478))
-            } else {
-                (clean, 3478)
-            };
-            if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        for ice in xmpp.get_ice_servers() {
+            if let Ok(ip) = ice.host.parse::<std::net::IpAddr>() {
                 if !ip.is_loopback() {
                     bypass_ips.push(ip);
                 }
-            } else if let Ok(resolved) = tokio::net::lookup_host((host, port)).await {
+            } else if let Ok(resolved) = tokio::net::lookup_host((ice.host.as_str(), ice.port)).await {
                 for addr in resolved {
                     if !addr.ip().is_loopback() {
                         bypass_ips.push(addr.ip());
@@ -443,7 +434,7 @@ impl ClientTransport for WrtcTransport {
         let nonce_prefix: [u8; 4] = auth_response.nonce_prefix.as_slice().try_into()?;
         let sequence = Arc::new(AtomicU64::new(0));
 
-        let stun_servers = xmpp.get_stun_servers();
+        let ice_servers = xmpp.get_ice_servers();
         let xmpp_arc = Arc::new(Mutex::new(xmpp));
         let xmpp_bg = Arc::clone(&xmpp_arc);
         let peer_xmpp = Arc::clone(&shared_peer);
@@ -531,7 +522,7 @@ impl ClientTransport for WrtcTransport {
             let wrtc_cfg_p2p = self.config.wrtc.clone();
 
             tokio::spawn(async move {
-                match create_p2p_channel(&stun_servers, &wrtc_cfg_p2p, &peer_sig.bind_addr).await {
+                match create_p2p_channel(&ice_servers, &wrtc_cfg_p2p, &peer_sig.bind_addr).await {
                     Ok(p2p) => {
                         let p2p_arc = Arc::new(p2p);
                         *p2p_store.lock().await = Some(p2p_arc.clone());
@@ -548,7 +539,7 @@ impl ClientTransport for WrtcTransport {
                                     if let Some(desc) = p2p_arc.pc.local_description().await {
                                         if desc.sdp.contains("a=candidate:") {
                                             final_sdp = desc.sdp;
-                                            if final_sdp.contains("typ srflx") {
+                                            if final_sdp.contains("typ srflx") || final_sdp.contains("typ relay") {
                                                 break;
                                             }
                                         }

@@ -15,6 +15,7 @@ use crate::wrtc::colibri::{
     is_valid_vp8_frame_header, ColibriMessage, ReceiverVideoConstraints, WrtcMessage, WrtcMode,
 };
 use crate::wrtc::jingle::{append_remote_video_ssrc_to_sdp, JingleSession};
+use crate::wrtc::xmpp_xml::XmppIceServer;
 use bytes::{BufMut, Bytes, BytesMut};
 use futures::{SinkExt, StreamExt};
 use rtc::interceptor::Registry;
@@ -22,7 +23,7 @@ use rtc::media_stream::MediaStreamTrack;
 use rtc::peer_connection::configuration::interceptor_registry::register_default_interceptors;
 use rtc::peer_connection::configuration::media_engine::{MediaEngine, MIME_TYPE_OPUS, MIME_TYPE_VP8};
 use rtc::peer_connection::configuration::setting_engine::SettingEngineBuilder;
-use rtc::peer_connection::configuration::RTCConfigurationBuilder;
+use rtc::peer_connection::configuration::{RTCConfigurationBuilder, RTCIceServer};
 use rtc::peer_connection::sdp::RTCSessionDescription;
 use rtc::peer_connection::transport::RTCDtlsRole;
 use rtc::rtp::{Header as RtpHeader, Packet as RtpPacket};
@@ -466,55 +467,60 @@ impl P2pSession {
     }
 }
 
+fn build_ice_server_tiers(discovered: &[XmppIceServer]) -> Vec<(Vec<RTCIceServer>, bool)> {
+    let filter_tier = |include_turn: bool, include_tcp_tls: bool| -> (Vec<RTCIceServer>, bool) {
+        let mut list = Vec::new();
+        let mut has_turn = false;
+        for s in discovered {
+            if !include_turn && s.is_turn {
+                continue;
+            }
+            if !include_tcp_tls && s.is_tcp_or_tls {
+                continue;
+            }
+            if s.is_turn {
+                has_turn = true;
+            }
+            list.push(RTCIceServer {
+                urls: s.urls.clone(),
+                username: s.username.clone(),
+                credential: s.credential.clone(),
+            });
+        }
+        (list, has_turn)
+    };
+
+    let mut tiers = Vec::with_capacity(4);
+    for (inc_turn, inc_tcp) in [(true, true), (true, false), (false, false)] {
+        let (list, has_turn) = filter_tier(inc_turn, inc_tcp);
+        if !list.is_empty() {
+            let urls_flat: Vec<&str> = list
+                .iter()
+                .flat_map(|i| i.urls.iter().map(|u| u.as_str()))
+                .collect();
+            let already_present = tiers.iter().any(|(existing, _): &(Vec<RTCIceServer>, bool)| {
+                let ex_urls: Vec<&str> = existing
+                    .iter()
+                    .flat_map(|i| i.urls.iter().map(|u| u.as_str()))
+                    .collect();
+                ex_urls == urls_flat
+            });
+            if !already_present {
+                tiers.push((list, has_turn));
+            }
+        }
+    }
+    tiers.push((Vec::new(), false));
+    tiers
+}
+
 pub async fn create_p2p_channel(
-    stun_servers: &[String],
+    ice_servers_info: &[XmppIceServer],
     wrtc_cfg: &WrtcConfig,
     bind_addr: &str,
 ) -> anyhow::Result<P2pSession> {
-    let mut media_engine = MediaEngine::default();
-    let registry = register_default_interceptors(Registry::new(), &mut media_engine)?;
-
-    use rtc::peer_connection::configuration::RTCIceServer;
-    let mut ice_servers = Vec::new();
-    for s in stun_servers {
-        ice_servers.push(RTCIceServer {
-            urls: vec![s.clone()],
-            username: String::new(),
-            credential: String::new(),
-        });
-    }
-    if ice_servers.is_empty() {
-        ice_servers.push(RTCIceServer {
-            urls: vec![
-                "stun:stun.l.google.com:19302".to_string(),
-                "stun:stun1.l.google.com:19302".to_string(),
-            ],
-            username: String::new(),
-            credential: String::new(),
-        });
-    }
-
-    let config = RTCConfigurationBuilder::new()
-        .with_ice_servers(ice_servers)
-        .build();
-
-    let setting_engine = SettingEngineBuilder::new()
-        .with_ice_timeouts(
-            Some(Duration::from_millis(wrtc_cfg.ice_disconnected_timeout_ms)),
-            Some(Duration::from_millis(wrtc_cfg.ice_failed_timeout_ms)),
-            Some(Duration::from_millis(wrtc_cfg.ice_keepalive_interval_ms)),
-        )
-        .with_sctp_max_receive_buffer_size(wrtc_cfg.sctp_max_receive_buffer_size)
-        .with_sctp_mtu(wrtc_cfg.sctp_mtu.min(1200) as _)
-        .with_receive_mtu(wrtc_cfg.receive_mtu)
-        .build();
-
     let is_open = Arc::new(AtomicBool::new(false));
     let open_notify = Arc::new(tokio::sync::Notify::new());
-
-    let handler = Arc::new(P2pEvents {
-        is_open: is_open.clone(),
-    });
 
     let effective_bind_addr = if !bind_addr.is_empty() && bind_addr != "0.0.0.0:0" {
         bind_addr.to_string()
@@ -525,20 +531,65 @@ pub async fn create_p2p_channel(
         "[P2P Direct] Pinned P2P UDP socket to physical interface: {effective_bind_addr}"
     );
 
-    let pc_res = PeerConnectionBuilder::new()
-        .with_configuration(config)
-        .with_setting_engine(setting_engine)
-        .with_media_engine(media_engine)
-        .with_interceptor_registry(registry)
-        .with_handler(handler)
-        .with_runtime(Arc::new(TunedTokioRuntime {
-            inner: TokioRuntime,
-            udp_socket_buffer_size: wrtc_cfg.udp_socket_buffer_size,
-        }))
-        .with_udp_addrs(vec![effective_bind_addr])
-        .with_dedicated_reactor_pool_size(wrtc_cfg.reactor_pool_size.max(1))
-        .build()
-        .await?;
+    let tiers = build_ice_server_tiers(ice_servers_info);
+    let mut last_err = None;
+    let mut built_pc = None;
+
+    for (tier_idx, (ice_servers, _)) in tiers.into_iter().enumerate() {
+        let mut media_engine = MediaEngine::default();
+        let registry = register_default_interceptors(Registry::new(), &mut media_engine)?;
+
+        let config = RTCConfigurationBuilder::new()
+            .with_ice_servers(ice_servers)
+            .build();
+
+        let setting_engine = SettingEngineBuilder::new()
+            .with_ice_timeouts(
+                Some(Duration::from_millis(wrtc_cfg.ice_disconnected_timeout_ms)),
+                Some(Duration::from_millis(wrtc_cfg.ice_failed_timeout_ms)),
+                Some(Duration::from_millis(wrtc_cfg.ice_keepalive_interval_ms)),
+            )
+            .with_sctp_max_receive_buffer_size(wrtc_cfg.sctp_max_receive_buffer_size)
+            .with_sctp_mtu(wrtc_cfg.sctp_mtu.min(1200) as _)
+            .with_receive_mtu(wrtc_cfg.receive_mtu)
+            .build();
+
+        let handler = Arc::new(P2pEvents {
+            is_open: is_open.clone(),
+        });
+
+        match PeerConnectionBuilder::new()
+            .with_configuration(config)
+            .with_setting_engine(setting_engine)
+            .with_media_engine(media_engine)
+            .with_interceptor_registry(registry)
+            .with_handler(handler)
+            .with_runtime(Arc::new(TunedTokioRuntime {
+                inner: TokioRuntime,
+                udp_socket_buffer_size: wrtc_cfg.udp_socket_buffer_size,
+            }))
+            .with_udp_addrs(vec![effective_bind_addr.clone()])
+            .with_dedicated_reactor_pool_size(wrtc_cfg.reactor_pool_size.max(1))
+            .build()
+            .await
+        {
+            Ok(pc_res) => {
+                built_pc = Some(pc_res);
+                break;
+            }
+            Err(e) => {
+                log::debug!(
+                    "[P2P Direct] ICE configuration tier {tier_idx} rejected by engine ({e}), trying fallback tier..."
+                );
+                last_err = Some(e);
+            }
+        }
+    }
+
+    let pc_res = match built_pc {
+        Some(pc) => pc,
+        None => return Err(anyhow::anyhow!("Failed to build P2P PeerConnection: {:?}", last_err)),
+    };
 
     let pc: Arc<dyn PeerConnection> = Arc::new(pc_res);
 
@@ -894,7 +945,6 @@ impl WrtcPeer {
         if let (Some(session), Some(xmpp)) = (session_opt, xmpp_opt) {
             log::info!("[WRTC Media] Initializing WebRTC PeerConnection with Audio (Opus) and Video (VP8)...");
 
-            let mut media_engine = MediaEngine::default();
             let audio_codec = RTCRtpCodecParameters {
                 rtp_codec: RTCRtpCodec {
                     mime_type: MIME_TYPE_OPUS.to_owned(),
@@ -906,7 +956,6 @@ impl WrtcPeer {
                 payload_type: WRTC_OPUS_PAYLOAD_TYPE,
                 ..Default::default()
             };
-            media_engine.register_codec(audio_codec.clone(), RtpCodecKind::Audio)?;
 
             let video_codec = RTCRtpCodecParameters {
                 rtp_codec: RTCRtpCodec {
@@ -919,80 +968,109 @@ impl WrtcPeer {
                 payload_type: video_pt,
                 ..Default::default()
             };
-            media_engine.register_codec(video_codec.clone(), RtpCodecKind::Video)?;
-
-            if video_pt != WRTC_VP8_FALLBACK_PAYLOAD_TYPE {
-                let mut fallback_vcodec = video_codec.clone();
-                fallback_vcodec.payload_type = WRTC_VP8_FALLBACK_PAYLOAD_TYPE;
-                let _ = media_engine.register_codec(fallback_vcodec, RtpCodecKind::Video);
-            }
-            if video_pt != WRTC_VP8_PRIMARY_PAYLOAD_TYPE {
-                let mut fallback_vcodec2 = video_codec.clone();
-                fallback_vcodec2.payload_type = WRTC_VP8_PRIMARY_PAYLOAD_TYPE;
-                let _ = media_engine.register_codec(fallback_vcodec2, RtpCodecKind::Video);
-            }
-
-            // Отключаем стандартные RTP-интерцепторы (NackResponder, NackGenerator, TWCC),
-            // чтобы исключить клонирование каждого пакета в кольцевой буфер ретрансляции
-            // и блокировки мьютексов BWE/TWCC внутри webrtc-rs при высокоскоростном потоке.
-            let registry = Registry::new();
-
-            let bind_addr = bind_addr.clone();
-
-            let config = RTCConfigurationBuilder::new()
-                .with_ice_servers(vec![])
-                .build();
-
-            let setting_engine = SettingEngineBuilder::new()
-                .with_answering_dtls_role(RTCDtlsRole::Client)
-                .with_ice_timeouts(
-                    Some(Duration::from_millis(wrtc_cfg.ice_disconnected_timeout_ms)),
-                    Some(Duration::from_millis(wrtc_cfg.ice_failed_timeout_ms)),
-                    Some(Duration::from_millis(wrtc_cfg.ice_keepalive_interval_ms)),
-                )
-                .with_sctp_max_receive_buffer_size(wrtc_cfg.sctp_max_receive_buffer_size)
-                .with_sctp_mtu(wrtc_cfg.sctp_mtu.min(1200) as _)
-                .with_receive_mtu(wrtc_cfg.receive_mtu)
-                .build();
 
             let remote_dc: Arc<Mutex<Option<Arc<dyn DataChannel>>>> = Arc::new(Mutex::new(None));
             let dc_open_notify = Arc::new(tokio::sync::Notify::new());
 
-            let handler = Arc::new(PeerEvents {
-                connected_tx,
-                is_connected: is_connected.clone(),
-                is_failed: is_failed.clone(),
-                has_ws: has_ws.clone(),
-                mode,
-                disconnected_at_ms: disconnected_at_ms.clone(),
-                start_instant,
-                failed_notify: failed_notify.clone(),
-                dc_is_open: dc_is_open.clone(),
-                dc_open_notify: dc_open_notify.clone(),
-                incoming_tx: incoming_tx.clone(),
-                remote_dc: remote_dc.clone(),
-                video_incoming_tx,
-                expected_peer_video_ssrc: expected_peer_video_ssrc.clone(),
-                first_video_rx: first_video_rx.clone(),
-                local_video_ssrc,
-            });
+            let discovered_ice = xmpp.get_ice_servers();
+            let tiers = build_ice_server_tiers(&discovered_ice);
+            let mut built_pc = None;
+            let mut has_turn_configured = false;
 
-            let pc_res = PeerConnectionBuilder::new()
-                .with_configuration(config)
-                .with_setting_engine(setting_engine)
-                .with_media_engine(media_engine)
-                .with_interceptor_registry(registry)
-                .with_handler(handler)
-                .with_runtime(Arc::new(TunedTokioRuntime {
-                    inner: TokioRuntime,
-                    udp_socket_buffer_size: wrtc_cfg.udp_socket_buffer_size,
-                }))
-                .with_udp_addrs(vec![bind_addr])
-                .with_dedicated_reactor_pool_size(wrtc_cfg.reactor_pool_size.max(1))
-                .build()
-                .await;
+            for (tier_idx, (ice_servers, tier_has_turn)) in tiers.into_iter().enumerate() {
+                let mut media_engine = MediaEngine::default();
+                media_engine.register_codec(audio_codec.clone(), RtpCodecKind::Audio)?;
+                media_engine.register_codec(video_codec.clone(), RtpCodecKind::Video)?;
 
-            if let Ok(pc_impl) = pc_res {
+                if video_pt != WRTC_VP8_FALLBACK_PAYLOAD_TYPE {
+                    let mut fallback_vcodec = video_codec.clone();
+                    fallback_vcodec.payload_type = WRTC_VP8_FALLBACK_PAYLOAD_TYPE;
+                    let _ = media_engine.register_codec(fallback_vcodec, RtpCodecKind::Video);
+                }
+                if video_pt != WRTC_VP8_PRIMARY_PAYLOAD_TYPE {
+                    let mut fallback_vcodec2 = video_codec.clone();
+                    fallback_vcodec2.payload_type = WRTC_VP8_PRIMARY_PAYLOAD_TYPE;
+                    let _ = media_engine.register_codec(fallback_vcodec2, RtpCodecKind::Video);
+                }
+
+                // Отключаем стандартные RTP-интерцепторы (NackResponder, NackGenerator, TWCC),
+                // чтобы исключить клонирование каждого пакета в кольцевой буфер ретрансляции
+                // и блокировки мьютексов BWE/TWCC внутри webrtc-rs при высокоскоростном потоке.
+                let registry = Registry::new();
+
+                let tier_urls: Vec<String> = ice_servers
+                    .iter()
+                    .flat_map(|s| s.urls.clone())
+                    .collect();
+
+                let config = RTCConfigurationBuilder::new()
+                    .with_ice_servers(ice_servers)
+                    .build();
+
+                let setting_engine = SettingEngineBuilder::new()
+                    .with_answering_dtls_role(RTCDtlsRole::Client)
+                    .with_ice_timeouts(
+                        Some(Duration::from_millis(wrtc_cfg.ice_disconnected_timeout_ms)),
+                        Some(Duration::from_millis(wrtc_cfg.ice_failed_timeout_ms)),
+                        Some(Duration::from_millis(wrtc_cfg.ice_keepalive_interval_ms)),
+                    )
+                    .with_sctp_max_receive_buffer_size(wrtc_cfg.sctp_max_receive_buffer_size)
+                    .with_sctp_mtu(wrtc_cfg.sctp_mtu.min(1200) as _)
+                    .with_receive_mtu(wrtc_cfg.receive_mtu)
+                    .build();
+
+                let handler = Arc::new(PeerEvents {
+                    connected_tx: connected_tx.clone(),
+                    is_connected: is_connected.clone(),
+                    is_failed: is_failed.clone(),
+                    has_ws: has_ws.clone(),
+                    mode,
+                    disconnected_at_ms: disconnected_at_ms.clone(),
+                    start_instant,
+                    failed_notify: failed_notify.clone(),
+                    dc_is_open: dc_is_open.clone(),
+                    dc_open_notify: dc_open_notify.clone(),
+                    incoming_tx: incoming_tx.clone(),
+                    remote_dc: remote_dc.clone(),
+                    video_incoming_tx: video_incoming_tx.clone(),
+                    expected_peer_video_ssrc: expected_peer_video_ssrc.clone(),
+                    first_video_rx: first_video_rx.clone(),
+                    local_video_ssrc,
+                });
+
+                match PeerConnectionBuilder::new()
+                    .with_configuration(config)
+                    .with_setting_engine(setting_engine)
+                    .with_media_engine(media_engine)
+                    .with_interceptor_registry(registry)
+                    .with_handler(handler)
+                    .with_runtime(Arc::new(TunedTokioRuntime {
+                        inner: TokioRuntime,
+                        udp_socket_buffer_size: wrtc_cfg.udp_socket_buffer_size,
+                    }))
+                    .with_udp_addrs(vec![bind_addr.clone()])
+                    .with_dedicated_reactor_pool_size(wrtc_cfg.reactor_pool_size.max(1))
+                    .build()
+                    .await
+                {
+                    Ok(pc_impl) => {
+                        log::info!(
+                            "[WRTC Media] PeerConnection built with ICE tier {tier_idx} (TURN={tier_has_turn}): {:?}",
+                            tier_urls
+                        );
+                        has_turn_configured = tier_has_turn;
+                        built_pc = Some(pc_impl);
+                        break;
+                    }
+                    Err(e) => {
+                        log::debug!(
+                            "[WRTC Media] ICE configuration tier {tier_idx} rejected by engine ({e}), trying fallback tier..."
+                        );
+                    }
+                }
+            }
+
+            if let Some(pc_impl) = built_pc {
                 let pc: Arc<dyn PeerConnection> = Arc::new(pc_impl);
 
                 let audio_track_desc = MediaStreamTrack::new(
@@ -1108,11 +1186,18 @@ impl WrtcPeer {
                             let _ = pc.set_local_description(answer.clone()).await;
 
                             let mut final_sdp = answer.sdp.clone();
-                            for _ in 0..WRTC_ICE_GATHER_POLL_ATTEMPTS {
+                            for attempt in 0..WRTC_ICE_GATHER_POLL_ATTEMPTS {
                                 if let Some(desc) = pc.local_description().await {
                                     if desc.sdp.contains("a=candidate:") {
                                         final_sdp = desc.sdp;
-                                        break;
+                                        let has_srflx = final_sdp.contains("typ srflx");
+                                        let has_relay = final_sdp.contains("typ relay");
+                                        if (has_srflx && (!has_turn_configured || has_relay))
+                                            || ((has_srflx || has_relay) && attempt >= 15)
+                                            || attempt >= 25
+                                        {
+                                            break;
+                                        }
                                     }
                                 }
                                 tokio::time::sleep(Duration::from_millis(
@@ -1122,13 +1207,26 @@ impl WrtcPeer {
                             }
 
                             let local_params = crate::wrtc::jingle::parse_sdp_answer(&final_sdp);
+                            let cand_summary: Vec<String> = local_params
+                                .candidates
+                                .iter()
+                                .filter_map(|c| {
+                                    let p: Vec<&str> = c.split_whitespace().collect();
+                                    if p.len() >= 8 && p[6] == "typ" {
+                                        Some(format!("{}:{}:{}", p[7], p[4], p[5]))
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect();
 
                             log::info!(
-                                "[WRTC Media] Generated local SDP Answer: ufrag={}, pwd={}, fp={}, candidates count={}",
+                                "[WRTC Media] Generated local SDP Answer: ufrag={}, pwd={}, fp={}, candidates count={} {:?}",
                                 local_params.ufrag,
                                 local_params.pwd,
                                 local_params.fingerprint,
-                                local_params.candidates.len()
+                                local_params.candidates.len(),
+                                cand_summary
                             );
 
                             let _ = xmpp

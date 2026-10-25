@@ -2,7 +2,9 @@ use crate::config::WrtcConfig;
 use crate::consts::{WRTC_XMPP_CHANNEL_CAPACITY, WRTC_XMPP_RAW_WS_CHANNEL_CAPACITY};
 use crate::http_help::BrowserProfile;
 use crate::wrtc::stealth::generate_random_guest_name;
-use crate::wrtc::xmpp_xml::{escape_xml_attr, parse_xmpp_stanzas, InboundXmpp, XmppBuilder};
+use crate::wrtc::xmpp_xml::{
+    escape_xml_attr, parse_xmpp_stanzas, InboundXmpp, XmppBuilder, XmppIceServer,
+};
 use futures::{SinkExt, StreamExt};
 use rand::Rng;
 use std::collections::HashSet;
@@ -21,7 +23,7 @@ pub struct XmppSession {
     pub origin: String,
     pub remote_ip: Option<std::net::IpAddr>,
     pub occupants: Arc<Mutex<HashSet<String>>>,
-    pub discovered_stuns: Arc<Mutex<Vec<String>>>,
+    pub discovered_ice_servers: Arc<Mutex<Vec<XmppIceServer>>>,
     write_tx: mpsc::Sender<String>,
     read_rx: mpsc::Receiver<String>,
     writer_handle: tokio::task::JoinHandle<()>,
@@ -51,16 +53,39 @@ impl XmppSession {
         occ.iter().cloned().collect()
     }
 
-    pub fn get_stun_servers(&self) -> Vec<String> {
-        let stuns = self.discovered_stuns.lock().unwrap();
-        if !stuns.is_empty() {
-            stuns.clone()
+    pub fn get_ice_servers(&self) -> Vec<XmppIceServer> {
+        let servers = self.discovered_ice_servers.lock().unwrap();
+        if !servers.is_empty() {
+            servers.clone()
         } else {
             vec![
-                "stun:stun1.ktalk.host:34788".to_string(),
-                "stun:stun3.ktalk.host:34788".to_string(),
+                XmppIceServer {
+                    urls: vec!["stun:stun1.ktalk.host:34788".to_string()],
+                    username: String::new(),
+                    credential: String::new(),
+                    host: "stun1.ktalk.host".to_string(),
+                    port: 34788,
+                    is_turn: false,
+                    is_tcp_or_tls: false,
+                },
+                XmppIceServer {
+                    urls: vec!["stun:stun3.ktalk.host:34788".to_string()],
+                    username: String::new(),
+                    credential: String::new(),
+                    host: "stun3.ktalk.host".to_string(),
+                    port: 34788,
+                    is_turn: false,
+                    is_tcp_or_tls: false,
+                },
             ]
         }
+    }
+
+    pub fn get_stun_servers(&self) -> Vec<String> {
+        self.get_ice_servers()
+            .into_iter()
+            .flat_map(|s| s.urls)
+            .collect()
     }
 
     pub async fn connect(
@@ -115,7 +140,7 @@ impl XmppSession {
         let mut jid = String::new();
         let endpoint_id = Self::generate_endpoint_id();
         let occupants = Arc::new(Mutex::new(HashSet::new()));
-        let discovered_stuns = Arc::new(Mutex::new(Vec::new()));
+        let discovered_ice_servers = Arc::new(Mutex::new(Vec::new()));
 
         let effective_client_name = match client_name_opt {
             Some(name) if !name.is_empty() && name != "ANet-Node" => name.to_string(),
@@ -124,6 +149,7 @@ impl XmppSession {
 
         let timeout = Duration::from_secs(handshake_timeout_secs);
         let occ_track = occupants.clone();
+        let discovered_ice_hs = discovered_ice_servers.clone();
         let my_ep = endpoint_id.clone();
         let conf_muc = format!("{conference_id}@muc.meet.jitsi/");
 
@@ -155,12 +181,20 @@ impl XmppSession {
                                     log::info!(
                                         "[XMPP] Successfully joined MUC room {conference_id} as occupant {endpoint_id}"
                                     );
-                                    // Запрашиваем STUN-серверы Контура по XEP-0215 extdisco
-                                    let extdisco_req = XmppBuilder::extdisco_services("extdisco_1");
-                                    let _ = ws_sink.send(Message::text(extdisco_req)).await;
                                     joined = true;
                                     break;
                                 }
+                            }
+                            InboundXmpp::ExtdiscoServices(ice_servers) => {
+                                let urls: Vec<String> = ice_servers
+                                    .iter()
+                                    .flat_map(|s| s.urls.clone())
+                                    .collect();
+                                log::info!(
+                                    "[XMPP] Discovered Ktalk ICE services (STUN/TURN/TURNS): {:?}",
+                                    urls
+                                );
+                                *discovered_ice_hs.lock().unwrap() = ice_servers;
                             }
                             InboundXmpp::SaslMechanisms if !authed => {
                                 log::info!("[XMPP] SASL mechanisms received, sending ANONYMOUS auth");
@@ -189,6 +223,12 @@ impl XmppSession {
                                 bound = true;
                                 jid = bound_jid;
                                 log::info!("[XMPP] Bound JID: {jid}");
+
+                                // Запрашиваем STUN/TURN/TURNS-серверы Контура по XEP-0215 extdisco сразу после бинда,
+                                // чтобы ответ гарантированно пришёл параллельно с входом в комнату MUC до session-initiate.
+                                let extdisco_req = XmppBuilder::extdisco_services("extdisco_1");
+                                log::info!("[XMPP OUT]: {extdisco_req}");
+                                ws_sink.send(Message::text(extdisco_req)).await?;
 
                                 log::info!(
                                     "[XMPP] Entering MUC room {conference_id} with occupant {endpoint_id} (name: {effective_client_name})..."
@@ -300,7 +340,7 @@ impl XmppSession {
 
         let write_tx_ack = write_tx.clone();
         let occ_track_bg = occupants.clone();
-        let discovered_stuns_bg = discovered_stuns.clone();
+        let discovered_ice_bg = discovered_ice_servers.clone();
         let raw_ws_tx_clone = raw_ws_tx.clone();
 
         let reader_handle = tokio::spawn(async move {
@@ -359,10 +399,17 @@ impl XmppSession {
                                         let _ = write_tx_ack.try_send(ack);
                                     }
                                 }
-                                InboundXmpp::ExtdiscoServices(stuns) => {
-                                    log::info!("[XMPP] Discovered Ktalk STUN services: {:?}", stuns);
-                                    let mut guard = discovered_stuns_bg.lock().unwrap();
-                                    *guard = stuns;
+                                InboundXmpp::ExtdiscoServices(ice_servers) => {
+                                    let urls: Vec<String> = ice_servers
+                                        .iter()
+                                        .flat_map(|s| s.urls.clone())
+                                        .collect();
+                                    log::info!(
+                                        "[XMPP] Discovered Ktalk ICE services (STUN/TURN/TURNS): {:?}",
+                                        urls
+                                    );
+                                    let mut guard = discovered_ice_bg.lock().unwrap();
+                                    *guard = ice_servers;
                                 }
                                 _ => {}
                             }
@@ -397,7 +444,7 @@ impl XmppSession {
             origin,
             remote_ip,
             occupants,
-            discovered_stuns,
+            discovered_ice_servers,
             write_tx,
             read_rx,
             writer_handle,
@@ -441,8 +488,23 @@ impl XmppSession {
                 if ip == "0.0.0.0" || ip == "127.0.0.1" || ip.starts_with("127.") || ip.starts_with("172.112.") {
                     continue;
                 }
+                let mut rel_attr = String::new();
+                let mut idx = 8;
+                while idx + 1 < parts.len() {
+                    if parts[idx] == "raddr" {
+                        let raddr = escape_xml_attr(parts[idx + 1]);
+                        rel_attr.push_str(&format!(r#" rel-addr="{raddr}""#));
+                        idx += 2;
+                    } else if parts[idx] == "rport" {
+                        let rport = escape_xml_attr(parts[idx + 1]);
+                        rel_attr.push_str(&format!(r#" rel-port="{rport}""#));
+                        idx += 2;
+                    } else {
+                        idx += 1;
+                    }
+                }
                 candidate_xml.push_str(&format!(
-                    r#"<candidate component="1" foundation="{foundation}" generation="0" id="c_{i}" ip="{ip}" port="{port}" priority="{priority}" protocol="{protocol}" type="{c_type}" network="0"/>"#
+                    r#"<candidate component="1" foundation="{foundation}" generation="0" id="c_{i}" ip="{ip}" port="{port}" priority="{priority}" protocol="{protocol}" type="{c_type}"{rel_attr} network="0"/>"#
                 ));
             }
         }

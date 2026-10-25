@@ -15,6 +15,17 @@ pub fn escape_xml_attr(s: &str) -> String {
     out
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XmppIceServer {
+    pub urls: Vec<String>,
+    pub username: String,
+    pub credential: String,
+    pub host: String,
+    pub port: u16,
+    pub is_turn: bool,
+    pub is_tcp_or_tls: bool,
+}
+
 #[derive(Debug, Clone)]
 pub enum InboundXmpp {
     Open,
@@ -36,7 +47,7 @@ pub enum InboundXmpp {
     },
     JingleAck { id: String, from: String },
     Jingle(JingleSession),
-    ExtdiscoServices(Vec<String>),
+    ExtdiscoServices(Vec<XmppIceServer>),
     Other,
 }
 
@@ -200,18 +211,68 @@ fn parse_single_element(
             }
 
             if let Some(services_node) = root.descendants().find(|n| n.has_tag_name("services")) {
-                let mut stuns = Vec::new();
+                let mut ice_servers = Vec::new();
                 for svc in services_node.children().filter(|n| n.has_tag_name("service")) {
-                    if svc.attribute("type") == Some("stun") {
-                        if let (Some(host), Some(port)) =
-                            (svc.attribute("host"), svc.attribute("port"))
-                        {
-                            stuns.push(format!("stun:{host}:{port}"));
-                        }
+                    let svc_type = svc.attribute("type").unwrap_or_default().to_lowercase();
+                    if !matches!(svc_type.as_str(), "stun" | "stuns" | "turn" | "turns") {
+                        continue;
                     }
+                    let Some(host_raw) = svc.attribute("host") else {
+                        continue;
+                    };
+                    let host = host_raw.trim().to_string();
+                    if host.is_empty() {
+                        continue;
+                    }
+                    let default_port = if svc_type == "turns" || svc_type == "stuns" {
+                        443
+                    } else {
+                        3478
+                    };
+                    let port = svc
+                        .attribute("port")
+                        .and_then(|p| p.trim().parse::<u16>().ok())
+                        .unwrap_or(default_port);
+                    let transport = svc
+                        .attribute("transport")
+                        .unwrap_or("udp")
+                        .trim()
+                        .to_lowercase();
+                    let username = svc.attribute("username").unwrap_or_default().to_string();
+                    let credential = svc.attribute("password").unwrap_or_default().to_string();
+
+                    let (url, is_turn, is_tcp_or_tls) = match svc_type.as_str() {
+                        "stun" => (format!("stun:{host}:{port}"), false, transport == "tcp"),
+                        "stuns" => (format!("stuns:{host}:{port}"), false, true),
+                        "turn" => {
+                            if transport == "tcp" {
+                                (format!("turn:{host}:{port}?transport=tcp"), true, true)
+                            } else {
+                                (format!("turn:{host}:{port}"), true, false)
+                            }
+                        }
+                        "turns" => {
+                            if transport == "tcp" {
+                                (format!("turns:{host}:{port}?transport=tcp"), true, true)
+                            } else {
+                                (format!("turns:{host}:{port}"), true, true)
+                            }
+                        }
+                        _ => continue,
+                    };
+
+                    ice_servers.push(XmppIceServer {
+                        urls: vec![url],
+                        username,
+                        credential,
+                        host,
+                        port,
+                        is_turn,
+                        is_tcp_or_tls,
+                    });
                 }
-                if !stuns.is_empty() {
-                    return Some(InboundXmpp::ExtdiscoServices(stuns));
+                if !ice_servers.is_empty() {
+                    return Some(InboundXmpp::ExtdiscoServices(ice_servers));
                 }
             }
 
