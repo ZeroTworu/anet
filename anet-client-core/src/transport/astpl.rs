@@ -16,7 +16,7 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 use tokio::io::{AsyncWriteExt, BufReader};
 
-const DUPLEX_BUFFER_BYTES: usize = 256 * 1024;
+const DUPLEX_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 const STREAM_READ_BUF_BYTES: usize = 64 * 1024;
 const RX_BATCH_LIMIT: usize = 64;
 
