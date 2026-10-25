@@ -14,10 +14,15 @@ use tokio::runtime::Runtime;
 use anet_client_core::{
     client::AnetClient,
     config::{ CoreConfig, PerAppMode },
+    connectivity_monitor::ConnectivityMonitor,
     events::{ set_handler, AccountInfo, AnetEvent, ClientState },
     platform::create_route_manager,
     server_config::{ apply_overrides, SERVER_CONFIG_ID, SERVER_CONFIG_DISPLAY_NAME },
     updater::{ ConfigFetchResult, Updater },
+};
+use anet_common::{
+    config::ConnectivityConfig,
+    connectivity::{ ConnectivitySnapshot, TelemetrySnapshot },
 };
 
 use crate::{
@@ -103,6 +108,8 @@ pub struct ANetApp {
     pub total_rtt: String,
     pub total_rxm: String,
     pub total_txm: String,
+    pub connectivity_snapshot: ConnectivitySnapshot,
+    pub telemetry_snapshot: TelemetrySnapshot,
     pub account_info: Option<AccountInfo>,
 
     pub tariff_billing: String,
@@ -244,6 +251,8 @@ impl ANetApp {
             total_rtt: "0".to_string(),
             total_rxm: "0 B".to_string(),
             total_txm: "0 B".to_string(),
+            connectivity_snapshot: ConnectivityMonitor::get_last_snapshot(),
+            telemetry_snapshot: TelemetrySnapshot::default(),
             account_info: None,
 
             tariff_billing: "—".to_string(),
@@ -288,6 +297,11 @@ impl ANetApp {
            
         
         };
+
+        // 0. Запускаем фоновый монитор связности сразу при старте GUI (работает и без VPN, и с VPN)
+        app.rt.spawn(async move {
+            ConnectivityMonitor::ensure_started(ConnectivityConfig::default());
+        });
 
         // 1. Загружаем активную конфигурацию (Server Config с оверлеями или пользовательский .toml)
         let config_to_load: Option<ConfigEntry> = {
@@ -1625,9 +1639,23 @@ pub fn save_routing_overrides(&mut self) {
                     self.total_rxm = rxm;
                     self.total_txm = txm;
                 }
-                AnetEvent::TrafficUpdate { .. }
-                | AnetEvent::ConnectivityUpdated(_)
-                | AnetEvent::TelemetryUpdated(_) => {}
+                AnetEvent::TrafficUpdate { .. } => {}
+                AnetEvent::ConnectivityUpdated(snap) => {
+                    if let Some(rtt) = snap.display_rtt_ms {
+                        self.total_rtt = format!("{rtt} мс");
+                    }
+                    self.connectivity_snapshot = snap;
+                }
+                AnetEvent::TelemetryUpdated(tel) => {
+                    self.total_rx = tel.total_rx_str.clone();
+                    self.total_tx = tel.total_tx_str.clone();
+                    self.total_rxm = tel.rx_speed_str.clone();
+                    self.total_txm = tel.tx_speed_str.clone();
+                    if let Some(rtt) = tel.rtt_ms {
+                        self.total_rtt = format!("{rtt} мс");
+                    }
+                    self.telemetry_snapshot = tel;
+                }
                 AnetEvent::Status(msg) => {
                     if msg.contains("Серверный конфиг актуален") {
                         self.show_toast("Серверный конфиг актуален");
@@ -1647,6 +1675,7 @@ pub fn save_routing_overrides(&mut self) {
                         self.total_rtt = "0".to_string();
                         self.total_rxm = "0 B".to_string();
                         self.total_txm = "0 B".to_string();
+                        self.telemetry_snapshot = TelemetrySnapshot::default();
                     }
 
                     if let Some(active_name) = server_name {

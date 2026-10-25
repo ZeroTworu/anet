@@ -88,14 +88,21 @@ impl NetworkCondition {
                     domestic_total.max(1)
                 ),
             ),
-            NetworkCondition::DirectOnline => (
-                "Магистраль в норме".to_string(),
-                format!(
-                    "Прямой канал дышит сам ({}/{}), глобальная сеть отвечает без костылей",
-                    global_ok,
-                    global_total.max(1)
-                ),
-            ),
+            NetworkCondition::DirectOnline => {
+                let total = global_total.max(1);
+                let subtitle = if global_ok >= total {
+                    format!(
+                        "Прямой канал дышит сам ({}/{}), глобальная сеть отвечает без костылей",
+                        global_ok, total
+                    )
+                } else {
+                    format!(
+                        "Прямой канал живой ({}/{}), основные внешние узлы отвечают",
+                        global_ok, total
+                    )
+                };
+                ("Магистраль в норме".to_string(), subtitle)
+            }
             NetworkCondition::TunnelLost => (
                 "Канал в коме".to_string(),
                 "Туннель открыт, но пакеты уходят в небытие. Реанимируем…".to_string(),
@@ -104,14 +111,21 @@ impl NetworkCondition {
                 "Связь только до узла".to_string(),
                 "До сервера достучались, но дальше него жизни пока нет".to_string(),
             ),
-            NetworkCondition::TunnelFullOnline => (
-                "Связь стабилизирована".to_string(),
-                format!(
-                    "Все внешние маршруты в строю ({}/{}). Полёт нормальный",
-                    global_ok,
-                    global_total.max(1)
-                ),
-            ),
+            NetworkCondition::TunnelFullOnline => {
+                let total = global_total.max(1);
+                let subtitle = if global_ok >= total {
+                    format!(
+                        "Все внешние маршруты в строю ({}/{}). Полёт нормальный",
+                        global_ok, total
+                    )
+                } else {
+                    format!(
+                        "Внешние маршруты на связи ({}/{}). Полёт нормальный",
+                        global_ok, total
+                    )
+                };
+                ("Связь стабилизирована".to_string(), subtitle)
+            }
         }
     }
 }

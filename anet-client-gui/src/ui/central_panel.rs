@@ -166,15 +166,15 @@ pub fn render_central_panel(app: &mut ANetApp, ctx: &egui::Context) {
             });
 
             // Карточка тарифа
-            ui.add_space(8.0);
+            ui.add_space(6.0);
             render_tariff_card(app, ui);
 
-            ui.add_space((ui.available_height() * 0.1).max(18.0));
+            ui.add_space(10.0);
 
             // Большая круглая кнопка подключения
             render_connect_button(app, ui, ctx, state);
 
-            ui.add_space(16.0);
+            ui.add_space(10.0);
 
             // Имя текущего конфига или статус ошибки
             ui.vertical_centered(|ui| {
@@ -196,7 +196,7 @@ pub fn render_central_panel(app: &mut ANetApp, ctx: &egui::Context) {
             // Выпадающий список выбора ноды
             render_node_selector(app, ui, state);
 
-            ui.add_space(20.0);
+            ui.add_space(8.0);
         });
 }
 

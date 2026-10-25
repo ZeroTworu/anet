@@ -616,6 +616,9 @@ pub extern "system" fn Java_org_alco_anet_MainActivity_startConnectivityMonitor(
 
     let rt = get_or_init_runtime_handle();
     rt.spawn(async move {
+        let initial =
+            anet_client_core::connectivity_monitor::ConnectivityMonitor::get_last_snapshot();
+        events::emit(AnetEvent::ConnectivityUpdated(initial));
         anet_client_core::connectivity_monitor::ConnectivityMonitor::ensure_started(
             connectivity_cfg,
         );
@@ -629,17 +632,6 @@ pub extern "system" fn Java_org_alco_anet_MainActivity_triggerConnectivityCheck(
     _this: JObject,
 ) {
     anet_client_core::connectivity_monitor::ConnectivityMonitor::trigger_check_now();
-}
-
-/// Возвращает актуальный снимок состояния связности (JSON) для мгновенной синхронной инициализации UI.
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_org_alco_anet_MainActivity_getConnectivitySnapshotJson(
-    env: JNIEnv,
-    _this: JObject,
-) -> jni::sys::jstring {
-    let snap = anet_client_core::connectivity_monitor::ConnectivityMonitor::get_last_snapshot();
-    let json = serde_json::to_string(&snap).unwrap_or_else(|_| "{}".to_string());
-    env.new_string(json).unwrap().into_raw()
 }
 
 #[unsafe(no_mangle)]

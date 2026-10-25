@@ -26,7 +26,7 @@ pub fn render_connect_button(
     state: ConnectionState,
 ) {
     ui.vertical_centered(|ui| {
-        let btn_size = egui::vec2(184.0, 184.0);
+        let btn_size = egui::vec2(160.0, 160.0);
         let (rect, response) = ui.allocate_exact_size(btn_size, egui::Sense::click());
         response.clone().on_hover_cursor(egui::CursorIcon::PointingHand);
 
