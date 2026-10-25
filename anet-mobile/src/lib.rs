@@ -816,7 +816,7 @@ pub extern "system" fn Java_org_alco_anet_ANetVpnService_connectVpn(
         Err(_) => String::new(),
     };
 
-    let mut config: CoreConfig = match toml::from_str(&config_toml) {
+    let mut config: CoreConfig = match toml::from_str::<CoreConfig>(&config_toml) {
         Ok(mut c) => {
             c.connectivity.apply_toml_fallbacks(&config_toml);
             c
