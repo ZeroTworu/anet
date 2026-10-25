@@ -17,8 +17,7 @@ impl ServerCertVerifier for AcceptTurnsServerCert {
     fn verify_server_cert(
         &self,
         _end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>,
-        ],
+        _intermediates: &[CertificateDer<'_>],
         _server_name: &ServerName<'_>,
         _ocsp_response: &[u8],
         _now: UnixTime,
