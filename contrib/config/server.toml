@@ -375,7 +375,7 @@ ice_keepalive_interval_ms = 2000
 sctp_max_receive_buffer_size = 4194304
 
 # Максимальный размер полезной нагрузки SCTP-пакета внутри DTLS (в байтах).
-sctp_mtu = 1280
+sctp_mtu = 1200
 
 # Размер буфера чтения одного входящего UDP/RTP пакета в движке WebRTC (в байтах).
 receive_mtu = 1600

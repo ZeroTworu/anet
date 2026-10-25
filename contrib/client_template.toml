@@ -170,7 +170,7 @@ ice_keepalive_interval_ms = 2000
 
 # Параметры буферов и MTU для SCTP (DataChannel) и RTP-приемника
 sctp_max_receive_buffer_size = 4194304
-sctp_mtu = 1280
+sctp_mtu = 1200
 receive_mtu = 1600
 
 # Запас MTU под заголовки IPv4+UDP+SRTP+RTP+VP8+ASTP (110 байт) и интервал VP8 keep-alive (мс)
