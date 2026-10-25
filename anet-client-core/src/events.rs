@@ -65,7 +65,11 @@ pub enum AnetEvent {
         rxm: u64,
         txm: u64,
     },
-     ServerConfigUpdated {
+    /// Снимок состояния сети (линейный пульс + щит диагностики из 6 состояний)
+    ConnectivityUpdated(anet_common::connectivity::ConnectivitySnapshot),
+    /// Снимок телеметрии скорости и трафика со скользящим буфером кривых (sparkline)
+    TelemetryUpdated(anet_common::connectivity::TelemetrySnapshot),
+    ServerConfigUpdated {
         updated_at: u64,
         nodes_count: usize,
     },

@@ -1,4 +1,4 @@
-use anet_common::config::{StealthConfig, WrtcConfig};
+pub use anet_common::config::{ConnectivityConfig, StealthConfig, WrtcConfig};
 use anet_common::quic_settings::QuicConfig;
 use serde::{Deserialize, Serialize};
 
@@ -504,7 +504,7 @@ pub struct RoutingConfig {
     pub overrides: anet_filter_core::LocalOverridesConfig,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct CoreConfig {
     #[serde(default)]
     pub main: MainConfig,
@@ -536,6 +536,9 @@ pub struct CoreConfig {
 
     #[serde(default)]
     pub wrtc: WrtcConfig,
+
+    #[serde(default)]
+    pub connectivity: ConnectivityConfig,
 }
 
 impl CoreConfig {

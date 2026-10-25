@@ -154,9 +154,19 @@ fn event_message(event: AnetEvent) -> Option<String> {
         }
         AnetEvent::Stats { .. }
         | AnetEvent::TrafficUpdate { .. }
+        | AnetEvent::ConnectivityUpdated(_)
+        | AnetEvent::TelemetryUpdated(_)
         | AnetEvent::ClientStateChanged { .. }
         | AnetEvent::AccountInfo(_) => None,
     }
+}
+
+fn get_or_init_runtime_handle() -> tokio::runtime::Handle {
+    let mut rt_guard = RUNTIME.lock().unwrap();
+    if rt_guard.is_none() {
+        *rt_guard = Some(Runtime::new().unwrap());
+    }
+    rt_guard.as_ref().unwrap().handle().clone()
 }
 
 #[cfg(test)]
@@ -349,7 +359,100 @@ fn init_jni_bridge_thread(jvm: Arc<JavaVM>) {
             info!("Rust JNI Bridge: Dedicated OS thread started.");
 
             if let Ok(mut env) = jvm.attach_current_thread() {
-                while let Ok(TimestampedEvent { timestamp: _timestamp, event }) = rx.recv() { // <-- распаковываем TimestampedEvent
+                while let Ok(TimestampedEvent { timestamp: _timestamp, event }) = rx.recv() {
+                    if let AnetEvent::ConnectivityUpdated(snap) = event {
+                        let ui_ref = UI_CALLBACK_REF.lock().unwrap().clone();
+                        let vpn_ref = VPN_CALLBACK_REF.lock().unwrap().clone();
+                        let targets: Vec<GlobalRef> =
+                            [ui_ref, vpn_ref].into_iter().flatten().collect();
+
+                        for cb in targets {
+                            let j_title = env.new_string(&snap.title);
+                            let j_subtitle = env.new_string(&snap.subtitle);
+                            if let (Ok(j_title), Ok(j_subtitle)) = (j_title, j_subtitle) {
+                                let rtt_val = snap.display_rtt_ms.map(|v| v as i64).unwrap_or(-1);
+                                let _ = env.call_method(
+                                    &cb,
+                                    "onConnectivityUpdated",
+                                    "(IIJZLjava/lang/String;Ljava/lang/String;IIII)V",
+                                    &[
+                                        JValue::Int(snap.condition.code()),
+                                        JValue::Int(snap.pulse_color.code()),
+                                        JValue::Long(rtt_val),
+                                        JValue::Bool(u8::from(snap.vpn_connected)),
+                                        JValue::Object(&j_title),
+                                        JValue::Object(&j_subtitle),
+                                        JValue::Int(snap.global_ok as i32),
+                                        JValue::Int(snap.global_total as i32),
+                                        JValue::Int(snap.domestic_ok as i32),
+                                        JValue::Int(snap.domestic_total as i32),
+                                    ],
+                                );
+                                let _ = env.exception_clear();
+                            }
+                        }
+                        continue;
+                    }
+
+                    if let AnetEvent::TelemetryUpdated(tel) = event {
+                        let ui_ref = UI_CALLBACK_REF.lock().unwrap().clone();
+                        let vpn_ref = VPN_CALLBACK_REF.lock().unwrap().clone();
+                        let targets: Vec<GlobalRef> =
+                            [vpn_ref, ui_ref].into_iter().flatten().collect();
+
+                        for cb in targets {
+                            let j_rx_spd = env.new_string(&tel.rx_speed_str);
+                            let j_tx_spd = env.new_string(&tel.tx_speed_str);
+                            let j_rx_tot = env.new_string(&tel.total_rx_str);
+                            let j_tx_tot = env.new_string(&tel.total_tx_str);
+                            let j_rx_curve = env.new_float_array(tel.rx_curve.len() as i32);
+                            let j_tx_curve = env.new_float_array(tel.tx_curve.len() as i32);
+
+                            if let (
+                                Ok(j_rx_spd),
+                                Ok(j_tx_spd),
+                                Ok(j_rx_tot),
+                                Ok(j_tx_tot),
+                                Ok(j_rx_curve),
+                                Ok(j_tx_curve),
+                            ) = (
+                                j_rx_spd,
+                                j_tx_spd,
+                                j_rx_tot,
+                                j_tx_tot,
+                                j_rx_curve,
+                                j_tx_curve,
+                            ) {
+                                let _ = env.set_float_array_region(&j_rx_curve, 0, &tel.rx_curve);
+                                let _ = env.set_float_array_region(&j_tx_curve, 0, &tel.tx_curve);
+                                let rtt_val = tel.rtt_ms.map(|v| v as i64).unwrap_or(-1);
+                                let rx_curve_obj = JObject::from(j_rx_curve);
+                                let tx_curve_obj = JObject::from(j_tx_curve);
+
+                                let _ = env.call_method(
+                                    &cb,
+                                    "onTelemetryUpdated",
+                                    "(JJJJJLjava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;[F[F)V",
+                                    &[
+                                        JValue::Long(tel.rx_bps as i64),
+                                        JValue::Long(tel.tx_bps as i64),
+                                        JValue::Long(tel.total_rx_bytes as i64),
+                                        JValue::Long(tel.total_tx_bytes as i64),
+                                        JValue::Long(rtt_val),
+                                        JValue::Object(&j_rx_spd),
+                                        JValue::Object(&j_tx_spd),
+                                        JValue::Object(&j_rx_tot),
+                                        JValue::Object(&j_tx_tot),
+                                        JValue::Object(&rx_curve_obj),
+                                        JValue::Object(&tx_curve_obj),
+                                    ],
+                                );
+                                let _ = env.exception_clear();
+                            }
+                        }
+                        continue;
+                    }
+
                     let is_update_event = matches!(
                         event,
                         AnetEvent::UpdateAvailable(_)
@@ -379,6 +482,7 @@ fn init_jni_bridge_thread(jvm: Arc<JavaVM>) {
                                             JValue::Object(&jserver),
                                         ],
                                     );
+                                    let _ = env.exception_clear();
                                 }
                             }
                             AnetEvent::Stats { rx, tx, rtt, rxm, txm } => {
@@ -402,6 +506,7 @@ fn init_jni_bridge_thread(jvm: Arc<JavaVM>) {
                                             JValue::Object(&j_txm),
                                         ],
                                     );
+                                    let _ = env.exception_clear();
                                 }
                             }
                             AnetEvent::TrafficUpdate { rx, tx, rtt, rxm, txm } => {
@@ -425,6 +530,7 @@ fn init_jni_bridge_thread(jvm: Arc<JavaVM>) {
                                             JValue::Object(&j_txm),
                                         ],
                                     );
+                                    let _ = env.exception_clear();
                                 }
                             }
                             AnetEvent::AccountInfo(info) => {
@@ -452,6 +558,7 @@ fn init_jni_bridge_thread(jvm: Arc<JavaVM>) {
                                             JValue::Object(&je),
                                         ]
                                     );
+                                    let _ = env.exception_clear();
                                 }
                             }
                             other => {
@@ -463,6 +570,7 @@ fn init_jni_bridge_thread(jvm: Arc<JavaVM>) {
                                             "(Ljava/lang/String;)V",
                                             &[JValue::Object(&jmsg)],
                                         );
+                                        let _ = env.exception_clear();
                                     }
                                 }
                             }
@@ -474,6 +582,64 @@ fn init_jni_bridge_thread(jvm: Arc<JavaVM>) {
         });
         tx
     });
+}
+
+/// Запускает фоновый монитор состояния сети и линейного пульса сразу при открытии Android-приложения
+/// (работает постоянно — как при выключенном, так и при включённом VPN).
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_alco_anet_MainActivity_startConnectivityMonitor(
+    mut env: JNIEnv,
+    this: JObject,
+    config_jstr: JString,
+) {
+    let jvm = env.get_java_vm().unwrap();
+    let jvm_arc = Arc::new(jvm);
+    if let Ok(this_ref) = env.new_global_ref(this) {
+        *UI_CALLBACK_REF.lock().unwrap() = Some(this_ref);
+    }
+
+    events::set_handler(Box::new(AndroidEventHandler));
+    init_jni_bridge_thread(jvm_arc);
+
+    let config_toml: String = env
+        .get_string(&config_jstr)
+        .map(Into::into)
+        .unwrap_or_default();
+
+    let connectivity_cfg = if !config_toml.trim().is_empty() {
+        toml::from_str::<CoreConfig>(&config_toml)
+            .map(|c| c.connectivity)
+            .unwrap_or_default()
+    } else {
+        anet_client_core::config::ConnectivityConfig::default()
+    };
+
+    let rt = get_or_init_runtime_handle();
+    rt.spawn(async move {
+        anet_client_core::connectivity_monitor::ConnectivityMonitor::ensure_started(
+            connectivity_cfg,
+        );
+    });
+}
+
+/// Принудительно запускает внеочередную проверку контрольных точек связности.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_alco_anet_MainActivity_triggerConnectivityCheck(
+    _env: JNIEnv,
+    _this: JObject,
+) {
+    anet_client_core::connectivity_monitor::ConnectivityMonitor::trigger_check_now();
+}
+
+/// Возвращает актуальный снимок состояния связности (JSON) для мгновенной синхронной инициализации UI.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_alco_anet_MainActivity_getConnectivitySnapshotJson(
+    env: JNIEnv,
+    _this: JObject,
+) -> jni::sys::jstring {
+    let snap = anet_client_core::connectivity_monitor::ConnectivityMonitor::get_last_snapshot();
+    let json = serde_json::to_string(&snap).unwrap_or_else(|_| "{}".to_string());
+    env.new_string(json).unwrap().into_raw()
 }
 
 #[unsafe(no_mangle)]

@@ -20,6 +20,7 @@ pub mod http_help;
 pub mod boring_tls;
 pub mod wrtc;
 pub mod icmp_probe;
+pub mod connectivity;
 
 pub use generated::*;
 pub mod protocol {

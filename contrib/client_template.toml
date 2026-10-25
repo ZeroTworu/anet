@@ -222,3 +222,35 @@ peer_close_timeout_secs = 3
 tunnel_ping_interval_secs = 15
 tunnel_ping_timeout_secs = 45
 server_idle_room_rotation_secs = 1800
+
+[connectivity]
+# Включить фоновую диагностику состояния сети и линейный индикатор пульса (true / false)
+enabled = true
+
+# Интервал отправки внутритуннельных ICMP-пингов для замера RTT при подключенном туннеле (в секундах, рекомендуется 1–2 с)
+ping_interval_secs = 2
+
+# Интервал опроса контрольных точек для оценки состояния внешних и локальных маршрутов (в секундах, рекомендуется 2–6 с)
+probe_interval_secs = 4
+
+# Тайм-аут ожидания ответа от одной контрольной точки при проверке связности (в миллисекундах)
+timeout_ms = 2500
+
+# Глобальные контрольные точки (проверка доступности внешних международных маршрутов)
+global_targets = [
+    "https://www.google.com/generate_204",
+    "https://connectivitycheck.gstatic.com/generate_204",
+    "https://captive.apple.com/hotspot-detect.html",
+    "https://www.msftconnecttest.com/connecttest.txt",
+    "https://store.steampowered.com/favicon.ico",
+]
+
+# Локальные контрольные точки (проверка базовой внутренней связности при деградации внешних маршрутов)
+domestic_targets = [
+    "https://ya.ru",
+    "https://vk.com",
+    "https://www.gosuslugi.ru",
+    "https://mail.ru",
+    "https://www.sberbank.ru",
+]
+

@@ -75,6 +75,9 @@ impl AnetClient {
         let rule_cache = crate::rule_updater::RuleCacheManager::new(
             crate::rule_updater::default_rules_cache_path(),
         );
+        crate::connectivity_monitor::ConnectivityMonitor::ensure_started(
+            config.connectivity.clone(),
+        );
         Self {
             config,
             tun_factory,
@@ -206,6 +209,9 @@ impl AnetClient {
 
         // Синхронизируем rules.abc сразу при старте клиента до поднятия туннеля (едино для CLI, GUI, Android, macOS, Windows, iOS)
         self.sync_rules_cache(&config_clone).await;
+        crate::connectivity_monitor::ConnectivityMonitor::ensure_started(
+            config_clone.connectivity.clone(),
+        );
 
         info!("[Core] Starting failover connection loop...");
         warn("[Core] Starting connection loop...");
@@ -617,6 +623,9 @@ impl AnetClient {
             let tx_probe_c = tx_probe.clone();
             let probe_shutdown = shutdown_notify.clone();
             let probe_start_time = session_start;
+            let ping_interval = Duration::from_secs(
+                config_clone.connectivity.ping_interval_secs.clamp(1, 30),
+            );
 
             tokio::spawn(async move {
                 let mut seq: u16 = 0;
@@ -642,7 +651,7 @@ impl AnetClient {
                     }
 
                     tokio::select! {
-                        _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+                        _ = tokio::time::sleep(ping_interval) => {}
                         _ = probe_shutdown.notified() => break,
                     }
                 }
@@ -859,6 +868,9 @@ impl AnetClient {
 
                                             last_rtt_rx.store(smoothed_us.max(100), Ordering::Relaxed);
                                             last_reply_rx.store(batch_rx_us, Ordering::Relaxed);
+                                            crate::connectivity_monitor::ConnectivityMonitor::update_tunnel_rtt_ms(
+                                                Some((smoothed_us / 1000).max(1)),
+                                            );
                                             log::debug!(
                                                 "[Probe/RTT] In-tunnel RTT: {:.2} ms (sample: {:.2} ms, seq: {})",
                                                 smoothed_us as f64 / 1000.0,
@@ -1380,8 +1392,10 @@ impl AnetClient {
             format!("Connected. Local IP: {}", result.auth_response.ip),
             Some(active_node_name.clone()),
         );
+        crate::connectivity_monitor::ConnectivityMonitor::set_vpn_connected(true);
 
         reconnect_signal.notified().await;
+        crate::connectivity_monitor::ConnectivityMonitor::set_vpn_connected(false);
 
         let duration = session_start.elapsed();
         let now_us = duration.as_micros() as u64;
@@ -1498,10 +1512,12 @@ impl AnetClient {
             let _ = self.route_manager.restore_routes().await;
             info!("[Core] VPN Stopped.");
             status("[Core] VPN Stopped.");
+            crate::connectivity_monitor::ConnectivityMonitor::set_vpn_connected(false);
             client_state(ClientState::Stopped, "VPN stopped", None);
         } else {
             info!("[Core] VPN Stopped (no active session).");
             status("[Core] VPN Stopped.");
+            crate::connectivity_monitor::ConnectivityMonitor::set_vpn_connected(false);
             client_state(ClientState::Stopped, "VPN stopped", None);
         }
         Ok(())

@@ -156,3 +156,52 @@ impl Default for WrtcConfig {
     }
 }
 
+/// Настройки фоновой диагностики сетевой связности и индикатора пульса (секция `[connectivity]`).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ConnectivityConfig {
+    /// Включить фоновый мониторинг состояния сети и контрольных точек (`true` / `false`).
+    pub enabled: bool,
+
+    /// Интервал отправки внутритуннельных ICMP-пингов для замера RTT при активном VPN (в секундах, рекомендуется 1–2 с).
+    pub ping_interval_secs: u64,
+
+    /// Интервал опроса глобальных и локальных контрольных точек для диагностики маршрутов (в секундах, рекомендуется 2–6 с).
+    #[serde(alias = "interval_secs")]
+    pub probe_interval_secs: u64,
+
+    /// Таймаут ожидания ответа от одной контрольной точки (в миллисекундах).
+    pub timeout_ms: u64,
+
+    /// Глобальные контрольные точки для проверки доступности внешних международных маршрутов.
+    pub global_targets: Vec<String>,
+
+    /// Локальные контрольные точки для определения режима ограниченной внутренней связности.
+    pub domestic_targets: Vec<String>,
+}
+
+impl Default for ConnectivityConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            ping_interval_secs: 2,
+            probe_interval_secs: 4,
+            timeout_ms: 2500,
+            global_targets: vec![
+                "https://www.google.com/generate_204".to_string(),
+                "https://connectivitycheck.gstatic.com/generate_204".to_string(),
+                "https://captive.apple.com/hotspot-detect.html".to_string(),
+                "https://www.msftconnecttest.com/connecttest.txt".to_string(),
+                "https://store.steampowered.com/favicon.ico".to_string(),
+            ],
+            domestic_targets: vec![
+                "https://ya.ru".to_string(),
+                "https://vk.com".to_string(),
+                "https://www.gosuslugi.ru".to_string(),
+                "https://mail.ru".to_string(),
+                "https://www.sberbank.ru".to_string(),
+            ],
+        }
+    }
+}
+

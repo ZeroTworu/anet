@@ -294,6 +294,7 @@ pub fn start_fast_stats_monitor(
         let interval = Duration::from_secs(1);
         let mut last_stats = provider.get_stats();
         let mut last_time = Instant::now();
+        let mut ring_buffer = anet_common::connectivity::TelemetryRingBuffer::new(60);
 
         loop {
             tokio::select! {
@@ -308,6 +309,9 @@ pub fn start_fast_stats_monitor(
                     // 2. Форматируем общие байты и RTT
                     let rx_str = format_bytes(current_stats.total_rx_bytes);
                     let tx_str = format_bytes(current_stats.total_tx_bytes);
+                    let rtt_ms_u64 = current_stats
+                        .rtt_ms
+                        .map(|rtt| (rtt.round() as u64).max(1));
                     let rtt_str = current_stats.rtt_ms
                         .map(|rtt| format!("{:.1}ms", rtt))
                         .unwrap_or_else(|| "N/A".to_string());
@@ -325,25 +329,36 @@ pub fn start_fast_stats_monitor(
                     let elapsed_secs = now.duration_since(last_time).as_secs_f64();
                     last_time = now;
 
-                    // 5. Расчет скорости в байтах/сек и Мбит/сек
+                    // 5. Расчет скорости в байтах/сек
                     let rx_bytes_per_sec = if elapsed_secs > 0.0 {
-                        let bytes_per_sec = rx_bytes_delta as f64 / elapsed_secs;
-                        bytes_per_sec
+                        rx_bytes_delta as f64 / elapsed_secs
                     } else {
                         0.0
                     };
 
                     let tx_bytes_per_sec = if elapsed_secs > 0.0 {
-                        let bytes_per_sec = tx_bytes_delta as f64 / elapsed_secs;
-                        bytes_per_sec
+                        tx_bytes_delta as f64 / elapsed_secs
                     } else {
                         0.0
                     };
 
                     // Обновляем базовый снимок для следующей итерации
-                    last_stats = current_stats;
+                    last_stats = current_stats.clone();
 
-                    // Форматируем скорость только в байтах/сек
+                    // Синхронизируем актуальный RTT туннеля с монитором связности
+                    crate::connectivity_monitor::ConnectivityMonitor::update_tunnel_rtt_ms(rtt_ms_u64);
+
+                    // Формируем снимок со скользящим окном 60 секунд для графика (sparkline)
+                    let telemetry = ring_buffer.push_sample(
+                        rx_bytes_per_sec.max(0.0) as u64,
+                        tx_bytes_per_sec.max(0.0) as u64,
+                        current_stats.total_rx_bytes,
+                        current_stats.total_tx_bytes,
+                        rtt_ms_u64,
+                    );
+                    emit(AnetEvent::TelemetryUpdated(telemetry));
+
+                    // Форматируем скорость только в байтах/сек (обратная совместимость)
                     let rx_speed_formatted = format_bytes_per_sec(rx_bytes_per_sec);
                     let tx_speed_formatted = format_bytes_per_sec(tx_bytes_per_sec);
 
@@ -362,3 +377,4 @@ pub fn start_fast_stats_monitor(
         }
     })
 }
+

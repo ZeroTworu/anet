@@ -1625,7 +1625,9 @@ pub fn save_routing_overrides(&mut self) {
                     self.total_rxm = rxm;
                     self.total_txm = txm;
                 }
-                AnetEvent::TrafficUpdate { .. } => {}
+                AnetEvent::TrafficUpdate { .. }
+                | AnetEvent::ConnectivityUpdated(_)
+                | AnetEvent::TelemetryUpdated(_) => {}
                 AnetEvent::Status(msg) => {
                     if msg.contains("Серверный конфиг актуален") {
                         self.show_toast("Серверный конфиг актуален");
