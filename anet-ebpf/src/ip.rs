@@ -10,8 +10,6 @@ const IPV4_SRC_OFFSET: usize = 12;
 const IPV4_DST_OFFSET: usize = 16;
 
 pub const ETH_P_IP_BE: u16 = 0x0800u16.to_be();
-#[allow(dead_code)]
-pub const IPPROTO_ICMP: u8 = 1;
 pub const IPPROTO_TCP: u8 = 6;
 pub const IPPROTO_UDP: u8 = 17;
 
