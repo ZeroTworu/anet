@@ -159,8 +159,8 @@ xmpp_handshake_timeout_secs = 15
 ws_write_timeout_secs = 5
 colibri_ws_connect_timeout_secs = 10
 
-# Системные буферы UDP-сокета (4 MB) и пул потоков реактора WebRTC
-udp_socket_buffer_size = 4194304
+# Системные буферы UDP-сокета (8 MB) и пул потоков реактора WebRTC
+udp_socket_buffer_size = 8388608
 reactor_pool_size = 4
 
 # Тайм-ауты проверки связности ICE (в миллисекундах)
@@ -169,7 +169,7 @@ ice_failed_timeout_ms = 25000
 ice_keepalive_interval_ms = 2000
 
 # Параметры буферов и MTU для SCTP (DataChannel) и RTP-приемника
-sctp_max_receive_buffer_size = 4194304
+sctp_max_receive_buffer_size = 8388608
 sctp_mtu = 1200
 receive_mtu = 1600
 

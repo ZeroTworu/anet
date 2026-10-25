@@ -541,8 +541,8 @@ ws_write_timeout_secs = 5
 colibri_ws_connect_timeout_secs = 10
 
 # Размер системных буферов сокета UDP (SO_RCVBUF / SO_SNDBUF) для медиа-трафика (в байтах).
-# 4 МБ предотвращают потерю пакетов (packet drop) ядром ОС при микровсплесках видеопотока.
-udp_socket_buffer_size = 4194304
+# 8 МБ предотвращают потерю пакетов (packet drop) ядром ОС при микровсплесках видеопотока.
+udp_socket_buffer_size = 8388608
 
 # Количество выделенных потоков реактора WebRTC для обработки входящих/исходящих RTP-пакетов.
 reactor_pool_size = 4
@@ -557,7 +557,7 @@ ice_failed_timeout_ms = 25000
 ice_keepalive_interval_ms = 2000
 
 # Максимальный размер приемного буфера SCTP (для транспорта `dc` / DataChannel) (в байтах).
-sctp_max_receive_buffer_size = 4194304
+sctp_max_receive_buffer_size = 8388608
 
 # Максимальный размер полезной нагрузки SCTP-пакета внутри DTLS (в байтах).
 sctp_mtu = 1200
