@@ -302,15 +302,17 @@ timeout_secs = 8
 # wrtc_fallback_jvb_ip = "89.169.16.6"  # Fallback IP медиасервера JVB
 # wrtc_fallback_jvb_port = 10002        # Fallback UDP порт JVB
 
-# 6. DoH (DNS-over-HTTPS / ASTP-L): Аварийный туннель через DNS-запросы в нестабильных сетях.
+# 6. DoH (DNS-over-HTTPS / Hybrid UDP DNS / ASTP-L): Аварийный туннель через рекурсивные DNS-резолверы.
+# Внешняя схема DSN всегда `doh://` (так как `https://` используется транспортом AHTTP).
 # Вся конфигурация инкапсулирована непосредственно в Query-параметрах DSN:
-#   resolver - URL публичного DoH-резолвера (может повторяться несколько раз для пула и балансировки)
-#   arq      - включение микро-ARQ (Selective Repeat) при потерях на плече UDP:53 (по умолчанию true)
+#   resolver - адрес публичного резолвера: `doh://host/dns-query` (DoH) или `udp://ip:53` (Classic UDP DNS)
+#   arq      - двусторонний канальный ARQ/SACK/NACK (по умолчанию true)
+#   dup      - коэффициент проактивного дублирования приоритетных пакетов через разные резолверы (по умолчанию 2)
 #   dup_hs   - дублирование чанков хендшейка через разные резолверы для быстрого RTT (по умолчанию true)
-#   hold_ms  - желаемое время удержания long-poll запроса в мс (по умолчанию 1200)
+#   hold_ms  - время микро-коалесцинга poll-запроса на сервере в мс (по умолчанию 25)
 # [[servers]]
 # name = "Emergency DoH Tunnel"
-# dsn = "doh://t1.anet-vpn.com?resolver=https://77.88.8.7/dns-query&resolver=https://dns.adguard-dns.com/dns-query&arq=true&dup_hs=true&hold_ms=1200"
+# dsn = "doh://t1.anet-vpn.com?resolver=doh://77.88.8.7/dns-query&resolver=doh://dns.adguard-dns.com/dns-query&resolver=udp://77.88.8.8:53&arq=true&dup=2&dup_hs=true&hold_ms=25"
 # timeout_secs = 10
 # server_pub_key = "<BASE64_ED25519_PUBLIC_KEY>"
 
@@ -603,8 +605,8 @@ ws_write_timeout_secs = 5
 colibri_ws_connect_timeout_secs = 10
 
 # Размер системных буферов сокета UDP (SO_RCVBUF / SO_SNDBUF) для медиа-трафика (в байтах).
-# 8 МБ предотвращают потерю пакетов (packet drop) ядром ОС при микровсплесках видеопотока.
-udp_socket_buffer_size = 8388608
+# 4 МБ предотвращают потерю пакетов (packet drop) ядром ОС при микровсплесках видеопотока.
+udp_socket_buffer_size = 4194304
 
 # Количество выделенных потоков реактора WebRTC для обработки входящих/исходящих RTP-пакетов.
 reactor_pool_size = 4
@@ -618,16 +620,11 @@ ice_failed_timeout_ms = 25000
 # Интервал отправки проверочных STUN Binding Request (ICE keep-alive) (мс).
 ice_keepalive_interval_ms = 2000
 
-# Интервал проактивного обновления TURN/TURNS-аллокации (Refresh) и nonce (сек).
-# Упреждает истечение 10-минутного окна жизни NONCE (438 Stale Nonce) на coturn
-# и удерживает открытой NAT/TLS-сессию релея.
-turn_refresh_interval_secs = 90
-
 # Максимальный размер приемного буфера SCTP (для транспорта `dc` / DataChannel) (в байтах).
-sctp_max_receive_buffer_size = 8388608
+sctp_max_receive_buffer_size = 4194304
 
 # Максимальный размер полезной нагрузки SCTP-пакета внутри DTLS (в байтах).
-sctp_mtu = 1200
+sctp_mtu = 1280
 
 # Размер буфера чтения одного входящего UDP/RTP пакета в движке WebRTC (в байтах).
 receive_mtu = 1600

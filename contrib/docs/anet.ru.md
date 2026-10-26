@@ -200,6 +200,11 @@ timeout_secs = 8
 [[servers]]
 dsn = "https://your-cdn-endpoint.net/api/v2/telemetry"
 timeout_secs = 10
+
+# 6. Шестая попытка: Аварийный гибридный DNS-туннель (DoH / UDP DNS с ARQ и дублированием)
+[[servers]]
+dsn = "doh://t1.anet-project.org?resolver=doh://77.88.8.7/dns-query&resolver=udp://77.88.8.8:53&arq=true&dup=2&dup_hs=true&hold_ms=25"
+timeout_secs = 10
 ```
 
 ---
