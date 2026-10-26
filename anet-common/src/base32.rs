@@ -89,9 +89,112 @@ pub fn split_into_labels(base32_str: &str, max_label_len: usize) -> String {
     out
 }
 
-/// Joins DNS labels back into a continuous base32 string by removing all dots.
+/// Joins DNS labels back into a continuous string by removing all dots.
 pub fn join_labels(domain_prefix: &str) -> String {
     domain_prefix.replace('.', "")
+}
+
+const BASE36_CHARS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+const B36_POWERS: [u64; 11] = [
+    1,
+    36,
+    1_296,
+    46_656,
+    1_679_616,
+    60_466_176,
+    2_176_782_336,
+    78_364_164_096,
+    2_821_109_907_456,
+    101_559_956_668_416,
+    3_656_158_440_062_976,
+];
+
+/// Encodes raw bytes into lowercase Base36 ('0-9a-z') using 7-byte -> 11-char blocks (5.17 bits/char).
+/// Tail blocks of 1..6 bytes are encoded into 2, 4, 5, 7, 8, 10 chars respectively.
+pub fn encode_base36(data: &[u8]) -> String {
+    if data.is_empty() {
+        return String::new();
+    }
+    const TAIL_CHARS: [usize; 8] = [0, 2, 4, 5, 7, 8, 10, 11];
+    let full_blocks = data.len() / 7;
+    let rem = data.len() % 7;
+    let mut out = String::with_capacity(full_blocks * 11 + TAIL_CHARS[rem]);
+
+    for chunk in data.chunks(7) {
+        let mut val: u64 = 0;
+        for &b in chunk {
+            val = (val << 8) | (b as u64);
+        }
+        let clen = TAIL_CHARS[chunk.len()];
+        let mut chars = [b'0'; 11];
+        for i in (0..clen).rev() {
+            chars[i] = BASE36_CHARS[(val % 36) as usize];
+            val /= 36;
+        }
+        for &c in &chars[..clen] {
+            out.push(c as char);
+        }
+    }
+
+    out
+}
+
+/// Decodes a lowercase/uppercase Base36 string (ignoring dots) back into raw bytes.
+pub fn decode_base36(input: &str) -> Result<Vec<u8>, Base32Error> {
+    let clean: Vec<u8> = input
+        .bytes()
+        .filter(|&b| b != b'.' && b != b'-')
+        .collect();
+    if clean.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let full_blocks = clean.len() / 11;
+    let rem = clean.len() % 11;
+    let rem_bytes = match rem {
+        0 => 0,
+        2 => 1,
+        4 => 2,
+        5 => 3,
+        7 => 4,
+        8 => 5,
+        10 => 6,
+        _ => return Err(Base32Error::InvalidLength),
+    };
+
+    let mut out = Vec::with_capacity(full_blocks * 7 + rem_bytes);
+
+    for chunk in clean.chunks(11) {
+        let b_len = match chunk.len() {
+            11 => 7,
+            10 => 6,
+            8 => 5,
+            7 => 4,
+            5 => 3,
+            4 => 2,
+            2 => 1,
+            _ => return Err(Base32Error::InvalidLength),
+        };
+        let _ = B36_POWERS[0];
+        let mut val: u64 = 0;
+        for &ch in chunk {
+            let digit = match ch {
+                b'0'..=b'9' => (ch - b'0') as u64,
+                b'a'..=b'z' => (ch - b'a' + 10) as u64,
+                b'A'..=b'Z' => (ch - b'A' + 10) as u64,
+                _ => return Err(Base32Error::InvalidCharacter(ch as char)),
+            };
+            val = val
+                .checked_mul(36)
+                .and_then(|v| v.checked_add(digit))
+                .ok_or(Base32Error::InvalidLength)?;
+        }
+        for shift_idx in (0..b_len).rev() {
+            out.push(((val >> (shift_idx * 8)) & 0xFF) as u8);
+        }
+    }
+
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -115,16 +218,26 @@ mod tests {
             let enc = encode(case);
             let dec = decode(&enc).expect("decode failed");
             assert_eq!(dec.as_slice(), case);
+
+            let enc36 = encode_base36(case);
+            let dec36 = decode_base36(&enc36).expect("decode_base36 failed");
+            assert_eq!(dec36.as_slice(), case);
         }
     }
 
     #[test]
     fn test_case_insensitivity_and_dots() {
-        let data = b"DNS over HTTPS";
+        let data = b"DNS over HTTPS with Base36 & Base32";
         let enc = encode(data);
         let labels = split_into_labels(&enc, 5);
         let upper_labels = labels.to_uppercase();
         let dec = decode(&upper_labels).expect("decode with uppercase and dots failed");
         assert_eq!(dec.as_slice(), data);
+
+        let enc36 = encode_base36(data);
+        let labels36 = split_into_labels(&enc36, 7);
+        let upper36 = labels36.to_uppercase();
+        let dec36 = decode_base36(&upper36).expect("decode_base36 with uppercase and dots failed");
+        assert_eq!(dec36.as_slice(), data);
     }
 }

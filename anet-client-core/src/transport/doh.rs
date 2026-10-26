@@ -22,7 +22,7 @@ use tokio::io::{AsyncWriteExt, WriteHalf};
 use tokio::sync::{Mutex, Notify, Semaphore};
 
 const RESOLVER_COOLDOWN_MS: u64 = 2_000;
-const DOH_TCP_MAX_MSS: u16 = 460;
+const DOH_TCP_MAX_MSS: u16 = 640;
 const CODEL_MAX_SOJOURN: Duration = Duration::from_millis(600);
 const MAX_BULK_QUEUE_LEN: usize = 48;
 const MAX_PRIO_QUEUE_LEN: usize = 128;
@@ -1256,8 +1256,8 @@ impl ClientTransport for DohTransport {
                         tokio::time::sleep(Duration::from_millis(110)).await;
                         let retransmits = rto_ul.lock().unwrap().collect_rto_retransmits();
                         for chunk in retransmits {
-                            let b32_str = base32::encode(&chunk);
-                            let labels = base32::split_into_labels(&b32_str, 63);
+                            let b36_str = base32::encode_base36(&chunk);
+                            let labels = base32::split_into_labels(&b36_str, 63);
                             let qname = format!("{}.{}", labels, rto_zone);
                             let query_bytes = build_doh_query(&qname, rand::random::<u16>());
 
@@ -1299,7 +1299,8 @@ impl ClientTransport for DohTransport {
             tokio::spawn(async move {
                 info!("[DoH TX] Uplink dispatcher loop active (dup={})", dup_count);
                 while let Some((mut packet_buf, is_prio)) = uplink_q.pop_batch(max_payload).await {
-                    let seq = sequence.fetch_add(1, Ordering::Relaxed);
+                    let raw_seq = sequence.fetch_add(1, Ordering::Relaxed);
+                    let seq = ((raw_seq - 1) % 65534) + 1;
                     cipher.apply_keystream(seq, session_id, &mut packet_buf);
 
                     let chunks = split_into_chunks(session_id, seq, &packet_buf, max_payload);
@@ -1313,8 +1314,8 @@ impl ClientTransport for DohTransport {
                     };
 
                     for chunk in chunks {
-                        let b32_str = base32::encode(&chunk);
-                        let labels = base32::split_into_labels(&b32_str, 63);
+                        let b36_str = base32::encode_base36(&chunk);
+                        let labels = base32::split_into_labels(&b36_str, 63);
                         let qname = format!("{}.{}", labels, domain_zone);
                         let query_bytes = build_doh_query(&qname, rand::random::<u16>());
 

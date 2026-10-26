@@ -116,7 +116,12 @@ pub fn build_dns_txt_response(
 ) -> Vec<u8> {
     let mut resp = Vec::with_capacity(512);
 
-    let has_answer = txt_payload.is_some();
+    let rr_slices: Vec<&[u8]> = match txt_payload {
+        Some(p) if !p.is_empty() => p.chunks(765).collect(),
+        Some(_) => vec![&[][..]],
+        None => Vec::new(),
+    };
+    let ancount = rr_slices.len() as u16;
 
     // 1. Header (12 bytes)
     resp.extend_from_slice(&parsed_q.tx_id.to_be_bytes());
@@ -125,7 +130,7 @@ pub fn build_dns_txt_response(
     let resp_flags = 0x8400 | rd_bit;
     resp.extend_from_slice(&resp_flags.to_be_bytes());
     resp.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT=1
-    resp.extend_from_slice(&(if has_answer { 1u16 } else { 0u16 }).to_be_bytes()); // ANCOUNT
+    resp.extend_from_slice(&ancount.to_be_bytes()); // ANCOUNT (Multi-TXT support)
     resp.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT=0
     resp.extend_from_slice(&1u16.to_be_bytes()); // ARCOUNT=1 (EDNS0)
 
@@ -145,18 +150,16 @@ pub fn build_dns_txt_response(
         resp.extend_from_slice(&DNS_QCLASS_IN.to_be_bytes());
     }
 
-    // 3. Answer section
-    if let Some(payload) = txt_payload {
-        // Name pointer to QNAME (offset 12 = 0xC00C)
+    // 3. Answer section (1 or more TXT Resource Records with 0xC00C name compression)
+    for payload in rr_slices {
         resp.extend_from_slice(&[0xC0, 0x0C]);
         resp.extend_from_slice(&DNS_QTYPE_TXT.to_be_bytes());
         resp.extend_from_slice(&DNS_QCLASS_IN.to_be_bytes());
         resp.extend_from_slice(&ttl.to_be_bytes());
 
-        // Calculate RDATA length: each character-string has 1 byte length + slice len
         let mut rdlength = 0usize;
         if payload.is_empty() {
-            rdlength = 1; // 1 byte for empty string length 0
+            rdlength = 1;
         } else {
             for chunk in payload.chunks(255) {
                 rdlength += 1 + chunk.len();
@@ -185,7 +188,7 @@ pub fn build_dns_txt_response(
     resp
 }
 
-/// Parses a binary DNS response and extracts concatenated TXT character-strings.
+/// Parses a binary DNS response and extracts concatenated TXT character-strings across all TXT Resource Records.
 pub fn parse_dns_txt_response(data: &[u8]) -> Option<Vec<u8>> {
     if data.len() < 12 {
         return None;
@@ -215,7 +218,10 @@ pub fn parse_dns_txt_response(data: &[u8]) -> Option<Vec<u8>> {
         pos += 4; // QTYPE (2) + QCLASS (2)
     }
 
-    // Parse Answer section looking for TXT (type 16)
+    let mut combined_txt = Vec::new();
+    let mut found_txt = false;
+
+    // Parse Answer section concatenating all TXT (type 16) Resource Records
     for _ in 0..ancount {
         pos = skip_dns_name(data, pos)?;
         if pos + 10 > data.len() {
@@ -223,8 +229,6 @@ pub fn parse_dns_txt_response(data: &[u8]) -> Option<Vec<u8>> {
         }
 
         let atype = u16::from_be_bytes([data[pos], data[pos + 1]]);
-        // let aclass = u16::from_be_bytes([data[pos + 2], data[pos + 3]]);
-        // let attl = u32::from_be_bytes([data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]]);
         let rdlength = u16::from_be_bytes([data[pos + 8], data[pos + 9]]) as usize;
         pos += 10;
 
@@ -233,8 +237,8 @@ pub fn parse_dns_txt_response(data: &[u8]) -> Option<Vec<u8>> {
         }
 
         if atype == DNS_QTYPE_TXT {
+            found_txt = true;
             let rdata = &data[pos..pos + rdlength];
-            let mut out = Vec::with_capacity(rdlength);
             let mut sub_pos = 0;
             while sub_pos < rdata.len() {
                 let slen = rdata[sub_pos] as usize;
@@ -242,16 +246,19 @@ pub fn parse_dns_txt_response(data: &[u8]) -> Option<Vec<u8>> {
                 if sub_pos + slen > rdata.len() {
                     break;
                 }
-                out.extend_from_slice(&rdata[sub_pos..sub_pos + slen]);
+                combined_txt.extend_from_slice(&rdata[sub_pos..sub_pos + slen]);
                 sub_pos += slen;
             }
-            return Some(out);
         }
 
         pos += rdlength;
     }
 
-    None
+    if found_txt {
+        Some(combined_txt)
+    } else {
+        None
+    }
 }
 
 fn skip_dns_name(buf: &[u8], mut pos: usize) -> Option<usize> {

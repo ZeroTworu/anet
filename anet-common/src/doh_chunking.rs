@@ -2,7 +2,8 @@ use bytes::{BufMut, Bytes, BytesMut};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-pub const DOH_HEADER_LEN: usize = 10;
+pub const DOH_HEADER_LEN: usize = 7;
+pub const DOH_LEGACY_HEADER_LEN: usize = 10;
 pub const MAX_DNS_FQDN_LEN: usize = 253;
 pub const MAX_DNS_LABEL_LEN: usize = 63;
 
@@ -15,58 +16,101 @@ pub struct DohChunkHeader {
 }
 
 impl DohChunkHeader {
+    /// Compact 7-byte wire header:
+    /// `[session_id: u32 BE (4B)] [seq_low16: u16 BE (2B)] [0x80 | ((chunk_idx & 0x07) << 4) | ((total_chunks - 1) & 0x0F) (1B)]`
     pub fn encode(&self) -> [u8; DOH_HEADER_LEN] {
         let mut buf = [0u8; DOH_HEADER_LEN];
         buf[0..4].copy_from_slice(&self.session_id.to_be_bytes());
-        buf[4..8].copy_from_slice(&self.sequence.to_be_bytes());
-        buf[8] = self.chunk_index;
-        buf[9] = self.total_chunks;
+        buf[4..6].copy_from_slice(&(self.sequence as u16).to_be_bytes());
+        let idx_bits = (self.chunk_index & 0x07) << 4;
+        let total_bits = self.total_chunks.saturating_sub(1) & 0x0F;
+        buf[6] = 0x80 | idx_bits | total_bits;
         buf
     }
 
-    pub fn decode(bytes: &[u8]) -> anyhow::Result<Self> {
+    pub fn decode_with_len(bytes: &[u8]) -> anyhow::Result<(Self, usize)> {
         if bytes.len() < DOH_HEADER_LEN {
-            anyhow::bail!("Buffer too short for DohChunkHeader: {} < {}", bytes.len(), DOH_HEADER_LEN);
+            anyhow::bail!(
+                "Buffer too short for DohChunkHeader: {} < {}",
+                bytes.len(),
+                DOH_HEADER_LEN
+            );
         }
         let session_id = u32::from_be_bytes(bytes[0..4].try_into()?);
+        if (bytes[6] & 0x80) != 0 {
+            let sequence = u16::from_be_bytes([bytes[4], bytes[5]]) as u32;
+            let chunk_index = (bytes[6] >> 4) & 0x07;
+            let total_chunks = (bytes[6] & 0x0F) + 1;
+            if total_chunks == 0 || chunk_index >= total_chunks {
+                anyhow::bail!(
+                    "Invalid compact chunk indexing: index {} / total {}",
+                    chunk_index,
+                    total_chunks
+                );
+            }
+            return Ok((
+                Self {
+                    session_id,
+                    sequence,
+                    chunk_index,
+                    total_chunks,
+                },
+                DOH_HEADER_LEN,
+            ));
+        }
+
+        if bytes.len() < DOH_LEGACY_HEADER_LEN {
+            anyhow::bail!("Buffer too short for legacy DohChunkHeader");
+        }
         let sequence = u32::from_be_bytes(bytes[4..8].try_into()?);
         let chunk_index = bytes[8];
         let total_chunks = bytes[9];
 
         if total_chunks == 0 || chunk_index >= total_chunks {
-            anyhow::bail!("Invalid chunk indexing: index {} / total {}", chunk_index, total_chunks);
+            anyhow::bail!(
+                "Invalid chunk indexing: index {} / total {}",
+                chunk_index,
+                total_chunks
+            );
         }
 
-        Ok(Self {
-            session_id,
-            sequence,
-            chunk_index,
-            total_chunks,
-        })
+        Ok((
+            Self {
+                session_id,
+                sequence,
+                chunk_index,
+                total_chunks,
+            },
+            DOH_LEGACY_HEADER_LEN,
+        ))
+    }
+
+    pub fn decode(bytes: &[u8]) -> anyhow::Result<Self> {
+        Ok(Self::decode_with_len(bytes)?.0)
     }
 }
 
-/// Dynamically calculates the maximum payload bytes that fit inside a single Base32 DNS chunk,
+/// Dynamically calculates the maximum payload bytes that fit inside a single Base36 DNS chunk,
 /// ensuring the fully-qualified domain name stays strictly below 253 bytes.
 pub fn calculate_max_chunk_payload(domain_zone: &str) -> usize {
     let clean_zone = domain_zone.trim_start_matches('.');
     // 1 dot for root separator + zone length
     let zone_overhead = clean_zone.len() + 1;
-    let max_base32_chars = MAX_DNS_FQDN_LEN.saturating_sub(zone_overhead + 6); // margin for dots every 63 chars
+    let max_encoded_chars = MAX_DNS_FQDN_LEN.saturating_sub(zone_overhead + 6); // margin for dots every 63 chars
 
-    // Base32: 5 bits per char => bytes = chars * 5 / 8
-    let max_raw_bytes = (max_base32_chars * 5) / 8;
-    // Minus 10 bytes of DohChunkHeader
-    max_raw_bytes.saturating_sub(DOH_HEADER_LEN).clamp(32, 135)
+    // Base36: 7 bytes per 11 chars
+    let max_raw_bytes = (max_encoded_chars * 7) / 11;
+    // Minus 7 bytes of compact DohChunkHeader
+    max_raw_bytes.saturating_sub(DOH_HEADER_LEN).clamp(32, 146)
 }
 
-/// Splits a raw IP packet (or payload) into chunk buffers ready for Base32 encoding.
+/// Splits a raw IP packet (or payload) into chunk buffers ready for Base36/Base32 encoding.
 pub fn split_into_chunks(session_id: u32, sequence: u32, payload: &[u8], max_payload_per_chunk: usize) -> Vec<Vec<u8>> {
     let chunk_size = max_payload_per_chunk.max(32);
     let total_chunks = ((payload.len() + chunk_size - 1) / chunk_size).max(1);
 
-    if total_chunks > 255 {
-        // Fallback safety cap
+    if total_chunks > 8 {
+        // Fallback if more than 8 chunks needed
         return vec![];
     }
 
@@ -80,7 +124,7 @@ pub fn split_into_chunks(session_id: u32, sequence: u32, payload: &[u8], max_pay
 
         let header = DohChunkHeader {
             session_id,
-            sequence,
+            sequence: sequence & 0xFFFF,
             chunk_index: idx as u8,
             total_chunks: total_u8,
         };
@@ -150,7 +194,7 @@ impl DohReassemblyQueue {
     /// Feeds an incoming raw chunk (header + chunk data).
     /// Returns `Some((session_id, sequence, full_payload))` if the packet is now fully assembled.
     pub fn feed(&mut self, chunk_raw: &[u8]) -> anyhow::Result<Option<(u32, u32, Bytes)>> {
-        let header = DohChunkHeader::decode(chunk_raw)?;
+        let (header, hdr_len) = DohChunkHeader::decode_with_len(chunk_raw)?;
         let key = (header.session_id, header.sequence);
 
         // Ignore duplicate chunks for packets that were already reassembled recently
@@ -159,7 +203,7 @@ impl DohReassemblyQueue {
             return Ok(None);
         }
 
-        let payload = Bytes::copy_from_slice(&chunk_raw[DOH_HEADER_LEN..]);
+        let payload = Bytes::copy_from_slice(&chunk_raw[hdr_len..]);
 
         let entry = self.packets.entry(key).or_insert_with(|| PartialPacket {
             total_chunks: header.total_chunks,

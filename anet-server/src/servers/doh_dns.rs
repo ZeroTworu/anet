@@ -21,9 +21,9 @@ use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Mutex};
 
-const DOH_TCP_MAX_MSS: u16 = 460;
-const MAX_SINGLE_DOWNLINK_PKT: usize = 500;
-const DOWNLINK_FRAG_DATA_LEN: usize = 460;
+const DOH_TCP_MAX_MSS: u16 = 640;
+const MAX_SINGLE_DOWNLINK_PKT: usize = 720;
+const DOWNLINK_FRAG_DATA_LEN: usize = 640;
 const CODEL_MAX_SOJOURN: Duration = Duration::from_millis(600);
 const MAX_BULK_QUEUE_LEN: usize = 64;
 const MAX_PRIO_QUEUE_LEN: usize = 128;
@@ -772,7 +772,7 @@ async fn handle_dns_datagram(
                     &session,
                     &client_info,
                     session_id,
-                    700,
+                    820,
                     Duration::from_millis(effective_hold_ms),
                     Some(qhash),
                     dl_ack,
@@ -897,11 +897,11 @@ async fn handle_dns_datagram(
         }
     }
 
-    // Case 3: Data Uplink chunk ("<base32_chunk_labels>")
+    // Case 3: Data Uplink chunk ("<base36_or_base32_chunk_labels>")
     let b32_str = base32::join_labels(prefix);
-    if let Ok(chunk_raw) = base32::decode(&b32_str) {
+    if let Ok(chunk_raw) = base32::decode_base36(&b32_str).or_else(|_| base32::decode(&b32_str)) {
         // Filter out intermediate QNAME-minimization suffixes whose session_id does not belong to an active client
-        let hdr = match anet_common::doh_chunking::DohChunkHeader::decode(&chunk_raw) {
+        let (hdr, _) = match anet_common::doh_chunking::DohChunkHeader::decode_with_len(&chunk_raw) {
             Ok(h) => h,
             Err(_) => {
                 let resp = build_dns_txt_response(&raw_query, &parsed_q, None, 0);
@@ -980,7 +980,7 @@ async fn handle_dns_datagram(
             &session,
             &client_info,
             hdr.session_id,
-            510,
+            680,
             piggyback_wait,
             Some(qhash),
             None,
