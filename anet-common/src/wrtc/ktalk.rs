@@ -52,7 +52,7 @@ impl KtalkClient {
         let cookie_jar = Arc::new(Jar::default());
         let builder = profile
             .build_reqwest_builder(cookie_jar)
-            .unwrap_or_else(|_| reqwest::Client::builder())
+            .expect("Failed to initialize BoringSSL Chrome TLS connector")
             .connect_timeout(std::time::Duration::from_secs(
                 wrtc_cfg.http_connect_timeout_secs,
             ))
@@ -61,7 +61,9 @@ impl KtalkClient {
             ));
 
         Self {
-            http: builder.build().unwrap_or_default(),
+            http: builder
+                .build()
+                .expect("Failed to build Ktalk HTTP client from BrowserProfile"),
             profile,
         }
     }

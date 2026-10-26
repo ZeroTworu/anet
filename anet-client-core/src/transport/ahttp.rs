@@ -163,11 +163,7 @@ impl ClientTransport for AHttpTransport {
 
         let cookie_jar = Arc::new(reqwest::cookie::Jar::default());
         let build_http_client = || -> Result<Client> {
-            let mut builder = if scheme == "https" {
-                profile.build_reqwest_builder(cookie_jar.clone())?
-            } else {
-                Client::builder().cookie_provider(cookie_jar.clone()).tcp_nodelay(true)
-            };
+            let mut builder = profile.build_reqwest_builder(cookie_jar.clone())?;
             builder = builder.resolve(&target_host, resolved_addr)
                 .pool_max_idle_per_host(self.config.ahttp.pool_max_idle_per_host.max(2))
                 .pool_idle_timeout(Some(Duration::from_secs(self.config.ahttp.pool_idle_timeout_secs)))

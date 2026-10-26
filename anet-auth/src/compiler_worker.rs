@@ -152,11 +152,13 @@ pub async fn fetch_and_cache_provider(
         .await
         .unwrap_or(0);
 
-    let client = reqwest::Client::builder()
+    let profile = anet_common::http_help::BrowserProfile::random();
+    let client = profile
+        .build_reqwest_builder(std::sync::Arc::new(reqwest::cookie::Jar::default()))?
         .timeout(Duration::from_secs(30))
         .build()?;
 
-    let mut req = client.get(&provider.url);
+    let mut req = profile.apply_to_reqwest(client.get(&provider.url), None, None);
     if !force && db_items_count > 0 {
         if let Some(etag) = &provider.last_etag {
             req = req.header("If-None-Match", etag.as_str());

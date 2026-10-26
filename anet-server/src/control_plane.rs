@@ -10,6 +10,7 @@ use crate::config::ControlPlaneConfig;
 use anet_common::dto::{
     NodeCommand, NodeCommandResultRequest, NodeHeartbeatRequest, NodeTrafficReport,
 };
+use anet_common::http_help::BrowserProfile;
 use log::{info, warn};
 use reqwest::Client;
 use std::sync::Arc;
@@ -22,7 +23,11 @@ pub async fn run_heartbeat(config: ControlPlaneConfig, registry: Arc<ClientRegis
         return;
     }
 
-    let client = match Client::builder().timeout(Duration::from_secs(5)).build() {
+    let profile = BrowserProfile::random();
+    let client = match profile
+        .build_reqwest_builder(Arc::new(reqwest::cookie::Jar::default()))
+        .and_then(|b| b.timeout(Duration::from_secs(5)).build().map_err(Into::into))
+    {
         Ok(client) => client,
         Err(error) => {
             warn!("[ControlPlane] Cannot create HTTP client: {error}");
@@ -50,8 +55,8 @@ pub async fn run_heartbeat(config: ControlPlaneConfig, registry: Arc<ClientRegis
             accepting_connections: registry.is_accepting_connections(),
         };
 
-        match client
-            .post(&endpoint)
+        match profile
+            .apply_to_reqwest(client.post(&endpoint), None, None)
             .header("X-Node-Token", &config.token)
             .json(&heartbeat)
             .send()
@@ -75,8 +80,8 @@ pub async fn run_heartbeat(config: ControlPlaneConfig, registry: Arc<ClientRegis
             samples,
             active_session_counts,
         };
-        match client
-            .post(traffic_endpoint)
+        match profile
+            .apply_to_reqwest(client.post(traffic_endpoint), None, None)
             .header("X-Node-Token", &config.token)
             .json(&report)
             .send()
@@ -90,8 +95,8 @@ pub async fn run_heartbeat(config: ControlPlaneConfig, registry: Arc<ClientRegis
             Err(error) => warn!("[ControlPlane] Traffic report failed: {error}"),
         }
 
-        match client
-            .get(&commands_endpoint)
+        match profile
+            .apply_to_reqwest(client.get(&commands_endpoint), None, None)
             .header("X-Node-Token", &config.token)
             .query(&[("node_id", &config.node_id)])
             .send()
@@ -101,7 +106,10 @@ pub async fn run_heartbeat(config: ControlPlaneConfig, registry: Arc<ClientRegis
                 match response.json::<Vec<NodeCommand>>().await {
                     Ok(commands) => {
                         for command in commands {
-                            execute_and_report_command(&client, &config, &registry, command).await;
+                            execute_and_report_command(
+                                &client, &profile, &config, &registry, command,
+                            )
+                            .await;
                         }
                     }
                     Err(error) => warn!("[ControlPlane] Invalid commands response: {error}"),
@@ -126,6 +134,7 @@ pub async fn run_heartbeat(config: ControlPlaneConfig, registry: Arc<ClientRegis
 
 async fn execute_and_report_command(
     client: &Client,
+    profile: &BrowserProfile,
     config: &ControlPlaneConfig,
     registry: &ClientRegistry,
     command: NodeCommand,
@@ -162,8 +171,8 @@ async fn execute_and_report_command(
         succeeded: result.is_ok(),
         error: result.err(),
     };
-    match client
-        .post(endpoint)
+    match profile
+        .apply_to_reqwest(client.post(endpoint), None, None)
         .header("X-Node-Token", &config.token)
         .json(&report)
         .send()

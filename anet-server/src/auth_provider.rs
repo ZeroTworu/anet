@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use log::{error, info};
@@ -6,6 +7,7 @@ use reqwest::Client as HttpClient;
 use anet_common::dto::{
     BillingType, CheckAccessRequest, CheckAccessResponse,
 };
+use anet_common::http_help::BrowserProfile;
 
 #[derive(Debug, Clone)]
 pub struct AccessGrant {
@@ -40,6 +42,9 @@ pub struct AuthProvider {
 
     /// HTTP клиент для запросов
     http_client: HttpClient,
+
+    /// Единый профиль браузера для HTTP-запросов
+    profile: BrowserProfile,
 }
 
 impl AuthProvider {
@@ -48,10 +53,13 @@ impl AuthProvider {
         auth_servers: Vec<String>,
         auth_token: String,
     ) -> Self {
-        let http_client = HttpClient::builder()
+        let profile = BrowserProfile::random();
+        let http_client = profile
+            .build_reqwest_builder(Arc::new(reqwest::cookie::Jar::default()))
+            .expect("Failed to initialize BoringSSL TLS connector")
             .timeout(Duration::from_secs(3))
             .build()
-            .unwrap();
+            .expect("Failed to build AuthProvider HTTP client");
 
         Self {
             allowed_clients,
@@ -59,6 +67,7 @@ impl AuthProvider {
             auth_token,
             node_id: None,
             http_client,
+            profile,
         }
     }
 
@@ -98,13 +107,12 @@ impl AuthProvider {
         info!("Auth servers: {:?}", self.auth_servers);
         for server_url in &self.auth_servers {
             let url = format!("{}/check_access", server_url);
-            let res = self
-                .http_client
-                .post(&url)
+            let req = self
+                .profile
+                .apply_to_reqwest(self.http_client.post(&url), None, None)
                 .header("X-Auth-Key", &self.auth_token)
-                .json(&req_body)
-                .send()
-                .await;
+                .json(&req_body);
+            let res = req.send().await;
 
             match res {
                 Ok(resp) => match resp.status() {
