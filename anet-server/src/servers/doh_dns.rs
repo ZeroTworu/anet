@@ -12,7 +12,8 @@ use base64::Engine;
 use bytes::Bytes;
 use dashmap::DashMap;
 use log::{debug, info, warn};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -26,6 +27,20 @@ const DOWNLINK_FRAG_DATA_LEN: usize = 460;
 const CODEL_MAX_SOJOURN: Duration = Duration::from_millis(600);
 const MAX_BULK_QUEUE_LEN: usize = 64;
 const MAX_PRIO_QUEUE_LEN: usize = 128;
+const DOWNLINK_ARQ_RTO: Duration = Duration::from_millis(380);
+const DOWNLINK_SACK_FAST_RTO: Duration = Duration::from_millis(120);
+const DOWNLINK_MAX_INFLIGHT: usize = 64;
+const DOWNLINK_MAX_RETRIES: u8 = 5;
+const RECENT_DNS_CACHE_TTL: Duration = Duration::from_secs(8);
+const RECENT_DNS_CACHE_MAX: usize = 256;
+
+#[derive(Clone)]
+struct InflightDownlinkFrame {
+    seq: u32,
+    encoded_b64: String,
+    sent_at: Instant,
+    retries: u8,
+}
 
 struct DohRxState {
     rx_router: mpsc::Receiver<Bytes>,
@@ -33,6 +48,60 @@ struct DohRxState {
     prio_queue: VecDeque<(Bytes, Instant)>,
     bulk_queue: VecDeque<(Bytes, Instant)>,
     next_frag_id: u16,
+    next_dl_seq: u32,
+    highest_cum_ack: u32,
+    highest_sacked_seq: u32,
+    inflight_dl: BTreeMap<u32, InflightDownlinkFrame>,
+    recent_queries: HashMap<u64, (Instant, Option<String>)>,
+    recent_order: VecDeque<u64>,
+}
+
+impl DohRxState {
+    fn process_downlink_ack(&mut self, ack_seq: u32, sack_bitmap: u16) {
+        if ack_seq > self.highest_cum_ack {
+            self.highest_cum_ack = ack_seq;
+        }
+        let cum = self.highest_cum_ack;
+        if cum > 0 {
+            self.inflight_dl.retain(|&seq, _| seq > cum);
+        }
+        for bit in 0..16u32 {
+            if (sack_bitmap & (1u16 << bit)) != 0 {
+                let sacked_seq = ack_seq.wrapping_add(1 + bit);
+                self.inflight_dl.remove(&sacked_seq);
+                if sacked_seq > self.highest_sacked_seq {
+                    self.highest_sacked_seq = sacked_seq;
+                }
+            }
+        }
+    }
+
+    fn check_recent_query(&mut self, qname_hash: u64) -> Option<Option<String>> {
+        let now = Instant::now();
+        if let Some((ts, cached)) = self.recent_queries.get(&qname_hash) {
+            if now.duration_since(*ts) <= RECENT_DNS_CACHE_TTL {
+                return Some(cached.clone());
+            }
+        }
+        None
+    }
+
+    fn record_recent_query(&mut self, qname_hash: u64, resp_b64: Option<String>) {
+        let now = Instant::now();
+        while self.recent_order.len() >= RECENT_DNS_CACHE_MAX {
+            if let Some(old_key) = self.recent_order.pop_front() {
+                self.recent_queries.remove(&old_key);
+            }
+        }
+        self.recent_queries.insert(qname_hash, (now, resp_b64));
+        self.recent_order.push_back(qname_hash);
+    }
+}
+
+fn hash_qname(qname: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    qname.hash(&mut hasher);
+    hasher.finish()
 }
 
 struct DohClientSession {
@@ -54,6 +123,12 @@ fn create_doh_session(
             prio_queue: VecDeque::new(),
             bulk_queue: VecDeque::new(),
             next_frag_id: 1,
+            next_dl_seq: 1,
+            highest_cum_ack: 0,
+            highest_sacked_seq: 0,
+            inflight_dl: BTreeMap::new(),
+            recent_queries: HashMap::new(),
+            recent_order: VecDeque::new(),
         }),
         cipher,
     })
@@ -272,17 +347,65 @@ fn pop_next_packet(state: &mut DohRxState) -> Option<(Bytes, bool)> {
 
 async fn pop_downlink_payload(
     session: &DohClientSession,
-    client_info: &ClientTransportInfo,
+    _client_info: &ClientTransportInfo,
     session_id: u32,
     max_raw_bytes: usize,
     wait_timeout: Duration,
+    qname_hash: Option<u64>,
+    dl_ack: Option<(u32, u16)>,
 ) -> Option<String> {
     let lock_deadline = tokio::time::Instant::now() + Duration::from_millis(200);
     let mut state = tokio::time::timeout_at(lock_deadline, session.rx_state.lock())
         .await
         .ok()?;
 
+    if let Some((ack_seq, sack_bitmap)) = dl_ack {
+        state.process_downlink_ack(ack_seq, sack_bitmap);
+    }
+
+    if let Some(qhash) = qname_hash {
+        if let Some(cached_opt) = state.check_recent_query(qhash) {
+            return cached_opt;
+        }
+    }
+
     drain_channel_into_queues(&mut state);
+
+    // 0. Check DownlinkArqWindow for frames needing fast SACK retransmission or RTO retransmission
+    {
+        let now = Instant::now();
+        let highest_sacked = state.highest_sacked_seq;
+        let mut expired_keys = Vec::new();
+        let mut retransmit_b64 = None;
+
+        for (&seq, frame) in state.inflight_dl.iter_mut() {
+            let elapsed = now.duration_since(frame.sent_at);
+            let fast_nack = seq < highest_sacked && elapsed >= DOWNLINK_SACK_FAST_RTO;
+            let rto_expired = elapsed >= DOWNLINK_ARQ_RTO;
+
+            if fast_nack || rto_expired {
+                if frame.retries >= DOWNLINK_MAX_RETRIES {
+                    expired_keys.push(seq);
+                } else {
+                    frame.sent_at = now;
+                    frame.retries += 1;
+                    retransmit_b64 = Some(frame.encoded_b64.clone());
+                    break;
+                }
+            }
+        }
+
+        for k in expired_keys {
+            state.inflight_dl.remove(&k);
+        }
+
+        if let Some(b64) = retransmit_b64 {
+            if let Some(qhash) = qname_hash {
+                state.record_recent_query(qhash, Some(b64.clone()));
+            }
+            return Some(b64);
+        }
+    }
 
     if state.pending_frags.is_empty()
         && state.prio_queue.is_empty()
@@ -294,6 +417,15 @@ async fn pop_downlink_payload(
         {
             enqueue_classified_packet(&mut state, pkt, Instant::now());
             drain_channel_into_queues(&mut state);
+        }
+    }
+
+    // Evict oldest inflight frame if window is full so new traffic never deadlocks
+    while state.inflight_dl.len() >= DOWNLINK_MAX_INFLIGHT {
+        if let Some(& oldest_seq) = state.inflight_dl.keys().next() {
+            state.inflight_dl.remove(&oldest_seq);
+        } else {
+            break;
         }
     }
 
@@ -368,13 +500,16 @@ async fn pop_downlink_payload(
         }
     }
 
-    drop(state);
-
     if packet_buf.is_empty() {
+        if let Some(qhash) = qname_hash {
+            state.record_recent_query(qhash, None);
+        }
         return None;
     }
 
-    let seq = client_info.sequence.fetch_add(1, Ordering::Relaxed) as u32;
+    let seq = state.next_dl_seq;
+    state.next_dl_seq = state.next_dl_seq.wrapping_add(1);
+
     session
         .cipher
         .apply_keystream(seq, session_id, &mut packet_buf);
@@ -383,7 +518,21 @@ async fn pop_downlink_payload(
     downlink_bytes.extend_from_slice(&seq.to_be_bytes());
     downlink_bytes.extend_from_slice(&packet_buf);
 
-    Some(BASE64_STANDARD.encode(&downlink_bytes))
+    let b64 = BASE64_STANDARD.encode(&downlink_bytes);
+    state.inflight_dl.insert(
+        seq,
+        InflightDownlinkFrame {
+            seq,
+            encoded_b64: b64.clone(),
+            sent_at: Instant::now(),
+            retries: 0,
+        },
+    );
+    if let Some(qhash) = qname_hash {
+        state.record_recent_query(qhash, Some(b64.clone()));
+    }
+
+    Some(b64)
 }
 
 /// Определяет основной внешний IPv4-адрес сервера через таблицу маршрутизации ядра (без отправки пакетов).
@@ -579,7 +728,9 @@ async fn handle_dns_datagram(
         return Ok(());
     }
 
-    // Case 1: Downlink Long-Poll query ("poll.<session_id_hex>.<nonce_hex>")
+    let qhash = hash_qname(&parsed_q.qname);
+
+    // Case 1: Downlink Poll query ("poll.<sid_hex>.<dl_ack_hex>.<dl_sack_hex>.<nonce_hex>" or legacy "poll.<sid_hex>.<nonce_hex>")
     if prefix.starts_with("poll.") {
         let parts: Vec<&str> = prefix.split('.').collect();
         if parts.len() >= 2 {
@@ -590,6 +741,14 @@ async fn handle_dns_datagram(
                     let _ = socket.send_to(&resp, remote_addr).await;
                     return Ok(());
                 }
+            };
+
+            let dl_ack = if parts.len() >= 5 {
+                let ack_seq = u32::from_str_radix(parts[2], 16).unwrap_or(0);
+                let sack_bitmap = u16::from_str_radix(parts[3], 16).unwrap_or(0);
+                Some((ack_seq, sack_bitmap))
+            } else {
+                None
             };
 
             let prefix_bytes = session_id.to_be_bytes();
@@ -615,6 +774,8 @@ async fn handle_dns_datagram(
                     session_id,
                     700,
                     Duration::from_millis(effective_hold_ms),
+                    Some(qhash),
+                    dl_ack,
                 )
                 .await
                 {
@@ -813,8 +974,16 @@ async fn handle_dns_datagram(
         } else {
             Duration::ZERO
         };
-        if let Some(b64) =
-            pop_downlink_payload(&session, &client_info, hdr.session_id, 510, piggyback_wait).await
+        if let Some(b64) = pop_downlink_payload(
+            &session,
+            &client_info,
+            hdr.session_id,
+            510,
+            piggyback_wait,
+            Some(qhash),
+            None,
+        )
+        .await
         {
             let resp = build_dns_txt_response(&raw_query, &parsed_q, Some(b64.as_bytes()), 0);
             let _ = socket.send_to(&resp, remote_addr).await;

@@ -343,21 +343,31 @@ struct PartialDownlinkPacket {
     created_at: Instant,
 }
 
+const REORDER_GAP_TIMEOUT: Duration = Duration::from_millis(420);
+const REORDER_MAX_WINDOW: usize = 64;
+
 struct DohDownlinkState {
     seen_seqs: VecDeque<u32>,
     partials: HashMap<u16, PartialDownlinkPacket>,
+    cum_ack_seq: u32,
+    reorder_buf: std::collections::BTreeMap<u32, (BytesMut, Instant)>,
+    dl_feedback: Arc<AtomicU64>,
 }
 
 impl DohDownlinkState {
-    fn new() -> Self {
+    fn new(dl_feedback: Arc<AtomicU64>) -> Self {
         Self {
             seen_seqs: VecDeque::with_capacity(256),
             partials: HashMap::new(),
+            cum_ack_seq: 0,
+            reorder_buf: std::collections::BTreeMap::new(),
+            dl_feedback,
         }
     }
 
     fn check_and_record_seq(&mut self, seq: u32) -> bool {
-        if self.seen_seqs.contains(&seq) {
+        if seq <= self.cum_ack_seq || self.seen_seqs.contains(&seq) {
+            self.update_feedback_atomic();
             return false;
         }
         if self.seen_seqs.len() >= 256 {
@@ -365,6 +375,96 @@ impl DohDownlinkState {
         }
         self.seen_seqs.push_back(seq);
         true
+    }
+
+    fn update_feedback_atomic(&self) {
+        let mut sack_bitmap = 0u16;
+        for bit in 0..16u32 {
+            let target = self.cum_ack_seq.wrapping_add(1 + bit);
+            if self.reorder_buf.contains_key(&target) || self.seen_seqs.contains(&target) {
+                sack_bitmap |= 1u16 << bit;
+            }
+        }
+        let packed = ((self.cum_ack_seq as u64) << 16) | (sack_bitmap as u64);
+        self.dl_feedback.store(packed, Ordering::Release);
+    }
+
+    fn insert_and_drain_ordered(&mut self, seq: u32, framed_bytes: BytesMut) -> BytesMut {
+        let now = Instant::now();
+        if self.cum_ack_seq == 0 && seq == 1 {
+            self.cum_ack_seq = 1;
+            let mut out = framed_bytes;
+            while let Some((&next_seq, _)) = self.reorder_buf.iter().next() {
+                if next_seq == self.cum_ack_seq + 1 {
+                    let (buf, _) = self.reorder_buf.remove(&next_seq).unwrap();
+                    out.extend_from_slice(&buf);
+                    self.cum_ack_seq = next_seq;
+                } else {
+                    break;
+                }
+            }
+            self.update_feedback_atomic();
+            return out;
+        }
+
+        if seq == self.cum_ack_seq + 1 {
+            self.cum_ack_seq = seq;
+            let mut out = framed_bytes;
+            while let Some((&next_seq, _)) = self.reorder_buf.iter().next() {
+                if next_seq == self.cum_ack_seq + 1 {
+                    let (buf, _) = self.reorder_buf.remove(&next_seq).unwrap();
+                    out.extend_from_slice(&buf);
+                    self.cum_ack_seq = next_seq;
+                } else {
+                    break;
+                }
+            }
+            self.update_feedback_atomic();
+            return out;
+        }
+
+        // Out-of-order frame (seq > cum_ack_seq + 1): store in reorder_buf
+        self.reorder_buf.insert(seq, (framed_bytes, now));
+
+        // If any gap is older than REORDER_GAP_TIMEOUT or buffer exceeds REORDER_MAX_WINDOW, flush past the gap
+        let mut out = BytesMut::new();
+        loop {
+            let should_flush_gap = if self.reorder_buf.len() >= REORDER_MAX_WINDOW {
+                true
+            } else if let Some((_, (_, first_ts))) = self.reorder_buf.iter().next() {
+                now.duration_since(*first_ts) >= REORDER_GAP_TIMEOUT
+            } else {
+                false
+            };
+
+            if !should_flush_gap {
+                break;
+            }
+
+            let Some((&first_seq, _)) = self.reorder_buf.iter().next() else {
+                break;
+            };
+            let (buf, _) = self.reorder_buf.remove(&first_seq).unwrap();
+            out.extend_from_slice(&buf);
+            if first_seq > self.cum_ack_seq {
+                self.cum_ack_seq = first_seq;
+            }
+
+            while let Some((&next_seq, _)) = self.reorder_buf.iter().next() {
+                if next_seq <= self.cum_ack_seq + 1 {
+                    let (nbuf, _) = self.reorder_buf.remove(&next_seq).unwrap();
+                    out.extend_from_slice(&nbuf);
+                    if next_seq > self.cum_ack_seq {
+                        self.cum_ack_seq = next_seq;
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+
+        self.update_feedback_atomic();
+        out
     }
 
     fn feed_fragment(&mut self, pkt_id: u16, frag_idx: u8, total_frags: u8, data: &[u8]) -> Option<Bytes> {
@@ -404,7 +504,7 @@ impl DohDownlinkState {
 }
 
 /// Processes a DNS response body (from either a `poll.` query or a piggybacked Uplink chunk query).
-/// Returns `Ok(true)` if downlink tunnel packet(s) were extracted and written to `tunnel_write`.
+/// Returns `Ok(true)` if downlink tunnel packet(s) were received (including buffered out-of-order frames).
 async fn process_downlink_dns_body(
     body: &[u8],
     cipher: &AstpLiteCipher,
@@ -428,8 +528,7 @@ async fn process_downlink_dns_body(
     let seq = u32::from_be_bytes(raw_payload[0..4].try_into().unwrap());
     let ciphertext = &mut raw_payload[4..];
 
-    let mut out_buf = BytesMut::new();
-    {
+    let ready_to_write = {
         let mut state = dl_state.lock().await;
         if !state.check_and_record_seq(seq) {
             return Ok(false);
@@ -437,6 +536,7 @@ async fn process_downlink_dns_body(
 
         cipher.apply_keystream(seq, session_id, ciphertext);
 
+        let mut frame_buf = BytesMut::new();
         match ciphertext.first().copied() {
             Some(0x00) => {
                 // Batched packets: [0x00, len_be16, pkt1, len_be16, pkt2, ...]
@@ -448,7 +548,7 @@ async fn process_downlink_dns_body(
                     if pos + pkt_len <= ciphertext.len() {
                         let mut pkt_vec = ciphertext[pos..pos + pkt_len].to_vec();
                         clamp_tcp_mss(&mut pkt_vec, DOH_TCP_MAX_MSS);
-                        frame_packet_into(&mut out_buf, &pkt_vec);
+                        frame_packet_into(&mut frame_buf, &pkt_vec);
                         pos += pkt_len;
                     } else {
                         break;
@@ -466,25 +566,26 @@ async fn process_downlink_dns_body(
                     {
                         let mut pkt_vec = full_pkt.to_vec();
                         clamp_tcp_mss(&mut pkt_vec, DOH_TCP_MAX_MSS);
-                        frame_packet_into(&mut out_buf, &pkt_vec);
+                        frame_packet_into(&mut frame_buf, &pkt_vec);
                     }
                 }
             }
             Some(_) => {
                 clamp_tcp_mss(ciphertext, DOH_TCP_MAX_MSS);
-                frame_packet_into(&mut out_buf, ciphertext);
+                frame_packet_into(&mut frame_buf, ciphertext);
             }
             None => {}
         }
-    }
 
-    if !out_buf.is_empty() {
+        state.insert_and_drain_ordered(seq, frame_buf)
+    };
+
+    if !ready_to_write.is_empty() {
         let mut guard = tunnel_write.lock().await;
         guard
-            .write_all(&out_buf)
+            .write_all(&ready_to_write)
             .await
             .context("Tunnel stream closed")?;
-        return Ok(true);
     }
 
     Ok(true)
@@ -895,7 +996,8 @@ impl ClientTransport for DohTransport {
         });
 
         let tunnel_write_mutex = Arc::new(Mutex::new(tunnel_write));
-        let downlink_state = Arc::new(Mutex::new(DohDownlinkState::new()));
+        let dl_feedback = Arc::new(AtomicU64::new(0));
+        let downlink_state = Arc::new(Mutex::new(DohDownlinkState::new(dl_feedback.clone())));
 
         // 1. Uplink Loop: Prioritizes ICMP/DNS/ACKs, coalesces small packets, and processes piggybacked downlink replies
         {
@@ -991,15 +1093,21 @@ impl ClientTransport for DohTransport {
                 let pool = resolver_pool.clone();
                 let tunnel_write = tunnel_write_mutex.clone();
                 let dl_state = downlink_state.clone();
+                let dl_fb = dl_feedback.clone();
 
                 tokio::spawn(async move {
                     debug!("[DoH RX-{}] Long-poll worker initialized", worker_id);
                     let mut backoff_ms = 15;
 
                     loop {
+                        let fb = dl_fb.load(Ordering::Acquire);
+                        let dl_ack_seq = (fb >> 16) as u32;
+                        let dl_sack_mask = (fb & 0xFFFF) as u16;
                         let nonce_hex = format!("{:08x}", rand::random::<u32>());
-                        let qname =
-                            format!("poll.{:08x}.{}.{}", session_id, nonce_hex, domain_zone);
+                        let qname = format!(
+                            "poll.{:08x}.{:x}.{:x}.{}.{}",
+                            session_id, dl_ack_seq, dl_sack_mask, nonce_hex, domain_zone
+                        );
                         let query_bytes = build_doh_query(&qname, rand::random::<u16>());
 
                         match pool
