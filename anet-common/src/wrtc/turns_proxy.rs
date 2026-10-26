@@ -1,3 +1,4 @@
+use crate::boring_tls::build_chrome_ws_ssl_connector;
 use bytes::BytesMut;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -5,60 +6,133 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::mpsc;
-use tokio_boring::SslConnectorExt;
-use crate::boring_tls::build_chrome_ws_ssl_connector;
 
-/// Запускает локальный UDP-проксирующий мост к удалённому серверу TURNS (TLS-over-TCP TURN)
-/// или TCP-over-TURN, позволяющий `webrtc-rs` использовать протокол `turn:127.0.0.1:<port>`
-/// со 100% браузерным TLS-отпечатком (BoringSSL Chrome Mimicry) и устойчивостью к блокировкам.
-pub async fn start_turns_udp_bridge(
-    local_bind_addr: SocketAddr,
-    target_addr_str: String,
+/// Удерживает фоновую задачу локального UDP <-> TURNS (TLS 1.3 TCP:443) моста.
+/// При дропе `TurnsProxyHandle` прокси-задача автоматически останавливается.
+pub struct TurnsProxyHandle {
+    pub local_turn_url: String,
+    pub remote_url: String,
+    pub local_addr: SocketAddr,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl std::fmt::Debug for TurnsProxyHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TurnsProxyHandle")
+            .field("local_turn_url", &self.local_turn_url)
+            .field("remote_url", &self.remote_url)
+            .field("local_addr", &self.local_addr)
+            .finish()
+    }
+}
+
+impl Drop for TurnsProxyHandle {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Поднимает локальный прозрачный мост `UDP (127.0.0.1:0) <-> TURNS (TLS 1.3 TCP:443)` или `TURN-TCP`.
+///
+/// На всех платформах (Android, iOS, Linux, Windows, macOS) `webrtc-rs` общается с этим
+/// мостом по `127.0.0.1` через loopback-сокет в `HybridAsyncUdpSocket` (мимо `tun0`),
+/// а сам мост устанавливает настоящее TLS 1.3 TCP:443 соединение через BoringSSL (Chrome Mimicry) с SNI `host`
+/// (например, `bst-talk-stun7.ktalk.host:443` или `dtl-talk-stun5.ktalk.host:443`)
+/// и инкапсулирует STUN и TURN `ChannelData` по RFC 5766 §11.4 / §11.5.
+pub fn spawn_turns_udp_proxy(
     host: String,
+    port: u16,
     use_tls: bool,
     remote_url: String,
-) -> Result<(), anyhow::Error> {
-    let udp_sock = Arc::new(UdpSocket::bind(local_bind_addr).await?);
-    let client_peer = Arc::new(std::sync::Mutex::new(None::<SocketAddr>));
-    let (pkt_tx, mut pkt_rx) = mpsc::channel::<Vec<u8>>(1024);
+    connect_timeout: Duration,
+    udp_buf_size: usize,
+) -> anyhow::Result<TurnsProxyHandle> {
+    let std_sock = std::net::UdpSocket::bind("127.0.0.1:0")?;
+    std_sock.set_nonblocking(true)?;
+    let sock_ref = socket2::SockRef::from(&std_sock);
+    let buf_sz = udp_buf_size.max(2 * 1024 * 1024);
+    let _ = sock_ref.set_recv_buffer_size(buf_sz);
+    let _ = sock_ref.set_send_buffer_size(buf_sz);
 
-    // Фоновая задача чтения локального UDP от webrtc-rs и пересылки в TCP/TLS
-    let udp_reader_sock = udp_sock.clone();
-    let udp_client_peer = client_peer.clone();
+    let local_addr = std_sock.local_addr()?;
+    let udp_sock = Arc::new(UdpSocket::from_std(std_sock)?);
+    let local_turn_url = format!("turn:{local_addr}");
+
+    log::info!(
+        "[WRTC TURNS Proxy] Bound local UDP bridge {} -> {} (TLS={}, SNI={}:{})",
+        local_turn_url,
+        remote_url,
+        use_tls,
+        host,
+        port
+    );
+
+    let remote_url_log = remote_url.clone();
+    let task = tokio::spawn(async move {
+        run_turns_proxy_loop(
+            udp_sock,
+            host,
+            port,
+            use_tls,
+            remote_url_log,
+            connect_timeout,
+        )
+        .await;
+    });
+
+    Ok(TurnsProxyHandle {
+        local_turn_url,
+        remote_url,
+        local_addr,
+        task,
+    })
+}
+
+async fn run_turns_proxy_loop(
+    udp_sock: Arc<UdpSocket>,
+    host: String,
+    port: u16,
+    use_tls: bool,
+    remote_url: String,
+    connect_timeout: Duration,
+) {
+    let (pkt_tx, mut pkt_rx) = mpsc::channel::<Vec<u8>>(1024);
+    let client_peer: Arc<std::sync::Mutex<Option<SocketAddr>>> =
+        Arc::new(std::sync::Mutex::new(None));
+
+    // Фоновый приёмник UDP-дейтаграмм от локального WebRTC сокета (127.0.0.1)
+    let udp_in = Arc::clone(&udp_sock);
+    let client_peer_in = Arc::clone(&client_peer);
     let udp_reader_task = tokio::spawn(async move {
-        let mut buf = [0u8; 4096];
-        loop {
-            match udp_reader_sock.recv_from(&mut buf).await {
-                Ok((n, src)) => {
-                    *udp_client_peer.lock().unwrap() = Some(src);
-                    if pkt_tx.send(buf[..n].to_vec()).await.is_err() {
-                        break;
-                    }
-                }
-                Err(e) => {
-                    log::warn!("[WRTC TURNS Proxy] UDP recv error: {e}");
-                    break;
-                }
+        let mut buf = vec![0u8; 65536];
+        while let Ok((n, src)) = udp_in.recv_from(&mut buf).await {
+            if n < 4 {
+                continue;
+            }
+            if let Ok(mut g) = client_peer_in.lock() {
+                *g = Some(src);
+            }
+            if pkt_tx.send(buf[..n].to_vec()).await.is_err() {
+                break;
             }
         }
     });
 
-    let connect_timeout = Duration::from_secs(5);
-
-    // Ждём первого исходящего пакета от webrtc-rs (Allocation Request)
-    let first_pkt = match pkt_rx.recv().await {
-        Some(p) => p,
-        None => {
+    let ssl_connector = match build_chrome_ws_ssl_connector() {
+        Ok(b) => b.build(),
+        Err(e) => {
+            log::warn!(
+                "[WRTC TURNS Proxy] Failed to build BoringSSL connector for {remote_url}: {e}"
+            );
             udp_reader_task.abort();
-            return Ok(());
+            return;
         }
     };
 
-    loop {
-        // Подключаем TCP сокет к TURNS-серверу
-        let target_clone = target_addr_str.clone();
-        let connect_res = tokio::time::timeout(connect_timeout, async move {
-            let tcp = TcpStream::connect(&target_clone).await?;
+    while let Some(first_pkt) = pkt_rx.recv().await {
+        let target_addr_str = format!("{host}:{port}");
+        let connect_res = tokio::time::timeout(connect_timeout, async {
+            let tcp = TcpStream::connect(&target_addr_str).await?;
             let _ = tcp.set_nodelay(true);
             let sock_ref = socket2::SockRef::from(&tcp);
             let _ = sock_ref.set_recv_buffer_size(4 * 1024 * 1024);
@@ -70,7 +144,9 @@ pub async fn start_turns_udp_bridge(
         let tcp_stream = match connect_res {
             Ok(Ok(s)) => s,
             Ok(Err(e)) => {
-                log::warn!("[WRTC TURNS Proxy] TCP connect to {remote_url} ({target_addr_str}) failed: {e}");
+                log::warn!(
+                    "[WRTC TURNS Proxy] TCP connect to {remote_url} ({target_addr_str}) failed: {e}"
+                );
                 tokio::time::sleep(Duration::from_millis(300)).await;
                 continue;
             }
@@ -86,17 +162,22 @@ pub async fn start_turns_udp_bridge(
         let remote_peer_ip = tcp_stream.peer_addr().ok();
 
         if use_tls {
-            let ssl_connector = match build_chrome_ws_ssl_connector() {
-                Ok(b) => b.build(),
+            let ssl_cfg = match ssl_connector.configure() {
+                Ok(mut cfg) => {
+                    cfg.set_verify_hostname(false);
+                    cfg
+                }
                 Err(e) => {
-                    log::warn!("[WRTC TURNS Proxy] Failed to build BoringSSL connector: {e}");
+                    log::warn!(
+                        "[WRTC TURNS Proxy] Failed to configure BoringSSL session for {remote_url}: {e}"
+                    );
                     break;
                 }
             };
 
             let tls_res = tokio::time::timeout(
                 connect_timeout,
-                ssl_connector.connect_async(&host, tcp_stream),
+                tokio_boring::connect(ssl_cfg, &host, tcp_stream),
             )
             .await;
 
@@ -151,7 +232,6 @@ pub async fn start_turns_udp_bridge(
     }
 
     udp_reader_task.abort();
-    Ok(())
 }
 
 /// Выполняет полнодуплексный бриджинг STUN / TURN `ChannelData` между потоком TCP/TLS (RFC 5766 §11.4/§11.5)

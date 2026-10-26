@@ -2,7 +2,7 @@ use http::HeaderValue;
 use http::header::{
     ACCEPT_ENCODING, ACCEPT_LANGUAGE, CACHE_CONTROL, ORIGIN, PRAGMA, REFERER, USER_AGENT,
 };
-use rand::{Rng, seq::SliceRandom};
+use rand::seq::SliceRandom;
 use std::net::{IpAddr, SocketAddr};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
@@ -40,6 +40,7 @@ impl BrowserProfile {
 
         #[cfg(target_os = "windows")]
         {
+            use rand::Rng;
             let uas = [
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36",
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36 Edg/153.0.0.0",

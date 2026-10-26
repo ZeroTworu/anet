@@ -15,14 +15,13 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use anet_common::boring_tls::build_chrome_ws_ssl_connector;
+use anet_common::boring_tls::connect_chrome_ws_tls;
 use anet_common::transport_trait::VpnStream;
 use std::collections::HashMap;
-use std::sync::Mutex as StdMutex;
+use std::sync::{LazyLock, Mutex as StdMutex};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
-use tokio_boring::SslConnectorExt;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, frame::coding::CloseCode};
@@ -31,10 +30,13 @@ use tokio_tungstenite::{WebSocketStream, client_async_with_config};
 type ClientSocket = WebSocketStream<Box<dyn VpnStream>>;
 const MAX_WS_MESSAGE_SIZE: usize = 256 * 1024;
 
-lazy_static::lazy_static! {
-    /// Глобальное хранилище Cookie для WebSocket транспорта с разделением по хостам
-    static ref WS_COOKIE_JAR: StdMutex<HashMap<String, HashMap<String, String>>> = StdMutex::new(HashMap::new());
+struct WebSocketAuthChannel {
+    socket: Mutex<ClientSocket>,
 }
+
+/// Глобальное хранилище Cookie для WebSocket транспорта с разделением по хостам
+static WS_COOKIE_JAR: LazyLock<StdMutex<HashMap<String, HashMap<String, String>>>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
 
 #[async_trait]
 impl AuthChannel for WebSocketAuthChannel {
@@ -124,10 +126,8 @@ async fn connect_authenticated(
         .to_ascii_lowercase();
 
     let stream: Box<dyn VpnStream> = if scheme == "wss" || scheme == "https" {
-        let ssl_connector = build_chrome_ws_ssl_connector()?.build();
         let sni_host = server.host.as_deref().unwrap_or(&target_host);
-        let tls_stream = ssl_connector
-            .connect_async(sni_host, tcp_stream)
+        let tls_stream = connect_chrome_ws_tls(sni_host, tcp_stream)
             .await
             .context("BoringSSL TLS handshake failed")?;
         Box::new(tls_stream)

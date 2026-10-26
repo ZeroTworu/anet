@@ -30,9 +30,8 @@ pub struct XmppSession {
     reader_handle: tokio::task::JoinHandle<()>,
 }
 
-use crate::boring_tls::build_chrome_ws_ssl_connector;
+use crate::boring_tls::connect_chrome_ws_tls;
 use crate::transport_trait::VpnStream;
-use tokio_boring::SslConnectorExt;
 
 impl XmppSession {
     pub fn generate_endpoint_id() -> String {
@@ -112,14 +111,12 @@ impl XmppSession {
         let remote_ip = tcp_stream.peer_addr().ok().map(|a| a.ip());
         let _ = tcp_stream.set_nodelay(true);
 
-        let ssl_connector = build_chrome_ws_ssl_connector()?.build();
         let tls_stream = tokio::time::timeout(
             Duration::from_secs(handshake_timeout_secs),
-            ssl_connector.connect_async(domain, tcp_stream),
+            connect_chrome_ws_tls(domain, tcp_stream),
         )
         .await
-        .map_err(|_| anyhow::anyhow!("XMPP BoringSSL TLS handshake with {domain} timed out"))?
-        .map_err(|e| anyhow::anyhow!("XMPP BoringSSL TLS handshake failed: {e}"))?;
+        .map_err(|_| anyhow::anyhow!("XMPP BoringSSL TLS handshake with {domain} timed out"))??;
 
         let stream: Box<dyn VpnStream> = Box::new(tls_stream);
         let (ws_stream, response) = tokio::time::timeout(
