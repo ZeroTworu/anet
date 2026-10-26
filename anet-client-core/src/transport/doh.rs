@@ -886,7 +886,7 @@ impl ResolverPool {
         self.ema_rtt_ms[idx].store(updated, Ordering::Relaxed);
     }
 
-    /// Sends a single attempt to a specific resolver index and validates DNS RCODE == 0.
+    /// Sends a single attempt to a specific resolver index (supporting both `doh://`/`https://` and `udp://`) and validates DNS RCODE == 0.
     async fn send_once_to_resolver(
         &self,
         client: &Client,
@@ -897,8 +897,75 @@ impl ResolverPool {
     ) -> Result<Bytes> {
         self.total_sent[idx].fetch_add(1, Ordering::Relaxed);
         let started = Instant::now();
+
+        if let Some(udp_rest) = resolver_url.strip_prefix("udp://") {
+            let host_port = udp_rest.trim_end_matches('/');
+            let target_str = if host_port.contains(':') {
+                host_port.to_string()
+            } else {
+                format!("{}:53", host_port)
+            };
+
+            let io_fut = async {
+                let mut addrs = tokio::net::lookup_host(&target_str)
+                    .await
+                    .context("UDP resolver DNS lookup failed")?;
+                let remote_addr = addrs
+                    .next()
+                    .context("No socket address resolved for UDP resolver")?;
+                let bind_addr = if remote_addr.is_ipv6() {
+                    "[::]:0"
+                } else {
+                    "0.0.0.0:0"
+                };
+                let sock = tokio::net::UdpSocket::bind(bind_addr).await?;
+                sock.connect(remote_addr).await?;
+                sock.send(query_bytes).await?;
+                let mut rx_buf = vec![0u8; 2048];
+                let n = sock.recv(&mut rx_buf).await?;
+                rx_buf.truncate(n);
+                Ok::<Vec<u8>, anyhow::Error>(rx_buf)
+            };
+
+            match tokio::time::timeout(attempt_timeout, io_fut).await {
+                Ok(Ok(body)) => {
+                    if body.len() >= 12 {
+                        if query_bytes.len() >= 2 && body[0..2] != query_bytes[0..2] {
+                            self.mark_failed(idx);
+                            bail!("UDP resolver {} txid mismatch", resolver_url);
+                        }
+                        let rcode = u16::from_be_bytes([body[2], body[3]]) & 0x000F;
+                        if rcode == 0 {
+                            self.mark_success(idx, started.elapsed().as_millis() as u64);
+                            return Ok(Bytes::from(body));
+                        } else {
+                            self.mark_failed(idx);
+                            bail!("UDP resolver {} DNS RCODE {}", resolver_url, rcode);
+                        }
+                    } else {
+                        self.mark_failed(idx);
+                        bail!("UDP resolver {} short DNS body", resolver_url);
+                    }
+                }
+                Ok(Err(e)) => {
+                    self.mark_failed(idx);
+                    return Err(e);
+                }
+                Err(_) => {
+                    self.mark_failed(idx);
+                    bail!("UDP resolver {} timed out", resolver_url);
+                }
+            }
+        }
+
+        let http_url = if let Some(rest) = resolver_url.strip_prefix("doh://") {
+            format!("https://{}", rest)
+        } else {
+            resolver_url.to_string()
+        };
+
         let req = client
-            .post(resolver_url)
+            .post(&http_url)
             .timeout(attempt_timeout)
             .header("Content-Type", "application/dns-message")
             .header("Accept", "application/dns-message")
@@ -1156,8 +1223,8 @@ impl ClientTransport for DohTransport {
         }
 
         if resolvers.is_empty() {
-            resolvers.push("https://77.88.8.7/dns-query".to_string());
-            resolvers.push("https://dns.adguard-dns.com/dns-query".to_string());
+            resolvers.push("doh://77.88.8.7/dns-query".to_string());
+            resolvers.push("doh://dns.adguard-dns.com/dns-query".to_string());
         }
 
         info!(
@@ -1221,7 +1288,7 @@ impl ClientTransport for DohTransport {
             session_id
         );
 
-        // Collect all DoH resolver IPs into bypass_ips so DoH HTTPS requests never loop back into the TUN interface
+        // Collect all DoH and UDP resolver IPs into bypass_ips so resolver queries never loop back into the TUN interface
         let mut bypass_ips = Vec::new();
         for res_url in &resolvers {
             if let Ok(parsed) = Url::parse(res_url) {
@@ -1231,7 +1298,8 @@ impl ClientTransport for DohTransport {
                             bypass_ips.push(ip);
                         }
                     } else {
-                        let port = parsed.port_or_known_default().unwrap_or(443);
+                        let default_port = if parsed.scheme() == "udp" { 53 } else { 443 };
+                        let port = parsed.port_or_known_default().unwrap_or(default_port);
                         if let Ok(addrs) = tokio::net::lookup_host((host, port)).await {
                             for addr in addrs {
                                 let ip = addr.ip();
