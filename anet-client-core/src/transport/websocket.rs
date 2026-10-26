@@ -15,97 +15,25 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::{DigitallySignedStruct, SignatureScheme};
+use anet_common::boring_tls::build_chrome_ssl_connector;
+use anet_common::transport_trait::VpnStream;
+use std::collections::HashMap;
+use std::sync::Mutex as StdMutex;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
+use tokio_boring::SslConnectorExt;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, frame::coding::CloseCode};
-use tokio_tungstenite::{
-    Connector, MaybeTlsStream, WebSocketStream, client_async_tls_with_config,
-};
+use tokio_tungstenite::{WebSocketStream, client_async_with_config};
 
-type ClientSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
-
+type ClientSocket = WebSocketStream<Box<dyn VpnStream>>;
 const MAX_WS_MESSAGE_SIZE: usize = 256 * 1024;
 
-struct WebSocketAuthChannel {
-    socket: Mutex<ClientSocket>,
-}
-
-#[derive(Debug)]
-struct AcceptAnyServerCert;
-
-impl ServerCertVerifier for AcceptAnyServerCert {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: UnixTime,
-    ) -> std::result::Result<ServerCertVerified, rustls::Error> {
-        Ok(ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
-    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
-    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        vec![
-            SignatureScheme::RSA_PSS_SHA256,
-            SignatureScheme::RSA_PSS_SHA384,
-            SignatureScheme::RSA_PSS_SHA512,
-            SignatureScheme::RSA_PKCS1_SHA256,
-            SignatureScheme::RSA_PKCS1_SHA384,
-            SignatureScheme::RSA_PKCS1_SHA512,
-            SignatureScheme::ECDSA_NISTP256_SHA256,
-            SignatureScheme::ECDSA_NISTP384_SHA384,
-            SignatureScheme::ED25519,
-        ]
-    }
-}
-
-fn wss_connector() -> Result<Connector> {
-    let tls = rustls::ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert))
-        .with_no_client_auth();
-    let mut tls = tls;
-    tls.alpn_protocols = vec![b"http/1.1".to_vec()];
-    Ok(Connector::Rustls(Arc::new(tls)))
-}
-
-fn connector_for(server: &ServerConfig) -> Result<Connector> {
-    let scheme = server
-        .dsn
-        .parse::<http::Uri>()?
-        .scheme_str()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if scheme == "wss" {
-        wss_connector()
-    } else {
-        Ok(Connector::Plain)
-    }
+lazy_static::lazy_static! {
+    /// Глобальное хранилище Cookie для WebSocket транспорта с разделением по хостам
+    static ref WS_COOKIE_JAR: StdMutex<HashMap<String, HashMap<String, String>>> = StdMutex::new(HashMap::new());
 }
 
 #[async_trait]
@@ -154,7 +82,26 @@ async fn connect_authenticated(
     resume_session_id: Option<String>,
 ) -> Result<(ClientSocket, anet_common::protocol::AuthResponse, [u8; 32], Option<IpAddr>)> {
     let url = server.websocket_url()?;
-    let request = profile.build_ws_request(&url, None)?;
+    let mut request = profile.build_ws_request(&url, None)?;
+    let target_host = url.parse::<http::Uri>()?.host().unwrap_or("").to_string();
+
+    // 1. Подставляем сохраненные Cookie для данного хоста
+    {
+        let jar = WS_COOKIE_JAR.lock().unwrap();
+        if let Some(host_cookies) = jar.get(&target_host) {
+            if !host_cookies.is_empty() {
+                let cookie_str = host_cookies
+                    .iter()
+                    .map(|(k, v)| format!("{}={}", k, v))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                if let Ok(val) = http::HeaderValue::from_str(&cookie_str) {
+                    request.headers_mut().insert(http::header::COOKIE, val);
+                }
+            }
+        }
+    }
+
     let ws_config = WebSocketConfig::default()
         .read_buffer_size(128 * 1024)
         .write_buffer_size(128 * 1024)
@@ -166,18 +113,44 @@ async fn connect_authenticated(
     let tcp_stream = TcpStream::connect(&endpoint)
         .await
         .with_context(|| format!("failed to connect to WebSocket endpoint {endpoint}"))?;
-
-    // Запоминаем реальный IP, к которому подключились
     let peer_ip = tcp_stream.peer_addr().ok().map(|sa| sa.ip());
     tcp_stream.set_nodelay(true)?;
 
-    let (socket, _) = client_async_tls_with_config(
-        request,
-        tcp_stream,
-        Some(ws_config),
-        Some(connector_for(server)?),
-    )
-        .await?;
+    let scheme = server
+        .dsn
+        .parse::<http::Uri>()?
+        .scheme_str()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    let stream: Box<dyn VpnStream> = if scheme == "wss" || scheme == "https" {
+        let ssl_connector = build_chrome_ssl_connector()?.build();
+        let sni_host = server.host.as_deref().unwrap_or(&target_host);
+        let tls_stream = ssl_connector
+            .connect_async(sni_host, tcp_stream)
+            .await
+            .context("BoringSSL TLS handshake failed")?;
+        Box::new(tls_stream)
+    } else {
+        Box::new(tcp_stream)
+    };
+
+    let (socket, response) = client_async_with_config(request, stream, Some(ws_config)).await?;
+
+    // 2. Перехватываем Set-Cookie из ответа сервера
+    {
+        let mut jar = WS_COOKIE_JAR.lock().unwrap();
+        let host_cookies = jar.entry(target_host).or_default();
+        for cookie_header in response.headers().get_all(http::header::SET_COOKIE) {
+            if let Ok(cookie_str) = cookie_header.to_str() {
+                if let Some(key_val) = cookie_str.split(';').next() {
+                    if let Some((key, val)) = key_val.split_once('=') {
+                        host_cookies.insert(key.trim().to_string(), val.trim().to_string());
+                    }
+                }
+            }
+        }
+    }
     let channel = WebSocketAuthChannel {
         socket: Mutex::new(socket),
     };
