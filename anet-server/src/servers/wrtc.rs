@@ -1136,7 +1136,7 @@ pub async fn run_wrtc_server(
                                                 }
                                                 info!("[P2P Direct] Sent anet_p2p_answer to client {client_ep}");
 
-                                                if let Some((_, prev_p2p)) =
+                                                if let Some(prev_p2p) =
                                                     p2p_map_c.insert(client_ep.clone(), p2p_arc.clone())
                                                 {
                                                     prev_p2p.close().await;
