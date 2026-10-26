@@ -60,3 +60,8 @@ pub use crypto;
 pub mod client;
 /// The TURN-specific STUN attributes, methods and ChannelData framing.
 pub mod proto;
+
+/// Compile-time marker verifying that the workspace is linked against the patched
+/// `patches/rtc-turn` crate rather than upstream `crates.io` `rtc-turn`.
+pub const ANET_RTC_TURN_PATCHED: bool = true;
+

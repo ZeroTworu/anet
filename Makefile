@@ -2,20 +2,25 @@
 
 
 win-gui:
-	 cargo build --release --target x86_64-pc-windows-gnu --package anet-client-gui
+	cargo update -p rtc-turn
+	cargo build --release --target x86_64-pc-windows-gnu --package anet-client-gui
 win-gui-d:
-	 cargo build --release --target x86_64-pc-windows-gnu --package anet-client-gui --features per-app --features console
+	cargo update -p rtc-turn
+	cargo build --release --target x86_64-pc-windows-gnu --package anet-client-gui --features per-app --features console
 
 # Default target
 all:
+	cargo update -p rtc-turn
 	cargo build --release
 
 # Run all checks (compile check without building)
 check:
+	cargo update -p rtc-turn
 	cargo check --workspace
 
 # Run tests
 test:
+	cargo update -p rtc-turn
 	cargo test --workspace
 
 # Clean build artifacts
@@ -24,10 +29,12 @@ clean:
 
 # Build static Linux binary (musl)
 musl:
+	cargo update -p rtc-turn
 	RUSTFLAGS="-C target-feature=+crt-static" cargo build --release --target x86_64-unknown-linux-musl --package anet-server --package anet-client-cli --package anet-auth
 
 # Build Android libraries (requires cargo-ndk)
 mob:
+	cargo update -p rtc-turn
 	cargo ndk -t x86_64-linux-android -t aarch64-linux-android -t armv7-linux-androideabi -o ./android-build/jniLibs build --release -p anet-mobile
 
 # run infrastructure
@@ -35,6 +42,7 @@ infra:
 	docker-compose -f contrib/docker/docker-compose.infra.yaml up --remove-orphans
 # Build macOS CLI client
 macos:
+	cargo update -p rtc-turn
 	cargo build --release -p anet-client-cli
 	@echo ""
 	@echo "Build complete: target/release/anet-client"
@@ -42,6 +50,7 @@ macos:
 
 # Build macOS GUI client
 macos-gui:
+	cargo update -p rtc-turn
 	cargo build --release -p anet-client-gui
 	@echo ""
 	@echo "Build complete: target/release/anet-gui"
@@ -49,6 +58,7 @@ macos-gui:
 
 # Build both macOS CLI and GUI
 macos-all:
+	cargo update -p rtc-turn
 	cargo build --release -p anet-client-cli -p anet-client-gui
 	@echo ""
 	@echo "Build complete:"
@@ -57,6 +67,7 @@ macos-all:
 
 # Build universal macOS binaries (Intel + Apple Silicon)
 macos-universal:
+	cargo update -p rtc-turn
 	@echo "Building for Apple Silicon (aarch64)..."
 	cargo build --release -p anet-client-cli -p anet-client-gui --target aarch64-apple-darwin
 	@echo "Building for Intel (x86_64)..."

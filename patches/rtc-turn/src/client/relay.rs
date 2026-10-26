@@ -263,9 +263,15 @@ impl Relay<'_> {
                 // block only callers with the same binding until
                 // the binding transaction has been complete
                 // binding state may have been changed while waiting. check again.
-                if bind_st == BindingState::Idle {
+                if bind_st == BindingState::Idle
+                    || (bind_st == BindingState::Request
+                        && now.saturating_duration_since(bind_at) > Duration::from_secs(15))
+                    || (bind_st == BindingState::Failed
+                        && now.saturating_duration_since(bind_at) > Duration::from_secs(5))
+                {
                     if let Some(b) = self.client.binding_mgr.get_by_addr(&bind_addr) {
                         b.set_state(BindingState::Request);
+                        b.set_refreshed_at(now);
                     }
                     self.channel_bind(
                         now,
@@ -297,9 +303,10 @@ impl Relay<'_> {
             }
 
             // binding is ready
-            // check if the binding needs a refresh
+            // check if the binding needs a refresh (refresh proactively at PERM_REFRESH_INTERVAL = 120s
+            // well before the 300s permission and 600s channel lifetimes expire)
             if (bind_st == BindingState::Ready
-                && now.saturating_duration_since(bind_at) > PERM_LIFETIME)
+                && now.saturating_duration_since(bind_at) > PERM_REFRESH_INTERVAL)
                 || (bind_st == BindingState::Refresh
                     && now.saturating_duration_since(bind_at) > Duration::from_secs(15))
             {
@@ -522,18 +529,55 @@ impl Relay<'_> {
     }
 
     pub(super) fn refresh_permissions(&mut self, now: Instant) -> Result<()> {
-        if let Some(relay) = self.client.relays.get_mut(&self.relayed_addr) {
+        let (addrs, nonce, key) = if let Some(relay) = self.client.relays.get_mut(&self.relayed_addr) {
             #[allow(clippy::map_clone)]
             let addrs: Vec<SocketAddr> = relay.perm_map.keys().map(|addr| *addr).collect();
-            if addrs.is_empty() {
-                debug!("no permission to refresh");
-                return Ok(());
-            }
-            let _ = self.create_permissions(now, &addrs, None)?;
-            Ok(())
+            (addrs, relay.nonce.clone(), relay.long_term_integrity_key.clone())
         } else {
-            Err(Error::ErrConnClosed)
+            return Err(Error::ErrConnClosed);
+        };
+
+        if addrs.is_empty() {
+            debug!("no permission to refresh");
+            return Ok(());
         }
+
+        let _ = self.create_permissions(now, &addrs, None)?;
+
+        // Also proactively refresh any established or pending channel bindings alongside
+        // permission refreshes (every 120s), so that even if a secondary TURN socket in the
+        // pool only receives inbound traffic or low-rate traffic, its ChannelBind never expires
+        // at the 600s mark on coturn.
+        let mut binds_to_refresh = Vec::new();
+        for addr in &addrs {
+            if let Some(b) = self.client.binding_mgr.get_by_addr(addr) {
+                let state = b.state();
+                if state == BindingState::Ready
+                    || state == BindingState::Failed
+                    || ((state == BindingState::Refresh || state == BindingState::Request)
+                        && now.duration_since(b.refreshed_at()) > Duration::from_secs(10))
+                {
+                    if state == BindingState::Ready {
+                        b.set_state(BindingState::Refresh);
+                    }
+                    b.set_refreshed_at(now);
+                    binds_to_refresh.push((*addr, b.number));
+                }
+            }
+        }
+
+        for (bind_addr, bind_number) in binds_to_refresh {
+            let _ = self.channel_bind(
+                now,
+                self.relayed_addr,
+                bind_addr,
+                bind_number,
+                nonce.clone(),
+                key.clone(),
+            );
+        }
+
+        Ok(())
     }
 
     fn channel_bind(
@@ -619,13 +663,12 @@ impl Relay<'_> {
                         ));
                     }
                 } else if let Some(b) = self.client.binding_mgr.get_by_addr(&bind_addr) {
+                    // Never delete a channel binding from `binding_mgr` on error:
+                    // if the remote peer or TURN server already knows this channel number
+                    // (e.g. 0x4000), deleting it causes `no binding found for channel`
+                    // on every subsequent inbound ChannelData packet.
                     if b.state() == BindingState::Refresh {
-                        // Never delete an already-established channel on refresh error:
-                        // coturn keeps sending inbound packets on this channel (e.g. 0x4000)
-                        // for 10 minutes, and deleting it causes ErrChannelBindNotFound storms.
                         b.set_state(BindingState::Ready);
-                    } else if Error::ErrUnexpectedResponse != err {
-                        self.client.binding_mgr.delete_by_addr(&bind_addr);
                     } else {
                         b.set_state(BindingState::Failed);
                     }

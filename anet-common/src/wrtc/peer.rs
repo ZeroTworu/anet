@@ -33,6 +33,8 @@ use rtc::rtp_transceiver::rtp_sender::{
     RtpCodecKind,
 };
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
+
+const _: () = assert!(rtc::turn::ANET_RTC_TURN_PATCHED);
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
