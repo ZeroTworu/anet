@@ -41,18 +41,12 @@ pub struct KtalkClient {
     pub profile: BrowserProfile,
 }
 
-impl Default for KtalkClient {
-    fn default() -> Self {
-        Self::new(BrowserProfile::random(), &WrtcConfig::default())
-    }
-}
-
 impl KtalkClient {
-    pub fn new(profile: BrowserProfile, wrtc_cfg: &WrtcConfig) -> Self {
+    pub fn new(profile: BrowserProfile, wrtc_cfg: &WrtcConfig) -> anyhow::Result<Self> {
         let cookie_jar = Arc::new(Jar::default());
         let builder = profile
             .build_reqwest_builder(cookie_jar)
-            .expect("Failed to initialize BoringSSL Chrome TLS connector")
+            .map_err(|e| anyhow::anyhow!("Failed to initialize BoringSSL Chrome TLS connector for WRTC/Ktalk: {e}"))?
             .connect_timeout(std::time::Duration::from_secs(
                 wrtc_cfg.http_connect_timeout_secs,
             ))
@@ -60,12 +54,11 @@ impl KtalkClient {
                 wrtc_cfg.http_request_timeout_secs,
             ));
 
-        Self {
-            http: builder
-                .build()
-                .expect("Failed to build Ktalk HTTP client from BrowserProfile"),
-            profile,
-        }
+        let http = builder
+            .build()
+            .map_err(|e| anyhow::anyhow!("Failed to build Ktalk HTTP client: {e}"))?;
+
+        Ok(Self { http, profile })
     }
 
     /// Generate random 15-char alphanumeric secret.

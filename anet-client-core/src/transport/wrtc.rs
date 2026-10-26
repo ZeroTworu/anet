@@ -102,7 +102,8 @@ impl ClientTransport for WrtcTransport {
             room_name, domain, guest_name
         );
 
-        let ktalk = KtalkClient::new(browser_profile.clone(), &self.config.wrtc);
+        let ktalk = KtalkClient::new(browser_profile.clone(), &self.config.wrtc)
+            .context("Failed to initialize WRTC Ktalk client with BoringSSL TLS")?;
         let anon_secret = KtalkClient::generate_anonymous_secret();
         let auth_res = ktalk
             .authorize_session(&domain, &room_name, Some(&guest_name), &anon_secret)
@@ -568,7 +569,10 @@ impl ClientTransport for WrtcTransport {
                             if peer_xmpp.check_dead_reason().is_some() {
                                 break;
                             }
-                            let ktalk_bg = KtalkClient::new(profile_xmpp.clone(), &wrtc_cfg_xmpp);
+                            let Ok(ktalk_bg) = KtalkClient::new(profile_xmpp.clone(), &wrtc_cfg_xmpp) else {
+                                log::warn!("[WRTC/XMPP] Failed to initialize background Ktalk client");
+                                continue;
+                            };
                             let secret_bg = KtalkClient::generate_anonymous_secret();
                             let guest_bg = generate_random_guest_name();
                             if let Ok(auth_bg) = ktalk_bg

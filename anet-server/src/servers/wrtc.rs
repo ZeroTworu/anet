@@ -81,7 +81,8 @@ pub async fn run_wrtc_server(
         let browser_profile = BrowserProfile::random();
         let guest_name = generate_random_guest_name();
 
-        let ktalk = KtalkClient::new(browser_profile.clone(), &config.wrtc);
+        let ktalk = KtalkClient::new(browser_profile.clone(), &config.wrtc)
+        .context("Failed to initialize WRTC Ktalk client on server with BoringSSL TLS")?;
         let anon_secret = KtalkClient::generate_anonymous_secret();
 
         let auth_res = match ktalk
