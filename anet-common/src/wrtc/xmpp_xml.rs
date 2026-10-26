@@ -299,6 +299,28 @@ pub fn parse_jingle_node(
     let iq_id = iq_node.attribute("id").map(|s| s.to_string());
     let from = iq_node.attribute("from").unwrap_or_default().to_string();
 
+    let reason = jingle_node
+        .children()
+        .find(|n| n.has_tag_name("reason"))
+        .map(|r_node| {
+            let text_opt = r_node
+                .children()
+                .find(|c| c.has_tag_name("text"))
+                .and_then(|t| t.text())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let code_opt = r_node
+                .children()
+                .find(|c| c.is_element() && !c.has_tag_name("text"))
+                .map(|c| c.tag_name().name().to_string());
+            match (code_opt, text_opt) {
+                (Some(code), Some(txt)) => format!("{code}: {txt}"),
+                (Some(code), None) => code,
+                (None, Some(txt)) => txt,
+                (None, None) => "unknown".to_string(),
+            }
+        });
+
     let mut transport_info = JingleTransportInfo::default();
     let mut sources = Vec::new();
     let mut video_sources = Vec::new();
@@ -368,7 +390,7 @@ pub fn parse_jingle_node(
                     if let (Some(ip), Some(port_str)) =
                         (child.attribute("ip"), child.attribute("port"))
                     {
-                        if ip == "127.0.0.1" || ip.starts_with("127.") || ip == "0.0.0.0" {
+                        if !crate::wrtc::jingle::is_valid_jvb_candidate_ip(ip) {
                             continue;
                         }
                         if let Ok(port) = port_str.parse::<u16>() {
@@ -402,7 +424,7 @@ pub fn parse_jingle_node(
         }
     }
 
-    if transport_info.candidates.is_empty() {
+    if transport_info.candidates.is_empty() && action != "session-terminate" {
         transport_info.candidates.push(JingleCandidate {
             ip: fallback_ip.to_string(),
             port: fallback_port,
@@ -419,6 +441,7 @@ pub fn parse_jingle_node(
         sid,
         from,
         action,
+        reason,
         transport: transport_info,
         sources,
         video_sources,

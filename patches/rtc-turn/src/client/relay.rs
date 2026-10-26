@@ -116,6 +116,29 @@ impl Relay<'_> {
         now: Instant,
         peer_addr: SocketAddr,
     ) -> Result<Option<TransactionId>> {
+        let ip = peer_addr.ip();
+        let is_non_routable = match ip {
+            std::net::IpAddr::V4(v4) => {
+                v4.is_loopback()
+                    || v4.is_unspecified()
+                    || v4.is_private()
+                    || v4.is_link_local()
+                    || v4.is_broadcast()
+                    || v4.is_multicast()
+                    || (v4.octets()[0] == 172 && v4.octets()[1] == 112)
+            }
+            std::net::IpAddr::V6(v6) => {
+                v6.is_loopback() || v6.is_unspecified() || v6.is_multicast()
+            }
+        };
+        if is_non_routable {
+            debug!(
+                "skipping TURN CreatePermission for non-public peer address {}",
+                peer_addr
+            );
+            return Ok(None);
+        }
+
         if let Some(relay) = self.client.relays.get_mut(&self.relayed_addr) {
             relay
                 .perm_map

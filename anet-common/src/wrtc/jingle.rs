@@ -26,12 +26,34 @@ fn default_vp8_pt() -> u8 {
     100
 }
 
+pub fn is_valid_jvb_candidate_ip(ip_str: &str) -> bool {
+    let Ok(ip) = ip_str.trim().parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            !v4.is_loopback()
+                && !v4.is_unspecified()
+                && !v4.is_private()
+                && !v4.is_link_local()
+                && !v4.is_broadcast()
+                && !v4.is_multicast()
+                && !(v4.octets()[0] == 172 && v4.octets()[1] == 112)
+        }
+        std::net::IpAddr::V6(v6) => {
+            !v6.is_loopback() && !v6.is_unspecified() && !v6.is_multicast()
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JingleSession {
     pub iq_id: Option<String>,
     pub sid: String,
     pub from: String,
     pub action: String,
+    #[serde(default)]
+    pub reason: Option<String>,
     pub transport: JingleTransportInfo,
     pub sources: Vec<u32>,
     #[serde(default)]
@@ -56,7 +78,7 @@ impl JingleSession {
             .transport
             .candidates
             .iter()
-            .find(|c| c.ip != "127.0.0.1" && !c.ip.starts_with("127.") && c.ip != "0.0.0.0")
+            .find(|c| is_valid_jvb_candidate_ip(&c.ip))
         {
             (first.ip.as_str(), first.port)
         } else {
@@ -79,7 +101,7 @@ impl JingleSession {
 
         let mut candidate_lines = String::new();
         for c in &self.transport.candidates {
-            if c.ip == "127.0.0.1" || c.ip.starts_with("127.") || c.ip == "0.0.0.0" || c.ip.starts_with("172.112.") {
+            if !is_valid_jvb_candidate_ip(&c.ip) {
                 continue;
             }
             let proto_lower = c.protocol.to_lowercase();

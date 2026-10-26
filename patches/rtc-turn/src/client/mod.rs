@@ -38,6 +38,7 @@ use binding::*;
 use transaction::*;
 
 use crate::client::relay::{Relay, RelayState};
+use crate::proto::PROTO_UDP;
 use crate::proto::chandata::*;
 use crate::proto::channum::ChannelNumber;
 use crate::proto::data::*;
@@ -45,7 +46,6 @@ use crate::proto::lifetime::Lifetime;
 use crate::proto::peeraddr::*;
 use crate::proto::relayaddr::RelayedAddress;
 use crate::proto::reqtrans::RequestedTransport;
-use crate::proto::{PROTO_TCP, PROTO_UDP};
 use shared::error::{Error, Result};
 use shared::util::lookup_host;
 use shared::{TransportContext, TransportMessage, TransportProtocol};
@@ -596,11 +596,10 @@ impl Client {
             Box::new(TransactionId::new()),
             Box::new(MessageType::new(METHOD_ALLOCATE, CLASS_REQUEST)),
             Box::new(RequestedTransport {
-                protocol: if self.transport_protocol == TransportProtocol::UDP {
-                    PROTO_UDP
-                } else {
-                    PROTO_TCP
-                },
+                // Always a UDP relay, however the server is reached: REQUESTED-TRANSPORT
+                // names what the allocation relays, not the client-to-server transport
+                // (RFC 8656 §7.1). TCP allocations (RFC 6062) are not implemented here.
+                protocol: PROTO_UDP,
             }),
             Box::new(FINGERPRINT),
         ])?;
@@ -661,11 +660,10 @@ impl Client {
                     Box::new(tid),
                     Box::new(MessageType::new(METHOD_ALLOCATE, CLASS_REQUEST)),
                     Box::new(RequestedTransport {
-                        protocol: if self.transport_protocol == TransportProtocol::UDP {
-                            PROTO_UDP
-                        } else {
-                            PROTO_TCP
-                        },
+                        // Always a UDP relay, however the server is reached: REQUESTED-TRANSPORT
+                        // names what the allocation relays, not the client-to-server transport
+                        // (RFC 8656 §7.1). TCP allocations (RFC 6062) are not implemented here.
+                        protocol: PROTO_UDP,
                     }),
                     Box::new(self.username.clone()),
                     Box::new(self.realm.clone()),

@@ -350,7 +350,13 @@ pub async fn run_wrtc_server(
                     for parsed in anet_common::wrtc::xmpp_xml::parse_xmpp_stanzas(&stanza, fallback_ip, fallback_port) {
                         match parsed {
                             anet_common::wrtc::xmpp_xml::InboundXmpp::Jingle(jingle) => {
-                                if jingle.action == "source-add"
+                                if jingle.action == "session-terminate" {
+                                    info!(
+                                        "[WRTC Server] Jicofo terminated Jingle session {} (reason: {:?}). Rotating server room session...",
+                                        jingle.sid, jingle.reason
+                                    );
+                                    self_removed = true;
+                                } else if jingle.action == "source-add"
                                     || jingle.action == "description-info"
                                     || jingle.action == "session-initiate"
                                 {
@@ -367,6 +373,9 @@ pub async fn run_wrtc_server(
                                     }
                                 }
                             }
+                            anet_common::wrtc::xmpp_xml::InboundXmpp::ExtdiscoServices(fresh_ice) => {
+                                shared_peer.rotate_turn_credentials(&fresh_ice).await;
+                            }
                             anet_common::wrtc::xmpp_xml::InboundXmpp::Presence { from, is_unavailable: true, .. } => {
                                 if let Some(occupant_id) = from.split('/').nth(1) {
                                     if occupant_id == srv_id {
@@ -376,7 +385,9 @@ pub async fn run_wrtc_server(
                                         client_modes.remove(occupant_id);
                                         let removed_video_ep = client_video_endpoints.remove(occupant_id).is_some();
                                         client_v2_endpoints.remove(occupant_id);
-                                        p2p_clients.remove(occupant_id);
+                                        if let Some((_, old_p2p)) = p2p_clients.remove(occupant_id) {
+                                            old_p2p.close().await;
+                                        }
                                         if removed_video_ep {
                                             let video_eps: Vec<String> = client_video_endpoints
                                                 .iter()
@@ -611,6 +622,9 @@ pub async fn run_wrtc_server(
                                                 clients_by_tag.remove(&old_tag);
                                                 client_video_warmed_up.remove(&old_tag);
                                                 clients_map.remove(&ep);
+                                                if let Some((_, old_p2p)) = p2p_clients.remove(&ep) {
+                                                    old_p2p.close().await;
+                                                }
                                             }
 
                                             let client_tag = anet_common::wrtc::colibri::client_tag_from_ip(&assigned_ip);
@@ -1122,7 +1136,11 @@ pub async fn run_wrtc_server(
                                                 }
                                                 info!("[P2P Direct] Sent anet_p2p_answer to client {client_ep}");
 
-                                                p2p_map_c.insert(client_ep.clone(), p2p_arc.clone());
+                                                if let Some((_, prev_p2p)) =
+                                                    p2p_map_c.insert(client_ep.clone(), p2p_arc.clone())
+                                                {
+                                                    prev_p2p.close().await;
+                                                }
 
                                                 // Воркер чтения пакетов из прямого DataChannel клиента в TUN
                                                 let p2p_read = p2p_arc.clone();
@@ -1191,49 +1209,65 @@ pub async fn run_wrtc_server(
                                                                             log::debug!("[P2P Direct] Decrypt error from {client_id_read}: {e}");
                                                                         }
                                                                     }
+                                                            } else {
+                                                                drop(c_info);
+                                                                clients_map_c.remove(&client_id_read);
+                                                                if let Some((_, dead_p2p)) = p2p_map_c.remove(&client_id_read) {
+                                                                    dead_p2p.close().await;
                                                                 }
+                                                                break;
                                                             }
-                                                            current_raw = p2p_read.try_recv_packet();
+                                                        } else {
+                                                            if let Some((_, dead_p2p)) = p2p_map_c.remove(&client_id_read) {
+                                                                dead_p2p.close().await;
+                                                            }
+                                                            break;
                                                         }
+                                                        current_raw = p2p_read.try_recv_packet();
                                                     }
-                                                    log::info!("[P2P Direct] Receiver loop stopped for {client_id_read}");
-                                                });
-                                            }
-                                            Err(e) => {
-                                                warn!("[P2P Direct] Server create_answer error: {e}");
-                                            }
+                                                }
+                                                log::info!("[P2P Direct] Receiver loop stopped for {client_id_read}");
+                                            });
+                                        }
+                                        Err(e) => {
+                                            warn!("[P2P Direct] Server create_answer error: {e}");
                                         }
                                     }
-                                    Err(e) => {
-                                        warn!("[P2P Direct] Invalid remote offer SDP from {client_ep}: {e}");
-                                    }
+                                }
+                                Err(e) => {
+                                    warn!("[P2P Direct] Invalid remote offer SDP from {client_ep}: {e}");
                                 }
                             }
-                            Err(e) => {
-                                warn!("[P2P Direct] Failed to create server P2P channel: {e:#}");
-                            }
                         }
-                    });
-                }
-                _ => {}
+                        Err(e) => {
+                            warn!("[P2P Direct] Failed to create server P2P channel: {e:#}");
+                        }
+                    }
+                });
             }
+            _ => {}
         }
+    }
 
-        video_uplink_task.abort();
-        xmpp.leave_room().await;
-        let _ = shared_peer.close().await;
+    video_uplink_task.abort();
+    let stale_p2ps: Vec<Arc<P2pSession>> = p2p_clients.iter().map(|e| e.value().clone()).collect();
+    for p2p in stale_p2ps {
+        p2p.close().await;
+    }
+    p2p_clients.clear();
+    xmpp.leave_room().await;
+    let _ = shared_peer.close().await;
 
-        for entry in active_clients.iter() {
-            registry.suspend_client(entry.value().clone());
-        }
-        active_clients.clear();
-        clients_by_tag.clear();
-        client_video_warmed_up.clear();
-        p2p_clients.clear();
-        client_modes.clear();
-        client_video_endpoints.clear();
-        client_v2_endpoints.clear();
-        known_client_video_ssrcs.clear();
+    for entry in active_clients.iter() {
+        registry.suspend_client(entry.value().clone());
+    }
+    active_clients.clear();
+    clients_by_tag.clear();
+    client_video_warmed_up.clear();
+    client_modes.clear();
+    client_video_endpoints.clear();
+    client_v2_endpoints.clear();
+    known_client_video_ssrcs.clear();
 
         info!(
             "[WRTC Server] Pausing {}s before re-entering conference room...",

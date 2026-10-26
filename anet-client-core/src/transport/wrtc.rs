@@ -468,8 +468,16 @@ impl ClientTransport for WrtcTransport {
         let peer_xmpp = Arc::clone(&shared_peer);
         let target_srv_xmpp = target_server_id.clone();
         let fb_ip_owned = fallback_ip.to_string();
+        let domain_xmpp = domain.clone();
+        let room_name_xmpp = room_name.clone();
+        let conf_id_xmpp = room_info.conference_id.clone();
+        let profile_xmpp = browser_profile.clone();
+        let wrtc_cfg_xmpp = self.config.wrtc.clone();
         let xmpp_jingle_task = tokio::spawn(async move {
             loop {
+                if peer_xmpp.is_failed.load(Ordering::SeqCst) {
+                    return;
+                }
                 let recv_res = {
                     let mut guard = xmpp_bg.lock().await;
                     tokio::time::timeout(Duration::from_millis(250), guard.recv_stanza()).await
@@ -483,7 +491,19 @@ impl ClientTransport for WrtcTransport {
                         ) {
                             match parsed {
                                 anet_common::wrtc::xmpp_xml::InboundXmpp::Jingle(jingle) => {
-                                    if jingle.action == "source-add"
+                                    if jingle.action == "session-terminate" {
+                                        warn!(
+                                            "[WRTC Client] Jicofo sent session-terminate (sid: {}, reason: {:?}). Triggering reconnect...",
+                                            jingle.sid, jingle.reason
+                                        );
+                                        warn(format!(
+                                            "[WRTC Client] Jingle session terminated ({:?}). Reconnecting...",
+                                            jingle.reason
+                                        ));
+                                        peer_xmpp.failed_notify.notify_waiters();
+                                        peer_xmpp.failed_notify.notify_one();
+                                        return;
+                                    } else if jingle.action == "source-add"
                                         || jingle.action == "description-info"
                                         || jingle.action == "session-initiate"
                                     {
@@ -498,6 +518,11 @@ impl ClientTransport for WrtcTransport {
                                             }
                                         }
                                     }
+                                }
+                                anet_common::wrtc::xmpp_xml::InboundXmpp::ExtdiscoServices(
+                                    fresh_ice,
+                                ) => {
+                                    peer_xmpp.rotate_turn_credentials(&fresh_ice).await;
                                 }
                                 anet_common::wrtc::xmpp_xml::InboundXmpp::Presence {
                                     from,
@@ -523,13 +548,81 @@ impl ClientTransport for WrtcTransport {
                         }
                     }
                     Ok(None) => {
-                        warn!(
-                            "[WRTC Client] XMPP signaling WebSocket closed. Triggering reconnect..."
+                        // Если медиа-туннель (VP8 RTP / Colibri-WS / P2P) уже мёртв — немедленно реконнектим.
+                        if peer_xmpp.check_dead_reason().is_some() {
+                            warn!(
+                                "[WRTC Client] XMPP signaling closed and media peer is dead. Triggering reconnect..."
+                            );
+                            peer_xmpp.failed_notify.notify_waiters();
+                            peer_xmpp.failed_notify.notify_one();
+                            return;
+                        }
+
+                        // Медиа-туннель ЖИВ! Не убиваем рабочий видео-канал из-за часового таймаута nginx на XMPP WS.
+                        // Переподключаем сигнальный XMPP в фоне, чтобы продолжать мониторить присутствие сервера и ротировать TURN-креды.
+                        info!(
+                            "[WRTC Client] XMPP signaling WebSocket closed while media tunnel is healthy. Reconnecting XMPP in background without dropping VPN..."
                         );
-                        warn("[WRTC Client] XMPP signaling closed. Reconnecting...");
-                        peer_xmpp.failed_notify.notify_waiters();
-                        peer_xmpp.failed_notify.notify_one();
-                        return;
+                        let mut reconnected = false;
+                        for attempt in 1..=3 {
+                            if peer_xmpp.check_dead_reason().is_some() {
+                                break;
+                            }
+                            let ktalk_bg = KtalkClient::new(profile_xmpp.clone(), &wrtc_cfg_xmpp);
+                            let secret_bg = KtalkClient::generate_anonymous_secret();
+                            let guest_bg = generate_random_guest_name();
+                            if let Ok(auth_bg) = ktalk_bg
+                                .authorize_session(
+                                    &domain_xmpp,
+                                    &room_name_xmpp,
+                                    Some(&guest_bg),
+                                    &secret_bg,
+                                )
+                                .await
+                            {
+                                if let Ok(new_xmpp) = XmppSession::connect(
+                                    &domain_xmpp,
+                                    &conf_id_xmpp,
+                                    &auth_bg.token,
+                                    Some(&guest_bg),
+                                    &profile_xmpp,
+                                    ping_secs,
+                                    &wrtc_cfg_xmpp,
+                                )
+                                .await
+                                {
+                                    let fresh_ice = new_xmpp.get_ice_servers();
+                                    peer_xmpp.rotate_turn_credentials(&fresh_ice).await;
+                                    let occupants = new_xmpp.get_other_occupants();
+                                    if !occupants.iter().any(|o| o == &target_srv_xmpp) {
+                                        warn!(
+                                            "[WRTC Client] Server occupant {target_srv_xmpp} is no longer in MUC room after XMPP reconnect. Triggering tunnel reconnect..."
+                                        );
+                                        new_xmpp.leave_room().await;
+                                        peer_xmpp.failed_notify.notify_waiters();
+                                        peer_xmpp.failed_notify.notify_one();
+                                        return;
+                                    }
+                                    info!(
+                                        "[WRTC Client] Background XMPP signaling reconnected (attempt {attempt}); server {target_srv_xmpp} is present, media tunnel preserved!"
+                                    );
+                                    let mut guard = xmpp_bg.lock().await;
+                                    *guard = new_xmpp;
+                                    reconnected = true;
+                                    break;
+                                }
+                            }
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        }
+
+                        if !reconnected {
+                            // Если фоновый XMPP не поднялся, оставляем живой медиа-туннель работать под контролем
+                            // внутритуннельного anet_ping/anet_pong и peer_xmpp.check_dead_reason().
+                            info!(
+                                "[WRTC Client] Background XMPP reconnect deferred; keeping active media tunnel alive under data-plane watchdog."
+                            );
+                            return;
+                        }
                     }
                     Err(_) => {
                         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1178,8 +1271,12 @@ impl ClientTransport for WrtcTransport {
         let remote_ip = bypass_ips.first().copied();
         let xmpp_shutdown = Arc::clone(&xmpp_arc);
         let peer_shutdown = Arc::clone(&shared_peer);
+        let p2p_shutdown = Arc::clone(&p2p_session_opt);
         let shutdown_hook: super::ShutdownHook = Box::pin(async move {
             xmpp_jingle_task.abort();
+            if let Some(p2p) = p2p_shutdown.lock().await.take() {
+                p2p.close().await;
+            }
             xmpp_shutdown.lock().await.leave_room().await;
             let _ = peer_shutdown.close().await;
         });

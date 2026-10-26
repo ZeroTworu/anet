@@ -12,7 +12,7 @@
 [package]
 edition = "2024"
 name = "rtc-turn"
-version = "0.21.0"
+version = "0.21.1"
 authors = ["Rain Liu <yliu@webrtc.rs>"]
 build = false
 autolib = false
@@ -54,7 +54,7 @@ path = "src/lib.rs"
 version = "1.12.0"
 
 [dependencies.crypto]
-version = "0.21.0"
+version = "0.21.1"
 default-features = false
 package = "rtc-crypto"
 
@@ -65,13 +65,13 @@ version = "0.4.33"
 version = "1"
 
 [dependencies.shared]
-version = "0.21.0"
+version = "0.21.1"
 features = []
 default-features = false
 package = "rtc-shared"
 
 [dependencies.stun]
-version = "0.21.0"
+version = "0.21.1"
 default-features = false
 package = "rtc-stun"
 

@@ -13,6 +13,9 @@ use stun::textattrs::TextAttribute;
 
 const MAX_RTX_INTERVAL_IN_MS: u64 = 1600;
 const MAX_RTX_COUNT: u16 = 7; // total 7 requests (Rc)
+/// Ti (RFC 8489 §6.2.2): over a reliable transport a request is sent once, and
+/// this is how long the client waits for its answer.
+const RELIABLE_TRANSACTION_TIMEOUT: Duration = Duration::from_millis(39_500);
 
 pub(crate) enum TransactionType {
     BindingRequest,
@@ -62,7 +65,11 @@ impl Transaction {
             transport_protocol: config.transport_protocol,
             n_rtx: 0,
             interval: config.interval,
-            timeout: config.now.add(Duration::from_millis(config.interval)),
+            timeout: if is_reliable(config.transport_protocol) {
+                config.now.add(RELIABLE_TRANSACTION_TIMEOUT)
+            } else {
+                config.now.add(Duration::from_millis(config.interval))
+            },
             transmits: VecDeque::new(),
         }
     }
@@ -77,6 +84,13 @@ impl Transaction {
 
     pub(crate) fn handle_timeout(&mut self, now: Instant) {
         if self.retries() < MAX_RTX_COUNT && self.timeout <= now {
+            if is_reliable(self.transport_protocol) {
+                // One deadline and no retransmission: TCP already retransmits, and
+                // repeating the request over it only sends the server duplicates.
+                // Passing Ti exhausts the transaction, which reports the timeout.
+                self.n_rtx = MAX_RTX_COUNT;
+                return;
+            }
             self.n_rtx += 1;
             self.interval *= 2;
             if self.interval > MAX_RTX_INTERVAL_IN_MS {
@@ -119,6 +133,12 @@ impl Transaction {
     pub(crate) fn retries(&self) -> u16 {
         self.n_rtx
     }
+}
+
+/// Whether the transport delivers reliably on its own, so a request must not be
+/// retransmitted over it. Anything that is not UDP is a stream.
+fn is_reliable(transport_protocol: TransportProtocol) -> bool {
+    transport_protocol != TransportProtocol::UDP
 }
 
 // TransactionMap is a thread-safe transaction map

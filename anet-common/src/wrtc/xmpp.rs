@@ -38,6 +38,7 @@ fn extract_ws_remote_ip(
         tokio_tungstenite::MaybeTlsStream::Rustls(s) => s.get_ref().0,
         _ => return None,
     };
+    let _ = tcp.set_nodelay(true);
     tcp.peer_addr().ok().map(|a| a.ip())
 }
 
