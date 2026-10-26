@@ -30,17 +30,9 @@ pub struct XmppSession {
     reader_handle: tokio::task::JoinHandle<()>,
 }
 
-fn extract_ws_remote_ip(
-    stream: &tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-) -> Option<std::net::IpAddr> {
-    let tcp = match stream {
-        tokio_tungstenite::MaybeTlsStream::Plain(s) => s,
-        tokio_tungstenite::MaybeTlsStream::Rustls(s) => s.get_ref().0,
-        _ => return None,
-    };
-    let _ = tcp.set_nodelay(true);
-    tcp.peer_addr().ok().map(|a| a.ip())
-}
+use crate::boring_tls::build_chrome_ssl_connector;
+use crate::transport_trait::VpnStream;
+use tokio_boring::SslConnectorExt;
 
 impl XmppSession {
     pub fn generate_endpoint_id() -> String {
@@ -111,18 +103,32 @@ impl XmppSession {
         );
 
         let handshake_timeout_secs = wrtc_cfg.xmpp_handshake_timeout_secs.max(1);
-        let (ws_stream, response) = tokio::time::timeout(
+        let tcp_stream = tokio::time::timeout(
             Duration::from_secs(handshake_timeout_secs),
-            tokio_tungstenite::connect_async(request),
+            tokio::net::TcpStream::connect((domain, 443)),
         )
         .await
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "XMPP WebSocket TCP/TLS connect timed out after {}s",
-                handshake_timeout_secs
-            )
-        })??;
-        let remote_ip = extract_ws_remote_ip(ws_stream.get_ref());
+        .map_err(|_| anyhow::anyhow!("XMPP TCP connect to {domain}:443 timed out"))??;
+        let remote_ip = tcp_stream.peer_addr().ok().map(|a| a.ip());
+        let _ = tcp_stream.set_nodelay(true);
+
+        let ssl_connector = build_chrome_ssl_connector()?.build();
+        let tls_stream = tokio::time::timeout(
+            Duration::from_secs(handshake_timeout_secs),
+            ssl_connector.connect_async(domain, tcp_stream),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("XMPP BoringSSL TLS handshake with {domain} timed out"))?
+        .map_err(|e| anyhow::anyhow!("XMPP BoringSSL TLS handshake failed: {e}"))?;
+
+        let stream: Box<dyn VpnStream> = Box::new(tls_stream);
+        let (ws_stream, response) = tokio::time::timeout(
+            Duration::from_secs(handshake_timeout_secs),
+            tokio_tungstenite::client_async_with_config(request, stream, None),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("XMPP WebSocket handshake timed out"))?
+        .map_err(|e| anyhow::anyhow!("XMPP WebSocket handshake failed: {e}"))?;
         log::info!(
             "[XMPP] WebSocket connected (HTTP status: {:?}, remote_ip: {:?})",
             response.status(),

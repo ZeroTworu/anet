@@ -1,197 +1,64 @@
 use bytes::BytesMut;
-use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::{DigitallySignedStruct, SignatureScheme};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::mpsc;
-use tokio_rustls::TlsConnector;
+use tokio_boring::SslConnectorExt;
+use crate::boring_tls::build_chrome_ssl_connector;
 
-#[derive(Debug)]
-struct AcceptTurnsServerCert;
-
-impl ServerCertVerifier for AcceptTurnsServerCert {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: UnixTime,
-    ) -> std::result::Result<ServerCertVerified, rustls::Error> {
-        Ok(ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
-    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
-    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        vec![
-            SignatureScheme::RSA_PSS_SHA256,
-            SignatureScheme::RSA_PSS_SHA384,
-            SignatureScheme::RSA_PSS_SHA512,
-            SignatureScheme::RSA_PKCS1_SHA256,
-            SignatureScheme::RSA_PKCS1_SHA384,
-            SignatureScheme::RSA_PKCS1_SHA512,
-            SignatureScheme::ECDSA_NISTP256_SHA256,
-            SignatureScheme::ECDSA_NISTP384_SHA384,
-            SignatureScheme::ED25519,
-        ]
-    }
-}
-
-fn build_turns_tls_connector() -> anyhow::Result<TlsConnector> {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let tls_cfg = rustls::ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()?
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(AcceptTurnsServerCert))
-        .with_no_client_auth();
-    Ok(TlsConnector::from(Arc::new(tls_cfg)))
-}
-
-/// Удерживает фоновую задачу локального UDP <-> TURNS (TLS 1.3 TCP:443) моста.
-/// При дропе `TurnsProxyHandle` прокси-задача автоматически останавливается.
-pub struct TurnsProxyHandle {
-    pub local_turn_url: String,
-    pub remote_url: String,
-    pub local_addr: SocketAddr,
-    task: tokio::task::JoinHandle<()>,
-}
-
-impl std::fmt::Debug for TurnsProxyHandle {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TurnsProxyHandle")
-            .field("local_turn_url", &self.local_turn_url)
-            .field("remote_url", &self.remote_url)
-            .field("local_addr", &self.local_addr)
-            .finish()
-    }
-}
-
-impl Drop for TurnsProxyHandle {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
-
-/// Поднимает локальный прозрачный мост `UDP (127.0.0.1:0) <-> TURNS (TLS 1.3 TCP:443)` или `TURN-TCP`.
-///
-/// На всех платформах (Android, iOS, Linux, Windows, macOS) `webrtc-rs` общается с этим
-/// мостом по `127.0.0.1` через loopback-сокет в `HybridAsyncUdpSocket` (мимо `tun0`),
-/// а сам мост устанавливает настоящее TLS 1.3 TCP:443 соединение с SNI `host`
-/// (например, `bst-talk-stun7.ktalk.host:443` или `dtl-talk-stun5.ktalk.host:443`)
-/// и инкапсулирует STUN и TURN `ChannelData` по RFC 5766 §11.4 / §11.5.
-pub fn spawn_turns_udp_proxy(
+/// Запускает локальный UDP-проксирующий мост к удалённому серверу TURNS (TLS-over-TCP TURN)
+/// или TCP-over-TURN, позволяющий `webrtc-rs` использовать протокол `turn:127.0.0.1:<port>`
+/// со 100% браузерным TLS-отпечатком (BoringSSL Chrome Mimicry) и устойчивостью к блокировкам.
+pub async fn start_turns_udp_bridge(
+    local_bind_addr: SocketAddr,
+    target_addr_str: String,
     host: String,
-    port: u16,
     use_tls: bool,
     remote_url: String,
-    connect_timeout: Duration,
-    udp_buf_size: usize,
-) -> anyhow::Result<TurnsProxyHandle> {
-    let std_sock = std::net::UdpSocket::bind("127.0.0.1:0")?;
-    std_sock.set_nonblocking(true)?;
-    let sock_ref = socket2::SockRef::from(&std_sock);
-    let buf_sz = udp_buf_size.max(2 * 1024 * 1024);
-    let _ = sock_ref.set_recv_buffer_size(buf_sz);
-    let _ = sock_ref.set_send_buffer_size(buf_sz);
-
-    let local_addr = std_sock.local_addr()?;
-    let udp_sock = Arc::new(UdpSocket::from_std(std_sock)?);
-    let local_turn_url = format!("turn:{local_addr}");
-
-    log::info!(
-        "[WRTC TURNS Proxy] Bound local UDP bridge {} -> {} (TLS={}, SNI={}:{})",
-        local_turn_url,
-        remote_url,
-        use_tls,
-        host,
-        port
-    );
-
-    let remote_url_log = remote_url.clone();
-    let task = tokio::spawn(async move {
-        run_turns_proxy_loop(
-            udp_sock,
-            host,
-            port,
-            use_tls,
-            remote_url_log,
-            connect_timeout,
-        )
-        .await;
-    });
-
-    Ok(TurnsProxyHandle {
-        local_turn_url,
-        remote_url,
-        local_addr,
-        task,
-    })
-}
-
-async fn run_turns_proxy_loop(
-    udp_sock: Arc<UdpSocket>,
-    host: String,
-    port: u16,
-    use_tls: bool,
-    remote_url: String,
-    connect_timeout: Duration,
-) {
+) -> Result<(), anyhow::Error> {
+    let udp_sock = Arc::new(UdpSocket::bind(local_bind_addr).await?);
+    let client_peer = Arc::new(std::sync::Mutex::new(None::<SocketAddr>));
     let (pkt_tx, mut pkt_rx) = mpsc::channel::<Vec<u8>>(1024);
-    let client_peer: Arc<std::sync::Mutex<Option<SocketAddr>>> =
-        Arc::new(std::sync::Mutex::new(None));
 
-    // Фоновый приёмник UDP-дейтаграмм от локального WebRTC сокета (127.0.0.1)
-    let udp_in = Arc::clone(&udp_sock);
-    let client_peer_in = Arc::clone(&client_peer);
+    // Фоновая задача чтения локального UDP от webrtc-rs и пересылки в TCP/TLS
+    let udp_reader_sock = udp_sock.clone();
+    let udp_client_peer = client_peer.clone();
     let udp_reader_task = tokio::spawn(async move {
-        let mut buf = vec![0u8; 65536];
-        while let Ok((n, src)) = udp_in.recv_from(&mut buf).await {
-            if n < 4 {
-                continue;
-            }
-            if let Ok(mut g) = client_peer_in.lock() {
-                *g = Some(src);
-            }
-            if pkt_tx.send(buf[..n].to_vec()).await.is_err() {
-                break;
+        let mut buf = [0u8; 4096];
+        loop {
+            match udp_reader_sock.recv_from(&mut buf).await {
+                Ok((n, src)) => {
+                    *udp_client_peer.lock().unwrap() = Some(src);
+                    if pkt_tx.send(buf[..n].to_vec()).await.is_err() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    log::warn!("[WRTC TURNS Proxy] UDP recv error: {e}");
+                    break;
+                }
             }
         }
     });
 
-    let tls_connector = match build_turns_tls_connector() {
-        Ok(c) => c,
-        Err(e) => {
-            log::warn!("[WRTC TURNS Proxy] Failed to build TLS connector for {remote_url}: {e}");
+    let connect_timeout = Duration::from_secs(5);
+
+    // Ждём первого исходящего пакета от webrtc-rs (Allocation Request)
+    let first_pkt = match pkt_rx.recv().await {
+        Some(p) => p,
+        None => {
             udp_reader_task.abort();
-            return;
+            return Ok(());
         }
     };
 
-    while let Some(first_pkt) = pkt_rx.recv().await {
-        let target_addr_str = format!("{host}:{port}");
-        let connect_res = tokio::time::timeout(connect_timeout, async {
-            let tcp = TcpStream::connect(&target_addr_str).await?;
+    loop {
+        // Подключаем TCP сокет к TURNS-серверу
+        let target_clone = target_addr_str.clone();
+        let connect_res = tokio::time::timeout(connect_timeout, async move {
+            let tcp = TcpStream::connect(&target_clone).await?;
             let _ = tcp.set_nodelay(true);
             let sock_ref = socket2::SockRef::from(&tcp);
             let _ = sock_ref.set_recv_buffer_size(4 * 1024 * 1024);
@@ -219,24 +86,24 @@ async fn run_turns_proxy_loop(
         let remote_peer_ip = tcp_stream.peer_addr().ok();
 
         if use_tls {
-            let server_name = match ServerName::try_from(host.clone()) {
-                Ok(sn) => sn,
+            let ssl_connector = match build_chrome_ssl_connector() {
+                Ok(b) => b.build(),
                 Err(e) => {
-                    log::warn!("[WRTC TURNS Proxy] Invalid SNI host '{host}': {e}");
+                    log::warn!("[WRTC TURNS Proxy] Failed to build BoringSSL connector: {e}");
                     break;
                 }
             };
 
             let tls_res = tokio::time::timeout(
                 connect_timeout,
-                tls_connector.connect(server_name, tcp_stream),
+                ssl_connector.connect_async(&host, tcp_stream),
             )
             .await;
 
             match tls_res {
                 Ok(Ok(tls_stream)) => {
                     log::info!(
-                        "[WRTC TURNS Proxy] Connected TLS 1.3 session to {} (remote_addr={:?})",
+                        "[WRTC TURNS Proxy] Connected TLS 1.3 session to {} (remote_addr={:?}) via BoringSSL",
                         remote_url,
                         remote_peer_ip
                     );
@@ -284,6 +151,7 @@ async fn run_turns_proxy_loop(
     }
 
     udp_reader_task.abort();
+    Ok(())
 }
 
 /// Выполняет полнодуплексный бриджинг STUN / TURN `ChannelData` между потоком TCP/TLS (RFC 5766 §11.4/§11.5)
@@ -326,7 +194,6 @@ async fn bridge_turn_stream<R, W>(
                             }
                             let b0 = read_buf[0];
                             let len_field = u16::from_be_bytes([read_buf[2], read_buf[3]]) as usize;
-
                             let (wire_frame_len, udp_frame_len) = if (b0 & 0xC0) == 0x00 {
                                 // STUN Control Message (20-byte header + len_field body)
                                 let total = 20 + len_field;
