@@ -503,6 +503,168 @@ impl DohDownlinkState {
     }
 }
 
+const UPLINK_ARQ_RTO: Duration = Duration::from_millis(340);
+const UPLINK_NACK_FAST_DELAY: Duration = Duration::from_millis(110);
+const UPLINK_MAX_INFLIGHT_PKTS: usize = 96;
+const UPLINK_MAX_CHUNK_RETRIES: u8 = 4;
+
+struct InflightUplinkPacket {
+    chunks: Vec<Vec<u8>>,
+    acked_mask: u16,
+    last_sent: Vec<Instant>,
+    retries: Vec<u8>,
+}
+
+struct UplinkArqState {
+    enabled: bool,
+    cum_ack: u32,
+    inflight: std::collections::BTreeMap<u32, InflightUplinkPacket>,
+    retransmit_chunks: VecDeque<Vec<u8>>,
+}
+
+impl UplinkArqState {
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            cum_ack: 0,
+            inflight: std::collections::BTreeMap::new(),
+            retransmit_chunks: VecDeque::new(),
+        }
+    }
+
+    fn record_sent_packet(&mut self, seq: u32, chunks: &[Vec<u8>]) {
+        if !self.enabled || chunks.is_empty() || chunks.len() > 16 {
+            return;
+        }
+        while self.inflight.len() >= UPLINK_MAX_INFLIGHT_PKTS {
+            if let Some(&oldest) = self.inflight.keys().next() {
+                self.inflight.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+        let now = Instant::now();
+        let n = chunks.len();
+        self.inflight.insert(
+            seq,
+            InflightUplinkPacket {
+                chunks: chunks.to_vec(),
+                acked_mask: 0,
+                last_sent: vec![now; n],
+                retries: vec![0; n],
+            },
+        );
+    }
+
+    fn process_ack_txt(&mut self, txt_str: &str) {
+        if !self.enabled {
+            return;
+        }
+        // Format: "OK:<ul_cum_ack_hex>[:<pkt_seq_hex>:<recv_mask_hex>...]"
+        let Some(rest) = txt_str.strip_prefix("OK:") else {
+            return;
+        };
+        let parts: Vec<&str> = rest.split(':').collect();
+        if parts.is_empty() {
+            return;
+        }
+        let Ok(cum_ack) = u32::from_str_radix(parts[0], 16) else {
+            return;
+        };
+        if cum_ack > self.cum_ack {
+            self.cum_ack = cum_ack;
+        }
+        let c_ack = self.cum_ack;
+        if c_ack > 0 {
+            self.inflight.retain(|&seq, _| seq > c_ack);
+        }
+
+        let now = Instant::now();
+        let mut idx = 1;
+        while idx + 1 < parts.len() {
+            if let (Ok(pkt_seq), Ok(recv_mask)) = (
+                u32::from_str_radix(parts[idx], 16),
+                u16::from_str_radix(parts[idx + 1], 16),
+            ) {
+                if let Some(entry) = self.inflight.get_mut(&pkt_seq) {
+                    entry.acked_mask |= recv_mask;
+                    let total = entry.chunks.len();
+                    let full_mask = if total >= 16 {
+                        0xFFFF
+                    } else {
+                        (1u16 << total) - 1
+                    };
+                    if (entry.acked_mask & full_mask) == full_mask {
+                        self.inflight.remove(&pkt_seq);
+                    } else {
+                        for c_idx in 0..total {
+                            if (entry.acked_mask & (1u16 << c_idx)) == 0
+                                && now.duration_since(entry.last_sent[c_idx])
+                                    >= UPLINK_NACK_FAST_DELAY
+                                && entry.retries[c_idx] < UPLINK_MAX_CHUNK_RETRIES
+                            {
+                                entry.last_sent[c_idx] = now;
+                                entry.retries[c_idx] += 1;
+                                if self.retransmit_chunks.len() < 128 {
+                                    self.retransmit_chunks
+                                        .push_back(entry.chunks[c_idx].clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            idx += 2;
+        }
+    }
+
+    fn collect_rto_retransmits(&mut self) -> Vec<Vec<u8>> {
+        if !self.enabled {
+            return Vec::new();
+        }
+        let now = Instant::now();
+        let mut expired_pkts = Vec::new();
+
+        for (&seq, entry) in self.inflight.iter_mut() {
+            let total = entry.chunks.len();
+            let mut all_dead = true;
+            for c_idx in 0..total {
+                if (entry.acked_mask & (1u16 << c_idx)) != 0 {
+                    continue;
+                }
+                if entry.retries[c_idx] >= UPLINK_MAX_CHUNK_RETRIES {
+                    continue;
+                }
+                all_dead = false;
+                if now.duration_since(entry.last_sent[c_idx]) >= UPLINK_ARQ_RTO {
+                    entry.last_sent[c_idx] = now;
+                    entry.retries[c_idx] += 1;
+                    if self.retransmit_chunks.len() < 128 {
+                        self.retransmit_chunks
+                            .push_back(entry.chunks[c_idx].clone());
+                    }
+                }
+            }
+            if all_dead {
+                expired_pkts.push(seq);
+            }
+        }
+
+        for seq in expired_pkts {
+            self.inflight.remove(&seq);
+        }
+
+        let mut out = Vec::with_capacity(self.retransmit_chunks.len().min(16));
+        while out.len() < 16 {
+            let Some(chunk) = self.retransmit_chunks.pop_front() else {
+                break;
+            };
+            out.push(chunk);
+        }
+        out
+    }
+}
+
 /// Processes a DNS response body (from either a `poll.` query or a piggybacked Uplink chunk query).
 /// Returns `Ok(true)` if downlink tunnel packet(s) were received (including buffered out-of-order frames).
 async fn process_downlink_dns_body(
@@ -510,12 +672,19 @@ async fn process_downlink_dns_body(
     cipher: &AstpLiteCipher,
     session_id: u32,
     dl_state: &Mutex<DohDownlinkState>,
+    ul_arq: &std::sync::Mutex<UplinkArqState>,
     tunnel_write: &Mutex<WriteHalf<tokio::io::DuplexStream>>,
 ) -> Result<bool> {
     let Some(txt_data) = parse_dns_txt_response(body) else {
         return Ok(false);
     };
     if txt_data.is_empty() || txt_data == b"OK" || txt_data == b"ACK" {
+        return Ok(false);
+    }
+    if txt_data.starts_with(b"OK:") {
+        if let Ok(txt_str) = std::str::from_utf8(&txt_data) {
+            ul_arq.lock().unwrap().process_ack_txt(txt_str);
+        }
         return Ok(false);
     }
     let Ok(mut raw_payload) = BASE64_STANDARD.decode(&txt_data) else {
@@ -998,8 +1167,9 @@ impl ClientTransport for DohTransport {
         let tunnel_write_mutex = Arc::new(Mutex::new(tunnel_write));
         let dl_feedback = Arc::new(AtomicU64::new(0));
         let downlink_state = Arc::new(Mutex::new(DohDownlinkState::new(dl_feedback.clone())));
+        let uplink_arq = Arc::new(std::sync::Mutex::new(UplinkArqState::new(arq_enabled)));
 
-        // 1. Uplink Loop: Prioritizes ICMP/DNS/ACKs, coalesces small packets, and processes piggybacked downlink replies
+        // 1. Uplink Loop: Prioritizes ICMP/DNS/ACKs, coalesces small packets, records ARQ state, and processes piggybacked replies
         {
             let http_client = tx_http_client.clone();
             let cipher = cipher.clone();
@@ -1008,9 +1178,61 @@ impl ClientTransport for DohTransport {
             let pool = resolver_pool.clone();
             let uplink_q = uplink_queue.clone();
             let dl_state = downlink_state.clone();
+            let ul_arq = uplink_arq.clone();
             let tunnel_write = tunnel_write_mutex.clone();
             let tx_sem = Arc::new(Semaphore::new(28));
             let prio_sem = Arc::new(Semaphore::new(8));
+
+            // Background Uplink ARQ / NACK retransmission worker (runs every 110ms)
+            if arq_enabled {
+                let rto_client = http_client.clone();
+                let rto_cipher = cipher.clone();
+                let rto_zone = domain_zone.clone();
+                let rto_pool = pool.clone();
+                let rto_dl = dl_state.clone();
+                let rto_ul = ul_arq.clone();
+                let rto_tw = tunnel_write.clone();
+                let rto_sem = prio_sem.clone();
+
+                tokio::spawn(async move {
+                    loop {
+                        tokio::time::sleep(Duration::from_millis(110)).await;
+                        let retransmits = rto_ul.lock().unwrap().collect_rto_retransmits();
+                        for chunk in retransmits {
+                            let b32_str = base32::encode(&chunk);
+                            let labels = base32::split_into_labels(&b32_str, 63);
+                            let qname = format!("{}.{}", labels, rto_zone);
+                            let query_bytes = build_doh_query(&qname, rand::random::<u16>());
+
+                            let c = rto_client.clone();
+                            let p = rto_pool.clone();
+                            let cip = rto_cipher.clone();
+                            let dl = rto_dl.clone();
+                            let ul = rto_ul.clone();
+                            let tw = rto_tw.clone();
+                            let sem = rto_sem.clone();
+
+                            tokio::spawn(async move {
+                                let _permit = sem.try_acquire_owned().ok();
+                                if let Ok(body) = p
+                                    .send_query_reliable(&c, &query_bytes, Duration::from_millis(600))
+                                    .await
+                                {
+                                    let _ = process_downlink_dns_body(
+                                        &body,
+                                        &cip,
+                                        session_id,
+                                        &dl,
+                                        &ul,
+                                        &tw,
+                                    )
+                                    .await;
+                                }
+                            });
+                        }
+                    }
+                });
+            }
 
             tokio::spawn(async move {
                 info!("[DoH TX] Uplink dispatcher loop active");
@@ -1019,6 +1241,8 @@ impl ClientTransport for DohTransport {
                     cipher.apply_keystream(seq, session_id, &mut packet_buf);
 
                     let chunks = split_into_chunks(session_id, seq, &packet_buf, max_payload);
+                    ul_arq.lock().unwrap().record_sent_packet(seq, &chunks);
+
                     for chunk in chunks {
                         let b32_str = base32::encode(&chunk);
                         let labels = base32::split_into_labels(&b32_str, 63);
@@ -1029,6 +1253,7 @@ impl ClientTransport for DohTransport {
                         let pool_clone = pool.clone();
                         let cipher_c = cipher.clone();
                         let dl_state_c = dl_state.clone();
+                        let ul_arq_c = ul_arq.clone();
                         let tunnel_write_c = tunnel_write.clone();
 
                         // Priority packets (ICMP probes, pings, DNS, TCP SYN/ACK) can grab from `prio_sem` immediately
@@ -1064,6 +1289,7 @@ impl ClientTransport for DohTransport {
                                         &cipher_c,
                                         session_id,
                                         &dl_state_c,
+                                        &ul_arq_c,
                                         &tunnel_write_c,
                                     )
                                     .await;
@@ -1093,6 +1319,7 @@ impl ClientTransport for DohTransport {
                 let pool = resolver_pool.clone();
                 let tunnel_write = tunnel_write_mutex.clone();
                 let dl_state = downlink_state.clone();
+                let ul_arq = uplink_arq.clone();
                 let dl_fb = dl_feedback.clone();
 
                 tokio::spawn(async move {
@@ -1125,6 +1352,7 @@ impl ClientTransport for DohTransport {
                                     &cipher,
                                     session_id,
                                     &dl_state,
+                                    &ul_arq,
                                     &tunnel_write,
                                 )
                                 .await

@@ -922,9 +922,11 @@ async fn handle_dns_datagram(
             .value()
             .clone();
 
-        let assembled_opt = {
+        let (assembled_opt, (ul_cum_ack, ul_nacks)) = {
             let mut reasm = reassembler.lock().await;
-            reasm.feed(&chunk_raw)?
+            let res = reasm.feed(&chunk_raw)?;
+            let fb = reasm.get_session_feedback(hdr.session_id);
+            (res, fb)
         };
 
         let mut completed_uplink = false;
@@ -990,7 +992,14 @@ async fn handle_dns_datagram(
             return Ok(());
         }
 
-        let resp = build_dns_txt_response(&raw_query, &parsed_q, Some(b"OK"), 0);
+        // Encode Uplink ARQ cumulative ACK + selective chunk NACK mask in the TXT ACK response:
+        // Format: "OK:<ul_cum_ack_hex>[:<pkt_seq_hex>:<recv_mask_hex>]"
+        let mut ack_txt = format!("OK:{:x}", ul_cum_ack);
+        for (nseq, nmask) in ul_nacks {
+            ack_txt.push_str(&format!(":{:x}:{:x}", nseq, nmask));
+        }
+
+        let resp = build_dns_txt_response(&raw_query, &parsed_q, Some(ack_txt.as_bytes()), 0);
         let _ = socket.send_to(&resp, remote_addr).await;
         return Ok(());
     }

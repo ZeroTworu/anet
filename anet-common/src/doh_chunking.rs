@@ -105,6 +105,7 @@ struct PartialPacket {
 pub struct DohReassemblyQueue {
     packets: HashMap<(u32, u32), PartialPacket>,
     completed: HashMap<(u32, u32), Instant>,
+    highest_contiguous: HashMap<u32, u32>,
     timeout: Duration,
 }
 
@@ -113,7 +114,36 @@ impl DohReassemblyQueue {
         Self {
             packets: HashMap::new(),
             completed: HashMap::new(),
+            highest_contiguous: HashMap::new(),
             timeout,
+        }
+    }
+
+    fn advance_contiguous(&mut self, session_id: u32) {
+        let now = Instant::now();
+        let cur = self.highest_contiguous.entry(session_id).or_insert(0);
+        loop {
+            let next = cur.wrapping_add(1);
+            if self.completed.contains_key(&(session_id, next)) {
+                *cur = next;
+                continue;
+            }
+            // If next is in packets and still fresh (< 550ms), wait for its missing chunks
+            if let Some(partial) = self.packets.get(&(session_id, next)) {
+                if now.duration_since(partial.created_at) < Duration::from_millis(550) {
+                    break;
+                }
+            }
+            // Check if any higher sequence is already completed while `next` is missing/stale (> 550ms)
+            let has_higher_completed = self
+                .completed
+                .iter()
+                .any(|(&(sid, seq), ts)| sid == session_id && seq > next && now.duration_since(*ts) < Duration::from_secs(3));
+            if has_higher_completed && !self.packets.contains_key(&(session_id, next)) {
+                *cur = next;
+                continue;
+            }
+            break;
         }
     }
 
@@ -125,6 +155,7 @@ impl DohReassemblyQueue {
 
         // Ignore duplicate chunks for packets that were already reassembled recently
         if self.completed.contains_key(&key) {
+            self.advance_contiguous(header.session_id);
             return Ok(None);
         }
 
@@ -146,6 +177,7 @@ impl DohReassemblyQueue {
         if entry.received_count == entry.total_chunks {
             let completed = self.packets.remove(&key).unwrap();
             self.completed.insert(key, Instant::now());
+            self.advance_contiguous(header.session_id);
             let mut assembled = BytesMut::new();
             for chunk_opt in completed.chunks {
                 if let Some(c) = chunk_opt {
@@ -155,7 +187,33 @@ impl DohReassemblyQueue {
             return Ok(Some((header.session_id, header.sequence, assembled.freeze())));
         }
 
+        self.advance_contiguous(header.session_id);
         Ok(None)
+    }
+
+    /// Returns `(cum_ack_seq, partial_nacks)` for a session, where each entry in `partial_nacks`
+    /// is `(pkt_seq, received_chunk_bitmask_u16)` for up to 2 incomplete multi-chunk packets.
+    pub fn get_session_feedback(&mut self, session_id: u32) -> (u32, Vec<(u32, u16)>) {
+        self.advance_contiguous(session_id);
+        let cum_ack = self.highest_contiguous.get(&session_id).copied().unwrap_or(0);
+        let mut nacks = Vec::new();
+
+        for (&(sid, seq), partial) in &self.packets {
+            if sid == session_id && seq > cum_ack {
+                let mut mask = 0u16;
+                for (i, c) in partial.chunks.iter().enumerate().take(16) {
+                    if c.is_some() {
+                        mask |= 1u16 << i;
+                    }
+                }
+                nacks.push((seq, mask));
+                if nacks.len() >= 2 {
+                    break;
+                }
+            }
+        }
+
+        (cum_ack, nacks)
     }
 
     /// Garbage-collects incomplete packets and completed deduplication entries older than the configured timeout.
