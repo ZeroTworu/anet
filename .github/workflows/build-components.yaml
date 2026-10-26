@@ -1005,6 +1005,7 @@ jobs:
           target: "/opt/anet/download"
           strip_components: 1
           overwrite: true
+          debug: true
 
       - name: "Set permissions for Nginx"
         uses: "appleboy/ssh-action@v1.0.3"
