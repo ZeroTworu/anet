@@ -126,8 +126,10 @@ async fn connect_authenticated(
         .to_ascii_lowercase();
 
     let stream: Box<dyn VpnStream> = if scheme == "wss" || scheme == "https" {
-        let sni_host = server.host.as_deref().unwrap_or(&target_host);
-        let tls_stream = connect_chrome_ws_tls(sni_host, tcp_stream)
+        // Нахуя оно ваще тут вычислялось?
+        // let sni_host = server.host.as_deref().unwrap_or(&target_host);
+        info!("[WS] CONNECTING TO: {}, HOST: {}", endpoint, &target_host);
+        let tls_stream = connect_chrome_ws_tls(&target_host, tcp_stream)
             .await
             .context("BoringSSL TLS handshake failed")?;
         Box::new(tls_stream)
