@@ -2172,7 +2172,7 @@ impl WrtcPeer {
         let new_cfg = RTCConfigurationBuilder::new()
             .with_ice_servers(updated_servers)
             .build();
-        if let Err(e) = pc.update_configuration(new_cfg).await {
+        if let Err(e) = pc.set_configuration(new_cfg).await {
             log::debug!("[WRTC Media] TURN credential rotation warning: {e}");
         } else {
             log::info!(
