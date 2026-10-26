@@ -36,9 +36,9 @@ tokio-tungstenite = { version = "0.28.0", default-features = false, features = [
 http = "1.3.1"
 windows-sys = { version = "0.59" }
 dashmap = { version = "7.0.0-rc2" }
-boring = "4.4"
-tokio-boring = "4.4"
-reqwest = { version = "0.12.28", default-features = false, features = ["json", "boring-tls", "http2", "cookies"] }
+boring = "4.22"
+tokio-boring = "4.22"
+reqwest = { package = "reqwest-boring", version = "0.13.5", default-features = false, features = ["json", "boring", "http2", "cookies"] }
 webrtc = "0.21.0"
 rtc = "0.21.0"
 roxmltree = "0.20"

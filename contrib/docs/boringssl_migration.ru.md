@@ -22,11 +22,11 @@
 В корневом `Cargo.toml` (секция `[workspace.dependencies]`):
 ```toml
 # Биндинги к BoringSSL от Google для точного соответствия TLS-отпечатку Chromium
-boring = "4.4"
-tokio-boring = "4.4"
+boring = "4.22"
+tokio-boring = "4.22"
 
-# Переключаем reqwest на boring-tls, отключаем rustls, добавляем поддержку cookies
-reqwest = { version = "0.12.28", default-features = false, features = ["json", "boring-tls", "http2", "cookies"] }
+# Переключаем reqwest на reqwest-boring с нативной поддержкой BoringSSL (фича "boring")
+reqwest = { package = "reqwest-boring", version = "0.13.5", default-features = false, features = ["json", "boring", "http2", "cookies"] }
 
 # Отключаем rustls в tokio-tungstenite (оставляем только базовые фичи connect и handshake)
 tokio-tungstenite = { version = "0.28.0", default-features = false, features = ["connect", "handshake"] }
