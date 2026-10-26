@@ -674,6 +674,7 @@ async fn process_downlink_dns_body(
     dl_state: &Mutex<DohDownlinkState>,
     ul_arq: &std::sync::Mutex<UplinkArqState>,
     tunnel_write: &Mutex<WriteHalf<tokio::io::DuplexStream>>,
+    poll_burst_notify: &Notify,
 ) -> Result<bool> {
     let Some(txt_data) = parse_dns_txt_response(body) else {
         return Ok(false);
@@ -694,13 +695,19 @@ async fn process_downlink_dns_body(
         return Ok(false);
     }
 
-    let seq = u32::from_be_bytes(raw_payload[0..4].try_into().unwrap());
+    let wire_seq = u32::from_be_bytes(raw_payload[0..4].try_into().unwrap());
+    let more_data_pending = (wire_seq & 0x8000_0000) != 0;
+    let seq = wire_seq & 0x7FFF_FFFF;
     let ciphertext = &mut raw_payload[4..];
+
+    if more_data_pending {
+        poll_burst_notify.notify_waiters();
+    }
 
     let ready_to_write = {
         let mut state = dl_state.lock().await;
         if !state.check_and_record_seq(seq) {
-            return Ok(false);
+            return Ok(more_data_pending);
         }
 
         cipher.apply_keystream(seq, session_id, ciphertext);
@@ -763,15 +770,25 @@ async fn process_downlink_dns_body(
 struct ResolverPool {
     urls: Vec<String>,
     cooldown_until_ms: Vec<AtomicU64>,
+    ema_rtt_ms: Vec<AtomicU64>,
+    total_sent: Vec<AtomicU64>,
+    total_failed: Vec<AtomicU64>,
     cursor: AtomicUsize,
 }
 
 impl ResolverPool {
     fn new(urls: Vec<String>) -> Self {
-        let cooldown_until_ms = urls.iter().map(|_| AtomicU64::new(0)).collect();
+        let n = urls.len();
+        let cooldown_until_ms = (0..n).map(|_| AtomicU64::new(0)).collect();
+        let ema_rtt_ms = (0..n).map(|_| AtomicU64::new(120)).collect();
+        let total_sent = (0..n).map(|_| AtomicU64::new(0)).collect();
+        let total_failed = (0..n).map(|_| AtomicU64::new(0)).collect();
         Self {
             urls,
             cooldown_until_ms,
+            ema_rtt_ms,
+            total_sent,
+            total_failed,
             cursor: AtomicUsize::new(0),
         }
     }
@@ -780,72 +797,93 @@ impl ResolverPool {
         self.urls.len()
     }
 
-    /// Selects the next healthy resolver (skipping resolvers currently in cooldown).
+    /// Computes a composite Least-Loss / Least-Latency score (`ema_rtt_ms * (1 + 8 * loss_rate)`).
+    fn resolver_score(&self, idx: usize) -> u64 {
+        let sent = self.total_sent[idx].load(Ordering::Relaxed).max(1);
+        let failed = self.total_failed[idx].load(Ordering::Relaxed).min(sent);
+        let rtt = self.ema_rtt_ms[idx].load(Ordering::Relaxed).clamp(10, 2000);
+        let loss_permille = (failed * 1000) / sent;
+        (rtt * (1000 + loss_permille * 8)) / 1000
+    }
+
+    /// Selects the next healthy resolver using BalancingLeastLoss with round-robin tie-breaking.
     fn next_healthy(&self) -> (usize, &str) {
         let n = self.urls.len();
         let now = now_epoch_ms();
         let start = self.cursor.fetch_add(1, Ordering::Relaxed);
 
+        let mut best_idx = None;
+        let mut best_score = u64::MAX;
+
         for offset in 0..n {
             let idx = (start + offset) % n;
             let until = self.cooldown_until_ms[idx].load(Ordering::Relaxed);
             if now >= until {
-                return (idx, &self.urls[idx]);
+                let score = self.resolver_score(idx);
+                // Allow a 25ms band for round-robin rotation among similarly performing resolvers
+                if best_idx.is_none() || score + 25 < best_score {
+                    best_score = score;
+                    best_idx = Some(idx);
+                }
             }
         }
 
+        if let Some(idx) = best_idx {
+            return (idx, &self.urls[idx]);
+        }
+
         // All resolvers are in cooldown: pick the one whose cooldown expires soonest
-        let mut best_idx = start % n;
+        let mut fallback_idx = start % n;
         let mut best_until = u64::MAX;
         for idx in 0..n {
             let until = self.cooldown_until_ms[idx].load(Ordering::Relaxed);
             if until < best_until {
                 best_until = until;
-                best_idx = idx;
+                fallback_idx = idx;
             }
         }
-        (best_idx, &self.urls[best_idx])
+        (fallback_idx, &self.urls[fallback_idx])
     }
 
-    /// Selects up to `count` distinct healthy resolvers for parallel packet duplication (hedging).
+    /// Selects up to `count` distinct healthy resolvers ordered by BalancingLeastLoss score.
     fn select_distinct_healthy(&self, count: usize) -> Vec<(usize, String)> {
         let n = self.urls.len();
         let target = count.clamp(1, n.max(1));
-        let mut selected = Vec::with_capacity(target);
         let now = now_epoch_ms();
         let start = self.cursor.fetch_add(1, Ordering::Relaxed);
 
-        for offset in 0..n {
-            if selected.len() >= target {
-                break;
-            }
-            let idx = (start + offset) % n;
-            let until = self.cooldown_until_ms[idx].load(Ordering::Relaxed);
-            if now >= until {
-                selected.push((idx, self.urls[idx].clone()));
-            }
-        }
+        let mut candidates: Vec<(usize, bool, u64)> = (0..n)
+            .map(|offset| {
+                let idx = (start + offset) % n;
+                let healthy = now >= self.cooldown_until_ms[idx].load(Ordering::Relaxed);
+                let score = self.resolver_score(idx);
+                (idx, healthy, score)
+            })
+            .collect();
 
-        for offset in 0..n {
-            if selected.len() >= target {
-                break;
-            }
-            let idx = (start + offset) % n;
-            if !selected.iter().any(|(i, _)| *i == idx) {
-                selected.push((idx, self.urls[idx].clone()));
-            }
-        }
+        candidates.sort_by(|a, b| {
+            b.1.cmp(&a.1)
+                .then_with(|| (a.2 / 25).cmp(&(b.2 / 25)))
+        });
 
-        selected
+        candidates
+            .into_iter()
+            .take(target)
+            .map(|(idx, _, _)| (idx, self.urls[idx].clone()))
+            .collect()
     }
 
     fn mark_failed(&self, idx: usize) {
+        self.total_failed[idx].fetch_add(1, Ordering::Relaxed);
         let until = now_epoch_ms() + RESOLVER_COOLDOWN_MS;
         self.cooldown_until_ms[idx].store(until, Ordering::Relaxed);
     }
 
-    fn mark_success(&self, idx: usize) {
+    fn mark_success(&self, idx: usize, rtt_ms: u64) {
         self.cooldown_until_ms[idx].store(0, Ordering::Relaxed);
+        let prev = self.ema_rtt_ms[idx].load(Ordering::Relaxed);
+        let updated = ((prev * 7) + rtt_ms.clamp(5, 2000)) / 8;
+        self.ema_rtt_ms[idx].store(updated, Ordering::Relaxed);
     }
 
     /// Sends a single attempt to a specific resolver index and validates DNS RCODE == 0.
@@ -857,6 +895,8 @@ impl ResolverPool {
         query_bytes: &[u8],
         attempt_timeout: Duration,
     ) -> Result<Bytes> {
+        self.total_sent[idx].fetch_add(1, Ordering::Relaxed);
+        let started = Instant::now();
         let req = client
             .post(resolver_url)
             .timeout(attempt_timeout)
@@ -870,7 +910,7 @@ impl ResolverPool {
                     if body.len() >= 12 {
                         let rcode = u16::from_be_bytes([body[2], body[3]]) & 0x000F;
                         if rcode == 0 {
-                            self.mark_success(idx);
+                            self.mark_success(idx, started.elapsed().as_millis() as u64);
                             Ok(body)
                         } else {
                             self.mark_failed(idx);
@@ -1225,6 +1265,7 @@ impl ClientTransport for DohTransport {
         let dl_feedback = Arc::new(AtomicU64::new(0));
         let downlink_state = Arc::new(Mutex::new(DohDownlinkState::new(dl_feedback.clone())));
         let uplink_arq = Arc::new(std::sync::Mutex::new(UplinkArqState::new(arq_enabled)));
+        let poll_burst_notify = Arc::new(Notify::new());
 
         // 1. Uplink Loop: Prioritizes ICMP/DNS/ACKs, coalesces small packets, records ARQ state, and processes piggybacked replies
         {
@@ -1237,6 +1278,7 @@ impl ClientTransport for DohTransport {
             let dl_state = downlink_state.clone();
             let ul_arq = uplink_arq.clone();
             let tunnel_write = tunnel_write_mutex.clone();
+            let burst_notify = poll_burst_notify.clone();
             let tx_sem = Arc::new(Semaphore::new(28));
             let prio_sem = Arc::new(Semaphore::new(8));
 
@@ -1249,6 +1291,7 @@ impl ClientTransport for DohTransport {
                 let rto_dl = dl_state.clone();
                 let rto_ul = ul_arq.clone();
                 let rto_tw = tunnel_write.clone();
+                let rto_burst = burst_notify.clone();
                 let rto_sem = prio_sem.clone();
 
                 tokio::spawn(async move {
@@ -1267,6 +1310,7 @@ impl ClientTransport for DohTransport {
                             let dl = rto_dl.clone();
                             let ul = rto_ul.clone();
                             let tw = rto_tw.clone();
+                            let bn = rto_burst.clone();
                             let sem = rto_sem.clone();
 
                             tokio::spawn(async move {
@@ -1287,6 +1331,7 @@ impl ClientTransport for DohTransport {
                                         &dl,
                                         &ul,
                                         &tw,
+                                        &bn,
                                     )
                                     .await;
                                 }
@@ -1325,6 +1370,7 @@ impl ClientTransport for DohTransport {
                         let dl_state_c = dl_state.clone();
                         let ul_arq_c = ul_arq.clone();
                         let tunnel_write_c = tunnel_write.clone();
+                        let burst_notify_c = burst_notify.clone();
 
                         // Priority packets (ICMP probes, pings, DNS, TCP SYN/ACK) can grab from `prio_sem` immediately
                         // without waiting behind bulk traffic permits.
@@ -1362,6 +1408,7 @@ impl ClientTransport for DohTransport {
                                         &dl_state_c,
                                         &ul_arq_c,
                                         &tunnel_write_c,
+                                        &burst_notify_c,
                                     )
                                     .await;
                                 }
@@ -1380,7 +1427,7 @@ impl ClientTransport for DohTransport {
             });
         }
 
-        // 2. Downlink Poller: Keeps 6 concurrent poll workers active on dedicated HTTP client
+        // 2. Downlink Poller: Adaptive Poll Pacer with 6 concurrent poll workers and immediate MORE_DATA_PENDING burst wakeup
         {
             let poll_concurrency = 6;
             for worker_id in 0..poll_concurrency {
@@ -1392,10 +1439,11 @@ impl ClientTransport for DohTransport {
                 let dl_state = downlink_state.clone();
                 let ul_arq = uplink_arq.clone();
                 let dl_fb = dl_feedback.clone();
+                let burst_notify = poll_burst_notify.clone();
 
                 tokio::spawn(async move {
-                    debug!("[DoH RX-{}] Long-poll worker initialized", worker_id);
-                    let mut backoff_ms = 15;
+                    debug!("[DoH RX-{}] Adaptive poll worker initialized", worker_id);
+                    let mut backoff_ms = 12;
 
                     loop {
                         let fb = dl_fb.load(Ordering::Acquire);
@@ -1417,7 +1465,7 @@ impl ClientTransport for DohTransport {
                             .await
                         {
                             Ok(body) => {
-                                backoff_ms = 15;
+                                backoff_ms = 12;
                                 match process_downlink_dns_body(
                                     &body,
                                     &cipher,
@@ -1425,15 +1473,19 @@ impl ClientTransport for DohTransport {
                                     &dl_state,
                                     &ul_arq,
                                     &tunnel_write,
+                                    &burst_notify,
                                 )
                                 .await
                                 {
                                     Ok(true) => {
-                                        // Received data: immediately poll again for next batch
+                                        // Received data or MORE_DATA_PENDING: immediately poll again for next batch
                                     }
                                     Ok(false) => {
-                                        // Empty poll: brief 15ms pacing sleep
-                                        tokio::time::sleep(Duration::from_millis(15)).await;
+                                        // Empty poll: sleep up to 12ms or wake immediately on MORE_DATA_PENDING signal
+                                        tokio::select! {
+                                            _ = tokio::time::sleep(Duration::from_millis(12)) => {}
+                                            _ = burst_notify.notified() => {}
+                                        }
                                     }
                                     Err(_) => {
                                         warn!("[DoH RX] Tunnel stream closed; exiting poller.");
@@ -1444,7 +1496,7 @@ impl ClientTransport for DohTransport {
                             Err(e) => {
                                 debug!("[DoH RX-{}] Poll request failed: {}", worker_id, e);
                                 tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-                                backoff_ms = (backoff_ms * 2).min(300);
+                                backoff_ms = (backoff_ms * 2).min(250);
                             }
                         }
                     }

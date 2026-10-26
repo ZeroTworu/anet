@@ -507,15 +507,25 @@ async fn pop_downlink_payload(
         return None;
     }
 
-    let seq = state.next_dl_seq;
-    state.next_dl_seq = state.next_dl_seq.wrapping_add(1);
+    let seq = state.next_dl_seq & 0x7FFF_FFFF;
+    state.next_dl_seq = (seq % 0x7FFF_FFFE) + 1;
 
     session
         .cipher
         .apply_keystream(seq, session_id, &mut packet_buf);
 
+    drain_channel_into_queues(&mut state);
+    let more_data_pending = !state.pending_frags.is_empty()
+        || !state.prio_queue.is_empty()
+        || !state.bulk_queue.is_empty();
+    let wire_seq = if more_data_pending {
+        seq | 0x8000_0000
+    } else {
+        seq
+    };
+
     let mut downlink_bytes = Vec::with_capacity(4 + packet_buf.len());
-    downlink_bytes.extend_from_slice(&seq.to_be_bytes());
+    downlink_bytes.extend_from_slice(&wire_seq.to_be_bytes());
     downlink_bytes.extend_from_slice(&packet_buf);
 
     let b64 = BASE64_STANDARD.encode(&downlink_bytes);
@@ -767,7 +777,7 @@ async fn handle_dns_datagram(
                     .value()
                     .clone();
 
-                let effective_hold_ms = poll_hold_timeout_ms.min(45);
+                let effective_hold_ms = poll_hold_timeout_ms.min(25);
                 if let Some(b64) = pop_downlink_payload(
                     &session,
                     &client_info,
