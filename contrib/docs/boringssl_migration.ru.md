@@ -66,6 +66,14 @@ tokio-tungstenite = { version = "0.28.0", default-features = false, features = [
     Помимо Go, `cmake` и `clang`, убедиться в наличии установленного Android NDK (`nttld/setup-ndk@v1`).
 6.  **В `contrib/docker/Dockerfile.auth`:**
     Добавить `cmake`, `clang` и `golang-go` в `apt-get install`, так как `anet-auth` транзитивно собирает `anet-common`.
+7.  **Статическая сборка под `x86_64-unknown-linux-musl` (`.cargo/config.toml` и `Makefile`):**
+    Пакет `musl-tools` в Linux предоставляет только C-враппер (`x86_64-linux-musl-gcc`), но не `x86_64-linux-musl-g++`. При этом C++ часть BoringSSL (`libssl.a`) собирается с `-fno-exceptions -fno-rtti`, собственной аллокацией (`OPENSSL_malloc`) и использует исключительно header-only шаблоны без зависимости от `libstdc++`. Для корректной сборки и статической линковки `boring-sys` под `x86_64-unknown-linux-musl` в `.cargo/config.toml` и `Makefile` задаются:
+    ```toml
+    [env]
+    CXX_x86_64_unknown_linux_musl = "g++"
+    CXXFLAGS_x86_64_unknown_linux_musl = "-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0"
+    BORING_BSSL_RUST_CPPLIB_x86_64_unknown_linux_musl = "c"
+    ```
 
 ---
 

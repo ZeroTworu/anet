@@ -1,0 +1,10 @@
+[env]
+# Статическая сборка под x86_64-unknown-linux-musl:
+# Пакет musl-tools в Linux-дистрибутивах предоставляет C-враппер (x86_64-linux-musl-gcc),
+# но не включает x86_64-linux-musl-g++.
+# BoringSSL (libssl.a) собирается с -fno-exceptions -fno-rtti, использует только
+# header-only шаблоны C++ и собственные аллокаторы (OPENSSL_malloc / placement new)
+# без единого символа из рантайма libstdc++.
+CXX_x86_64_unknown_linux_musl = "g++"
+CXXFLAGS_x86_64_unknown_linux_musl = "-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0"
+BORING_BSSL_RUST_CPPLIB_x86_64_unknown_linux_musl = "c"

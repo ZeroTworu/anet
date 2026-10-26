@@ -30,7 +30,16 @@ clean:
 # Build static Linux binary (musl)
 musl:
 	cargo update -p rtc-turn
-	RUSTFLAGS="-C target-feature=+crt-static" cargo build --release --target x86_64-unknown-linux-musl --package anet-server --package anet-client-cli --package anet-auth
+	@for d in target/x86_64-unknown-linux-musl/release/build/boring-sys-*/out; do \
+		if [ -d "$$d/build" ] && [ ! -f "$$d/build/ssl/libssl.a" ] && [ ! -f "$$d/build/libssl.a" ]; then \
+			rm -rf "$$d/build"; \
+		fi; \
+	done
+	CXX_x86_64_unknown_linux_musl=g++ \
+	CXXFLAGS_x86_64_unknown_linux_musl="-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0" \
+	BORING_BSSL_RUST_CPPLIB_x86_64_unknown_linux_musl=c \
+	RUSTFLAGS="-C target-feature=+crt-static" \
+	cargo build --release --target x86_64-unknown-linux-musl --package anet-server --package anet-client-cli --package anet-auth
 
 # Build Android libraries (requires cargo-ndk)
 mob:

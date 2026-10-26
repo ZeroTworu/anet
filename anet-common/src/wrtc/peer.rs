@@ -49,6 +49,8 @@ use webrtc::runtime::{
     RecvMeta, Runtime as WrtcRuntime, TokioRuntime, Transmit,
 };
 
+const _: bool = rtc::turn::ANET_RTC_TURN_PATCHED;
+
 #[derive(Debug)]
 struct HybridAsyncUdpSocket {
     primary: Arc<dyn AsyncUdpSocket>,
