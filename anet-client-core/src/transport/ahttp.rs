@@ -163,14 +163,12 @@ impl ClientTransport for AHttpTransport {
 
         let cookie_jar = Arc::new(reqwest::cookie::Jar::default());
         let build_http_client = || -> Result<Client> {
-            let mut builder = Client::builder()
-                .resolve(&target_host, resolved_addr)
-                .cookie_provider(cookie_jar.clone());
-
-            if scheme == "https" {
-                let ssl_builder = anet_common::boring_tls::build_chrome_ssl_connector()?;
-                builder = builder.use_preconfigured_tls(ssl_builder.build());
-            }
+            let mut builder = if scheme == "https" {
+                profile.build_reqwest_builder(cookie_jar.clone())?
+            } else {
+                Client::builder().cookie_provider(cookie_jar.clone()).tcp_nodelay(true)
+            };
+            builder = builder.resolve(&target_host, resolved_addr)
                 .pool_max_idle_per_host(self.config.ahttp.pool_max_idle_per_host.max(2))
                 .pool_idle_timeout(Some(Duration::from_secs(self.config.ahttp.pool_idle_timeout_secs)))
                 .tcp_nodelay(self.config.ahttp.tcp_nodelay)

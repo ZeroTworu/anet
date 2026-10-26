@@ -161,6 +161,17 @@ impl BrowserProfile {
         builder
     }
 
+    /// Создает сконфигурированный `reqwest::ClientBuilder` со встроенным TLS-отпечатком BoringSSL Chrome Mimicry,
+    /// поддержкой сессионного Cookie Jar и базовыми браузерными параметрами.
+    pub fn build_reqwest_builder(&self, cookie_jar: std::sync::Arc<reqwest::cookie::Jar>) -> anyhow::Result<reqwest::ClientBuilder> {
+        let ssl_builder = crate::boring_tls::build_chrome_ssl_connector()?;
+        let builder = reqwest::Client::builder()
+            .use_preconfigured_tls(ssl_builder.build())
+            .cookie_provider(cookie_jar)
+            .tcp_nodelay(true);
+        Ok(builder)
+    }
+
     /// Применяет маскировочные заголовки к запросу tokio-tungstenite (WebSocket / WRTC XMPP).
     pub fn apply_to_ws_request<T>(
         &self,

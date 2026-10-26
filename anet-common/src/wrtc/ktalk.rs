@@ -51,18 +51,15 @@ impl Default for KtalkClient {
 impl KtalkClient {
     pub fn new(profile: BrowserProfile, wrtc_cfg: &WrtcConfig) -> Self {
         let cookie_jar = Arc::new(Jar::default());
-        let mut builder = reqwest::Client::builder()
-            .cookie_provider(cookie_jar)
+        let builder = profile
+            .build_reqwest_builder(cookie_jar)
+            .unwrap_or_else(|_| reqwest::Client::builder())
             .connect_timeout(std::time::Duration::from_secs(
                 wrtc_cfg.http_connect_timeout_secs,
             ))
             .timeout(std::time::Duration::from_secs(
                 wrtc_cfg.http_request_timeout_secs,
             ));
-
-        if let Ok(ssl_builder) = build_chrome_ssl_connector() {
-            builder = builder.use_preconfigured_tls(ssl_builder.build());
-        }
 
         Self {
             http: builder.build().unwrap_or_default(),
