@@ -21,6 +21,7 @@ pub mod boring_tls;
 pub mod wrtc;
 pub mod icmp_probe;
 pub mod connectivity;
+pub mod probe_nodes;
 
 pub use generated::*;
 pub mod protocol {

@@ -70,8 +70,21 @@ message Message {
         AuthRequest auth_request = 5;
         AuthResponse auth_response = 6;
         AuthDenyNotification auth_error = 7;
+        TransportProbeRequest transport_probe_request = 9;
+        TransportProbeResponse transport_probe_response = 10;
     }
     bytes padding = 8;
+}
+
+message TransportProbeRequest {
+    uint64 timestamp_micros = 1;
+    bytes nonce = 2;
+}
+
+message TransportProbeResponse {
+    uint64 timestamp_micros = 1;
+    bytes echo_nonce = 2;
+    bool accepting_connections = 3;
 }
 
 enum DenyReason {

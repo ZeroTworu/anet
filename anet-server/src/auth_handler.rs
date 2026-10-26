@@ -22,7 +22,7 @@ use anet_common::padding_utils::{calculate_padding_needed, generate_random_paddi
 use anet_common::protocol::{
     message::Content, AuthDenyNotification, AuthResponse, BillingType as ProtoBillingType,
     DhClientExchange, DhServerExchange, EncryptedAuthRequest, EncryptedAuthResponse,
-    Message as AnetMessage,
+    Message as AnetMessage, TransportProbeResponse,
 };
 
 use crate::auth_provider::{AccessGrant, AuthProvider};
@@ -190,6 +190,23 @@ impl ServerAuthHandler {
         }
     }
 
+    pub fn is_probe_packet(&self, packet: &[u8]) -> bool {
+        if packet.len() < NONCE_LEN + 16 {
+            return false;
+        }
+        let (nonce, ciphertext) = packet.split_at(NONCE_LEN);
+        let Ok(plaintext) = self
+            .handshake_cipher
+            .decrypt(nonce, Bytes::copy_from_slice(ciphertext))
+        else {
+            return false;
+        };
+        let Ok(msg) = AnetMessage::decode(plaintext) else {
+            return false;
+        };
+        matches!(msg.content, Some(Content::TransportProbeRequest(_)))
+    }
+
     pub async fn process_handshake_packet(
         &self,
         packet: Bytes,
@@ -216,6 +233,21 @@ impl ServerAuthHandler {
                     .context("ASTP shared-key authentication failed")?;
                 let resp_bytes = self.encode_obfuscated_packet(resp_msg)?;
                 Ok((Some(resp_bytes), auth_tuple))
+            }
+            Some(Content::TransportProbeRequest(probe_req)) => {
+                let mut resp_msg = AnetMessage {
+                    content: Some(Content::TransportProbeResponse(TransportProbeResponse {
+                        timestamp_micros: probe_req.timestamp_micros,
+                        echo_nonce: probe_req.nonce,
+                        accepting_connections: self.registry.is_accepting_connections(),
+                    })),
+                    padding: vec![],
+                };
+                let wire_len = resp_msg.encoded_len() + NONCE_LEN + PROTO_PAD_FIELD_OVERHEAD;
+                resp_msg.padding =
+                    generate_random_padding(calculate_padding_needed(wire_len, self.padding_step));
+                let resp_bytes = self.encode_obfuscated_packet(resp_msg)?;
+                Ok((Some(resp_bytes), None))
             }
             _ => Err(anyhow!("Invalid payload message type")),
         }

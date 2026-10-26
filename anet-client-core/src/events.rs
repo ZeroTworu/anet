@@ -69,6 +69,8 @@ pub enum AnetEvent {
     ConnectivityUpdated(anet_common::connectivity::ConnectivitySnapshot),
     /// Снимок телеметрии скорости и трафика со скользящим буфером кривых (sparkline)
     TelemetryUpdated(anet_common::connectivity::TelemetrySnapshot),
+    /// Снимок реальной доступности серверных нод и протоколов (QUIC/SSH/VNC/WS/AHTTP/WRTC)
+    NodeProbeUpdated(anet_common::probe_nodes::NodeProbeSnapshot),
     ServerConfigUpdated {
         updated_at: u64,
         nodes_count: usize,

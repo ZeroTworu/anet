@@ -459,13 +459,26 @@ impl AnetClient {
 
         let (server_host, server_port) = server.host_port()?;
         let mut bypass_ips = Vec::new();
-        if let Ok(server_ip) = IpAddr::from_str(&server_host) {
-            bypass_ips.push(server_ip);
-        } else if let Ok(resolved) = lookup_host((server_host.as_str(), server_port)).await {
-            bypass_ips.extend(resolved.map(|addr| addr.ip()));
-            bypass_ips.sort_unstable();
-            bypass_ips.dedup();
+        let mut hosts_to_bypass = vec![(server_host, server_port)];
+        for s in &self.config.servers {
+            if let Ok(hp) = s.host_port() {
+                hosts_to_bypass.push(hp);
+            }
         }
+        hosts_to_bypass.extend(crate::connectivity_monitor::NodeProbeMonitor::configured_hosts_and_ports());
+        hosts_to_bypass.sort_unstable();
+        hosts_to_bypass.dedup();
+
+        for (h, p) in hosts_to_bypass {
+            if let Ok(ip) = IpAddr::from_str(&h) {
+                bypass_ips.push(ip);
+            } else if let Ok(resolved) = lookup_host((h.as_str(), p)).await {
+                bypass_ips.extend(resolved.map(|addr| addr.ip()));
+            }
+        }
+        bypass_ips.sort_unstable();
+        bypass_ips.dedup();
+
         for server_ip in bypass_ips {
             let prefix = if server_ip.is_ipv4() { 32 } else { 128 };
             self.route_manager

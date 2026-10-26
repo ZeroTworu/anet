@@ -40,6 +40,8 @@ roxmltree = { workspace = true }
 socket2 = { workspace = true }
 rustls = { workspace = true }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+russh = { workspace = true }
+url = "2.5.7"
 
 
 [build-dependencies]

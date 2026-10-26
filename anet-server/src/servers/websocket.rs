@@ -81,12 +81,17 @@ async fn handle_session(
             }
         };
 
+        let is_probe = auth_handler.is_probe_packet(&payload);
         let (response, result) = auth_handler
             .process_handshake_packet(payload, remote_addr, "ws")
             .await
             .with_context(|| format!("WebSocket ASTP handshake phase {}", handshake_phase))?;
         if let Some(response) = response {
             socket.send(Message::Binary(response)).await?;
+        }
+        if is_probe {
+            let _ = socket.close(None).await;
+            return Ok(());
         }
 
         if let Some((client_info, _)) = result {

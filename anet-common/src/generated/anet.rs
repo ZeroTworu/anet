@@ -81,7 +81,7 @@ pub struct AuthResponse {
 pub struct Message {
     #[prost(bytes = "vec", tag = "8")]
     pub padding: ::prost::alloc::vec::Vec<u8>,
-    #[prost(oneof = "message::Content", tags = "1, 2, 3, 4, 5, 6, 7")]
+    #[prost(oneof = "message::Content", tags = "1, 2, 3, 4, 5, 6, 7, 9, 10")]
     pub content: ::core::option::Option<message::Content>,
 }
 /// Nested message and enum types in `Message`.
@@ -102,7 +102,27 @@ pub mod message {
         AuthResponse(super::AuthResponse),
         #[prost(message, tag = "7")]
         AuthError(super::AuthDenyNotification),
+        #[prost(message, tag = "9")]
+        TransportProbeRequest(super::TransportProbeRequest),
+        #[prost(message, tag = "10")]
+        TransportProbeResponse(super::TransportProbeResponse),
     }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct TransportProbeRequest {
+    #[prost(uint64, tag = "1")]
+    pub timestamp_micros: u64,
+    #[prost(bytes = "vec", tag = "2")]
+    pub nonce: ::prost::alloc::vec::Vec<u8>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct TransportProbeResponse {
+    #[prost(uint64, tag = "1")]
+    pub timestamp_micros: u64,
+    #[prost(bytes = "vec", tag = "2")]
+    pub echo_nonce: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bool, tag = "3")]
+    pub accepting_connections: bool,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct AuthDenyNotification {

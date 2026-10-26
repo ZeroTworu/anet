@@ -22,6 +22,7 @@ struct AnetSshHandler {
     tun_tx: mpsc::Sender<Bytes>,
     auth_handler: ServerAuthHandler,
     pending_channels: HashMap<ChannelId, Channel<server::Msg>>,
+    probe_completed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl AnetSshHandler {
@@ -31,6 +32,7 @@ impl AnetSshHandler {
         registry: Arc<ClientRegistry>,
         tun_tx: mpsc::Sender<Bytes>,
         auth_handler: ServerAuthHandler,
+        probe_completed: Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
         Self {
             remote_addr,
@@ -39,6 +41,7 @@ impl AnetSshHandler {
             tun_tx,
             auth_handler,
             pending_channels: HashMap::new(),
+            probe_completed,
         }
     }
 }
@@ -87,6 +90,7 @@ impl server::Handler for AnetSshHandler {
         let tun_tx = self.tun_tx.clone();
         let remote_addr = self.remote_addr;
         let auth_handler = self.auth_handler.clone();
+        let probe_completed = self.probe_completed.clone();
 
         tokio::spawn(async move {
             if let Err(error) = handle_ssh_vpn_session(
@@ -96,6 +100,7 @@ impl server::Handler for AnetSshHandler {
                 tun_tx,
                 remote_addr,
                 auth_handler,
+                probe_completed,
             )
             .await
             {
@@ -134,16 +139,20 @@ async fn handle_ssh_vpn_session<S>(
     tun_tx: mpsc::Sender<Bytes>,
     remote_addr: SocketAddr,
     auth_handler: ServerAuthHandler,
+    probe_completed: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let client_info = tokio::time::timeout(
+    let Some(client_info) = tokio::time::timeout(
         ASTP_AUTH_TIMEOUT,
-        authenticate(&mut stream, remote_addr, &auth_handler),
+        authenticate(&mut stream, remote_addr, &auth_handler, &probe_completed),
     )
     .await
-    .context("ASTP authentication timed out")??;
+    .context("ASTP authentication timed out")??
+    else {
+        return Ok(());
+    };
     info!(
         "[SSH] ASTP authenticated for {}; assigned IP {}",
         remote_addr, client_info.assigned_ip
@@ -177,7 +186,8 @@ async fn authenticate<S>(
     stream: &mut S,
     remote_addr: SocketAddr,
     auth_handler: &ServerAuthHandler,
-) -> Result<Arc<ClientTransportInfo>>
+    probe_completed: &Arc<std::sync::atomic::AtomicBool>,
+) -> Result<Option<Arc<ClientTransportInfo>>>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -185,6 +195,7 @@ where
         let packet = read_next_packet(stream)
             .await?
             .context("client disconnected during ASTP authentication")?;
+        let is_probe = auth_handler.is_probe_packet(&packet);
         let (response, result) = auth_handler
             .process_handshake_packet(packet, remote_addr, "ssh")
             .await?;
@@ -193,8 +204,13 @@ where
             stream.write_all(&frame_packet(response)).await?;
             stream.flush().await?;
         }
+        if is_probe {
+            probe_completed.store(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = stream.shutdown().await;
+            return Ok(None);
+        }
         if let Some((client_info, _)) = result {
-            return Ok(client_info);
+            return Ok(Some(client_info));
         }
     }
 }
@@ -252,17 +268,21 @@ pub async fn run_ssh_server(
         let (stream, remote_addr) = listener.accept().await?;
         stream.set_nodelay(true)?;
         let ssh_config = ssh_config.clone();
+        let probe_completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let handler = AnetSshHandler::new(
             remote_addr,
             config.clone(),
             registry.clone(),
             tun_tx.clone(),
             auth_handler.clone(),
+            probe_completed.clone(),
         );
 
         tokio::spawn(async move {
             if let Err(error) = server::run_stream(ssh_config, stream, handler).await {
-                warn!("[SSH] Connection {remote_addr} stopped: {error:#}");
+                if !probe_completed.load(std::sync::atomic::Ordering::SeqCst) {
+                    warn!("[SSH] Connection {remote_addr} stopped: {error:#}");
+                }
             }
         });
     }

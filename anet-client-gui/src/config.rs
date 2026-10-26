@@ -131,7 +131,11 @@ impl AppSettings {
     }
 
     pub fn get_active_config_with_overrides(&self, storage_key: &[u8; 32]) -> Option<ConfigEntry> {
-        let active_id = self.active_config_id.as_deref()?;
+        let active_id = match self.active_config_id.as_deref() {
+            Some(id) => id,
+            None if self.cached_server_config.is_some() => SERVER_CONFIG_ID,
+            None => return None,
+        };
         if active_id == SERVER_CONFIG_ID {
             if let Some(bundle) = &self.cached_server_config {
                 if let Ok(raw_content) = anet_client_core::updater::Updater::decrypt_config(bundle, storage_key) {

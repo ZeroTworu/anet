@@ -82,10 +82,19 @@ fn inspect_config(config_toml: &str) -> String {
             }
         }
     } else {
+        let mut dsn_counts = std::collections::HashMap::<String, usize>::new();
+        for server in &config.servers {
+            *dsn_counts.entry(server.dsn.trim().to_string()).or_insert(0) += 1;
+        }
         for server in config.servers {
             result.push('\n');
-            let id_safe = server.dsn.replace(['\r', '\n', '|'], " ");
             let name_safe = server.get_name().replace(['\r', '\n', '|'], " ");
+            let raw_dsn = server.dsn.trim();
+            let id_safe = if dsn_counts.get(raw_dsn).copied().unwrap_or(0) > 1 {
+                name_safe.clone()
+            } else {
+                server.dsn.replace(['\r', '\n', '|'], " ")
+            };
             result.push_str(&format!("{}|{}", id_safe, name_safe));
         }
     }
@@ -156,6 +165,7 @@ fn event_message(event: AnetEvent) -> Option<String> {
         | AnetEvent::TrafficUpdate { .. }
         | AnetEvent::ConnectivityUpdated(_)
         | AnetEvent::TelemetryUpdated(_)
+        | AnetEvent::NodeProbeUpdated(_)
         | AnetEvent::ClientStateChanged { .. }
         | AnetEvent::AccountInfo(_) => None,
     }
@@ -259,7 +269,16 @@ pub extern "system" fn Java_org_alco_anet_MainActivity_inspectConfig(
 ) -> jni::sys::jstring {
     let result = env
         .get_string(&config_jstr)
-        .map(|value| inspect_config(&String::from(value)))
+        .map(|value| {
+            let s = String::from(value);
+            let out = inspect_config(&s);
+            if out.starts_with("OK") {
+                let rt = get_or_init_runtime_handle();
+                let _guard = rt.enter();
+                anet_client_core::connectivity_monitor::NodeProbeMonitor::update_config_toml(&s);
+            }
+            out
+        })
         .unwrap_or_else(|error| format!("ERROR\n{error}"));
     env.new_string(result).unwrap().into_raw()
 }
@@ -453,6 +472,102 @@ fn init_jni_bridge_thread(jvm: Arc<JavaVM>) {
                         continue;
                     }
 
+                    if let AnetEvent::NodeProbeUpdated(probe_snap) = event {
+                        let ui_ref = UI_CALLBACK_REF.lock().unwrap().clone();
+                        let vpn_ref = VPN_CALLBACK_REF.lock().unwrap().clone();
+                        let targets: Vec<GlobalRef> =
+                            [ui_ref, vpn_ref].into_iter().flatten().collect();
+
+                        for cb in targets {
+                            let count = probe_snap.groups.len() as i32;
+                            let str_cls = env.find_class("java/lang/String");
+                            let empty_1 = env.new_string("");
+                            let empty_2 = env.new_string("");
+                            let empty_3 = env.new_string("");
+
+                            if let (Ok(str_cls), Ok(empty_1), Ok(empty_2), Ok(empty_3)) =
+                                (str_cls, empty_1, empty_2, empty_3)
+                            {
+                                let j_ids = env.new_object_array(count, &str_cls, &empty_1);
+                                let j_names = env.new_object_array(count, &str_cls, &empty_2);
+                                let j_protos = env.new_object_array(count, &str_cls, &empty_3);
+                                let j_statuses = env.new_int_array(count);
+                                let j_rtts = env.new_int_array(count);
+                                let j_reachables = env.new_int_array(count);
+                                let j_totals = env.new_int_array(count);
+
+                                if let (
+                                    Ok(j_ids),
+                                    Ok(j_names),
+                                    Ok(j_protos),
+                                    Ok(j_statuses),
+                                    Ok(j_rtts),
+                                    Ok(j_reachables),
+                                    Ok(j_totals),
+                                ) = (
+                                    j_ids,
+                                    j_names,
+                                    j_protos,
+                                    j_statuses,
+                                    j_rtts,
+                                    j_reachables,
+                                    j_totals,
+                                ) {
+                                    let mut statuses_vec = Vec::with_capacity(count as usize);
+                                    let mut rtts_vec = Vec::with_capacity(count as usize);
+                                    let mut reachables_vec = Vec::with_capacity(count as usize);
+                                    let mut totals_vec = Vec::with_capacity(count as usize);
+
+                                    for (i, g) in probe_snap.groups.iter().enumerate() {
+                                        if let Ok(js) = env.new_string(&g.group_id) {
+                                            let _ = env.set_object_array_element(&j_ids, i as i32, js);
+                                        }
+                                        if let Ok(js) = env.new_string(&g.group_name) {
+                                            let _ = env.set_object_array_element(&j_names, i as i32, js);
+                                        }
+                                        if let Ok(js) = env.new_string(g.compact_protocols_text()) {
+                                            let _ = env.set_object_array_element(&j_protos, i as i32, js);
+                                        }
+                                        statuses_vec.push(g.status.as_u8() as i32);
+                                        rtts_vec.push(g.best_rtt_ms.map(|v| v as i32).unwrap_or(-1));
+                                        reachables_vec.push(g.reachable_endpoints as i32);
+                                        totals_vec.push(g.total_endpoints as i32);
+                                    }
+
+                                    let _ = env.set_int_array_region(&j_statuses, 0, &statuses_vec);
+                                    let _ = env.set_int_array_region(&j_rtts, 0, &rtts_vec);
+                                    let _ = env.set_int_array_region(&j_reachables, 0, &reachables_vec);
+                                    let _ = env.set_int_array_region(&j_totals, 0, &totals_vec);
+
+                                    let ids_obj = JObject::from(j_ids);
+                                    let names_obj = JObject::from(j_names);
+                                    let statuses_obj = JObject::from(j_statuses);
+                                    let rtts_obj = JObject::from(j_rtts);
+                                    let reachables_obj = JObject::from(j_reachables);
+                                    let totals_obj = JObject::from(j_totals);
+                                    let protos_obj = JObject::from(j_protos);
+
+                                    let _ = env.call_method(
+                                        &cb,
+                                        "onNodeProbeUpdated",
+                                        "([Ljava/lang/String;[Ljava/lang/String;[I[I[I[I[Ljava/lang/String;)V",
+                                        &[
+                                            JValue::Object(&ids_obj),
+                                            JValue::Object(&names_obj),
+                                            JValue::Object(&statuses_obj),
+                                            JValue::Object(&rtts_obj),
+                                            JValue::Object(&reachables_obj),
+                                            JValue::Object(&totals_obj),
+                                            JValue::Object(&protos_obj),
+                                        ],
+                                    );
+                                    let _ = env.exception_clear();
+                                }
+                            }
+                        }
+                        continue;
+                    }
+
                     let is_update_event = matches!(
                         event,
                         AnetEvent::UpdateAvailable(_)
@@ -620,6 +735,11 @@ pub extern "system" fn Java_org_alco_anet_MainActivity_startConnectivityMonitor(
         let initial =
             anet_client_core::connectivity_monitor::ConnectivityMonitor::get_last_snapshot();
         events::emit(AnetEvent::ConnectivityUpdated(initial));
+        if !config_toml.trim().is_empty() {
+            anet_client_core::connectivity_monitor::NodeProbeMonitor::update_config_toml(
+                &config_toml,
+            );
+        }
     });
 }
 
@@ -629,7 +749,10 @@ pub extern "system" fn Java_org_alco_anet_MainActivity_triggerConnectivityCheck(
     _env: JNIEnv,
     _this: JObject,
 ) {
+    let rt = get_or_init_runtime_handle();
+    let _guard = rt.enter();
     anet_client_core::connectivity_monitor::ConnectivityMonitor::trigger_check_now();
+    anet_client_core::connectivity_monitor::NodeProbeMonitor::trigger_probe_now();
 }
 
 #[unsafe(no_mangle)]
@@ -878,7 +1001,11 @@ pub extern "system" fn Java_org_alco_anet_ANetVpnService_connectVpn(
                 anet_client_core::events::status(format!("Группа выбрана (id): {}", selected_group_id));
             }
         } else if !selected_server.is_empty() {
-            if let Some(idx) = config.servers.iter().position(|s| s.dsn == selected_server) {
+            if let Some(idx) = config
+                .servers
+                .iter()
+                .position(|s| s.dsn == selected_server || s.get_name() == selected_server)
+            {
                 config.servers.rotate_left(idx);
                 anet_client_core::events::status(format!("Приоритет установлен: {}", selected_server));
             }

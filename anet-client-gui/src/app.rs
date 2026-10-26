@@ -14,7 +14,7 @@ use tokio::runtime::Runtime;
 use anet_client_core::{
     client::AnetClient,
     config::{ CoreConfig, PerAppMode },
-    connectivity_monitor::ConnectivityMonitor,
+    connectivity_monitor::{ ConnectivityMonitor, NodeProbeMonitor },
     events::{ set_handler, AccountInfo, AnetEvent, ClientState },
     platform::create_route_manager,
     server_config::{ apply_overrides, SERVER_CONFIG_ID, SERVER_CONFIG_DISPLAY_NAME },
@@ -23,6 +23,7 @@ use anet_client_core::{
 use anet_common::{
     config::ConnectivityConfig,
     connectivity::{ ConnectivitySnapshot, TelemetrySnapshot },
+    probe_nodes::NodeProbeSnapshot,
 };
 
 use crate::{
@@ -110,6 +111,7 @@ pub struct ANetApp {
     pub total_txm: String,
     pub connectivity_snapshot: ConnectivitySnapshot,
     pub telemetry_snapshot: TelemetrySnapshot,
+    pub node_probe_snapshot: NodeProbeSnapshot,
     pub account_info: Option<AccountInfo>,
 
     pub tariff_billing: String,
@@ -253,6 +255,7 @@ impl ANetApp {
             total_txm: "0 B".to_string(),
             connectivity_snapshot: ConnectivityMonitor::get_last_snapshot(),
             telemetry_snapshot: TelemetrySnapshot::default(),
+            node_probe_snapshot: NodeProbeMonitor::get_last_snapshot(),
             account_info: None,
 
             tariff_billing: "—".to_string(),
@@ -298,6 +301,8 @@ impl ANetApp {
 
         };
 
+        NodeProbeMonitor::set_runtime_handle(app.rt.handle().clone());
+
         // 1. Загружаем активную конфигурацию (Server Config с оверлеями или пользовательский .toml)
         let config_to_load: Option<ConfigEntry> = {
             let settings = lock_ignore_poison(&app.settings);
@@ -309,9 +314,10 @@ impl ANetApp {
             .unwrap_or_default();
 
         // 0. Запускаем фоновый монитор связности сразу при старте GUI с параметрами активного конфига
-        app.rt.spawn(async move {
+        {
+            let _rt_guard = app.rt.enter();
             ConnectivityMonitor::ensure_started(initial_conn_cfg);
-        });
+        }
         app.connectivity_snapshot = ConnectivityMonitor::get_last_snapshot();
 
         if let Some(config) = config_to_load {
@@ -449,7 +455,7 @@ impl ANetApp {
     }
 
     /// Автоматическое и ручное обновление серверного конфига по ссылке из Keystore
-    pub fn fetch_and_apply_server_config(&mut self, force_reconnect: bool) {
+    pub fn fetch_and_apply_server_config(&mut self, force_refresh: bool) {
         let Some(url) = DesktopSecureStore::get_server_config_url() else {
             return;
         };
@@ -461,7 +467,13 @@ impl ANetApp {
         let config_load_tx = self.config_load_tx.clone();
         let shared_clone = self.shared.clone();
 
-        let current_etag = {
+        // Переподключаем VPN ТОЛЬКО если в момент обновления туннель уже был подключён
+        let should_reconnect =
+            lock_ignore_poison(&self.shared).state == ConnectionState::Connected;
+
+        let current_etag = if force_refresh {
+            None
+        } else {
             let settings = lock_ignore_poison(&settings_arc);
             settings.cached_server_config.as_ref().and_then(|b| b.etag.clone())
         };
@@ -472,10 +484,22 @@ impl ANetApp {
             match Updater::fetch_server_config(&url, current_etag.as_deref()).await {
                 Ok(ConfigFetchResult::Updated { content, updated_at, etag }) => {
                     if let Ok(bundle) = Updater::encrypt_config(&content, &storage_key, etag) {
-                        let (merged_cfg, nodes_count) = {
+                        let (mut merged_cfg, nodes_count, is_server_active) = {
                             let mut settings = lock_ignore_poison(&settings_arc);
+                            let was_server_active =
+                                settings.active_config_id.as_deref() == Some(SERVER_CONFIG_ID) ||
+                                settings.active_config_id.is_none();
+                            if settings.active_config_id.is_none() {
+                                settings.active_config_id = Some(SERVER_CONFIG_ID.to_string());
+                            }
                             settings.cached_server_config = Some(bundle);
-                            let mut core_cfg: CoreConfig = toml::from_str(&content).unwrap();
+                            let mut core_cfg: CoreConfig = match toml::from_str(&content) {
+                                Ok(cfg) => cfg,
+                                Err(e) => {
+                                    push_log(&logs_arc, &format!("Ошибка разбора серверного TOML: {}", e));
+                                    return;
+                                }
+                            };
                             core_cfg.connectivity.apply_toml_fallbacks(&content);
                             if core_cfg.main.get_config_url().is_none() {
                                 core_cfg.main.config_url = Some(url.clone());
@@ -486,18 +510,27 @@ impl ANetApp {
                                 &settings.server_config_overrides
                             );
                             settings.save();
-                            (merged, count)
-                        };
-
-                        let is_server_active = {
-                            let settings = lock_ignore_poison(&settings_arc);
-                            settings.active_config_id.as_deref() == Some(SERVER_CONFIG_ID) ||
-                                (settings.active_config_id.is_none() &&
-                                    settings.cached_server_config.is_some())
+                            (merged, count, was_server_active)
                         };
 
                         if is_server_active {
                             ConnectivityMonitor::ensure_started(merged_cfg.connectivity.clone());
+                            NodeProbeMonitor::update_config_toml(&content);
+                            Self::filter_servers_for_selection(
+                                &settings_arc,
+                                SERVER_CONFIG_ID,
+                                &mut merged_cfg,
+                            );
+
+                            let old_client = if should_reconnect {
+                                lock_ignore_poison(&shared_clone).client.clone()
+                            } else {
+                                None
+                            };
+                            if let Some(old) = old_client {
+                                let _ = old.stop().await;
+                            }
+
                             let tun = Box::new(
                                 DesktopTunFactory::new(
                                     merged_cfg.main.tun_name.clone(),
@@ -510,7 +543,7 @@ impl ANetApp {
                                 let _ = config_load_tx.send(ConfigLoadOutcome::Loaded {
                                     id: SERVER_CONFIG_ID.to_string(),
                                     name: SERVER_CONFIG_DISPLAY_NAME.to_string(),
-                                    reconnect: force_reconnect,
+                                    reconnect: should_reconnect,
                                 });
                             }
                         }
@@ -528,6 +561,7 @@ impl ANetApp {
                     }
                 }
                 Ok(ConfigFetchResult::NotModified) => {
+                    NodeProbeMonitor::trigger_probe_now();
                     push_log(&logs_arc, "Серверный конфиг актуален (304 Not Modified).");
                     anet_client_core::events::status("Серверный конфиг актуален (изменений нет)");
                 }
@@ -679,6 +713,86 @@ impl ANetApp {
     #[cfg(not(target_os = "windows"))]
     pub fn refresh_processes(&mut self) {}
 
+    fn filter_servers_for_selection(
+        settings_arc: &Arc<Mutex<AppSettings>>,
+        id: &str,
+        cfg: &mut CoreConfig,
+    ) {
+        let selected_name_opt = {
+            let settings = lock_ignore_poison(settings_arc);
+            settings.selected_servers.get(id).cloned()
+        };
+
+        let has_groups = cfg
+            .servers
+            .iter()
+            .any(|s| s.group_name.as_ref().map_or(false, |g| !g.trim().is_empty()));
+
+        if has_groups {
+            let selected_group_id = selected_name_opt
+                .filter(|sel_id| {
+                    cfg.servers.iter().any(|s| {
+                        let g_name = s.group_name.as_deref().unwrap_or("");
+                        let g_id = s.group_id.as_deref().unwrap_or(g_name).trim();
+                        g_id == sel_id.as_str() || g_name.trim() == sel_id.as_str()
+                    })
+                })
+                .unwrap_or_else(|| {
+                    cfg.servers
+                        .iter()
+                        .find_map(|s| {
+                            if s.group_name.as_deref().map_or(true, |g| g.trim().is_empty()) {
+                                return None;
+                            }
+                            Some(
+                                s.group_id
+                                    .as_deref()
+                                    .unwrap_or(s.group_name.as_ref().unwrap())
+                                    .trim()
+                                    .to_string(),
+                            )
+                        })
+                        .unwrap_or_default()
+                });
+
+            if !selected_group_id.is_empty() {
+                let mut settings = lock_ignore_poison(settings_arc);
+                settings
+                    .selected_servers
+                    .insert(id.to_string(), selected_group_id.clone());
+                settings.save();
+            }
+
+            let mut group_servers: Vec<_> = cfg
+                .servers
+                .iter()
+                .filter(|s| {
+                    if s.group_name.as_deref().map_or(true, |g| g.trim().is_empty()) {
+                        return false;
+                    }
+                    let g_name = s.group_name.as_ref().unwrap().trim();
+                    let g_id = s.group_id.as_deref().unwrap_or(g_name).trim();
+                    g_id == selected_group_id.as_str() || g_name == selected_group_id.as_str()
+                })
+                .cloned()
+                .collect();
+
+            group_servers.sort_by(|a, b| b.weight().cmp(&a.weight()));
+
+            if !group_servers.is_empty() {
+                cfg.servers = group_servers;
+            }
+        } else if let Some(selected_id) = selected_name_opt {
+            if let Some(idx) = cfg
+                .servers
+                .iter()
+                .position(|s| s.dsn == selected_id || s.get_name() == selected_id)
+            {
+                cfg.servers.rotate_left(idx);
+            }
+        }
+    }
+
     /// Загрузка конфигурации TOML, выбор ноды и запуск клиента
     pub fn load_config_from_content(
         &mut self,
@@ -687,6 +801,7 @@ impl ANetApp {
         name: &str,
         reconnect: bool
     ) {
+        NodeProbeMonitor::set_runtime_handle(self.rt.handle().clone());
         match toml::from_str::<CoreConfig>(content) {
             Ok(mut cfg) => {
 
@@ -699,9 +814,12 @@ impl ANetApp {
                 let conn_cfg = cfg.connectivity.clone();
                 self.connectivity_snapshot.global_total = conn_cfg.global_targets.len();
                 self.connectivity_snapshot.domestic_total = conn_cfg.domestic_targets.len();
-                self.rt.spawn(async move {
+                {
+                    let _rt_guard = self.rt.enter();
                     ConnectivityMonitor::ensure_started(conn_cfg);
-                });
+                    NodeProbeMonitor::update_config_toml(content);
+                }
+                self.node_probe_snapshot = NodeProbeMonitor::get_last_snapshot();
 
                 if cfg.main.get_config_url().is_none() {
                     let fallback_url = if id == SERVER_CONFIG_ID {
@@ -755,77 +873,7 @@ impl ANetApp {
                         .any(|app| app.eq_ignore_ascii_case(&proc.name));
                 }
 
-                let selected_name_opt = {
-                    let settings = lock_ignore_poison(&self.settings);
-                    settings.selected_servers.get(id).cloned()
-                };
-
-                let has_groups = cfg.servers
-                    .iter()
-                    .any(|s| { s.group_name.as_ref().map_or(false, |g| !g.trim().is_empty()) });
-
-                if has_groups {
-                    let selected_group_id = selected_name_opt
-                        .filter(|id| {
-                            cfg.servers.iter().any(|s| {
-                                let g_name = s.group_name.as_deref().unwrap_or("");
-                                let g_id = s.group_id.as_deref().unwrap_or(g_name).trim();
-                                g_id == id.as_str()
-                            })
-                        })
-                        .unwrap_or_else(|| {
-                            cfg.servers
-                                .iter()
-                                .find_map(|s| {
-                                    if
-                                        s.group_name
-                                            .as_deref()
-                                            .map_or(true, |g| g.trim().is_empty())
-                                    {
-                                        return None;
-                                    }
-                                    Some(
-                                        s.group_id
-                                            .as_deref()
-                                            .unwrap_or(s.group_name.as_ref().unwrap())
-                                            .trim()
-                                            .to_string()
-                                    )
-                                })
-                                .unwrap_or_default()
-                        });
-
-                    if !selected_group_id.is_empty() {
-                        let mut settings = lock_ignore_poison(&self.settings);
-                        settings.selected_servers.insert(id.to_string(), selected_group_id.clone());
-                        settings.save();
-                    }
-
-                    let mut group_servers: Vec<_> = cfg.servers
-                        .iter()
-                        .filter(|s| {
-                            if s.group_name.as_deref().map_or(true, |g| g.trim().is_empty()) {
-                                return false;
-                            }
-                            let g_id = s.group_id
-                                .as_deref()
-                                .unwrap_or(s.group_name.as_ref().unwrap())
-                                .trim();
-                            g_id == selected_group_id.as_str()
-                        })
-                        .cloned()
-                        .collect();
-
-                    group_servers.sort_by(|a, b| b.weight().cmp(&a.weight()));
-
-                    if !group_servers.is_empty() {
-                        cfg.servers = group_servers;
-                    }
-                } else if let Some(selected_id) = selected_name_opt {
-                    if let Some(idx) = cfg.servers.iter().position(|s| s.dsn == selected_id) {
-                        cfg.servers.rotate_left(idx);
-                    }
-                }
+                Self::filter_servers_for_selection(&self.settings, id, &mut cfg);
 
                 let tun = Box::new(
                     DesktopTunFactory::new(cfg.main.tun_name.clone(), !cfg.main.per_app.is_empty())
@@ -933,10 +981,18 @@ impl ANetApp {
                     }
                     groups
                 } else {
-                    raw_cfg.servers
-                        .iter()
-                        .map(|s| (s.dsn.clone(), s.get_name()))
-                        .collect()
+                    let mut out = Vec::with_capacity(raw_cfg.servers.len());
+                    let mut seen_dsns = std::collections::HashSet::new();
+                    for s in &raw_cfg.servers {
+                        let display = s.get_name();
+                        let key_id = if seen_dsns.insert(s.dsn.clone()) {
+                            s.dsn.clone()
+                        } else {
+                            display.clone()
+                        };
+                        out.push((key_id, display));
+                    }
+                    out
                 }
             }
             Err(_) => Vec::new(),
@@ -1672,8 +1728,12 @@ pub fn save_routing_overrides(&mut self) {
                     }
                     self.telemetry_snapshot = tel;
                 }
+                AnetEvent::NodeProbeUpdated(probe_snap) => {
+                    self.node_probe_snapshot = probe_snap;
+                }
                 AnetEvent::Status(msg) => {
                     if msg.contains("Серверный конфиг актуален") {
+                        self.is_fetching_server_config = false;
                         self.show_toast("Серверный конфиг актуален");
                     }
                     self.log(&msg);
@@ -1769,9 +1829,13 @@ pub fn save_routing_overrides(&mut self) {
         while let Ok(outcome) = self.config_load_rx.try_recv() {
             match outcome {
                 ConfigLoadOutcome::Loaded { id, name, reconnect } => {
-                    let is_still_active =
-                        lock_ignore_poison(&self.settings).active_config_id.as_deref() ==
-                        Some(id.as_str());
+                    let is_still_active = {
+                        let settings = lock_ignore_poison(&self.settings);
+                        settings.active_config_id.as_deref() == Some(id.as_str())
+                            || (id == SERVER_CONFIG_ID
+                                && settings.active_config_id.is_none()
+                                && settings.cached_server_config.is_some())
+                    };
                     if is_still_active {
                         self.config_err = None;
                         self.config_name = name.clone();
@@ -1783,9 +1847,13 @@ pub fn save_routing_overrides(&mut self) {
                     }
                 }
                 ConfigLoadOutcome::Failed { id, error } => {
-                    let is_still_active =
-                        lock_ignore_poison(&self.settings).active_config_id.as_deref() ==
-                        Some(id.as_str());
+                    let is_still_active = {
+                        let settings = lock_ignore_poison(&self.settings);
+                        settings.active_config_id.as_deref() == Some(id.as_str())
+                            || (id == SERVER_CONFIG_ID
+                                && settings.active_config_id.is_none()
+                                && settings.cached_server_config.is_some())
+                    };
                     if is_still_active {
                         self.config_err = Some(error);
                         self.log("Failed to create route manager");
@@ -1821,11 +1889,18 @@ impl eframe::App for ANetApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let _rt_guard = self.rt.enter();
         egui_extras::install_image_loaders(ctx);
         apply_dark_theme(ctx);
         ctx.request_repaint_after(std::time::Duration::from_millis(500));
 
         self.drain_events();
+        if self.node_probe_snapshot.groups.is_empty() {
+            let snap = NodeProbeMonitor::get_last_snapshot();
+            if !snap.groups.is_empty() {
+                self.node_probe_snapshot = snap;
+            }
+        }
 
         if !self.settingsbar_open && !self.logbar_open && !self.show_url_modal {
             self.check_and_show_url_modal_if_empty();

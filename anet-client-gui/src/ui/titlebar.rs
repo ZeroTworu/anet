@@ -22,14 +22,40 @@ pub fn render_titlebar(app: &mut ANetApp, ctx: &egui::Context) {
                 Colors::TITLE_BG
             );
 
-            let response = ui.interact(
-                rect,
-                ui.id().with("title_bar"),
-                egui::Sense::click_and_drag()
-            );
-            if response.dragged_by(egui::PointerButton::Primary)
-                || response.drag_started_by(egui::PointerButton::Primary)
-            {
+            // Исключаем область кнопок свернуть/закрыть справа (84px) из зоны перетаскивания.
+            // ВАЖНО для Wayland / KDE (KWin): нельзя использовать `Sense::click_and_drag()` для
+            // системного перетаскивания окна (`ViewportCommand::StartDrag` -> `xdg_toplevel::move`),
+            // так как композитор забирает фокус указателя себе и НЕ возвращает событие отпускания ЛКМ
+            // обратно в winit/egui. Из-за этого egui навечно остаётся в состоянии `dragged_id = Some(...)`
+            // (с курсором руки `CursorIcon::Grabbing`) и при каждом возврате курсора в окно снова шлёт StartDrag.
+            let mut drag_rect = rect;
+            drag_rect.max.x = (rect.max.x - 84.0).max(rect.min.x);
+            let drag_armed_id = ui.id().with("title_bar_drag_armed");
+            let mut drag_armed = ctx.data_mut(|d| d.get_temp::<bool>(drag_armed_id).unwrap_or(false));
+
+            let should_start_drag = ctx.input(|i| {
+                if !i.pointer.primary_down() || i.pointer.button_released(egui::PointerButton::Primary) {
+                    drag_armed = false;
+                }
+                if i.pointer.button_pressed(egui::PointerButton::Primary) {
+                    if let Some(pos) = i.pointer.interact_pos().or_else(|| i.pointer.hover_pos()) {
+                        if drag_rect.contains(pos) {
+                            drag_armed = true;
+                        }
+                    }
+                }
+                if drag_armed && i.pointer.primary_down() && i.pointer.delta() != egui::Vec2::ZERO {
+                    drag_armed = false;
+                    true
+                } else {
+                    false
+                }
+            });
+
+            ctx.data_mut(|d| d.insert_temp(drag_armed_id, drag_armed));
+
+            if should_start_drag {
+                ctx.stop_dragging();
                 ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
             }
 

@@ -49,4 +49,6 @@ fn main() {
     writeln!(f, "pub const GIT_TAG: &str = \"{}\";", git_tag).unwrap();
     writeln!(f, "pub const COMMIT_HASH: &str = \"{}\";", commit_hash).unwrap();
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=../.git/HEAD");
+    println!("cargo:rerun-if-changed=../.git/refs");
 }
