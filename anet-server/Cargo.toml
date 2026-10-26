@@ -26,7 +26,7 @@ async-trait = { workspace = true }
 futures = { workspace = true }
 tokio-tungstenite = { workspace = true }
 dashmap = { workspace = true }
-reqwest = { workspace = true, default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { workspace = true }
 http = { workspace = true }
 russh = { workspace = true }
 rtc = { workspace = true }

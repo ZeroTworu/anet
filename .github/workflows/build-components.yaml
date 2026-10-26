@@ -40,12 +40,14 @@ jobs:
     steps:
       - uses: "actions/checkout@v4"
 
+      - name: "Install Go (Required for BoringSSL)"
+        uses: actions/setup-go@v5
+        with:
+          go-version: '>=1.20'
       - name: "Install dependencies"
         run: |
           sudo apt-get update
-          # ВАЖНО: 'llvm' и 'clang' убраны из apt-get, чтобы системный llvm-config 
-          # не ломал сборку bpf-linker под nightly!
-          sudo apt-get install -y musl-tools protobuf-compiler gcc-aarch64-linux-gnu mingw-w64
+          sudo apt-get install -y musl-tools protobuf-compiler gcc-aarch64-linux-gnu mingw-w64 cmake clang
 
       - name: "Install Rust Stable"
         uses: dtolnay/rust-toolchain@stable
@@ -110,10 +112,14 @@ jobs:
     steps:
       - uses: "actions/checkout@v6"
 
+      - name: "Install Go (Required for BoringSSL)"
+        uses: actions/setup-go@v5
+        with:
+          go-version: '>=1.20'
       - name: "Install dependencies"
         run: |
           sudo apt-get update
-          sudo apt-get install -y musl-tools protobuf-compiler
+          sudo apt-get install -y musl-tools protobuf-compiler cmake clang
 
       - name: "Install Rust"
         uses: "actions-rs/toolchain@v1"
@@ -175,8 +181,12 @@ jobs:
     steps:
       - uses: "actions/checkout@v6"
 
-      - name: "Install protoc (Windows)"
-        run: "choco install protoc"
+      - name: "Install Go (Required for BoringSSL)"
+        uses: actions/setup-go@v5
+        with:
+          go-version: '>=1.20'
+      - name: "Install Build Tools (Windows)"
+        run: "choco install protoc cmake nasm -y"
 
       - name: "Install Rust"
         uses: "actions-rs/toolchain@v1"

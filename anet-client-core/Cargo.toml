@@ -33,7 +33,9 @@ http = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 toml = "0.8"
 
-reqwest = { workspace = true, features = ["json", "rustls-tls-webpki-roots", "http2"] }
+reqwest = { workspace = true }
+boring = { workspace = true }
+tokio-boring = { workspace = true }
 
 russh = { workspace = true }
 rtc = { workspace = true }
