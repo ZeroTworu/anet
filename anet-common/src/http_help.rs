@@ -163,10 +163,12 @@ impl BrowserProfile {
 
     /// Создает сконфигурированный `reqwest::ClientBuilder` со встроенным TLS-отпечатком BoringSSL Chrome Mimicry,
     /// поддержкой сессионного Cookie Jar и базовыми браузерными параметрами.
+    /// Это ЕДИНСТВЕННАЯ разрешенная точка создания HTTP-клиентов `reqwest` во всей системе.
     pub fn build_reqwest_builder(&self, cookie_jar: std::sync::Arc<reqwest::cookie::Jar>) -> anyhow::Result<reqwest::ClientBuilder> {
         let ssl_builder = crate::boring_tls::build_chrome_ssl_connector()?;
         let builder = reqwest::Client::builder()
             .use_preconfigured_tls(ssl_builder.build())
+            .user_agent(self.user_agent)
             .cookie_provider(cookie_jar)
             .tcp_nodelay(true);
         Ok(builder)

@@ -1,7 +1,7 @@
 # Stage 1: Build binary
 FROM rust:1.94-slim AS builder
 WORKDIR /app
-RUN apt-get update && apt-get install -y pkg-config libssl-dev protobuf-compiler && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y pkg-config libssl-dev protobuf-compiler cmake clang golang-go && rm -rf /var/lib/apt/lists/*
 
 # Копируем весь репозиторий, чтобы Cargo видел структуру воркспейса
 COPY . .

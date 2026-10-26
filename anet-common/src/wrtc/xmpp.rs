@@ -30,7 +30,7 @@ pub struct XmppSession {
     reader_handle: tokio::task::JoinHandle<()>,
 }
 
-use crate::boring_tls::build_chrome_ssl_connector;
+use crate::boring_tls::build_chrome_ws_ssl_connector;
 use crate::transport_trait::VpnStream;
 use tokio_boring::SslConnectorExt;
 
@@ -112,7 +112,7 @@ impl XmppSession {
         let remote_ip = tcp_stream.peer_addr().ok().map(|a| a.ip());
         let _ = tcp_stream.set_nodelay(true);
 
-        let ssl_connector = build_chrome_ssl_connector()?.build();
+        let ssl_connector = build_chrome_ws_ssl_connector()?.build();
         let tls_stream = tokio::time::timeout(
             Duration::from_secs(handshake_timeout_secs),
             ssl_connector.connect_async(domain, tcp_stream),

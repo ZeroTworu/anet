@@ -1,7 +1,7 @@
 use std::env;
 use std::fs;
 use std::process::Command;
-use reqwest::Client;
+use std::sync::Arc;
 use log::{info, warn};
 use std::path::{Path, PathBuf};
 use crate::events::update_progress;
@@ -12,6 +12,7 @@ use serde::Deserialize;
 use zip::ZipArchive;
 use crate::server_config::{EncryptedServerConfigBundle, current_timestamp_secs};
 use anet_common::encryption::Cipher;
+use anet_common::http_help::BrowserProfile;
 use rand::RngCore;
 use rand::rngs::OsRng;
 use base64::prelude::*;
@@ -58,15 +59,16 @@ impl Updater {
 
         info!("[UPDATER] Запрос конфигурации по адресу: {}", target_url);
 
-        let client = Client::builder()
-            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) ANet-Client")
+        let profile = BrowserProfile::random();
+        let client = profile
+            .build_reqwest_builder(Arc::new(reqwest::cookie::Jar::default()))
+            .map_err(|e| anyhow::anyhow!("Не удалось инициализировать TLS-профиль: {}", e))?
             .timeout(std::time::Duration::from_secs(15))
-            .danger_accept_invalid_certs(true) // Обход самоподписанных TLS сертификатов
             .build()
             .map_err(|e| anyhow::anyhow!("Не удалось создать HTTP-клиент: {}", e))?;
 
-        let response = client
-            .get(&target_url)
+        let response = profile
+            .apply_to_reqwest(client.get(&target_url), None, None)
             .send()
             .await
             .map_err(|e| anyhow::anyhow!("Не удалось подключиться по указанной ссылке: {}", e))?;
@@ -114,15 +116,20 @@ impl Updater {
     pub async fn check_latest(url: &str, current_version: &str) -> anyhow::Result<Option<GithubRelease>> {
         info!("[UPDATER] Checking for updates...");
 
-        let client = Client::builder()
-            .user_agent("ANet-Client-GUI")
+        let profile = BrowserProfile::random();
+        let client = profile
+            .build_reqwest_builder(Arc::new(reqwest::cookie::Jar::default()))
+            .map_err(|e| anyhow::anyhow!("Failed to initialize TLS profile: {}", e))?
             .timeout(std::time::Duration::from_secs(10))
             .build()
             .map_err(|e| anyhow::anyhow!("Failed to build HTTP client: {}", e))?;
 
         info!("[UPDATER] Requesting URL: {}", url);
 
-        let response = client.get(url).send().await
+        let response = profile
+            .apply_to_reqwest(client.get(url), None, None)
+            .send()
+            .await
             .map_err(|e| anyhow::anyhow!("Network error: {}", e))?;
 
         if !response.status().is_success() {
@@ -142,14 +149,20 @@ impl Updater {
     }
 
     pub async fn download_apk(release: GithubRelease, target_path: String) -> anyhow::Result<()> {
-        let client = Client::builder().user_agent("ANet-Updater").build()?;
+        let profile = BrowserProfile::random();
+        let client = profile
+            .build_reqwest_builder(Arc::new(reqwest::cookie::Jar::default()))?
+            .build()?;
 
         let asset = release.assets.iter()
             .find(|a| a.name.ends_with(".apk"))
             .ok_or_else(|| anyhow::anyhow!("APK не найден в релизе"))?;
 
         let total_size = asset.size as u64;
-        let mut response = client.get(&asset.browser_download_url).send().await?;
+        let mut response = profile
+            .apply_to_reqwest(client.get(&asset.browser_download_url), None, None)
+            .send()
+            .await?;
 
         let mut downloaded: u64 = 0;
         let mut file = std::fs::File::create(&target_path)?;
@@ -169,14 +182,20 @@ impl Updater {
 
     pub async fn download_and_apply(release: GithubRelease) -> anyhow::Result<()> {
         info!("[UPDATER] Downloading update...");
-        let client = Client::builder().user_agent("ANet-Updater").build()?;
+        let profile = BrowserProfile::random();
+        let client = profile
+            .build_reqwest_builder(Arc::new(reqwest::cookie::Jar::default()))?
+            .build()?;
 
         let asset = release.assets.iter()
             .find(|a| a.name.to_lowercase().contains("client-windows") && a.name.ends_with(".zip"))
             .ok_or_else(|| anyhow::anyhow!("Архив не найден"))?;
 
         let total_size = asset.size as u64;
-        let mut response = client.get(&asset.browser_download_url).send().await?;
+        let mut response = profile
+            .apply_to_reqwest(client.get(&asset.browser_download_url), None, None)
+            .send()
+            .await?;
 
         let mut downloaded: u64 = 0;
         let mut buffer = Vec::with_capacity(total_size as usize);
@@ -264,13 +283,13 @@ impl Updater {
     ) -> anyhow::Result<ConfigFetchResult> {
         info!("[UPDATER] Запрос серверного конфига: {}", url);
 
-        let client = Client::builder()
-            .user_agent("ANet-Client-Core")
+        let profile = BrowserProfile::random();
+        let client = profile
+            .build_reqwest_builder(Arc::new(reqwest::cookie::Jar::default()))?
             .timeout(std::time::Duration::from_secs(12))
-            .danger_accept_invalid_certs(true)
             .build()?;
 
-        let mut req = client.get(url);
+        let mut req = profile.apply_to_reqwest(client.get(url), None, None);
         if let Some(etag) = current_etag {
             req = req.header(reqwest::header::IF_NONE_MATCH, etag);
         }

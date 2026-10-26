@@ -265,9 +265,14 @@ jobs:
     steps:
       - uses: "actions/checkout@v6"
 
-      # На macOS-latest protobuf обычно есть, но для гарантии
-      - name: "Install Protobuf"
-        run: brew install protobuf
+      - name: "Install Go (Required for BoringSSL)"
+        uses: actions/setup-go@v5
+        with:
+          go-version: '>=1.20'
+
+      # На macOS-latest protobuf обычно есть, но для гарантии ставим вместе с cmake
+      - name: "Install Dependencies"
+        run: brew install protobuf cmake
 
       - name: "Install Rust Targets (Apple Silicon & Intel)"
         run: |
@@ -623,6 +628,16 @@ jobs:
     steps:
       - uses: "actions/checkout@v6"
 
+      - name: "Install Go (Required for BoringSSL)"
+        uses: actions/setup-go@v5
+        with:
+          go-version: '>=1.20'
+
+      - name: "Install dependencies"
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler cmake clang
+
       # Установка Android NDK и Rust таргетов
       - name: "Setup Android NDK"
         uses: nttld/setup-ndk@v1
@@ -792,10 +807,15 @@ jobs:
     steps:
       - uses: "actions/checkout@v6"
 
+      - name: "Install Go (Required for BoringSSL)"
+        uses: actions/setup-go@v5
+        with:
+          go-version: '>=1.20'
+
       - name: "Install dependencies"
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libappindicator3-dev protobuf-compiler libxdo-dev
+          sudo apt-get install -y libgtk-3-dev libappindicator3-dev protobuf-compiler libxdo-dev cmake clang
 
       - name: "Install Rust"
         uses: "actions-rs/toolchain@v1"

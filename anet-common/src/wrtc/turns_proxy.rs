@@ -6,7 +6,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::mpsc;
 use tokio_boring::SslConnectorExt;
-use crate::boring_tls::build_chrome_ssl_connector;
+use crate::boring_tls::build_chrome_ws_ssl_connector;
 
 /// Запускает локальный UDP-проксирующий мост к удалённому серверу TURNS (TLS-over-TCP TURN)
 /// или TCP-over-TURN, позволяющий `webrtc-rs` использовать протокол `turn:127.0.0.1:<port>`
@@ -86,7 +86,7 @@ pub async fn start_turns_udp_bridge(
         let remote_peer_ip = tcp_stream.peer_addr().ok();
 
         if use_tls {
-            let ssl_connector = match build_chrome_ssl_connector() {
+            let ssl_connector = match build_chrome_ws_ssl_connector() {
                 Ok(b) => b.build(),
                 Err(e) => {
                     log::warn!("[WRTC TURNS Proxy] Failed to build BoringSSL connector: {e}");

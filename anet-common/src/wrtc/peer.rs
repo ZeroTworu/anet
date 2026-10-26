@@ -956,7 +956,7 @@ impl WrtcPeer {
                                 let _ = tcp.set_nodelay(true);
 
                                 let stream: Box<dyn crate::transport_trait::VpnStream> = if is_wss {
-                                    let ssl_connector = crate::boring_tls::build_chrome_ssl_connector()?.build();
+                                    let ssl_connector = crate::boring_tls::build_chrome_ws_ssl_connector()?.build();
                                     use tokio_boring::SslConnectorExt;
                                     let tls = ssl_connector.connect_async(&target_host, tcp).await
                                         .map_err(|e| anyhow::anyhow!("BoringSSL TLS handshake failed: {e}"))?;

@@ -40,7 +40,6 @@ async-trait = "0.1.89"
 roxmltree = { workspace = true }
 socket2 = { workspace = true }
 rustls = { workspace = true }
-tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 
 
 [build-dependencies]

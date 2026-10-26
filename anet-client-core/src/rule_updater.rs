@@ -1,5 +1,6 @@
 //! Менеджер загрузки и Zero-Copy отображения правил маршрутизации `rules.abc`.
 
+use anet_common::http_help::BrowserProfile;
 use anet_filter_core::{CompiledRoutingCache, RuleAction};
 use arc_swap::ArcSwap;
 use log::{error, info, warn};
@@ -182,11 +183,13 @@ impl RuleCacheManager {
         info!("{msg}");
         crate::events::status(&msg);
 
-        let client = reqwest::Client::builder()
+        let profile = BrowserProfile::random();
+        let client = profile
+            .build_reqwest_builder(Arc::new(reqwest::cookie::Jar::default()))?
             .timeout(std::time::Duration::from_secs(10))
             .build()?;
 
-        let mut req = client.get(&endpoint);
+        let mut req = profile.apply_to_reqwest(client.get(&endpoint), None, None);
 
         // Читаем локальный ETag из файла .etag если есть
         let etag_file = self.cache_path.with_extension("etag");

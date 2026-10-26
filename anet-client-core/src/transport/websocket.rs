@@ -15,7 +15,7 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use anet_common::boring_tls::build_chrome_ssl_connector;
+use anet_common::boring_tls::build_chrome_ws_ssl_connector;
 use anet_common::transport_trait::VpnStream;
 use std::collections::HashMap;
 use std::sync::Mutex as StdMutex;
@@ -124,7 +124,7 @@ async fn connect_authenticated(
         .to_ascii_lowercase();
 
     let stream: Box<dyn VpnStream> = if scheme == "wss" || scheme == "https" {
-        let ssl_connector = build_chrome_ssl_connector()?.build();
+        let ssl_connector = build_chrome_ws_ssl_connector()?.build();
         let sni_host = server.host.as_deref().unwrap_or(&target_host);
         let tls_stream = ssl_connector
             .connect_async(sni_host, tcp_stream)
