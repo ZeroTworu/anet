@@ -138,6 +138,11 @@ pub struct ANetApp {
     pub server_config_banner: Option<ServerConfigBanner>,
     pub storage_key: [u8; 32],
     pub is_fetching_server_config: bool,
+
+    pub routing_overrides: anet_client_core::LocalOverridesConfig,
+    pub routing_override_input: String,
+    pub routing_overrides_tab: crate::types::OverrideTab,
+    pub routing_overrides_changed: bool,
 }
 
 impl ANetApp {
@@ -259,6 +264,11 @@ impl ANetApp {
             dns_input_buffer: String::new(),
             is_dns_overridden,
 
+            routing_overrides: anet_client_core::LocalOverridesConfig::default(),
+            routing_override_input: String::new(),
+            routing_overrides_tab: crate::types::OverrideTab::Direct,
+            routing_overrides_changed: false,
+
             toast_message: None,
             toast_until: None,
 
@@ -272,7 +282,11 @@ impl ANetApp {
 
             server_config_banner: None,
             storage_key,
-            is_fetching_server_config: false,
+            is_fetching_server_config: false,       
+
+           
+           
+        
         };
 
         // 1. Загружаем активную конфигурацию (Server Config с оверлеями или пользовательский .toml)
@@ -653,6 +667,12 @@ impl ANetApp {
     ) {
         match toml::from_str::<CoreConfig>(content) {
             Ok(mut cfg) => {
+
+          
+
+        // Загружаем [routing.overrides] из конфига:
+        self.routing_overrides = cfg.routing.overrides.clone();
+
                 if cfg.main.get_config_url().is_none() {
                     let fallback_url = if id == SERVER_CONFIG_ID {
                         DesktopSecureStore::get_server_config_url()
@@ -671,10 +691,13 @@ impl ANetApp {
                 }
                 let _ = cfg.sanitize();
                 self.filter_mode = match cfg.main.per_app_mode {
-                    PerAppMode::All => FilterMode::All,
-                    PerAppMode::Include => FilterMode::Include,
-                    PerAppMode::Exclude => FilterMode::Exclude,
-                };
+            PerAppMode::All => FilterMode::All,
+            PerAppMode::Include => FilterMode::Include,
+            PerAppMode::Exclude => FilterMode::Exclude,
+        };
+
+        // Загружаем [routing.overrides] из конфига:
+        self.routing_overrides = cfg.routing.overrides.clone();
 
                 if let Ok(raw_toml) = toml::from_str::<toml::Value>(content) {
                     self.tray_value = raw_toml
@@ -1326,13 +1349,13 @@ impl ANetApp {
             return;
         }
         let content = match std::fs::read_to_string(&path) {
-            Ok(c) => c,
-            Err(e) => {
-                self.log(&format!("Failed to read file: {}", e));
-                self.show_toast("Не удалось прочитать файл");
-                return;
-            }
-        };
+        Ok(c) => c,
+        Err(e) => {
+            self.log(&format!("Failed to read file: {}", e));
+            self.show_toast("Не удалось прочитать файл");
+            return;
+        }
+    };
 
         if let Err(e) = toml::from_str::<CoreConfig>(&content) {
             self.log(&format!("Некорректный TOML конфиг: {}", e));
@@ -1441,6 +1464,124 @@ impl ANetApp {
             self.show_url_modal = true;
         }
     }
+
+    // В impl ANetApp:
+
+pub fn save_routing_overrides(&mut self) {
+    let is_server_cfg = {
+        let settings = lock_ignore_poison(&self.settings);
+        settings.active_config_id.as_deref() == Some(SERVER_CONFIG_ID) ||
+            self.config_name == SERVER_CONFIG_DISPLAY_NAME ||
+            (settings.active_config_id.is_none() && settings.cached_server_config.is_some())
+    };
+
+    // 1. РЕЖИМ SERVER CONFIG: сохраняем в оверлеи settings.json
+    if is_server_cfg {
+        {
+            let mut settings = lock_ignore_poison(&self.settings);
+            settings.active_config_id = Some(SERVER_CONFIG_ID.to_string());
+            settings.server_config_overrides.routing_overrides = Some(
+                self.routing_overrides.clone()
+            );
+            settings.save();
+        }
+
+        self.show_toast("Исключения [routing.overrides] для Server config сохранены");
+        self.log("Правила [routing.overrides] сохранены в оверлей Server config.");
+
+        let should_reconnect =
+            lock_ignore_poison(&self.shared).state == ConnectionState::Connected;
+        if should_reconnect {
+            self.log("Переподключение VPN с обновленными правилами [routing.overrides]...");
+        }
+
+        let config_opt = {
+            let settings = lock_ignore_poison(&self.settings);
+            settings.get_active_config_with_overrides(&self.storage_key)
+        };
+
+        if let Some(config) = config_opt {
+            self.load_config_from_content(
+                &config.id,
+                &config.content,
+                &config.name,
+                should_reconnect
+            );
+        }
+        return;
+    }
+
+    // 2. РЕЖИМ КЛИЕНТСКОГО .TOML КОНФИГА: обновляем и сохраняем файл на диске
+    let mut updated_config_data: Option<(String, String, String)> = None;
+
+    {
+        let mut settings = lock_ignore_poison(&self.settings);
+        let active_id = settings.active_config_id.clone();
+
+        if let Some(id) = active_id {
+            if let Some(cfg) = settings.configs.iter_mut().find(|c| c.id == id) {
+                cfg.content = crate::utils::toml::inject_routing_overrides_to_toml(&cfg.content, &self.routing_overrides);
+                updated_config_data = Some((
+                    cfg.id.clone(),
+                    cfg.content.clone(),
+                    cfg.name.clone(),
+                ));
+            }
+            settings.save();
+        } else if !settings.configs.is_empty() {
+            let cfg = &mut settings.configs[0];
+            cfg.content = crate::utils::toml::inject_routing_overrides_to_toml(&cfg.content, &self.routing_overrides);
+            let id = cfg.id.clone();
+            let content = cfg.content.clone();
+            let name = cfg.name.clone();
+            settings.active_config_id = Some(id.clone());
+            updated_config_data = Some((id, content, name));
+            settings.save();
+        }
+    }
+
+    let Some((id, content, name)) = updated_config_data else {
+        self.log("Ошибка: нет активного конфига для сохранения [routing.overrides].");
+        self.show_toast("Ошибка: нет активного конфига");
+        return;
+    };
+
+    let path_by_id = std::path::PathBuf::from("configs").join(format!("{}.toml", id));
+    let path_by_name = std::path::PathBuf::from("configs").join(format!("{}.toml", name));
+
+    let target_path = if path_by_id.exists() {
+        Some(path_by_id)
+    } else if path_by_name.exists() {
+        Some(path_by_name)
+    } else {
+        let root_id = std::path::PathBuf::from(format!("{}.toml", id));
+        let root_name = std::path::PathBuf::from(format!("{}.toml", name));
+        if root_id.exists() {
+            Some(root_id)
+        } else if root_name.exists() {
+            Some(root_name)
+        } else {
+            None
+        }
+    };
+
+    if let Some(path) = target_path {
+        match std::fs::write(&path, &content) {
+            Ok(_) => self.log(&format!("Секция [routing.overrides] сохранена в {:?}", path)),
+            Err(e) => self.log(&format!("Ошибка записи в {:?}: {}", path, e)),
+        }
+    }
+
+    let should_reconnect = lock_ignore_poison(&self.shared).state == ConnectionState::Connected;
+    if should_reconnect {
+        self.log("Переподключение VPN с обновленными правилами [routing.overrides]...");
+    }
+
+    self.load_config_from_content(&id, &content, &name, should_reconnect);
+    self.show_toast("Правила [routing.overrides] сохранены в файл профиля");
+}
+
+
 
     pub fn drain_events(&mut self) {
         while let Ok(event) = self.event_rx.try_recv() {

@@ -1,7 +1,8 @@
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
-use crate::config::PerAppMode;
+use crate::config::{CoreConfig, PerAppMode};
+use anet_filter_core::LocalOverridesConfig;
 
 pub const SERVER_CONFIG_ID: &str = "__SERVER_CONFIG__";
 pub const SERVER_CONFIG_DISPLAY_NAME: &str = "Server config";
@@ -56,6 +57,10 @@ pub struct ServerConfigOverrides {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tray_mode: Option<bool>,
+
+    /// Пользовательские исключения [routing.overrides] (block, direct, proxy)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing_overrides: Option<LocalOverridesConfig>,
 }
 
 impl ServerConfigOverrides {
@@ -78,7 +83,7 @@ pub struct EncryptedServerConfigBundle {
 }
 
 /// Применение Overrides к распарсенному `CoreConfig`
-pub fn apply_overrides(mut cfg: crate::config::CoreConfig, overrides: &ServerConfigOverrides) -> crate::config::CoreConfig {
+pub fn apply_overrides(mut cfg: CoreConfig, overrides: &ServerConfigOverrides) -> CoreConfig {
     if let Some(ref excludes) = overrides.exclude_route_for {
         cfg.main.exclude_route_for = excludes.clone();
     }
@@ -90,6 +95,9 @@ pub fn apply_overrides(mut cfg: crate::config::CoreConfig, overrides: &ServerCon
     }
     if let Some(mode) = overrides.per_app_mode {
         cfg.main.per_app_mode = mode;
+    }   
+    if let Some(ref routing_ovr) = overrides.routing_overrides {
+        cfg.routing.overrides = routing_ovr.clone();
     }
     cfg
 }

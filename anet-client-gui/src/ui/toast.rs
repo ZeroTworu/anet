@@ -12,12 +12,11 @@ pub fn render_toast(app: &mut ANetApp, ctx: &egui::Context) {
                 .order(egui::Order::Foreground)
                 .show(ctx, |ui| {
                     egui::Frame::NONE
-                        .fill(egui::Color32::from_rgb(35, 37, 44))
+                        .fill(egui::Color32::from_rgb(255, 185, 0))
                         .corner_radius(8.0)
-                        .inner_margin(egui::Margin::symmetric(16, 10))
-                        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(60, 63, 72)))
+                        .inner_margin(egui::Margin::symmetric(16, 10))                        
                         .show(ui, |ui| {
-                            ui.label(egui::RichText::new(message).size(11.0).color(egui::Color32::WHITE));
+                            ui.label(egui::RichText::new(message).size(11.0).color(egui::Color32::BLACK));
                         });
                 });
             ctx.request_repaint_after(until.duration_since(now));

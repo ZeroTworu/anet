@@ -11,7 +11,7 @@ use crate::radix::{IpRoutingTable, IpRoutingTableBuilder};
 use crate::trie::split_domain_to_reversed_labels;
 
 /// Конфигурация локальных правил пользователя из `client.toml`
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LocalOverridesConfig {
     #[serde(default)]
     pub block: Vec<String>,

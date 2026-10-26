@@ -39,3 +39,56 @@ pub fn validate_exclude_route(value: &str) -> bool {
             && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
     })
 }
+
+
+// anet-client-gui/src/utils/validator.rs
+
+/// Проверка валидности записи для [routing.overrides]
+pub fn validate_routing_override_target(value: &str) -> bool {
+    let value = value.trim();
+
+    if value.is_empty() || value.chars().any(|c| c.is_whitespace()) {
+        return false;
+    }
+
+    // 1. IP
+    if value.parse::<std::net::IpAddr>().is_ok() {
+        return true;
+    }
+
+    // 2. CIDR
+    if let Some((ip, prefix)) = value.split_once('/') {
+        if let (Ok(addr), Ok(prefix_num)) = (ip.parse::<std::net::IpAddr>(), prefix.parse::<u8>()) {
+            let max_prefix = match addr {
+                std::net::IpAddr::V4(_) => 32,
+                std::net::IpAddr::V6(_) => 128,
+            };
+            return prefix_num <= max_prefix;
+        }
+    }
+
+    // 3. Доменное имя или Wildcard (*.domain / +.domain)
+    let domain_part = if let Some(stripped) = value.strip_prefix("*.") {
+        stripped
+    } else if let Some(stripped) = value.strip_prefix("+.") {
+        stripped
+    } else {
+        value
+    };
+
+    if domain_part.contains("://")
+        || domain_part.contains(':')
+        || domain_part.starts_with('.')
+        || domain_part.ends_with('.')
+    {
+        return false;
+    }
+
+    domain_part.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    })
+}
