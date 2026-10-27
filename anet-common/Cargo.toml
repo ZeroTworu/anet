@@ -40,6 +40,7 @@ async-trait = "0.1.89"
 roxmltree = { workspace = true }
 socket2 = { workspace = true }
 rustls = { workspace = true }
+rustls-native-certs = { workspace = true }
 
 
 [build-dependencies]

@@ -639,7 +639,8 @@ impl ClientBuilder {
                 ),
                 #[cfg(feature = "__rustls")]
                 TlsBackend::BuiltBoring(conn) => {
-                    let conn = crate::boring_tls::Config::preconfigured(conn);
+                    let mut conn = crate::boring_tls::Config::preconfigured(conn);
+                    conn.verify_hostname = config.hostname_verification && config.certs_verification;
                     #[cfg(feature = "http3")]
                     {
                         let mut h3_tls = conn.clone();

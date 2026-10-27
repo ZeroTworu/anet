@@ -183,19 +183,31 @@ server {
 
 ### 4.1. Клиент (`client.toml`)
 
-В `dsn` сервера поддерживаются необязательные query-параметры для быстрой подстройки под конкретный маршрут без изменения глобальной секции `[ahttp]`:
+В `dsn` сервера поддерживаются необязательные query-параметры для быстрой подстройки под конкретный маршрут без изменения глобальной секции `[ahttp]` или `[stealth]`:
 * `?cdn=1` — включает профиль совместимости с CDNVideo (ограничивает Uplink-батч до `49152` байт и при `http2_adaptive_window = false` выставляет окна `49152` байт);
 * `?budget=65536` — явное переопределение лимита Uplink-батча в байтах для данного сервера;
 * `?pool=4` — переопределение числа TCP/TLS соединений в пуле (`tcp_pool_size`);
-* `?method=POST` — переопределение HTTP-метода отправки (`POST`, `PUT` и т.д.).
+* `?method=POST` — переопределение HTTP-метода отправки (`POST`, `PUT` и т.д.);
+* `?fp=auto|chrome|firefox|safari|randomized` — переопределение профиля TLS ClientHello (BoringSSL) и синхронизированных с ним HTTP-заголовков;
+* `?verify=1|0` и `?pin=<SHA256>` — управление защитой от активного спуфинга ТСПУ (по умолчанию `tls_verify_peer = true`).
 
 ```toml
-# Пример 1: Прямое подключение к серверу (без CDN)
+[stealth]
+# Профиль TLS-отпечатка и синхронизированных HTTP-заголовков:
+# "auto" (по умолчанию) | "chrome" | "firefox" | "safari" | "randomized"
+tls_fingerprint = "auto"
+# Защита от активного спуфинга ТСПУ (подмены сертификата на этапе TLS Handshake). По умолчанию: true
+tls_verify_peer = true
+
+# Пример 1: Прямое подключение к серверу (без CDN) с валидным сертификатом Let's Encrypt
 [[servers]]
 name = "Direct Node [AHTTP]"
 dsn = "https://example.com/api/v2/telemetry"
 timeout_secs = 10
 server_pub_key = "<BASE64_ED25519_PUBLIC_KEY>"
+# Опционально: жёсткий SHA-256 пиннинг публичного ключа (SPKI) или сертификата сервера
+# tls_pin_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+# tls_fingerprint = "randomized"
 
 # Пример 2: Подключение через CDNVideo
 # [[servers]]

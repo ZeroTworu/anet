@@ -1,5 +1,10 @@
+use crate::boring_tls::{TlsClientConfig, TlsFingerprint};
 use crate::consts::WRTC_VIDEO_MTU_OVERHEAD;
 use serde::{Deserialize, Serialize};
+
+fn default_tls_verify_peer() -> bool {
+    true
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
@@ -18,6 +23,21 @@ pub struct StealthConfig {
     pub frag_min_chunks: u8,
     /// Максимальное число частей, на которое дробится хендшейк.
     pub frag_max_chunks: u8,
+
+    /// Профиль TLS-отпечатка ClientHello и синхронизированных HTTP-заголовков:
+    /// "auto" | "chrome" | "firefox" | "safari" | "randomized"
+    pub tls_fingerprint: TlsFingerprint,
+
+    /// Защита от активного спуфинга ТСПУ (MITM / подмены сертификата при TLS-рукопожатии).
+    /// Строго опционально через конфиг, по умолчанию — включено (`true`).
+    #[serde(default = "default_tls_verify_peer")]
+    pub tls_verify_peer: bool,
+
+    /// Опциональный SHA-256 пиннинг сертификата или публичного ключа (SPKI) сервера (Hex или Base64).
+    pub tls_pin_sha256: Option<String>,
+
+    /// Опциональный путь к PEM-файлу корневого/серверного сертификата или сам PEM-текст.
+    pub tls_ca_cert: Option<String>,
 }
 
 impl Default for StealthConfig {
@@ -29,6 +49,22 @@ impl Default for StealthConfig {
             frag_enabled: false,
             frag_min_chunks: 2,
             frag_max_chunks: 3,
+            tls_fingerprint: TlsFingerprint::Auto,
+            tls_verify_peer: true,
+            tls_pin_sha256: None,
+            tls_ca_cert: None,
+        }
+    }
+}
+
+impl StealthConfig {
+    pub fn to_tls_client_config(&self) -> TlsClientConfig {
+        TlsClientConfig {
+            fingerprint: self.tls_fingerprint,
+            random_seed: rand::random(),
+            verify_peer: self.tls_verify_peer,
+            pin_sha256: self.tls_pin_sha256.clone(),
+            ca_cert: self.tls_ca_cert.clone(),
         }
     }
 }

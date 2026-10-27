@@ -30,7 +30,6 @@ pub struct XmppSession {
     reader_handle: tokio::task::JoinHandle<()>,
 }
 
-use crate::boring_tls::connect_chrome_ws_tls;
 use crate::transport_trait::VpnStream;
 
 impl XmppSession {
@@ -113,7 +112,7 @@ impl XmppSession {
 
         let tls_stream = tokio::time::timeout(
             Duration::from_secs(handshake_timeout_secs),
-            connect_chrome_ws_tls(domain, tcp_stream),
+            profile.connect_ws_tls(domain, tcp_stream),
         )
         .await
         .map_err(|_| anyhow::anyhow!("XMPP BoringSSL TLS handshake with {domain} timed out"))??;

@@ -131,7 +131,8 @@ impl AHttpTransport {
 #[async_trait]
 impl ClientTransport for AHttpTransport {
     async fn connect(&self) -> Result<ConnectionResult> {
-        let profile = BrowserProfile::random();
+        let tls_cfg = self.server.effective_tls_config(&self.config.stealth);
+        let profile = BrowserProfile::with_tls_config(tls_cfg);
 
         let dsn_url = Url::parse(&self.server.dsn)?;
         let scheme = dsn_url.scheme();

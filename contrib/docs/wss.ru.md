@@ -189,21 +189,36 @@ server {
 ### 5.1. Клиент (`client.toml`)
 
 ```toml
+[stealth]
+# Профиль TLS ClientHello (ALPN: strictly "http/1.1" для WSS) и синхронизированных HTTP Upgrade заголовков:
+# "auto" (по умолчанию) | "chrome" | "firefox" | "safari" | "randomized"
+tls_fingerprint = "auto"
+# Защита от активного спуфинга ТСПУ (по умолчанию: true — разрывает соединение на этапе TLS Handshake
+# при подмене сертификата до отправки HTTP Upgrade / Sec-WebSocket-Key и пути /socket)
+tls_verify_peer = true
+
 [[servers]]
 name = "Direct or CDN Node [WSS]"
 # Схема wss:// (через Nginx/CDN с TLS) или ws:// (без TLS)
 # Дополнительные query-параметры (опционально):
-#   ?pool=4  — количество параллельных WebSocket-соединений в пуле (по умолчанию 4, макс. 8)
+#   ?pool=4        — количество параллельных WebSocket-соединений в пуле (по умолчанию 4, макс. 8)
+#   ?fp=firefox    — переопределение TLS-профиля ("auto", "chrome", "firefox", "safari", "randomized")
+#   ?verify=1      — управление проверкой сертификата (по умолчанию включена)
+#   ?pin=<SHA256>  — SHA-256 пиннинг сертификата или SPKI публичного ключа
 dsn = "wss://example.com/socket?pool=4"
 timeout_secs = 10
 server_pub_key = "<BASE64_ED25519_PUBLIC_KEY>"
+# Опциональные переопределения на уровне ноды:
+# tls_fingerprint = "randomized"
+# tls_verify_peer = true
+# tls_pin_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
 # Интервал плановой ротации долгоживущих WebSocket-соединений (в секундах)
 websocket_min_session_secs = 900
 websocket_max_session_secs = 1800
 ```
 
-*Примечание по проверке сертификата:* клиентский TLS-коннектор использует браузерный список ALPN (`["h2", "http/1.1"]`), но намеренно не требует привязки к системному CA (`AcceptAnyServerCert`), так как подлинность сервера криптографически верифицируется на этапе ASTP-рукопожатия ключом `server_pub_key` (Ed25519).
+*Примечание по проверке сертификата и защите от активного спуфинга ТСПУ:* клиентский TLS-коннектор WebSocket на базе BoringSSL анонсирует в ALPN строго `["http/1.1"]` и по умолчанию (`tls_verify_peer = true`) проверяет цепочку доверия сертификата (WebPKI + совпадение домена SNI) либо сверяет криптографический пин `tls_pin_sha256`. Если ТСПУ пытается перехватить TLS-сессию поддельным сертификатом, рукопожатие обрывается на уровне TLS до отправки заголовка `Upgrade: websocket` и пути `/socket`. Подробные команды `tcpdump` / `tshark` для проверки отпечатка приведены в [`boringssl_migration.ru.md`](./boringssl_migration.ru.md).
 
 ### 5.2. Сервер (`server.toml`)
 

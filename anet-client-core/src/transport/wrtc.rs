@@ -94,7 +94,9 @@ impl AuthChannel for WrtcAuthChannel {
 impl ClientTransport for WrtcTransport {
     async fn connect(&self) -> Result<ConnectionResult> {
         let (domain, room_name) = self.server.wrtc_room()?;
-        let browser_profile = BrowserProfile::random();
+        let tls_cfg = self.server.effective_tls_config(&self.config.stealth);
+        anet_common::boring_tls::set_default_tls_config(tls_cfg.clone());
+        let browser_profile = BrowserProfile::with_tls_config(tls_cfg);
         let guest_name = generate_random_guest_name();
 
         info!(

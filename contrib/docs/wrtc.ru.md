@@ -332,6 +332,13 @@ pub struct ColibriMessage {
 
 ### В `client.toml`:
 ```toml
+[stealth]
+# Синхронизированный профиль TLS (BoringSSL) и HTTP/WS заголовков для Ktalk REST API, XMPP-WS, Colibri-WS и TURNS:
+# "auto" (по умолчанию) | "chrome" | "firefox" | "safari" | "randomized"
+tls_fingerprint = "auto"
+# Защита от активного спуфинга ТСПУ (верифкация сертификатов *.ktalk.ru / *.ktalk.host, по умолчанию: true)
+tls_verify_peer = true
+
 [[servers]]
 name = "Ktalk Node [WRTC]"
 dsn = "wrtc://example.ktalk.ru/example-room-id"
@@ -341,6 +348,8 @@ wrtc_media_keepalive_interval_ms = 20 # Эмуляция Opus тишины (мс
 wrtc_ping_interval_secs = 20          # Пинг сигнального WSS (сек)
 wrtc_fallback_jvb_ip = "203.0.113.7"  # Fallback IP медиасервера JVB
 wrtc_fallback_jvb_port = 10004        # Fallback UDP порт JVB
+# Опциональное переопределение TLS-профиля для этой ноды:
+# tls_fingerprint = "chrome"
 
 # Режим транспорта данных: "media_video" | "p2p_direct" | "jvb_datachannel" | "ws" | "auto"
 wrtc_mode = "media_video"

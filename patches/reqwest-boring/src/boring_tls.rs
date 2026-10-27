@@ -184,7 +184,7 @@ impl Config {
             sessions: Arc::default(),
             alpn_protocols: Vec::new(),
             enable_sni: true,
-            verify_hostname: false,
+            verify_hostname: true,
             #[cfg(feature = "http3")]
             enable_early_data: false,
             #[cfg(feature = "http3")]

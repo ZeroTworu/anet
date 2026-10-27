@@ -193,6 +193,23 @@ pub struct ServerConfig {
     /// WebRTC Data Transport mode: "auto" | "p2p_direct" | "jvb_datachannel" | "ws" | "media_video"
     #[serde(default)]
     pub wrtc_mode: Option<String>,
+
+    /// Опциональное переопределение TLS-отпечатка для конкретного сервера:
+    /// "auto" | "chrome" | "firefox" | "safari" | "randomized"
+    #[serde(default)]
+    pub tls_fingerprint: Option<anet_common::boring_tls::TlsFingerprint>,
+
+    /// Опциональное переопределение защиты от активного спуфинга ТСПУ для этого сервера.
+    #[serde(default)]
+    pub tls_verify_peer: Option<bool>,
+
+    /// Опциональный SHA-256 пиннинг сертификата или SPKI публичного ключа для этого сервера.
+    #[serde(default)]
+    pub tls_pin_sha256: Option<String>,
+
+    /// Опциональный пользовательский корневой/серверный PEM-сертификат для этого сервера.
+    #[serde(default)]
+    pub tls_ca_cert: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -214,6 +231,10 @@ impl Default for ServerConfig {
             wrtc_fallback_jvb_ip: None,
             wrtc_fallback_jvb_port: None,
             wrtc_mode: None,
+            tls_fingerprint: None,
+            tls_verify_peer: None,
+            tls_pin_sha256: None,
+            tls_ca_cert: None,
         }
     }
 }
@@ -251,6 +272,53 @@ impl ServerConfig {
         }
     }
 
+    /// Возвращает результирующую TLS-конфигурацию для данного сервера
+    /// (объединяя глобальную секцию `[stealth]`, поля `[[servers]]` и query-параметры в `dsn`: `?fp=...&verify=...&pin=...`).
+    pub fn effective_tls_config(
+        &self,
+        stealth: &StealthConfig,
+    ) -> anet_common::boring_tls::TlsClientConfig {
+        let mut cfg = stealth.to_tls_client_config();
+        if let Some(fp) = self.tls_fingerprint {
+            cfg.fingerprint = fp;
+        }
+        if let Some(verify) = self.tls_verify_peer {
+            cfg.verify_peer = verify;
+        }
+        if let Some(ref pin) = self.tls_pin_sha256 {
+            cfg.pin_sha256 = Some(pin.clone());
+        }
+        if let Some(ref ca) = self.tls_ca_cert {
+            cfg.ca_cert = Some(ca.clone());
+        }
+
+        if let Ok(parsed_url) = reqwest::Url::parse(&self.dsn) {
+            for (k, v) in parsed_url.query_pairs() {
+                match k.as_ref() {
+                    "fp" | "tls_fingerprint" => {
+                        if let Ok(fp) = v.parse::<anet_common::boring_tls::TlsFingerprint>() {
+                            cfg.fingerprint = fp;
+                        }
+                    }
+                    "verify" | "tls_verify_peer" => {
+                        cfg.verify_peer = !matches!(
+                            v.trim().to_ascii_lowercase().as_str(),
+                            "0" | "false" | "no" | "off"
+                        );
+                    }
+                    "pin" | "tls_pin_sha256" => {
+                        if !v.trim().is_empty() {
+                            cfg.pin_sha256 = Some(v.into_owned());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        cfg
+    }
+
     /// Гарантированно возвращает "host:port" даже если порт не был указан в DSN
     pub fn endpoint(&self) -> anyhow::Result<String> {
         let (host, port) = self.host_port()?;
@@ -260,6 +328,30 @@ impl ServerConfig {
     pub fn websocket_url(&self) -> anyhow::Result<String> {
         let mode = self.mode()?;
         anyhow::ensure!(mode == TransportMode::Websocket, "DSN '{}' is not a websocket endpoint", self.dsn);
+        if let Ok(mut parsed) = reqwest::Url::parse(&self.dsn) {
+            if parsed.query().is_some() {
+                let kept: Vec<(String, String)> = parsed
+                    .query_pairs()
+                    .filter(|(k, _)| {
+                        !matches!(
+                            k.as_ref(),
+                            "fp" | "tls_fingerprint" | "verify" | "tls_verify_peer" | "pin" | "tls_pin_sha256"
+                        )
+                    })
+                    .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                    .collect();
+                if kept.is_empty() {
+                    parsed.set_query(None);
+                } else {
+                    let mut pairs = parsed.query_pairs_mut();
+                    pairs.clear();
+                    for (k, v) in kept {
+                        pairs.append_pair(&k, &v);
+                    }
+                }
+                return Ok(parsed.to_string());
+            }
+        }
         Ok(self.dsn.clone())
     }
 
@@ -490,13 +582,26 @@ impl CoreConfig {
             self.main.per_app_mode = PerAppMode::All;
         }
 
+        if let Some(ref pin) = self.stealth.tls_pin_sha256 {
+            if !pin.trim().is_empty() {
+                anet_common::boring_tls::parse_sha256_pin(pin)?;
+            }
+        }
+
         for server in &self.servers {
             server.mode()?;
             server.host_port()?;
             if server.mode()? == TransportMode::Websocket {
                 server.websocket_url()?;
             }
+            if let Some(ref pin) = server.tls_pin_sha256 {
+                if !pin.trim().is_empty() {
+                    anet_common::boring_tls::parse_sha256_pin(pin)?;
+                }
+            }
         }
+
+        anet_common::boring_tls::set_default_tls_config(self.stealth.to_tls_client_config());
 
         Ok(())
     }
@@ -510,22 +615,8 @@ mod tests {
     #[test]
     fn dsn_selects_transport_and_endpoint() {
         let server = ServerConfig {
-            name: None,
             dsn: "quic://vpn.example.com:4519".to_string(),
-            timeout_secs: 10,
-            server_pub_key: None,
-            ssh_user: None,
-            group_name: None,
-            group_id: None,
-            weight: None,
-            weigth: None,
-            websocket_min_session_secs: 480,
-            websocket_max_session_secs: 1500,
-            wrtc_media_keepalive_interval_ms: None,
-            wrtc_ping_interval_secs: None,
-            wrtc_fallback_jvb_ip: None,
-            wrtc_fallback_jvb_port: None,
-            wrtc_mode: None,
+            ..Default::default()
         };
         assert_eq!(server.mode().unwrap(), TransportMode::Quic);
         assert_eq!(server.endpoint().unwrap(), "vpn.example.com:4519");
@@ -538,22 +629,8 @@ mod tests {
         assert_eq!(websocket.websocket_url().unwrap(), "wss://vpn.example.com:8443/socket");
 
         let ws_no_port = ServerConfig {
-            name: None,
             dsn: "wss://vpn.example.com/socket".to_string(),
-            timeout_secs: 10,
-            server_pub_key: None,
-            ssh_user: None,
-            group_name: None,
-            group_id: None,
-            weight: None,
-            weigth: None,
-            websocket_min_session_secs: 480,
-            websocket_max_session_secs: 1500,
-            wrtc_media_keepalive_interval_ms: None,
-            wrtc_ping_interval_secs: None,
-            wrtc_fallback_jvb_ip: None,
-            wrtc_fallback_jvb_port: None,
-            wrtc_mode: None,
+            ..Default::default()
         };
         assert_eq!(ws_no_port.endpoint().unwrap(), "vpn.example.com:443");
     }
@@ -587,5 +664,63 @@ mod tests {
         assert_eq!(cfg.servers[0].group_name.as_deref(), Some("Group A"));
         assert_eq!(cfg.servers[0].weight(), 50);
         assert_eq!(cfg.servers[1].weight(), 100);
+    }
+
+    #[test]
+    fn tls_fingerprint_and_verify_config_resolution() {
+        use super::CoreConfig;
+        use anet_common::boring_tls::TlsFingerprint;
+
+        let toml_str = r#"
+            [stealth]
+            tls_fingerprint = "randomized"
+            # tls_verify_peer по умолчанию должен быть true!
+
+            [[servers]]
+            name = "Default Inherited Node"
+            dsn = "https://node1.example.com/api/v2/telemetry"
+
+            [[servers]]
+            name = "Firefox Pinned Node"
+            dsn = "wss://node2.example.com/socket"
+            tls_fingerprint = "firefox"
+            tls_pin_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+            [[servers]]
+            name = "Query Override Node"
+            dsn = "https://node3.example.com/api/v2/telemetry?fp=safari&verify=0"
+        "#;
+
+        let mut cfg: CoreConfig = toml::from_str(toml_str).unwrap();
+        cfg.sanitize().unwrap();
+
+        assert_eq!(cfg.stealth.tls_fingerprint, TlsFingerprint::Randomized);
+        assert!(cfg.stealth.tls_verify_peer);
+
+        let eff0 = cfg.servers[0].effective_tls_config(&cfg.stealth);
+        assert_eq!(eff0.fingerprint, TlsFingerprint::Randomized);
+        assert!(eff0.verify_peer);
+        assert!(eff0.pin_sha256.is_none());
+
+        let eff1 = cfg.servers[1].effective_tls_config(&cfg.stealth);
+        assert_eq!(eff1.fingerprint, TlsFingerprint::Firefox);
+        assert!(eff1.verify_peer);
+        assert_eq!(
+            eff1.pin_sha256.as_deref(),
+            Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+        );
+
+        let eff2 = cfg.servers[2].effective_tls_config(&cfg.stealth);
+        assert_eq!(eff2.fingerprint, TlsFingerprint::Safari);
+        assert!(!eff2.verify_peer);
+
+        let ws_with_query = ServerConfig {
+            dsn: "wss://node2.example.com/socket?fp=firefox&verify=1".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            ws_with_query.websocket_url().unwrap(),
+            "wss://node2.example.com/socket"
+        );
     }
 }

@@ -1,4 +1,3 @@
-use crate::boring_tls::build_chrome_ws_ssl_connector;
 use bytes::BytesMut;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -118,17 +117,6 @@ async fn run_turns_proxy_loop(
         }
     });
 
-    let ssl_connector = match build_chrome_ws_ssl_connector() {
-        Ok(b) => b.build(),
-        Err(e) => {
-            log::warn!(
-                "[WRTC TURNS Proxy] Failed to build BoringSSL connector for {remote_url}: {e}"
-            );
-            udp_reader_task.abort();
-            return;
-        }
-    };
-
     while let Some(first_pkt) = pkt_rx.recv().await {
         let target_addr_str = format!("{host}:{port}");
         let connect_res = tokio::time::timeout(connect_timeout, async {
@@ -162,22 +150,9 @@ async fn run_turns_proxy_loop(
         let remote_peer_ip = tcp_stream.peer_addr().ok();
 
         if use_tls {
-            let ssl_cfg = match ssl_connector.configure() {
-                Ok(mut cfg) => {
-                    cfg.set_verify_hostname(false);
-                    cfg
-                }
-                Err(e) => {
-                    log::warn!(
-                        "[WRTC TURNS Proxy] Failed to configure BoringSSL session for {remote_url}: {e}"
-                    );
-                    break;
-                }
-            };
-
             let tls_res = tokio::time::timeout(
                 connect_timeout,
-                tokio_boring::connect(ssl_cfg, &host, tcp_stream),
+                crate::boring_tls::connect_chrome_ws_tls(&host, tcp_stream),
             )
             .await;
 

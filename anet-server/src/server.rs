@@ -27,6 +27,7 @@ pub struct ANetServer {
 
 impl ANetServer {
     pub fn new(cfg_ref: &Config) -> Result<Self> {
+        anet_common::boring_tls::set_default_tls_config(cfg_ref.stealth.to_tls_client_config());
         let t_prm = TunParams {
             netmask: cfg_ref.network.mask.parse()?, gateway: cfg_ref.network.gateway.parse()?,
             address: cfg_ref.network.self_ip.parse()?, name: cfg_ref.network.if_name.clone(),

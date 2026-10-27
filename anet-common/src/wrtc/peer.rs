@@ -1008,7 +1008,7 @@ impl WrtcPeer {
                                 let peer_ip = tcp.peer_addr().ok().map(|a| a.ip());
                                 let _ = tcp.set_nodelay(true);
                                 let stream: Box<dyn crate::transport_trait::VpnStream> = if is_wss {
-                                    let tls = crate::boring_tls::connect_chrome_ws_tls(&target_host, tcp).await?;
+                                    let tls = ws_profile.connect_ws_tls(&target_host, tcp).await?;
                                     Box::new(tls)
                                 } else {
                                     Box::new(tcp)

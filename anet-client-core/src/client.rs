@@ -71,6 +71,7 @@ impl AnetClient {
         route_manager: Box<dyn RouteManager>,
     ) -> Self {
         let dns_manager = get_dns_manager();
+        anet_common::boring_tls::set_default_tls_config(config.stealth.to_tls_client_config());
         let rule_cache = crate::rule_updater::RuleCacheManager::new(
             crate::rule_updater::default_rules_cache_path(),
         );
@@ -221,6 +222,9 @@ impl AnetClient {
             let reconnect_signal = Arc::new(Notify::new());
 
             let server = &config_clone.servers[current_server_index];
+            anet_common::boring_tls::set_default_tls_config(
+                server.effective_tls_config(&config_clone.stealth),
+            );
 
             let server_name = server.get_name();
             info!(

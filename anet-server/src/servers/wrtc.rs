@@ -78,7 +78,7 @@ pub async fn run_wrtc_server(
     );
 
     loop {
-        let browser_profile = BrowserProfile::random();
+        let browser_profile = BrowserProfile::with_tls_config(config.stealth.to_tls_client_config());
         let guest_name = generate_random_guest_name();
 
         let ktalk = KtalkClient::new(browser_profile.clone(), &config.wrtc)

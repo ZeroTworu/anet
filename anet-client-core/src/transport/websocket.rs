@@ -15,7 +15,6 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use anet_common::boring_tls::connect_chrome_ws_tls;
 use anet_common::transport_trait::VpnStream;
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex as StdMutex};
@@ -129,7 +128,8 @@ async fn connect_authenticated(
         // Нахуя оно ваще тут вычислялось?
         // let sni_host = server.host.as_deref().unwrap_or(&target_host);
         info!("[WS] CONNECTING TO: {}, HOST: {}", endpoint, &target_host);
-        let tls_stream = connect_chrome_ws_tls(&target_host, tcp_stream)
+        let tls_stream = profile
+            .connect_ws_tls(&target_host, tcp_stream)
             .await
             .context("BoringSSL TLS handshake failed")?;
         Box::new(tls_stream)
@@ -191,7 +191,8 @@ async fn close_browser_session(socket: &mut ClientSocket) {
 #[async_trait]
 impl ClientTransport for WebSocketTransport {
     async fn connect(&self) -> Result<ConnectionResult> {
-        let browser_profile = BrowserProfile::random();
+        let tls_cfg = self.server.effective_tls_config(&self.config.stealth);
+        let browser_profile = BrowserProfile::with_tls_config(tls_cfg);
         let (initial_socket, auth_response, initial_key, remote_ip) =
             connect_authenticated(&self.config, &self.server, &browser_profile, None).await?;
         let expected_ip = auth_response.ip.clone();

@@ -140,6 +140,12 @@ TXT: [ "Base64_Chunk_1...", "Base64_Chunk_2...", "Base64_Chunk_3..." ]
 
 ### 6.1. Настройка клиента (`client.toml`)
 ```toml
+[stealth]
+# Полиморфный TLS-отпечаток BoringSSL (Chrome / Firefox / Safari / Randomized)
+# и защита от активного спуфинга сертификатов публичных DoH-резолверов (по умолчанию: true)
+tls_fingerprint = "auto"
+tls_verify_peer = true
+
 [[servers]]
 name = "DoH Emergency Tunnel"
 # Базовый DSN с указанием авторитативной зоны
