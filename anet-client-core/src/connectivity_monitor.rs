@@ -369,8 +369,10 @@ impl ConnectivityMonitor {
     /// Принудительно пробуждает фоновый воркер для немедленной проверки контрольных точек
     /// и сразу отправляет промежуточный снимок в UI для визуального отклика.
     pub fn trigger_check_now() {
-        NodeProbeMonitor::trigger_probe_now();
         let monitor = Self::global();
+        if !monitor.vpn_connected.load(Ordering::Relaxed) {
+            NodeProbeMonitor::trigger_probe_now();
+        }
         let (global_total, domestic_total) = {
             let cfg = monitor.config.lock().unwrap();
             (cfg.global_targets.len(), cfg.domestic_targets.len())

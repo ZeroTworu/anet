@@ -181,7 +181,10 @@ pub fn render_node_selector(app: &mut ANetApp, ui: &mut egui::Ui, state: Connect
             .unwrap_or(NodeProbeStatus::Checking);
         // Если туннель уже успешно поднят на этой ноде, она гарантированно доступна
         let selected_status = if state == ConnectionState::Connected
-            && raw_selected_status == NodeProbeStatus::Unavailable
+            && matches!(
+                raw_selected_status,
+                NodeProbeStatus::Unavailable | NodeProbeStatus::Checking
+            )
         {
             NodeProbeStatus::Available
         } else {

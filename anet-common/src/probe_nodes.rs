@@ -1,6 +1,7 @@
 use crate::config::WrtcConfig;
 use crate::consts::NONCE_LEN;
 use crate::crypto_utils::{create_handshake_cipher, sign_data};
+use crate::handshake_fragmentation::{FragmentConfig, send_fragmented_datagrams};
 use crate::http_help::BrowserProfile;
 use crate::protocol::{
     DhClientExchange, Message, TransportProbeRequest, TransportProbeResponse, message::Content,
@@ -965,7 +966,7 @@ async fn probe_ahttp(target: &ProbeTarget, timeout_dur: Duration) -> Result<(u32
     };
     let url = format!("{}{}", base_url, path);
 
-    let (probe_pkt, expected_nonce) = build_transport_probe_packet(&target.server_pub_key)?;
+    let dh_pkt = build_dh_probe_packet(&target.server_pub_key)?;
 
     let client = HttpClient::builder()
         .timeout(timeout_dur)
@@ -975,99 +976,38 @@ async fn probe_ahttp(target: &ProbeTarget, timeout_dur: Duration) -> Result<(u32
         .build()?;
 
     let profile = BrowserProfile::random();
-    let full_started = Instant::now();
-    let req = client
-        .post(&url)
-        .header("Content-Type", "application/octet-stream")
-        .body(probe_pkt.to_vec());
-    let req = profile.apply_to_reqwest(req, Some(&base_url), Some(&base_url));
+    let tcp_pure_fut = measure_tcp_connect_rtt(&target.host_port, Duration::from_millis(800));
+    let http_fut = async {
+        let full_started = Instant::now();
+        let req = client
+            .post(&url)
+            .header("Content-Type", "application/octet-stream")
+            .body(dh_pkt.to_vec());
+        let req = profile.apply_to_reqwest(req, Some(&base_url), Some(&base_url));
 
-    let response = req.send().await.context("AHTTP request failed")?;
-    let status = response.status();
-    let body = response.bytes().await?;
-    let mut full_rtt = full_started.elapsed().as_millis().max(1) as u32;
+        let response = req.send().await.context("AHTTP request failed")?;
+        let status = response.status();
+        let body = response.bytes().await?;
+        let full_rtt = full_started.elapsed().as_millis().max(1) as u32;
+        Ok::<(reqwest::StatusCode, Bytes, u32), anyhow::Error>((status, body, full_rtt))
+    };
+
+    let (tcp_pure_opt, http_res) = tokio::join!(tcp_pure_fut, http_fut);
+    let (status, body, full_rtt) = http_res?;
 
     if status.is_success() && !body.is_empty() {
-        let accepting =
-            parse_any_astp_probe_response(&target.server_pub_key, &body, Some(&expected_nonce))?;
+        let accepting = parse_any_astp_probe_response(&target.server_pub_key, &body, None)?;
         if !accepting {
             return Err(anyhow!("AHTTP node refused connections"));
         }
-
-        // Выполняем 2-й лёгкий запрос по уже открытому TLS keep-alive соединению для замера чистого 1-RTT пинга
-        let mut pure_rtt = measure_tcp_connect_rtt(&target.host_port, Duration::from_millis(800))
-            .await
-            .unwrap_or_else(|| (full_rtt / 3).max(1));
-
-        if let Ok((pkt2, nonce2)) = build_transport_probe_packet(&target.server_pub_key) {
-            let warm_started = Instant::now();
-            let req2 = client
-                .post(&url)
-                .header("Content-Type", "application/octet-stream")
-                .body(pkt2.to_vec());
-            let req2 = profile.apply_to_reqwest(req2, Some(&base_url), Some(&base_url));
-            if let Ok(Ok(resp2)) = timeout(Duration::from_millis(900), req2.send()).await {
-                if resp2.status().is_success() {
-                    if let Ok(body2) = resp2.bytes().await {
-                        if parse_any_astp_probe_response(
-                            &target.server_pub_key,
-                            &body2,
-                            Some(&nonce2),
-                        )
-                        .is_ok()
-                        {
-                            let warm_ms = warm_started.elapsed().as_millis().max(1) as u32;
-                            pure_rtt = pure_rtt.min(warm_ms);
-                        }
-                    }
-                }
-            }
-        }
-
+        let pure_rtt = tcp_pure_opt
+            .unwrap_or_else(|| (full_rtt / 3).max(1))
+            .min(full_rtt);
         return Ok((
             pure_rtt,
             full_rtt.max(pure_rtt),
             format!("AHTTP ASTP OK ({} / {} ms)", full_rtt.max(pure_rtt), pure_rtt),
         ));
-    }
-
-    // Fallback для AHTTP серверов на базе `master` (через DhClientExchange)
-    if let Ok(dh_pkt) = build_dh_probe_packet(&target.server_pub_key) {
-        let dh_started = Instant::now();
-        let req_dh = client
-            .post(&url)
-            .header("Content-Type", "application/octet-stream")
-            .body(dh_pkt.to_vec());
-        let req_dh = profile.apply_to_reqwest(req_dh, Some(&base_url), Some(&base_url));
-        if let Ok(resp_dh) = req_dh.send().await {
-            if resp_dh.status().is_success() {
-                if let Ok(body_dh) = resp_dh.bytes().await {
-                    if !body_dh.is_empty() {
-                        let accepting = parse_any_astp_probe_response(
-                            &target.server_pub_key,
-                            &body_dh,
-                            None,
-                        )?;
-                        if !accepting {
-                            return Err(anyhow!("AHTTP node refused connections"));
-                        }
-                        full_rtt = dh_started.elapsed().as_millis().max(1) as u32;
-                        let pure_rtt = measure_tcp_connect_rtt(
-                            &target.host_port,
-                            Duration::from_millis(800),
-                        )
-                        .await
-                        .unwrap_or_else(|| (full_rtt / 3).max(1))
-                        .min(full_rtt);
-                        return Ok((
-                            pure_rtt,
-                            full_rtt.max(pure_rtt),
-                            format!("AHTTP ASTP OK ({} / {} ms)", full_rtt.max(pure_rtt), pure_rtt),
-                        ));
-                    }
-                }
-            }
-        }
     }
 
     Err(anyhow!("AHTTP HTTP status {}", status))
