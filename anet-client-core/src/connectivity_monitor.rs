@@ -3,7 +3,7 @@ use anet_common::config::ConnectivityConfig;
 use anet_common::connectivity::{ConnectivityProber, ConnectivitySnapshot};
 use anet_common::probe_nodes::{
     DEFAULT_PROBE_TIMEOUT_MS, NodeProbeSnapshot, ProbeTarget, build_initial_snapshot,
-    extract_probe_targets_from_toml, probe_targets,
+    extract_probe_targets_from_toml, probe_targets_with_progress,
 };
 use log::debug;
 use std::collections::hash_map::DefaultHasher;
@@ -118,6 +118,8 @@ impl NodeProbeMonitor {
                 s
             } else {
                 guard.is_checking = true;
+                guard.completed_endpoints = 0;
+                guard.total_endpoints = targets.len();
                 guard.clone()
             }
         };
@@ -194,9 +196,25 @@ impl NodeProbeMonitor {
                 continue;
             }
 
+            {
+                let mut guard = self.last_snapshot.lock().unwrap();
+                if guard.groups.is_empty() {
+                    *guard = build_initial_snapshot(&targets);
+                } else {
+                    guard.is_checking = true;
+                    guard.completed_endpoints = 0;
+                    guard.total_endpoints = targets.len();
+                }
+                emit(AnetEvent::NodeProbeUpdated(guard.clone()));
+            }
+
             let timeout_dur = Duration::from_millis(DEFAULT_PROBE_TIMEOUT_MS);
+            let self_progress = self.clone();
             let snapshot = tokio::select! {
-                res = probe_targets(&targets, timeout_dur) => res,
+                res = probe_targets_with_progress(&targets, timeout_dur, move |partial_snap| {
+                    *self_progress.last_snapshot.lock().unwrap() = partial_snap.clone();
+                    emit(AnetEvent::NodeProbeUpdated(partial_snap));
+                }) => res,
                 _ = self.wake_notify.notified() => {
                     continue;
                 }
@@ -419,6 +437,9 @@ impl ConnectivityMonitor {
     }
 
     async fn run_loop(self: Arc<Self>) {
+        let mut cached_prober: Option<(ConnectivityConfig, ConnectivityProber)> = None;
+        let mut last_vpn_state: Option<bool> = None;
+
         loop {
             let cfg = self.config.lock().unwrap().clone();
             if !cfg.enabled {
@@ -429,8 +450,17 @@ impl ConnectivityMonitor {
                 continue;
             }
 
-            let prober = ConnectivityProber::new(cfg.clone());
             let vpn_on = self.vpn_connected.load(Ordering::Relaxed);
+            let need_new_prober = cached_prober
+                .as_ref()
+                .map_or(true, |(prev_cfg, _)| *prev_cfg != cfg)
+                || last_vpn_state != Some(vpn_on);
+            if need_new_prober {
+                cached_prober = Some((cfg.clone(), ConnectivityProber::new(cfg.clone())));
+                last_vpn_state = Some(vpn_on);
+            }
+            let prober = cached_prober.as_ref().unwrap().1.clone();
+
             let tunnel_rtt = if vpn_on {
                 self.current_tunnel_rtt()
             } else {

@@ -14,12 +14,13 @@ use crate::wrtc::ktalk::KtalkClient;
 use anyhow::{Context, Result, anyhow};
 use base64::prelude::*;
 use bytes::{BufMut, Bytes, BytesMut};
+use futures::stream::FuturesUnordered;
 use futures::{SinkExt, StreamExt};
 use prost::Message as ProstMessage;
 use rand::RngCore;
 use reqwest::Client as HttpClient;
 use russh::client::Handler;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::ready;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -31,7 +32,7 @@ use tokio::time::timeout;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message as WsMessage};
 
 pub const DEFAULT_PROBE_TIMEOUT_MS: u64 = 2800;
-pub const MAX_CONCURRENT_NODE_PROBES: usize = 16;
+pub const MAX_CONCURRENT_NODE_PROBES: usize = 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ProbeProtocol {
@@ -103,7 +104,10 @@ pub struct EndpointProbeResult {
     pub group_name: String,
     pub protocol: ProbeProtocol,
     pub status: NodeProbeStatus,
+    /// Чистый сетевой 1-RTT пинг без учёта времени установки TCP/TLS/SSH/RFB-сессии
     pub rtt_ms: Option<u32>,
+    /// Полный пинг вместе с рукопожатием транспорта (DNS + TCP/TLS/SSH/RFB/Ktalk + пакет проверки)
+    pub full_rtt_ms: Option<u32>,
     pub detail: String,
 }
 
@@ -112,6 +116,7 @@ pub struct ProtocolBadgeStatus {
     pub protocol: ProbeProtocol,
     pub status: NodeProbeStatus,
     pub rtt_ms: Option<u32>,
+    pub full_rtt_ms: Option<u32>,
     pub detail: String,
 }
 
@@ -120,35 +125,51 @@ pub struct NodeGroupProbeSummary {
     pub group_id: String,
     pub group_name: String,
     pub status: NodeProbeStatus,
+    /// Лучший чистый 1-RTT пинг среди доступных транспортов группы
     pub best_rtt_ms: Option<u32>,
+    /// Полный пинг (с учётом рукопожатия) среди доступных транспортов группы
+    pub best_full_rtt_ms: Option<u32>,
     pub reachable_endpoints: usize,
     pub total_endpoints: usize,
     pub protocols: Vec<ProtocolBadgeStatus>,
 }
 
 impl NodeGroupProbeSummary {
+    pub fn format_dual_rtt(full_opt: Option<u32>, pure_opt: Option<u32>, unit: &str) -> Option<String> {
+        match (full_opt, pure_opt) {
+            (Some(full), Some(pure)) => Some(format!("{} / {} {}", full.max(pure), pure, unit)),
+            (None, Some(pure)) => Some(format!("{} / {} {}", pure, pure, unit)),
+            (Some(full), None) => Some(format!("{} {}", full, unit)),
+            (None, None) => None,
+        }
+    }
+
     pub fn short_badge_text(&self) -> String {
         match self.status {
             NodeProbeStatus::Checking => "...".to_string(),
             NodeProbeStatus::Available => {
-                if let Some(rtt) = self.best_rtt_ms {
+                if let Some(dual) =
+                    Self::format_dual_rtt(self.best_full_rtt_ms, self.best_rtt_ms, "мс")
+                {
                     if self.total_endpoints > 1 {
                         format!(
-                            "{} ms · {}/{}",
-                            rtt, self.reachable_endpoints, self.total_endpoints
+                            "{} · {}/{}",
+                            dual, self.reachable_endpoints, self.total_endpoints
                         )
                     } else {
-                        format!("{} ms", rtt)
+                        dual
                     }
                 } else {
                     format!("{}/{}", self.reachable_endpoints, self.total_endpoints)
                 }
             }
             NodeProbeStatus::Degraded => {
-                if let Some(rtt) = self.best_rtt_ms {
+                if let Some(dual) =
+                    Self::format_dual_rtt(self.best_full_rtt_ms, self.best_rtt_ms, "мс")
+                {
                     format!(
-                        "{} ms · {}/{}",
-                        rtt, self.reachable_endpoints, self.total_endpoints
+                        "{} · {}/{}",
+                        dual, self.reachable_endpoints, self.total_endpoints
                     )
                 } else {
                     format!("{}/{}", self.reachable_endpoints, self.total_endpoints)
@@ -158,7 +179,7 @@ impl NodeGroupProbeSummary {
                 if self.total_endpoints > 1 {
                     format!("0/{}", self.total_endpoints)
                 } else {
-                    "offline".to_string()
+                    "недоступен".to_string()
                 }
             }
         }
@@ -168,21 +189,58 @@ impl NodeGroupProbeSummary {
         if self.protocols.is_empty() {
             return String::new();
         }
+        if self.total_endpoints <= 1 && self.protocols.len() == 1 {
+            let p = &self.protocols[0];
+            return match p.status {
+                NodeProbeStatus::Available | NodeProbeStatus::Degraded => {
+                    if let (Some(full), Some(pure)) = (p.full_rtt_ms, p.rtt_ms) {
+                        format!(
+                            "{} • полный {} мс / чистый {} мс",
+                            p.protocol.as_str(),
+                            full.max(pure),
+                            pure
+                        )
+                    } else if let Some(pure) = p.rtt_ms {
+                        format!("{} • {} мс", p.protocol.as_str(), pure)
+                    } else {
+                        format!("{} • доступен", p.protocol.as_str())
+                    }
+                }
+                NodeProbeStatus::Unavailable => {
+                    format!("{} • транспорт недоступен", p.protocol.as_str())
+                }
+                NodeProbeStatus::Checking => {
+                    format!("{} • проверка узла...", p.protocol.as_str())
+                }
+            };
+        }
+
         let mut parts = Vec::with_capacity(self.protocols.len());
         for p in &self.protocols {
-            let mark = match p.status {
-                NodeProbeStatus::Available => "+",
-                NodeProbeStatus::Degraded => "~",
-                NodeProbeStatus::Unavailable => "-",
-                NodeProbeStatus::Checking => "?",
-            };
-            if let Some(rtt) = p.rtt_ms {
-                parts.push(format!("{}{}({}ms)", p.protocol.as_str(), mark, rtt));
-            } else {
-                parts.push(format!("{}{}", p.protocol.as_str(), mark));
+            match p.status {
+                NodeProbeStatus::Available | NodeProbeStatus::Degraded => {
+                    if let (Some(full), Some(pure)) = (p.full_rtt_ms, p.rtt_ms) {
+                        parts.push(format!(
+                            "{}: {}/{} мс",
+                            p.protocol.as_str(),
+                            full.max(pure),
+                            pure
+                        ));
+                    } else if let Some(pure) = p.rtt_ms {
+                        parts.push(format!("{}: {} мс", p.protocol.as_str(), pure));
+                    } else {
+                        parts.push(format!("{}: OK", p.protocol.as_str()));
+                    }
+                }
+                NodeProbeStatus::Unavailable => {
+                    parts.push(format!("{}: недоступен", p.protocol.as_str()));
+                }
+                NodeProbeStatus::Checking => {
+                    parts.push(format!("{}: ...", p.protocol.as_str()));
+                }
             }
         }
-        parts.join(" ")
+        format!("В группе {}: {}", self.group_name, parts.join(" · "))
     }
 }
 
@@ -190,6 +248,8 @@ impl NodeGroupProbeSummary {
 pub struct NodeProbeSnapshot {
     pub checked_at_unix_ms: u64,
     pub is_checking: bool,
+    pub completed_endpoints: usize,
+    pub total_endpoints: usize,
     pub endpoints: Vec<EndpointProbeResult>,
     pub groups: Vec<NodeGroupProbeSummary>,
 }
@@ -328,7 +388,17 @@ async fn resolve_socket_addr(host_port: &str) -> Result<SocketAddr> {
         .ok_or_else(|| anyhow!("No addresses resolved for {}", normalized))
 }
 
-async fn probe_quic(target: &ProbeTarget, timeout_dur: Duration) -> Result<(u32, String)> {
+async fn measure_tcp_connect_rtt(host_port: &str, max_wait: Duration) -> Option<u32> {
+    let addr = timeout(max_wait, resolve_socket_addr(host_port)).await.ok()?.ok()?;
+    let started = Instant::now();
+    let stream = timeout(max_wait, TcpStream::connect(addr)).await.ok()?.ok()?;
+    let rtt = started.elapsed().as_millis().max(1) as u32;
+    drop(stream);
+    Some(rtt)
+}
+
+async fn probe_quic(target: &ProbeTarget, timeout_dur: Duration) -> Result<(u32, u32, String)> {
+    let full_started = Instant::now();
     let addr = resolve_socket_addr(&target.host_port).await?;
     let bind_addr = if addr.is_ipv4() {
         "0.0.0.0:0"
@@ -343,11 +413,11 @@ async fn probe_quic(target: &ProbeTarget, timeout_dur: Duration) -> Result<(u32,
     let mut recv_buf = [0u8; 2048];
 
     for attempt in 0..2 {
-        let started = Instant::now();
+        let pure_started = Instant::now();
         socket.send(&probe_pkt).await?;
         match timeout(per_attempt, socket.recv(&mut recv_buf)).await {
             Ok(Ok(len)) => {
-                let rtt = started.elapsed().as_millis().max(1) as u32;
+                let first_rtt = pure_started.elapsed().as_millis().max(1) as u32;
                 let resp = parse_transport_probe_response(
                     &target.server_pub_key,
                     &recv_buf[..len],
@@ -356,7 +426,38 @@ async fn probe_quic(target: &ProbeTarget, timeout_dur: Duration) -> Result<(u32,
                 if !resp.accepting_connections {
                     return Err(anyhow!("QUIC node not accepting connections"));
                 }
-                return Ok((rtt, format!("QUIC ASTP OK ({} ms)", rtt)));
+
+                // Второй быстрый проверочный пакет по прогретому маршруту для точного 1-RTT и полного 2-RTT замера
+                let mut best_pure_rtt = first_rtt;
+                if let Ok((pkt2, nonce2)) = build_transport_probe_packet(&target.server_pub_key) {
+                    let warm_started = Instant::now();
+                    if socket.send(&pkt2).await.is_ok() {
+                        if let Ok(Ok(len2)) =
+                            timeout(Duration::from_millis(450), socket.recv(&mut recv_buf)).await
+                        {
+                            if parse_transport_probe_response(
+                                &target.server_pub_key,
+                                &recv_buf[..len2],
+                                &nonce2,
+                            )
+                            .is_ok()
+                            {
+                                let warm_rtt = warm_started.elapsed().as_millis().max(1) as u32;
+                                best_pure_rtt = best_pure_rtt.min(warm_rtt);
+                            }
+                        }
+                    }
+                }
+
+                let full_rtt = full_started
+                    .elapsed()
+                    .as_millis()
+                    .max(best_pure_rtt as u128) as u32;
+                return Ok((
+                    best_pure_rtt,
+                    full_rtt,
+                    format!("QUIC ASTP OK ({} / {} ms)", full_rtt, best_pure_rtt),
+                ));
             }
             Ok(Err(e)) => {
                 if attempt == 1 {
@@ -386,9 +487,9 @@ impl Handler for SshProbeClientHandler {
     }
 }
 
-async fn probe_ssh(target: &ProbeTarget, timeout_dur: Duration) -> Result<(u32, String)> {
+async fn probe_ssh(target: &ProbeTarget, timeout_dur: Duration) -> Result<(u32, u32, String)> {
+    let full_started = Instant::now();
     let addr = resolve_socket_addr(&target.host_port).await?;
-    let started = Instant::now();
     let (probe_pkt, expected_nonce) = build_transport_probe_packet(&target.server_pub_key)?;
 
     let fut = async {
@@ -396,8 +497,11 @@ async fn probe_ssh(target: &ProbeTarget, timeout_dur: Duration) -> Result<(u32, 
             nodelay: true,
             ..Default::default()
         });
+        let tcp_started = Instant::now();
         let tcp = TcpStream::connect(addr).await?;
+        let tcp_rtt = tcp_started.elapsed().as_millis().max(1) as u32;
         let _ = tcp.set_nodelay(true);
+
         let mut session =
             russh::client::connect_stream(ssh_config, tcp, SshProbeClientHandler).await?;
 
@@ -416,16 +520,19 @@ async fn probe_ssh(target: &ProbeTarget, timeout_dur: Duration) -> Result<(u32, 
 
         let channel = session.channel_open_session().await?;
         channel.exec(true, "anet-vpn").await?;
-        let handshake_rtt = started.elapsed().as_millis().max(1) as u32;
+        let handshake_rtt = full_started.elapsed().as_millis().max(1) as u32;
 
         let mut stream = channel.into_stream();
         let framed = frame_packet(probe_pkt);
+        let pure_started = Instant::now();
         stream.write_all(&framed).await?;
         stream.flush().await?;
 
         match read_next_packet(&mut stream).await {
             Ok(Some(reply)) => {
-                let rtt = started.elapsed().as_millis().max(1) as u32;
+                let astp_rtt = pure_started.elapsed().as_millis().max(1) as u32;
+                let full_rtt = full_started.elapsed().as_millis().max(1) as u32;
+                let pure_rtt = astp_rtt.min(tcp_rtt);
                 let _ = stream.shutdown().await;
                 let _ = session
                     .disconnect(russh::Disconnect::ByApplication, "probe", "en")
@@ -438,14 +545,22 @@ async fn probe_ssh(target: &ProbeTarget, timeout_dur: Duration) -> Result<(u32, 
                 if !resp.accepting_connections {
                     return Err(anyhow!("SSH node not accepting connections"));
                 }
-                Ok((rtt, format!("SSH ASTP OK ({} ms)", rtt)))
+                Ok((
+                    pure_rtt,
+                    full_rtt.max(pure_rtt),
+                    format!("SSH ASTP OK ({} / {} ms)", full_rtt.max(pure_rtt), pure_rtt),
+                ))
             }
             Ok(None) | Err(_) => {
                 let _ = stream.shutdown().await;
                 let _ = session
                     .disconnect(russh::Disconnect::ByApplication, "probe", "en")
                     .await;
-                Ok((handshake_rtt, format!("SSH exec OK ({} ms)", handshake_rtt)))
+                Ok((
+                    tcp_rtt,
+                    handshake_rtt.max(tcp_rtt),
+                    format!("SSH exec OK ({} / {} ms)", handshake_rtt.max(tcp_rtt), tcp_rtt),
+                ))
             }
         }
     };
@@ -455,13 +570,15 @@ async fn probe_ssh(target: &ProbeTarget, timeout_dur: Duration) -> Result<(u32, 
         .context("SSH probe timeout")?
 }
 
-async fn probe_vnc(target: &ProbeTarget, timeout_dur: Duration) -> Result<(u32, String)> {
+async fn probe_vnc(target: &ProbeTarget, timeout_dur: Duration) -> Result<(u32, u32, String)> {
+    let full_started = Instant::now();
     let addr = resolve_socket_addr(&target.host_port).await?;
-    let started = Instant::now();
     let (probe_pkt, expected_nonce) = build_transport_probe_packet(&target.server_pub_key)?;
 
     let fut = async {
+        let tcp_started = Instant::now();
         let mut stream = TcpStream::connect(addr).await?;
+        let tcp_rtt = tcp_started.elapsed().as_millis().max(1) as u32;
         let _ = stream.set_nodelay(true);
 
         let mut ver = [0u8; 12];
@@ -498,14 +615,17 @@ async fn probe_vnc(target: &ProbeTarget, timeout_dur: Duration) -> Result<(u32, 
         let mut name_buf = vec![0u8; name_len];
         stream.read_exact(&mut name_buf).await?;
 
-        let rfb_rtt = started.elapsed().as_millis().max(1) as u32;
+        let rfb_rtt = full_started.elapsed().as_millis().max(1) as u32;
 
+        let pure_started = Instant::now();
         write_cut_text(&mut stream, CLIENT_CUT_TEXT, &probe_pkt).await?;
         stream.flush().await?;
 
         match read_cut_text(&mut stream, SERVER_CUT_TEXT).await {
             Ok(Some(payload)) => {
-                let rtt = started.elapsed().as_millis().max(1) as u32;
+                let astp_rtt = pure_started.elapsed().as_millis().max(1) as u32;
+                let full_rtt = full_started.elapsed().as_millis().max(1) as u32;
+                let pure_rtt = astp_rtt.min(tcp_rtt);
                 let _ = stream.shutdown().await;
                 let resp = parse_transport_probe_response(
                     &target.server_pub_key,
@@ -515,11 +635,19 @@ async fn probe_vnc(target: &ProbeTarget, timeout_dur: Duration) -> Result<(u32, 
                 if !resp.accepting_connections {
                     return Err(anyhow!("VNC node not accepting connections"));
                 }
-                Ok((rtt, format!("VNC ASTP OK ({} ms)", rtt)))
+                Ok((
+                    pure_rtt,
+                    full_rtt.max(pure_rtt),
+                    format!("VNC ASTP OK ({} / {} ms)", full_rtt.max(pure_rtt), pure_rtt),
+                ))
             }
             Ok(None) | Err(_) => {
                 let _ = stream.shutdown().await;
-                Ok((rfb_rtt, format!("VNC RFB OK ({} ms)", rfb_rtt)))
+                Ok((
+                    tcp_rtt,
+                    rfb_rtt.max(tcp_rtt),
+                    format!("VNC RFB OK ({} / {} ms)", rfb_rtt.max(tcp_rtt), tcp_rtt),
+                ))
             }
         }
     };
@@ -529,7 +657,7 @@ async fn probe_vnc(target: &ProbeTarget, timeout_dur: Duration) -> Result<(u32, 
         .context("VNC probe timeout")?
 }
 
-async fn probe_ws(target: &ProbeTarget, timeout_dur: Duration) -> Result<(u32, String)> {
+async fn probe_ws(target: &ProbeTarget, timeout_dur: Duration) -> Result<(u32, u32, String)> {
     let ws_url = target
         .websocket_url
         .as_deref()
@@ -539,18 +667,20 @@ async fn probe_ws(target: &ProbeTarget, timeout_dur: Duration) -> Result<(u32, S
     let profile = BrowserProfile::random();
     let request = profile.build_ws_request(ws_url, None)?;
 
-    let started = Instant::now();
+    let full_started = Instant::now();
     let (probe_pkt, expected_nonce) = build_transport_probe_packet(&target.server_pub_key)?;
 
     let fut = async {
         let (mut ws_stream, _) = connect_async(request).await?;
-        let upgrade_rtt = started.elapsed().as_millis().max(1) as u32;
+        let upgrade_rtt = full_started.elapsed().as_millis().max(1) as u32;
 
+        let pure_started = Instant::now();
         ws_stream.send(WsMessage::Binary(probe_pkt)).await?;
 
         match ws_stream.next().await {
             Some(Ok(WsMessage::Binary(data))) => {
-                let rtt = started.elapsed().as_millis().max(1) as u32;
+                let pure_rtt = pure_started.elapsed().as_millis().max(1) as u32;
+                let full_rtt = full_started.elapsed().as_millis().max(1) as u32;
                 let _ = ws_stream.close(None).await;
                 let resp = parse_transport_probe_response(
                     &target.server_pub_key,
@@ -560,13 +690,29 @@ async fn probe_ws(target: &ProbeTarget, timeout_dur: Duration) -> Result<(u32, S
                 if !resp.accepting_connections {
                     return Err(anyhow!("WS node not accepting connections"));
                 }
-                Ok((rtt, format!("WS ASTP OK ({} ms)", rtt)))
+                Ok((
+                    pure_rtt,
+                    full_rtt.max(pure_rtt),
+                    format!("WS ASTP OK ({} / {} ms)", full_rtt.max(pure_rtt), pure_rtt),
+                ))
             }
             Some(Ok(WsMessage::Close(_))) | None => {
-                Ok((upgrade_rtt, format!("WS Upgrade OK ({} ms)", upgrade_rtt)))
+                let est_pure = (upgrade_rtt / 3).max(1);
+                Ok((
+                    est_pure,
+                    upgrade_rtt,
+                    format!("WS Upgrade OK ({} / {} ms)", upgrade_rtt, est_pure),
+                ))
             }
             Some(Err(e)) => Err(anyhow!("WS read error: {}", e)),
-            _ => Ok((upgrade_rtt, format!("WS Upgrade OK ({} ms)", upgrade_rtt))),
+            _ => {
+                let est_pure = (upgrade_rtt / 3).max(1);
+                Ok((
+                    est_pure,
+                    upgrade_rtt,
+                    format!("WS Upgrade OK ({} / {} ms)", upgrade_rtt, est_pure),
+                ))
+            }
         }
     };
 
@@ -575,7 +721,7 @@ async fn probe_ws(target: &ProbeTarget, timeout_dur: Duration) -> Result<(u32, S
         .context("WS probe timeout")?
 }
 
-async fn probe_ahttp(target: &ProbeTarget, timeout_dur: Duration) -> Result<(u32, String)> {
+async fn probe_ahttp(target: &ProbeTarget, timeout_dur: Duration) -> Result<(u32, u32, String)> {
     let base_url = if target.dsn.starts_with("http://") || target.dsn.starts_with("https://") {
         target.dsn.trim_end_matches('/').to_string()
     } else if target.host_port.ends_with(":80") {
@@ -595,12 +741,13 @@ async fn probe_ahttp(target: &ProbeTarget, timeout_dur: Duration) -> Result<(u32
 
     let client = HttpClient::builder()
         .timeout(timeout_dur)
+        .pool_max_idle_per_host(2)
         .danger_accept_invalid_certs(true)
         .no_proxy()
         .build()?;
 
     let profile = BrowserProfile::random();
-    let started = Instant::now();
+    let full_started = Instant::now();
     let req = client
         .post(&url)
         .header("Content-Type", "application/octet-stream")
@@ -610,20 +757,51 @@ async fn probe_ahttp(target: &ProbeTarget, timeout_dur: Duration) -> Result<(u32
     let response = req.send().await.context("AHTTP request failed")?;
     let status = response.status();
     let body = response.bytes().await?;
-    let rtt = started.elapsed().as_millis().max(1) as u32;
+    let full_rtt = full_started.elapsed().as_millis().max(1) as u32;
 
     if status.is_success() && !body.is_empty() {
         let resp = parse_transport_probe_response(&target.server_pub_key, &body, &expected_nonce)?;
         if !resp.accepting_connections {
             return Err(anyhow!("AHTTP node refused connections"));
         }
-        return Ok((rtt, format!("AHTTP ASTP OK ({} ms)", rtt)));
+
+        // Выполняем 2-й лёгкий запрос по уже открытому TLS keep-alive соединению для замера чистого 1-RTT пинга
+        let mut pure_rtt = measure_tcp_connect_rtt(&target.host_port, Duration::from_millis(800))
+            .await
+            .unwrap_or_else(|| (full_rtt / 3).max(1));
+
+        if let Ok((pkt2, nonce2)) = build_transport_probe_packet(&target.server_pub_key) {
+            let warm_started = Instant::now();
+            let req2 = client
+                .post(&url)
+                .header("Content-Type", "application/octet-stream")
+                .body(pkt2.to_vec());
+            let req2 = profile.apply_to_reqwest(req2, Some(&base_url), Some(&base_url));
+            if let Ok(Ok(resp2)) = timeout(Duration::from_millis(900), req2.send()).await {
+                if resp2.status().is_success() {
+                    if let Ok(body2) = resp2.bytes().await {
+                        if parse_transport_probe_response(&target.server_pub_key, &body2, &nonce2)
+                            .is_ok()
+                        {
+                            let warm_ms = warm_started.elapsed().as_millis().max(1) as u32;
+                            pure_rtt = pure_rtt.min(warm_ms);
+                        }
+                    }
+                }
+            }
+        }
+
+        return Ok((
+            pure_rtt,
+            full_rtt.max(pure_rtt),
+            format!("AHTTP ASTP OK ({} / {} ms)", full_rtt.max(pure_rtt), pure_rtt),
+        ));
     }
 
     Err(anyhow!("AHTTP HTTP status {}", status))
 }
 
-async fn probe_wrtc(target: &ProbeTarget, timeout_dur: Duration) -> Result<(u32, String)> {
+async fn probe_wrtc(target: &ProbeTarget, timeout_dur: Duration) -> Result<(u32, u32, String)> {
     let uri: http::Uri = target.dsn.parse().context("Invalid WRTC DSN URI")?;
     let domain = uri
         .host()
@@ -641,20 +819,43 @@ async fn probe_wrtc(target: &ProbeTarget, timeout_dur: Duration) -> Result<(u32,
 
     let ktalk = KtalkClient::new(BrowserProfile::random(), &wrtc_cfg);
     let secret = KtalkClient::generate_anonymous_secret();
-    let started = Instant::now();
+    let host_port = format!("{}:443", domain);
 
     let fut = async {
+        // Сначала измеряем чистый 1-RTT TCP SYN->SYN-ACK до шлюза сигналинга без конкуренции с TLS
+        let tcp_rtt_opt = measure_tcp_connect_rtt(&host_port, Duration::from_millis(900)).await;
+
+        let full_started = Instant::now();
         let session = ktalk
             .authorize_session(&domain, &room_short_name, None, &secret)
             .await?;
+
+        // Соединение в пуле ktalk.http уже установлено (TCP + TLS прогреты) — замеряем одиночный запрос
+        let warm_started = Instant::now();
         let room = ktalk
             .resolve_room(&domain, &room_short_name, &session.token)
             .await?;
-        let rtt = started.elapsed().as_millis().max(1) as u32;
+        let warm_rtt = warm_started.elapsed().as_millis().max(1) as u32;
+        let full_rtt = full_started.elapsed().as_millis().max(1) as u32;
+
         if room.conference_id.is_empty() {
             return Err(anyhow!("Empty Ktalk conferenceId"));
         }
-        Ok((rtt, format!("WRTC Signaling OK ({} ms)", rtt)))
+
+        let pure_rtt = match tcp_rtt_opt {
+            Some(tcp_ms) => warm_rtt.min(tcp_ms),
+            None => warm_rtt,
+        };
+
+        Ok((
+            pure_rtt,
+            full_rtt.max(pure_rtt),
+            format!(
+                "WRTC Signaling OK ({} / {} ms)",
+                full_rtt.max(pure_rtt),
+                pure_rtt
+            ),
+        ))
     };
 
     timeout(timeout_dur, fut)
@@ -676,13 +877,14 @@ pub async fn probe_single_target(
     };
 
     match res {
-        Ok((rtt_ms, detail)) => EndpointProbeResult {
+        Ok((pure_rtt_ms, full_rtt_ms, detail)) => EndpointProbeResult {
             endpoint_index: target.endpoint_index,
             group_id: target.group_id.clone(),
             group_name: target.group_name.clone(),
             protocol: target.protocol,
             status: NodeProbeStatus::Available,
-            rtt_ms: Some(rtt_ms),
+            rtt_ms: Some(pure_rtt_ms),
+            full_rtt_ms: Some(full_rtt_ms.max(pure_rtt_ms)),
             detail,
         },
         Err(err) => EndpointProbeResult {
@@ -692,6 +894,7 @@ pub async fn probe_single_target(
             protocol: target.protocol,
             status: NodeProbeStatus::Unavailable,
             rtt_ms: None,
+            full_rtt_ms: None,
             detail: err.to_string(),
         },
     }
@@ -707,6 +910,7 @@ pub fn build_initial_snapshot(targets: &[ProbeTarget]) -> NodeProbeSnapshot {
             protocol: t.protocol,
             status: NodeProbeStatus::Checking,
             rtt_ms: None,
+            full_rtt_ms: None,
             detail: "Проверка...".to_string(),
         })
         .collect();
@@ -714,42 +918,97 @@ pub fn build_initial_snapshot(targets: &[ProbeTarget]) -> NodeProbeSnapshot {
     let groups = aggregate_groups(targets, &endpoints, true);
     NodeProbeSnapshot {
         checked_at_unix_ms: 0,
-        is_checking: true,
+        is_checking: !targets.is_empty(),
+        completed_endpoints: 0,
+        total_endpoints: targets.len(),
         endpoints,
         groups,
     }
 }
 
 pub async fn probe_targets(targets: &[ProbeTarget], timeout_dur: Duration) -> NodeProbeSnapshot {
-    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_NODE_PROBES));
-    let mut handles = Vec::with_capacity(targets.len());
+    probe_targets_with_progress(targets, timeout_dur, |_| {}).await
+}
 
-    for target in targets.iter().cloned() {
+pub async fn probe_targets_with_progress<F>(
+    targets: &[ProbeTarget],
+    timeout_dur: Duration,
+    mut on_progress: F,
+) -> NodeProbeSnapshot
+where
+    F: FnMut(NodeProbeSnapshot),
+{
+    let total_endpoints = targets.len();
+    if total_endpoints == 0 {
+        return NodeProbeSnapshot::default();
+    }
+
+    let mut current_endpoints: Vec<EndpointProbeResult> = targets
+        .iter()
+        .map(|t| EndpointProbeResult {
+            endpoint_index: t.endpoint_index,
+            group_id: t.group_id.clone(),
+            group_name: t.group_name.clone(),
+            protocol: t.protocol,
+            status: NodeProbeStatus::Checking,
+            rtt_ms: None,
+            full_rtt_ms: None,
+            detail: "Проверка...".to_string(),
+        })
+        .collect();
+
+    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_NODE_PROBES));
+    let mut futures = FuturesUnordered::new();
+
+    for (pos, target) in targets.iter().cloned().enumerate() {
         let sem = semaphore.clone();
-        handles.push(tokio::spawn(async move {
+        futures.push(tokio::spawn(async move {
             let _permit = sem.acquire_owned().await.ok();
-            probe_single_target(&target, timeout_dur).await
+            let res = probe_single_target(&target, timeout_dur).await;
+            (pos, res)
         }));
     }
 
-    let mut endpoints = Vec::with_capacity(targets.len());
-    for handle in handles {
-        if let Ok(res) = handle.await {
-            endpoints.push(res);
+    let mut completed_endpoints = 0usize;
+    while let Some(joined) = futures.next().await {
+        if let Ok((pos, res)) = joined {
+            if pos < current_endpoints.len() {
+                current_endpoints[pos] = res;
+            }
+            completed_endpoints += 1;
+            let is_checking = completed_endpoints < total_endpoints;
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            let groups = aggregate_groups(targets, &current_endpoints, is_checking);
+            let partial = NodeProbeSnapshot {
+                checked_at_unix_ms: now_ms,
+                is_checking,
+                completed_endpoints,
+                total_endpoints,
+                endpoints: current_endpoints.clone(),
+                groups,
+            };
+            if is_checking {
+                on_progress(partial);
+            } else {
+                return partial;
+            }
         }
     }
-    endpoints.sort_by_key(|e| e.endpoint_index);
 
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-
-    let groups = aggregate_groups(targets, &endpoints, false);
+    let groups = aggregate_groups(targets, &current_endpoints, false);
     NodeProbeSnapshot {
         checked_at_unix_ms: now_ms,
         is_checking: false,
-        endpoints,
+        completed_endpoints: total_endpoints,
+        total_endpoints,
+        endpoints: current_endpoints,
         groups,
     }
 }
@@ -757,7 +1016,7 @@ pub async fn probe_targets(targets: &[ProbeTarget], timeout_dur: Duration) -> No
 fn aggregate_groups(
     targets: &[ProbeTarget],
     endpoints: &[EndpointProbeResult],
-    is_checking: bool,
+    global_is_checking: bool,
 ) -> Vec<NodeGroupProbeSummary> {
     let mut group_order: Vec<(String, String)> = Vec::new();
     for t in targets {
@@ -773,13 +1032,27 @@ fn aggregate_groups(
             .filter(|e| e.group_id == group_id)
             .collect();
         let total = group_eps.len();
+        let any_ep_checking = group_eps
+            .iter()
+            .any(|e| e.status == NodeProbeStatus::Checking);
+        let group_checking = (global_is_checking && any_ep_checking) || total == 0;
+
         let reachable = group_eps
             .iter()
             .filter(|e| e.status == NodeProbeStatus::Available)
             .count();
-        let best_rtt_ms = group_eps.iter().filter_map(|e| e.rtt_ms).min();
 
-        let status = if is_checking || total == 0 {
+        let best_ep = group_eps
+            .iter()
+            .filter(|e| e.status == NodeProbeStatus::Available && e.rtt_ms.is_some())
+            .min_by_key(|e| e.rtt_ms.unwrap_or(u32::MAX));
+
+        let best_rtt_ms = best_ep.and_then(|e| e.rtt_ms);
+        let best_full_rtt_ms = best_ep
+            .and_then(|e| e.full_rtt_ms)
+            .or_else(|| group_eps.iter().filter_map(|e| e.full_rtt_ms).min());
+
+        let status = if group_checking {
             NodeProbeStatus::Checking
         } else if reachable == total {
             NodeProbeStatus::Available
@@ -797,12 +1070,23 @@ fn aggregate_groups(
         let mut protocols = Vec::with_capacity(by_proto.len());
         for (proto, items) in by_proto {
             let p_total = items.len();
+            let p_any_checking = items
+                .iter()
+                .any(|i| i.status == NodeProbeStatus::Checking);
             let p_ok = items
                 .iter()
                 .filter(|i| i.status == NodeProbeStatus::Available)
                 .count();
-            let p_rtt = items.iter().filter_map(|i| i.rtt_ms).min();
-            let p_status = if is_checking {
+            let best_proto_ep = items
+                .iter()
+                .filter(|i| i.status == NodeProbeStatus::Available && i.rtt_ms.is_some())
+                .min_by_key(|i| i.rtt_ms.unwrap_or(u32::MAX));
+            let p_rtt = best_proto_ep.and_then(|i| i.rtt_ms);
+            let p_full_rtt = best_proto_ep
+                .and_then(|i| i.full_rtt_ms)
+                .or_else(|| items.iter().filter_map(|i| i.full_rtt_ms).min());
+
+            let p_status = if global_is_checking && p_any_checking {
                 NodeProbeStatus::Checking
             } else if p_ok == p_total {
                 NodeProbeStatus::Available
@@ -822,6 +1106,7 @@ fn aggregate_groups(
                 protocol: proto,
                 status: p_status,
                 rtt_ms: p_rtt,
+                full_rtt_ms: p_full_rtt,
                 detail,
             });
         }
@@ -831,6 +1116,7 @@ fn aggregate_groups(
             group_name,
             status,
             best_rtt_ms,
+            best_full_rtt_ms,
             reachable_endpoints: reachable,
             total_endpoints: total,
             protocols,
@@ -893,6 +1179,20 @@ pub fn extract_probe_targets_from_toml(raw_toml: &str) -> Vec<ProbeTarget> {
             .and_then(|v| v.as_str())
             .map_or(false, |g| !g.trim().is_empty())
     });
+
+    // Подсчитываем частоту DSN для конфигов без групп, чтобы точки с одинаковым DSN
+    // (например, FN WRTC VIDEO / WS / DC / P2P с общим dsn = "wrtc://kontur") получали уникальные group_id
+    let mut dsn_counts: HashMap<String, usize> = HashMap::new();
+    for item in servers_arr {
+        if let Some(tbl) = item.as_table() {
+            if let Some(dsn_str) = tbl.get("dsn").and_then(|v| v.as_str()) {
+                let trimmed = dsn_str.trim();
+                if !trimmed.is_empty() {
+                    *dsn_counts.entry(trimmed.to_string()).or_insert(0) += 1;
+                }
+            }
+        }
+    }
 
     let mut targets = Vec::with_capacity(servers_arr.len());
     for (idx, item) in servers_arr.iter().enumerate() {
@@ -1002,11 +1302,9 @@ pub fn extract_probe_targets_from_toml(raw_toml: &str) -> Vec<ProbeTarget> {
                     .unwrap_or(host_port.as_str());
                 format!("{}:{}", host_only, protocol.as_str())
             });
-            // Если в конфиге без групп несколько [[servers]] имеют одинаковый DSN, но разные имена
-            // (например, разные режимы WRTC: FN WRTC VIDEO / FN WRTC WS / FN WRTC DC / FN WRTC P2P),
-            // используем имя как уникальный ключ группы, если DSN уже встречался.
-            let dsn_already_used = targets.iter().any(|t: &ProbeTarget| t.group_id == dsn);
-            let unique_id = if dsn_already_used && name.is_some() {
+            let is_duplicate_dsn = dsn_counts.get(dsn.as_str()).copied().unwrap_or(0) > 1
+                || targets.iter().any(|t: &ProbeTarget| t.group_id == dsn);
+            let unique_id = if is_duplicate_dsn && name.is_some() {
                 fallback_name.clone()
             } else {
                 dsn.clone()
@@ -1116,6 +1414,8 @@ group_id = "grp-hel-1"
 
         let snap = build_initial_snapshot(&targets);
         assert_eq!(snap.groups.len(), 2);
+        assert_eq!(snap.total_endpoints, 3);
+        assert_eq!(snap.completed_endpoints, 0);
         assert_eq!(snap.groups[0].total_endpoints, 2);
         assert_eq!(snap.groups[1].total_endpoints, 1);
         assert!(snap.group_for_key("grp-fra-1").is_some());

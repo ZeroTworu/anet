@@ -870,11 +870,14 @@ impl AnetClient {
                                         ) {
                                             let sample_us = batch_rx_us.saturating_sub(sent_ts_us);
 
-                                            // Экспоненциальное сглаживание EWMA (alpha = 0.25):
-                                            // smoothed_rtt = 0.75 * smoothed_rtt + 0.25 * sample
+                                            // Асимметричное экспоненциальное сглаживание (EWMA):
+                                            // - при росте задержки (bufferbloat под нагрузкой): alpha = 0.25 (плавное демпфирование)
+                                            // - при снижении задержки (после завершения Speedtest): alpha = 0.75 (быстрый возврат к норме)
                                             let prev_us = last_rtt_rx.load(Ordering::Relaxed);
                                             let smoothed_us = if prev_us == u64::MAX {
                                                 sample_us
+                                            } else if sample_us < prev_us {
+                                                (prev_us + (sample_us * 3)) / 4
                                             } else {
                                                 ((prev_us * 3) + sample_us) / 4
                                             };

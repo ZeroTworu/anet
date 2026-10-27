@@ -24,6 +24,8 @@ static CLIENT_LIFECYCLE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(
 static CLIENT_GENERATION: AtomicU64 = AtomicU64::new(0);
 static CURRENT_CLIENT_STATE: AtomicI32 = AtomicI32::new(0);
 static CURRENT_SERVER_NAME: Mutex<Option<String>> = Mutex::new(None);
+static LAST_TELEMETRY: Mutex<Option<anet_common::connectivity::TelemetrySnapshot>> = Mutex::new(None);
+static LAST_ACCOUNT_INFO: Mutex<Option<anet_client_core::events::AccountInfo>> = Mutex::new(None);
 
 // --- ГЛОБАЛЬНЫЙ МНОГОПОТОЧНЫЙ JNI-МОСТ (Защита от утечек и дедлоков) ---
 static JNI_SENDER: OnceLock<Sender<TimestampedEvent>> = OnceLock::new();
@@ -36,16 +38,25 @@ struct AndroidEventHandler;
 
 impl EventHandler for AndroidEventHandler {
     fn on_event(&self, event: TimestampedEvent) {
-        if let AnetEvent::ClientStateChanged {
-            state, server_name, ..
-        } = &event.event
-        {
-            CURRENT_CLIENT_STATE.store(client_state_code(*state), Ordering::SeqCst);
-            if let Some(server_name) = server_name {
-                *CURRENT_SERVER_NAME.lock().unwrap() = Some(server_name.clone());
-            } else if matches!(state, ClientState::Disconnected | ClientState::Stopped) {
-                *CURRENT_SERVER_NAME.lock().unwrap() = None;
+        match &event.event {
+            AnetEvent::ClientStateChanged {
+                state, server_name, ..
+            } => {
+                CURRENT_CLIENT_STATE.store(client_state_code(*state), Ordering::SeqCst);
+                if let Some(server_name) = server_name {
+                    *CURRENT_SERVER_NAME.lock().unwrap() = Some(server_name.clone());
+                } else if matches!(state, ClientState::Disconnected | ClientState::Stopped) {
+                    *CURRENT_SERVER_NAME.lock().unwrap() = None;
+                    *LAST_TELEMETRY.lock().unwrap() = None;
+                }
             }
+            AnetEvent::TelemetryUpdated(tel) => {
+                *LAST_TELEMETRY.lock().unwrap() = Some(tel.clone());
+            }
+            AnetEvent::AccountInfo(info) => {
+                *LAST_ACCOUNT_INFO.lock().unwrap() = Some(info.clone());
+            }
+            _ => {}
         }
         if let Some(sender) = JNI_SENDER.get() {
             let _ = sender.send(event);
@@ -493,6 +504,7 @@ fn init_jni_bridge_thread(jvm: Arc<JavaVM>) {
                                 let j_protos = env.new_object_array(count, &str_cls, &empty_3);
                                 let j_statuses = env.new_int_array(count);
                                 let j_rtts = env.new_int_array(count);
+                                let j_full_rtts = env.new_int_array(count);
                                 let j_reachables = env.new_int_array(count);
                                 let j_totals = env.new_int_array(count);
 
@@ -502,6 +514,7 @@ fn init_jni_bridge_thread(jvm: Arc<JavaVM>) {
                                     Ok(j_protos),
                                     Ok(j_statuses),
                                     Ok(j_rtts),
+                                    Ok(j_full_rtts),
                                     Ok(j_reachables),
                                     Ok(j_totals),
                                 ) = (
@@ -510,11 +523,13 @@ fn init_jni_bridge_thread(jvm: Arc<JavaVM>) {
                                     j_protos,
                                     j_statuses,
                                     j_rtts,
+                                    j_full_rtts,
                                     j_reachables,
                                     j_totals,
                                 ) {
                                     let mut statuses_vec = Vec::with_capacity(count as usize);
                                     let mut rtts_vec = Vec::with_capacity(count as usize);
+                                    let mut full_rtts_vec = Vec::with_capacity(count as usize);
                                     let mut reachables_vec = Vec::with_capacity(count as usize);
                                     let mut totals_vec = Vec::with_capacity(count as usize);
 
@@ -530,12 +545,19 @@ fn init_jni_bridge_thread(jvm: Arc<JavaVM>) {
                                         }
                                         statuses_vec.push(g.status.as_u8() as i32);
                                         rtts_vec.push(g.best_rtt_ms.map(|v| v as i32).unwrap_or(-1));
+                                        full_rtts_vec.push(
+                                            g.best_full_rtt_ms
+                                                .or(g.best_rtt_ms)
+                                                .map(|v| v as i32)
+                                                .unwrap_or(-1),
+                                        );
                                         reachables_vec.push(g.reachable_endpoints as i32);
                                         totals_vec.push(g.total_endpoints as i32);
                                     }
 
                                     let _ = env.set_int_array_region(&j_statuses, 0, &statuses_vec);
                                     let _ = env.set_int_array_region(&j_rtts, 0, &rtts_vec);
+                                    let _ = env.set_int_array_region(&j_full_rtts, 0, &full_rtts_vec);
                                     let _ = env.set_int_array_region(&j_reachables, 0, &reachables_vec);
                                     let _ = env.set_int_array_region(&j_totals, 0, &totals_vec);
 
@@ -543,6 +565,7 @@ fn init_jni_bridge_thread(jvm: Arc<JavaVM>) {
                                     let names_obj = JObject::from(j_names);
                                     let statuses_obj = JObject::from(j_statuses);
                                     let rtts_obj = JObject::from(j_rtts);
+                                    let full_rtts_obj = JObject::from(j_full_rtts);
                                     let reachables_obj = JObject::from(j_reachables);
                                     let totals_obj = JObject::from(j_totals);
                                     let protos_obj = JObject::from(j_protos);
@@ -550,19 +573,62 @@ fn init_jni_bridge_thread(jvm: Arc<JavaVM>) {
                                     let _ = env.call_method(
                                         &cb,
                                         "onNodeProbeUpdated",
-                                        "([Ljava/lang/String;[Ljava/lang/String;[I[I[I[I[Ljava/lang/String;)V",
+                                        "([Ljava/lang/String;[Ljava/lang/String;[I[I[I[I[I[Ljava/lang/String;ZII)V",
                                         &[
                                             JValue::Object(&ids_obj),
                                             JValue::Object(&names_obj),
                                             JValue::Object(&statuses_obj),
                                             JValue::Object(&rtts_obj),
+                                            JValue::Object(&full_rtts_obj),
                                             JValue::Object(&reachables_obj),
                                             JValue::Object(&totals_obj),
                                             JValue::Object(&protos_obj),
+                                            JValue::Bool(u8::from(probe_snap.is_checking)),
+                                            JValue::Int(probe_snap.completed_endpoints as i32),
+                                            JValue::Int(probe_snap.total_endpoints as i32),
                                         ],
                                     );
                                     let _ = env.exception_clear();
                                 }
+                            }
+                        }
+                        continue;
+                    }
+
+                    if let AnetEvent::AccountInfo(info) = event {
+                        let ui_ref = UI_CALLBACK_REF.lock().unwrap().clone();
+                        let vpn_ref = VPN_CALLBACK_REF.lock().unwrap().clone();
+                        let targets: Vec<GlobalRef> =
+                            [vpn_ref, ui_ref].into_iter().flatten().collect();
+
+                        for cb in targets {
+                            let j_billing = env.new_string(&info.billing_str);
+                            let j_group = env.new_string(&info.group_str);
+                            let j_sessions = env.new_string(&info.sessions_str);
+                            let j_speed = env.new_string(&info.speed_str);
+                            let j_consumed = env.new_string(&info.consumed_str);
+                            let j_limit = env.new_string(&info.limit_str);
+                            let j_expires = env.new_string(&info.expires_str);
+
+                            if let (Ok(jb), Ok(jg), Ok(jse), Ok(jsp), Ok(jc), Ok(jl), Ok(je)) = (
+                                j_billing, j_group, j_sessions, j_speed, j_consumed, j_limit,
+                                j_expires,
+                            ) {
+                                let _ = env.call_method(
+                                    &cb,
+                                    "onAccountInfo",
+                                    "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
+                                    &[
+                                        JValue::Object(&jb),
+                                        JValue::Object(&jg),
+                                        JValue::Object(&jse),
+                                        JValue::Object(&jsp),
+                                        JValue::Object(&jc),
+                                        JValue::Object(&jl),
+                                        JValue::Object(&je),
+                                    ],
+                                );
+                                let _ = env.exception_clear();
                             }
                         }
                         continue;
@@ -648,34 +714,6 @@ fn init_jni_bridge_thread(jvm: Arc<JavaVM>) {
                                     let _ = env.exception_clear();
                                 }
                             }
-                            AnetEvent::AccountInfo(info) => {
-                                let j_billing = env.new_string(&info.billing_str);
-                                let j_group = env.new_string(&info.group_str);
-                                let j_sessions = env.new_string(&info.sessions_str);
-                                let j_speed = env.new_string(&info.speed_str);
-                                let j_consumed = env.new_string(&info.consumed_str);
-                                let j_limit = env.new_string(&info.limit_str);
-                                let j_expires = env.new_string(&info.expires_str);
-                                
-                                if let (Ok(jb), Ok(jg), Ok(jse), Ok(jsp), Ok(jc), Ok(jl), Ok(je)) = 
-                                    (j_billing, j_group, j_sessions, j_speed, j_consumed, j_limit, j_expires) {
-                                    let _ = env.call_method(
-                                        &callback_ref,
-                                        "onAccountInfo",
-                                        "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
-                                        &[
-                                            JValue::Object(&jb),
-                                            JValue::Object(&jg),
-                                            JValue::Object(&jse),
-                                            JValue::Object(&jsp),
-                                            JValue::Object(&jc),
-                                            JValue::Object(&jl),
-                                            JValue::Object(&je),
-                                        ]
-                                    );
-                                    let _ = env.exception_clear();
-                                }
-                            }
                             other => {
                                 if let Some(msg) = event_message(other) {
                                     if let Ok(jmsg) = env.new_string(msg) {
@@ -735,6 +773,12 @@ pub extern "system" fn Java_org_alco_anet_MainActivity_startConnectivityMonitor(
         let initial =
             anet_client_core::connectivity_monitor::ConnectivityMonitor::get_last_snapshot();
         events::emit(AnetEvent::ConnectivityUpdated(initial));
+        if let Some(cached_tel) = LAST_TELEMETRY.lock().unwrap().clone() {
+            events::emit(AnetEvent::TelemetryUpdated(cached_tel));
+        }
+        if let Some(cached_acc) = LAST_ACCOUNT_INFO.lock().unwrap().clone() {
+            events::emit(AnetEvent::AccountInfo(cached_acc));
+        }
         if !config_toml.trim().is_empty() {
             anet_client_core::connectivity_monitor::NodeProbeMonitor::update_config_toml(
                 &config_toml,

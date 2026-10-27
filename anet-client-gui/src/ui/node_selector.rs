@@ -19,7 +19,7 @@ fn probe_status_color(status: NodeProbeStatus) -> egui::Color32 {
 }
 
 fn render_group_probe_tooltip(ui: &mut egui::Ui, summary: &NodeGroupProbeSummary) {
-    ui.set_min_width(190.0);
+    ui.set_min_width(220.0);
     let title_color = egui::Color32::from_rgb(242, 243, 246);
     let muted_color = egui::Color32::from_rgb(160, 164, 172);
 
@@ -28,7 +28,7 @@ fn render_group_probe_tooltip(ui: &mut egui::Ui, summary: &NodeGroupProbeSummary
         let (dot_rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
         ui.painter().circle_filled(dot_rect.center(), 4.0, dot_color);
         ui.label(
-            egui::RichText::new(&summary.group_name)
+            egui::RichText::new(format!("В группе {}:", summary.group_name))
                 .size(12.0)
                 .strong()
                 .color(title_color),
@@ -37,17 +37,17 @@ fn render_group_probe_tooltip(ui: &mut egui::Ui, summary: &NodeGroupProbeSummary
 
     ui.add_space(3.0);
     let summary_line = match summary.status {
-        NodeProbeStatus::Checking => "Проверка доступности транспортов...".to_string(),
+        NodeProbeStatus::Checking => "Проверка доступности узлов (полный / чистый пинг)...".to_string(),
         NodeProbeStatus::Available => format!(
-            "Все транспорты доступны ({}/{})",
+            "Все транспорты доступны ({}/{}) • [полный / чистый]",
             summary.reachable_endpoints, summary.total_endpoints
         ),
         NodeProbeStatus::Degraded => format!(
-            "Частичная доступность ({}/{})",
+            "Частичная доступность ({}/{}) • [полный / чистый]",
             summary.reachable_endpoints, summary.total_endpoints
         ),
         NodeProbeStatus::Unavailable => format!(
-            "Нода недоступна (0/{})",
+            "Узел недоступен (0/{})",
             summary.total_endpoints
         ),
     };
@@ -67,14 +67,18 @@ fn render_group_probe_tooltip(ui: &mut egui::Ui, summary: &NodeGroupProbeSummary
                         .color(title_color),
                 );
                 let right_txt = match proto.status {
-                    NodeProbeStatus::Available => proto
-                        .rtt_ms
-                        .map(|ms| format!("{} мс", ms))
-                        .unwrap_or_else(|| "OK".to_string()),
-                    NodeProbeStatus::Degraded => proto
-                        .rtt_ms
-                        .map(|ms| format!("~{} мс", ms))
-                        .unwrap_or_else(|| "частично".to_string()),
+                    NodeProbeStatus::Available => match (proto.full_rtt_ms, proto.rtt_ms) {
+                        (Some(full), Some(pure)) => format!("{} / {} мс", full.max(pure), pure),
+                        (None, Some(pure)) => format!("{} мс", pure),
+                        (Some(full), None) => format!("{} мс", full),
+                        (None, None) => "OK".to_string(),
+                    },
+                    NodeProbeStatus::Degraded => match (proto.full_rtt_ms, proto.rtt_ms) {
+                        (Some(full), Some(pure)) => format!("~{} / {} мс", full.max(pure), pure),
+                        (None, Some(pure)) => format!("~{} мс", pure),
+                        (Some(full), None) => format!("~{} мс", full),
+                        (None, None) => "частично".to_string(),
+                    },
                     NodeProbeStatus::Unavailable => "недоступен".to_string(),
                     NodeProbeStatus::Checking => "...".to_string(),
                 };
@@ -165,7 +169,7 @@ pub fn render_node_selector(app: &mut ANetApp, ui: &mut egui::Ui, state: Connect
         );
         ui.add_space(4.0);
 
-        const NODE_WIDTH: f32 = 266.0;
+        const NODE_WIDTH: f32 = 278.0;
         const NODE_HEIGHT: f32 = 34.0;
         const NODE_RADIUS: u8 = 17;
         const ITEM_HEIGHT: f32 = 34.0;
@@ -204,11 +208,6 @@ pub fn render_node_selector(app: &mut ANetApp, ui: &mut egui::Ui, state: Connect
                 .clone()
                 .on_hover_cursor(egui::CursorIcon::PointingHand);
         }
-        if let Some(ref probe) = selected_probe {
-            response.clone().on_hover_ui(|tip_ui| {
-                render_group_probe_tooltip(tip_ui, probe);
-            });
-        }
 
         if state != ConnectionState::Disconnected {
             app.node_popup_open = false;
@@ -219,6 +218,14 @@ pub fn render_node_selector(app: &mut ANetApp, ui: &mut egui::Ui, state: Connect
         }
 
         let popup_open = app.node_popup_open;
+
+        if !popup_open {
+            if let Some(ref probe) = selected_probe {
+                response.clone().on_hover_ui(|tip_ui| {
+                    render_group_probe_tooltip(tip_ui, probe);
+                });
+            }
+        }
 
         let field_fill = if response.hovered() && state == ConnectionState::Disconnected {
             hover_bg
@@ -257,7 +264,7 @@ pub fn render_node_selector(app: &mut ANetApp, ui: &mut egui::Ui, state: Connect
             .unwrap_or_else(|| "...".to_string());
         let badge_color = probe_status_color(selected_status);
         let badge_x = if state == ConnectionState::Disconnected {
-            rect.right() - 30.0
+            rect.right() - 28.0
         } else {
             rect.right() - 14.0
         };
@@ -265,12 +272,12 @@ pub fn render_node_selector(app: &mut ANetApp, ui: &mut egui::Ui, state: Connect
             egui::pos2(badge_x, center_y),
             egui::Align2::RIGHT_CENTER,
             badge_text,
-            egui::FontId::new(10.5, egui::FontFamily::Name("Inter-V".into())),
+            egui::FontId::new(10.0, egui::FontFamily::Name("Inter-V".into())),
             badge_color,
         );
 
         if state == ConnectionState::Disconnected {
-            let cx = rect.right() - 17.0;
+            let cx = rect.right() - 16.0;
             let cy = center_y;
             ui.painter().add(egui::Shape::convex_polygon(
                 vec![
@@ -281,6 +288,47 @@ pub fn render_node_selector(app: &mut ANetApp, ui: &mut egui::Ui, state: Connect
                 muted,
                 egui::Stroke::NONE,
             ));
+        }
+
+        // Визуальный прогресс-бар «ПРОВЕРКА УЗЛОВ X/Y» при активном опросе
+        if app.node_probe_snapshot.is_checking && app.node_probe_snapshot.total_endpoints > 0 {
+            let done = app
+                .node_probe_snapshot
+                .completed_endpoints
+                .min(app.node_probe_snapshot.total_endpoints);
+            let total = app.node_probe_snapshot.total_endpoints.max(1);
+            let ratio = (done as f32 / total as f32).clamp(0.06, 1.0);
+
+            ui.add_space(4.0);
+            let (prog_rect, _) =
+                ui.allocate_exact_size(egui::vec2(NODE_WIDTH - 12.0, 14.0), egui::Sense::hover());
+            let bar_rect = egui::Rect::from_min_size(
+                egui::pos2(prog_rect.left(), prog_rect.top() + 1.0),
+                egui::vec2(prog_rect.width(), 3.0),
+            );
+            ui.painter().rect_filled(
+                bar_rect,
+                egui::CornerRadius::same(2),
+                egui::Color32::from_rgb(38, 42, 54),
+            );
+            let fill_rect = egui::Rect::from_min_size(
+                bar_rect.min,
+                egui::vec2(bar_rect.width() * ratio, bar_rect.height()),
+            );
+            ui.painter().rect_filled(
+                fill_rect,
+                egui::CornerRadius::same(2),
+                egui::Color32::from_rgb(56, 201, 118),
+            );
+            ui.painter().text(
+                egui::pos2(prog_rect.center().x, prog_rect.bottom() - 2.0),
+                egui::Align2::CENTER_BOTTOM,
+                format!("ПРОВЕРКА УЗЛОВ {}/{}", done, total),
+                egui::FontId::new(8.5, egui::FontFamily::Name("Inter-V".into())),
+                muted,
+            );
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(80));
         }
 
         if state == ConnectionState::Disconnected && popup_open {

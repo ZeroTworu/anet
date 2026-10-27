@@ -292,7 +292,8 @@ impl ConnectivityProber {
             .timeout(timeout)
             .connect_timeout(timeout)
             .redirect(reqwest::redirect::Policy::none())
-            .pool_max_idle_per_host(0)
+            .pool_max_idle_per_host(2)
+            .pool_idle_timeout(Duration::from_secs(90))
             .danger_accept_invalid_certs(true)
             .user_agent("Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/126.0.0.0")
             .build()
@@ -365,9 +366,32 @@ async fn probe_single_target(client: &reqwest::Client, target: &str) -> Option<u
     // Любой осмысленный HTTP-ответ от целевого сервера (2xx, 3xx, 401/403/404)
     // подтверждает успешное прохождение DNS + TCP + TLS хендшейка.
     let status = resp.status().as_u16();
+    let _ = resp.bytes().await;
     if (100..600).contains(&status) {
-        let elapsed_ms = start.elapsed().as_millis() as u64;
-        Some(elapsed_ms.max(1))
+        let first_ms = (start.elapsed().as_millis() as u64).max(1);
+        // Если первый запрос шёл по холодному соединению (включал TCP + TLS хендшейк),
+        // сразу делаем короткий повторный запрос по уже прогретому keep-alive сокету,
+        // чтобы «Пульс канала» показывал чистый 1-RTT, а не сумму 3×RTT рукопожатий.
+        if first_ms > 90 {
+            let warm_start = Instant::now();
+            if let Ok(Ok(warm_resp)) = tokio::time::timeout(
+                Duration::from_millis(900),
+                client
+                    .get(trimmed)
+                    .header("Cache-Control", "no-cache, no-store")
+                    .send(),
+            )
+            .await
+            {
+                let warm_status = warm_resp.status().as_u16();
+                let _ = warm_resp.bytes().await;
+                if (100..600).contains(&warm_status) {
+                    let warm_ms = (warm_start.elapsed().as_millis() as u64).max(1);
+                    return Some(first_ms.min(warm_ms));
+                }
+            }
+        }
+        Some(first_ms)
     } else {
         None
     }
