@@ -2,25 +2,25 @@
 
 
 win-gui:
-	cargo update -p rtc-turn
+	cargo update -p rtc-turn -p reqwest-boring
 	cargo build --release --target x86_64-pc-windows-gnu --package anet-client-gui
 win-gui-d:
-	cargo update -p rtc-turn
+	cargo update -p rtc-turn -p reqwest-boring
 	cargo build --release --target x86_64-pc-windows-gnu --package anet-client-gui --features per-app --features console
 
 # Default target
 all:
-	cargo update -p rtc-turn
+	cargo update -p rtc-turn -p reqwest-boring
 	cargo build --release
 
 # Run all checks (compile check without building)
 check:
-	cargo update -p rtc-turn
+	cargo update -p rtc-turn -p reqwest-boring
 	cargo check --workspace
 
 # Run tests
 test:
-	cargo update -p rtc-turn
+	cargo update -p rtc-turn -p reqwest-boring
 	cargo test --workspace
 
 # Clean build artifacts
@@ -29,7 +29,7 @@ clean:
 
 # Build static Linux binary (musl)
 musl:
-	cargo update -p rtc-turn
+	cargo update -p rtc-turn -p reqwest-boring
 	@for d in target/x86_64-unknown-linux-musl/release/build/boring-sys-*/out; do \
 		if [ -d "$$d/build" ] && [ ! -f "$$d/build/ssl/libssl.a" ] && [ ! -f "$$d/build/libssl.a" ]; then \
 			rm -rf "$$d/build"; \
@@ -43,7 +43,7 @@ musl:
 
 # Build Android libraries (requires cargo-ndk)
 mob:
-	cargo update -p rtc-turn
+	cargo update -p rtc-turn -p reqwest-boring
 	cargo ndk -t x86_64-linux-android -t aarch64-linux-android -t armv7-linux-androideabi -o ./android-build/jniLibs build --release -p anet-mobile
 
 # run infrastructure
@@ -51,7 +51,7 @@ infra:
 	docker-compose -f contrib/docker/docker-compose.infra.yaml up --remove-orphans
 # Build macOS CLI client
 macos:
-	cargo update -p rtc-turn
+	cargo update -p rtc-turn -p reqwest-boring
 	cargo build --release -p anet-client-cli
 	@echo ""
 	@echo "Build complete: target/release/anet-client"
@@ -59,7 +59,7 @@ macos:
 
 # Build macOS GUI client
 macos-gui:
-	cargo update -p rtc-turn
+	cargo update -p rtc-turn -p reqwest-boring
 	cargo build --release -p anet-client-gui
 	@echo ""
 	@echo "Build complete: target/release/anet-gui"
@@ -67,7 +67,7 @@ macos-gui:
 
 # Build both macOS CLI and GUI
 macos-all:
-	cargo update -p rtc-turn
+	cargo update -p rtc-turn -p reqwest-boring
 	cargo build --release -p anet-client-cli -p anet-client-gui
 	@echo ""
 	@echo "Build complete:"
@@ -76,7 +76,7 @@ macos-all:
 
 # Build universal macOS binaries (Intel + Apple Silicon)
 macos-universal:
-	cargo update -p rtc-turn
+	cargo update -p rtc-turn -p reqwest-boring
 	@echo "Building for Apple Silicon (aarch64)..."
 	cargo build --release -p anet-client-cli -p anet-client-gui --target aarch64-apple-darwin
 	@echo "Building for Intel (x86_64)..."

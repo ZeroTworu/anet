@@ -1,10 +1,15 @@
 [env]
-# Статическая сборка под x86_64-unknown-linux-musl:
+# Статическая сборка под Linux musl (x86_64 / aarch64) и Android NDK:
 # Пакет musl-tools в Linux-дистрибутивах предоставляет C-враппер (x86_64-linux-musl-gcc),
-# но не включает x86_64-linux-musl-g++.
+# но не включает x86_64-linux-musl-g++, а в Android NDK (r26+) отсутствует libstdc++.
 # BoringSSL (libssl.a) собирается с -fno-exceptions -fno-rtti, использует только
 # header-only шаблоны C++ и собственные аллокаторы (OPENSSL_malloc / placement new)
 # без единого символа из рантайма libstdc++.
 CXX_x86_64_unknown_linux_musl = "g++"
 CXXFLAGS_x86_64_unknown_linux_musl = "-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0"
 BORING_BSSL_RUST_CPPLIB_x86_64_unknown_linux_musl = "c"
+BORING_BSSL_RUST_CPPLIB_aarch64_unknown_linux_musl = "c"
+BORING_BSSL_RUST_CPPLIB_aarch64_linux_android = "c"
+BORING_BSSL_RUST_CPPLIB_armv7_linux_androideabi = "c"
+BORING_BSSL_RUST_CPPLIB_x86_64_linux_android = "c"
+BORING_BSSL_RUST_CPPLIB_i686_linux_android = "c"

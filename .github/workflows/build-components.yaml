@@ -155,12 +155,9 @@ jobs:
 
       # Сборка ARM64 (aarch64) в готовом musl cross-окружении.
       - name: "Build Client (ARM64)"
-        env:
-          # cross не передаёт CI в контейнер автоматически. Этот флаг нужен,
-          # чтобы anet-common использовал закоммиченный generated protobuf-код
-          # и не пытался запускать отсутствующий внутри контейнера protoc.
-          CROSS_CONTAINER_OPTS: "-e CI=true"
         run: |
+          GOROOT_DIR="$(go env GOROOT)"
+          CROSS_CONTAINER_OPTS="-e CI=true -e BORING_BSSL_RUST_CPPLIB_aarch64_unknown_linux_musl=c -v ${GOROOT_DIR}:/usr/local/go -e PATH=/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
           cross build --locked --release --package anet-client-cli --target aarch64-unknown-linux-musl
 
       # Загрузка артефакта AMD64
@@ -640,6 +637,7 @@ jobs:
 
       # Установка Android NDK и Rust таргетов
       - name: "Setup Android NDK"
+        id: setup-ndk
         uses: nttld/setup-ndk@v1
         with:
           ndk-version: r26d
@@ -666,6 +664,8 @@ jobs:
         run: "cargo install cargo-ndk"
 
       - name: "Build .so libs"
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: |
           cargo ndk -t aarch64-linux-android -t armv7-linux-androideabi -o ./jniLibs build --release -p anet-mobile
 

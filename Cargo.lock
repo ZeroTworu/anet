@@ -7817,8 +7817,6 @@ checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
 [[package]]
 name = "reqwest-boring"
 version = "0.13.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dbca433bc4a5529955230ff764624e6baaefc34b464741fe6e3fde9f3c1ba738"
 dependencies = [
  "base64 0.23.1",
  "boring",
