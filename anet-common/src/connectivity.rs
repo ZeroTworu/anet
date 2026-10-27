@@ -355,9 +355,24 @@ async fn probe_single_target(client: &reqwest::Client, target: &str) -> Option<u
         return None;
     }
 
+    if let Some(rtt) = probe_url_once(client, trimmed).await {
+        return Some(rtt);
+    }
+
+    // Если в старом сохранённом конфиге осталась точка gosuslugi.ru, которая режет
+    // зарубежные выходные IP (например, при включённом VPN через Нидерланды/Финляндию),
+    // страхуем её проверкой dzen.ru, чтобы индикатор РФ 3/3 не ловил ложный серый сегмент.
+    if trimmed.contains("gosuslugi.ru") {
+        return probe_url_once(client, "https://dzen.ru").await;
+    }
+
+    None
+}
+
+async fn probe_url_once(client: &reqwest::Client, url: &str) -> Option<u64> {
     let start = Instant::now();
     let resp = client
-        .get(trimmed)
+        .get(url)
         .header("Cache-Control", "no-cache, no-store")
         .send()
         .await
@@ -377,7 +392,7 @@ async fn probe_single_target(client: &reqwest::Client, target: &str) -> Option<u
             if let Ok(Ok(warm_resp)) = tokio::time::timeout(
                 Duration::from_millis(900),
                 client
-                    .get(trimmed)
+                    .get(url)
                     .header("Cache-Control", "no-cache, no-store")
                     .send(),
             )

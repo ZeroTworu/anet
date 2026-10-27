@@ -1,9 +1,9 @@
 use crate::config::WrtcConfig;
 use crate::consts::NONCE_LEN;
-use crate::crypto_utils::create_handshake_cipher;
+use crate::crypto_utils::{create_handshake_cipher, sign_data};
 use crate::http_help::BrowserProfile;
 use crate::protocol::{
-    Message, TransportProbeRequest, TransportProbeResponse, message::Content,
+    DhClientExchange, Message, TransportProbeRequest, TransportProbeResponse, message::Content,
 };
 use crate::stream_framing::{frame_packet, read_next_packet};
 use crate::vnc::{
@@ -14,12 +14,17 @@ use crate::wrtc::ktalk::KtalkClient;
 use anyhow::{Context, Result, anyhow};
 use base64::prelude::*;
 use bytes::{BufMut, Bytes, BytesMut};
+use ed25519_dalek::SigningKey;
 use futures::stream::FuturesUnordered;
 use futures::{SinkExt, StreamExt};
 use prost::Message as ProstMessage;
 use rand::RngCore;
+use rand::rngs::OsRng;
 use reqwest::Client as HttpClient;
 use russh::client::Handler;
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{DigitallySignedStruct, SignatureScheme};
 use std::collections::{BTreeMap, HashMap};
 use std::future::ready;
 use std::net::SocketAddr;
@@ -29,7 +34,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket, lookup_host};
 use tokio::sync::Semaphore;
 use tokio::time::timeout;
-use tokio_tungstenite::{connect_async, tungstenite::protocol::Message as WsMessage};
+use tokio_tungstenite::{
+    Connector, client_async_tls_with_config, tungstenite::protocol::Message as WsMessage,
+};
+use x25519_dalek::{PublicKey, StaticSecret};
 
 pub const DEFAULT_PROBE_TIMEOUT_MS: u64 = 2800;
 pub const MAX_CONCURRENT_NODE_PROBES: usize = 6;
@@ -317,20 +325,25 @@ pub fn build_transport_probe_packet(server_pub_key_b64: &str) -> Result<(Bytes, 
     let mut echo_nonce = vec![0u8; 12];
     rand::thread_rng().fill_bytes(&mut echo_nonce);
 
+    // Добиваем пакет паддингом (64 байта), чтобы зашифрованный датаграмм (116 байт)
+    // гарантированно превышал MIN_HANDSHAKE_LEN (78 байт) в MultiKeyAnetUdpSocket на сервере.
+    let mut padding = vec![0u8; 64];
+    rand::thread_rng().fill_bytes(&mut padding);
+
     let now_micros = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_micros() as u64;
 
     let msg = Message {
-        padding: vec![],
+        padding,
         content: Some(Content::TransportProbeRequest(TransportProbeRequest {
             timestamp_micros: now_micros,
             nonce: echo_nonce.clone(),
         })),
     };
 
-    let mut plain = Vec::with_capacity(48);
+    let mut plain = Vec::with_capacity(112);
     msg.encode(&mut plain)?;
 
     let mut wire_nonce = [0u8; NONCE_LEN];
@@ -345,6 +358,52 @@ pub fn build_transport_probe_packet(server_pub_key_b64: &str) -> Result<(Bytes, 
     packet.put(ciphertext);
 
     Ok((packet.freeze(), echo_nonce))
+}
+
+/// Строит криптографически валидный пакет Фазы 1 (DhClientExchange) с одноразовым эфемерным ключом.
+/// Позволяет проверять доступность QUIC/UDP и AHTTP узлов даже на серверах ветки `master`,
+/// где ещё нет поддержки `TransportProbeRequest` (сервер расшифрует пакет и вернёт ASTP-ответ без создания сессии).
+pub fn build_dh_probe_packet(server_pub_key_b64: &str) -> Result<Bytes> {
+    let pub_key_bytes = decode_pub_key_bytes(server_pub_key_b64)?;
+    let cipher = create_handshake_cipher(&pub_key_bytes);
+
+    let ephemeral_secret = StaticSecret::random_from_rng(OsRng);
+    let client_dh_pub = PublicKey::from(&ephemeral_secret);
+
+    let mut signing_bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut signing_bytes);
+    let signing_key = SigningKey::from_bytes(&signing_bytes);
+    let client_verifying_key = signing_key.verifying_key();
+    let client_signed_dh_key = sign_data(&signing_key, client_dh_pub.as_bytes());
+
+    let mut padding = vec![0u8; 32];
+    OsRng.fill_bytes(&mut padding);
+
+    let msg = Message {
+        padding,
+        content: Some(Content::DhClientExchange(DhClientExchange {
+            public_key: client_dh_pub.as_bytes().to_vec(),
+            client_signed_dh_key,
+            client_public_key: client_verifying_key.to_bytes().to_vec(),
+            resume_session_id: String::new(),
+        })),
+    };
+
+    let mut plain = Vec::with_capacity(192);
+    msg.encode(&mut plain)?;
+
+    let mut wire_nonce = [0u8; NONCE_LEN];
+    OsRng.fill_bytes(&mut wire_nonce);
+
+    let ciphertext = cipher
+        .encrypt(&wire_nonce, Bytes::from(plain))
+        .map_err(|e| anyhow!("DH probe encryption failed: {}", e))?;
+
+    let mut packet = BytesMut::with_capacity(NONCE_LEN + ciphertext.len());
+    packet.put_slice(&wire_nonce);
+    packet.put(ciphertext);
+
+    Ok(packet.freeze())
 }
 
 pub fn parse_transport_probe_response(
@@ -375,6 +434,46 @@ pub fn parse_transport_probe_response(
     }
 }
 
+/// Расшифровывает любой валидный ASTP-ответ сервера (`TransportProbeResponse`, `DhServerExchange` или `AuthError`).
+/// Возвращает `Ok(true)`, если узел жив и принимает подключения, либо `Ok(false)`, если узел в режиме draining.
+pub fn parse_any_astp_probe_response(
+    server_pub_key_b64: &str,
+    encrypted_packet: &[u8],
+    expected_nonce: Option<&[u8]>,
+) -> Result<bool> {
+    if encrypted_packet.len() < NONCE_LEN + 16 {
+        return Err(anyhow!("ASTP response packet too short"));
+    }
+    let pub_key_bytes = decode_pub_key_bytes(server_pub_key_b64)?;
+    let cipher = create_handshake_cipher(&pub_key_bytes);
+
+    let (nonce, ciphertext) = encrypted_packet.split_at(NONCE_LEN);
+    let decrypted = cipher
+        .decrypt(nonce, Bytes::copy_from_slice(ciphertext))
+        .map_err(|e| anyhow!("Failed to decrypt ASTP response: {}", e))?;
+
+    let msg = Message::decode(decrypted).context("Failed to decode ASTP response protobuf")?;
+    match msg.content {
+        Some(Content::TransportProbeResponse(resp)) => {
+            if let Some(exp) = expected_nonce {
+                if resp.echo_nonce != exp {
+                    return Err(anyhow!("Probe echo_nonce mismatch"));
+                }
+            }
+            Ok(resp.accepting_connections)
+        }
+        Some(Content::DhServerExchange(_)) => Ok(true),
+        Some(Content::AuthError(err)) => {
+            if err.message.contains("Node is not accepting new connections") {
+                Ok(false)
+            } else {
+                Ok(true)
+            }
+        }
+        _ => Err(anyhow!("Unexpected protobuf content in ASTP response")),
+    }
+}
+
 async fn resolve_socket_addr(host_port: &str) -> Result<SocketAddr> {
     let normalized = host_port.trim();
     if let Ok(addr) = normalized.parse::<SocketAddr>() {
@@ -397,8 +496,86 @@ async fn measure_tcp_connect_rtt(host_port: &str, max_wait: Duration) -> Option<
     Some(rtt)
 }
 
+async fn measure_host_pure_rtt(addr: SocketAddr, max_wait: Duration) -> Option<u32> {
+    for port in [addr.port(), 443, 22] {
+        let candidate = SocketAddr::new(addr.ip(), port);
+        let started = Instant::now();
+        if let Ok(Ok(stream)) = timeout(max_wait, TcpStream::connect(candidate)).await {
+            let rtt = started.elapsed().as_millis().max(1) as u32;
+            drop(stream);
+            return Some(rtt);
+        }
+    }
+    None
+}
+
+#[derive(Debug)]
+struct ProbeAcceptAnyServerCert;
+
+impl ServerCertVerifier for ProbeAcceptAnyServerCert {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> std::result::Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        vec![
+            SignatureScheme::RSA_PSS_SHA256,
+            SignatureScheme::RSA_PSS_SHA384,
+            SignatureScheme::RSA_PSS_SHA512,
+            SignatureScheme::RSA_PKCS1_SHA256,
+            SignatureScheme::RSA_PKCS1_SHA384,
+            SignatureScheme::RSA_PKCS1_SHA512,
+            SignatureScheme::ECDSA_NISTP256_SHA256,
+            SignatureScheme::ECDSA_NISTP384_SHA384,
+            SignatureScheme::ED25519,
+        ]
+    }
+}
+
+fn build_probe_ws_connector(ws_url: &str) -> Connector {
+    let is_wss = ws_url
+        .parse::<http::Uri>()
+        .ok()
+        .and_then(|u| u.scheme_str().map(|s| s.eq_ignore_ascii_case("wss")))
+        .unwrap_or_else(|| ws_url.trim().starts_with("wss://"));
+    if is_wss {
+        let mut tls = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(ProbeAcceptAnyServerCert))
+            .with_no_client_auth();
+        tls.alpn_protocols = vec![b"http/1.1".to_vec()];
+        Connector::Rustls(Arc::new(tls))
+    } else {
+        Connector::Plain
+    }
+}
+
 async fn probe_quic(target: &ProbeTarget, timeout_dur: Duration) -> Result<(u32, u32, String)> {
-    let full_started = Instant::now();
     let addr = resolve_socket_addr(&target.host_port).await?;
     let bind_addr = if addr.is_ipv4() {
         "0.0.0.0:0"
@@ -409,69 +586,108 @@ async fn probe_quic(target: &ProbeTarget, timeout_dur: Duration) -> Result<(u32,
     socket.connect(addr).await?;
 
     let (probe_pkt, expected_nonce) = build_transport_probe_packet(&target.server_pub_key)?;
-    let per_attempt = (timeout_dur / 2).max(Duration::from_millis(600));
     let mut recv_buf = [0u8; 2048];
 
-    for attempt in 0..2 {
-        let pure_started = Instant::now();
-        socket.send(&probe_pkt).await?;
-        match timeout(per_attempt, socket.recv(&mut recv_buf)).await {
-            Ok(Ok(len)) => {
-                let first_rtt = pure_started.elapsed().as_millis().max(1) as u32;
-                let resp = parse_transport_probe_response(
-                    &target.server_pub_key,
-                    &recv_buf[..len],
-                    &expected_nonce,
-                )?;
-                if !resp.accepting_connections {
-                    return Err(anyhow!("QUIC node not accepting connections"));
-                }
-
-                // Второй быстрый проверочный пакет по прогретому маршруту для точного 1-RTT и полного 2-RTT замера
-                let mut best_pure_rtt = first_rtt;
-                if let Ok((pkt2, nonce2)) = build_transport_probe_packet(&target.server_pub_key) {
-                    let warm_started = Instant::now();
-                    if socket.send(&pkt2).await.is_ok() {
-                        if let Ok(Ok(len2)) =
-                            timeout(Duration::from_millis(450), socket.recv(&mut recv_buf)).await
+    // 1. Быстрая попытка через легковесный TransportProbeRequest (116 байт >= MIN_HANDSHAKE_LEN)
+    let full_started = Instant::now();
+    let pure_started = Instant::now();
+    socket.send(&probe_pkt).await?;
+    let fast_wait = Duration::from_millis(340).min(timeout_dur / 3);
+    if let Ok(Ok(len)) = timeout(fast_wait, socket.recv(&mut recv_buf)).await {
+        let first_rtt = pure_started.elapsed().as_millis().max(1) as u32;
+        if let Ok(resp) = parse_transport_probe_response(
+            &target.server_pub_key,
+            &recv_buf[..len],
+            &expected_nonce,
+        ) {
+            if !resp.accepting_connections {
+                return Err(anyhow!("QUIC node not accepting connections"));
+            }
+            let mut best_pure_rtt = first_rtt;
+            if let Ok((pkt2, nonce2)) = build_transport_probe_packet(&target.server_pub_key) {
+                let warm_started = Instant::now();
+                if socket.send(&pkt2).await.is_ok() {
+                    if let Ok(Ok(len2)) =
+                        timeout(Duration::from_millis(400), socket.recv(&mut recv_buf)).await
+                    {
+                        if parse_transport_probe_response(
+                            &target.server_pub_key,
+                            &recv_buf[..len2],
+                            &nonce2,
+                        )
+                        .is_ok()
                         {
-                            if parse_transport_probe_response(
-                                &target.server_pub_key,
-                                &recv_buf[..len2],
-                                &nonce2,
-                            )
-                            .is_ok()
-                            {
-                                let warm_rtt = warm_started.elapsed().as_millis().max(1) as u32;
-                                best_pure_rtt = best_pure_rtt.min(warm_rtt);
-                            }
+                            let warm_rtt = warm_started.elapsed().as_millis().max(1) as u32;
+                            best_pure_rtt = best_pure_rtt.min(warm_rtt);
                         }
                     }
                 }
+            }
+            let full_rtt = full_started
+                .elapsed()
+                .as_millis()
+                .max(best_pure_rtt as u128) as u32;
+            return Ok((
+                best_pure_rtt,
+                full_rtt,
+                format!("QUIC ASTP OK ({} / {} ms)", full_rtt, best_pure_rtt),
+            ));
+        }
+    }
 
-                let full_rtt = full_started
-                    .elapsed()
-                    .as_millis()
-                    .max(best_pure_rtt as u128) as u32;
-                return Ok((
-                    best_pure_rtt,
-                    full_rtt,
-                    format!("QUIC ASTP OK ({} / {} ms)", full_rtt, best_pure_rtt),
-                ));
-            }
-            Ok(Err(e)) => {
-                if attempt == 1 {
-                    return Err(anyhow!("UDP recv error: {}", e));
+    // 2. Fallback для серверов на базе `master` (где поддерживается только DhClientExchange):
+    // параллельно замеряем чистый 1-RTT до хоста и отправляем эфемерный DhClientExchange.
+    let dh_pkt = build_dh_probe_packet(&target.server_pub_key)?;
+    let rem_timeout = timeout_dur
+        .checked_sub(full_started.elapsed())
+        .unwrap_or(Duration::from_millis(1200))
+        .max(Duration::from_millis(900));
+    let per_dh_attempt = (rem_timeout / 2).max(Duration::from_millis(550));
+
+    let tcp_pure_fut = measure_host_pure_rtt(addr, Duration::from_millis(650));
+    let dh_fut = async {
+        for attempt in 0..2 {
+            let dh_started = Instant::now();
+            socket.send(&dh_pkt).await?;
+            match timeout(per_dh_attempt, socket.recv(&mut recv_buf)).await {
+                Ok(Ok(len)) => {
+                    let dh_rtt = dh_started.elapsed().as_millis().max(1) as u32;
+                    let accepting = parse_any_astp_probe_response(
+                        &target.server_pub_key,
+                        &recv_buf[..len],
+                        None,
+                    )?;
+                    if !accepting {
+                        return Err(anyhow!("QUIC node not accepting connections"));
+                    }
+                    return Ok(dh_rtt);
                 }
-            }
-            Err(_) => {
-                if attempt == 1 {
-                    return Err(anyhow!("QUIC ASTP timeout"));
+                Ok(Err(e)) => {
+                    if attempt == 1 {
+                        return Err(anyhow!("UDP recv error: {}", e));
+                    }
+                }
+                Err(_) => {
+                    if attempt == 1 {
+                        return Err(anyhow!("QUIC ASTP timeout"));
+                    }
                 }
             }
         }
-    }
-    Err(anyhow!("QUIC probe failed"))
+        Err(anyhow!("QUIC probe failed"))
+    };
+
+    let (tcp_pure_opt, dh_res) = tokio::join!(tcp_pure_fut, dh_fut);
+    let full_rtt = dh_res?;
+    let pure_rtt = tcp_pure_opt
+        .map(|p| p.min(full_rtt))
+        .unwrap_or_else(|| (full_rtt / 3).max(1));
+
+    Ok((
+        pure_rtt,
+        full_rtt.max(pure_rtt),
+        format!("QUIC ASTP OK ({} / {} ms)", full_rtt.max(pure_rtt), pure_rtt),
+    ))
 }
 
 struct SshProbeClientHandler;
@@ -537,12 +753,12 @@ async fn probe_ssh(target: &ProbeTarget, timeout_dur: Duration) -> Result<(u32, 
                 let _ = session
                     .disconnect(russh::Disconnect::ByApplication, "probe", "en")
                     .await;
-                let resp = parse_transport_probe_response(
+                let accepting = parse_any_astp_probe_response(
                     &target.server_pub_key,
                     &reply,
-                    &expected_nonce,
+                    Some(&expected_nonce),
                 )?;
-                if !resp.accepting_connections {
+                if !accepting {
                     return Err(anyhow!("SSH node not accepting connections"));
                 }
                 Ok((
@@ -627,12 +843,12 @@ async fn probe_vnc(target: &ProbeTarget, timeout_dur: Duration) -> Result<(u32, 
                 let full_rtt = full_started.elapsed().as_millis().max(1) as u32;
                 let pure_rtt = astp_rtt.min(tcp_rtt);
                 let _ = stream.shutdown().await;
-                let resp = parse_transport_probe_response(
+                let accepting = parse_any_astp_probe_response(
                     &target.server_pub_key,
                     &payload,
-                    &expected_nonce,
+                    Some(&expected_nonce),
                 )?;
-                if !resp.accepting_connections {
+                if !accepting {
                     return Err(anyhow!("VNC node not accepting connections"));
                 }
                 Ok((
@@ -666,28 +882,45 @@ async fn probe_ws(target: &ProbeTarget, timeout_dur: Duration) -> Result<(u32, u
 
     let profile = BrowserProfile::random();
     let request = profile.build_ws_request(ws_url, None)?;
+    let connector = build_probe_ws_connector(ws_url);
+    let addr = resolve_socket_addr(&target.host_port).await?;
 
     let full_started = Instant::now();
     let (probe_pkt, expected_nonce) = build_transport_probe_packet(&target.server_pub_key)?;
 
     let fut = async {
-        let (mut ws_stream, _) = connect_async(request).await?;
+        let tcp_started = Instant::now();
+        let tcp_stream = TcpStream::connect(addr)
+            .await
+            .with_context(|| format!("WS TCP connect failed to {}", addr))?;
+        let tcp_rtt = tcp_started.elapsed().as_millis().max(1) as u32;
+        let _ = tcp_stream.set_nodelay(true);
+
+        let (mut ws_stream, _) =
+            client_async_tls_with_config(request, tcp_stream, None, Some(connector)).await?;
         let upgrade_rtt = full_started.elapsed().as_millis().max(1) as u32;
 
         let pure_started = Instant::now();
-        ws_stream.send(WsMessage::Binary(probe_pkt)).await?;
+        if ws_stream.send(WsMessage::Binary(probe_pkt)).await.is_err() {
+            return Ok((
+                tcp_rtt,
+                upgrade_rtt.max(tcp_rtt),
+                format!("WS Upgrade OK ({} / {} ms)", upgrade_rtt.max(tcp_rtt), tcp_rtt),
+            ));
+        }
 
         match ws_stream.next().await {
             Some(Ok(WsMessage::Binary(data))) => {
-                let pure_rtt = pure_started.elapsed().as_millis().max(1) as u32;
+                let astp_rtt = pure_started.elapsed().as_millis().max(1) as u32;
                 let full_rtt = full_started.elapsed().as_millis().max(1) as u32;
+                let pure_rtt = astp_rtt.min(tcp_rtt);
                 let _ = ws_stream.close(None).await;
-                let resp = parse_transport_probe_response(
+                let accepting = parse_any_astp_probe_response(
                     &target.server_pub_key,
                     &data,
-                    &expected_nonce,
+                    Some(&expected_nonce),
                 )?;
-                if !resp.accepting_connections {
+                if !accepting {
                     return Err(anyhow!("WS node not accepting connections"));
                 }
                 Ok((
@@ -696,21 +929,16 @@ async fn probe_ws(target: &ProbeTarget, timeout_dur: Duration) -> Result<(u32, u
                     format!("WS ASTP OK ({} / {} ms)", full_rtt.max(pure_rtt), pure_rtt),
                 ))
             }
-            Some(Ok(WsMessage::Close(_))) | None => {
-                let est_pure = (upgrade_rtt / 3).max(1);
+            // На серверах ветки `master` (без TransportProbeRequest) сервер успешно завершает
+            // HTTP 101 WebSocket Upgrade по секретному пути `websocket_path`, а после получения
+            // неизвестного probe-пакета закрывает сокет (Close / EOF / ResetWithoutClosingHandshake),
+            // аналогично `probe_ssh` и `probe_vnc`.
+            Some(Ok(WsMessage::Close(_))) | None | Some(Err(_)) | _ => {
+                let _ = ws_stream.close(None).await;
                 Ok((
-                    est_pure,
-                    upgrade_rtt,
-                    format!("WS Upgrade OK ({} / {} ms)", upgrade_rtt, est_pure),
-                ))
-            }
-            Some(Err(e)) => Err(anyhow!("WS read error: {}", e)),
-            _ => {
-                let est_pure = (upgrade_rtt / 3).max(1);
-                Ok((
-                    est_pure,
-                    upgrade_rtt,
-                    format!("WS Upgrade OK ({} / {} ms)", upgrade_rtt, est_pure),
+                    tcp_rtt,
+                    upgrade_rtt.max(tcp_rtt),
+                    format!("WS Upgrade OK ({} / {} ms)", upgrade_rtt.max(tcp_rtt), tcp_rtt),
                 ))
             }
         }
@@ -757,11 +985,12 @@ async fn probe_ahttp(target: &ProbeTarget, timeout_dur: Duration) -> Result<(u32
     let response = req.send().await.context("AHTTP request failed")?;
     let status = response.status();
     let body = response.bytes().await?;
-    let full_rtt = full_started.elapsed().as_millis().max(1) as u32;
+    let mut full_rtt = full_started.elapsed().as_millis().max(1) as u32;
 
     if status.is_success() && !body.is_empty() {
-        let resp = parse_transport_probe_response(&target.server_pub_key, &body, &expected_nonce)?;
-        if !resp.accepting_connections {
+        let accepting =
+            parse_any_astp_probe_response(&target.server_pub_key, &body, Some(&expected_nonce))?;
+        if !accepting {
             return Err(anyhow!("AHTTP node refused connections"));
         }
 
@@ -780,8 +1009,12 @@ async fn probe_ahttp(target: &ProbeTarget, timeout_dur: Duration) -> Result<(u32
             if let Ok(Ok(resp2)) = timeout(Duration::from_millis(900), req2.send()).await {
                 if resp2.status().is_success() {
                     if let Ok(body2) = resp2.bytes().await {
-                        if parse_transport_probe_response(&target.server_pub_key, &body2, &nonce2)
-                            .is_ok()
+                        if parse_any_astp_probe_response(
+                            &target.server_pub_key,
+                            &body2,
+                            Some(&nonce2),
+                        )
+                        .is_ok()
                         {
                             let warm_ms = warm_started.elapsed().as_millis().max(1) as u32;
                             pure_rtt = pure_rtt.min(warm_ms);
@@ -796,6 +1029,45 @@ async fn probe_ahttp(target: &ProbeTarget, timeout_dur: Duration) -> Result<(u32
             full_rtt.max(pure_rtt),
             format!("AHTTP ASTP OK ({} / {} ms)", full_rtt.max(pure_rtt), pure_rtt),
         ));
+    }
+
+    // Fallback для AHTTP серверов на базе `master` (через DhClientExchange)
+    if let Ok(dh_pkt) = build_dh_probe_packet(&target.server_pub_key) {
+        let dh_started = Instant::now();
+        let req_dh = client
+            .post(&url)
+            .header("Content-Type", "application/octet-stream")
+            .body(dh_pkt.to_vec());
+        let req_dh = profile.apply_to_reqwest(req_dh, Some(&base_url), Some(&base_url));
+        if let Ok(resp_dh) = req_dh.send().await {
+            if resp_dh.status().is_success() {
+                if let Ok(body_dh) = resp_dh.bytes().await {
+                    if !body_dh.is_empty() {
+                        let accepting = parse_any_astp_probe_response(
+                            &target.server_pub_key,
+                            &body_dh,
+                            None,
+                        )?;
+                        if !accepting {
+                            return Err(anyhow!("AHTTP node refused connections"));
+                        }
+                        full_rtt = dh_started.elapsed().as_millis().max(1) as u32;
+                        let pure_rtt = measure_tcp_connect_rtt(
+                            &target.host_port,
+                            Duration::from_millis(800),
+                        )
+                        .await
+                        .unwrap_or_else(|| (full_rtt / 3).max(1))
+                        .min(full_rtt);
+                        return Ok((
+                            pure_rtt,
+                            full_rtt.max(pure_rtt),
+                            format!("AHTTP ASTP OK ({} / {} ms)", full_rtt.max(pure_rtt), pure_rtt),
+                        ));
+                    }
+                }
+            }
+        }
     }
 
     Err(anyhow!("AHTTP HTTP status {}", status))

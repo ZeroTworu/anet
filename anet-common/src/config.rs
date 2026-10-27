@@ -195,7 +195,7 @@ impl Default for ConnectivityConfig {
             domestic_targets: vec![
                 "https://ya.ru".to_string(),
                 "https://vk.com".to_string(),
-                "https://www.gosuslugi.ru".to_string(),
+                "https://dzen.ru".to_string(),
             ],
         }
     }

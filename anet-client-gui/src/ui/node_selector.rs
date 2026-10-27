@@ -175,11 +175,19 @@ pub fn render_node_selector(app: &mut ANetApp, ui: &mut egui::Ui, state: Connect
         const ITEM_HEIGHT: f32 = 34.0;
 
         let orange = egui::Color32::from_rgb(235, 140, 52);
-        let selected_status = selected_probe
+        let raw_selected_status = selected_probe
             .as_ref()
             .map(|p| p.status)
             .unwrap_or(NodeProbeStatus::Checking);
-        let indicator = if selected_probe.is_some() {
+        // Если туннель уже успешно поднят на этой ноде, она гарантированно доступна
+        let selected_status = if state == ConnectionState::Connected
+            && raw_selected_status == NodeProbeStatus::Unavailable
+        {
+            NodeProbeStatus::Available
+        } else {
+            raw_selected_status
+        };
+        let indicator = if selected_probe.is_some() || state == ConnectionState::Connected {
             probe_status_color(selected_status)
         } else {
             match state {
@@ -195,6 +203,8 @@ pub fn render_node_selector(app: &mut ANetApp, ui: &mut egui::Ui, state: Connect
         let text = egui::Color32::from_rgb(242, 243, 246);
         let muted = egui::Color32::from_rgb(160, 164, 172);
 
+        let was_popup_open = app.node_popup_open;
+
         let (rect, response) = ui.allocate_exact_size(
             egui::vec2(NODE_WIDTH, NODE_HEIGHT),
             if state == ConnectionState::Disconnected {
@@ -207,6 +217,68 @@ pub fn render_node_selector(app: &mut ANetApp, ui: &mut egui::Ui, state: Connect
             response
                 .clone()
                 .on_hover_cursor(egui::CursorIcon::PointingHand);
+        }
+
+        // Кнопка принудительной перепроверки статуса серверов справа от селектора
+        let refresh_rect = egui::Rect::from_min_size(
+            egui::pos2(rect.right() + 8.0, rect.top()),
+            egui::vec2(NODE_HEIGHT, NODE_HEIGHT),
+        );
+        let refresh_resp = ui.interact(
+            refresh_rect,
+            egui::Id::new("btn_refresh_nodes_status"),
+            egui::Sense::click(),
+        );
+        if refresh_resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        let is_probing_nodes = app.node_probe_snapshot.is_checking;
+        let refresh_fill = if refresh_resp.hovered() || is_probing_nodes {
+            hover_bg
+        } else {
+            bg
+        };
+        let refresh_border = if is_probing_nodes {
+            egui::Color32::from_rgb(56, 201, 118)
+        } else if refresh_resp.hovered() {
+            orange
+        } else {
+            border
+        };
+        ui.painter().rect_filled(
+            refresh_rect,
+            egui::CornerRadius::same(NODE_RADIUS),
+            refresh_fill,
+        );
+        ui.painter().rect_stroke(
+            refresh_rect,
+            egui::CornerRadius::same(NODE_RADIUS),
+            egui::Stroke::new(1.0, refresh_border),
+            egui::StrokeKind::Inside,
+        );
+        ui.painter().text(
+            refresh_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            if is_probing_nodes { "…" } else { "↻" },
+            egui::FontId::proportional(14.5),
+            if is_probing_nodes {
+                egui::Color32::from_rgb(56, 201, 118)
+            } else if refresh_resp.hovered() {
+                text
+            } else {
+                muted
+            },
+        );
+        if refresh_resp
+            .clone()
+            .on_hover_text("Принудительно перепроверить доступность и пинг серверов")
+            .clicked()
+        {
+            anet_client_core::connectivity_monitor::NodeProbeMonitor::trigger_probe_now();
+            app.node_probe_snapshot =
+                anet_client_core::connectivity_monitor::NodeProbeMonitor::get_last_snapshot();
+            app.node_probe_snapshot.is_checking = true;
+            ui.ctx().request_repaint();
         }
 
         if state != ConnectionState::Disconnected {
@@ -258,10 +330,20 @@ pub fn render_node_selector(app: &mut ANetApp, ui: &mut egui::Ui, state: Connect
             text,
         );
 
-        let badge_text = selected_probe
-            .as_ref()
-            .map(|p| p.short_badge_text())
-            .unwrap_or_else(|| "...".to_string());
+        let badge_text = if state == ConnectionState::Connected
+            && raw_selected_status == NodeProbeStatus::Unavailable
+        {
+            app.connectivity_snapshot
+                .display_rtt_ms
+                .filter(|&ms| ms > 0)
+                .map(|ms| format!("{} мс", ms))
+                .unwrap_or_else(|| "В СЕТИ".to_string())
+        } else {
+            selected_probe
+                .as_ref()
+                .map(|p| p.short_badge_text())
+                .unwrap_or_else(|| "...".to_string())
+        };
         let badge_color = probe_status_color(selected_status);
         let badge_x = if state == ConnectionState::Disconnected {
             rect.right() - 28.0
@@ -342,7 +424,31 @@ pub fn render_node_selector(app: &mut ANetApp, ui: &mut egui::Ui, state: Connect
                 rect.bottom() + 6.0
             };
             let popup_pos = egui::pos2(rect.left(), popup_y);
+            let popup_rect =
+                egui::Rect::from_min_size(popup_pos, egui::vec2(NODE_WIDTH, popup_height))
+                    .expand(4.0);
             let popup_area_id = egui::Id::new("node_selection_popup");
+
+            // Закрываем выпадающий список при клике вне селектора/списка или по нажатию Escape (как в вебе)
+            if was_popup_open {
+                let esc_pressed = ui.input(|i| i.key_pressed(egui::Key::Escape));
+                let clicked_outside = ui.input(|i| {
+                    if i.pointer.any_pressed() {
+                        if let Some(pos) = i.pointer.interact_pos() {
+                            !rect.contains(pos)
+                                && !refresh_rect.contains(pos)
+                                && !popup_rect.contains(pos)
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                });
+                if esc_pressed || clicked_outside {
+                    app.node_popup_open = false;
+                }
+            }
 
             egui::Area::new(popup_area_id)
                 .order(egui::Order::Foreground)
