@@ -50,12 +50,21 @@ where
                 .ok_or("missing host")?
                 .trim_start_matches('[')
                 .trim_end_matches(']');
+
+            let is_ip = host.parse::<std::net::IpAddr>().is_ok();
+            let mut ssl_config = tls.configure(host, dst.port_u16().unwrap_or(443))?;
+
+            if is_ip {
+                ssl_config.set_use_server_name_indication(false);
+                ssl_config.set_verify_hostname(false);
+            }
+
             let io = tokio_boring::connect(
-                tls.configure(host, dst.port_u16().unwrap_or(443))?,
+                ssl_config,
                 host,
                 TokioIo::new(io),
             )
-            .await?;
+                .await?;
             Ok(MaybeHttpsStream::Https(TokioIo::new(io)))
         })
     }

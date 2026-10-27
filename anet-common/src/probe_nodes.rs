@@ -21,11 +21,7 @@ use futures::{SinkExt, StreamExt};
 use prost::Message as ProstMessage;
 use rand::RngCore;
 use rand::rngs::OsRng;
-use reqwest::Client as HttpClient;
 use russh::client::Handler;
-use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::{DigitallySignedStruct, SignatureScheme};
 use std::collections::{BTreeMap, HashMap};
 use std::future::ready;
 use std::net::SocketAddr;
@@ -36,7 +32,7 @@ use tokio::net::{TcpStream, UdpSocket, lookup_host};
 use tokio::sync::Semaphore;
 use tokio::time::timeout;
 use tokio_tungstenite::{
-    Connector, client_async_tls_with_config, tungstenite::protocol::Message as WsMessage,
+    client_async_with_config, tungstenite::protocol::Message as WsMessage,
 };
 use x25519_dalek::{PublicKey, StaticSecret};
 
@@ -510,72 +506,6 @@ async fn measure_host_pure_rtt(addr: SocketAddr, max_wait: Duration) -> Option<u
     None
 }
 
-#[derive(Debug)]
-struct ProbeAcceptAnyServerCert;
-
-impl ServerCertVerifier for ProbeAcceptAnyServerCert {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: UnixTime,
-    ) -> std::result::Result<ServerCertVerified, rustls::Error> {
-        Ok(ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
-    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
-    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        vec![
-            SignatureScheme::RSA_PSS_SHA256,
-            SignatureScheme::RSA_PSS_SHA384,
-            SignatureScheme::RSA_PSS_SHA512,
-            SignatureScheme::RSA_PKCS1_SHA256,
-            SignatureScheme::RSA_PKCS1_SHA384,
-            SignatureScheme::RSA_PKCS1_SHA512,
-            SignatureScheme::ECDSA_NISTP256_SHA256,
-            SignatureScheme::ECDSA_NISTP384_SHA384,
-            SignatureScheme::ED25519,
-        ]
-    }
-}
-
-fn build_probe_ws_connector(ws_url: &str) -> Connector {
-    let is_wss = ws_url
-        .parse::<http::Uri>()
-        .ok()
-        .and_then(|u| u.scheme_str().map(|s| s.eq_ignore_ascii_case("wss")))
-        .unwrap_or_else(|| ws_url.trim().starts_with("wss://"));
-    if is_wss {
-        let mut tls = rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(ProbeAcceptAnyServerCert))
-            .with_no_client_auth();
-        tls.alpn_protocols = vec![b"http/1.1".to_vec()];
-        Connector::Rustls(Arc::new(tls))
-    } else {
-        Connector::Plain
-    }
-}
-
 async fn probe_quic(target: &ProbeTarget, timeout_dur: Duration) -> Result<(u32, u32, String)> {
     let addr = resolve_socket_addr(&target.host_port).await?;
     let bind_addr = if addr.is_ipv4() {
@@ -616,7 +546,7 @@ async fn probe_quic(target: &ProbeTarget, timeout_dur: Duration) -> Result<(u32,
                             &recv_buf[..len2],
                             &nonce2,
                         )
-                        .is_ok()
+                            .is_ok()
                         {
                             let warm_rtt = warm_started.elapsed().as_millis().max(1) as u32;
                             best_pure_rtt = best_pure_rtt.min(warm_rtt);
@@ -881,10 +811,19 @@ async fn probe_ws(target: &ProbeTarget, timeout_dur: Duration) -> Result<(u32, u
         .filter(|s| !s.trim().is_empty())
         .unwrap_or(&target.dsn);
 
-    let profile = BrowserProfile::random();
+    // Зададим профиль с отключенной проверкой сертификатов для зондирования
+    let mut tls_cfg = crate::boring_tls::get_default_tls_config();
+    tls_cfg.verify_peer = false;
+    let profile = BrowserProfile::with_tls_config(tls_cfg);
+
     let request = profile.build_ws_request(ws_url, None)?;
-    let connector = build_probe_ws_connector(ws_url);
     let addr = resolve_socket_addr(&target.host_port).await?;
+
+    let is_wss = ws_url
+        .parse::<http::Uri>()
+        .ok()
+        .and_then(|u| u.scheme_str().map(|s| s.eq_ignore_ascii_case("wss") || s.eq_ignore_ascii_case("https")))
+        .unwrap_or_else(|| ws_url.trim().starts_with("wss://"));
 
     let full_started = Instant::now();
     let (probe_pkt, expected_nonce) = build_transport_probe_packet(&target.server_pub_key)?;
@@ -897,8 +836,17 @@ async fn probe_ws(target: &ProbeTarget, timeout_dur: Duration) -> Result<(u32, u
         let tcp_rtt = tcp_started.elapsed().as_millis().max(1) as u32;
         let _ = tcp_stream.set_nodelay(true);
 
+        // Используем наш стрим (boring TLS или чистый TCP)
+        let stream: Box<dyn crate::transport_trait::VpnStream> = if is_wss {
+            let target_host = request.uri().host().unwrap_or("").to_string();
+            let tls_stream = profile.connect_ws_tls(&target_host, tcp_stream).await?;
+            Box::new(tls_stream)
+        } else {
+            Box::new(tcp_stream)
+        };
+
         let (mut ws_stream, _) =
-            client_async_tls_with_config(request, tcp_stream, None, Some(connector)).await?;
+            client_async_with_config(request, stream, None).await?;
         let upgrade_rtt = full_started.elapsed().as_millis().max(1) as u32;
 
         let pure_started = Instant::now();
@@ -930,10 +878,6 @@ async fn probe_ws(target: &ProbeTarget, timeout_dur: Duration) -> Result<(u32, u
                     format!("WS ASTP OK ({} / {} ms)", full_rtt.max(pure_rtt), pure_rtt),
                 ))
             }
-            // На серверах ветки `master` (без TransportProbeRequest) сервер успешно завершает
-            // HTTP 101 WebSocket Upgrade по секретному пути `websocket_path`, а после получения
-            // неизвестного probe-пакета закрывает сокет (Close / EOF / ResetWithoutClosingHandshake),
-            // аналогично `probe_ssh` и `probe_vnc`.
             Some(Ok(WsMessage::Close(_))) | None | Some(Err(_)) | _ => {
                 let _ = ws_stream.close(None).await;
                 Ok((
@@ -968,14 +912,17 @@ async fn probe_ahttp(target: &ProbeTarget, timeout_dur: Duration) -> Result<(u32
 
     let dh_pkt = build_dh_probe_packet(&target.server_pub_key)?;
 
-    let client = HttpClient::builder()
+    let mut tls_cfg = crate::boring_tls::get_default_tls_config();
+    tls_cfg.verify_peer = false;
+    let profile = BrowserProfile::with_tls_config(tls_cfg);
+
+    let client = profile
+        .build_reqwest_builder(std::sync::Arc::new(reqwest::cookie::Jar::default()))?
         .timeout(timeout_dur)
         .pool_max_idle_per_host(2)
-        .danger_accept_invalid_certs(true)
         .no_proxy()
         .build()?;
 
-    let profile = BrowserProfile::random();
     let tcp_pure_fut = measure_tcp_connect_rtt(&target.host_port, Duration::from_millis(800));
     let http_fut = async {
         let full_started = Instant::now();
@@ -1024,12 +971,16 @@ async fn probe_wrtc(target: &ProbeTarget, timeout_dur: Duration) -> Result<(u32,
         return Err(anyhow!("WRTC DSN missing room name"));
     }
 
+    let mut tls_cfg = crate::boring_tls::get_default_tls_config();
+    tls_cfg.verify_peer = false;
+    let profile = BrowserProfile::with_tls_config(tls_cfg);
+
     let mut wrtc_cfg = WrtcConfig::default();
     let secs = (timeout_dur.as_secs()).max(2);
     wrtc_cfg.http_connect_timeout_secs = secs;
     wrtc_cfg.http_request_timeout_secs = secs;
 
-    let ktalk = KtalkClient::new(BrowserProfile::random(), &wrtc_cfg);
+    let ktalk = KtalkClient::new(profile, &wrtc_cfg)?;
     let secret = KtalkClient::generate_anonymous_secret();
     let host_port = format!("{}:443", domain);
 

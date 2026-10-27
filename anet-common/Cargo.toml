@@ -23,7 +23,7 @@ aead = { version = "0.5.2", features = ["getrandom"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = "1.0"
 toml = { workspace = true }
-reqwest = { workspace = true, features = ["json", "rustls-tls"] }
+reqwest = { workspace = true, features = ["json", "rustls"] }
 tokio-tungstenite = { workspace = true }
 rand = {workspace = true}
 x25519-dalek = {workspace = true}
@@ -42,8 +42,9 @@ rustls = { workspace = true }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 russh = { workspace = true }
 url = "2.5.7"
-
-
+tokio-boring = {workspace = true}
+rustls-native-certs = { workspace = true }
+boring = {workspace = true}
 [build-dependencies]
 prost-build = "0.14.1"
 
