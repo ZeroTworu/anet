@@ -985,52 +985,43 @@ impl WrtcPeer {
                             }
                         };
 
-                        let uri = req.uri().clone();
-                        let scheme = uri.scheme_str().unwrap_or("wss");
-                        let is_tls = scheme.eq_ignore_ascii_case("wss") || scheme.eq_ignore_ascii_case("https");
-                        let target_host = uri.host().unwrap_or("localhost").to_string();
-                        let default_port = if is_tls { 443 } else { 80 };
-                        let target_port = uri.port_u16().unwrap_or(default_port);
-                        let connect_addr = format!("{target_host}:{target_port}");
+                        let parsed_uri = ws_url_c.parse::<http::Uri>().ok();
+                        let is_wss = parsed_uri
+                            .as_ref()
+                            .and_then(|u| u.scheme_str())
+                            .map(|s| s.eq_ignore_ascii_case("wss") || s.eq_ignore_ascii_case("https"))
+                            .unwrap_or(true);
+                        let target_host = parsed_uri
+                            .as_ref()
+                            .and_then(|u| u.host())
+                            .unwrap_or("")
+                            .to_string();
+                        let target_port = parsed_uri
+                            .as_ref()
+                            .and_then(|u| u.port_u16())
+                            .unwrap_or(if is_wss { 443 } else { 80 });
 
-                        let connect_res: Result<
-                            Result<
-                                (
-                                    tokio_tungstenite::WebSocketStream<crate::boring_tls::BoringMaybeTlsStream<tokio::net::TcpStream>>,
-                                    _,
-                                ),
-                                anyhow::Error,
-                            >,
-                            _,
-                        > = tokio::time::timeout(
+                        let connect_res = tokio::time::timeout(
                             Duration::from_secs(colibri_connect_timeout),
                             async {
-                                let tcp = tokio::net::TcpStream::connect(&connect_addr).await?;
+                                let tcp = tokio::net::TcpStream::connect((target_host.as_str(), target_port)).await?;
+                                let peer_ip = tcp.peer_addr().ok().map(|a| a.ip());
                                 let _ = tcp.set_nodelay(true);
-                                let stream = if is_tls {
+                                let stream: Box<dyn crate::transport_trait::VpnStream> = if is_wss {
                                     let tls = crate::boring_tls::connect_chrome_ws_tls(&target_host, tcp).await?;
-                                    crate::boring_tls::BoringMaybeTlsStream::BoringTls(tls)
+                                    Box::new(tls)
                                 } else {
-                                    crate::boring_tls::BoringMaybeTlsStream::Plain(tcp)
+                                    Box::new(tcp)
                                 };
-                                let res = tokio_tungstenite::client_async_with_config(req, stream, None).await?;
-                                Ok(res)
+                                let (ws_stream, _resp) =
+                                    tokio_tungstenite::client_async_with_config(req, stream, None).await?;
+                                Ok::<_, anyhow::Error>((ws_stream, peer_ip))
                             },
                         )
                         .await;
 
-                        if let Ok(Ok((mut ws_stream, _))) = connect_res {
+                        if let Ok(Ok((mut ws_stream, peer_ip))) = connect_res {
                             reconnect_attempts = 0;
-                            let peer_ip = match ws_stream.get_ref() {
-                                crate::boring_tls::BoringMaybeTlsStream::Plain(s) => {
-                                    let _ = s.set_nodelay(true);
-                                    s.peer_addr().ok().map(|a| a.ip())
-                                }
-                                crate::boring_tls::BoringMaybeTlsStream::BoringTls(s) => {
-                                    let _ = s.get_ref().set_nodelay(true);
-                                    s.get_ref().peer_addr().ok().map(|a| a.ip())
-                                }
-                            };
                             if let Some(ip) = peer_ip {
                                 if let Ok(mut g) = colibri_ws_ip_c.lock() {
                                     *g = Some(ip);
