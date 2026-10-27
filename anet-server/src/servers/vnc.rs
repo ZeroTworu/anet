@@ -79,13 +79,13 @@ async fn handle_vnc_session(
     registry.finalize_client(&client_info.assigned_ip, router_tx);
 
     let (reader, writer) = tokio::io::split(stream);
-    let mut inbound = tokio::spawn(receive_from_client(
+    let inbound = tokio::spawn(receive_from_client(
         reader,
         tun_tx,
         client_info.clone(),
         registry.clone(),
     ));
-    let mut outbound = tokio::spawn(send_to_client(
+    let outbound = tokio::spawn(send_to_client(
         writer,
         router_rx,
         client_info.clone(),

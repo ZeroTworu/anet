@@ -8,7 +8,7 @@ use anet_common::stream_framing::{frame_packet, read_next_packet, supervise_bidi
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use log::{info, warn};
-use russh::{Channel, ChannelId, CryptoVec, server};
+use russh::{Channel, ChannelId, server};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -72,7 +72,7 @@ impl server::Handler for AnetSshHandler {
             // Защита от активного сканирования/зондирования ТСПУ:
             // При попытке выполнения сторонней команды выдаем стандартный баннер и закрываем канал
             self.pending_channels.remove(&channel_id);
-            session.data(channel_id, CryptoVec::from_slice(b"Welcome to Simple SSH Server.\r\n"));
+            let _ = session.data(channel_id, &b"Welcome to Simple SSH Server.\r\n"[..]);
             let _ = session.close(channel_id);
             return Ok(());
         }
@@ -121,7 +121,7 @@ impl server::Handler for AnetSshHandler {
         channel: ChannelId,
         session: &mut server::Session,
     ) -> Result<(), Self::Error> {
-        session.data(channel, CryptoVec::from_slice(b"Welcome to Simple SSH Server.\r\n"));
+        let _ = session.data(channel, &b"Welcome to Simple SSH Server.\r\n"[..]);
         let _ = session.close(channel);
         Ok(())
     }
@@ -152,13 +152,13 @@ where
     let (router_tx, router_rx) = mpsc::channel(CHANNEL_BUFFER_SIZE);
     registry.finalize_client(&client_info.assigned_ip, router_tx);
     let (reader, writer) = tokio::io::split(stream);
-    let mut inbound = tokio::spawn(receive_from_client(
+    let inbound = tokio::spawn(receive_from_client(
         reader,
         tun_tx,
         client_info.clone(),
         registry.clone(),
     ));
-    let mut outbound = tokio::spawn(anet_common::jitter::bridge_crypto_stream_with_jitter(
+    let outbound = tokio::spawn(anet_common::jitter::bridge_crypto_stream_with_jitter(
         router_rx,
         writer,
         config.stealth.clone(),

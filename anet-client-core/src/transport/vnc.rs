@@ -107,9 +107,9 @@ impl ClientTransport for VncTransport {
 
         tokio::spawn(async move {
             let tunnel_start = std::time::Instant::now();
-            let mut inbound =
+            let inbound =
                 tokio::spawn(receive_from_server(reader, tunnel_writer, cipher.clone()));
-            let mut outbound = tokio::spawn(send_to_server(
+            let outbound = tokio::spawn(send_to_server(
                 tunnel_reader,
                 writer,
                 cipher,
@@ -329,12 +329,7 @@ async fn send_to_server(
     Ok(())
 }
 
-fn flatten_worker_result(
-    worker: &'static str,
-    result: std::result::Result<Result<()>, tokio::task::JoinError>,
-) -> Result<()> {
-    result.with_context(|| format!("VNC {worker} task failed"))?
-}
+
 
 fn schedule_with_jitter(
     pending: &mut FuturesUnordered<BoxFuture<'static, Bytes>>,

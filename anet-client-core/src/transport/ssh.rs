@@ -124,7 +124,7 @@ impl ClientTransport for SshTransport {
         tokio::spawn(async move {
             let tunnel_start = std::time::Instant::now();
             let _session_guard = ssh_session;
-            let mut outbound = tokio::spawn(send_to_server(
+            let outbound = tokio::spawn(send_to_server(
                 tunnel_reader,
                 writer,
                 stealth,
@@ -132,7 +132,7 @@ impl ClientTransport for SshTransport {
                 sequence,
                 nonce_prefix,
             ));
-            let mut inbound = tokio::spawn(receive_from_server(reader, tunnel_writer, cipher));
+            let inbound = tokio::spawn(receive_from_server(reader, tunnel_writer, cipher));
 
             let (finished_worker, result) =
                 supervise_bidirectional_workers(inbound, outbound, "SSH").await;
@@ -178,12 +178,7 @@ fn resolve_address(address: &str) -> Result<SocketAddr> {
         .with_context(|| format!("SSH endpoint {address} resolved to no addresses"))
 }
 
-fn flatten_worker_result(
-    worker: &'static str,
-    result: std::result::Result<Result<()>, tokio::task::JoinError>,
-) -> Result<()> {
-    result.with_context(|| format!("SSH {worker} task failed"))?
-}
+
 
 async fn send_to_server<W>(
     mut tunnel_reader: tokio::io::ReadHalf<tokio::io::DuplexStream>,
