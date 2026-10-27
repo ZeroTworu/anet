@@ -15,24 +15,30 @@ pub fn render_error_modal(app: &mut ANetApp, ctx: &egui::Context) {
     }
 
     let screen_rect = ctx.content_rect();
-    let modal_width = (screen_rect.width() - 48.0).clamp(280.0, 360.0);
+
+    // Отступы от границ родительского окна:
+    // 16 px по бокам (слева/справа) и 20 px сверху/снизу
+    let margin_x = 16.0;
+    let margin_y = 20.0;
+
+    let modal_width = (screen_rect.width() - margin_x * 2.0).clamp(260.0, 360.0);
+    let max_modal_height = (screen_rect.height() - margin_y * 2.0).max(200.0);
 
     // 1. Полупрозрачное затемнение фона (Backdrop)
     egui::Area::new(egui::Id::new("error_modal_backdrop"))
         .order(egui::Order::Foreground)
         .fixed_pos(egui::pos2(0.0, 0.0))
         .interactable(true)
-        
         .show(ctx, |ui| {
             ui.allocate_exact_size(screen_rect.size(), egui::Sense::click());
             ui.painter().rect_filled(
                 screen_rect,
-                14.0,
+                14.0, // Скругление под безрамочное окно
                 egui::Color32::from_rgba_unmultiplied(10, 12, 16, 200),
             );
         });
 
-    // 2. Основная карточка модального окна
+    // 2. Основная карточка модального окна с гарантированными отступами
     egui::Window::new("ERROR_SYSTEM_WINDOW")
         .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
         .collapsible(false)
@@ -43,13 +49,14 @@ pub fn render_error_modal(app: &mut ANetApp, ctx: &egui::Context) {
             egui::Frame::NONE
                 .fill(egui::Color32::from_rgb(24, 26, 33))
                 .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(50, 55, 68)))
-                .inner_margin(egui::Margin::symmetric(20, 20))
-                .outer_margin(egui::Margin::symmetric(10, 10))
+                .inner_margin(egui::Margin::symmetric(18, 18))
                 .corner_radius(14.0),
         )
         .show(ctx, |ui| {
+            // Ограничиваем ширину и высоту карточки, чтобы она не прилипала к краям
             ui.set_width(modal_width);
             ui.set_max_width(modal_width);
+            ui.set_max_height(max_modal_height);
 
             ui.vertical(|ui| {
                 // Шапка: Иконка в круге + Заголовок
@@ -57,7 +64,6 @@ pub fn render_error_modal(app: &mut ANetApp, ctx: &egui::Context) {
                     let badge_size = egui::vec2(34.0, 34.0);
                     let (badge_rect, _) = ui.allocate_exact_size(badge_size, egui::Sense::hover());
 
-                    // Подложка иконки с мягким красным свечением
                     ui.painter().circle_filled(
                         badge_rect.center(),
                         17.0,
@@ -98,7 +104,10 @@ pub fn render_error_modal(app: &mut ANetApp, ctx: &egui::Context) {
 
                 ui.add_space(14.0);
 
-                // Контейнер с текстом ошибки (со скроллом и моноширинным шрифтом)
+                // Адаптивная высота блока текста ошибки: никогда не вытолкнет окно за экран
+                let scroll_max_height = (max_modal_height - 180.0).clamp(80.0, 200.0);
+
+                // Контейнер с текстом ошибки
                 egui::Frame::NONE
                     .fill(egui::Color32::from_rgb(17, 19, 25))
                     .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(38, 42, 53)))
@@ -108,7 +117,7 @@ pub fn render_error_modal(app: &mut ANetApp, ctx: &egui::Context) {
                         ui.set_width(ui.available_width());
 
                         egui::ScrollArea::vertical()
-                            .max_height(140.0)
+                            .max_height(scroll_max_height)
                             .auto_shrink([false, true])
                             .show(ui, |ui| {
                                 ui.add(
@@ -126,11 +135,10 @@ pub fn render_error_modal(app: &mut ANetApp, ctx: &egui::Context) {
 
                 ui.add_space(18.0);
 
-                // Кнопки управления: «Скопировать» и «Понятно»
+                // Кнопки управления: «Копировать» и «Понятно»
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 10.0;
 
-                    // Кнопка копирования ошибки
                     let copy_btn = egui::Button::new(
                         egui::RichText::new("Скопировать")
                             .size(11.0)
@@ -142,15 +150,14 @@ pub fn render_error_modal(app: &mut ANetApp, ctx: &egui::Context) {
                     .min_size(egui::vec2(100.0, 32.0))
                     .corner_radius(6.0);
 
-                   if ui.add(copy_btn).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-    ctx.copy_text(err_msg.clone());
-    app.show_toast("Текст ошибки скопирован");
-}
+                    if ui.add(copy_btn).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                        ctx.copy_text(err_msg.clone());
+                        app.show_toast("Текст ошибки скопирован");
+                    }
 
-                    // Основная кнопка закрытия
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let close_btn = egui::Button::new(
-                            egui::RichText::new("ОК")
+                            egui::RichText::new("Ок")
                                 .size(11.5)
                                 .strong()
                                 .color(egui::Color32::BLACK)
