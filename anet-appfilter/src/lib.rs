@@ -47,7 +47,7 @@ impl AppFilter {
     pub fn start(
         policy: AppPolicy,
         initial_bypass: impl IntoIterator<Item = IpAddr>,
-        vpn_ip: IpAddr,
+        vpn_ip: IpAddr,        
     ) -> Result<(Self, mpsc::Sender<Bytes>, mpsc::Receiver<Bytes>)> {
         let map = FlowMap::new();
         let bypass = BypassSet::with_initial(initial_bypass);

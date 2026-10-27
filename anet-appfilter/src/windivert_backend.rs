@@ -2,7 +2,7 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use bytes::Bytes;
@@ -18,37 +18,22 @@ use crate::policy::AppPolicy;
 use crate::proc_name::image_name_for_pid;
 
 const RECV_BUF: usize = 0xFFFF;
-
-/// Сколько держим запись в NAT-таблице после SocketClose, чтобы дать
-/// долететь финальным FIN/RST/data от сервера.
-const NAT_GRACE_PERIOD: Duration = Duration::from_secs(60);
-
-/// Короткое окно ожидания записи в FlowMap для первого пакета нового flow
-/// (гонка между socket-tracker'ом и packet-router'ом).
+const NAT_GRACE_PERIOD: Duration = Duration::from_secs(45);
 const FLOW_RACE_STEP: Duration = Duration::from_millis(1);
-const FLOW_RACE_RETRIES: u32 = 5;
+const FLOW_RACE_RETRIES: u32 = 8;
+const DEFAULT_TCP_MSS: u16 = 1360;
 
-// ============================================================================
-// ТИПЫ
-// ============================================================================
-
-/// Ключ NAT-таблицы. Специально НЕ содержит local_addr: входящий из туннеля
-/// пакет имеет dst = vpn_ip, а не реальный локальный IP клиента, поэтому
-/// local_addr на входящей стороне восстановить нельзя. Для уникальности
-/// хватает (proto, local_port, remote_addr, remote_port).
 pub type NatKey = (u8, u16, IpAddr, u16);
 
-pub type NatMap =
-    Arc<DashMap<NatKey, (IpAddr, windivert::address::WinDivertAddress<NetworkLayer>)>>;
+#[derive(Clone)]
+pub struct NatEntry {
+    pub orig_ip: IpAddr,
+    pub orig_addr: windivert::address::WinDivertAddress<NetworkLayer>,
+    pub expires_at: Option<Instant>,
+}
 
-/// «Липкое» решение tunnel/direct на весь TCP/UDP поток.
-/// Ключ — полный 5-tuple, чтобы разные соединения с одинаковым local_port
-/// (например, серверные accept'ы) не затирали друг друга.
+pub type NatMap = Arc<DashMap<NatKey, NatEntry>>;
 pub type DecisionSet = Arc<DashMap<FlowKey, bool>>;
-
-/// Множество flow, для которых мы уже напечатали `[BYPASS]` в лог.
-/// Без него долгоживущие соединения (например, сам туннель к VPN-серверу)
-/// генерируют по строке на каждый пакет и забивают лог.
 pub type LoggedBypass = Arc<DashMap<FlowKey, ()>>;
 
 #[inline]
@@ -61,8 +46,6 @@ fn nat_key_inbound(k: &NetworkPacketKey) -> NatKey {
     (k.protocol, k.dport, k.src_addr, k.sport)
 }
 
-/// Пакеты, которые appfilter не должен трогать ни при каких условиях:
-/// loopback, multicast, broadcast, link-local, unspecified (0.0.0.0 / ::).
 #[inline]
 fn is_ignored_ip(ip: &IpAddr) -> bool {
     match ip {
@@ -79,23 +62,13 @@ fn is_ignored_ip(ip: &IpAddr) -> bool {
     }
 }
 
-// ============================================================================
-// ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
-// ============================================================================
-
 fn clear_checksums(data: &mut [u8]) {
-    if data.is_empty() {
-        return;
-    }
+    if data.is_empty() { return; }
     let version = data[0] >> 4;
     if version == 4 {
-        if data.len() < 20 {
-            return;
-        }
+        if data.len() < 20 { return; }
         let ihl = ((data[0] & 0x0F) * 4) as usize;
-        if data.len() < ihl {
-            return;
-        }
+        if data.len() < ihl { return; }
 
         data[10] = 0;
         data[11] = 0;
@@ -118,36 +91,24 @@ fn clear_checksums(data: &mut [u8]) {
 fn clamp_tcp_mss(data: &mut [u8], max_mss: u16) -> bool {
     let version = data[0] >> 4;
     let (ihl, protocol) = if version == 4 {
-        if data.len() < 20 {
-            return false;
-        }
+        if data.len() < 20 { return false; }
         let ihl = ((data[0] & 0x0F) * 4) as usize;
-        if data.len() < ihl + 20 {
-            return false;
-        }
+        if data.len() < ihl + 20 { return false; }
         (ihl, data[9])
     } else {
         return false;
     };
 
-    if protocol != 6 {
-        return false;
-    }
+    if protocol != 6 { return false; }
 
     let tcp_offset = ihl;
-    if data.len() < tcp_offset + 20 {
-        return false;
-    }
+    if data.len() < tcp_offset + 20 { return false; }
 
     let tcp_flags = data[tcp_offset + 13];
-    if (tcp_flags & 0x02) == 0 {
-        return false;
-    }
+    if (tcp_flags & 0x02) == 0 { return false; }
 
     let tcp_hdr_len = ((data[tcp_offset + 12] >> 4) * 4) as usize;
-    if data.len() < tcp_offset + tcp_hdr_len {
-        return false;
-    }
+    if data.len() < tcp_offset + tcp_hdr_len { return false; }
 
     let mut opt_offset = tcp_offset + 20;
     let opt_end = tcp_offset + tcp_hdr_len;
@@ -155,21 +116,12 @@ fn clamp_tcp_mss(data: &mut [u8], max_mss: u16) -> bool {
 
     while opt_offset < opt_end {
         let kind = data[opt_offset];
-        if kind == 0 {
-            break;
-        }
-        if kind == 1 {
-            opt_offset += 1;
-            continue;
-        }
+        if kind == 0 { break; }
+        if kind == 1 { opt_offset += 1; continue; }
+        if opt_offset + 1 >= opt_end { break; }
 
-        if opt_offset + 1 >= opt_end {
-            break;
-        }
         let len = data[opt_offset + 1] as usize;
-        if len < 2 || opt_offset + len > opt_end {
-            break;
-        }
+        if len < 2 || opt_offset + len > opt_end { break; }
 
         if kind == 2 && len == 4 {
             let current_mss = u16::from_be_bytes([data[opt_offset + 2], data[opt_offset + 3]]);
@@ -186,7 +138,7 @@ fn clamp_tcp_mss(data: &mut [u8], max_mss: u16) -> bool {
 }
 
 // ============================================================================
-// ПОТОК 1: ОТСЛЕЖИВАНИЕ СОКЕТОВ (SOCKET TRACKER)
+// ПОТОК 1: SOCKET TRACKER
 // ============================================================================
 pub fn run_socket_tracker(
     handle: Arc<WinDivert<SocketLayer>>,
@@ -198,11 +150,30 @@ pub fn run_socket_tracker(
     let mut buf = [0u8; RECV_BUF];
     info!("appfilter: Socket tracker thread initialized and running.");
 
+    // Единый фоновый поток очистки устаревших NAT-записей
+    {
+        let nat_map_sweeper = nat_map.clone();
+        std::thread::Builder::new()
+            .name("anet-nat-sweeper".to_string())
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(Duration::from_secs(5));
+                    let now = Instant::now();
+                    nat_map_sweeper.retain(|_, entry| {
+                        match entry.expires_at {
+                            Some(exp) => exp > now,
+                            None => true,
+                        }
+                    });
+                }
+            })?;
+    }
+
     loop {
         let packet = match handle.recv(Some(&mut buf)) {
             Ok(p) => p,
             Err(e) => {
-                info!("appfilter: Socket tracker stopped (handle closed or error: {})", e);
+                info!("appfilter: Socket tracker stopped ({})", e);
                 break;
             }
         };
@@ -216,41 +187,26 @@ pub fn run_socket_tracker(
         let event = packet.address.event();
 
         match event {
-            // SocketConnect (клиент) и SocketAccept (сервер) — единственные
-            // события, где известен полный 5-tuple. Именно их и пишем в FlowMap.
             WinDivertEvent::SocketConnect | WinDivertEvent::SocketAccept => {
-                if pid == 0 || pid == 4 {
-                    continue;
-                }
-
-                // Loopback / multicast / link-local — не наш трафик.
-                // Отсекаем здесь, чтобы не забивать FlowMap записями,
-                // которые роутер всё равно проигнорирует.
-                if is_ignored_ip(&local_addr) || is_ignored_ip(&remote_addr) {
-                    continue;
-                }
+                if pid == 0 || pid == 4 { continue; }
+                if is_ignored_ip(&local_addr) || is_ignored_ip(&remote_addr) { continue; }
 
                 let key = FlowKey::new(protocol, local_addr, local_port, remote_addr, remote_port);
-
                 let new_image_name = image_name_for_pid(pid);
 
                 if let Some(ref img) = new_image_name {
-                    // Перенесено в debug: при policy=Include это событие
-                    // случается на каждый DNS-запрос svchost'а и на каждое
-                    // loopback-соединение Battle.net — info-уровень слишком шумный.
                     debug!(
-                        "appfilter: Socket track | Event: {:?} | App: {} (PID: {}) | {}:{} -> {}:{} | Proto: {}",
-                        event, img, pid, local_addr, local_port, remote_addr, remote_port, protocol
+                        "appfilter: Socket track | App: {} (PID: {}) | {}:{} -> {}:{} | Proto: {}",
+                        img, pid, local_addr, local_port, remote_addr, remote_port, protocol
                     );
                     map.insert(
                         key,
                         FlowOwner {
                             process_id: pid,
-                            image_name: new_image_name,
+                            image_name: new_image_name.clone(),
                         },
                     );
                 } else {
-                    // Не перезаписываем, если в карте уже есть запись с именем.
                     let existing_has_name = map
                         .lookup(&key)
                         .and_then(|owner| owner.image_name)
@@ -266,11 +222,28 @@ pub fn run_socket_tracker(
                         );
                     }
                 }
+
+                if protocol == 17 && local_port != 0 {
+                    map.insert_udp_port(local_port, FlowOwner {
+                        process_id: pid,
+                        image_name: new_image_name,
+                    });
+                }
             }
 
-            // SocketBind — удалённый адрес ещё не известен (0.0.0.0:0).
-            // Запись создаст последующий Connect/Accept с полным ключом.
-            WinDivertEvent::SocketBind => {}
+            // Отслеживание UDP сокетов, вызывающих bind() без connect()
+            WinDivertEvent::SocketBind => {
+                if pid == 0 || pid == 4 || local_port == 0 { continue; }
+                if protocol == 17 {
+                    if let Some(img) = image_name_for_pid(pid) {
+                        debug!("appfilter: UDP Bind tracked: port {} -> {} (PID: {})", local_port, img, pid);
+                        map.insert_udp_port(local_port, FlowOwner {
+                            process_id: pid,
+                            image_name: Some(img),
+                        });
+                    }
+                }
+            }
 
             WinDivertEvent::SocketClose => {
                 let flow_key =
@@ -281,13 +254,13 @@ pub fn run_socket_tracker(
                 decisions.remove(&flow_key);
                 logged_bypass.remove(&flow_key);
 
-                // nat_map чистим с задержкой: сервер может ещё досылать
-                // FIN/RST/data по уже закрытому соединению.
-                let nat_map = nat_map.clone();
-                std::thread::spawn(move || {
-                    std::thread::sleep(NAT_GRACE_PERIOD);
-                    nat_map.remove(&nat_key);
-                });
+                if protocol == 17 && local_port != 0 {
+                    map.remove_udp_port(local_port);
+                }
+
+                if let Some(mut entry) = nat_map.get_mut(&nat_key) {
+                    entry.expires_at = Some(Instant::now() + NAT_GRACE_PERIOD);
+                }
             }
 
             _ => {}
@@ -295,8 +268,9 @@ pub fn run_socket_tracker(
     }
     Ok(())
 }
+
 // ============================================================================
-// ПОТОК 2: МАРШРУТИЗАТОР И NAT ПАКЕТОВ (PACKET ROUTER)
+// ПОТОК 2: PACKET ROUTER (10 АРГУМЕНТОВ — ПОЛНАЯ СОВМЕСТИМОСТЬ С LIB.RS)
 // ============================================================================
 pub fn run_packet_router(
     handle: Arc<WinDivert<NetworkLayer>>,
@@ -310,68 +284,67 @@ pub fn run_packet_router(
     decisions: DecisionSet,
     logged_bypass: LoggedBypass,
 ) -> Result<()> {
-    // --- ВХОДЯЩИЙ ТРАФИК (Из туннеля в Windows) ---
+    let target_tcp_mss = DEFAULT_TCP_MSS;
+
+    // Входящий трафик (из туннеля в Windows)
     {
         let handle = handle.clone();
         let nat_map = nat_map.clone();
-        std::thread::spawn(move || {
-            info!("appfilter: Inbound packet reinjector thread running.");
-            while let Some(pkt) = from_tunnel.blocking_recv() {
-                let mut wd = unsafe { WinDivertPacket::<NetworkLayer>::new(pkt.to_vec()) };
-                wd.address.set_outbound(false);
+        std::thread::Builder::new()
+            .name("anet-inbound-reinject".to_string())
+            .spawn(move || {
+                info!("appfilter: Inbound packet reinjector thread running.");
+                while let Some(pkt) = from_tunnel.blocking_recv() {
+                    let mut wd = unsafe { WinDivertPacket::<NetworkLayer>::new(pkt.to_vec()) };
+                    wd.address.set_outbound(false);
 
-                if let Some(key) = classify(&wd.data) {
-                    let lookup_key = nat_key_inbound(&key);
+                    if let Some(key) = classify(&wd.data) {
+                        let lookup_key = nat_key_inbound(&key);
 
-                    if let Some(orig) = nat_map.get(&lookup_key) {
-                        let (orig_ip, orig_addr) = orig.value();
+                        if let Some(orig) = nat_map.get(&lookup_key) {
+                            let orig_ip = orig.orig_ip;
+                            let orig_addr = orig.orig_addr.clone();
 
-                        wd.address = orig_addr.clone();
-                        wd.address.set_outbound(false);
-                        wd.address.set_impostor(true);
+                            wd.address = orig_addr;
+                            wd.address.set_outbound(false);
+                            wd.address.set_impostor(true);
 
-                        // DNAT: восстанавливаем оригинальный физический IP-адрес
-                        // в поле dst (байты 16..20 в IPv4-заголовке).
-                        if let (IpAddr::V4(v4), IpAddr::V4(_)) = (orig_ip, key.dst_addr) {
-                            wd.data.to_mut()[16..20].copy_from_slice(&v4.octets());
+                            if let (IpAddr::V4(v4), IpAddr::V4(_)) = (orig_ip, key.dst_addr) {
+                                wd.data.to_mut()[16..20].copy_from_slice(&v4.octets());
+                            }
+
+                            clear_checksums(wd.data.to_mut());
+                            clamp_tcp_mss(wd.data.to_mut(), target_tcp_mss);
+
+                            let _ = wd.recalculate_checksums(ChecksumFlags::new());
+                            if let Err(e) = handle.send(&wd) {
+                                error!("appfilter: Reinject (from tunnel) failed: {e}");
+                                break;
+                            }
+                        } else {
+                            debug!(
+                                "appfilter: [INBOUND] Dropped (no NAT entry) | {:?}:{} <- {:?}:{}",
+                                key.dst_addr, key.dport, key.src_addr, key.sport
+                            );
                         }
-
-                        clear_checksums(wd.data.to_mut());
-                        clamp_tcp_mss(wd.data.to_mut(), 1360);
-
-                        let _ = wd.recalculate_checksums(ChecksumFlags::new());
-                        if let Err(e) = handle.send(&wd) {
-                            error!("appfilter: Reinject (from tunnel) failed: {e}");
-                            break;
-                        }
-                    } else {
-                        // Штатная ситуация: пакет от stale-flow или от сессии,
-                        // установленной до старта appfilter. Дропаем тихо.
-                        debug!(
-                            "appfilter: [INBOUND] Dropped (no NAT entry) | {:?}:{} <- {:?}:{}",
-                            key.dst_addr, key.dport, key.src_addr, key.sport
-                        );
                     }
                 }
-            }
-            info!("appfilter: Reinjector stopped.");
-        });
+                info!("appfilter: Reinjector stopped.");
+            })?;
     }
 
-    info!("appfilter: Packet router started (policy={policy:?})");
+    info!("appfilter: Packet router started (policy={policy:?}, target_mss={target_tcp_mss})");
     let mut buf = [0u8; RECV_BUF];
 
-    // --- ИСХОДЯЩИЙ ТРАФИК (Из Windows в Туннель или напрямую) ---
     loop {
         let packet = match handle.recv(Some(&mut buf)) {
             Ok(p) => p,
             Err(e) => {
-                info!("appfilter: Packet router stopped (handle closed or error: {})", e);
+                info!("appfilter: Packet router stopped ({})", e);
                 break;
             }
         };
 
-        // Пакет с impostor уже был нами отмечен ранее — не перехватываем.
         if !packet.address.outbound() {
             let mut p = packet;
             p.address.set_impostor(true);
@@ -391,8 +364,6 @@ pub fn run_packet_router(
             }
         };
 
-        // Loopback / multicast / broadcast / link-local / unspecified —
-        // не наш трафик вообще: ни туннель, ни policy к ним не относятся.
         if is_ignored_ip(&key.src_addr) || is_ignored_ip(&key.dst_addr) {
             if let Err(e) = handle.send(&packet) {
                 error!("appfilter: Failed to re-inject ignored packet: {e}");
@@ -400,9 +371,6 @@ pub fn run_packet_router(
             continue;
         }
 
-        // Явный bypass-лист: пакет должен уйти напрямую, минуя туннель.
-        // Логируем только первый пакет каждого flow, чтобы долгоживущие
-        // соединения (например, сам туннель к VPN-серверу) не забивали лог.
         if bypass.contains_blocking(&key.src_addr) || bypass.contains_blocking(&key.dst_addr) {
             let flow_key = FlowKey::new(
                 key.protocol,
@@ -431,16 +399,12 @@ pub fn run_packet_router(
             key.dport,
         );
 
-        // «Липкое» решение: tunnel=true ИЛИ false фиксируется один раз на весь flow.
-        // freshly_decided == true только в том пакете, где решение принято впервые
-        // (нужно, чтобы не логировать один и тот же flow на каждый пакет).
         let (tunnel, owner_opt, freshly_decided) =
             if let Some(v) = decisions.get(&flow_key).map(|d| *d) {
                 (v, map.lookup(&flow_key), false)
             } else {
                 let mut owner_opt = map.lookup(&flow_key);
                 if owner_opt.is_none() {
-                    // Гонка при первом пакете: socket-tracker мог ещё не успеть.
                     for _ in 0..FLOW_RACE_RETRIES {
                         std::thread::sleep(FLOW_RACE_STEP);
                         owner_opt = map.lookup(&flow_key);
@@ -450,19 +414,12 @@ pub fn run_packet_router(
                     }
                 }
 
-                let result = owner_opt
-                    .as_ref()
-                    .map(|o| policy.should_tunnel(o))
-                    .unwrap_or(false);
-
-                // Фиксируем решение ТОЛЬКО если владелец известен. Иначе ждём
-                // следующего пакета — если залипнуть сейчас, соединение уйдёт
-                // не туда из-за слишком раннего «untracked».
-                let decided = owner_opt.is_some();
-                if decided {
+                let result = policy.should_tunnel(owner_opt.as_ref());
+                let can_lock_decision = owner_opt.is_some() || matches!(policy, AppPolicy::Include(_));
+                if can_lock_decision {
                     decisions.insert(flow_key, result);
                 }
-                (result, owner_opt, decided)
+                (result, owner_opt, can_lock_decision)
             };
 
         if freshly_decided {
@@ -484,29 +441,28 @@ pub fn run_packet_router(
         }
 
         if tunnel {
-            // Блокируем IPv6 для быстрой сработки IPv4 fallback.
             if key.src_addr.is_ipv6() {
-                info!(
-                    "appfilter: IPv6 packet dropped to trigger IPv4 fallback for port: {}",
-                    key.sport
-                );
+                debug!("appfilter: IPv6 packet dropped for tunnel flow on port: {}", key.sport);
                 continue;
             }
 
             let nat_key = nat_key_outbound(&key);
-            nat_map.insert(nat_key, (key.src_addr, packet.address.clone()));
+            nat_map.insert(nat_key, NatEntry {
+                orig_ip: key.src_addr,
+                orig_addr: packet.address.clone(),
+                expires_at: None,
+            });
 
             let mut wd = unsafe { WinDivertPacket::<NetworkLayer>::new(packet.data.to_vec()) };
             wd.address = packet.address.clone();
             wd.address.set_outbound(true);
 
-            // SNAT: подменяем Source IP на выданный сервером VPN IP.
             if let IpAddr::V4(v4) = vpn_ip {
                 wd.data.to_mut()[12..16].copy_from_slice(&v4.octets());
             }
 
             clear_checksums(wd.data.to_mut());
-            clamp_tcp_mss(wd.data.to_mut(), 1360);
+            clamp_tcp_mss(wd.data.to_mut(), target_tcp_mss);
 
             let _ = wd.recalculate_checksums(ChecksumFlags::new());
 
@@ -531,10 +487,6 @@ pub fn run_packet_router(
     Ok(())
 }
 
-// ============================================================================
-// ПАРСЕР ПАКЕТОВ
-// ============================================================================
-
 struct NetworkPacketKey {
     protocol: u8,
     src_addr: IpAddr,
@@ -553,18 +505,12 @@ fn classify(data: &[u8]) -> Option<NetworkPacketKey> {
 }
 
 fn classify_v4(data: &[u8]) -> Option<NetworkPacketKey> {
-    if data.len() < 20 {
-        return None;
-    }
+    if data.len() < 20 { return None; }
     let ihl = (data[0] & 0x0F) as usize * 4;
-    if data.len() < ihl + 4 {
-        return None;
-    }
+    if data.len() < ihl + 4 { return None; }
 
     let protocol = data[9];
-    if protocol != 6 && protocol != 17 {
-        return None;
-    }
+    if protocol != 6 && protocol != 17 { return None; }
 
     let src = Ipv4Addr::new(data[12], data[13], data[14], data[15]);
     let dst = Ipv4Addr::new(data[16], data[17], data[18], data[19]);
@@ -582,14 +528,9 @@ fn classify_v4(data: &[u8]) -> Option<NetworkPacketKey> {
 }
 
 fn classify_v6(data: &[u8]) -> Option<NetworkPacketKey> {
-    if data.len() < 40 {
-        return None;
-    }
-
+    if data.len() < 40 { return None; }
     let next_header = data[6];
-    if next_header != 6 && next_header != 17 {
-        return None;
-    }
+    if next_header != 6 && next_header != 17 { return None; }
 
     let mut src_bytes = [0u8; 16];
     src_bytes.copy_from_slice(&data[8..24]);
@@ -600,9 +541,7 @@ fn classify_v6(data: &[u8]) -> Option<NetworkPacketKey> {
     let dst = Ipv6Addr::from(dst_bytes);
 
     let transport_offset = 40;
-    if data.len() < transport_offset + 4 {
-        return None;
-    }
+    if data.len() < transport_offset + 4 { return None; }
 
     let sport = u16::from_be_bytes([data[transport_offset], data[transport_offset + 1]]);
     let dport = u16::from_be_bytes([data[transport_offset + 2], data[transport_offset + 3]]);

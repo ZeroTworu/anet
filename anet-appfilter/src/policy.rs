@@ -6,13 +6,11 @@ use std::sync::Arc;
 use crate::flow_map::FlowOwner;
 
 /// Режим фильтрации по приложениям.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum AppPolicy {
-    /// Include-режим (как `addAllowedApplication` в Android): в туннель идут
-    /// ТОЛЬКО перечисленные процессы, остальные — напрямую.
+    /// Include-режим: в туннель идут ТОЛЬКО перечисленные процессы, остальные — напрямую.
     Include(HashSet<Arc<str>>),
-    /// Exclude-режим (как `addDisallowedApplication`): в туннель идёт всё,
-    /// КРОМЕ перечисленных процессов.
+    /// Exclude-режим: в туннель идёт всё, КРОМЕ перечисленных процессов.
     Exclude(HashSet<Arc<str>>),
     /// Весь трафик в туннель (поведение по умолчанию, как классический VPN).
     All,
@@ -37,13 +35,25 @@ impl AppPolicy {
         AppPolicy::Exclude(normalize(names))
     }
 
-    /// Решение: должен ли поток этого владельца идти в туннель.
-    ///
-    /// Если владелец неизвестен (`image_name == None` — процесс уже умер,
-    /// либо это системный трафик без процесса), применяем безопасный дефолт:
-    /// в include-режиме — НЕ трогаем (выпускаем напрямую), в exclude-режиме —
-    /// заворачиваем. То есть неизвестное всегда трактуется как «не в списке».
-    pub fn should_tunnel(&self, owner: &FlowOwner) -> bool {
+    /// Решение по умолчанию, если владелец сокета пока не определен (рассинхрон или гонка):
+    /// - Include: НЕ трогаем (выпускаем напрямую, так как приложения нет в списке доверенных)
+    /// - Exclude: ЗАВОРАЧИВАЕМ в туннель (так как процесс не подтвержден как исключенный)
+    /// - All: ЗАВОРАЧИВАЕМ в туннель
+    #[inline]
+    pub fn should_tunnel_unknown(&self) -> bool {
+        match self {
+            AppPolicy::All => true,
+            AppPolicy::Include(_) => false,
+            AppPolicy::Exclude(_) => true,
+        }
+    }
+
+    /// Решение: должен ли поток идти в туннель на основе владельца (если известен).
+    pub fn should_tunnel(&self, owner: Option<&FlowOwner>) -> bool {
+        let Some(owner) = owner else {
+            return self.should_tunnel_unknown();
+        };
+
         match self {
             AppPolicy::All => true,
             AppPolicy::Include(set) => owner
@@ -86,28 +96,24 @@ mod tests {
     #[test]
     fn include_only_listed_apps_tunnel() {
         let p = AppPolicy::include(["Firefox.exe", "Telegram.exe"]);
-        assert!(p.should_tunnel(&owner(Some("firefox.exe")))); // регистр нормализован
-        assert!(!p.should_tunnel(&owner(Some("chrome.exe"))));
+        assert!(p.should_tunnel(Some(&owner(Some("firefox.exe")))));
+        assert!(!p.should_tunnel(Some(&owner(Some("chrome.exe")))));
+        assert!(!p.should_tunnel(None));
     }
 
     #[test]
     fn exclude_listed_apps_bypass() {
         let p = AppPolicy::exclude(["steam.exe"]);
-        assert!(!p.should_tunnel(&owner(Some("steam.exe"))));
-        assert!(p.should_tunnel(&owner(Some("firefox.exe"))));
-    }
-
-    #[test]
-    fn unknown_owner_defaults_to_not_in_list() {
-        // include: неизвестный -> напрямую (не в списке разрешённых)
-        assert!(!AppPolicy::include(["a.exe"]).should_tunnel(&owner(None)));
-        // exclude: неизвестный -> в туннель (не в списке исключённых)
-        assert!(AppPolicy::exclude(["a.exe"]).should_tunnel(&owner(None)));
+        assert!(!p.should_tunnel(Some(&owner(Some("steam.exe")))));
+        assert!(p.should_tunnel(Some(&owner(Some("firefox.exe")))));
+        assert!(p.should_tunnel(None));
+        assert!(p.should_tunnel(Some(&owner(None))));
     }
 
     #[test]
     fn all_policy_tunnels_everything() {
-        assert!(AppPolicy::All.should_tunnel(&owner(None)));
-        assert!(AppPolicy::All.should_tunnel(&owner(Some("anything.exe"))));
+        assert!(AppPolicy::All.should_tunnel(None));
+        assert!(AppPolicy::All.should_tunnel(Some(&owner(None))));
+        assert!(AppPolicy::All.should_tunnel(Some(&owner(Some("anything.exe")))));
     }
 }
