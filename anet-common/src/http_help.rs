@@ -371,6 +371,10 @@ impl BrowserProfile {
 
     /// Накладывает браузерные заголовки на HTTP-запрос `reqwest::RequestBuilder`.
     /// Для профилей Firefox и Safari заголовки `sec-ch-ua*` НЕ отправляются (так как эти браузеры не поддерживают Client Hints).
+    /// Примечание: `Accept-Encoding` намеренно НЕ выставляется вручную, так как `reqwest` собран без фич
+    /// декомпрессии (`gzip`, `brotli`, `zstd`), и при отправке `Accept-Encoding: gzip, deflate, br, zstd`
+    /// серверы (например, Ktalk / Envoy / Nginx) возвращают сжатое тело (`Content-Encoding: br`),
+    /// что приводит к ошибке `error decoding response body` при парсинге JSON.
     pub fn apply_to_reqwest(
         &self,
         mut req: reqwest::RequestBuilder,
@@ -380,7 +384,6 @@ impl BrowserProfile {
         req = req
             .header("User-Agent", self.user_agent)
             .header("Accept-Language", self.accept_language)
-            .header("Accept-Encoding", self.accept_encoding)
             .header("Cache-Control", "no-cache")
             .header("Pragma", "no-cache")
             .header("Sec-Fetch-Dest", "empty")
@@ -408,6 +411,23 @@ impl BrowserProfile {
     /// строго соответствующих выбранному профилю браузера.
     pub fn build_ws_request(&self, url: &str, origin: Option<&str>) -> anyhow::Result<Request<()>> {
         let mut req = url.into_client_request()?;
+        let uri = req.uri().clone();
+        let target_host = uri.host();
+
+        let effective_origin = origin.map(|s| s.to_string()).unwrap_or_else(|| {
+            let scheme = match uri.scheme_str() {
+                Some(s) if s.eq_ignore_ascii_case("ws") || s.eq_ignore_ascii_case("http") => "http",
+                _ => "https",
+            };
+            match uri.port_u16() {
+                Some(p) if p != 80 && p != 443 => {
+                    format!("{scheme}://{}:{p}", target_host.unwrap_or("localhost"))
+                }
+                _ => format!("{scheme}://{}", target_host.unwrap_or("localhost")),
+            }
+        });
+
+        let sec_fetch_site = compute_sec_fetch_site(target_host, &effective_origin);
         let headers = req.headers_mut();
 
         headers.insert("User-Agent", HeaderValue::from_static(self.user_agent));
@@ -421,6 +441,9 @@ impl BrowserProfile {
         );
         headers.insert("Cache-Control", HeaderValue::from_static("no-cache"));
         headers.insert("Pragma", HeaderValue::from_static("no-cache"));
+        headers.insert("Sec-Fetch-Dest", HeaderValue::from_static("websocket"));
+        headers.insert("Sec-Fetch-Mode", HeaderValue::from_static("websocket"));
+        headers.insert("Sec-Fetch-Site", HeaderValue::from_static(sec_fetch_site));
 
         if let Some(ch_ua) = self.sec_ch_ua {
             headers.insert("sec-ch-ua", HeaderValue::from_static(ch_ua));
@@ -434,27 +457,46 @@ impl BrowserProfile {
             );
         }
 
-        if let Some(orig) = origin {
-            if let Ok(val) = HeaderValue::from_str(orig) {
-                headers.insert("Origin", val);
-            }
-        } else if let Ok(uri) = url.parse::<http::Uri>() {
-            if let Some(host) = uri.host() {
-                let scheme = match uri.scheme_str() {
-                    Some("ws") | Some("http") => "http",
-                    _ => "https",
-                };
-                let derived = match uri.port_u16() {
-                    Some(p) if p != 80 && p != 443 => format!("{scheme}://{host}:{p}"),
-                    _ => format!("{scheme}://{host}"),
-                };
-                if let Ok(val) = HeaderValue::from_str(&derived) {
-                    headers.insert("Origin", val);
-                }
-            }
+        if let Ok(val) = HeaderValue::from_str(&effective_origin) {
+            headers.insert("Origin", val);
         }
 
         Ok(req)
+    }
+}
+
+/// Вычисляет корректное значение `Sec-Fetch-Site` (`same-origin`, `same-site` или `cross-site`)
+/// при сопоставлении целевого хоста запроса и заголовка `Origin`.
+pub fn compute_sec_fetch_site(target_host: Option<&str>, origin_url: &str) -> &'static str {
+    let Some(target) = target_host else {
+        return "same-origin";
+    };
+    let Ok(origin_uri) = origin_url.parse::<http::Uri>() else {
+        return "same-origin";
+    };
+    let Some(orig_host) = origin_uri.host() else {
+        return "same-origin";
+    };
+    if target.eq_ignore_ascii_case(orig_host) {
+        return "same-origin";
+    }
+    if is_same_registrable_domain(target, orig_host) {
+        return "same-site";
+    }
+    "cross-site"
+}
+
+fn is_same_registrable_domain(h1: &str, h2: &str) -> bool {
+    if h1.parse::<IpAddr>().is_ok() || h2.parse::<IpAddr>().is_ok() {
+        return false;
+    }
+    let mut p1 = h1.rsplit('.');
+    let mut p2 = h2.rsplit('.');
+    match (p1.next(), p1.next(), p2.next(), p2.next()) {
+        (Some(tld1), Some(sld1), Some(tld2), Some(sld2)) => {
+            tld1.eq_ignore_ascii_case(tld2) && sld1.eq_ignore_ascii_case(sld2)
+        }
+        _ => false,
     }
 }
 

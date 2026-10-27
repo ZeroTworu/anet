@@ -592,9 +592,14 @@ where
 {
     let ssl_connector = build_ws_ssl_connector_with_config(cfg)?.build();
     let mut ssl_config = ssl_connector.configure()?;
-    // Включаем проверку соответствия домена/IP в сертификате (SAN/CN), если активна WebPKI-верификация без ручного пина.
-    let verify_hostname =
-        cfg.verify_peer && cfg.pin_sha256.as_ref().is_none_or(|p| p.trim().is_empty());
+    let is_ip = domain.parse::<std::net::IpAddr>().is_ok();
+    if is_ip {
+        ssl_config.set_use_server_name_indication(false);
+    }
+    // Включаем проверку соответствия домена в сертификате (SAN/CN), если целевой хост — домен и активна WebPKI-верификация без ручного пина.
+    let verify_hostname = !is_ip
+        && cfg.verify_peer
+        && cfg.pin_sha256.as_ref().is_none_or(|p| p.trim().is_empty());
     ssl_config.set_verify_hostname(verify_hostname);
     tokio_boring::connect(ssl_config, domain, stream)
         .await
