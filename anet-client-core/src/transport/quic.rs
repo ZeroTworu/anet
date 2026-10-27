@@ -87,14 +87,13 @@ impl ClientTransport for QuicTransport {
         let (auth_response, shared_key) = auth_handler.authenticate(&channel).await?;
 
         let mut quic_cfg = self.config.quic_transport.clone();
-        // Для клиентского соединения выставляем надежный keep-alive (7s) во избежание
-        // сброса NAT мобильными операторами/роутерами и стабильный idle timeout (60s),
-        // чтобы соединение не рвалось при кратковременном джиттере или потере 1-2 пингов.
+        // Берем keep_alive_interval_seconds из конфигурации пользователя без принудительного
+        // занижения до 10 секунд (по умолчанию 7s при отсутствии значения в конфиге).
         quic_cfg.keep_alive_interval_seconds = Some(
-            quic_cfg.keep_alive_interval_seconds.unwrap_or(7).min(10)
+            quic_cfg.keep_alive_interval_seconds.unwrap_or(7)
         );
         quic_cfg.idle_timeout_seconds = Some(
-            quic_cfg.idle_timeout_seconds.unwrap_or(60).max(60)
+            quic_cfg.idle_timeout_seconds.unwrap_or(60)
         );
 
         let transport_config =

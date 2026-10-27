@@ -1,9 +1,12 @@
 use super::{ClientTransport, ConnectionResult};
 use crate::auth::{AuthChannel, AuthHandler};
 use crate::config::{CoreConfig, ServerConfig};
-use anet_common::consts::{COALESCE_BUDGET_BYTES, CRYPTO_COALESCE_BUDGET_BYTES, PADDING_MTU};
+use anet_common::consts::{
+    COALESCE_BUDGET_BYTES, CRYPTO_COALESCE_BUDGET_BYTES, MAX_PENDING_JITTER_PACKETS, PADDING_MTU,
+    RFB_HANDSHAKE_TIMEOUT,
+};
 use anet_common::handshake_fragmentation::{FragmentConfig, write_fragmented};
-use anet_common::stream_framing::{FrameReader, frame_packet_into};
+use anet_common::stream_framing::{FrameReader, frame_packet_into, supervise_bidirectional_workers, FinishedWorker};
 use anet_common::vnc::{
     CLIENT_CUT_TEXT, RFB_VERSION, SECURITY_TYPE_NONE, SERVER_CUT_TEXT, encode_cut_text,
     read_cut_text,
@@ -24,8 +27,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 
-const RFB_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
-const MAX_PENDING_JITTER_PACKETS: usize = 256;
+
 
 struct VncAuthChannel {
     stream: Mutex<TcpStream>,
@@ -116,31 +118,8 @@ impl ClientTransport for VncTransport {
                 stealth,
             ));
 
-            #[derive(Debug)]
-            enum FinishedWorker {
-                Inbound,
-                Outbound,
-            }
-
-            let (finished_worker, result) = tokio::select! {
-                result = &mut inbound => (
-                    FinishedWorker::Inbound,
-                    flatten_worker_result("network reader", result),
-                ),
-                result = &mut outbound => (
-                    FinishedWorker::Outbound,
-                    flatten_worker_result("network writer", result),
-                ),
-            };
-
-            if !matches!(finished_worker, FinishedWorker::Inbound) {
-                inbound.abort();
-                let _ = inbound.await;
-            }
-            if !matches!(finished_worker, FinishedWorker::Outbound) {
-                outbound.abort();
-                let _ = outbound.await;
-            }
+            let (finished_worker, result) =
+                supervise_bidirectional_workers(inbound, outbound, "VNC").await;
 
             let duration = tunnel_start.elapsed().as_secs_f64();
             match result {

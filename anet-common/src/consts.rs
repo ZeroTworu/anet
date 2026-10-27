@@ -142,3 +142,22 @@ pub const WRTC_SDP_RENEGOTIATE_TIMEOUT_SECS: u64 = 5;
 /// Дефолтные резервные реквизиты JVB при отсутствии кандидатов в Jingle.
 pub const WRTC_DEFAULT_FALLBACK_JVB_IP: &str = "89.169.16.6";
 pub const WRTC_DEFAULT_FALLBACK_JVB_PORT: u16 = 10002;
+// =========================================================================
+// Константы протоколов SSH и VNC (ASTP туннелирование и защита от ТСПУ)
+// =========================================================================
+
+/// Таймаут ASTP-аутентификации для потоковых транспортов (SSH / VNC).
+/// Если клиент не завершает рукопожатие за это время, сессия сбрасывается.
+pub const ASTP_AUTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Таймаут RFB-рукопожатия для VNC-транспорта.
+pub const RFB_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Размер окна входящего SSH-канала (4 MB) для обеспечения высокой пропускной способности.
+pub const SSH_CHANNEL_WINDOW_SIZE: u32 = 4 * 1024 * 1024;
+
+/// Максимальный размер пакета SSH-канала (32 KB по стандарту RFC 4253).
+pub const SSH_MAX_PACKET_SIZE: u32 = 32 * 1024;
+
+/// Максимальное количество пакетов в очереди джиттера до принудительного сброса.
+pub const MAX_PENDING_JITTER_PACKETS: usize = 256;

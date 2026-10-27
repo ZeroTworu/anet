@@ -3,10 +3,37 @@ use bytes::{BufMut, Bytes, BytesMut};
 use std::io;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+/// Версия протокола RFB (3.8) для маскировки под стандартный VNC сервер.
 pub const RFB_VERSION: &[u8; 12] = b"RFB 003.008\n";
+/// Тип аутентификации RFB: 1 = None (без пароля).
 pub const SECURITY_TYPE_NONE: u8 = 1;
+/// Тип сообщения RFB от клиента: ClientCutText (буфер обмена / туннель данных).
 pub const CLIENT_CUT_TEXT: u8 = 6;
+/// Тип сообщения RFB от сервера: ServerCutText (буфер обмена / туннель данных).
 pub const SERVER_CUT_TEXT: u8 = 3;
+
+/// Поддерживаемые сервером типы аутентификации: 1 тип, SecurityType = None.
+pub const RFB_SECURITY_TYPES: &[u8] = &[1, SECURITY_TYPE_NONE];
+/// Результат безопасности RFB: 4 нулевых байта (SecurityResult OK).
+pub const RFB_SECURITY_OK: &[u8] = &[0, 0, 0, 0];
+/// Инициализация сервера RFB (ServerInit):
+/// Разрешение 1024x768, 32 bpp, глубина 24, little-endian, true-colour, имя десктопа "Xvnc".
+pub const RFB_SERVER_INIT: &[u8] = &[
+    0x04, 0x00, 0x03, 0x00, // 1024x768
+    0x20, 0x18, 0x00, 0x01, // 32 bpp, depth 24, little-endian, true-colour
+    0x00, 0xff, 0x00, 0xff, 0x00, 0xff, 0x10, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04,
+    b'X', b'v', b'n', b'c',
+];
+
+/// RFB FramebufferUpdate с черным экраном (Raw 1024x768x4 байт) для правдоподобного ответа
+/// обычному VNC-клиенту или активному сканеру перед закрытием сеанса.
+/// Заголовок FramebufferUpdate: [type=0, pad=0, rect_count=1 (u16)].
+pub const RFB_FRAMEBUFFER_UPDATE_HDR: &[u8] = &[
+    0x00, 0x00, 0x00, 0x01, // msg_type: 0 (FramebufferUpdate), pad: 0, rect_count: 1
+    0x00, 0x00, 0x00, 0x00, // x=0, y=0
+    0x04, 0x00, 0x03, 0x00, // width=1024, height=768
+    0x00, 0x00, 0x00, 0x00, // encoding: 0 (Raw)
+];
 
 const CUT_TEXT_HEADER_LEN: usize = 8;
 const MAX_CUT_TEXT_PAYLOAD: usize = MAX_PACKET_SIZE * 2;

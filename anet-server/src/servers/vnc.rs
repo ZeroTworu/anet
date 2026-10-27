@@ -1,9 +1,14 @@
 use crate::auth_handler::ServerAuthHandler;
 use crate::client_registry::{ClientRegistry, ClientTransportInfo};
 use crate::config::Config;
-use anet_common::consts::{CRYPTO_COALESCE_BUDGET_BYTES, PADDING_MTU};
+use anet_common::consts::{
+    ASTP_AUTH_TIMEOUT, CRYPTO_COALESCE_BUDGET_BYTES, MAX_PENDING_JITTER_PACKETS, PADDING_MTU,
+    RFB_HANDSHAKE_TIMEOUT,
+};
+use anet_common::stream_framing::supervise_bidirectional_workers;
 use anet_common::vnc::{
-    CLIENT_CUT_TEXT, RFB_VERSION, SECURITY_TYPE_NONE, SERVER_CUT_TEXT, encode_cut_text,
+    CLIENT_CUT_TEXT, RFB_FRAMEBUFFER_UPDATE_HDR, RFB_SECURITY_OK, RFB_SECURITY_TYPES,
+    RFB_SERVER_INIT, RFB_VERSION, SECURITY_TYPE_NONE, SERVER_CUT_TEXT, encode_cut_text,
     read_cut_text, write_cut_text,
 };
 use anyhow::{Context, Result};
@@ -20,18 +25,6 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
-
-const RFB_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
-const ASTP_AUTH_TIMEOUT: Duration = Duration::from_secs(30);
-const MAX_PENDING_JITTER_PACKETS: usize = 256;
-const RFB_SECURITY_TYPES: &[u8] = &[1, SECURITY_TYPE_NONE];
-const RFB_SECURITY_OK: &[u8] = &[0, 0, 0, 0];
-const RFB_SERVER_INIT: &[u8] = &[
-    0x04, 0x00, 0x03, 0x00, // 1024x768
-    0x20, 0x18, 0x00, 0x01, // 32 bpp, depth 24, little-endian, true-colour
-    0x00, 0xff, 0x00, 0xff, 0x00, 0xff, 0x10, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04,
-    b'X', b'v', b'n', b'c',
-];
 
 async fn emulate_rfb_server_handshake(stream: &mut TcpStream) -> Result<()> {
     stream.write_all(RFB_VERSION).await?;
@@ -99,43 +92,38 @@ async fn handle_vnc_session(
         config.stealth.clone(),
     ));
 
-    enum FinishedWorker {
-        Inbound,
-        Outbound,
-    }
-
-    let (finished_worker, result) = tokio::select! {
-        result = &mut inbound => (FinishedWorker::Inbound, flatten_worker_result("reader", result)),
-        result = &mut outbound => (FinishedWorker::Outbound, flatten_worker_result("writer", result)),
-    };
-    if !matches!(finished_worker, FinishedWorker::Inbound) {
-        inbound.abort();
-        let _ = inbound.await;
-    }
-    if !matches!(finished_worker, FinishedWorker::Outbound) {
-        outbound.abort();
-        let _ = outbound.await;
-    }
+    let (_finished_worker, result) =
+        supervise_bidirectional_workers(inbound, outbound, "VNC").await;
     registry.remove_client(&client_info).await;
     result
 }
 
-fn flatten_worker_result(
-    worker: &'static str,
-    result: std::result::Result<Result<()>, tokio::task::JoinError>,
-) -> Result<()> {
-    result.with_context(|| format!("VNC {worker} task failed"))?
-}
 
+
+/// Выполняет аутентификацию ASTP поверх VNC (RFB ClientCutText / ServerCutText).
+/// В случае подключения стороннего VNC-клиента или сканера ТСПУ (отправляющего SetPixelFormat,
+/// SetEncodings или FramebufferUpdateRequest вместо ClientCutText) отправляет чёрный кадр экрана
+/// и штатно завершает сеанс, маскируя сервер под реальный, но не отвечающий VNC десктоп.
 async fn authenticate(
     stream: &mut TcpStream,
     remote_addr: SocketAddr,
     auth_handler: &ServerAuthHandler,
 ) -> Result<Arc<ClientTransportInfo>> {
     loop {
-        let packet = read_cut_text(stream, CLIENT_CUT_TEXT)
-            .await?
-            .context("client disconnected during ASTP authentication")?;
+        let read_res = read_cut_text(stream, CLIENT_CUT_TEXT).await;
+        let packet = match read_res {
+            Ok(Some(p)) => p,
+            Ok(None) => anyhow::bail!("client disconnected during ASTP authentication"),
+            Err(e) => {
+                // Если клиент прислал не ClientCutText (0x06), а другой RFB-запрос
+                // (например FramebufferUpdateRequest=3, SetEncodings=2, SetPixelFormat=0):
+                // шлем FramebufferUpdate с черным экраном и закрываем соединение.
+                log::debug!("[VNC] Non-ASTP RFB message from {remote_addr} ({e}); answering black frame probe defense");
+                let _ = send_rfb_probe_black_screen(stream).await;
+                anyhow::bail!("non-ASTP RFB probe from {remote_addr} handled and closed");
+            }
+        };
+
         let (response, result) = auth_handler
             .process_handshake_packet(packet, remote_addr, "vnc")
             .await?;
@@ -147,6 +135,26 @@ async fn authenticate(
             return Ok(client_info);
         }
     }
+}
+
+/// Отправляет черное изображение рабочего стола (1024x768) в формате RFB Raw 32bpp,
+/// чтобы любой VNC-сканер (ТСПУ, nmap, RealVNC/TightVNC клиент) зафиксировал легитимный сеанс
+/// и не определил туннель ANet.
+async fn send_rfb_probe_black_screen(stream: &mut TcpStream) -> Result<()> {
+    stream.write_all(RFB_FRAMEBUFFER_UPDATE_HDR).await?;
+    // 1024x768 пикселей по 4 байта = 3,145,728 байт нулей (черный экран)
+    const CHUNK_SIZE: usize = 64 * 1024;
+    const TOTAL_BYTES: usize = 1024 * 768 * 4;
+    let black_chunk = [0u8; CHUNK_SIZE];
+    let mut written = 0;
+    while written < TOTAL_BYTES {
+        let to_write = std::cmp::min(CHUNK_SIZE, TOTAL_BYTES - written);
+        stream.write_all(&black_chunk[..to_write]).await?;
+        written += to_write;
+    }
+    stream.flush().await?;
+    let _ = stream.shutdown().await;
+    Ok(())
 }
 
 async fn receive_from_client(

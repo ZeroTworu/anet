@@ -241,3 +241,40 @@ mod tests {
     }
 }
 
+
+/// Результат ожидания завершения одного из двух воркеров двунаправленного потока (inbound / outbound).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinishedWorker {
+    Inbound,
+    Outbound,
+}
+
+/// Выполняет синхронное ожидание первого завершившегося воркера (`inbound` или `outbound`),
+/// после чего корректно абортит и очищает оставшийся воркер, устраняя дублирование логики в SSH/VNC серверах.
+pub async fn supervise_bidirectional_workers(
+    mut inbound: tokio::task::JoinHandle<anyhow::Result<()>>,
+    mut outbound: tokio::task::JoinHandle<anyhow::Result<()>>,
+    transport_name: &str,
+) -> (FinishedWorker, anyhow::Result<()>) {
+    let (finished_worker, result) = tokio::select! {
+        result = &mut inbound => (
+            FinishedWorker::Inbound,
+            result.map_err(|e| anyhow::anyhow!("{transport_name} reader task panicked: {e}")).and_then(|r| r)
+        ),
+        result = &mut outbound => (
+            FinishedWorker::Outbound,
+            result.map_err(|e| anyhow::anyhow!("{transport_name} writer task panicked: {e}")).and_then(|r| r)
+        ),
+    };
+
+    if finished_worker != FinishedWorker::Inbound {
+        inbound.abort();
+        let _ = inbound.await;
+    }
+    if finished_worker != FinishedWorker::Outbound {
+        outbound.abort();
+        let _ = outbound.await;
+    }
+
+    (finished_worker, result)
+}

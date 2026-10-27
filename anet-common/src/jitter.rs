@@ -1,5 +1,5 @@
 use crate::config::StealthConfig;
-use crate::consts::{COALESCE_BUDGET_BYTES, CRYPTO_COALESCE_BUDGET_BYTES};
+use crate::consts::{COALESCE_BUDGET_BYTES, CRYPTO_COALESCE_BUDGET_BYTES, MAX_PENDING_JITTER_PACKETS};
 use crate::encryption::Cipher;
 use crate::padding_utils::calculate_padding_needed;
 use crate::stream_framing::frame_packet_into;
@@ -17,7 +17,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
 
-const MAX_PENDING_JITTER_PACKETS: usize = 256;
+
 
 pub async fn bridge_with_jitter<S>(
     mut rx: mpsc::Receiver<Bytes>,

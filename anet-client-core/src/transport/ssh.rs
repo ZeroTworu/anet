@@ -2,10 +2,11 @@ use super::{ClientTransport, ConnectionResult};
 use crate::auth::{AuthHandler, StreamAuthChannel};
 use crate::config::{CoreConfig, ServerConfig};
 use anet_common::consts::{
-    CHANNEL_BUFFER_SIZE, COALESCE_BUDGET_BYTES, CRYPTO_COALESCE_BUDGET_BYTES, PADDING_MTU,
+    CHANNEL_BUFFER_SIZE, COALESCE_BUDGET_BYTES, CRYPTO_COALESCE_BUDGET_BYTES,
+    MAX_PENDING_JITTER_PACKETS, PADDING_MTU, SSH_CHANNEL_WINDOW_SIZE, SSH_MAX_PACKET_SIZE,
 };
 use anet_common::padding_utils::calculate_padding_needed;
-use anet_common::stream_framing::{FrameReader, frame_packet_into};
+use anet_common::stream_framing::{FrameReader, frame_packet_into, supervise_bidirectional_workers, FinishedWorker};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
@@ -25,9 +26,7 @@ use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 
 const SSH_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
-const SSH_CHANNEL_WINDOW_SIZE: u32 = 4 * 1024 * 1024;
-const SSH_MAX_PACKET_SIZE: u32 = 32 * 1024;
-const MAX_PENDING_JITTER_PACKETS: usize = 256;
+
 
 struct ClientHandler;
 
@@ -135,31 +134,8 @@ impl ClientTransport for SshTransport {
             ));
             let mut inbound = tokio::spawn(receive_from_server(reader, tunnel_writer, cipher));
 
-            #[derive(Debug)]
-            enum FinishedWorker {
-                Outbound,
-                Inbound,
-            }
-
-            let (finished_worker, result) = tokio::select! {
-                result = &mut outbound => (
-                    FinishedWorker::Outbound,
-                    flatten_worker_result("network writer", result),
-                ),
-                result = &mut inbound => (
-                    FinishedWorker::Inbound,
-                    flatten_worker_result("network reader", result),
-                ),
-            };
-
-            if !matches!(finished_worker, FinishedWorker::Outbound) {
-                outbound.abort();
-                let _ = outbound.await;
-            }
-            if !matches!(finished_worker, FinishedWorker::Inbound) {
-                inbound.abort();
-                let _ = inbound.await;
-            }
+            let (finished_worker, result) =
+                supervise_bidirectional_workers(inbound, outbound, "SSH").await;
 
             let duration = tunnel_start.elapsed().as_secs_f64();
             match result {

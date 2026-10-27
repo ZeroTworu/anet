@@ -1,22 +1,19 @@
 use crate::auth_handler::ServerAuthHandler;
 use crate::client_registry::{ClientRegistry, ClientTransportInfo};
 use crate::config::Config;
-use anet_common::consts::CHANNEL_BUFFER_SIZE;
-use anet_common::stream_framing::{frame_packet, read_next_packet};
+use anet_common::consts::{
+    ASTP_AUTH_TIMEOUT, CHANNEL_BUFFER_SIZE, SSH_CHANNEL_WINDOW_SIZE, SSH_MAX_PACKET_SIZE,
+};
+use anet_common::stream_framing::{frame_packet, read_next_packet, supervise_bidirectional_workers};
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use log::{info, warn};
-use russh::{Channel, ChannelId, server};
+use russh::{Channel, ChannelId, CryptoVec, server};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
-
-const ASTP_AUTH_TIMEOUT: Duration = Duration::from_secs(30);
-const SSH_CHANNEL_WINDOW_SIZE: u32 = 4 * 1024 * 1024;
-const SSH_MAX_PACKET_SIZE: u32 = 32 * 1024;
 
 struct AnetSshHandler {
     remote_addr: SocketAddr,
@@ -72,9 +69,11 @@ impl server::Handler for AnetSshHandler {
         session: &mut server::Session,
     ) -> Result<(), Self::Error> {
         if command != b"anet-vpn" {
+            // Защита от активного сканирования/зондирования ТСПУ:
+            // При попытке выполнения сторонней команды выдаем стандартный баннер и закрываем канал
             self.pending_channels.remove(&channel_id);
-            session.channel_failure(channel_id)?;
-            session.close(channel_id)?;
+            session.data(channel_id, CryptoVec::from_slice(b"Welcome to Simple SSH Server.\r\n"));
+            let _ = session.close(channel_id);
             return Ok(());
         }
         let Some(channel) = self.pending_channels.remove(&channel_id) else {
@@ -115,12 +114,15 @@ impl server::Handler for AnetSshHandler {
         Ok(())
     }
 
+    /// Обработка интерактивного входа по SSH (зондирование сканерами ТСПУ / nmap).
+    /// Выдает приветственный баннер и штатно закрывает канал, маскируя сервер под легитимный OpenSSH / Dropbear.
     async fn shell_request(
         &mut self,
         channel: ChannelId,
         session: &mut server::Session,
     ) -> Result<(), Self::Error> {
-        session.channel_failure(channel)?;
+        session.data(channel, CryptoVec::from_slice(b"Welcome to Simple SSH Server.\r\n"));
+        let _ = session.close(channel);
         Ok(())
     }
 }
@@ -165,23 +167,8 @@ where
         client_info.nonce_prefix,
     ));
 
-    enum FinishedWorker {
-        Inbound,
-        Outbound,
-    }
-
-    let (finished_worker, result) = tokio::select! {
-        result = &mut inbound => (FinishedWorker::Inbound, flatten_worker_result("reader", result)),
-        result = &mut outbound => (FinishedWorker::Outbound, flatten_worker_result("writer", result)),
-    };
-    if !matches!(finished_worker, FinishedWorker::Inbound) {
-        inbound.abort();
-        let _ = inbound.await;
-    }
-    if !matches!(finished_worker, FinishedWorker::Outbound) {
-        outbound.abort();
-        let _ = outbound.await;
-    }
+    let (_finished_worker, result) =
+        supervise_bidirectional_workers(inbound, outbound, "SSH").await;
     registry.remove_client(&client_info).await;
     result
 }
@@ -241,13 +228,6 @@ where
         }
     }
     Ok(())
-}
-
-fn flatten_worker_result(
-    worker: &'static str,
-    result: std::result::Result<Result<()>, tokio::task::JoinError>,
-) -> Result<()> {
-    result.with_context(|| format!("SSH {worker} task failed"))?
 }
 
 pub async fn run_ssh_server(
