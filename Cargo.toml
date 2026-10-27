@@ -39,7 +39,7 @@ windows-sys = { version = "0.59" }
 dashmap = { version = "7.0.0-rc2" }
 boring = "4.22"
 tokio-boring = "4.22"
-reqwest = { package = "reqwest-boring", version = "0.13.5", default-features = false, features = ["json", "boring", "http2", "cookies", "query"] }
+reqwest = { package = "reqwest-boring", version = "0.13.5", default-features = false, features = ["json", "boring", "http2", "cookies", "query", "gzip", "brotli", "deflate", "zstd"] }
 webrtc = "0.21.1"
 rtc = "0.21.1"
 roxmltree = "0.20"

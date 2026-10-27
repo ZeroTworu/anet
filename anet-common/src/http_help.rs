@@ -371,10 +371,9 @@ impl BrowserProfile {
 
     /// Накладывает браузерные заголовки на HTTP-запрос `reqwest::RequestBuilder`.
     /// Для профилей Firefox и Safari заголовки `sec-ch-ua*` НЕ отправляются (так как эти браузеры не поддерживают Client Hints).
-    /// Примечание: `Accept-Encoding` намеренно НЕ выставляется вручную, так как `reqwest` собран без фич
-    /// декомпрессии (`gzip`, `brotli`, `zstd`), и при отправке `Accept-Encoding: gzip, deflate, br, zstd`
-    /// серверы (например, Ktalk / Envoy / Nginx) возвращают сжатое тело (`Content-Encoding: br`),
-    /// что приводит к ошибке `error decoding response body` при парсинге JSON.
+    /// Заголовки включают настоящий `Accept-Encoding` выбранного профиля браузера (`gzip, deflate, br, zstd`),
+    /// что обеспечивает 100% браузерную мимикрию. Декомпрессия выполняется автоматически через
+    /// фичи `reqwest` (`gzip`, `brotli`, `deflate`, `zstd`).
     pub fn apply_to_reqwest(
         &self,
         mut req: reqwest::RequestBuilder,
@@ -384,6 +383,7 @@ impl BrowserProfile {
         req = req
             .header("User-Agent", self.user_agent)
             .header("Accept-Language", self.accept_language)
+            .header("Accept-Encoding", self.accept_encoding)
             .header("Cache-Control", "no-cache")
             .header("Pragma", "no-cache")
             .header("Sec-Fetch-Dest", "empty")

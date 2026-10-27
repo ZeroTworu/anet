@@ -105,16 +105,27 @@ impl KtalkClient {
             .apply_to_reqwest(req, Some(&origin), Some(&referer));
 
         let resp = req.json(&body).send().await?;
-        if !resp.status().is_success() {
-            let status = resp.status();
+
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
             anyhow::bail!("Ktalk authorize/session failed ({status}): {text}");
         }
 
-        let auth_res: AuthorizeSessionResponse = resp.json().await?;
+        let bytes = resp.bytes().await.map_err(|e| {
+            anyhow::anyhow!("Ktalk read response bytes failed (status {status}, headers {headers:?}): {e}")
+        })?;
+
+        let auth_res: AuthorizeSessionResponse = serde_json::from_slice(&bytes).map_err(|e| {
+            let body_preview = String::from_utf8_lossy(&bytes);
+            anyhow::anyhow!(
+                "Ktalk decode AuthorizeSessionResponse failed: {e}. Raw body ({len} bytes, headers {headers:?}): {body_preview}",
+                len = bytes.len()
+            )
+        })?;
         Ok(auth_res)
     }
-
     /// Resolve conference room ID from short room name with browser stealth headers.
     pub async fn resolve_room(
         &self,
@@ -136,13 +147,25 @@ impl KtalkClient {
             .apply_to_reqwest(req, Some(&origin), Some(&referer));
 
         let resp = req.send().await?;
-        if !resp.status().is_success() {
-            let status = resp.status();
+
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
             anyhow::bail!("Ktalk resolve room failed ({status}): {text}");
         }
 
-        let room_info: RoomInfoResponse = resp.json().await?;
+        let bytes = resp.bytes().await.map_err(|e| {
+            anyhow::anyhow!("Ktalk read room response bytes failed (status {status}, headers {headers:?}): {e}")
+        })?;
+
+        let room_info: RoomInfoResponse = serde_json::from_slice(&bytes).map_err(|e| {
+            let body_preview = String::from_utf8_lossy(&bytes);
+            anyhow::anyhow!(
+                "Ktalk decode RoomInfoResponse failed: {e}. Raw body ({len} bytes, headers {headers:?}): {body_preview}",
+                len = bytes.len()
+            )
+        })?;
         Ok(room_info)
     }
 }
