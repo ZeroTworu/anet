@@ -769,6 +769,7 @@ async fn process_downlink_dns_body(
 
 struct ResolverPool {
     urls: Vec<String>,
+    udp_targets: Vec<Option<std::net::SocketAddr>>,
     cooldown_until_ms: Vec<AtomicU64>,
     ema_rtt_ms: Vec<AtomicU64>,
     total_sent: Vec<AtomicU64>,
@@ -777,7 +778,7 @@ struct ResolverPool {
 }
 
 impl ResolverPool {
-    fn new(urls: Vec<String>) -> Self {
+    fn new(urls: Vec<String>, udp_targets: Vec<Option<std::net::SocketAddr>>) -> Self {
         let n = urls.len();
         let cooldown_until_ms = (0..n).map(|_| AtomicU64::new(0)).collect();
         let ema_rtt_ms = (0..n).map(|_| AtomicU64::new(120)).collect();
@@ -785,6 +786,7 @@ impl ResolverPool {
         let total_failed = (0..n).map(|_| AtomicU64::new(0)).collect();
         Self {
             urls,
+            udp_targets,
             cooldown_until_ms,
             ema_rtt_ms,
             total_sent,
@@ -899,6 +901,7 @@ impl ResolverPool {
         let started = Instant::now();
 
         if let Some(udp_rest) = resolver_url.strip_prefix("udp://") {
+            let pre_resolved = self.udp_targets.get(idx).copied().flatten();
             let host_port = udp_rest.trim_end_matches('/');
             let target_str = if host_port.contains(':') {
                 host_port.to_string()
@@ -907,12 +910,17 @@ impl ResolverPool {
             };
 
             let io_fut = async {
-                let mut addrs = tokio::net::lookup_host(&target_str)
-                    .await
-                    .context("UDP resolver DNS lookup failed")?;
-                let remote_addr = addrs
-                    .next()
-                    .context("No socket address resolved for UDP resolver")?;
+                let remote_addr = if let Some(addr) = pre_resolved {
+                    addr
+                } else {
+                    let mut addrs = tokio::net::lookup_host(&target_str)
+                        .await
+                        .context("UDP resolver DNS lookup failed")?;
+                    addrs
+                        .find(|a| a.is_ipv4())
+                        .or_else(|| addrs.next())
+                        .context("No socket address resolved for UDP resolver")?
+                };
                 let bind_addr = if remote_addr.is_ipv6() {
                     "[::]:0"
                 } else {
@@ -1235,23 +1243,91 @@ impl ClientTransport for DohTransport {
             hold_ms
         );
 
-        let tx_http_client = Client::builder()
+        // Pre-resolve all DoH and UDP resolver hostnames BEFORE TUN setup or HTTP client creation:
+        // 1. Collect IPv4 bypass IPs so RouteManager and Windows AppFilter never fail on IPv6-over-IPv4-gateway routes or hijack DoH packets.
+        // 2. Pin hostname -> IPv4 SocketAddrs in reqwest and ResolverPool so runtime queries never depend on system DNS after TUN is up.
+        let mut bypass_ips: Vec<std::net::IpAddr> = Vec::new();
+        let mut udp_targets: Vec<Option<std::net::SocketAddr>> = Vec::with_capacity(resolvers.len());
+        let mut pinned_hosts: HashMap<String, Vec<std::net::SocketAddr>> = HashMap::new();
+
+        for res_url in &resolvers {
+            let mut resolved_udp: Option<std::net::SocketAddr> = None;
+            let normalized_url = if let Some(rest) = res_url.strip_prefix("doh://") {
+                format!("https://{}", rest)
+            } else {
+                res_url.clone()
+            };
+
+            if let Ok(parsed) = Url::parse(&normalized_url) {
+                if let Some(host) = parsed.host_str() {
+                    let default_port = if parsed.scheme() == "udp" { 53 } else { 443 };
+                    let port = parsed.port_or_known_default().unwrap_or(default_port);
+
+                    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+                        if ip.is_ipv4() && !bypass_ips.contains(&ip) {
+                            bypass_ips.push(ip);
+                        }
+                        if parsed.scheme() == "udp" {
+                            resolved_udp = Some(std::net::SocketAddr::new(ip, port));
+                        }
+                    } else if let Ok(addrs) = tokio::net::lookup_host((host, port)).await {
+                        let all_addrs: Vec<std::net::SocketAddr> = addrs.collect();
+                        let v4_addrs: Vec<std::net::SocketAddr> = all_addrs
+                            .iter()
+                            .copied()
+                            .filter(|a| a.is_ipv4())
+                            .collect();
+                        let chosen = if !v4_addrs.is_empty() {
+                            v4_addrs
+                        } else {
+                            all_addrs
+                        };
+
+                        for addr in &chosen {
+                            let ip = addr.ip();
+                            if ip.is_ipv4() && !bypass_ips.contains(&ip) {
+                                bypass_ips.push(ip);
+                            }
+                        }
+                        if parsed.scheme() == "udp" {
+                            resolved_udp = chosen.first().copied();
+                        } else if !chosen.is_empty() {
+                            pinned_hosts.insert(host.to_string(), chosen);
+                        }
+                    }
+                }
+            }
+            udp_targets.push(resolved_udp);
+        }
+
+        let mut tx_builder = Client::builder()
             .pool_max_idle_per_host(32)
             .pool_idle_timeout(Some(Duration::from_secs(60)))
             .tcp_nodelay(true)
             .connect_timeout(Duration::from_millis(1000))
             .timeout(Duration::from_millis(1800))
             .http2_adaptive_window(true)
-            .build()
-            .context("Failed to build TX HTTP/2 client for DoH")?;
+            .local_address(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
 
-        let rx_http_client = Client::builder()
+        let mut rx_builder = Client::builder()
             .pool_max_idle_per_host(16)
             .pool_idle_timeout(Some(Duration::from_secs(60)))
             .tcp_nodelay(true)
             .connect_timeout(Duration::from_millis(1000))
             .timeout(Duration::from_millis(1800))
             .http2_adaptive_window(true)
+            .local_address(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+
+        for (host, addrs) in &pinned_hosts {
+            tx_builder = tx_builder.resolve_to_addrs(host, addrs);
+            rx_builder = rx_builder.resolve_to_addrs(host, addrs);
+        }
+
+        let tx_http_client = tx_builder
+            .build()
+            .context("Failed to build TX HTTP/2 client for DoH")?;
+
+        let rx_http_client = rx_builder
             .build()
             .context("Failed to build RX HTTP/2 client for DoH")?;
 
@@ -1259,7 +1335,7 @@ impl ClientTransport for DohTransport {
         let hs_max_payload = max_payload.saturating_sub(24).max(32);
         let temp_session_id = rand::random::<u32>() | 0x80000000;
 
-        let resolver_pool = Arc::new(ResolverPool::new(resolvers.clone()));
+        let resolver_pool = Arc::new(ResolverPool::new(resolvers.clone(), udp_targets));
 
         let auth_channel = DohAuthChannel {
             client: tx_http_client.clone(),
@@ -1284,48 +1360,29 @@ impl ClientTransport for DohTransport {
         let session_id = u32::from_be_bytes(nonce_prefix_bytes);
 
         info!(
-            "[DoH] Authenticated successfully. Assigned session ID: {:08x}",
-            session_id
+            "[DoH] Authenticated successfully. Assigned session ID: {:08x} (bypass IPs: {:?})",
+            session_id, bypass_ips
         );
-
-        // Collect all DoH and UDP resolver IPs into bypass_ips so resolver queries never loop back into the TUN interface
-        let mut bypass_ips = Vec::new();
-        for res_url in &resolvers {
-            if let Ok(parsed) = Url::parse(res_url) {
-                if let Some(host) = parsed.host_str() {
-                    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-                        if !bypass_ips.contains(&ip) {
-                            bypass_ips.push(ip);
-                        }
-                    } else {
-                        let default_port = if parsed.scheme() == "udp" { 53 } else { 443 };
-                        let port = parsed.port_or_known_default().unwrap_or(default_port);
-                        if let Ok(addrs) = tokio::net::lookup_host((host, port)).await {
-                            for addr in addrs {
-                                let ip = addr.ip();
-                                if !bypass_ips.contains(&ip) {
-                                    bypass_ips.push(ip);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
 
         let cipher = Arc::new(AstpLiteCipher::new(&shared_key));
         let sequence = Arc::new(AtomicU32::new(1));
         let health_pause = Arc::new(AtomicBool::new(false));
+        let shutdown_flag = Arc::new(AtomicBool::new(false));
+        let shutdown_notify = Arc::new(Notify::new());
 
         let (client_stream, internal_router) = tokio::io::duplex(64 * 1024);
         let (mut tunnel_read, tunnel_write) = tokio::io::split(internal_router);
         let uplink_queue = Arc::new(DohUplinkQueue::new());
 
         let queue_writer = uplink_queue.clone();
+        let reader_shutdown_flag = shutdown_flag.clone();
+        let reader_shutdown_notify = shutdown_notify.clone();
         let tunnel_reader_task = tokio::spawn(async move {
             while let Ok(Some(packet)) = read_next_packet(&mut tunnel_read).await {
                 queue_writer.push(packet);
             }
+            reader_shutdown_flag.store(true, Ordering::Release);
+            reader_shutdown_notify.notify_waiters();
             queue_writer.close();
         });
 
@@ -1349,6 +1406,8 @@ impl ClientTransport for DohTransport {
             let burst_notify = poll_burst_notify.clone();
             let tx_sem = Arc::new(Semaphore::new(28));
             let prio_sem = Arc::new(Semaphore::new(8));
+            let tx_shutdown_flag = shutdown_flag.clone();
+            let tx_shutdown_notify = shutdown_notify.clone();
 
             // Background Uplink ARQ / NACK retransmission worker (runs every 110ms)
             if arq_enabled {
@@ -1361,10 +1420,18 @@ impl ClientTransport for DohTransport {
                 let rto_tw = tunnel_write.clone();
                 let rto_burst = burst_notify.clone();
                 let rto_sem = prio_sem.clone();
+                let rto_shutdown_flag = shutdown_flag.clone();
+                let rto_shutdown_notify = shutdown_notify.clone();
 
                 tokio::spawn(async move {
                     loop {
-                        tokio::time::sleep(Duration::from_millis(110)).await;
+                        tokio::select! {
+                            _ = tokio::time::sleep(Duration::from_millis(110)) => {}
+                            _ = rto_shutdown_notify.notified() => break,
+                        }
+                        if rto_shutdown_flag.load(Ordering::Acquire) {
+                            break;
+                        }
                         let retransmits = rto_ul.lock().unwrap().collect_rto_retransmits();
                         for chunk in retransmits {
                             let b36_str = base32::encode_base36(&chunk);
@@ -1412,8 +1479,11 @@ impl ClientTransport for DohTransport {
             tokio::spawn(async move {
                 info!("[DoH TX] Uplink dispatcher loop active (dup={})", dup_count);
                 while let Some((mut packet_buf, is_prio)) = uplink_q.pop_batch(max_payload).await {
+                    if tx_shutdown_flag.load(Ordering::Acquire) {
+                        break;
+                    }
                     let raw_seq = sequence.fetch_add(1, Ordering::Relaxed);
-                    let seq = ((raw_seq - 1) % 65534) + 1;
+                    let seq = ((raw_seq - 1) % 32766) + 1;
                     cipher.apply_keystream(seq, session_id, &mut packet_buf);
 
                     let chunks = split_into_chunks(session_id, seq, &packet_buf, max_payload);
@@ -1490,6 +1560,8 @@ impl ClientTransport for DohTransport {
                         });
                     }
                 }
+                tx_shutdown_flag.store(true, Ordering::Release);
+                tx_shutdown_notify.notify_waiters();
                 tunnel_reader_task.abort();
                 info!("[DoH TX] Uplink loop exited");
             });
@@ -1508,12 +1580,18 @@ impl ClientTransport for DohTransport {
                 let ul_arq = uplink_arq.clone();
                 let dl_fb = dl_feedback.clone();
                 let burst_notify = poll_burst_notify.clone();
+                let rx_shutdown_flag = shutdown_flag.clone();
+                let rx_shutdown_notify = shutdown_notify.clone();
 
                 tokio::spawn(async move {
                     debug!("[DoH RX-{}] Adaptive poll worker initialized", worker_id);
                     let mut backoff_ms = 12;
 
                     loop {
+                        if rx_shutdown_flag.load(Ordering::Acquire) {
+                            break;
+                        }
+
                         let fb = dl_fb.load(Ordering::Acquire);
                         let dl_ack_seq = (fb >> 16) as u32;
                         let dl_sack_mask = (fb & 0xFFFF) as u16;
@@ -1524,14 +1602,16 @@ impl ClientTransport for DohTransport {
                         );
                         let query_bytes = build_doh_query(&qname, rand::random::<u16>());
 
-                        match pool
-                            .send_query_reliable(
+                        let query_res = tokio::select! {
+                            res = pool.send_query_reliable(
                                 &http_client,
                                 &query_bytes,
                                 Duration::from_millis(850),
-                            )
-                            .await
-                        {
+                            ) => res,
+                            _ = rx_shutdown_notify.notified() => break,
+                        };
+
+                        match query_res {
                             Ok(body) => {
                                 backoff_ms = 12;
                                 match process_downlink_dns_body(
@@ -1553,9 +1633,12 @@ impl ClientTransport for DohTransport {
                                         tokio::select! {
                                             _ = tokio::time::sleep(Duration::from_millis(12)) => {}
                                             _ = burst_notify.notified() => {}
+                                            _ = rx_shutdown_notify.notified() => break,
                                         }
                                     }
                                     Err(_) => {
+                                        rx_shutdown_flag.store(true, Ordering::Release);
+                                        rx_shutdown_notify.notify_waiters();
                                         warn!("[DoH RX] Tunnel stream closed; exiting poller.");
                                         break;
                                     }
@@ -1563,16 +1646,30 @@ impl ClientTransport for DohTransport {
                             }
                             Err(e) => {
                                 debug!("[DoH RX-{}] Poll request failed: {}", worker_id, e);
-                                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                                tokio::select! {
+                                    _ = tokio::time::sleep(Duration::from_millis(backoff_ms)) => {}
+                                    _ = rx_shutdown_notify.notified() => break,
+                                }
                                 backoff_ms = (backoff_ms * 2).min(250);
                             }
                         }
                     }
+                    debug!("[DoH RX-{}] Poll worker exited", worker_id);
                 });
             }
         }
 
         info!("[DoH] Transport session fully established.");
+
+        let hook_flag = shutdown_flag.clone();
+        let hook_notify = shutdown_notify.clone();
+        let hook_queue = uplink_queue.clone();
+        let shutdown_hook = Box::new(move || {
+            hook_flag.store(true, Ordering::Release);
+            hook_notify.notify_waiters();
+            hook_queue.close();
+            Box::pin(async {}) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        });
 
         Ok(ConnectionResult {
             auth_response,
@@ -1583,7 +1680,7 @@ impl ClientTransport for DohTransport {
             remote_ip: None,
             bypass_ips,
             effective_mode: None,
-            shutdown_hook: None,
+            shutdown_hook: Some(shutdown_hook),
         })
     }
 }

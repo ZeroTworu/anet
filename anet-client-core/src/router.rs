@@ -140,6 +140,14 @@ pub mod desktop {
                 .original_ifindex
                 .context("Interface index not backed up")?;
 
+            if target.is_ipv6() != gateway.is_ipv6() {
+                debug!(
+                    "Skipping bypass route for {}/{} due to address family mismatch with gateway {}",
+                    target, prefix, gateway
+                );
+                return Ok(());
+            }
+
             info!(
                 "Adding BYPASS route for {}/{} via physical gateway {}",
                 target, prefix, gateway

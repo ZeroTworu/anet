@@ -107,6 +107,7 @@ fn hash_qname(qname: &str) -> u64 {
 struct DohClientSession {
     rx_state: Mutex<DohRxState>,
     cipher: Arc<AstpLiteCipher>,
+    waiting_polls: std::sync::atomic::AtomicUsize,
 }
 
 fn create_doh_session(
@@ -131,6 +132,7 @@ fn create_doh_session(
             recent_order: VecDeque::new(),
         }),
         cipher,
+        waiting_polls: std::sync::atomic::AtomicUsize::new(0),
     })
 }
 
@@ -412,12 +414,19 @@ async fn pop_downlink_payload(
         && state.bulk_queue.is_empty()
         && !wait_timeout.is_zero()
     {
-        let wait_deadline = tokio::time::Instant::now() + wait_timeout;
-        if let Ok(Some(pkt)) = tokio::time::timeout_at(wait_deadline, state.rx_router.recv()).await
-        {
-            enqueue_classified_packet(&mut state, pkt, Instant::now());
-            drain_channel_into_queues(&mut state);
+        // Only allow 1 poll query at a time to hold the lock waiting on rx_router.recv()
+        // so 6 concurrent poll workers never serialize into a 150ms lock queue.
+        let prev_waiting = session.waiting_polls.fetch_add(1, Ordering::AcqRel);
+        if prev_waiting == 0 {
+            let wait_deadline = tokio::time::Instant::now() + wait_timeout;
+            if let Ok(Some(pkt)) =
+                tokio::time::timeout_at(wait_deadline, state.rx_router.recv()).await
+            {
+                enqueue_classified_packet(&mut state, pkt, Instant::now());
+                drain_channel_into_queues(&mut state);
+            }
         }
+        session.waiting_polls.fetch_sub(1, Ordering::Release);
     }
 
     // Evict oldest inflight frame if window is full so new traffic never deadlocks
@@ -818,8 +827,11 @@ async fn handle_dns_datagram(
             let temp_session_id = u32::from_str_radix(parts[1], 16).unwrap_or(0);
             let b32_str = base32::join_labels(parts[4]);
 
-            if let Ok(chunk_raw) = base32::decode(&b32_str) {
-                if let Ok(hdr) = anet_common::doh_chunking::DohChunkHeader::decode(&chunk_raw) {
+            if let Ok(chunk_raw) =
+                base32::decode(&b32_str).or_else(|_| base32::decode_base36(&b32_str))
+            {
+                let parsed_hdr = anet_common::doh_chunking::DohChunkHeader::decode(&chunk_raw).ok();
+                if let Some(hdr) = parsed_hdr {
                     if let Some(cached) =
                         phase_handshake_responses.get(&(temp_session_id, hdr.sequence))
                     {
@@ -832,14 +844,26 @@ async fn handle_dns_datagram(
                         let _ = socket.send_to(&dns_resp, remote_addr).await;
                         return Ok(());
                     }
-                    if hdr.sequence > 0 && hdr.chunk_index == 0 {
-                        temp_handshake_responses.remove(&temp_session_id);
-                    }
                 }
 
-                let assembled_opt = {
+                let (assembled_opt, already_completed) = {
                     let mut reasm = handshake_reassembler.lock().await;
-                    reasm.feed(&chunk_raw)?
+                    let was_done = parsed_hdr
+                        .map(|h| reasm.is_completed(temp_session_id, h.sequence))
+                        .unwrap_or(false);
+                    if !was_done {
+                        if let Some(hdr) = parsed_hdr {
+                            if hdr.sequence > 0
+                                && hdr.chunk_index == 0
+                                && !phase_handshake_responses
+                                    .contains_key(&(temp_session_id, hdr.sequence))
+                            {
+                                temp_handshake_responses.remove(&temp_session_id);
+                            }
+                        }
+                    }
+                    let res = reasm.feed(&chunk_raw)?;
+                    (res, was_done)
                 };
 
                 if let Some((_sid, seq, full_handshake)) = assembled_opt {
@@ -898,6 +922,28 @@ async fn handle_dns_datagram(
                         let _ = socket.send_to(&dns_resp, remote_addr).await;
                         return Ok(());
                     }
+                } else if already_completed {
+                    if let Some(hdr) = parsed_hdr {
+                        if hdr.chunk_index + 1 == hdr.total_chunks {
+                            // Another hedged copy of the final handshake chunk is currently processing;
+                            // wait briefly so this duplicate also returns the real Base64 handshake response instead of "ACK".
+                            for _ in 0..40 {
+                                if let Some(cached) =
+                                    phase_handshake_responses.get(&(temp_session_id, hdr.sequence))
+                                {
+                                    let dns_resp = build_dns_txt_response(
+                                        &raw_query,
+                                        &parsed_q,
+                                        Some(cached.0.as_bytes()),
+                                        0,
+                                    );
+                                    let _ = socket.send_to(&dns_resp, remote_addr).await;
+                                    return Ok(());
+                                }
+                                tokio::time::sleep(Duration::from_millis(10)).await;
+                            }
+                        }
+                    }
                 }
 
                 let dns_resp = build_dns_txt_response(&raw_query, &parsed_q, Some(b"ACK"), 0);
@@ -908,24 +954,25 @@ async fn handle_dns_datagram(
     }
 
     // Case 3: Data Uplink chunk ("<base36_or_base32_chunk_labels>")
+    // Evaluate both Base36 and Base32 decodings and pick the candidate whose session_id matches an active client in registry.
     let b32_str = base32::join_labels(prefix);
-    if let Ok(chunk_raw) = base32::decode_base36(&b32_str).or_else(|_| base32::decode(&b32_str)) {
-        // Filter out intermediate QNAME-minimization suffixes whose session_id does not belong to an active client
-        let (hdr, _) = match anet_common::doh_chunking::DohChunkHeader::decode_with_len(&chunk_raw) {
-            Ok(h) => h,
-            Err(_) => {
-                let resp = build_dns_txt_response(&raw_query, &parsed_q, None, 0);
-                let _ = socket.send_to(&resp, remote_addr).await;
-                return Ok(());
+    let mut matched_uplink = None;
+    for candidate_res in [
+        base32::decode_base36(&b32_str),
+        base32::decode(&b32_str),
+    ] {
+        if let Ok(raw) = candidate_res {
+            if let Ok((hdr, _)) = anet_common::doh_chunking::DohChunkHeader::decode_with_len(&raw) {
+                let prefix_bytes = hdr.session_id.to_be_bytes();
+                if let Some(c_info) = registry.get_by_prefix(&prefix_bytes) {
+                    matched_uplink = Some((raw, hdr, c_info));
+                    break;
+                }
             }
-        };
-        let prefix_bytes = hdr.session_id.to_be_bytes();
-        let Some(client_info) = registry.get_by_prefix(&prefix_bytes) else {
-            let resp = build_dns_txt_response(&raw_query, &parsed_q, None, 0);
-            let _ = socket.send_to(&resp, remote_addr).await;
-            return Ok(());
-        };
+        }
+    }
 
+    if let Some((chunk_raw, hdr, client_info)) = matched_uplink {
         let session = active_sessions
             .entry(hdr.session_id)
             .or_insert_with(|| create_doh_session(&registry, &client_info))

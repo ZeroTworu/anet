@@ -394,6 +394,7 @@ impl AnetClient {
         &self,
         _server: &ServerConfig,
         auth: &anet_common::protocol::AuthResponse,
+        extra_bypass_ips: &[IpAddr],
     ) -> anyhow::Result<(
         tokio::sync::mpsc::Sender<bytes::Bytes>,
         tokio::sync::mpsc::Receiver<bytes::Bytes>,
@@ -411,13 +412,25 @@ impl AnetClient {
             return Ok((tun_tx, tun_rx, iface_name, None));
         }
 
-        let initial_bypass: Vec<IpAddr> = self
+        let mut initial_bypass: Vec<IpAddr> = self
             .config
             .servers
             .iter()
             .filter_map(|s| s.host_port().ok())
             .filter_map(|(host, _)| IpAddr::from_str(&host).ok())
             .collect();
+
+        for &ip in extra_bypass_ips {
+            if !initial_bypass.contains(&ip) {
+                initial_bypass.push(ip);
+            }
+        }
+        for direct_dns_ip in crate::dns_interceptor::DIRECT_UPSTREAM_DNS_IPS {
+            let ip = IpAddr::V4(direct_dns_ip);
+            if !initial_bypass.contains(&ip) {
+                initial_bypass.push(ip);
+            }
+        }
 
         let policy = match mode {
             crate::config::PerAppMode::Exclude => {
@@ -438,12 +451,15 @@ impl AnetClient {
         let (server_host, server_port) = _server.host_port()?;
         if let Ok(ip) = IpAddr::from_str(&server_host) {
             filter.add_bypass(ip).await;
-        } else if let Ok(mut addrs) =
+        } else if let Ok(addrs) =
             tokio::net::lookup_host((server_host.as_str(), server_port)).await
         {
-            if let Some(sa) = addrs.next() {
+            for sa in addrs {
                 filter.add_bypass(sa.ip()).await;
             }
+        }
+        for &ip in extra_bypass_ips {
+            filter.add_bypass(ip).await;
         }
 
         let apps_names = self.config.main.per_app.join(", ");
@@ -475,6 +491,7 @@ impl AnetClient {
         &self,
         _server: &ServerConfig,
         auth: &AuthResponse,
+        _extra_bypass_ips: &[IpAddr],
     ) -> Result<(Sender<Bytes>, Receiver<Bytes>, String, Option<()>)> {
         let (tx, rx, iface) = self.tun_factory.create_tun(auth).await?;
         Ok((tx, rx, iface, None))
@@ -557,19 +574,20 @@ impl AnetClient {
                 tokio::time::timeout(Duration::from_millis(1500), lookup_host((h.as_str(), p)))
                     .await
             {
-                bypass_ips.extend(resolved.map(|addr| addr.ip()));
+                bypass_ips.extend(resolved.map(|addr| addr.ip()).filter(|ip| ip.is_ipv4()));
             }
         }
         bypass_ips.sort_unstable();
         bypass_ips.dedup();
 
-        for server_ip in bypass_ips {
+        for server_ip in &bypass_ips {
             let prefix = if server_ip.is_ipv4() { 32 } else { 128 };
             self.route_manager
-                .add_bypass_route(server_ip, prefix)
+                .add_bypass_route(*server_ip, prefix)
                 .await?;
         }
 
+        let mut transport_bypass_ips = bypass_ips;
         // ГАРАНТИЯ: если транспорт закрепил конкретный IP CDN (Round-Robin),
         // обязательно добавляем его в обход туннеля, чтобы избежать петли маршрутизации!
         if let Some(pinned_ip) = result.remote_ip {
@@ -577,13 +595,26 @@ impl AnetClient {
             self.route_manager
                 .add_bypass_route(pinned_ip, prefix)
                 .await?;
+            if !transport_bypass_ips.contains(&pinned_ip) {
+                transport_bypass_ips.push(pinned_ip);
+            }
         }
 
         for bypass_ip in result.bypass_ips {
             let prefix = if bypass_ip.is_ipv4() { 32 } else { 128 };
-            self.route_manager
+            if let Err(e) = self
+                .route_manager
                 .add_bypass_route(bypass_ip, prefix)
-                .await?;
+                .await
+            {
+                warn!(
+                    "[Core] Failed to add supplementary bypass route for {}/{}: {}",
+                    bypass_ip, prefix, e
+                );
+            }
+            if !transport_bypass_ips.contains(&bypass_ip) {
+                transport_bypass_ips.push(bypass_ip);
+            }
         }
 
         // Гарантируем, что прямые DNS-резолверы для Direct-правил всегда идут в обход туннеля
@@ -724,7 +755,7 @@ impl AnetClient {
         }
 
         let (tx_to_tun, mut rx_from_tun, iface_name, _app_filter) = self
-            .acquire_packet_source(server, &result.auth_response)
+            .acquire_packet_source(server, &result.auth_response, &transport_bypass_ips)
             .await?;
 
         let direct_ip_cache = crate::direct_ip_cache::DirectIpCache::new();
@@ -878,6 +909,9 @@ impl AnetClient {
                 }
 
                 if let Some(dst_ip) = crate::dns_interceptor::extract_packet_dst_ip(pkt) {
+                    if transport_bypass_ips.contains(&dst_ip) {
+                        return false;
+                    }
                     let ip_action = local_overrides_tx
                         .lookup_ip(dst_ip)
                         .or_else(|| direct_ip_cache_tx.check(&dst_ip))

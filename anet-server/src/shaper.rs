@@ -132,6 +132,10 @@ impl Shaper {
     /// Устанавливает (или обновляет) ограничение скорости для туннельного
     /// IP клиента. `kbps` — килобиты в секунду, как в схеме `rates`/`groups`.
     pub async fn set_limit(&self, ip: Ipv4Addr, kbps: u32) -> Result<()> {
+        if kbps == 0 {
+            self.clear_limit(ip).await;
+            return Ok(());
+        }
         let rate_bytes_per_sec = (kbps as u64) * 1000 / 8;
         let burst_bytes = (rate_bytes_per_sec / 10).max(MIN_BURST_BYTES);
         let rule = RateRule { rate_bytes_per_sec, burst_bytes };

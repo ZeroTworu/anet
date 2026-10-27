@@ -116,12 +116,7 @@ pub fn build_dns_txt_response(
 ) -> Vec<u8> {
     let mut resp = Vec::with_capacity(512);
 
-    let rr_slices: Vec<&[u8]> = match txt_payload {
-        Some(p) if !p.is_empty() => p.chunks(765).collect(),
-        Some(_) => vec![&[][..]],
-        None => Vec::new(),
-    };
-    let ancount = rr_slices.len() as u16;
+    let ancount: u16 = if txt_payload.is_some() { 1 } else { 0 };
 
     // 1. Header (12 bytes)
     resp.extend_from_slice(&parsed_q.tx_id.to_be_bytes());
@@ -130,7 +125,7 @@ pub fn build_dns_txt_response(
     let resp_flags = 0x8400 | rd_bit;
     resp.extend_from_slice(&resp_flags.to_be_bytes());
     resp.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT=1
-    resp.extend_from_slice(&ancount.to_be_bytes()); // ANCOUNT (Multi-TXT support)
+    resp.extend_from_slice(&ancount.to_be_bytes()); // ANCOUNT=1 (single TXT RR preserves character-string order across all resolvers)
     resp.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT=0
     resp.extend_from_slice(&1u16.to_be_bytes()); // ARCOUNT=1 (EDNS0)
 
@@ -150,8 +145,8 @@ pub fn build_dns_txt_response(
         resp.extend_from_slice(&DNS_QCLASS_IN.to_be_bytes());
     }
 
-    // 3. Answer section (1 or more TXT Resource Records with 0xC00C name compression)
-    for payload in rr_slices {
+    // 3. Answer section (single TXT Resource Record with multiple <=255B character-strings and 0xC00C name compression)
+    if let Some(payload) = txt_payload {
         resp.extend_from_slice(&[0xC0, 0x0C]);
         resp.extend_from_slice(&DNS_QTYPE_TXT.to_be_bytes());
         resp.extend_from_slice(&DNS_QCLASS_IN.to_be_bytes());

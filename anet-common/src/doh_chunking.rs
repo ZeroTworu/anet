@@ -16,15 +16,16 @@ pub struct DohChunkHeader {
 }
 
 impl DohChunkHeader {
-    /// Compact 7-byte wire header:
-    /// `[session_id: u32 BE (4B)] [seq_low16: u16 BE (2B)] [0x80 | ((chunk_idx & 0x07) << 4) | ((total_chunks - 1) & 0x0F) (1B)]`
+    /// Compact 7-byte wire header supporting up to 16 chunks:
+    /// `[session_id: u32 BE (4B)] [0x8000 | (seq & 0x7FFF): u16 BE (2B)] [((chunk_idx & 0x0F) << 4) | ((total_chunks - 1) & 0x0F) (1B)]`
     pub fn encode(&self) -> [u8; DOH_HEADER_LEN] {
         let mut buf = [0u8; DOH_HEADER_LEN];
         buf[0..4].copy_from_slice(&self.session_id.to_be_bytes());
-        buf[4..6].copy_from_slice(&(self.sequence as u16).to_be_bytes());
-        let idx_bits = (self.chunk_index & 0x07) << 4;
+        let seq_flagged = 0x8000u16 | ((self.sequence as u16) & 0x7FFF);
+        buf[4..6].copy_from_slice(&seq_flagged.to_be_bytes());
+        let idx_bits = (self.chunk_index & 0x0F) << 4;
         let total_bits = self.total_chunks.saturating_sub(1) & 0x0F;
-        buf[6] = 0x80 | idx_bits | total_bits;
+        buf[6] = idx_bits | total_bits;
         buf
     }
 
@@ -37,6 +38,27 @@ impl DohChunkHeader {
             );
         }
         let session_id = u32::from_be_bytes(bytes[0..4].try_into()?);
+        if (bytes[4] & 0x80) != 0 {
+            let sequence = (u16::from_be_bytes([bytes[4], bytes[5]]) & 0x7FFF) as u32;
+            let chunk_index = (bytes[6] >> 4) & 0x0F;
+            let total_chunks = (bytes[6] & 0x0F) + 1;
+            if total_chunks == 0 || chunk_index >= total_chunks {
+                anyhow::bail!(
+                    "Invalid compact16 chunk indexing: index {} / total {}",
+                    chunk_index,
+                    total_chunks
+                );
+            }
+            return Ok((
+                Self {
+                    session_id,
+                    sequence,
+                    chunk_index,
+                    total_chunks,
+                },
+                DOH_HEADER_LEN,
+            ));
+        }
         if (bytes[6] & 0x80) != 0 {
             let sequence = u16::from_be_bytes([bytes[4], bytes[5]]) as u32;
             let chunk_index = (bytes[6] >> 4) & 0x07;
@@ -109,8 +131,8 @@ pub fn split_into_chunks(session_id: u32, sequence: u32, payload: &[u8], max_pay
     let chunk_size = max_payload_per_chunk.max(32);
     let total_chunks = ((payload.len() + chunk_size - 1) / chunk_size).max(1);
 
-    if total_chunks > 8 {
-        // Fallback if more than 8 chunks needed
+    if total_chunks > 16 {
+        // Fallback if more than 16 chunks needed
         return vec![];
     }
 
@@ -124,7 +146,7 @@ pub fn split_into_chunks(session_id: u32, sequence: u32, payload: &[u8], max_pay
 
         let header = DohChunkHeader {
             session_id,
-            sequence: sequence & 0xFFFF,
+            sequence: sequence & 0x7FFF,
             chunk_index: idx as u8,
             total_chunks: total_u8,
         };
@@ -161,6 +183,10 @@ impl DohReassemblyQueue {
             highest_contiguous: HashMap::new(),
             timeout,
         }
+    }
+
+    pub fn is_completed(&self, session_id: u32, sequence: u32) -> bool {
+        self.completed.contains_key(&(session_id, sequence))
     }
 
     fn advance_contiguous(&mut self, session_id: u32) {

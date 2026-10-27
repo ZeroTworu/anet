@@ -239,7 +239,9 @@ impl ClientRegistry {
             return;
         };
         tokio::spawn(async move {
-            if let Err(e) = shaper.set_limit(ip, kbps).await {
+            if kbps == 0 {
+                shaper.clear_limit(ip).await;
+            } else if let Err(e) = shaper.set_limit(ip, kbps).await {
                 warn!("[Shaper] Failed to apply speed limit for {}: {}", ip, e);
             }
         });

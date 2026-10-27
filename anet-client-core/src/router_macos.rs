@@ -217,6 +217,14 @@ impl RouteManager for MacOSRouteManager {
                 .context("Gateway not backed up - call backup_routes() first")?
         };
 
+        if target.is_ipv6() != gateway.is_ipv6() {
+            debug!(
+                "Skipping bypass route for {}/{} due to address family mismatch with gateway {}",
+                target, prefix, gateway
+            );
+            return Ok(());
+        }
+
         info!(
             "Adding BYPASS route: {}/{} via gateway {}",
             target, prefix, gateway
