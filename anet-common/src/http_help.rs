@@ -458,60 +458,41 @@ impl BrowserProfile {
     }
 }
 
-/// Извлекает реальный IP клиента из HTTP-заголовков (`X-Real-IP` или первого валидного IP в `X-Forwarded-For`),
-/// возвращая `peer_addr` (с сохранением порта), если заголовки отсутствуют или соединение пришло не с локального прокси.
-pub fn extract_real_ip(headers: &http::HeaderMap, peer_addr: SocketAddr) -> SocketAddr {
-    if !peer_addr.ip().is_loopback() {
-        return peer_addr;
-    }
-
-    if let Some(real_ip) = headers.get("x-real-ip").and_then(|v| v.to_str().ok()) {
-        if let Ok(ip) = real_ip.trim().parse::<IpAddr>() {
-            return SocketAddr::new(ip, peer_addr.port());
-        }
-    }
-
-    if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
-        if let Some(first) = xff.split(',').next() {
-            if let Ok(ip) = first.trim().parse::<IpAddr>() {
-                return SocketAddr::new(ip, peer_addr.port());
+/// Извлекает реальный IP клиента из заголовков `X-Real-IP` или `X-Forwarded-For`,
+/// выставленных обратным прокси (`nginx`), с откатом на `fallback` (адрес TCP-пира).
+pub fn extract_real_ip(headers: &http::HeaderMap, fallback: SocketAddr) -> SocketAddr {
+    for header_name in ["x-real-ip", "x-forwarded-for"] {
+        if let Some(val) = headers.get(header_name) {
+            if let Ok(ip_str) = val.to_str() {
+                if let Some(ip) = parse_first_ip(ip_str) {
+                    return SocketAddr::new(ip, fallback.port());
+                }
             }
         }
     }
-
-    peer_addr
+    fallback
 }
 
-/// Извлекает реальный IP клиента из сырой строки HTTP-заголовков (для легковесного парсера AHTTP).
-pub fn extract_real_ip_from_raw(raw_headers: &str, peer_addr: SocketAddr) -> SocketAddr {
-    if !peer_addr.ip().is_loopback() {
-        return peer_addr;
-    }
-
-    let mut xff_ip: Option<IpAddr> = None;
-
-    for line in raw_headers.lines() {
-        if let Some((name, val)) = line.split_once(':') {
-            let name_trimmed = name.trim();
-            if name_trimmed.eq_ignore_ascii_case("x-real-ip") {
-                if let Ok(ip) = val.trim().parse::<IpAddr>() {
-                    return SocketAddr::new(ip, peer_addr.port());
-                }
-            } else if name_trimmed.eq_ignore_ascii_case("x-forwarded-for") && xff_ip.is_none() {
-                if let Some(first) = val.split(',').next() {
-                    if let Ok(ip) = first.trim().parse::<IpAddr>() {
-                        xff_ip = Some(ip);
-                    }
+/// Извлекает реальный IP клиента из сырых пар заголовков (например, `httparse::Header` в `http_stream.rs`).
+pub fn extract_real_ip_from_raw<'a, I>(headers: I, fallback: SocketAddr) -> SocketAddr
+where
+    I: IntoIterator<Item = (&'a str, &'a [u8])>,
+{
+    for (name, value) in headers {
+        if name.eq_ignore_ascii_case("x-real-ip") || name.eq_ignore_ascii_case("x-forwarded-for") {
+            if let Ok(ip_str) = std::str::from_utf8(value) {
+                if let Some(ip) = parse_first_ip(ip_str) {
+                    return SocketAddr::new(ip, 0);
                 }
             }
         }
     }
+    SocketAddr::new(fallback.ip(), 0)
+}
 
-    if let Some(ip) = xff_ip {
-        return SocketAddr::new(ip, peer_addr.port());
-    }
-
-    peer_addr
+fn parse_first_ip(ip_str: &str) -> Option<IpAddr> {
+    let first = ip_str.split(',').next()?.trim();
+    first.parse::<IpAddr>().ok()
 }
 
 #[cfg(test)]
@@ -581,5 +562,23 @@ mod tests {
                 assert!(auto_prof.user_agent.contains("Firefox") || auto_prof.user_agent.contains("FxiOS"));
             }
         }
+    }
+
+    #[test]
+    fn real_ip_extraction_behind_nginx() {
+        let fallback: SocketAddr = "127.0.0.1:45120".parse().unwrap();
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            "X-Forwarded-For",
+            HeaderValue::from_static("203.0.113.42, 10.0.0.1"),
+        );
+        let extracted = extract_real_ip(&headers, fallback);
+        assert_eq!(extracted.ip().to_string(), "203.0.113.42");
+        assert_eq!(extracted.port(), 45120);
+
+        let raw_headers = [("X-Real-IP", b"198.51.100.7" as &[u8])];
+        let extracted_raw = extract_real_ip_from_raw(raw_headers, fallback);
+        assert_eq!(extracted_raw.ip().to_string(), "198.51.100.7");
+        assert_eq!(extracted_raw.port(), 0);
     }
 }

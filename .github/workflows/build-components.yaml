@@ -165,10 +165,15 @@ jobs:
 
       # Сборка ARM64 (aarch64) в готовом musl cross-окружении.
       - name: "Build Client (ARM64)"
+        env:
+          CI: "true"
+          CC_aarch64_unknown_linux_musl: "aarch64-linux-musl-gcc"
+          CXX_aarch64_unknown_linux_musl: "aarch64-linux-musl-g++"
+          AR_aarch64_unknown_linux_musl: "aarch64-linux-musl-ar"
+          BORING_BSSL_RUST_CPPLIB_aarch64_unknown_linux_musl: "c"
+          BORING_BSSL_SYSROOT_aarch64_unknown_linux_musl: "/usr/local/aarch64-linux-musl"
         run: |
           cargo update -p rtc-turn -p reqwest-boring
-          GOROOT_DIR="$(go env GOROOT)"
-          CROSS_CONTAINER_OPTS="-e CI=true -e BORING_BSSL_RUST_CPPLIB_aarch64_unknown_linux_musl=c -e BORING_BSSL_SYSROOT_aarch64_unknown_linux_musl=/usr/local/aarch64-linux-musl -v ${GOROOT_DIR}:/usr/local/go -e PATH=/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
           cross build --release --package anet-client-cli --target aarch64-unknown-linux-musl
 
       # Загрузка артефакта AMD64
