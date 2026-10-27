@@ -536,9 +536,9 @@ fn configure_verification(
 
         if !preverify_ok {
             log::warn!(
-                "[TLS Anti-Spoof] Peer certificate verification failed at depth {} ({}): aborting handshake before sending payload (possible TSPU active spoofing / MITM or untrusted certificate).",
+                "[TLS Anti-Spoof] Peer certificate verification failed at depth {} ({:?}): aborting handshake before sending payload (possible TSPU active spoofing / MITM or untrusted certificate).",
                 x509_ctx.error_depth(),
-                x509_ctx.error()
+                x509_ctx.verify_result()
             );
         }
         preverify_ok
