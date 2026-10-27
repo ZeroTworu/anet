@@ -255,6 +255,33 @@ pub extern "system" fn Java_org_alco_anet_MainActivity_inspectConfig(
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_org_alco_anet_MainActivity_fetchConfigFromUrl(
+    mut env: JNIEnv,
+    _this: JObject,
+    url_jstr: JString,
+) -> jni::sys::jstring {
+    let url: String = match env.get_string(&url_jstr) {
+        Ok(s) => s.into(),
+        Err(error) => return env.new_string(format!("ERROR\n{error}")).unwrap().into_raw(),
+    };
+
+    let rt = {
+        let mut rt_guard = RUNTIME.lock().unwrap();
+        if rt_guard.is_none() {
+            *rt_guard = Some(Runtime::new().unwrap());
+        }
+        rt_guard.as_ref().unwrap().handle().clone()
+    };
+
+    let result = match rt.block_on(Updater::fetch_config_from_url(&url)) {
+        Ok(content) => format!("OK\n{content}"),
+        Err(error) => format!("ERROR\n{error}"),
+    };
+
+    env.new_string(result).unwrap().into_raw()
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_alco_anet_MainActivity_getVpnStateCode(
     _env: JNIEnv,
     _this: JObject,
