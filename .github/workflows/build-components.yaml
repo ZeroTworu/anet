@@ -78,7 +78,12 @@ jobs:
 
       # 1. Сборка Linux бинарников со встроенным eBPF (Static MUSL)
       - name: "Build Linux Binaries (Musl)"
+        env:
+          CXX_x86_64_unknown_linux_musl: g++
+          CXXFLAGS_x86_64_unknown_linux_musl: "-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0"
+          BORING_BSSL_RUST_CPPLIB_x86_64_unknown_linux_musl: c
         run: |
+          cargo update -p rtc-turn -p reqwest-boring
           RUSTFLAGS="-C target-feature=+crt-static" cargo build --release --package anet-server --target x86_64-unknown-linux-musl
           RUSTFLAGS="-C target-feature=+crt-static" cargo build --release --package anet-auth --target x86_64-unknown-linux-musl
           RUSTFLAGS="-C target-feature=+crt-static" cargo build --release --package anet-keygen --target x86_64-unknown-linux-musl
@@ -150,15 +155,21 @@ jobs:
 
       # Сборка AMD64 (x86_64)
       - name: "Build Client (AMD64)"
+        env:
+          CXX_x86_64_unknown_linux_musl: g++
+          CXXFLAGS_x86_64_unknown_linux_musl: "-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0"
+          BORING_BSSL_RUST_CPPLIB_x86_64_unknown_linux_musl: c
         run: |
+          cargo update -p rtc-turn -p reqwest-boring
           RUSTFLAGS="-C target-feature=+crt-static" cargo build --release --package anet-client-cli --target x86_64-unknown-linux-musl
 
       # Сборка ARM64 (aarch64) в готовом musl cross-окружении.
       - name: "Build Client (ARM64)"
         run: |
+          cargo update -p rtc-turn -p reqwest-boring
           GOROOT_DIR="$(go env GOROOT)"
-          CROSS_CONTAINER_OPTS="-e CI=true -e BORING_BSSL_RUST_CPPLIB_aarch64_unknown_linux_musl=c -v ${GOROOT_DIR}:/usr/local/go -e PATH=/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
-          cross build --locked --release --package anet-client-cli --target aarch64-unknown-linux-musl
+          CROSS_CONTAINER_OPTS="-e CI=true -e BORING_BSSL_RUST_CPPLIB_aarch64_unknown_linux_musl=c -e BORING_BSSL_SYSROOT_aarch64_unknown_linux_musl=/usr/local/aarch64-linux-musl -v ${GOROOT_DIR}:/usr/local/go -e PATH=/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+          cross build --release --package anet-client-cli --target aarch64-unknown-linux-musl
 
       # Загрузка артефакта AMD64
       - uses: "actions/upload-artifact@v6"
@@ -227,7 +238,9 @@ jobs:
           Remove-Item "windivert_sdk_raw", "windivert.zip" -Recurse -Force
 
       - name: "Build Client (CLI) (Windows)"
-        run: "cargo build --release --package anet-client-cli --features per-app"
+        run: |
+          cargo update -p rtc-turn -p reqwest-boring
+          cargo build --release --package anet-client-cli --features per-app
 
       - uses: "actions/upload-artifact@v6"
         with:
@@ -290,7 +303,9 @@ jobs:
 
       # Сборка CLI (Intel + ARM)
       - name: "Build CLI (x86_64)"
-        run: cargo build --release --package anet-client-cli --target x86_64-apple-darwin
+        run: |
+          cargo update -p rtc-turn -p reqwest-boring
+          cargo build --release --package anet-client-cli --target x86_64-apple-darwin
 
       - name: "Build CLI (aarch64)"
         run: cargo build --release --package anet-client-cli --target aarch64-apple-darwin
@@ -667,6 +682,7 @@ jobs:
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: |
+          cargo update -p rtc-turn -p reqwest-boring
           cargo ndk -t aarch64-linux-android -t armv7-linux-androideabi -o ./jniLibs build --release -p anet-mobile
 
       - uses: "actions/upload-artifact@v6"
@@ -836,6 +852,7 @@ jobs:
 
       - name: "Build GUI Client"
         run: |
+          cargo update -p rtc-turn -p reqwest-boring
           cargo build --release --package anet-client-gui
 
       - name: "Upload raw binary"

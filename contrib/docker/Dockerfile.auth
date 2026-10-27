@@ -7,7 +7,7 @@ RUN apt-get update && apt-get install -y pkg-config libssl-dev protobuf-compiler
 COPY . .
 
 # Собираем только наш бэкенд авторизации
-RUN cargo build --release --package anet-auth
+RUN cargo update -p rtc-turn -p reqwest-boring && cargo build --release --package anet-auth
 
 # Stage 2: Run in minimal container
 FROM debian:bookworm-slim
