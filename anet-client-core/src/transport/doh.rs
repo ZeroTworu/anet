@@ -6,6 +6,7 @@ use anet_common::base32;
 use anet_common::dns_proto::{build_doh_query, parse_dns_txt_response};
 use anet_common::doh_chunking::{calculate_max_chunk_payload, split_into_chunks};
 use anet_common::handshake_fragmentation::FragmentConfig;
+use anet_common::http_help::BrowserProfile;
 use anet_common::stream_framing::{frame_packet_into, read_next_packet};
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
@@ -770,6 +771,7 @@ async fn process_downlink_dns_body(
 struct ResolverPool {
     urls: Vec<String>,
     udp_targets: Vec<Option<std::net::SocketAddr>>,
+    profile: BrowserProfile,
     cooldown_until_ms: Vec<AtomicU64>,
     ema_rtt_ms: Vec<AtomicU64>,
     total_sent: Vec<AtomicU64>,
@@ -778,7 +780,11 @@ struct ResolverPool {
 }
 
 impl ResolverPool {
-    fn new(urls: Vec<String>, udp_targets: Vec<Option<std::net::SocketAddr>>) -> Self {
+    fn new(
+        urls: Vec<String>,
+        udp_targets: Vec<Option<std::net::SocketAddr>>,
+        profile: BrowserProfile,
+    ) -> Self {
         let n = urls.len();
         let cooldown_until_ms = (0..n).map(|_| AtomicU64::new(0)).collect();
         let ema_rtt_ms = (0..n).map(|_| AtomicU64::new(120)).collect();
@@ -787,16 +793,13 @@ impl ResolverPool {
         Self {
             urls,
             udp_targets,
+            profile,
             cooldown_until_ms,
             ema_rtt_ms,
             total_sent,
             total_failed,
             cursor: AtomicUsize::new(0),
         }
-    }
-
-    fn len(&self) -> usize {
-        self.urls.len()
     }
 
     /// Computes a composite Least-Loss / Least-Latency score (`ema_rtt_ms * (1 + 8 * loss_rate)`).
@@ -972,8 +975,9 @@ impl ResolverPool {
             resolver_url.to_string()
         };
 
-        let req = client
-            .post(&http_url)
+        let req = self
+            .profile
+            .apply_to_reqwest(client.post(&http_url), None, None)
             .timeout(attempt_timeout)
             .header("Content-Type", "application/dns-message")
             .header("Accept", "application/dns-message")
@@ -1300,7 +1304,14 @@ impl ClientTransport for DohTransport {
             udp_targets.push(resolved_udp);
         }
 
-        let mut tx_builder = Client::builder()
+        let tls_cfg = self.server.effective_tls_config(&self.config.stealth);
+        anet_common::boring_tls::set_default_tls_config(tls_cfg.clone());
+        let profile = BrowserProfile::with_tls_config(tls_cfg);
+
+        let tx_cookie_jar = Arc::new(reqwest::cookie::Jar::default());
+        let mut tx_builder = profile
+            .build_reqwest_builder(tx_cookie_jar)
+            .context("Failed to initialize BoringSSL TX client builder for DoH")?
             .pool_max_idle_per_host(32)
             .pool_idle_timeout(Some(Duration::from_secs(60)))
             .tcp_nodelay(true)
@@ -1309,7 +1320,10 @@ impl ClientTransport for DohTransport {
             .http2_adaptive_window(true)
             .local_address(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
 
-        let mut rx_builder = Client::builder()
+        let rx_cookie_jar = Arc::new(reqwest::cookie::Jar::default());
+        let mut rx_builder = profile
+            .build_reqwest_builder(rx_cookie_jar)
+            .context("Failed to initialize BoringSSL RX client builder for DoH")?
             .pool_max_idle_per_host(16)
             .pool_idle_timeout(Some(Duration::from_secs(60)))
             .tcp_nodelay(true)
@@ -1335,7 +1349,7 @@ impl ClientTransport for DohTransport {
         let hs_max_payload = max_payload.saturating_sub(24).max(32);
         let temp_session_id = rand::random::<u32>() | 0x80000000;
 
-        let resolver_pool = Arc::new(ResolverPool::new(resolvers.clone(), udp_targets));
+        let resolver_pool = Arc::new(ResolverPool::new(resolvers.clone(), udp_targets, profile));
 
         let auth_channel = DohAuthChannel {
             client: tx_http_client.clone(),
