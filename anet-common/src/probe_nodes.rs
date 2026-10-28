@@ -22,7 +22,7 @@ use prost::Message as ProstMessage;
 use rand::RngCore;
 use rand::rngs::OsRng;
 use russh::client::Handler;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::future::ready;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -93,6 +93,7 @@ pub struct ProbeTarget {
     pub endpoint_index: usize,
     pub group_id: String,
     pub group_name: String,
+    pub server_name: String,
     pub protocol: ProbeProtocol,
     pub dsn: String,
     pub host_port: String,
@@ -107,6 +108,7 @@ pub struct EndpointProbeResult {
     pub endpoint_index: usize,
     pub group_id: String,
     pub group_name: String,
+    pub server_name: String,
     pub protocol: ProbeProtocol,
     pub status: NodeProbeStatus,
     /// Чистый сетевой 1-RTT пинг без учёта времени установки TCP/TLS/SSH/RFB-сессии
@@ -118,6 +120,7 @@ pub struct EndpointProbeResult {
 
 #[derive(Debug, Clone)]
 pub struct ProtocolBadgeStatus {
+    pub name: String,
     pub protocol: ProbeProtocol,
     pub status: NodeProbeStatus,
     pub rtt_ms: Option<u32>,
@@ -196,52 +199,59 @@ impl NodeGroupProbeSummary {
         }
         if self.total_endpoints <= 1 && self.protocols.len() == 1 {
             let p = &self.protocols[0];
+            let label = if !p.name.trim().is_empty()
+                && !p.name.trim().eq_ignore_ascii_case(self.group_name.trim())
+            {
+                p.name.trim()
+            } else {
+                p.protocol.as_str()
+            };
             return match p.status {
                 NodeProbeStatus::Available | NodeProbeStatus::Degraded => {
                     if let (Some(full), Some(pure)) = (p.full_rtt_ms, p.rtt_ms) {
                         format!(
                             "{} • полный {} мс / чистый {} мс",
-                            p.protocol.as_str(),
+                            label,
                             full.max(pure),
                             pure
                         )
                     } else if let Some(pure) = p.rtt_ms {
-                        format!("{} • {} мс", p.protocol.as_str(), pure)
+                        format!("{} • {} мс", label, pure)
                     } else {
-                        format!("{} • доступен", p.protocol.as_str())
+                        format!("{} • доступен", label)
                     }
                 }
                 NodeProbeStatus::Unavailable => {
-                    format!("{} • транспорт недоступен", p.protocol.as_str())
+                    format!("{} • транспорт недоступен", label)
                 }
                 NodeProbeStatus::Checking => {
-                    format!("{} • проверка узла...", p.protocol.as_str())
+                    format!("{} • проверка узла...", label)
                 }
             };
         }
 
         let mut parts = Vec::with_capacity(self.protocols.len());
         for p in &self.protocols {
+            let label = if !p.name.trim().is_empty() {
+                p.name.trim()
+            } else {
+                p.protocol.as_str()
+            };
             match p.status {
                 NodeProbeStatus::Available | NodeProbeStatus::Degraded => {
                     if let (Some(full), Some(pure)) = (p.full_rtt_ms, p.rtt_ms) {
-                        parts.push(format!(
-                            "{}: {}/{} мс",
-                            p.protocol.as_str(),
-                            full.max(pure),
-                            pure
-                        ));
+                        parts.push(format!("{}: {}/{} мс", label, full.max(pure), pure));
                     } else if let Some(pure) = p.rtt_ms {
-                        parts.push(format!("{}: {} мс", p.protocol.as_str(), pure));
+                        parts.push(format!("{}: {} мс", label, pure));
                     } else {
-                        parts.push(format!("{}: OK", p.protocol.as_str()));
+                        parts.push(format!("{}: OK", label));
                     }
                 }
                 NodeProbeStatus::Unavailable => {
-                    parts.push(format!("{}: недоступен", p.protocol.as_str()));
+                    parts.push(format!("{}: недоступен", label));
                 }
                 NodeProbeStatus::Checking => {
-                    parts.push(format!("{}: ...", p.protocol.as_str()));
+                    parts.push(format!("{}: ...", label));
                 }
             }
         }
@@ -494,12 +504,25 @@ async fn measure_tcp_connect_rtt(host_port: &str, max_wait: Duration) -> Option<
 }
 
 async fn measure_host_pure_rtt(addr: SocketAddr, max_wait: Duration) -> Option<u32> {
-    for port in [addr.port(), 443, 22] {
+    let mut ports = vec![addr.port(), 443, 22, 80];
+    ports.dedup();
+    let mut futs = FuturesUnordered::new();
+    for port in ports {
         let candidate = SocketAddr::new(addr.ip(), port);
-        let started = Instant::now();
-        if let Ok(Ok(stream)) = timeout(max_wait, TcpStream::connect(candidate)).await {
-            let rtt = started.elapsed().as_millis().max(1) as u32;
-            drop(stream);
+        futs.push(async move {
+            let started = Instant::now();
+            match timeout(max_wait, TcpStream::connect(candidate)).await {
+                Ok(Ok(stream)) => {
+                    let rtt = started.elapsed().as_millis().max(1) as u32;
+                    drop(stream);
+                    Some(rtt)
+                }
+                _ => None,
+            }
+        });
+    }
+    while let Some(res) = futs.next().await {
+        if let Some(rtt) = res {
             return Some(rtt);
         }
     }
@@ -517,12 +540,18 @@ async fn probe_quic(target: &ProbeTarget, timeout_dur: Duration) -> Result<(u32,
     socket.connect(addr).await?;
 
     let (probe_pkt, expected_nonce) = build_transport_probe_packet(&target.server_pub_key)?;
+    let frag_cfg = FragmentConfig::default();
     let mut recv_buf = [0u8; 2048];
 
-    // 1. Быстрая попытка через легковесный TransportProbeRequest (116 байт >= MIN_HANDSHAKE_LEN)
+    // 1. Быстрая попытка через легковесный TransportProbeRequest (с 2-байтным заголовком [0, 1] для DatagramReassembler)
     let full_started = Instant::now();
     let pure_started = Instant::now();
-    socket.send(&probe_pkt).await?;
+    send_fragmented_datagrams(&probe_pkt, &frag_cfg, |frag| {
+        let s = &socket;
+        async move { s.send(&frag).await.map(|_| ()) }
+    })
+    .await?;
+
     let fast_wait = Duration::from_millis(340).min(timeout_dur / 3);
     if let Ok(Ok(len)) = timeout(fast_wait, socket.recv(&mut recv_buf)).await {
         let first_rtt = pure_started.elapsed().as_millis().max(1) as u32;
@@ -537,7 +566,13 @@ async fn probe_quic(target: &ProbeTarget, timeout_dur: Duration) -> Result<(u32,
             let mut best_pure_rtt = first_rtt;
             if let Ok((pkt2, nonce2)) = build_transport_probe_packet(&target.server_pub_key) {
                 let warm_started = Instant::now();
-                if socket.send(&pkt2).await.is_ok() {
+                if send_fragmented_datagrams(&pkt2, &frag_cfg, |frag| {
+                    let s = &socket;
+                    async move { s.send(&frag).await.map(|_| ()) }
+                })
+                .await
+                .is_ok()
+                {
                     if let Ok(Ok(len2)) =
                         timeout(Duration::from_millis(400), socket.recv(&mut recv_buf)).await
                     {
@@ -546,7 +581,7 @@ async fn probe_quic(target: &ProbeTarget, timeout_dur: Duration) -> Result<(u32,
                             &recv_buf[..len2],
                             &nonce2,
                         )
-                            .is_ok()
+                        .is_ok()
                         {
                             let warm_rtt = warm_started.elapsed().as_millis().max(1) as u32;
                             best_pure_rtt = best_pure_rtt.min(warm_rtt);
@@ -567,7 +602,7 @@ async fn probe_quic(target: &ProbeTarget, timeout_dur: Duration) -> Result<(u32,
     }
 
     // 2. Fallback для серверов на базе `master` (где поддерживается только DhClientExchange):
-    // параллельно замеряем чистый 1-RTT до хоста и отправляем эфемерный DhClientExchange.
+    // параллельно замеряем чистый 1-RTT до хоста и отправляем эфемерный DhClientExchange через send_fragmented_datagrams.
     let dh_pkt = build_dh_probe_packet(&target.server_pub_key)?;
     let rem_timeout = timeout_dur
         .checked_sub(full_started.elapsed())
@@ -579,7 +614,11 @@ async fn probe_quic(target: &ProbeTarget, timeout_dur: Duration) -> Result<(u32,
     let dh_fut = async {
         for attempt in 0..2 {
             let dh_started = Instant::now();
-            socket.send(&dh_pkt).await?;
+            send_fragmented_datagrams(&dh_pkt, &frag_cfg, |frag| {
+                let s = &socket;
+                async move { s.send(&frag).await.map(|_| ()) }
+            })
+            .await?;
             match timeout(per_dh_attempt, socket.recv(&mut recv_buf)).await {
                 Ok(Ok(len)) => {
                     let dh_rtt = dh_started.elapsed().as_millis().max(1) as u32;
@@ -1044,6 +1083,7 @@ pub async fn probe_single_target(
             endpoint_index: target.endpoint_index,
             group_id: target.group_id.clone(),
             group_name: target.group_name.clone(),
+            server_name: target.server_name.clone(),
             protocol: target.protocol,
             status: NodeProbeStatus::Available,
             rtt_ms: Some(pure_rtt_ms),
@@ -1054,6 +1094,7 @@ pub async fn probe_single_target(
             endpoint_index: target.endpoint_index,
             group_id: target.group_id.clone(),
             group_name: target.group_name.clone(),
+            server_name: target.server_name.clone(),
             protocol: target.protocol,
             status: NodeProbeStatus::Unavailable,
             rtt_ms: None,
@@ -1070,6 +1111,7 @@ pub fn build_initial_snapshot(targets: &[ProbeTarget]) -> NodeProbeSnapshot {
             endpoint_index: t.endpoint_index,
             group_id: t.group_id.clone(),
             group_name: t.group_name.clone(),
+            server_name: t.server_name.clone(),
             protocol: t.protocol,
             status: NodeProbeStatus::Checking,
             rtt_ms: None,
@@ -1112,6 +1154,7 @@ where
             endpoint_index: t.endpoint_index,
             group_id: t.group_id.clone(),
             group_name: t.group_name.clone(),
+            server_name: t.server_name.clone(),
             protocol: t.protocol,
             status: NodeProbeStatus::Checking,
             rtt_ms: None,
@@ -1225,52 +1268,25 @@ fn aggregate_groups(
             NodeProbeStatus::Unavailable
         };
 
-        let mut by_proto: BTreeMap<ProbeProtocol, Vec<&EndpointProbeResult>> = BTreeMap::new();
+        let mut protocols = Vec::with_capacity(group_eps.len());
         for ep in &group_eps {
-            by_proto.entry(ep.protocol).or_default().push(ep);
-        }
-
-        let mut protocols = Vec::with_capacity(by_proto.len());
-        for (proto, items) in by_proto {
-            let p_total = items.len();
-            let p_any_checking = items
-                .iter()
-                .any(|i| i.status == NodeProbeStatus::Checking);
-            let p_ok = items
-                .iter()
-                .filter(|i| i.status == NodeProbeStatus::Available)
-                .count();
-            let best_proto_ep = items
-                .iter()
-                .filter(|i| i.status == NodeProbeStatus::Available && i.rtt_ms.is_some())
-                .min_by_key(|i| i.rtt_ms.unwrap_or(u32::MAX));
-            let p_rtt = best_proto_ep.and_then(|i| i.rtt_ms);
-            let p_full_rtt = best_proto_ep
-                .and_then(|i| i.full_rtt_ms)
-                .or_else(|| items.iter().filter_map(|i| i.full_rtt_ms).min());
-
-            let p_status = if global_is_checking && p_any_checking {
+            let p_status = if global_is_checking && ep.status == NodeProbeStatus::Checking {
                 NodeProbeStatus::Checking
-            } else if p_ok == p_total {
-                NodeProbeStatus::Available
-            } else if p_ok > 0 {
-                NodeProbeStatus::Degraded
             } else {
-                NodeProbeStatus::Unavailable
+                ep.status
             };
-            let detail = items
-                .iter()
-                .find(|i| i.status == NodeProbeStatus::Available)
-                .or_else(|| items.first())
-                .map(|i| i.detail.clone())
-                .unwrap_or_default();
-
+            let ep_name = if !ep.server_name.trim().is_empty() {
+                ep.server_name.trim().to_string()
+            } else {
+                ep.protocol.as_str().to_string()
+            };
             protocols.push(ProtocolBadgeStatus {
-                protocol: proto,
+                name: ep_name,
+                protocol: ep.protocol,
                 status: p_status,
-                rtt_ms: p_rtt,
-                full_rtt_ms: p_full_rtt,
-                detail,
+                rtt_ms: ep.rtt_ms,
+                full_rtt_ms: ep.full_rtt_ms,
+                detail: ep.detail.clone(),
             });
         }
 
@@ -1475,10 +1491,15 @@ pub fn extract_probe_targets_from_toml(raw_toml: &str) -> Vec<ProbeTarget> {
             (unique_id, fallback_name)
         };
 
+        let server_name = name
+            .clone()
+            .unwrap_or_else(|| protocol.as_str().to_string());
+
         targets.push(ProbeTarget {
             endpoint_index: idx,
             group_id,
             group_name,
+            server_name,
             protocol,
             dsn,
             host_port,

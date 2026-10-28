@@ -1,7 +1,9 @@
 use crate::config::ConnectivityConfig;
+use crate::http_help::BrowserProfile;
 use futures::future::join_all;
 use serde::{Deserialize, Serialize};
-use std:: collections::VecDeque;
+use std::collections::VecDeque;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Цветовой код линейного индикатора пульса и щита состояния сети.
@@ -282,24 +284,37 @@ pub struct ProbeGroupResult {
 #[derive(Clone)]
 pub struct ConnectivityProber {
     client: reqwest::Client,
+    profile: BrowserProfile,
     config: ConnectivityConfig,
 }
 
 impl ConnectivityProber {
     pub fn new(config: ConnectivityConfig) -> Self {
         let timeout = Duration::from_millis(config.timeout_ms.clamp(500, 15_000));
-        let client = reqwest::Client::builder()
-            .timeout(timeout)
-            .connect_timeout(timeout)
-            .redirect(reqwest::redirect::Policy::none())
-            .pool_max_idle_per_host(2)
-            .pool_idle_timeout(Duration::from_secs(90))
-            .danger_accept_invalid_certs(true)
-            .user_agent("Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/126.0.0.0")
-            .build()
+        let mut tls_cfg = crate::boring_tls::get_default_tls_config();
+        tls_cfg.verify_peer = false;
+        let profile = BrowserProfile::with_tls_config(tls_cfg);
+        let cookie_jar = Arc::new(reqwest::cookie::Jar::default());
+
+        let client = profile
+            .build_reqwest_builder(cookie_jar)
+            .and_then(|builder| {
+                Ok(builder
+                    .timeout(timeout)
+                    .connect_timeout(timeout)
+                    .redirect(reqwest::redirect::Policy::none())
+                    .pool_max_idle_per_host(2)
+                    .pool_idle_timeout(Duration::from_secs(90))
+                    .no_proxy()
+                    .build()?)
+            })
             .unwrap_or_else(|_| reqwest::Client::new());
 
-        Self { client, config }
+        Self {
+            client,
+            profile,
+            config,
+        }
     }
 
     pub fn config(&self) -> &ConnectivityConfig {
@@ -327,7 +342,7 @@ impl ConnectivityProber {
 
         let futures = targets
             .iter()
-            .map(|url| probe_single_target(&self.client, url));
+            .map(|url| probe_single_target(&self.client, &self.profile, url));
         let results = join_all(futures).await;
 
         let mut ok_count = 0usize;
@@ -349,13 +364,17 @@ impl ConnectivityProber {
     }
 }
 
-async fn probe_single_target(client: &reqwest::Client, target: &str) -> Option<u64> {
+async fn probe_single_target(
+    client: &reqwest::Client,
+    profile: &BrowserProfile,
+    target: &str,
+) -> Option<u64> {
     let trimmed = target.trim();
     if trimmed.is_empty() {
         return None;
     }
 
-    if let Some(rtt) = probe_url_once(client, trimmed).await {
+    if let Some(rtt) = probe_url_once(client, profile, trimmed).await {
         return Some(rtt);
     }
 
@@ -363,20 +382,20 @@ async fn probe_single_target(client: &reqwest::Client, target: &str) -> Option<u
     // зарубежные выходные IP (например, при включённом VPN через Нидерланды/Финляндию),
     // страхуем её проверкой dzen.ru, чтобы индикатор РФ 3/3 не ловил ложный серый сегмент.
     if trimmed.contains("gosuslugi.ru") {
-        return probe_url_once(client, "https://dzen.ru").await;
+        return probe_url_once(client, profile, "https://dzen.ru").await;
     }
 
     None
 }
 
-async fn probe_url_once(client: &reqwest::Client, url: &str) -> Option<u64> {
+async fn probe_url_once(
+    client: &reqwest::Client,
+    profile: &BrowserProfile,
+    url: &str,
+) -> Option<u64> {
     let start = Instant::now();
-    let resp = client
-        .get(url)
-        .header("Cache-Control", "no-cache, no-store")
-        .send()
-        .await
-        .ok()?;
+    let req = profile.apply_to_reqwest(client.get(url), None, None);
+    let resp = req.send().await.ok()?;
 
     // Любой осмысленный HTTP-ответ от целевого сервера (2xx, 3xx, 401/403/404)
     // подтверждает успешное прохождение DNS + TCP + TLS хендшейка.
@@ -388,20 +407,15 @@ async fn probe_url_once(client: &reqwest::Client, url: &str) -> Option<u64> {
         // сразу делаем короткий повторный запрос по уже прогретому keep-alive сокету,
         // чтобы «Пульс канала» показывал чистый 1-RTT, а не сумму 3×RTT рукопожатий.
         if first_ms > 90 {
-            let warm_start = Instant::now();
-            if let Ok(Ok(warm_resp)) = tokio::time::timeout(
-                Duration::from_millis(900),
-                client
-                    .get(url)
-                    .header("Cache-Control", "no-cache, no-store")
-                    .send(),
-            )
-            .await
+            let warm_started = Instant::now();
+            let warm_req = profile.apply_to_reqwest(client.get(url), None, None);
+            if let Ok(Ok(warm_resp)) =
+                tokio::time::timeout(Duration::from_millis(900), warm_req.send()).await
             {
                 let warm_status = warm_resp.status().as_u16();
                 let _ = warm_resp.bytes().await;
                 if (100..600).contains(&warm_status) {
-                    let warm_ms = (warm_start.elapsed().as_millis() as u64).max(1);
+                    let warm_ms = (warm_started.elapsed().as_millis() as u64).max(1);
                     return Some(first_ms.min(warm_ms));
                 }
             }

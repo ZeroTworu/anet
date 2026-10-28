@@ -61,8 +61,13 @@ fn render_group_probe_tooltip(ui: &mut egui::Ui, summary: &NodeGroupProbeSummary
                 let (p_rect, _) =
                     ui.allocate_exact_size(egui::vec2(7.0, 7.0), egui::Sense::hover());
                 ui.painter().circle_filled(p_rect.center(), 3.5, p_color);
+                let display_label = if !proto.name.trim().is_empty() {
+                    proto.name.trim()
+                } else {
+                    proto.protocol.as_str()
+                };
                 ui.label(
-                    egui::RichText::new(format!("{:<5}", proto.protocol.as_str()))
+                    egui::RichText::new(display_label)
                         .size(11.0)
                         .color(title_color),
                 );
@@ -334,7 +339,10 @@ pub fn render_node_selector(app: &mut ANetApp, ui: &mut egui::Ui, state: Connect
         );
 
         let badge_text = if state == ConnectionState::Connected
-            && raw_selected_status == NodeProbeStatus::Unavailable
+            && matches!(
+                raw_selected_status,
+                NodeProbeStatus::Unavailable | NodeProbeStatus::Checking
+            )
         {
             app.connectivity_snapshot
                 .display_rtt_ms

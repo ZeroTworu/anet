@@ -787,7 +787,7 @@ pub extern "system" fn Java_org_alco_anet_MainActivity_startConnectivityMonitor(
     });
 }
 
-/// Принудительно запускает внеочередную проверку контрольных точек связности.
+/// Принудительно запускает внеочередную проверку внешних контрольных точек связности (РФ / Мир).
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_org_alco_anet_MainActivity_triggerConnectivityCheck(
     _env: JNIEnv,
@@ -796,6 +796,16 @@ pub extern "system" fn Java_org_alco_anet_MainActivity_triggerConnectivityCheck(
     let rt = get_or_init_runtime_handle();
     let _guard = rt.enter();
     anet_client_core::connectivity_monitor::ConnectivityMonitor::trigger_check_now();
+}
+
+/// Принудительно запускает внеочередную проверку пинга и доступности узлов VPN.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_alco_anet_MainActivity_triggerNodeProbe(
+    _env: JNIEnv,
+    _this: JObject,
+) {
+    let rt = get_or_init_runtime_handle();
+    let _guard = rt.enter();
     anet_client_core::connectivity_monitor::NodeProbeMonitor::trigger_probe_now();
 }
 

@@ -23,7 +23,7 @@ aead = { version = "0.5.2", features = ["getrandom"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = "1.0"
 toml = { workspace = true }
-reqwest = { workspace = true, features = ["json", "rustls"] }
+reqwest = { workspace = true }
 tokio-tungstenite = { workspace = true }
 rand = {workspace = true}
 x25519-dalek = {workspace = true}
