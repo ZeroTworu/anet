@@ -34,9 +34,55 @@ on:
         value: ${{ jobs.build-macos-client.outputs.artifact }}
 
 jobs:
+  test:
+    name: "Run Unit Tests"
+    runs-on: "ubuntu-latest"
+    steps:
+      - uses: "actions/checkout@v4"
+
+      - name: "Install Go (Required for BoringSSL)"
+        uses: actions/setup-go@v5
+        with:
+          go-version: '>=1.20'
+
+      - name: "Install dependencies"
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler cmake clang
+
+      - name: "Install Rust Stable"
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: "Install Rust Nightly (for anet-ebpf)"
+        run: |
+          rustup toolchain install nightly --component rust-src
+
+      - name: "Install bpf-linker"
+        uses: taiki-e/install-action@v2
+        with:
+          tool: bpf-linker
+
+      - name: "Cache Rust dependencies"
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-tests-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-tests-
+            ${{ runner.os }}-cargo-server-full-
+
+      - name: "Run Workspace Unit Tests"
+        run: |
+          cargo update -p rtc-turn -p reqwest-boring
+          cargo test --package anet-common --package anet-filter-core --package anet-client-core --package anet-client-cli --package anet-server --package anet-auth --package anet-keygen --package anet-ebpf-common
+
   build-linux-server:
     name: "Build Linux Server & Tools"
     runs-on: "ubuntu-latest"
+    needs: "test"
     steps:
       - uses: "actions/checkout@v4"
 
@@ -114,6 +160,7 @@ jobs:
   build-linux-client:
     name: "Build Linux Client (AMD64 & ARM64)"
     runs-on: "ubuntu-latest"
+    needs: "test"
     steps:
       - uses: "actions/checkout@v6"
 
@@ -187,6 +234,7 @@ jobs:
   build-windows-client:
     name: "Build Windows Client"
     runs-on: "windows-latest"
+    needs: "test"
     steps:
       - uses: "actions/checkout@v6"
 
@@ -273,6 +321,7 @@ jobs:
   build-macos-client:
     name: "Build macOS Client (Universal)"
     runs-on: "macos-latest"
+    needs: "test"
     steps:
       - uses: "actions/checkout@v6"
 
@@ -638,6 +687,7 @@ jobs:
   build-android-libs:
     name: "Build Rust for Android"
     runs-on: "ubuntu-latest"
+    needs: "test"
     steps:
       - uses: "actions/checkout@v6"
 
@@ -754,6 +804,7 @@ jobs:
   build-push-webui-docker:
     name: "Build & Push WebUI to GHCR"
     runs-on: "ubuntu-latest"
+    needs: "test"
     permissions:
       contents: read
       packages: write
@@ -788,6 +839,7 @@ jobs:
   build-push-auth-docker:
     name: "Build & Push Auth Backend to GHCR"
     runs-on: "ubuntu-latest"
+    needs: "test"
     permissions:
       contents: read
       packages: write
@@ -821,6 +873,7 @@ jobs:
   build-linux-gui:
     name: "Build Linux GUI Client (Amd64)"
     runs-on: "ubuntu-latest"
+    needs: "test"
     steps:
       - uses: "actions/checkout@v6"
 
