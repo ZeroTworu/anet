@@ -1,4 +1,6 @@
-pub use anet_common::config::{ConnectivityConfig, StealthConfig, WrtcConfig};
+pub use anet_common::config::{
+    BrowserProfileConfig, ConnectivityConfig, StealthConfig, WrtcConfig,
+};
 use anet_common::quic_settings::QuicConfig;
 use serde::{Deserialize, Serialize};
 
@@ -482,10 +484,10 @@ impl Default for AhttpConfig {
             reassembly_queue_max_size: 1024,
 
             http2_adaptive_window: false,
-            http2_initial_stream_window_size: Some(6_291_456),
-            http2_initial_connection_window_size: Some(15_728_640),
+            http2_initial_stream_window_size: None,
+            http2_initial_connection_window_size: None,
             http2_max_frame_size: None,
-            http2_max_header_list_size: Some(262_144),
+            http2_max_header_list_size: None,
             http2_keep_alive_interval_secs: Some(20),
             http2_keep_alive_timeout_secs: Some(10),
             http2_keep_alive_while_idle: true,
@@ -539,6 +541,9 @@ pub struct CoreConfig {
 
     #[serde(default)]
     pub connectivity: ConnectivityConfig,
+
+    #[serde(default)]
+    pub browser_profiles: Vec<BrowserProfileConfig>,
 }
 
 impl CoreConfig {
@@ -605,6 +610,9 @@ impl CoreConfig {
         }
 
         anet_common::boring_tls::set_default_tls_config(self.stealth.to_tls_client_config());
+        if !self.browser_profiles.is_empty() {
+            anet_common::boring_tls::set_browser_profiles(self.browser_profiles.clone());
+        }
 
         Ok(())
     }
@@ -725,5 +733,44 @@ mod tests {
             ws_with_query.websocket_url().unwrap(),
             "wss://node2.example.com/socket"
         );
+    }
+
+    #[test]
+    fn browser_profiles_toml_deserialization() {
+        use super::CoreConfig;
+
+        let toml_str = r#"
+            [[servers]]
+            name = "Node 1"
+            dsn = "https://node1.example.com/api/v2/telemetry"
+
+            [[browser_profiles]]
+            name = "Chrome"
+            grease = true
+            permute_extensions = true
+            session_ticket = true
+            ocsp_stapling = true
+            signed_cert_timestamps = true
+            ech_grease = true
+            alps_h2 = true
+            cert_compression = ["brotli"]
+            user_agents = ["CustomUA/1.0"]
+            headers = ["Accept-Language: ru-RU,ru;q=0.9"]
+            ws_headers_order = ["Host", "Upgrade", "Connection"]
+            h2_initial_stream_window_size = 6291456
+            h2_initial_connection_window_size = 15728640
+            h2_max_header_list_size = 262144
+        "#;
+
+        let mut cfg: CoreConfig = toml::from_str(toml_str).unwrap();
+        cfg.sanitize().unwrap();
+        assert_eq!(cfg.browser_profiles.len(), 1);
+        assert_eq!(cfg.browser_profiles[0].name, "Chrome");
+        assert_eq!(cfg.browser_profiles[0].cert_compression, vec!["brotli"]);
+        assert_eq!(
+            cfg.browser_profiles[0].h2_initial_stream_window_size,
+            Some(6_291_456)
+        );
+        anet_common::boring_tls::set_browser_profiles(Vec::new());
     }
 }

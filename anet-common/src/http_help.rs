@@ -1,23 +1,29 @@
 use crate::boring_tls::{
-    build_ssl_connector_with_config, connect_ws_tls_with_config, get_default_tls_config,
-    TlsClientConfig, TlsFingerprint,
+    build_ssl_connector_with_config, connect_ws_tls_with_config, get_browser_profile_override,
+    get_default_tls_config, TlsClientConfig, TlsFingerprint,
 };
-use http::{HeaderValue, Request};
+use http::{HeaderMap, HeaderName, HeaderValue, Request};
 use rand::seq::SliceRandom;
 use rand::Rng;
 use std::net::{IpAddr, SocketAddr};
+use std::str::FromStr;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
-/// Профиль браузера, жёстко синхронизирующий L7 (HTTP/1.1, HTTP/2, WebSocket заголовки)
+/// Профиль браузера, жёстко синхронизирующий L7 (HTTP/1.1, HTTP/2 SETTINGS, WebSocket заголовки)
 /// и L4 (TLS-отпечаток BoringSSL ClientHello и защиту от активного спуфинга ТСПУ).
 #[derive(Debug, Clone)]
 pub struct BrowserProfile {
-    pub user_agent: &'static str,
-    pub sec_ch_ua: Option<&'static str>,
-    pub sec_ch_ua_mobile: &'static str,
-    pub sec_ch_ua_platform: &'static str,
-    pub accept_language: &'static str,
-    pub accept_encoding: &'static str,
+    pub user_agent: String,
+    pub sec_ch_ua: Option<String>,
+    pub sec_ch_ua_mobile: String,
+    pub sec_ch_ua_platform: String,
+    pub accept_language: String,
+    pub accept_encoding: String,
+    pub custom_headers: Vec<(String, String)>,
+    pub ws_headers_order: Vec<String>,
+    pub h2_initial_stream_window_size: u32,
+    pub h2_initial_connection_window_size: u32,
+    pub h2_max_header_list_size: u32,
     pub tls_config: TlsClientConfig,
 }
 
@@ -258,6 +264,60 @@ const SAFARI_TEMPLATES: &[StaticBrowserTemplate] = &[
     },
 ];
 
+fn default_ws_headers_order(family: TlsFingerprint) -> Vec<String> {
+    match family {
+        TlsFingerprint::Firefox => vec![
+            "Host".to_string(),
+            "User-Agent".to_string(),
+            "Accept".to_string(),
+            "Accept-Language".to_string(),
+            "Accept-Encoding".to_string(),
+            "Sec-WebSocket-Version".to_string(),
+            "Origin".to_string(),
+            "Sec-WebSocket-Extensions".to_string(),
+            "Sec-WebSocket-Key".to_string(),
+            "Connection".to_string(),
+            "Pragma".to_string(),
+            "Cache-Control".to_string(),
+            "Upgrade".to_string(),
+        ],
+        TlsFingerprint::Safari => vec![
+            "Host".to_string(),
+            "Upgrade".to_string(),
+            "Connection".to_string(),
+            "Sec-WebSocket-Key".to_string(),
+            "Origin".to_string(),
+            "Sec-WebSocket-Version".to_string(),
+            "User-Agent".to_string(),
+            "Accept-Language".to_string(),
+            "Accept-Encoding".to_string(),
+            "Sec-WebSocket-Extensions".to_string(),
+        ],
+        _ => vec![
+            "Host".to_string(),
+            "Connection".to_string(),
+            "Pragma".to_string(),
+            "Cache-Control".to_string(),
+            "User-Agent".to_string(),
+            "Upgrade".to_string(),
+            "Origin".to_string(),
+            "Sec-WebSocket-Version".to_string(),
+            "Accept-Encoding".to_string(),
+            "Accept-Language".to_string(),
+            "Sec-WebSocket-Key".to_string(),
+            "Sec-WebSocket-Extensions".to_string(),
+        ],
+    }
+}
+
+fn default_h2_windows(family: TlsFingerprint) -> (u32, u32, u32) {
+    match family {
+        TlsFingerprint::Firefox => (131_072, 12_582_912, 65_536),
+        TlsFingerprint::Safari => (4_194_304, 10_485_760, 65_536),
+        _ => (6_291_456, 15_728_640, 262_144),
+    }
+}
+
 impl BrowserProfile {
     /// Возвращает случайный профиль браузера, синхронизированный с текущей глобальной конфигурацией TLS (`[stealth]`).
     pub fn random() -> Self {
@@ -272,8 +332,8 @@ impl BrowserProfile {
         Self::with_tls_config(cfg)
     }
 
-    /// Создаёт профиль браузера с полной синхронизацией L4 (TLS ClientHello) и L7 (HTTP-заголовки)
-    /// по переданному `TlsClientConfig`.
+    /// Создаёт профиль браузера с полной синхронизацией L4 (TLS ClientHello) и L7 (HTTP-заголовки и HTTP/2 SETTINGS)
+    /// по переданному `TlsClientConfig` с учётом пользовательских переопределений `[[browser_profiles]]`.
     pub fn with_tls_config(mut tls_config: TlsClientConfig) -> Self {
         let mut rng = rand::thread_rng();
         if tls_config.random_seed == 0 {
@@ -321,19 +381,95 @@ impl BrowserProfile {
             };
         }
 
+        let mut user_agent = template.user_agent.to_string();
+        let mut sec_ch_ua = template.sec_ch_ua.map(str::to_string);
+        let mut sec_ch_ua_mobile = template.sec_ch_ua_mobile.to_string();
+        let mut sec_ch_ua_platform = template.sec_ch_ua_platform.to_string();
+        let mut accept_language = template.accept_language.to_string();
+        let mut accept_encoding = template.accept_encoding.to_string();
+        let mut custom_headers = Vec::new();
+        let mut ws_headers_order = default_ws_headers_order(template.family);
+        let (mut h2_stream_win, mut h2_conn_win, mut h2_max_headers) =
+            default_h2_windows(template.family);
+
+        if let Some(ov) = get_browser_profile_override(template.family) {
+            let valid_uas: Vec<&str> = ov
+                .user_agents
+                .iter()
+                .map(String::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect();
+            if let Some(&chosen_ua) = valid_uas.choose(&mut rng) {
+                user_agent = chosen_ua.to_string();
+            }
+
+            for raw_hdr in &ov.headers {
+                if let Some((raw_name, raw_val)) = raw_hdr.split_once(':') {
+                    let name = raw_name.trim();
+                    let val = raw_val.trim();
+                    if name.is_empty() || val.is_empty() {
+                        continue;
+                    }
+                    match name.to_ascii_lowercase().as_str() {
+                        "sec-ch-ua" => sec_ch_ua = Some(val.to_string()),
+                        "sec-ch-ua-mobile" => sec_ch_ua_mobile = val.to_string(),
+                        "sec-ch-ua-platform" => sec_ch_ua_platform = val.to_string(),
+                        "accept-language" => accept_language = val.to_string(),
+                        "accept-encoding" => accept_encoding = val.to_string(),
+                        "user-agent" => user_agent = val.to_string(),
+                        _ => custom_headers.push((name.to_string(), val.to_string())),
+                    }
+                }
+            }
+
+            if !ov.ws_headers_order.is_empty() {
+                ws_headers_order = ov
+                    .ws_headers_order
+                    .into_iter()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+            }
+
+            if let Some(w) = ov.h2_initial_stream_window_size {
+                h2_stream_win = w;
+            }
+            if let Some(w) = ov.h2_initial_connection_window_size {
+                h2_conn_win = w;
+            }
+            if let Some(m) = ov.h2_max_header_list_size {
+                h2_max_headers = m;
+            }
+        }
+
+        // Профили Firefox и Safari никогда не отправляют заголовки Client Hints sec-ch-ua*
+        if matches!(
+            template.family,
+            TlsFingerprint::Firefox | TlsFingerprint::Safari
+        ) {
+            sec_ch_ua = None;
+        }
+
         Self {
-            user_agent: template.user_agent,
-            sec_ch_ua: template.sec_ch_ua,
-            sec_ch_ua_mobile: template.sec_ch_ua_mobile,
-            sec_ch_ua_platform: template.sec_ch_ua_platform,
-            accept_language: template.accept_language,
-            accept_encoding: template.accept_encoding,
+            user_agent,
+            sec_ch_ua,
+            sec_ch_ua_mobile,
+            sec_ch_ua_platform,
+            accept_language,
+            accept_encoding,
+            custom_headers,
+            ws_headers_order,
+            h2_initial_stream_window_size: h2_stream_win,
+            h2_initial_connection_window_size: h2_conn_win,
+            h2_max_header_list_size: h2_max_headers,
             tls_config,
         }
     }
 
     /// Создает сконфигурированный `reqwest::ClientBuilder` со встроенным TLS-отпечатком BoringSSL,
-    /// синхронизированным с этим `BrowserProfile`, защитой от активного спуфинга и сессионным Cookie Jar.
+    /// клиентским кэшем TLS-сессий (`NewSessionTicket`), синхронизированными окнами HTTP/2 `SETTINGS`,
+    /// защитой от активного спуфинга и сессионным Cookie Jar.
     /// Это ЕДИНСТВЕННАЯ разрешенная точка создания HTTP-клиентов `reqwest` во всей системе.
     pub fn build_reqwest_builder(
         &self,
@@ -347,11 +483,14 @@ impl BrowserProfile {
                 .as_ref()
                 .is_none_or(|p| p.trim().is_empty());
         let builder = reqwest::Client::builder()
-            .use_preconfigured_tls(ssl_builder.build())
+            .use_preconfigured_tls(ssl_builder)
             .tls_danger_accept_invalid_certs(!self.tls_config.verify_peer)
             .tls_danger_accept_invalid_hostnames(!verify_hostname)
-            .user_agent(self.user_agent)
+            .user_agent(&self.user_agent)
             .cookie_provider(cookie_jar)
+            .http2_initial_stream_window_size(self.h2_initial_stream_window_size)
+            .http2_initial_connection_window_size(self.h2_initial_connection_window_size)
+            .http2_max_header_list_size(self.h2_max_header_list_size)
             .tcp_nodelay(true);
         Ok(builder)
     }
@@ -381,9 +520,9 @@ impl BrowserProfile {
         referer: Option<&str>,
     ) -> reqwest::RequestBuilder {
         req = req
-            .header("User-Agent", self.user_agent)
-            .header("Accept-Language", self.accept_language)
-            .header("Accept-Encoding", self.accept_encoding)
+            .header("User-Agent", &self.user_agent)
+            .header("Accept-Language", &self.accept_language)
+            .header("Accept-Encoding", &self.accept_encoding)
             .header("Cache-Control", "no-cache")
             .header("Pragma", "no-cache")
             .header("Sec-Fetch-Dest", "empty")
@@ -391,11 +530,15 @@ impl BrowserProfile {
             .header("Sec-Fetch-Site", "same-origin")
             .header("Priority", "u=1, i");
 
-        if let Some(ch_ua) = self.sec_ch_ua {
+        if let Some(ref ch_ua) = self.sec_ch_ua {
             req = req
                 .header("sec-ch-ua", ch_ua)
-                .header("sec-ch-ua-mobile", self.sec_ch_ua_mobile)
-                .header("sec-ch-ua-platform", self.sec_ch_ua_platform);
+                .header("sec-ch-ua-mobile", &self.sec_ch_ua_mobile)
+                .header("sec-ch-ua-platform", &self.sec_ch_ua_platform);
+        }
+
+        for (k, v) in &self.custom_headers {
+            req = req.header(k.as_str(), v.as_str());
         }
 
         if let Some(orig) = origin {
@@ -407,8 +550,8 @@ impl BrowserProfile {
         req
     }
 
-    /// Строит WebSocket Upgrade-запрос с полным комплектом браузерных заголовков,
-    /// строго соответствующих выбранному профилю браузера.
+    /// Строит WebSocket Upgrade-запрос с полным комплектом браузерных заголовков
+    /// и порядком следования (`ws_headers_order`), строго соответствующим выбранному профилю браузера.
     pub fn build_ws_request(&self, url: &str, origin: Option<&str>) -> anyhow::Result<Request<()>> {
         let mut req = url.into_client_request()?;
         let uri = req.uri().clone();
@@ -430,35 +573,59 @@ impl BrowserProfile {
         let sec_fetch_site = compute_sec_fetch_site(target_host, &effective_origin);
         let headers = req.headers_mut();
 
-        headers.insert("User-Agent", HeaderValue::from_static(self.user_agent));
-        headers.insert(
-            "Accept-Language",
-            HeaderValue::from_static(self.accept_language),
-        );
-        headers.insert(
-            "Accept-Encoding",
-            HeaderValue::from_static(self.accept_encoding),
-        );
+        if let Ok(val) = HeaderValue::from_str(&self.user_agent) {
+            headers.insert("User-Agent", val);
+        }
+        if let Ok(val) = HeaderValue::from_str(&self.accept_language) {
+            headers.insert("Accept-Language", val);
+        }
+        if let Ok(val) = HeaderValue::from_str(&self.accept_encoding) {
+            headers.insert("Accept-Encoding", val);
+        }
         headers.insert("Cache-Control", HeaderValue::from_static("no-cache"));
         headers.insert("Pragma", HeaderValue::from_static("no-cache"));
         headers.insert("Sec-Fetch-Dest", HeaderValue::from_static("websocket"));
         headers.insert("Sec-Fetch-Mode", HeaderValue::from_static("websocket"));
         headers.insert("Sec-Fetch-Site", HeaderValue::from_static(sec_fetch_site));
 
-        if let Some(ch_ua) = self.sec_ch_ua {
-            headers.insert("sec-ch-ua", HeaderValue::from_static(ch_ua));
-            headers.insert(
-                "sec-ch-ua-mobile",
-                HeaderValue::from_static(self.sec_ch_ua_mobile),
-            );
-            headers.insert(
-                "sec-ch-ua-platform",
-                HeaderValue::from_static(self.sec_ch_ua_platform),
-            );
+        if let Some(ref ch_ua) = self.sec_ch_ua {
+            if let Ok(val) = HeaderValue::from_str(ch_ua) {
+                headers.insert("sec-ch-ua", val);
+            }
+            if let Ok(val) = HeaderValue::from_str(&self.sec_ch_ua_mobile) {
+                headers.insert("sec-ch-ua-mobile", val);
+            }
+            if let Ok(val) = HeaderValue::from_str(&self.sec_ch_ua_platform) {
+                headers.insert("sec-ch-ua-platform", val);
+            }
+        }
+
+        for (k, v) in &self.custom_headers {
+            if let (Ok(name), Ok(val)) = (HeaderName::from_str(k), HeaderValue::from_str(v)) {
+                headers.insert(name, val);
+            }
         }
 
         if let Ok(val) = HeaderValue::from_str(&effective_origin) {
             headers.insert("Origin", val);
+        }
+
+        if !self.ws_headers_order.is_empty() {
+            let mut old_headers = std::mem::take(headers);
+            let mut ordered = HeaderMap::with_capacity(old_headers.len());
+            for key_str in &self.ws_headers_order {
+                if let Ok(name) = HeaderName::from_str(key_str) {
+                    if let Some(val) = old_headers.remove(&name) {
+                        ordered.insert(name, val);
+                    }
+                }
+            }
+            for (opt_name, val) in old_headers {
+                if let Some(name) = opt_name {
+                    ordered.insert(name, val);
+                }
+            }
+            *headers = ordered;
         }
 
         Ok(req)
@@ -623,4 +790,56 @@ mod tests {
         assert_eq!(extracted_raw.ip().to_string(), "198.51.100.7");
         assert_eq!(extracted_raw.port(), 0);
     }
+
+    #[test]
+    fn test_custom_browser_profiles_override_and_ws_header_order() {
+        use crate::boring_tls::set_browser_profiles;
+        use crate::config::BrowserProfileConfig;
+
+        set_browser_profiles(vec![BrowserProfileConfig {
+            name: "Chrome".to_string(),
+            user_agents: vec!["CustomChrome/140.0.0.0".to_string()],
+            headers: vec![
+                "Accept-Language: ru-RU,ru;q=0.9".to_string(),
+                "X-Custom-Stealth: 1".to_string(),
+            ],
+            ws_headers_order: vec![
+                "Host".to_string(),
+                "User-Agent".to_string(),
+                "Upgrade".to_string(),
+                "Connection".to_string(),
+            ],
+            h2_initial_stream_window_size: Some(8_388_608),
+            h2_initial_connection_window_size: Some(16_777_216),
+            h2_max_header_list_size: Some(524_288),
+            ..Default::default()
+        }]);
+
+        let prof = BrowserProfile::for_fingerprint(TlsFingerprint::Chrome);
+        assert_eq!(prof.user_agent, "CustomChrome/140.0.0.0");
+        assert_eq!(prof.accept_language, "ru-RU,ru;q=0.9");
+        assert_eq!(prof.h2_initial_stream_window_size, 8_388_608);
+        assert_eq!(prof.h2_initial_connection_window_size, 16_777_216);
+        assert_eq!(prof.h2_max_header_list_size, 524_288);
+
+        let ws_req = prof
+            .build_ws_request("wss://vpn.example.com/socket", None)
+            .unwrap();
+        let keys: Vec<&str> = ws_req.headers().keys().map(|k| k.as_str()).collect();
+        assert_eq!(keys[0], "host");
+        assert_eq!(keys[1], "user-agent");
+        assert_eq!(keys[2], "upgrade");
+        assert_eq!(keys[3], "connection");
+        assert_eq!(
+            ws_req
+                .headers()
+                .get("x-custom-stealth")
+                .and_then(|v| v.to_str().ok()),
+            Some("1")
+        );
+
+        // Очищаем глобальный реестр после теста
+        set_browser_profiles(Vec::new());
+    }
 }
+

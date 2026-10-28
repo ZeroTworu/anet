@@ -193,14 +193,42 @@ impl Config {
             quic_sessions: Arc::default(),
         }
     }
+    pub fn preconfigured_builder(mut builder: SslConnectorBuilder) -> crate::Result<Self> {
+        let sessions = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let cache = sessions.clone();
+        let index = session_index().map_err(crate::error::builder)?;
+        builder.set_session_cache_mode(boring::ssl::SslSessionCacheMode::CLIENT);
+        builder.set_new_session_callback(move |ssl, session| {
+            if let Some(key) = ssl.ex_data(index) {
+                if let Ok(mut cache) = cache.lock() {
+                    if cache.len() >= 64 {
+                        cache.clear();
+                    }
+                    cache.insert(key.clone(), session);
+                }
+            }
+        });
+        Ok(Self {
+            connector: builder.build(),
+            sessions,
+            alpn_protocols: Vec::new(),
+            enable_sni: true,
+            verify_hostname: true,
+            #[cfg(feature = "http3")]
+            enable_early_data: false,
+            #[cfg(feature = "http3")]
+            settings: None,
+            #[cfg(feature = "http3")]
+            quic_sessions: Arc::default(),
+        })
+    }
     pub fn configure(&self, host: &str, port: u16) -> Result<ConnectConfiguration, ErrorStack> {
         let mut config = self.connector.configure()?;
         #[cfg(target_vendor = "apple")]
         config.set_ex_data(hostname_index()?, host.to_owned());
-        #[cfg(not(target_vendor = "apple"))]
-        let _ = host;
-        config.set_use_server_name_indication(self.enable_sni);
-        config.set_verify_hostname(self.verify_hostname);
+        let is_ip = host.parse::<std::net::IpAddr>().is_ok();
+        config.set_use_server_name_indication(self.enable_sni && !is_ip);
+        config.set_verify_hostname(self.verify_hostname && !is_ip);
         let mut alpn = Vec::new();
         for protocol in &self.alpn_protocols {
             alpn.push(protocol.len() as u8);

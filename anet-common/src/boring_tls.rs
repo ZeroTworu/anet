@@ -170,6 +170,41 @@ pub fn get_default_tls_config() -> TlsClientConfig {
         .unwrap_or_default()
 }
 
+/// Глобальный реестр пользовательских переопределений профилей браузеров (`[[browser_profiles]]`).
+static CUSTOM_BROWSER_PROFILES: LazyLock<RwLock<Vec<crate::config::BrowserProfileConfig>>> =
+    LazyLock::new(|| RwLock::new(Vec::new()));
+
+/// Устанавливает пользовательские переопределения профилей браузеров из `client.toml` или `server.toml`.
+pub fn set_browser_profiles(profiles: Vec<crate::config::BrowserProfileConfig>) {
+    if let Ok(mut guard) = CUSTOM_BROWSER_PROFILES.write() {
+        *guard = profiles;
+    }
+}
+
+/// Возвращает пользовательское переопределение `[[browser_profiles]]` для указанного семейства браузера, если оно задано.
+pub fn get_browser_profile_override(
+    fp: TlsFingerprint,
+) -> Option<crate::config::BrowserProfileConfig> {
+    let target = match fp {
+        TlsFingerprint::Chrome | TlsFingerprint::Auto => "chrome",
+        TlsFingerprint::Firefox => "firefox",
+        TlsFingerprint::Safari => "safari",
+        TlsFingerprint::Randomized => return None,
+    };
+    let guard = CUSTOM_BROWSER_PROFILES.read().ok()?;
+    guard
+        .iter()
+        .find(|p| {
+            p.name.trim().eq_ignore_ascii_case(target)
+                || p.name
+                    .trim()
+                    .parse::<TlsFingerprint>()
+                    .ok()
+                    .is_some_and(|parsed| parsed.as_str() == target)
+        })
+        .cloned()
+}
+
 /// Однократно загруженный кэш системных корневых сертификатов ОС (Linux, Windows, macOS, Android, iOS).
 static SYSTEM_ROOT_CERTS: LazyLock<Vec<X509>> = LazyLock::new(load_platform_root_certs);
 
@@ -399,31 +434,151 @@ pub fn build_ssl_connector_base_with_config(
     let concrete_fp = cfg.fingerprint.resolve_for_os(cfg.random_seed);
     match concrete_fp {
         TlsFingerprint::Chrome | TlsFingerprint::Auto => {
-            builder.set_grease_enabled(true);
-            builder.set_permute_extensions(true);
-            set_chrome_curves(&mut builder)?;
-            builder.enable_ocsp_stapling();
-            builder.enable_signed_cert_timestamps();
-            builder.set_cipher_list(CHROME_CIPHERS)?;
-            let _ = builder.set_sigalgs_list(CHROME_SIGALGS);
+            let ov = get_browser_profile_override(TlsFingerprint::Chrome);
+            builder.set_grease_enabled(ov.as_ref().and_then(|o| o.grease).unwrap_or(true));
+            builder.set_permute_extensions(
+                ov.as_ref()
+                    .and_then(|o| o.permute_extensions)
+                    .unwrap_or(true),
+            );
+            if ov.as_ref().and_then(|o| o.session_ticket) == Some(false) {
+                builder.set_options(boring::ssl::SslOptions::NO_TICKET);
+            }
+            if let Some(curves) = ov
+                .as_ref()
+                .and_then(|o| o.curves.as_deref())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                if builder.set_curves_list(curves).is_err() && curves.contains("X25519MLKEM768:") {
+                    let fallback = curves.replace("X25519MLKEM768:", "");
+                    builder.set_curves_list(&fallback)?;
+                }
+            } else {
+                set_chrome_curves(&mut builder)?;
+            }
+            if ov.as_ref().and_then(|o| o.ocsp_stapling).unwrap_or(true) {
+                builder.enable_ocsp_stapling();
+            }
+            if ov
+                .as_ref()
+                .and_then(|o| o.signed_cert_timestamps)
+                .unwrap_or(true)
+            {
+                builder.enable_signed_cert_timestamps();
+            }
+            let ciphers = ov
+                .as_ref()
+                .and_then(|o| o.cipher_list.as_deref())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(CHROME_CIPHERS);
+            builder.set_cipher_list(ciphers)?;
+            let sigalgs = ov
+                .as_ref()
+                .and_then(|o| o.sigalgs.as_deref())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(CHROME_SIGALGS);
+            let _ = builder.set_sigalgs_list(sigalgs);
         }
         TlsFingerprint::Firefox => {
-            builder.set_grease_enabled(false);
-            builder.set_permute_extensions(false);
-            builder.set_curves_list("X25519:P-256:P-384:P-521")?;
-            builder.enable_ocsp_stapling();
-            builder.set_cipher_list(FIREFOX_CIPHERS)?;
-            let _ = builder.set_sigalgs_list(FIREFOX_SIGALGS);
+            let ov = get_browser_profile_override(TlsFingerprint::Firefox);
+            builder.set_grease_enabled(ov.as_ref().and_then(|o| o.grease).unwrap_or(false));
+            builder.set_permute_extensions(
+                ov.as_ref()
+                    .and_then(|o| o.permute_extensions)
+                    .unwrap_or(false),
+            );
+            if ov.as_ref().and_then(|o| o.session_ticket) == Some(false) {
+                builder.set_options(boring::ssl::SslOptions::NO_TICKET);
+            }
+            if let Some(curves) = ov
+                .as_ref()
+                .and_then(|o| o.curves.as_deref())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                if builder.set_curves_list(curves).is_err() && curves.contains("X25519MLKEM768:") {
+                    let fallback = curves.replace("X25519MLKEM768:", "");
+                    builder.set_curves_list(&fallback)?;
+                }
+            } else {
+                builder.set_curves_list("X25519:P-256:P-384:P-521")?;
+            }
+            if ov.as_ref().and_then(|o| o.ocsp_stapling).unwrap_or(true) {
+                builder.enable_ocsp_stapling();
+            }
+            if ov
+                .as_ref()
+                .and_then(|o| o.signed_cert_timestamps)
+                .unwrap_or(false)
+            {
+                builder.enable_signed_cert_timestamps();
+            }
+            let ciphers = ov
+                .as_ref()
+                .and_then(|o| o.cipher_list.as_deref())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(FIREFOX_CIPHERS);
+            builder.set_cipher_list(ciphers)?;
+            let sigalgs = ov
+                .as_ref()
+                .and_then(|o| o.sigalgs.as_deref())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(FIREFOX_SIGALGS);
+            let _ = builder.set_sigalgs_list(sigalgs);
         }
         TlsFingerprint::Safari => {
-            builder.set_grease_enabled(true);
-            builder.set_permute_extensions(false);
-            builder.set_options(boring::ssl::SslOptions::NO_TICKET);
-            builder.set_curves_list("X25519:P-256:P-384:P-521")?;
-            builder.enable_ocsp_stapling();
-            builder.enable_signed_cert_timestamps();
-            builder.set_cipher_list(SAFARI_CIPHERS)?;
-            let _ = builder.set_sigalgs_list(SAFARI_SIGALGS);
+            let ov = get_browser_profile_override(TlsFingerprint::Safari);
+            builder.set_grease_enabled(ov.as_ref().and_then(|o| o.grease).unwrap_or(true));
+            builder.set_permute_extensions(
+                ov.as_ref()
+                    .and_then(|o| o.permute_extensions)
+                    .unwrap_or(false),
+            );
+            if !ov.as_ref().and_then(|o| o.session_ticket).unwrap_or(false) {
+                builder.set_options(boring::ssl::SslOptions::NO_TICKET);
+            }
+            if let Some(curves) = ov
+                .as_ref()
+                .and_then(|o| o.curves.as_deref())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                if builder.set_curves_list(curves).is_err() && curves.contains("X25519MLKEM768:") {
+                    let fallback = curves.replace("X25519MLKEM768:", "");
+                    builder.set_curves_list(&fallback)?;
+                }
+            } else {
+                builder.set_curves_list("X25519:P-256:P-384:P-521")?;
+            }
+            if ov.as_ref().and_then(|o| o.ocsp_stapling).unwrap_or(true) {
+                builder.enable_ocsp_stapling();
+            }
+            if ov
+                .as_ref()
+                .and_then(|o| o.signed_cert_timestamps)
+                .unwrap_or(true)
+            {
+                builder.enable_signed_cert_timestamps();
+            }
+            let ciphers = ov
+                .as_ref()
+                .and_then(|o| o.cipher_list.as_deref())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(SAFARI_CIPHERS);
+            builder.set_cipher_list(ciphers)?;
+            let sigalgs = ov
+                .as_ref()
+                .and_then(|o| o.sigalgs.as_deref())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(SAFARI_SIGALGS);
+            let _ = builder.set_sigalgs_list(sigalgs);
         }
         TlsFingerprint::Randomized => {
             let h1 = splitmix64(cfg.random_seed);

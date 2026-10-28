@@ -1,4 +1,4 @@
-use anet_common::config::{StealthConfig, WrtcConfig};
+use anet_common::config::{BrowserProfileConfig, StealthConfig, WrtcConfig};
 use anet_common::quic_settings::QuicConfig;
 use clap::Parser;
 use log::warn;
@@ -244,6 +244,9 @@ pub struct Config {
 
     #[serde(default)]
     pub wrtc: WrtcConfig,
+
+    #[serde(default)]
+    pub browser_profiles: Vec<BrowserProfileConfig>,
 }
 
 #[derive(Debug, Parser)]
@@ -258,6 +261,10 @@ pub async fn load() -> anyhow::Result<Config> {
     match toml_str {
         Ok(toml_str) => {
             let cfg: Config = toml::from_str(&toml_str)?;
+            anet_common::boring_tls::set_default_tls_config(cfg.stealth.to_tls_client_config());
+            if !cfg.browser_profiles.is_empty() {
+                anet_common::boring_tls::set_browser_profiles(cfg.browser_profiles.clone());
+            }
             Ok(cfg)
         }
         Err(_) => {

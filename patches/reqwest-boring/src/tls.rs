@@ -581,6 +581,8 @@ pub(crate) enum TlsBackend {
     Boring,
     #[cfg(feature = "__rustls")]
     BuiltBoring(boring::ssl::SslConnector),
+    #[cfg(feature = "__rustls")]
+    BuiltBoringBuilder(boring::ssl::SslConnectorBuilder),
     #[cfg(any(feature = "__native-tls", feature = "__rustls",))]
     UnknownPreconfigured,
 }
@@ -596,6 +598,8 @@ impl fmt::Debug for TlsBackend {
             TlsBackend::Boring => write!(f, "Boring"),
             #[cfg(feature = "__rustls")]
             TlsBackend::BuiltBoring(_) => write!(f, "BuiltBoring"),
+            #[cfg(feature = "__rustls")]
+            TlsBackend::BuiltBoringBuilder(_) => write!(f, "BuiltBoringBuilder"),
             #[cfg(any(feature = "__native-tls", feature = "__rustls",))]
             TlsBackend::UnknownPreconfigured => write!(f, "UnknownPreconfigured"),
         }

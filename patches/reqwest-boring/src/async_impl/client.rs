@@ -641,6 +641,7 @@ impl ClientBuilder {
                 TlsBackend::BuiltBoring(conn) => {
                     let mut conn = crate::boring_tls::Config::preconfigured(conn);
                     conn.verify_hostname = config.hostname_verification && config.certs_verification;
+                    conn.enable_sni = config.tls_sni;
                     #[cfg(feature = "http3")]
                     {
                         let mut h3_tls = conn.clone();
@@ -681,6 +682,54 @@ impl ClientBuilder {
                         ))]
                         config.interface.as_deref(),
                         config.nodelay,
+                        config.tls_info,
+                    )
+                }
+                #[cfg(feature = "__rustls")]
+                TlsBackend::BuiltBoringBuilder(builder) => {
+                    let mut conn = crate::boring_tls::Config::preconfigured_builder(builder)?;
+                    conn.verify_hostname = config.hostname_verification && config.certs_verification;
+                    conn.enable_sni = config.tls_sni;
+                    #[cfg(feature = "http3")]
+                    {
+                        let mut h3_tls = conn.clone();
+                        h3_tls.alpn_protocols = vec!["h3".into()];
+
+                        h3_connector = build_h3_connector(
+                            resolver.clone(),
+                            h3_tls,
+                            config.quic_max_idle_timeout,
+                            config.quic_stream_receive_window,
+                            config.quic_receive_window,
+                            config.quic_send_window,
+                            config.quic_congestion_bbr,
+                            config.h3_max_field_section_size,
+                            config.h3_send_grease,
+                            config.local_address,
+                            &config.http_version_pref,
+                        )?;
+                    }
+
+                    ConnectorBuilder::new_boring_tls(
+                        http,
+                        conn,
+                        proxies.clone(),
+                        user_agent(&config.headers),
+                        config.local_address,
+                        #[cfg(any(
+                            target_os = "android",
+                            target_os = "fuchsia",
+                            target_os = "illumos",
+                            target_os = "ios",
+                            target_os = "linux",
+                            target_os = "macos",
+                            target_os = "solaris",
+                            target_os = "tvos",
+                            target_os = "visionos",
+                            target_os = "watchos",
+                        ))]
+                        config.interface.as_deref(),
+                        config.interface.as_deref().is_none() && config.nodelay || config.nodelay,
                         config.tls_info,
                     )
                 }
@@ -2102,6 +2151,14 @@ impl ClientBuilder {
             {
                 let tls = conn.take().expect("is definitely Some");
                 let tls = crate::tls::TlsBackend::BuiltBoring(tls);
+                self.config.tls = tls;
+                return self;
+            }
+            if let Some(builder) = (&mut tls as &mut dyn Any)
+                .downcast_mut::<Option<boring::ssl::SslConnectorBuilder>>()
+            {
+                let tls = builder.take().expect("is definitely Some");
+                let tls = crate::tls::TlsBackend::BuiltBoringBuilder(tls);
                 self.config.tls = tls;
                 return self;
             }

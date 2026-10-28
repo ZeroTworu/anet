@@ -289,4 +289,45 @@ fn find_string_array_in_toml(
     None
 }
 
-
+/// Пользовательское описание или переопределение браузерного профиля (`[[browser_profiles]]` в `client.toml` и `server.toml`).
+/// Позволяет переопределять параметры встроенных профилей (`Chrome`, `Firefox`, `Safari`) без пересборки бинарника.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct BrowserProfileConfig {
+    /// Имя профиля ("Chrome", "Firefox", "Safari"). Сопоставляется без учёта регистра.
+    pub name: String,
+    /// Список шифров TLS 1.2 в формате BoringSSL (`SSL_CTX_set_cipher_list`).
+    pub cipher_list: Option<String>,
+    /// Список эллиптических кривых / групп (`SSL_CTX_set1_curves_list`).
+    pub curves: Option<String>,
+    /// Список алгоритмов подписи (`SSL_CTX_set1_sigalgs_list`).
+    pub sigalgs: Option<String>,
+    /// Включить TLS GREASE (`SSL_CTX_set_grease_enabled`).
+    pub grease: Option<bool>,
+    /// Включить случайную перестановку расширений ClientHello (`SSL_CTX_set_permute_extensions`).
+    pub permute_extensions: Option<bool>,
+    /// Включить поддержку TLS Session Ticket (`false` выставляет `SslOptions::NO_TICKET`).
+    pub session_ticket: Option<bool>,
+    /// Включить расширение `status_request` / OCSP Stapling (`0x0005`).
+    pub ocsp_stapling: Option<bool>,
+    /// Включить расширение `signed_certificate_timestamp` / SCT (`0x0012`).
+    pub signed_cert_timestamps: Option<bool>,
+    /// Флаг ECH GREASE (`0xfe0d`) в профиле браузера.
+    pub ech_grease: Option<bool>,
+    /// Флаг ALPS для `h2` (`0x4469`) в профиле браузера.
+    pub alps_h2: Option<bool>,
+    /// Список алгоритмов сжатия сертификатов (`0x001b`, например `["brotli"]` или `["zlib", "brotli"]`).
+    pub cert_compression: Vec<String>,
+    /// Пул строк `User-Agent`, из которых случайно выбирается одна на сессию.
+    pub user_agents: Vec<String>,
+    /// Дополнительные или переопределяемые HTTP-заголовки в формате `"Header-Name: Value"`.
+    pub headers: Vec<String>,
+    /// Порядок заголовков при формировании HTTP/1.1 WebSocket Upgrade запроса.
+    pub ws_headers_order: Vec<String>,
+    /// Начальный размер окна потока HTTP/2 (`SETTINGS_INITIAL_WINDOW_SIZE`).
+    pub h2_initial_stream_window_size: Option<u32>,
+    /// Начальный размер окна соединения HTTP/2 (`WINDOW_UPDATE`).
+    pub h2_initial_connection_window_size: Option<u32>,
+    /// Максимальный размер списка заголовков HTTP/2 (`SETTINGS_MAX_HEADER_LIST_SIZE`).
+    pub h2_max_header_list_size: Option<u32>,
+}

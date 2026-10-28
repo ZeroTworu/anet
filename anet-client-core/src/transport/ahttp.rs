@@ -173,21 +173,39 @@ impl ClientTransport for AHttpTransport {
                 .http2_adaptive_window(self.config.ahttp.http2_adaptive_window);
 
             if !self.config.ahttp.http2_adaptive_window {
-                if let Some(stream_win) = self.config.ahttp.http2_initial_stream_window_size.or(if dsn_cdn_mode { Some(49152) } else { None }) {
-                    builder = builder.http2_initial_stream_window_size(stream_win);
-                }
-                if let Some(conn_win) = self.config.ahttp.http2_initial_connection_window_size.or(if dsn_cdn_mode { Some(49152) } else { None }) {
-                    builder = builder.http2_initial_connection_window_size(conn_win);
-                }
+                let stream_win = self
+                    .config
+                    .ahttp
+                    .http2_initial_stream_window_size
+                    .unwrap_or(if dsn_cdn_mode {
+                        49152
+                    } else {
+                        profile.h2_initial_stream_window_size
+                    });
+                builder = builder.http2_initial_stream_window_size(stream_win);
+
+                let conn_win = self
+                    .config
+                    .ahttp
+                    .http2_initial_connection_window_size
+                    .unwrap_or(if dsn_cdn_mode {
+                        49152
+                    } else {
+                        profile.h2_initial_connection_window_size
+                    });
+                builder = builder.http2_initial_connection_window_size(conn_win);
             }
 
             if let Some(max_frame) = self.config.ahttp.http2_max_frame_size {
                 builder = builder.http2_max_frame_size(max_frame);
             }
 
-            if let Some(max_header) = self.config.ahttp.http2_max_header_list_size {
-                builder = builder.http2_max_header_list_size(max_header);
-            }
+            let max_header = self
+                .config
+                .ahttp
+                .http2_max_header_list_size
+                .unwrap_or(profile.h2_max_header_list_size);
+            builder = builder.http2_max_header_list_size(max_header);
 
             if let Some(ka_interval) = self.config.ahttp.http2_keep_alive_interval_secs {
                 builder = builder.http2_keep_alive_interval(Some(Duration::from_secs(ka_interval)));

@@ -413,3 +413,122 @@ tunnel_ping_timeout_secs = 45
 # Интервал профилактической ротации пустой комнаты на сервере при отсутствии клиентов (сек).
 # По умолчанию: 1800 (30 минут).
 server_idle_room_rotation_secs = 1800
+
+# =========================================================================
+# Профили браузерной мимикрии L4 (TLS ClientHello) и L7 (HTTP/2 + WebSocket)
+# =========================================================================
+# Используются сервером при исходящих обращениях к Контур.Толк (WRTC) и внешним узлам.
+# Встроенные дефолты зашиты в бинарник и продублированы здесь для возможности переопределения.
+[[browser_profiles]]
+name = "Chrome"
+cipher_list = "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-RSA-AES128-SHA:ECDHE-RSA-AES256-SHA:AES128-GCM-SHA256:AES256-GCM-SHA384:AES128-SHA:AES256-SHA"
+curves = "X25519MLKEM768:X25519:P-256:P-384"
+sigalgs = "ecdsa_secp256r1_sha256:rsa_pss_rsae_sha256:rsa_pkcs1_sha256:ecdsa_secp384r1_sha384:rsa_pss_rsae_sha384:rsa_pkcs1_sha384:rsa_pss_rsae_sha512:rsa_pkcs1_sha512"
+grease = true
+permute_extensions = true
+session_ticket = true
+ocsp_stapling = true
+signed_cert_timestamps = true
+ech_grease = true
+alps_h2 = true
+cert_compression = ["brotli"]
+h2_initial_stream_window_size = 6291456
+h2_initial_connection_window_size = 15728640
+h2_max_header_list_size = 262144
+ws_headers_order = [
+    "Host",
+    "Connection",
+    "Pragma",
+    "Cache-Control",
+    "User-Agent",
+    "Upgrade",
+    "Origin",
+    "Sec-WebSocket-Version",
+    "Accept-Encoding",
+    "Accept-Language",
+    "Sec-WebSocket-Key",
+    "Sec-WebSocket-Extensions",
+]
+user_agents = [
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+]
+headers = [
+    "Accept-Language: ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Accept-Encoding: gzip, deflate, br, zstd",
+]
+
+[[browser_profiles]]
+name = "Firefox"
+cipher_list = "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES256-SHA:ECDHE-ECDSA-AES128-SHA:ECDHE-RSA-AES128-SHA:ECDHE-RSA-AES256-SHA:AES128-GCM-SHA256:AES256-GCM-SHA384:AES128-SHA:AES256-SHA"
+curves = "X25519:P-256:P-384:P-521"
+sigalgs = "ecdsa_secp256r1_sha256:ecdsa_secp384r1_sha384:ecdsa_secp521r1_sha512:rsa_pss_rsae_sha256:rsa_pss_rsae_sha384:rsa_pss_rsae_sha512:rsa_pkcs1_sha256:rsa_pkcs1_sha384:rsa_pkcs1_sha512:ecdsa_sha1:rsa_pkcs1_sha1"
+grease = false
+permute_extensions = false
+session_ticket = true
+ocsp_stapling = true
+signed_cert_timestamps = false
+ech_grease = true
+alps_h2 = false
+cert_compression = ["zlib", "brotli", "zstd"]
+h2_initial_stream_window_size = 131072
+h2_initial_connection_window_size = 12582912
+h2_max_header_list_size = 65536
+ws_headers_order = [
+    "Host",
+    "User-Agent",
+    "Accept",
+    "Accept-Language",
+    "Accept-Encoding",
+    "Sec-WebSocket-Version",
+    "Origin",
+    "Sec-WebSocket-Extensions",
+    "Sec-WebSocket-Key",
+    "Connection",
+    "Pragma",
+    "Cache-Control",
+    "Upgrade",
+]
+user_agents = [
+    "Mozilla/5.0 (X11; Linux x86_64; rv:136.0) Gecko/20100101 Firefox/136.0",
+]
+headers = [
+    "Accept-Language: ru-RU,ru;q=0.8,en-US;q=0.5,en;q=0.3",
+    "Accept-Encoding: gzip, deflate, br, zstd",
+]
+
+[[browser_profiles]]
+name = "Safari"
+cipher_list = "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-ECDSA-AES256-SHA:ECDHE-ECDSA-AES128-SHA:ECDHE-RSA-AES256-SHA:ECDHE-RSA-AES128-SHA:AES256-GCM-SHA384:AES128-GCM-SHA256:AES256-SHA:AES128-SHA:ECDHE-ECDSA-DES-CBC3-SHA:ECDHE-RSA-DES-CBC3-SHA:DES-CBC3-SHA"
+curves = "X25519:P-256:P-384:P-521"
+sigalgs = "ecdsa_secp256r1_sha256:rsa_pss_rsae_sha256:rsa_pkcs1_sha256:ecdsa_secp384r1_sha384:ecdsa_secp521r1_sha512:rsa_pss_rsae_sha384:rsa_pss_rsae_sha512:rsa_pkcs1_sha384:rsa_pkcs1_sha512:ecdsa_sha1:rsa_pkcs1_sha1"
+grease = true
+permute_extensions = false
+session_ticket = false
+ocsp_stapling = true
+signed_cert_timestamps = true
+ech_grease = false
+alps_h2 = false
+cert_compression = ["zlib"]
+h2_initial_stream_window_size = 4194304
+h2_initial_connection_window_size = 10485760
+h2_max_header_list_size = 65536
+ws_headers_order = [
+    "Host",
+    "Upgrade",
+    "Connection",
+    "Sec-WebSocket-Key",
+    "Origin",
+    "Sec-WebSocket-Version",
+    "User-Agent",
+    "Accept-Language",
+    "Accept-Encoding",
+    "Sec-WebSocket-Extensions",
+]
+user_agents = [
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.15",
+]
+headers = [
+    "Accept-Language: ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Accept-Encoding: gzip, deflate, br",
+]
