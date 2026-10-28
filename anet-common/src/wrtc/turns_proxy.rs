@@ -152,7 +152,7 @@ async fn run_turns_proxy_loop(
         if use_tls {
             let tls_res = tokio::time::timeout(
                 connect_timeout,
-                crate::boring_tls::connect_chrome_ws_tls(&host, tcp_stream),
+                crate::http_help::BrowserProfile::random().connect_ws_tls(&host, tcp_stream),
             )
             .await;
 

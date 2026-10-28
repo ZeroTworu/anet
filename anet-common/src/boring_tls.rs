@@ -51,35 +51,25 @@ impl TlsFingerprint {
             Self::Auto => {
                 #[cfg(target_os = "ios")]
                 {
-                    match seed % 3 {
-                        0 | 1 => Self::Safari,
-                        _ => Self::Randomized,
-                    }
+                    let _ = seed;
+                    Self::Safari
                 }
                 #[cfg(target_os = "macos")]
                 {
-                    match seed % 4 {
+                    match seed % 2 {
                         0 => Self::Chrome,
-                        1 => Self::Safari,
-                        2 => Self::Firefox,
-                        _ => Self::Randomized,
+                        _ => Self::Safari,
                     }
                 }
                 #[cfg(target_os = "android")]
                 {
-                    match seed % 3 {
-                        0 => Self::Chrome,
-                        1 => Self::Firefox,
-                        _ => Self::Randomized,
-                    }
+                    let _ = seed;
+                    Self::Chrome
                 }
                 #[cfg(not(any(target_os = "ios", target_os = "macos", target_os = "android")))]
                 {
-                    match seed % 3 {
-                        0 => Self::Chrome,
-                        1 => Self::Firefox,
-                        _ => Self::Randomized,
-                    }
+                    let _ = seed;
+                    Self::Chrome
                 }
             }
             concrete => concrete,
@@ -355,10 +345,10 @@ const SAFARI_CIPHERS: &str = "\
     ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES128-GCM-SHA256:\
     ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-AES256-GCM-SHA384:\
     ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-CHACHA20-POLY1305:\
-    ECDHE-ECDSA-AES256-SHA384:ECDHE-RSA-AES256-SHA384:\
-    ECDHE-ECDSA-AES128-SHA256:ECDHE-RSA-AES128-SHA256:\
-    ECDHE-ECDSA-AES256-SHA:ECDHE-RSA-AES256-SHA:\
-    ECDHE-ECDSA-AES128-SHA:ECDHE-RSA-AES128-SHA";
+    ECDHE-ECDSA-AES256-SHA:ECDHE-ECDSA-AES128-SHA:\
+    ECDHE-RSA-AES256-SHA:ECDHE-RSA-AES128-SHA:\
+    AES256-GCM-SHA384:AES128-GCM-SHA256:AES256-SHA:AES128-SHA:\
+    ECDHE-ECDSA-DES-CBC3-SHA:ECDHE-RSA-DES-CBC3-SHA:DES-CBC3-SHA";
 
 const CHACHA_FIRST_CIPHERS: &str = "\
     ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:\
@@ -375,13 +365,15 @@ const CHROME_SIGALGS: &str = "\
 const FIREFOX_SIGALGS: &str = "\
     ecdsa_secp256r1_sha256:ecdsa_secp384r1_sha384:ecdsa_secp521r1_sha512:\
     rsa_pss_rsae_sha256:rsa_pss_rsae_sha384:rsa_pss_rsae_sha512:\
-    rsa_pkcs1_sha256:rsa_pkcs1_sha384:rsa_pkcs1_sha512";
+    rsa_pkcs1_sha256:rsa_pkcs1_sha384:rsa_pkcs1_sha512:\
+    ecdsa_sha1:rsa_pkcs1_sha1";
 
 const SAFARI_SIGALGS: &str = "\
     ecdsa_secp256r1_sha256:rsa_pss_rsae_sha256:rsa_pkcs1_sha256:\
     ecdsa_secp384r1_sha384:ecdsa_secp521r1_sha512:\
     rsa_pss_rsae_sha384:rsa_pss_rsae_sha512:\
-    rsa_pkcs1_sha384:rsa_pkcs1_sha512";
+    rsa_pkcs1_sha384:rsa_pkcs1_sha512:\
+    ecdsa_sha1:rsa_pkcs1_sha1";
 
 fn set_chrome_curves(builder: &mut SslConnectorBuilder) -> anyhow::Result<()> {
     // Современный Chrome 131+ анонсирует гибридную постквантовую группу X25519MLKEM768.
@@ -426,6 +418,7 @@ pub fn build_ssl_connector_base_with_config(
         TlsFingerprint::Safari => {
             builder.set_grease_enabled(true);
             builder.set_permute_extensions(false);
+            builder.set_options(boring::ssl::SslOptions::NO_TICKET);
             builder.set_curves_list("X25519:P-256:P-384:P-521")?;
             builder.enable_ocsp_stapling();
             builder.enable_signed_cert_timestamps();
@@ -436,28 +429,32 @@ pub fn build_ssl_connector_base_with_config(
             let h1 = splitmix64(cfg.random_seed);
             let h2 = splitmix64(h1);
 
-            let grease = (h1 & 0b11) != 0; // 75% вероятности включения GREASE
-            let permute = ((h1 >> 2) & 1) == 1;
             let enable_sct = ((h1 >> 3) & 1) == 1;
 
-            builder.set_grease_enabled(grease);
-            builder.set_permute_extensions(permute);
+            builder.set_grease_enabled(true);
+            builder.set_permute_extensions(true);
             builder.enable_ocsp_stapling();
             if enable_sct {
                 builder.enable_signed_cert_timestamps();
             }
 
             match (h1 >> 4) % 4 {
-                0 => set_chrome_curves(&mut builder)?,
-                1 => builder.set_curves_list("X25519:P-256:P-384:P-521")?,
-                2 => builder.set_curves_list("X25519:P-384:P-256")?,
+                0 | 1 => set_chrome_curves(&mut builder)?,
+                2 => builder.set_curves_list("X25519:P-256:P-384:P-521")?,
                 _ => builder.set_curves_list("X25519:P-256:P-384")?,
             }
 
+            #[cfg(target_vendor = "apple")]
             let ciphers = match h2 % 4 {
                 0 => CHROME_CIPHERS,
                 1 => FIREFOX_CIPHERS,
                 2 => SAFARI_CIPHERS,
+                _ => CHACHA_FIRST_CIPHERS,
+            };
+            #[cfg(not(target_vendor = "apple"))]
+            let ciphers = match h2 % 3 {
+                0 => CHROME_CIPHERS,
+                1 => FIREFOX_CIPHERS,
                 _ => CHACHA_FIRST_CIPHERS,
             };
             builder.set_cipher_list(ciphers)?;

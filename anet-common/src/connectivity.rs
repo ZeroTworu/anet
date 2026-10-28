@@ -297,7 +297,7 @@ impl ConnectivityProber {
         let cookie_jar = Arc::new(reqwest::cookie::Jar::default());
 
         let client = profile
-            .build_reqwest_builder(cookie_jar)
+            .build_reqwest_builder(cookie_jar.clone())
             .and_then(|builder| {
                 Ok(builder
                     .timeout(timeout)
@@ -308,7 +308,13 @@ impl ConnectivityProber {
                     .no_proxy()
                     .build()?)
             })
-            .unwrap_or_else(|_| reqwest::Client::new());
+            .unwrap_or_else(|_| {
+                profile
+                    .build_reqwest_builder(cookie_jar)
+                    .expect("Failed to initialize BoringSSL reqwest builder")
+                    .build()
+                    .expect("Failed to build BoringSSL reqwest client")
+            });
 
         Self {
             client,

@@ -67,11 +67,33 @@ impl Updater {
             .build()
             .map_err(|e| anyhow::anyhow!("Не удалось создать HTTP-клиент: {}", e))?;
 
-        let response = profile
+        let response = match profile
             .apply_to_reqwest(client.get(&target_url), None, None)
             .send()
             .await
-            .map_err(|e| anyhow::anyhow!("Не удалось подключиться по указанной ссылке: {}", e))?;
+        {
+            Ok(resp) => resp,
+            Err(primary_err) => {
+                warn!(
+                    "[UPDATER] Строгая TLS-проверка не прошла для {} ({}), повтор через BrowserProfile с verify_peer=false",
+                    target_url, primary_err
+                );
+                let mut relaxed_tls = profile.tls_config.clone();
+                relaxed_tls.verify_peer = false;
+                let relaxed_profile = BrowserProfile::with_tls_config(relaxed_tls);
+                let fallback_client = relaxed_profile
+                    .build_reqwest_builder(Arc::new(reqwest::cookie::Jar::default()))
+                    .map_err(|e| anyhow::anyhow!("Не удалось инициализировать TLS-профиль: {}", e))?
+                    .timeout(std::time::Duration::from_secs(15))
+                    .build()
+                    .map_err(|e| anyhow::anyhow!("Не удалось создать HTTP-клиент: {}", e))?;
+                relaxed_profile
+                    .apply_to_reqwest(fallback_client.get(&target_url), None, None)
+                    .send()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Не удалось подключиться по указанной ссылке: {}", e))?
+            }
+        };
 
         if !response.status().is_success() {
             return Err(anyhow::anyhow!(
