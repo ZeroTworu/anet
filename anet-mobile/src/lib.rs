@@ -892,15 +892,13 @@ pub extern "system" fn Java_org_alco_anet_MainActivity_startDownload(mut env: JN
     let release_opt = PENDING_RELEASE.lock().unwrap().take();
 
     if let Some(release) = release_opt {
-        let rt_guard = RUNTIME.lock().unwrap();
-        if let Some(rt) = rt_guard.as_ref() {
-            rt.spawn(async move {
-                if let Err(e) = Updater::download_apk(release, path).await {
-                    error!("Download failed: {}", e);
-                    events::err(format!("Ошибка загрузки: {}", e));
-                }
-            });
-        }
+        let rt_handle = get_or_init_runtime_handle();
+        rt_handle.spawn(async move {
+            if let Err(e) = Updater::download_apk(release, path).await {
+                error!("Download failed: {}", e);
+                events::err(format!("Ошибка загрузки: {}", e));
+            }
+        });
     }
 }
 
@@ -934,6 +932,27 @@ pub extern "system" fn Java_org_alco_anet_ANetVpnService_connectVpn(
     selected_server_jstr: JString,
 ) {
     info!("JNI: connectVpn called");
+
+    crate::android_impl::reset_tun_session_flags();
+
+    // Defensive reset of ANetVpnService.isShuttingDown = false and isServiceRunning = true
+    // in case Android reused the VpnService instance across stopSelf() / startService().
+    if env
+        .set_field(&this, "isShuttingDown", "Z", JValue::Bool(0))
+        .is_err()
+    {
+        let _ = env.exception_clear();
+    }
+    if let Ok(cls) = env.get_object_class(&this) {
+        if env
+            .set_static_field(&cls, ("org/alco/anet/ANetVpnService", "isServiceRunning", "Z"), JValue::Bool(1))
+            .is_err()
+        {
+            let _ = env.exception_clear();
+        }
+    } else {
+        let _ = env.exception_clear();
+    }
 
     // Автоматически определяем путь к приватному кэшу приложения через Android Context: this.getCacheDir().getAbsolutePath()
     if let Ok(cache_dir_val) = env.call_method(&this, "getCacheDir", "()Ljava/io/File;", &[]) {
@@ -981,11 +1000,7 @@ pub extern "system" fn Java_org_alco_anet_ANetVpnService_connectVpn(
 
     events::set_handler(Box::new(AndroidEventHandler));
 
-    let mut rt_guard = RUNTIME.lock().unwrap();
-    if rt_guard.is_none() {
-        *rt_guard = Some(Runtime::new().unwrap());
-    }
-    let rt = rt_guard.as_ref().unwrap();
+    let rt_handle = get_or_init_runtime_handle();
 
     let config_toml: String = match env.get_string(&config_jstr) {
         Ok(java_str) => java_str.into(),
@@ -1014,7 +1029,7 @@ pub extern "system" fn Java_org_alco_anet_ANetVpnService_connectVpn(
     };
 
     let generation = CLIENT_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
-    rt.spawn(async move {
+    rt_handle.spawn(async move {
         let client = {
             let _lifecycle = CLIENT_LIFECYCLE.lock().await;
             if CLIENT_GENERATION.load(Ordering::SeqCst) != generation { return; }
@@ -1117,19 +1132,38 @@ pub extern "system" fn Java_org_alco_anet_ANetVpnService_stopVpn(_env: JNIEnv, _
     client_state(ClientState::Stopping, "Stopping VPN", None);
 
     CLIENT_GENERATION.fetch_add(1, Ordering::SeqCst);
-    let rt_guard = RUNTIME.lock().unwrap();
-    if let Some(rt) = rt_guard.as_ref() {
-        let client_opt = {
+    crate::android_impl::reset_tun_session_flags();
+
+    let rt_handle_opt = {
+        let rt_guard = RUNTIME.lock().unwrap();
+        rt_guard.as_ref().map(|rt| rt.handle().clone())
+    };
+
+    if let Some(rt_handle) = rt_handle_opt {
+        let initial_client = {
             let mut client_guard = CLIENT.lock().unwrap();
             client_guard.take()
         };
-        if let Some(client) = client_opt {
-            rt.block_on(async move {
-                let _lifecycle = CLIENT_LIFECYCLE.lock().await;
-                info!("Rust JNI: Sending stop signal to active client loop...");
+        rt_handle.block_on(async move {
+            if let Some(client) = initial_client {
+                info!("Rust JNI: Sending immediate stop signal to active client...");
                 let _ = client.stop().await;
-            });
-        }
+            }
+            if let Ok(_lifecycle) = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                CLIENT_LIFECYCLE.lock(),
+            )
+            .await
+            {
+                let late_client = {
+                    let mut client_guard = CLIENT.lock().unwrap();
+                    client_guard.take()
+                };
+                if let Some(client) = late_client {
+                    let _ = client.stop().await;
+                }
+            }
+        });
     }
     client_state(ClientState::Stopped, "VPN stopped", None);
     status("VPN Stopped");

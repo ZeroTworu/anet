@@ -187,4 +187,14 @@ impl CompiledRoutingCache {
 
         Ok(archived)
     }
+
+    /// Возвращает ссылку на корень архива без повторного прохода `bytecheck` по всему графу.
+    ///
+    /// # Safety
+    /// Вызывающий код обязан гарантировать, что буфер `bytes` ранее успешно прошёл
+    /// полную проверку через `CompiledRoutingCache::from_bytes(bytes)`.
+    #[inline(always)]
+    pub unsafe fn from_bytes_unchecked(bytes: &[u8]) -> &ArchivedCompiledRoutingCache {
+        unsafe { rkyv::archived_root::<CompiledRoutingCache>(bytes) }
+    }
 }

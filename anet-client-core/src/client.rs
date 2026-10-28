@@ -92,27 +92,35 @@ impl AnetClient {
     }
 
     async fn sync_rules_cache(&self, config: &CoreConfig) {
+        if self.stop_requested.load(Ordering::SeqCst) {
+            return;
+        }
         if let Some(rules_server_url) = config.get_rules_server_url() {
-            match tokio::time::timeout(
-                Duration::from_secs(5),
-                self.rule_cache.update_from_server(&rules_server_url),
-            )
-            .await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    let msg = format!(
-                        "[RuleCache] Failed to download rules.abc from {rules_server_url}: {e}"
-                    );
-                    warn!("{msg}");
-                    status(&msg);
+            tokio::select! {
+                _ = self.cancel_signal.notified() => {
+                    info!("[RuleCache] Sync cancelled by stop signal.");
                 }
-                Err(_) => {
-                    let msg = format!(
-                        "[RuleCache] Timeout downloading rules.abc from {rules_server_url} (using cached rules if available)"
-                    );
-                    warn!("{msg}");
-                    status(&msg);
+                res = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    self.rule_cache.update_from_server(&rules_server_url),
+                ) => {
+                    match res {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            let msg = format!(
+                                "[RuleCache] Failed to download rules.abc from {rules_server_url}: {e}"
+                            );
+                            warn!("{msg}");
+                            status(&msg);
+                        }
+                        Err(_) => {
+                            let msg = format!(
+                                "[RuleCache] Timeout downloading rules.abc from {rules_server_url} (using cached rules if available)"
+                            );
+                            warn!("{msg}");
+                            status(&msg);
+                        }
+                    }
                 }
             }
         } else {
@@ -198,7 +206,10 @@ impl AnetClient {
             return Err(anyhow!("VPN tunnel is already active"));
         }
 
-        self.stop_requested.store(false, Ordering::SeqCst);
+        if self.stop_requested.load(Ordering::SeqCst) {
+            self.is_active.store(false, Ordering::SeqCst);
+            return Ok(());
+        }
 
         let mut config_clone = self.config.clone();
         if let Err(e) = config_clone.sanitize() {
@@ -209,6 +220,11 @@ impl AnetClient {
 
         // Синхронизируем rules.abc сразу при старте клиента до поднятия туннеля (едино для CLI, GUI, Android, macOS, Windows, iOS)
         self.sync_rules_cache(&config_clone).await;
+        if self.stop_requested.load(Ordering::SeqCst) {
+            info!("[Core] Stop requested during initial rules sync. Exiting.");
+            self.is_active.store(false, Ordering::SeqCst);
+            return Ok(());
+        }
         crate::connectivity_monitor::ConnectivityMonitor::ensure_started(
             config_clone.connectivity.clone(),
         );
@@ -566,35 +582,56 @@ impl AnetClient {
                 && config_clone.main.per_app.is_empty());
 
         if !per_app_requested && config_clone.main.route_for.is_empty() {
+            // Применяем пользовательские исключения exclude_route_for до создания TUN,
+            // чтобы Android VpnService и десктопные RouteManager получили все маршруты за один проход
+            if !config_clone.main.exclude_route_for.is_empty() {
+                let exclude_routes = self
+                    .resolve_list(&config_clone.main.exclude_route_for)
+                    .await;
+                let batch: Vec<(IpAddr, u8)> = exclude_routes
+                    .iter()
+                    .map(|net| (net.network(), net.prefix_len()))
+                    .collect();
+                if !batch.is_empty() {
+                    let _ = self.route_manager.add_bypass_routes(&batch).await;
+                }
+            }
+
             // Применяем локальные исключения [routing.overrides] direct из client.toml
             if !config_clone.routing.overrides.direct.is_empty() {
                 let local_direct_routes = self
                     .resolve_list(&config_clone.routing.overrides.direct)
                     .await;
-                for net in local_direct_routes.iter() {
-                    let _ = self
-                        .route_manager
-                        .add_bypass_route(net.network(), net.prefix_len())
-                        .await;
+                let batch: Vec<(IpAddr, u8)> = local_direct_routes
+                    .iter()
+                    .map(|net| (net.network(), net.prefix_len()))
+                    .collect();
+                if !batch.is_empty() {
+                    let _ = self.route_manager.add_bypass_routes(&batch).await;
                 }
             }
 
-            // Применяем статические CIDR-маршруты Direct из скомпилированного rules.abc
+            // Применяем статические CIDR-маршруты Direct из скомпилированного rules.abc единым пакетом
             let abc_direct_routes = rule_cache.collect_direct_routes();
             if !abc_direct_routes.is_empty() {
-                let mut applied = 0usize;
-                for (ip, prefix) in abc_direct_routes {
-                    if self.route_manager.add_bypass_route(ip, prefix).await.is_ok() {
-                        applied += 1;
-                    }
-                }
+                let count = abc_direct_routes.len();
+                let _ = self
+                    .route_manager
+                    .add_bypass_routes(&abc_direct_routes)
+                    .await;
                 let msg = format!(
                     "[RuleCache] Applied {} static Direct CIDR bypass routes from rules.abc",
-                    applied
+                    count
                 );
                 info!("{msg}");
                 status(&msg);
             }
+        }
+
+        if self.stop_requested.load(Ordering::SeqCst) {
+            info!("[Core] Connection cancelled before acquiring packet source.");
+            let _ = self.route_manager.restore_routes().await;
+            return Ok(());
         }
 
         let (tx_to_tun, mut rx_from_tun, iface_name, _app_filter) = self
@@ -746,13 +783,7 @@ impl AnetClient {
                         .or_else(|| direct_ip_cache_tx.check(&dst_ip))
                         .or_else(|| rule_cache_tx.lookup_ip(dst_ip));
 
-                    if matches!(
-                        ip_action,
-                        Some(
-                            anet_filter_core::RuleAction::Block
-                                | anet_filter_core::RuleAction::Direct
-                        )
-                    ) {
+                    if matches!(ip_action, Some(anet_filter_core::RuleAction::Block)) {
                         return false;
                     }
                 }
@@ -908,7 +939,8 @@ impl AnetClient {
                                         }
                                     }
 
-                                    // Если из туннеля пришел DNS-ответ для Direct-домена, регистрируем bypass-маршруты ДО передачи пакета в ОС
+                                    // Если из туннеля пришел DNS-ответ для Direct-домена, регистрируем bypass-маршруты асинхронно,
+                                    // не блокируя горячий цикл приёма пакетов 'rx_loop
                                     if let Some((qname, resolved_ips)) = dns_interceptor_rx
                                         .inspect_dns_response(&packet, |domain| rule_cache_rx.lookup_domain(domain))
                                     {
@@ -917,12 +949,15 @@ impl AnetClient {
                                                 .iter()
                                                 .map(|ip| (*ip, if ip.is_ipv4() { 32 } else { 128 }))
                                                 .collect();
-                                            let _ = route_manager_rx.add_bypass_routes(&routes).await;
-                                            log::info!(
-                                                "[DNS/Direct] Domain '{}' resolved via tunnel -> added OS bypass routes for {:?}",
-                                                qname,
-                                                resolved_ips
-                                            );
+                                            let rm_bg = route_manager_rx.clone();
+                                            tokio::spawn(async move {
+                                                let _ = rm_bg.add_bypass_routes(&routes).await;
+                                                log::info!(
+                                                    "[DNS/Direct] Domain '{}' resolved via tunnel -> added OS bypass routes for {:?}",
+                                                    qname,
+                                                    resolved_ips
+                                                );
+                                            });
                                         }
                                     }
 
@@ -982,17 +1017,6 @@ impl AnetClient {
                         .await?;
                 }
             } else {
-                if !config_clone.main.exclude_route_for.is_empty() {
-                    let exclude_routes = self
-                        .resolve_list(&config_clone.main.exclude_route_for)
-                        .await;
-                    for net in exclude_routes.iter() {
-                        self.route_manager
-                            .add_bypass_route(net.network(), net.prefix_len())
-                            .await?;
-                    }
-                }
-
                 self.route_manager
                     .set_default_route(&result.auth_response.gateway, &iface_name)
                     .await?;

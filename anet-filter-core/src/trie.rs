@@ -61,7 +61,13 @@ impl DomainTrie {
 
     /// Поиск правила маршрутизации для заданного доменного имени
     pub fn lookup(&self, domain: &str) -> Option<RuleAction> {
-        let labels = split_domain_to_reversed_labels(domain);
+        let normalized: std::borrow::Cow<'_, str> =
+            if domain.bytes().any(|b| b.is_ascii_uppercase()) {
+                std::borrow::Cow::Owned(domain.to_ascii_lowercase())
+            } else {
+                std::borrow::Cow::Borrowed(domain)
+            };
+        let labels = split_domain_to_reversed_labels(&normalized);
         if labels.is_empty() || self.root_count == 0 {
             return None;
         }
@@ -75,10 +81,12 @@ impl DomainTrie {
                 return last_wildcard_action;
             }
             let current_slice = &self.nodes[current_start..current_start + current_count];
-            let Some(matched_node) = current_slice.iter().find(|n| n.label.as_str() == *label)
+            let Ok(found_idx) =
+                current_slice.binary_search_by(|n| n.label.as_str().cmp(*label))
             else {
                 return last_wildcard_action;
             };
+            let matched_node = &current_slice[found_idx];
 
             if matched_node.match_subdomains && matched_node.terminal_action.is_some() {
                 last_wildcard_action = matched_node.terminal_action;
@@ -149,7 +157,13 @@ impl DomainTrie {
 impl ArchivedDomainTrie {
     /// Высокопроизводительный поиск действия без выделения памяти в куче
     pub fn lookup(&self, domain: &str) -> Option<RuleAction> {
-        let labels = split_domain_to_reversed_labels(domain);
+        let normalized: std::borrow::Cow<'_, str> =
+            if domain.bytes().any(|b| b.is_ascii_uppercase()) {
+                std::borrow::Cow::Owned(domain.to_ascii_lowercase())
+            } else {
+                std::borrow::Cow::Borrowed(domain)
+            };
+        let labels = split_domain_to_reversed_labels(&normalized);
         if labels.is_empty() || self.root_count == 0 {
             return None;
         }
@@ -164,12 +178,12 @@ impl ArchivedDomainTrie {
                 return last_wildcard_action;
             }
             let current_slice = &nodes[current_start..current_start + current_count];
-            let Some(matched_node) = current_slice
-                .iter()
-                .find(|n| n.label.as_str() == *label)
+            let Ok(found_idx) =
+                current_slice.binary_search_by(|n| n.label.as_str().cmp(*label))
             else {
                 return last_wildcard_action;
             };
+            let matched_node = &current_slice[found_idx];
 
             if matched_node.match_subdomains {
                 if let Some(action) = matched_node.terminal_action.as_ref() {
@@ -291,16 +305,19 @@ impl DomainTrieBuilder {
         for (idx, label) in labels.iter().enumerate() {
             let is_last = idx == labels.len() - 1;
 
-            let node_pos = match current_nodes.iter().position(|n| n.label == *label) {
-                Some(pos) => pos,
-                None => {
-                    current_nodes.push(BuilderNode {
-                        label: (*label).to_string(),
-                        terminal_action: None,
-                        match_subdomains: false,
-                        children: Vec::new(),
-                    });
-                    current_nodes.len() - 1
+            let node_pos = match current_nodes.binary_search_by(|n| n.label.as_str().cmp(*label)) {
+                Ok(pos) => pos,
+                Err(insert_pos) => {
+                    current_nodes.insert(
+                        insert_pos,
+                        BuilderNode {
+                            label: (*label).to_string(),
+                            terminal_action: None,
+                            match_subdomains: false,
+                            children: Vec::new(),
+                        },
+                    );
+                    insert_pos
                 }
             };
 
@@ -329,6 +346,9 @@ impl DomainTrieBuilder {
 
         // Сортируем корневые узлы по алфавиту
         self.roots.sort_by(|a, b| a.label.cmp(&b.label));
+        if self.roots.len() > u16::MAX as usize {
+            self.roots.truncate(u16::MAX as usize);
+        }
 
         let mut flat_nodes: Vec<TrieNode> = Vec::new();
         let mut queue: std::collections::VecDeque<(usize, Vec<BuilderNode>)> =
@@ -355,6 +375,9 @@ impl DomainTrieBuilder {
 
         while let Some((parent_idx, mut children)) = queue.pop_front() {
             children.sort_by(|a, b| a.label.cmp(&b.label));
+            if children.len() > u16::MAX as usize {
+                children.truncate(u16::MAX as usize);
+            }
             let children_start = flat_nodes.len() as u32;
             let children_count = children.len() as u16;
 

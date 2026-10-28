@@ -62,15 +62,13 @@ impl ActiveTunSession {
         let include_str = AndroidCallbackTunFactory::ipnet_list_to_string(&self.include_nets);
         let exclude_str = AndroidCallbackTunFactory::ipnet_list_to_string(&exclude_nets);
 
-        let fallback_str = if self.include_nets.is_empty()
-            && !exclude_nets.is_empty()
-            && exclude_nets.len() <= 256
-        {
-            let fallback_nets = AndroidCallbackTunFactory::calculate_fallback_routes(&exclude_nets);
-            AndroidCallbackTunFactory::ipnet_list_to_string(&fallback_nets)
-        } else if self.include_nets.is_empty() && !self.user_excludes.is_empty() {
-            let fallback_nets =
-                AndroidCallbackTunFactory::calculate_fallback_routes(&self.user_excludes);
+        let fallback_str = if self.include_nets.is_empty() && !exclude_nets.is_empty() {
+            let capped = if exclude_nets.len() <= 128 {
+                &exclude_nets[..]
+            } else {
+                &exclude_nets[..128]
+            };
+            let fallback_nets = AndroidCallbackTunFactory::calculate_fallback_routes(capped);
             AndroidCallbackTunFactory::ipnet_list_to_string(&fallback_nets)
         } else {
             String::new()
@@ -121,15 +119,16 @@ impl ActiveTunSession {
         let _ = tx_new_dev.send(Some((new_device, ack_act_tx)));
         let _ = ack_act_rx.await;
 
-        // Даём netd в Android время применить обновлённые правила маршрутизации до отдачи DNS-ответа
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-
         info!(
             "[Android RouteManager] Hot-updated VpnService TUN exclusions (ExcludeItems={})",
             exclude_nets.len()
         );
         Ok(())
     }
+}
+
+pub fn reset_tun_session_flags() {
+    TUN_ACTIVE_FLAG.store(false, Ordering::Release);
 }
 
 pub struct AndroidRouteManager {
@@ -157,15 +156,20 @@ impl anet_client_core::traits::RouteManager for AndroidRouteManager {
         {
             let mut list = self.bypass_ips.lock().unwrap();
             for &(target, prefix) in routes {
-                if !target.is_ipv4() {
+                let IpAddr::V4(v4) = target else {
                     continue;
-                }
-                if !list.contains(&(target, prefix)) {
-                    info!(
-                        "[Android RouteManager] Recorded bypass route: {}/{}",
-                        target, prefix
-                    );
-                    list.push((target, prefix));
+                };
+                let normalized_ip = IpNet::new(IpAddr::V4(v4), prefix)
+                    .map(|n| n.network())
+                    .unwrap_or(IpAddr::V4(v4));
+                if !list.contains(&(normalized_ip, prefix)) {
+                    if routes.len() <= 16 {
+                        info!(
+                            "[Android RouteManager] Recorded bypass route: {}/{}",
+                            normalized_ip, prefix
+                        );
+                    }
+                    list.push((normalized_ip, prefix));
                     added_new = true;
                 }
             }
@@ -181,7 +185,7 @@ impl anet_client_core::traits::RouteManager for AndroidRouteManager {
 
         if added_new {
             // Коалесцируем параллельные DNS-ответы (например, example.com + static.example.com) в одно обновление TUN
-            tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
 
         let mutex = active_tun_mutex();
@@ -253,8 +257,11 @@ impl AndroidCallbackTunFactory {
             }
             // 1. CIDR
             if let Ok(net) = trimmed.parse::<IpNet>() {
-                if net.addr().is_ipv4() && !result.contains(&net) {
-                    result.push(net);
+                if net.addr().is_ipv4() {
+                    let normalized = IpNet::new(net.network(), net.prefix_len()).unwrap_or(net);
+                    if !result.contains(&normalized) {
+                        result.push(normalized);
+                    }
                 }
                 continue;
             }
@@ -473,6 +480,7 @@ fn spawn_tun_io_worker(
             }
 
             let mut swap_req = None;
+            let mut reader_finished = false;
             'io_loop: loop {
                 tokio::select! {
                     biased;
@@ -483,6 +491,7 @@ fn spawn_tun_io_worker(
                         break 'io_loop;
                     }
                     _ = &mut reader_handle => {
+                        reader_finished = true;
                         break 'io_loop;
                     }
                     pkt_opt = rx_from_core.recv() => {
@@ -507,8 +516,10 @@ fn spawn_tun_io_worker(
             }
 
             // Останавливаем и дропаем старые reader и writer до закрытия дескриптора в Java
-            reader_stop.notify_one();
-            let _ = reader_handle.await;
+            if !reader_finished {
+                reader_stop.notify_one();
+                let _ = reader_handle.await;
+            }
             drop(writer);
 
             if let Some(TunSwapRequest {
@@ -546,18 +557,25 @@ impl TunFactory for AndroidCallbackTunFactory {
         let base_exclude_nets = user_excludes.clone();
         let mut exclude_nets = base_exclude_nets.clone();
 
-        // Добавляем все маршруты обхода (сервер, DNS, статические Direct CIDR из rules.abc,
-        // локальные overrides из client.toml), которые client.rs уже записал в bypass_ips
-        let bypass_list = self.bypass_ips.lock().unwrap().clone();
+        // Синхронизируем user_excludes в bypass_ips и собираем все маршруты обхода
+        // (сервер, DNS, статические Direct CIDR из rules.abc, локальные overrides из client.toml)
+        let bypass_list = {
+            let mut guard = self.bypass_ips.lock().unwrap();
+            for net in &base_exclude_nets {
+                let entry = (net.network(), net.prefix_len());
+                if !guard.contains(&entry) {
+                    guard.push(entry);
+                }
+            }
+            guard.clone()
+        };
+
         for (ip, prefix) in bypass_list {
             if ip.is_ipv4() {
                 if let Ok(net) = IpNet::new(ip, prefix) {
-                    if !exclude_nets.contains(&net) {
-                        info!(
-                            "[Android VpnService] Adding bypass route {}/{} to tunnel exclusions",
-                            ip, prefix
-                        );
-                        exclude_nets.push(net);
+                    let normalized = IpNet::new(net.network(), net.prefix_len()).unwrap_or(net);
+                    if !exclude_nets.contains(&normalized) {
+                        exclude_nets.push(normalized);
                     }
                 }
             }
@@ -566,11 +584,13 @@ impl TunFactory for AndroidCallbackTunFactory {
         let include_str = Self::ipnet_list_to_string(&include_nets);
         let exclude_str = Self::ipnet_list_to_string(&exclude_nets);
 
-        let fallback_str = if include_nets.is_empty() && !exclude_nets.is_empty() && exclude_nets.len() <= 256 {
-            let fallback_nets = Self::calculate_fallback_routes(&exclude_nets);
-            Self::ipnet_list_to_string(&fallback_nets)
-        } else if include_nets.is_empty() && !user_excludes.is_empty() {
-            let fallback_nets = Self::calculate_fallback_routes(&user_excludes);
+        let fallback_str = if include_nets.is_empty() && !exclude_nets.is_empty() {
+            let capped = if exclude_nets.len() <= 128 {
+                &exclude_nets[..]
+            } else {
+                &exclude_nets[..128]
+            };
+            let fallback_nets = Self::calculate_fallback_routes(capped);
             Self::ipnet_list_to_string(&fallback_nets)
         } else {
             String::new()

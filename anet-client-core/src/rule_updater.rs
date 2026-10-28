@@ -92,6 +92,8 @@ pub fn default_rules_cache_path() -> PathBuf {
 pub struct RuleCacheManager {
     cache_path: PathBuf,
     current_mmap: Arc<ArcSwap<Option<Arc<Mmap>>>>,
+    has_domain_rules: Arc<std::sync::atomic::AtomicBool>,
+    has_ip_rules: Arc<std::sync::atomic::AtomicBool>,
     update_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
@@ -101,6 +103,8 @@ impl RuleCacheManager {
         let manager = Self {
             cache_path,
             current_mmap: Arc::new(ArcSwap::new(Arc::new(None))),
+            has_domain_rules: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            has_ip_rules: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             update_lock: Arc::new(tokio::sync::Mutex::new(())),
         };
         // Пробуем загрузить локальный кэш с диска при старте (Zero Cold Start)
@@ -131,7 +135,7 @@ impl RuleCacheManager {
         match File::open(&self.cache_path) {
             Ok(file) => match unsafe { Mmap::map(&file) } {
                 Ok(mmap) => {
-                    // Валидация Zero-Copy корня
+                    // Валидация Zero-Copy корня выполняется ОДИН РАЗ при загрузке файла в память
                     let (domains_cnt, ips_cnt) = match CompiledRoutingCache::from_bytes(&mmap) {
                         Ok(archived) => (
                             archived.domain_trie.nodes.len(),
@@ -154,6 +158,10 @@ impl RuleCacheManager {
                     );
                     info!("{msg}");
                     crate::events::status(&msg);
+                    self.has_domain_rules
+                        .store(domains_cnt > 0, std::sync::atomic::Ordering::Release);
+                    self.has_ip_rules
+                        .store(ips_cnt > 0, std::sync::atomic::Ordering::Release);
                     self.current_mmap.store(Arc::new(Some(Arc::new(mmap))));
                     true
                 }
@@ -257,46 +265,62 @@ impl RuleCacheManager {
         Ok(())
     }
 
-    /// Быстрый Zero-Copy поиск по домену
+    /// Быстрый Zero-Copy поиск по домену (без повторной bytecheck-валидации графа)
+    #[inline]
     pub fn lookup_domain(&self, domain: &str) -> Option<RuleAction> {
+        if !self
+            .has_domain_rules
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return None;
+        }
         let guard = self.current_mmap.load();
         if let Some(mmap) = guard.as_ref() {
-            if let Ok(archived) = CompiledRoutingCache::from_bytes(mmap) {
-                return archived.domain_trie.lookup(domain);
-            }
+            let archived = unsafe { CompiledRoutingCache::from_bytes_unchecked(mmap) };
+            return archived.domain_trie.lookup(domain);
         }
         None
     }
 
-    /// Быстрый Zero-Copy поиск по IP
+    /// Быстрый Zero-Copy поиск по IP (без повторной bytecheck-валидации графа на каждый пакет)
+    #[inline]
     pub fn lookup_ip(&self, ip: IpAddr) -> Option<RuleAction> {
+        if !self.has_ip_rules.load(std::sync::atomic::Ordering::Acquire) {
+            return None;
+        }
         let guard = self.current_mmap.load();
         if let Some(mmap) = guard.as_ref() {
-            if let Ok(archived) = CompiledRoutingCache::from_bytes(mmap) {
-                return archived.ip_table.lookup(ip);
-            }
+            let archived = unsafe { CompiledRoutingCache::from_bytes_unchecked(mmap) };
+            return archived.ip_table.lookup(ip);
         }
         None
     }
 
     /// Возвращает все статические подсети (IP, prefix_len) с действием `Direct` из `rules.abc`
     pub fn collect_direct_routes(&self) -> Vec<(IpAddr, u8)> {
+        if !self.has_ip_rules.load(std::sync::atomic::Ordering::Acquire) {
+            return Vec::new();
+        }
         let guard = self.current_mmap.load();
         if let Some(mmap) = guard.as_ref() {
-            if let Ok(archived) = CompiledRoutingCache::from_bytes(mmap) {
-                return archived.ip_table.collect_direct_routes();
-            }
+            let archived = unsafe { CompiledRoutingCache::from_bytes_unchecked(mmap) };
+            return archived.ip_table.collect_direct_routes();
         }
         Vec::new()
     }
 
     /// Возвращает все доменные имена (включая wildcard базы) с действием `Direct` из `rules.abc`
     pub fn collect_direct_domains(&self) -> Vec<String> {
+        if !self
+            .has_domain_rules
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Vec::new();
+        }
         let guard = self.current_mmap.load();
         if let Some(mmap) = guard.as_ref() {
-            if let Ok(archived) = CompiledRoutingCache::from_bytes(mmap) {
-                return archived.domain_trie.collect_direct_domains();
-            }
+            let archived = unsafe { CompiledRoutingCache::from_bytes_unchecked(mmap) };
+            return archived.domain_trie.collect_direct_domains();
         }
         Vec::new()
     }
