@@ -1250,6 +1250,7 @@ impl ClientTransport for WrtcTransport {
                     if p2p.is_open.load(Ordering::SeqCst) {
                         while let Some(first_bytes) = p2p.recv_packet().await {
                             let mut current_raw = Some(first_bytes);
+                            let mut drained = 0usize;
                             while let Some(raw_bytes) = current_raw.take() {
                                 match unwrap_packet_bytes(&cipher_p2p, raw_bytes) {
                                     Ok(decrypted) => {
@@ -1273,6 +1274,11 @@ impl ClientTransport for WrtcTransport {
                                         warn!("[P2P Direct] Decrypt packet error: {e}");
                                         warn(format!("[P2P Direct] Decrypt packet error: {e}"));
                                     }
+                                }
+                                drained += 1;
+                                if drained >= 32 {
+                                    tokio::task::yield_now().await;
+                                    break;
                                 }
                                 current_raw = p2p.try_recv_packet();
                             }
@@ -1312,6 +1318,7 @@ impl ClientTransport for WrtcTransport {
         }
         tokio::spawn(async move {
             'outer: while let Some(mut raw_frame) = peer_video_rx.recv_video_frame().await {
+                let mut drained = 0usize;
                 loop {
                     if raw_frame.len() >= WRTC_MIN_ASTP_VIDEO_FRAME_LEN {
                         let tag = u16::from_be_bytes([raw_frame[0], raw_frame[1]]);
@@ -1350,6 +1357,11 @@ impl ClientTransport for WrtcTransport {
                                 }
                             }
                         }
+                    }
+                    drained += 1;
+                    if drained >= 32 {
+                        tokio::task::yield_now().await;
+                        break;
                     }
                     match peer_video_rx.try_recv_video_frame() {
                         Some(next) => raw_frame = next,

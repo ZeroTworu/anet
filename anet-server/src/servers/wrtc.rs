@@ -253,6 +253,7 @@ pub async fn run_wrtc_server(
         let video_uplink_task = tokio::spawn(async move {
             while let Some(first_frame) = peer_video_rx.recv_video_frame().await {
                 let mut current_frame = Some(first_frame);
+                let mut drained = 0usize;
                 while let Some(raw_frame) = current_frame.take() {
                     if raw_frame.len() < WRTC_MIN_ASTP_VIDEO_FRAME_LEN {
                         // Слишком короткий для ASTP кадра (2B tag + 12B nonce + 20B IPv4 + 16B MAC)
@@ -333,6 +334,11 @@ pub async fn run_wrtc_server(
                                 }
                             }
                         }
+                    }
+                    drained += 1;
+                    if drained >= 32 {
+                        tokio::task::yield_now().await;
+                        break;
                     }
                     current_frame = peer_video_rx.try_recv_video_frame();
                 }

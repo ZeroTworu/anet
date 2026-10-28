@@ -75,7 +75,7 @@ impl AsyncUdpSocket for HybridAsyncUdpSocket {
                             "[WRTC UDP] Transient loopback send error to {} ignored to preserve TURN/ICE state: {e}",
                             transmit.destination
                         );
-                        std::task::Poll::Ready(Ok(transmit.message.len()))
+                        std::task::Poll::Ready(Ok(transmit.contents.len()))
                     }
                     other => other,
                 };
@@ -93,7 +93,7 @@ impl AsyncUdpSocket for HybridAsyncUdpSocket {
                     "[WRTC UDP] Transient UDP send error to {} ignored to preserve TURN allocation: {e}",
                     transmit.destination
                 );
-                std::task::Poll::Ready(Ok(transmit.message.len()))
+                std::task::Poll::Ready(Ok(transmit.contents.len()))
             }
             other => other,
         }
@@ -449,7 +449,10 @@ impl PeerConnectionEventHandler for PeerEvents {
                                         pkt.header.ssrc, data.len()
                                     );
                                 }
-                                let _ = in_tx.send(data).await;
+                                // Неблокирующая передача в буфер video_incoming_tx (емкость 32768),
+                                // чтобы задача track.poll() никогда не засыпала на .await и мгновенно
+                                // вычитывала внутреннюю очередь TrackRemote в webrtc-rs без ошибки Full(OnRtpPacket).
+                                let _ = in_tx.try_send(data);
                             }
                         }
                         TrackRemoteEvent::OnEnded => {
@@ -973,7 +976,7 @@ pub async fn create_p2p_channel(
                     break;
                 }
                 DataChannelEvent::OnMessage(msg) => {
-                    let _ = in_tx.send(msg.data.into()).await;
+                    let _ = in_tx.try_send(msg.data.into());
                 }
                 _ => {}
             }
