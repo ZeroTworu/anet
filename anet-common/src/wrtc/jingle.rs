@@ -129,6 +129,10 @@ impl JingleSession {
 
         let remote_audio_ssrc = self.sources.first().copied().unwrap_or(10001);
         let primary_video_ssrc = 10002u32;
+        let vstream_id = crate::wrtc::stealth::generate_random_uuid_v4();
+        let vtrack_id = crate::wrtc::stealth::generate_random_uuid_v4();
+        let astream_id = crate::wrtc::stealth::generate_random_uuid_v4();
+        let atrack_id = crate::wrtc::stealth::generate_random_uuid_v4();
 
         let video_section = if include_video {
             let pt = self.video_payload_type;
@@ -153,8 +157,8 @@ impl JingleSession {
                  a=setup:{setup}\r\n\
                  a=mid:video\r\n\
                  a=sendrecv\r\n\
-                 a=ssrc:{primary_video_ssrc} cname:jvb-video\r\n\
-                 a=ssrc:{primary_video_ssrc} msid:jvb-vstream-{primary_video_ssrc} jvb-vtrack-{primary_video_ssrc}\r\n\
+                 a=ssrc:{primary_video_ssrc} cname:{vstream_id}\r\n\
+                 a=ssrc:{primary_video_ssrc} msid:{vstream_id} {vtrack_id}\r\n\
                  {candidate_lines}"
             )
         } else {
@@ -196,8 +200,8 @@ impl JingleSession {
              a=setup:{setup}\r\n\
              a=mid:audio\r\n\
              a=sendrecv\r\n\
-             a=ssrc:{remote_audio_ssrc} cname:jvb-audio\r\n\
-             a=ssrc:{remote_audio_ssrc} msid:jvb-astream jvb-atrack0\r\n\
+             a=ssrc:{remote_audio_ssrc} cname:{astream_id}\r\n\
+             a=ssrc:{remote_audio_ssrc} msid:{astream_id} {atrack_id}\r\n\
              {candidate_lines}\
              {video_section}\
              {data_section}"
@@ -259,6 +263,8 @@ pub fn append_remote_video_ssrc_to_sdp(current_sdp: &str, new_ssrc: u32, video_p
 
     let pt = if video_pt != 0 { video_pt } else { 100 };
     let alt_pt = if pt == 100 { 96 } else { 100 };
+    let stream_uuid = crate::wrtc::stealth::generate_random_uuid_v4();
+    let track_uuid = crate::wrtc::stealth::generate_random_uuid_v4();
 
     let mut updated = String::with_capacity(current_sdp.len() + 640);
     for raw_line in current_sdp.lines() {
@@ -291,12 +297,34 @@ pub fn append_remote_video_ssrc_to_sdp(current_sdp: &str, new_ssrc: u32, video_p
          a=setup:{setup}\r\n\
          a=mid:{mid_tag}\r\n\
          a=sendonly\r\n\
-         a=ssrc:{new_ssrc} cname:jvb-video-{new_ssrc}\r\n\
-         a=ssrc:{new_ssrc} msid:jvb-vstream-{new_ssrc} jvb-vtrack-{new_ssrc}\r\n\
+         a=ssrc:{new_ssrc} cname:{stream_uuid}\r\n\
+         a=ssrc:{new_ssrc} msid:{stream_uuid} {track_uuid}\r\n\
          {candidate_lines}"
     ));
 
     updated
+}
+
+/// Фильтрует SDP для режима `p2p_direct` (Relay-Only):
+/// удаляет все локальные (`typ host`) и STUN (`typ srflx`) ICE-кандидаты,
+/// оставляя исключительно релейные кандидаты (`typ relay`) через TURN/TURNS-серверы Ktalk,
+/// а также маскирует IP-адрес в строках `c=IN IP4`.
+pub fn filter_p2p_sdp_relay_only(sdp: &str) -> String {
+    let mut out = String::with_capacity(sdp.len());
+    for raw_line in sdp.lines() {
+        let line = raw_line.trim_end_matches('\r');
+        if line.starts_with("a=candidate:") {
+            if !line.contains(" typ relay") {
+                continue;
+            }
+        } else if line.starts_with("c=IN IP4 ") {
+            out.push_str("c=IN IP4 0.0.0.0\r\n");
+            continue;
+        }
+        out.push_str(line);
+        out.push_str("\r\n");
+    }
+    out
 }
 
 pub fn parse_jingle_session(
@@ -353,3 +381,4 @@ pub fn parse_sdp_answer(sdp: &str) -> LocalJingleParams {
         candidates,
     }
 }
+

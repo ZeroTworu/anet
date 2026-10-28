@@ -1329,10 +1329,14 @@ impl WrtcPeer {
             if let Some(pc_impl) = built_pc {
                 let pc: Arc<dyn PeerConnection> = Arc::new(pc_impl);
 
+                let media_stream_id = crate::wrtc::stealth::generate_random_uuid_v4();
+                let audio_track_id = crate::wrtc::stealth::generate_random_uuid_v4();
+                let video_track_id = crate::wrtc::stealth::generate_random_uuid_v4();
+
                 let audio_track_desc = MediaStreamTrack::new(
-                    format!("webrtc-rs-stream-id-{}", RtpCodecKind::Audio),
-                    format!("webrtc-rs-track-id-{}", RtpCodecKind::Audio),
-                    format!("webrtc-rs-track-label-{}", RtpCodecKind::Audio),
+                    media_stream_id.clone(),
+                    audio_track_id.clone(),
+                    audio_track_id,
                     RtpCodecKind::Audio,
                     vec![RTCRtpEncodingParameters {
                         rtp_coding_parameters: RTCRtpCodingParameters {
@@ -1349,9 +1353,9 @@ impl WrtcPeer {
                     .await;
 
                 let video_track_desc = MediaStreamTrack::new(
-                    format!("webrtc-rs-stream-id-{}", RtpCodecKind::Video),
-                    format!("webrtc-rs-track-id-{}", RtpCodecKind::Video),
-                    format!("webrtc-rs-track-label-{}", RtpCodecKind::Video),
+                    media_stream_id,
+                    video_track_id.clone(),
+                    video_track_id,
                     RtpCodecKind::Video,
                     vec![RTCRtpEncodingParameters {
                         rtp_coding_parameters: RTCRtpCodingParameters {

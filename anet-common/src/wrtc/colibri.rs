@@ -134,7 +134,7 @@ impl std::str::FromStr for WrtcMode {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum WrtcMessage {
-    #[serde(rename = "anet_discover")]
+    #[serde(rename = "e2ee-ping", alias = "anet_discover")]
     Discover {
         client_nonce: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -144,7 +144,7 @@ pub enum WrtcMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         video_v2: Option<bool>,
     },
-    #[serde(rename = "anet_beacon")]
+    #[serde(rename = "e2ee-ack", alias = "anet_beacon")]
     Beacon {
         server_id: String,
         client_nonce: String,
@@ -154,31 +154,31 @@ pub enum WrtcMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         video_v2: Option<bool>,
     },
-    #[serde(rename = "astp")]
+    #[serde(rename = "ReceiverAudioSubscription", alias = "astp")]
     Astp {
         data: String,
     },
-    #[serde(rename = "astp_batch")]
+    #[serde(rename = "dominant-speaker-stats", alias = "astp_batch")]
     AstpBatch {
         data: String,
     },
-    #[serde(rename = "anet_p2p_offer")]
+    #[serde(rename = "ice-offer", alias = "anet_p2p_offer")]
     P2pOffer {
         sdp: String,
         candidates: Vec<String>,
     },
-    #[serde(rename = "anet_p2p_answer")]
+    #[serde(rename = "ice-answer", alias = "anet_p2p_answer")]
     P2pAnswer {
         sdp: String,
         candidates: Vec<String>,
     },
-    #[serde(rename = "anet_p2p_candidate")]
+    #[serde(rename = "ice-candidate", alias = "anet_p2p_candidate")]
     P2pCandidate {
         candidate: String,
     },
-    #[serde(rename = "anet_ping")]
+    #[serde(rename = "keepalive", alias = "anet_ping")]
     Ping,
-    #[serde(rename = "anet_pong")]
+    #[serde(rename = "keepalive-ack", alias = "anet_pong")]
     Pong,
     #[serde(other)]
     Unknown,
@@ -186,6 +186,42 @@ pub enum WrtcMessage {
 
 fn default_wrtc_message() -> WrtcMessage {
     WrtcMessage::Unknown
+}
+
+/// Вычисляет 2-байтный детерминированный суффикс (4 hex-символа) серверного MUC `endpoint_id`:
+/// `SHA256(server_pub_key_bytes || conference_id)[0..2]`.
+pub fn compute_server_endpoint_suffix(
+    server_pub_key_bytes: &[u8; 32],
+    conference_id: &str,
+) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(server_pub_key_bytes);
+    hasher.update(conference_id.as_bytes());
+    let digest = hasher.finalize();
+    format!("{:02x}{:02x}", digest[0], digest[1])
+}
+
+/// Вычисляет 2-байтный детерминированный суффикс (4 hex-символа) серверного MUC `endpoint_id`
+/// из Base64-кодированного публичного ключа Ed25519 и `conference_id`.
+pub fn compute_server_endpoint_suffix_from_b64(
+    server_pub_key_b64: &str,
+    conference_id: &str,
+) -> Option<String> {
+    let pub_bytes = BASE64_STANDARD.decode(server_pub_key_b64.trim()).ok()?;
+    let pub_array: [u8; 32] = pub_bytes.as_slice().try_into().ok()?;
+    Some(compute_server_endpoint_suffix(&pub_array, conference_id))
+}
+
+/// Генерирует 8-символьный hex `endpoint_id` сервера, в котором старшие 2 байта случайны,
+/// а младшие 2 байта равны `SHA256(server_pub_key_bytes || conference_id)[0..2]`.
+pub fn generate_server_endpoint_id(
+    server_pub_key_bytes: &[u8; 32],
+    conference_id: &str,
+) -> String {
+    let prefix: u16 = rand::random();
+    let suffix = compute_server_endpoint_suffix(server_pub_key_bytes, conference_id);
+    format!("{prefix:04x}{suffix}")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -341,3 +377,4 @@ pub fn verify_beacon(
 
     Ok(verifying_key.verify(&message, &signature).is_ok())
 }
+

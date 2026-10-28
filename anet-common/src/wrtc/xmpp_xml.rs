@@ -546,6 +546,8 @@ impl XmppBuilder {
         include_data_content: bool,
         include_video_content: bool,
     ) -> String {
+        let vtrack_id = crate::wrtc::stealth::generate_random_uuid_v4();
+        let atrack_id = crate::wrtc::stealth::generate_random_uuid_v4();
         let video_section = if include_video_content && video_ssrc != 0 {
             let pt = if video_payload_type != 0 { video_payload_type } else { 100 };
             let rtcp_fb = r#"<rtcp-fb xmlns="urn:xmpp:jingle:apps:rtp:fb:0" type="goog-remb"/><rtcp-fb xmlns="urn:xmpp:jingle:apps:rtp:fb:0" type="ccm" subtype="fir"/><rtcp-fb xmlns="urn:xmpp:jingle:apps:rtp:fb:0" type="nack"/><rtcp-fb xmlns="urn:xmpp:jingle:apps:rtp:fb:0" type="nack" subtype="pli"/>"#;
@@ -555,7 +557,7 @@ impl XmppBuilder {
                 "".to_string()
             };
             format!(
-                r#"<content creator="initiator" name="video" senders="both"><description xmlns="urn:xmpp:jingle:apps:rtp:1" media="video"><payload-type id="{pt}" name="VP8" clockrate="90000">{rtcp_fb}</payload-type>{pt_fallback}<rtcp-mux/><source xmlns="urn:xmpp:jingle:apps:rtp:ssma:0" ssrc="{video_ssrc}"><parameter xmlns="urn:xmpp:jingle:apps:rtp:1" name="cname" value="{cname}"/><parameter xmlns="urn:xmpp:jingle:apps:rtp:1" name="msid" value="{msid} v0"/></source></description><transport xmlns="urn:xmpp:jingle:transports:ice-udp:1" ufrag="{ufrag}" pwd="{pwd}"><rtcp-mux/><fingerprint xmlns="urn:xmpp:jingle:apps:dtls:0" hash="{fingerprint_hash}" setup="active">{fingerprint}</fingerprint>{candidate_xml}</transport></content>"#,
+                r#"<content creator="initiator" name="video" senders="both"><description xmlns="urn:xmpp:jingle:apps:rtp:1" media="video"><payload-type id="{pt}" name="VP8" clockrate="90000">{rtcp_fb}</payload-type>{pt_fallback}<rtcp-mux/><source xmlns="urn:xmpp:jingle:apps:rtp:ssma:0" ssrc="{video_ssrc}"><parameter xmlns="urn:xmpp:jingle:apps:rtp:1" name="cname" value="{cname}"/><parameter xmlns="urn:xmpp:jingle:apps:rtp:1" name="msid" value="{msid} {vtrack_id}"/></source></description><transport xmlns="urn:xmpp:jingle:transports:ice-udp:1" ufrag="{ufrag}" pwd="{pwd}"><rtcp-mux/><fingerprint xmlns="urn:xmpp:jingle:apps:dtls:0" hash="{fingerprint_hash}" setup="active">{fingerprint}</fingerprint>{candidate_xml}</transport></content>"#,
                 ufrag = escape_xml_attr(ufrag),
                 pwd = escape_xml_attr(pwd),
                 fingerprint_hash = escape_xml_attr(fingerprint_hash),
@@ -564,6 +566,7 @@ impl XmppBuilder {
                 video_ssrc = video_ssrc,
                 cname = escape_xml_attr(cname),
                 msid = escape_xml_attr(msid),
+                vtrack_id = vtrack_id,
                 pt = pt,
                 rtcp_fb = rtcp_fb,
                 pt_fallback = pt_fallback,
@@ -586,7 +589,7 @@ impl XmppBuilder {
         };
 
         format!(
-            r#"<iq to="{to}" type="set" id="{id}"><jingle xmlns="urn:xmpp:jingle:1" action="session-accept" initiator="{init}" responder="{resp}" sid="{sid}"><content creator="initiator" name="audio" senders="both"><description xmlns="urn:xmpp:jingle:apps:rtp:1" media="audio"><payload-type id="111" name="opus" clockrate="48000" channels="2"/><rtcp-mux/><source xmlns="urn:xmpp:jingle:apps:rtp:ssma:0" ssrc="{ssrc}"><parameter xmlns="urn:xmpp:jingle:apps:rtp:1" name="cname" value="{cname}"/><parameter xmlns="urn:xmpp:jingle:apps:rtp:1" name="msid" value="{msid} a0"/></source></description><transport xmlns="urn:xmpp:jingle:transports:ice-udp:1" ufrag="{ufrag}" pwd="{pwd}"><rtcp-mux/><fingerprint xmlns="urn:xmpp:jingle:apps:dtls:0" hash="{fp_hash}" setup="active">{fp}</fingerprint>{candidate_xml}</transport></content>{video_section}{data_section}</jingle></iq>"#,
+            r#"<iq to="{to}" type="set" id="{id}"><jingle xmlns="urn:xmpp:jingle:1" action="session-accept" initiator="{init}" responder="{resp}" sid="{sid}"><content creator="initiator" name="audio" senders="both"><description xmlns="urn:xmpp:jingle:apps:rtp:1" media="audio"><payload-type id="111" name="opus" clockrate="48000" channels="2"/><rtcp-mux/><source xmlns="urn:xmpp:jingle:apps:rtp:ssma:0" ssrc="{ssrc}"><parameter xmlns="urn:xmpp:jingle:apps:rtp:1" name="cname" value="{cname}"/><parameter xmlns="urn:xmpp:jingle:apps:rtp:1" name="msid" value="{msid} {atrack_id}"/></source></description><transport xmlns="urn:xmpp:jingle:transports:ice-udp:1" ufrag="{ufrag}" pwd="{pwd}"><rtcp-mux/><fingerprint xmlns="urn:xmpp:jingle:apps:dtls:0" hash="{fp_hash}" setup="active">{fp}</fingerprint>{candidate_xml}</transport></content>{video_section}{data_section}</jingle></iq>"#,
             to = escape_xml_attr(focus_jid),
             id = escape_xml_attr(req_id),
             init = escape_xml_attr(focus_jid),
@@ -595,6 +598,7 @@ impl XmppBuilder {
             ssrc = ssrc,
             cname = escape_xml_attr(cname),
             msid = escape_xml_attr(msid),
+            atrack_id = atrack_id,
             ufrag = escape_xml_attr(ufrag),
             pwd = escape_xml_attr(pwd),
             fp_hash = escape_xml_attr(fingerprint_hash),
@@ -613,15 +617,17 @@ impl XmppBuilder {
         cname: &str,
         msid: &str,
     ) -> String {
+        let atrack_id = crate::wrtc::stealth::generate_random_uuid_v4();
         format!(
-            r#"<iq to="{to}" type="set" id="{id}"><jingle xmlns="urn:xmpp:jingle:1" action="source-add" initiator="{init}" sid="{sid}"><content name="audio"><description xmlns="urn:xmpp:jingle:apps:rtp:1" media="audio"><source xmlns="urn:xmpp:jingle:apps:rtp:ssma:0" ssrc="{ssrc}"><parameter name="cname" value="{cname}"/><parameter name="msid" value="{msid} a0"/></source></description></content></jingle></iq>"#,
+            r#"<iq to="{to}" type="set" id="{id}"><jingle xmlns="urn:xmpp:jingle:1" action="source-add" initiator="{init}" sid="{sid}"><content name="audio"><description xmlns="urn:xmpp:jingle:apps:rtp:1" media="audio"><source xmlns="urn:xmpp:jingle:apps:rtp:ssma:0" ssrc="{ssrc}"><parameter name="cname" value="{cname}"/><parameter name="msid" value="{msid} {atrack_id}"/></source></description></content></jingle></iq>"#,
             to = escape_xml_attr(focus_jid),
             id = escape_xml_attr(req_id),
             init = escape_xml_attr(focus_jid),
             sid = escape_xml_attr(sid),
             ssrc = ssrc,
             cname = escape_xml_attr(cname),
-            msid = escape_xml_attr(msid)
+            msid = escape_xml_attr(msid),
+            atrack_id = atrack_id
         )
     }
 

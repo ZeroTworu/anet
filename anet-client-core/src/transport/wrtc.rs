@@ -20,8 +20,10 @@ use anet_common::transport::{
 };
 use anet_common::wrtc::{
     batcher::{unpack_batch, PacketBatcher},
-    colibri::{verify_beacon, ColibriMessage, WrtcMessage},
-    jingle::parse_jingle_session,
+    colibri::{
+        compute_server_endpoint_suffix_from_b64, verify_beacon, ColibriMessage, WrtcMessage,
+    },
+    jingle::{filter_p2p_sdp_relay_only, parse_jingle_session},
     ktalk::KtalkClient,
     peer::{create_p2p_channel, P2pSession, WrtcPeer},
     stealth::generate_random_guest_name,
@@ -312,6 +314,9 @@ impl ClientTransport for WrtcTransport {
                 }
             });
 
+        let expected_srv_suffix = server_pub_key
+            .and_then(|pk| compute_server_endpoint_suffix_from_b64(pk, &room_info.conference_id));
+
         let mut verified_server_id = None;
         while tokio::time::Instant::now() < deadline {
             tokio::select! {
@@ -323,16 +328,24 @@ impl ClientTransport for WrtcTransport {
                         anet_common::wrtc::colibri::WrtcMode::JvbDatachannel => (None, "jvb_datachannel"),
                         anet_common::wrtc::colibri::WrtcMode::Auto => (Some(peer.video_ssrc), "auto"),
                     };
-                    info!("[WRTC] Sending anet_discover broadcast (nonce: {client_nonce}, mode: {c_mode_str}, video_ssrc: {c_video_ssrc:?})...");
-                    status(format!("[WRTC] Sending anet_discover broadcast (nonce: {client_nonce}, mode: {c_mode_str}, video_ssrc: {c_video_ssrc:?})..."));
-                    let discover_broadcast = ColibriMessage::discover(None, client_nonce.clone(), c_video_ssrc, Some(c_mode_str.to_string()));
-                    let _ = peer.send(discover_broadcast).await;
 
                     let current_occupants = xmpp.get_other_occupants();
-                    for occupant in current_occupants {
-                        info!("[WRTC] Sending anet_discover to occupant: {occupant}");
-                        status(format!("[WRTC] Sending anet_discover to occupant: {occupant}"));
-                        let unicast_discover = ColibriMessage::discover(Some(occupant), client_nonce.clone(), c_video_ssrc, Some(c_mode_str.to_string()));
+                    let target_occupants: Vec<String> = match expected_srv_suffix {
+                        Some(ref suffix) => current_occupants
+                            .into_iter()
+                            .filter(|occ| occ.ends_with(suffix.as_str()))
+                            .collect(),
+                        None => current_occupants,
+                    };
+                    for occupant in target_occupants {
+                        info!("[WRTC] Sending unicast e2ee-ping to server occupant: {occupant} (nonce: {client_nonce}, mode: {c_mode_str}, video_ssrc: {c_video_ssrc:?})");
+                        status(format!("[WRTC] Sending unicast e2ee-ping to occupant: {occupant}"));
+                        let unicast_discover = ColibriMessage::discover(
+                            Some(occupant),
+                            client_nonce.clone(),
+                            c_video_ssrc,
+                            Some(c_mode_str.to_string()),
+                        );
                         let _ = peer.send(unicast_discover).await;
                     }
                 }
@@ -638,11 +651,9 @@ impl ClientTransport for WrtcTransport {
         });
 
         let p2p_session_opt: Arc<Mutex<Option<Arc<P2pSession>>>> = Arc::new(Mutex::new(None));
-        if wrtc_mode == anet_common::wrtc::colibri::WrtcMode::P2pDirect
-            || wrtc_mode == anet_common::wrtc::colibri::WrtcMode::Auto
-        {
-            info!("[P2P Direct] Initiating direct WebRTC P2P DataChannel with server {target_server_id}...");
-            status(format!("[P2P Direct] Initiating direct WebRTC P2P DataChannel with server {target_server_id}..."));
+        if wrtc_mode == anet_common::wrtc::colibri::WrtcMode::P2pDirect {
+            info!("[P2P Direct] Initiating Relay-Only WebRTC P2P DataChannel with server {target_server_id}...");
+            status(format!("[P2P Direct] Initiating Relay-Only WebRTC P2P DataChannel with server {target_server_id}..."));
             let p2p_store = p2p_session_opt.clone();
             let peer_sig = shared_peer.clone();
             let target_srv = target_server_id.clone();
@@ -666,7 +677,7 @@ impl ClientTransport for WrtcTransport {
                                     if let Some(desc) = p2p_arc.pc.local_description().await {
                                         if desc.sdp.contains("a=candidate:") {
                                             final_sdp = desc.sdp;
-                                            if final_sdp.contains("typ srflx") || final_sdp.contains("typ relay") {
+                                            if final_sdp.contains("typ relay") {
                                                 break;
                                             }
                                         }
@@ -681,14 +692,15 @@ impl ClientTransport for WrtcTransport {
                                         final_sdp = desc.sdp;
                                     }
                                 }
+                                let relay_only_sdp = filter_p2p_sdp_relay_only(&final_sdp);
 
-                                let offer_msg = ColibriMessage::p2p_offer(target_srv.clone(), final_sdp, vec![]);
+                                let offer_msg = ColibriMessage::p2p_offer(target_srv.clone(), relay_only_sdp, vec![]);
                                 if let Err(e) = peer_sig.send(offer_msg).await {
-                                    warn!("[P2P Direct] Failed to send anet_p2p_offer: {e}");
+                                    warn!("[P2P Direct] Failed to send ice-offer: {e}");
                                     warn(format!("[P2P Direct] Send failed: {e}"));
                                 } else {
-                                    info!("[P2P Direct] Sent anet_p2p_offer to server {target_srv}");
-                                    status(format!("[P2P Direct] Sent anet_p2p_offer to server {target_srv}"));
+                                    info!("[P2P Direct] Sent Relay-Only ice-offer to server {target_srv}");
+                                    status(format!("[P2P Direct] Sent Relay-Only ice-offer to server {target_srv}"));
                                 }
                             }
                             Err(e) => {
@@ -797,9 +809,7 @@ impl ClientTransport for WrtcTransport {
                     } => {
                         let Some(mut packet) = packet_opt else { break; };
 
-                        if wrtc_mode == anet_common::wrtc::colibri::WrtcMode::P2pDirect
-                            || wrtc_mode == anet_common::wrtc::colibri::WrtcMode::Auto
-                        {
+                        if wrtc_mode == anet_common::wrtc::colibri::WrtcMode::P2pDirect {
                             if cached_p2p.is_none() {
                                 cached_p2p = p2p_uplink.lock().await.clone();
                             }
@@ -1063,14 +1073,15 @@ impl ClientTransport for WrtcTransport {
                     Some(msg) => {
                         match msg.msg_payload {
                             WrtcMessage::P2pAnswer { sdp, .. } => {
-                                info!("[P2P Direct] Received anet_p2p_answer from server! Applying remote SDP...");
-                                status("[P2P Direct] Received anet_p2p_answer from server! Applying remote SDP...");
+                                info!("[P2P Direct] Received ice-answer from server! Applying remote Relay-Only SDP...");
+                                status("[P2P Direct] Received ice-answer from server! Applying remote SDP...");
                                 let p2p_opt = {
                                     let guard = p2p_sig.lock().await;
                                     guard.clone()
                                 };
                                 if let Some(p2p) = p2p_opt {
-                                    if let Ok(answer_desc) = RTCSessionDescription::answer(sdp) {
+                                    let relay_sdp = filter_p2p_sdp_relay_only(&sdp);
+                                    if let Ok(answer_desc) = RTCSessionDescription::answer(relay_sdp) {
                                         if let Err(e) = p2p.pc.set_remote_description(answer_desc).await {
                                             warn!("[P2P Direct] set_remote_description error: {e}");
                                         } else {

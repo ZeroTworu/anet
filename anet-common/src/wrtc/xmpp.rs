@@ -88,6 +88,29 @@ impl XmppSession {
         ping_interval_secs: u64,
         wrtc_cfg: &WrtcConfig,
     ) -> anyhow::Result<Self> {
+        Self::connect_with_endpoint(
+            domain,
+            conference_id,
+            session_token,
+            client_name_opt,
+            None,
+            profile,
+            ping_interval_secs,
+            wrtc_cfg,
+        )
+        .await
+    }
+
+    pub async fn connect_with_endpoint(
+        domain: &str,
+        conference_id: &str,
+        session_token: &str,
+        client_name_opt: Option<&str>,
+        custom_endpoint_id: Option<String>,
+        profile: &BrowserProfile,
+        ping_interval_secs: u64,
+        wrtc_cfg: &WrtcConfig,
+    ) -> anyhow::Result<Self> {
         let ws_url = format!(
             "wss://{domain}/jitsi/xmpp-websocket?room={conference_id}&sessionToken={session_token}"
         );
@@ -141,7 +164,9 @@ impl XmppSession {
         let mut bind_sent = false;
         let mut bound = false;
         let mut jid = String::new();
-        let endpoint_id = Self::generate_endpoint_id();
+        let endpoint_id = custom_endpoint_id
+            .filter(|ep| !ep.is_empty())
+            .unwrap_or_else(Self::generate_endpoint_id);
         let occupants = Arc::new(Mutex::new(HashSet::new()));
         let discovered_ice_servers = Arc::new(Mutex::new(Vec::new()));
 
@@ -471,8 +496,8 @@ impl XmppSession {
         has_video: bool,
     ) -> anyhow::Result<()> {
         let req_id = format!("accept_{:08x}", rand::random::<u32>());
-        let cname = format!("cname_{:08x}", rand::random::<u32>());
-        let msid = format!("msid_{:08x}", rand::random::<u32>());
+        let cname = crate::wrtc::stealth::generate_random_uuid_v4();
+        let msid = crate::wrtc::stealth::generate_random_uuid_v4();
 
         let mut candidate_xml = String::new();
         for (i, c_line) in candidates.iter().enumerate() {
@@ -546,8 +571,8 @@ impl XmppSession {
         ssrc: u32,
     ) -> anyhow::Result<()> {
         let req_id = format!("src_add_{:08x}", rand::random::<u32>());
-        let cname = format!("cname_{:08x}", rand::random::<u32>());
-        let msid = format!("msid_{:08x}", rand::random::<u32>());
+        let cname = crate::wrtc::stealth::generate_random_uuid_v4();
+        let msid = crate::wrtc::stealth::generate_random_uuid_v4();
 
         let stanza = XmppBuilder::jingle_source_add(
             focus_jid,

@@ -194,7 +194,9 @@
 
 ## 4. Этап 3. Строгая типизация Colibri, обнаружение и авторизация
 
-### 4.1. Схема протокола сообщений
+### 4.1. Схема протокола сообщений (мимикрия под сервисные сообщения Jitsi)
+
+Все управляющие и туннельные сообщения внутри `EndpointMessage` маскируются под штатные системные события Jitsi Meet (с сохранением обратной совместимости при десериализации через `#[serde(alias = "...")]`), а идентификаторы медиапотоков и треков (`msid` / `cname`) генерируются как случайные RFC 4122 UUIDv4:
 
 ```rust
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -203,8 +205,8 @@ pub enum ColibriClass {
     EndpointMessage,
     #[serde(rename = "DominantSpeakerEndpointChangeEvent")]
     DominantSpeaker,
-    #[serde(rename = "ServerHello")]
-    ServerHello,
+    #[serde(rename = "ReceiverVideoConstraints")]
+    ReceiverVideoConstraints,
     #[serde(other)]
     Unknown,
 }
@@ -212,36 +214,40 @@ pub enum ColibriClass {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum WrtcMessage {
-    #[serde(rename = "anet_discover")]
+    #[serde(rename = "e2ee-ping", alias = "anet_discover")]
     Discover {
         client_nonce: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         video_ssrc: Option<u32>,
-        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         mode: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         video_v2: Option<bool>,
     },
-    #[serde(rename = "anet_beacon")]
+    #[serde(rename = "e2ee-ack", alias = "anet_beacon")]
     Beacon {
         server_id: String,
         client_nonce: String,
         signature: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         video_ssrc: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        video_v2: Option<bool>,
     },
-    #[serde(rename = "anet_ping")]
-    Ping,
-    #[serde(rename = "anet_pong")]
-    Pong,
-    #[serde(rename = "astp")]
+    #[serde(rename = "ReceiverAudioSubscription", alias = "astp")]
     Astp { data: String },
-    #[serde(rename = "astp_batch")]
+    #[serde(rename = "dominant-speaker-stats", alias = "astp_batch")]
     AstpBatch { data: String },
-    #[serde(rename = "anet_p2p_offer")]
+    #[serde(rename = "ice-offer", alias = "anet_p2p_offer")]
     P2pOffer { sdp: String, candidates: Vec<String> },
-    #[serde(rename = "anet_p2p_answer")]
+    #[serde(rename = "ice-answer", alias = "anet_p2p_answer")]
     P2pAnswer { sdp: String, candidates: Vec<String> },
+    #[serde(rename = "ice-candidate", alias = "anet_p2p_candidate")]
+    P2pCandidate { candidate: String },
+    #[serde(rename = "keepalive", alias = "anet_ping")]
+    Ping,
+    #[serde(rename = "keepalive-ack", alias = "anet_pong")]
+    Pong,
     #[serde(other)]
     Unknown,
 }
@@ -254,7 +260,7 @@ pub struct ColibriMessage {
     pub to: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub from: Option<String>,
-    #[serde(rename = "msgPayload")]
+    #[serde(rename = "msgPayload", default = "default_wrtc_message")]
     pub msg_payload: WrtcMessage,
 }
 ```
@@ -263,19 +269,21 @@ pub struct ColibriMessage {
        [Клиент]                    [JVB Мост]                  [Сервер]
           |                            |                          |
           |                            |<--- Сервер в комнате     |
-          |                            |     (WebRTC Connected)   |
+          |                            |     endpoint_id:         |
+          |                            |     [rnd:2B][tag:2B]     |
           |                            |                          |
- 1. Вошел в комнату                    |                          |
-    Шлет Discovery:                    |                          |
-    - broadcast (без "to")             |                          |
-    - unicast ("to": occupant_id)      |                          |
+ 1. Вошел в комнату, вычислил          |                          |
+    server_ep_suffix =                 |                          |
+    SHA256(pub_key || conf_id)[0..2]   |                          |
+    Шлет строго unicast Discovery      |                          |
+    ("type": "e2ee-ping", "to": srv_id)|                          |
     ---------------------------------->|                          |
                                        |--- forwards to Server -->| 2. Принял Discovery
                                        |                          |    Подписал (Nonce + SrvId)
                                        |                          |    ключом server_signing_key
                                        |                          |
                                        |<--- Beacon (to: Client) -| 3. Отправил Beacon
- 4. Проверил подпись                   |<-------------------------|    {"type":"anet_beacon",
+ 4. Проверил подпись                   |<-------------------------|    {"type":"e2ee-ack",
     по server_pub_key.                 |                               "signature":"..."}
     Сервер верифицирован!              |
                                        |
@@ -291,13 +299,13 @@ pub struct ColibriMessage {
  ================================================================>| 8. Маршрутизация в TUN
 ```
 
-### 4.2. Механизм обнаружения сервера (Challenge-Response Discovery)
-1. Клиент собирает список всех присутствующих в MUC участников (`get_other_occupants`).
-2. Клиент отправляет `WrtcMessage::Discover` с криптографическим нонсом (`client_nonce`):
-   * В общий broadcast (без поля `to`);
-   * Адресно каждому известному эндпоинту комнаты.
-3. Сервер, получив запрос, подписывает `(client_nonce + server_id)` своим `server_signing_key` (Ed25519) и отправляет `WrtcMessage::Beacon` строго в адрес клиента (`to: client_endpoint`).
-4. Клиент верифицирует подпись открытым ключом `server_pub_key`. При успехе `server_id` фиксируется как целевой адрес для ASTP.
+### 4.2. Детерминированный механизм обнаружения сервера без Broadcast (Unicast Discovery)
+1. При подключении к MUC-комнате сервер формирует свой 8-символьный hex `endpoint_id` (`generate_server_endpoint_id`) таким образом, чтобы старшие 2 байта были случайными, а младшие 2 байта (4 hex-символа) детерминированно вычислялись от публичного ключа Ed25519 и идентификатора конференции:
+   $$\text{server\_ep\_suffix} = \text{hex}\big(\text{SHA256}(\text{server\_pub\_key\_bytes} \parallel \text{conference\_id})[0..2]\big)$$
+2. Клиент, зная `server_pub_key` и `conference_id`, вычисляет этот же 4-символьный суффикс (`compute_server_endpoint_suffix_from_b64`) и фильтрует список присутствующих в MUC участников (`get_other_occupants`) по совпадению суффикса.
+3. Клиент отправляет `WrtcMessage::Discover` (`"type": "e2ee-ping"`) с криптографическим нонсом (`client_nonce`) **строго unicast (`to: Some(server_occupant_id)`)**, полностью исключая широковещательный опрос (`to: None`) и рассылку пакетов сторонним участникам комнаты.
+4. Сервер, получив запрос, подписывает `(client_nonce + server_id)` своим `server_signing_key` (Ed25519) и отправляет `WrtcMessage::Beacon` (`"type": "e2ee-ack"`) строго в адрес клиента (`to: client_endpoint`).
+5. Клиент верифицирует подпись открытым ключом `server_pub_key`. При успехе `server_id` фиксируется как целевой адрес для ASTP.
 
 ### 4.3. Рукопожатие ASTP и предотвращение рассинхронизации ключей
 1. В Phase III клиент передает зашифрованные авторизационные данные серверу.
@@ -434,20 +442,22 @@ server_signing_key = "<BASE64_ED25519_PRIVATE_KEY>"
 
 ---
 
-### 7.3. Tier 1: Прямой WebRTC P2P (Direct ICE: Client ⇄ Server)
+### 7.3. Tier 1: Relay-Only WebRTC P2P (`p2p_direct` через TURN/TURNS Ktalk)
 
-#### 7.3.1. Концепция
-XMPP/Контур выступает **исключительно сигнальным брокером**. Медиатрафик не нагружает сервера Контура и идет напрямую между узлами через прямое пробитие NAT (STUN hole punching).
+#### 7.3.1. Концепция и изоляция IP-адресов
+В режиме `wrtc_mode = "auto"` автоматическая инициация P2P-канала **отключена** — автопереключение работает исключительно между JVB-опосредованными режимами (`media_video` $\leftrightarrow$ `jvb_datachannel` $\leftrightarrow$ `ws`), чтобы реальные IP-адреса клиента и сервера никогда не раскрывались автоматически.
+Если в конфигурации явно задан режим `wrtc_mode = "p2p_direct"`, устанавливается выделенный DataChannel между узлами строго в режиме **Relay-Only** через инфраструктурные TURN/TURNS-серверы Контура (`bst-talk-stun7.ktalk.host:443`, `dtl-talk-stun5.ktalk.host:443`).
 
-#### 7.3.2. Сигналинг через комнату Ktalk
-1. После завершения Discovery и ASTP-авторизации клиент и сервер инициируют создание независимой P2P-сессии (`P2pSession`):
-   * Клиент вызывает `create_p2p_channel(&stun_servers)` и формирует SDP Offer.
-   * Клиент отправляет серверу сообщение `ColibriMessage` с типом `WrtcMessage::P2pOffer { sdp, candidates }`.
-2. Сервер, получив `P2pOffer`, вызывает `create_p2p_channel(&stun_servers)`, применяет оффер через `set_remote_description`, генерирует SDP Answer и отсылает `WrtcMessage::P2pAnswer { sdp, candidates }` обратно клиенту.
-3. Клиент применяет ответ через `set_remote_description`. Состояние ICE переходит в `Connected` за 1 RTT (5–15 мс при наличии белого IP у сервера или Cone NAT).
+#### 7.3.2. Сигналинг через комнату Ktalk и фильтрация кандидатов (`filter_p2p_sdp_relay_only`)
+1. После завершения Discovery и ASTP-авторизации клиент (при `wrtc_mode = "p2p_direct"`) инициирует создание P2P-сессии (`P2pSession`):
+   * Клиент вызывает `create_p2p_channel(&ice_servers, ...)` и ожидает сбора релейных кандидатов (`typ relay`).
+   * Функция `filter_p2p_sdp_relay_only(&sdp)` принудительно удаляет из SDP все локальные (`typ host`) и STUN (`typ srflx`) кандидаты, а также маскирует адрес в `c=IN IP4 0.0.0.0`, оставляя только `typ relay`.
+   * Клиент отправляет серверу сообщение `ColibriMessage` с типом `WrtcMessage::P2pOffer` (`"type": "ice-offer"`).
+2. Сервер, получив `P2pOffer`, также фильтрует входящий SDP через `filter_p2p_sdp_relay_only`, вызывает `create_p2p_channel(&ice_servers, ...)`, генерирует SDP Answer, очищает его от `host`/`srflx` кандидатов через `filter_p2p_sdp_relay_only` и отсылает `WrtcMessage::P2pAnswer` (`"type": "ice-answer"`) обратно клиенту.
+3. Клиент применяет ответ через `set_remote_description`, и соединение устанавливается через TURN/TURNS релей без раскрытия прямых IP-адресов сторон.
 
 #### 7.3.3. Конфигурация DataChannel (`webrtc-rs` / `rtc`)
-В прямом соединении создается выделенный неблокирующий канал данных:
+В P2P-соединении создается выделенный неблокирующий канал данных:
 ```rust
 let dc_init = RTCDataChannelInit {
     ordered: false,              // Отключение Head-of-Line Blocking
@@ -458,10 +468,10 @@ let dc_init = RTCDataChannelInit {
 };
 let dc = pc.create_data_channel("anet-data", Some(dc_init)).await?;
 ```
-* **Формат кадра:** сырой бинарный IP-пакет (`send_packet(&enc_bytes)`).
+* **Формат кадра:** сырой бинарный IP-пакет или микро-батч (`send_packet(&enc_bytes)`).
 * **Маркеры в логах:** `[P2P Direct] established: DataChannel 'anet-data' is now OPEN!`, `[P2P Direct OUT]`, `[P2P Direct IN]`.
-* **Накладные расходы:** 0% JSON, 0% Base64. Задержка минимальная физическая (Wire speed).
-* **Отказоустойчивость:** Если прямое P2P-соединение не может установиться (например, симметричный корпоративный NAT на обоих концах), трафик прозрачно продолжает передаваться через Colibri-WS с микробатчингом без потери пакетов.
+* **Накладные расходы:** 0% JSON, 0% Base64.
+* **Отказоустойчивость:** Если P2P-соединение через релей недоступно, трафик прозрачно передается через Colibri-WS с микробатчингом без потери пакетов.
 
 ---
 
@@ -530,18 +540,18 @@ let dc = pc.create_data_channel("anet-data", Some(dc_init)).await?;
    * При передаче трафика пакеты агрегируются модулем `PacketBatcher` и передаются через `AstpBatch`.
    * Отсутствуют ошибки STUN `TransactionTimeOut`.
 
-##### Шаг Б. Проверка режима `p2p_direct` (Прямой WebRTC P2P DataChannel)
+##### Шаг Б. Проверка режима `p2p_direct` (Relay-Only WebRTC P2P DataChannel)
 1. В `client.toml` выставляем:
    ```toml
    wrtc_mode = "p2p_direct"
    ```
 2. Подключаем клиент.
 3. **Что наблюдаем:**
-   * В логах клиента появляется: `[P2P Direct] Initiating direct WebRTC P2P DataChannel with server...` и `[P2P Direct] Sent anet_p2p_offer to server`.
-   * В логах сервера появляется: `[P2P Direct] Received anet_p2p_offer from client ...! Setting up P2P DataChannel...` и `[P2P Direct] Sent anet_p2p_answer to client`.
+   * В логах клиента появляется: `[P2P Direct] Initiating Relay-Only WebRTC P2P DataChannel with server...` и `[P2P Direct] Sent Relay-Only ice-offer to server`.
+   * В логах сервера появляется: `[P2P Direct] Received ice-offer from client ...! Setting up Relay-Only P2P DataChannel...` и `[P2P Direct] Sent Relay-Only ice-answer to client`.
    * Клиент применяет ответ сервера: `[P2P Direct] Applied remote answer successfully. Awaiting DataChannel open...`.
    * Канал переходит в открытое состояние: `[P2P Direct] established: DataChannel 'anet-data' is now OPEN!`.
-   * При передаче сетевого трафика пакеты идут напрямую с нулевым оверхедом: в логах клиента фиксируются маркеры `[P2P Direct OUT]`, а на сервере `[P2P Direct IN]`.
+   * При передаче сетевого трафика пакеты идут с нулевым JSON/Base64 оверхедом через TURN/TURNS релей: в логах клиента фиксируются маркеры `[P2P Direct OUT]`, а на сервере `[P2P Direct IN]`.
 
 ---
 
@@ -639,8 +649,8 @@ ANet Client                        JVB / Prosody                      ANet Serve
     |     (Фоновый Opus silence 20ms)    |      (Фоновый Opus silence 20ms)|
     |                                    |                                 |
     | [Control Plane over Colibri-WS]    |                                 |
-    |---- 3. anet_discover ------------->|---- forwards ------------------>|
-    |<--- 4. anet_beacon ----------------|<--- forwards -------------------|
+    |---- 3. e2ee-ping (Discover) ------>|---- forwards ------------------>|
+    |<--- 4. e2ee-ack (Beacon) ----------|<--- forwards -------------------|
     |     (Сервер сообщил:               |     (Сервер сохранил контекст)  |
     |      server_video_ssrc)            |                                 |
     |                                    |                                 |
@@ -707,13 +717,13 @@ ANet Client                        JVB / Prosody                      ANet Serve
 
 #### Этап 4: Защита от штормов, сброс зомби-сессий и MTU
 * **Старт передачи:** Клиент начинает отправку пакетов данных в видео-трек строго после получения ответа ASTP Phase IV и перехода WebRTC в статус `Connected`.
-* **Инвалидация старых потоков:** При получении повторного `anet_discover` сервер сбрасывает старый `expected_peer_video_ssrc` и обнуляет sequence numbers.
+* **Инвалидация старых потоков:** При получении повторного `e2ee-ping` (`WrtcMessage::Discover`) сервер обновляет `expected_peer_video_ssrc` и привязывает его к трансиверу.
 * **Расчёт безопасного MTU:**
   * WebRTC safe UDP MTU = 1280 байт.
   * Заголовок RTP = 12 байт.
-  * VP8 Descriptor = 1 байт.
-  * Заголовок ASTP (IV + Flags + AuthTag) = 29 байт.
-  * **Итоговый MTU интерфейса TUN: 1238 байт** (округление до 1230–1240 байт для полного исключения фрагментации на уровне JVB).
+  * VP8 Descriptor + Frame Header + Client Tag = 26 байт (`VP8_ASTP_PREFIX_LEN`).
+  * Заголовок ASTP (IV + Ciphertext + AuthTag) = 28 байт.
+  * **Итоговый запас `video_mtu_overhead`: 60 байт** (с нижней границей 1200 байт для полного исключения фрагментации на уровне JVB).
 
 #### Этап 5: Режимы конфигурации `wrtc_mode`
 * Добавление режима `media_video` в `WrtcMode`:
@@ -721,7 +731,7 @@ ANet Client                        JVB / Prosody                      ANet Serve
   # Режим транспорта: "media_video" | "p2p_direct" | "jvb_datachannel" | "ws" | "auto"
   wrtc_mode = "media_video"
   ```
-* В режиме `auto` клиент пытается поднять P2P Direct; при недоступности STUN/P2P автоматически переходит на `media_video` (через мост JVB), а при блокировке UDP — прозрачно работает поверх `Colibri-WS`.
+* В режиме `auto` клиент автоматически согласует передачу через мост JVB (`media_video` $\leftrightarrow$ `jvb_datachannel` $\leftrightarrow$ `ws`) без запуска прямого P2P, сохраняя полную изоляцию IP-адресов клиента и сервера.
 
 ---
 

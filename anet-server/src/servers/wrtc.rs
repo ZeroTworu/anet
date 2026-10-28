@@ -16,8 +16,8 @@ use anet_common::transport::{
 };
 use anet_common::wrtc::{
     batcher::{unpack_batch, PacketBatcher},
-    colibri::{sign_beacon, ColibriMessage, WrtcMessage},
-    jingle::parse_jingle_session,
+    colibri::{generate_server_endpoint_id, sign_beacon, ColibriMessage, WrtcMessage},
+    jingle::{filter_p2p_sdp_relay_only, parse_jingle_session},
     ktalk::KtalkClient,
     peer::{create_p2p_channel, P2pSession, WrtcPeer},
     stealth::generate_random_guest_name,
@@ -113,11 +113,15 @@ pub async fn run_wrtc_server(
         };
 
         let ping_secs = config.server.wrtc_ping_interval_secs;
-        let mut xmpp = match XmppSession::connect(
+        let pub_key_bytes = signing_key.verifying_key().to_bytes();
+        let deterministic_ep =
+            generate_server_endpoint_id(&pub_key_bytes, &room_info.conference_id);
+        let mut xmpp = match XmppSession::connect_with_endpoint(
             &domain,
             &room_info.conference_id,
             &auth_res.token,
             Some(&guest_name),
+            Some(deterministic_ep),
             &browser_profile,
             ping_secs,
             &config.wrtc,
@@ -137,7 +141,7 @@ pub async fn run_wrtc_server(
 
         let server_endpoint_id = xmpp.endpoint_id.clone();
         info!(
-            "[WRTC Server] Joined room as server occupant: {}",
+            "[WRTC Server] Joined room as deterministic server occupant: {}",
             server_endpoint_id
         );
 
@@ -718,7 +722,7 @@ pub async fn run_wrtc_server(
                                                                     let is_v2 = client_v2_ep_dl.contains(&target_client_id);
                                                                     let video_warmed_up = client_video_warmed_dl.contains(&client_tag);
 
-                                                                    let p2p_session = if matches!(client_pref_mode.as_str(), "p2p_direct" | "auto") {
+                                                                    let p2p_session = if client_pref_mode == "p2p_direct" {
                                                                         p2p_clients_dl
                                                                             .get(&target_client_id)
                                                                             .and_then(|entry| {
@@ -1082,7 +1086,7 @@ pub async fn run_wrtc_server(
                     }
                 }
                 WrtcMessage::P2pOffer { sdp, .. } => {
-                    info!("[P2P Direct] Received anet_p2p_offer from client {from_endpoint}! Setting up P2P DataChannel...");
+                    info!("[P2P Direct] Received ice-offer from client {from_endpoint}! Setting up Relay-Only P2P DataChannel...");
                     let p2p_map_c = p2p_clients.clone();
                     let peer_c = shared_peer.clone();
                     let tun_tx_c = tun_clone.clone();
@@ -1096,7 +1100,8 @@ pub async fn run_wrtc_server(
                         match create_p2p_channel(&ice_servers, &wrtc_cfg_p2p, &peer_c.bind_addr).await {
                             Ok(p2p) => {
                                 let p2p_arc = Arc::new(p2p);
-                                match RTCSessionDescription::offer(sdp) {
+                                let relay_offer_sdp = filter_p2p_sdp_relay_only(&sdp);
+                                match RTCSessionDescription::offer(relay_offer_sdp) {
                                     Ok(offer_desc) => {
                                         if let Err(e) = p2p_arc.pc.set_remote_description(offer_desc).await {
                                             warn!("[P2P Direct] Server set_remote_description error: {e}");
@@ -1114,7 +1119,7 @@ pub async fn run_wrtc_server(
                                                     if let Some(desc) = p2p_arc.pc.local_description().await {
                                                         if desc.sdp.contains("a=candidate:") {
                                                             answer_sdp = desc.sdp;
-                                                            if answer_sdp.contains("typ srflx") || answer_sdp.contains("typ relay") {
+                                                            if answer_sdp.contains("typ relay") {
                                                                 break;
                                                             }
                                                         }
@@ -1129,13 +1134,14 @@ pub async fn run_wrtc_server(
                                                         answer_sdp = desc.sdp;
                                                     }
                                                 }
+                                                let relay_answer_sdp = filter_p2p_sdp_relay_only(&answer_sdp);
 
-                                                let answer_msg = ColibriMessage::p2p_answer(client_ep.clone(), answer_sdp, vec![]);
+                                                let answer_msg = ColibriMessage::p2p_answer(client_ep.clone(), relay_answer_sdp, vec![]);
                                                 if let Err(e) = peer_c.send(answer_msg).await {
-                                                    warn!("[P2P Direct] Failed to send anet_p2p_answer: {e}");
+                                                    warn!("[P2P Direct] Failed to send ice-answer: {e}");
                                                     return;
                                                 }
-                                                info!("[P2P Direct] Sent anet_p2p_answer to client {client_ep}");
+                                                info!("[P2P Direct] Sent Relay-Only ice-answer to client {client_ep}");
 
                                                 if let Some(prev_p2p) =
                                                     p2p_map_c.insert(client_ep.clone(), p2p_arc.clone())

@@ -96,8 +96,8 @@ $$\text{TUN\_MTU} = \max(\text{server\_mtu} - 60, 1200)$$
 * **Пул реакторов:** `PeerConnection` инициализируется с `with_dedicated_reactor_pool_size(4)` и `with_receive_mtu(1600)`.
 
 ### 3.4. Динамическая привязка видео-SSRC (`add_remote_video_ssrc`) и `ReceiverVideoConstraints`
-* Когда JVB пересылает видеопоток участника, он использует SSRC, объявленный в Jingle (`session-initiate`, `source-add`, `description-info`) или в сообщениях `anet_discover` / `anet_beacon`.
-* Метод `WrtcPeer::add_remote_video_ssrc(ssrc)` динамически инжектирует `m=video` секцию (`mid=v_{ssrc}`, `a=recvonly`) в SDP через `append_remote_video_ssrc_to_sdp()` и обновляет `RemoteDescription` / `LocalDescription`, привязывая входящий SSRC к выделенному `Recvonly`-трансиверу.
+* Когда JVB пересылает видеопоток участника, он использует SSRC, объявленный в Jingle (`session-initiate`, `source-add`, `description-info`) или в сообщениях `e2ee-ping` (`Discover`) / `e2ee-ack` (`Beacon`).
+* Метод `WrtcPeer::add_remote_video_ssrc(ssrc)` динамически инжектирует `m=video` секцию (`mid=v_{ssrc}`, `a=sendonly`) в SDP через `append_remote_video_ssrc_to_sdp()` с рандомизированными UUIDv4 `msid`/`cname` и обновляет `RemoteDescription` / `LocalDescription`, привязывая входящий SSRC к выделенному `Recvonly`-трансиверу.
 * При старте и обнаружении пиров отправляется сообщение `ReceiverVideoConstraints` (`lastN: -1`, `maxHeight: 2160`, `selectedEndpoints` / `onStageEndpoints`), гарантирующее, что SFU JVB форвардит видеопоток в полном объёме без троттлинга.
 * Пока клиент не получил первый расшифрованный видеокадр (`client_video_warmed_up` / `first_client_rx`), пакеты параллельно страхуются отправкой через резервный канал (`DataChannel` / `Colibri-WS`), что обеспечивает мгновенное прохождение рукопожатия и первых пакетов до прогрева видеотракта JVB.
 
@@ -119,7 +119,7 @@ $$\text{TUN\_MTU} = \max(\text{server\_mtu} - 60, 1200)$$
   1. `PeerConnection` или `Colibri-WS` перешли в состояние `Failed` / `Closed`.
   2. `PeerConnection` находится в состоянии `Disconnected` дольше 8 секунд.
   3. Спустя 12 секунд после старта одновременно закрыты и `Colibri-WS`, и `SCTP DataChannel`.
-* На клиенте дополнительно действует 45-секундный watchdog по `anet_ping` / `anet_pong`, а сервер отвечает `anet_pong` только при условии, что сессия клиента числится активной в реестре (`reg_clone.is_session_active(&client_info.session_id)`).
+* На клиенте дополнительно действует watchdog по `keepalive` / `keepalive-ack` (`WrtcMessage::Ping` / `WrtcMessage::Pong`), а сервер отвечает `keepalive-ack` только при условии, что сессия клиента числится активной в реестре (`reg_clone.is_session_active(&client_info.session_id)`).
 * При любом выходе из цикла комнаты сервер гарантированно прерывает `video_uplink_task`, вызывает `reg_clone.remove_client()` для всех клиентов комнаты, закрывает `WrtcPeer` (`pc.close()` с таймаутом 3 с, в том числе в `Drop for WrtcPeer`) и отправляет `<presence type="unavailable">` в MUC.
 
 ---
