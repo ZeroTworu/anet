@@ -286,6 +286,10 @@ pub fn render_node_selector(app: &mut ANetApp, ui: &mut egui::Ui, state: Connect
             app.node_probe_snapshot =
                 anet_client_core::connectivity_monitor::NodeProbeMonitor::get_last_snapshot();
             app.node_probe_snapshot.is_checking = true;
+            if app.node_probe_snapshot.total_endpoints == 0 {
+                app.node_probe_snapshot.total_endpoints = server_names.len().max(1);
+            }
+            app.show_toast("Проверка узлов...");
             ui.ctx().request_repaint();
         }
 
@@ -384,20 +388,21 @@ pub fn render_node_selector(app: &mut ANetApp, ui: &mut egui::Ui, state: Connect
         }
 
         // Визуальный прогресс-бар «ПРОВЕРКА УЗЛОВ X/Y» при активном опросе
-        if app.node_probe_snapshot.is_checking && app.node_probe_snapshot.total_endpoints > 0 {
-            let done = app
+        if app.node_probe_snapshot.is_checking {
+            let total = app
                 .node_probe_snapshot
-                .completed_endpoints
-                .min(app.node_probe_snapshot.total_endpoints);
-            let total = app.node_probe_snapshot.total_endpoints.max(1);
-            let ratio = (done as f32 / total as f32).clamp(0.06, 1.0);
+                .total_endpoints
+                .max(server_names.len())
+                .max(1);
+            let done = app.node_probe_snapshot.completed_endpoints.min(total);
+            let ratio = (done as f32 / total as f32).clamp(0.08, 1.0);
 
             ui.add_space(4.0);
             let (prog_rect, _) =
-                ui.allocate_exact_size(egui::vec2(NODE_WIDTH - 12.0, 14.0), egui::Sense::hover());
+                ui.allocate_exact_size(egui::vec2(NODE_WIDTH - 12.0, 15.0), egui::Sense::hover());
             let bar_rect = egui::Rect::from_min_size(
                 egui::pos2(prog_rect.left(), prog_rect.top() + 1.0),
-                egui::vec2(prog_rect.width(), 3.0),
+                egui::vec2(prog_rect.width(), 3.5),
             );
             ui.painter().rect_filled(
                 bar_rect,
@@ -414,14 +419,14 @@ pub fn render_node_selector(app: &mut ANetApp, ui: &mut egui::Ui, state: Connect
                 egui::Color32::from_rgb(56, 201, 118),
             );
             ui.painter().text(
-                egui::pos2(prog_rect.center().x, prog_rect.bottom() - 2.0),
+                egui::pos2(prog_rect.center().x, prog_rect.bottom() - 1.0),
                 egui::Align2::CENTER_BOTTOM,
                 format!("ПРОВЕРКА УЗЛОВ {}/{}", done, total),
                 egui::FontId::new(8.5, egui::FontFamily::Name("Inter-V".into())),
-                muted,
+                egui::Color32::from_rgb(190, 196, 206),
             );
             ui.ctx()
-                .request_repaint_after(std::time::Duration::from_millis(80));
+                .request_repaint_after(std::time::Duration::from_millis(50));
         }
 
         if state == ConnectionState::Disconnected && popup_open {

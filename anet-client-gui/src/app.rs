@@ -1901,6 +1901,9 @@ impl eframe::App for ANetApp {
                 self.node_probe_snapshot = snap;
             }
         }
+        if self.node_probe_snapshot.is_checking {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
 
         if !self.settingsbar_open && !self.logbar_open && !self.show_url_modal {
             self.check_and_show_url_modal_if_empty();

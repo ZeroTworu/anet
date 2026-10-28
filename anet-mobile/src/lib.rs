@@ -801,9 +801,17 @@ pub extern "system" fn Java_org_alco_anet_MainActivity_triggerConnectivityCheck(
 /// Принудительно запускает внеочередную проверку пинга и доступности узлов VPN.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_org_alco_anet_MainActivity_triggerNodeProbe(
-    _env: JNIEnv,
-    _this: JObject,
+    env: JNIEnv,
+    this: JObject,
 ) {
+    if let Ok(jvm) = env.get_java_vm() {
+        let jvm_arc = Arc::new(jvm);
+        if let Ok(this_ref) = env.new_global_ref(this) {
+            *UI_CALLBACK_REF.lock().unwrap() = Some(this_ref);
+        }
+        events::set_handler(Box::new(AndroidEventHandler));
+        init_jni_bridge_thread(jvm_arc);
+    }
     let rt = get_or_init_runtime_handle();
     let _guard = rt.enter();
     anet_client_core::connectivity_monitor::NodeProbeMonitor::trigger_probe_now();

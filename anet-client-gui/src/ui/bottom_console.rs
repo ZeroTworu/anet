@@ -156,6 +156,19 @@ fn pulse_palette(color: PulseColor) -> (Color32, Color32, Color32) {
 /// Уровень 1: Виджет «Щит диагностики сети» с динамическим сегментным индикатором маршрутов РФ / Мир
 fn render_connectivity_shield_card(app: &mut ANetApp, ui: &mut egui::Ui) {
     let snap = app.connectivity_snapshot.clone();
+    let vpn_state = crate::utils::helpers::lock_ignore_poison(&app.shared).state;
+    let shield_pulse = match vpn_state {
+        crate::types::ConnectionState::Disconnected => PulseColor::Red,
+        crate::types::ConnectionState::Connecting => PulseColor::Yellow,
+        crate::types::ConnectionState::Connected => {
+            if snap.condition == NetworkCondition::TunnelFullOnline || snap.global_ok > 0 {
+                PulseColor::Green
+            } else {
+                PulseColor::Yellow
+            }
+        }
+    };
+    let (shield_accent, _, _) = pulse_palette(shield_pulse);
     let (accent, stroke_col, bg_col) = pulse_palette(snap.pulse_color);
     let text_sub = Color32::from_rgb(168, 176, 190);
     let is_checking = snap.title.starts_with("Сверяем");
@@ -174,7 +187,7 @@ fn render_connectivity_shield_card(app: &mut ANetApp, ui: &mut egui::Ui) {
                 ui.horizontal(|ui| {
                     let (shield_rect, _) =
                         ui.allocate_exact_size(egui::vec2(16.0, 16.0), Sense::hover());
-                    draw_shield_icon(ui.painter(), shield_rect, accent, snap.pulse_color);
+                    draw_shield_icon(ui.painter(), shield_rect, shield_accent, shield_pulse);
 
                     ui.add_space(4.0);
                     ui.label(

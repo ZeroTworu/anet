@@ -196,6 +196,7 @@ impl NodeProbeMonitor {
                 continue;
             }
 
+            let probe_started = std::time::Instant::now();
             {
                 let mut guard = self.last_snapshot.lock().unwrap();
                 if guard.groups.is_empty() {
@@ -219,6 +220,21 @@ impl NodeProbeMonitor {
                     continue;
                 }
             };
+
+            let min_total_dur = Duration::from_millis(900);
+            let min_complete_hold = Duration::from_millis(450);
+            let elapsed = probe_started.elapsed();
+            let hold_dur = if elapsed < min_total_dur {
+                (min_total_dur - elapsed).max(min_complete_hold)
+            } else {
+                min_complete_hold
+            };
+            tokio::select! {
+                _ = tokio::time::sleep(hold_dur) => {}
+                _ = self.wake_notify.notified() => {
+                    continue;
+                }
+            }
 
             {
                 *self.last_snapshot.lock().unwrap() = snapshot.clone();

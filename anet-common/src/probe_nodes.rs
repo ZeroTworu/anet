@@ -1182,25 +1182,20 @@ where
                 current_endpoints[pos] = res;
             }
             completed_endpoints += 1;
-            let is_checking = completed_endpoints < total_endpoints;
             let now_ms = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis() as u64;
-            let groups = aggregate_groups(targets, &current_endpoints, is_checking);
+            let groups = aggregate_groups(targets, &current_endpoints, true);
             let partial = NodeProbeSnapshot {
                 checked_at_unix_ms: now_ms,
-                is_checking,
+                is_checking: true,
                 completed_endpoints,
                 total_endpoints,
                 endpoints: current_endpoints.clone(),
                 groups,
             };
-            if is_checking {
-                on_progress(partial);
-            } else {
-                return partial;
-            }
+            on_progress(partial);
         }
     }
 
