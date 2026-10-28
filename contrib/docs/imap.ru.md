@@ -1,63 +1,138 @@
-# Архитектура и спецификация транспорта `imap` (ASTP over IMAP)
+# Архитектура и спецификация транспорта `imap` (ASTP over IMAPS:993)
 
-Документация актуальна для ветки `master`.
+Документация актуальна для ветки `master` / `dev/connectivity2`.
+Спецификация верифицирована 10-минутным нагрузочным тестом (Soak-Test: 1512 `APPEND`, 9040 пакетов, ~9.5 МиБ данных, 0 ошибок) на боевом сервере `imap.mail.ru:993`.
+
+---
 
 ## 1. Введение и концепция
-Транспорт `imap` — это специализированный транспорт повышенной отказоустойчивости (High Resilience Transport). Он спроектирован для обеспечения стабильной связи в сетях со сложной топологией, строгими корпоративными политиками маршрутизации (Default Deny) и системами глубокой инспекции пакетов (IDS/IPS), где традиционные протоколы работают нестабильно, но сохраняется приоритетный доступ к базовым корпоративным сервисам (электронной почте).
+Транспорт `imap` — это специализированный транспорт повышенной отказоустойчивости (High Resilience Transport). Он спроектирован для обеспечения стабильной связи в сетях со сложной топологией, строгими корпоративными политиками маршрутизации (Default Deny), «Белыми списками» и системами глубокой инспекции пакетов (ТСПУ / IDS / IPS), где традиционные протоколы блокируются, но сохраняется приоритетный доступ к базовым российским почтовым сервисам (`imap.mail.ru`, `imap.yandex.ru`, `imap.timeweb.ru`).
 
-Транспорт инкапсулирует зашифрованные IP-пакеты (ASTP) в текстовые сообщения (MIME/Base64) и передает их через инфраструктуру публичных почтовых провайдеров (Mail.ru, Timeweb) с использованием стандартных команд IMAP `APPEND`, `FETCH` и `IDLE`.
+Транспорт инкапсулирует батчи зашифрованных IP-пакетов (ASTP) в валидные RFC 5322 черновики (MIME/Base64 с флагами `\Seen \Draft`) и передает их через инфраструктуру публичных почтовых провайдеров по протоколу IMAPS (TLS 1.3 поверх **BoringSSL** на порт `993`) с использованием команд `APPEND`, `IDLE`, `UID FETCH`, `UID STORE` и `UID EXPUNGE`.
 
-Для промежуточных узлов сетевой инфраструктуры обмен данными абсолютно неотличим от штатной сессии легитимного почтового клиента, синхронизирующего черновики по протоколу TLS 1.3 на порт 993.
+Для промежуточных узлов сетевой инфраструктуры и ТСПУ обмен данными неотличим от штатной сессии почтового клиента, синхронизирующего черновики и заметки с сервером `imap.mail.ru:993`.
 
-## 2. Схема маршрутизации трафика (Data Flow)
-Клиент и Сервер ANet не устанавливают прямого TCP/UDP соединения друг с другом. Оба узла выступают в роли IMAP-клиентов по отношению к почтовому провайдеру. Направления трафика (Uplink/Downlink) разнесены по разным папкам для предотвращения широковещательных коллизий.
+---
+
+## 2. Схема маршрутизации трафика и архитектура «Cross-Selected Writer»
+
+Клиент и Сервер ANet не устанавливают прямого TCP/UDP соединения друг с другом. Оба узла выступают в роли IMAPS-клиентов по отношению к почтовому провайдеру. Направления трафика (Uplink/Downlink) разнесены по разным папкам (`Drafts` и `Notes`).
+
+В почтовом аккаунте создаются отдельные пароли внешних приложений (App Passwords): один — для сервера (`anet-server`), другой — для клиентов (`anet-client`).
+
+### Архитектура «Cross-Selected Writer» (Ноль переключений `SELECT` при сборке мусора)
+По стандарту RFC 3501 §6.3.11 команда `APPEND "<Folder>" ...` **не требует**, чтобы целевая папка была открыта через `SELECT`. Напротив, команды удаления `UID STORE ... (\Deleted)` и `UID EXPUNGE` работают строго в текущей выбранной (`SELECT`) папке.
+Поэтому парные соединения на клиенте и сервере скрещиваются по папкам:
+* **На Сервере:**
+    * `SRV_READER` делает `SELECT "Drafts"` и крутит только цикл `IDLE` $\leftrightarrow$ `UID FETCH` (читает Uplink), передавая прочитанные UIDs в локальный канал очистки.
+    * `SRV_WRITER` также делает `SELECT "Drafts"` один раз при старте: он отправляет Downlink-пакеты клиенту через `APPEND "Notes" (\Seen \Draft) {<len>}`, а в паузах удаляет прочитанные `SRV_READER`'ом письма в текущей папке `"Drafts"` через `UID STORE` + `UID EXPUNGE` без единого вызова `SELECT`!
+* **На Клиенте:**
+    * `CLI_READER` делает `SELECT "Notes"` и крутит только цикл `IDLE` $\leftrightarrow$ `UID FETCH` (читает Downlink), передавая прочитанные UIDs в локальный канал очистки.
+    * `CLI_WRITER` также делает `SELECT "Notes"` один раз при старте: он отправляет Uplink-пакеты серверу через `APPEND "Drafts" (\Seen \Draft) {<len>}`, а в паузах удаляет прочитанные `CLI_READER`'ом письма в текущей папке `"Notes"`!
 
 ```text
-[UPLINK: Клиент -> Сервер]
-+---------------+      1. IMAP APPEND (TLS:993)      +-------------------+
-|  ANet Client  |      Folder: "Drafts"              |   IMAP Provider   |
-| (Packet Batch)|===================================>| (e.g., Mail.ru)   |
-+---------------+      Subject: {Prefix} [ID: SRV]   +-------------------+
-                                                               |
-                                                               | 2. IMAP IDLE Wakeup
-                                                               |    SEARCH UNSEEN
-                                                               V
-                                                     +-------------------+
-                                                     |    ANet Server    |
-                                                     |  (IMAP Worker)    |
-                                                     +-------------------+
+[UPLINK: Клиент -> Сервер (папка "Drafts")]
++--------------------+   1. APPEND "Drafts" (\Seen \Draft)   +--------------------+
+|     CLI_WRITER     |======================================>|    imap.mail.ru    |
+| (SELECT "Notes")   |   Subject: {Prefix} [ID: <SRV>:<ID>]  |  CAPABILITY: IDLE, |
++--------------------+                                       |  UIDPLUS, MOVE     |
+                                                             +--------------------+
+                                                                       |
+                                                             2. * N EXISTS (0.1ms)
+                                                                UID FETCH <last+1>:*
+                                                                       V
+                                                             +--------------------+
+                                                             |     SRV_READER     |
+                                                             | (SELECT "Drafts")  |
+                                                             +--------------------+
+                                                                       |
+                                                             3. UIDs -> SRV_WRITER
+                                                                UID STORE + UID EXPUNGE
 
-[DOWNLINK: Сервер -> Клиент]
-+---------------+      4. IMAP IDLE Wakeup           +-------------------+
-|  ANet Client  |      SEARCH UNSEEN                 |   IMAP Provider   |
-| (TUN Inject)  |<-----------------------------------| (e.g., Mail.ru)   |
-+---------------+      Subject: {Prefix} [ID: Sess]  +-------------------+
-          ^                                                    ^
-          |                                                    | 3. IMAP APPEND
-          +====================================================+ Folder: "Notes"
+[DOWNLINK: Сервер -> Клиент (папка "Notes")]
++--------------------+   4. * N EXISTS -> UID FETCH          +--------------------+
+|     CLI_READER     |<--------------------------------------|    imap.mail.ru    |
+| (SELECT "Notes")   |   Subject: {Prefix} [ID: <SessID>]    |     (Port 993)     |
++--------------------+                                       +--------------------+
+          |                                                            ^
+5. UIDs -> CLI_WRITER                                                  | 3. APPEND "Notes" (\Seen \Draft)
+   UID STORE + UID EXPUNGE                                   +--------------------+
+                                                             |     SRV_WRITER     |
+                                                             | (SELECT "Drafts")  |
+                                                             +--------------------+
 ```
 
-## 3. Обработка VPN-трафика (Data Plane)
-После успешного прохождения криптографического рукопожатия (ASTP Handshake), транспорт переходит в режим передачи полезного трафика.
+---
 
-### 3.1. Клиентская часть
-*   **Отправка (Uplink):** IP-пакеты, поступающие из виртуального TUN-интерфейса, попадают в компонент `PacketBatcher`. Для минимизации количества запросов к почтовому серверу пакеты накапливаются. По истечении таймаута (`batch_ms`) или при достижении лимита объема (`max_kb`), накопленный батч шифруется протоколом ASTP (ChaCha20Poly1305), кодируется в Base64 и отправляется на сервер провайдера командой `APPEND` в папку `Drafts`.
-*   **Прием (Downlink):** Клиент удерживает фоновое соединение командой `IDLE` в папке `Notes`. При получении уведомления от провайдера о новом письме, клиент скачивает его (`FETCH`), немедленно удаляет из ящика (`STORE \Deleted` + `EXPUNGE`), декодирует Base64, расшифровывает батч, разделяет его на исходные IP-пакеты и инжектит их в TUN-интерфейс операционной системы.
+## 3. Профиль работы `imap.mail.ru:993` и критические оптимизации Data Plane
 
-### 3.2. Серверная часть
-*   **Прием (Uplink):** Серверный воркер удерживает `IDLE` в папке `Drafts`. При появлении письма он скачивает его, удаляет из ящика, извлекает идентификатор клиента из темы письма, расшифровывает батч соответствующим ключом сессии и передает IP-пакеты в ядро маршрутизации сервера.
-*   **Отправка (Downlink):** Пакеты, предназначенные клиенту, поступают из маршрутизатора сервера в индивидуальную очередь отправки. Воркер батчит их, шифрует ключом клиента, кодирует в Base64 и отправляет через `APPEND` в папку `Notes` с указанием идентификатора сессии клиента в теме письма.
+По результатам 10-минутного нагрузочного тестирования на `imap.mail.ru:993` зафиксированы следующие характеристики сервера:
+* **Поддерживаемые расширения (`CAPABILITY`):** `IMAP4rev1 ID XLIST UIDPLUS UNSELECT MOVE LIST-STATUS IDLE` (расширение `LITERAL+` не поддерживается, `APPEND` выполняется в 2 шага с ожиданием `+`).
+* **Задержка `APPEND`:** медиана `p50 = 316 мс` (Uplink) / `455 мс` (Downlink).
+* **Задержка `UID FETCH`:** медиана `p50 = 296 мс`.
+* **Задержка `STORE + EXPUNGE`:** медиана `p50 = 248 мс`.
+* **Вероятность попадания в «Слепое окно» (`BlindWindowHits`):** на сервере в **48.8% случаев (459 из 940 батчей)** уведомление `* <N> EXISTS` о следующем письме приходит от `imap.mail.ru` в тот момент, когда Reader уже вышел из `IDLE` и читает ответ `UID FETCH`.
 
-## 4. Идентификация и Виртуальные Сокеты (Virtual Sockets)
-Почтовый ящик функционирует как общая магистраль данных. Фильтрация пакетов осуществляется на стороне провайдера через команду `SEARCH SUBJECT`.
+### 3.1. Защита от гонки «Слепого окна» (`pending_exists`) и отказ от `async-imap`
+В готовом крейте `async-imap` метод `session.uid_fetch()` поглощает нетегированные ответы `* <N> EXISTS` внутри стрима `Fetch`, не уведомляя вызывающий код. При следующем входе в `IDLE` сервер `imap.mail.ru` повторно `* EXISTS` не присылает, что приводит к зависанию туннеля.
+
+Поэтому транспорт `imap` реализует собственный легковесный клиент `ImapConn` (~150 строк кода) напрямую поверх `tokio::io::BufReader<tokio_boring::SslStream<TcpStream>>`:
+1. Низкоуровневый метод `read_line()` проверяет **каждую** входящую строку от сервера (включая строки, приходящие во время `DONE` и `UID FETCH`).
+2. Если строка соответствует `^\*\s+\d+\s+EXISTS`, немедленно взводится флаг `self.pending_exists = true`.
+3. Перед входом в `IDLE` метод `wait_idle_or_pending()` проверяет `if self.pending_exists`: если флаг уже взведён, воркер **пропускает фазу `IDLE` / `DONE`** (экономя ~250 мс) и мгновенно переходит к следующему `UID FETCH`!
+
+### 3.2. Защита от дублей UID при запросе `<last_uid + 1>:*`
+В стандарте RFC 3501 символ `*` обозначает максимальный существующий UID в папке. Если новых писем больше нет, запрос `UID FETCH 100:*` при максимальном UID в папке `99` интерпретируется сервером как `100:99` $\equiv$ `99:100` и повторно возвращает письмо с `UID = 99` (в 10-минутном тесте это произошло 491 раз).
+* **Обязательное правило:** При разборе ответа `UID FETCH <last_uid + 1>:*` код обязан проверять `if msg_uid <= last_uid { continue; }` и обновлять `last_uid = last_uid.max(msg_uid)`.
+
+### 3.3. Self-Clocking коалесценция (`PacketBatcher`) — снижение RTT на 500 мс
+Чтобы не добавлять искусственную задержку `batch_ms` к одиночным пакетам (DNS, TCP SYN, ICMP-пинг):
+1. Когда `Writer` свободен и из канала `tx_queue` приходит первый пакет, воркер ждёт микро-окно не более **`10–15 мс`** (собирая текущий бурст через `try_recv`) и **немедленно начинает `APPEND`**.
+2. Пока этот `APPEND` выполняется по сети (`~320–450 мс`), новые пакеты из TUN естественным образом накапливаются в `tx_queue`.
+3. Как только `APPEND` завершается, `Writer` выгребает все накопившиеся за эти `320 мс` пакеты (до `max_kb = 32 КБ`) в один `PacketBatcher`, шифрует весь собранный буфер **одним вызовом** `wrap_packet_slice(&cipher, &nonce_prefix, seq, &raw_batch, 0)` и сразу запускает следующий `APPEND`.
+
+### 3.4. Неблокирующая сборка мусора (`UID EXPUNGE` в паузах трафика)
+Поскольку `imap.mail.ru` поддерживает расширение `UIDPLUS` (RFC 4315):
+1. Для удаления прочитанных писем используется точечная команда `UID EXPUNGE <uid_set>` (с фолбэком на `EXPUNGE`):
+   ```text
+   UID STORE 4,5,6,7,8 +FLAGS.SILENT (\Deleted)
+   UID EXPUNGE 4,5,6,7,8
+   ```
+2. `Writer` запускает удаление в двух случаях:
+    * **Приоритетно в паузе трафика:** когда очередь исходящих пакетов `tx_queue` пуста (`is_empty()`), а в списке `cleanup_uids` есть хотя бы 1 прочитанный UID;
+    * **Принудительно под нагрузкой:** когда в `cleanup_uids` накопилось $\ge 20$ прочитанных UIDs (чтобы не тормозить серию активных `APPEND` каждые 5 пакетов).
+
+### 3.5. Формат письма RFC 5322 при `APPEND`
+Каждое сообщение отправляется с флагами **`(\Seen \Draft)`** и валидной шапкой RFC 5322 с разбивкой Base64 по 76 символов:
+
+```text
+From: <account_email>
+To: <account_email>
+Subject: {subject_prefix} [ID: <TargetID>]
+Date: <RFC2822_Date>
+Message-ID: <<random_hex>@mail.ru>
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: base64
+
+<Base64_Payload_Chunked_76_Chars>
+```
+
+---
+
+## 4. Идентификация, Фазы Handshake и Виртуальные Сокеты (Virtual Sockets)
 
 Тема письма формируется динамически: `Subject: {Template_Prefix} [ID: <TargetID>]`
-*   `{Template_Prefix}` — настраиваемая строка (например, `Re: Отчет по проекту`).
-*   **TargetID Сервера:** Первые 8 символов от `Base64(SHA256(server_pub_key))`. Это гарантирует уникальность узла без ручной настройки.
-*   **TargetID Клиента:** До авторизации — `TempID` (первые 8 символов хэша от публичного ключа клиента). После авторизации — выданный `session_id`.
+* **На этапе Handshake (Фаза 1 и Фаза 3):**
+    * Клиент $\to$ Сервер (`Drafts`): `Subject: {Prefix} [ID: <SRV_ID>:<Client_TempID>]`
+      где `SRV_ID` — первые 8 hex-символов от `SHA256(server_pub_key_bytes)`, а `Client_TempID` — первые 8 hex-символов от `SHA256(client_ephemeral_or_pub_key)`.
+    * Сервер $\to$ Клиент (`Notes`, Фаза 2 и Фаза 4): `Subject: {Prefix} [ID: <Client_TempID>]`.
+* **На этапе Data Plane (после завершения Фазы 4 и получения `session_id`):**
+    * Клиент $\to$ Сервер (`Drafts`): `Subject: {Prefix} [ID: <SRV_ID>:<session_id>]`
+    * Сервер $\to$ Клиент (`Notes`): `Subject: {Prefix} [ID: <session_id>]`
 
-### 4.1. Генерация виртуального SocketAddr (Сторона Сервера)
-Поскольку ядро ANet (`AuthHandler`) требует `SocketAddr` для привязки ключей хендшейка, IMAP-воркер сервера динамически конвертирует `TargetID` клиента в фейковый IP-адрес. Базовый IP-адрес вычисляется динамически, чтобы **гарантированно не пересекаться** с подсетью VPN.
+### 4.1. Генерация виртуального `SocketAddr` (Сторона Сервера)
+Поскольку `ServerAuthHandler` привязывает состояние Фазы 1 (`temp_dh_map`) к `SocketAddr`, IMAP-воркер сервера детерминированно конвертирует `Client_TempID` в уникальный виртуальный `SocketAddr`:
 
 ```rust
 use sha2::{Sha256, Digest};
@@ -68,201 +143,203 @@ use std::str::FromStr;
 /// гарантируя отсутствие коллизий с маршрутами внутри VPN-туннеля.
 pub fn get_safe_fake_base(vpn_net_str: &str) -> Ipv4Addr {
     let vpn_ip = Ipv4Addr::from_str(vpn_net_str).unwrap_or(Ipv4Addr::new(10, 0, 0, 0));
-    let octets = vpn_ip.octets();
-
-    // Используем loopback-блок 127.127.X.Y.
-    // Если VPN настроен на 127.x.x.x, откатываемся на тестовую подсеть 198.18.x.x
-    if octets[0] == 127 {
+    if vpn_ip.octets()[0] == 127 {
         Ipv4Addr::new(198, 18, 0, 0)
     } else {
         Ipv4Addr::new(127, 127, 0, 0)
     }
 }
 
-/// Превращает строковый ID клиента из темы письма в уникальный виртуальный SocketAddr
+/// Превращает строковый TempID клиента из темы письма в уникальный виртуальный SocketAddr
 pub fn fake_addr_from_cli_id(cli_id: &str, safe_base: Ipv4Addr) -> SocketAddr {
-    let mut hasher = Sha256::new();
-    hasher.update(cli_id.as_bytes());
-    let hash = hasher.finalize();
-
-    let base_octets = safe_base.octets();
-    let ip = Ipv4Addr::new(base_octets[0], base_octets[1], hash[2], hash[3]);
-    
-    let mut port = u16::from_be_bytes([hash[4], hash[5]]);
-    if port == 0 { port = 1; }
-
+    let hash = Sha256::digest(cli_id.as_bytes());
+    let base = safe_base.octets();
+    let ip = Ipv4Addr::new(base[0], base[1], hash[2], hash[3]);
+    let port = u16::from_be_bytes([hash[4], hash[5]]).max(1);
     SocketAddr::new(std::net::IpAddr::V4(ip), port)
 }
 ```
 
-## 5. Разделение стадий Auth и Data (State-Based Dispatching)
-Для обеспечения максимальной производительности (Zero-Lock Hot Path) сервер использует локальный кэш сессий внутри IMAP-воркера, что позволяет мгновенно отличать пакеты установленных сессий от новых рукопожатий.
+---
+
+## 5. Обработка стадий Auth и Data на сервере (`anet-server/src/servers/imap.rs`)
+
+На стороне сервера критически важно обработать второй элемент ответа `auth_handler.process_handshake_packet(...)`: когда в Фазе 3 возвращается `Some((client_info, _auth_response))`, сервер обязан зарегистрировать канал маршрутизации через `registry.finalize_client(&client_info.assigned_ip, tx_router)` и запустить фоновую задачу Downlink-отправки для этого клиента:
 
 ```rust
-use std::collections::HashMap;
-use std::sync::Arc;
-use bytes::Bytes;
-
-/// Контекст, передаваемый каждому асинхронному воркеру на сервере
-struct WorkerContext {
-    /// Учетные данные конкретного почтового ящика (Логин, Пароль)
-    account: (String, String),
-    /// Глобальный реестр активных клиентских сессий
-    registry: Arc<ClientRegistry>,
-    /// Канал для передачи извлеченных IP-пакетов в виртуальный TUN-интерфейс
-    tun_tx: tokio::sync::mpsc::Sender<Bytes>,
-    /// Обработчик криптографических рукопожатий (ASTP)
-    auth_handler: ServerAuthHandler,
-    /// Безопасный базовый IP-адрес для генерации виртуальных сокетов
-    safe_base_ip: Ipv4Addr,
-    /// Уникальный идентификатор сервера, вычисленный из публичного ключа
-    srv_id: String,
+// Псевдокод обработки входящего письма из папки "Drafts" на сервере:
+let Some((msg_srv_id, cli_token)) = extract_srv_and_cli_token(&subject) else {
+    continue;
+};
+if msg_srv_id != worker_ctx.srv_id {
+    continue; // Письмо предназначено другому серверу
 }
 
-// Псевдокод внутри цикла чтения писем IMAP-воркера:
-// Локальный кэш воркера (без мьютексов!)
-let mut local_sessions: HashMap<String, Arc<ClientTransportInfo>> = HashMap::new();
-
-let cli_id = extract_cli_id_from_subject(&subject); // "f9e8d7c6" или "sess_8899"
-
-// 1. FAST PATH (Трафик) - Отрабатывает за наносекунды
-if let Some(client_info) = local_sessions.get(&cli_id) {
-    if let Ok(packet) = unwrap_packet_bytes(&client_info.cipher, payload) {
-        let _ = tun_tx.try_send(packet);
+// 1. FAST PATH (Установленная сессия Data Plane, cli_token == session_id)
+if let Some(client_info) = local_sessions.get(cli_token).cloned()
+    .or_else(|| {
+        let info = worker_ctx.registry.get_by_session(cli_token)?;
+        local_sessions.insert(cli_token.to_string(), info.clone());
+        Some(info)
+    })
+{
+    if let Ok(decrypted_batch) = unwrap_packet_bytes(&client_info.cipher, raw_payload) {
+        for pkt in unpack_batch(&decrypted_batch) {
+            if let Some(reply) = anet_common::icmp_probe::handle_in_tunnel_icmp_probe(&pkt) {
+                if let Some(dst_ip) = crate::utils::extract_ip_dst(&reply) {
+                    worker_ctx.registry.route_packet_to_ipv4(dst_ip, reply).await;
+                }
+                continue;
+            }
+            let pkt_len = pkt.len();
+            if worker_ctx.tun_tx.try_send(pkt).is_ok() {
+                worker_ctx.registry.record_rx(&client_info, pkt_len, "imap");
+            }
+        }
     }
     continue;
 }
 
-// 2. SLOW PATH (Первый пакет трафика после авторизации)
-if let Some(client_info) = registry.get_by_session(&cli_id) {
-    local_sessions.insert(cli_id.clone(), client_info.clone());
-    if let Ok(packet) = unwrap_packet_bytes(&client_info.cipher, payload) {
-        let _ = tun_tx.try_send(packet);
+// 2. AUTH PLANE (Хендшейк Фазы 1 или Фазы 3, cli_token == Client_TempID)
+let fake_addr = fake_addr_from_cli_id(cli_token, worker_ctx.safe_base_ip);
+match worker_ctx.auth_handler.process_handshake_packet(raw_payload, fake_addr, "imap").await {
+    Ok((response_opt, auth_tuple_opt)) => {
+        if let Some((client_info, _auth_response)) = auth_tuple_opt {
+            let assigned_ip = client_info.assigned_ip.clone();
+            let session_id = client_info.session_id.clone();
+            local_sessions.insert(session_id.clone(), client_info.clone());
+
+            let (tx_router, mut rx_router) = tokio::sync::mpsc::channel::<Bytes>(CHANNEL_BUFFER_SIZE);
+            worker_ctx.registry.finalize_client(&assigned_ip, tx_router);
+
+            let writer_tx = worker_ctx.notes_append_tx.clone();
+            let c_info = client_info.clone();
+            tokio::spawn(async move {
+                // Задача Downlink: собирает пакеты из rx_router в PacketBatcher (Self-Clocking),
+                // шифрует одним вызовом wrap_packet_slice и отправляет через APPEND в "Notes"
+                // с темой Subject: "{Prefix} [ID: <session_id>]"
+                run_client_downlink_batcher(&mut rx_router, c_info, writer_tx).await;
+            });
+        }
+
+        if let Some(response_bytes) = response_opt {
+            let _ = worker_ctx.notes_append_tx.send((cli_token.to_string(), response_bytes)).await;
+        }
     }
-} else {
-    // 3. AUTH PLANE (Хендшейк Фазы 1 или 3)
-    let fake_addr = fake_addr_from_cli_id(&cli_id, safe_base_ip);
-    let auth_res = auth_handler.process_handshake_packet(payload, fake_addr, "imap").await;
-    
-    if let Ok((Some(response_bytes), _)) = auth_res {
-        // Отправка ответа клиенту (Фаза 2 или 4)
-        send_imap_append("Notes", &cli_id, response_bytes).await;
+    Err(e) => {
+        log::debug!("[IMAP Auth] Handshake packet ignored for {}: {e}", cli_token);
     }
 }
 ```
 
-## 6. Интеграция в панель управления (anet-auth & anet-webui)
-Во избежание компрометации паролей и для удобства управления, почтовые ящики хранятся в базе данных как справочник. Пароли шифруются с помощью компонента `DbEncryptor`. Строка подключения (DSN) собирается сервером «на лету» при выдаче конфигурации клиенту.
+---
+
+## 6. Интеграция в панель управления (`anet-auth` & `anet-webui`)
+Во избежание компрометации паролей и для удобства управления почтовые ящики хранятся в базе данных как справочник. Пароли шифруются с помощью компонента `DbEncryptor`. Строка подключения (DSN) собирается сервером «на лету» при выдаче конфигурации клиенту.
 
 ### 6.1. База данных и DTO (`anet-auth`)
-Необходимо создать новую таблицу `imap_mailboxes` через SeaORM миграцию.
+1. В `anet-auth/src/entities/protocol_type.rs` (и миграцией PostgreSQL `ALTER TYPE protocol_type ADD VALUE IF NOT EXISTS 'imap';`) добавить вариант `ProtocolType::Imap` (`"imap"`).
+2. Создать таблицу `imap_mailboxes` через SeaORM миграцию:
 
 ```rust
 /// Модель данных служебного почтового ящика в БД
 pub struct Model {
-    /// Уникальный идентификатор записи ящика
     pub id: Uuid,
     /// Адрес IMAP-сервера провайдера (например, imap.mail.ru)
     pub host: String,
-    /// Порт IMAP-сервера (обычно 993 для TLS)
+    /// Порт IMAP-сервера (обычно 993 для IMAPS)
     pub port: i32,
     /// Логин (email) от почтового ящика
     pub email: String,
-    /// Зашифрованный пароль (ОБЯЗАТЕЛЬНО шифруется через DbEncryptor::encrypt при сохранении)
-    pub password_encrypted: String,
-    /// Статус активности ящика (используется ли он в пулах)
+    /// Зашифрованный пароль приложения для КЛИЕНТОВ (шифруется через DbEncryptor::encrypt)
+    pub client_password_encrypted: String,
+    /// Опциональный отдельный зашифрованный пароль приложения для СЕРВЕРА
+    pub server_password_encrypted: Option<String>,
     pub is_active: bool,
-    /// Дата создания записи
     pub created_at: DateTime,
-    /// Дата последнего обновления записи
     pub updated_at: DateTime,
 }
 ```
 
-В контроллерах (API) при создании (`POST`) или обновлении (`PATCH`) записи почтового ящика, строковый пароль должен быть передан в `DbEncryptor::encrypt()` перед записью в базу данных.
-
 ### 6.2. Изменения в `anet-webui` (Frontend)
-1.  **Справочник ящиков:** Создать новый раздел в UI (аналог DoH Resolvers) для управления пулом почтовых ящиков (CRUD операции).
-2.  **Настройка пулов (Node Pools):** В компоненте `PoolModal.vue` добавить протокол `IMAP`.
-3.  При выборе протокола `IMAP` отображать выпадающий список (Multiple Select) для выбора ящиков из справочника БД.
-4.  Выбранные ID ящиков сериализуются в строку и сохраняются в поле `port_or_url` таблицы `node_pool_members` (например, `id1,id2,id3`).
+1. **Справочник ящиков:** Создать раздел в UI для управления пулом почтовых ящиков (CRUD операции).
+2. **Настройка пулов (Node Pools):** В компоненте `PoolModal.vue` добавить протокол `IMAP`.
+3. При выборе протокола `IMAP` отображать выпадающий список (Multiple Select) для выбора ящиков из справочника БД. Выбранные ID ящиков сериализуются через запятую в поле `port_or_url` таблицы `node_pool_members`.
 
 ### 6.3. Сборка DSN «на лету» (`anet-auth/src/api/users.rs`)
 При вызове эндпоинта генерации `client.toml` (`download_config`):
-1.  Бэкенд обрабатывает `ProtocolType::Imap` в блоке генерации серверов.
-2.  Извлекает IDs ящиков из поля `port_or_url`.
-3.  Делает запрос в БД (`imap_mailboxes`), получает записи.
-4.  Дешифрует пароли с помощью `DbEncryptor::decrypt()`.
-5.  Формирует строку DSN: `imap://imap.mail.ru:993?acc=user1%40mail.ru:pass1&acc=user2%40mail.ru:pass2&batch_ms=400` и экспортирует её в блок `[[servers]]` файла `client.toml` в исходном виде, без попыток автоматического добавления портов.
+1. Бэкенд обрабатывает `ProtocolType::Imap` в блоке генерации серверов.
+2. Извлекает ID ящиков из `port_or_url`, загружает активные записи из `imap_mailboxes`, дешифрует клиентские пароли через `DbEncryptor::decrypt()`.
+3. Формирует строку DSN:
+   `imap://imap.mail.ru:993?acc=user1%40mail.ru:client_pass1&acc=user2%40mail.ru:client_pass2&batch_ms=250`
+   и экспортирует её в блок `[[servers]]` файла `client.toml`.
+
+---
 
 ## 7. Интеграция в ядро ANet (Core Integration)
 
-### 7.1. Зависимости (`Cargo.toml`)
-Для реализации транспорта необходимо добавить крейт `async-imap` в воркспейс.
-```toml
-# Подключается в anet-client-core и anet-server.
-# Строго отключаем async-std, используем только tokio и rustls.
-async-imap = { version = "0.9", default-features = false, features = ["runtime-tokio", "rustls"] }
-```
+### 7.1. Никаких внешних IMAP-крейтов с `rustls`!
+Транспорт **не использует** крейт `async-imap` (так как `async-imap` теряет нетегированные `* EXISTS` во время `UID FETCH` и тянет `rustls`).
+Вместо этого в `anet-common/src/imap_conn.rs` реализуется нативный асинхронный `ImapConn` поверх `tokio::io::BufReader<tokio_boring::SslStream<TcpStream>>`, использующий штатный **BoringSSL** коннектор из `anet-common/src/boring_tls.rs`.
+
+В `anet-common/src/boring_tls.rs` добавляется функция `connect_raw_tls_with_config(domain, stream, cfg)` без HTTP-специфичного ALPN (`h2`/`http/1.1`), чтобы на порту `993` ClientHello выглядел как классический TLS-клиент почтовой программы.
 
 ### 7.2. Клиент (`anet-client-core`)
-1.  **`config.rs`**: Добавить `TransportMode::Imap` и парсинг схемы `imap` в `ServerConfig::mode()`.
-2.  **`transport/factory.rs`**: Добавить ветвление `TransportMode::Imap => Box::new(ImapTransport::new(...))`.
-3.  Создать `transport/imap.rs` со следующими структурами:
+1. **`config.rs`**:
+    * В `TransportMode` добавить вариант `Imap`.
+    * В `ServerConfig::mode()` добавить `"imap" | "imaps" => Ok(TransportMode::Imap)`.
+    * В `ServerConfig::host_port()` добавить `"imap" | "imaps" => 993`, чтобы `AnetClient::connect_and_run` автоматически добавлял все IP-адреса `imap.mail.ru` в `route_manager.add_bypass_route()` (и в исключения `VpnService` на Android)!
+    * В `ServerConfig::get_name()` добавить `TransportMode::Imap => "IMAP"`.
+2. **`transport/factory.rs`**: Добавить ветвление `TransportMode::Imap => Box::new(ImapTransport::new(config.clone(), server.clone()))`.
+3. Создать `transport/imap.rs` со следующими структурами:
 
 ```rust
-/// Конфигурация IMAP-транспорта, динамически извлеченная из DSN
 struct ImapConfig {
-    /// Хост почтового провайдера (например, imap.mail.ru)
     host: String,
-    /// Порт подключения (TLS, обычно 993)
     port: u16,
-    /// Пул служебных аккаунтов в формате (Логин, Пароль)
     accounts: Vec<(String, String)>,
-    /// Базовый шаблон для темы письма (маскировка под легитимный трафик)
     subject_prefix: String,
-    /// Максимальное время удержания пакетов в буфере (коалесценция) в миллисекундах
     batch_ms: u64,
-    /// Максимальный размер одного отправляемого пакета-черновика в килобайтах
     max_kb: usize,
 }
 
-/// Основная структура клиента для IMAP-транспорта
 pub struct ImapTransport {
-    /// Глобальная конфигурация ядра клиента ANet
     config: CoreConfig,
-    /// Конфигурация конкретного сервера из client.toml
     server: ServerConfig,
 }
 ```
 
 ### 7.3. Сервер (`anet-server`)
-1.  **`config.rs`**: В структуру `ServerCoreConfig` добавить поле `pub imap_dsn: Option<String>`. *(Администратор сервера генерирует эту строку через CLI или копирует из админки).*
-2.  **`server.rs`**: В методе `ANetServer::run()` добавить запуск супервизора:
-    ```rust
-    if let Some(ref imap_dsn) = self.cfg.server.imap_dsn {
-        if !imap_dsn.trim().is_empty() {
-            let c = self.cfg.clone();
-            let rg = self.registry.clone();
-            let tx = client_pkt_tx.clone();
-            let auth = self.auth_handler_core.clone();
-            handle_collection.push(tokio::spawn(async move {
-                if let Err(e) = imap::run_imap_server(c, rg, tx, auth).await {
-                    error!("Fatal error: [IMAP] Server halted: {}", e);
-                }
-            }));
-        }
-    }
-    ```
-3.  Создать модуль `servers/imap.rs` с реализацией пула воркеров (по одному на каждый аккаунт из `imap_dsn`).
+1. **`config.rs`**: В структуру `ServerCoreConfig` добавить поле `pub imap_dsn: Option<String>`.
+2. **`server.rs`**: В методе `ANetServer::run()` добавить запуск супервизора:
+   ```rust
+   if let Some(ref imap_dsn) = self.cfg.server.imap_dsn {
+       if !imap_dsn.trim().is_empty() {
+           let c = self.cfg.clone();
+           let rg = self.registry.clone();
+           let tx = client_pkt_tx.clone();
+           let auth = self.auth_handler_core.clone();
+           handle_collection.push(tokio::spawn(async move {
+               if let Err(e) = imap::run_imap_server(c, rg, tx, auth).await {
+                   error!("Fatal error: [IMAP] Server halted: {}", e);
+               }
+           }));
+       }
+   }
+   ```
+3. Создать модуль `servers/imap.rs` с реализацией пула воркеров для всех ящиков из `imap_dsn`.
 
-## 8. Строгие требования к реализации (AI Prompts)
-При написании кода разработчик (или ИИ-ассистент) обязан соблюдать следующие директивы:
+---
 
-1.  **Strict Tokio Runtime:** Запрещено использовать `async-std` или синхронные блокирующие вызовы. Использовать только `async-imap` с фичей `runtime-tokio`.
-2.  **Full-Duplex Connections:** Команда `IDLE` блокирует сессию. Строго обязательно открывать **два независимых TCP/TLS соединения** к одному ящику (одно исключительно для Writer/`APPEND`, второе исключительно для Reader/`IDLE`). Это критично для предотвращения Deadlock.
-3.  **Adaptive Batching:** Использовать существующий `PacketBatcher` (перенести его из `wrtc/batcher.rs` в `anet-common/src/batcher.rs`). Накапливать IP-пакеты из TUN и отправлять их единым Base64-блоком по истечении `batch_ms` или при достижении `max_kb`.
-4.  **Garbage Collection (Критично):** После выполнения `FETCH` и успешной обработки пакета, код обязан немедленно пометить письмо на удаление `STORE <UID> +FLAGS (\Deleted)` и выполнить `EXPUNGE`. Утечка писем недопустима.
-5.  **Cryptography:** Использовать `wrap_packet` и `unwrap_packet` из `anet-common/src/transport.rs` (ChaCha20Poly1305). Инкапсулировать зашифрованный бинарный буфер в Base64 перед вставкой в тело письма.
-6.  **Failover ящиков (только Клиент):** Если клиент получает ошибку авторизации или лимита от провайдера на текущем ящике, он должен инкрементировать индекс пула `(index + 1) % accounts.len()` и пересоздать сессии с новым ящиком, не обрывая TUN-интерфейс.
-7.  **Мультиплексирование (только Сервер):** Сервер должен спавнить асинхронные воркеры (Reader/Writer) для **всех** ящиков, указанных в серверном DSN одновременно. Все воркеры должны обращаться к единому `ClientRegistry` и использовать локальный кэш (Fast Path).
+## 8. Строгие директивы для ИИ-агента при написании Rust-кода
+
+1. **BoringSSL Only (Никакого `rustls` на 993 порту):** Устанавливать TCP-соединение через `TcpStream::connect`, оборачивать его через `anet_common::boring_tls::connect_raw_tls_with_config(&host, tcp_stream, &tls_cfg)`.
+2. **Архитектура «Cross-Selected Writer»:**
+    * На сервере и `SRV_READER`, и `SRV_WRITER` делают `SELECT "Drafts"`. `SRV_WRITER` выполняет `APPEND "Notes" (\Seen \Draft) {<len>}` и чистит прочитанные UIDs в `"Drafts"`.
+    * На клиенте и `CLI_READER`, и `CLI_WRITER` делают `SELECT "Notes"`. `CLI_WRITER` выполняет `APPEND "Drafts" (\Seen \Draft) {<len>}` и чистит прочитанные UIDs в `"Notes"`.
+3. **Защита от «Слепого окна» (`pending_exists`):** В методе чтения строк из сокета любая строка `^\*\s+\d+\s+EXISTS` обязана взводить `self.pending_exists = true`. Метод `wait_idle_or_pending()` обязан проверять этот флаг до входа в `IDLE` и сразу после выхода из `IDLE`.
+4. **Чтение строго по `UID FETCH <last_uid + 1>:*` с фильтрацией дублей:** Никогда не использовать `SEARCH`. Запрашивать `UID FETCH <last_uid + 1>:* (UID BODY.PEEK[HEADER.FIELDS (SUBJECT)] BODY.PEEK[TEXT])`, игнорировать элементы с `uid <= last_uid` и обновлять `last_uid = last_uid.max(uid)`.
+5. **Self-Clocking Batcher:** Первый пакет при свободном `Writer` отправляется с микро-задержкой коалесценции не более `15 мс`, а следующие пакеты естественно коалесцируются в очереди, пока текущий `APPEND` выполняется по сети (`~320 мс`).
+6. **Неблокирующий `UID EXPUNGE`:** Использовать `UID STORE <uids> +FLAGS.SILENT (\Deleted)` + `UID EXPUNGE <uids>` (с фолбэком на `EXPUNGE`) в моменты, когда очередь отправки `Writer` пуста, либо при накоплении $\ge 20$ прочитанных UIDs.
+7. **Failover ящиков (Клиент):** Если клиент получает ошибку авторизации, разрыв соединения или лимит от провайдера на текущем ящике, он переключается на следующий аккаунт `(index + 1) % accounts.len()` с сохранением `resume_session_id` (бесшовный реконнект без пересоздания TUN).
+8. **Мультиплексирование (Сервер):** Сервер спавнит независимые пары воркеров (Reader + Writer) для каждого почтового ящика из `imap_dsn` параллельно, разделяя единый `ClientRegistry`.
