@@ -213,8 +213,7 @@ mod tests {
                 tun_name = "anet"
                 [[servers]]
                 name = "Primary"
-                address = "127.0.0.1:443"
-                mode = "quic"
+                dsn = "quic://127.0.0.1:443"
             "#,
         );
         assert_eq!(result, "OK\nPrimary");

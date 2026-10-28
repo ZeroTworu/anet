@@ -48,6 +48,7 @@ pub const CAPTIVE_PORTAL_DOMAINS: &[&str] = &[
     serde::Deserialize,
 )]
 #[archive(check_bytes)]
+#[archive_attr(derive(Debug, PartialEq, Eq, Clone, Copy))]
 #[repr(u8)]
 pub enum RuleAction {
     /// Трафик направляется через защищенный VPN-туннель
@@ -56,6 +57,23 @@ pub enum RuleAction {
     Direct = 1,
     /// Трафик блокируется (генерация 0.0.0.0 / :: на уровне DNS или сброс пакета)
     Block = 2,
+}
+
+impl PartialEq<RuleAction> for ArchivedRuleAction {
+    fn eq(&self, other: &RuleAction) -> bool {
+        matches!(
+            (self, other),
+            (ArchivedRuleAction::Proxy, RuleAction::Proxy)
+                | (ArchivedRuleAction::Direct, RuleAction::Direct)
+                | (ArchivedRuleAction::Block, RuleAction::Block)
+        )
+    }
+}
+
+impl PartialEq<ArchivedRuleAction> for RuleAction {
+    fn eq(&self, other: &ArchivedRuleAction) -> bool {
+        other == self
+    }
 }
 
 impl RuleAction {
