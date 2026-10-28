@@ -1664,11 +1664,10 @@ impl ClientTransport for DohTransport {
         let hook_flag = shutdown_flag.clone();
         let hook_notify = shutdown_notify.clone();
         let hook_queue = uplink_queue.clone();
-        let shutdown_hook = Box::new(move || {
+        let shutdown_hook: super::ShutdownHook = Box::pin(async move {
             hook_flag.store(true, Ordering::Release);
             hook_notify.notify_waiters();
             hook_queue.close();
-            Box::pin(async {}) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
         });
 
         Ok(ConnectionResult {

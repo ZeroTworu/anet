@@ -36,7 +36,6 @@ const RECENT_DNS_CACHE_MAX: usize = 256;
 
 #[derive(Clone)]
 struct InflightDownlinkFrame {
-    seq: u32,
     encoded_b64: String,
     sent_at: Instant,
     retries: u8,
@@ -541,7 +540,6 @@ async fn pop_downlink_payload(
     state.inflight_dl.insert(
         seq,
         InflightDownlinkFrame {
-            seq,
             encoded_b64: b64.clone(),
             sent_at: Instant::now(),
             retries: 0,
