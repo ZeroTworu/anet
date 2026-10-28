@@ -729,7 +729,7 @@ impl ClientBuilder {
                             target_os = "watchos",
                         ))]
                         config.interface.as_deref(),
-                        config.interface.as_deref().is_none() && config.nodelay || config.nodelay,
+                        config.nodelay,
                         config.tls_info,
                     )
                 }
