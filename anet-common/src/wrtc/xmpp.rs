@@ -305,6 +305,11 @@ impl XmppSession {
 
         let writer_handle = tokio::spawn(async move {
             let mut ping_interval = tokio::time::interval(Duration::from_secs(ping_secs));
+            let mut extdisco_interval = tokio::time::interval_at(
+                tokio::time::Instant::now() + Duration::from_secs(600),
+                Duration::from_secs(600),
+            );
+            extdisco_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tokio::select! {
                     stanza_opt = write_rx.recv() => {
@@ -360,6 +365,11 @@ impl XmppSession {
                             log::warn!("[XMPP] Failed or timed out sending XMPP IQ ping");
                             break;
                         }
+                    }
+                    _ = extdisco_interval.tick() => {
+                        // Периодическое обновление динамических TURN/TURNS credentials по XEP-0215
+                        let extdisco_iq = XmppBuilder::extdisco_services(&format!("extdisco_{:08x}", rand::random::<u32>()));
+                        let _ = tokio::time::timeout(write_timeout_dur, ws_sink.send(Message::text(extdisco_iq))).await;
                     }
                 }
             }

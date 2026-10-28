@@ -69,10 +69,34 @@ impl AsyncUdpSocket for HybridAsyncUdpSocket {
     ) -> std::task::Poll<std::io::Result<usize>> {
         if transmit.destination.ip().is_loopback() {
             if let Some(ref lo) = self.loopback {
-                return lo.poll_send(cx, transmit);
+                return match lo.poll_send(cx, transmit) {
+                    std::task::Poll::Ready(Err(e)) => {
+                        log::debug!(
+                            "[WRTC UDP] Transient loopback send error to {} ignored to preserve TURN/ICE state: {e}",
+                            transmit.destination
+                        );
+                        std::task::Poll::Ready(Ok(transmit.message.len()))
+                    }
+                    other => other,
+                };
             }
         }
-        self.primary.poll_send(cx, transmit)
+        match self.primary.poll_send(cx, transmit) {
+            std::task::Poll::Ready(Err(e)) => {
+                // КРИТИЧНО: В webrtc-0.21.1 любая ошибка UdpSocket::send_to (например, кратковременный
+                // os error 101 Network unreachable при продлении DHCP-аренды или обновлении таблицы маршрутов)
+                // заставляет PeerConnectionDriver генерировать RTCTurnRelayEventIn::SocketWriteFailure(four_tuple),
+                // что вызывает RTCTurnRelayer::remove_client() и БЕЗВОЗВРАТНО удаляет живую TURN-аллокацию!
+                // Поглощая транзиентную ошибку отправки на уровне UDP-сокета (семантика потери UDP-датаграммы в сети),
+                // мы сохраняем TURN-клиент и relay-кандидат живыми.
+                log::debug!(
+                    "[WRTC UDP] Transient UDP send error to {} ignored to preserve TURN allocation: {e}",
+                    transmit.destination
+                );
+                std::task::Poll::Ready(Ok(transmit.message.len()))
+            }
+            other => other,
+        }
     }
 
     fn poll_recv(
@@ -491,14 +515,37 @@ impl PeerConnectionEventHandler for PeerEvents {
 
 struct P2pEvents {
     is_open: Arc<AtomicBool>,
+    is_connected: Arc<AtomicBool>,
+    is_failed: Arc<AtomicBool>,
+    disconnected_at_ms: Arc<AtomicU64>,
+    start_instant: std::time::Instant,
 }
 
 #[async_trait::async_trait]
 impl PeerConnectionEventHandler for P2pEvents {
     async fn on_connection_state_change(&self, state: RTCPeerConnectionState) {
         log::info!("[P2P Direct] WebRTC PeerConnection state: {state:?}");
-        if state == RTCPeerConnectionState::Failed || state == RTCPeerConnectionState::Closed {
-            self.is_open.store(false, Ordering::SeqCst);
+        match state {
+            RTCPeerConnectionState::Connected => {
+                self.is_connected.store(true, Ordering::SeqCst);
+                self.disconnected_at_ms.store(0, Ordering::SeqCst);
+            }
+            RTCPeerConnectionState::Disconnected => {
+                self.is_connected.store(false, Ordering::SeqCst);
+                let now_ms = (self.start_instant.elapsed().as_millis() as u64).max(1);
+                let _ = self.disconnected_at_ms.compare_exchange(
+                    0,
+                    now_ms,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                );
+            }
+            RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed => {
+                self.is_connected.store(false, Ordering::SeqCst);
+                self.is_open.store(false, Ordering::SeqCst);
+                self.is_failed.store(true, Ordering::SeqCst);
+            }
+            _ => {}
         }
     }
 }
@@ -507,17 +554,44 @@ pub struct P2pSession {
     pub pc: Arc<dyn PeerConnection>,
     pub dc: Arc<dyn DataChannel>,
     pub is_open: Arc<AtomicBool>,
+    pub is_connected: Arc<AtomicBool>,
+    pub is_failed: Arc<AtomicBool>,
+    pub disconnected_at_ms: Arc<AtomicU64>,
+    pub start_instant: std::time::Instant,
     pub open_notify: Arc<tokio::sync::Notify>,
     pub incoming_rx: Mutex<mpsc::Receiver<Bytes>>,
     pub turns_proxies: Vec<TurnsProxyHandle>,
+    pub active_ice_servers: std::sync::Mutex<Vec<RTCIceServer>>,
     pub bg_tasks: std::sync::Mutex<Vec<tokio::task::AbortHandle>>,
     pub peer_close_timeout_secs: u64,
 }
 
 impl P2pSession {
+    #[inline]
+    pub fn is_ready(&self) -> bool {
+        self.is_open.load(Ordering::Relaxed)
+            && self.is_connected.load(Ordering::Relaxed)
+            && !self.is_failed.load(Ordering::Relaxed)
+    }
+
+    pub fn should_renegotiate(&self, disconnected_timeout_ms: u64, handshake_timeout_ms: u64) -> bool {
+        if self.is_failed.load(Ordering::SeqCst) {
+            return true;
+        }
+        let now_ms = self.start_instant.elapsed().as_millis() as u64;
+        let disc_ms = self.disconnected_at_ms.load(Ordering::SeqCst);
+        if disc_ms > 0 && now_ms.saturating_sub(disc_ms) >= disconnected_timeout_ms {
+            return true;
+        }
+        if !self.is_open.load(Ordering::SeqCst) && now_ms >= handshake_timeout_ms {
+            return true;
+        }
+        false
+    }
+
     pub async fn send_packet(&self, data: &Bytes) -> anyhow::Result<()> {
-        if !self.is_open.load(Ordering::SeqCst) {
-            anyhow::bail!("P2P DataChannel is not open");
+        if !self.is_ready() {
+            anyhow::bail!("P2P DataChannel is not ready (disconnected or closed)");
         }
         self.dc
             .send(BytesMut::from(data.as_ref()))
@@ -539,8 +613,53 @@ impl P2pSession {
         }
     }
 
+    pub async fn rotate_turn_credentials(&self, discovered: &[XmppIceServer]) {
+        let Some(fresh_turn) = discovered
+            .iter()
+            .find(|s| s.is_turn && !s.username.is_empty() && !s.credential.is_empty())
+        else {
+            return;
+        };
+        let updated_servers = {
+            let Ok(mut guard) = self.active_ice_servers.lock() else {
+                return;
+            };
+            if guard.is_empty() {
+                return;
+            }
+            let mut changed = false;
+            for srv in guard.iter_mut() {
+                if !srv.username.is_empty()
+                    && (srv.username != fresh_turn.username
+                        || srv.credential != fresh_turn.credential)
+                {
+                    srv.username = fresh_turn.username.clone();
+                    srv.credential = fresh_turn.credential.clone();
+                    changed = true;
+                }
+            }
+            if !changed {
+                return;
+            }
+            guard.clone()
+        };
+        let new_cfg = RTCConfigurationBuilder::new()
+            .with_ice_servers(updated_servers)
+            .build();
+        if let Err(e) = self.pc.set_configuration(new_cfg).await {
+            log::debug!("[P2P Direct] TURN credential rotation warning: {e}");
+        } else {
+            log::info!(
+                "[P2P Direct] Rotated live TURN credentials via extdisco (username={})",
+                fresh_turn.username
+            );
+        }
+    }
+
     pub async fn close(&self) {
         self.is_open.store(false, Ordering::SeqCst);
+        self.is_connected.store(false, Ordering::SeqCst);
+        self.is_failed.store(true, Ordering::SeqCst);
         if let Ok(mut tasks) = self.bg_tasks.lock() {
             for handle in tasks.drain(..) {
                 handle.abort();
@@ -557,6 +676,8 @@ impl P2pSession {
 impl Drop for P2pSession {
     fn drop(&mut self) {
         self.is_open.store(false, Ordering::SeqCst);
+        self.is_connected.store(false, Ordering::SeqCst);
+        self.is_failed.store(true, Ordering::SeqCst);
         if let Ok(mut tasks) = self.bg_tasks.lock() {
             for handle in tasks.drain(..) {
                 handle.abort();
@@ -721,6 +842,10 @@ pub async fn create_p2p_channel(
     bind_addr: &str,
 ) -> anyhow::Result<P2pSession> {
     let is_open = Arc::new(AtomicBool::new(false));
+    let is_connected = Arc::new(AtomicBool::new(false));
+    let is_failed = Arc::new(AtomicBool::new(false));
+    let disconnected_at_ms = Arc::new(AtomicU64::new(0));
+    let start_instant = std::time::Instant::now();
     let open_notify = Arc::new(tokio::sync::Notify::new());
 
     let effective_bind_addr = if !bind_addr.is_empty() && bind_addr != "0.0.0.0:0" {
@@ -735,11 +860,13 @@ pub async fn create_p2p_channel(
     let (tiers, turns_proxies) = build_ice_server_tiers(ice_servers_info, wrtc_cfg);
     let mut last_err = None;
     let mut built_pc = None;
+    let mut active_ice_servers: Vec<RTCIceServer> = Vec::new();
 
     for tier in tiers {
         let tier_label = tier.label;
         let tier_has_turn = tier.has_turn;
         let tier_urls = tier.display_urls;
+        let tier_servers_clone = tier.servers.clone();
         let mut media_engine = MediaEngine::default();
         let registry = register_default_interceptors(Registry::new(), &mut media_engine)?;
 
@@ -763,6 +890,10 @@ pub async fn create_p2p_channel(
 
         let handler = Arc::new(P2pEvents {
             is_open: is_open.clone(),
+            is_connected: is_connected.clone(),
+            is_failed: is_failed.clone(),
+            disconnected_at_ms: disconnected_at_ms.clone(),
+            start_instant,
         });
 
         match PeerConnectionBuilder::new()
@@ -785,6 +916,7 @@ pub async fn create_p2p_channel(
                     "[P2P Direct] PeerConnection built with {tier_label} (TURN={tier_has_turn}): {:?}",
                     tier_urls
                 );
+                active_ice_servers = tier_servers_clone;
                 built_pc = Some(pc_res);
                 break;
             }
@@ -815,9 +947,12 @@ pub async fn create_p2p_channel(
     let dc: Arc<dyn DataChannel> = pc.create_data_channel("anet-data", Some(dc_init)).await?;
 
     let (incoming_tx, incoming_rx) = mpsc::channel::<Bytes>(WRTC_P2P_CHANNEL_CAPACITY);
-    let in_tx = incoming_tx.clone();
+    let in_tx = incoming_tx;
 
     let is_open_c = is_open.clone();
+    let is_connected_c = is_connected.clone();
+    let is_failed_c = is_failed.clone();
+    let disconnected_at_c = disconnected_at_ms.clone();
     let notify_c = open_notify.clone();
     let dc_poll = Arc::clone(&dc);
 
@@ -826,12 +961,15 @@ pub async fn create_p2p_channel(
             match event {
                 DataChannelEvent::OnOpen => {
                     log::info!("[P2P Direct] established: DataChannel 'anet-data' is now OPEN!");
+                    is_connected_c.store(true, Ordering::SeqCst);
+                    disconnected_at_c.store(0, Ordering::SeqCst);
                     is_open_c.store(true, Ordering::SeqCst);
                     notify_c.notify_waiters();
                 }
                 DataChannelEvent::OnClose => {
                     log::info!("[P2P Direct] DataChannel closed");
                     is_open_c.store(false, Ordering::SeqCst);
+                    is_failed_c.store(true, Ordering::SeqCst);
                     break;
                 }
                 DataChannelEvent::OnMessage(msg) => {
@@ -846,9 +984,14 @@ pub async fn create_p2p_channel(
         pc,
         dc,
         is_open,
+        is_connected,
+        is_failed,
+        disconnected_at_ms,
+        start_instant,
         open_notify,
         incoming_rx: Mutex::new(incoming_rx),
         turns_proxies,
+        active_ice_servers: std::sync::Mutex::new(active_ice_servers),
         bg_tasks: std::sync::Mutex::new(vec![dc_task.abort_handle()]),
         peer_close_timeout_secs: wrtc_cfg.peer_close_timeout_secs.max(1),
     })

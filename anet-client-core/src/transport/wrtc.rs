@@ -478,7 +478,9 @@ impl ClientTransport for WrtcTransport {
         let nonce_prefix: [u8; 4] = auth_response.nonce_prefix.as_slice().try_into()?;
         let sequence = Arc::new(AtomicU64::new(0));
 
-        let ice_servers = xmpp.get_ice_servers();
+        let p2p_session_opt: Arc<Mutex<Option<Arc<P2pSession>>>> = Arc::new(Mutex::new(None));
+        let p2p_negotiating = Arc::new(AtomicBool::new(false));
+        let p2p_xmpp_rot = p2p_session_opt.clone();
         let xmpp_arc = Arc::new(Mutex::new(xmpp));
         let xmpp_bg = Arc::clone(&xmpp_arc);
         let peer_xmpp = Arc::clone(&shared_peer);
@@ -539,6 +541,9 @@ impl ClientTransport for WrtcTransport {
                                     fresh_ice,
                                 ) => {
                                     peer_xmpp.rotate_turn_credentials(&fresh_ice).await;
+                                    if let Some(p2p) = p2p_xmpp_rot.lock().await.clone() {
+                                        p2p.rotate_turn_credentials(&fresh_ice).await;
+                                    }
                                 }
                                 anet_common::wrtc::xmpp_xml::InboundXmpp::Presence {
                                     from,
@@ -612,6 +617,9 @@ impl ClientTransport for WrtcTransport {
                                 {
                                     let fresh_ice = new_xmpp.get_ice_servers();
                                     peer_xmpp.rotate_turn_credentials(&fresh_ice).await;
+                                    if let Some(p2p) = p2p_xmpp_rot.lock().await.clone() {
+                                        p2p.rotate_turn_credentials(&fresh_ice).await;
+                                    }
                                     let occupants = new_xmpp.get_other_occupants();
                                     if !occupants.iter().any(|o| o == &target_srv_xmpp) {
                                         warn!(
@@ -650,70 +658,116 @@ impl ClientTransport for WrtcTransport {
             }
         });
 
-        let p2p_session_opt: Arc<Mutex<Option<Arc<P2pSession>>>> = Arc::new(Mutex::new(None));
-        if wrtc_mode == anet_common::wrtc::colibri::WrtcMode::P2pDirect {
-            info!("[P2P Direct] Initiating Relay-Only WebRTC P2P DataChannel with server {target_server_id}...");
-            status(format!("[P2P Direct] Initiating Relay-Only WebRTC P2P DataChannel with server {target_server_id}..."));
+        let spawn_p2p_handshake = {
             let p2p_store = p2p_session_opt.clone();
+            let p2p_neg_flag = p2p_negotiating.clone();
             let peer_sig = shared_peer.clone();
             let target_srv = target_server_id.clone();
             let wrtc_cfg_p2p = self.config.wrtc.clone();
+            let xmpp_for_p2p = xmpp_arc.clone();
 
-            tokio::spawn(async move {
-                match create_p2p_channel(&ice_servers, &wrtc_cfg_p2p, &peer_sig.bind_addr).await {
-                    Ok(p2p) => {
-                        let p2p_arc = Arc::new(p2p);
-                        *p2p_store.lock().await = Some(p2p_arc.clone());
+            move |reason_label: &'static str| {
+                if p2p_neg_flag
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_err()
+                {
+                    return;
+                }
+                let p2p_store = p2p_store.clone();
+                let p2p_neg_flag = p2p_neg_flag.clone();
+                let peer_sig = peer_sig.clone();
+                let target_srv = target_srv.clone();
+                let wrtc_cfg_p2p = wrtc_cfg_p2p.clone();
+                let xmpp_for_p2p = xmpp_for_p2p.clone();
 
-                        match p2p_arc.pc.create_offer(None).await {
-                            Ok(offer) => {
-                                if let Err(e) = p2p_arc.pc.set_local_description(offer.clone()).await {
-                                    warn!("[P2P Direct] set_local_description error: {e}");
-                                    warn(format!("[P2P Direct] set_local_description error: {e}"));
-                                    return;
-                                }
-                                let mut final_sdp = offer.sdp.clone();
-                                for _ in 0..WRTC_ICE_GATHER_POLL_ATTEMPTS {
-                                    if let Some(desc) = p2p_arc.pc.local_description().await {
-                                        if desc.sdp.contains("a=candidate:") {
-                                            final_sdp = desc.sdp;
-                                            if final_sdp.contains("typ relay") {
-                                                break;
+                tokio::spawn(async move {
+                    info!(
+                        "[P2P Direct] {reason_label}: initiating Relay-Only WebRTC P2P DataChannel with server {target_srv}..."
+                    );
+                    status(format!(
+                        "[P2P Direct] {reason_label}: initiating Relay-Only P2P with {target_srv}..."
+                    ));
+                    let fresh_ice = {
+                        let guard = xmpp_for_p2p.lock().await;
+                        guard.get_ice_servers()
+                    };
+                    match create_p2p_channel(&fresh_ice, &wrtc_cfg_p2p, &peer_sig.bind_addr).await {
+                        Ok(p2p) => {
+                            let p2p_arc = Arc::new(p2p);
+                            let old_p2p = {
+                                let mut guard = p2p_store.lock().await;
+                                guard.replace(p2p_arc.clone())
+                            };
+                            if let Some(prev) = old_p2p {
+                                prev.close().await;
+                            }
+
+                            match p2p_arc.pc.create_offer(None).await {
+                                Ok(offer) => {
+                                    if let Err(e) =
+                                        p2p_arc.pc.set_local_description(offer.clone()).await
+                                    {
+                                        warn!("[P2P Direct] set_local_description error: {e}");
+                                        warn(format!(
+                                            "[P2P Direct] set_local_description error: {e}"
+                                        ));
+                                        p2p_neg_flag.store(false, Ordering::SeqCst);
+                                        return;
+                                    }
+                                    let mut final_sdp = offer.sdp.clone();
+                                    for _ in 0..WRTC_ICE_GATHER_POLL_ATTEMPTS {
+                                        if let Some(desc) = p2p_arc.pc.local_description().await {
+                                            if desc.sdp.contains("a=candidate:") {
+                                                final_sdp = desc.sdp;
+                                                if final_sdp.contains("typ relay") {
+                                                    break;
+                                                }
                                             }
                                         }
+                                        tokio::time::sleep(Duration::from_millis(
+                                            WRTC_P2P_ICE_GATHER_POLL_INTERVAL_MS,
+                                        ))
+                                        .await;
                                     }
-                                    tokio::time::sleep(Duration::from_millis(
-                                        WRTC_P2P_ICE_GATHER_POLL_INTERVAL_MS,
-                                    ))
-                                    .await;
-                                }
-                                if final_sdp.is_empty() {
-                                    if let Some(desc) = p2p_arc.pc.local_description().await {
-                                        final_sdp = desc.sdp;
+                                    if final_sdp.is_empty() {
+                                        if let Some(desc) = p2p_arc.pc.local_description().await {
+                                            final_sdp = desc.sdp;
+                                        }
                                     }
-                                }
-                                let relay_only_sdp = filter_p2p_sdp_relay_only(&final_sdp);
+                                    let relay_only_sdp = filter_p2p_sdp_relay_only(&final_sdp);
 
-                                let offer_msg = ColibriMessage::p2p_offer(target_srv.clone(), relay_only_sdp, vec![]);
-                                if let Err(e) = peer_sig.send(offer_msg).await {
-                                    warn!("[P2P Direct] Failed to send ice-offer: {e}");
-                                    warn(format!("[P2P Direct] Send failed: {e}"));
-                                } else {
-                                    info!("[P2P Direct] Sent Relay-Only ice-offer to server {target_srv}");
-                                    status(format!("[P2P Direct] Sent Relay-Only ice-offer to server {target_srv}"));
+                                    let offer_msg = ColibriMessage::p2p_offer(
+                                        target_srv.clone(),
+                                        relay_only_sdp,
+                                        vec![],
+                                    );
+                                    if let Err(e) = peer_sig.send(offer_msg).await {
+                                        warn!("[P2P Direct] Failed to send ice-offer: {e}");
+                                        warn(format!("[P2P Direct] Send failed: {e}"));
+                                    } else {
+                                        info!("[P2P Direct] Sent Relay-Only ice-offer to server {target_srv}");
+                                        status(format!(
+                                            "[P2P Direct] Sent Relay-Only ice-offer to server {target_srv}"
+                                        ));
+                                    }
                                 }
-                            }
-                            Err(e) => {
-                                warn!("[P2P Direct] create_offer error: {e}");
-                                warn(format!("[P2P Direct] Create offer error: {e}"));
+                                Err(e) => {
+                                    warn!("[P2P Direct] create_offer error: {e}");
+                                    warn(format!("[P2P Direct] Create offer error: {e}"));
+                                }
                             }
                         }
+                        Err(e) => {
+                            warn!("[P2P Direct] Failed to create P2P channel: {e:#}");
+                        }
                     }
-                    Err(e) => {
-                        warn!("[P2P Direct] Failed to create P2P channel: {e:#}");
-                    }
-                }
-            });
+                    p2p_neg_flag.store(false, Ordering::SeqCst);
+                });
+            }
+        };
+
+        if wrtc_mode == anet_common::wrtc::colibri::WrtcMode::P2pDirect {
+            spawn_p2p_handshake("Initial connect");
         }
 
         let (client_stream, internal_router) = tokio::io::duplex(WRTC_DUPLEX_BUFFER_SIZE);
@@ -810,13 +864,17 @@ impl ClientTransport for WrtcTransport {
                         let Some(mut packet) = packet_opt else { break; };
 
                         if wrtc_mode == anet_common::wrtc::colibri::WrtcMode::P2pDirect {
-                            if cached_p2p.is_none() {
+                            let need_refresh = cached_p2p
+                                .as_ref()
+                                .map(|p| !p.is_ready())
+                                .unwrap_or(true);
+                            if need_refresh {
                                 cached_p2p = p2p_uplink.lock().await.clone();
                             }
                         }
                         let p2p_active = cached_p2p
                             .as_ref()
-                            .map(|p| p.is_open.load(Ordering::Relaxed))
+                            .map(|p| p.is_ready())
                             .unwrap_or(false);
                         let use_video = !p2p_active
                             && (wrtc_mode == anet_common::wrtc::colibri::WrtcMode::MediaVideo
@@ -1032,6 +1090,19 @@ impl ClientTransport for WrtcTransport {
                             warn(format!("[WRTC Client] Watchdog detected dead session ({reason}). Reconnecting..."));
                             break;
                         }
+                        if wrtc_mode == anet_common::wrtc::colibri::WrtcMode::P2pDirect {
+                            let need_reneg = {
+                                let guard = p2p_uplink.lock().await;
+                                match guard.as_ref() {
+                                    Some(p2p) => p2p.should_renegotiate(6_000, 15_000),
+                                    None => true,
+                                }
+                            };
+                            if need_reneg {
+                                cached_p2p = None;
+                                spawn_p2p_handshake("Watchdog P2P auto-recovery");
+                            }
+                        }
                         if (wrtc_mode == anet_common::wrtc::colibri::WrtcMode::MediaVideo
                             || wrtc_mode == anet_common::wrtc::colibri::WrtcMode::Auto)
                             && peer_tx.is_video_v2()
@@ -1098,8 +1169,17 @@ impl ClientTransport for WrtcTransport {
                                             &cipher_rx,
                                             Bytes::from(raw_encrypted),
                                         ) {
-                                            Ok(packet) => {
-                                                let _ = tun_inject_ws.send(packet).await;
+                                            Ok(decrypted) => {
+                                                if decrypted.first() == Some(&VIDEO_BATCH_MARKER) {
+                                                    let packets = unpack_batch(&decrypted[1..]);
+                                                    for pkt in packets {
+                                                        if pkt.len() >= WRTC_MIN_IP_PACKET_LEN {
+                                                            let _ = tun_inject_ws.send(pkt).await;
+                                                        }
+                                                    }
+                                                } else if decrypted.len() >= WRTC_MIN_IP_PACKET_LEN {
+                                                    let _ = tun_inject_ws.send(decrypted).await;
+                                                }
                                             }
                                             Err(e) => {
                                                 warn!("[WRTC Client] Decrypt packet error: {e}");
@@ -1119,8 +1199,17 @@ impl ClientTransport for WrtcTransport {
                                         let packets = unpack_batch(&raw_batch);
                                         for enc_pkt in packets {
                                             match unwrap_packet_bytes(&cipher_rx, enc_pkt) {
-                                                Ok(packet) => {
-                                                    let _ = tun_inject_ws.send(packet).await;
+                                                Ok(decrypted) => {
+                                                    if decrypted.first() == Some(&VIDEO_BATCH_MARKER) {
+                                                        let inner_pkts = unpack_batch(&decrypted[1..]);
+                                                        for pkt in inner_pkts {
+                                                            if pkt.len() >= WRTC_MIN_IP_PACKET_LEN {
+                                                                let _ = tun_inject_ws.send(pkt).await;
+                                                            }
+                                                        }
+                                                    } else if decrypted.len() >= WRTC_MIN_IP_PACKET_LEN {
+                                                        let _ = tun_inject_ws.send(decrypted).await;
+                                                    }
                                                 }
                                                 Err(e) => {
                                                     warn!("[WRTC Client] Decrypt batch packet error: {e}");
@@ -1159,7 +1248,7 @@ impl ClientTransport for WrtcTransport {
 
                 if let Some(p2p) = p2p_opt {
                     if p2p.is_open.load(Ordering::SeqCst) {
-                        'p2p_outer: while let Some(first_bytes) = p2p.recv_packet().await {
+                        while let Some(first_bytes) = p2p.recv_packet().await {
                             let mut current_raw = Some(first_bytes);
                             while let Some(raw_bytes) = current_raw.take() {
                                 match unwrap_packet_bytes(&cipher_p2p, raw_bytes) {
@@ -1169,14 +1258,14 @@ impl ClientTransport for WrtcTransport {
                                             for pkt in packets {
                                                 if pkt.len() >= WRTC_MIN_IP_PACKET_LEN {
                                                     if tun_inject_p2p.send(pkt).await.is_err() {
-                                                        break 'p2p_outer;
+                                                        return;
                                                     }
                                                 }
                                             }
                                         } else if decrypted.len() >= WRTC_MIN_IP_PACKET_LEN {
                                             log::trace!("[P2P Direct IN] Decrypted packet ({} bytes)", decrypted.len());
                                             if tun_inject_p2p.send(decrypted).await.is_err() {
-                                                break 'p2p_outer;
+                                                return;
                                             }
                                         }
                                     }
@@ -1188,7 +1277,6 @@ impl ClientTransport for WrtcTransport {
                                 current_raw = p2p.try_recv_packet();
                             }
                         }
-                        break;
                     }
                 }
                 tokio::time::sleep(Duration::from_millis(100)).await;
