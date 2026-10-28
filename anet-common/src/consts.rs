@@ -159,5 +159,23 @@ pub const SSH_CHANNEL_WINDOW_SIZE: u32 = 4 * 1024 * 1024;
 /// Максимальный размер пакета SSH-канала (32 KB по стандарту RFC 4253).
 pub const SSH_MAX_PACKET_SIZE: u32 = 32 * 1024;
 
+/// Дефолтный идентификационный баннер SSHv2 (RFC 4253), маскирующий библиотеку `russh`
+/// под стандартный демон/клиент OpenSSH Ubuntu LTS для обхода сигнатурных правил ТСПУ.
+pub const DEFAULT_SSH_BANNER: &str = "SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13.5";
+
+/// Нормализует пользовательскую строку SSH-баннера (гарантирует префикс `SSH-2.0-` и отсутствие `\r\n`).
+pub fn normalize_ssh_banner(custom: Option<&str>) -> String {
+    let raw = custom
+        .map(|s| s.trim_matches(|c: char| c == '\r' || c == '\n' || c.is_whitespace()))
+        .filter(|s| !s.is_empty())
+        .unwrap_or(DEFAULT_SSH_BANNER);
+    if raw.starts_with("SSH-2.0-") {
+        raw.to_string()
+    } else {
+        format!("SSH-2.0-{raw}")
+    }
+}
+
 /// Максимальное количество пакетов в очереди джиттера до принудительного сброса.
 pub const MAX_PENDING_JITTER_PACKETS: usize = 256;
+

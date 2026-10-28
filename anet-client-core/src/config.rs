@@ -135,12 +135,15 @@ impl Default for TransportMode {
 #[derive(Debug, Clone, Deserialize)]
 pub struct TransportConfig {
     pub ssh_user: Option<String>,
+    #[serde(default)]
+    pub ssh_banner: Option<String>,
 }
 
 impl Default for TransportConfig {
     fn default() -> Self {
         Self {
             ssh_user: Some("hanyuu".to_string()),
+            ssh_banner: None,
         }
     }
 }
@@ -164,6 +167,10 @@ pub struct ServerConfig {
 
     // Опциональное переопределение пользователя SSH
     pub ssh_user: Option<String>,
+
+    // Опциональное переопределение идентификационного баннера SSHv2 (например, "SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13.5")
+    #[serde(default)]
+    pub ssh_banner: Option<String>,
 
     // Имя пула / группы серверов
     #[serde(default)]
@@ -222,6 +229,7 @@ impl Default for ServerConfig {
             timeout_secs: default_timeout_secs(),
             server_pub_key: None,
             ssh_user: None,
+            ssh_banner: None,
             group_name: None,
             group_id: None,
             weight: None,

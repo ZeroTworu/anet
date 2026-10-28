@@ -253,7 +253,9 @@ pub async fn run_ssh_server(
     auth_handler: ServerAuthHandler,
 ) -> Result<()> {
     let host_key = russh::keys::load_secret_key(&config.server.ssh_host_key, None)?;
+    let banner = anet_common::consts::normalize_ssh_banner(config.server.ssh_banner.as_deref());
     let ssh_config = Arc::new(server::Config {
+        server_id: russh::SshId::Standard(banner.into()),
         keys: vec![host_key],
         window_size: SSH_CHANNEL_WINDOW_SIZE,
         maximum_packet_size: SSH_MAX_PACKET_SIZE,

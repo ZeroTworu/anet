@@ -64,7 +64,15 @@ impl ClientTransport for SshTransport {
             .or(self.config.transport.ssh_user.as_deref())
             .unwrap_or("root");
 
+        let banner = anet_common::consts::normalize_ssh_banner(
+            self.server
+                .ssh_banner
+                .as_deref()
+                .or(self.config.transport.ssh_banner.as_deref()),
+        );
+
         let ssh_config = Arc::new(russh::client::Config {
+            client_id: russh::SshId::Standard(banner.into()),
             window_size: SSH_CHANNEL_WINDOW_SIZE,
             maximum_packet_size: SSH_MAX_PACKET_SIZE,
             channel_buffer_size: CHANNEL_BUFFER_SIZE,
@@ -342,3 +350,18 @@ fn schedule_with_jitter(
     );
 }
 
+#[cfg(test)]
+mod tests {
+    use anet_common::consts::{DEFAULT_SSH_BANNER, normalize_ssh_banner};
+
+    #[test]
+    fn ssh_banner_masks_russh_signature() {
+        let default_banner = normalize_ssh_banner(None);
+        assert_eq!(default_banner, DEFAULT_SSH_BANNER);
+        assert!(default_banner.starts_with("SSH-2.0-OpenSSH_"));
+        assert!(!default_banner.contains("russh"));
+
+        let custom_without_prefix = normalize_ssh_banner(Some("OpenSSH_9.2p1 Debian-2+deb12u3\r\n"));
+        assert_eq!(custom_without_prefix, "SSH-2.0-OpenSSH_9.2p1 Debian-2+deb12u3");
+    }
+}

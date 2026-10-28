@@ -680,6 +680,7 @@ async fn probe_ssh(target: &ProbeTarget, timeout_dur: Duration) -> Result<(u32, 
 
     let fut = async {
         let ssh_config = Arc::new(russh::client::Config {
+            client_id: russh::SshId::Standard(crate::consts::DEFAULT_SSH_BANNER.into()),
             nodelay: true,
             ..Default::default()
         });
