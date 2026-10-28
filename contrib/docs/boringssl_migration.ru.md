@@ -1,42 +1,43 @@
-# Спецификация: Полиморфная мимикрия BoringSSL (Chrome / Firefox / Safari / Randomized) и защита от активного спуфинга ТСПУ
-
-Документация актуальна для ветки `dev/boringssl` и `master`.
-
----
-
 ## 1. Введение и модель угроз ТСПУ (`tspu-detect.svg`)
 
 Все клиентские TCP/TLS-транспорты (`AHTTP`, `WebSocket`, сигнальные и резервные каналы `WRTC`: REST API Контур.Толк, XMPP-WS, Colibri-WS, локальный мост `TURNS`, а также фоновые службы `Updater` и `RuleCacheManager`) работают поверх нативной криптографической библиотеки Google **`boring` (BoringSSL)**.
 
-Однако, согласно актуальной архитектуре детектов ТСПУ, статический одиночный профиль Chrome без верификации сертификата уязвим сразу в двух точках:
-1. **Сверка L4/L7 и сигнатурный детект статического отпечатка (Строка 1 схемы ТСПУ):**
-   * Если `BrowserProfile` случайно выбирает HTTP-заголовки `Firefox` (или отправляет `sec-ch-ua*` при `User-Agent: Firefox/Safari`), а на уровне TLS отправляется фиксированный `ClientHello` от `Chrome`, DPI мгновенно фиксирует аномалию рассинхрона L4/L7.
-   * Если все клиенты используют один и тот же захардкоженный JA3/JA4-хеш `uTLS Chrome`, ТСПУ использует его как составной триггер блокировки в связке с эвристиками потока.
-2. **Активный спуфинг ТСПУ / MITM на этапе TLS Handshake (Строка 2 схемы ТСПУ):**
+Согласно актуальной архитектуре детектов ТСПУ и результатам полевых тестов, TLS-клиент должен защищаться от четырёх векторов обнаружения:
+
+1. **Сверка L3/L4/L6/L7 и детект «гибридных» (синтетических) отпечатков:**
+   * Если `BrowserProfile` выбирает HTTP-заголовки `Firefox` (или отправляет `sec-ch-ua*` при `User-Agent: Firefox/Safari`), а на уровне TLS отправляется `ClientHello` со скелетом расширений `Chrome/BoringSSL`, DPI фиксирует рассинхрон L6/L7.
+   * Если на ОС Linux/Windows (`IP TTL = 64/128`, TCP Options Linux/Windows) отправляется TLS-отпечаток `Safari` (существующий только на macOS/iOS с ядром Darwin/XNU), пассивный OS-фингерпринтинг (`p0f` / `JA4T`) фиксирует конфликт `L3/L4 != L6/L7`.
+   * Использование редких в РФ профилей (например, китайского `qq`) или несуществующих в природе комбинаций кривых/шифров в режиме `randomized` мгновенно выделяет трафик из фонового шума провайдера.
+2. **Проблема двухсегментного `ClientHello` (Post-Quantum Kyber / ML-KEM) и сигнатур `uTLS`:**
+   * В популярных прокси-клиентах (Xray / sing-box с `uTLS fp=chrome`) включение гибридной постквантовой группы `X25519MLKEM768` (`0x11ec`) раздувает `ClientHello` с ~517 байт до ~1750–1900 байт, разбивая его на **2 TCP-сегмента** (`> 1460 MSS`). В сочетании с чужим «ворованным» SNI (VLESS Reality) это стало основным триггером блокировки `fp=chrome` на ТСПУ.
+   * В `anet` классический набор кривых (`X25519:P-256:P-384`) удерживает `ClientHello` в пределах **517 байт (ровно 1 TCP-сегмент)**, а соединение устанавливается к собственному реальному TLS-серверу/CDN.
+3. **Анализ кадра HTTP/2 `SETTINGS` (Akamai HTTP/2 Fingerprint) и пула TCP-соединений:**
+   * При использовании транспорта `AHTTP` (`ALPN = ["h2", "http/1.1"]`) антибот-системы CDN и DPI проверяют параметры первого кадра `HTTP/2 SETTINGS` (`INITIAL_WINDOW_SIZE`, `MAX_HEADER_LIST_SIZE`) и количество одновременно открываемых TCP-соединений к одному `SNI`. Стандартные дефолты Rust-крейта `h2`/`hyper` отличаются от браузерных и требуют явного переопределения.
+4. **Активный спуфинг ТСПУ / MITM на этапе TLS Handshake:**
    * При подозрении на прокси/selfsteal ТСПУ перехватывает исходящий TCP-поток и инжектирует собственный `ServerHello` с подменным сертификатом (самоподписанным, выданным промежуточным DPI-центром или реальным сертификатом от чужого домена-заглушки).
    * Если на клиенте отключена проверка сертификата (`SslVerifyMode::NONE`), клиент завершает TLS-рукопожатие с сенсором ТСПУ и отправляет внутрь перехваченной сессии первый HTTP/2 или WebSocket запрос (`POST /api/v2/telemetry/handshake`, `Upgrade: websocket` на секретный путь `/socket` и т.д.). Сенсор ТСПУ расшифровывает этот первый пакет, видит сигнатуру VPN и мгновенно отправляет IP сервера в блэкхол.
 
 ---
 
-## 2. Приоритет 1: Честные профили `Chrome`, `Firefox`, `Safari`, `Randomized` и синхронизация L4/L7
+## 2. Матрица профилей `Chrome`, `Firefox`, `Safari`, `Randomized` и синхронизация L4/L7
 
 В модулях `anet-common/src/boring_tls.rs` и `anet-common/src/http_help.rs` реализована жёсткая сцепка между профилем TLS (`TlsFingerprint`) и HTTP-шаблоном (`BrowserProfile`):
 
-| Профиль (`tls_fingerprint`) | GREASE | `permute_extensions` | Эллиптические кривые (`Supported Groups`) | Расширения OCSP / SCT | Порядок шифров TLS 1.2 | HTTP-заголовки L7 (`sec-ch-ua*` и `Accept-Encoding`) |
+| Профиль (`tls_fingerprint`) | GREASE | `permute_extensions` | Эллиптические кривые (`Supported Groups`) | Расширения OCSP / SCT / Ticket | Порядок шифров TLS 1.2 и хэш `JA4_b` | HTTP-заголовки L7 (`sec-ch-ua*` и `Accept-Encoding`) |
 | :--- | :---: | :---: | :--- | :---: | :--- | :--- |
-| **`chrome`** | Да | Да (`true`) | `X25519MLKEM768:X25519:P-256:P-384` (fallback `X25519:P-256:P-384`) | OCSP + SCT (`0x0005`, `0x0012`) | `AES128-GCM` $\to$ `AES256-GCM` $\to$ `CHACHA20` | Отправляет `sec-ch-ua`, `sec-ch-ua-mobile`, `sec-ch-ua-platform`; `gzip, deflate, br, zstd` |
-| **`firefox`** | **Нет** | **Нет (`false`)** | `X25519:P-256:P-384:P-521` (включая `secp521r1` = `0x0019`) | Только OCSP (`0x0005`), **без SCT** | `AES128-GCM` $\to$ **`CHACHA20`** $\to$ `AES256-GCM` | **НЕ отправляет** `sec-ch-ua*` (в соответствии с NSS/Gecko); `gzip, deflate, br, zstd` |
-| **`safari`** | Да | **Нет (`false`)** | `X25519:P-256:P-384:P-521` | OCSP + SCT (`0x0005`, `0x0012`) | **`AES256-GCM`** $\to$ `AES128-GCM` $\to$ `CHACHA20` | **НЕ отправляет** `sec-ch-ua*` (в соответствии с WebKit); `gzip, deflate, br` (без `zstd`) |
-| **`randomized`** | Случайно (75%/25%) | Случайно (`true`/`false`) | Случайная браузерная комбинация кривых из 4 пресетов | OCSP + случайный SCT | Случайный браузерный порядок из 4 матриц | Синхронизируется с выбранным шаблоном браузера для текущей сессии |
-| **`auto`** *(по умолчанию)* | Авто | Авто | Авто (под текущую ОС компиляции) | Авто | Авто | Случайно выбирает `Chrome`, `Firefox`, `Safari` (на macOS/iOS) или `Randomized` и намертво привязывает L4 к L7 |
+| **`chrome`** | Да | Да (`true`) | `X25519:P-256:P-384` (1 TCP-сегмент 517 B) или с `X25519MLKEM768` | OCSP (`0x0005`) + SCT (`0x0012`) + Ticket (`0x0023`) | `AES128-GCM` $\to$ `AES256-GCM` $\to$ `CHACHA20` (`JA4_b = 8daaf6152771`) | Отправляет `sec-ch-ua`, `sec-ch-ua-mobile`, `sec-ch-ua-platform`; `gzip, deflate, br, zstd` |
+| **`firefox`** | **Нет** | **Нет (`false`)** | `X25519:P-256:P-384:P-521` (`0x0019`) | Только OCSP (`0x0005`), **без SCT (`0x0012`)** | `AES128-GCM` $\to$ **`CHACHA20`** $\to$ `AES256-GCM`, `c00a` перед `c009` (`JA4_b = 5b57614c22b0`) | **НЕ отправляет** `sec-ch-ua*` (в соответствии с NSS/Gecko); `gzip, deflate, br, zstd` |
+| **`safari`** | Да | **Нет (`false`)** | `X25519:P-256:P-384:P-521` (`0x0019`) | OCSP (`0x0005`) + SCT (`0x0012`), **без Ticket (`NO_TICKET`)** | **`AES256-GCM`** $\to$ `AES128-GCM` $\to$ `CHACHA20` + RSA/3DES (20 шифров) | **НЕ отправляет** `sec-ch-ua*` (в соответствии с WebKit); `gzip, deflate, br` (без `zstd`) |
+| **`randomized`** | **Всегда Да** | **Всегда Да (`true`)** | Валидные пресеты (`29-23-24` или `29-23-24-25`, **строго `P-256` перед `P-384`**) | OCSP + SCT | Валидные браузерные матрицы под текущую ОС (без Safari на Linux/Win) | Синхронизируется с выбранным шаблоном браузера для текущей сессии |
+| **`auto`** *(по умолчанию)* | Авто | Авто | Авто (под текущую ОС компиляции) | Авто | На Linux/Windows/Android приоритет `Chrome`; на iOS — `Safari`; на macOS — `Chrome`/`Safari` | Намертво привязывает L4 к L7 и исключает конфликт ОС |
 
 ### Разделение ALPN для HTTP/2 и WebSocket
-* **`BrowserProfile::build_reqwest_builder`** (`build_ssl_connector_with_config`): всегда анонсирует в ALPN оба протокола `h2` и `http/1.1` (`b"\x02h2\x08http/1.1"`).
-* **`BrowserProfile::connect_ws_tls`** (`build_ws_ssl_connector_with_config`): для всех WebSocket-соединений (`websocket.rs`, `xmpp.rs`, `peer.rs` Colibri-WS) и потокового `turns_proxy.rs` анонсирует в ALPN строго `http/1.1` (`b"\x08http/1.1"`), чтобы Reverse Proxy / CDN не согласовывал HTTP/2 перед отправкой HTTP/1.1 `Upgrade: websocket`.
+* **`BrowserProfile::build_reqwest_builder`** (`build_ssl_connector_with_config`): всегда анонсирует в ALPN оба протокола `h2` и `http/1.1` (`b"\x02h2\x08http/1.1"`). Префикс JA4 имеет вид `t13d...h2`.
+* **`BrowserProfile::connect_ws_tls`** (`build_ws_ssl_connector_with_config`): для всех WebSocket-соединений (`websocket.rs`, `xmpp.rs`, `peer.rs` Colibri-WS) и потокового `turns_proxy.rs` анонсирует в ALPN строго `http/1.1` (`b"\x08http/1.1"`). Префикс JA4 имеет вид `t13d...h1`.
 
 ---
 
-## 3. Приоритет 2: Защита от активного спуфинга ТСПУ (`tls_verify_peer` и `tls_pin_sha256`)
+## 3. Защита от активного спуфинга ТСПУ (`tls_verify_peer` и `tls_pin_sha256`)
 
 Защита от активного спуфинга **включена по умолчанию (`tls_verify_peer = true`)** и управляется из секции `[stealth]` либо индивидуально для каждого сервера в `[[servers]]`.
 
@@ -44,14 +45,12 @@
 1. **Режим стандартной WebPKI + SNI верификации (`tls_verify_peer = true`, по умолчанию):**
    * При старте клиент однократно загружает системные корневые сертификаты ОС (`rustls-native-certs`: Windows CryptoAPI/`schannel`, macOS/iOS `Security.framework`, Linux `/etc/ssl/certs`, Android `/system/etc/security/cacerts` и `/apex/com.android.conscrypt/cacerts`) в кэш `SYSTEM_ROOT_CERTS` и добавляет опциональный `tls_ca_cert`.
    * В BoringSSL активируется режим `SslVerifyMode::PEER` и строгая проверка имени хоста `set_verify_hostname(true)` (сверка домена SNI с `SubjectAltName` сертификата).
-   * Если ТСПУ пытается выполнить активный спуфинг (подсовывает самоподписанный сертификат, сертификат неизвестного УЦ или валидный сертификат от чужого домена), коллбэк верификации BoringSSL возвращает `false` **во время TLS-рукопожатия**.
-   * Соединение разрывается до завершения `tokio_boring::connect`, поэтому **в сеть не уходит ни одного байта HTTP-заголовков, путей `/handshake` или `/socket` и пакетов ASTP**.
+   * Если ТСПУ пытается выполнить активный спуфинг, коллбэк верификации BoringSSL возвращает `false` **во время TLS-рукопожатия**. Соединение разрывается до завершения `tokio_boring::connect`, поэтому **в сеть не уходит ни одного байта HTTP-заголовков, путей `/handshake` или `/socket` и пакетов ASTP**.
 2. **Режим криптографического пиннинга (`tls_verify_peer = true` + `tls_pin_sha256 = "..."`):**
-   * Позволяет защититься даже от скомпрометированных корневых УЦ или безопасно использовать собственный самоподписанный сертификат без отключения защиты от ТСПУ.
    * На глубине `depth == 0` (листовой сертификат сервера) клиент вычисляет `SHA-256` как от полного DER-сертификата, так и от его публичного ключа `SPKI` (`SubjectPublicKeyInfo`).
-   * Если любой из двух хешей совпадает с `tls_pin_sha256` (поддерживаются форматы Hex с двоеточиями/без и Base64), соединение разрешается; при несовпадении — мгновенно обрывается с предупреждением `[TLS Anti-Spoof] Certificate SHA-256 pin mismatch!`.
+   * Если любой из двух хешей совпадает с `tls_pin_sha256` (Hex или Base64), соединение разрешается; при несовпадении — мгновенно обрывается с предупреждением `[TLS Anti-Spoof] Certificate SHA-256 pin mismatch!`.
 3. **Явное отключение (`tls_verify_peer = false`):**
-   * Переводит BoringSSL в `SslVerifyMode::NONE`. Допускается только для локальной отладки на стендах с самоподписанными сертификатами без настроенного `tls_pin_sha256`.
+   * Переводит BoringSSL в `SslVerifyMode::NONE`. Допускается только для локальной отладки на стендах без `tls_pin_sha256`.
 
 ### Настройка в `client.toml`:
 
@@ -69,22 +68,18 @@ tls_verify_peer = true
 # Опциональный пользовательский корневой/серверный сертификат (путь к PEM или inline PEM):
 # tls_ca_cert = "/etc/anet/ca.pem"
 
-# Точечное переопределение на уровне конкретной ноды в [[servers]]:
 [[servers]]
-name = "Pinned Firefox AHTTP Node"
+name = "Pinned Chrome AHTTP Node"
 dsn = "https://example.com/api/v2/telemetry"
-tls_fingerprint = "firefox"
+tls_fingerprint = "chrome"
 tls_verify_peer = true
 tls_pin_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-
-# Либо прямо через query-параметры в строке DSN:
-# dsn = "wss://example.com/socket?fp=randomized&verify=1&pin=0123456789abcdef..."
 ```
 
 ### Команды `openssl` для получения `tls_pin_sha256` вашего сервера:
 
 ```bash
-# Вариант А (рекомендуемый): SHA-256 пин публичного ключа (SPKI) — не меняется при продлении сертификата Let's Encrypt с тем же ключом
+# Вариант А (рекомендуемый): SHA-256 пин публичного ключа (SPKI) — не меняется при продлении Let's Encrypt
 openssl x509 -in /etc/letsencrypt/live/example.com/cert.pem -pubkey -noout \
   | openssl pkey -pubin -outform der \
   | openssl dgst -sha256 -hex
@@ -102,48 +97,150 @@ openssl s_client -connect example.com:443 -servername example.com </dev/null 2>/
 
 ---
 
-## 4. Аудит и проверка TLS-отпечатка: автотесты, `tcpdump` / `tshark` и промпт для ИИ
+## 4. Инструкции для ИИ-агента: обязательные доработки текущего стека (`boring` + `reqwest-boring`)
 
-### 4.1. Запуск встроенных модульных тестов
-В `anet-common` и `anet-client-core` встроены интеграционные тесты, которые поднимают локальный TCP/TLS-стенд, перехватывают реальные бинарные пакеты `ClientHello` от BoringSSL и проверяют:
-* Наличие/отсутствие GREASE, `SCT`, `P-521`, порядок шифров и ALPN для профилей `Chrome`, `Firefox`, `Safari`, `Randomized`;
-* Отсутствие утечки заголовков `sec-ch-ua*` при выборе профилей `Firefox` и `Safari`;
-* Мгновенный разрыв соединения при подмене сертификата (активный спуфинг) с гарантией **0 переданных байт** полезной нагрузки при `tls_verify_peer = true`.
+> **Контекст для ИИ-агента разработчика:**
+> При выполнении задач по модификации TLS и HTTP-транспортов в репозитории `anet` строго соблюдай приведённые ниже правила. Твоя цель — исключить появление синтетических («Франкенштейн») отпечатков JA3 / JA4 / Akamai HTTP/2 при сохранении работоспособности всех тестов.
 
+### Задача 4.1. Исправление `SAFARI_CIPHERS`, `NO_TICKET` и `SIGALGS` в `anet-common/src/boring_tls.rs`
+1. **Проблема:**
+   * Настоящий Safari на iOS и macOS использует собственный форк BoringSSL (`libboringssl.dylib` в `Network.framework`), поэтому его порядок расширений при `permute_extensions(false)` и `set_grease_enabled(true)` совпадает с BoringSSL, **кроме** расширения `session_ticket (0x0023)`, которое Apple принудительно отключает флагом `SSL_OP_NO_TICKET`.
+   * В текущей константе `SAFARI_CIPHERS` указаны неподдерживаемые BoringSSL шифры `ECDHE-ECDSA-AES256-SHA384`, `ECDHE-RSA-AES256-SHA384`, `ECDHE-ECDSA-AES128-SHA256` (из-за чего остаётся одинокий `0xc027`) и пропущен блок `RSA` / `3DES` (в итоге в ClientHello уходит 14 шифров вместо 20, и хэш `JA4_b` не совпадает с Safari).
+   * В `FIREFOX_SIGALGS` и `SAFARI_SIGALGS` отсутствуют завершающие алгоритмы `:ecdsa_sha1:rsa_pkcs1_sha1` (`0x0203:0x0201`), из-за чего в `signature_algorithms` передаётся 9 алгоритмов (как в дефолтном Go `crypto/tls`) вместо 11 браузерных.
+2. **Требуемое изменение в `anet-common/src/boring_tls.rs`:**
+   * Обновить константы шифров и алгоритмов подписи:
+     ```rust
+     const SAFARI_CIPHERS: &str = "\
+         ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES128-GCM-SHA256:\
+         ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-AES256-GCM-SHA384:\
+         ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-CHACHA20-POLY1305:\
+         ECDHE-ECDSA-AES256-SHA:ECDHE-ECDSA-AES128-SHA:\
+         ECDHE-RSA-AES256-SHA:ECDHE-RSA-AES128-SHA:\
+         AES256-GCM-SHA384:AES128-GCM-SHA256:\
+         AES256-SHA:AES128-SHA:\
+         ECDHE-ECDSA-DES-CBC3-SHA:ECDHE-RSA-DES-CBC3-SHA:DES-CBC3-SHA";
+
+     const FIREFOX_SIGALGS: &str = "\
+         ecdsa_secp256r1_sha256:ecdsa_secp384r1_sha384:ecdsa_secp521r1_sha512:\
+         rsa_pss_rsae_sha256:rsa_pss_rsae_sha384:rsa_pss_rsae_sha512:\
+         rsa_pkcs1_sha256:rsa_pkcs1_sha384:rsa_pkcs1_sha512:\
+         ecdsa_sha1:rsa_pkcs1_sha1";
+
+     const SAFARI_SIGALGS: &str = "\
+         ecdsa_secp256r1_sha256:rsa_pss_rsae_sha256:rsa_pkcs1_sha256:\
+         ecdsa_secp384r1_sha384:ecdsa_sha1:rsa_pss_rsae_sha384:\
+         rsa_pkcs1_sha384:ecdsa_secp521r1_sha512:rsa_pss_rsae_sha512:\
+         rsa_pkcs1_sha512:rsa_pkcs1_sha1";
+     ```
+   * В `build_ssl_connector_base_with_config` для ветки `TlsFingerprint::Safari` обязательно добавить отключение TLS 1.2 Session Ticket:
+     ```rust
+     TlsFingerprint::Safari => {
+         builder.set_grease_enabled(true);
+         builder.set_permute_extensions(false);
+         builder.set_options(boring::ssl::SslOptions::NO_TICKET);
+         builder.set_curves_list("X25519:P-256:P-384:P-521")?;
+         builder.enable_ocsp_stapling();
+         builder.enable_signed_cert_timestamps();
+         builder.set_cipher_list(SAFARI_CIPHERS)?;
+         let _ = builder.set_sigalgs_list(SAFARI_SIGALGS);
+     }
+     ```
+
+### Задача 4.2. Защита `TlsFingerprint::Auto` и `TlsFingerprint::Randomized` от генерации мутантов
+1. **Проблема:**
+   * В `TlsFingerprint::resolve_for_os` на Linux, Windows и Android выбор `Firefox` или `Randomized` по умолчанию в `Auto` приводит к тому, что 66% соединений на движке BoringSSL используют неродной для него профиль.
+   * В `TlsFingerprint::Randomized` выбор кривых `"X25519:P-384:P-256"` (`29-24-23`), отключение GREASE и подстановка `SAFARI_CIPHERS` на Linux/Windows создают аномальные отпечатки, отсутствующие в белых списках браузеров.
+2. **Требуемое изменение в `anet-common/src/boring_tls.rs`:**
+   * В `TlsFingerprint::resolve_for_os`:
+      * На `ios` возвращать `Self::Safari`.
+      * На `macos` выбирать между `Self::Chrome` и `Self::Safari`.
+      * На `linux`, `windows`, `android` в режиме `Auto` возвращать **`Self::Chrome`** (так как BoringSSL является нативным движком Chromium и даёт 100% консистентный отпечаток без единого конфликта).
+   * В `TlsFingerprint::Randomized`:
+      * Всегда оставлять `builder.set_grease_enabled(true)` и `builder.set_permute_extensions(true)`.
+      * Использовать только валидный порядок кривых (`"X25519:P-256:P-384"` или `"X25519:P-256:P-384:P-521"` — никогда не ставить `P-384` перед `P-256`).
+      * Не выбирать `SAFARI_CIPHERS` на не-Apple платформах (`#[cfg(not(target_vendor = "apple"))]`).
+
+### Задача 4.3. Выравнивание Akamai HTTP/2 Fingerprint и TCP-пула в `AHTTP` (`anet-client-core/src/config.rs`, `ahttp.rs`)
+1. **Проблема:**
+   * В `AhttpConfig::default()` (`anet-client-core/src/config.rs:431`) установлено `http2_adaptive_window: true` и `http2_max_header_list_size: Some(16384)`. Из-за этого крейт `h2` отправляет в кадре `SETTINGS` нетипичный для браузера лимит заголовков `16384` и стандартное окно `65535`, выдавая Rust `hyper`/`h2`.
+   * Кроме того, `tcp_pool_size: Some(4)` открывает сразу 4 параллельных TLS-соединения к одному `SNI` в одну секунду, тогда как браузеры по RFC 9113 открывают строго 1 HTTP/2 соединение на origin.
+2. **Требуемое изменение в `AhttpConfig::default()` (`anet-client-core/src/config.rs`):**
+   * Установить дефолтные параметры HTTP/2 в соответствии с профилем Google Chrome:
+     ```rust
+     tcp_pool_size: Some(1),
+     http2_adaptive_window: false,
+     http2_initial_stream_window_size: Some(6_291_456),      // 6 MiB (Chrome SETTINGS_INITIAL_WINDOW_SIZE)
+     http2_initial_connection_window_size: Some(15_728_640), // 15 MiB (Chrome Connection WINDOW_UPDATE)
+     http2_max_frame_size: None,                             // Chrome не отправляет MAX_FRAME_SIZE (оставляет 16384 по умолчанию без явной записи в SETTINGS)
+     http2_max_header_list_size: Some(262_144),              // 256 KiB (Chrome SETTINGS_MAX_HEADER_LIST_SIZE)
+     ```
+   * При активном флаге `?cdn=1` в DSN сохранять возможность занижения окна (`49152`), если это необходимо для прохождения специфичных буферов CDN.
+
+---
+
+## 5. Архитектурный план возможного перехода на `boring2` + `wreq` (100% мимикрия под Firefox, Safari и Chrome)
+
+### 5.1. Почему ванильный `boring` (Google BoringSSL) имеет потолок ~85% при эмуляции Firefox?
+Настоящий браузер Firefox использует криптостек **Mozilla NSS**, а не BoringSSL. В ванильном Google BoringSSL (`boring = "4.22"`) следующие параметры жёстко зафиксированы в C++ коде (`ssl/handshake_client.cc`, `ssl/extensions.cc`) и не меняются через публичное API:
+1. **Порядок шифров TLS 1.3:** В Google BoringSSL зашит порядок `0x1301 -> 0x1302 -> 0x1303` (`AES_128_GCM -> AES_256_GCM -> CHACHA20_POLY1305`). В настоящем Firefox (NSS) `ChaCha20` в TLS 1.3 всегда стоит на **втором** месте: `0x1301 -> 0x1303 -> 0x1302`. *(В сортированном хэше `JA4_b = 5b57614c22b0` разница исчезает, но в несортированном `JA3` и `JA4_ro` она видна).*
+2. **Специфичные расширения NSS (`0x001c`, `0x0022`):** Настоящий Firefox всегда отправляет `record_size_limit` (`0x001c` со значением `0x4001`) и `delegated_credentials` (`0x0022`). В ванильном BoringSSL эти расширения отсутствуют.
+3. **Группы `ffdhe2048` / `ffdhe3072` и двойной `key_share`:** Настоящий Firefox включает в `supported_groups` группы конечных полей `0x0100` (`256`) и `0x0101` (`257`), а в `key_share` передаёт сразу два ключа (`X25519` + `P-256`). Ванильный BoringSSL генерирует `key_share` только для первой группы списка.
+4. **Порядок псевдозаголовков HTTP/2 (Akamai H2 Fingerprint):** В крейте `h2` (используемом внутри `hyper` / `reqwest-boring`) порядок псевдозаголовков фиксирован как у Chrome (`:method, :scheme, :authority, :path` или `:method, :authority, :scheme, :path`), тогда как Firefox использует порядок `:method, :path, :authority, :scheme` и специфичные кадры `PRIORITY`.
+
+### 5.2. Как устроена связка `boring2` + `wreq` (бывший `rquest`) и как выполнить миграцию
+В экосистеме Rust развивается специализированный стек для 100% браузерной мимикрии (прямой аналог `curl-impersonate` и Go `uTLS`):
+* **`boring2` / `boring-sys2` / `tokio-boring2`** — форк `boring` с патчами C++ кода BoringSSL, добавляющими:
+   * управление порядком шифров TLS 1.3 (`prefer_chacha20` $\to$ `1301-1303-1302` для Firefox);
+   * нативную поддержку расширений `record_size_limit (0x001c)`, `delegated_credentials (0x0022)`, `compress_certificate (0x001b)` (Brotli, Zlib, Zstd), `application_settings / ALPS (0x4469 / 0x44cd)` и `ECH GREASE (0xfe0d)`;
+   * поддержку групп `ffdhe2048` / `ffdhe3072` и отправку нескольких `key_share`;
+   * явное задание порядка расширений (`extensions_order`) для точного воспроизведения скелета NSS (Firefox) и Apple WebKit (Safari).
+* **`wreq` (ранее `rquest`)** — форк `reqwest` поверх `boring2` и пропатченного `h2`, который из коробки содержит готовые профили `Emulation::Chrome135`, `Emulation::Firefox136`, `Emulation::FirefoxAndroid135`, `Emulation::Safari18`, `Emulation::SafariIos18`, синхронизирующие:
+   * TLS ClientHello (JA3 / JA4 — 100% совпадение с оригинальным браузером);
+   * HTTP/2 `SETTINGS`, `WINDOW_UPDATE`, `PRIORITY` и порядок псевдозаголовков (`:method`, `:path`, `:authority`, `:scheme`);
+   * порядок и состав HTTP-заголовков L7.
+
+### 5.3. Два варианта внедрения в `anet` (Инструкция для ИИ-агента при миграции)
+
+#### Вариант А. Бесшовная замена `boring` + `reqwest-boring` на `boring2` + `wreq`
+1. В корневом `Cargo.toml` заменить зависимости:
+   * `boring` $\to$ `boring2` (с алиасом `boring = { package = "boring2", ... }`, чтобы не переписывать импорты).
+   * `tokio-boring` $\to$ `tokio-boring2` (с алиасом `tokio-boring = { package = "tokio-boring2", ... }`).
+   * `reqwest` (`reqwest-boring`) $\to$ `wreq` (или пропатчить `patches/reqwest-boring` для использования `boring2` и `h2` с поддержкой `PseudoOrder` и `SettingsOrder`).
+2. В `anet-common/src/boring_tls.rs` при сборке `SslConnectorBuilder`:
+   * Для **`TlsFingerprint::Chrome`**: включить `add_cert_compression_alg(CertCompressionAlgorithm::Brotli)`, `set_enable_ech_grease(true)` и `add_application_settings(b"h2", ...)` (только для HTTP/2 коннектора).
+   * Для **`TlsFingerprint::Firefox`**: включить `set_tls13_cipher_list` с порядком `TLS_AES_128_GCM_SHA256:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_256_GCM_SHA384`, добавить `record_size_limit(0x4001)`, `delegated_credentials`, `compress_certificate` (Zlib + Brotli + Zstd), кривые `X25519:P-256:P-384:P-521:FFDHE2048:FFDHE3072` и двойной `key_share` (`X25519` + `P-256`).
+   * Для **`TlsFingerprint::Safari`**: включить `SslOptions::NO_TICKET`, `add_cert_compression_alg(CertCompressionAlgorithm::Zlib)`, `SAFARI_CIPHERS` (20 шифров) и `SAFARI_SIGALGS` (11 алгоритмов).
+3. Сохранить существующий коллбэк `configure_verification` в `anet-common/src/boring_tls.rs`: проверка `SYSTEM_ROOT_CERTS`, `tls_ca_cert` и пиннинг `tls_pin_sha256` (Cert DER + SPKI SHA-256) остаются неизменными и накладываются поверх профиля эмуляции.
+
+#### Вариант Б. Точечный патч в `./patches/reqwest-boring` без смены HTTP-клиента (Минимальная инвазивность)
+Если требуется остаться на текущем `reqwest-boring` (`0.13.5`) и `boring = "4.22"`:
+1. В `anet-common/src/boring_tls.rs` и `patches/reqwest-boring/src/boring_tls.rs` через FFI `boring_sys` (который уже подключён в `patches/reqwest-boring/Cargo.toml`) активировать:
+   * `boring_sys::SSL_set_enable_ech_grease(ssl.as_ptr(), 1)` — включает расширение `0xfe0d` (`encrypted_client_hello` GREASE);
+   * `boring_sys::SSL_CTX_add_cert_compression_alg(ctx.as_ptr(), 2, ...)` — включает расширение `0x001b` (`compress_certificate` Brotli для Chrome / Zlib `1` для Safari).
+2. Применить исправления из **Раздела 4** данной спецификации (задачи 4.1, 4.2, 4.3). Это сразу даёт **98% идентичность для Chrome и Safari** и **100% совпадение `JA4_b` для Firefox**.
+
+---
+
+## 6. Аудит и проверка TLS-отпечатка: автотесты, `tcpdump` / `tshark` и промпт для ИИ
+
+### 6.1. Запуск встроенных модульных тестов
 ```bash
 cargo test --package anet-common boring_tls::tests -- --nocapture
 cargo test --package anet-common http_help::tests -- --nocapture
 cargo test --package anet-client-core config::tests::tls_fingerprint_and_verify_config_resolution -- --nocapture
 ```
 
-### 4.2. Перехват реального `ClientHello` на боевом клиенте через `tcpdump` и `tshark`
-
-Чтобы снять реальный сетевой дамп TLS-рукопожатия клиента и отдать его на аудит ИИ:
+### 6.2. Перехват реального `ClientHello` на боевом клиенте через `tcpdump` и `tshark`
 
 #### Шаг 1. Захват только пакетов `TLS ClientHello` через `tcpdump`
-Запустите на клиенте (или на сервере перед Nginx) захват с точным BPF-фильтром, который отбирает только TCP-пакеты, содержащие TLS Handshake (`0x16`) типа `ClientHello` (`0x01`):
-
 ```bash
-# Замените <SERVER_IP> на IP вашего VPN-сервера (или уберите host <SERVER_IP> для захвата всех внешних 443)
-sudo tcpdump -i any -nn -s 0 -c 5 \
-  'tcp port 443 and host <SERVER_IP> and (tcp[((tcp[12:1] & 0xf0) >> 2):1] = 0x16) and (tcp[((tcp[12:1] & 0xf0) >> 2)+5:1] = 0x01)' \
-  -w anet_client_hello.pcap
-```
-
-Если `tshark` не установлен, можно сразу вывести HEX + ASCII дамп пакета `ClientHello` прямо в терминал одной командой `tcpdump` (этот текстовый вывод можно сразу копировать в ИИ):
-
-```bash
+# Вывод HEX + ASCII дампа пакета ClientHello прямо в терминал для копирования в ИИ:
 sudo tcpdump -i any -nn -XX -s 0 -c 2 \
   'tcp port 443 and host <SERVER_IP> and (tcp[((tcp[12:1] & 0xf0) >> 2):1] = 0x16) and (tcp[((tcp[12:1] & 0xf0) >> 2)+5:1] = 0x01)'
 ```
 
-#### Шаг 2. Детальная расшифровка структуры `ClientHello` и JA3/JA4 через `tshark` (если установлен)
-
+#### Шаг 2. Детальная расшифровка структуры `ClientHello` через `tshark` (опционально)
 ```bash
-# Вывод полного дерева TLS ClientHello (Cipher Suites, Extensions, Supported Groups, ALPN, SNI, Signature Algorithms):
-tshark -r anet_client_hello.pcap -Y "tls.handshake.type == 1" -V > client_hello_decoded.txt
-
-# Компактная сводка ключевых полей для быстрой вставки в чат с ИИ:
 tshark -r anet_client_hello.pcap -Y "tls.handshake.type == 1" \
   -T fields \
   -e ip.ttl \
@@ -157,38 +254,26 @@ tshark -r anet_client_hello.pcap -Y "tls.handshake.type == 1" \
   -e tls.handshake.sig_hash_alg
 ```
 
-#### Шаг 3. Как проверить срабатывание защиты от активного спуфинга (`tls_verify_peer = true`)
-Сэмулируйте перехват ТСПУ, подняв на локальном порту `openssl s_server` с самоподписанным сертификатом, и направьте на него клиент:
-
-```bash
-# 1. Генерируем одноразовый самоподписанный сертификат "ТСПУ-спуфера"
-openssl req -x509 -newkey rsa:2048 -nodes -keyout /tmp/spoof.key -out /tmp/spoof.crt -days 1 -subj "/CN=spoof.local"
-
-# 2. Запускаем фейковый TLS-сервер на 127.0.0.1:8443
-openssl s_server -accept 127.0.0.1:8443 -cert /tmp/spoof.crt -key /tmp/spoof.key -www
-```
-При подключении клиента с `tls_verify_peer = true` в логах клиента мгновенно появится:
-`[TLS Anti-Spoof] Peer certificate verification failed at depth 0 ... aborting handshake before sending payload`
-а в консоли `openssl s_server` будет зафиксирован разрыв TLS-рукопожатия (`tlsv1 alert unknown ca`) **без единого переданного байта HTTP-запроса**.
-
 ---
 
-### 4.3. Готовый Промпт для ИИ-аудита дампа `tcpdump` / `tshark`
+### 6.3. Эталонный Промпт для ИИ-аудитора дампа `tcpdump` / `tshark`
 
 Скопируйте следующий промпт и вставьте после него вывод команды `tcpdump -XX` или `tshark -V`:
 
 ```text
 Ты — ведущий специалист по сетевой безопасности, анализу TLS-фингерпринтинга (JA3 / JA4 / Akamai HTTP/2) и системам DPI/ТСПУ.
-Ниже приведён дамп пакета TLS ClientHello (и/или HTTP-заголовков), захваченный с моего клиента на ОС [УКАЖИТЕ ОС: Linux / Windows / macOS / Android] при установленном профиле tls_fingerprint = "[УКАЖИТЕ: auto / chrome / firefox / safari / randomized]" для транспорта [УКАЖИТЕ: AHTTP (HTTP/2) / WebSocket (WSS) / WRTC].
+Ниже приведён дамп пакета TLS ClientHello (и/или HTTP-заголовков), захваченный с моего клиента.
+Если я не указал явно ОС, профиль tls_fingerprint и транспорт — определи их самостоятельно по заголовкам L2/L3/L4, структуре шифров/расширений и полю ALPN в дампе.
 
-Проведи строгий технический аудит дампа по следующим 7 пунктам:
-1. GREASE и перестановка расширений: присутствуют ли GREASE-значения (0x?a?a) в Cipher Suites, Extensions, Supported Groups и Key Share? Соответствует ли их наличие/отсутствие заявленному браузеру (Chrome/Safari — да, Firefox — нет)?
-2. Порядок Cipher Suites: соответствует ли список и приоритет шифров TLS 1.3 и TLS 1.2 реальному браузеру (например, для Chrome: AES_128_GCM -> AES_256_GCM -> CHACHA20_POLY1305; для Firefox: ChaCha20 перед AES-256 в TLS 1.2)?
-3. Supported Groups (Elliptic Curves) и Signature Algorithms: присутствуют ли корректные кривые (X25519MLKEM768 / X25519 / P-256 / P-384 для Chrome; наличие P-521 = 0x0019 для Firefox/Safari)? Нет ли нетипичных для браузера групп?
-4. Набор TLS-расширений: проверь наличие status_request (OCSP, 0x0005), signed_certificate_timestamp (SCT, 0x0012 — должен быть у Chrome/Safari и отсутствовать у Firefox), compress_certificate / ALPS / ECH / padding.
-5. ALPN (0x0010): проверь, что для HTTP-транспорта (AHTTP/DoH/REST) анонсируется ["h2", "http/1.1"], а для WebSocket (WSS/XMPP/Colibri) — строго ["http/1.1"] (без "h2").
-6. Синхронизация L3/L4/L7 (OS & Browser Consistency): совпадает ли IP TTL / TCP Window Size с заявленной ОС, и нет ли конфликта между TLS ClientHello и HTTP-заголовками (например, утечки заголовков sec-ch-ua* при профиле Firefox/Safari)?
-7. Вердикт по схеме детектов ТСПУ: есть ли в этом пакете какие-либо аномалии или маркеры нестандартного TLS-клиента (rustls / Go crypto/tls / OpenSSL default), за которые может зацепиться пассивный анализатор DPI?
+Проведи строгий побайтовый технический аудит дампа (с вычислением точных строк и хешей JA3 и JA4) по следующим 8 пунктам:
+1. GREASE и перестановка расширений (Extension Permutation): присутствуют ли GREASE-значения (0x?a?a) во всех 5 точках (Cipher Suites, Extensions, Supported Groups, Key Share, Supported Versions)? Совпадает ли GREASE-группа в Key Share с первой GREASE-группой в Supported Groups? Соответствует ли наличие/отсутствие GREASE и перестановки расширений заявленному браузеру (Chrome — GREASE + permutation; Safari — GREASE без permutation; Firefox — без классических GREASE)?
+2. Порядок и состав Cipher Suites (JA3 vs JA4_b): соответствует ли список и приоритет шифров TLS 1.3 и TLS 1.2 реальному браузеру? Проверь, нет ли гибридного конфликта (например, порядка TLS 1.3 0x1301->0x1302->0x1303 от BoringSSL при шифрах TLS 1.2 от Firefox, или урезанного списка шифров Safari без RSA-блока). Совпадает ли вычисленный JA4_b с эталонным хешем браузера (8daaf6152771 для Chrome, 5b57614c22b0 для Firefox)?
+3. Supported Groups и Signature Algorithms: присутствуют ли корректные кривые (29-23-24 для Chrome; наличие P-521 = 0x0019 для Firefox/Safari; нет ли аномального порядка P-384 перед P-256)? Проверь список signature_algorithms (0x000d): 8 алгоритмов у Chrome, 11 алгоритмов (включая legacy 0x0203/0x0201) у Firefox и Safari. Не обрезан ли список до 9 алгоритмов (маркер Go crypto/tls)?
+4. Набор и скелет TLS-расширений (JA4_c): проверь наличие status_request (OCSP, 0x0005), signed_certificate_timestamp (SCT, 0x0012 — обязан быть у Chrome/Safari и отсутствовать у Firefox), отсутствие session_ticket (0x0023) у Safari, наличие compress_certificate (0x001b) / ALPS (0x4469) / ECH (0xfe0d) / padding (0x0015).
+5. Размер пакета и сегментация TCP (BoringSSL Padding & Post-Quantum): проверь общий размер TLS Record и TCP-пейлоада. Укладывается ли ClientHello в один TCP-сегмент (< 1460 байт MSS, например 517 байт при выравнивании BoringSSL padding до 512 байт), и уместно ли наличие padding (0x0015) для выбранного профиля?
+6. ALPN (0x0010): проверь, что для HTTP/2-транспорта (AHTTP/REST) анонсируется ["h2", "http/1.1"] (JA4 префикс h2), а для WebSocket (WSS/XMPP/Colibri/TURNS) — строго ["http/1.1"] без "h2" (JA4 префикс h1).
+7. Синхронизация L3/L4/L6/L7 (OS & Browser Consistency): совпадает ли IP TTL, флаг DF и TCP Window / Options с ОС и выбранным браузером (например, нет ли отправки профиля Safari с Linux/Windows TCP-стека, или утечки заголовков sec-ch-ua* при профиле Firefox/Safari)?
+8. Итоговый вердикт по схеме детектов ТСПУ / DPI: оцени по 10-балльной шкале стойкость пакета против пассивного DPI (чёрные списки библиотек Go/rustls/OpenSSL vs белые списки браузерных JA3/JA4) и укажи точные строки кода в boring_tls.rs / http_help.rs, если требуются исправления.
 
 Вот дамп:
 [ВСТАВЬТЕ ВЫВОД TCPDUMP -XX ИЛИ TSHARK -V СЮДА]
