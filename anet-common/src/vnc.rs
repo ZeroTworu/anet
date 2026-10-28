@@ -11,6 +11,8 @@ pub const SECURITY_TYPE_NONE: u8 = 1;
 pub const CLIENT_CUT_TEXT: u8 = 6;
 /// Тип сообщения RFB от сервера: ServerCutText (буфер обмена / туннель данных).
 pub const SERVER_CUT_TEXT: u8 = 3;
+/// Тип сообщения RFB от сервера: FramebufferUpdate (обновление области экрана для маскировки Data Plane).
+pub const FRAMEBUFFER_UPDATE: u8 = 0;
 
 /// Поддерживаемые сервером типы аутентификации: 1 тип, SecurityType = None.
 pub const RFB_SECURITY_TYPES: &[u8] = &[1, SECURITY_TYPE_NONE];
@@ -36,6 +38,7 @@ pub const RFB_FRAMEBUFFER_UPDATE_HDR: &[u8] = &[
 ];
 
 const CUT_TEXT_HEADER_LEN: usize = 8;
+const FRAMEBUFFER_UPDATE_HEADER_LEN: usize = 16;
 const MAX_CUT_TEXT_PAYLOAD: usize = MAX_PACKET_SIZE * 2;
 
 pub fn encode_cut_text(message_type: u8, payload: &[u8]) -> io::Result<Bytes> {
@@ -56,12 +59,44 @@ pub fn encode_cut_text(message_type: u8, payload: &[u8]) -> io::Result<Bytes> {
     Ok(frame.freeze())
 }
 
+/// Упаковывает зашифрованный пакет ASTP в кадр RFB `FramebufferUpdate` (`0x00`, Raw encoding = 0,
+/// 1 прямоугольник `width = payload.len()`, `height = 1`) для маскировки трафика Server -> Client
+/// под передачу пиксельных областей рабочего стола VNC.
+pub fn encode_framebuffer_update(payload: &[u8]) -> io::Result<Bytes> {
+    if payload.len() > MAX_CUT_TEXT_PAYLOAD || payload.len() > u16::MAX as usize {
+        return Err(invalid_data(
+            "RFB FramebufferUpdate payload exceeds the transport limit",
+        ));
+    }
+
+    let mut frame = BytesMut::with_capacity(FRAMEBUFFER_UPDATE_HEADER_LEN + payload.len());
+    frame.put_u8(FRAMEBUFFER_UPDATE);
+    frame.put_u8(0); // padding
+    frame.put_u16(1); // number-of-rectangles = 1
+    frame.put_u16(0); // x-position = 0
+    frame.put_u16(0); // y-position = 0
+    frame.put_u16(payload.len() as u16); // width = payload_len
+    frame.put_u16(1); // height = 1
+    frame.put_i32(0); // encoding-type = 0 (Raw)
+    frame.put_slice(payload);
+    Ok(frame.freeze())
+}
+
 pub async fn write_cut_text<W>(writer: &mut W, message_type: u8, payload: &[u8]) -> io::Result<()>
 where
     W: AsyncWrite + Unpin,
 {
     writer
         .write_all(&encode_cut_text(message_type, payload)?)
+        .await
+}
+
+pub async fn write_framebuffer_update<W>(writer: &mut W, payload: &[u8]) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    writer
+        .write_all(&encode_framebuffer_update(payload)?)
         .await
 }
 
@@ -75,12 +110,53 @@ where
         Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(error) => return Err(error),
     }
+
+    // При чтении потока от сервера прозрачно поддерживаем как FramebufferUpdate (0x00),
+    // так и классический ServerCutText (0x03) для полной обратной совместимости.
+    if expected_type == SERVER_CUT_TEXT && header[0] == FRAMEBUFFER_UPDATE {
+        let mut fb_hdr = [0u8; FRAMEBUFFER_UPDATE_HEADER_LEN - 1];
+        reader.read_exact(&mut fb_hdr).await?;
+        if fb_hdr[0] != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("non-zero RFB FramebufferUpdate padding: {}", fb_hdr[0]),
+            ));
+        }
+        let rect_count = u16::from_be_bytes([fb_hdr[1], fb_hdr[2]]);
+        let width = u16::from_be_bytes([fb_hdr[7], fb_hdr[8]]) as usize;
+        let height = u16::from_be_bytes([fb_hdr[9], fb_hdr[10]]);
+        let encoding = i32::from_be_bytes([fb_hdr[11], fb_hdr[12], fb_hdr[13], fb_hdr[14]]);
+        if rect_count != 1 || height != 1 || encoding != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "unexpected RFB FramebufferUpdate layout: rects={rect_count}, height={height}, encoding={encoding}"
+                ),
+            ));
+        }
+        if width > MAX_CUT_TEXT_PAYLOAD {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "RFB FramebufferUpdate payload exceeds limit: width={} > MAX={}",
+                    width, MAX_CUT_TEXT_PAYLOAD
+                ),
+            ));
+        }
+        let mut payload = vec![0; width];
+        reader.read_exact(&mut payload).await?;
+        return Ok(Some(Bytes::from(payload)));
+    }
+
     reader.read_exact(&mut header[1..]).await?;
 
     if header[0] != expected_type {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("unexpected RFB message type: {} (0x{:02x}), expected {} (0x{:02x})", header[0], header[0], expected_type, expected_type),
+            format!(
+                "unexpected RFB message type: {} (0x{:02x}), expected {} (0x{:02x})",
+                header[0], header[0], expected_type, expected_type
+            ),
         ));
     }
     if header[1..4] != [0; 3] {
@@ -95,7 +171,10 @@ where
     if payload_len > MAX_CUT_TEXT_PAYLOAD {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("RFB CutText payload exceeds limit: payload_len={} > MAX={}", payload_len, MAX_CUT_TEXT_PAYLOAD),
+            format!(
+                "RFB CutText payload exceeds limit: payload_len={} > MAX={}",
+                payload_len, MAX_CUT_TEXT_PAYLOAD
+            ),
         ));
     }
 
@@ -119,6 +198,20 @@ mod tests {
         let mut reader = std::io::Cursor::new(frame);
 
         let decoded = read_cut_text(&mut reader, CLIENT_CUT_TEXT)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(decoded, payload);
+    }
+
+    #[tokio::test]
+    async fn framebuffer_update_round_trip() {
+        let payload = Bytes::from_static(b"encrypted astp downlink frame inside rfb raw rect");
+        let frame = encode_framebuffer_update(&payload).unwrap();
+        assert_eq!(frame[0], FRAMEBUFFER_UPDATE);
+        let mut reader = std::io::Cursor::new(frame);
+
+        let decoded = read_cut_text(&mut reader, SERVER_CUT_TEXT)
             .await
             .unwrap()
             .unwrap();
@@ -162,5 +255,7 @@ mod tests {
     fn rejects_oversized_payload_when_encoding() {
         let payload = vec![0; MAX_CUT_TEXT_PAYLOAD + 1];
         assert!(encode_cut_text(CLIENT_CUT_TEXT, &payload).is_err());
+        assert!(encode_framebuffer_update(&payload).is_err());
     }
 }
+

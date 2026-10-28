@@ -8,7 +8,7 @@ use anet_common::consts::{
 use anet_common::stream_framing::supervise_bidirectional_workers;
 use anet_common::vnc::{
     CLIENT_CUT_TEXT, RFB_FRAMEBUFFER_UPDATE_HDR, RFB_SECURITY_OK, RFB_SECURITY_TYPES,
-    RFB_SERVER_INIT, RFB_VERSION, SECURITY_TYPE_NONE, SERVER_CUT_TEXT, encode_cut_text,
+    RFB_SERVER_INIT, RFB_VERSION, SECURITY_TYPE_NONE, SERVER_CUT_TEXT, encode_framebuffer_update,
     read_cut_text, write_cut_text,
 };
 use anyhow::{Context, Result};
@@ -257,7 +257,7 @@ async fn send_to_client(
                     safe_padding,
                 )?;
 
-                if let Ok(frame) = encode_cut_text(SERVER_CUT_TEXT, &encrypted) {
+                if let Ok(frame) = encode_framebuffer_update(&encrypted) {
                     batch_buf.extend_from_slice(&frame);
                 }
             }
