@@ -1,6 +1,5 @@
+````markdown
 # Архитектура и спецификация транспорта `imap` (ASTP over IMAPS:993)
-
-Документация актуальна для ветки `master` / `dev/connectivity2`.
 Спецификация верифицирована 10-минутным нагрузочным тестом (Soak-Test: 1512 `APPEND`, 9040 пакетов, ~9.5 МиБ данных, 0 ошибок) на боевом сервере `imap.mail.ru:993`.
 
 ---
@@ -24,11 +23,11 @@
 По стандарту RFC 3501 §6.3.11 команда `APPEND "<Folder>" ...` **не требует**, чтобы целевая папка была открыта через `SELECT`. Напротив, команды удаления `UID STORE ... (\Deleted)` и `UID EXPUNGE` работают строго в текущей выбранной (`SELECT`) папке.
 Поэтому парные соединения на клиенте и сервере скрещиваются по папкам:
 * **На Сервере:**
-    * `SRV_READER` делает `SELECT "Drafts"` и крутит только цикл `IDLE` $\leftrightarrow$ `UID FETCH` (читает Uplink), передавая прочитанные UIDs в локальный канал очистки.
-    * `SRV_WRITER` также делает `SELECT "Drafts"` один раз при старте: он отправляет Downlink-пакеты клиенту через `APPEND "Notes" (\Seen \Draft) {<len>}`, а в паузах удаляет прочитанные `SRV_READER`'ом письма в текущей папке `"Drafts"` через `UID STORE` + `UID EXPUNGE` без единого вызова `SELECT`!
+  * `SRV_READER` делает `SELECT "Drafts"` и крутит только цикл `IDLE` $\leftrightarrow$ `UID FETCH` (читает Uplink), передавая прочитанные UIDs в локальный канал очистки.
+  * `SRV_WRITER` также делает `SELECT "Drafts"` один раз при старте: он отправляет Downlink-пакеты клиенту через `APPEND "Notes" (\Seen \Draft) {<len>}`, а в паузах удаляет прочитанные `SRV_READER`'ом письма в текущей папке `"Drafts"` через `UID STORE` + `UID EXPUNGE` без единого вызова `SELECT`!
 * **На Клиенте:**
-    * `CLI_READER` делает `SELECT "Notes"` и крутит только цикл `IDLE` $\leftrightarrow$ `UID FETCH` (читает Downlink), передавая прочитанные UIDs в локальный канал очистки.
-    * `CLI_WRITER` также делает `SELECT "Notes"` один раз при старте: он отправляет Uplink-пакеты серверу через `APPEND "Drafts" (\Seen \Draft) {<len>}`, а в паузах удаляет прочитанные `CLI_READER`'ом письма в текущей папке `"Notes"`!
+  * `CLI_READER` делает `SELECT "Notes"` и крутит только цикл `IDLE` $\leftrightarrow$ `UID FETCH` (читает Downlink), передавая прочитанные UIDs в локальный канал очистки.
+  * `CLI_WRITER` также делает `SELECT "Notes"` один раз при старте: он отправляет Uplink-пакеты серверу через `APPEND "Drafts" (\Seen \Draft) {<len>}`, а в паузах удаляет прочитанные `CLI_READER`'ом письма в текущей папке `"Notes"`!
 
 ```text
 [UPLINK: Клиент -> Сервер (папка "Drafts")]
@@ -99,8 +98,8 @@
    UID EXPUNGE 4,5,6,7,8
    ```
 2. `Writer` запускает удаление в двух случаях:
-    * **Приоритетно в паузе трафика:** когда очередь исходящих пакетов `tx_queue` пуста (`is_empty()`), а в списке `cleanup_uids` есть хотя бы 1 прочитанный UID;
-    * **Принудительно под нагрузкой:** когда в `cleanup_uids` накопилось $\ge 20$ прочитанных UIDs (чтобы не тормозить серию активных `APPEND` каждые 5 пакетов).
+   * **Приоритетно в паузе трафика:** когда очередь исходящих пакетов `tx_queue` пуста (`is_empty()`), а в списке `cleanup_uids` есть хотя бы 1 прочитанный UID;
+   * **Принудительно под нагрузкой:** когда в `cleanup_uids` накопилось $\ge 20$ прочитанных UIDs (чтобы не тормозить серию активных `APPEND` каждые 5 пакетов).
 
 ### 3.5. Формат письма RFC 5322 при `APPEND`
 Каждое сообщение отправляется с флагами **`(\Seen \Draft)`** и валидной шапкой RFC 5322 с разбивкой Base64 по 76 символов:
@@ -124,12 +123,12 @@ Content-Transfer-Encoding: base64
 
 Тема письма формируется динамически: `Subject: {Template_Prefix} [ID: <TargetID>]`
 * **На этапе Handshake (Фаза 1 и Фаза 3):**
-    * Клиент $\to$ Сервер (`Drafts`): `Subject: {Prefix} [ID: <SRV_ID>:<Client_TempID>]`
-      где `SRV_ID` — первые 8 hex-символов от `SHA256(server_pub_key_bytes)`, а `Client_TempID` — первые 8 hex-символов от `SHA256(client_ephemeral_or_pub_key)`.
-    * Сервер $\to$ Клиент (`Notes`, Фаза 2 и Фаза 4): `Subject: {Prefix} [ID: <Client_TempID>]`.
+  * Клиент $\to$ Сервер (`Drafts`): `Subject: {Prefix} [ID: <SRV_ID>:<Client_TempID>]`
+    где `SRV_ID` — первые 8 hex-символов от `SHA256(server_pub_key_bytes)`, а `Client_TempID` — первые 8 hex-символов от `SHA256(client_ephemeral_or_pub_key)`.
+  * Сервер $\to$ Клиент (`Notes`, Фаза 2 и Фаза 4): `Subject: {Prefix} [ID: <Client_TempID>]`.
 * **На этапе Data Plane (после завершения Фазы 4 и получения `session_id`):**
-    * Клиент $\to$ Сервер (`Drafts`): `Subject: {Prefix} [ID: <SRV_ID>:<session_id>]`
-    * Сервер $\to$ Клиент (`Notes`): `Subject: {Prefix} [ID: <session_id>]`
+  * Клиент $\to$ Сервер (`Drafts`): `Subject: {Prefix} [ID: <SRV_ID>:<session_id>]`
+  * Сервер $\to$ Клиент (`Notes`): `Subject: {Prefix} [ID: <session_id>]`
 
 ### 4.1. Генерация виртуального `SocketAddr` (Сторона Сервера)
 Поскольку `ServerAuthHandler` привязывает состояние Фазы 1 (`temp_dh_map`) к `SocketAddr`, IMAP-воркер сервера детерминированно конвертирует `Client_TempID` в уникальный виртуальный `SocketAddr`:
@@ -286,10 +285,10 @@ pub struct Model {
 
 ### 7.2. Клиент (`anet-client-core`)
 1. **`config.rs`**:
-    * В `TransportMode` добавить вариант `Imap`.
-    * В `ServerConfig::mode()` добавить `"imap" | "imaps" => Ok(TransportMode::Imap)`.
-    * В `ServerConfig::host_port()` добавить `"imap" | "imaps" => 993`, чтобы `AnetClient::connect_and_run` автоматически добавлял все IP-адреса `imap.mail.ru` в `route_manager.add_bypass_route()` (и в исключения `VpnService` на Android)!
-    * В `ServerConfig::get_name()` добавить `TransportMode::Imap => "IMAP"`.
+   * В `TransportMode` добавить вариант `Imap`.
+   * В `ServerConfig::mode()` добавить `"imap" | "imaps" => Ok(TransportMode::Imap)`.
+   * В `ServerConfig::host_port()` добавить `"imap" | "imaps" => 993`, чтобы `AnetClient::connect_and_run` автоматически добавлял все IP-адреса `imap.mail.ru` в `route_manager.add_bypass_route()` (и в исключения `VpnService` на Android)!
+   * В `ServerConfig::get_name()` добавить `TransportMode::Imap => "IMAP"`.
 2. **`transport/factory.rs`**: Добавить ветвление `TransportMode::Imap => Box::new(ImapTransport::new(config.clone(), server.clone()))`.
 3. Создать `transport/imap.rs` со следующими структурами:
 
@@ -335,11 +334,12 @@ pub struct ImapTransport {
 
 1. **BoringSSL Only (Никакого `rustls` на 993 порту):** Устанавливать TCP-соединение через `TcpStream::connect`, оборачивать его через `anet_common::boring_tls::connect_raw_tls_with_config(&host, tcp_stream, &tls_cfg)`.
 2. **Архитектура «Cross-Selected Writer»:**
-    * На сервере и `SRV_READER`, и `SRV_WRITER` делают `SELECT "Drafts"`. `SRV_WRITER` выполняет `APPEND "Notes" (\Seen \Draft) {<len>}` и чистит прочитанные UIDs в `"Drafts"`.
-    * На клиенте и `CLI_READER`, и `CLI_WRITER` делают `SELECT "Notes"`. `CLI_WRITER` выполняет `APPEND "Drafts" (\Seen \Draft) {<len>}` и чистит прочитанные UIDs в `"Notes"`.
+   * На сервере и `SRV_READER`, и `SRV_WRITER` делают `SELECT "Drafts"`. `SRV_WRITER` выполняет `APPEND "Notes" (\Seen \Draft) {<len>}` и чистит прочитанные UIDs в `"Drafts"`.
+   * На клиенте и `CLI_READER`, и `CLI_WRITER` делают `SELECT "Notes"`. `CLI_WRITER` выполняет `APPEND "Drafts" (\Seen \Draft) {<len>}` и чистит прочитанные UIDs в `"Notes"`.
 3. **Защита от «Слепого окна» (`pending_exists`):** В методе чтения строк из сокета любая строка `^\*\s+\d+\s+EXISTS` обязана взводить `self.pending_exists = true`. Метод `wait_idle_or_pending()` обязан проверять этот флаг до входа в `IDLE` и сразу после выхода из `IDLE`.
 4. **Чтение строго по `UID FETCH <last_uid + 1>:*` с фильтрацией дублей:** Никогда не использовать `SEARCH`. Запрашивать `UID FETCH <last_uid + 1>:* (UID BODY.PEEK[HEADER.FIELDS (SUBJECT)] BODY.PEEK[TEXT])`, игнорировать элементы с `uid <= last_uid` и обновлять `last_uid = last_uid.max(uid)`.
 5. **Self-Clocking Batcher:** Первый пакет при свободном `Writer` отправляется с микро-задержкой коалесценции не более `15 мс`, а следующие пакеты естественно коалесцируются в очереди, пока текущий `APPEND` выполняется по сети (`~320 мс`).
 6. **Неблокирующий `UID EXPUNGE`:** Использовать `UID STORE <uids> +FLAGS.SILENT (\Deleted)` + `UID EXPUNGE <uids>` (с фолбэком на `EXPUNGE`) в моменты, когда очередь отправки `Writer` пуста, либо при накоплении $\ge 20$ прочитанных UIDs.
 7. **Failover ящиков (Клиент):** Если клиент получает ошибку авторизации, разрыв соединения или лимит от провайдера на текущем ящике, он переключается на следующий аккаунт `(index + 1) % accounts.len()` с сохранением `resume_session_id` (бесшовный реконнект без пересоздания TUN).
 8. **Мультиплексирование (Сервер):** Сервер спавнит независимые пары воркеров (Reader + Writer) для каждого почтового ящика из `imap_dsn` параллельно, разделяя единый `ClientRegistry`.
+````
