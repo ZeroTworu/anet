@@ -260,6 +260,13 @@ timeout_secs = 10
 handshake_path = "/handshake"
 auth_path = "/auth"
 traffic_path = "/traffic"
+
+# Кастомизация браузерных профилей TLS и HTTP/2 (опционально, встроенные дефолты уже в бинарнике):
+# [[browser_profiles]]
+# name = "Chrome"
+# h2_initial_stream_window_size = 6291456
+# h2_initial_connection_window_size = 15728640
+# h2_max_header_list_size = 262144
 ```
 
 ### 4.2. Сервер (`server.toml`)

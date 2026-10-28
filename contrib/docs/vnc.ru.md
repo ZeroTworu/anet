@@ -93,44 +93,52 @@
 +-------------------+-------------------+-------------------------------------------+
 ```
 
-### 3.2. Формат фрейма `ClientCutText` / `ServerCutText` (`anet-common/src/vnc.rs`)
-После завершения `ServerInit` каждый пакет (как во время ASTP-хендшейка, так и в режиме передачи данных) упаковывается функцией `encode_cut_text(message_type, payload)` с 8-байтным заголовком RFC 6143:
+### 3.2. Формат кадров RFB 3.8 в ANet (`anet-common/src/vnc.rs`)
+После завершения `ServerInit` и стартового обмена `SetPixelFormat` / `SetEncodings` / `FramebufferUpdateRequest` пакеты инкапсулируются в стандартные сообщения RFB 3.8:
 
-```text
-+---------------------------------------------------------------------------------------------------+
-|                                   TCP Stream (RFB 3.8 CutText Frame)                              |
-+-------------------+-------------------+-------------------+---------------------------------------+
-| Message Type (1 Б)| Padding (3 байта) | Length (4 байта)  | Payload (ASTP Handshake или Data)     |
-| 0x06 (Client->Srv)| [0x00, 0x00, 0x00]| u32 Big-Endian    | [Nonce (12 Б)][ChaCha20 + Poly1305]   |
-| 0x03 (Srv->Client)|                   | (до 4096 байт)    |                                       |
-+-------------------+-------------------+-------------------+---------------------------------------+
-| <----------------- 8 байт заголовок RFB ----------------> | <----- 38 + IP_Len + Padding байт --->|
-```
+1. **От клиента к серверу (`Client -> Server`):** сообщение **`ClientCutText` (тип `6` / `0x06`)** с 8-байтным заголовком RFC 6143:
+   ```text
+   +-------------------+-------------------+-------------------+---------------------------------------+
+   | Message Type (1 Б)| Padding (3 байта) | Length (4 байта)  | Payload (ASTP Handshake или Data)     |
+   | 0x06 (Client->Srv)| [0x00, 0x00, 0x00]| u32 Big-Endian    | [Nonce (12 Б)][ChaCha20 + Poly1305]   |
+   +-------------------+-------------------+-------------------+---------------------------------------+
+   ```
+2. **От сервера к клиенту (`Server -> Client`):**
+   * В фазе передачи данных (Data Plane) сервер кодирует пакеты как **`FramebufferUpdate` (тип `0` / `0x00`, Raw encoding `0`)** с 16-байтным заголовком одного прямоугольника (`rect_count = 1`, `x = 0`, `y = 0`, `width = payload_len (u16 BE)`, `height = 1`, `encoding = 0 (Raw)`):
+     ```text
+     +-------------------+-------------------+-------------------+-------------------+-------------------+
+     | MsgType=0x00 (1 Б)| Pad=0x00 (1 Б)    | Rects=0x0001 (2 Б)| X=0, Y=0 (4 Б)    | Width=Len (2 Б BE)|
+     +-------------------+-------------------+-------------------+-------------------+-------------------+
+     | Height=0x0001(2 Б)| Encoding=0 (4 Б)  | Payload (ASTP Data Envelope: Nonce + ChaCha20 + Poly1305) |
+     +-------------------+-------------------+-----------------------------------------------------------+
+     ```
+   * Для полной обратной совместимости парсер клиента (`read_server_rfb_frame` / `read_cut_text`) прозрачно принимает как `FramebufferUpdate (0x00)`, так и `ServerCutText (0x03)`.
+   * Использование `FramebufferUpdate (0x00)` для нисходящего потока полностью имитирует реальную видеосессию VNC (где основной объём трафика от сервера к клиенту — обновления пикселей экрана, а не бесконечный гигабайтный буфер обмена `ServerCutText`), исключая срабатывание эвристик ТСПУ на аномальное соотношение `CutText` кадров.
 
-### 3.3. Строгая валидация фреймов в `read_cut_text`
-Функция `read_cut_text(reader, expected_type)` в `anet-common/src/vnc.rs` защищает парсер от рассинхронизации потока и атак на исчерпание памяти (OOM):
-1. **Корректная обработка чистого `EOF`:** Сначала читается ровно 1 первый байт (`header[..1]`). Если TCP-соединение закрыто (`UnexpectedEof` на границе фрейма), возвращается `Ok(None)`. Если же `UnexpectedEof` возникает при дочитывании остальных 7 байт заголовка (`header[1..8]`) или тела пакета, возвращается ошибка `Err(UnexpectedEof)` (оборванный посередине кадр не маскируется под штатное закрытие).
-2. **Проверка направления (`expected_type`):** Клиент принимает исключительно `SERVER_CUT_TEXT (3)`, сервер — исключительно `CLIENT_CUT_TEXT (6)`. Любой другой байт типа немедленно вызывает `InvalidData`.
-3. **Проверка нулевого паддинга:** Байты `header[1..4]` обязаны быть равны `[0, 0, 0]`, иначе возвращается `InvalidData`.
-4. **Защита от OOM до аллокации буфера:** Поле длины `payload_len` (`u32 BE`) проверяется на `payload_len <= MAX_CUT_TEXT_PAYLOAD` (`MAX_PACKET_SIZE * 2 = 4096` байт) **до** вызова `vec![0; payload_len]`.
+### 3.3. Строгая валидация фреймов в `read_cut_text` / `read_rfb_frame`
+Функции чтения фреймов в `anet-common/src/vnc.rs` защищают парсер от рассинхронизации потока и атак на исчерпание памяти (OOM):
+1. **Корректная обработка чистого `EOF`:** Сначала читается ровно 1 первый байт (`header[..1]`). Если TCP-соединение закрыто (`UnexpectedEof` на границе фрейма), возвращается `Ok(None)`. Если же `UnexpectedEof` возникает при дочитывании остальных байт заголовка или тела пакета, возвращается ошибка `Err(UnexpectedEof)`.
+2. **Проверка направления:** Клиент принимает `SERVER_FRAMEBUFFER_UPDATE (0)` и `SERVER_CUT_TEXT (3)`, сервер — `CLIENT_CUT_TEXT (6)` (а также корректно пропускает стандартные управляющие сообщения RFB во время инициализации).
+3. **Защита от OOM до аллокации буфера:** Поле длины `payload_len` проверяется на `payload_len <= MAX_CUT_TEXT_PAYLOAD` (`MAX_PACKET_SIZE * 2 = 4096` байт) **до** вызова `vec![0; payload_len]`.
 
 ---
 
 ## 4. Особенности Data Plane, коалесценции и Stealth-режима
 
-### 4.1. TCP-фрагментация рукопожатия ASTP (`VncAuthChannel`)
-В `VncAuthChannel::send` (`anet-client-core/src/transport/vnc.rs`) пакеты Phase I и Phase III сначала упаковываются в `ClientCutText` (`encode_cut_text(CLIENT_CUT_TEXT, &data)`), а затем записываются в TCP-сокет с `TCP_NODELAY = true` через **`write_fragmented(&mut *stream, &frame, fragmentation)`**.
-Если в `[stealth]` включён `frag_enabled = true`, первый `ClientCutText`-фрейм разрезается в случайных точках на несколько TCP-сегментов с наносекундным джиттером между ними, сохраняя полную совместимость с потоковым парсером `read_cut_text` на сервере.
+### 4.1. Отсутствие открытых маркеров фрагментации в TCP-потоке (`write_fragmented`)
+В отличие от UDP-транспорта, где датаграммы требуют 2-байтного заголовка `[frag_index, frag_total]`, в потоковом транспорте `VNC` (`VncAuthChannel::send`) используется **`write_fragmented(&mut *stream, &frame, fragmentation)`** без каких-либо дополнительных байтовых префиксов:
+* При `frag_enabled = false` кадр `ClientCutText` отправляется одним вызовом `write_all` без сигнатурного маркера `[0x00, 0x01]`.
+* При `frag_enabled = true` первый `ClientCutText`-фрейм разрезается на уровне TCP-сегментов (`TCP_NODELAY = true`) в случайных точках с наносекундным джиттером, оставаясь на 100% валидным потоком RFB 3.8 для любого анализатора протокола.
 
-### 4.2. Коалесценция CutText-фреймов (`CRYPTO_COALESCE_BUDGET_BYTES = 16 КБ`)
+### 4.2. Коалесценция RFB-фреймов (`CRYPTO_COALESCE_BUDGET_BYTES = 16 КБ`)
 Как в `send_to_server` (клиент), так и в `send_to_client` (сервер) реализован высокопроизводительный цикл пакетной отправки:
 1. Каждый IP-пакет шифруется через `anet_common::transport::wrap_packet` с добавлением выравнивающего паддинга (`padding_step`, но не более `PADDING_MTU = 1450` байт).
-2. Зашифрованный конверт оборачивается в `encode_cut_text(CLIENT_CUT_TEXT / SERVER_CUT_TEXT, &encrypted)` и дописывается в общий буфер `batch_buf: BytesMut`.
+2. Зашифрованный конверт оборачивается в RFB-кадр (`encode_cut_text` на клиенте / `encode_framebuffer_update` на сервере) и дописывается в общий буфер `batch_buf: BytesMut`.
 3. В неблокирующем цикле `try_recv()` в этот же `batch_buf` добираются следующие готовые пакеты из очереди до достижения бюджета **`CRYPTO_COALESCE_BUDGET_BYTES = 16 384` байт (16 КиБ)**.
-4. Весь буфер из нескольких подряд идущих `CutText`-фреймов отправляется в `TcpStream` за один системный вызов `writer.write_all(&batch_buf).await` без принудительного `flush()`.
+4. Весь буфер отправляется в `TcpStream` за один системный вызов `writer.write_all(&batch_buf).await` без принудительного `flush()`.
 
 ### 4.3. Zero-Copy дешифрация и Backpressure
-* **На приёме (`receive_from_server` и `receive_from_client`):** Полученный `Bytes` из `read_cut_text` передаётся в `unwrap_packet_bytes_in_place(&cipher, encrypted)`, который расшифровывает `ChaCha20-Poly1305` прямо поверх выделенного буфера без повторной аллокации.
+* **На приёме (`receive_from_server` и `receive_from_client`):** Полученный `Bytes` передаётся в `unwrap_packet_bytes_in_place(&cipher, encrypted)`, который расшифровывает `ChaCha20-Poly1305` прямо поверх выделенного буфера без повторной аллокации.
 * **На сервере (`receive_from_client`):** Запись в канал TUN-интерфейса выполняется через неблокирующий `tun_tx.try_send(packet)`. При переполнении очереди TUN пакет отбрасывается (`[VNC] TUN queue full, dropping uplink packet`), исключая взаимную блокировку (Deadlock) TCP-чтения и записи.
 
 ---
@@ -141,12 +149,12 @@
 ```toml
 [[servers]]
 name = "VNC Node"
-dsn = "vnc://vpn.example.com:5900"  # Если порт не указан (vnc://host), по умолчанию используется порт 5900
+dsn = "vnc://vpn.example.com:5900"  # Если порт не указан (vnc://host), по умолчанию используется стандартный порт 5900
 timeout_secs = 15
 server_pub_key = "<BASE64_ED25519_PUBLIC_KEY>"
 
 [stealth]
-padding_step = 64                   # Выравнивание размера зашифрованного пакета внутри CutText
+padding_step = 64                   # Выравнивание размера зашифрованного пакета внутри RFB-кадра
 min_jitter_ns = 0
 max_jitter_ns = 0
 frag_enabled = true                 # TCP-фрагментация пакетов рукопожатия ClientCutText
@@ -157,7 +165,7 @@ frag_max_chunks = 3
 ### 5.2. Настройка сервера (`server.toml`)
 ```toml
 [server]
-vnc_bind_to = "0.0.0.0:5900"        # Пустая строка "" отключает VNC-сервер
+vnc_bind_to = "0.0.0.0:5900"        # Пустая строка "" отключает VNC-сервер (рекомендуется стандартный порт 5900..5909)
 
 [crypto]
 server_signing_key = "<BASE64_ED25519_PRIVATE_KEY>"
@@ -176,4 +184,4 @@ max_jitter_ns = 0
 ```bash
 sudo tcpdump -ni any "tcp port 5900" -c 30 -A
 ```
-В начале TCP-потока будут видны стандартные ASCII-маркеры `RFB 003.008` и имя десктопа `Xvnc`, а последующие пакеты распознаются диссектором Wireshark (`VNC`) как сообщения `ClientCutText` и `ServerCutText`.
+В начале TCP-потока будут видны стандартные ASCII-маркеры `RFB 003.008` и имя десктопа `Xvnc`, а последующие пакеты распознаются диссектором Wireshark (`VNC`) как сообщения `ClientCutText` и `FramebufferUpdate`.

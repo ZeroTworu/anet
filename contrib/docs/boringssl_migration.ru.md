@@ -176,48 +176,45 @@ openssl s_client -connect example.com:443 -servername example.com </dev/null 2>/
      ```
    * При активном флаге `?cdn=1` в DSN сохранять возможность занижения окна (`49152`), если это необходимо для прохождения специфичных буферов CDN.
 
+### Задача 4.4. Нативные расширения BoringSSL FFI (`0xfe0d` ECH GREASE, `0x001b` `compress_certificate`, `0x4469` ALPS) и `SessionCache` в `reqwest-boring`
+1. **Проблема:**
+   * Без FFI-вызовов `boring_sys` в `ClientHello` отсутствуют три ключевых браузерных расширения: `encrypted_client_hello` GREASE (`0xfe0d`), `compress_certificate` (`0x001b`, RFC 8879 — Brotli у Chrome, Zlib у Safari, Zlib+Brotli у Firefox) и `application_settings` / ALPS (`0x4469` для `h2` у Chrome).
+   * В `patches/reqwest-boring/src/boring_tls.rs` метод `Config::preconfigured` (используемый при вызове `.tls_built_in_boring_connector`) не инициализирует `SessionCache` (из-за чего при повторных соединениях к тому же хосту не отправляется `pre_shared_key` `0x0029`) и жёстко ставит `verify_hostname: true` даже при `SslVerifyMode::NONE` (ломая `verify_peer = false` и IP-подключения).
+2. **Реализация в `anet-common/src/boring_tls.rs` и `patches/reqwest-boring/src/boring_tls.rs`:**
+   * Через `boring_sys` активированы:
+     * `SSL_set_enable_ech_grease(ssl, 1)` для профилей `Chrome`, `Firefox` и `Randomized`;
+     * `SSL_CTX_add_cert_compression_alg` с распаковкой Brotli (`2`, через крейт `brotli`) и Zlib (`1`, через крейт `flate2`);
+     * `SSL_add_application_settings` (`h2`) для HTTP/2 коннектора профиля `Chrome`.
+   * В `patches/reqwest-boring/src/boring_tls.rs` в `Config::preconfigured` подключён `SessionCache` (`SslSessionCacheMode::CLIENT` + `set_new_session_callback`), а флаг `verify_hostname` автоматически синхронизируется с `ssl.verify_mode() != SslVerifyMode::NONE`.
+
 ---
 
-## 5. Архитектурный план возможного перехода на `boring2` + `wreq` (100% мимикрия под Firefox, Safari и Chrome)
+## 5. Пользовательская конфигурация профилей `[[browser_profiles]]` в `client.toml` и `server.toml`
 
-### 5.1. Почему ванильный `boring` (Google BoringSSL) имеет потолок ~85% при эмуляции Firefox?
-Настоящий браузер Firefox использует криптостек **Mozilla NSS**, а не BoringSSL. В ванильном Google BoringSSL (`boring = "4.22"`) следующие параметры жёстко зафиксированы в C++ коде (`ssl/handshake_client.cc`, `ssl/extensions.cc`) и не меняются через публичное API:
-1. **Порядок шифров TLS 1.3:** В Google BoringSSL зашит порядок `0x1301 -> 0x1302 -> 0x1303` (`AES_128_GCM -> AES_256_GCM -> CHACHA20_POLY1305`). В настоящем Firefox (NSS) `ChaCha20` в TLS 1.3 всегда стоит на **втором** месте: `0x1301 -> 0x1303 -> 0x1302`. *(В сортированном хэше `JA4_b = 5b57614c22b0` разница исчезает, но в несортированном `JA3` и `JA4_ro` она видна).*
-2. **Специфичные расширения NSS (`0x001c`, `0x0022`):** Настоящий Firefox всегда отправляет `record_size_limit` (`0x001c` со значением `0x4001`) и `delegated_credentials` (`0x0022`). В ванильном BoringSSL эти расширения отсутствуют.
-3. **Группы `ffdhe2048` / `ffdhe3072` и двойной `key_share`:** Настоящий Firefox включает в `supported_groups` группы конечных полей `0x0100` (`256`) и `0x0101` (`257`), а в `key_share` передаёт сразу два ключа (`X25519` + `P-256`). Ванильный BoringSSL генерирует `key_share` только для первой группы списка.
-4. **Порядок псевдозаголовков HTTP/2 (Akamai H2 Fingerprint):** В крейте `h2` (используемом внутри `hyper` / `reqwest-boring`) порядок псевдозаголовков фиксирован как у Chrome (`:method, :scheme, :authority, :path` или `:method, :authority, :scheme, :path`), тогда как Firefox использует порядок `:method, :path, :authority, :scheme` и специфичные кадры `PRIORITY`.
+Помимо встроенных в бинарник эталонных профилей (`Chrome`, `Firefox`, `Safari`), конфигурационные файлы `client.toml`, `server.toml` и `contrib/client_template.toml` поддерживают массив таблиц **`[[browser_profiles]]`**.
+Это позволяет переопределять параметры существующих профилей (по имени `name = "Chrome" | "Firefox" | "Safari"`) или добавлять собственные кастомные профили без пересборки бинарников.
 
-### 5.2. Как устроена связка `boring2` + `wreq` (бывший `rquest`) и как выполнить миграцию
-В экосистеме Rust развивается специализированный стек для 100% браузерной мимикрии (прямой аналог `curl-impersonate` и Go `uTLS`):
-* **`boring2` / `boring-sys2` / `tokio-boring2`** — форк `boring` с патчами C++ кода BoringSSL, добавляющими:
-   * управление порядком шифров TLS 1.3 (`prefer_chacha20` $\to$ `1301-1303-1302` для Firefox);
-   * нативную поддержку расширений `record_size_limit (0x001c)`, `delegated_credentials (0x0022)`, `compress_certificate (0x001b)` (Brotli, Zlib, Zstd), `application_settings / ALPS (0x4469 / 0x44cd)` и `ECH GREASE (0xfe0d)`;
-   * поддержку групп `ffdhe2048` / `ffdhe3072` и отправку нескольких `key_share`;
-   * явное задание порядка расширений (`extensions_order`) для точного воспроизведения скелета NSS (Firefox) и Apple WebKit (Safari).
-* **`wreq` (ранее `rquest`)** — форк `reqwest` поверх `boring2` и пропатченного `h2`, который из коробки содержит готовые профили `Emulation::Chrome135`, `Emulation::Firefox136`, `Emulation::FirefoxAndroid135`, `Emulation::Safari18`, `Emulation::SafariIos18`, синхронизирующие:
-   * TLS ClientHello (JA3 / JA4 — 100% совпадение с оригинальным браузером);
-   * HTTP/2 `SETTINGS`, `WINDOW_UPDATE`, `PRIORITY` и порядок псевдозаголовков (`:method`, `:path`, `:authority`, `:scheme`);
-   * порядок и состав HTTP-заголовков L7.
+### 5.1. Поддерживаемые поля `[[browser_profiles]]`
+* `name` — имя профиля (`"Chrome"`, `"Firefox"`, `"Safari"` или произвольное имя).
+* `cipher_list` — строка шифров TLS 1.2 в формате BoringSSL (`SSL_CTX_set_cipher_list`).
+* `curves` — список эллиптических кривых / групп (`"X25519:P-256:P-384"` или `"X25519:P-256:P-384:P-521"`).
+* `sigalgs` — список алгоритмов подписи (`SSL_CTX_set_sigalgs_list`).
+* `grease` — включение GREASE (`true` / `false`).
+* `permute_extensions` — случайная перестановка порядка расширений TLS (`true` / `false`).
+* `session_ticket` — отправка расширения `session_ticket (0x0023)` (`true` для Chrome/Firefox, `false` для Safari).
+* `ocsp_stapling` и `signed_cert_timestamps` — управление расширениями `status_request (0x0005)` и `SCT (0x0012)`.
+* `ech_grease` — отправка расширения `encrypted_client_hello` GREASE (`0xfe0d`).
+* `alps_h2` — отправка расширения `application_settings / ALPS (0x4469)` для протокола `h2`.
+* `cert_compression` — массив алгоритмов сжатия сертификатов RFC 8879 (`["brotli"]`, `["zlib"]`, `["zlib", "brotli"]`).
+* `user_agents` — список строк `User-Agent` (при создании профиля выбирается случайная строка из списка).
+* `headers` — упорядоченный список дополнительных HTTP-заголовков в формате `"Header-Name: value"` (применяется к HTTP/HTTPS запросам в указанном порядке).
+* `ws_headers_order` — порядок заголовков HTTP/1.1 WebSocket Upgrade.
+* `h2_initial_stream_window_size`, `h2_initial_connection_window_size`, `h2_max_header_list_size` — синхронизированные с браузером параметры кадра HTTP/2 `SETTINGS`.
 
-### 5.3. Два варианта внедрения в `anet` (Инструкция для ИИ-агента при миграции)
-
-#### Вариант А. Бесшовная замена `boring` + `reqwest-boring` на `boring2` + `wreq`
-1. В корневом `Cargo.toml` заменить зависимости:
-   * `boring` $\to$ `boring2` (с алиасом `boring = { package = "boring2", ... }`, чтобы не переписывать импорты).
-   * `tokio-boring` $\to$ `tokio-boring2` (с алиасом `tokio-boring = { package = "tokio-boring2", ... }`).
-   * `reqwest` (`reqwest-boring`) $\to$ `wreq` (или пропатчить `patches/reqwest-boring` для использования `boring2` и `h2` с поддержкой `PseudoOrder` и `SettingsOrder`).
-2. В `anet-common/src/boring_tls.rs` при сборке `SslConnectorBuilder`:
-   * Для **`TlsFingerprint::Chrome`**: включить `add_cert_compression_alg(CertCompressionAlgorithm::Brotli)`, `set_enable_ech_grease(true)` и `add_application_settings(b"h2", ...)` (только для HTTP/2 коннектора).
-   * Для **`TlsFingerprint::Firefox`**: включить `set_tls13_cipher_list` с порядком `TLS_AES_128_GCM_SHA256:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_256_GCM_SHA384`, добавить `record_size_limit(0x4001)`, `delegated_credentials`, `compress_certificate` (Zlib + Brotli + Zstd), кривые `X25519:P-256:P-384:P-521:FFDHE2048:FFDHE3072` и двойной `key_share` (`X25519` + `P-256`).
-   * Для **`TlsFingerprint::Safari`**: включить `SslOptions::NO_TICKET`, `add_cert_compression_alg(CertCompressionAlgorithm::Zlib)`, `SAFARI_CIPHERS` (20 шифров) и `SAFARI_SIGALGS` (11 алгоритмов).
-3. Сохранить существующий коллбэк `configure_verification` в `anet-common/src/boring_tls.rs`: проверка `SYSTEM_ROOT_CERTS`, `tls_ca_cert` и пиннинг `tls_pin_sha256` (Cert DER + SPKI SHA-256) остаются неизменными и накладываются поверх профиля эмуляции.
-
-#### Вариант Б. Точечный патч в `./patches/reqwest-boring` без смены HTTP-клиента (Минимальная инвазивность)
-Если требуется остаться на текущем `reqwest-boring` (`0.13.5`) и `boring = "4.22"`:
-1. В `anet-common/src/boring_tls.rs` и `patches/reqwest-boring/src/boring_tls.rs` через FFI `boring_sys` (который уже подключён в `patches/reqwest-boring/Cargo.toml`) активировать:
-   * `boring_sys::SSL_set_enable_ech_grease(ssl.as_ptr(), 1)` — включает расширение `0xfe0d` (`encrypted_client_hello` GREASE);
-   * `boring_sys::SSL_CTX_add_cert_compression_alg(ctx.as_ptr(), 2, ...)` — включает расширение `0x001b` (`compress_certificate` Brotli для Chrome / Zlib `1` для Safari).
-2. Применить исправления из **Раздела 4** данной спецификации (задачи 4.1, 4.2, 4.3). Это сразу даёт **98% идентичность для Chrome и Safari** и **100% совпадение `JA4_b` для Firefox**.
+### 5.2. Синхронизация HTTP/2 `SETTINGS` и порядка заголовков WebSocket Upgrade
+* **`AHTTP` (`anet-client-core/src/transport/ahttp.rs`):** если в `[ahttp]` не заданы ручные переопределения окон, транспорт автоматически берёт `h2_initial_stream_window_size`, `h2_initial_connection_window_size` и `h2_max_header_list_size` из активного профиля браузера (`Chrome`: `6 MiB / 15 MiB / 256 KiB`; `Firefox`: `131072 / 12 MiB / 65536`; `Safari`: `4 MiB / 10 MiB / 65536`).
+* **`WebSocket` (`websocket.rs`, `wrtc/xmpp.rs`, `wrtc/peer.rs`):** порядок заголовков в HTTP/1.1 `GET ... Upgrade: websocket` формируется строго по `ws_headers_order` выбранного профиля (`Chrome` включает `Pragma: no-cache`, `Cache-Control: no-cache`, `User-Agent`, `Upgrade`, `Origin`, `Sec-WebSocket-Version`, `Accept-Encoding`, `Accept-Language`, `Sec-WebSocket-Key`, `Sec-WebSocket-Extensions`; `Firefox` и `Safari` используют свой нативный порядок без нехарактерных заголовков).
+* **100% покрытие HTTP-трафика:** все исходящие HTTP/HTTPS-запросы в рабочей области (`ahttp`, `websocket`, `wrtc/ktalk`, `updater`, `rule_updater`, `connectivity`, `probe_nodes`, `auth_provider`, `control_plane`, `anet-auth/compiler_worker`) создаются исключительно через `BrowserProfile::build_reqwest_builder` + `apply_to_reqwest`.
 
 ---
 

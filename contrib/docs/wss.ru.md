@@ -218,7 +218,7 @@ websocket_min_session_secs = 900
 websocket_max_session_secs = 1800
 ```
 
-*Примечание по проверке сертификата и защите от активного спуфинга ТСПУ:* клиентский TLS-коннектор WebSocket на базе BoringSSL анонсирует в ALPN строго `["http/1.1"]` и по умолчанию (`tls_verify_peer = true`) проверяет цепочку доверия сертификата (WebPKI + совпадение домена SNI) либо сверяет криптографический пин `tls_pin_sha256`. Если ТСПУ пытается перехватить TLS-сессию поддельным сертификатом, рукопожатие обрывается на уровне TLS до отправки заголовка `Upgrade: websocket` и пути `/socket`. Подробные команды `tcpdump` / `tshark` для проверки отпечатка приведены в [`boringssl_migration.ru.md`](./boringssl_migration.ru.md).
+*Примечание по проверке сертификата, порядку заголовков Upgrade и защите от активного спуфинга ТСПУ:* клиентский TLS-коннектор WebSocket на базе BoringSSL анонсирует в ALPN строго `["http/1.1"]`, формирует порядок HTTP/1.1 Upgrade-заголовков строго по профилю браузера (`ws_headers_order` из `[[browser_profiles]]`) и по умолчанию (`tls_verify_peer = true`) проверяет цепочку доверия сертификата (WebPKI + совпадение домена SNI) либо сверяет криптографический пин `tls_pin_sha256`. Если ТСПУ пытается перехватить TLS-сессию поддельным сертификатом, рукопожатие обрывается на уровне TLS до отправки заголовка `Upgrade: websocket` и пути `/socket`. Подробные команды `tcpdump` / `tshark` и описание `[[browser_profiles]]` приведены в [`boringssl_migration.ru.md`](./boringssl_migration.ru.md).
 
 ### 5.2. Сервер (`server.toml`)
 

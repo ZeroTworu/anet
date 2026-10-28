@@ -137,17 +137,31 @@
 
 ---
 
-## 5. Конфигурация
+## 5. Маскировка идентификационного баннера SSHv2 и защита от DPI/ТСПУ
 
-### 5.1. Настройка клиента (`client.toml`)
+### 5.1. Замена дефолтного баннера `SSH-2.0-russh_*` на `OpenSSH`
+По умолчанию библиотека `russh` отправляет в первых открытых байтах TCP-потока нестандартную идентификационную строку `SSH-2.0-russh_0.54.0\r\n`. На нестандартных портах (например, `822`) эта строка легко выделяется сигнатурными правилами ТСПУ.
+
+В `anet-client-core/src/transport/ssh.rs` и `anet-server/src/servers/ssh.rs` поля `russh::client::Config::client_id` и `russh::server::Config::server_id` принудительно переопределены на стандартный баннер Ubuntu OpenSSH:
+* **Баннер по умолчанию:** `SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13.5` (`SshId::Standard`).
+* **Кастомный баннер:** может быть переопределён пользователем в `client.toml` (`[transport] ssh_banner = "..."` или в `[[servers]] ssh_banner = "..."`) и `server.toml` (`[server] ssh_banner = "..."`). При указании строки без префикса `SSH-2.0-` он добавляется автоматически.
+* **Рекомендация по выбору порта:** при жёсткой фильтрации со стороны ТСПУ по матрице `Порт != Протокол` рекомендуется размещать SSH-транспорт на стандартном порту `22` (или пробрасывать порт `22` внешнего IP на `ssh_bind_to`).
+
+---
+
+## 6. Конфигурация
+
+### 6.1. Настройка клиента (`client.toml`)
 ```toml
 [transport]
 ssh_user = "hanyuu"                 # Глобальное имя пользователя SSH по умолчанию (если не задано — "root")
+ssh_banner = "SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13.5" # Опциональное переопределение SSH-2.0 баннера клиента
 
 [[servers]]
 name = "SSH Node"
-dsn = "ssh://vpn.example.com:822"   # Если порт не указан (ssh://host), по умолчанию используется порт 22
+dsn = "ssh://vpn.example.com:22"    # Если порт не указан (ssh://host), по умолчанию используется порт 22
 ssh_user = "deploy"                 # Опциональное переопределение пользователя SSH для конкретной ноды
+# ssh_banner = "SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13.5"
 timeout_secs = 15
 server_pub_key = "<BASE64_ED25519_PUBLIC_KEY>"
 
@@ -160,11 +174,12 @@ frag_min_chunks = 2
 frag_max_chunks = 3
 ```
 
-### 5.2. Настройка сервера (`server.toml`)
+### 6.2. Настройка сервера (`server.toml`)
 ```toml
 [server]
-ssh_bind_to = "0.0.0.0:822"         # Пустая строка "" отключает SSH-сервер
+ssh_bind_to = "0.0.0.0:822"         # Пустая строка "" отключает SSH-сервер (рекомендуется порт 22 или DNAT :22 -> :822)
 ssh_host_key = "/etc/ssh/ssh_host_rsa_key" # Путь к приватному ключу хоста OpenSSH (RSA / Ed25519 / ECDSA)
+ssh_banner = "SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13.5" # Строка идентификации SSH-сервера
 
 [crypto]
 server_signing_key = "<BASE64_ED25519_PRIVATE_KEY>"
@@ -184,3 +199,4 @@ ssh-keygen -t ed25519 -f /etc/anet/ssh_host_ed25519_key -N ""
 [server]
 ssh_host_key = "/etc/anet/ssh_host_ed25519_key"
 ```
+
