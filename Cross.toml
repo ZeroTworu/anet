@@ -1,16 +1,11 @@
 [target.aarch64-unknown-linux-musl]
 pre-build = [
     "apt-get update && apt-get install -y --no-install-recommends cmake clang libclang-dev git ca-certificates",
-    "for tool in gcc g++ c++ ar ranlib strip objcopy objdump ld; do if [ -x /usr/local/bin/aarch64-linux-musl-$tool ] && [ ! -e /usr/local/bin/aarch64-unknown-linux-musl-$tool ]; then ln -s /usr/local/bin/aarch64-linux-musl-$tool /usr/local/bin/aarch64-unknown-linux-musl-$tool; fi; done",
+    "for tool in gcc g++ c++ ar ranlib strip objcopy objdump ld nm; do if [ -x /x-tools/aarch64-unknown-linux-musl/bin/aarch64-unknown-linux-musl-$tool ]; then ln -sf /x-tools/aarch64-unknown-linux-musl/bin/aarch64-unknown-linux-musl-$tool /usr/local/bin/aarch64-unknown-linux-musl-$tool && ln -sf /x-tools/aarch64-unknown-linux-musl/bin/aarch64-unknown-linux-musl-$tool /usr/local/bin/aarch64-linux-musl-$tool; fi; done",
 ]
 
 [target.aarch64-unknown-linux-musl.env]
 passthrough = [
     "CI",
-    "CC_aarch64_unknown_linux_musl",
-    "CXX_aarch64_unknown_linux_musl",
-    "AR_aarch64_unknown_linux_musl",
     "BORING_BSSL_RUST_CPPLIB_aarch64_unknown_linux_musl",
-    "BORING_BSSL_SYSROOT_aarch64_unknown_linux_musl",
 ]
-
