@@ -2,12 +2,11 @@
 """
 IMAP Full Duplex High-Throughput Soak Test for ANet ASTP-over-IMAPS:993
 ======================================================================
-Улучшения:
-  1. Монолитное чтение UID FETCH <start>:* (UID RFC822.PEEK) через ОДИН литерал {len};
-  2. Никаких подвисаний readline() на разделителях между письмами;
-  3. Flow Control / Backpressure: пауза отправки, если накопилось > 15 неудалённых писем;
-  4. Авто-реконнект с экспоненциальным отбоем при разрывах сокета;
-  5. Сквозной расчёт RTT и скорости в Mbps для Uplink и Downlink.
+Универсальный парсер:
+  - Корректно извлекает UID независимо от порядка атрибутов Mail.ru (UID до или ПОСЛЕ {len});
+  - Читает литерал побайтово readexactly(len);
+  - Парсит остаток строки до \r\n для захвата " UID <id>)";
+  - Включает скользящее окно Backpressure (max 20 in-flight).
 """
 
 import argparse
@@ -135,7 +134,7 @@ class SoakStats:
             )
 
 
-class MonolithicImapClient:
+class RobustImapClient:
     def __init__(self, host: str, port: int, email_addr: str, password: str, label: str, stats: SoakStats):
         self.host = host
         self.port = port
@@ -278,11 +277,11 @@ class MonolithicImapClient:
         except asyncio.TimeoutError:
             self.logger.warning("Timeout waiting for IDLE tagged response after DONE")
 
-    async def fetch_messages_monolithic(self, last_uid: int) -> Tuple[List[Tuple[int, str, bytes]], int, float]:
+    async def fetch_messages_robust(self, last_uid: int) -> Tuple[List[Tuple[int, str, bytes]], int, float]:
         """
-        Монолитное чтение UID FETCH <start>:* (UID RFC822.PEEK)
-        Гарантирует ровно ОДИН литерал {length} на сообщение.
-        Парсинг письма выполняется в памяти через встроенный модуль email.
+        Универсальный парсер FETCH ответа:
+        Извлекает {len}, читает тело строго побайтово, а затем парсит хвост строки.
+        Корректно работает, если UID стоит ПОСЛЕ литерала тела (специфика Mail.ru!).
         """
         t0 = time.time()
         tag = self.next_tag()
@@ -297,35 +296,44 @@ class MonolithicImapClient:
             if line.startswith(f"{tag} OK") or line.startswith(f"{tag} NO") or line.startswith(f"{tag} BAD"):
                 break
 
-            # * <seq> FETCH (UID <uid> RFC822 {<len>}
-            uid_m = re.search(r"UID\s+(\d+)", line, re.IGNORECASE)
+            # Проверяем, есть ли литерал длины сообщения: * <seq> FETCH (... {<len>}\r\n
             lit_m = re.search(r"\{(\d+)\}", line)
+            if not lit_m:
+                continue
 
-            if uid_m and lit_m:
-                uid = int(uid_m.group(1))
-                msg_len = int(lit_m.group(1))
+            msg_len = int(lit_m.group(1))
 
-                if uid <= last_uid:
-                    self.stats.uid_fetch_duplicate_hits += 1
-                else:
-                    new_max_uid = max(new_max_uid, uid)
+            # 1. Читаем ровно msg_len байт письма
+            msg_bytes = await self.reader.readexactly(msg_len)
 
-                # Вычитываем монолитный RFC822 блок строго заданной длины
-                msg_bytes = await self.reader.readexactly(msg_len)
+            # 2. Дочитываем хвост текущей строки FETCH (там закрывающая скобка и UID!)
+            rest_line = await self.readline()
 
-                # Разбираем письмо в памяти (без обращения к сокету!)
-                try:
-                    parsed_email = email.message_from_bytes(msg_bytes, policy=email.policy.default)
-                    subject = parsed_email.get("Subject", "")
-                    payload_part = parsed_email.get_body(preferencelist=("plain",))
-                    if payload_part:
-                        b64_str = payload_part.get_content().replace("\r", "").replace("\n", "").strip()
-                        raw_payload = base64.b64decode(b64_str)
-                        if uid > last_uid:
-                            messages.append((uid, subject, raw_payload))
-                except Exception as e:
-                    self.stats.errors.append(f"Parse error UID {uid}: {e}")
-                    self.logger.error(f"Failed to parse email message UID {uid}: {e}")
+            # 3. Ищем UID в заголовке или в хвосте строки (у Mail.ru он в rest_line: " UID 123)\r\n")
+            full_meta = line + " " + rest_line
+            uid_m = re.search(r"UID\s+(\d+)", full_meta, re.IGNORECASE)
+            if not uid_m:
+                continue
+
+            uid = int(uid_m.group(1))
+            if uid <= last_uid:
+                self.stats.uid_fetch_duplicate_hits += 1
+                continue
+
+            new_max_uid = max(new_max_uid, uid)
+
+            # 4. Разбираем письмо в памяти
+            try:
+                parsed_email = email.message_from_bytes(msg_bytes, policy=email.policy.default)
+                subject = str(parsed_email.get("Subject", ""))
+                payload_part = parsed_email.get_body(preferencelist=("plain",))
+                if payload_part:
+                    b64_str = payload_part.get_content().replace("\r", "").replace("\n", "").strip()
+                    raw_payload = base64.b64decode(b64_str)
+                    messages.append((uid, subject, raw_payload))
+            except Exception as e:
+                self.stats.errors.append(f"Parse error UID {uid}: {e}")
+                self.logger.error(f"Failed to parse email message UID {uid}: {e}")
 
         t_fetch = (time.time() - t0) * 1000.0
         self.stats.fetch_latency_samples.append(t_fetch)
@@ -365,8 +373,8 @@ async def run_server_worker(
     stop_event: asyncio.Event,
 ):
     logger.info("[SRV] Starting Server Workers (Reader & Writer)...")
-    srv_reader = MonolithicImapClient(host, port, email_addr, srv_pass, "SRV_READER", stats)
-    srv_writer = MonolithicImapClient(host, port, email_addr, srv_pass, "SRV_WRITER", stats)
+    srv_reader = RobustImapClient(host, port, email_addr, srv_pass, "SRV_READER", stats)
+    srv_writer = RobustImapClient(host, port, email_addr, srv_pass, "SRV_WRITER", stats)
 
     await srv_reader.connect()
     await srv_reader.select("Drafts")
@@ -381,7 +389,7 @@ async def run_server_worker(
     async def srv_writer_loop():
         while not stop_event.is_set():
             try:
-                # Очистка в "Drafts" имеет высший приоритет, чтобы не триггерить лимиты папки!
+                # Очистка в "Drafts" имеет высший приоритет
                 if cleanup_queue:
                     to_clean = cleanup_queue[:]
                     cleanup_queue.clear()
@@ -416,7 +424,7 @@ async def run_server_worker(
 
             srv_reader.pending_exists = False
 
-            msgs, new_max, _ = await srv_reader.fetch_messages_monolithic(last_seen_uid)
+            msgs, new_max, _ = await srv_reader.fetch_messages_robust(last_seen_uid)
             last_seen_uid = new_max
 
             for uid, subject, payload in msgs:
@@ -446,8 +454,8 @@ async def run_client_worker(
     batch_kb: int,
 ):
     logger.info(f"[CLI] Starting Client Workers (Batch Size: {batch_kb} KB)...")
-    cli_reader = MonolithicImapClient(host, port, email_addr, cli_pass, "CLI_READER", stats)
-    cli_writer = MonolithicImapClient(host, port, email_addr, cli_pass, "CLI_WRITER", stats)
+    cli_reader = RobustImapClient(host, port, email_addr, cli_pass, "CLI_READER", stats)
+    cli_writer = RobustImapClient(host, port, email_addr, cli_pass, "CLI_WRITER", stats)
 
     await cli_reader.connect()
     await cli_reader.select("Notes")
@@ -466,11 +474,10 @@ async def run_client_worker(
         nonlocal seq_counter
         while not stop_event.is_set():
             try:
-                # Flow Control / Backpressure:
-                # Если в папке накопилось много неотвеченных писем, даём серверу их очистить
+                # Backpressure: удерживаем не более 15 неподтвержденных пакетов
                 unacked = len(sent_timestamps)
-                if unacked > 20:
-                    await asyncio.sleep(0.1)
+                if unacked > 15:
+                    await asyncio.sleep(0.05)
                     continue
 
                 seq_counter += 1
@@ -511,7 +518,7 @@ async def run_client_worker(
 
             cli_reader.pending_exists = False
 
-            msgs, new_max, _ = await cli_reader.fetch_messages_monolithic(last_seen_uid)
+            msgs, new_max, _ = await cli_reader.fetch_messages_robust(last_seen_uid)
             last_seen_uid = new_max
 
             for uid, subject, payload in msgs:
