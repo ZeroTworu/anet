@@ -284,15 +284,49 @@ pub struct Model {
 Транспорт **не использует** крейт `async-imap` (так как `async-imap` теряет нетегированные `* EXISTS` во время `UID FETCH` и тянет `rustls`).
 Вместо этого в `anet-common/src/imap_conn.rs` реализуется нативный асинхронный `ImapConn` поверх `tokio::io::BufReader<tokio_boring::SslStream<TcpStream>>`, использующий штатный **BoringSSL** коннектор из `anet-common/src/boring_tls.rs`.
 
-В `anet-common/src/boring_tls.rs` добавляются функции создания сырого TLS-коннектора без HTTP/WS ALPN (`h2`/`http/1.1`):
+### 7.1.1. Эталонный TLS-фингерпринт почтового клиента (KMail / OpenSSL 3.x)
+В результате реального сниффинга сессии десктопного почтового клиента `KMail` (KDE / Qt6 / OpenSSL 3.x) на порт `993` (`imap.gmail.com:993`) зафиксирован эталонный сетевой отпечаток почтового трафика:
+1. **Ноль GREASE и ноль Permutation:** Настоящие почтовые клиенты (KMail, Thunderbird, Evolution) не используют GREASE (`0x?a?a`) и не тасуют расширения ClientHello. Порядок расширений строго детерминирован стеком OpenSSL/Qt:
+   `0xff01 (renegotiation_info)` $\to$ `0x0000 (server_name)` $\to$ `0x000b (ec_point_formats)` $\to$ `0x000a (supported_groups)` $\to$ `0x0023 (session_ticket)` $\to$ `0x0016 (encrypt_then_mac)` $\to$ `0x0017 (extended_master_secret)` $\to$ `0x000d (signature_algorithms)` $\to$ `0x002b (supported_versions)` $\to$ `0x002d (psk_modes)` $\to$ `0x0033 (key_share)`.
+2. **Отсутствие ALPN (0x0010):** Для неявного IMAPS на порту 993 расширение ALPN **не отправляется вовсе** (никаких `h2`/`http/1.1`).
+3. **Отсутствие Padding (0x0015):** В отличие от Chromium, дополняющего ClientHello до 512 байт, почтовый клиент не использует расширение 0x0015.
+4. **Пост-квантовая криптография (ML-KEM / Kyber 768):** В `supported_groups` во главе списка передаётся гибридная группа `0x11ec` (`X25519MLKEM768`), а в `key_share` сразу включается 1216-байтный квантово-устойчивый публичный ключ.
+5. **Приоритет AES-256 в TLS 1.3:** В списке шифров первым идёт `1302` (`TLS_AES_256_GCM_SHA384`), далее `1303` (`TLS_CHACHA20_POLY1305_SHA256`) и `1301` (`TLS_AES_128_GCM_SHA256`).
+
+### 7.1.2. Реализация профиля в `anet-common/src/boring_tls.rs`
+В `boring_tls.rs` добавляется выделенный конструктор `build_email_ssl_connector_with_config`:
 ```rust
-/// Создает конфигурацию BoringSSL для «сырых» TLS-протоколов (IMAPS:993)
-pub fn build_raw_ssl_connector_with_config(cfg: &TlsClientConfig) -> anyhow::Result<SslConnectorBuilder> {
-    build_ssl_connector_base_with_config(cfg)
+/// Создает конфигуратор BoringSSL с идеальной мимикрией под Linux-почтовик (KMail / OpenSSL 3.x):
+/// отключены GREASE, Permutation и ALPN, выставлен приоритет AES-256 и поддержка X25519MLKEM768.
+pub fn build_email_ssl_connector_with_config(
+    cfg: &TlsClientConfig,
+) -> anyhow::Result<SslConnectorBuilder> {
+    let mut builder = SslConnector::builder(SslMethod::tls_client())?;
+    builder.set_min_proto_version(Some(SslVersion::TLS1_2))?;
+    builder.set_max_proto_version(Some(SslVersion::TLS1_3))?;
+
+    // Отключаем браузерный GREASE и случайную перестановку расширений
+    builder.set_grease_enabled(false);
+    builder.set_permute_extensions(false);
+
+    // НЕ вызываем builder.set_alpn_protos() - на 993 порту ALPN отсутствует!
+
+    // Шифры: приоритет AES-256-GCM в TLS 1.3 и полный классический стек OpenSSL
+    builder.set_cipher_list(
+        "TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256:         ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:         DHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:         ECDHE-RSA-CHACHA20-POLY1305:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256"
+    )?;
+
+    // Пост-квантовые группы обмена ключами
+    let _ = builder.set_curves_list("X25519MLKEM768:X25519:P-256:P-384");
+
+    // Политика проверки сертификата сервера
+    configure_verify_and_pinning(&mut builder, cfg)?;
+
+    Ok(builder)
 }
 
-/// Выполняет асинхронный клиентский TLS-хендшейк для чистых TLS-протоколов (порт 993 IMAPS)
-pub async fn connect_raw_tls_with_config<S>(
+/// Выполняет асинхронный клиентский TLS-хендшейк для IMAPS (порт 993) с профилем почтового клиента
+pub async fn connect_email_tls_with_config<S>(
     domain: &str,
     stream: S,
     cfg: &TlsClientConfig,
@@ -300,10 +334,10 @@ pub async fn connect_raw_tls_with_config<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let builder = build_raw_ssl_connector_with_config(cfg)?;
+    let builder = build_email_ssl_connector_with_config(cfg)?;
     let ssl = builder.build().configure()?.into_ssl(domain)?;
     tokio_boring::connect(ssl, stream).await
-        .map_err(|e| anyhow::anyhow!("BoringSSL Raw TLS handshake failed for {domain}: {e}"))
+        .map_err(|e| anyhow::anyhow!("BoringSSL Email TLS handshake failed for {domain}: {e}"))
 }
 ```
 
