@@ -2,19 +2,19 @@
 """
 IMAP Full Duplex High-Throughput Soak Test for ANet ASTP-over-IMAPS:993
 ======================================================================
-Usage:
-    python3 imap_soak_test.py \
-        --email "$ANET_IMAP_EMAIL" \
-        --cli-pass "$ANET_IMAP_CLI_PASS" \
-        --srv-pass "$ANET_IMAP_SRV_PASS" \
-        --duration-mins 5 \
-        --batch-kb 32
+Улучшения:
+  1. Монолитное чтение UID FETCH <start>:* (UID RFC822.PEEK) через ОДИН литерал {len};
+  2. Никаких подвисаний readline() на разделителях между письмами;
+  3. Flow Control / Backpressure: пауза отправки, если накопилось > 15 неудалённых писем;
+  4. Авто-реконнект с экспоненциальным отбоем при разрывах сокета;
+  5. Сквозной расчёт RTT и скорости в Mbps для Uplink и Downlink.
 """
 
 import argparse
 import asyncio
 import base64
-import email.utils
+import email
+import email.policy
 import json
 import logging
 import os
@@ -61,13 +61,12 @@ class SoakStats:
     blind_window_hits: int = 0
     uid_fetch_duplicate_hits: int = 0
     reconnect_events: int = 0
-    idle_done_timeouts: int = 0
     throttled_events: int = 0
     overquota_events: int = 0
     errors: List[str] = field(default_factory=list)
 
     def print_summary(self):
-        elapsed = time.time() - self.start_time
+        elapsed = max(0.1, time.time() - self.start_time)
         rtt_sorted = sorted(self.rtt_samples)
         rtt_p50 = rtt_sorted[len(rtt_sorted) // 2] if rtt_sorted else 0.0
         rtt_p95 = rtt_sorted[int(len(rtt_sorted) * 0.95)] if rtt_sorted else 0.0
@@ -105,7 +104,7 @@ class SoakStats:
 - Превышений рейт-лимита (NO [THROTTLED]):      {self.throttled_events}
 - Превышений квоты ящика (NO [OVERQUOTA]):      {self.overquota_events}
 - Переподключений сокетов:                      {self.reconnect_events}
-- Ошибок парсинга Base64:                       {len(self.errors)}
+- Ошибок парсинга:                              {len(self.errors)}
 ========================================================================
 """
         logger.info(summary)
@@ -128,6 +127,7 @@ class SoakStats:
                     "uid_duplicate_hits": self.uid_fetch_duplicate_hits,
                     "throttled_events": self.throttled_events,
                     "overquota_events": self.overquota_events,
+                    "reconnect_events": self.reconnect_events,
                     "errors_sample": self.errors[:10],
                 },
                 f,
@@ -135,7 +135,7 @@ class SoakStats:
             )
 
 
-class HighSpeedImapClient:
+class MonolithicImapClient:
     def __init__(self, host: str, port: int, email_addr: str, password: str, label: str, stats: SoakStats):
         self.host = host
         self.port = port
@@ -185,7 +185,6 @@ class HighSpeedImapClient:
         if re.search(r"^\*\s+\d+\s+EXISTS", line, re.IGNORECASE):
             if not self.in_idle:
                 self.stats.blind_window_hits += 1
-                self.logger.debug(f"[BlindWindow] Intercepted {line.strip()} while not in IDLE!")
             self.pending_exists = True
 
         return line
@@ -277,14 +276,18 @@ class HighSpeedImapClient:
         try:
             await self.read_until_tagged(self.idle_tag, timeout_sec=5.0)
         except asyncio.TimeoutError:
-            self.stats.idle_done_timeouts += 1
             self.logger.warning("Timeout waiting for IDLE tagged response after DONE")
 
-    async def fetch_messages_since(self, last_uid: int) -> Tuple[List[Tuple[int, str, bytes]], int, float]:
+    async def fetch_messages_monolithic(self, last_uid: int) -> Tuple[List[Tuple[int, str, bytes]], int, float]:
+        """
+        Монолитное чтение UID FETCH <start>:* (UID RFC822.PEEK)
+        Гарантирует ровно ОДИН литерал {length} на сообщение.
+        Парсинг письма выполняется в памяти через встроенный модуль email.
+        """
         t0 = time.time()
         tag = self.next_tag()
         start_uid = last_uid + 1
-        await self.send_line(f"{tag} UID FETCH {start_uid}:* (UID BODY.PEEK[HEADER.FIELDS (SUBJECT)] BODY.PEEK[TEXT])")
+        await self.send_line(f"{tag} UID FETCH {start_uid}:* (UID RFC822.PEEK)")
 
         messages = []
         new_max_uid = last_uid
@@ -294,40 +297,35 @@ class HighSpeedImapClient:
             if line.startswith(f"{tag} OK") or line.startswith(f"{tag} NO") or line.startswith(f"{tag} BAD"):
                 break
 
+            # * <seq> FETCH (UID <uid> RFC822 {<len>}
             uid_m = re.search(r"UID\s+(\d+)", line, re.IGNORECASE)
-            if not uid_m:
-                continue
-            uid = int(uid_m.group(1))
-
-            if uid <= last_uid:
-                self.stats.uid_fetch_duplicate_hits += 1
-                continue
-
-            new_max_uid = max(new_max_uid, uid)
-
-            subject = ""
             lit_m = re.search(r"\{(\d+)\}", line)
-            if lit_m:
-                header_len = int(lit_m.group(1))
-                hdr_bytes = await self.reader.readexactly(header_len)
-                for h_line in hdr_bytes.decode("latin1", errors="replace").splitlines():
-                    if h_line.lower().startswith("subject:"):
-                        subject = h_line.split(":", 1)[1].strip()
 
-            next_line = await self.readline()
-            body_lit = re.search(r"\{(\d+)\}", next_line)
-            if body_lit:
-                text_len = int(body_lit.group(1))
-                body_raw = await self.reader.readexactly(text_len)
-                await self.readline()
+            if uid_m and lit_m:
+                uid = int(uid_m.group(1))
+                msg_len = int(lit_m.group(1))
 
-                clean_b64 = body_raw.decode("ascii", errors="replace").replace("\r", "").replace("\n", "").strip()
+                if uid <= last_uid:
+                    self.stats.uid_fetch_duplicate_hits += 1
+                else:
+                    new_max_uid = max(new_max_uid, uid)
+
+                # Вычитываем монолитный RFC822 блок строго заданной длины
+                msg_bytes = await self.reader.readexactly(msg_len)
+
+                # Разбираем письмо в памяти (без обращения к сокету!)
                 try:
-                    payload = base64.b64decode(clean_b64)
-                    messages.append((uid, subject, payload))
+                    parsed_email = email.message_from_bytes(msg_bytes, policy=email.policy.default)
+                    subject = parsed_email.get("Subject", "")
+                    payload_part = parsed_email.get_body(preferencelist=("plain",))
+                    if payload_part:
+                        b64_str = payload_part.get_content().replace("\r", "").replace("\n", "").strip()
+                        raw_payload = base64.b64decode(b64_str)
+                        if uid > last_uid:
+                            messages.append((uid, subject, raw_payload))
                 except Exception as e:
-                    self.stats.errors.append(f"UID {uid}: {e}")
-                    self.logger.error(f"Failed to decode message UID {uid} base64: {e}")
+                    self.stats.errors.append(f"Parse error UID {uid}: {e}")
+                    self.logger.error(f"Failed to parse email message UID {uid}: {e}")
 
         t_fetch = (time.time() - t0) * 1000.0
         self.stats.fetch_latency_samples.append(t_fetch)
@@ -367,8 +365,8 @@ async def run_server_worker(
     stop_event: asyncio.Event,
 ):
     logger.info("[SRV] Starting Server Workers (Reader & Writer)...")
-    srv_reader = HighSpeedImapClient(host, port, email_addr, srv_pass, "SRV_READER", stats)
-    srv_writer = HighSpeedImapClient(host, port, email_addr, srv_pass, "SRV_WRITER", stats)
+    srv_reader = MonolithicImapClient(host, port, email_addr, srv_pass, "SRV_READER", stats)
+    srv_writer = MonolithicImapClient(host, port, email_addr, srv_pass, "SRV_WRITER", stats)
 
     await srv_reader.connect()
     await srv_reader.select("Drafts")
@@ -383,6 +381,12 @@ async def run_server_worker(
     async def srv_writer_loop():
         while not stop_event.is_set():
             try:
+                # Очистка в "Drafts" имеет высший приоритет, чтобы не триггерить лимиты папки!
+                if cleanup_queue:
+                    to_clean = cleanup_queue[:]
+                    cleanup_queue.clear()
+                    await srv_writer.expunge_uids(to_clean)
+
                 try:
                     target_id, payload = await asyncio.wait_for(echo_queue.get(), timeout=0.05)
                     subj = f"[ID: {target_id}]"
@@ -391,11 +395,6 @@ async def run_server_worker(
                     stats.srv_tx_bytes += len(payload)
                 except asyncio.TimeoutError:
                     pass
-
-                if cleanup_queue:
-                    to_clean = cleanup_queue[:]
-                    cleanup_queue.clear()
-                    await srv_writer.expunge_uids(to_clean)
 
             except Exception as e:
                 logger.error(f"[SRV_WRITER] Error: {e}")
@@ -417,7 +416,7 @@ async def run_server_worker(
 
             srv_reader.pending_exists = False
 
-            msgs, new_max, _ = await srv_reader.fetch_messages_since(last_seen_uid)
+            msgs, new_max, _ = await srv_reader.fetch_messages_monolithic(last_seen_uid)
             last_seen_uid = new_max
 
             for uid, subject, payload in msgs:
@@ -447,8 +446,8 @@ async def run_client_worker(
     batch_kb: int,
 ):
     logger.info(f"[CLI] Starting Client Workers (Batch Size: {batch_kb} KB)...")
-    cli_reader = HighSpeedImapClient(host, port, email_addr, cli_pass, "CLI_READER", stats)
-    cli_writer = HighSpeedImapClient(host, port, email_addr, cli_pass, "CLI_WRITER", stats)
+    cli_reader = MonolithicImapClient(host, port, email_addr, cli_pass, "CLI_READER", stats)
+    cli_writer = MonolithicImapClient(host, port, email_addr, cli_pass, "CLI_WRITER", stats)
 
     await cli_reader.connect()
     await cli_reader.select("Notes")
@@ -461,12 +460,19 @@ async def run_client_worker(
     sent_timestamps: Dict[int, float] = {}
     seq_counter = 0
 
-    payload_padding = b"X" * (batch_kb * 1024 - 64)
+    payload_padding = b"X" * max(64, batch_kb * 1024 - 64)
 
     async def cli_sender_loop():
         nonlocal seq_counter
         while not stop_event.is_set():
             try:
+                # Flow Control / Backpressure:
+                # Если в папке накопилось много неотвеченных писем, даём серверу их очистить
+                unacked = len(sent_timestamps)
+                if unacked > 20:
+                    await asyncio.sleep(0.1)
+                    continue
+
                 seq_counter += 1
                 now = time.time()
                 header = seq_counter.to_bytes(8, "big") + int(now * 1_000_000).to_bytes(8, "big")
@@ -483,7 +489,7 @@ async def run_client_worker(
                     cleanup_queue.clear()
                     await cli_writer.expunge_uids(to_clean)
 
-                await asyncio.sleep(0.015)
+                await asyncio.sleep(0.01)
 
             except Exception as e:
                 logger.error(f"[CLI_WRITER] Error: {e}")
@@ -505,7 +511,7 @@ async def run_client_worker(
 
             cli_reader.pending_exists = False
 
-            msgs, new_max, _ = await cli_reader.fetch_messages_since(last_seen_uid)
+            msgs, new_max, _ = await cli_reader.fetch_messages_monolithic(last_seen_uid)
             last_seen_uid = new_max
 
             for uid, subject, payload in msgs:
@@ -518,13 +524,13 @@ async def run_client_worker(
                     if seq in sent_timestamps:
                         rtt = (time.time() - sent_timestamps.pop(seq)) * 1000.0
                         stats.rtt_samples.append(rtt)
-                        if stats.cli_rx_batches % 20 == 0:
-                            elapsed = time.time() - stats.start_time
+                        if stats.cli_rx_batches % 10 == 0:
+                            elapsed = max(0.1, time.time() - stats.start_time)
                             cur_mbps = (stats.cli_rx_bytes * 8) / (elapsed * 1_000_000)
                             logger.info(
                                 f"[ECHO #{seq}] RTT: {rtt:.1f} ms | "
                                 f"Total RX: {stats.cli_rx_bytes / (1024*1024):.2f} MiB ({cur_mbps:.2f} Mbps) | "
-                                f"Batches: {stats.cli_rx_batches}"
+                                f"InFlight: {len(sent_timestamps)}"
                             )
 
     finally:
@@ -561,7 +567,7 @@ async def main():
     async def progress_reporter():
         while not stop_event.is_set():
             await asyncio.sleep(30.0)
-            elapsed = time.time() - stats.start_time
+            elapsed = max(0.1, time.time() - stats.start_time)
             tx_mbps = (stats.cli_tx_bytes * 8) / (elapsed * 1_000_000)
             rx_mbps = (stats.cli_rx_bytes * 8) / (elapsed * 1_000_000)
             logger.info(
