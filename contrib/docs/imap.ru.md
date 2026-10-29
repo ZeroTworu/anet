@@ -124,10 +124,10 @@ Content-Transfer-Encoding: base64
 * **На этапе Handshake (Фаза 1 и Фаза 3):**
   * Клиент $\to$ Сервер (`Drafts`): `Subject: {Prefix} [ID: <SRV_ID>:<Client_TempID>]`
     где `SRV_ID` — первые 8 hex-символов от `SHA256(server_pub_key_bytes)`, а `Client_TempID` — первые 8 hex-символов от `SHA256(client_ephemeral_or_pub_key)`.
-  * Сервер $\to$ Клиент (`Notes`, Фаза 2 и Фаза 4): `Subject: {Prefix} [ID: <Client_TempID>]`.
+  * Сервер $\to$ Клиент (`Notes`, Фаза 2 и Фаза 4): `Subject: [ID: <Client_TempID>]` (в приватной папке `"Notes"` префикс шаблона избыточен).
 * **На этапе Data Plane (после завершения Фазы 4 и получения `session_id`):**
   * Клиент $\to$ Сервер (`Drafts`): `Subject: {Prefix} [ID: <SRV_ID>:<session_id>]`
-  * Сервер $\to$ Клиент (`Notes`): `Subject: {Prefix} [ID: <session_id>]`
+  * Сервер $\to$ Клиент (`Notes`): `Subject: [ID: <session_id>]`
 
 ### 4.1. Генерация виртуального `SocketAddr` (Сторона Сервера)
 Поскольку `ServerAuthHandler` привязывает состояние Фазы 1 (`temp_dh_map`) к `SocketAddr`, IMAP-воркер сервера детерминированно конвертирует `Client_TempID` в уникальный виртуальный `SocketAddr`:
@@ -148,12 +148,13 @@ pub fn get_safe_fake_base(vpn_net_str: &str) -> Ipv4Addr {
     }
 }
 
-/// Превращает строковый TempID клиента из темы письма в уникальный виртуальный SocketAddr
+/// Превращает строковый TempID клиента из темы письма в детерминированный виртуальный SocketAddr
+/// для использования в качестве ключа во внутреннем temp_dh_map (ServerAuthHandler).
 pub fn fake_addr_from_cli_id(cli_id: &str, safe_base: Ipv4Addr) -> SocketAddr {
     let hash = Sha256::digest(cli_id.as_bytes());
     let base = safe_base.octets();
     let ip = Ipv4Addr::new(base[0], base[1], hash[2], hash[3]);
-    let port = u16::from_be_bytes([hash[4], hash[5]]).max(1);
+    let port = (u16::from_be_bytes([hash[4], hash[5]]) | 0x8000).max(1024);
     SocketAddr::new(std::net::IpAddr::V4(ip), port)
 }
 ```
@@ -181,8 +182,11 @@ if let Some(client_info) = local_sessions.get(cli_token).cloned()
         Some(info)
     })
 {
-    if let Ok(decrypted_batch) = unwrap_packet_bytes(&client_info.cipher, raw_payload) {
-        for pkt in unpack_batch(&decrypted_batch) {
+    // Обновляем метку последней активности для контроля TTL сессии
+    worker_ctx.registry.touch_client(&client_info);
+
+    if let Ok(decrypted_batch) = anet_common::transport::unwrap_packet(&client_info.cipher, &raw_payload) {
+        for pkt in anet_common::batcher::unpack_batch(&decrypted_batch) {
             if let Some(reply) = anet_common::icmp_probe::handle_in_tunnel_icmp_probe(&pkt) {
                 if let Some(dst_ip) = crate::utils::extract_ip_dst(&reply) {
                     worker_ctx.registry.route_packet_to_ipv4(dst_ip, reply).await;
@@ -280,7 +284,28 @@ pub struct Model {
 Транспорт **не использует** крейт `async-imap` (так как `async-imap` теряет нетегированные `* EXISTS` во время `UID FETCH` и тянет `rustls`).
 Вместо этого в `anet-common/src/imap_conn.rs` реализуется нативный асинхронный `ImapConn` поверх `tokio::io::BufReader<tokio_boring::SslStream<TcpStream>>`, использующий штатный **BoringSSL** коннектор из `anet-common/src/boring_tls.rs`.
 
-В `anet-common/src/boring_tls.rs` добавляется функция `connect_raw_tls_with_config(domain, stream, cfg)` без HTTP-специфичного ALPN (`h2`/`http/1.1`), чтобы на порту `993` ClientHello выглядел как классический TLS-клиент почтовой программы.
+В `anet-common/src/boring_tls.rs` добавляются функции создания сырого TLS-коннектора без HTTP/WS ALPN (`h2`/`http/1.1`):
+```rust
+/// Создает конфигурацию BoringSSL для «сырых» TLS-протоколов (IMAPS:993)
+pub fn build_raw_ssl_connector_with_config(cfg: &TlsClientConfig) -> anyhow::Result<SslConnectorBuilder> {
+    build_ssl_connector_base_with_config(cfg)
+}
+
+/// Выполняет асинхронный клиентский TLS-хендшейк для чистых TLS-протоколов (порт 993 IMAPS)
+pub async fn connect_raw_tls_with_config<S>(
+    domain: &str,
+    stream: S,
+    cfg: &TlsClientConfig,
+) -> anyhow::Result<tokio_boring::SslStream<S>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let builder = build_raw_ssl_connector_with_config(cfg)?;
+    let ssl = builder.build().configure()?.into_ssl(domain)?;
+    tokio_boring::connect(ssl, stream).await
+        .map_err(|e| anyhow::anyhow!("BoringSSL Raw TLS handshake failed for {domain}: {e}"))
+}
+```
 
 ### 7.2. Клиент (`anet-client-core`)
 1. **`config.rs`**:
@@ -289,23 +314,12 @@ pub struct Model {
    * В `ServerConfig::host_port()` добавить `"imap" | "imaps" => 993`, чтобы `AnetClient::connect_and_run` автоматически добавлял все IP-адреса `imap.mail.ru` в `route_manager.add_bypass_route()` (и в исключения `VpnService` на Android)!
    * В `ServerConfig::get_name()` добавить `TransportMode::Imap => "IMAP"`.
 2. **`transport/factory.rs`**: Добавить ветвление `TransportMode::Imap => Box::new(ImapTransport::new(config.clone(), server.clone()))`.
-3. Создать `transport/imap.rs` со следующими структурами:
-
-```rust
-struct ImapConfig {
-    host: String,
-    port: u16,
-    accounts: Vec<(String, String)>,
-    subject_prefix: String,
-    batch_ms: u64,
-    max_kb: usize,
-}
-
-pub struct ImapTransport {
-    config: CoreConfig,
-    server: ServerConfig,
-}
-```
+3. **Вынесение `PacketBatcher` в общее пространство:** Модуль пакетирования выносится из `anet-common/src/wrtc/batcher.rs` в `anet-common/src/batcher.rs` (с реэкспортом в `wrtc` для обратной совместимости).
+4. **Связывание с VPN-стеком через `tokio::io::duplex`:**
+   В методе `ImapTransport::connect()` создаётся локальный дуплексный канал `(client_stream, internal_router) = tokio::io::duplex(DUPLEX_BUFFER_SIZE)`.
+   * `client_stream` возвращается в `ConnectionResult { vpn_stream: Box::new(client_stream), ... }`.
+   * `internal_router` разделяется на `(reader, writer)`: накопитель `PacketBatcher` выгребает пакеты из `reader` и отправляет через `CLI_WRITER (APPEND "Drafts")`, а `CLI_READER (IDLE/FETCH "Notes")` распаковывает входящие батчи и инжектирует пакеты в `writer`.
+5. Создать `transport/imap.rs` со структурами конфигурации `ImapConfig` и реализацией `ClientTransport`.
 
 ### 7.3. Сервер (`anet-server`)
 1. **`config.rs`**: В структуру `ServerCoreConfig` добавить поле `pub imap_dsn: Option<String>`.
@@ -326,6 +340,64 @@ pub struct ImapTransport {
    }
    ```
 3. Создать модуль `servers/imap.rs` с реализацией пула воркеров для всех ящиков из `imap_dsn`.
+
+---
+
+## 7.4. Конфигурационные параметры в `client.toml` и `server.toml` (Все интервалы строго в миллисекундах!)
+
+### В `client.toml` / `client_template.toml`:
+```toml
+# =========================================================================
+# Тонкая настройка транспорта IMAP (секция [imap])
+# =========================================================================
+[imap]
+# Интервал перевхода в IDLE (keepalive) для проверки живости соединения (мс).
+# По умолчанию: 120000 мс (2 минуты).
+idle_refresh_interval_ms = 120000
+
+# Таймаут ожидания ответа на команду IMAP (APPEND, FETCH, DONE) (мс).
+# По умолчанию: 15000 мс (15 секунд).
+command_timeout_ms = 15000
+
+# Максимальная задержка накопления микро-батча перед первым APPEND (мс).
+# По умолчанию: 15 мс.
+batch_coalesce_ms = 15
+
+# Максимальный размер одного зашифрованного пакета-черновика (КБ).
+max_batch_kb = 32
+
+# Таймаут переподключения при получении THROTTLED/OVERQUOTA (мс).
+# По умолчанию: 30000 мс (30 секунд).
+throttle_backoff_ms = 30000
+```
+
+### В `server.toml`:
+```toml
+[server]
+# Строка подключения IMAP пула (DSN)
+imap_dsn = "imap://imap.mail.ru:993?acc=node1%40mail.ru:srv_pass1&acc=node2%40mail.ru:srv_pass2"
+
+[imap]
+# Время жизни неактивной клиентской сессии при отсутствии пакетов (мс).
+# По умолчанию: 180000 мс (3 минуты).
+session_ttl_ms = 180000
+
+# Интервал перевхода серверного воркера в IDLE (мс).
+# По умолчанию: 120000 мс (2 минуты).
+idle_refresh_interval_ms = 120000
+
+# Таймаут ожидания команды IMAP (мс).
+# По умолчанию: 15000 мс (15 секунд).
+command_timeout_ms = 15000
+
+# Интервал проверки и очистки зависших сессий (мс).
+# По умолчанию: 30000 мс (30 секунд).
+cleanup_interval_ms = 30000
+
+# Таймаут отката при рейт-лимитах провайдера (мс).
+# По умолчанию: 30000 мс (30 секунд).
+throttle_backoff_ms = 30000
+```
 
 ---
 
