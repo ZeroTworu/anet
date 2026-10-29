@@ -3,7 +3,8 @@
 IMAP Full Duplex High-Throughput Soak Test for ANet ASTP-over-IMAPS:993
 ======================================================================
 Универсальный парсер:
-  - Корректно извлекает UID независимо от порядка атрибутов Mail.ru (UID до или ПОСЛЕ {len});
+  - Использует валидный IMAP синтаксис BODY.PEEK[] вместо RFC822.PEEK;
+  - Корректно извлекает UID независимо от порядка атрибутов Mail.ru;
   - Читает литерал побайтово readexactly(len);
   - Парсит остаток строки до \r\n для захвата " UID <id>)";
   - Включает скользящее окно Backpressure (max 20 in-flight).
@@ -280,13 +281,14 @@ class RobustImapClient:
     async def fetch_messages_robust(self, last_uid: int) -> Tuple[List[Tuple[int, str, bytes]], int, float]:
         """
         Универсальный парсер FETCH ответа:
-        Извлекает {len}, читает тело строго побайтово, а затем парсит хвост строки.
-        Корректно работает, если UID стоит ПОСЛЕ литерала тела (специфика Mail.ru!).
+        Использует валидный IMAP синтаксис BODY.PEEK[] (вместо RFC822.PEEK).
+        Корректно считывает UID независимо от того, стоит он до или ПОСЛЕ литерала тела {len}.
         """
         t0 = time.time()
         tag = self.next_tag()
         start_uid = last_uid + 1
-        await self.send_line(f"{tag} UID FETCH {start_uid}:* (UID RFC822.PEEK)")
+        # По стандарту RFC 3501 валидный запрос полного сообщения без изменения флагов: BODY.PEEK[]
+        await self.send_line(f"{tag} UID FETCH {start_uid}:* (UID BODY.PEEK[])")
 
         messages = []
         new_max_uid = last_uid
