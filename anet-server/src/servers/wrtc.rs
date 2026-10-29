@@ -757,6 +757,7 @@ pub async fn run_wrtc_server(
                                                         biased;
                                                         packet_opt = rx_router.recv() => {
                                                             let Some(mut packet) = packet_opt else { break; };
+                                                            let mut burst_sent = 0usize;
 
                                                             loop {
                                                                 if packet.len() >= WRTC_MIN_IP_PACKET_LEN {
@@ -986,6 +987,12 @@ pub async fn run_wrtc_server(
                                                                             }
                                                                         }
                                                                     }
+                                                                }
+
+                                                                burst_sent += 1;
+                                                                if burst_sent >= 32 {
+                                                                    burst_sent = 0;
+                                                                    tokio::task::yield_now().await;
                                                                 }
 
                                                                 if let Some(next_p) = pending_packet.take() {

@@ -1,11 +1,11 @@
 use crate::config::WrtcConfig;
 use crate::consts::{
-    TAG_UNTAGGED, VP8_ASTP_PREFIX_LEN, VP8_INTERFRAME_HEADER, VP8_KEYFRAME_1080P_HEADER,
+    TAG_UNTAGGED, VP8_ASTP_PREFIX_LEN, VP8_KEYFRAME_1080P_HEADER,
     VP8_KEYFRAME_HEADER, WRTC_BURST_KEYFRAME_COUNT, WRTC_BURST_KEYFRAME_INTERVAL_MS,
     WRTC_COLIBRI_CHANNEL_CAPACITY, WRTC_CONSTRAINTS_RETRY_ATTEMPTS,
     WRTC_CONSTRAINTS_RETRY_INTERVAL_MS, WRTC_DC_SEND_MAX_RETRIES, WRTC_DC_SEND_RETRY_DELAY_MS,
     WRTC_ICE_GATHER_POLL_ATTEMPTS, WRTC_ICE_GATHER_POLL_INTERVAL_MS,
-    WRTC_INITIAL_FORCE_KEYFRAMES, WRTC_KEYFRAME_INTERVAL_MASK, WRTC_OPUS_CHANNELS,
+    WRTC_INITIAL_FORCE_KEYFRAMES, WRTC_OPUS_CHANNELS,
     WRTC_OPUS_CLOCK_RATE, WRTC_OPUS_PAYLOAD_TYPE, WRTC_OPUS_SILENCE_FRAME,
     WRTC_P2P_CHANNEL_CAPACITY, WRTC_REASSERT_FORCE_KEYFRAMES, WRTC_VIDEO_CHANNEL_CAPACITY,
     WRTC_VP8_CLOCK_RATE, WRTC_VP8_FALLBACK_PAYLOAD_TYPE, WRTC_VP8_PRIMARY_PAYLOAD_TYPE,
@@ -2216,7 +2216,7 @@ impl WrtcPeer {
         let elapsed_ms = self.start_instant.elapsed().as_millis() as u64;
         self.last_video_tx_ms.store(elapsed_ms, Ordering::Relaxed);
 
-        let force_kf = self
+        let _ = self
             .force_keyframe_remaining
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |rem| {
                 if rem > 0 {
@@ -2224,15 +2224,15 @@ impl WrtcPeer {
                 } else {
                     None
                 }
-            })
-            .is_ok();
+            });
 
+        // КРИТИЧНО: Всегда маркируем каждый RTP-пакет как самодостаточный VP8 Keyframe (P=0, 1920x1080).
+        // Использование P-frame (VP8_INTERFRAME_HEADER, P=1) приводит к тому, что при потере даже одного
+        // UDP-пакета на участке Server->JVB или JVB->Client фильтр Vp8AdaptiveTrackProjectionContext в JVB
+        // переходит в состояние needsKeyframe=true и отбрасывает ВСЕ последующие P-frame пакеты (включая
+        // одиночные TCP RTO ретрансляции!), вызывая замирание TCP-потоков в 0.00 bits/sec на 2–4 секунды.
         let vp8_hdr = if self.video_v2_enabled.load(Ordering::Relaxed) {
-            if force_kf || (frame_num & WRTC_KEYFRAME_INTERVAL_MASK) == 0 {
-                &VP8_KEYFRAME_1080P_HEADER
-            } else {
-                &VP8_INTERFRAME_HEADER
-            }
+            &VP8_KEYFRAME_1080P_HEADER
         } else {
             &VP8_KEYFRAME_HEADER
         };
