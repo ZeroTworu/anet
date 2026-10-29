@@ -372,11 +372,17 @@ impl ConnectivityMonitor {
         monitor.tunnel_rtt_ms.store(raw, Ordering::Relaxed);
 
         if monitor.vpn_connected.load(Ordering::Relaxed) {
-            let mut guard = monitor.last_snapshot.lock().unwrap();
-            if let Some(ref current) = *guard {
-                let updated = current.with_updated_tunnel_rtt(true, rtt_ms);
-                *guard = Some(updated.clone());
-                drop(guard);
+            let updated_opt = {
+                let mut guard = monitor.last_snapshot.lock().unwrap();
+                if let Some(ref current) = *guard {
+                    let updated = current.with_updated_tunnel_rtt(true, rtt_ms);
+                    *guard = Some(updated.clone());
+                    Some(updated)
+                } else {
+                    None
+                }
+            };
+            if let Some(updated) = updated_opt {
                 emit(AnetEvent::ConnectivityUpdated(updated));
             }
         }

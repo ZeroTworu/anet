@@ -105,18 +105,21 @@ impl ClientTransport for VncTransport {
         let sequence = Arc::new(AtomicU64::new(0));
         let stealth = self.config.stealth.clone();
 
-        tokio::spawn(async move {
+        let inbound =
+            tokio::spawn(receive_from_server(reader, tunnel_writer, cipher.clone()));
+        let inbound_abort = inbound.abort_handle();
+        let outbound = tokio::spawn(send_to_server(
+            tunnel_reader,
+            writer,
+            cipher,
+            sequence,
+            nonce_prefix,
+            stealth,
+        ));
+        let outbound_abort = outbound.abort_handle();
+
+        let supervisor_task = tokio::spawn(async move {
             let tunnel_start = std::time::Instant::now();
-            let inbound =
-                tokio::spawn(receive_from_server(reader, tunnel_writer, cipher.clone()));
-            let outbound = tokio::spawn(send_to_server(
-                tunnel_reader,
-                writer,
-                cipher,
-                sequence,
-                nonce_prefix,
-                stealth,
-            ));
 
             let (finished_worker, result) =
                 supervise_bidirectional_workers(inbound, outbound, "VNC").await;
@@ -139,6 +142,12 @@ impl ClientTransport for VncTransport {
                 ),
             }
         });
+        let supervisor_abort = supervisor_task.abort_handle();
+        let shutdown_hook: super::ShutdownHook = Box::pin(async move {
+            supervisor_abort.abort();
+            inbound_abort.abort();
+            outbound_abort.abort();
+        });
 
         Ok(ConnectionResult {
             auth_response,
@@ -149,7 +158,7 @@ impl ClientTransport for VncTransport {
             remote_ip: Some(addr.ip()), // Передаем IP в bypass
             bypass_ips: Vec::new(),
             effective_mode: None,
-            shutdown_hook: None,
+            shutdown_hook: Some(shutdown_hook),
         })
     }
 }

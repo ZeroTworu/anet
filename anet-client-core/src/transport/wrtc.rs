@@ -658,6 +658,8 @@ impl ClientTransport for WrtcTransport {
             }
         });
 
+        let p2p_handshake_aborts: Arc<std::sync::Mutex<Vec<tokio::task::AbortHandle>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
         let spawn_p2p_handshake = {
             let p2p_store = p2p_session_opt.clone();
             let p2p_neg_flag = p2p_negotiating.clone();
@@ -665,6 +667,7 @@ impl ClientTransport for WrtcTransport {
             let target_srv = target_server_id.clone();
             let wrtc_cfg_p2p = self.config.wrtc.clone();
             let xmpp_for_p2p = xmpp_arc.clone();
+            let p2p_aborts = p2p_handshake_aborts.clone();
 
             move |reason_label: &'static str| {
                 if p2p_neg_flag
@@ -680,7 +683,7 @@ impl ClientTransport for WrtcTransport {
                 let wrtc_cfg_p2p = wrtc_cfg_p2p.clone();
                 let xmpp_for_p2p = xmpp_for_p2p.clone();
 
-                tokio::spawn(async move {
+                let handshake_task = tokio::spawn(async move {
                     info!(
                         "[P2P Direct] {reason_label}: initiating Relay-Only WebRTC P2P DataChannel with server {target_srv}..."
                     );
@@ -763,6 +766,11 @@ impl ClientTransport for WrtcTransport {
                     }
                     p2p_neg_flag.store(false, Ordering::SeqCst);
                 });
+                {
+                    let mut guard = p2p_aborts.lock().unwrap();
+                    guard.retain(|h| !h.is_finished());
+                    guard.push(handshake_task.abort_handle());
+                }
             }
         };
 
@@ -793,6 +801,7 @@ impl ClientTransport for WrtcTransport {
                 }
             }
         });
+        let tunnel_writer_abort = tunnel_writer_task.abort_handle();
 
         let peer_tx = shared_peer.clone();
         let target_srv_tx = target_server_id.clone();
@@ -818,7 +827,7 @@ impl ClientTransport for WrtcTransport {
         let last_pong_tx = last_pong.clone();
         let mut batcher = PacketBatcher::new(WRTC_BATCHER_MAX_BYTES, WRTC_BATCHER_MAX_DELAY_MS);
 
-        tokio::spawn(async move {
+        let uplink_task = tokio::spawn(async move {
             const VIDEO_WARMUP_PAYLOAD: [u8; 16] = [
                 VIDEO_BATCH_MARKER,
                 0xFF,
@@ -1137,7 +1146,7 @@ impl ClientTransport for WrtcTransport {
         let tun_inject_ws = tun_inject_tx.clone();
         let p2p_sig = p2p_session_opt.clone();
 
-        tokio::spawn(async move {
+        let ws_rx_task = tokio::spawn(async move {
             loop {
                 let msg_opt = peer_rx.recv().await;
                 match msg_opt {
@@ -1239,7 +1248,7 @@ impl ClientTransport for WrtcTransport {
         let cipher_p2p = cipher.clone();
         let tun_inject_p2p = tun_inject_tx.clone();
 
-        tokio::spawn(async move {
+        let p2p_rx_worker = tokio::spawn(async move {
             loop {
                 let p2p_opt = {
                     let guard = p2p_rx_task.lock().await;
@@ -1285,6 +1294,9 @@ impl ClientTransport for WrtcTransport {
                         }
                     }
                 }
+                if tun_inject_p2p.is_closed() {
+                    break;
+                }
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         });
@@ -1293,12 +1305,13 @@ impl ClientTransport for WrtcTransport {
         let cipher_video = cipher.clone();
         let tun_inject_video = tun_inject_tx.clone();
 
-        if wrtc_mode == anet_common::wrtc::colibri::WrtcMode::MediaVideo
-            || wrtc_mode == anet_common::wrtc::colibri::WrtcMode::Auto {
+        let constraints_task = if wrtc_mode == anet_common::wrtc::colibri::WrtcMode::MediaVideo
+            || wrtc_mode == anet_common::wrtc::colibri::WrtcMode::Auto
+        {
             let first_rx_clone = first_client_rx.clone();
             let peer_reassert = shared_peer.clone();
             let srv_ep_reassert = target_server_id.clone();
-            tokio::spawn(async move {
+            Some(tokio::spawn(async move {
                 for _ in 0..WRTC_CLIENT_CONSTRAINTS_REASSERT_COUNT {
                     tokio::time::sleep(Duration::from_secs(
                         WRTC_CLIENT_CONSTRAINTS_REASSERT_INTERVAL_SECS,
@@ -1314,9 +1327,11 @@ impl ClientTransport for WrtcTransport {
                     let _ = peer_reassert.send_video_constraints(&constraints).await;
                     log::debug!("[WRTC Client] Periodic re-assertion of ReceiverVideoConstraints for server endpoint {srv_ep_reassert}");
                 }
-            });
-        }
-        tokio::spawn(async move {
+            }))
+        } else {
+            None
+        };
+        let video_rx_task = tokio::spawn(async move {
             'outer: while let Some(mut raw_frame) = peer_video_rx.recv_video_frame().await {
                 let mut drained = 0usize;
                 loop {
@@ -1391,6 +1406,20 @@ impl ClientTransport for WrtcTransport {
         let p2p_shutdown = Arc::clone(&p2p_session_opt);
         let shutdown_hook: super::ShutdownHook = Box::pin(async move {
             xmpp_jingle_task.abort();
+            uplink_task.abort();
+            ws_rx_task.abort();
+            p2p_rx_worker.abort();
+            if let Some(t) = constraints_task {
+                t.abort();
+            }
+            video_rx_task.abort();
+            tunnel_writer_abort.abort();
+            {
+                let mut guard = p2p_handshake_aborts.lock().unwrap();
+                for h in guard.drain(..) {
+                    h.abort();
+                }
+            }
             if let Some(p2p) = p2p_shutdown.lock().await.take() {
                 p2p.close().await;
             }

@@ -13,6 +13,7 @@ pub enum ConnectionState {
     Disconnected,
     Connecting,
     Connected,
+    Stopping,
 }
 
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]

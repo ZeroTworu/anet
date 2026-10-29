@@ -209,7 +209,7 @@ impl ClientTransport for WebSocketTransport {
         let (client_stream, internal_router) = tokio::io::duplex(512 * 1024);
         let (mut tunnel_read, mut tunnel_write) = tokio::io::split(internal_router);
 
-        tokio::spawn(async move {
+        let supervisor_task = tokio::spawn(async move {
             let mut socket = initial_socket;
             let mut key = initial_key;
             let mut current_response = initial_response;
@@ -391,6 +391,10 @@ impl ClientTransport for WebSocketTransport {
             close_browser_session(&mut socket).await;
             info!("[WebSocket] Transport supervisor stopped");
         });
+        let supervisor_abort = supervisor_task.abort_handle();
+        let shutdown_hook: super::ShutdownHook = Box::pin(async move {
+            supervisor_abort.abort();
+        });
 
         Ok(ConnectionResult {
             auth_response,
@@ -401,7 +405,7 @@ impl ClientTransport for WebSocketTransport {
             remote_ip, // Передаем IP для добавления в bypass
             bypass_ips: Vec::new(),
             effective_mode: None,
-            shutdown_hook: None,
+            shutdown_hook: Some(shutdown_hook),
         })
     }
 }

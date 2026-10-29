@@ -159,7 +159,8 @@ fn render_connectivity_shield_card(app: &mut ANetApp, ui: &mut egui::Ui) {
     let vpn_state = crate::utils::helpers::lock_ignore_poison(&app.shared).state;
     let shield_pulse = match vpn_state {
         crate::types::ConnectionState::Disconnected => PulseColor::Red,
-        crate::types::ConnectionState::Connecting => PulseColor::Yellow,
+        crate::types::ConnectionState::Connecting
+        | crate::types::ConnectionState::Stopping => PulseColor::Yellow,
         crate::types::ConnectionState::Connected => {
             if snap.condition == NetworkCondition::TunnelFullOnline || snap.global_ok > 0 {
                 PulseColor::Green

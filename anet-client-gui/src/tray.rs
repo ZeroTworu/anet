@@ -130,19 +130,27 @@ impl TrayBackground {
 
                     match current_state {
                         ConnectionState::Disconnected => {
+                            toggle_vpn_item.set_enabled(true);
                             toggle_vpn_item.set_text("🟢 Подключить VPN");
                             let _ = tray_icon.set_tooltip(Some("ANet VPN (Отключено)"));
                             if !muted { Self::notify_disconnected(); }
                         }
                         ConnectionState::Connecting => {
+                            toggle_vpn_item.set_enabled(true);
                             toggle_vpn_item.set_text("🔴 Отменить подключение");
                             let _ = tray_icon.set_tooltip(Some("ANet VPN (Подключение...)"));
                             if !muted { Self::notify_connecting(); }
                         }
                         ConnectionState::Connected => {
+                            toggle_vpn_item.set_enabled(true);
                             toggle_vpn_item.set_text("🔴 Отключить VPN");
                             let _ = tray_icon.set_tooltip(Some("ANet VPN (Подключено)"));
                             if !muted { Self::notify_connected(); }
+                        }
+                        ConnectionState::Stopping => {
+                            toggle_vpn_item.set_enabled(false);
+                            toggle_vpn_item.set_text("⏳ Остановка VPN...");
+                            let _ = tray_icon.set_tooltip(Some("ANet VPN (Остановка...)"));
                         }
                     }
                 }

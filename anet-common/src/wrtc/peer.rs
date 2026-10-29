@@ -350,6 +350,7 @@ struct PeerEvents {
     expected_peer_video_ssrc: Arc<AtomicU32>,
     first_video_rx: Arc<AtomicBool>,
     local_video_ssrc: u32,
+    bg_tasks: Arc<std::sync::Mutex<Vec<tokio::task::AbortHandle>>>,
 }
 
 #[async_trait::async_trait]
@@ -401,7 +402,7 @@ impl PeerConnectionEventHandler for PeerEvents {
             let expected_ssrc = self.expected_peer_video_ssrc.clone();
             let first_rx = self.first_video_rx.clone();
             let local_v_ssrc = self.local_video_ssrc;
-            tokio::spawn(async move {
+            let t = tokio::spawn(async move {
                 while let Some(event) = track.poll().await {
                     match event {
                         TrackRemoteEvent::OnRtpPacket(pkt) => {
@@ -463,14 +464,20 @@ impl PeerConnectionEventHandler for PeerEvents {
                     }
                 }
             });
+            if let Ok(mut guard) = self.bg_tasks.lock() {
+                guard.push(t.abort_handle());
+            }
         } else if kind == RtpCodecKind::Audio {
-            tokio::spawn(async move {
+            let t = tokio::spawn(async move {
                 while let Some(event) = track.poll().await {
                     if matches!(event, TrackRemoteEvent::OnEnded) {
                         break;
                     }
                 }
             });
+            if let Ok(mut guard) = self.bg_tasks.lock() {
+                guard.push(t.abort_handle());
+            }
         }
     }
 
@@ -488,7 +495,7 @@ impl PeerConnectionEventHandler for PeerEvents {
         let dc_is_open_c = self.dc_is_open.clone();
         let dc_poll = Arc::clone(&data_channel);
 
-        tokio::spawn(async move {
+        let t = tokio::spawn(async move {
             while let Some(event) = dc_poll.poll().await {
                 match event {
                     DataChannelEvent::OnOpen => {
@@ -513,6 +520,9 @@ impl PeerConnectionEventHandler for PeerEvents {
                 }
             }
         });
+        if let Ok(mut guard) = self.bg_tasks.lock() {
+            guard.push(t.abort_handle());
+        }
     }
 }
 
@@ -567,6 +577,7 @@ pub struct P2pSession {
     pub active_ice_servers: std::sync::Mutex<Vec<RTCIceServer>>,
     pub bg_tasks: std::sync::Mutex<Vec<tokio::task::AbortHandle>>,
     pub peer_close_timeout_secs: u64,
+    pub pc_closed: AtomicBool,
 }
 
 impl P2pSession {
@@ -668,11 +679,13 @@ impl P2pSession {
                 handle.abort();
             }
         }
-        let _ = tokio::time::timeout(
-            Duration::from_secs(self.peer_close_timeout_secs.max(1)),
-            self.pc.close(),
-        )
-        .await;
+        if !self.pc_closed.swap(true, Ordering::SeqCst) {
+            let _ = tokio::time::timeout(
+                Duration::from_secs(self.peer_close_timeout_secs.max(1)),
+                self.pc.close(),
+            )
+            .await;
+        }
     }
 }
 
@@ -686,11 +699,15 @@ impl Drop for P2pSession {
                 handle.abort();
             }
         }
-        let pc = Arc::clone(&self.pc);
-        let close_secs = self.peer_close_timeout_secs.max(1);
-        tokio::spawn(async move {
-            let _ = tokio::time::timeout(Duration::from_secs(close_secs), pc.close()).await;
-        });
+        if !self.pc_closed.swap(true, Ordering::SeqCst) {
+            let pc = Arc::clone(&self.pc);
+            let close_secs = self.peer_close_timeout_secs.max(1);
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    let _ = tokio::time::timeout(Duration::from_secs(close_secs), pc.close()).await;
+                });
+            }
+        }
     }
 }
 
@@ -997,6 +1014,7 @@ pub async fn create_p2p_channel(
         active_ice_servers: std::sync::Mutex::new(active_ice_servers),
         bg_tasks: std::sync::Mutex::new(vec![dc_task.abort_handle()]),
         peer_close_timeout_secs: wrtc_cfg.peer_close_timeout_secs.max(1),
+        pc_closed: AtomicBool::new(false),
     })
 }
 
@@ -1036,10 +1054,11 @@ pub struct WrtcPeer {
     pub local_candidates_summary: Vec<String>,
     pub turns_proxies: Vec<TurnsProxyHandle>,
     pub active_ice_servers: std::sync::Mutex<Vec<RTCIceServer>>,
-    pub bg_tasks: std::sync::Mutex<Vec<tokio::task::AbortHandle>>,
+    pub bg_tasks: Arc<std::sync::Mutex<Vec<tokio::task::AbortHandle>>>,
     pub watchdog_disconnected_timeout_ms: u64,
     pub watchdog_channel_grace_secs: u64,
     pub peer_close_timeout_secs: u64,
+    pub pc_closed: AtomicBool,
 }
 
 impl WrtcPeer {
@@ -1094,7 +1113,8 @@ impl WrtcPeer {
         let active_video_constraints: Arc<std::sync::Mutex<Option<ReceiverVideoConstraints>>> =
             Arc::new(std::sync::Mutex::new(None));
 
-        let mut bg_tasks: Vec<tokio::task::AbortHandle> = Vec::new();
+        let bg_tasks: Arc<std::sync::Mutex<Vec<tokio::task::AbortHandle>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
 
         if let Some(session) = session_opt {
             if let Some(ref ws_url) = session.transport.colibri_ws_url {
@@ -1323,7 +1343,9 @@ impl WrtcPeer {
                         tokio::time::sleep(Duration::from_millis(500)).await;
                     }
                 });
-                bg_tasks.push(ws_task.abort_handle());
+                if let Ok(mut g) = bg_tasks.lock() {
+                    g.push(ws_task.abort_handle());
+                }
             }
         }
 
@@ -1436,6 +1458,7 @@ impl WrtcPeer {
                     expected_peer_video_ssrc: expected_peer_video_ssrc.clone(),
                     first_video_rx: first_video_rx.clone(),
                     local_video_ssrc,
+                    bg_tasks: bg_tasks.clone(),
                 });
 
                 match PeerConnectionBuilder::new()
@@ -1534,7 +1557,7 @@ impl WrtcPeer {
                             let in_tx = incoming_tx.clone();
                             let active_constraints_dc = active_video_constraints.clone();
 
-                            tokio::spawn(async move {
+                            let dc_poll_task = tokio::spawn(async move {
                                 while let Some(event) = dc_in.poll().await {
                                     match event {
                                         DataChannelEvent::OnOpen => {
@@ -1574,6 +1597,9 @@ impl WrtcPeer {
                                     }
                                 }
                             });
+                            if let Ok(mut g) = bg_tasks.lock() {
+                                g.push(dc_poll_task.abort_handle());
+                            }
                             data_channel_res = Some(dc);
                         }
                         Err(e) => {
@@ -1796,7 +1822,9 @@ impl WrtcPeer {
                         }
                     }
                 });
-                bg_tasks.push(sender_task.abort_handle());
+                if let Ok(mut g) = bg_tasks.lock() {
+                    g.push(sender_task.abort_handle());
+                }
 
                 let track_keepalive = Arc::clone(&audio_track);
                 let seq_c = Arc::new(AtomicU16::new(0));
@@ -1858,7 +1886,9 @@ impl WrtcPeer {
                         }
                     }
                 });
-                bg_tasks.push(opus_task.abort_handle());
+                if let Ok(mut g) = bg_tasks.lock() {
+                    g.push(opus_task.abort_handle());
+                }
 
                 let video_track_keepalive = Arc::clone(&video_track);
                 let video_seq_c = Arc::clone(&video_seq);
@@ -1943,7 +1973,9 @@ impl WrtcPeer {
                         }
                     }
                 });
-                bg_tasks.push(vp8_task.abort_handle());
+                if let Ok(mut g) = bg_tasks.lock() {
+                    g.push(vp8_task.abort_handle());
+                }
 
                 peer_connection_opt = Some(pc);
                 data_channel_opt = data_channel_res;
@@ -1988,13 +2020,14 @@ impl WrtcPeer {
             local_candidates_summary,
             turns_proxies,
             active_ice_servers: std::sync::Mutex::new(active_ice_servers),
-            bg_tasks: std::sync::Mutex::new(bg_tasks),
+            bg_tasks,
             watchdog_disconnected_timeout_ms: wrtc_cfg
                 .watchdog_disconnected_timeout_secs
                 .saturating_mul(1000)
                 .max(1000),
             watchdog_channel_grace_secs: wrtc_cfg.watchdog_channel_grace_secs.max(1),
             peer_close_timeout_secs: wrtc_cfg.peer_close_timeout_secs.max(1),
+            pc_closed: AtomicBool::new(false),
         })
     }
 
@@ -2044,7 +2077,7 @@ impl WrtcPeer {
             let video_v2_c = Arc::clone(&self.video_v2_enabled);
             let v_pt = self.video_payload_type;
             let v_ssrc = self.video_ssrc;
-            tokio::spawn(async move {
+            let kf_task = tokio::spawn(async move {
                 for _ in 0..WRTC_BURST_KEYFRAME_COUNT {
                     let frame_num = video_ts_c.fetch_add(1, Ordering::Relaxed);
                     let seq = (frame_num & 0xFFFF) as u16;
@@ -2084,6 +2117,10 @@ impl WrtcPeer {
                     tokio::time::sleep(Duration::from_millis(WRTC_BURST_KEYFRAME_INTERVAL_MS)).await;
                 }
             });
+            if let Ok(mut g) = self.bg_tasks.lock() {
+                g.retain(|h| !h.is_finished());
+                g.push(kf_task.abort_handle());
+            }
         }
     }
 
@@ -2361,9 +2398,11 @@ impl WrtcPeer {
                 handle.abort();
             }
         }
-        let close_secs = self.peer_close_timeout_secs;
-        if let Some(ref pc) = self.peer_connection {
-            let _ = tokio::time::timeout(Duration::from_secs(close_secs), pc.close()).await;
+        if !self.pc_closed.swap(true, Ordering::SeqCst) {
+            let close_secs = self.peer_close_timeout_secs;
+            if let Some(ref pc) = self.peer_connection {
+                let _ = tokio::time::timeout(Duration::from_secs(close_secs), pc.close()).await;
+            }
         }
         Ok(())
     }
@@ -2379,11 +2418,15 @@ impl Drop for WrtcPeer {
                 handle.abort();
             }
         }
-        let close_secs = self.peer_close_timeout_secs;
-        if let Some(pc) = self.peer_connection.take() {
-            tokio::spawn(async move {
-                let _ = tokio::time::timeout(Duration::from_secs(close_secs), pc.close()).await;
-            });
+        if !self.pc_closed.swap(true, Ordering::SeqCst) {
+            let close_secs = self.peer_close_timeout_secs;
+            if let Some(pc) = self.peer_connection.take() {
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    handle.spawn(async move {
+                        let _ = tokio::time::timeout(Duration::from_secs(close_secs), pc.close()).await;
+                    });
+                }
+            }
         }
     }
 }

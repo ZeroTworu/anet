@@ -128,19 +128,21 @@ impl ClientTransport for SshTransport {
         let stealth = self.config.stealth.clone();
 
         let ssh_session = session;
+        let outbound = tokio::spawn(send_to_server(
+            tunnel_reader,
+            writer,
+            stealth,
+            cipher.clone(),
+            sequence,
+            nonce_prefix,
+        ));
+        let outbound_abort = outbound.abort_handle();
+        let inbound = tokio::spawn(receive_from_server(reader, tunnel_writer, cipher));
+        let inbound_abort = inbound.abort_handle();
 
-        tokio::spawn(async move {
+        let supervisor_task = tokio::spawn(async move {
             let tunnel_start = std::time::Instant::now();
             let _session_guard = ssh_session;
-            let outbound = tokio::spawn(send_to_server(
-                tunnel_reader,
-                writer,
-                stealth,
-                cipher.clone(),
-                sequence,
-                nonce_prefix,
-            ));
-            let inbound = tokio::spawn(receive_from_server(reader, tunnel_writer, cipher));
 
             let (finished_worker, result) =
                 supervise_bidirectional_workers(inbound, outbound, "SSH").await;
@@ -163,6 +165,12 @@ impl ClientTransport for SshTransport {
                 ),
             }
         });
+        let supervisor_abort = supervisor_task.abort_handle();
+        let shutdown_hook: super::ShutdownHook = Box::pin(async move {
+            supervisor_abort.abort();
+            inbound_abort.abort();
+            outbound_abort.abort();
+        });
 
         Ok(ConnectionResult {
             auth_response,
@@ -173,7 +181,7 @@ impl ClientTransport for SshTransport {
             remote_ip: Some(address.ip()),
             bypass_ips: Vec::new(),
             effective_mode: None,
-            shutdown_hook: None,
+            shutdown_hook: Some(shutdown_hook),
         })
     }
 }

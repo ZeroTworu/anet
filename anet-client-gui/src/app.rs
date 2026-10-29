@@ -1347,14 +1347,19 @@ impl ANetApp {
     }
 
     pub fn start_vpn(&mut self) {
-        let mut guard = lock_ignore_poison(&self.shared);
-        if guard.state != ConnectionState::Disconnected {
-            return;
-        }
-        if let Some(client_clone) = guard.client.clone() {
-            guard.state = ConnectionState::Connecting;
-            drop(guard);
+        let client_opt = {
+            let mut guard = lock_ignore_poison(&self.shared);
+            if guard.state != ConnectionState::Disconnected {
+                None
+            } else if let Some(client_clone) = guard.client.clone() {
+                guard.state = ConnectionState::Connecting;
+                Some(client_clone)
+            } else {
+                None
+            }
+        };
 
+        if let Some(client_clone) = client_opt {
             let shared_clone = self.shared.clone();
             self.rt.spawn(async move {
                 if let Err(e) = client_clone.start().await {
@@ -1366,13 +1371,27 @@ impl ANetApp {
     }
 
     pub fn stop_vpn(&mut self) {
-        let mut guard = lock_ignore_poison(&self.shared);
-        if let Some(client_clone) = guard.client.clone() {
-            guard.state = ConnectionState::Disconnected;
-            drop(guard);
+        let client_opt = {
+            let mut guard = lock_ignore_poison(&self.shared);
+            if matches!(guard.state, ConnectionState::Disconnected | ConnectionState::Stopping) {
+                None
+            } else if let Some(client_clone) = guard.client.clone() {
+                guard.state = ConnectionState::Stopping;
+                Some(client_clone)
+            } else {
+                guard.state = ConnectionState::Disconnected;
+                None
+            }
+        };
 
+        if let Some(client_clone) = client_opt {
+            let shared_clone = self.shared.clone();
             self.rt.spawn(async move {
                 let _ = client_clone.stop().await;
+                let mut guard = lock_ignore_poison(&shared_clone);
+                if guard.state == ConnectionState::Stopping {
+                    guard.state = ConnectionState::Disconnected;
+                }
             });
         }
     }

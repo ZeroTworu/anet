@@ -1032,60 +1032,94 @@ pub extern "system" fn Java_org_alco_anet_ANetVpnService_connectVpn(
     rt_handle.spawn(async move {
         let client = {
             let _lifecycle = CLIENT_LIFECYCLE.lock().await;
-            if CLIENT_GENERATION.load(Ordering::SeqCst) != generation { return; }
+            if CLIENT_GENERATION.load(Ordering::SeqCst) != generation {
+                return;
+            }
             let old_client = CLIENT.lock().unwrap().take();
             if let Some(client) = old_client {
                 info!("Rust JNI: Stopping old active client task...");
                 let _ = client.stop().await;
             }
-            if CLIENT_GENERATION.load(Ordering::SeqCst) != generation { return; }
+            crate::android_impl::shutdown_active_tun().await;
+            if CLIENT_GENERATION.load(Ordering::SeqCst) != generation {
+                return;
+            }
             if let Err(error) = config.sanitize() {
-                client_state(ClientState::Failed, format!("Invalid configuration: {error}"), None);
+                client_state(
+                    ClientState::Failed,
+                    format!("Invalid configuration: {error}"),
+                    None,
+                );
                 return;
             }
 
-        let has_groups = config.servers.iter().any(|s| {
-            s.group_name.as_ref().map_or(false, |g| !g.trim().is_empty())
-        });
+            let has_groups = config.servers.iter().any(|s| {
+                s.group_name
+                    .as_ref()
+                    .map_or(false, |g| !g.trim().is_empty())
+            });
 
-        if has_groups {
-            let selected_group_id = if !selected_server.is_empty() {
-                selected_server.clone()
-            } else {
-                config.servers.iter()
-                    .find_map(|s| {
-                        if s.group_name.as_deref().map_or(true, |g| g.trim().is_empty()) { return None; }
-                        Some(s.group_id.as_deref().unwrap_or(s.group_name.as_ref().unwrap()).trim().to_string())
+            if has_groups {
+                let selected_group_id = if !selected_server.is_empty() {
+                    selected_server.clone()
+                } else {
+                    config
+                        .servers
+                        .iter()
+                        .find_map(|s| {
+                            if s.group_name.as_deref().map_or(true, |g| g.trim().is_empty()) {
+                                return None;
+                            }
+                            Some(
+                                s.group_id
+                                    .as_deref()
+                                    .unwrap_or(s.group_name.as_ref().unwrap())
+                                    .trim()
+                                    .to_string(),
+                            )
+                        })
+                        .unwrap_or_default()
+                };
+
+                let mut group_servers: Vec<_> = config
+                    .servers
+                    .iter()
+                    .filter(|s| {
+                        if s.group_name.as_deref().map_or(true, |g| g.trim().is_empty()) {
+                            return false;
+                        }
+                        let g_id = s
+                            .group_id
+                            .as_deref()
+                            .unwrap_or(s.group_name.as_ref().unwrap())
+                            .trim();
+                        g_id == selected_group_id.as_str()
                     })
-                    .unwrap_or_default()
-            };
+                    .cloned()
+                    .collect();
 
-            let mut group_servers: Vec<_> = config.servers
-                .iter()
-                .filter(|s| {
-                    if s.group_name.as_deref().map_or(true, |g| g.trim().is_empty()) { return false; }
-                    let g_id = s.group_id.as_deref().unwrap_or(s.group_name.as_ref().unwrap()).trim();
-                    g_id == selected_group_id.as_str()
-                })
-                .cloned()
-                .collect();
+                group_servers.sort_by(|a, b| b.weight().cmp(&a.weight()));
 
-            group_servers.sort_by(|a, b| b.weight().cmp(&a.weight()));
-
-            if !group_servers.is_empty() {
-                config.servers = group_servers;
-                anet_client_core::events::status(format!("Группа выбрана (id): {}", selected_group_id));
+                if !group_servers.is_empty() {
+                    config.servers = group_servers;
+                    anet_client_core::events::status(format!(
+                        "Группа выбрана (id): {}",
+                        selected_group_id
+                    ));
+                }
+            } else if !selected_server.is_empty() {
+                if let Some(idx) = config
+                    .servers
+                    .iter()
+                    .position(|s| s.dsn == selected_server || s.get_name() == selected_server)
+                {
+                    config.servers.rotate_left(idx);
+                    anet_client_core::events::status(format!(
+                        "Приоритет установлен: {}",
+                        selected_server
+                    ));
+                }
             }
-        } else if !selected_server.is_empty() {
-            if let Some(idx) = config
-                .servers
-                .iter()
-                .position(|s| s.dsn == selected_server || s.get_name() == selected_server)
-            {
-                config.servers.rotate_left(idx);
-                anet_client_core::events::status(format!("Приоритет установлен: {}", selected_server));
-            }
-        }
 
             let bypass_ips = Arc::new(std::sync::Mutex::new(Vec::new()));
             let tun_factory = Box::new(AndroidCallbackTunFactory::new(
@@ -1105,7 +1139,9 @@ pub extern "system" fn Java_org_alco_anet_ANetVpnService_connectVpn(
             Ok(_) => info!("Rust: VPN Loop exited cleanly"),
             Err(e) => {
                 error!("Rust: VPN Start Failed: {}", e);
-                client_state(ClientState::Failed, format!("VPN start failed: {e}"), None);
+                if CLIENT_GENERATION.load(Ordering::SeqCst) == generation {
+                    client_state(ClientState::Failed, format!("VPN start failed: {e}"), None);
+                }
             }
         }
     });
@@ -1131,7 +1167,7 @@ pub extern "system" fn Java_org_alco_anet_ANetVpnService_stopVpn(_env: JNIEnv, _
     info!("Rust: stopVpn JNI trigger received");
     client_state(ClientState::Stopping, "Stopping VPN", None);
 
-    CLIENT_GENERATION.fetch_add(1, Ordering::SeqCst);
+    let stop_gen = CLIENT_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
     crate::android_impl::reset_tun_session_flags();
 
     let rt_handle_opt = {
@@ -1145,6 +1181,7 @@ pub extern "system" fn Java_org_alco_anet_ANetVpnService_stopVpn(_env: JNIEnv, _
             client_guard.take()
         };
         rt_handle.block_on(async move {
+            crate::android_impl::shutdown_active_tun().await;
             if let Some(client) = initial_client {
                 info!("Rust JNI: Sending immediate stop signal to active client...");
                 let _ = client.stop().await;
@@ -1155,18 +1192,23 @@ pub extern "system" fn Java_org_alco_anet_ANetVpnService_stopVpn(_env: JNIEnv, _
             )
             .await
             {
-                let late_client = {
-                    let mut client_guard = CLIENT.lock().unwrap();
-                    client_guard.take()
-                };
-                if let Some(client) = late_client {
-                    let _ = client.stop().await;
+                if CLIENT_GENERATION.load(Ordering::SeqCst) == stop_gen {
+                    let late_client = {
+                        let mut client_guard = CLIENT.lock().unwrap();
+                        client_guard.take()
+                    };
+                    if let Some(client) = late_client {
+                        let _ = client.stop().await;
+                    }
+                    crate::android_impl::shutdown_active_tun().await;
                 }
             }
         });
     }
-    client_state(ClientState::Stopped, "VPN stopped", None);
-    status("VPN Stopped");
+    if CLIENT_GENERATION.load(Ordering::SeqCst) == stop_gen {
+        client_state(ClientState::Stopped, "VPN stopped", None);
+        status("VPN Stopped");
+    }
 }
 
 #[unsafe(no_mangle)]

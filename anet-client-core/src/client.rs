@@ -47,7 +47,11 @@ struct RunningSession {
     reconnect_signal: Arc<Notify>,
     disconnect_reason: Arc<Mutex<String>>,
     main_task: JoinHandle<()>,
-    stats_task: Option<JoinHandle<()>>,
+    t1_abort: tokio::task::AbortHandle,
+    t2_abort: tokio::task::AbortHandle,
+    health_abort: tokio::task::AbortHandle,
+    aux_aborts: Vec<tokio::task::AbortHandle>,
+    dns_aborts: Arc<Mutex<Vec<tokio::task::AbortHandle>>>,
     iface_name: String,
     shutdown_hook: Option<crate::transport::ShutdownHook>,
 }
@@ -62,6 +66,7 @@ pub struct AnetClient {
     stop_requested: AtomicBool,
     is_active: AtomicBool,
     cancel_signal: Arc<Notify>,
+    active_finished_notify: Arc<Notify>,
 }
 
 impl AnetClient {
@@ -88,6 +93,7 @@ impl AnetClient {
             stop_requested: AtomicBool::new(false),
             is_active: AtomicBool::new(false),
             cancel_signal: Arc::new(Notify::new()),
+            active_finished_notify: Arc::new(Notify::new()),
         }
     }
 
@@ -208,12 +214,14 @@ impl AnetClient {
 
         if self.stop_requested.load(Ordering::SeqCst) {
             self.is_active.store(false, Ordering::SeqCst);
+            self.active_finished_notify.notify_waiters();
             return Ok(());
         }
 
         let mut config_clone = self.config.clone();
         if let Err(e) = config_clone.sanitize() {
             self.is_active.store(false, Ordering::SeqCst);
+            self.active_finished_notify.notify_waiters();
             client_state(ClientState::Failed, format!("Config error: {}", e), None);
             return Err(e);
         }
@@ -223,6 +231,7 @@ impl AnetClient {
         if self.stop_requested.load(Ordering::SeqCst) {
             info!("[Core] Stop requested during initial rules sync. Exiting.");
             self.is_active.store(false, Ordering::SeqCst);
+            self.active_finished_notify.notify_waiters();
             return Ok(());
         }
         crate::connectivity_monitor::ConnectivityMonitor::ensure_started(
@@ -334,6 +343,7 @@ impl AnetClient {
         }
 
         self.is_active.store(false, Ordering::SeqCst);
+        self.active_finished_notify.notify_waiters();
         Ok(())
     }
 
@@ -442,13 +452,17 @@ impl AnetClient {
         let connect_fut = transport.connect();
         let stop_flag = &self.stop_requested;
 
-        let result = tokio::select! {
+        let mut result = tokio::select! {
             res = tokio::time::timeout(conn_timeout, connect_fut) => {
                 match res {
                     Ok(Ok(auth_res)) => auth_res,
                     Ok(Err(e)) => return Err(e),
                     Err(_) => return Err(anyhow::anyhow!("Connection handshake timed out")),
                 }
+            }
+            _ = self.cancel_signal.notified() => {
+                info!("[Core] Handshake cancelled by user.");
+                return Ok(());
             }
             _ = async {
                 loop {
@@ -465,6 +479,12 @@ impl AnetClient {
 
         if self.stop_requested.load(Ordering::SeqCst) {
             info!("[Core] Connection cancelled before configuring tunnel.");
+            if let Some(hook) = result.shutdown_hook.take() {
+                let _ = tokio::time::timeout(Duration::from_millis(800), hook).await;
+            }
+            if let Some(ref endpoint) = result.endpoint {
+                endpoint.close(0u32.into(), b"cancelled");
+            }
             return Ok(());
         }
 
@@ -532,6 +552,7 @@ impl AnetClient {
         let local_overrides = Arc::new(anet_filter_core::LocalOverrides::from_config(
             &config_clone.routing.overrides,
         ));
+        let mut aux_aborts: Vec<tokio::task::AbortHandle> = Vec::new();
         let rule_cache = self.rule_cache.clone();
         if let Some(rules_server_url) = config_clone.get_rules_server_url() {
             // Добавляем IP сервера правил в обход туннеля для фоновых ETag-обновлений
@@ -562,7 +583,7 @@ impl AnetClient {
             let rc_bg = rule_cache.clone();
             let url_bg = rules_server_url.clone();
             let shutdown_bg = self.cancel_signal.clone();
-            tokio::spawn(async move {
+            let rules_bg_task = tokio::spawn(async move {
                 loop {
                     tokio::select! {
                         _ = sleep(Duration::from_secs(600)) => {
@@ -574,6 +595,7 @@ impl AnetClient {
                     }
                 }
             });
+            aux_aborts.push(rules_bg_task.abort_handle());
         }
 
         let per_app_requested = cfg!(all(windows, feature = "per-app"))
@@ -630,6 +652,15 @@ impl AnetClient {
 
         if self.stop_requested.load(Ordering::SeqCst) {
             info!("[Core] Connection cancelled before acquiring packet source.");
+            for h in aux_aborts.drain(..) {
+                h.abort();
+            }
+            if let Some(hook) = result.shutdown_hook.take() {
+                let _ = tokio::time::timeout(Duration::from_millis(800), hook).await;
+            }
+            if let Some(ref endpoint) = result.endpoint {
+                endpoint.close(0u32.into(), b"cancelled");
+            }
             let _ = self.route_manager.restore_routes().await;
             return Ok(());
         }
@@ -677,7 +708,7 @@ impl AnetClient {
                 config_clone.connectivity.ping_interval_secs.clamp(1, 30),
             );
 
-            tokio::spawn(async move {
+            let icmp_probe_task = tokio::spawn(async move {
                 let mut seq: u16 = 0;
                 // Небольшая задержка перед первым зондом для завершения инициализации туннеля
                 tokio::select! {
@@ -706,7 +737,13 @@ impl AnetClient {
                     }
                 }
             });
+            aux_aborts.push(icmp_probe_task.abort_handle());
         }
+
+        let dns_aborts: Arc<Mutex<Vec<tokio::task::AbortHandle>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let dns_aborts_t1 = dns_aborts.clone();
+        let dns_aborts_t2 = dns_aborts.clone();
 
         let (mut stream_reader, mut stream_writer) = io_split(result.vpn_stream);
 
@@ -750,7 +787,7 @@ impl AnetClient {
                         let tun_tx_c = tx_to_tun_dns.clone();
                         let probe_tx_c = tx_probe_dns.clone();
                         let rm_c = route_manager_dns.clone();
-                        tokio::spawn(async move {
+                        let dns_task = tokio::spawn(async move {
                             if let Some((reply_pkt, resolved_ips)) =
                                 interceptor_c.resolve_direct_dns_packet(&pkt_c, &dns_c).await
                             {
@@ -772,6 +809,11 @@ impl AnetClient {
                                 let _ = probe_tx_c.send(pkt_c).await;
                             }
                         });
+                        {
+                            let mut guard = dns_aborts_t1.lock().unwrap();
+                            guard.retain(|h| !h.is_finished());
+                            guard.push(dns_task.abort_handle());
+                        }
                         return false;
                     }
                     crate::dns_interceptor::InterceptResult::PassThrough => {}
@@ -950,7 +992,7 @@ impl AnetClient {
                                                 .map(|ip| (*ip, if ip.is_ipv4() { 32 } else { 128 }))
                                                 .collect();
                                             let rm_bg = route_manager_rx.clone();
-                                            tokio::spawn(async move {
+                                            let dns_rx_task = tokio::spawn(async move {
                                                 let _ = rm_bg.add_bypass_routes(&routes).await;
                                                 log::info!(
                                                     "[DNS/Direct] Domain '{}' resolved via tunnel -> added OS bypass routes for {:?}",
@@ -958,6 +1000,11 @@ impl AnetClient {
                                                     resolved_ips
                                                 );
                                             });
+                                            {
+                                                let mut guard = dns_aborts_t2.lock().unwrap();
+                                                guard.retain(|h| !h.is_finished());
+                                                guard.push(dns_rx_task.abort_handle());
+                                            }
                                         }
                                     }
 
@@ -1242,7 +1289,7 @@ impl AnetClient {
         });
 
         let stats_shutdown = shutdown_notify.clone();
-        let stats_task = {
+        {
             let provider: Arc<dyn statistic::StatsProvider> =
                 if let Some(ref conn) = result.connection {
                     Arc::new(statistic::QuicStatsProvider::new(conn.clone()))
@@ -1269,51 +1316,62 @@ impl AnetClient {
 
             let fast_handle =
                 statistic::start_fast_stats_monitor(full_provider.clone(), stats_shutdown.clone());
+            aux_aborts.push(fast_handle.abort_handle());
 
             let slow_handle = if config_clone.stats.enabled {
-                Some(statistic::start_stats_monitor(
+                let h = statistic::start_stats_monitor(
                     full_provider,
                     config_clone.stats.interval_minutes,
                     stats_shutdown,
-                ))
+                );
+                aux_aborts.push(h.abort_handle());
+                Some(h)
             } else {
                 None
             };
 
-            Some(spawn(async move {
+            let joined = spawn(async move {
                 if let Some(slow) = slow_handle {
                     let _ = tokio::join!(fast_handle, slow);
                 } else {
                     let _ = fast_handle.await;
                 }
-            }))
+            });
+            aux_aborts.push(joined.abort_handle());
+        };
+
+        let t1_abort = t1.abort_handle();
+        let t2_abort = t2.abort_handle();
+        let health_abort = health_task.abort_handle();
+        let main_task = tokio::spawn(async move {
+            let _ = tokio::join!(t1, t2);
+        });
+
+        let running_session = RunningSession {
+            endpoint: result.endpoint,
+            shutdown_notify: shutdown_notify.clone(),
+            reconnect_signal: reconnect_signal.clone(),
+            disconnect_reason: disconnect_reason.clone(),
+            main_task,
+            t1_abort,
+            t2_abort,
+            health_abort: health_abort.clone(),
+            aux_aborts,
+            dns_aborts,
+            iface_name: iface_name.clone(),
+            shutdown_hook: result.shutdown_hook,
         };
 
         if self.stop_requested.load(Ordering::SeqCst) {
             info!("[Core] Connection cancelled before storing session.");
             status("[Core] Connection cancelled before storing session.");
-            if let Some(hook) = result.shutdown_hook {
-                let _ = tokio::time::timeout(Duration::from_millis(500), hook).await;
-            }
-            let _ = self.dns_manager.restore_dns(&iface_name);
-            let _ = self.route_manager.restore_routes().await;
+            self.cleanup_running_session(running_session).await;
             return Ok(());
         }
 
         {
             let mut state = self.session.lock().unwrap();
-            *state = Some(RunningSession {
-                endpoint: result.endpoint,
-                shutdown_notify: shutdown_notify.clone(),
-                reconnect_signal: reconnect_signal.clone(),
-                disconnect_reason: disconnect_reason.clone(),
-                main_task: tokio::spawn(async move {
-                    let _ = tokio::join!(t1, t2);
-                }),
-                stats_task,
-                iface_name: iface_name.clone(),
-                shutdown_hook: result.shutdown_hook,
-            });
+            *state = Some(running_session);
         }
 
         let billing_str =
@@ -1474,32 +1532,52 @@ impl AnetClient {
         info!("[Core] Cleaning up dead session...");
         status("[Core] Cleaning up dead session...");
         shutdown_notify.notify_waiters();
-        health_task.abort();
+        health_abort.abort();
 
         let session_to_clean = {
             let mut state = self.session.lock().unwrap();
             state.take()
         };
         if let Some(sess) = session_to_clean {
-            if let Some(hook) = sess.shutdown_hook {
-                let _ = tokio::time::timeout(Duration::from_millis(500), hook).await;
-            }
-            if let Some(ref endpoint) = sess.endpoint {
-                endpoint.close(0u32.into(), b"reconnecting");
-            }
-            if let Some(task) = sess.stats_task {
-                task.abort();
-            }
-            sess.shutdown_notify.notify_waiters();
-            if tokio::time::timeout(Duration::from_secs(2), sess.main_task).await.is_err() {
-                warn!("[Core] Main task did not finish in 2s during cleanup, proceeding");
+            self.cleanup_running_session(sess).await;
+        }
+
+        Ok(())
+    }
+
+    async fn cleanup_running_session(&self, mut running: RunningSession) {
+        running.shutdown_notify.notify_waiters();
+        running.health_abort.abort();
+        for h in running.aux_aborts.drain(..) {
+            h.abort();
+        }
+        {
+            let mut dns_guard = running.dns_aborts.lock().unwrap();
+            for h in dns_guard.drain(..) {
+                h.abort();
             }
         }
 
-        let _ = self.dns_manager.restore_dns(&iface_name);
-        let _ = self.route_manager.restore_routes().await;
+        if let Some(hook) = running.shutdown_hook.take() {
+            let _ = tokio::time::timeout(Duration::from_millis(1200), hook).await;
+        }
 
-        Ok(())
+        if let Some(ref endpoint) = running.endpoint {
+            endpoint.close(0u32.into(), b"session closed");
+        }
+
+        if tokio::time::timeout(Duration::from_millis(300), &mut running.main_task)
+            .await
+            .is_err()
+        {
+            warn!("[Core] Main task did not finish in 300ms, aborting tunnel workers...");
+            running.t1_abort.abort();
+            running.t2_abort.abort();
+            let _ = tokio::time::timeout(Duration::from_millis(200), &mut running.main_task).await;
+        }
+
+        let _ = self.dns_manager.restore_dns(&running.iface_name);
+        let _ = self.route_manager.restore_routes().await;
     }
 
     pub fn trigger_reconnect(&self) {
@@ -1532,34 +1610,28 @@ impl AnetClient {
             running.shutdown_notify.notify_waiters();
             running.reconnect_signal.notify_one();
 
-            if let Some(hook) = running.shutdown_hook {
-                let _ = tokio::time::timeout(Duration::from_millis(500), hook).await;
-            }
-
-            if let Some(task) = running.stats_task {
-                task.abort();
-            }
-
-            if tokio::time::timeout(Duration::from_millis(500), running.main_task).await.is_err() {
-                warn!("[Core] Main task did not exit in 500ms, proceeding with teardown");
-            }
-
-            if let Some(endpoint) = running.endpoint {
-                endpoint.close(0u32.into(), b"Disconnected by user");
-            }
-
-            let _ = self.dns_manager.restore_dns(&running.iface_name);
+            self.cleanup_running_session(running).await;
+        } else if self.is_active.load(Ordering::SeqCst) {
+            info!("[Core] Stopping VPN (cancelling active connection attempt)...");
+            status("[Core] Stopping VPN...");
+            client_state(ClientState::Stopping, "Stopping VPN", None);
             let _ = self.route_manager.restore_routes().await;
-            info!("[Core] VPN Stopped.");
-            status("[Core] VPN Stopped.");
-            crate::connectivity_monitor::ConnectivityMonitor::set_vpn_connected(false);
-            client_state(ClientState::Stopped, "VPN stopped", None);
         } else {
             info!("[Core] VPN Stopped (no active session).");
-            status("[Core] VPN Stopped.");
-            crate::connectivity_monitor::ConnectivityMonitor::set_vpn_connected(false);
-            client_state(ClientState::Stopped, "VPN stopped", None);
         }
+
+        let wait_start = Instant::now();
+        while self.is_active.load(Ordering::SeqCst) && wait_start.elapsed() < Duration::from_secs(2) {
+            tokio::select! {
+                _ = self.active_finished_notify.notified() => {}
+                _ = sleep(Duration::from_millis(25)) => {}
+            }
+        }
+
+        info!("[Core] VPN Stopped.");
+        status("[Core] VPN Stopped.");
+        crate::connectivity_monitor::ConnectivityMonitor::set_vpn_connected(false);
+        client_state(ClientState::Stopped, "VPN stopped", None);
         Ok(())
     }
 }

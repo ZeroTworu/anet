@@ -33,13 +33,18 @@ impl DirectIpCache {
 
     /// Проверяет наличие IP в кэше и валидность TTL
     pub fn check(&self, ip: &IpAddr) -> Option<RuleAction> {
-        if let Some(entry) = self.entries.get(ip) {
-            if Instant::now() < entry.expires_at {
-                return Some(entry.action);
+        let expired = {
+            if let Some(entry) = self.entries.get(ip) {
+                if Instant::now() < entry.expires_at {
+                    return Some(entry.action);
+                }
+                true
             } else {
-                drop(entry);
-                self.entries.remove(ip);
+                false
             }
+        };
+        if expired {
+            self.entries.remove(ip);
         }
         None
     }

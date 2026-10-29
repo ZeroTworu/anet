@@ -61,6 +61,15 @@ pub fn render_connect_button(
                 "STOP",
                 "ЗАЩИТА АКТИВНА",
             ),
+            ConnectionState::Stopping => {
+                ctx.request_repaint();
+                (
+                    egui::Color32::from_rgb(251, 191, 36),
+                    egui::Color32::from_rgb(244, 63, 94),
+                    "STOPPING",
+                    "ОСТАНОВКА...",
+                )
+            }
         };
 
         // 1. Анимация мягкого свечения при наведении (Hover Glow)
@@ -91,8 +100,8 @@ pub fn render_connect_button(
             }
         }
 
-        // 2. АНИМАЦИЯ CONNECTING: Пульсирующая расходящаяся градиентная волна сонара
-        if state == ConnectionState::Connecting {
+        // 2. АНИМАЦИЯ CONNECTING / STOPPING: Пульсирующая расходящаяся градиентная волна сонара
+        if matches!(state, ConnectionState::Connecting | ConnectionState::Stopping) {
             let wave_progress = (time * 1.1).fract(); // 0.0 -> 1.0
             let wave_radius = ring_radius + wave_progress * 18.0;
             let wave_alpha = ((1.0 - wave_progress).powi(2) * 120.0) as u8;
@@ -123,8 +132,8 @@ pub fn render_connect_button(
         );
 
         // 4. Отрисовка основного цветного градиентного кольца
-        if state == ConnectionState::Connecting {
-            // В режиме Connecting: приглушенный градиентный фон + вращающаяся градиентная комета
+        if matches!(state, ConnectionState::Connecting | ConnectionState::Stopping) {
+            // В режиме Connecting / Stopping: приглушенный градиентный фон + вращающаяся градиентная комета
             let dim_top = egui::Color32::from_rgba_unmultiplied(color_top.r(), color_top.g(), color_top.b(), 45);
             let dim_bot = egui::Color32::from_rgba_unmultiplied(color_bottom.r(), color_bottom.g(), color_bottom.b(), 45);
             let segments = 64;
@@ -211,7 +220,7 @@ pub fn render_connect_button(
         );
 
 
-        // 7. Главный текст кнопки (CONNECT / CONNECTING / STOP)
+        // 7. Главный текст кнопки (CONNECT / CONNECTING / STOP / STOPPING)
         let title_font = egui::FontId::new(20.0, egui::FontFamily::Name("Inter-V".into()));
         let title_pos = egui::pos2(center.x, center.y);
         ui.painter().text(
@@ -261,9 +270,10 @@ pub fn render_connect_button(
                         app.start_vpn();
                     }
                 }
-                _ => {
+                ConnectionState::Connecting | ConnectionState::Connected => {
                     app.stop_vpn();
                 }
+                ConnectionState::Stopping => {}
             }
         }
     });

@@ -48,13 +48,38 @@ pub fn toggle_vpn(
     rt_handle: &Handle,
     _logs: &Arc<Mutex<Vec<String>>>
 ) {
-    let mut guard = lock_ignore_poison(shared);
+    enum ToggleAction {
+        Start(Arc<anet_client_core::client::AnetClient>),
+        Stop(Arc<anet_client_core::client::AnetClient>),
+        Noop,
+    }
 
-    if guard.state == ConnectionState::Disconnected {
-        if let Some(client_clone) = guard.client.clone() {
-            guard.state = ConnectionState::Connecting;
-            drop(guard);
+    let action = {
+        let mut guard = lock_ignore_poison(shared);
+        match guard.state {
+            ConnectionState::Disconnected => {
+                if let Some(client_clone) = guard.client.clone() {
+                    guard.state = ConnectionState::Connecting;
+                    ToggleAction::Start(client_clone)
+                } else {
+                    ToggleAction::Noop
+                }
+            }
+            ConnectionState::Connecting | ConnectionState::Connected => {
+                if let Some(client_clone) = guard.client.clone() {
+                    guard.state = ConnectionState::Stopping;
+                    ToggleAction::Stop(client_clone)
+                } else {
+                    guard.state = ConnectionState::Disconnected;
+                    ToggleAction::Noop
+                }
+            }
+            ConnectionState::Stopping => ToggleAction::Noop,
+        }
+    };
 
+    match action {
+        ToggleAction::Start(client_clone) => {
             let shared_clone = shared.clone();
             rt_handle.spawn(async move {
                 if let Err(e) = client_clone.start().await {
@@ -63,13 +88,17 @@ pub fn toggle_vpn(
                 }
             });
         }
-    } else if let Some(client_clone) = guard.client.clone() {
-        guard.state = ConnectionState::Disconnected;
-        drop(guard);
-
-        rt_handle.spawn(async move {
-            let _ = client_clone.stop().await;
-        });
+        ToggleAction::Stop(client_clone) => {
+            let shared_clone = shared.clone();
+            rt_handle.spawn(async move {
+                let _ = client_clone.stop().await;
+                let mut guard = lock_ignore_poison(&shared_clone);
+                if guard.state == ConnectionState::Stopping {
+                    guard.state = ConnectionState::Disconnected;
+                }
+            });
+        }
+        ToggleAction::Noop => {}
     }
 }
 

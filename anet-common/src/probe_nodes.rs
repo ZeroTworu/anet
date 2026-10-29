@@ -497,9 +497,10 @@ async fn resolve_socket_addr(host_port: &str) -> Result<SocketAddr> {
 async fn measure_tcp_connect_rtt(host_port: &str, max_wait: Duration) -> Option<u32> {
     let addr = timeout(max_wait, resolve_socket_addr(host_port)).await.ok()?.ok()?;
     let started = Instant::now();
-    let stream = timeout(max_wait, TcpStream::connect(addr)).await.ok()?.ok()?;
-    let rtt = started.elapsed().as_millis().max(1) as u32;
-    drop(stream);
+    let rtt = {
+        let _stream = timeout(max_wait, TcpStream::connect(addr)).await.ok()?.ok()?;
+        started.elapsed().as_millis().max(1) as u32
+    };
     Some(rtt)
 }
 
@@ -512,9 +513,8 @@ async fn measure_host_pure_rtt(addr: SocketAddr, max_wait: Duration) -> Option<u
         futs.push(async move {
             let started = Instant::now();
             match timeout(max_wait, TcpStream::connect(candidate)).await {
-                Ok(Ok(stream)) => {
+                Ok(Ok(_stream)) => {
                     let rtt = started.elapsed().as_millis().max(1) as u32;
-                    drop(stream);
                     Some(rtt)
                 }
                 _ => None,
@@ -1070,13 +1070,20 @@ pub async fn probe_single_target(
     target: &ProbeTarget,
     timeout_dur: Duration,
 ) -> EndpointProbeResult {
-    let res = match target.protocol {
-        ProbeProtocol::Quic => probe_quic(target, timeout_dur).await,
-        ProbeProtocol::Ssh => probe_ssh(target, timeout_dur).await,
-        ProbeProtocol::Vnc => probe_vnc(target, timeout_dur).await,
-        ProbeProtocol::Ws => probe_ws(target, timeout_dur).await,
-        ProbeProtocol::Ahttp => probe_ahttp(target, timeout_dur).await,
-        ProbeProtocol::Wrtc => probe_wrtc(target, timeout_dur).await,
+    let hard_limit = timeout_dur + Duration::from_millis(500);
+    let inner_fut = async {
+        match target.protocol {
+            ProbeProtocol::Quic => probe_quic(target, timeout_dur).await,
+            ProbeProtocol::Ssh => probe_ssh(target, timeout_dur).await,
+            ProbeProtocol::Vnc => probe_vnc(target, timeout_dur).await,
+            ProbeProtocol::Ws => probe_ws(target, timeout_dur).await,
+            ProbeProtocol::Ahttp => probe_ahttp(target, timeout_dur).await,
+            ProbeProtocol::Wrtc => probe_wrtc(target, timeout_dur).await,
+        }
+    };
+    let res = match timeout(hard_limit, inner_fut).await {
+        Ok(r) => r,
+        Err(_) => Err(anyhow!("Probe timed out")),
     };
 
     match res {
@@ -1169,16 +1176,18 @@ where
 
     for (pos, target) in targets.iter().cloned().enumerate() {
         let sem = semaphore.clone();
-        futures.push(tokio::spawn(async move {
-            let _permit = sem.acquire_owned().await.ok();
-            let res = probe_single_target(&target, timeout_dur).await;
+        futures.push(async move {
+            let res = {
+                let _permit = sem.acquire_owned().await.ok();
+                probe_single_target(&target, timeout_dur).await
+            };
             (pos, res)
-        }));
+        });
     }
 
     let mut completed_endpoints = 0usize;
-    while let Some(joined) = futures.next().await {
-        if let Ok((pos, res)) = joined {
+    while let Some((pos, res)) = futures.next().await {
+        {
             if pos < current_endpoints.len() {
                 current_endpoints[pos] = res;
             }

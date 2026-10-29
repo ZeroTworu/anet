@@ -274,6 +274,7 @@ impl ClientTransport for AHttpTransport {
                 if tunnel_packet_tx.send(packet).await.is_err() { break; }
             }
         });
+        let tunnel_reader_abort = tunnel_reader_task.abort_handle();
 
         let padding_step = self.config.stealth.padding_step;
         let config_ahttp = self.config.ahttp.clone();
@@ -285,11 +286,15 @@ impl ClientTransport for AHttpTransport {
 
         let rx_reassembler = Arc::new(Mutex::new(ReassemblyQueue::new(config_ahttp.reassembly_queue_max_size)));
         let concurrency_semaphore = Arc::new(tokio::sync::Semaphore::new(config_ahttp.concurrency));
+        let concurrency_sem_shutdown = concurrency_semaphore.clone();
         let tunnel_write_mutex = Arc::new(Mutex::new(tunnel_write));
         let downlink_notify = Arc::new(tokio::sync::Notify::new());
         let downlink_credits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let inflight_aborts: Arc<std::sync::Mutex<Vec<tokio::task::AbortHandle>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let inflight_aborts_loop = inflight_aborts.clone();
 
-        tokio::spawn(async move {
+        let traffic_loop_task = tokio::spawn(async move {
             // Приоритет бюджета Uplink-батча: ?budget=... в DSN -> ?cdn=1 (49152 B) -> uplink_coalesce_budget_bytes -> coalesce_budget_bytes
             let uplink_budget_bytes = dsn_budget_override
                 .or(if dsn_cdn_mode { Some(49152) } else { None })
@@ -426,97 +431,99 @@ impl ClientTransport for AHttpTransport {
                 let downlink_credits_clone = downlink_credits.clone();
                 let max_concurrency = config_ahttp.concurrency;
 
-                tokio::spawn(async move {
-                    let mut success = false;
-                    let mut attempts = 0;
+                let req_task = tokio::spawn(async move {
                     let mut rx_bytes_total = 0usize;
                     let mut rx_pkts_total = 0usize;
 
-                    if !payload.is_empty() {
-                        debug!("[AHTTP Client] >>> Sending {} bytes ({} packets)", payload.len(), tx_pkts_count);
-                    }
+                    {
+                        let _permit = permit;
+                        let mut success = false;
+                        let mut attempts = 0;
 
-                    // Seamless Reconnect: Повторяем до 5 раз при обрывах со стороны CDN
-                    while attempts < 5 {
-                        let req = worker_client
-                            .request(uplink_method_clone.clone(), &traffic_url_clone)
-                            .header("Accept", "*/*");
-                        let req = profile_ul_clone.apply_to_reqwest(
-                            req,
-                            Some(&origin_ul_clone),
-                            Some(&referer_ul_clone),
-                        );
-
-                        // Передаем payload.clone() — zero-copy для Bytes
-                        let res = req.body(reqwest::Body::from(payload.clone())).send().await;
-
-                        match res {
-                            Ok(resp) if resp.status().is_success() => {
-                                if let Ok(body) = resp.bytes().await {
-                                    if !body.is_empty() {
-                                        rx_bytes_total = body.len();
-                                        debug!("[AHTTP Client] <<< Received {} bytes", rx_bytes_total);
-                                        let mut cursor = std::io::Cursor::new(body);
-                                        let mut unpacked_batch = Vec::with_capacity(64);
-
-                                        // 1. Дешифруем все пакеты ответа БЕЗ удержания мьютексов
-                                        while let Ok(Some(encrypted_packet)) = read_next_packet(&mut cursor).await {
-                                            if let Ok((seq, decrypted)) = unwrap_packet_with_seq(&cipher_ul_clone, encrypted_packet) {
-                                                unpacked_batch.push((seq, decrypted));
-                                            }
-                                        }
-
-                                        let rx_pkts_count = unpacked_batch.len();
-                                        rx_pkts_total = rx_pkts_count;
-                                        if rx_pkts_count > 0 {
-                                            // 2. Один раз берем лок сборщика и вставляем весь батч
-                                            let ready_packets = {
-                                                let mut reassembler = rx_reassembler_clone.lock().await;
-                                                reassembler.insert_batch(unpacked_batch)
-                                            };
-
-                                            // 3. Собираем готовые пакеты в единый буфер и пишем в туннель за ОДИН вызов write_all
-                                            if !ready_packets.is_empty() {
-                                                let mut out_buf = BytesMut::with_capacity(ready_packets.len() * 1500);
-                                                for packet in ready_packets {
-                                                    frame_packet_into(&mut out_buf, &packet);
-                                                }
-                                                let mut tunnel_write_guard = tunnel_write_clone.lock().await;
-                                                if tunnel_write_guard.write_all(&out_buf).await.is_err() {
-                                                    warn!("[AHTTP Client] Tunnel stream closed, discarding remaining packets.");
-                                                }
-                                            }
-                                        }
-                                        debug!("[AHTTP Client] <<< Unpacked {} valid packets", rx_pkts_count);
-                                    }
-                                }
-                                success = true;
-                                break;
-                            }
-                            Ok(resp) => {
-                                warn!("[AHTTP Client] CDN returned HTTP {}", resp.status());
-                                if resp.status() == reqwest::StatusCode::UNAUTHORIZED || resp.status() == reqwest::StatusCode::NOT_FOUND {
-                                    break;
-                                }
-                            }
-                            Err(e) => {
-                                debug!("[AHTTP Client] Request failed: {}", e);
-                            }
+                        if !payload.is_empty() {
+                            debug!("[AHTTP Client] >>> Sending {} bytes ({} packets)", payload.len(), tx_pkts_count);
                         }
 
-                        attempts += 1;
-                        tokio::time::sleep(Duration::from_millis(50)).await;
-                    }
+                        // Seamless Reconnect: Повторяем до 5 раз при обрывах со стороны CDN
+                        while attempts < 5 {
+                            let req = worker_client
+                                .request(uplink_method_clone.clone(), &traffic_url_clone)
+                                .header("Accept", "*/*");
+                            let req = profile_ul_clone.apply_to_reqwest(
+                                req,
+                                Some(&origin_ul_clone),
+                                Some(&referer_ul_clone),
+                            );
 
-                    if !success && !payload.is_empty() {
-                        warn!("[AHTTP Client] Traffic exchange transaction failed after retries. Payload dropped.");
-                    }
+                            // Передаем payload.clone() — zero-copy для Bytes
+                            let res = req.body(reqwest::Body::from(payload.clone())).send().await;
 
-                    drop(permit);
+                            match res {
+                                Ok(resp) if resp.status().is_success() => {
+                                    if let Ok(body) = resp.bytes().await {
+                                        if !body.is_empty() {
+                                            rx_bytes_total = body.len();
+                                            debug!("[AHTTP Client] <<< Received {} bytes", rx_bytes_total);
+                                            let mut cursor = std::io::Cursor::new(body);
+                                            let mut unpacked_batch = Vec::with_capacity(64);
+
+                                            // 1. Дешифруем все пакеты ответа БЕЗ удержания мьютексов
+                                            while let Ok(Some(encrypted_packet)) = read_next_packet(&mut cursor).await {
+                                                if let Ok((seq, decrypted)) = unwrap_packet_with_seq(&cipher_ul_clone, encrypted_packet) {
+                                                    unpacked_batch.push((seq, decrypted));
+                                                }
+                                            }
+
+                                            let rx_pkts_count = unpacked_batch.len();
+                                            rx_pkts_total = rx_pkts_count;
+                                            if rx_pkts_count > 0 {
+                                                // 2. Один раз берем лок сборщика и вставляем весь батч
+                                                let ready_packets = {
+                                                    let mut reassembler = rx_reassembler_clone.lock().await;
+                                                    reassembler.insert_batch(unpacked_batch)
+                                                };
+
+                                                // 3. Собираем готовые пакеты в единый буфер и пишем в туннель за ОДИН вызов write_all
+                                                if !ready_packets.is_empty() {
+                                                    let mut out_buf = BytesMut::with_capacity(ready_packets.len() * 1500);
+                                                    for packet in ready_packets {
+                                                        frame_packet_into(&mut out_buf, &packet);
+                                                    }
+                                                    let mut tunnel_write_guard = tunnel_write_clone.lock().await;
+                                                    if tunnel_write_guard.write_all(&out_buf).await.is_err() {
+                                                        warn!("[AHTTP Client] Tunnel stream closed, discarding remaining packets.");
+                                                    }
+                                                }
+                                            }
+                                            debug!("[AHTTP Client] <<< Unpacked {} valid packets", rx_pkts_count);
+                                        }
+                                    }
+                                    success = true;
+                                    break;
+                                }
+                                Ok(resp) => {
+                                    warn!("[AHTTP Client] CDN returned HTTP {}", resp.status());
+                                    if resp.status() == reqwest::StatusCode::UNAUTHORIZED || resp.status() == reqwest::StatusCode::NOT_FOUND {
+                                        break;
+                                    }
+                                }
+                                Err(e) => {
+                                    debug!("[AHTTP Client] Request failed: {}", e);
+                                }
+                            }
+
+                            attempts += 1;
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                        }
+
+                        if !success && !payload.is_empty() {
+                            warn!("[AHTTP Client] Traffic exchange transaction failed after retries. Payload dropped.");
+                        }
+                    }
 
                     // Downlink Self-Clocking: если сервер прислал данные, немедленно (без ожидания poll_timeout_ms)
                     // будим диспетчер для отправки следующего запроса; при получении полного пакета (>= 1300 байт)
-                    // или 2+ пакетов — агрессивно наращиваем число параллельных poll-запросов до max_concurrency.
+                    // или 2+ пакетов — агрессивно нарассиваем число параллельных poll-запросов до max_concurrency.
                     if rx_pkts_total > 0 {
                         if rx_bytes_total >= 1300 || rx_pkts_total >= 2 {
                             let _ = downlink_credits_clone.fetch_update(Ordering::AcqRel, Ordering::Acquire, |c| {
@@ -528,6 +535,11 @@ impl ClientTransport for AHttpTransport {
                         downlink_notify_clone.notify_one();
                     }
                 });
+                {
+                    let mut guard = inflight_aborts_loop.lock().unwrap();
+                    guard.retain(|h| !h.is_finished());
+                    guard.push(req_task.abort_handle());
+                }
 
                 if tunnel_packet_rx.is_closed() { break; }
             }
@@ -536,8 +548,19 @@ impl ClientTransport for AHttpTransport {
             let _ = tunnel_reader_task.await;
             info!("[AHTTP] Traffic loop exited cleanly.");
         });
+        let traffic_loop_abort = traffic_loop_task.abort_handle();
 
         info!("[AHTTP] Transport session initialized.");
+
+        let shutdown_hook: super::ShutdownHook = Box::pin(async move {
+            concurrency_sem_shutdown.close();
+            traffic_loop_abort.abort();
+            tunnel_reader_abort.abort();
+            let mut guard = inflight_aborts.lock().unwrap();
+            for h in guard.drain(..) {
+                h.abort();
+            }
+        });
 
         Ok(ConnectionResult {
             auth_response,
@@ -548,7 +571,7 @@ impl ClientTransport for AHttpTransport {
             remote_ip: Some(resolved_addr.ip()),
             bypass_ips: Vec::new(),
             effective_mode: None,
-            shutdown_hook: None,
+            shutdown_hook: Some(shutdown_hook),
         })
     }
 }

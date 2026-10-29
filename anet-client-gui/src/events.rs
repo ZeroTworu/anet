@@ -34,14 +34,20 @@ impl EventHandler for GuiEventHandler {
                 ClientState::Connecting | ClientState::Reconnecting => {
                     ConnectionState::Connecting
                 }
-                ClientState::Stopping | ClientState::Disconnected | ClientState::Stopped | ClientState::Failed => {
+                ClientState::Stopping => ConnectionState::Stopping,
+                ClientState::Disconnected | ClientState::Stopped | ClientState::Failed => {
                     ConnectionState::Disconnected
                 }
             };
 
             let mut guard = lock_ignore_poison(&self.shared);
-            let stale_after_user_stop = guard.state == ConnectionState::Disconnected
-                && matches!(new_state, ConnectionState::Connecting | ConnectionState::Connected);
+            let stale_after_user_stop = matches!(
+                guard.state,
+                ConnectionState::Disconnected | ConnectionState::Stopping
+            ) && matches!(
+                new_state,
+                ConnectionState::Connecting | ConnectionState::Connected
+            );
 
             if !stale_after_user_stop {
                 guard.state = new_state;

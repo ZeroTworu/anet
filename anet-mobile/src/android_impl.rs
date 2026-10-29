@@ -18,6 +18,7 @@ use tokio::sync::mpsc;
 use tun::Configuration;
 
 static TUN_ACTIVE_FLAG: AtomicBool = AtomicBool::new(false);
+static REBIND_SCHEDULED: AtomicBool = AtomicBool::new(false);
 static DIRTY_GEN: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_TUN: OnceLock<tokio::sync::Mutex<Option<ActiveTunSession>>> = OnceLock::new();
 
@@ -42,18 +43,23 @@ struct ActiveTunSession {
     dns_str: String,
     bypass_ips: Arc<std::sync::Mutex<Vec<(IpAddr, u8)>>>,
     tx_cmd: mpsc::UnboundedSender<TunSwapRequest>,
+    worker_handle: tokio::task::JoinHandle<()>,
     applied_gen: u64,
 }
 
 impl ActiveTunSession {
     async fn rebind_tun(&mut self) -> Result<()> {
+        if !TUN_ACTIVE_FLAG.load(Ordering::Acquire) {
+            return Ok(());
+        }
         let mut exclude_nets = self.base_exclude_nets.clone();
         let bypass_list = self.bypass_ips.lock().unwrap().clone();
         for (ip, prefix) in bypass_list {
             if ip.is_ipv4() {
                 if let Ok(net) = IpNet::new(ip, prefix) {
-                    if !exclude_nets.contains(&net) {
-                        exclude_nets.push(net);
+                    let normalized = IpNet::new(net.network(), net.prefix_len()).unwrap_or(net);
+                    if !exclude_nets.contains(&normalized) {
+                        exclude_nets.push(normalized);
                     }
                 }
             }
@@ -74,7 +80,7 @@ impl ActiveTunSession {
             String::new()
         };
 
-        // 1. Останавливаем и дропаем старые AsyncFd (reader/writer) до пересоздания TUN в Java
+        // 1. Останавливаем и освобождаем старые AsyncFd (reader/writer) до пересоздания TUN в Java
         let (ack_prep_tx, ack_prep_rx) = tokio::sync::oneshot::channel();
         let (tx_new_dev, rx_new_dev) = tokio::sync::oneshot::channel();
         if self
@@ -88,6 +94,11 @@ impl ActiveTunSession {
             return Ok(());
         }
         let _ = ack_prep_rx.await;
+
+        if !TUN_ACTIVE_FLAG.load(Ordering::Acquire) {
+            let _ = tx_new_dev.send(None);
+            return Ok(());
+        }
 
         // 2. Пересоздаём TUN через JNI с обновлённым списком исключений
         let fd = match call_configure_tun_jni(
@@ -129,6 +140,21 @@ impl ActiveTunSession {
 
 pub fn reset_tun_session_flags() {
     TUN_ACTIVE_FLAG.store(false, Ordering::Release);
+    REBIND_SCHEDULED.store(false, Ordering::Release);
+}
+
+pub async fn shutdown_active_tun() {
+    reset_tun_session_flags();
+    let old_session = active_tun_mutex().lock().await.take();
+    if let Some(session) = old_session {
+        call_close_tun_jni(&session.jvm, &session.vpn_service_ref);
+        session.worker_handle.abort();
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            session.worker_handle,
+        )
+        .await;
+    }
 }
 
 pub struct AndroidRouteManager {
@@ -152,6 +178,7 @@ impl anet_client_core::traits::RouteManager for AndroidRouteManager {
     }
 
     async fn add_bypass_routes(&self, routes: &[(IpAddr, u8)]) -> Result<()> {
+        let tun_is_active = TUN_ACTIVE_FLAG.load(Ordering::Acquire);
         let mut added_new = false;
         {
             let mut list = self.bypass_ips.lock().unwrap();
@@ -159,17 +186,66 @@ impl anet_client_core::traits::RouteManager for AndroidRouteManager {
                 let IpAddr::V4(v4) = target else {
                     continue;
                 };
-                let normalized_ip = IpNet::new(IpAddr::V4(v4), prefix)
-                    .map(|n| n.network())
-                    .unwrap_or(IpAddr::V4(v4));
-                if !list.contains(&(normalized_ip, prefix)) {
+                // Динамические /32 маршруты от DNS-ответов (когда TUN уже поднят) агрегируем в /24,
+                // чтобы подсети CDN (Яндекс, VK, Ozon и др.) покрывались одним маршрутом без каскадных
+                // пересозданий TUN на каждый новый хост в той же /24.
+                // Защита: если внутри этой /24 уже зарегистрирован статический /32 (например, IP VPN-сервера
+                // или внешний DNS, добавленный до старта TUN), оставляем точный /32.
+                let effective_prefix = if tun_is_active && prefix == 32 {
+                    let cand_24 = Ipv4Net::new(v4, 24)
+                        .map(|n| n.trunc())
+                        .unwrap_or_else(|_| Ipv4Net::from(v4));
+                    let conflicts_with_existing_host = list.iter().any(|&(existing_ip, existing_p)| {
+                        if existing_p == 32 {
+                            if let IpAddr::V4(ev4) = existing_ip {
+                                return cand_24.contains(&ev4) && ev4 != v4;
+                            }
+                        }
+                        false
+                    });
+                    if conflicts_with_existing_host {
+                        32
+                    } else {
+                        24
+                    }
+                } else {
+                    prefix
+                };
+
+                let Ok(cand_net) = Ipv4Net::new(v4, effective_prefix).map(|n| n.trunc()) else {
+                    continue;
+                };
+
+                let already_covered = list.iter().any(|&(existing_ip, existing_p)| {
+                    if let IpAddr::V4(ev4) = existing_ip {
+                        if let Ok(existing_net) = Ipv4Net::new(ev4, existing_p) {
+                            return existing_net.contains(&cand_net);
+                        }
+                    }
+                    false
+                });
+
+                if !already_covered {
+                    if effective_prefix < 32 {
+                        list.retain(|&(existing_ip, existing_p)| {
+                            if let IpAddr::V4(ev4) = existing_ip {
+                                if existing_p > effective_prefix {
+                                    if let Ok(existing_net) = Ipv4Net::new(ev4, existing_p) {
+                                        return !cand_net.contains(&existing_net);
+                                    }
+                                }
+                            }
+                            true
+                        });
+                    }
+                    let normalized_ip = IpAddr::V4(cand_net.network());
                     if routes.len() <= 16 {
                         info!(
                             "[Android RouteManager] Recorded bypass route: {}/{}",
-                            normalized_ip, prefix
+                            normalized_ip, effective_prefix
                         );
                     }
-                    list.push((normalized_ip, prefix));
+                    list.push((normalized_ip, effective_prefix));
                     added_new = true;
                 }
             }
@@ -179,25 +255,45 @@ impl anet_client_core::traits::RouteManager for AndroidRouteManager {
             DIRTY_GEN.fetch_add(1, Ordering::AcqRel);
         }
 
-        if !TUN_ACTIVE_FLAG.load(Ordering::Acquire) {
+        if !tun_is_active || !added_new {
             return Ok(());
         }
 
-        if added_new {
-            // Коалесцируем параллельные DNS-ответы (например, example.com + static.example.com) в одно обновление TUN
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
-
-        let mutex = active_tun_mutex();
-        let mut guard = mutex.lock().await;
-        if let Some(session) = guard.as_mut() {
-            let latest_gen = DIRTY_GEN.load(Ordering::Acquire);
-            if session.applied_gen < latest_gen {
-                session.applied_gen = latest_gen;
-                if let Err(e) = session.rebind_tun().await {
-                    warn!("[Android RouteManager] Failed to hot-update TUN routes: {e}");
+        // Неблокирующая фоновая коалесценция: не задерживаем обработку DNS-ответов и чтение TUN
+        if REBIND_SCHEDULED
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    if !TUN_ACTIVE_FLAG.load(Ordering::Acquire) {
+                        REBIND_SCHEDULED.store(false, Ordering::Release);
+                        break;
+                    }
+                    let mutex = active_tun_mutex();
+                    let mut guard = mutex.lock().await;
+                    if !TUN_ACTIVE_FLAG.load(Ordering::Acquire) {
+                        REBIND_SCHEDULED.store(false, Ordering::Release);
+                        break;
+                    }
+                    let Some(session) = guard.as_mut() else {
+                        REBIND_SCHEDULED.store(false, Ordering::Release);
+                        break;
+                    };
+                    let latest_gen = DIRTY_GEN.load(Ordering::Acquire);
+                    if session.applied_gen < latest_gen {
+                        session.applied_gen = latest_gen;
+                        if let Err(e) = session.rebind_tun().await {
+                            warn!("[Android RouteManager] Failed to hot-update TUN routes: {e}");
+                        }
+                    }
+                    if DIRTY_GEN.load(Ordering::Acquire) <= session.applied_gen {
+                        REBIND_SCHEDULED.store(false, Ordering::Release);
+                        break;
+                    }
                 }
-            }
+            });
         }
 
         Ok(())
@@ -218,8 +314,7 @@ impl anet_client_core::traits::RouteManager for AndroidRouteManager {
     }
 
     async fn restore_routes(&self) -> Result<()> {
-        TUN_ACTIVE_FLAG.store(false, Ordering::Release);
-        *active_tun_mutex().lock().await = None;
+        shutdown_active_tun().await;
         self.bypass_ips.lock().unwrap().clear();
         Ok(())
     }
@@ -411,6 +506,14 @@ fn call_configure_tun_jni(
     Ok(fd)
 }
 
+fn call_close_tun_jni(jvm: &Arc<JavaVM>, vpn_service_ref: &GlobalRef) {
+    if let Ok(mut env) = jvm.attach_current_thread() {
+        if env.call_method(vpn_service_ref, "closeTun", "()V", &[]).is_err() {
+            let _ = env.exception_clear();
+        }
+    }
+}
+
 fn open_async_tun(fd: i32, auth: &AuthResponse) -> Result<tun::AsyncDevice> {
     let mut config = Configuration::default();
     config.raw_fd(fd);
@@ -434,7 +537,7 @@ fn spawn_tun_io_worker(
     tx_to_core: mpsc::Sender<Bytes>,
     mut rx_from_core: mpsc::Receiver<Bytes>,
     mut rx_cmd: mpsc::UnboundedReceiver<TunSwapRequest>,
-) {
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut current_device_opt: Option<(
             tun::AsyncDevice,
@@ -442,85 +545,96 @@ fn spawn_tun_io_worker(
         )> = Some((initial_device, None));
 
         while let Some((device, ack_activated)) = current_device_opt.take() {
-            let Ok((mut writer, mut reader)) = device.split() else {
-                break;
-            };
+            let mut swap_req = None;
+            {
+                let Ok((mut writer, mut reader)) = device.split() else {
+                    break;
+                };
 
-            let reader_stop = Arc::new(tokio::sync::Notify::new());
-            let reader_stop_c = reader_stop.clone();
-            let tx_to_core_c = tx_to_core.clone();
+                let reader_stop = Arc::new(tokio::sync::Notify::new());
+                let reader_stop_c = reader_stop.clone();
+                let tx_to_core_c = tx_to_core.clone();
 
-            let mut reader_handle = tokio::spawn(async move {
-                const READ_CHUNK: usize = 64 * MAX_PACKET_SIZE;
-                let mut buf = BytesMut::with_capacity(READ_CHUNK);
-                loop {
-                    if buf.capacity() < MAX_PACKET_SIZE {
-                        buf = BytesMut::with_capacity(READ_CHUNK);
+                let mut reader_handle = tokio::spawn(async move {
+                    const READ_CHUNK: usize = 64 * MAX_PACKET_SIZE;
+                    let mut buf = BytesMut::with_capacity(READ_CHUNK);
+                    loop {
+                        if buf.capacity() < MAX_PACKET_SIZE {
+                            buf = BytesMut::with_capacity(READ_CHUNK);
+                        }
+                        tokio::select! {
+                            biased;
+                            _ = reader_stop_c.notified() => break,
+                            res = reader.read_buf(&mut buf) => {
+                                match res {
+                                    Ok(n) if n > 0 => {
+                                        let pkt = buf.split().freeze();
+                                        tokio::select! {
+                                            biased;
+                                            _ = reader_stop_c.notified() => break,
+                                            send_res = tx_to_core_c.send(pkt) => {
+                                                if send_res.is_err() {
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Ok(_) => break,
+                                    Err(_) => break,
+                                }
+                            }
+                        }
                     }
+                });
+
+                if let Some(ack) = ack_activated {
+                    let _ = ack.send(());
+                }
+
+                let mut reader_finished = false;
+                'io_loop: loop {
                     tokio::select! {
                         biased;
-                        _ = reader_stop_c.notified() => break,
-                        res = reader.read_buf(&mut buf) => {
-                            match res {
-                                Ok(n) if n > 0 => {
-                                    if tx_to_core_c.send(buf.split().freeze()).await.is_err() {
-                                        break;
-                                    }
-                                }
-                                Ok(_) => break,
-                                Err(_) => break,
+                        cmd = rx_cmd.recv() => {
+                            if let Some(req) = cmd {
+                                swap_req = Some(req);
                             }
+                            break 'io_loop;
                         }
-                    }
-                }
-            });
-
-            if let Some(ack) = ack_activated {
-                let _ = ack.send(());
-            }
-
-            let mut swap_req = None;
-            let mut reader_finished = false;
-            'io_loop: loop {
-                tokio::select! {
-                    biased;
-                    cmd = rx_cmd.recv() => {
-                        if let Some(req) = cmd {
-                            swap_req = Some(req);
+                        _ = &mut reader_handle => {
+                            reader_finished = true;
+                            break 'io_loop;
                         }
-                        break 'io_loop;
-                    }
-                    _ = &mut reader_handle => {
-                        reader_finished = true;
-                        break 'io_loop;
-                    }
-                    pkt_opt = rx_from_core.recv() => {
-                        let Some(mut pkt) = pkt_opt else {
-                            reader_stop.notify_one();
-                            let _ = reader_handle.await;
-                            return;
-                        };
-                        loop {
-                            if writer.write_all(&pkt).await.is_err() {
+                        pkt_opt = rx_from_core.recv() => {
+                            let Some(mut pkt) = pkt_opt else {
                                 reader_stop.notify_one();
+                                reader_handle.abort();
                                 let _ = reader_handle.await;
                                 return;
-                            }
-                            match rx_from_core.try_recv() {
-                                Ok(next) => pkt = next,
-                                Err(_) => break,
+                            };
+                            loop {
+                                if writer.write_all(&pkt).await.is_err() {
+                                    reader_stop.notify_one();
+                                    reader_handle.abort();
+                                    let _ = reader_handle.await;
+                                    return;
+                                }
+                                match rx_from_core.try_recv() {
+                                    Ok(next) => pkt = next,
+                                    Err(_) => break,
+                                }
                             }
                         }
                     }
                 }
-            }
 
-            // Останавливаем и дропаем старые reader и writer до закрытия дескриптора в Java
-            if !reader_finished {
-                reader_stop.notify_one();
-                let _ = reader_handle.await;
+                // Останавливаем и освобождаем старые reader и writer выходом из области видимости до закрытия дескриптора в Java
+                if !reader_finished {
+                    reader_stop.notify_one();
+                    reader_handle.abort();
+                    let _ = reader_handle.await;
+                }
             }
-            drop(writer);
 
             if let Some(TunSwapRequest {
                 ack_prepared,
@@ -537,7 +651,7 @@ fn spawn_tun_io_worker(
                 break;
             }
         }
-    });
+    })
 }
 
 #[async_trait]
@@ -546,8 +660,7 @@ impl TunFactory for AndroidCallbackTunFactory {
         &self,
         auth: &AuthResponse,
     ) -> Result<(mpsc::Sender<Bytes>, mpsc::Receiver<Bytes>, String)> {
-        TUN_ACTIVE_FLAG.store(false, Ordering::Release);
-        *active_tun_mutex().lock().await = None;
+        shutdown_active_tun().await;
 
         // --- 1. Асинхронная подготовка (БЕЗ JNI) ---
         let include_nets = self.resolve_to_ipnet(&self.config.main.route_for).await;
@@ -635,7 +748,7 @@ impl TunFactory for AndroidCallbackTunFactory {
         let (tx_to_tun, rx_from_core) = mpsc::channel::<Bytes>(CHANNEL_BUFFER_SIZE);
         let (tx_cmd, rx_cmd) = mpsc::unbounded_channel::<TunSwapRequest>();
 
-        spawn_tun_io_worker(device, tx_to_core, rx_from_core, rx_cmd);
+        let worker_handle = spawn_tun_io_worker(device, tx_to_core, rx_from_core, rx_cmd);
 
         let current_gen = DIRTY_GEN.load(Ordering::Acquire);
         *active_tun_mutex().lock().await = Some(ActiveTunSession {
@@ -648,6 +761,7 @@ impl TunFactory for AndroidCallbackTunFactory {
             dns_str,
             bypass_ips: self.bypass_ips.clone(),
             tx_cmd,
+            worker_handle,
             applied_gen: current_gen,
         });
         TUN_ACTIVE_FLAG.store(true, Ordering::Release);

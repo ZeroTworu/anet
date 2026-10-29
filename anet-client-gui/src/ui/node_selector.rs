@@ -98,12 +98,13 @@ pub fn render_node_selector(app: &mut ANetApp, ui: &mut egui::Ui, state: Connect
     let mut selected_display_name = String::new();
 
     {
-        let settings = lock_ignore_poison(&app.settings);
-        if let Some(active_cfg) = settings.get_active_config_with_overrides(&app.storage_key) {
-            let active_cfg_id = active_cfg.id.clone();
-            let active_cfg_content = active_cfg.content.clone();
-            drop(settings);
-
+        let active_cfg_opt = {
+            let settings = lock_ignore_poison(&app.settings);
+            settings
+                .get_active_config_with_overrides(&app.storage_key)
+                .map(|c| (c.id.clone(), c.content.clone()))
+        };
+        if let Some((active_cfg_id, active_cfg_content)) = active_cfg_opt {
             app.refresh_server_names_cache(&active_cfg_id, &active_cfg_content);
 
             if app.node_probe_snapshot.groups.is_empty() && !active_cfg_content.is_empty() {
@@ -200,7 +201,9 @@ pub fn render_node_selector(app: &mut ANetApp, ui: &mut egui::Ui, state: Connect
         } else {
             match state {
                 ConnectionState::Connected => orange,
-                ConnectionState::Disconnected | ConnectionState::Connecting => {
+                ConnectionState::Disconnected
+                | ConnectionState::Connecting
+                | ConnectionState::Stopping => {
                     probe_status_color(NodeProbeStatus::Checking)
                 }
             }
