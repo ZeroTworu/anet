@@ -427,7 +427,7 @@ fn init_jni_bridge_thread(jvm: Arc<JavaVM>) {
                         let ui_ref = UI_CALLBACK_REF.lock().unwrap().clone();
                         let vpn_ref = VPN_CALLBACK_REF.lock().unwrap().clone();
                         let targets: Vec<GlobalRef> =
-                            [vpn_ref, ui_ref].into_iter().flatten().collect();
+                            [vpn_ref.clone(), ui_ref].into_iter().flatten().collect();
 
                         for cb in targets {
                             let j_rx_spd = env.new_string(&tel.rx_speed_str);
@@ -474,6 +474,35 @@ fn init_jni_bridge_thread(jvm: Arc<JavaVM>) {
                                         JValue::Object(&j_tx_tot),
                                         JValue::Object(&rx_curve_obj),
                                         JValue::Object(&tx_curve_obj),
+                                    ],
+                                );
+                                let _ = env.exception_clear();
+                            }
+                        }
+
+                        // Также синхронизируем ANetVpnService.onTrafficStats в едином русском формате без мерцания единиц
+                        if let Some(ref vpn_cb) = vpn_ref {
+                            let rtt_str = tel
+                                .rtt_ms
+                                .map(|ms| format!("{ms} мс"))
+                                .unwrap_or_else(|| "—".to_string());
+                            if let (Ok(j_rx), Ok(j_tx), Ok(j_rtt), Ok(j_rxm), Ok(j_txm)) = (
+                                env.new_string(&tel.total_rx_str),
+                                env.new_string(&tel.total_tx_str),
+                                env.new_string(&rtt_str),
+                                env.new_string(&tel.rx_speed_str),
+                                env.new_string(&tel.tx_speed_str),
+                            ) {
+                                let _ = env.call_method(
+                                    vpn_cb,
+                                    "onTrafficStats",
+                                    "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
+                                    &[
+                                        JValue::Object(&j_rx),
+                                        JValue::Object(&j_tx),
+                                        JValue::Object(&j_rtt),
+                                        JValue::Object(&j_rxm),
+                                        JValue::Object(&j_txm),
                                     ],
                                 );
                                 let _ = env.exception_clear();
@@ -649,6 +678,24 @@ fn init_jni_bridge_thread(jvm: Arc<JavaVM>) {
                     if let Some(callback_ref) = callback_ref_opt {
                         match event {
                             AnetEvent::ClientStateChanged { state, message, server_name } => {
+                                if matches!(
+                                    state,
+                                    ClientState::Connecting
+                                        | ClientState::Connected
+                                        | ClientState::Reconnecting
+                                ) {
+                                    if env
+                                        .set_field(
+                                            &callback_ref,
+                                            "isShuttingDown",
+                                            "Z",
+                                            JValue::Bool(0),
+                                        )
+                                        .is_err()
+                                    {
+                                        let _ = env.exception_clear();
+                                    }
+                                }
                                 let jmsg = env.new_string(message);
                                 let jserver = env.new_string(server_name.unwrap_or_default());
                                 if let (Ok(jmsg), Ok(jserver)) = (jmsg, jserver) {
@@ -1029,6 +1076,11 @@ pub extern "system" fn Java_org_alco_anet_ANetVpnService_connectVpn(
     };
 
     let generation = CLIENT_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+    // Немедленно сигнализируем старому клиенту об отмене без ожидания асинхронных мьютексов
+    if let Some(existing) = CLIENT.lock().unwrap().as_ref() {
+        existing.cancel();
+    }
+
     rt_handle.spawn(async move {
         let client = {
             let _lifecycle = CLIENT_LIFECYCLE.lock().await;
@@ -1038,6 +1090,7 @@ pub extern "system" fn Java_org_alco_anet_ANetVpnService_connectVpn(
             let old_client = CLIENT.lock().unwrap().take();
             if let Some(client) = old_client {
                 info!("Rust JNI: Stopping old active client task...");
+                client.cancel();
                 let _ = client.stop().await;
             }
             crate::android_impl::shutdown_active_tun().await;
@@ -1121,14 +1174,16 @@ pub extern "system" fn Java_org_alco_anet_ANetVpnService_connectVpn(
                 }
             }
 
+            let owner_id = crate::android_impl::next_tun_owner_id();
             let bypass_ips = Arc::new(std::sync::Mutex::new(Vec::new()));
             let tun_factory = Box::new(AndroidCallbackTunFactory::new(
+                owner_id,
                 jvm_for_factory,
                 this_ref.clone(),
                 config.clone(),
                 bypass_ips.clone(),
             ));
-            let route_manager = Box::new(AndroidRouteManager::new(bypass_ips));
+            let route_manager = Box::new(AndroidRouteManager::new(owner_id, bypass_ips));
             let client = Arc::new(AnetClient::new(config, tun_factory, route_manager));
             *CLIENT.lock().unwrap() = Some(client.clone());
             client
@@ -1170,16 +1225,20 @@ pub extern "system" fn Java_org_alco_anet_ANetVpnService_stopVpn(_env: JNIEnv, _
     let stop_gen = CLIENT_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
     crate::android_impl::reset_tun_session_flags();
 
+    let initial_client = {
+        let mut client_guard = CLIENT.lock().unwrap();
+        client_guard.take()
+    };
+    if let Some(ref client) = initial_client {
+        client.cancel();
+    }
+
     let rt_handle_opt = {
         let rt_guard = RUNTIME.lock().unwrap();
         rt_guard.as_ref().map(|rt| rt.handle().clone())
     };
 
     if let Some(rt_handle) = rt_handle_opt {
-        let initial_client = {
-            let mut client_guard = CLIENT.lock().unwrap();
-            client_guard.take()
-        };
         rt_handle.block_on(async move {
             crate::android_impl::shutdown_active_tun().await;
             if let Some(client) = initial_client {
@@ -1198,6 +1257,7 @@ pub extern "system" fn Java_org_alco_anet_ANetVpnService_stopVpn(_env: JNIEnv, _
                         client_guard.take()
                     };
                     if let Some(client) = late_client {
+                        client.cancel();
                         let _ = client.stop().await;
                     }
                     crate::android_impl::shutdown_active_tun().await;

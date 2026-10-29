@@ -59,6 +59,7 @@ pub fn toggle_vpn(
         match guard.state {
             ConnectionState::Disconnected => {
                 if let Some(client_clone) = guard.client.clone() {
+                    client_clone.prepare_for_start();
                     guard.state = ConnectionState::Connecting;
                     ToggleAction::Start(client_clone)
                 } else {
@@ -82,9 +83,22 @@ pub fn toggle_vpn(
         ToggleAction::Start(client_clone) => {
             let shared_clone = shared.clone();
             rt_handle.spawn(async move {
-                if let Err(e) = client_clone.start().await {
-                    lock_ignore_poison(&shared_clone).state = ConnectionState::Disconnected;
-                    anet_client_core::events::err(e.to_string());
+                match client_clone.start().await {
+                    Ok(()) => {
+                        let mut guard = lock_ignore_poison(&shared_clone);
+                        if !client_clone.is_running()
+                            && matches!(
+                                guard.state,
+                                ConnectionState::Connecting | ConnectionState::Stopping
+                            )
+                        {
+                            guard.state = ConnectionState::Disconnected;
+                        }
+                    }
+                    Err(e) => {
+                        lock_ignore_poison(&shared_clone).state = ConnectionState::Disconnected;
+                        anet_client_core::events::err(e.to_string());
+                    }
                 }
             });
         }

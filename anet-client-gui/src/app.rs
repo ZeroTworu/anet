@@ -1352,6 +1352,7 @@ impl ANetApp {
             if guard.state != ConnectionState::Disconnected {
                 None
             } else if let Some(client_clone) = guard.client.clone() {
+                client_clone.prepare_for_start();
                 guard.state = ConnectionState::Connecting;
                 Some(client_clone)
             } else {
@@ -1362,9 +1363,22 @@ impl ANetApp {
         if let Some(client_clone) = client_opt {
             let shared_clone = self.shared.clone();
             self.rt.spawn(async move {
-                if let Err(e) = client_clone.start().await {
-                    lock_ignore_poison(&shared_clone).state = ConnectionState::Disconnected;
-                    anet_client_core::events::err(e.to_string());
+                match client_clone.start().await {
+                    Ok(()) => {
+                        let mut guard = lock_ignore_poison(&shared_clone);
+                        if !client_clone.is_running()
+                            && matches!(
+                                guard.state,
+                                ConnectionState::Connecting | ConnectionState::Stopping
+                            )
+                        {
+                            guard.state = ConnectionState::Disconnected;
+                        }
+                    }
+                    Err(e) => {
+                        lock_ignore_poison(&shared_clone).state = ConnectionState::Disconnected;
+                        anet_client_core::events::err(e.to_string());
+                    }
                 }
             });
         }

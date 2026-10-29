@@ -64,6 +64,7 @@ pub struct AnetClient {
     rule_cache: crate::rule_updater::RuleCacheManager,
     session: Mutex<Option<RunningSession>>,
     stop_requested: AtomicBool,
+    permanently_cancelled: AtomicBool,
     is_active: AtomicBool,
     cancel_signal: Arc<Notify>,
     active_finished_notify: Arc<Notify>,
@@ -91,9 +92,31 @@ impl AnetClient {
             rule_cache,
             session: Mutex::new(None),
             stop_requested: AtomicBool::new(false),
+            permanently_cancelled: AtomicBool::new(false),
             is_active: AtomicBool::new(false),
             cancel_signal: Arc::new(Notify::new()),
             active_finished_notify: Arc::new(Notify::new()),
+        }
+    }
+
+    /// Подготавливает экземпляр клиента к новому запуску `start()` после предыдущего `stop()`.
+    pub fn prepare_for_start(&self) {
+        self.permanently_cancelled.store(false, Ordering::SeqCst);
+        if !self.is_active.load(Ordering::SeqCst) {
+            self.stop_requested.store(false, Ordering::SeqCst);
+        }
+    }
+
+    /// Неблокирующая синхронная отмена текущей сессии/попытки подключения.
+    pub fn cancel(&self) {
+        self.permanently_cancelled.store(true, Ordering::SeqCst);
+        self.stop_requested.store(true, Ordering::SeqCst);
+        self.cancel_signal.notify_waiters();
+        if let Ok(state) = self.session.lock() {
+            if let Some(ref running) = *state {
+                running.shutdown_notify.notify_waiters();
+                running.reconnect_signal.notify_one();
+            }
         }
     }
 
@@ -212,11 +235,13 @@ impl AnetClient {
             return Err(anyhow!("VPN tunnel is already active"));
         }
 
-        if self.stop_requested.load(Ordering::SeqCst) {
+        if self.permanently_cancelled.load(Ordering::SeqCst) {
             self.is_active.store(false, Ordering::SeqCst);
             self.active_finished_notify.notify_waiters();
             return Ok(());
         }
+        // Сбрасываем stop_requested от предыдущего цикла stop(), чтобы повторный Connect в GUI работал безотказно
+        self.stop_requested.store(false, Ordering::SeqCst);
 
         let mut config_clone = self.config.clone();
         if let Err(e) = config_clone.sanitize() {
@@ -633,16 +658,23 @@ impl AnetClient {
                 }
             }
 
-            // Применяем статические CIDR-маршруты Direct из скомпилированного rules.abc единым пакетом
+            // Применяем статические CIDR-маршруты Direct из скомпилированного rules.abc:
+            // - На Android маршруты передаются единым списком в VpnService.Builder.excludeRoute при создании TUN.
+            // - На Desktop (Linux/Windows/macOS) добавление 5200+ маршрутов через системные утилиты ip/route/netsh
+            //   блокирует старт на десятки секунд, поэтому на Desktop точечные /32 bypass-маршруты добавляются
+            //   динамически через DnsInterceptor при разрешении Direct-доменов.
             let abc_direct_routes = rule_cache.collect_direct_routes();
             if !abc_direct_routes.is_empty() {
                 let count = abc_direct_routes.len();
-                let _ = self
-                    .route_manager
-                    .add_bypass_routes(&abc_direct_routes)
-                    .await;
+                #[cfg(target_os = "android")]
+                {
+                    let _ = self
+                        .route_manager
+                        .add_bypass_routes(&abc_direct_routes)
+                        .await;
+                }
                 let msg = format!(
-                    "[RuleCache] Applied {} static Direct CIDR bypass routes from rules.abc",
+                    "[RuleCache] Loaded {} static Direct CIDR bypass routes from rules.abc",
                     count
                 );
                 info!("{msg}");
@@ -865,7 +897,9 @@ impl AnetClient {
                 };
 
                 write_buf.clear();
-                if is_probe || should_forward_to_tunnel(&packet) {
+                if is_probe {
+                    frame_packet_into(&mut write_buf, &packet);
+                } else if should_forward_to_tunnel(&packet) {
                     let len = packet.len() as u64;
                     tx_bytes.fetch_add(len, Ordering::Relaxed);
                     tx_packets.fetch_add(1, Ordering::Relaxed);
@@ -874,9 +908,6 @@ impl AnetClient {
 
                 while write_buf.len() < COALESCE_BUDGET_BYTES {
                     if let Ok(p) = rx_probe.try_recv() {
-                        let len = p.len() as u64;
-                        tx_bytes.fetch_add(len, Ordering::Relaxed);
-                        tx_packets.fetch_add(1, Ordering::Relaxed);
                         frame_packet_into(&mut write_buf, &p);
                         continue;
                     }
@@ -930,11 +961,8 @@ impl AnetClient {
                                 rx_time.store(batch_rx_us, Ordering::Relaxed);
                                 let mut current_pkt = Some(first_packet);
                                 while let Some(packet) = current_pkt.take() {
-                                    let len = packet.len() as u64;
-                                    rx_bytes.fetch_add(len, Ordering::Relaxed);
-                                    rx_packets.fetch_add(1, Ordering::Relaxed);
-
                                     // Перехватываем внутритуннельный ICMP Echo Reply (замер честного RTT)
+                                    // Не учитываем служебные 40-байтные пинг-зонды в пользовательском трафике rx_bytes
                                     if let Some(c_ip) = client_ip_opt {
                                         if let Some((_seq, sent_ts_us)) = parse_ipv4_icmp_echo_reply(
                                             &packet,
@@ -980,6 +1008,10 @@ impl AnetClient {
                                             }
                                         }
                                     }
+
+                                    let len = packet.len() as u64;
+                                    rx_bytes.fetch_add(len, Ordering::Relaxed);
+                                    rx_packets.fetch_add(1, Ordering::Relaxed);
 
                                     // Если из туннеля пришел DNS-ответ для Direct-домена, регистрируем bypass-маршруты асинхронно,
                                     // не блокируя горячий цикл приёма пакетов 'rx_loop
@@ -1559,21 +1591,21 @@ impl AnetClient {
         }
 
         if let Some(hook) = running.shutdown_hook.take() {
-            let _ = tokio::time::timeout(Duration::from_millis(1200), hook).await;
+            let _ = tokio::time::timeout(Duration::from_millis(450), hook).await;
         }
 
         if let Some(ref endpoint) = running.endpoint {
             endpoint.close(0u32.into(), b"session closed");
         }
 
-        if tokio::time::timeout(Duration::from_millis(300), &mut running.main_task)
+        if tokio::time::timeout(Duration::from_millis(150), &mut running.main_task)
             .await
             .is_err()
         {
-            warn!("[Core] Main task did not finish in 300ms, aborting tunnel workers...");
+            warn!("[Core] Main task did not finish in 150ms, aborting tunnel workers...");
             running.t1_abort.abort();
             running.t2_abort.abort();
-            let _ = tokio::time::timeout(Duration::from_millis(200), &mut running.main_task).await;
+            let _ = tokio::time::timeout(Duration::from_millis(100), &mut running.main_task).await;
         }
 
         let _ = self.dns_manager.restore_dns(&running.iface_name);

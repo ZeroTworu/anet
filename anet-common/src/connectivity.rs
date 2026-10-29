@@ -506,19 +506,40 @@ impl TelemetryRingBuffer {
         }
         self.samples.push_back(SpeedSample { rx_bps, tx_bps });
 
-        // Минимум 64 КБ/с для масштаба по оси Y, чтобы мелкий фоновый трафик не выглядел как 100% пик
-        let mut peak_bps: u64 = 64 * 1024;
+        // Независимая адаптивная нормализация для RX и TX:
+        // - нижний порог 4 КБ/с (чтобы и лёгкий сёрфинг 10–50 КБ/с, и гигабитный Speedtest отображались живо)
+        // - запас по высоте 18% (headroom 1.18x над максимумом окна), чтобы кривая не срезалась в плоский «стол» на уровне 1.0
+        // - мягкая нелинейная компрессия (gamma = 0.62), делающая колебания скорости наглядными во всём диапазоне
+        const MIN_SCALE_BPS: f64 = 4.0 * 1024.0;
+        const HEADROOM_FACTOR: f64 = 1.18;
+        const GAMMA: f64 = 0.62;
+
+        let mut max_rx: u64 = 0;
+        let mut max_tx: u64 = 0;
         for s in &self.samples {
-            peak_bps = peak_bps.max(s.rx_bps).max(s.tx_bps);
+            max_rx = max_rx.max(s.rx_bps);
+            max_tx = max_tx.max(s.tx_bps);
         }
 
-        let denom = peak_bps as f32;
+        let peak_bps = max_rx.max(max_tx).max(MIN_SCALE_BPS as u64);
+        let rx_denom = ((max_rx as f64) * HEADROOM_FACTOR).max(MIN_SCALE_BPS);
+        let tx_denom = ((max_tx as f64) * HEADROOM_FACTOR).max(MIN_SCALE_BPS);
+
+        let normalize_point = |bps: u64, denom: f64| -> f32 {
+            if bps == 0 {
+                return 0.0;
+            }
+            let linear = ((bps as f64) / denom).clamp(0.0, 1.0);
+            let shaped = linear.powf(GAMMA) as f32;
+            shaped.clamp(0.02, 0.96)
+        };
+
         let mut rx_curve = Vec::with_capacity(self.samples.len());
         let mut tx_curve = Vec::with_capacity(self.samples.len());
 
         for s in &self.samples {
-            rx_curve.push((s.rx_bps as f32 / denom).clamp(0.0, 1.0));
-            tx_curve.push((s.tx_bps as f32 / denom).clamp(0.0, 1.0));
+            rx_curve.push(normalize_point(s.rx_bps, rx_denom));
+            tx_curve.push(normalize_point(s.tx_bps, tx_denom));
         }
 
         TelemetrySnapshot {
@@ -644,7 +665,7 @@ mod tests {
         let snap = ring.push_sample(1024 * 1024, 512 * 1024, 10_000_000, 5_000_000, Some(45));
         assert_eq!(snap.rx_curve.len(), 4);
         assert_eq!(snap.tx_curve.len(), 4);
-        assert!((snap.rx_curve[3] - 1.0).abs() < 1e-4);
-        assert!((snap.tx_curve[3] - 0.5).abs() < 1e-4);
+        assert!(snap.rx_curve[3] > 0.80 && snap.rx_curve[3] < 0.98);
+        assert!(snap.tx_curve[3] > 0.80 && snap.tx_curve[3] < 0.98);
     }
 }
