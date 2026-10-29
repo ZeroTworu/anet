@@ -1,6 +1,12 @@
 use std::ops::Range;
 
+pub const DNS_QTYPE_A: u16 = 1;
+pub const DNS_QTYPE_NS: u16 = 2;
+pub const DNS_QTYPE_SOA: u16 = 6;
 pub const DNS_QTYPE_TXT: u16 = 16;
+pub const DNS_QTYPE_AAAA: u16 = 28;
+pub const DNS_QTYPE_SVCB: u16 = 64;
+pub const DNS_QTYPE_HTTPS: u16 = 65;
 pub const DNS_QCLASS_IN: u16 = 1;
 pub const EDNS0_UDP_SIZE: u16 = 1232;
 
@@ -107,7 +113,21 @@ pub fn build_doh_query(qname: &str, tx_id: u16) -> Vec<u8> {
     buf
 }
 
-/// Constructs a DNS response with a TXT record, echoing Question section exactly (0x20 bit compliant).
+fn encode_dns_name(buf: &mut Vec<u8>, name: &str) {
+    for label in name.trim_matches('.').split('.') {
+        if label.is_empty() {
+            continue;
+        }
+        let bytes = label.as_bytes();
+        let len = bytes.len().min(63);
+        buf.push(len as u8);
+        buf.extend_from_slice(&bytes[..len]);
+    }
+    buf.push(0x00);
+}
+
+/// Constructs a DNS response with a TXT record, echoing Question section exactly (0x20 bit compliant)
+/// and respecting RFC 6891 §6.1.1 (only includes EDNS0 OPT RR if the request included Additional records).
 pub fn build_dns_txt_response(
     orig_query: &[u8],
     parsed_q: &ParsedDnsQuery,
@@ -117,32 +137,28 @@ pub fn build_dns_txt_response(
     let mut resp = Vec::with_capacity(512);
 
     let ancount: u16 = if txt_payload.is_some() { 1 } else { 0 };
+    let query_has_edns =
+        orig_query.len() >= 12 && u16::from_be_bytes([orig_query[10], orig_query[11]]) > 0;
+    let arcount: u16 = if query_has_edns { 1 } else { 0 };
 
     // 1. Header (12 bytes)
     resp.extend_from_slice(&parsed_q.tx_id.to_be_bytes());
-    // Flags: QR=1 (response), AA=1 (authoritative), RD=preserved, RA=1, RCODE=0 (NoError)
+    // Flags: QR=1 (response), AA=1 (authoritative), RD=preserved, RA=0, RCODE=0 (NoError)
     let rd_bit = parsed_q.flags & 0x0100;
     let resp_flags = 0x8400 | rd_bit;
     resp.extend_from_slice(&resp_flags.to_be_bytes());
     resp.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT=1
     resp.extend_from_slice(&ancount.to_be_bytes()); // ANCOUNT=1 (single TXT RR preserves character-string order across all resolvers)
     resp.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT=0
-    resp.extend_from_slice(&1u16.to_be_bytes()); // ARCOUNT=1 (EDNS0)
+    resp.extend_from_slice(&arcount.to_be_bytes()); // ARCOUNT=1 only when query had EDNS0
 
     // 2. Question section (copied verbatim from orig_query to preserve 0x20 casing)
     if parsed_q.question_end <= orig_query.len() {
         resp.extend_from_slice(&orig_query[12..parsed_q.question_end]);
     } else {
-        // Fallback
-        for label in parsed_q.qname.split('.') {
-            if !label.is_empty() {
-                resp.push(label.len() as u8);
-                resp.extend_from_slice(label.as_bytes());
-            }
-        }
-        resp.push(0x00);
-        resp.extend_from_slice(&DNS_QTYPE_TXT.to_be_bytes());
-        resp.extend_from_slice(&DNS_QCLASS_IN.to_be_bytes());
+        encode_dns_name(&mut resp, &parsed_q.qname);
+        resp.extend_from_slice(&parsed_q.qtype.to_be_bytes());
+        resp.extend_from_slice(&parsed_q.qclass.to_be_bytes());
     }
 
     // 3. Answer section (single TXT Resource Record with multiple <=255B character-strings and 0xC00C name compression)
@@ -173,12 +189,91 @@ pub fn build_dns_txt_response(
         }
     }
 
-    // 4. Additional section: EDNS0 OPT RR (RFC 6891)
-    resp.push(0x00); // Root name
-    resp.extend_from_slice(&41u16.to_be_bytes()); // TYPE = OPT (41)
-    resp.extend_from_slice(&EDNS0_UDP_SIZE.to_be_bytes()); // UDP payload size = 1232
-    resp.extend_from_slice(&0u32.to_be_bytes()); // Extended RCODE and flags
-    resp.extend_from_slice(&0u16.to_be_bytes()); // RDLENGTH = 0
+    // 4. Additional section: EDNS0 OPT RR (RFC 6891) only if requested
+    if query_has_edns {
+        resp.push(0x00); // Root name
+        resp.extend_from_slice(&41u16.to_be_bytes()); // TYPE = OPT (41)
+        resp.extend_from_slice(&EDNS0_UDP_SIZE.to_be_bytes()); // UDP payload size = 1232
+        resp.extend_from_slice(&0u32.to_be_bytes()); // Extended RCODE and flags
+        resp.extend_from_slice(&0u16.to_be_bytes()); // RDLENGTH = 0
+    }
+
+    resp
+}
+
+/// Constructs an authoritative NS / SOA / NODATA response for zone-apex and QNAME-minimization probes
+/// so recursive resolvers (Yandex 77.88.8.*, Google, Cloudflare) never mark the tunnel zone as lame.
+pub fn build_dns_zone_response(
+    orig_query: &[u8],
+    parsed_q: &ParsedDnsQuery,
+    domain_zone: &str,
+    ttl: u32,
+) -> Vec<u8> {
+    let mut resp = Vec::with_capacity(256);
+    let query_has_edns =
+        orig_query.len() >= 12 && u16::from_be_bytes([orig_query[10], orig_query[11]]) > 0;
+    let arcount: u16 = if query_has_edns { 1 } else { 0 };
+
+    let is_ns = parsed_q.qtype == DNS_QTYPE_NS;
+    let is_soa = parsed_q.qtype == DNS_QTYPE_SOA;
+    let ancount: u16 = if is_ns || is_soa { 1 } else { 0 };
+    let nscount: u16 = if !is_ns && !is_soa { 1 } else { 0 };
+
+    let rd_bit = parsed_q.flags & 0x0100;
+    let resp_flags = 0x8400 | rd_bit;
+
+    resp.extend_from_slice(&parsed_q.tx_id.to_be_bytes());
+    resp.extend_from_slice(&resp_flags.to_be_bytes());
+    resp.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT=1
+    resp.extend_from_slice(&ancount.to_be_bytes());
+    resp.extend_from_slice(&nscount.to_be_bytes());
+    resp.extend_from_slice(&arcount.to_be_bytes());
+
+    if parsed_q.question_end <= orig_query.len() {
+        resp.extend_from_slice(&orig_query[12..parsed_q.question_end]);
+    } else {
+        encode_dns_name(&mut resp, &parsed_q.qname);
+        resp.extend_from_slice(&parsed_q.qtype.to_be_bytes());
+        resp.extend_from_slice(&parsed_q.qclass.to_be_bytes());
+    }
+
+    let ns_name = format!("ns1.{}", domain_zone.trim_matches('.'));
+    let hostmaster = format!("hostmaster.{}", domain_zone.trim_matches('.'));
+
+    if is_ns {
+        resp.extend_from_slice(&[0xC0, 0x0C]);
+        resp.extend_from_slice(&DNS_QTYPE_NS.to_be_bytes());
+        resp.extend_from_slice(&DNS_QCLASS_IN.to_be_bytes());
+        resp.extend_from_slice(&ttl.to_be_bytes());
+        let mut rdata = Vec::new();
+        encode_dns_name(&mut rdata, &ns_name);
+        resp.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+        resp.extend_from_slice(&rdata);
+    } else {
+        // Either direct SOA answer (ANCOUNT=1) or Authority SOA for NODATA (NSCOUNT=1)
+        encode_dns_name(&mut resp, domain_zone);
+        resp.extend_from_slice(&DNS_QTYPE_SOA.to_be_bytes());
+        resp.extend_from_slice(&DNS_QCLASS_IN.to_be_bytes());
+        resp.extend_from_slice(&ttl.to_be_bytes());
+        let mut rdata = Vec::new();
+        encode_dns_name(&mut rdata, &ns_name);
+        encode_dns_name(&mut rdata, &hostmaster);
+        rdata.extend_from_slice(&2026102801u32.to_be_bytes()); // Serial
+        rdata.extend_from_slice(&3600u32.to_be_bytes()); // Refresh
+        rdata.extend_from_slice(&900u32.to_be_bytes()); // Retry
+        rdata.extend_from_slice(&604800u32.to_be_bytes()); // Expire
+        rdata.extend_from_slice(&60u32.to_be_bytes()); // Minimum TTL
+        resp.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+        resp.extend_from_slice(&rdata);
+    }
+
+    if query_has_edns {
+        resp.push(0x00);
+        resp.extend_from_slice(&41u16.to_be_bytes());
+        resp.extend_from_slice(&EDNS0_UDP_SIZE.to_be_bytes());
+        resp.extend_from_slice(&0u32.to_be_bytes());
+        resp.extend_from_slice(&0u16.to_be_bytes());
+    }
 
     resp
 }

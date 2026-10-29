@@ -449,13 +449,16 @@ impl AnetClient {
         let (filter, tx, rx) = anet_appfilter::AppFilter::start(policy, initial_bypass, vpn_ip)?;
 
         let (server_host, server_port) = _server.host_port()?;
+        let is_doh = matches!(_server.mode(), Ok(crate::config::TransportMode::Doh));
         if let Ok(ip) = IpAddr::from_str(&server_host) {
             filter.add_bypass(ip).await;
-        } else if let Ok(addrs) =
-            tokio::net::lookup_host((server_host.as_str(), server_port)).await
-        {
-            for sa in addrs {
-                filter.add_bypass(sa.ip()).await;
+        } else if !is_doh {
+            if let Ok(addrs) =
+                tokio::net::lookup_host((server_host.as_str(), server_port)).await
+            {
+                for sa in addrs {
+                    filter.add_bypass(sa.ip()).await;
+                }
             }
         }
         for &ip in extra_bypass_ips {
@@ -553,11 +556,17 @@ impl AnetClient {
         self.route_manager.backup_routes().await?;
 
         let (server_host, server_port) = server.host_port()?;
+        let is_doh_mode = matches!(server.mode(), Ok(crate::config::TransportMode::Doh));
         let mut bypass_ips = Vec::new();
-        let mut hosts_to_bypass = vec![(server_host, server_port)];
+        let mut hosts_to_bypass = Vec::new();
+        if !is_doh_mode {
+            hosts_to_bypass.push((server_host, server_port));
+        }
         for s in &self.config.servers {
-            if let Ok(hp) = s.host_port() {
-                hosts_to_bypass.push(hp);
+            if !matches!(s.mode(), Ok(crate::config::TransportMode::Doh)) {
+                if let Ok(hp) = s.host_port() {
+                    hosts_to_bypass.push(hp);
+                }
             }
         }
         hosts_to_bypass.extend(crate::connectivity_monitor::NodeProbeMonitor::configured_hosts_and_ports());

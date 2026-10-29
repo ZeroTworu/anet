@@ -74,7 +74,7 @@ pub fn decode(input: &str) -> Result<Vec<u8>, Base32Error> {
     Ok(result)
 }
 
-/// Formats a continuous base32 string into DNS labels of up to `max_label_len` chars (standard 63), separated by dots.
+/// Formats a continuous base32/base36 string into DNS labels of up to `max_label_len` chars (standard 63), separated by dots.
 pub fn split_into_labels(base32_str: &str, max_label_len: usize) -> String {
     let mut out = String::with_capacity(base32_str.len() + base32_str.len() / max_label_len + 1);
     let mut start = 0;
@@ -89,9 +89,53 @@ pub fn split_into_labels(base32_str: &str, max_label_len: usize) -> String {
     out
 }
 
-/// Joins DNS labels back into a continuous string by removing all dots.
+/// Formats a continuous base32/base36 string into DNS labels while inserting up to 2 interior `'-'`
+/// characters at deterministic positions derived from `salt` (when `salt > 0`).
+/// Because both `decode` and `decode_base36` ignore `'-'` and `'.'`, salted QNAMEs decode to the
+/// exact same bytes on the server while bypassing recursive resolver negative/SERVFAIL caching and query coalescing.
+pub fn split_into_salted_labels(encoded: &str, max_label_len: usize, salt: u16) -> String {
+    if salt == 0 || encoded.len() < 6 {
+        return split_into_labels(encoded, max_label_len);
+    }
+
+    let safe_max = max_label_len.clamp(8, 63);
+    // Reserve 2 chars in the first two labels so inserting '-' never exceeds 63 chars per label
+    let chunk_step = safe_max - 1;
+    let mut out = String::with_capacity(encoded.len() + encoded.len() / chunk_step + 4);
+    let mut start = 0;
+    let mut label_idx = 0usize;
+
+    while start < encoded.len() {
+        let end = (start + chunk_step).min(encoded.len());
+        let slice = &encoded[start..end];
+        if !out.is_empty() {
+            out.push('.');
+        }
+        if label_idx < 2 && slice.len() >= 4 {
+            let s_val = if label_idx == 0 {
+                (salt as usize) & 0xFF
+            } else {
+                ((salt as usize) >> 8) ^ ((salt as usize) & 0x3F)
+            };
+            let insert_pos = 1 + (s_val % (slice.len() - 1));
+            out.push_str(&slice[..insert_pos]);
+            out.push('-');
+            out.push_str(&slice[insert_pos..]);
+        } else {
+            out.push_str(slice);
+        }
+        start = end;
+        label_idx += 1;
+    }
+    out
+}
+
+/// Joins DNS labels back into a continuous string by removing all dots and hyphens.
 pub fn join_labels(domain_prefix: &str) -> String {
-    domain_prefix.replace('.', "")
+    domain_prefix
+        .chars()
+        .filter(|&c| c != '.' && c != '-')
+        .collect()
 }
 
 const BASE36_CHARS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";

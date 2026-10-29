@@ -178,9 +178,22 @@ impl TunManager {
                 // (Каждый write в TUN обязан оставаться отдельным вызовом —
                 // это один пакет на write() без IFF_VNET_HDR.)
                 loop {
-                    if let Err(e) = writer.write_all(&packet).await {
-                        error!("Failed to write to TUN: {}, bytes: {:?}", e, packet);
-                        break 'outer;
+                    if !packet.is_empty() {
+                        if let Err(e) = writer.write_all(&packet).await {
+                            let raw_os = e.raw_os_error().unwrap_or(0);
+                            // EBADF (9) or ENXIO (6) means the TUN device FD was closed;
+                            // per-packet errors (EINVAL 22, EMSGSIZE 90, EAFNOSUPPORT 97) should not kill the tunnel loop.
+                            if raw_os == 9 || raw_os == 6 || e.kind() == std::io::ErrorKind::BrokenPipe {
+                                error!("TUN writer closed ({}), exiting writer task.", e);
+                                break 'outer;
+                            } else {
+                                warn!(
+                                    "Ignored transient TUN write error ({}) for packet len={}",
+                                    e,
+                                    packet.len()
+                                );
+                            }
+                        }
                     }
                     match rx_to_tun.try_recv() {
                         Ok(next) => packet = next,

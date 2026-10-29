@@ -23,9 +23,9 @@ use tokio::io::{AsyncWriteExt, WriteHalf};
 use tokio::sync::{Mutex, Notify, Semaphore};
 
 const RESOLVER_COOLDOWN_MS: u64 = 2_000;
-const DOH_TCP_MAX_MSS: u16 = 640;
+const DOH_TCP_MAX_MSS: u16 = 240;
 const CODEL_MAX_SOJOURN: Duration = Duration::from_millis(600);
-const MAX_BULK_QUEUE_LEN: usize = 48;
+const MAX_BULK_QUEUE_LEN: usize = 64;
 const MAX_PRIO_QUEUE_LEN: usize = 128;
 
 fn now_epoch_ms() -> u64 {
@@ -33,6 +33,148 @@ fn now_epoch_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+fn ipv4_header_checksum(hdr: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+    let mut i = 0;
+    while i + 1 < hdr.len() {
+        if i != 10 {
+            sum += u16::from_be_bytes([hdr[i], hdr[i + 1]]) as u32;
+        }
+        i += 2;
+    }
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+/// Inspects an outbound IP packet from the TUN interface before queuing into DoH:
+/// 1. Drops IPv6 packets (`version == 6`) since the tunnel is IPv4-only.
+/// 2. Intercepts IPv4 UDP packets to ports 443/853 (QUIC / HTTP/3 / DoT) and returns a synthetic
+///    ICMPv4 Port Unreachable (Type 3, Code 3) reply so browsers immediately fall back to TCP (`MSS=240`)
+///    without flooding the DNS tunnel with 1250B QUIC datagrams.
+/// 3. Intercepts IPv4 UDP:53 DNS queries for `AAAA` (28), `HTTPS` (65), and `SVCB` (64) and returns
+///    an instant synthetic DNS `NOERROR, ANCOUNT=0` (NODATA) reply so browsers only send `A` queries
+///    over the DoH tunnel and never attempt HTTP/3 via `HTTPS` records.
+enum TunnelPacketAction {
+    Forward,
+    Drop,
+    SyntheticReply(Vec<u8>),
+}
+
+fn inspect_outbound_tunnel_packet(pkt: &[u8]) -> TunnelPacketAction {
+    if pkt.len() < 20 {
+        return TunnelPacketAction::Drop;
+    }
+    let version = pkt[0] >> 4;
+    if version == 6 {
+        return TunnelPacketAction::Drop;
+    }
+    if version != 4 {
+        return TunnelPacketAction::Drop;
+    }
+
+    let ihl = ((pkt[0] & 0x0F) as usize) * 4;
+    if ihl < 20 || pkt.len() < ihl {
+        return TunnelPacketAction::Drop;
+    }
+    let frag_off = u16::from_be_bytes([pkt[6], pkt[7]]) & 0x1FFF;
+    let proto = pkt[9];
+
+    if proto == 17 && frag_off == 0 && pkt.len() >= ihl + 8 {
+        let src_port = u16::from_be_bytes([pkt[ihl], pkt[ihl + 1]]);
+        let dst_port = u16::from_be_bytes([pkt[ihl + 2], pkt[ihl + 3]]);
+
+        // Block QUIC (UDP:443) and DoT/QUIC-DNS (UDP:853) with immediate ICMP Port Unreachable
+        if dst_port == 443 || dst_port == 853 {
+            let quoted_len = (ihl + 8).min(pkt.len());
+            let icmp_len = 8 + quoted_len;
+            let total_len = 20 + icmp_len;
+            let mut reply = vec![0u8; total_len];
+
+            reply[0] = 0x45;
+            reply[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
+            reply[6..8].copy_from_slice(&0x4000u16.to_be_bytes()); // DF
+            reply[8] = 64; // TTL
+            reply[9] = 1; // ICMP
+            reply[12..16].copy_from_slice(&pkt[16..20]); // src = original dst
+            reply[16..20].copy_from_slice(&pkt[12..16]); // dst = original src
+            let ip_csum = ipv4_header_checksum(&reply[0..20]);
+            reply[10..12].copy_from_slice(&ip_csum.to_be_bytes());
+
+            // ICMP Type 3 (Destination Unreachable), Code 3 (Port Unreachable)
+            reply[20] = 3;
+            reply[21] = 3;
+            reply[28..28 + quoted_len].copy_from_slice(&pkt[..quoted_len]);
+
+            let mut sum: u32 = 0;
+            let icmp_slice = &reply[20..];
+            let mut i = 0;
+            while i + 1 < icmp_slice.len() {
+                sum += u16::from_be_bytes([icmp_slice[i], icmp_slice[i + 1]]) as u32;
+                i += 2;
+            }
+            if i < icmp_slice.len() {
+                sum += (icmp_slice[i] as u32) << 8;
+            }
+            while (sum >> 16) != 0 {
+                sum = (sum & 0xFFFF) + (sum >> 16);
+            }
+            let icmp_csum = !(sum as u16);
+            reply[22..24].copy_from_slice(&icmp_csum.to_be_bytes());
+
+            return TunnelPacketAction::SyntheticReply(reply);
+        }
+
+        // Synthesize instant NODATA (NOERROR, ANCOUNT=0) for in-tunnel AAAA (28), SVCB (64), HTTPS (65) DNS queries
+        if dst_port == 53 && pkt.len() > ihl + 8 {
+            let dns_req = &pkt[ihl + 8..];
+            if let Some(parsed) = anet_common::dns_proto::parse_dns_query(dns_req) {
+                if matches!(
+                    parsed.qtype,
+                    anet_common::dns_proto::DNS_QTYPE_AAAA
+                        | anet_common::dns_proto::DNS_QTYPE_SVCB
+                        | anet_common::dns_proto::DNS_QTYPE_HTTPS
+                ) && parsed.question_end <= dns_req.len()
+                {
+                    let q_section = &dns_req[12..parsed.question_end];
+                    let dns_resp_len = 12 + q_section.len();
+                    let udp_len = 8 + dns_resp_len;
+                    let total_len = 20 + udp_len;
+                    let mut reply = vec![0u8; total_len];
+
+                    reply[0] = 0x45;
+                    reply[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
+                    reply[6..8].copy_from_slice(&0x4000u16.to_be_bytes());
+                    reply[8] = 64;
+                    reply[9] = 17; // UDP
+                    reply[12..16].copy_from_slice(&pkt[16..20]);
+                    reply[16..20].copy_from_slice(&pkt[12..16]);
+                    let ip_csum = ipv4_header_checksum(&reply[0..20]);
+                    reply[10..12].copy_from_slice(&ip_csum.to_be_bytes());
+
+                    // UDP header (checksum 0 is valid for IPv4 UDP)
+                    reply[20..22].copy_from_slice(&dst_port.to_be_bytes());
+                    reply[22..24].copy_from_slice(&src_port.to_be_bytes());
+                    reply[24..26].copy_from_slice(&(udp_len as u16).to_be_bytes());
+
+                    // DNS Header: QR=1, RD=preserved, RA=1, RCODE=0, QDCOUNT=1, AN/NS/AR=0
+                    let rd_bit = parsed.flags & 0x0100;
+                    let dns_flags: u16 = 0x8080 | rd_bit;
+                    reply[28..30].copy_from_slice(&parsed.tx_id.to_be_bytes());
+                    reply[30..32].copy_from_slice(&dns_flags.to_be_bytes());
+                    reply[32..34].copy_from_slice(&1u16.to_be_bytes());
+                    reply[40..40 + q_section.len()].copy_from_slice(q_section);
+
+                    return TunnelPacketAction::SyntheticReply(reply);
+                }
+            }
+        }
+    }
+
+    TunnelPacketAction::Forward
 }
 
 /// Returns true if the IP packet is latency-sensitive (ICMP ping/probe, DNS port 53, or small TCP SYN/ACK/control).
@@ -504,8 +646,8 @@ impl DohDownlinkState {
     }
 }
 
-const UPLINK_ARQ_RTO: Duration = Duration::from_millis(340);
-const UPLINK_NACK_FAST_DELAY: Duration = Duration::from_millis(110);
+const UPLINK_ARQ_RTO: Duration = Duration::from_millis(750);
+const UPLINK_NACK_FAST_DELAY: Duration = Duration::from_millis(240);
 const UPLINK_MAX_INFLIGHT_PKTS: usize = 96;
 const UPLINK_MAX_CHUNK_RETRIES: u8 = 4;
 
@@ -1065,6 +1207,172 @@ impl ResolverPool {
         Err(last_err.unwrap_or_else(|| anyhow::anyhow!("All hedged DoH resolvers failed")))
     }
 
+    /// Sends a handshake chunk with distinct salted QNAMEs across hedged copies and retries
+    /// so recursive resolvers never coalesce copies or return cached SERVFAIL.
+    async fn send_hs_chunk_hedged(
+        self: &Arc<Self>,
+        client: &Client,
+        temp_session_id: u32,
+        idx: usize,
+        total: usize,
+        chunk: &[u8],
+        domain_zone: &str,
+        attempt_timeout: Duration,
+        dup_count: usize,
+    ) -> Result<Bytes> {
+        let targets = self.select_distinct_healthy(dup_count);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<Bytes>>(targets.len().max(1));
+
+        for (copy_idx, (res_idx, url)) in targets.into_iter().enumerate() {
+            let salt = if copy_idx == 0 {
+                0
+            } else {
+                rand::random::<u16>() | 1
+            };
+            let q = build_salted_hs_query(temp_session_id, idx, total, chunk, domain_zone, salt);
+            let pool = self.clone();
+            let c = client.clone();
+            let tx_c = tx.clone();
+            tokio::spawn(async move {
+                let res = pool
+                    .send_once_to_resolver(&c, res_idx, &url, &q, attempt_timeout)
+                    .await;
+                let _ = tx_c.send(res).await;
+            });
+        }
+        drop(tx);
+
+        let mut last_err = None;
+        while let Some(res) = rx.recv().await {
+            match res {
+                Ok(body) => return Ok(body),
+                Err(e) => last_err = Some(e),
+            }
+        }
+
+        // Reliable failover with fresh salted QNAME per attempt
+        let max_attempts = self.urls.len().clamp(2, 4);
+        for _ in 0..max_attempts {
+            let (res_idx, resolver_url) = self.next_healthy();
+            let salt = rand::random::<u16>() | 1;
+            let q = build_salted_hs_query(temp_session_id, idx, total, chunk, domain_zone, salt);
+            match self
+                .send_once_to_resolver(client, res_idx, resolver_url, &q, attempt_timeout)
+                .await
+            {
+                Ok(body) => return Ok(body),
+                Err(e) => last_err = Some(e),
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("All hedged DoH resolvers failed")))
+    }
+
+    /// Sends an Uplink Data Chunk across `dup_count` distinct resolvers using unique salted QNAMEs
+    /// and processes EVERY successful response body through `process_downlink_dns_body` so no
+    /// piggybacked downlink frame from a secondary hedged copy is ever discarded.
+    #[allow(clippy::too_many_arguments)]
+    async fn send_data_chunk_hedged(
+        self: &Arc<Self>,
+        client: &Client,
+        chunk: &[u8],
+        domain_zone: &str,
+        attempt_timeout: Duration,
+        dup_count: usize,
+        initial_salt: bool,
+        cipher: &Arc<AstpLiteCipher>,
+        session_id: u32,
+        dl_state: &Arc<Mutex<DohDownlinkState>>,
+        ul_arq: &Arc<std::sync::Mutex<UplinkArqState>>,
+        tunnel_write: &Arc<Mutex<WriteHalf<tokio::io::DuplexStream>>>,
+        burst_notify: &Arc<Notify>,
+    ) -> Result<()> {
+        let targets = self.select_distinct_healthy(dup_count);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<()>>(targets.len().max(1));
+
+        for (copy_idx, (res_idx, url)) in targets.into_iter().enumerate() {
+            let salt = if copy_idx == 0 && !initial_salt {
+                0
+            } else {
+                rand::random::<u16>() | 1
+            };
+            let q = build_salted_data_query(chunk, domain_zone, salt);
+            let pool = self.clone();
+            let c = client.clone();
+            let cip = cipher.clone();
+            let dl = dl_state.clone();
+            let ul = ul_arq.clone();
+            let tw = tunnel_write.clone();
+            let bn = burst_notify.clone();
+            let tx_c = tx.clone();
+
+            tokio::spawn(async move {
+                match pool
+                    .send_once_to_resolver(&c, res_idx, &url, &q, attempt_timeout)
+                    .await
+                {
+                    Ok(body) => {
+                        let _ = process_downlink_dns_body(
+                            &body,
+                            &cip,
+                            session_id,
+                            &dl,
+                            &ul,
+                            &tw,
+                            &bn,
+                        )
+                        .await;
+                        let _ = tx_c.send(Ok(())).await;
+                    }
+                    Err(e) => {
+                        let _ = tx_c.send(Err(e)).await;
+                    }
+                }
+            });
+        }
+        drop(tx);
+
+        let mut last_err = None;
+        while let Some(res) = rx.recv().await {
+            match res {
+                Ok(()) => return Ok(()),
+                Err(e) => last_err = Some(e),
+            }
+        }
+
+        // All initial hedged copies failed: retry sequentially across healthy resolvers with fresh salt
+        let max_attempts = self.urls.len().clamp(2, 3);
+        for _ in 0..max_attempts {
+            let (res_idx, resolver_url) = self.next_healthy();
+            let salt = rand::random::<u16>() | 1;
+            let q = build_salted_data_query(chunk, domain_zone, salt);
+            match self
+                .send_once_to_resolver(client, res_idx, resolver_url, &q, attempt_timeout)
+                .await
+            {
+                Ok(body) => {
+                    let _ = process_downlink_dns_body(
+                        &body,
+                        cipher,
+                        session_id,
+                        dl_state,
+                        ul_arq,
+                        tunnel_write,
+                        burst_notify,
+                    )
+                    .await;
+                    return Ok(());
+                }
+                Err(e) => {
+                    debug!("[DoH] Resolver {} failed on retry: {}", resolver_url, e);
+                    last_err = Some(e);
+                }
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("All DoH resolvers failed for data chunk")))
+    }
+
     /// Sends a DoH DNS wire query with a fast per-attempt timeout, checking DNS RCODE and failing over across resolvers.
     async fn send_query_reliable(
         &self,
@@ -1093,6 +1401,55 @@ impl ResolverPool {
     }
 }
 
+fn build_salted_data_query(chunk: &[u8], domain_zone: &str, salt: u16) -> Vec<u8> {
+    let b36_str = base32::encode_base36(chunk);
+    let labels = base32::split_into_salted_labels(&b36_str, 63, salt);
+    let qname = format!("{}.{}", labels, domain_zone);
+    build_doh_query(&qname, rand::random::<u16>())
+}
+
+fn build_salted_hs_query(
+    temp_session_id: u32,
+    idx: usize,
+    total: usize,
+    chunk: &[u8],
+    domain_zone: &str,
+    salt: u16,
+) -> Vec<u8> {
+    let b32_str = base32::encode(chunk);
+    let labels = base32::split_into_salted_labels(&b32_str, 63, salt);
+    let qname = format!(
+        "hs.{:08x}.{}.{}.{}.{}",
+        temp_session_id, idx, total, labels, domain_zone
+    );
+    build_doh_query(&qname, rand::random::<u16>())
+}
+
+/// Converts any DoH/HTTPS/UDP resolver URL into a `udp://host:port` string when the outer DSN scheme is `udp://` or `dns://`.
+fn coerce_resolver_to_udp(raw_url: &str) -> String {
+    let trimmed = raw_url.trim();
+    if trimmed.starts_with("udp://") {
+        return trimmed.to_string();
+    }
+    let normalized = if let Some(rest) = trimmed.strip_prefix("doh://") {
+        format!("https://{}", rest)
+    } else if !trimmed.contains("://") {
+        format!("udp://{}", trimmed)
+    } else {
+        trimmed.to_string()
+    };
+    if let Ok(parsed) = Url::parse(&normalized) {
+        if let Some(host) = parsed.host_str() {
+            let port = match parsed.port() {
+                Some(p) if p != 443 && p != 80 => p,
+                _ => 53,
+            };
+            return format!("udp://{}:{}", host, port);
+        }
+    }
+    trimmed.to_string()
+}
+
 struct DohAuthChannel {
     client: Client,
     pool: Arc<ResolverPool>,
@@ -1117,18 +1474,18 @@ impl AuthChannel for DohAuthChannel {
         let total = chunks.len();
         let hs_dup = if self.dup_hs { 3 } else { 1 };
         for (idx, chunk) in chunks.into_iter().enumerate() {
-            let b32_str = base32::encode(&chunk);
-            let labels = base32::split_into_labels(&b32_str, 63);
-            let qname = format!(
-                "hs.{:08x}.{}.{}.{}.{}",
-                self.temp_session_id, idx, total, labels, self.domain_zone
-            );
-
-            let query_bytes = build_doh_query(&qname, rand::random::<u16>());
-
             match self
                 .pool
-                .send_query_hedged(&self.client, &query_bytes, Duration::from_millis(900), hs_dup)
+                .send_hs_chunk_hedged(
+                    &self.client,
+                    self.temp_session_id,
+                    idx,
+                    total,
+                    &chunk,
+                    &self.domain_zone,
+                    Duration::from_millis(1000),
+                    hs_dup,
+                )
                 .await
             {
                 Ok(body) => {
@@ -1212,6 +1569,7 @@ impl DohTransport {
 impl ClientTransport for DohTransport {
     async fn connect(&self) -> Result<ConnectionResult> {
         let dsn_url = Url::parse(&self.server.dsn).context("Failed to parse DoH DSN")?;
+        let is_udp_dsn = matches!(dsn_url.scheme(), "udp" | "dns");
         let domain_zone = dsn_url
             .host_str()
             .context("No domain zone in DoH DSN")?
@@ -1235,12 +1593,24 @@ impl ClientTransport for DohTransport {
         }
 
         if resolvers.is_empty() {
-            resolvers.push("doh://77.88.8.7/dns-query".to_string());
-            resolvers.push("doh://dns.adguard-dns.com/dns-query".to_string());
+            if is_udp_dsn {
+                resolvers.push("udp://77.88.8.7:53".to_string());
+                resolvers.push("udp://77.88.8.8:53".to_string());
+                resolvers.push("udp://77.88.8.1:53".to_string());
+            } else {
+                resolvers.push("doh://77.88.8.7/dns-query".to_string());
+                resolvers.push("doh://dns.adguard-dns.com/dns-query".to_string());
+            }
+        } else if is_udp_dsn {
+            resolvers = resolvers
+                .into_iter()
+                .map(|r| coerce_resolver_to_udp(&r))
+                .collect();
         }
 
         info!(
-            "[DoH] Initializing transport for domain '{}' via {} resolvers (ARQ: {}, Hold: {}ms)",
+            "[DoH] Initializing transport ({}) for domain '{}' via {} resolvers (ARQ: {}, Hold: {}ms)",
+            if is_udp_dsn { "UDP-53" } else { "DoH-HTTPS" },
             domain_zone,
             resolvers.len(),
             arq_enabled,
@@ -1315,8 +1685,8 @@ impl ClientTransport for DohTransport {
             .pool_max_idle_per_host(32)
             .pool_idle_timeout(Some(Duration::from_secs(60)))
             .tcp_nodelay(true)
-            .connect_timeout(Duration::from_millis(1000))
-            .timeout(Duration::from_millis(1800))
+            .connect_timeout(Duration::from_millis(1200))
+            .timeout(Duration::from_millis(2200))
             .http2_adaptive_window(true)
             .local_address(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
 
@@ -1327,8 +1697,8 @@ impl ClientTransport for DohTransport {
             .pool_max_idle_per_host(16)
             .pool_idle_timeout(Some(Duration::from_secs(60)))
             .tcp_nodelay(true)
-            .connect_timeout(Duration::from_millis(1000))
-            .timeout(Duration::from_millis(1800))
+            .connect_timeout(Duration::from_millis(1200))
+            .timeout(Duration::from_millis(2200))
             .http2_adaptive_window(true)
             .local_address(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
 
@@ -1386,21 +1756,35 @@ impl ClientTransport for DohTransport {
 
         let (client_stream, internal_router) = tokio::io::duplex(64 * 1024);
         let (mut tunnel_read, tunnel_write) = tokio::io::split(internal_router);
+        let tunnel_write_mutex = Arc::new(Mutex::new(tunnel_write));
         let uplink_queue = Arc::new(DohUplinkQueue::new());
 
         let queue_writer = uplink_queue.clone();
+        let reader_tunnel_write = tunnel_write_mutex.clone();
         let reader_shutdown_flag = shutdown_flag.clone();
         let reader_shutdown_notify = shutdown_notify.clone();
         let tunnel_reader_task = tokio::spawn(async move {
             while let Ok(Some(packet)) = read_next_packet(&mut tunnel_read).await {
-                queue_writer.push(packet);
+                match inspect_outbound_tunnel_packet(&packet) {
+                    TunnelPacketAction::Forward => {
+                        queue_writer.push(packet);
+                    }
+                    TunnelPacketAction::Drop => {}
+                    TunnelPacketAction::SyntheticReply(reply_pkt) => {
+                        let mut frame_buf = BytesMut::with_capacity(4 + reply_pkt.len());
+                        frame_packet_into(&mut frame_buf, &reply_pkt);
+                        let mut guard = reader_tunnel_write.lock().await;
+                        if guard.write_all(&frame_buf).await.is_err() {
+                            break;
+                        }
+                    }
+                }
             }
             reader_shutdown_flag.store(true, Ordering::Release);
             reader_shutdown_notify.notify_waiters();
             queue_writer.close();
         });
 
-        let tunnel_write_mutex = Arc::new(Mutex::new(tunnel_write));
         let dl_feedback = Arc::new(AtomicU64::new(0));
         let downlink_state = Arc::new(Mutex::new(DohDownlinkState::new(dl_feedback.clone())));
         let uplink_arq = Arc::new(std::sync::Mutex::new(UplinkArqState::new(arq_enabled)));
@@ -1423,7 +1807,7 @@ impl ClientTransport for DohTransport {
             let tx_shutdown_flag = shutdown_flag.clone();
             let tx_shutdown_notify = shutdown_notify.clone();
 
-            // Background Uplink ARQ / NACK retransmission worker (runs every 110ms)
+            // Background Uplink ARQ / NACK retransmission worker (runs every 120ms)
             if arq_enabled {
                 let rto_client = http_client.clone();
                 let rto_cipher = cipher.clone();
@@ -1440,7 +1824,7 @@ impl ClientTransport for DohTransport {
                 tokio::spawn(async move {
                     loop {
                         tokio::select! {
-                            _ = tokio::time::sleep(Duration::from_millis(110)) => {}
+                            _ = tokio::time::sleep(Duration::from_millis(120)) => {}
                             _ = rto_shutdown_notify.notified() => break,
                         }
                         if rto_shutdown_flag.load(Ordering::Acquire) {
@@ -1448,13 +1832,9 @@ impl ClientTransport for DohTransport {
                         }
                         let retransmits = rto_ul.lock().unwrap().collect_rto_retransmits();
                         for chunk in retransmits {
-                            let b36_str = base32::encode_base36(&chunk);
-                            let labels = base32::split_into_labels(&b36_str, 63);
-                            let qname = format!("{}.{}", labels, rto_zone);
-                            let query_bytes = build_doh_query(&qname, rand::random::<u16>());
-
                             let c = rto_client.clone();
                             let p = rto_pool.clone();
+                            let z = rto_zone.clone();
                             let cip = rto_cipher.clone();
                             let dl = rto_dl.clone();
                             let ul = rto_ul.clone();
@@ -1464,17 +1844,14 @@ impl ClientTransport for DohTransport {
 
                             tokio::spawn(async move {
                                 let _permit = sem.try_acquire_owned().ok();
-                                if let Ok(body) = p
-                                    .send_query_hedged(
+                                let _ = p
+                                    .send_data_chunk_hedged(
                                         &c,
-                                        &query_bytes,
-                                        Duration::from_millis(600),
+                                        &chunk,
+                                        &z,
+                                        Duration::from_millis(950),
                                         dup_count.max(2),
-                                    )
-                                    .await
-                                {
-                                    let _ = process_downlink_dns_body(
-                                        &body,
+                                        true, // always salt retransmissions so cached SERVFAIL is bypassed
                                         &cip,
                                         session_id,
                                         &dl,
@@ -1483,7 +1860,6 @@ impl ClientTransport for DohTransport {
                                         &bn,
                                     )
                                     .await;
-                                }
                             });
                         }
                     }
@@ -1511,13 +1887,9 @@ impl ClientTransport for DohTransport {
                     };
 
                     for chunk in chunks {
-                        let b36_str = base32::encode_base36(&chunk);
-                        let labels = base32::split_into_labels(&b36_str, 63);
-                        let qname = format!("{}.{}", labels, domain_zone);
-                        let query_bytes = build_doh_query(&qname, rand::random::<u16>());
-
                         let client = http_client.clone();
                         let pool_clone = pool.clone();
+                        let zone_c = domain_zone.clone();
                         let cipher_c = cipher.clone();
                         let dl_state_c = dl_state.clone();
                         let ul_arq_c = ul_arq.clone();
@@ -1543,33 +1915,27 @@ impl ClientTransport for DohTransport {
 
                         tokio::spawn(async move {
                             let _permit = permit;
-                            match pool_clone
-                                .send_query_hedged(
+                            if let Err(e) = pool_clone
+                                .send_data_chunk_hedged(
                                     &client,
-                                    &query_bytes,
-                                    Duration::from_millis(650),
+                                    &chunk,
+                                    &zone_c,
+                                    Duration::from_millis(1050),
                                     pkt_dup,
+                                    false,
+                                    &cipher_c,
+                                    session_id,
+                                    &dl_state_c,
+                                    &ul_arq_c,
+                                    &tunnel_write_c,
+                                    &burst_notify_c,
                                 )
                                 .await
                             {
-                                Ok(body) => {
-                                    let _ = process_downlink_dns_body(
-                                        &body,
-                                        &cipher_c,
-                                        session_id,
-                                        &dl_state_c,
-                                        &ul_arq_c,
-                                        &tunnel_write_c,
-                                        &burst_notify_c,
-                                    )
-                                    .await;
-                                }
-                                Err(e) => {
-                                    debug!(
-                                        "[DoH TX] Uplink chunk failed across all resolvers: {}",
-                                        e
-                                    );
-                                }
+                                debug!(
+                                    "[DoH TX] Uplink chunk failed across all resolvers: {}",
+                                    e
+                                );
                             }
                         });
                     }
@@ -1620,7 +1986,7 @@ impl ClientTransport for DohTransport {
                             res = pool.send_query_reliable(
                                 &http_client,
                                 &query_bytes,
-                                Duration::from_millis(850),
+                                Duration::from_millis(1150),
                             ) => res,
                             _ = rx_shutdown_notify.notified() => break,
                         };

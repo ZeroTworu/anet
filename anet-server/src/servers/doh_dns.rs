@@ -4,7 +4,7 @@ use crate::config::Config;
 use anet_common::astp_lite::AstpLiteCipher;
 use anet_common::base32;
 use anet_common::consts::CHANNEL_BUFFER_SIZE;
-use anet_common::dns_proto::{build_dns_txt_response, parse_dns_query};
+use anet_common::dns_proto::{build_dns_txt_response, build_dns_zone_response, parse_dns_query};
 use anet_common::doh_chunking::DohReassemblyQueue;
 use anyhow::Result;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -21,14 +21,14 @@ use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Mutex};
 
-const DOH_TCP_MAX_MSS: u16 = 640;
-const MAX_SINGLE_DOWNLINK_PKT: usize = 720;
-const DOWNLINK_FRAG_DATA_LEN: usize = 640;
+const DOH_TCP_MAX_MSS: u16 = 240;
+const MAX_SINGLE_DOWNLINK_PKT: usize = 300;
+const DOWNLINK_FRAG_DATA_LEN: usize = 260;
 const CODEL_MAX_SOJOURN: Duration = Duration::from_millis(600);
 const MAX_BULK_QUEUE_LEN: usize = 64;
 const MAX_PRIO_QUEUE_LEN: usize = 128;
-const DOWNLINK_ARQ_RTO: Duration = Duration::from_millis(380);
-const DOWNLINK_SACK_FAST_RTO: Duration = Duration::from_millis(120);
+const DOWNLINK_ARQ_RTO: Duration = Duration::from_millis(800);
+const DOWNLINK_SACK_FAST_RTO: Duration = Duration::from_millis(240);
 const DOWNLINK_MAX_INFLIGHT: usize = 64;
 const DOWNLINK_MAX_RETRIES: u8 = 5;
 const RECENT_DNS_CACHE_TTL: Duration = Duration::from_secs(8);
@@ -180,7 +180,7 @@ fn is_priority_packet(pkt: &[u8]) -> bool {
     false
 }
 
-/// Clamps TCP MSS option on IPv4/IPv6 SYN / SYN-ACK packets so TCP segments fit cleanly inside single DoH DNS responses.
+/// Clamps TCP MSS option on IPv4/IPv6 SYN / SYN-ACK packets so TCP segments fit cleanly inside single <=512B DoH DNS responses.
 fn clamp_tcp_mss(pkt: &mut [u8], max_mss: u16) {
     if pkt.len() < 40 {
         return;
@@ -372,6 +372,8 @@ async fn pop_downlink_payload(
 
     drain_channel_into_queues(&mut state);
 
+    let max_b64_len = ((max_raw_bytes + 4 + 2) / 3) * 4;
+
     // 0. Check DownlinkArqWindow for frames needing fast SACK retransmission or RTO retransmission
     {
         let now = Instant::now();
@@ -387,7 +389,7 @@ async fn pop_downlink_payload(
             if fast_nack || rto_expired {
                 if frame.retries >= DOWNLINK_MAX_RETRIES {
                     expired_keys.push(seq);
-                } else {
+                } else if frame.encoded_b64.len() <= max_b64_len {
                     frame.sent_at = now;
                     frame.retries += 1;
                     retransmit_b64 = Some(frame.encoded_b64.clone());
@@ -430,7 +432,7 @@ async fn pop_downlink_payload(
 
     // Evict oldest inflight frame if window is full so new traffic never deadlocks
     while state.inflight_dl.len() >= DOWNLINK_MAX_INFLIGHT {
-        if let Some(& oldest_seq) = state.inflight_dl.keys().next() {
+        if let Some(&oldest_seq) = state.inflight_dl.keys().next() {
             state.inflight_dl.remove(&oldest_seq);
         } else {
             break;
@@ -439,12 +441,28 @@ async fn pop_downlink_payload(
 
     let mut packet_buf: Vec<u8> = Vec::new();
 
-    // 1. If there is a pending fragment of a large packet, send it immediately as a 0x01 frame
-    if let Some(frag_frame) = state.pending_frags.pop_front() {
-        packet_buf = frag_frame.to_vec();
-    } else if let Some((first_pkt, _is_prio)) = pop_next_packet(&mut state) {
+    // 1. If there is a pending fragment of a large packet, send it if it fits within max_raw_bytes
+    if let Some(front_frag) = state.pending_frags.front() {
+        if front_frag.len() <= max_raw_bytes {
+            packet_buf = state.pending_frags.pop_front().unwrap().to_vec();
+        } else {
+            return None;
+        }
+    } else if let Some((first_pkt, first_is_prio)) = pop_next_packet(&mut state) {
+        // When piggybacking on a long Uplink Data Chunk query (`max_raw_bytes < MAX_SINGLE_DOWNLINK_PKT`),
+        // only piggyback small packets (ICMP Echo Reply, DNS reply, TCP SYN-ACK/ACK) that fit in <= 512B UDP DNS!
+        // Leave larger TCP data segments in the queue for the dedicated `poll.` workers.
+        if max_raw_bytes < MAX_SINGLE_DOWNLINK_PKT && first_pkt.len() > max_raw_bytes {
+            if first_is_prio {
+                state.prio_queue.push_front((first_pkt, Instant::now()));
+            } else {
+                state.bulk_queue.push_front((first_pkt, Instant::now()));
+            }
+            return None;
+        }
+
         if first_pkt.len() > MAX_SINGLE_DOWNLINK_PKT {
-            // Split oversized packet into <= 460B fragments with 0x01 header:
+            // Split oversized packet into <= 260B fragments with 0x01 header:
             // [0x01, pkt_id_be16, frag_idx: u8, total_frags: u8, data...]
             let pkt_id = state.next_frag_id;
             state.next_frag_id = state.next_frag_id.wrapping_add(1);
@@ -466,7 +484,7 @@ async fn pop_downlink_payload(
                 }
             }
         } else {
-            // Normal packet (<= 500B): try batching additional packets that fit strictly within max_raw_bytes
+            // Normal packet (<= 300B): try batching additional packets that fit strictly within max_raw_bytes
             let mut packets: Vec<Bytes> = Vec::with_capacity(8);
             let mut total_raw = first_pkt.len();
             packets.push(first_pkt);
@@ -738,9 +756,10 @@ async fn handle_dns_datagram(
         .trim_end_matches(&domain_zone)
         .trim_end_matches('.');
 
-    // Filter out QNAME-minimization probes: non-TXT queries (A, NS, SOA) or empty zone apex
+    // Respond to QNAME-minimization and zone-liveness probes (NS, SOA, A, or empty zone apex)
+    // with proper authoritative NS/SOA records so recursive resolvers never mark the zone as lame.
     if parsed_q.qtype != anet_common::dns_proto::DNS_QTYPE_TXT || prefix.is_empty() {
-        let resp = build_dns_txt_response(&raw_query, &parsed_q, None, 0);
+        let resp = build_dns_zone_response(&raw_query, &parsed_q, &domain_zone, 60);
         let _ = socket.send_to(&resp, remote_addr).await;
         return Ok(());
     }
@@ -785,11 +804,12 @@ async fn handle_dns_datagram(
                     .clone();
 
                 let effective_hold_ms = poll_hold_timeout_ms.min(25);
+                // Cap poll payload at 300 raw bytes (408B Base64 -> <= 485B total UDP DNS response, strictly <= 512B!)
                 if let Some(b64) = pop_downlink_payload(
                     &session,
                     &client_info,
                     session_id,
-                    820,
+                    300,
                     Duration::from_millis(effective_hold_ms),
                     Some(qhash),
                     dl_ack,
@@ -1024,8 +1044,8 @@ async fn handle_dns_datagram(
             }
         }
 
-        // Piggyback ready downlink packets (or quick replies such as in-tunnel ICMP Echo Reply)
-        // directly in the TXT response of the uplink query (capped at 510 raw bytes so UDP DNS <= 994B).
+        // Piggyback small downlink replies (such as in-tunnel ICMP Echo Reply, DNS A reply, or TCP SYN-ACK/ACK <= 140B)
+        // directly in the TXT response of the uplink query so total UDP DNS packet stays <= 512 bytes even with a 245B Question!
         let piggyback_wait = if completed_uplink {
             Duration::from_millis(3)
         } else {
@@ -1035,7 +1055,7 @@ async fn handle_dns_datagram(
             &session,
             &client_info,
             hdr.session_id,
-            680,
+            140,
             piggyback_wait,
             Some(qhash),
             None,
