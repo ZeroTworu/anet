@@ -33,14 +33,19 @@ clean:
 musl:
 	cargo update -p rtc-turn -p reqwest-boring
 	@for d in target/x86_64-unknown-linux-musl/release/build/boring-sys-*/out; do \
-		if [ -d "$$d/build" ] && [ ! -f "$$d/build/ssl/libssl.a" ] && [ ! -f "$$d/build/libssl.a" ]; then \
-			rm -rf "$$d/build"; \
+		if [ -d "$$d/build" ]; then \
+			if [ ! -f "$$d/build/ssl/libssl.a" ] && [ ! -f "$$d/build/libssl.a" ]; then \
+				rm -rf "$$d/build"; \
+			elif ! grep -q -- "-fno-exceptions" "$$d/build/CMakeCache.txt" 2>/dev/null; then \
+				rm -rf "$$d/build"; \
+				cargo clean -p boring-sys --release --target x86_64-unknown-linux-musl; \
+			fi; \
 		fi; \
 	done
 	CXX_x86_64_unknown_linux_musl=g++ \
-	CXXFLAGS_x86_64_unknown_linux_musl="-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0" \
+	CXXFLAGS_x86_64_unknown_linux_musl="-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-exceptions -fno-rtti -fno-sized-deallocation -DBORINGSSL_TEMPORARY_NO_CXX_RUNTIME" \
 	BORING_BSSL_RUST_CPPLIB_x86_64_unknown_linux_musl=c \
-	RUSTFLAGS="-C target-feature=+crt-static" \
+	RUSTFLAGS="-C target-feature=+crt-static -C link-arg=-Wl,--defsym=fopen64=fopen -C link-arg=-Wl,--defsym=__isoc23_strtoull=strtoull -C link-arg=-Wl,--defsym=__isoc23_strtol=strtol -C link-arg=-Wl,--defsym=__isoc23_strtoul=strtoul -C link-arg=-Wl,--defsym=__cxa_pure_virtual=abort -C link-arg=-Wl,--defsym=_ZdlPv=free -C link-arg=-Wl,--defsym=_ZdlPvm=free -C link-arg=-Wl,--defsym=_ZSt24__throw_out_of_range_fmtPKcz=abort -C link-arg=-Wl,--defsym=_ZSt20__throw_length_errorPKc=abort -C link-arg=-Wl,--defsym=_ZSt17__throw_bad_allocv=abort -C link-arg=-Wl,--defsym=_ZSt28__throw_bad_array_new_lengthv=abort" \
 	cargo build --release --target x86_64-unknown-linux-musl --package anet-server --package anet-client-cli --package anet-auth
 
 # Build Android libraries (requires cargo-ndk)
