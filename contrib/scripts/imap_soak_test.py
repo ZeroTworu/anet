@@ -269,12 +269,49 @@ class RobustImapClient:
     async def exit_idle(self):
         if not self.in_idle:
             return
-        await self.send_line("DONE")
-        self.in_idle = False
         try:
+            await self.send_line("DONE")
             await self.read_until_tagged(self.idle_tag, timeout_sec=5.0)
         except asyncio.TimeoutError:
             self.logger.warning("Timeout waiting for IDLE tagged response after DONE")
+        finally:
+            self.in_idle = False
+
+    async def get_max_uid(self) -> int:
+        """Определяет максимальный UID в выбранной папке без загрузки писем."""
+        tag = self.next_tag()
+        await self.send_line(f"{tag} UID FETCH * (UID)")
+        resp = await self.read_until_tagged(tag)
+        max_uid = 0
+        for line in resp:
+            m = re.search(r"UID\s+(\d+)", line, re.IGNORECASE)
+            if m:
+                max_uid = max(max_uid, int(m.group(1)))
+        return max_uid
+
+    async def wait_idle_or_event(self, timeout_sec: float = 29.0) -> bool:
+        """
+        Активно слушает сокет в режиме IDLE:
+        при получении '* EXISTS' сразу просыпается и завершает IDLE за миллисекунды.
+        """
+        await self.enter_idle()
+        got_event = False
+        t_start = time.time()
+        try:
+            while self.in_idle:
+                remaining = timeout_sec - (time.time() - t_start)
+                if remaining <= 0:
+                    break
+                try:
+                    line = await asyncio.wait_for(self.readline(), timeout=min(remaining, 5.0))
+                    if re.search(r"^\*\s+\d+\s+EXISTS", line, re.IGNORECASE):
+                        got_event = True
+                        break
+                except asyncio.TimeoutError:
+                    continue
+        finally:
+            await self.exit_idle()
+        return got_event
 
     async def fetch_messages_robust(self, last_uid: int) -> Tuple[List[Tuple[int, str, bytes]], int, float]:
         """
@@ -396,7 +433,8 @@ async def run_server_worker(
     await srv_writer.connect()
     await srv_writer.select("Drafts")
 
-    last_seen_uid = 0
+    last_seen_uid = await srv_reader.get_max_uid()
+    srv_reader.logger.info(f"Initial folder baseline UID: {last_seen_uid}")
     cleanup_queue: List[int] = []
     echo_queue: asyncio.Queue = asyncio.Queue()
 
@@ -427,13 +465,9 @@ async def run_server_worker(
     try:
         while not stop_event.is_set():
             if not srv_reader.pending_exists:
-                await srv_reader.enter_idle()
-                t_idle_start = time.time()
-                while not srv_reader.pending_exists and not stop_event.is_set():
-                    if time.time() - t_idle_start > 30.0:
-                        break
-                    await asyncio.sleep(0.005)
-                await srv_reader.exit_idle()
+                await srv_reader.wait_idle_or_event(timeout_sec=29.0)
+                if stop_event.is_set():
+                    break
 
             srv_reader.pending_exists = False
 
@@ -476,7 +510,8 @@ async def run_client_worker(
     await cli_writer.connect()
     await cli_writer.select("Notes")
 
-    last_seen_uid = 0
+    last_seen_uid = await cli_reader.get_max_uid()
+    cli_reader.logger.info(f"Initial folder baseline UID: {last_seen_uid}")
     cleanup_queue: List[int] = []
     sent_timestamps: Dict[int, float] = {}
     seq_counter = 0
@@ -520,13 +555,9 @@ async def run_client_worker(
     try:
         while not stop_event.is_set():
             if not cli_reader.pending_exists:
-                await cli_reader.enter_idle()
-                t_idle_start = time.time()
-                while not cli_reader.pending_exists and not stop_event.is_set():
-                    if time.time() - t_idle_start > 30.0:
-                        break
-                    await asyncio.sleep(0.005)
-                await cli_reader.exit_idle()
+                await cli_reader.wait_idle_or_event(timeout_sec=29.0)
+                if stop_event.is_set():
+                    break
 
             cli_reader.pending_exists = False
 
@@ -543,7 +574,7 @@ async def run_client_worker(
                     if seq in sent_timestamps:
                         rtt = (time.time() - sent_timestamps.pop(seq)) * 1000.0
                         stats.rtt_samples.append(rtt)
-                        if stats.cli_rx_batches % 10 == 0:
+                        if stats.cli_rx_batches == 1 or stats.cli_rx_batches % 10 == 0:
                             elapsed = max(0.1, time.time() - stats.start_time)
                             cur_mbps = (stats.cli_rx_bytes * 8) / (elapsed * 1_000_000)
                             logger.info(
@@ -585,14 +616,16 @@ async def main():
 
     async def progress_reporter():
         while not stop_event.is_set():
-            await asyncio.sleep(30.0)
+            await asyncio.sleep(15.0)
             elapsed = max(0.1, time.time() - stats.start_time)
             tx_mbps = (stats.cli_tx_bytes * 8) / (elapsed * 1_000_000)
             rx_mbps = (stats.cli_rx_bytes * 8) / (elapsed * 1_000_000)
             logger.info(
-                f"[SPEED] {elapsed/60.0:.1f}/{args.duration_mins} min | "
-                f"TX: {stats.cli_tx_bytes/(1024*1024):.1f} MiB ({tx_mbps:.2f} Mbps) | "
-                f"RX: {stats.cli_rx_bytes/(1024*1024):.1f} MiB ({rx_mbps:.2f} Mbps) | "
+                f"[SPEED] {elapsed/60.0:.2f}/{args.duration_mins} min | "
+                f"CLI TX: {stats.cli_tx_bytes/(1024*1024):.1f} MiB ({tx_mbps:.2f} Mbps) | "
+                f"CLI RX: {stats.cli_rx_bytes/(1024*1024):.1f} MiB ({rx_mbps:.2f} Mbps) | "
+                f"SRV RX: {stats.srv_rx_bytes/(1024*1024):.1f} MiB | "
+                f"SRV TX: {stats.srv_tx_bytes/(1024*1024):.1f} MiB | "
                 f"BlindWindow: {stats.blind_window_hits}"
             )
 
