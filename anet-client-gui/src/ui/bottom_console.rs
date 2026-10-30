@@ -157,19 +157,25 @@ fn pulse_palette(color: PulseColor) -> (Color32, Color32, Color32) {
 fn render_connectivity_shield_card(app: &mut ANetApp, ui: &mut egui::Ui) {
     let snap = app.connectivity_snapshot.clone();
     let vpn_state = crate::utils::helpers::lock_ignore_poison(&app.shared).state;
-    let shield_pulse = match vpn_state {
-        crate::types::ConnectionState::Disconnected => PulseColor::Red,
-        crate::types::ConnectionState::Connecting
-        | crate::types::ConnectionState::Stopping => PulseColor::Yellow,
-        crate::types::ConnectionState::Connected => {
-            if snap.condition == NetworkCondition::TunnelFullOnline || snap.global_ok > 0 {
-                PulseColor::Green
-            } else {
-                PulseColor::Yellow
-            }
-        }
+    let vpn_active = vpn_state == crate::types::ConnectionState::Connected || snap.vpn_connected;
+    // Правила цвета щита:
+    // - "ЖЁЛТЫЙ": "Белые списки" (РФ доступна, Мир 0/3 — что с VPN, что без него)
+    // - "КРАСНЫЙ": ни VPN, ни связи (Мир 0/3 и РФ 0/3)
+    // - "ЗЕЛЁНЫЙ": связь есть + VPN активен
+    // - "СЕРЫЙ": связь есть, нет VPN
+    let (shield_accent, shield_pulse) = if snap.domestic_ok > 0 && snap.global_ok == 0 {
+        let (c, _, _) = pulse_palette(PulseColor::Yellow);
+        (c, PulseColor::Yellow)
+    } else if snap.global_ok == 0 && snap.domestic_ok == 0 {
+        let (c, _, _) = pulse_palette(PulseColor::Red);
+        (c, PulseColor::Red)
+    } else if vpn_active {
+        let (c, _, _) = pulse_palette(PulseColor::Green);
+        (c, PulseColor::Green)
+    } else {
+        // СЕРЫЙ: связь есть, нет VPN
+        (Color32::from_rgb(138, 148, 166), PulseColor::Red)
     };
-    let (shield_accent, _, _) = pulse_palette(shield_pulse);
     let (accent, stroke_col, bg_col) = pulse_palette(snap.pulse_color);
     let text_sub = Color32::from_rgb(168, 176, 190);
     let is_checking = snap.title.starts_with("Сверяем");
@@ -400,7 +406,11 @@ fn render_pulse_line_card(app: &ANetApp, ui: &mut egui::Ui, ctx: &egui::Context)
     let (accent, _, _) = pulse_palette(snap.pulse_color);
     let text_muted = Color32::from_rgb(140, 145, 155);
 
-    let rtt_opt = snap.display_rtt_ms.or(app.telemetry_snapshot.rtt_ms);
+    let rtt_opt = if snap.pulse_color == PulseColor::Red || (snap.global_ok == 0 && snap.domestic_ok == 0) {
+        None
+    } else {
+        snap.display_rtt_ms.or(app.telemetry_snapshot.rtt_ms)
+    };
     let rtt_text = match rtt_opt {
         Some(ms) => format!("{ms} мс"),
         None => "— мс".to_string(),

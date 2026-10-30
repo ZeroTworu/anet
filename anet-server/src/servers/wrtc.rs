@@ -232,6 +232,10 @@ pub async fn run_wrtc_server(
             Arc::new(DashSet::new());
         let known_client_video_ssrcs: Arc<DashSet<u32>> =
             Arc::new(DashSet::new());
+        let downlink_tasks_by_tag: Arc<DashMap<u16, tokio::task::AbortHandle>> =
+            Arc::new(DashMap::new());
+        let downlink_tasks_by_ep: Arc<DashMap<String, tokio::task::AbortHandle>> =
+            Arc::new(DashMap::new());
 
         let reg_clone = registry.clone();
         let auth_clone = auth_handler.clone();
@@ -336,7 +340,7 @@ pub async fn run_wrtc_server(
                         }
                     }
                     drained += 1;
-                    if drained >= 32 {
+                    if drained >= 256 {
                         tokio::task::yield_now().await;
                         break;
                     }
@@ -417,12 +421,18 @@ pub async fn run_wrtc_server(
                                             );
                                             let _ = shared_peer.send_video_constraints(&constraints).await;
                                         }
+                                        if let Some((_, h)) = downlink_tasks_by_ep.remove(occupant_id) {
+                                            h.abort();
+                                        }
                                         if let Some((_, dead_client)) = clients_map.remove(occupant_id) {
                                             info!(
                                                 "[WRTC Server] Occupant {occupant_id} left MUC room. Removing session {} (IP: {}) immediately.",
                                                 dead_client.session_id, dead_client.assigned_ip
                                             );
                                             let old_tag = anet_common::wrtc::colibri::client_tag_from_ip(&dead_client.assigned_ip);
+                                            if let Some((_, h)) = downlink_tasks_by_tag.remove(&old_tag) {
+                                                h.abort();
+                                            }
                                             clients_by_tag.remove(&old_tag);
                                             client_video_warmed_up.remove(&old_tag);
                                             reg_clone.remove_client(&dead_client).await;
@@ -647,9 +657,15 @@ pub async fn run_wrtc_server(
                                             );
 
                                             // 1. Если этот же MUC occupant (from_endpoint) переаутентифицировался, очищаем его старую сессию
+                                            if let Some((_, h)) = downlink_tasks_by_ep.remove(&from_endpoint) {
+                                                h.abort();
+                                            }
                                             if let Some((_, old_ep_client)) = clients_map.remove(&from_endpoint) {
                                                 if old_ep_client.session_id != client_info.session_id {
                                                     let old_tag = anet_common::wrtc::colibri::client_tag_from_ip(&old_ep_client.assigned_ip);
+                                                    if let Some((_, h)) = downlink_tasks_by_tag.remove(&old_tag) {
+                                                        h.abort();
+                                                    }
                                                     clients_by_tag.remove(&old_tag);
                                                     client_video_warmed_up.remove(&old_tag);
                                                     reg_clone.remove_client(&old_ep_client).await;
@@ -670,6 +686,12 @@ pub async fn run_wrtc_server(
                                                 .collect();
                                             for (ep, stale) in stale_eps {
                                                 let old_tag = anet_common::wrtc::colibri::client_tag_from_ip(&stale.assigned_ip);
+                                                if let Some((_, h)) = downlink_tasks_by_tag.remove(&old_tag) {
+                                                    h.abort();
+                                                }
+                                                if let Some((_, h)) = downlink_tasks_by_ep.remove(&ep) {
+                                                    h.abort();
+                                                }
                                                 clients_by_tag.remove(&old_tag);
                                                 client_video_warmed_up.remove(&old_tag);
                                                 clients_map.remove(&ep);
@@ -679,6 +701,9 @@ pub async fn run_wrtc_server(
                                             }
 
                                             let client_tag = anet_common::wrtc::colibri::client_tag_from_ip(&assigned_ip);
+                                            if let Some((_, old_h)) = downlink_tasks_by_tag.remove(&client_tag) {
+                                                old_h.abort();
+                                            }
                                             client_video_warmed_up.remove(&client_tag);
                                             clients_by_tag.insert(client_tag, client_info.clone());
                                             shared_peer.force_next_keyframe();
@@ -708,7 +733,7 @@ pub async fn run_wrtc_server(
                                                 .saturating_sub(30)
                                                 .min(MAX_VIDEO_BATCH_BYTES);
 
-                                            tokio::spawn(async move {
+                                            let downlink_handle = tokio::spawn(async move {
                                                 const VIDEO_WARMUP_PAYLOAD: [u8; 16] = [
                                                     VIDEO_BATCH_MARKER,
                                                     0xFF,
@@ -1061,6 +1086,9 @@ pub async fn run_wrtc_server(
                                                     }
                                                 }
                                             });
+                                            let abort_handle = downlink_handle.abort_handle();
+                                            downlink_tasks_by_tag.insert(client_tag, abort_handle.clone());
+                                            downlink_tasks_by_ep.insert(from_endpoint.clone(), abort_handle);
                                         }
 
                                         // 2. Затем отправляем финальный ответ хэндшейка клиенту
@@ -1366,6 +1394,14 @@ pub async fn run_wrtc_server(
     }
 
     video_uplink_task.abort();
+    for entry in downlink_tasks_by_tag.iter() {
+        entry.value().abort();
+    }
+    downlink_tasks_by_tag.clear();
+    for entry in downlink_tasks_by_ep.iter() {
+        entry.value().abort();
+    }
+    downlink_tasks_by_ep.clear();
     let stale_p2ps: Vec<Arc<P2pSession>> = p2p_clients.iter().map(|e| e.value().clone()).collect();
     for p2p in stale_p2ps {
         p2p.close().await;

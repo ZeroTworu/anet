@@ -285,17 +285,17 @@ pub fn start_stats_monitor(
     })
 }
 
-/// Запуск высокочастотного мониторинга трафика (4 Гц / 250 мс) для живого обновления UI и графика
+/// Запуск высокочастотного мониторинга трафика (2 Гц / 500 мс) для живого обновления UI и графика
 pub fn start_fast_stats_monitor(
     provider: Arc<dyn StatsProvider>,
     shutdown_notify: Arc<Notify>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let interval = Duration::from_millis(250);
+        let interval = Duration::from_millis(500);
         let mut last_stats = provider.get_stats();
         let mut last_time = Instant::now();
-        // 120 точек по 250 мс = 30 секунд плавной истории в высоком разрешении
-        let mut ring_buffer = anet_common::connectivity::TelemetryRingBuffer::new(120);
+        // 60 точек по 500 мс = 30 секунд плавной истории без перегрузки UI-потока Android после сворачивания
+        let mut ring_buffer = anet_common::connectivity::TelemetryRingBuffer::new(60);
         let mut ema_rx_bps: f64 = 0.0;
         let mut ema_tx_bps: f64 = 0.0;
 
@@ -309,10 +309,17 @@ pub fn start_fast_stats_monitor(
                     // 1. Получаем актуальный снимок метрик
                     let current_stats = provider.get_stats();
 
-                    // 2. Извлекаем RTT
-                    let rtt_ms_u64 = current_stats
+                    // 2. Извлекаем RTT (если транспорт не даёт собственный RTT, берём живой внутритуннельный ICMP RTT)
+                    let rtt_ms_u64 = match current_stats
                         .rtt_ms
-                        .map(|rtt| (rtt.round() as u64).max(1));
+                        .map(|rtt| (rtt.round() as u64).max(1))
+                    {
+                        Some(rtt) => {
+                            crate::connectivity_monitor::ConnectivityMonitor::update_tunnel_rtt_ms(Some(rtt));
+                            Some(rtt)
+                        }
+                        None => crate::connectivity_monitor::ConnectivityMonitor::get_tunnel_rtt_ms(),
+                    };
 
                     // 3. Считаем дельту байт
                     let rx_bytes_delta = current_stats
@@ -364,9 +371,6 @@ pub fn start_fast_stats_monitor(
 
                     // Обновляем базовый снимок для следующей итерации
                     last_stats = current_stats.clone();
-
-                    // Синхронизируем актуальный RTT туннеля с монитором связности
-                    crate::connectivity_monitor::ConnectivityMonitor::update_tunnel_rtt_ms(rtt_ms_u64);
 
                     // Формируем единый снимок телеметрии (единые русские единицы скорости и объёма без мерцания KiB/s <-> КБ/с)
                     let telemetry = ring_buffer.push_sample(

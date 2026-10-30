@@ -1191,14 +1191,12 @@ impl ClientTransport for WrtcTransport {
                                                 }
                                             }
                                             Err(e) => {
-                                                warn!("[WRTC Client] Decrypt packet error: {e}");
-                                                warn(format!("[WRTC Client] Decrypt packet error: {e}"));
+                                                log::debug!("[WRTC Client] Decrypt packet error: {e}");
                                             }
                                         }
                                     }
                                     Err(e) => {
-                                        warn!("[WRTC Client] Base64 decode error: {e}");
-                                        warn(format!("[WRTC Client] wrap_packet error: {e}"));
+                                        log::debug!("[WRTC Client] Base64 decode error: {e}");
                                     }
                                 }
                             }
@@ -1221,15 +1219,13 @@ impl ClientTransport for WrtcTransport {
                                                     }
                                                 }
                                                 Err(e) => {
-                                                    warn!("[WRTC Client] Decrypt batch packet error: {e}");
-                                                    warn(format!("[WRTC Client] Decrypt batch packet: {e}"));
+                                                    log::debug!("[WRTC Client] Decrypt batch packet error: {e}");
                                                 }
                                             }
                                         }
                                     }
                                     Err(e) => {
-                                        warn!("[WRTC Client] Base64 batch decode error: {e}");
-                                        warn(format!("[WRTC Client] Decrypt batch error: {e}"));
+                                        log::debug!("[WRTC Client] Base64 batch decode error: {e}");
                                     }
                                 }
                             }
@@ -1280,12 +1276,11 @@ impl ClientTransport for WrtcTransport {
                                         }
                                     }
                                     Err(e) => {
-                                        warn!("[P2P Direct] Decrypt packet error: {e}");
-                                        warn(format!("[P2P Direct] Decrypt packet error: {e}"));
+                                        log::debug!("[P2P Direct] Decrypt packet error: {e}");
                                     }
                                 }
                                 drained += 1;
-                                if drained >= 32 {
+                                if drained >= 256 {
                                     tokio::task::yield_now().await;
                                     break;
                                 }
@@ -1367,14 +1362,13 @@ impl ClientTransport for WrtcTransport {
                                     }
                                 }
                                 Err(e) => {
-                                    warn!("[WRTC Media Video IN] Decrypt packet error: {e} (raw_astp len: {raw_len})");
-                                    warn(format!("[WRTC Media Video IN] Decrypt packet error: {e} (raw_astp len: {raw_len})"));
+                                    log::debug!("[WRTC Media Video IN] Decrypt packet error: {e} (raw_astp len: {raw_len})");
                                 }
                             }
                         }
                     }
                     drained += 1;
-                    if drained >= 32 {
+                    if drained >= 256 {
                         tokio::task::yield_now().await;
                         break;
                     }

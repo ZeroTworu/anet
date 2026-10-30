@@ -46,8 +46,12 @@ fn main() -> Result<(), eframe::Error> {
         }
     }
 
-    // 2. Инициализация логгера
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    // 2. Инициализация логгера (подавляем гигабайтные дампы сырых RTP-пакетов из webrtc/rtc при микробёрстах)
+    env_logger::Builder::from_env(
+        env_logger::Env::default()
+            .default_filter_or("info,rtc::peer_connection::handler=error,webrtc::peer_connection::driver=off"),
+    )
+    .init();
 
     // 3. Иконка и заголовок
     let icon = icons::load_icon();

@@ -411,14 +411,10 @@ impl PeerConnectionEventHandler for PeerEvents {
                                 continue;
                             }
 
-                            // 2. Отсекаем RTP-паддинг (RFC 3550 Section 5.1), если SFU/JVB выставил флаг padding
-                            let mut raw_payload = pkt.payload;
-                            if pkt.header.padding && !raw_payload.is_empty() {
-                                let pad_len = raw_payload[raw_payload.len() - 1] as usize;
-                                if pad_len > 0 && pad_len <= raw_payload.len() {
-                                    raw_payload = raw_payload.slice(..raw_payload.len() - pad_len);
-                                }
-                            }
+                            // 2. Примечание: rtc::rtp::Packet::unmarshal уже отсекает RTP-паддинг (RFC 3550)
+                            // и уменьшает длину pkt.payload, оставляя pkt.header.padding = true.
+                            // Повторное отсечение по последнему байту полезной нагрузки повреждало хвост Poly1305 тега!
+                            let raw_payload = pkt.payload;
 
                             // 3. Отсекаем дескриптор VP8 (RFC 7741)
                             if let Some(mut data) = strip_vp8_payload_descriptor(raw_payload) {
