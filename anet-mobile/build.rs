@@ -66,10 +66,13 @@ fn main() {
 
     if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("android") {
         // BoringSSL 5.4.0 uses C++17 (std::variant, std::optional, std::bitset, virtual destructors).
-        // Link NDK's libc++_static.a and libc++abi.a into libanet_mobile.so so no external
-        // libc++_shared.so or unresolved __gxx_personality_v0 is required at runtime.
-        println!("cargo:rustc-link-lib=static=c++_static");
-        println!("cargo:rustc-link-lib=static=c++abi");
+        // Pass -Wl,-Bstatic -lc++_static -lc++abi -Wl,-Bdynamic directly to the NDK clang linker
+        // when linking libanet_mobile.so (cdylib), because NDK clang knows the sysroot path to
+        // libc++_static.a and libc++abi.a whereas rustc's own -L paths only include the API-level dir.
+        println!("cargo:rustc-cdylib-link-arg=-Wl,-Bstatic");
+        println!("cargo:rustc-cdylib-link-arg=-lc++_static");
+        println!("cargo:rustc-cdylib-link-arg=-lc++abi");
+        println!("cargo:rustc-cdylib-link-arg=-Wl,-Bdynamic");
     }
 
     println!("cargo:rerun-if-changed=build.rs");

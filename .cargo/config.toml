@@ -12,10 +12,10 @@ CXXFLAGS_aarch64_linux_android = "-fno-exceptions -fno-rtti -fno-sized-deallocat
 CXXFLAGS_armv7_linux_androideabi = "-fno-exceptions -fno-rtti -fno-sized-deallocation -DBORINGSSL_TEMPORARY_NO_CXX_RUNTIME"
 CXXFLAGS_x86_64_linux_android = "-fno-exceptions -fno-rtti -fno-sized-deallocation -DBORINGSSL_TEMPORARY_NO_CXX_RUNTIME"
 CXXFLAGS_i686_linux_android = "-fno-exceptions -fno-rtti -fno-sized-deallocation -DBORINGSSL_TEMPORARY_NO_CXX_RUNTIME"
-BORING_BSSL_RUST_CPPLIB_aarch64_linux_android = "static=c++_static"
-BORING_BSSL_RUST_CPPLIB_armv7_linux_androideabi = "static=c++_static"
-BORING_BSSL_RUST_CPPLIB_x86_64_linux_android = "static=c++_static"
-BORING_BSSL_RUST_CPPLIB_i686_linux_android = "static=c++_static"
+BORING_BSSL_RUST_CPPLIB_aarch64_linux_android = "c"
+BORING_BSSL_RUST_CPPLIB_armv7_linux_androideabi = "c"
+BORING_BSSL_RUST_CPPLIB_x86_64_linux_android = "c"
+BORING_BSSL_RUST_CPPLIB_i686_linux_android = "c"
 
 [target.x86_64-unknown-linux-musl]
 rustflags = [
