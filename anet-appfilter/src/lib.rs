@@ -27,7 +27,7 @@ use windivert::layer::{NetworkLayer, SocketLayer};
 #[cfg(all(windows, feature = "windivert"))]
 use windivert::prelude::*;
 #[cfg(all(windows, feature = "windivert"))]
-use windivert::{WinDivert, WinDivertShutdownHandle};
+use windivert::{ShutdownHandle, WinDivert};
 
 #[cfg(all(windows, feature = "windivert"))]
 use anet_common::consts::CHANNEL_BUFFER_SIZE;
@@ -36,9 +36,9 @@ pub struct AppFilter {
     _map: FlowMap,
     bypass: BypassSet,
     #[cfg(all(windows, feature = "windivert"))]
-    socket_shutdown: WinDivertShutdownHandle<SocketLayer>,
+    socket_shutdown: ShutdownHandle,
     #[cfg(all(windows, feature = "windivert"))]
-    network_shutdown: WinDivertShutdownHandle<NetworkLayer>,
+    network_shutdown: ShutdownHandle,
 }
 
 impl AppFilter {
@@ -179,7 +179,7 @@ impl AppFilter {
 #[cfg(all(windows, feature = "windivert"))]
 impl Drop for AppFilter {
     fn drop(&mut self) {
-        log::info!("AppFilter: shutting down WinDivert handles via WinDivertShutdownHandle...");
+        log::info!("AppFilter: shutting down WinDivert handles via ShutdownHandle...");
         if let Err(e) = self.socket_shutdown.shutdown() {
             log::debug!("AppFilter: socket shutdown returned: {e}");
         }

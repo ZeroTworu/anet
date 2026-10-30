@@ -11,7 +11,6 @@ use log::{debug, error, info, warn};
 use tokio::sync::mpsc;
 use windivert::layer::{NetworkLayer, SocketLayer};
 use windivert::prelude::*;
-use windivert::sys::ChecksumFlags;
 
 use crate::flow_map::{BypassSet, FlowKey, FlowMap, FlowOwner};
 use crate::policy::AppPolicy;
@@ -83,35 +82,77 @@ fn is_ignored_local_ip(ip: &IpAddr) -> bool {
     }
 }
 
-fn clear_checksums(data: &mut [u8]) {
-    if data.is_empty() {
+#[inline]
+fn ones_complement_sum(mut sum: u32, buf: &[u8]) -> u32 {
+    let mut chunks = buf.chunks_exact(2);
+    for chunk in &mut chunks {
+        sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
+    }
+    if let &[rem] = chunks.remainder() {
+        sum += u16::from_be_bytes([rem, 0]) as u32;
+    }
+    sum
+}
+
+#[inline]
+fn fold_checksum(mut sum: u32) -> u16 {
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+fn recalculate_checksums(wd: &mut WinDivertPacket<NetworkLayer>) {
+    let data = wd.data.to_mut();
+    if data.len() < 20 || (data[0] >> 4) != 4 {
         return;
     }
-    let version = data[0] >> 4;
-    if version == 4 {
-        if data.len() < 20 {
-            return;
-        }
-        let ihl = ((data[0] & 0x0F) * 4) as usize;
-        if data.len() < ihl {
-            return;
-        }
+    let ihl = ((data[0] & 0x0F) as usize) * 4;
+    if ihl < 20 || data.len() < ihl {
+        return;
+    }
 
-        data[10] = 0;
-        data[11] = 0;
+    let total_len = (u16::from_be_bytes([data[2], data[3]]) as usize).min(data.len());
+    if total_len < ihl {
+        return;
+    }
 
-        let protocol = data[9];
-        if protocol == 6 {
-            if data.len() >= ihl + 18 {
-                data[ihl + 16] = 0;
-                data[ihl + 17] = 0;
-            }
-        } else if protocol == 17 {
-            if data.len() >= ihl + 8 {
-                data[ihl + 6] = 0;
-                data[ihl + 7] = 0;
-            }
+    data[10] = 0;
+    data[11] = 0;
+    let ip_csum = fold_checksum(ones_complement_sum(0, &data[..ihl])).to_be_bytes();
+    data[10] = ip_csum[0];
+    data[11] = ip_csum[1];
+    wd.address.set_ip_checksum(true);
+
+    let protocol = data[9];
+    let payload_len = total_len - ihl;
+
+    if protocol == 6 && payload_len >= 20 {
+        data[ihl + 16] = 0;
+        data[ihl + 17] = 0;
+        let mut sum = ones_complement_sum(0, &data[12..20]);
+        sum += protocol as u32;
+        sum += payload_len as u32;
+        sum = ones_complement_sum(sum, &data[ihl..total_len]);
+        let tcp_csum = fold_checksum(sum).to_be_bytes();
+        data[ihl + 16] = tcp_csum[0];
+        data[ihl + 17] = tcp_csum[1];
+        wd.address.set_tcp_checksum(true);
+    } else if protocol == 17 && payload_len >= 8 {
+        data[ihl + 6] = 0;
+        data[ihl + 7] = 0;
+        let mut sum = ones_complement_sum(0, &data[12..20]);
+        sum += protocol as u32;
+        sum += payload_len as u32;
+        sum = ones_complement_sum(sum, &data[ihl..total_len]);
+        let mut udp_csum = fold_checksum(sum);
+        if udp_csum == 0 {
+            udp_csum = 0xFFFF;
         }
+        let udp_csum_bytes = udp_csum.to_be_bytes();
+        data[ihl + 6] = udp_csum_bytes[0];
+        data[ihl + 7] = udp_csum_bytes[1];
+        wd.address.set_udp_checksum(true);
     }
 }
 
@@ -425,10 +466,8 @@ pub fn run_packet_router(
                                 wd.data.to_mut()[16..20].copy_from_slice(&v4.octets());
                             }
 
-                            clear_checksums(wd.data.to_mut());
                             clamp_tcp_mss(wd.data.to_mut(), target_tcp_mss);
-
-                            let _ = wd.recalculate_checksums(ChecksumFlags::new());
+                            recalculate_checksums(&mut wd);
                             if let Err(e) = handle.send(&wd) {
                                 error!("appfilter: Reinject (from tunnel) failed: {e}");
                                 break;
@@ -602,10 +641,8 @@ pub fn run_packet_router(
                 wd.data.to_mut()[12..16].copy_from_slice(&v4.octets());
             }
 
-            clear_checksums(wd.data.to_mut());
             clamp_tcp_mss(wd.data.to_mut(), target_tcp_mss);
-
-            let _ = wd.recalculate_checksums(ChecksumFlags::new());
+            recalculate_checksums(&mut wd);
 
             if let Err(e) = to_tunnel.try_send(Bytes::copy_from_slice(&wd.data)) {
                 match e {

@@ -241,7 +241,7 @@
 - **Правило**:
   - В `windivert 0.7.0-beta.4` на `WinDivert<SocketLayer>` метод `handle.recv()` вызывается **без аргументов** и возвращает `WinDivertPacket<SocketLayer>` с массивом `events`.
   - На `WinDivert<NetworkLayer>` метод `handle.recv(&mut buf)` принимает буфер `&mut [u8]`.
-  - Для штатной остановки блокирующих вызовов `recv()` в `Drop for AppFilter` используйте `handle.shutdown_handle()` (`WinDivertShutdownHandle::shutdown(WinDivertShutdownMode::Both)`). Не используйте `unsafe`-касты структуры `WinDivert` к сырым указателям `HANDLE` и не добавляйте старые версии `windows = "0.48"` или `windivert-sys = "0.10"` в `Cargo.toml`.
+  - Для штатной остановки блокирующих вызовов `recv()` в `Drop for AppFilter` используйте `handle.shutdown_handle()` (`windivert::ShutdownHandle::shutdown()`). Не используйте `unsafe`-касты структуры `WinDivert` к сырым указателям `HANDLE` и не добавляйте старые версии `windows = "0.48"` или `windivert-sys = "0.10"` в `Cargo.toml`.
 
 ### Инвариант 8: Сохранение `if_idx` и `sub_if_idx` при инъекции ответов
 - **Проблема**: Сетевой стек Windows может отбросить инжектированный входящий пакет (`inbound = true`), если у него не указаны индексы сетевого интерфейса (`interface_index` и `sub_interface_index`), через который ушёл исходный запрос.

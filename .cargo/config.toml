@@ -20,6 +20,7 @@ BORING_BSSL_RUST_CPPLIB_i686_linux_android = "c"
 [target.x86_64-unknown-linux-musl]
 rustflags = [
     "-C", "target-feature=+crt-static",
+    "-C", "link-arg=-Wl,-u,fopen,-u,strtoull,-u,strtol,-u,strtoul,-u,abort,-u,free",
     "-C", "link-arg=-Wl,--defsym=fopen64=fopen",
     "-C", "link-arg=-Wl,--defsym=__isoc23_strtoull=strtoull",
     "-C", "link-arg=-Wl,--defsym=__isoc23_strtol=strtol",
@@ -36,6 +37,7 @@ rustflags = [
 [target.aarch64-unknown-linux-musl]
 rustflags = [
     "-C", "target-feature=+crt-static",
+    "-C", "link-arg=-Wl,-u,abort,-u,free",
     "-C", "link-arg=-Wl,--defsym=__cxa_pure_virtual=abort",
     "-C", "link-arg=-Wl,--defsym=_ZdlPv=free",
     "-C", "link-arg=-Wl,--defsym=_ZdlPvm=free",
