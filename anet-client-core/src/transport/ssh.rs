@@ -35,7 +35,7 @@ impl Handler for ClientHandler {
 
     fn check_server_key(
         &mut self,
-        _server_public_key: &russh::keys::PublicKey,
+        _server_public_key: &russh::keys::PublicKeyOrCertificate,
     ) -> impl Future<Output = Result<bool, Self::Error>> + Send {
         // Подлинность конечного узла дополнительно проверяется подписанным ASTP DH-обменом.
         ready(Ok(true))

@@ -281,11 +281,11 @@ features = ["serde-serialize"]
 version = "0.3"
 
 [target.'cfg(not(all(target_arch = "wasm32", any(target_os = "unknown", target_os = "none"))))'.dependencies.boring]
-version = "4.22"
+version = "5.4.0"
 optional = true
 
 [target.'cfg(not(all(target_arch = "wasm32", any(target_os = "unknown", target_os = "none"))))'.dependencies.boring-sys]
-version = "4.22"
+version = "5.4.0"
 optional = true
 
 [target.'cfg(not(all(target_arch = "wasm32", any(target_os = "unknown", target_os = "none"))))'.dependencies.cookie_crate]
@@ -386,7 +386,7 @@ features = [
 default-features = false
 
 [target.'cfg(not(all(target_arch = "wasm32", any(target_os = "unknown", target_os = "none"))))'.dependencies.tokio-boring]
-version = "4.22"
+version = "5.3.0"
 optional = true
 
 [target.'cfg(not(all(target_arch = "wasm32", any(target_os = "unknown", target_os = "none"))))'.dependencies.tokio-native-tls]

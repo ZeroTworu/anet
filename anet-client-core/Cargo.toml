@@ -42,7 +42,7 @@ rtc = { workspace = true }
 webrtc = { workspace = true }
 zip = "8.6.0"
 
-hickory-resolver = { version = "0.24", features = ["tokio"] }
+hickory-resolver = { version = "0.25", features = ["tokio"] }
 anet-common = { path = "../anet-common" }
 anet-filter-core = { path = "../anet-filter-core" }
 memmap2 = "0.9"

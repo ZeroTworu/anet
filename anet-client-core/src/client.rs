@@ -3,8 +3,10 @@ use crate::statistic;
 use anyhow::Context;
 use anyhow::{Result, anyhow};
 use bytes::{Bytes, BytesMut};
-use hickory_resolver::TokioAsyncResolver;
-use hickory_resolver::config::{NameServerConfig, Protocol, ResolverConfig, ResolverOpts};
+use hickory_resolver::TokioResolver;
+use hickory_resolver::config::{NameServerConfig, ResolverConfig, ResolverOpts};
+use hickory_resolver::name_server::TokioConnectionProvider;
+use hickory_resolver::proto::xfer::Protocol;
 use ipnet::IpNet;
 use log::{error, info, warn};
 use quinn::Endpoint;
@@ -185,7 +187,12 @@ impl AnetClient {
         if resolver_config.name_servers().is_empty() {
             resolver_config = ResolverConfig::google();
         }
-        let resolver = TokioAsyncResolver::tokio(resolver_config, ResolverOpts::default());
+        let resolver = TokioResolver::builder_with_config(
+            resolver_config,
+            TokioConnectionProvider::default(),
+        )
+        .with_options(ResolverOpts::default())
+        .build();
 
         for target in list {
             if self.stop_requested.load(Ordering::SeqCst) {
@@ -563,10 +570,10 @@ impl AnetClient {
         bypass_ips.sort_unstable();
         bypass_ips.dedup();
 
-        for server_ip in bypass_ips {
+        for server_ip in &bypass_ips {
             let prefix = if server_ip.is_ipv4() { 32 } else { 128 };
             self.route_manager
-                .add_bypass_route(server_ip, prefix)
+                .add_bypass_route(*server_ip, prefix)
                 .await?;
         }
 
@@ -577,6 +584,7 @@ impl AnetClient {
             self.route_manager
                 .add_bypass_route(pinned_ip, prefix)
                 .await?;
+            bypass_ips.push(pinned_ip);
         }
 
         for bypass_ip in result.bypass_ips {
@@ -584,6 +592,7 @@ impl AnetClient {
             self.route_manager
                 .add_bypass_route(bypass_ip, prefix)
                 .await?;
+            bypass_ips.push(bypass_ip);
         }
 
         // Гарантируем, что прямые DNS-резолверы для Direct-правил всегда идут в обход туннеля
@@ -592,6 +601,7 @@ impl AnetClient {
                 .route_manager
                 .add_bypass_route(IpAddr::V4(direct_dns_ip), 32)
                 .await;
+            bypass_ips.push(IpAddr::V4(direct_dns_ip));
         }
 
         // Инициализация и синхронизация движка Smart DNS, Geo-Routing и AdBlock (.abc + Local Overrides)
@@ -727,6 +737,23 @@ impl AnetClient {
             .acquire_packet_source(server, &result.auth_response)
             .await?;
 
+        #[cfg(all(windows, feature = "per-app"))]
+        if let Some(ref filter) = _app_filter {
+            for ip in &bypass_ips {
+                filter.add_bypass_sync(*ip);
+            }
+            if !config_clone.main.exclude_route_for.is_empty() {
+                for net in self.resolve_list(&config_clone.main.exclude_route_for).await {
+                    filter.add_bypass_net(net);
+                }
+            }
+            if !config_clone.routing.overrides.direct.is_empty() {
+                for net in self.resolve_list(&config_clone.routing.overrides.direct).await {
+                    filter.add_bypass_net(net);
+                }
+            }
+        }
+
         let direct_ip_cache = crate::direct_ip_cache::DirectIpCache::new();
         let dns_interceptor = crate::dns_interceptor::DnsInterceptor::new(
             local_overrides.clone(),
@@ -820,6 +847,11 @@ impl AnetClient {
         let local_overrides_tx = local_overrides.clone();
         let direct_ip_cache_tx = direct_ip_cache.clone();
 
+        #[cfg(all(windows, feature = "per-app"))]
+        let app_filter_bypass_t1 = _app_filter.as_ref().map(|f| f.bypass_set());
+        #[cfg(all(windows, feature = "per-app"))]
+        let app_filter_bypass_t2 = _app_filter.as_ref().map(|f| f.bypass_set());
+
         let t1 = spawn(async move {
             let mut write_buf = BytesMut::with_capacity(COALESCE_BUDGET_BYTES);
 
@@ -845,11 +877,19 @@ impl AnetClient {
                         let tun_tx_c = tx_to_tun_dns.clone();
                         let probe_tx_c = tx_probe_dns.clone();
                         let rm_c = route_manager_dns.clone();
+                        #[cfg(all(windows, feature = "per-app"))]
+                        let af_bypass = app_filter_bypass_t1.clone();
                         let dns_task = tokio::spawn(async move {
                             if let Some((reply_pkt, resolved_ips)) =
                                 interceptor_c.resolve_direct_dns_packet(&pkt_c, &dns_c).await
                             {
                                 if !resolved_ips.is_empty() {
+                                    #[cfg(all(windows, feature = "per-app"))]
+                                    if let Some(ref bp) = af_bypass {
+                                        for ip in &resolved_ips {
+                                            bp.add_sync(*ip);
+                                        }
+                                    }
                                     let routes: Vec<(IpAddr, u8)> = resolved_ips
                                         .iter()
                                         .map(|ip| (*ip, if ip.is_ipv4() { 32 } else { 128 }))
@@ -1045,6 +1085,12 @@ impl AnetClient {
                                         .inspect_dns_response(&packet, |domain| rule_cache_rx.lookup_domain(domain))
                                     {
                                         if !resolved_ips.is_empty() {
+                                            #[cfg(all(windows, feature = "per-app"))]
+                                            if let Some(ref bp) = app_filter_bypass_t2 {
+                                                for ip in &resolved_ips {
+                                                    bp.add_sync(*ip);
+                                                }
+                                            }
                                             let routes: Vec<(IpAddr, u8)> = resolved_ips
                                                 .iter()
                                                 .map(|ip| (*ip, if ip.is_ipv4() { 32 } else { 128 }))

@@ -12,34 +12,33 @@ pub use flow_map::{BypassSet, FlowKey, FlowMap, FlowOwner};
 pub use policy::AppPolicy;
 
 use anyhow::Result;
+use bytes::Bytes;
+use ipnet::IpNet;
+use std::net::IpAddr;
+use tokio::sync::mpsc;
 
 #[cfg(all(windows, feature = "windivert"))]
 use anyhow::Context;
-use bytes::Bytes;
-use std::net::IpAddr;
 #[cfg(all(windows, feature = "windivert"))]
 use std::sync::Arc;
-use tokio::sync::mpsc;
 
 #[cfg(all(windows, feature = "windivert"))]
 use windivert::layer::{NetworkLayer, SocketLayer};
 #[cfg(all(windows, feature = "windivert"))]
 use windivert::prelude::*;
 #[cfg(all(windows, feature = "windivert"))]
-use windivert::WinDivert;
+use windivert::{WinDivert, WinDivertShutdownHandle};
 
 #[cfg(all(windows, feature = "windivert"))]
 use anet_common::consts::CHANNEL_BUFFER_SIZE;
-#[cfg(all(windows, feature = "windivert"))]
-use windows::Win32::Foundation::HANDLE;
 
 pub struct AppFilter {
     _map: FlowMap,
     bypass: BypassSet,
     #[cfg(all(windows, feature = "windivert"))]
-    socket_handle: Arc<WinDivert<SocketLayer>>,
+    socket_shutdown: WinDivertShutdownHandle<SocketLayer>,
     #[cfg(all(windows, feature = "windivert"))]
-    network_handle: Arc<WinDivert<NetworkLayer>>,
+    network_shutdown: WinDivertShutdownHandle<NetworkLayer>,
 }
 
 impl AppFilter {
@@ -47,7 +46,7 @@ impl AppFilter {
     pub fn start(
         policy: AppPolicy,
         initial_bypass: impl IntoIterator<Item = IpAddr>,
-        vpn_ip: IpAddr,        
+        vpn_ip: IpAddr,
     ) -> Result<(Self, mpsc::Sender<Bytes>, mpsc::Receiver<Bytes>)> {
         let map = FlowMap::new();
         let bypass = BypassSet::with_initial(initial_bypass);
@@ -69,16 +68,28 @@ impl AppFilter {
                  && localPort != 139",
                 0,
                 socket_flags,
-            ).context("failed to open WinDivert socket layer")?
+            )
+            .context("failed to open WinDivert socket layer")?,
         );
+        let socket_shutdown = socket_handle.shutdown_handle();
+
+        // Сразу после открытия SocketLayer снимаем снимок уже открытых в системе TCP/UDP сокетов
+        // (чтобы приложения, запущенные до включения VPN, такие как BitTorrent, игры или браузеры,
+        // были известны до старта перехвата пакетов в NetworkLayer).
+        map.populate_initial_sockets();
 
         // ВАЖНО: Флаг !impostor.
         // Когда мы возвращаем пакет из туннеля в Windows, он помечается как "impostor" (самозванец).
         // Этот флаг в правиле гарантирует, что мы не будем перехватывать собственные реинжектированные пакеты по бесконечному кругу.
         let network_handle = Arc::new(
-            WinDivert::<NetworkLayer>::network("(ip || ipv6) && !impostor", 0, WinDivertFlags::new())
-                .context("failed to open WinDivert network layer")?
+            WinDivert::<NetworkLayer>::network(
+                "(ip || ipv6) && !impostor",
+                0,
+                WinDivertFlags::new(),
+            )
+            .context("failed to open WinDivert network layer")?,
         );
+        let network_shutdown = network_handle.shutdown_handle();
 
         // Поток 1: Отслеживание сокетов (Строгий контроль открытий/закрытий портов)
         {
@@ -131,8 +142,8 @@ impl AppFilter {
             Self {
                 _map: map,
                 bypass,
-                socket_handle,
-                network_handle,
+                socket_shutdown,
+                network_shutdown,
             },
             downlink_tx,
             uplink_rx,
@@ -141,6 +152,18 @@ impl AppFilter {
 
     pub async fn add_bypass(&self, ip: IpAddr) {
         self.bypass.add(ip).await;
+    }
+
+    pub fn add_bypass_sync(&self, ip: IpAddr) {
+        self.bypass.add_sync(ip);
+    }
+
+    pub fn add_bypass_net(&self, net: IpNet) {
+        self.bypass.add_net_sync(net);
+    }
+
+    pub fn bypass_set(&self) -> BypassSet {
+        self.bypass.clone()
     }
 
     #[cfg(not(all(windows, feature = "windivert")))]
@@ -156,12 +179,12 @@ impl AppFilter {
 #[cfg(all(windows, feature = "windivert"))]
 impl Drop for AppFilter {
     fn drop(&mut self) {
-        log::info!("AppFilter: dropping, forcing shutdown of WinDivert handles via memory layout cast...");
-        let socket_raw = unsafe { *(&*self.socket_handle as *const WinDivert<SocketLayer> as *const HANDLE) };
-        let network_raw = unsafe { *(&*self.network_handle as *const WinDivert<NetworkLayer> as *const HANDLE) };
-        unsafe {
-            windivert_sys::WinDivertShutdown(socket_raw, windivert_sys::WinDivertShutdownMode::Both);
-            windivert_sys::WinDivertShutdown(network_raw, windivert_sys::WinDivertShutdownMode::Both);
+        log::info!("AppFilter: shutting down WinDivert handles via WinDivertShutdownHandle...");
+        if let Err(e) = self.socket_shutdown.shutdown() {
+            log::debug!("AppFilter: socket shutdown returned: {e}");
+        }
+        if let Err(e) = self.network_shutdown.shutdown() {
+            log::debug!("AppFilter: network shutdown returned: {e}");
         }
     }
 }

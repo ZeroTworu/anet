@@ -120,7 +120,8 @@ pub fn toggle_vpn(
 pub fn force_wake_up_window(ctx: &egui::Context) {
     #[cfg(target_os = "windows")]
     {
-        use windows_sys::Win32::Foundation::{ BOOL, HWND, LPARAM };
+        use windows_sys::core::BOOL;
+        use windows_sys::Win32::Foundation::{ HWND, LPARAM };
         use windows_sys::Win32::UI::WindowsAndMessaging::{
             EnumWindows,
             GetWindowTextW,

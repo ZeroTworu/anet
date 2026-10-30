@@ -28,20 +28,20 @@ x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }
 ed25519-dalek = { version = "2.1.1", features = ["std", "rand_core"] }
 sha2 = "0.10.9"
 async-trait = "0.1.89"
-netdev = { version = "0.39", features = ["gateway"] }
-ipnet = "2.11.0"
+netdev = { version = "0.47.0", features = ["gateway"] }
+ipnet = "2.12.0"
 futures = "0.3.31"
-russh = "0.62.6"
+russh = "0.65.0"
 tokio-tungstenite = { version = "0.28.0", default-features = false, features = ["connect", "handshake"] }
 http = "1.3.1"
-windows-sys = { version = "0.59" }
+windows-sys = { version = "0.61.2" }
 dashmap = { version = "7.0.0-rc2" }
-boring = "4.22"
-tokio-boring = "4.22"
+boring = "5.4.0"
+tokio-boring = "5.3.0"
 reqwest = { package = "reqwest-boring", version = "0.13.5", default-features = false, features = ["json", "boring", "http2", "cookies", "query", "gzip", "brotli", "deflate", "zstd"] }
 webrtc = "0.21.1"
 rtc = "0.21.1"
-roxmltree = "0.20"
+roxmltree = "0.21.2"
 socket2 = "0.6.5"
 
 # eBPF-шейпер трафика (anet-ebpf / anet-ebpf-common), собирается и
