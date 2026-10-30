@@ -667,7 +667,7 @@ impl Handler for SshProbeClientHandler {
 
     fn check_server_key(
         &mut self,
-        _server_public_key: &russh::keys::PublicKey,
+        _server_public_key: &russh::keys::PublicKeyOrCertificate,
     ) -> impl std::future::Future<Output = Result<bool, Self::Error>> + Send {
         ready(Ok(true))
     }

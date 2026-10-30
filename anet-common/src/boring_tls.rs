@@ -426,7 +426,7 @@ fn set_chrome_curves(builder: &mut SslConnectorBuilder) -> anyhow::Result<()> {
 pub fn build_ssl_connector_base_with_config(
     cfg: &TlsClientConfig,
 ) -> anyhow::Result<SslConnectorBuilder> {
-    let mut builder = SslConnector::builder(SslMethod::tls_client())?;
+    let mut builder = SslConnector::builder(SslMethod::tls())?;
 
     builder.set_min_proto_version(Some(SslVersion::TLS1_2))?;
     builder.set_max_proto_version(Some(SslVersion::TLS1_3))?;
