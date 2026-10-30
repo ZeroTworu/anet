@@ -491,6 +491,7 @@ impl BrowserProfile {
             .http2_initial_stream_window_size(self.h2_initial_stream_window_size)
             .http2_initial_connection_window_size(self.h2_initial_connection_window_size)
             .http2_max_header_list_size(self.h2_max_header_list_size)
+            .connect_timeout(std::time::Duration::from_secs(5))
             .tcp_nodelay(true);
         Ok(builder)
     }

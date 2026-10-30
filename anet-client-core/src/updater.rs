@@ -63,7 +63,8 @@ impl Updater {
         let client = profile
             .build_reqwest_builder(Arc::new(reqwest::cookie::Jar::default()))
             .map_err(|e| anyhow::anyhow!("Не удалось инициализировать TLS-профиль: {}", e))?
-            .timeout(std::time::Duration::from_secs(15))
+            .connect_timeout(std::time::Duration::from_secs(4))
+            .timeout(std::time::Duration::from_secs(6))
             .build()
             .map_err(|e| anyhow::anyhow!("Не удалось создать HTTP-клиент: {}", e))?;
 
@@ -84,7 +85,8 @@ impl Updater {
                 let fallback_client = relaxed_profile
                     .build_reqwest_builder(Arc::new(reqwest::cookie::Jar::default()))
                     .map_err(|e| anyhow::anyhow!("Не удалось инициализировать TLS-профиль: {}", e))?
-                    .timeout(std::time::Duration::from_secs(15))
+                    .connect_timeout(std::time::Duration::from_secs(4))
+                    .timeout(std::time::Duration::from_secs(6))
                     .build()
                     .map_err(|e| anyhow::anyhow!("Не удалось создать HTTP-клиент: {}", e))?;
                 relaxed_profile

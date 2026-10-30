@@ -32,14 +32,6 @@ fn active_tun_mutex() -> &'static tokio::sync::Mutex<Option<ActiveTunSession>> {
     ACTIVE_TUN.get_or_init(|| tokio::sync::Mutex::new(None))
 }
 
-struct AbortOnDrop(tokio::task::AbortHandle);
-
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
-}
-
 struct TunSwapRequest {
     ack_prepared: tokio::sync::oneshot::Sender<()>,
     rx_new_device: tokio::sync::oneshot::Receiver<
@@ -163,14 +155,18 @@ pub fn reset_tun_session_flags() {
     REBIND_SCHEDULED.store(false, Ordering::Release);
 }
 
-pub fn request_tun_shutdown() {
-    TUN_SHUTDOWN_REQUESTED.store(true, Ordering::Release);
+fn abort_active_tun_worker() {
     TUN_ACTIVE_FLAG.store(false, Ordering::Release);
     REBIND_SCHEDULED.store(false, Ordering::Release);
     if let Some((abort_handle, stop_notify)) = active_tun_abort_slot().lock().unwrap().take() {
         stop_notify.notify_waiters();
         abort_handle.abort();
     }
+}
+
+pub fn request_tun_shutdown() {
+    TUN_SHUTDOWN_REQUESTED.store(true, Ordering::Release);
+    abort_active_tun_worker();
 }
 
 async fn stop_and_close_tun_session(mut session: ActiveTunSession) {
@@ -186,7 +182,7 @@ async fn stop_and_close_tun_session(mut session: ActiveTunSession) {
 }
 
 pub async fn shutdown_active_tun() {
-    request_tun_shutdown();
+    abort_active_tun_worker();
     let old_session = match tokio::time::timeout(
         std::time::Duration::from_millis(250),
         active_tun_mutex().lock(),
@@ -736,53 +732,17 @@ fn spawn_tun_io_worker(
                     break;
                 };
 
-                let reader_stop = Arc::new(tokio::sync::Notify::new());
-                let reader_stop_c = reader_stop.clone();
-                let worker_stop_c = worker_stop.clone();
-                let tx_to_core_c = tx_to_core.clone();
-
-                let mut reader_handle = tokio::spawn(async move {
-                    const READ_CHUNK: usize = 64 * MAX_PACKET_SIZE;
-                    let mut buf = BytesMut::with_capacity(READ_CHUNK);
-                    loop {
-                        if buf.capacity() < MAX_PACKET_SIZE {
-                            buf = BytesMut::with_capacity(READ_CHUNK);
-                        }
-                        tokio::select! {
-                            biased;
-                            _ = reader_stop_c.notified() => break,
-                            _ = worker_stop_c.notified() => break,
-                            _ = tx_to_core_c.closed() => break,
-                            res = reader.read_buf(&mut buf) => {
-                                match res {
-                                    Ok(n) if n > 0 => {
-                                        let pkt = buf.split().freeze();
-                                        tokio::select! {
-                                            biased;
-                                            _ = reader_stop_c.notified() => break,
-                                            _ = worker_stop_c.notified() => break,
-                                            send_res = tx_to_core_c.send(pkt) => {
-                                                if send_res.is_err() {
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                    }
-                                    Ok(_) => break,
-                                    Err(_) => break,
-                                }
-                            }
-                        }
-                    }
-                });
-                let _reader_abort_guard = AbortOnDrop(reader_handle.abort_handle());
-
                 if let Some(ack) = ack_activated {
                     let _ = ack.send(());
                 }
 
-                let mut reader_finished = false;
+                const READ_CHUNK: usize = 64 * MAX_PACKET_SIZE;
+                let mut buf = BytesMut::with_capacity(READ_CHUNK);
+
                 'io_loop: loop {
+                    if buf.capacity() < MAX_PACKET_SIZE {
+                        buf = BytesMut::with_capacity(READ_CHUNK);
+                    }
                     tokio::select! {
                         biased;
                         _ = worker_stop.notified() => {
@@ -794,22 +754,39 @@ fn spawn_tun_io_worker(
                             }
                             break 'io_loop;
                         }
-                        _ = &mut reader_handle => {
-                            reader_finished = true;
+                        _ = tx_to_core.closed() => {
                             break 'io_loop;
+                        }
+                        res = reader.read_buf(&mut buf) => {
+                            match res {
+                                Ok(n) if n > 0 => {
+                                    let pkt = buf.split().freeze();
+                                    match tx_to_core.try_send(pkt) {
+                                        Ok(()) => {}
+                                        Err(mpsc::error::TrySendError::Full(pkt)) => {
+                                            tokio::select! {
+                                                biased;
+                                                _ = worker_stop.notified() => break 'io_loop,
+                                                send_res = tx_to_core.send(pkt) => {
+                                                    if send_res.is_err() {
+                                                        break 'io_loop;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Err(mpsc::error::TrySendError::Closed(_)) => break 'io_loop,
+                                    }
+                                }
+                                Ok(_) => break 'io_loop,
+                                Err(_) => break 'io_loop,
+                            }
                         }
                         pkt_opt = rx_from_core.recv() => {
                             let Some(mut pkt) = pkt_opt else {
-                                reader_stop.notify_one();
-                                reader_handle.abort();
-                                let _ = reader_handle.await;
                                 return;
                             };
                             loop {
                                 if writer.write_all(&pkt).await.is_err() {
-                                    reader_stop.notify_one();
-                                    reader_handle.abort();
-                                    let _ = reader_handle.await;
                                     return;
                                 }
                                 match rx_from_core.try_recv() {
@@ -819,12 +796,6 @@ fn spawn_tun_io_worker(
                             }
                         }
                     }
-                }
-
-                if !reader_finished {
-                    reader_stop.notify_one();
-                    reader_handle.abort();
-                    let _ = reader_handle.await;
                 }
             }
 

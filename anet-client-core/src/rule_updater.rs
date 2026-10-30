@@ -177,6 +177,15 @@ impl RuleCacheManager {
         }
     }
 
+    pub fn has_cached_rules(&self) -> bool {
+        self.has_domain_rules
+            .load(std::sync::atomic::Ordering::Acquire)
+            || self
+                .has_ip_rules
+                .load(std::sync::atomic::Ordering::Acquire)
+            || self.cache_path.exists()
+    }
+
     /// Выполняет обновление правил по HTTP с проверкой ETag
     pub async fn update_from_server(&self, server_url: &str) -> anyhow::Result<()> {
         let _guard = self.update_lock.lock().await;
@@ -191,24 +200,44 @@ impl RuleCacheManager {
         info!("{msg}");
         crate::events::status(&msg);
 
+        let etag_file = self.cache_path.with_extension("etag");
+        let cached_etag = fs::read_to_string(&etag_file)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty() && self.cache_path.exists());
+
         let profile = BrowserProfile::random();
         let client = profile
             .build_reqwest_builder(Arc::new(reqwest::cookie::Jar::default()))?
-            .timeout(std::time::Duration::from_secs(10))
+            .connect_timeout(std::time::Duration::from_secs(3))
+            .timeout(std::time::Duration::from_secs(5))
             .build()?;
 
         let mut req = profile.apply_to_reqwest(client.get(&endpoint), None, None);
-
-        // Читаем локальный ETag из файла .etag если есть
-        let etag_file = self.cache_path.with_extension("etag");
-        if let Ok(etag) = fs::read_to_string(&etag_file) {
-            let clean_etag = etag.trim();
-            if !clean_etag.is_empty() && self.cache_path.exists() {
-                req = req.header("If-None-Match", clean_etag);
-            }
+        if let Some(ref clean_etag) = cached_etag {
+            req = req.header("If-None-Match", clean_etag);
         }
 
-        let resp = req.send().await?;
+        let resp = match req.send().await {
+            Ok(resp) => resp,
+            Err(primary_err) if !primary_err.is_timeout() => {
+                let mut relaxed_tls = profile.tls_config.clone();
+                relaxed_tls.verify_peer = false;
+                let relaxed_profile = BrowserProfile::with_tls_config(relaxed_tls);
+                let fallback_client = relaxed_profile
+                    .build_reqwest_builder(Arc::new(reqwest::cookie::Jar::default()))?
+                    .connect_timeout(std::time::Duration::from_secs(3))
+                    .timeout(std::time::Duration::from_secs(5))
+                    .build()?;
+                let mut fallback_req =
+                    relaxed_profile.apply_to_reqwest(fallback_client.get(&endpoint), None, None);
+                if let Some(ref clean_etag) = cached_etag {
+                    fallback_req = fallback_req.header("If-None-Match", clean_etag);
+                }
+                fallback_req.send().await?
+            }
+            Err(e) => return Err(e.into()),
+        };
 
         if resp.status() == reqwest::StatusCode::NOT_MODIFIED {
             let msg = format!(

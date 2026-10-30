@@ -125,12 +125,17 @@ impl AnetClient {
             return;
         }
         if let Some(rules_server_url) = config.get_rules_server_url() {
+            let sync_timeout = if self.rule_cache.has_cached_rules() {
+                Duration::from_millis(2500)
+            } else {
+                Duration::from_secs(5)
+            };
             tokio::select! {
                 _ = self.cancel_signal.notified() => {
                     info!("[RuleCache] Sync cancelled by stop signal.");
                 }
                 res = tokio::time::timeout(
-                    Duration::from_secs(5),
+                    sync_timeout,
                     self.rule_cache.update_from_server(&rules_server_url),
                 ) => {
                     match res {
