@@ -8,7 +8,7 @@ use bytes::{Bytes, BytesMut};
 use ipnet::{IpNet, Ipv4Net};
 use jni::JavaVM;
 use jni::objects::{GlobalRef, JValue};
-use log::{info, warn};
+use log::info;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};

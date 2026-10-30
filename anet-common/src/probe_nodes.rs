@@ -1178,7 +1178,7 @@ where
         let sem = semaphore.clone();
         futures.push(async move {
             let mut res = {
-                let _permit = sem.acquire_owned().await.ok();
+                let _permit = sem.clone().acquire_owned().await.ok();
                 probe_single_target(&target, timeout_dur).await
             };
             if res.status == NodeProbeStatus::Unavailable {
