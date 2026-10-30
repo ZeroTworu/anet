@@ -7,6 +7,8 @@ win-gui:
 win-gui-d:
 	cargo update -p rtc-turn -p reqwest-boring
 	cargo build --release --target x86_64-pc-windows-gnu --package anet-client-gui --features per-app --features console
+lin-gui:
+	cargo build --release --package anet-client-gui
 
 # Default target
 all:
