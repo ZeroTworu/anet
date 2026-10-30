@@ -51,6 +51,18 @@ musl:
 # Build Android libraries (requires cargo-ndk)
 mob:
 	cargo update -p rtc-turn -p reqwest-boring
+	@for t in x86_64-linux-android aarch64-linux-android armv7-linux-androideabi; do \
+		for d in target/$$t/release/build/boring-sys-*/out; do \
+			if [ -d "$$d/build" ]; then \
+				if [ ! -f "$$d/build/ssl/libssl.a" ] && [ ! -f "$$d/build/libssl.a" ]; then \
+					rm -rf "$$d/build"; \
+				elif ! grep -q -- "-fno-exceptions" "$$d/build/CMakeCache.txt" 2>/dev/null; then \
+					rm -rf "$$d/build"; \
+					cargo clean -p boring-sys -p anet-mobile --release --target $$t; \
+				fi; \
+			fi; \
+		done; \
+	done
 	@NDK_HOME_RESOLVED="$${ANDROID_NDK_HOME:-$${ANDROID_NDK_ROOT:-$${ANDROID_NDK_PATH:-$${NDK_HOME:-}}}}"; \
 	if [ -n "$$NDK_HOME_RESOLVED" ] && [ ! -f "$$NDK_HOME_RESOLVED/build/cmake/android.toolchain.cmake" ]; then \
 		SUB_NDK="$$(ls -1d "$$NDK_HOME_RESOLVED"/* 2>/dev/null | sort -V | tail -n 1)"; \

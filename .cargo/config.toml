@@ -1,15 +1,46 @@
 [env]
-# Статическая сборка под Linux musl (x86_64 / aarch64) и Android NDK:
-# Пакет musl-tools в Linux-дистрибутивах предоставляет C-враппер (x86_64-linux-musl-gcc),
-# но не включает x86_64-linux-musl-g++, а в Android NDK (r26+) отсутствует libstdc++.
-# BoringSSL (libssl.a) собирается с -fno-exceptions -fno-rtti, использует только
-# header-only шаблоны C++ и собственные аллокаторы (OPENSSL_malloc / placement new)
-# без единого символа из рантайма libstdc++.
+# Статическая сборка под Linux musl (x86_64 / aarch64) и Android NDK для BoringSSL 5.4.0 (C++17):
+# В BoringSSL 5.4.0 весь код crypto/ и ssl/ переведён на C++17. Для таргета ssl в CMakeLists.txt
+# по умолчанию не выставлены -fno-exceptions -fno-rtti, поэтому передаём их явно через CXXFLAGS_*.
 CXX_x86_64_unknown_linux_musl = "g++"
-CXXFLAGS_x86_64_unknown_linux_musl = "-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0"
+CXXFLAGS_x86_64_unknown_linux_musl = "-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-exceptions -fno-rtti -fno-sized-deallocation -DBORINGSSL_TEMPORARY_NO_CXX_RUNTIME"
+CXXFLAGS_aarch64_unknown_linux_musl = "-fno-exceptions -fno-rtti -fno-sized-deallocation -DBORINGSSL_TEMPORARY_NO_CXX_RUNTIME"
 BORING_BSSL_RUST_CPPLIB_x86_64_unknown_linux_musl = "c"
 BORING_BSSL_RUST_CPPLIB_aarch64_unknown_linux_musl = "c"
-BORING_BSSL_RUST_CPPLIB_aarch64_linux_android = "c"
-BORING_BSSL_RUST_CPPLIB_armv7_linux_androideabi = "c"
-BORING_BSSL_RUST_CPPLIB_x86_64_linux_android = "c"
-BORING_BSSL_RUST_CPPLIB_i686_linux_android = "c"
+
+CXXFLAGS_aarch64_linux_android = "-fno-exceptions -fno-rtti -fno-sized-deallocation -DBORINGSSL_TEMPORARY_NO_CXX_RUNTIME"
+CXXFLAGS_armv7_linux_androideabi = "-fno-exceptions -fno-rtti -fno-sized-deallocation -DBORINGSSL_TEMPORARY_NO_CXX_RUNTIME"
+CXXFLAGS_x86_64_linux_android = "-fno-exceptions -fno-rtti -fno-sized-deallocation -DBORINGSSL_TEMPORARY_NO_CXX_RUNTIME"
+CXXFLAGS_i686_linux_android = "-fno-exceptions -fno-rtti -fno-sized-deallocation -DBORINGSSL_TEMPORARY_NO_CXX_RUNTIME"
+BORING_BSSL_RUST_CPPLIB_aarch64_linux_android = "static=c++_static"
+BORING_BSSL_RUST_CPPLIB_armv7_linux_androideabi = "static=c++_static"
+BORING_BSSL_RUST_CPPLIB_x86_64_linux_android = "static=c++_static"
+BORING_BSSL_RUST_CPPLIB_i686_linux_android = "static=c++_static"
+
+[target.x86_64-unknown-linux-musl]
+rustflags = [
+    "-C", "target-feature=+crt-static",
+    "-C", "link-arg=-Wl,--defsym=fopen64=fopen",
+    "-C", "link-arg=-Wl,--defsym=__isoc23_strtoull=strtoull",
+    "-C", "link-arg=-Wl,--defsym=__isoc23_strtol=strtol",
+    "-C", "link-arg=-Wl,--defsym=__isoc23_strtoul=strtoul",
+    "-C", "link-arg=-Wl,--defsym=__cxa_pure_virtual=abort",
+    "-C", "link-arg=-Wl,--defsym=_ZdlPv=free",
+    "-C", "link-arg=-Wl,--defsym=_ZdlPvm=free",
+    "-C", "link-arg=-Wl,--defsym=_ZSt24__throw_out_of_range_fmtPKcz=abort",
+    "-C", "link-arg=-Wl,--defsym=_ZSt20__throw_length_errorPKc=abort",
+    "-C", "link-arg=-Wl,--defsym=_ZSt17__throw_bad_allocv=abort",
+    "-C", "link-arg=-Wl,--defsym=_ZSt28__throw_bad_array_new_lengthv=abort",
+]
+
+[target.aarch64-unknown-linux-musl]
+rustflags = [
+    "-C", "target-feature=+crt-static",
+    "-C", "link-arg=-Wl,--defsym=__cxa_pure_virtual=abort",
+    "-C", "link-arg=-Wl,--defsym=_ZdlPv=free",
+    "-C", "link-arg=-Wl,--defsym=_ZdlPvm=free",
+    "-C", "link-arg=-Wl,--defsym=_ZSt24__throw_out_of_range_fmtPKcz=abort",
+    "-C", "link-arg=-Wl,--defsym=_ZSt20__throw_length_errorPKc=abort",
+    "-C", "link-arg=-Wl,--defsym=_ZSt17__throw_bad_allocv=abort",
+    "-C", "link-arg=-Wl,--defsym=_ZSt28__throw_bad_array_new_lengthv=abort",
+]

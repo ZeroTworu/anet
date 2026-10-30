@@ -959,7 +959,7 @@ mod tests {
         builder.set_not_after(&not_after).unwrap();
 
         let bc = BasicConstraints::new().critical().ca().build().unwrap();
-        builder.append_extension(bc).unwrap();
+        builder.append_extension(&bc).unwrap();
 
         let ku = KeyUsage::new()
             .critical()
@@ -968,13 +968,13 @@ mod tests {
             .key_cert_sign()
             .build()
             .unwrap();
-        builder.append_extension(ku).unwrap();
+        builder.append_extension(&ku).unwrap();
 
         let san = SubjectAlternativeName::new()
             .dns(domain)
             .build(&builder.x509v3_context(None, None))
             .unwrap();
-        builder.append_extension(san).unwrap();
+        builder.append_extension(&san).unwrap();
 
         builder.sign(&pkey, MessageDigest::sha256()).unwrap();
         let cert = builder.build();

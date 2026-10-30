@@ -126,13 +126,14 @@ jobs:
       - name: "Build Linux Binaries (Musl)"
         env:
           CXX_x86_64_unknown_linux_musl: g++
-          CXXFLAGS_x86_64_unknown_linux_musl: "-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0"
+          CXXFLAGS_x86_64_unknown_linux_musl: "-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-exceptions -fno-rtti -fno-sized-deallocation -DBORINGSSL_TEMPORARY_NO_CXX_RUNTIME"
           BORING_BSSL_RUST_CPPLIB_x86_64_unknown_linux_musl: c
+          MUSL_RUSTFLAGS: "-C target-feature=+crt-static -C link-arg=-Wl,--defsym=fopen64=fopen -C link-arg=-Wl,--defsym=__isoc23_strtoull=strtoull -C link-arg=-Wl,--defsym=__isoc23_strtol=strtol -C link-arg=-Wl,--defsym=__isoc23_strtoul=strtoul -C link-arg=-Wl,--defsym=__cxa_pure_virtual=abort -C link-arg=-Wl,--defsym=_ZdlPv=free -C link-arg=-Wl,--defsym=_ZdlPvm=free -C link-arg=-Wl,--defsym=_ZSt24__throw_out_of_range_fmtPKcz=abort -C link-arg=-Wl,--defsym=_ZSt20__throw_length_errorPKc=abort -C link-arg=-Wl,--defsym=_ZSt17__throw_bad_allocv=abort -C link-arg=-Wl,--defsym=_ZSt28__throw_bad_array_new_lengthv=abort"
         run: |
           cargo update -p rtc-turn -p reqwest-boring
-          RUSTFLAGS="-C target-feature=+crt-static" cargo build --release --package anet-server --target x86_64-unknown-linux-musl
-          RUSTFLAGS="-C target-feature=+crt-static" cargo build --release --package anet-auth --target x86_64-unknown-linux-musl
-          RUSTFLAGS="-C target-feature=+crt-static" cargo build --release --package anet-keygen --target x86_64-unknown-linux-musl
+          RUSTFLAGS="$MUSL_RUSTFLAGS" cargo build --release --package anet-server --target x86_64-unknown-linux-musl
+          RUSTFLAGS="$MUSL_RUSTFLAGS" cargo build --release --package anet-auth --target x86_64-unknown-linux-musl
+          RUSTFLAGS="$MUSL_RUSTFLAGS" cargo build --release --package anet-keygen --target x86_64-unknown-linux-musl
 
       # 2. Сборка Windows Keygen (Cross-compile)
       - name: "Build Windows Keygen"
@@ -204,17 +205,19 @@ jobs:
       - name: "Build Client (AMD64)"
         env:
           CXX_x86_64_unknown_linux_musl: g++
-          CXXFLAGS_x86_64_unknown_linux_musl: "-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0"
+          CXXFLAGS_x86_64_unknown_linux_musl: "-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-exceptions -fno-rtti -fno-sized-deallocation -DBORINGSSL_TEMPORARY_NO_CXX_RUNTIME"
           BORING_BSSL_RUST_CPPLIB_x86_64_unknown_linux_musl: c
+          MUSL_RUSTFLAGS: "-C target-feature=+crt-static -C link-arg=-Wl,--defsym=fopen64=fopen -C link-arg=-Wl,--defsym=__isoc23_strtoull=strtoull -C link-arg=-Wl,--defsym=__isoc23_strtol=strtol -C link-arg=-Wl,--defsym=__isoc23_strtoul=strtoul -C link-arg=-Wl,--defsym=__cxa_pure_virtual=abort -C link-arg=-Wl,--defsym=_ZdlPv=free -C link-arg=-Wl,--defsym=_ZdlPvm=free -C link-arg=-Wl,--defsym=_ZSt24__throw_out_of_range_fmtPKcz=abort -C link-arg=-Wl,--defsym=_ZSt20__throw_length_errorPKc=abort -C link-arg=-Wl,--defsym=_ZSt17__throw_bad_allocv=abort -C link-arg=-Wl,--defsym=_ZSt28__throw_bad_array_new_lengthv=abort"
         run: |
           cargo update -p rtc-turn -p reqwest-boring
-          RUSTFLAGS="-C target-feature=+crt-static" cargo build --release --package anet-client-cli --target x86_64-unknown-linux-musl
+          RUSTFLAGS="$MUSL_RUSTFLAGS" cargo build --release --package anet-client-cli --target x86_64-unknown-linux-musl
 
       # Сборка ARM64 (aarch64) в готовом musl cross-окружении.
       - name: "Build Client (ARM64)"
         env:
           CI: "true"
           BORING_BSSL_RUST_CPPLIB_aarch64_unknown_linux_musl: "c"
+          CXXFLAGS_aarch64_unknown_linux_musl: "-fno-exceptions -fno-rtti -fno-sized-deallocation -DBORINGSSL_TEMPORARY_NO_CXX_RUNTIME"
         run: |
           cargo update -p rtc-turn -p reqwest-boring
           cross build --release --package anet-client-cli --target aarch64-unknown-linux-musl

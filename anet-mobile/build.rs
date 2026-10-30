@@ -64,6 +64,14 @@ fn main() {
     writeln!(f, "pub const BUILD_TIME: &str = \"{}\";", datetime).unwrap();
     writeln!(f, "pub const BUILD_TYPE: &str = \"{}\";", build_type).unwrap();
 
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("android") {
+        // BoringSSL 5.4.0 uses C++17 (std::variant, std::optional, std::bitset, virtual destructors).
+        // Link NDK's libc++_static.a and libc++abi.a into libanet_mobile.so so no external
+        // libc++_shared.so or unresolved __gxx_personality_v0 is required at runtime.
+        println!("cargo:rustc-link-lib=static=c++_static");
+        println!("cargo:rustc-link-lib=static=c++abi");
+    }
+
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=../.git/HEAD");
     println!("cargo:rerun-if-changed=../.git/refs");

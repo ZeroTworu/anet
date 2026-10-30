@@ -8,4 +8,5 @@ pre-build = [
 passthrough = [
     "CI",
     "BORING_BSSL_RUST_CPPLIB_aarch64_unknown_linux_musl",
+    "CXXFLAGS_aarch64_unknown_linux_musl",
 ]
