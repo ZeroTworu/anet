@@ -1420,11 +1420,19 @@ impl ClientTransport for WrtcTransport {
                     h.abort();
                 }
             }
-            if let Some(p2p) = p2p_shutdown.lock().await.take() {
-                p2p.close().await;
-            }
-            xmpp_shutdown.lock().await.leave_room().await;
-            let _ = peer_shutdown.close().await;
+            let p2p_opt = p2p_shutdown.lock().await.take();
+            let p2p_fut = async move {
+                if let Some(p2p) = p2p_opt {
+                    let _ = tokio::time::timeout(Duration::from_millis(350), p2p.close()).await;
+                }
+            };
+            let xmpp_fut = async move {
+                if let Ok(mut xmpp) = tokio::time::timeout(Duration::from_millis(200), xmpp_shutdown.lock()).await {
+                    let _ = tokio::time::timeout(Duration::from_millis(350), xmpp.leave_room()).await;
+                }
+            };
+            let peer_fut = tokio::time::timeout(Duration::from_millis(350), peer_shutdown.close());
+            let _ = tokio::join!(p2p_fut, xmpp_fut, peer_fut);
         });
 
         Ok(ConnectionResult {

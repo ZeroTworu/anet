@@ -303,8 +303,8 @@ impl ConnectivityProber {
                     .timeout(timeout)
                     .connect_timeout(timeout)
                     .redirect(reqwest::redirect::Policy::none())
-                    .pool_max_idle_per_host(2)
-                    .pool_idle_timeout(Duration::from_secs(90))
+                    .pool_max_idle_per_host(1)
+                    .pool_idle_timeout(Duration::from_secs(2))
                     .no_proxy()
                     .build()?)
             })
@@ -346,9 +346,10 @@ impl ConnectivityProber {
             return ProbeGroupResult::default();
         }
 
+        let per_target_timeout = Duration::from_millis(self.config.timeout_ms.clamp(800, 4_000));
         let futures = targets
             .iter()
-            .map(|url| probe_single_target(&self.client, &self.profile, url));
+            .map(|url| probe_single_target(&self.client, &self.profile, url, per_target_timeout));
         let results = join_all(futures).await;
 
         let mut ok_count = 0usize;
@@ -374,13 +375,14 @@ async fn probe_single_target(
     client: &reqwest::Client,
     profile: &BrowserProfile,
     target: &str,
+    timeout: Duration,
 ) -> Option<u64> {
     let trimmed = target.trim();
     if trimmed.is_empty() {
         return None;
     }
 
-    if let Some(rtt) = probe_url_once(client, profile, trimmed).await {
+    if let Some(rtt) = probe_url_once(client, profile, trimmed, timeout).await {
         return Some(rtt);
     }
 
@@ -388,7 +390,7 @@ async fn probe_single_target(
     // зарубежные выходные IP (например, при включённом VPN через Нидерланды/Финляндию),
     // страхуем её проверкой dzen.ru, чтобы индикатор РФ 3/3 не ловил ложный серый сегмент.
     if trimmed.contains("gosuslugi.ru") {
-        return probe_url_once(client, profile, "https://dzen.ru").await;
+        return probe_url_once(client, profile, "https://dzen.ru", timeout).await;
     }
 
     None
@@ -398,15 +400,16 @@ async fn probe_url_once(
     client: &reqwest::Client,
     profile: &BrowserProfile,
     url: &str,
+    timeout: Duration,
 ) -> Option<u64> {
     let start = Instant::now();
     let req = profile.apply_to_reqwest(client.get(url), None, None);
-    let resp = req.send().await.ok()?;
+    let resp = tokio::time::timeout(timeout, req.send()).await.ok()?.ok()?;
 
     // Любой осмысленный HTTP-ответ от целевого сервера (2xx, 3xx, 401/403/404)
     // подтверждает успешное прохождение DNS + TCP + TLS хендшейка.
     let status = resp.status().as_u16();
-    let _ = resp.bytes().await;
+    let _ = tokio::time::timeout(Duration::from_millis(600), resp.bytes()).await;
     if (100..600).contains(&status) {
         let first_ms = (start.elapsed().as_millis() as u64).max(1);
         // Если первый запрос шёл по холодному соединению (включал TCP + TLS хендшейк),

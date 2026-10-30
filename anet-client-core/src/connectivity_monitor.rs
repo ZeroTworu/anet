@@ -360,6 +360,21 @@ impl ConnectivityMonitor {
             monitor.tunnel_rtt_ms.store(NO_RTT_MARKER, Ordering::Relaxed);
         }
         if prev != connected {
+            let updated_opt = {
+                let mut guard = monitor.last_snapshot.lock().unwrap();
+                if let Some(ref mut current) = *guard {
+                    current.vpn_connected = connected;
+                    if !connected {
+                        current.tunnel_rtt_ms = None;
+                    }
+                    Some(current.clone())
+                } else {
+                    None
+                }
+            };
+            if let Some(updated) = updated_opt {
+                emit(AnetEvent::ConnectivityUpdated(updated));
+            }
             monitor.wake_notify.notify_one();
         }
     }
@@ -369,15 +384,25 @@ impl ConnectivityMonitor {
     pub fn update_tunnel_rtt_ms(rtt_ms: Option<u64>) {
         let monitor = Self::global();
         let raw = rtt_ms.unwrap_or(NO_RTT_MARKER);
-        monitor.tunnel_rtt_ms.store(raw, Ordering::Relaxed);
+        let prev = monitor.tunnel_rtt_ms.swap(raw, Ordering::Relaxed);
+        if prev == raw {
+            return;
+        }
 
         if monitor.vpn_connected.load(Ordering::Relaxed) {
             let updated_opt = {
                 let mut guard = monitor.last_snapshot.lock().unwrap();
                 if let Some(ref current) = *guard {
                     let updated = current.with_updated_tunnel_rtt(true, rtt_ms);
+                    let changed = updated.condition != current.condition
+                        || updated.pulse_color != current.pulse_color
+                        || updated.display_rtt_ms != current.display_rtt_ms;
                     *guard = Some(updated.clone());
-                    Some(updated)
+                    if changed {
+                        Some(updated)
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 }
@@ -398,13 +423,13 @@ impl ConnectivityMonitor {
         };
 
         let checking_snap = {
-            let mut guard = monitor.last_snapshot.lock().unwrap();
+            let guard = monitor.last_snapshot.lock().unwrap();
             let mut snap = guard.clone().unwrap_or_default();
+            snap.vpn_connected = monitor.vpn_connected.load(Ordering::Relaxed);
             snap.global_total = global_total;
             snap.domestic_total = domestic_total;
             snap.title = "Сверяем показания приборов…".to_string();
             snap.subtitle = "Опрашиваем контрольные точки маршрутизации…".to_string();
-            *guard = Some(snap.clone());
             snap
         };
         emit(AnetEvent::ConnectivityUpdated(checking_snap));
@@ -458,9 +483,6 @@ impl ConnectivityMonitor {
     }
 
     async fn run_loop(self: Arc<Self>) {
-        let mut cached_prober: Option<(ConnectivityConfig, ConnectivityProber)> = None;
-        let mut last_vpn_state: Option<bool> = None;
-
         loop {
             let cfg = self.config.lock().unwrap().clone();
             if !cfg.enabled {
@@ -472,15 +494,7 @@ impl ConnectivityMonitor {
             }
 
             let vpn_on = self.vpn_connected.load(Ordering::Relaxed);
-            let need_new_prober = cached_prober
-                .as_ref()
-                .map_or(true, |(prev_cfg, _)| *prev_cfg != cfg)
-                || last_vpn_state != Some(vpn_on);
-            if need_new_prober {
-                cached_prober = Some((cfg.clone(), ConnectivityProber::new(cfg.clone())));
-                last_vpn_state = Some(vpn_on);
-            }
-            let prober = cached_prober.as_ref().unwrap().1.clone();
+            let prober = ConnectivityProber::new(cfg.clone());
 
             let tunnel_rtt = if vpn_on {
                 self.current_tunnel_rtt()
@@ -488,8 +502,27 @@ impl ConnectivityMonitor {
                 None
             };
 
+            let outer_timeout = Duration::from_millis(cfg.timeout_ms.clamp(1000, 4500) + 1500);
             let snapshot = tokio::select! {
-                res = prober.probe_once(vpn_on, tunnel_rtt) => res,
+                res = tokio::time::timeout(outer_timeout, prober.probe_once(vpn_on, tunnel_rtt)) => {
+                    match res {
+                        Ok(snap) => snap,
+                        Err(_) => ConnectivitySnapshot::evaluate(
+                            vpn_on,
+                            tunnel_rtt,
+                            anet_common::connectivity::ProbeGroupResult {
+                                ok_count: 0,
+                                total_count: cfg.global_targets.len(),
+                                min_rtt_ms: None,
+                            },
+                            anet_common::connectivity::ProbeGroupResult {
+                                ok_count: 0,
+                                total_count: cfg.domestic_targets.len(),
+                                min_rtt_ms: None,
+                            },
+                        ),
+                    }
+                }
                 _ = self.wake_notify.notified() => {
                     // Внеочередное пробуждение (смена конфига, переключение VPN или ручной клик "Перепроверить")
                     // немедленно перезапускает опрос с актуальными параметрами.

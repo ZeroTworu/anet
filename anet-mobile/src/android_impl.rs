@@ -18,6 +18,7 @@ use tokio::sync::mpsc;
 use tun::Configuration;
 
 static TUN_ACTIVE_FLAG: AtomicBool = AtomicBool::new(false);
+static TUN_SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 static REBIND_SCHEDULED: AtomicBool = AtomicBool::new(false);
 static DIRTY_GEN: AtomicU64 = AtomicU64::new(0);
 static NEXT_TUN_OWNER_ID: AtomicU64 = AtomicU64::new(1);
@@ -148,27 +149,43 @@ impl ActiveTunSession {
 }
 
 pub fn reset_tun_session_flags() {
+    TUN_SHUTDOWN_REQUESTED.store(false, Ordering::Release);
     TUN_ACTIVE_FLAG.store(false, Ordering::Release);
     REBIND_SCHEDULED.store(false, Ordering::Release);
 }
 
-async fn stop_and_close_tun_session(session: ActiveTunSession) {
-    // КРИТИЧНО: Сначала останавливаем Tokio I/O воркер и ждём его завершения, чтобы
-    // дублированный файловый дескриптор (dup_fd) был дерегистрирован из epoll и закрыт
-    // ДО того, как Java закроет свой ParcelFileDescriptor. Иначе ядро Linux может
-    // переиспользовать номер fd для нового сокета/туннеля, пока старый AsyncFd ещё в epoll!
+pub fn request_tun_shutdown() {
+    TUN_SHUTDOWN_REQUESTED.store(true, Ordering::Release);
+    TUN_ACTIVE_FLAG.store(false, Ordering::Release);
+    REBIND_SCHEDULED.store(false, Ordering::Release);
+}
+
+async fn stop_and_close_tun_session(mut session: ActiveTunSession) {
+    // КРИТИЧНО: Сначала уведомляем worker_stop и даём воркеру до 200 мс штатно выйти из цикла,
+    // чтобы он сам отменил и дождался завершения дочернего reader_handle и синхронно закрыл
+    // оба половинных дескриптора (reader + writer dup_fd) ДО закрытия ParcelFileDescriptor в Java!
     session.worker_stop.notify_waiters();
-    session.worker_handle.abort();
-    let _ = tokio::time::timeout(
-        std::time::Duration::from_millis(300),
-        session.worker_handle,
+    if tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        &mut session.worker_handle,
     )
-    .await;
+    .await
+    .is_err()
+    {
+        warn!("[Android TUN] Worker did not finish within 200ms, forcing abort");
+        session.worker_handle.abort();
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            session.worker_handle,
+        )
+        .await;
+    }
     call_close_tun_jni(&session.jvm, &session.vpn_service_ref);
 }
 
 pub async fn shutdown_active_tun() {
-    reset_tun_session_flags();
+    TUN_ACTIVE_FLAG.store(false, Ordering::Release);
+    REBIND_SCHEDULED.store(false, Ordering::Release);
     let old_session = active_tun_mutex().lock().await.take();
     if let Some(session) = old_session {
         stop_and_close_tun_session(session).await;
@@ -179,7 +196,8 @@ pub async fn shutdown_active_tun_for_owner(owner_id: u64) {
     let old_session = {
         let mut guard = active_tun_mutex().lock().await;
         if guard.as_ref().is_some_and(|s| s.owner_id == owner_id) {
-            reset_tun_session_flags();
+            TUN_ACTIVE_FLAG.store(false, Ordering::Release);
+            REBIND_SCHEDULED.store(false, Ordering::Release);
             guard.take()
         } else {
             None
@@ -219,69 +237,93 @@ impl anet_client_core::traits::RouteManager for AndroidRouteManager {
         let mut added_new = false;
         {
             let mut list = self.bypass_ips.lock().unwrap();
-            for &(target, prefix) in routes {
-                let IpAddr::V4(v4) = target else {
-                    continue;
-                };
-                let effective_prefix = prefix.min(32);
-
-                let Ok(cand_net) = Ipv4Net::new(v4, effective_prefix).map(|n| n.trunc()) else {
-                    continue;
-                };
-
-                // КРИТИЧНО для Android < 13 (API < 33, например Lenovo Tab P11 / Android 11):
-                // Точные /32 маршруты (IP VPN-сервера, WebRTC TURN-сервера, DNS) НИКОГДА не должны
-                // поглощаться или удаляться широкими подсетями /16 или /18 из rules.abc!
-                // Иначе при расчёте fallback-маршрутов (первые N элементов) /32 адрес сервера/TURN
-                // пропадает из начала списка и трафик к самому VPN/TURN-серверу заворачивается внутрь tun0 (routing loop).
-                let already_covered = list.iter().any(|&(existing_ip, existing_p)| {
-                    if let IpAddr::V4(ev4) = existing_ip {
+            if routes.len() > 64 {
+                // Быстрый O(N) импорт большого списка подсетей из rules.abc без квадратичной проверки вложенности
+                let mut seen: std::collections::HashSet<(IpAddr, u8)> =
+                    list.iter().copied().collect();
+                let mut first_non_32 = list
+                    .iter()
+                    .position(|&(_, p)| p < 32)
+                    .unwrap_or(list.len());
+                for &(target, prefix) in routes {
+                    let IpAddr::V4(v4) = target else {
+                        continue;
+                    };
+                    let effective_prefix = prefix.min(32);
+                    let Ok(cand_net) = Ipv4Net::new(v4, effective_prefix).map(|n| n.trunc()) else {
+                        continue;
+                    };
+                    let entry = (IpAddr::V4(cand_net.network()), effective_prefix);
+                    if seen.insert(entry) {
                         if effective_prefix == 32 {
-                            return existing_p == 32 && ev4 == cand_net.network();
+                            list.insert(first_non_32, entry);
+                            first_non_32 += 1;
+                        } else {
+                            list.push(entry);
                         }
-                        if let Ok(existing_net) = Ipv4Net::new(ev4, existing_p) {
-                            return existing_net.contains(&cand_net);
-                        }
+                        added_new = true;
                     }
-                    false
-                });
+                }
+            } else {
+                for &(target, prefix) in routes {
+                    let IpAddr::V4(v4) = target else {
+                        continue;
+                    };
+                    let effective_prefix = prefix.min(32);
 
-                if !already_covered {
-                    if effective_prefix < 32 {
-                        list.retain(|&(existing_ip, existing_p)| {
-                            // Никогда не удаляем точные /32 маршруты (сервер, TURN, DNS)
-                            if existing_p == 32 {
-                                return true;
+                    let Ok(cand_net) = Ipv4Net::new(v4, effective_prefix).map(|n| n.trunc()) else {
+                        continue;
+                    };
+
+                    // КРИТИЧНО для Android < 13 (API < 33, например Lenovo Tab P11 / Android 11):
+                    // Точные /32 маршруты (IP VPN-сервера, WebRTC TURN-сервера, DNS) НИКОГДА не должны
+                    // поглощаться или удаляться широкими подсетями /16 или /18 из rules.abc!
+                    let already_covered = list.iter().any(|&(existing_ip, existing_p)| {
+                        if let IpAddr::V4(ev4) = existing_ip {
+                            if effective_prefix == 32 {
+                                return existing_p == 32 && ev4 == cand_net.network();
                             }
-                            if let IpAddr::V4(ev4) = existing_ip {
-                                if existing_p > effective_prefix {
-                                    if let Ok(existing_net) = Ipv4Net::new(ev4, existing_p) {
-                                        return !cand_net.contains(&existing_net);
+                            if let Ok(existing_net) = Ipv4Net::new(ev4, existing_p) {
+                                return existing_net.contains(&cand_net);
+                            }
+                        }
+                        false
+                    });
+
+                    if !already_covered {
+                        if effective_prefix < 32 {
+                            list.retain(|&(existing_ip, existing_p)| {
+                                if existing_p == 32 {
+                                    return true;
+                                }
+                                if let IpAddr::V4(ev4) = existing_ip {
+                                    if existing_p > effective_prefix {
+                                        if let Ok(existing_net) = Ipv4Net::new(ev4, existing_p) {
+                                            return !cand_net.contains(&existing_net);
+                                        }
                                     }
                                 }
-                            }
-                            true
-                        });
+                                true
+                            });
+                        }
+                        let normalized_ip = IpAddr::V4(cand_net.network());
+                        if routes.len() <= 16 {
+                            info!(
+                                "[Android RouteManager] Recorded bypass route: {}/{}",
+                                normalized_ip, effective_prefix
+                            );
+                        }
+                        if effective_prefix == 32 {
+                            let insert_pos = list
+                                .iter()
+                                .position(|&(_, p)| p < 32)
+                                .unwrap_or(list.len());
+                            list.insert(insert_pos, (normalized_ip, 32));
+                        } else {
+                            list.push((normalized_ip, effective_prefix));
+                        }
+                        added_new = true;
                     }
-                    let normalized_ip = IpAddr::V4(cand_net.network());
-                    if routes.len() <= 16 {
-                        info!(
-                            "[Android RouteManager] Recorded bypass route: {}/{}",
-                            normalized_ip, effective_prefix
-                        );
-                    }
-                    if effective_prefix == 32 {
-                        // Все /32 маршруты (VPN сервер, TURN relay, DNS) вставляем в начало списка,
-                        // чтобы они гарантированно имели наивысший приоритет на всех версиях Android
-                        let insert_pos = list
-                            .iter()
-                            .position(|&(_, p)| p < 32)
-                            .unwrap_or(list.len());
-                        list.insert(insert_pos, (normalized_ip, 32));
-                    } else {
-                        list.push((normalized_ip, effective_prefix));
-                    }
-                    added_new = true;
                 }
             }
         }
@@ -290,10 +332,6 @@ impl anet_client_core::traits::RouteManager for AndroidRouteManager {
             DIRTY_GEN.fetch_add(1, Ordering::AcqRel);
         }
 
-        // Все статические маршруты (VPN сервер, TURN, DNS, rules.abc, overrides) добавляются ДО вызова create_tun().
-        // Когда TUN уже поднят (tun_is_active == true), мы НЕ вызываем VpnService.Builder.establish() повторно
-        // на каждый фоновый DNS-ответ, так как на Android повторный establish() пересоздаёт интерфейс tun0
-        // и сбрасывает активные сокеты (включая Speedtest и WebRTC/QUIC).
         let _ = tun_is_active;
         Ok(())
     }
@@ -344,24 +382,24 @@ impl AndroidCallbackTunFactory {
         }
     }
 
-    /// Формирует список исключений с жёстким приоритетом:
+    /// Формирует список исключений с жёстким приоритетом за O(N):
     /// 1) Сначала все точные `/32` адреса (VPN-сервер, WebRTC TURN-серверы, DNS, хосты из exclude_route_for)
     /// 2) Затем пользовательские подсети из `exclude_route_for`
     /// 3) Затем остальные CIDR-маршруты из `rules.abc`
-    /// Это гарантирует, что на Android < 13 (API < 33, где работает `fallback_str` с лимитом подсетей)
-    /// IP-адреса самого VPN-сервера и TURN-релеев ВСЕГДА попадают в исключения и никогда не вызывают routing loop.
     fn build_prioritized_exclude_nets(
         base_exclude_nets: &[IpNet],
         bypass_list: &[(IpAddr, u8)],
     ) -> Vec<IpNet> {
-        let mut exclude_nets = Vec::with_capacity(base_exclude_nets.len() + bypass_list.len());
+        let cap = base_exclude_nets.len() + bypass_list.len();
+        let mut exclude_nets = Vec::with_capacity(cap);
+        let mut seen = std::collections::HashSet::with_capacity(cap);
 
         // 1. Сначала все /32 из bypass_list (сервер, TURN, DNS) и base_exclude_nets
         for &(ip, prefix) in bypass_list {
             if prefix == 32 && ip.is_ipv4() {
                 if let Ok(net) = IpNet::new(ip, 32) {
                     let normalized = IpNet::new(net.network(), net.prefix_len()).unwrap_or(net);
-                    if !exclude_nets.contains(&normalized) {
+                    if seen.insert(normalized) {
                         exclude_nets.push(normalized);
                     }
                 }
@@ -370,7 +408,7 @@ impl AndroidCallbackTunFactory {
         for net in base_exclude_nets {
             if net.addr().is_ipv4() && net.prefix_len() == 32 {
                 let normalized = IpNet::new(net.network(), net.prefix_len()).unwrap_or(*net);
-                if !exclude_nets.contains(&normalized) {
+                if seen.insert(normalized) {
                     exclude_nets.push(normalized);
                 }
             }
@@ -380,7 +418,7 @@ impl AndroidCallbackTunFactory {
         for net in base_exclude_nets {
             if net.addr().is_ipv4() && net.prefix_len() < 32 {
                 let normalized = IpNet::new(net.network(), net.prefix_len()).unwrap_or(*net);
-                if !exclude_nets.contains(&normalized) {
+                if seen.insert(normalized) {
                     exclude_nets.push(normalized);
                 }
             }
@@ -391,7 +429,7 @@ impl AndroidCallbackTunFactory {
             if prefix < 32 && ip.is_ipv4() {
                 if let Ok(net) = IpNet::new(ip, prefix) {
                     let normalized = IpNet::new(net.network(), net.prefix_len()).unwrap_or(net);
-                    if !exclude_nets.contains(&normalized) {
+                    if seen.insert(normalized) {
                         exclude_nets.push(normalized);
                     }
                 }
@@ -405,6 +443,9 @@ impl AndroidCallbackTunFactory {
     async fn resolve_to_ipnet(&self, list: &[String]) -> Vec<IpNet> {
         let mut result = Vec::new();
         for target in list {
+            if TUN_SHUTDOWN_REQUESTED.load(Ordering::Acquire) {
+                break;
+            }
             let trimmed = target.trim();
             if trimmed.is_empty() {
                 continue;
@@ -438,7 +479,12 @@ impl AndroidCallbackTunFactory {
             }
 
             let target_with_port = format!("{}:443", clean);
-            if let Ok(addrs) = lookup_host(&target_with_port).await {
+            if let Ok(Ok(addrs)) = tokio::time::timeout(
+                std::time::Duration::from_millis(1500),
+                lookup_host(&target_with_port),
+            )
+            .await
+            {
                 for addr in addrs {
                     if addr.ip().is_ipv4() {
                         let net = IpNet::from(addr.ip());
@@ -532,33 +578,43 @@ fn call_configure_tun_jni(
     dns_str: &str,
 ) -> Result<i32> {
     let mut env = jvm.attach_current_thread()?;
-
-    let ip_jstr = env.new_string(&auth.ip)?;
-    let include_jstr = env.new_string(include_str)?;
-    let exclude_jstr = env.new_string(exclude_str)?;
-    let fallback_jstr = env.new_string(fallback_str)?;
-    let dns_jstr = env.new_string(dns_str)?;
+    if env.exception_check().unwrap_or(false) {
+        let _ = env.exception_clear();
+    }
 
     // На Android 11+ при наличии IPv6 минимально допустимый MTU для VpnService.Builder равен 1280 (RFC 8200)
     let mtu_jint = (auth.mtu as i32).max(1280);
     let prefix = ip_mask_to_prefix(&auth.netmask)?;
 
-    let fd_val = env.call_method(
-        vpn_service_ref,
-        "configureTun",
-        "(Ljava/lang/String;IILjava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)I",
-        &[
-            JValue::Object(&ip_jstr),
-            JValue::Int(prefix as i32),
-            JValue::Int(mtu_jint),
-            JValue::Object(&include_jstr),
-            JValue::Object(&exclude_jstr),
-            JValue::Object(&fallback_jstr),
-            JValue::Object(&dns_jstr),
-        ],
-    )?;
+    let res = env.with_local_frame(16, |env| -> jni::errors::Result<i32> {
+        let ip_jstr = env.new_string(&auth.ip)?;
+        let include_jstr = env.new_string(include_str)?;
+        let exclude_jstr = env.new_string(exclude_str)?;
+        let fallback_jstr = env.new_string(fallback_str)?;
+        let dns_jstr = env.new_string(dns_str)?;
 
-    let fd = fd_val.i()?;
+        let fd_val = env.call_method(
+            vpn_service_ref,
+            "configureTun",
+            "(Ljava/lang/String;IILjava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)I",
+            &[
+                JValue::Object(&ip_jstr),
+                JValue::Int(prefix as i32),
+                JValue::Int(mtu_jint),
+                JValue::Object(&include_jstr),
+                JValue::Object(&exclude_jstr),
+                JValue::Object(&fallback_jstr),
+                JValue::Object(&dns_jstr),
+            ],
+        )?;
+        fd_val.i()
+    });
+
+    if env.exception_check().unwrap_or(false) {
+        let _ = env.exception_clear();
+    }
+
+    let fd = res.map_err(|e| anyhow::anyhow!("JNI configureTun error: {e}"))?;
     if fd < 0 {
         return Err(anyhow::anyhow!("Java returned invalid FD"));
     }
@@ -567,7 +623,16 @@ fn call_configure_tun_jni(
 
 fn call_close_tun_jni(jvm: &Arc<JavaVM>, vpn_service_ref: &GlobalRef) {
     if let Ok(mut env) = jvm.attach_current_thread() {
-        if env.call_method(vpn_service_ref, "closeTun", "()V", &[]).is_err() {
+        if env.exception_check().unwrap_or(false) {
+            let _ = env.exception_clear();
+        }
+        let _ = env.with_local_frame(8, |env| -> jni::errors::Result<()> {
+            if env.call_method(vpn_service_ref, "closeTun", "()V", &[]).is_err() {
+                let _ = env.exception_clear();
+            }
+            Ok(())
+        });
+        if env.exception_check().unwrap_or(false) {
             let _ = env.exception_clear();
         }
     }
@@ -576,12 +641,6 @@ fn call_close_tun_jni(jvm: &Arc<JavaVM>, vpn_service_ref: &GlobalRef) {
 fn open_async_tun(fd: i32, auth: &AuthResponse) -> Result<tun::AsyncDevice> {
     use std::os::fd::{BorrowedFd, FromRawFd, IntoRawFd, OwnedFd};
 
-    // КРИТИЧНО: Дублируем файловый дескриптор (F_DUPFD_CLOEXEC) специально для Rust/Tokio AsyncFd!
-    // Если передавать сырой fd из Java напрямую с close_fd_on_drop(false), то при закрытии
-    // ParcelFileDescriptor на стороне Java или переиспользовании номера fd ядром Linux
-    // для нового сокета возникает конфликт в epoll реакторе Tokio (0 RX / зависание коннекта).
-    // С собственным dup_fd и close_fd_on_drop(true) жизненный цикл epoll-регистрации в Rust
-    // полностью изолирован от Java ParcelFileDescriptor.
     let dup_fd = unsafe { BorrowedFd::borrow_raw(fd) }
         .try_clone_to_owned()
         .map_err(|e| anyhow::anyhow!("Failed to duplicate TUN fd {}: {}", fd, e))?
@@ -646,6 +705,7 @@ fn spawn_tun_io_worker(
                             biased;
                             _ = reader_stop_c.notified() => break,
                             _ = worker_stop_c.notified() => break,
+                            _ = tx_to_core_c.closed() => break,
                             res = reader.read_buf(&mut buf) => {
                                 match res {
                                     Ok(n) if n > 0 => {
@@ -668,8 +728,6 @@ fn spawn_tun_io_worker(
                         }
                     }
                 });
-                // Гарантируем, что даже при внешнем abort() этой задачи дочерний reader_handle
-                // мгновенно отменяется и освобождает AsyncFd!
                 let _reader_abort_guard = AbortOnDrop(reader_handle.abort_handle());
 
                 if let Some(ack) = ack_activated {
@@ -716,7 +774,6 @@ fn spawn_tun_io_worker(
                     }
                 }
 
-                // Останавливаем и освобождаем старые reader и writer выходом из области видимости до закрытия дескриптора в Java
                 if !reader_finished {
                     reader_stop.notify_one();
                     reader_handle.abort();
@@ -749,16 +806,20 @@ impl TunFactory for AndroidCallbackTunFactory {
         auth: &AuthResponse,
     ) -> Result<(mpsc::Sender<Bytes>, mpsc::Receiver<Bytes>, String)> {
         shutdown_active_tun().await;
+        if TUN_SHUTDOWN_REQUESTED.load(Ordering::Acquire) {
+            return Err(anyhow::anyhow!("TUN creation aborted: shutdown requested"));
+        }
 
         // --- 1. Асинхронная подготовка (БЕЗ JNI) ---
         let include_nets = self.resolve_to_ipnet(&self.config.main.route_for).await;
         let user_excludes = self
             .resolve_to_ipnet(&self.config.main.exclude_route_for)
             .await;
+        if TUN_SHUTDOWN_REQUESTED.load(Ordering::Acquire) {
+            return Err(anyhow::anyhow!("TUN creation aborted: shutdown requested"));
+        }
         let base_exclude_nets = user_excludes.clone();
 
-        // Синхронизируем user_excludes в bypass_ips и собираем все маршруты обхода
-        // (сервер, TURN, DNS, статические Direct CIDR из rules.abc, локальные overrides из client.toml)
         let bypass_list = {
             let mut guard = self.bypass_ips.lock().unwrap();
             for net in &base_exclude_nets {
@@ -784,10 +845,6 @@ impl TunFactory for AndroidCallbackTunFactory {
         let include_str = Self::ipnet_list_to_string(&include_nets);
         let exclude_str = Self::ipnet_list_to_string(&exclude_nets);
 
-        // На Android < 13 (API < 33, включая Android 11 на Lenovo Tab P11), где нет нативного
-        // Builder.excludeRoute(IpPrefix), маршрутизация строится через вычитание исключений из 0.0.0.0/0.
-        // Благодаря build_prioritized_exclude_nets в начале exclude_nets ВСЕГДА находятся все /32
-        // маршруты (VPN-сервер, WebRTC TURN, DNS) и пользовательские исключения.
         let fallback_str = if include_nets.is_empty() && !exclude_nets.is_empty() {
             let capped = if exclude_nets.len() <= 64 {
                 &exclude_nets[..]
@@ -800,8 +857,6 @@ impl TunFactory for AndroidCallbackTunFactory {
             String::new()
         };
 
-        // Настройка DNS: если список пуст, используем виртуальный шлюз туннеля (auth.gateway),
-        // чтобы Android VpnService не пытался делать DoT на порт 853 (1.1.1.1:853), создавая 5-секундную задержку
         let dns_str = if self.config.main.dns_server_list.is_empty() {
             if !auth.gateway.trim().is_empty() {
                 auth.gateway.trim().to_string()
@@ -821,6 +876,14 @@ impl TunFactory for AndroidCallbackTunFactory {
             info!("Fallback generated: contains split routes covering 0.0.0.0/0 minus exclusions");
         }
 
+        let mut active_guard = active_tun_mutex().lock().await;
+        if let Some(prev_session) = active_guard.take() {
+            stop_and_close_tun_session(prev_session).await;
+        }
+        if TUN_SHUTDOWN_REQUESTED.load(Ordering::Acquire) {
+            return Err(anyhow::anyhow!("TUN creation aborted: shutdown requested"));
+        }
+
         // --- 2. JNI ---
         let fd = call_configure_tun_jni(
             &self.jvm,
@@ -833,7 +896,13 @@ impl TunFactory for AndroidCallbackTunFactory {
         )?;
 
         // --- 3. Tun Creation & Hot-Swap Worker ---
-        let device = open_async_tun(fd, auth)?;
+        let device = match open_async_tun(fd, auth) {
+            Ok(dev) => dev,
+            Err(e) => {
+                call_close_tun_jni(&self.jvm, &self.vpn_service_ref);
+                return Err(e);
+            }
+        };
 
         let (tx_to_core, rx_from_tun) = mpsc::channel::<Bytes>(CHANNEL_BUFFER_SIZE);
         let (tx_to_tun, rx_from_core) = mpsc::channel::<Bytes>(CHANNEL_BUFFER_SIZE);
@@ -849,7 +918,7 @@ impl TunFactory for AndroidCallbackTunFactory {
         );
 
         let current_gen = DIRTY_GEN.load(Ordering::Acquire);
-        *active_tun_mutex().lock().await = Some(ActiveTunSession {
+        let session = ActiveTunSession {
             owner_id: self.owner_id,
             jvm: self.jvm.clone(),
             vpn_service_ref: self.vpn_service_ref.clone(),
@@ -863,7 +932,15 @@ impl TunFactory for AndroidCallbackTunFactory {
             worker_stop,
             worker_handle,
             applied_gen: current_gen,
-        });
+        };
+
+        if TUN_SHUTDOWN_REQUESTED.load(Ordering::Acquire) {
+            drop(active_guard);
+            stop_and_close_tun_session(session).await;
+            return Err(anyhow::anyhow!("TUN creation aborted after open: shutdown requested"));
+        }
+
+        *active_guard = Some(session);
         TUN_ACTIVE_FLAG.store(true, Ordering::Release);
 
         Ok((tx_to_tun, rx_from_tun, "tun0".to_string()))

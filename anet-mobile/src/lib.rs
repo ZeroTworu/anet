@@ -382,398 +382,408 @@ pub extern "system" fn Java_org_alco_anet_ANetVpnService_initLogger(_env: JNIEnv
 // Запуск выделенного фонового потока JNI-моста (выполняется один раз на весь жизненный цикл приложения)
 fn init_jni_bridge_thread(jvm: Arc<JavaVM>) {
     JNI_SENDER.get_or_init(move || {
-        let (tx, rx) = mpsc::channel::<TimestampedEvent>(); // <-- изменили на TimestampedEvent
+        let (tx, rx) = mpsc::channel::<TimestampedEvent>();
 
         std::thread::spawn(move || {
             info!("Rust JNI Bridge: Dedicated OS thread started.");
 
             if let Ok(mut env) = jvm.attach_current_thread() {
                 while let Ok(TimestampedEvent { timestamp: _timestamp, event }) = rx.recv() {
-                    if let AnetEvent::ConnectivityUpdated(snap) = event {
-                        let ui_ref = UI_CALLBACK_REF.lock().unwrap().clone();
-                        let vpn_ref = VPN_CALLBACK_REF.lock().unwrap().clone();
-                        let targets: Vec<GlobalRef> =
-                            [ui_ref, vpn_ref].into_iter().flatten().collect();
+                    if env.exception_check().unwrap_or(false) {
+                        let _ = env.exception_clear();
+                    }
 
-                        for cb in targets {
-                            let j_title = env.new_string(&snap.title);
-                            let j_subtitle = env.new_string(&snap.subtitle);
-                            if let (Ok(j_title), Ok(j_subtitle)) = (j_title, j_subtitle) {
-                                let rtt_val = snap.display_rtt_ms.map(|v| v as i64).unwrap_or(-1);
-                                let _ = env.call_method(
-                                    &cb,
-                                    "onConnectivityUpdated",
-                                    "(IIJZLjava/lang/String;Ljava/lang/String;IIII)V",
-                                    &[
-                                        JValue::Int(snap.condition.code()),
-                                        JValue::Int(snap.pulse_color.code()),
-                                        JValue::Long(rtt_val),
-                                        JValue::Bool(u8::from(snap.vpn_connected)),
-                                        JValue::Object(&j_title),
-                                        JValue::Object(&j_subtitle),
-                                        JValue::Int(snap.global_ok as i32),
-                                        JValue::Int(snap.global_total as i32),
-                                        JValue::Int(snap.domestic_ok as i32),
-                                        JValue::Int(snap.domestic_total as i32),
-                                    ],
-                                );
-                                let _ = env.exception_clear();
-                            }
-                        }
+                    // Stats and TrafficUpdate are superseded by TelemetryUpdated.
+                    if matches!(event, AnetEvent::Stats { .. } | AnetEvent::TrafficUpdate { .. }) {
                         continue;
                     }
 
-                    if let AnetEvent::TelemetryUpdated(tel) = event {
-                        let ui_ref = UI_CALLBACK_REF.lock().unwrap().clone();
-                        let vpn_ref = VPN_CALLBACK_REF.lock().unwrap().clone();
-                        let targets: Vec<GlobalRef> =
-                            [vpn_ref.clone(), ui_ref].into_iter().flatten().collect();
+                    let _ = env.with_local_frame(128, |env| -> jni::errors::Result<()> {
+                        if let AnetEvent::ConnectivityUpdated(snap) = event {
+                            let ui_ref = UI_CALLBACK_REF.lock().unwrap().clone();
+                            let vpn_ref = VPN_CALLBACK_REF.lock().unwrap().clone();
+                            let targets: Vec<GlobalRef> =
+                                [ui_ref, vpn_ref].into_iter().flatten().collect();
 
-                        for cb in targets {
-                            let j_rx_spd = env.new_string(&tel.rx_speed_str);
-                            let j_tx_spd = env.new_string(&tel.tx_speed_str);
-                            let j_rx_tot = env.new_string(&tel.total_rx_str);
-                            let j_tx_tot = env.new_string(&tel.total_tx_str);
-                            let j_rx_curve = env.new_float_array(tel.rx_curve.len() as i32);
-                            let j_tx_curve = env.new_float_array(tel.tx_curve.len() as i32);
-
-                            if let (
-                                Ok(j_rx_spd),
-                                Ok(j_tx_spd),
-                                Ok(j_rx_tot),
-                                Ok(j_tx_tot),
-                                Ok(j_rx_curve),
-                                Ok(j_tx_curve),
-                            ) = (
-                                j_rx_spd,
-                                j_tx_spd,
-                                j_rx_tot,
-                                j_tx_tot,
-                                j_rx_curve,
-                                j_tx_curve,
-                            ) {
-                                let _ = env.set_float_array_region(&j_rx_curve, 0, &tel.rx_curve);
-                                let _ = env.set_float_array_region(&j_tx_curve, 0, &tel.tx_curve);
-                                let rtt_val = tel.rtt_ms.map(|v| v as i64).unwrap_or(-1);
-                                let rx_curve_obj = JObject::from(j_rx_curve);
-                                let tx_curve_obj = JObject::from(j_tx_curve);
-
-                                let _ = env.call_method(
-                                    &cb,
-                                    "onTelemetryUpdated",
-                                    "(JJJJJLjava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;[F[F)V",
-                                    &[
-                                        JValue::Long(tel.rx_bps as i64),
-                                        JValue::Long(tel.tx_bps as i64),
-                                        JValue::Long(tel.total_rx_bytes as i64),
-                                        JValue::Long(tel.total_tx_bytes as i64),
-                                        JValue::Long(rtt_val),
-                                        JValue::Object(&j_rx_spd),
-                                        JValue::Object(&j_tx_spd),
-                                        JValue::Object(&j_rx_tot),
-                                        JValue::Object(&j_tx_tot),
-                                        JValue::Object(&rx_curve_obj),
-                                        JValue::Object(&tx_curve_obj),
-                                    ],
-                                );
-                                let _ = env.exception_clear();
+                            for cb in targets {
+                                let j_title = env.new_string(&snap.title);
+                                let j_subtitle = env.new_string(&snap.subtitle);
+                                if let (Ok(j_title), Ok(j_subtitle)) = (j_title, j_subtitle) {
+                                    let rtt_val =
+                                        snap.display_rtt_ms.map(|v| v as i64).unwrap_or(-1);
+                                    let _ = env.call_method(
+                                        &cb,
+                                        "onConnectivityUpdated",
+                                        "(IIJZLjava/lang/String;Ljava/lang/String;IIII)V",
+                                        &[
+                                            JValue::Int(snap.condition.code()),
+                                            JValue::Int(snap.pulse_color.code()),
+                                            JValue::Long(rtt_val),
+                                            JValue::Bool(u8::from(snap.vpn_connected)),
+                                            JValue::Object(&j_title),
+                                            JValue::Object(&j_subtitle),
+                                            JValue::Int(snap.global_ok as i32),
+                                            JValue::Int(snap.global_total as i32),
+                                            JValue::Int(snap.domestic_ok as i32),
+                                            JValue::Int(snap.domestic_total as i32),
+                                        ],
+                                    );
+                                }
+                                if env.exception_check().unwrap_or(false) {
+                                    let _ = env.exception_clear();
+                                }
                             }
+                            return Ok(());
                         }
 
-                        // Также синхронизируем ANetVpnService.onTrafficStats в едином русском формате без мерцания единиц
-                        if let Some(ref vpn_cb) = vpn_ref {
-                            let rtt_str = tel
-                                .rtt_ms
-                                .map(|ms| format!("{ms} мс"))
-                                .unwrap_or_else(|| "—".to_string());
-                            if let (Ok(j_rx), Ok(j_tx), Ok(j_rtt), Ok(j_rxm), Ok(j_txm)) = (
-                                env.new_string(&tel.total_rx_str),
-                                env.new_string(&tel.total_tx_str),
-                                env.new_string(&rtt_str),
-                                env.new_string(&tel.rx_speed_str),
-                                env.new_string(&tel.tx_speed_str),
-                            ) {
-                                let _ = env.call_method(
-                                    vpn_cb,
-                                    "onTrafficStats",
-                                    "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
-                                    &[
-                                        JValue::Object(&j_rx),
-                                        JValue::Object(&j_tx),
-                                        JValue::Object(&j_rtt),
-                                        JValue::Object(&j_rxm),
-                                        JValue::Object(&j_txm),
-                                    ],
-                                );
-                                let _ = env.exception_clear();
-                            }
-                        }
-                        continue;
-                    }
+                        if let AnetEvent::TelemetryUpdated(tel) = event {
+                            let ui_ref = UI_CALLBACK_REF.lock().unwrap().clone();
+                            let vpn_ref = VPN_CALLBACK_REF.lock().unwrap().clone();
+                            let targets: Vec<GlobalRef> =
+                                [vpn_ref, ui_ref].into_iter().flatten().collect();
 
-                    if let AnetEvent::NodeProbeUpdated(probe_snap) = event {
-                        let ui_ref = UI_CALLBACK_REF.lock().unwrap().clone();
-                        let vpn_ref = VPN_CALLBACK_REF.lock().unwrap().clone();
-                        let targets: Vec<GlobalRef> =
-                            [ui_ref, vpn_ref].into_iter().flatten().collect();
-
-                        for cb in targets {
-                            let count = probe_snap.groups.len() as i32;
-                            let str_cls = env.find_class("java/lang/String");
-                            let empty_1 = env.new_string("");
-                            let empty_2 = env.new_string("");
-                            let empty_3 = env.new_string("");
-
-                            if let (Ok(str_cls), Ok(empty_1), Ok(empty_2), Ok(empty_3)) =
-                                (str_cls, empty_1, empty_2, empty_3)
-                            {
-                                let j_ids = env.new_object_array(count, &str_cls, &empty_1);
-                                let j_names = env.new_object_array(count, &str_cls, &empty_2);
-                                let j_protos = env.new_object_array(count, &str_cls, &empty_3);
-                                let j_statuses = env.new_int_array(count);
-                                let j_rtts = env.new_int_array(count);
-                                let j_full_rtts = env.new_int_array(count);
-                                let j_reachables = env.new_int_array(count);
-                                let j_totals = env.new_int_array(count);
+                            for cb in targets {
+                                let j_rx_spd = env.new_string(&tel.rx_speed_str);
+                                let j_tx_spd = env.new_string(&tel.tx_speed_str);
+                                let j_rx_tot = env.new_string(&tel.total_rx_str);
+                                let j_tx_tot = env.new_string(&tel.total_tx_str);
+                                let j_rx_curve = env.new_float_array(tel.rx_curve.len() as i32);
+                                let j_tx_curve = env.new_float_array(tel.tx_curve.len() as i32);
 
                                 if let (
-                                    Ok(j_ids),
-                                    Ok(j_names),
-                                    Ok(j_protos),
-                                    Ok(j_statuses),
-                                    Ok(j_rtts),
-                                    Ok(j_full_rtts),
-                                    Ok(j_reachables),
-                                    Ok(j_totals),
+                                    Ok(j_rx_spd),
+                                    Ok(j_tx_spd),
+                                    Ok(j_rx_tot),
+                                    Ok(j_tx_tot),
+                                    Ok(j_rx_curve),
+                                    Ok(j_tx_curve),
                                 ) = (
-                                    j_ids,
-                                    j_names,
-                                    j_protos,
-                                    j_statuses,
-                                    j_rtts,
-                                    j_full_rtts,
-                                    j_reachables,
-                                    j_totals,
+                                    j_rx_spd,
+                                    j_tx_spd,
+                                    j_rx_tot,
+                                    j_tx_tot,
+                                    j_rx_curve,
+                                    j_tx_curve,
                                 ) {
-                                    let mut statuses_vec = Vec::with_capacity(count as usize);
-                                    let mut rtts_vec = Vec::with_capacity(count as usize);
-                                    let mut full_rtts_vec = Vec::with_capacity(count as usize);
-                                    let mut reachables_vec = Vec::with_capacity(count as usize);
-                                    let mut totals_vec = Vec::with_capacity(count as usize);
-
-                                    for (i, g) in probe_snap.groups.iter().enumerate() {
-                                        if let Ok(js) = env.new_string(&g.group_id) {
-                                            let _ = env.set_object_array_element(&j_ids, i as i32, js);
-                                        }
-                                        if let Ok(js) = env.new_string(&g.group_name) {
-                                            let _ = env.set_object_array_element(&j_names, i as i32, js);
-                                        }
-                                        if let Ok(js) = env.new_string(g.compact_protocols_text()) {
-                                            let _ = env.set_object_array_element(&j_protos, i as i32, js);
-                                        }
-                                        statuses_vec.push(g.status.as_u8() as i32);
-                                        rtts_vec.push(g.best_rtt_ms.map(|v| v as i32).unwrap_or(-1));
-                                        full_rtts_vec.push(
-                                            g.best_full_rtt_ms
-                                                .or(g.best_rtt_ms)
-                                                .map(|v| v as i32)
-                                                .unwrap_or(-1),
-                                        );
-                                        reachables_vec.push(g.reachable_endpoints as i32);
-                                        totals_vec.push(g.total_endpoints as i32);
-                                    }
-
-                                    let _ = env.set_int_array_region(&j_statuses, 0, &statuses_vec);
-                                    let _ = env.set_int_array_region(&j_rtts, 0, &rtts_vec);
-                                    let _ = env.set_int_array_region(&j_full_rtts, 0, &full_rtts_vec);
-                                    let _ = env.set_int_array_region(&j_reachables, 0, &reachables_vec);
-                                    let _ = env.set_int_array_region(&j_totals, 0, &totals_vec);
-
-                                    let ids_obj = JObject::from(j_ids);
-                                    let names_obj = JObject::from(j_names);
-                                    let statuses_obj = JObject::from(j_statuses);
-                                    let rtts_obj = JObject::from(j_rtts);
-                                    let full_rtts_obj = JObject::from(j_full_rtts);
-                                    let reachables_obj = JObject::from(j_reachables);
-                                    let totals_obj = JObject::from(j_totals);
-                                    let protos_obj = JObject::from(j_protos);
+                                    let _ =
+                                        env.set_float_array_region(&j_rx_curve, 0, &tel.rx_curve);
+                                    let _ =
+                                        env.set_float_array_region(&j_tx_curve, 0, &tel.tx_curve);
+                                    let rtt_val = tel.rtt_ms.map(|v| v as i64).unwrap_or(-1);
+                                    let rx_curve_obj = JObject::from(j_rx_curve);
+                                    let tx_curve_obj = JObject::from(j_tx_curve);
 
                                     let _ = env.call_method(
                                         &cb,
-                                        "onNodeProbeUpdated",
-                                        "([Ljava/lang/String;[Ljava/lang/String;[I[I[I[I[I[Ljava/lang/String;ZII)V",
+                                        "onTelemetryUpdated",
+                                        "(JJJJJLjava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;[F[F)V",
                                         &[
-                                            JValue::Object(&ids_obj),
-                                            JValue::Object(&names_obj),
-                                            JValue::Object(&statuses_obj),
-                                            JValue::Object(&rtts_obj),
-                                            JValue::Object(&full_rtts_obj),
-                                            JValue::Object(&reachables_obj),
-                                            JValue::Object(&totals_obj),
-                                            JValue::Object(&protos_obj),
-                                            JValue::Bool(u8::from(probe_snap.is_checking)),
-                                            JValue::Int(probe_snap.completed_endpoints as i32),
-                                            JValue::Int(probe_snap.total_endpoints as i32),
+                                            JValue::Long(tel.rx_bps as i64),
+                                            JValue::Long(tel.tx_bps as i64),
+                                            JValue::Long(tel.total_rx_bytes as i64),
+                                            JValue::Long(tel.total_tx_bytes as i64),
+                                            JValue::Long(rtt_val),
+                                            JValue::Object(&j_rx_spd),
+                                            JValue::Object(&j_tx_spd),
+                                            JValue::Object(&j_rx_tot),
+                                            JValue::Object(&j_tx_tot),
+                                            JValue::Object(&rx_curve_obj),
+                                            JValue::Object(&tx_curve_obj),
                                         ],
                                     );
+                                }
+                                if env.exception_check().unwrap_or(false) {
                                     let _ = env.exception_clear();
                                 }
                             }
+                            return Ok(());
                         }
-                        continue;
-                    }
 
-                    if let AnetEvent::AccountInfo(info) = event {
-                        let ui_ref = UI_CALLBACK_REF.lock().unwrap().clone();
-                        let vpn_ref = VPN_CALLBACK_REF.lock().unwrap().clone();
-                        let targets: Vec<GlobalRef> =
-                            [vpn_ref, ui_ref].into_iter().flatten().collect();
+                        if let AnetEvent::NodeProbeUpdated(probe_snap) = event {
+                            let ui_ref = UI_CALLBACK_REF.lock().unwrap().clone();
+                            let vpn_ref = VPN_CALLBACK_REF.lock().unwrap().clone();
+                            let targets: Vec<GlobalRef> =
+                                [ui_ref, vpn_ref].into_iter().flatten().collect();
 
-                        for cb in targets {
-                            let j_billing = env.new_string(&info.billing_str);
-                            let j_group = env.new_string(&info.group_str);
-                            let j_sessions = env.new_string(&info.sessions_str);
-                            let j_speed = env.new_string(&info.speed_str);
-                            let j_consumed = env.new_string(&info.consumed_str);
-                            let j_limit = env.new_string(&info.limit_str);
-                            let j_expires = env.new_string(&info.expires_str);
+                            let frame_cap = ((probe_snap.groups.len() * 4) + 32).max(64) as i32;
+                            for cb in targets {
+                                let _ = env.with_local_frame(
+                                    frame_cap,
+                                    |env| -> jni::errors::Result<()> {
+                                        let count = probe_snap.groups.len() as i32;
+                                        let str_cls = env.find_class("java/lang/String");
+                                        let empty_1 = env.new_string("");
+                                        let empty_2 = env.new_string("");
+                                        let empty_3 = env.new_string("");
 
-                            if let (Ok(jb), Ok(jg), Ok(jse), Ok(jsp), Ok(jc), Ok(jl), Ok(je)) = (
-                                j_billing, j_group, j_sessions, j_speed, j_consumed, j_limit,
-                                j_expires,
-                            ) {
-                                let _ = env.call_method(
-                                    &cb,
-                                    "onAccountInfo",
-                                    "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
-                                    &[
-                                        JValue::Object(&jb),
-                                        JValue::Object(&jg),
-                                        JValue::Object(&jse),
-                                        JValue::Object(&jsp),
-                                        JValue::Object(&jc),
-                                        JValue::Object(&jl),
-                                        JValue::Object(&je),
-                                    ],
+                                        if let (
+                                            Ok(str_cls),
+                                            Ok(empty_1),
+                                            Ok(empty_2),
+                                            Ok(empty_3),
+                                        ) = (str_cls, empty_1, empty_2, empty_3)
+                                        {
+                                            let j_ids =
+                                                env.new_object_array(count, &str_cls, &empty_1);
+                                            let j_names =
+                                                env.new_object_array(count, &str_cls, &empty_2);
+                                            let j_protos =
+                                                env.new_object_array(count, &str_cls, &empty_3);
+                                            let j_statuses = env.new_int_array(count);
+                                            let j_rtts = env.new_int_array(count);
+                                            let j_full_rtts = env.new_int_array(count);
+                                            let j_reachables = env.new_int_array(count);
+                                            let j_totals = env.new_int_array(count);
+
+                                            if let (
+                                                Ok(j_ids),
+                                                Ok(j_names),
+                                                Ok(j_protos),
+                                                Ok(j_statuses),
+                                                Ok(j_rtts),
+                                                Ok(j_full_rtts),
+                                                Ok(j_reachables),
+                                                Ok(j_totals),
+                                            ) = (
+                                                j_ids,
+                                                j_names,
+                                                j_protos,
+                                                j_statuses,
+                                                j_rtts,
+                                                j_full_rtts,
+                                                j_reachables,
+                                                j_totals,
+                                            ) {
+                                                let mut statuses_vec =
+                                                    Vec::with_capacity(count as usize);
+                                                let mut rtts_vec =
+                                                    Vec::with_capacity(count as usize);
+                                                let mut full_rtts_vec =
+                                                    Vec::with_capacity(count as usize);
+                                                let mut reachables_vec =
+                                                    Vec::with_capacity(count as usize);
+                                                let mut totals_vec =
+                                                    Vec::with_capacity(count as usize);
+
+                                                for (i, g) in probe_snap.groups.iter().enumerate() {
+                                                    if let Ok(js) = env.new_string(&g.group_id) {
+                                                        let _ = env.set_object_array_element(
+                                                            &j_ids, i as i32, js,
+                                                        );
+                                                    }
+                                                    if let Ok(js) = env.new_string(&g.group_name) {
+                                                        let _ = env.set_object_array_element(
+                                                            &j_names, i as i32, js,
+                                                        );
+                                                    }
+                                                    if let Ok(js) = env
+                                                        .new_string(g.compact_protocols_text())
+                                                    {
+                                                        let _ = env.set_object_array_element(
+                                                            &j_protos, i as i32, js,
+                                                        );
+                                                    }
+                                                    statuses_vec.push(g.status.as_u8() as i32);
+                                                    rtts_vec.push(
+                                                        g.best_rtt_ms
+                                                            .map(|v| v as i32)
+                                                            .unwrap_or(-1),
+                                                    );
+                                                    full_rtts_vec.push(
+                                                        g.best_full_rtt_ms
+                                                            .or(g.best_rtt_ms)
+                                                            .map(|v| v as i32)
+                                                            .unwrap_or(-1),
+                                                    );
+                                                    reachables_vec
+                                                        .push(g.reachable_endpoints as i32);
+                                                    totals_vec.push(g.total_endpoints as i32);
+                                                }
+
+                                                let _ = env.set_int_array_region(
+                                                    &j_statuses,
+                                                    0,
+                                                    &statuses_vec,
+                                                );
+                                                let _ =
+                                                    env.set_int_array_region(&j_rtts, 0, &rtts_vec);
+                                                let _ = env.set_int_array_region(
+                                                    &j_full_rtts,
+                                                    0,
+                                                    &full_rtts_vec,
+                                                );
+                                                let _ = env.set_int_array_region(
+                                                    &j_reachables,
+                                                    0,
+                                                    &reachables_vec,
+                                                );
+                                                let _ = env.set_int_array_region(
+                                                    &j_totals,
+                                                    0,
+                                                    &totals_vec,
+                                                );
+
+                                                let ids_obj = JObject::from(j_ids);
+                                                let names_obj = JObject::from(j_names);
+                                                let statuses_obj = JObject::from(j_statuses);
+                                                let rtts_obj = JObject::from(j_rtts);
+                                                let full_rtts_obj = JObject::from(j_full_rtts);
+                                                let reachables_obj = JObject::from(j_reachables);
+                                                let totals_obj = JObject::from(j_totals);
+                                                let protos_obj = JObject::from(j_protos);
+
+                                                let _ = env.call_method(
+                                                    &cb,
+                                                    "onNodeProbeUpdated",
+                                                    "([Ljava/lang/String;[Ljava/lang/String;[I[I[I[I[I[Ljava/lang/String;ZII)V",
+                                                    &[
+                                                        JValue::Object(&ids_obj),
+                                                        JValue::Object(&names_obj),
+                                                        JValue::Object(&statuses_obj),
+                                                        JValue::Object(&rtts_obj),
+                                                        JValue::Object(&full_rtts_obj),
+                                                        JValue::Object(&reachables_obj),
+                                                        JValue::Object(&totals_obj),
+                                                        JValue::Object(&protos_obj),
+                                                        JValue::Bool(u8::from(
+                                                            probe_snap.is_checking,
+                                                        )),
+                                                        JValue::Int(
+                                                            probe_snap.completed_endpoints as i32,
+                                                        ),
+                                                        JValue::Int(
+                                                            probe_snap.total_endpoints as i32,
+                                                        ),
+                                                    ],
+                                                );
+                                            }
+                                        }
+                                        if env.exception_check().unwrap_or(false) {
+                                            let _ = env.exception_clear();
+                                        }
+                                        Ok(())
+                                    },
                                 );
-                                let _ = env.exception_clear();
                             }
+                            return Ok(());
                         }
-                        continue;
-                    }
 
-                    let is_update_event = matches!(
-                        event,
-                        AnetEvent::UpdateAvailable(_)
-                            | AnetEvent::UpdateProgress(_)
-                            | AnetEvent::UpdateStatus(_)
-                            | AnetEvent::UpdateReady
-                    );
-                    let callback_ref_opt = if is_update_event {
-                        UI_CALLBACK_REF.lock().unwrap().clone()
-                    } else {
-                        VPN_CALLBACK_REF.lock().unwrap().clone()
-                    };
+                        if let AnetEvent::AccountInfo(info) = event {
+                            let ui_ref = UI_CALLBACK_REF.lock().unwrap().clone();
+                            let vpn_ref = VPN_CALLBACK_REF.lock().unwrap().clone();
+                            let targets: Vec<GlobalRef> =
+                                [vpn_ref, ui_ref].into_iter().flatten().collect();
 
-                    if let Some(callback_ref) = callback_ref_opt {
+                            for cb in targets {
+                                let j_billing = env.new_string(&info.billing_str);
+                                let j_group = env.new_string(&info.group_str);
+                                let j_sessions = env.new_string(&info.sessions_str);
+                                let j_speed = env.new_string(&info.speed_str);
+                                let j_consumed = env.new_string(&info.consumed_str);
+                                let j_limit = env.new_string(&info.limit_str);
+                                let j_expires = env.new_string(&info.expires_str);
+
+                                if let (
+                                    Ok(jb),
+                                    Ok(jg),
+                                    Ok(jse),
+                                    Ok(jsp),
+                                    Ok(jc),
+                                    Ok(jl),
+                                    Ok(je),
+                                ) = (
+                                    j_billing, j_group, j_sessions, j_speed, j_consumed,
+                                    j_limit, j_expires,
+                                ) {
+                                    let _ = env.call_method(
+                                        &cb,
+                                        "onAccountInfo",
+                                        "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
+                                        &[
+                                            JValue::Object(&jb),
+                                            JValue::Object(&jg),
+                                            JValue::Object(&jse),
+                                            JValue::Object(&jsp),
+                                            JValue::Object(&jc),
+                                            JValue::Object(&jl),
+                                            JValue::Object(&je),
+                                        ],
+                                    );
+                                }
+                                if env.exception_check().unwrap_or(false) {
+                                    let _ = env.exception_clear();
+                                }
+                            }
+                            return Ok(());
+                        }
+
                         match event {
                             AnetEvent::ClientStateChanged { state, message, server_name } => {
-                                if matches!(
-                                    state,
-                                    ClientState::Connecting
-                                        | ClientState::Connected
-                                        | ClientState::Reconnecting
-                                ) {
-                                    if env
-                                        .set_field(
-                                            &callback_ref,
-                                            "isShuttingDown",
-                                            "Z",
-                                            JValue::Bool(0),
-                                        )
-                                        .is_err()
-                                    {
+                                let vpn_ref = VPN_CALLBACK_REF.lock().unwrap().clone();
+                                let ui_ref = UI_CALLBACK_REF.lock().unwrap().clone();
+                                let targets: Vec<GlobalRef> =
+                                    [vpn_ref, ui_ref].into_iter().flatten().collect();
+                                let srv_str = server_name.unwrap_or_default();
+                                let code = client_state_code(state);
+                                for cb in targets {
+                                    let jmsg = env.new_string(&message);
+                                    let jserver = env.new_string(&srv_str);
+                                    if let (Ok(jmsg), Ok(jserver)) = (jmsg, jserver) {
+                                        let _ = env.call_method(
+                                            &cb,
+                                            "onVpnStateChanged",
+                                            "(ILjava/lang/String;Ljava/lang/String;)V",
+                                            &[
+                                                JValue::Int(code),
+                                                JValue::Object(&jmsg),
+                                                JValue::Object(&jserver),
+                                            ],
+                                        );
+                                    }
+                                    if env.exception_check().unwrap_or(false) {
                                         let _ = env.exception_clear();
                                     }
-                                }
-                                let jmsg = env.new_string(message);
-                                let jserver = env.new_string(server_name.unwrap_or_default());
-                                if let (Ok(jmsg), Ok(jserver)) = (jmsg, jserver) {
-                                    let _ = env.call_method(
-                                        &callback_ref,
-                                        "onVpnStateChanged",
-                                        "(ILjava/lang/String;Ljava/lang/String;)V",
-                                        &[
-                                            JValue::Int(client_state_code(state)),
-                                            JValue::Object(&jmsg),
-                                            JValue::Object(&jserver),
-                                        ],
-                                    );
-                                    let _ = env.exception_clear();
-                                }
-                            }
-                            AnetEvent::Stats { rx, tx, rtt, rxm, txm } => {
-                                let j_rx = env.new_string(rx);
-                                let j_tx = env.new_string(tx);
-                                let j_rtt = env.new_string(rtt);
-                                let j_rxm = env.new_string(rxm);
-                                let j_txm = env.new_string(txm);
-                                if let (Ok(j_rx), Ok(j_tx), Ok(j_rtt), Ok(j_rxm), Ok(j_txm)) =
-                                    (j_rx, j_tx, j_rtt, j_rxm, j_txm)
-                                {
-                                    let _ = env.call_method(
-                                        &callback_ref,
-                                        "onTrafficStats",
-                                        "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
-                                        &[
-                                            JValue::Object(&j_rx),
-                                            JValue::Object(&j_tx),
-                                            JValue::Object(&j_rtt),
-                                            JValue::Object(&j_rxm),
-                                            JValue::Object(&j_txm),
-                                        ],
-                                    );
-                                    let _ = env.exception_clear();
-                                }
-                            }
-                            AnetEvent::TrafficUpdate { rx, tx, rtt, rxm, txm } => {
-                                let j_rx = env.new_string(format_bytes(rx));
-                                let j_tx = env.new_string(format_bytes(tx));
-                                let j_rtt = env.new_string(format!("{rtt}ms"));
-                                let j_rxm = env.new_string(format_bytes_per_sec(rxm as f64));
-                                let j_txm = env.new_string(format_bytes_per_sec(txm as f64));
-                                if let (Ok(j_rx), Ok(j_tx), Ok(j_rtt), Ok(j_rxm), Ok(j_txm)) =
-                                    (j_rx, j_tx, j_rtt, j_rxm, j_txm)
-                                {
-                                    let _ = env.call_method(
-                                        &callback_ref,
-                                        "onTrafficStats",
-                                        "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
-                                        &[
-                                            JValue::Object(&j_rx),
-                                            JValue::Object(&j_tx),
-                                            JValue::Object(&j_rtt),
-                                            JValue::Object(&j_rxm),
-                                            JValue::Object(&j_txm),
-                                        ],
-                                    );
-                                    let _ = env.exception_clear();
                                 }
                             }
                             other => {
-                                if let Some(msg) = event_message(other) {
-                                    if let Ok(jmsg) = env.new_string(msg) {
-                                        let _ = env.call_method(
-                                            &callback_ref,
-                                            "onStatusChanged",
-                                            "(Ljava/lang/String;)V",
-                                            &[JValue::Object(&jmsg)],
-                                        );
-                                        let _ = env.exception_clear();
+                                let is_update_event = matches!(
+                                    other,
+                                    AnetEvent::UpdateAvailable(_)
+                                        | AnetEvent::UpdateProgress(_)
+                                        | AnetEvent::UpdateStatus(_)
+                                        | AnetEvent::UpdateReady
+                                );
+                                let callback_ref_opt = if is_update_event {
+                                    UI_CALLBACK_REF.lock().unwrap().clone()
+                                } else {
+                                    VPN_CALLBACK_REF
+                                        .lock()
+                                        .unwrap()
+                                        .clone()
+                                        .or_else(|| UI_CALLBACK_REF.lock().unwrap().clone())
+                                };
+                                if let Some(callback_ref) = callback_ref_opt {
+                                    if let Some(msg) = event_message(other) {
+                                        if let Ok(jmsg) = env.new_string(msg) {
+                                            let _ = env.call_method(
+                                                &callback_ref,
+                                                "onStatusChanged",
+                                                "(Ljava/lang/String;)V",
+                                                &[JValue::Object(&jmsg)],
+                                            );
+                                        }
+                                        if env.exception_check().unwrap_or(false) {
+                                            let _ = env.exception_clear();
+                                        }
                                     }
                                 }
                             }
                         }
+                        Ok(())
+                    });
+
+                    if env.exception_check().unwrap_or(false) {
+                        let _ = env.exception_clear();
                     }
                 }
             }
@@ -980,7 +990,7 @@ pub extern "system" fn Java_org_alco_anet_ANetVpnService_connectVpn(
 ) {
     info!("JNI: connectVpn called");
 
-    crate::android_impl::reset_tun_session_flags();
+    crate::android_impl::request_tun_shutdown();
 
     // Defensive reset of ANetVpnService.isShuttingDown = false and isServiceRunning = true
     // in case Android reused the VpnService instance across stopSelf() / startService().
@@ -1185,6 +1195,7 @@ pub extern "system" fn Java_org_alco_anet_ANetVpnService_connectVpn(
             ));
             let route_manager = Box::new(AndroidRouteManager::new(owner_id, bypass_ips));
             let client = Arc::new(AnetClient::new(config, tun_factory, route_manager));
+            crate::android_impl::reset_tun_session_flags();
             *CLIENT.lock().unwrap() = Some(client.clone());
             client
         };
@@ -1198,6 +1209,9 @@ pub extern "system" fn Java_org_alco_anet_ANetVpnService_connectVpn(
                     client_state(ClientState::Failed, format!("VPN start failed: {e}"), None);
                 }
             }
+        }
+        if CLIENT_GENERATION.load(Ordering::SeqCst) == generation {
+            crate::android_impl::shutdown_active_tun().await;
         }
     });
 }
@@ -1223,7 +1237,7 @@ pub extern "system" fn Java_org_alco_anet_ANetVpnService_stopVpn(_env: JNIEnv, _
     client_state(ClientState::Stopping, "Stopping VPN", None);
 
     let stop_gen = CLIENT_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
-    crate::android_impl::reset_tun_session_flags();
+    crate::android_impl::request_tun_shutdown();
 
     let initial_client = {
         let mut client_guard = CLIENT.lock().unwrap();
@@ -1246,7 +1260,7 @@ pub extern "system" fn Java_org_alco_anet_ANetVpnService_stopVpn(_env: JNIEnv, _
                 let _ = client.stop().await;
             }
             if let Ok(_lifecycle) = tokio::time::timeout(
-                std::time::Duration::from_secs(3),
+                std::time::Duration::from_millis(1500),
                 CLIENT_LIFECYCLE.lock(),
             )
             .await
@@ -1266,6 +1280,7 @@ pub extern "system" fn Java_org_alco_anet_ANetVpnService_stopVpn(_env: JNIEnv, _
         });
     }
     if CLIENT_GENERATION.load(Ordering::SeqCst) == stop_gen {
+        CURRENT_CLIENT_STATE.store(client_state_code(ClientState::Stopped), Ordering::SeqCst);
         client_state(ClientState::Stopped, "VPN stopped", None);
         status("VPN Stopped");
     }

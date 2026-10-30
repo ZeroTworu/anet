@@ -199,15 +199,17 @@ impl AnetClient {
             if clean.is_empty() {
                 continue;
             }
-            match resolver.lookup_ip(clean).await {
-                Ok(lookup) => {
+            match tokio::time::timeout(Duration::from_millis(1500), resolver.lookup_ip(clean)).await
+            {
+                Ok(Ok(lookup)) => {
                     for ip in lookup.iter() {
                         if ip.is_ipv4() {
                             result.push(IpNet::from(ip));
                         }
                     }
                 }
-                Err(e) => warn!("[Core] Failed to resolve {}: {}", clean, e),
+                Ok(Err(e)) => warn!("[Core] Failed to resolve {}: {}", clean, e),
+                Err(_) => warn!("[Core] Timeout resolving {}", clean),
             }
         }
 
@@ -531,9 +533,15 @@ impl AnetClient {
         hosts_to_bypass.dedup();
 
         for (h, p) in hosts_to_bypass {
+            if self.stop_requested.load(Ordering::SeqCst) {
+                break;
+            }
             if let Ok(ip) = IpAddr::from_str(&h) {
                 bypass_ips.push(ip);
-            } else if let Ok(resolved) = lookup_host((h.as_str(), p)).await {
+            } else if let Ok(Ok(resolved)) =
+                tokio::time::timeout(Duration::from_millis(1500), lookup_host((h.as_str(), p)))
+                    .await
+            {
                 bypass_ips.extend(resolved.map(|addr| addr.ip()));
             }
         }
@@ -591,7 +599,10 @@ impl AnetClient {
                     if let Ok(ip) = IpAddr::from_str(host) {
                         let prefix = if ip.is_ipv4() { 32 } else { 128 };
                         let _ = self.route_manager.add_bypass_route(ip, prefix).await;
-                    } else if let Ok(addrs) = lookup_host((host, port)).await {
+                    } else if let Ok(Ok(addrs)) =
+                        tokio::time::timeout(Duration::from_millis(1500), lookup_host((host, port)))
+                            .await
+                    {
                         for addr in addrs {
                             let ip = addr.ip();
                             let prefix = if ip.is_ipv4() { 32 } else { 128 };
@@ -1653,7 +1664,9 @@ impl AnetClient {
         }
 
         let wait_start = Instant::now();
-        while self.is_active.load(Ordering::SeqCst) && wait_start.elapsed() < Duration::from_secs(2) {
+        while self.is_active.load(Ordering::SeqCst)
+            && wait_start.elapsed() < Duration::from_millis(800)
+        {
             tokio::select! {
                 _ = self.active_finished_notify.notified() => {}
                 _ = sleep(Duration::from_millis(25)) => {}
