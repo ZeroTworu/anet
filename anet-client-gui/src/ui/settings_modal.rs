@@ -8,7 +8,7 @@ use crate::{
     types::{OverrideTab, SettingsCategory},
     utils::{
         helpers::lock_ignore_poison,
-        validator::{validate_exclude_route, validate_routing_override_target},
+        validator::validate_routing_override_target,
     },
 };
 use anet_client_core::server_config::{

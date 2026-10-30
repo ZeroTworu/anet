@@ -176,8 +176,8 @@ mod os_crypto {
 
     #[repr(C)]
     struct DATA_BLOB {
-        cbData: u32,
-        pbData: *mut u8,
+        cb_data: u32,
+        pb_data: *mut u8,
     }
 
     #[link(name = "crypt32")]
@@ -210,18 +210,18 @@ mod os_crypto {
 
     pub fn protect_key(key: &[u8]) -> Option<Vec<u8>> {
         let in_blob = DATA_BLOB {
-            cbData: key.len() as u32,
-            pbData: key.as_ptr() as *mut u8,
+            cb_data: key.len() as u32,
+            pb_data: key.as_ptr() as *mut u8,
         };
         let mut out_blob = DATA_BLOB {
-            cbData: 0,
-            pbData: ptr::null_mut(),
+            cb_data: 0,
+            pb_data: ptr::null_mut(),
         };
 
         unsafe {
             if CryptProtectData(&in_blob, ptr::null(), ptr::null(), ptr::null_mut(), ptr::null_mut(), 0x01, &mut out_blob) != 0 {
-                let slice = std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize).to_vec();
-                LocalFree(out_blob.pbData as *mut _);
+                let slice = std::slice::from_raw_parts(out_blob.pb_data, out_blob.cb_data as usize).to_vec();
+                LocalFree(out_blob.pb_data as *mut _);
                 Some(slice)
             } else {
                 None
@@ -231,18 +231,18 @@ mod os_crypto {
 
     pub fn unprotect_key(data: &[u8]) -> Option<Vec<u8>> {
         let in_blob = DATA_BLOB {
-            cbData: data.len() as u32,
-            pbData: data.as_ptr() as *mut u8,
+            cb_data: data.len() as u32,
+            pb_data: data.as_ptr() as *mut u8,
         };
         let mut out_blob = DATA_BLOB {
-            cbData: 0,
-            pbData: ptr::null_mut(),
+            cb_data: 0,
+            pb_data: ptr::null_mut(),
         };
 
         unsafe {
             if CryptUnprotectData(&in_blob, ptr::null_mut(), ptr::null(), ptr::null_mut(), ptr::null_mut(), 0x01, &mut out_blob) != 0 {
-                let slice = std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize).to_vec();
-                LocalFree(out_blob.pbData as *mut _);
+                let slice = std::slice::from_raw_parts(out_blob.pb_data, out_blob.cb_data as usize).to_vec();
+                LocalFree(out_blob.pb_data as *mut _);
                 Some(slice)
             } else {
                 None

@@ -27,19 +27,6 @@ pub fn format_bytes(bytes: u64) -> String {
     }
 }
 
-/// Форматирование скорости передаваемых байт в секунду в человекочитаемый вид
-fn format_bytes_per_sec(bytes_per_sec: f64) -> String {
-    if bytes_per_sec < KIB {
-        format!("{:.0} B/s", bytes_per_sec)
-    } else if bytes_per_sec < MIB {
-        format!("{:.0} KiB/s", bytes_per_sec / KIB)
-    } else if bytes_per_sec < GIB {
-        format!("{:.0} MiB/s", bytes_per_sec / MIB)
-    } else {
-        format!("{:.0} GiB/s", bytes_per_sec / GIB)
-    }
-}
-
 /// Унифицированный снимок состояния сети
 #[derive(Debug, Clone, Default)]
 pub struct StatsSnapshot {
