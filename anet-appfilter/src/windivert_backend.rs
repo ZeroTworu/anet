@@ -150,7 +150,7 @@ pub fn run_socket_tracker(
     let mut buf = [0u8; RECV_BUF];
     info!("appfilter: Socket tracker thread initialized and running.");
 
-    // Единый фоновый поток очистки устаревших NAT-записей
+    // Фоновый сборщик устаревших NAT-записей
     {
         let nat_map_sweeper = nat_map.clone();
         std::thread::Builder::new()
@@ -250,17 +250,27 @@ pub fn run_socket_tracker(
                     FlowKey::new(protocol, local_addr, local_port, remote_addr, remote_port);
                 let nat_key: NatKey = (protocol, local_port, remote_addr, remote_port);
 
-                map.remove(&flow_key);
-                decisions.remove(&flow_key);
-                logged_bypass.remove(&flow_key);
-
                 if protocol == 17 && local_port != 0 {
                     map.remove_udp_port(local_port);
                 }
 
+                // Помечаем NAT-запись временем устаревания
                 if let Some(mut entry) = nat_map.get_mut(&nat_key) {
                     entry.expires_at = Some(Instant::now() + NAT_GRACE_PERIOD);
                 }
+
+                // ВНИМАНИЕ: decisions и map для TCP НЕ удаляем в ту же миллисекунду,
+                // иначе финальные FIN/ACK/RST пакеты станут "unknown" и утекут мимо VPN!
+                // Их очистит sweeper с задержкой:
+                let decisions_clone = decisions.clone();
+                let logged_bypass_clone = logged_bypass.clone();
+                let map_clone = map.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_secs(15));
+                    map_clone.remove(&flow_key);
+                    decisions_clone.remove(&flow_key);
+                    logged_bypass_clone.remove(&flow_key);
+                });
             }
 
             _ => {}
@@ -270,7 +280,7 @@ pub fn run_socket_tracker(
 }
 
 // ============================================================================
-// ПОТОК 2: PACKET ROUTER (10 АРГУМЕНТОВ — ПОЛНАЯ СОВМЕСТИМОСТЬ С LIB.RS)
+// ПОТОК 2: PACKET ROUTER (10 АРГУМЕНТОВ — ПОЛНАЯ СОВМЕСТИМОСТЬ)
 // ============================================================================
 pub fn run_packet_router(
     handle: Arc<WinDivert<NetworkLayer>>,
@@ -309,6 +319,7 @@ pub fn run_packet_router(
                             wd.address.set_outbound(false);
                             wd.address.set_impostor(true);
 
+                            // DNAT: восстанавливаем физический IP
                             if let (IpAddr::V4(v4), IpAddr::V4(_)) = (orig_ip, key.dst_addr) {
                                 wd.data.to_mut()[16..20].copy_from_slice(&v4.octets());
                             }
@@ -371,6 +382,7 @@ pub fn run_packet_router(
             continue;
         }
 
+        // Проверка явного bypass списка (VPN сервер, Ktalk, прямые маршруты)
         if bypass.contains_blocking(&key.src_addr) || bypass.contains_blocking(&key.dst_addr) {
             let flow_key = FlowKey::new(
                 key.protocol,
@@ -399,28 +411,35 @@ pub fn run_packet_router(
             key.dport,
         );
 
-        let (tunnel, owner_opt, freshly_decided) =
-            if let Some(v) = decisions.get(&flow_key).map(|d| *d) {
-                (v, map.lookup(&flow_key), false)
-            } else {
-                let mut owner_opt = map.lookup(&flow_key);
-                if owner_opt.is_none() {
-                    for _ in 0..FLOW_RACE_RETRIES {
-                        std::thread::sleep(FLOW_RACE_STEP);
-                        owner_opt = map.lookup(&flow_key);
-                        if owner_opt.is_some() {
-                            break;
-                        }
+        let nat_key = nat_key_outbound(&key);
+
+        // ВАЖНО: Если соединение уже находится в nat_map, значит оно УЖЕ туннелируется.
+        // Это предотвращает утечку хвостовых FIN/ACK пакетов в CLEAR OUT при закрытии сокета!
+        let is_existing_tunnel_flow = nat_map.contains_key(&nat_key);
+
+        let (tunnel, owner_opt, freshly_decided) = if is_existing_tunnel_flow {
+            (true, map.lookup(&flow_key), false)
+        } else if let Some(v) = decisions.get(&flow_key).map(|d| *d) {
+            (v, map.lookup(&flow_key), false)
+        } else {
+            let mut owner_opt = map.lookup(&flow_key);
+            if owner_opt.is_none() {
+                for _ in 0..FLOW_RACE_RETRIES {
+                    std::thread::sleep(FLOW_RACE_STEP);
+                    owner_opt = map.lookup(&flow_key);
+                    if owner_opt.is_some() {
+                        break;
                     }
                 }
+            }
 
-                let result = policy.should_tunnel(owner_opt.as_ref());
-                let can_lock_decision = owner_opt.is_some() || matches!(policy, AppPolicy::Include(_));
-                if can_lock_decision {
-                    decisions.insert(flow_key, result);
-                }
-                (result, owner_opt, can_lock_decision)
-            };
+            let result = policy.should_tunnel(owner_opt.as_ref());
+            let can_lock_decision = owner_opt.is_some() || matches!(policy, AppPolicy::Include(_));
+            if can_lock_decision {
+                decisions.insert(flow_key, result);
+            }
+            (result, owner_opt, can_lock_decision)
+        };
 
         if freshly_decided {
             let app_name = owner_opt
@@ -446,7 +465,6 @@ pub fn run_packet_router(
                 continue;
             }
 
-            let nat_key = nat_key_outbound(&key);
             nat_map.insert(nat_key, NatEntry {
                 orig_ip: key.src_addr,
                 orig_addr: packet.address.clone(),

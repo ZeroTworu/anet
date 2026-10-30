@@ -197,6 +197,7 @@ pub fn render_central_panel(app: &mut ANetApp, ctx: &egui::Context) {
             render_node_selector(app, ui, state);
 
             ui.add_space(4.0);
+            
         });
 }
 

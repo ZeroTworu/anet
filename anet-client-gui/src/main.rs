@@ -60,8 +60,8 @@ fn main() -> Result<(), eframe::Error> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(window_title)
-            .with_inner_size([400.0, 830.0])
-            .with_min_inner_size([360.0, 780.0])
+            .with_inner_size([400.0, 760.0])
+            .with_min_inner_size([400.0, 760.0])
             .with_icon(icon)
             .with_resizable(false)
             .with_decorations(false)
