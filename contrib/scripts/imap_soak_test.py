@@ -3,18 +3,16 @@
 IMAP Full Duplex High-Throughput Soak Test for ANet ASTP-over-IMAPS:993
 ======================================================================
 Универсальный парсер:
-  - Использует валидный IMAP синтаксис BODY.PEEK[] вместо RFC822.PEEK;
-  - Корректно извлекает UID независимо от порядка атрибутов Mail.ru;
+  - Прямое бинарное извлечение Base64 тела после заголовков (\\r\\n\\r\\n);
+  - Корректный разбор UID из ответа Mail.ru (UID до или ПОСЛЕ {len});
   - Читает литерал побайтово readexactly(len);
-  - Парсит остаток строки до \r\n для захвата " UID <id>)";
   - Включает скользящее окно Backpressure (max 20 in-flight).
 """
 
 import argparse
 import asyncio
 import base64
-import email
-import email.policy
+import email.utils
 import json
 import logging
 import os
@@ -280,14 +278,14 @@ class RobustImapClient:
 
     async def fetch_messages_robust(self, last_uid: int) -> Tuple[List[Tuple[int, str, bytes]], int, float]:
         """
-        Универсальный парсер FETCH ответа:
-        Использует валидный IMAP синтаксис BODY.PEEK[] (вместо RFC822.PEEK).
-        Корректно считывает UID независимо от того, стоит он до или ПОСЛЕ литерала тела {len}.
+        Универсальный и надёжный парсер:
+        1. Отправляет UID FETCH <start>:* (UID BODY.PEEK[])
+        2. Считывает ровно msg_len байт через readexactly
+        3. Находит Subject в заголовках и декодирует чистый Base64 после \\r\\n\\r\\n напрямую!
         """
         t0 = time.time()
         tag = self.next_tag()
         start_uid = last_uid + 1
-        # По стандарту RFC 3501 валидный запрос полного сообщения без изменения флагов: BODY.PEEK[]
         await self.send_line(f"{tag} UID FETCH {start_uid}:* (UID BODY.PEEK[])")
 
         messages = []
@@ -298,7 +296,6 @@ class RobustImapClient:
             if line.startswith(f"{tag} OK") or line.startswith(f"{tag} NO") or line.startswith(f"{tag} BAD"):
                 break
 
-            # Проверяем, есть ли литерал длины сообщения: * <seq> FETCH (... {<len>}\r\n
             lit_m = re.search(r"\{(\d+)\}", line)
             if not lit_m:
                 continue
@@ -311,7 +308,7 @@ class RobustImapClient:
             # 2. Дочитываем хвост текущей строки FETCH (там закрывающая скобка и UID!)
             rest_line = await self.readline()
 
-            # 3. Ищем UID в заголовке или в хвосте строки (у Mail.ru он в rest_line: " UID 123)\r\n")
+            # 3. Ищем UID в заголовке или в хвосте строки
             full_meta = line + " " + rest_line
             uid_m = re.search(r"UID\s+(\d+)", full_meta, re.IGNORECASE)
             if not uid_m:
@@ -324,18 +321,33 @@ class RobustImapClient:
 
             new_max_uid = max(new_max_uid, uid)
 
-            # 4. Разбираем письмо в памяти
+            # 4. Прямой разбор RFC 822 без капризных библиотек:
+            # Ищем границу заголовков и тела (\r\n\r\n или \n\n)
             try:
-                parsed_email = email.message_from_bytes(msg_bytes, policy=email.policy.default)
-                subject = str(parsed_email.get("Subject", ""))
-                payload_part = parsed_email.get_body(preferencelist=("plain",))
-                if payload_part:
-                    b64_str = payload_part.get_content().replace("\r", "").replace("\n", "").strip()
-                    raw_payload = base64.b64decode(b64_str)
-                    messages.append((uid, subject, raw_payload))
+                split_idx = msg_bytes.find(b"\r\n\r\n")
+                if split_idx != -1:
+                    hdr_raw = msg_bytes[:split_idx].decode("latin1", errors="replace")
+                    body_raw = msg_bytes[split_idx+4:]
+                else:
+                    split_idx = msg_bytes.find(b"\n\n")
+                    hdr_raw = msg_bytes[:split_idx].decode("latin1", errors="replace")
+                    body_raw = msg_bytes[split_idx+2:]
+
+                # Извлекаем Subject
+                subject = ""
+                for h in hdr_raw.splitlines():
+                    if h.lower().startswith("subject:"):
+                        subject = h.split(":", 1)[1].strip()
+                        break
+
+                # Чистим тело от пробелов и переводов строк
+                clean_b64 = body_raw.replace(b"\r", b"").replace(b"\n", b"").strip()
+                payload = base64.b64decode(clean_b64)
+                messages.append((uid, subject, payload))
+
             except Exception as e:
-                self.stats.errors.append(f"Parse error UID {uid}: {e}")
-                self.logger.error(f"Failed to parse email message UID {uid}: {e}")
+                self.stats.errors.append(f"UID {uid}: {e}")
+                self.logger.error(f"Failed to extract payload UID {uid}: {e}")
 
         t_fetch = (time.time() - t0) * 1000.0
         self.stats.fetch_latency_samples.append(t_fetch)
@@ -391,7 +403,6 @@ async def run_server_worker(
     async def srv_writer_loop():
         while not stop_event.is_set():
             try:
-                # Очистка в "Drafts" имеет высший приоритет
                 if cleanup_queue:
                     to_clean = cleanup_queue[:]
                     cleanup_queue.clear()
@@ -476,7 +487,6 @@ async def run_client_worker(
         nonlocal seq_counter
         while not stop_event.is_set():
             try:
-                # Backpressure: удерживаем не более 15 неподтвержденных пакетов
                 unacked = len(sent_timestamps)
                 if unacked > 15:
                     await asyncio.sleep(0.05)
