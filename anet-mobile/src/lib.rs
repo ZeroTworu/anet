@@ -11,7 +11,7 @@ use anet_client_core::updater::{GithubRelease, Updater};
 use jni::objects::{GlobalRef, JClass, JObject, JString, JValue};
 use jni::{JNIEnv, JavaVM};
 use log::{LevelFilter, error, info};
-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::sync::mpsc::{self, Sender};
 use tokio::runtime::Runtime;
@@ -22,6 +22,7 @@ static RUNTIME: Mutex<Option<Runtime>> = Mutex::new(None);
 static PENDING_RELEASE: Mutex<Option<GithubRelease>> = Mutex::new(None);
 static CLIENT_LIFECYCLE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 static CLIENT_GENERATION: AtomicU64 = AtomicU64::new(0);
+static STOP_REQUESTED_GLOBAL: AtomicBool = AtomicBool::new(false);
 static CURRENT_CLIENT_STATE: AtomicI32 = AtomicI32::new(0);
 static CURRENT_SERVER_NAME: Mutex<Option<String>> = Mutex::new(None);
 static LAST_TELEMETRY: Mutex<Option<anet_common::connectivity::TelemetrySnapshot>> = Mutex::new(None);
@@ -42,6 +43,16 @@ impl EventHandler for AndroidEventHandler {
             AnetEvent::ClientStateChanged {
                 state, server_name, ..
             } => {
+                if STOP_REQUESTED_GLOBAL.load(Ordering::SeqCst)
+                    && matches!(
+                        state,
+                        ClientState::Connecting
+                            | ClientState::Connected
+                            | ClientState::Reconnecting
+                    )
+                {
+                    return;
+                }
                 CURRENT_CLIENT_STATE.store(client_state_code(*state), Ordering::SeqCst);
                 if let Some(server_name) = server_name {
                     *CURRENT_SERVER_NAME.lock().unwrap() = Some(server_name.clone());
@@ -842,11 +853,19 @@ pub extern "system" fn Java_org_alco_anet_MainActivity_startConnectivityMonitor(
         let is_connected =
             CURRENT_CLIENT_STATE.load(Ordering::SeqCst) == client_state_code(ClientState::Connected);
         if is_connected {
-            if let Some(cached_tel) = LAST_TELEMETRY.lock().unwrap().clone() {
-                events::emit(AnetEvent::TelemetryUpdated(cached_tel));
+            let cached_tel = { LAST_TELEMETRY.lock().unwrap().clone() };
+            if let Some(cached_tel) = cached_tel {
+                if let Some(sender) = JNI_SENDER.get() {
+                    let _ = sender.send(TimestampedEvent::new(AnetEvent::TelemetryUpdated(
+                        cached_tel,
+                    )));
+                }
             }
-            if let Some(cached_acc) = LAST_ACCOUNT_INFO.lock().unwrap().clone() {
-                events::emit(AnetEvent::AccountInfo(cached_acc));
+            let cached_acc = { LAST_ACCOUNT_INFO.lock().unwrap().clone() };
+            if let Some(cached_acc) = cached_acc {
+                if let Some(sender) = JNI_SENDER.get() {
+                    let _ = sender.send(TimestampedEvent::new(AnetEvent::AccountInfo(cached_acc)));
+                }
             }
         }
         if !config_toml.trim().is_empty() {
@@ -1093,19 +1112,23 @@ pub extern "system" fn Java_org_alco_anet_ANetVpnService_connectVpn(
         }
     };
 
+    STOP_REQUESTED_GLOBAL.store(false, Ordering::SeqCst);
     let generation = CLIENT_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
-    // Немедленно сигнализируем старому клиенту об отмене без ожидания асинхронных мьютексов
-    if let Some(existing) = CLIENT.lock().unwrap().as_ref() {
+    // Немедленно сигнализируем старому клиенту об отмене без удержания мьютекса CLIENT
+    let existing_client = { CLIENT.lock().unwrap().clone() };
+    if let Some(existing) = existing_client {
         existing.cancel();
     }
 
     rt_handle.spawn(async move {
         let client = {
             let _lifecycle = CLIENT_LIFECYCLE.lock().await;
-            if CLIENT_GENERATION.load(Ordering::SeqCst) != generation {
+            if CLIENT_GENERATION.load(Ordering::SeqCst) != generation
+                || STOP_REQUESTED_GLOBAL.load(Ordering::SeqCst)
+            {
                 return;
             }
-            let old_client = CLIENT.lock().unwrap().take();
+            let old_client = { CLIENT.lock().unwrap().take() };
             if let Some(client) = old_client {
                 info!("Rust JNI: Stopping old active client task...");
                 client.cancel();
@@ -1120,7 +1143,9 @@ pub extern "system" fn Java_org_alco_anet_ANetVpnService_connectVpn(
                 crate::android_impl::shutdown_active_tun(),
             )
             .await;
-            if CLIENT_GENERATION.load(Ordering::SeqCst) != generation {
+            if CLIENT_GENERATION.load(Ordering::SeqCst) != generation
+                || STOP_REQUESTED_GLOBAL.load(Ordering::SeqCst)
+            {
                 return;
             }
             if let Err(error) = config.sanitize() {
@@ -1211,17 +1236,31 @@ pub extern "system" fn Java_org_alco_anet_ANetVpnService_connectVpn(
             ));
             let route_manager = Box::new(AndroidRouteManager::new(owner_id, bypass_ips));
             let client = Arc::new(AnetClient::new(config, tun_factory, route_manager));
+            if CLIENT_GENERATION.load(Ordering::SeqCst) != generation
+                || STOP_REQUESTED_GLOBAL.load(Ordering::SeqCst)
+            {
+                return;
+            }
             crate::android_impl::reset_tun_session_flags();
             *CLIENT.lock().unwrap() = Some(client.clone());
             client
         };
+
+        if CLIENT_GENERATION.load(Ordering::SeqCst) != generation
+            || STOP_REQUESTED_GLOBAL.load(Ordering::SeqCst)
+        {
+            client.cancel();
+            return;
+        }
 
         info!("Rust: Calling start()...");
         match client.start().await {
             Ok(_) => info!("Rust: VPN Loop exited cleanly"),
             Err(e) => {
                 error!("Rust: VPN Start Failed: {}", e);
-                if CLIENT_GENERATION.load(Ordering::SeqCst) == generation {
+                if CLIENT_GENERATION.load(Ordering::SeqCst) == generation
+                    && !STOP_REQUESTED_GLOBAL.load(Ordering::SeqCst)
+                {
                     client_state(ClientState::Failed, format!("VPN start failed: {e}"), None);
                 }
             }
@@ -1249,16 +1288,9 @@ pub extern "system" fn Java_org_alco_anet_ANetVpnService_reconnectVpn(_env: JNIE
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_org_alco_anet_ANetVpnService_stopVpn(_env: JNIEnv, _class: JClass) {
-    info!("Rust: stopVpn JNI trigger received");
-    client_state(ClientState::Stopping, "Stopping VPN", None);
-
+    STOP_REQUESTED_GLOBAL.store(true, Ordering::SeqCst);
     let stop_gen = CLIENT_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
     crate::android_impl::request_tun_shutdown();
-    *CURRENT_SERVER_NAME.lock().unwrap() = None;
-    *LAST_TELEMETRY.lock().unwrap() = None;
-    *LAST_ACCOUNT_INFO.lock().unwrap() = None;
-    anet_client_core::connectivity_monitor::ConnectivityMonitor::set_vpn_connected(false);
-
     let initial_client = {
         let mut client_guard = CLIENT.lock().unwrap();
         client_guard.take()
@@ -1266,6 +1298,14 @@ pub extern "system" fn Java_org_alco_anet_ANetVpnService_stopVpn(_env: JNIEnv, _
     if let Some(ref client) = initial_client {
         client.cancel();
     }
+
+    info!("Rust: stopVpn JNI trigger received");
+    client_state(ClientState::Stopping, "Stopping VPN", None);
+
+    *CURRENT_SERVER_NAME.lock().unwrap() = None;
+    *LAST_TELEMETRY.lock().unwrap() = None;
+    *LAST_ACCOUNT_INFO.lock().unwrap() = None;
+    anet_client_core::connectivity_monitor::ConnectivityMonitor::set_vpn_connected(false);
 
     let rt_handle_opt = {
         let rt_guard = RUNTIME.lock().unwrap();

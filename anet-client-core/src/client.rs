@@ -188,6 +188,9 @@ impl AnetClient {
         let resolver = TokioAsyncResolver::tokio(resolver_config, ResolverOpts::default());
 
         for target in list {
+            if self.stop_requested.load(Ordering::SeqCst) {
+                break;
+            }
             let trimmed = target.trim();
             if trimmed.is_empty() {
                 continue;
@@ -204,17 +207,21 @@ impl AnetClient {
             if clean.is_empty() {
                 continue;
             }
-            match tokio::time::timeout(Duration::from_millis(1500), resolver.lookup_ip(clean)).await
-            {
-                Ok(Ok(lookup)) => {
-                    for ip in lookup.iter() {
-                        if ip.is_ipv4() {
-                            result.push(IpNet::from(ip));
+            tokio::select! {
+                _ = self.cancel_signal.notified() => break,
+                res = tokio::time::timeout(Duration::from_millis(1500), resolver.lookup_ip(clean)) => {
+                    match res {
+                        Ok(Ok(lookup)) => {
+                            for ip in lookup.iter() {
+                                if ip.is_ipv4() {
+                                    result.push(IpNet::from(ip));
+                                }
+                            }
                         }
+                        Ok(Err(e)) => warn!("[Core] Failed to resolve {}: {}", clean, e),
+                        Err(_) => warn!("[Core] Timeout resolving {}", clean),
                     }
                 }
-                Ok(Err(e)) => warn!("[Core] Failed to resolve {}: {}", clean, e),
-                Err(_) => warn!("[Core] Timeout resolving {}", clean),
             }
         }
 
@@ -329,8 +336,11 @@ impl AnetClient {
                     }
                 }
                 Err(e) => {
-                    if self.stop_requested.load(Ordering::SeqCst) {
+                    if self.stop_requested.load(Ordering::SeqCst)
+                        || e.to_string().contains("shutdown requested")
+                    {
                         info!("[Core] Stop requested by user. Exiting connection loop.");
+                        self.stop_requested.store(true, Ordering::SeqCst);
                         break;
                     }
 
@@ -1540,7 +1550,12 @@ impl AnetClient {
         );
         crate::connectivity_monitor::ConnectivityMonitor::set_vpn_connected(true);
 
-        reconnect_signal.notified().await;
+        if !self.stop_requested.load(Ordering::SeqCst) {
+            tokio::select! {
+                _ = reconnect_signal.notified() => {}
+                _ = self.cancel_signal.notified() => {}
+            }
+        }
         crate::connectivity_monitor::ConnectivityMonitor::set_vpn_connected(false);
 
         let duration = session_start.elapsed();
