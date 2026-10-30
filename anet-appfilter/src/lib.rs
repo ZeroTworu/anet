@@ -41,6 +41,12 @@ pub struct AppFilter {
     network_shutdown: ShutdownHandle,
 }
 
+// Безопасно: FlowMap и BypassSet являются Send + Sync, а ShutdownHandle содержит Weak<HANDLE>
+// (в windows 0.62 HANDLE — это *mut c_void, а в windivert 0.7.0-beta.4 для ShutdownHandle
+// реализован только unsafe impl Send, но пропущен Sync) и используется исключительно в Drop (&mut self).
+unsafe impl Send for AppFilter {}
+unsafe impl Sync for AppFilter {}
+
 impl AppFilter {
     #[cfg(all(windows, feature = "windivert"))]
     pub fn start(

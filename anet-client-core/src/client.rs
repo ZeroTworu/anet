@@ -400,12 +400,12 @@ impl AnetClient {
     async fn acquire_packet_source(
         &self,
         _server: &ServerConfig,
-        auth: &anet_common::protocol::AuthResponse,
-    ) -> anyhow::Result<(
-        tokio::sync::mpsc::Sender<bytes::Bytes>,
-        tokio::sync::mpsc::Receiver<bytes::Bytes>,
+        auth: &AuthResponse,
+    ) -> Result<(
+        Sender<Bytes>,
+        Receiver<Bytes>,
         String,
-        Option<anet_appfilter::AppFilter>,
+        Option<AppFilter>,
     )> {
         let (tun_tx, tun_rx, iface_name) = self.tun_factory.create_tun(auth).await?;
         let mode = self.config.main.per_app_mode;
@@ -427,20 +427,14 @@ impl AnetClient {
             .collect();
 
         let policy = match mode {
-            crate::config::PerAppMode::Exclude => {
-                anet_appfilter::AppPolicy::exclude(self.config.main.per_app.clone())
-            }
-            crate::config::PerAppMode::Include => {
-                anet_appfilter::AppPolicy::include(self.config.main.per_app.clone())
-            }
-            crate::config::PerAppMode::All => {
-                anet_appfilter::AppPolicy::exclude(Vec::<String>::new())
-            }
+            PerAppMode::Exclude => AppPolicy::exclude(self.config.main.per_app.clone()),
+            PerAppMode::Include => AppPolicy::include(self.config.main.per_app.clone()),
+            PerAppMode::All => AppPolicy::exclude(Vec::<String>::new()),
         };
 
         let vpn_ip = IpAddr::from_str(&auth.ip).context("Failed to parse assigned VPN IP")?;       
 
-        let (filter, tx, rx) = anet_appfilter::AppFilter::start(policy, initial_bypass, vpn_ip)?;
+        let (filter, tx, rx) = AppFilter::start(policy, initial_bypass, vpn_ip)?;
 
         let (server_host, server_port) = _server.host_port()?;
         if let Ok(ip) = IpAddr::from_str(&server_host) {

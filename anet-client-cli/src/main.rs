@@ -3,7 +3,9 @@ include!(concat!(env!("OUT_DIR"), "/built.rs"));
 use anet_client_cli::tun_factory::DesktopTunFactory;
 use anet_client_core::client::AnetClient;
 use anet_client_core::config::CoreConfig;
-use anet_client_core::platform::{create_route_manager, requires_elevated_privileges};
+use anet_client_core::platform::create_route_manager;
+#[cfg(unix)]
+use anet_client_core::platform::requires_elevated_privileges;
 use anyhow::Result;
 use clap::Parser;
 use log::{error, info};
