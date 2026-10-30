@@ -1177,10 +1177,18 @@ where
     for (pos, target) in targets.iter().cloned().enumerate() {
         let sem = semaphore.clone();
         futures.push(async move {
-            let res = {
+            let mut res = {
                 let _permit = sem.acquire_owned().await.ok();
                 probe_single_target(&target, timeout_dur).await
             };
+            if res.status == NodeProbeStatus::Unavailable {
+                tokio::time::sleep(Duration::from_millis(120)).await;
+                let _permit = sem.acquire_owned().await.ok();
+                let retry_res = probe_single_target(&target, timeout_dur).await;
+                if retry_res.status != NodeProbeStatus::Unavailable {
+                    res = retry_res;
+                }
+            }
             (pos, res)
         });
     }

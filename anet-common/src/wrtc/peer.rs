@@ -2249,6 +2249,7 @@ impl WrtcPeer {
         let elapsed_ms = self.start_instant.elapsed().as_millis() as u64;
         self.last_video_tx_ms.store(elapsed_ms, Ordering::Relaxed);
 
+        #[allow(deprecated)]
         let _ = self
             .force_keyframe_remaining
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |rem| {

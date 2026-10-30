@@ -45,9 +45,13 @@ impl EventHandler for AndroidEventHandler {
                 CURRENT_CLIENT_STATE.store(client_state_code(*state), Ordering::SeqCst);
                 if let Some(server_name) = server_name {
                     *CURRENT_SERVER_NAME.lock().unwrap() = Some(server_name.clone());
-                } else if matches!(state, ClientState::Disconnected | ClientState::Stopped) {
+                } else if matches!(
+                    state,
+                    ClientState::Disconnected | ClientState::Stopped | ClientState::Failed
+                ) {
                     *CURRENT_SERVER_NAME.lock().unwrap() = None;
                     *LAST_TELEMETRY.lock().unwrap() = None;
+                    *LAST_ACCOUNT_INFO.lock().unwrap() = None;
                 }
             }
             AnetEvent::TelemetryUpdated(tel) => {
@@ -185,7 +189,12 @@ fn event_message(event: AnetEvent) -> Option<String> {
 fn get_or_init_runtime_handle() -> tokio::runtime::Handle {
     let mut rt_guard = RUNTIME.lock().unwrap();
     if rt_guard.is_none() {
-        *rt_guard = Some(Runtime::new().unwrap());
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(8)
+            .enable_all()
+            .build()
+            .unwrap_or_else(|_| Runtime::new().unwrap());
+        *rt_guard = Some(rt);
     }
     rt_guard.as_ref().unwrap().handle().clone()
 }
@@ -216,7 +225,7 @@ mod tests {
                 dsn = "quic://127.0.0.1:443"
             "#,
         );
-        assert_eq!(result, "OK\nPrimary");
+        assert_eq!(result, "OK\nquic://127.0.0.1:443|Primary");
     }
 
     #[test]
@@ -304,17 +313,18 @@ pub extern "system" fn Java_org_alco_anet_MainActivity_fetchConfigFromUrl(
         Err(error) => return env.new_string(format!("ERROR\n{error}")).unwrap().into_raw(),
     };
 
-    let rt = {
-        let mut rt_guard = RUNTIME.lock().unwrap();
-        if rt_guard.is_none() {
-            *rt_guard = Some(Runtime::new().unwrap());
-        }
-        rt_guard.as_ref().unwrap().handle().clone()
-    };
+    let rt = get_or_init_runtime_handle();
 
-    let result = match rt.block_on(Updater::fetch_config_from_url(&url)) {
-        Ok(content) => format!("OK\n{content}"),
-        Err(error) => format!("ERROR\n{error}"),
+    let result = match rt.block_on(async move {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(12),
+            Updater::fetch_config_from_url(&url),
+        )
+        .await
+    }) {
+        Ok(Ok(content)) => format!("OK\n{content}"),
+        Ok(Err(error)) => format!("ERROR\n{error}"),
+        Err(_) => "ERROR\nConfig fetch timed out".to_string(),
     };
 
     env.new_string(result).unwrap().into_raw()
@@ -829,11 +839,15 @@ pub extern "system" fn Java_org_alco_anet_MainActivity_startConnectivityMonitor(
         let initial =
             anet_client_core::connectivity_monitor::ConnectivityMonitor::get_last_snapshot();
         events::emit(AnetEvent::ConnectivityUpdated(initial));
-        if let Some(cached_tel) = LAST_TELEMETRY.lock().unwrap().clone() {
-            events::emit(AnetEvent::TelemetryUpdated(cached_tel));
-        }
-        if let Some(cached_acc) = LAST_ACCOUNT_INFO.lock().unwrap().clone() {
-            events::emit(AnetEvent::AccountInfo(cached_acc));
+        let is_connected =
+            CURRENT_CLIENT_STATE.load(Ordering::SeqCst) == client_state_code(ClientState::Connected);
+        if is_connected {
+            if let Some(cached_tel) = LAST_TELEMETRY.lock().unwrap().clone() {
+                events::emit(AnetEvent::TelemetryUpdated(cached_tel));
+            }
+            if let Some(cached_acc) = LAST_ACCOUNT_INFO.lock().unwrap().clone() {
+                events::emit(AnetEvent::AccountInfo(cached_acc));
+            }
         }
         if !config_toml.trim().is_empty() {
             anet_client_core::connectivity_monitor::NodeProbeMonitor::update_config_toml(
@@ -915,13 +929,7 @@ pub extern "system" fn Java_org_alco_anet_MainActivity_checkUpdates(
         "https://api.github.com/repos/ZeroTworu/anet/releases/latest".to_string()
     };
 
-    let rt = {
-        let mut rt_guard = RUNTIME.lock().unwrap();
-        if rt_guard.is_none() {
-            *rt_guard = Some(Runtime::new().unwrap());
-        }
-        rt_guard.as_ref().unwrap().handle().clone()
-    };
+    let rt = get_or_init_runtime_handle();
 
     rt.spawn(async move {
         info!("[UPDATER] Checking URL: {}", update_url);
@@ -1101,9 +1109,17 @@ pub extern "system" fn Java_org_alco_anet_ANetVpnService_connectVpn(
             if let Some(client) = old_client {
                 info!("Rust JNI: Stopping old active client task...");
                 client.cancel();
-                let _ = client.stop().await;
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_millis(1200),
+                    client.stop(),
+                )
+                .await;
             }
-            crate::android_impl::shutdown_active_tun().await;
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_millis(400),
+                crate::android_impl::shutdown_active_tun(),
+            )
+            .await;
             if CLIENT_GENERATION.load(Ordering::SeqCst) != generation {
                 return;
             }
@@ -1238,6 +1254,10 @@ pub extern "system" fn Java_org_alco_anet_ANetVpnService_stopVpn(_env: JNIEnv, _
 
     let stop_gen = CLIENT_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
     crate::android_impl::request_tun_shutdown();
+    *CURRENT_SERVER_NAME.lock().unwrap() = None;
+    *LAST_TELEMETRY.lock().unwrap() = None;
+    *LAST_ACCOUNT_INFO.lock().unwrap() = None;
+    anet_client_core::connectivity_monitor::ConnectivityMonitor::set_vpn_connected(false);
 
     let initial_client = {
         let mut client_guard = CLIENT.lock().unwrap();
@@ -1254,13 +1274,21 @@ pub extern "system" fn Java_org_alco_anet_ANetVpnService_stopVpn(_env: JNIEnv, _
 
     if let Some(rt_handle) = rt_handle_opt {
         rt_handle.block_on(async move {
-            crate::android_impl::shutdown_active_tun().await;
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_millis(400),
+                crate::android_impl::shutdown_active_tun(),
+            )
+            .await;
             if let Some(client) = initial_client {
                 info!("Rust JNI: Sending immediate stop signal to active client...");
-                let _ = client.stop().await;
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_millis(1200),
+                    client.stop(),
+                )
+                .await;
             }
             if let Ok(_lifecycle) = tokio::time::timeout(
-                std::time::Duration::from_millis(1500),
+                std::time::Duration::from_millis(800),
                 CLIENT_LIFECYCLE.lock(),
             )
             .await
@@ -1272,9 +1300,17 @@ pub extern "system" fn Java_org_alco_anet_ANetVpnService_stopVpn(_env: JNIEnv, _
                     };
                     if let Some(client) = late_client {
                         client.cancel();
-                        let _ = client.stop().await;
+                        let _ = tokio::time::timeout(
+                            std::time::Duration::from_millis(800),
+                            client.stop(),
+                        )
+                        .await;
                     }
-                    crate::android_impl::shutdown_active_tun().await;
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_millis(300),
+                        crate::android_impl::shutdown_active_tun(),
+                    )
+                    .await;
                 }
             }
         });

@@ -734,7 +734,7 @@ jobs:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: |
           cargo update -p rtc-turn -p reqwest-boring
-          cargo ndk -t aarch64-linux-android -t armv7-linux-androideabi -o ./jniLibs build --release -p anet-mobile
+          cargo ndk -t aarch64-linux-android -t armv7-linux-androideabi -t x86_64-linux-android -o ./jniLibs build --release -p anet-mobile
 
       - uses: "actions/upload-artifact@v6"
         with:

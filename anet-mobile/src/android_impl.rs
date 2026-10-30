@@ -148,6 +148,15 @@ impl ActiveTunSession {
     }
 }
 
+static ACTIVE_TUN_ABORT: OnceLock<
+    std::sync::Mutex<Option<(tokio::task::AbortHandle, Arc<tokio::sync::Notify>)>>,
+> = OnceLock::new();
+
+fn active_tun_abort_slot(
+) -> &'static std::sync::Mutex<Option<(tokio::task::AbortHandle, Arc<tokio::sync::Notify>)>> {
+    ACTIVE_TUN_ABORT.get_or_init(|| std::sync::Mutex::new(None))
+}
+
 pub fn reset_tun_session_flags() {
     TUN_SHUTDOWN_REQUESTED.store(false, Ordering::Release);
     TUN_ACTIVE_FLAG.store(false, Ordering::Release);
@@ -158,50 +167,57 @@ pub fn request_tun_shutdown() {
     TUN_SHUTDOWN_REQUESTED.store(true, Ordering::Release);
     TUN_ACTIVE_FLAG.store(false, Ordering::Release);
     REBIND_SCHEDULED.store(false, Ordering::Release);
+    if let Some((abort_handle, stop_notify)) = active_tun_abort_slot().lock().unwrap().take() {
+        stop_notify.notify_waiters();
+        abort_handle.abort();
+    }
 }
 
 async fn stop_and_close_tun_session(mut session: ActiveTunSession) {
-    // КРИТИЧНО: Сначала уведомляем worker_stop и даём воркеру до 200 мс штатно выйти из цикла,
-    // чтобы он сам отменил и дождался завершения дочернего reader_handle и синхронно закрыл
-    // оба половинных дескриптора (reader + writer dup_fd) ДО закрытия ParcelFileDescriptor в Java!
+    let _ = active_tun_abort_slot().lock().unwrap().take();
     session.worker_stop.notify_waiters();
-    if tokio::time::timeout(
-        std::time::Duration::from_millis(200),
+    session.worker_handle.abort();
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_millis(120),
         &mut session.worker_handle,
     )
-    .await
-    .is_err()
-    {
-        warn!("[Android TUN] Worker did not finish within 200ms, forcing abort");
-        session.worker_handle.abort();
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            session.worker_handle,
-        )
-        .await;
-    }
+    .await;
     call_close_tun_jni(&session.jvm, &session.vpn_service_ref);
 }
 
 pub async fn shutdown_active_tun() {
-    TUN_ACTIVE_FLAG.store(false, Ordering::Release);
-    REBIND_SCHEDULED.store(false, Ordering::Release);
-    let old_session = active_tun_mutex().lock().await.take();
+    request_tun_shutdown();
+    let old_session = match tokio::time::timeout(
+        std::time::Duration::from_millis(250),
+        active_tun_mutex().lock(),
+    )
+    .await
+    {
+        Ok(mut guard) => guard.take(),
+        Err(_) => None,
+    };
     if let Some(session) = old_session {
         stop_and_close_tun_session(session).await;
     }
 }
 
 pub async fn shutdown_active_tun_for_owner(owner_id: u64) {
-    let old_session = {
-        let mut guard = active_tun_mutex().lock().await;
-        if guard.as_ref().is_some_and(|s| s.owner_id == owner_id) {
-            TUN_ACTIVE_FLAG.store(false, Ordering::Release);
-            REBIND_SCHEDULED.store(false, Ordering::Release);
-            guard.take()
-        } else {
-            None
+    let old_session = match tokio::time::timeout(
+        std::time::Duration::from_millis(250),
+        active_tun_mutex().lock(),
+    )
+    .await
+    {
+        Ok(mut guard) => {
+            if guard.as_ref().is_some_and(|s| s.owner_id == owner_id) {
+                TUN_ACTIVE_FLAG.store(false, Ordering::Release);
+                REBIND_SCHEDULED.store(false, Ordering::Release);
+                guard.take()
+            } else {
+                None
+            }
         }
+        Err(_) => None,
     };
     if let Some(session) = old_session {
         stop_and_close_tun_session(session).await;
@@ -638,13 +654,44 @@ fn call_close_tun_jni(jvm: &Arc<JavaVM>, vpn_service_ref: &GlobalRef) {
     }
 }
 
+fn set_fd_nonblocking_and_cloexec(fd: i32) {
+    #[cfg(unix)]
+    unsafe {
+        unsafe extern "C" {
+            fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+        }
+        const F_GETFD: i32 = 1;
+        const F_SETFD: i32 = 2;
+        const F_GETFL: i32 = 3;
+        const F_SETFL: i32 = 4;
+        const FD_CLOEXEC: i32 = 1;
+        const O_NONBLOCK: i32 = 0o4000;
+
+        let fl = fcntl(fd, F_GETFL);
+        if fl >= 0 {
+            let _ = fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+        }
+        let fd_fl = fcntl(fd, F_GETFD);
+        if fd_fl >= 0 {
+            let _ = fcntl(fd, F_SETFD, fd_fl | FD_CLOEXEC);
+        }
+    }
+}
+
 fn open_async_tun(fd: i32, auth: &AuthResponse) -> Result<tun::AsyncDevice> {
     use std::os::fd::{BorrowedFd, FromRawFd, IntoRawFd, OwnedFd};
+
+    // Выставляем O_NONBLOCK и на исходном, и на дублированном дескрипторе TUN,
+    // так как Android VpnService.Builder.establish() возвращает блокирующий дескриптор,
+    // а tokio::io::unix::AsyncFd требует неблокирующего режима (возврата EAGAIN/WouldBlock).
+    set_fd_nonblocking_and_cloexec(fd);
 
     let dup_fd = unsafe { BorrowedFd::borrow_raw(fd) }
         .try_clone_to_owned()
         .map_err(|e| anyhow::anyhow!("Failed to duplicate TUN fd {}: {}", fd, e))?
         .into_raw_fd();
+
+    set_fd_nonblocking_and_cloexec(dup_fd);
 
     let mut config = Configuration::default();
     config.raw_fd(dup_fd);
@@ -916,6 +963,8 @@ impl TunFactory for AndroidCallbackTunFactory {
             rx_cmd,
             worker_stop.clone(),
         );
+        *active_tun_abort_slot().lock().unwrap() =
+            Some((worker_handle.abort_handle(), worker_stop.clone()));
 
         let current_gen = DIRTY_GEN.load(Ordering::Acquire);
         let session = ActiveTunSession {

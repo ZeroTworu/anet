@@ -64,12 +64,22 @@ impl NodeProbeMonitor {
     /// быстрый параллельный опрос реальной доступности нод и протоколов.
     pub fn update_config_toml(raw_toml: &str) {
         let monitor = Self::global();
+        let targets = extract_probe_targets_from_toml(raw_toml);
+
         let mut hasher = DefaultHasher::new();
-        raw_toml.hash(&mut hasher);
+        targets.len().hash(&mut hasher);
+        for t in &targets {
+            t.endpoint_index.hash(&mut hasher);
+            t.group_id.hash(&mut hasher);
+            t.group_name.hash(&mut hasher);
+            t.server_name.hash(&mut hasher);
+            t.dsn.hash(&mut hasher);
+            t.host_port.hash(&mut hasher);
+            t.protocol.hash(&mut hasher);
+        }
         let new_hash = hasher.finish();
 
         let prev_hash = monitor.config_hash.swap(new_hash, Ordering::SeqCst);
-        let targets = extract_probe_targets_from_toml(raw_toml);
 
         let should_reprobe = {
             let mut guard = monitor.targets.lock().unwrap();
@@ -413,6 +423,16 @@ impl ConnectivityMonitor {
         }
     }
 
+    /// Возвращает актуальное значение внутритуннельного RTT (если туннель активен и замер получен).
+    pub fn get_tunnel_rtt_ms() -> Option<u64> {
+        let monitor = Self::global();
+        if monitor.vpn_connected.load(Ordering::Relaxed) {
+            monitor.current_tunnel_rtt()
+        } else {
+            None
+        }
+    }
+
     /// Принудительно пробуждает фоновый воркер для немедленной проверки контрольных точек
     /// и сразу отправляет промежуточный снимок в UI для визуального отклика.
     pub fn trigger_check_now() {
@@ -502,7 +522,7 @@ impl ConnectivityMonitor {
                 None
             };
 
-            let outer_timeout = Duration::from_millis(cfg.timeout_ms.clamp(1000, 4500) + 1500);
+            let outer_timeout = Duration::from_millis(cfg.timeout_ms.clamp(1000, 4500) * 2 + 2500);
             let snapshot = tokio::select! {
                 res = tokio::time::timeout(outer_timeout, prober.probe_once(vpn_on, tunnel_rtt)) => {
                     match res {

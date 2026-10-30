@@ -317,6 +317,7 @@ impl ClientTransport for AHttpTransport {
 
                 // 1. Ждем первый пакет, сигнал активного Downlink (self-clocking) ИЛИ таймаут пуллинга
                 let (first_packet_opt, is_poll_wakeup) = if has_poll_credit {
+                    #[allow(deprecated)]
                     let _ = downlink_credits.fetch_update(Ordering::AcqRel, Ordering::Acquire, |c| {
                         Some(c.saturating_sub(1))
                     });
@@ -330,6 +331,7 @@ impl ClientTransport for AHttpTransport {
                             }
                         }
                         _ = downlink_notify.notified() => {
+                            #[allow(deprecated)]
                             let _ = downlink_credits.fetch_update(Ordering::AcqRel, Ordering::Acquire, |c| {
                                 Some(c.saturating_sub(1))
                             });
@@ -526,6 +528,7 @@ impl ClientTransport for AHttpTransport {
                     // или 2+ пакетов — агрессивно нарассиваем число параллельных poll-запросов до max_concurrency.
                     if rx_pkts_total > 0 {
                         if rx_bytes_total >= 1300 || rx_pkts_total >= 2 {
+                            #[allow(deprecated)]
                             let _ = downlink_credits_clone.fetch_update(Ordering::AcqRel, Ordering::Acquire, |c| {
                                 Some((c + 3).min(max_concurrency))
                             });

@@ -1421,7 +1421,7 @@ impl ClientTransport for WrtcTransport {
                 }
             };
             let xmpp_fut = async move {
-                if let Ok(mut xmpp) = tokio::time::timeout(Duration::from_millis(200), xmpp_shutdown.lock()).await {
+                if let Ok(xmpp) = tokio::time::timeout(Duration::from_millis(200), xmpp_shutdown.lock()).await {
                     let _ = tokio::time::timeout(Duration::from_millis(350), xmpp.leave_room()).await;
                 }
             };
