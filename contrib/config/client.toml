@@ -302,17 +302,17 @@ timeout_secs = 8
 # wrtc_fallback_jvb_ip = "89.169.16.6"  # Fallback IP медиасервера JVB
 # wrtc_fallback_jvb_port = 10002        # Fallback UDP порт JVB
 
-# 6. DoH (DNS-over-HTTPS / Hybrid UDP DNS / ASTP-L): Аварийный туннель через рекурсивные DNS-резолверы.
-# Внешняя схема DSN всегда `doh://` (так как `https://` используется транспортом AHTTP).
+# 6. DoH / DNS (DNS-over-HTTPS / Classic UDP DNS / ASTP-L): Аварийный туннель через рекурсивные DNS-резолверы.
+# Внешняя схема DSN: `doh://` (по умолчанию DoH) или `dns://` (принудительный классический UDP DNS :53).
 # Вся конфигурация инкапсулирована непосредственно в Query-параметрах DSN:
-#   resolver - адрес публичного резолвера: `doh://host/dns-query` (DoH) или `udp://ip:53` (Classic UDP DNS)
+#   resolver - адрес публичного резолвера: `doh://host/dns-query` (DoH) или `dns://ip:53` (Classic UDP DNS)
 #   arq      - двусторонний канальный ARQ/SACK/NACK (по умолчанию true)
 #   dup      - коэффициент проактивного дублирования приоритетных пакетов через разные резолверы (по умолчанию 2)
 #   dup_hs   - дублирование чанков хендшейка через разные резолверы для быстрого RTT (по умолчанию true)
 #   hold_ms  - время микро-коалесцинга poll-запроса на сервере в мс (по умолчанию 25)
 # [[servers]]
 # name = "Emergency DoH Tunnel"
-# dsn = "doh://t1.anet-vpn.com?resolver=doh://77.88.8.7/dns-query&resolver=doh://dns.adguard-dns.com/dns-query&resolver=udp://77.88.8.8:53&arq=true&dup=2&dup_hs=true&hold_ms=25"
+# dsn = "doh://t1.anet-vpn.com?resolver=doh://77.88.8.7/dns-query&resolver=doh://dns.adguard-dns.com/dns-query&resolver=dns://77.88.8.8:53&arq=true&dup=2&dup_hs=true&hold_ms=25"
 # timeout_secs = 10
 # server_pub_key = "<BASE64_ED25519_PUBLIC_KEY>"
 

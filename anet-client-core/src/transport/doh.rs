@@ -919,7 +919,7 @@ async fn process_downlink_dns_body(
 
 struct ResolverPool {
     urls: Vec<String>,
-    udp_targets: Vec<Option<std::net::SocketAddr>>,
+    dns_targets: Vec<Option<std::net::SocketAddr>>,
     profile: BrowserProfile,
     cooldown_until_ms: Vec<AtomicU64>,
     consec_failures: Vec<AtomicU32>,
@@ -932,7 +932,7 @@ struct ResolverPool {
 impl ResolverPool {
     fn new(
         urls: Vec<String>,
-        udp_targets: Vec<Option<std::net::SocketAddr>>,
+        dns_targets: Vec<Option<std::net::SocketAddr>>,
         profile: BrowserProfile,
     ) -> Self {
         let n = urls.len();
@@ -943,7 +943,7 @@ impl ResolverPool {
         let total_failed = (0..n).map(|_| AtomicU64::new(0)).collect();
         Self {
             urls,
-            udp_targets,
+            dns_targets,
             profile,
             cooldown_until_ms,
             consec_failures,
@@ -1047,7 +1047,7 @@ impl ResolverPool {
         self.ema_rtt_ms[idx].store(updated, Ordering::Relaxed);
     }
 
-    /// Sends a single attempt to a specific resolver index (supporting both `doh://`/`https://` and `udp://`) and validates DNS RCODE == 0.
+    /// Sends a single attempt to a specific resolver index (supporting both `doh://`/`https://` and `dns://`) and validates DNS RCODE == 0.
     async fn send_once_to_resolver(
         &self,
         client: &Client,
@@ -1059,9 +1059,9 @@ impl ResolverPool {
         self.total_sent[idx].fetch_add(1, Ordering::Relaxed);
         let started = Instant::now();
 
-        if let Some(udp_rest) = resolver_url.strip_prefix("udp://") {
-            let pre_resolved = self.udp_targets.get(idx).copied().flatten();
-            let host_port = udp_rest.trim_end_matches('/');
+        if let Some(dns_rest) = resolver_url.strip_prefix("dns://") {
+            let pre_resolved = self.dns_targets.get(idx).copied().flatten();
+            let host_port = dns_rest.trim_end_matches('/');
             let target_str = if host_port.contains(':') {
                 host_port.to_string()
             } else {
@@ -1074,11 +1074,11 @@ impl ResolverPool {
                 } else {
                     let mut addrs = tokio::net::lookup_host(&target_str)
                         .await
-                        .context("UDP resolver DNS lookup failed")?;
+                        .context("DNS resolver lookup failed")?;
                     addrs
                         .find(|a| a.is_ipv4())
                         .or_else(|| addrs.next())
-                        .context("No socket address resolved for UDP resolver")?
+                        .context("No socket address resolved for DNS resolver")?
                 };
                 let bind_addr = if remote_addr.is_ipv6() {
                     "[::]:0"
@@ -1099,7 +1099,7 @@ impl ResolverPool {
                     if body.len() >= 12 {
                         if query_bytes.len() >= 2 && body[0..2] != query_bytes[0..2] {
                             self.mark_failed(idx);
-                            bail!("UDP resolver {} txid mismatch", resolver_url);
+                            bail!("DNS resolver {} txid mismatch", resolver_url);
                         }
                         let rcode = u16::from_be_bytes([body[2], body[3]]) & 0x000F;
                         if rcode == 0 {
@@ -1107,11 +1107,11 @@ impl ResolverPool {
                             return Ok(Bytes::from(body));
                         } else {
                             self.mark_failed(idx);
-                            bail!("UDP resolver {} DNS RCODE {}", resolver_url, rcode);
+                            bail!("DNS resolver {} DNS RCODE {}", resolver_url, rcode);
                         }
                     } else {
                         self.mark_failed(idx);
-                        bail!("UDP resolver {} short DNS body", resolver_url);
+                        bail!("DNS resolver {} short DNS body", resolver_url);
                     }
                 }
                 Ok(Err(e)) => {
@@ -1120,7 +1120,7 @@ impl ResolverPool {
                 }
                 Err(_) => {
                     self.mark_failed(idx);
-                    bail!("UDP resolver {} timed out", resolver_url);
+                    bail!("DNS resolver {} timed out", resolver_url);
                 }
             }
         }
@@ -1495,16 +1495,16 @@ fn build_salted_hs_query(
     build_doh_query(&qname, rand::random::<u16>())
 }
 
-/// Converts any DoH/HTTPS/UDP resolver URL into a `udp://host:port` string when the outer DSN scheme is `udp://` or `dns://`.
-fn coerce_resolver_to_udp(raw_url: &str) -> String {
+/// Converts any DoH/HTTPS/DNS resolver URL into a `dns://host:port` string when the outer DSN scheme is `dns://`.
+fn coerce_resolver_to_dns(raw_url: &str) -> String {
     let trimmed = raw_url.trim();
-    if trimmed.starts_with("udp://") {
+    if trimmed.starts_with("dns://") {
         return trimmed.to_string();
     }
     let normalized = if let Some(rest) = trimmed.strip_prefix("doh://") {
         format!("https://{}", rest)
     } else if !trimmed.contains("://") {
-        format!("udp://{}", trimmed)
+        format!("http://{}", trimmed)
     } else {
         trimmed.to_string()
     };
@@ -1514,7 +1514,7 @@ fn coerce_resolver_to_udp(raw_url: &str) -> String {
                 Some(p) if p != 443 && p != 80 => p,
                 _ => 53,
             };
-            return format!("udp://{}:{}", host, port);
+            return format!("dns://{}:{}", host, port);
         }
     }
     trimmed.to_string()
@@ -1639,7 +1639,7 @@ impl DohTransport {
 impl ClientTransport for DohTransport {
     async fn connect(&self) -> Result<ConnectionResult> {
         let dsn_url = Url::parse(&self.server.dsn).context("Failed to parse DoH DSN")?;
-        let is_udp_dsn = matches!(dsn_url.scheme(), "udp" | "dns");
+        let is_dns_dsn = dsn_url.scheme() == "dns";
         let domain_zone = dsn_url
             .host_str()
             .context("No domain zone in DoH DSN")?
@@ -1663,56 +1663,59 @@ impl ClientTransport for DohTransport {
         }
 
         if resolvers.is_empty() {
-            if is_udp_dsn {
-                resolvers.push("udp://77.88.8.7:53".to_string());
-                resolvers.push("udp://77.88.8.8:53".to_string());
-                resolvers.push("udp://77.88.8.1:53".to_string());
+            if is_dns_dsn {
+                resolvers.push("dns://77.88.8.7:53".to_string());
+                resolvers.push("dns://77.88.8.8:53".to_string());
+                resolvers.push("dns://77.88.8.1:53".to_string());
             } else {
                 resolvers.push("doh://77.88.8.7/dns-query".to_string());
                 resolvers.push("doh://dns.adguard-dns.com/dns-query".to_string());
             }
-        } else if is_udp_dsn {
+        } else if is_dns_dsn {
             resolvers = resolvers
                 .into_iter()
-                .map(|r| coerce_resolver_to_udp(&r))
+                .map(|r| coerce_resolver_to_dns(&r))
                 .collect();
         }
 
         info!(
             "[DoH] Initializing transport ({}) for domain '{}' via {} resolvers (ARQ: {}, Hold: {}ms)",
-            if is_udp_dsn { "UDP-53" } else { "DoH-HTTPS" },
+            if is_dns_dsn { "DNS-53" } else { "DoH-HTTPS" },
             domain_zone,
             resolvers.len(),
             arq_enabled,
             hold_ms
         );
 
-        // Pre-resolve all DoH and UDP resolver hostnames BEFORE TUN setup or HTTP client creation:
+        // Pre-resolve all DoH (`doh://`) and raw DNS (`dns://`) resolver hostnames BEFORE TUN setup or HTTP client creation:
         // 1. Collect IPv4 bypass IPs so RouteManager and Windows AppFilter never fail on IPv6-over-IPv4-gateway routes or hijack DoH packets.
         // 2. Pin hostname -> IPv4 SocketAddrs in reqwest and ResolverPool so runtime queries never depend on system DNS after TUN is up.
         let mut bypass_ips: Vec<std::net::IpAddr> = Vec::new();
-        let mut udp_targets: Vec<Option<std::net::SocketAddr>> = Vec::with_capacity(resolvers.len());
+        let mut dns_targets: Vec<Option<std::net::SocketAddr>> = Vec::with_capacity(resolvers.len());
         let mut pinned_hosts: HashMap<String, Vec<std::net::SocketAddr>> = HashMap::new();
 
         for res_url in &resolvers {
-            let mut resolved_udp: Option<std::net::SocketAddr> = None;
+            let mut resolved_dns: Option<std::net::SocketAddr> = None;
+            let is_dns_scheme = res_url.starts_with("dns://");
             let normalized_url = if let Some(rest) = res_url.strip_prefix("doh://") {
                 format!("https://{}", rest)
+            } else if let Some(rest) = res_url.strip_prefix("dns://") {
+                format!("http://{}", rest)
             } else {
                 res_url.clone()
             };
 
             if let Ok(parsed) = Url::parse(&normalized_url) {
                 if let Some(host) = parsed.host_str() {
-                    let default_port = if parsed.scheme() == "udp" { 53 } else { 443 };
-                    let port = parsed.port_or_known_default().unwrap_or(default_port);
+                    let default_port = if is_dns_scheme { 53 } else { 443 };
+                    let port = parsed.port().unwrap_or(default_port);
 
                     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
                         if ip.is_ipv4() && !bypass_ips.contains(&ip) {
                             bypass_ips.push(ip);
                         }
-                        if parsed.scheme() == "udp" {
-                            resolved_udp = Some(std::net::SocketAddr::new(ip, port));
+                        if is_dns_scheme {
+                            resolved_dns = Some(std::net::SocketAddr::new(ip, port));
                         }
                     } else if let Ok(addrs) = tokio::net::lookup_host((host, port)).await {
                         let all_addrs: Vec<std::net::SocketAddr> = addrs.collect();
@@ -1733,15 +1736,15 @@ impl ClientTransport for DohTransport {
                                 bypass_ips.push(ip);
                             }
                         }
-                        if parsed.scheme() == "udp" {
-                            resolved_udp = chosen.first().copied();
+                        if is_dns_scheme {
+                            resolved_dns = chosen.first().copied();
                         } else if !chosen.is_empty() {
                             pinned_hosts.insert(host.to_string(), chosen);
                         }
                     }
                 }
             }
-            udp_targets.push(resolved_udp);
+            dns_targets.push(resolved_dns);
         }
 
         let tls_cfg = self.server.effective_tls_config(&self.config.stealth);
@@ -1789,7 +1792,7 @@ impl ClientTransport for DohTransport {
         let hs_max_payload = max_payload.saturating_sub(24).max(32);
         let temp_session_id = rand::random::<u32>() | 0x80000000;
 
-        let resolver_pool = Arc::new(ResolverPool::new(resolvers.clone(), udp_targets, profile));
+        let resolver_pool = Arc::new(ResolverPool::new(resolvers.clone(), dns_targets, profile));
 
         let auth_channel = DohAuthChannel {
             client: tx_http_client.clone(),
