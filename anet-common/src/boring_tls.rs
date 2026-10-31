@@ -210,16 +210,31 @@ static SYSTEM_ROOT_CERTS: LazyLock<Vec<X509>> = LazyLock::new(load_platform_root
 
 fn load_platform_root_certs() -> Vec<X509> {
     let mut certs = Vec::new();
+    let mut seen_der = std::collections::HashSet::new();
+
+    let mut push_unique_der = |der_bytes: &[u8]| {
+        if seen_der.insert(der_bytes.to_vec()) {
+            if let Ok(x509) = X509::from_der(der_bytes) {
+                certs.push(x509);
+            }
+        }
+    };
 
     // 1. Нативное хранилище ОС (Windows CryptoAPI/schannel, macOS/iOS Keychain, Linux openssl-probe)
     let native_result = rustls_native_certs::load_native_certs();
     for der in native_result.certs {
-        if let Ok(x509) = X509::from_der(der.as_ref()) {
-            certs.push(x509);
-        }
+        push_unique_der(der.as_ref());
     }
 
-    // 2. Стандартные пути к PEM-бандлам в Linux / BSD / macOS
+    // 2. Встроенный бандл корневых сертификатов Mozilla WebPKI (CCADB).
+    // Критично для Windows 10/11: CryptoAPI лениво подгружает новые корневые УЦ (например, GlobalSign Root R46)
+    // из Windows Update только при обращениях через Schannel/Edge, поэтому в локальном системном хранилище ROOT
+    // при прямой проверке через BoringSSL часть корневых сертификатов может отсутствовать.
+    for root_der in webpki_root_certs::TLS_SERVER_ROOT_CERTS {
+        push_unique_der(root_der.as_ref());
+    }
+
+    // 3. Стандартные пути к PEM-бандлам в Linux / BSD / macOS
     const BUNDLE_PATHS: &[&str] = &[
         "/etc/ssl/certs/ca-certificates.crt",
         "/etc/pki/tls/certs/ca-bundle.crt",
@@ -228,20 +243,22 @@ fn load_platform_root_certs() -> Vec<X509> {
         "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
         "/etc/ssl/cert.pem",
     ];
-    if certs.is_empty() {
-        for path in BUNDLE_PATHS {
-            if let Ok(pem_bytes) = std::fs::read(path) {
-                if let Ok(stack) = X509::stack_from_pem(&pem_bytes) {
-                    certs.extend(stack);
-                    if !certs.is_empty() {
-                        break;
+    for path in BUNDLE_PATHS {
+        if let Ok(pem_bytes) = std::fs::read(path) {
+            if let Ok(stack) = X509::stack_from_pem(&pem_bytes) {
+                for cert in stack {
+                    if let Ok(der) = cert.to_der() {
+                        if seen_der.insert(der) {
+                            certs.push(cert);
+                        }
                     }
                 }
+                break;
             }
         }
     }
 
-    // 3. Системные директории корневых сертификатов Android (Android 8..16+)
+    // 4. Системные директории корневых сертификатов Android (Android 8..16+)
     for android_dir in [
         "/system/etc/security/cacerts",
         "/apex/com.android.conscrypt/cacerts",
@@ -250,9 +267,15 @@ fn load_platform_root_certs() -> Vec<X509> {
             for entry in entries.flatten() {
                 if let Ok(bytes) = std::fs::read(entry.path()) {
                     if let Ok(stack) = X509::stack_from_pem(&bytes) {
-                        certs.extend(stack);
-                    } else if let Ok(x509) = X509::from_der(&bytes) {
-                        certs.push(x509);
+                        for cert in stack {
+                            if let Ok(der) = cert.to_der() {
+                                if seen_der.insert(der) {
+                                    certs.push(cert);
+                                }
+                            }
+                        }
+                    } else {
+                        push_unique_der(&bytes);
                     }
                 }
             }

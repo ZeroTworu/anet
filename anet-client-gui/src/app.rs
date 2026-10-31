@@ -534,7 +534,7 @@ impl ANetApp {
                             let tun = Box::new(
                                 DesktopTunFactory::new(
                                     merged_cfg.main.tun_name.clone(),
-                                    !merged_cfg.main.per_app.is_empty()
+                                    merged_cfg.main.is_per_app_active()
                                 )
                             );
                             if let Ok(route) = create_route_manager(false) {
@@ -876,7 +876,7 @@ impl ANetApp {
                 Self::filter_servers_for_selection(&self.settings, id, &mut cfg);
 
                 let tun = Box::new(
-                    DesktopTunFactory::new(cfg.main.tun_name.clone(), !cfg.main.per_app.is_empty())
+                    DesktopTunFactory::new(cfg.main.tun_name.clone(), cfg.main.is_per_app_active())
                 );
 
                 let cached_info = {

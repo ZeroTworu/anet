@@ -66,6 +66,11 @@ impl MainConfig {
     pub fn get_config_url(&self) -> Option<&str> {
         self.config_url.as_deref().or(self.subscription_url.as_deref())
     }
+
+    pub fn is_per_app_active(&self) -> bool {
+        self.per_app_mode != PerAppMode::All
+            && !(self.per_app_mode == PerAppMode::Include && self.per_app.is_empty())
+    }
 }
 
 impl Default for MainConfig {

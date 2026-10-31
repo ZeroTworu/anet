@@ -24,6 +24,7 @@ pub struct XmppSession {
     pub remote_ip: Option<std::net::IpAddr>,
     pub occupants: Arc<Mutex<HashSet<String>>>,
     pub discovered_ice_servers: Arc<Mutex<Vec<XmppIceServer>>>,
+    active_jingle: Arc<Mutex<Option<(String, String)>>>,
     write_tx: mpsc::Sender<String>,
     read_rx: mpsc::Receiver<String>,
     writer_handle: tokio::task::JoinHandle<()>,
@@ -316,7 +317,8 @@ impl XmppSession {
                         match stanza_opt {
                             Some(stanza) => {
                                 if stanza == "__CLOSE__" {
-                                    let _ = tokio::time::timeout(Duration::from_secs(2), ws_sink.close()).await;
+                                    let _ = tokio::time::timeout(Duration::from_millis(500), ws_sink.flush()).await;
+                                    let _ = tokio::time::timeout(Duration::from_millis(500), ws_sink.close()).await;
                                     break;
                                 }
                                 match tokio::time::timeout(write_timeout_dur, ws_sink.send(Message::text(stanza))).await {
@@ -483,6 +485,7 @@ impl XmppSession {
             remote_ip,
             occupants,
             discovered_ice_servers,
+            active_jingle: Arc::new(Mutex::new(None)),
             write_tx,
             read_rx,
             writer_handle,
@@ -570,6 +573,9 @@ impl XmppSession {
             has_video,
         );
 
+        if let Ok(mut guard) = self.active_jingle.lock() {
+            *guard = Some((sid.to_string(), focus_jid.to_string()));
+        }
         log::info!("[XMPP] Sending Jingle session-accept (sid: {sid}) to Jicofo ({focus_jid})...");
         self.send_stanza(stanza).await
     }
@@ -628,6 +634,21 @@ impl XmppSession {
     }
 
     pub async fn leave_room(&self) {
+        if let Ok(mut guard) = self.active_jingle.lock() {
+            if let Some((sid, focus_jid)) = guard.take() {
+                let req_id = format!("term_{:08x}", rand::random::<u32>());
+                let term_stanza = XmppBuilder::jingle_session_terminate(
+                    &focus_jid,
+                    &req_id,
+                    &self.jid,
+                    &sid,
+                );
+                log::info!(
+                    "[XMPP] Sending Jingle session-terminate (sid: {sid}) to Jicofo ({focus_jid})..."
+                );
+                let _ = self.write_tx.try_send(term_stanza);
+            }
+        }
         let leave_stanza = XmppBuilder::muc_leave(&self.conference_id, &self.endpoint_id);
         log::info!(
             "[XMPP] Leaving MUC room {} as occupant {}: {}",
@@ -638,7 +659,12 @@ impl XmppSession {
         let _ = self.write_tx.try_send(leave_stanza);
         let _ = self.write_tx.try_send(XmppBuilder::close().to_string());
         let _ = self.write_tx.try_send("__CLOSE__".to_string());
-        tokio::time::sleep(Duration::from_millis(60)).await;
+        for _ in 0..25 {
+            if self.writer_handle.is_finished() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         self.reader_handle.abort();
         self.writer_handle.abort();
     }
@@ -646,16 +672,32 @@ impl XmppSession {
 
 impl Drop for XmppSession {
     fn drop(&mut self) {
+        if let Ok(mut guard) = self.active_jingle.lock() {
+            if let Some((sid, focus_jid)) = guard.take() {
+                let req_id = format!("term_{:08x}", rand::random::<u32>());
+                let term_stanza = XmppBuilder::jingle_session_terminate(
+                    &focus_jid,
+                    &req_id,
+                    &self.jid,
+                    &sid,
+                );
+                let _ = self.write_tx.try_send(term_stanza);
+            }
+        }
         let leave_stanza = XmppBuilder::muc_leave(&self.conference_id, &self.endpoint_id);
         let _ = self.write_tx.try_send(leave_stanza);
         let _ = self.write_tx.try_send(XmppBuilder::close().to_string());
         let _ = self.write_tx.try_send("__CLOSE__".to_string());
         self.reader_handle.abort();
         let writer_abort = self.writer_handle.abort_handle();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(100)).await;
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                writer_abort.abort();
+            });
+        } else {
             writer_abort.abort();
-        });
+        }
     }
 }
 

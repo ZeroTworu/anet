@@ -550,7 +550,7 @@ impl XmppBuilder {
         let atrack_id = crate::wrtc::stealth::generate_random_uuid_v4();
         let video_section = if include_video_content && video_ssrc != 0 {
             let pt = if video_payload_type != 0 { video_payload_type } else { 100 };
-            let rtcp_fb = r#"<rtcp-fb xmlns="urn:xmpp:jingle:apps:rtp:fb:0" type="goog-remb"/><rtcp-fb xmlns="urn:xmpp:jingle:apps:rtp:fb:0" type="ccm" subtype="fir"/><rtcp-fb xmlns="urn:xmpp:jingle:apps:rtp:fb:0" type="nack"/><rtcp-fb xmlns="urn:xmpp:jingle:apps:rtp:fb:0" type="nack" subtype="pli"/>"#;
+            let rtcp_fb = r#"<rtcp-fb xmlns="urn:xmpp:jingle:apps:rtp:rtcp-fb:0" type="goog-remb"/><rtcp-fb xmlns="urn:xmpp:jingle:apps:rtp:rtcp-fb:0" type="ccm" subtype="fir"/><rtcp-fb xmlns="urn:xmpp:jingle:apps:rtp:rtcp-fb:0" type="nack"/><rtcp-fb xmlns="urn:xmpp:jingle:apps:rtp:rtcp-fb:0" type="nack" subtype="pli"/>"#;
             let pt_fallback = if pt != 96 {
                 format!(r#"<payload-type id="96" name="VP8" clockrate="90000">{rtcp_fb}</payload-type>"#)
             } else {
@@ -606,6 +606,21 @@ impl XmppBuilder {
             candidate_xml = candidate_xml,
             video_section = video_section,
             data_section = data_section
+        )
+    }
+
+    pub fn jingle_session_terminate(
+        focus_jid: &str,
+        req_id: &str,
+        my_jid: &str,
+        sid: &str,
+    ) -> String {
+        format!(
+            r#"<iq to="{to}" type="set" id="{id}"><jingle xmlns="urn:xmpp:jingle:1" action="session-terminate" responder="{resp}" sid="{sid}"><reason><success/></reason></jingle></iq>"#,
+            to = escape_xml_attr(focus_jid),
+            id = escape_xml_attr(req_id),
+            resp = escape_xml_attr(my_jid),
+            sid = escape_xml_attr(sid),
         )
     }
 

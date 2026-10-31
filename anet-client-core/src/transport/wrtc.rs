@@ -171,6 +171,14 @@ impl ClientTransport for WrtcTransport {
             );
         };
 
+        if session.sources.len() > 50 || session.video_sources.len() > 50 {
+            warn!(
+                "[WRTC Client] Ktalk room '{room_name}' contains {} audio / {} video Jingle sources in Jicofo (stale ghost endpoints). If WRTC VIDEO fails to warm up due to multi-bridge JVB split, switch to a fresh Ktalk room URL.",
+                session.sources.len(),
+                session.video_sources.len()
+            );
+        }
+
         let mut bypass_ips: Vec<std::net::IpAddr> = Vec::new();
 
         if let Some(ip) = xmpp.remote_ip {
@@ -486,11 +494,6 @@ impl ClientTransport for WrtcTransport {
         let peer_xmpp = Arc::clone(&shared_peer);
         let target_srv_xmpp = target_server_id.clone();
         let fb_ip_owned = fallback_ip.to_string();
-        let domain_xmpp = domain.clone();
-        let room_name_xmpp = room_name.clone();
-        let conf_id_xmpp = room_info.conference_id.clone();
-        let profile_xmpp = browser_profile.clone();
-        let wrtc_cfg_xmpp = self.config.wrtc.clone();
         let xmpp_jingle_task = tokio::spawn(async move {
             loop {
                 if peer_xmpp.is_failed.load(Ordering::SeqCst) {
@@ -528,14 +531,33 @@ impl ClientTransport for WrtcTransport {
                                         let expected_srv_ssrc = peer_xmpp
                                             .expected_peer_video_ssrc
                                             .load(Ordering::Relaxed);
+                                        let mut updated_ssrc = false;
                                         for v_ssrc in jingle.video_sources {
                                             // На клиенте привязываем только видео-SSRC сервера, игнорируя SSRC других клиентов в комнате
                                             if expected_srv_ssrc == 0 || v_ssrc == expected_srv_ssrc
                                             {
                                                 peer_xmpp.add_remote_video_ssrc(v_ssrc).await;
+                                                updated_ssrc = true;
                                             }
                                         }
+                                        if updated_ssrc {
+                                            let constraints = anet_common::wrtc::colibri::ReceiverVideoConstraints::for_endpoint(
+                                                &target_srv_xmpp,
+                                                WRTC_DEFAULT_MAX_VIDEO_HEIGHT,
+                                            );
+                                            let _ = peer_xmpp.send_video_constraints(&constraints).await;
+                                            peer_xmpp.force_next_keyframe();
+                                        }
                                     }
+                                }
+                                anet_common::wrtc::xmpp_xml::InboundXmpp::JingleAck(ack_id) => {
+                                    log::info!("[WRTC Client] Jicofo acknowledged Jingle IQ {ack_id}");
+                                    let constraints = anet_common::wrtc::colibri::ReceiverVideoConstraints::for_endpoint(
+                                        &target_srv_xmpp,
+                                        WRTC_DEFAULT_MAX_VIDEO_HEIGHT,
+                                    );
+                                    let _ = peer_xmpp.send_video_constraints(&constraints).await;
+                                    peer_xmpp.force_next_keyframe();
                                 }
                                 anet_common::wrtc::xmpp_xml::InboundXmpp::ExtdiscoServices(
                                     fresh_ice,
@@ -569,87 +591,16 @@ impl ClientTransport for WrtcTransport {
                         }
                     }
                     Ok(None) => {
-                        // Если медиа-туннель (VP8 RTP / Colibri-WS / P2P) уже мёртв — немедленно реконнектим.
-                        if peer_xmpp.check_dead_reason().is_some() {
-                            warn!(
-                                "[WRTC Client] XMPP signaling closed and media peer is dead. Triggering reconnect..."
-                            );
-                            peer_xmpp.failed_notify.notify_waiters();
-                            peer_xmpp.failed_notify.notify_one();
-                            return;
-                        }
-
-                        // Медиа-туннель ЖИВ! Не убиваем рабочий видео-канал из-за часового таймаута nginx на XMPP WS.
-                        // Переподключаем сигнальный XMPP в фоне, чтобы продолжать мониторить присутствие сервера и ротировать TURN-креды.
-                        info!(
-                            "[WRTC Client] XMPP signaling WebSocket closed while media tunnel is healthy. Reconnecting XMPP in background without dropping VPN..."
+                        // Когда сигнальный XMPP WebSocket закрывается, Prosody рассылает <presence type="unavailable"/>
+                        // для нашего occupant_id, и как Jicofo, так и anet-server немедленно удаляют эту сессию.
+                        // Фоновое подключение нового XmppSession без полного Jingle-хэндшейка лишь плодит
+                        // "призрачные" (ghost) источники в Jicofo каждые 60 секунд, поэтому выполняем чистый реконнект.
+                        warn!(
+                            "[WRTC Client] XMPP signaling WebSocket closed. Triggering clean session reconnect..."
                         );
-                        let mut reconnected = false;
-                        for attempt in 1..=3 {
-                            if peer_xmpp.check_dead_reason().is_some() {
-                                break;
-                            }
-                            let Ok(ktalk_bg) = KtalkClient::new(profile_xmpp.clone(), &wrtc_cfg_xmpp) else {
-                                log::warn!("[WRTC/XMPP] Failed to initialize background Ktalk client");
-                                continue;
-                            };
-                            let secret_bg = KtalkClient::generate_anonymous_secret();
-                            let guest_bg = generate_random_guest_name();
-                            if let Ok(auth_bg) = ktalk_bg
-                                .authorize_session(
-                                    &domain_xmpp,
-                                    &room_name_xmpp,
-                                    Some(&guest_bg),
-                                    &secret_bg,
-                                )
-                                .await
-                            {
-                                if let Ok(new_xmpp) = XmppSession::connect(
-                                    &domain_xmpp,
-                                    &conf_id_xmpp,
-                                    &auth_bg.token,
-                                    Some(&guest_bg),
-                                    &profile_xmpp,
-                                    ping_secs,
-                                    &wrtc_cfg_xmpp,
-                                )
-                                .await
-                                {
-                                    let fresh_ice = new_xmpp.get_ice_servers();
-                                    peer_xmpp.rotate_turn_credentials(&fresh_ice).await;
-                                    if let Some(p2p) = p2p_xmpp_rot.lock().await.clone() {
-                                        p2p.rotate_turn_credentials(&fresh_ice).await;
-                                    }
-                                    let occupants = new_xmpp.get_other_occupants();
-                                    if !occupants.iter().any(|o| o == &target_srv_xmpp) {
-                                        warn!(
-                                            "[WRTC Client] Server occupant {target_srv_xmpp} is no longer in MUC room after XMPP reconnect. Triggering tunnel reconnect..."
-                                        );
-                                        new_xmpp.leave_room().await;
-                                        peer_xmpp.failed_notify.notify_waiters();
-                                        peer_xmpp.failed_notify.notify_one();
-                                        return;
-                                    }
-                                    info!(
-                                        "[WRTC Client] Background XMPP signaling reconnected (attempt {attempt}); server {target_srv_xmpp} is present, media tunnel preserved!"
-                                    );
-                                    let mut guard = xmpp_bg.lock().await;
-                                    *guard = new_xmpp;
-                                    reconnected = true;
-                                    break;
-                                }
-                            }
-                            tokio::time::sleep(Duration::from_secs(1)).await;
-                        }
-
-                        if !reconnected {
-                            // Если фоновый XMPP не поднялся, оставляем живой медиа-туннель работать под контролем
-                            // внутритуннельного anet_ping/anet_pong и peer_xmpp.check_dead_reason().
-                            info!(
-                                "[WRTC Client] Background XMPP reconnect deferred; keeping active media tunnel alive under data-plane watchdog."
-                            );
-                            return;
-                        }
+                        peer_xmpp.failed_notify.notify_waiters();
+                        peer_xmpp.failed_notify.notify_one();
+                        return;
                     }
                     Err(_) => {
                         tokio::time::sleep(Duration::from_millis(50)).await;

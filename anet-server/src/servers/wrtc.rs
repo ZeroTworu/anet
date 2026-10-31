@@ -186,6 +186,15 @@ pub async fn run_wrtc_server(
             continue;
         };
 
+        if session.sources.len() > 50 || session.video_sources.len() > 50 {
+            warn!(
+                "[WRTC Server] Ktalk room '{}' contains {} audio / {} video Jingle sources in Jicofo (stale ghost endpoints). If WRTC VIDEO fails to warm up due to multi-bridge JVB split, switch to a fresh Ktalk room URL.",
+                room_info.conference_id,
+                session.sources.len(),
+                session.video_sources.len()
+            );
+        }
+
         let server_mode = config.server.wrtc_transport_mode();
         let audio_keepalive_ms = config.server.wrtc_media_keepalive_interval_ms;
         let peer = match WrtcPeer::create(
@@ -375,6 +384,7 @@ pub async fn run_wrtc_server(
                                     || jingle.action == "description-info"
                                     || jingle.action == "session-initiate"
                                 {
+                                    let mut any_video_updated = false;
                                     for v_ssrc in jingle.video_sources {
                                         if known_client_video_ssrcs.contains(&v_ssrc) {
                                             info!("[WRTC Server] Jingle stanza ({}) announced authorized client video SSRC: {v_ssrc}", jingle.action);
@@ -382,10 +392,42 @@ pub async fn run_wrtc_server(
                                                 Duration::from_secs(WRTC_SDP_RENEGOTIATE_TIMEOUT_SECS),
                                                 shared_peer.add_remote_video_ssrc(v_ssrc),
                                             ).await;
+                                            any_video_updated = true;
                                         } else {
                                             log::debug!("[WRTC Server] Ignoring Jingle ({}) SSRC {v_ssrc} from non-ANET room occupant", jingle.action);
                                         }
                                     }
+                                    if any_video_updated || !client_video_endpoints.is_empty() {
+                                        let video_eps: Vec<String> = client_video_endpoints
+                                            .iter()
+                                            .map(|e| e.key().clone())
+                                            .collect();
+                                        if !video_eps.is_empty() {
+                                            let constraints =
+                                                anet_common::wrtc::colibri::ReceiverVideoConstraints::for_endpoints(
+                                                    &video_eps,
+                                                    WRTC_DEFAULT_MAX_VIDEO_HEIGHT,
+                                                );
+                                            let _ = shared_peer.send_video_constraints(&constraints).await;
+                                            shared_peer.force_next_keyframe();
+                                        }
+                                    }
+                                }
+                            }
+                            anet_common::wrtc::xmpp_xml::InboundXmpp::JingleAck(ack_id) => {
+                                info!("[WRTC Server] Jicofo acknowledged Jingle IQ {ack_id}");
+                                let video_eps: Vec<String> = client_video_endpoints
+                                    .iter()
+                                    .map(|e| e.key().clone())
+                                    .collect();
+                                if !video_eps.is_empty() {
+                                    let constraints =
+                                        anet_common::wrtc::colibri::ReceiverVideoConstraints::for_endpoints(
+                                            &video_eps,
+                                            WRTC_DEFAULT_MAX_VIDEO_HEIGHT,
+                                        );
+                                    let _ = shared_peer.send_video_constraints(&constraints).await;
+                                    shared_peer.force_next_keyframe();
                                 }
                             }
                             anet_common::wrtc::xmpp_xml::InboundXmpp::ExtdiscoServices(fresh_ice) => {
@@ -1069,6 +1111,21 @@ pub async fn run_wrtc_server(
                                                                 && has_video
                                                                 && is_v2
                                                             {
+                                                                if !client_video_warmed_dl.contains(&client_tag) {
+                                                                    let video_eps: Vec<String> = client_video_ep_dl
+                                                                        .iter()
+                                                                        .map(|e| e.key().clone())
+                                                                        .collect();
+                                                                    if !video_eps.is_empty() {
+                                                                        let constraints =
+                                                                            anet_common::wrtc::colibri::ReceiverVideoConstraints::for_endpoints(
+                                                                                &video_eps,
+                                                                                WRTC_DEFAULT_MAX_VIDEO_HEIGHT,
+                                                                            );
+                                                                        let _ = peer_downlink.send_video_constraints(&constraints).await;
+                                                                    }
+                                                                    peer_downlink.force_next_keyframe();
+                                                                }
                                                                 let seq = c_info.sequence.fetch_add(1, Ordering::Relaxed);
                                                                 if let Ok(enc_buf) = wrap_packet_slice_with_headroom(
                                                                     &c_info.cipher,

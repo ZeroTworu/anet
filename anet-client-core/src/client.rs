@@ -631,14 +631,15 @@ impl AnetClient {
                 }
             }
 
-            if !rule_cache.is_loaded() {
-                self.sync_rules_cache(&config_clone).await;
-            }
-
             let rc_bg = rule_cache.clone();
             let url_bg = rules_server_url.clone();
             let shutdown_bg = self.cancel_signal.clone();
             let rules_bg_task = tokio::spawn(async move {
+                if !rc_bg.is_loaded() {
+                    if let Err(e) = rc_bg.update_from_server(&url_bg).await {
+                        log::debug!("[RuleCache] Initial background rules.abc fetch failed: {e}");
+                    }
+                }
                 loop {
                     tokio::select! {
                         _ = sleep(Duration::from_secs(600)) => {
@@ -727,9 +728,26 @@ impl AnetClient {
             return Ok(());
         }
 
-        let (tx_to_tun, mut rx_from_tun, iface_name, _app_filter) = self
+        let (tx_to_tun, mut rx_from_tun, iface_name, _app_filter) = match self
             .acquire_packet_source(server, &result.auth_response)
-            .await?;
+            .await
+        {
+            Ok(res) => res,
+            Err(e) => {
+                warn!("[Core] Failed to acquire packet source (TUN/WinDivert): {e:#}. Cleaning up transport session...");
+                for h in aux_aborts.drain(..) {
+                    h.abort();
+                }
+                if let Some(hook) = result.shutdown_hook.take() {
+                    let _ = tokio::time::timeout(Duration::from_millis(1200), hook).await;
+                }
+                if let Some(ref endpoint) = result.endpoint {
+                    endpoint.close(0u32.into(), b"tun_failed");
+                }
+                let _ = self.route_manager.restore_routes().await;
+                return Err(e);
+            }
+        };
 
         #[cfg(all(windows, feature = "per-app"))]
         if let Some(ref filter) = _app_filter {
@@ -1149,22 +1167,48 @@ impl AnetClient {
         let per_app_active = _app_filter.is_some();
 
         if !per_app_active {
-            if !config_clone.main.route_for.is_empty() {
-                let include_routes = self.resolve_list(&config_clone.main.route_for).await;
-                for net in include_routes.iter() {
+            let route_setup_res: Result<()> = async {
+                if !config_clone.main.route_for.is_empty() {
+                    let include_routes = self.resolve_list(&config_clone.main.route_for).await;
+                    for net in include_routes.iter() {
+                        self.route_manager
+                            .add_specific_route(
+                                net.network(),
+                                net.prefix_len(),
+                                &result.auth_response.gateway,
+                                &iface_name,
+                            )
+                            .await?;
+                    }
+                } else {
                     self.route_manager
-                        .add_specific_route(
-                            net.network(),
-                            net.prefix_len(),
-                            &result.auth_response.gateway,
-                            &iface_name,
-                        )
+                        .set_default_route(&result.auth_response.gateway, &iface_name)
                         .await?;
                 }
-            } else {
-                self.route_manager
-                    .set_default_route(&result.auth_response.gateway, &iface_name)
-                    .await?;
+                Ok(())
+            }
+            .await;
+
+            if let Err(e) = route_setup_res {
+                warn!("[Core] Failed to configure routes on '{}': {e:#}. Cleaning up session...", iface_name);
+                shutdown_notify.notify_waiters();
+                t1.abort();
+                t2.abort();
+                for h in aux_aborts.drain(..) {
+                    h.abort();
+                }
+                for h in dns_aborts.lock().unwrap().drain(..) {
+                    h.abort();
+                }
+                drop(tx_to_tun);
+                if let Some(hook) = result.shutdown_hook.take() {
+                    let _ = tokio::time::timeout(Duration::from_millis(1200), hook).await;
+                }
+                if let Some(ref endpoint) = result.endpoint {
+                    endpoint.close(0u32.into(), b"route_failed");
+                }
+                let _ = self.route_manager.restore_routes().await;
+                return Err(e);
             }
 
             if !config_clone.main.dns_server_list.is_empty() {

@@ -81,7 +81,7 @@ async fn main() -> Result<()> {
     let tun_fac = Box::new(
         DesktopTunFactory::new(
             config.main.tun_name.clone(),
-            !config.main.per_app.is_empty(),
+            config.main.is_per_app_active(),
         ));
     let client = Arc::new(AnetClient::new(config, tun_fac, route_mgr));
 

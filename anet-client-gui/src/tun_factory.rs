@@ -70,24 +70,39 @@ mod windows_impl {
             &self,
             auth: &AuthResponse,
         ) -> Result<(mpsc::Sender<Bytes>, mpsc::Receiver<Bytes>, String)> {
-            info!("Step 1: Loading wintun.dll...");
+            info!("Step 1: Loading wintun.dll & creating adapter '{}'...", self.tun_name);
             if !std::path::Path::new("wintun.dll").exists() {
                 anyhow::bail!("CRITICAL: wintun.dll not found in current directory!");
             }
 
-            let wintun = unsafe { wintun::load_from_path("wintun.dll").context("Failed to load wintun.dll")? };
+            let tun_name_init = self.tun_name.clone();
+            let (adapter, session) = tokio::task::spawn_blocking(move || -> Result<(Arc<wintun::Adapter>, Arc<wintun::Session>)> {
+                let wintun = unsafe { wintun::load_from_path("wintun.dll").context("Failed to load wintun.dll")? };
 
-            info!("Step 2: Creating adapter '{}'...", self.tun_name);
-            let adapter = match wintun::Adapter::create(&wintun, &self.tun_name, &self.tun_name, None) {
-                Ok(a) => a,
-                Err(e) => {
-                    error!("Create failed: {}. Trying open...", e);
-                    wintun::Adapter::open(&wintun, &self.tun_name).context("Failed to open existing Wintun adapter")?
-                }
-            };
+                let adapter = match wintun::Adapter::create(&wintun, &tun_name_init, &tun_name_init, None) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        log::warn!("Wintun Adapter::create('{}') failed ({}). Trying open or retry after orphan cleanup...", tun_name_init, e);
+                        match wintun::Adapter::open(&wintun, &tun_name_init) {
+                            Ok(a) => a,
+                            Err(_) => {
+                                // Когда предыдущий экземпляр оставил осиротевший адаптер ("anet-client 1"),
+                                // первый вызов Adapter::create удаляет его, но сам возвращает ошибку.
+                                // Повторный вызов Adapter::create после короткой паузы создаёт чистый адаптер.
+                                std::thread::sleep(Duration::from_millis(600));
+                                wintun::Adapter::create(&wintun, &tun_name_init, &tun_name_init, None)
+                                    .context("Failed to create Wintun adapter after orphan cleanup")?
+                            }
+                        }
+                    }
+                };
 
-            info!("Step 3: Starting session...");
-            let session = Arc::new(adapter.start_session(wintun::MAX_RING_CAPACITY)?);
+                info!("Step 3: Starting session...");
+                let session = Arc::new(adapter.start_session(wintun::MAX_RING_CAPACITY)?);
+                Ok((adapter, session))
+            })
+            .await
+            .context("Wintun initialization task panicked")??;
 
             info!("Step 4: Waiting for Windows to register interface...");
             let start = std::time::Instant::now();
@@ -226,13 +241,16 @@ mod windows_impl {
             });
 
             // Асинхронный монитор жизни адаптера.
-            // Ждет закрытия канала tx_from_tun (когда клиент завершает сессию)
-            // и принудительно уничтожает Wintun-адаптер.
+            // Ждет закрытия канала tx_from_tun (когда клиент завершает сессию),
+            // пробуждает блокирующий поток чтения через session.shutdown() и уничтожает Wintun-адаптер.
             let tx_monitor = tx_from_tun.clone();
+            let monitor_session = session.clone();
             tokio::spawn(async move {
                 tx_monitor.closed().await;
+                let _ = monitor_session.shutdown();
+                drop(monitor_session);
                 drop(adapter);
-                info!("Wintun adapter dropped cleanly via channel monitor.");
+                info!("Wintun session and adapter shut down cleanly via channel monitor.");
             });
 
             Ok((tx_to_tun, rx_from_tun, target_name))

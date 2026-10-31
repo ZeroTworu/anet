@@ -44,6 +44,7 @@ russh = { workspace = true }
 url = "2.5.7"
 tokio-boring = {workspace = true}
 rustls-native-certs = { workspace = true }
+webpki-root-certs = "1.0.4"
 boring = {workspace = true}
 [build-dependencies]
 prost-build = "0.14.1"
