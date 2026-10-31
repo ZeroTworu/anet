@@ -22,11 +22,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncWriteExt, WriteHalf};
 use tokio::sync::{Mutex, Notify, Semaphore};
 
-const RESOLVER_COOLDOWN_MS: u64 = 2_000;
-const DOH_TCP_MAX_MSS: u16 = 240;
-const CODEL_MAX_SOJOURN: Duration = Duration::from_millis(600);
-const MAX_BULK_QUEUE_LEN: usize = 64;
-const MAX_PRIO_QUEUE_LEN: usize = 128;
+const RESOLVER_COOLDOWN_MS: u64 = 800;
+const DOH_TCP_MAX_MSS: u16 = 260;
+const CODEL_MAX_SOJOURN: Duration = Duration::from_secs(15);
+const MAX_BULK_QUEUE_LEN: usize = 1024;
+const MAX_PRIO_QUEUE_LEN: usize = 256;
 
 fn now_epoch_ms() -> u64 {
     SystemTime::now()
@@ -486,8 +486,8 @@ struct PartialDownlinkPacket {
     created_at: Instant,
 }
 
-const REORDER_GAP_TIMEOUT: Duration = Duration::from_millis(420);
-const REORDER_MAX_WINDOW: usize = 64;
+const REORDER_GAP_TIMEOUT: Duration = Duration::from_millis(2400);
+const REORDER_MAX_WINDOW: usize = 512;
 
 struct DohDownlinkState {
     seen_seqs: VecDeque<u32>,
@@ -500,7 +500,7 @@ struct DohDownlinkState {
 impl DohDownlinkState {
     fn new(dl_feedback: Arc<AtomicU64>) -> Self {
         Self {
-            seen_seqs: VecDeque::with_capacity(256),
+            seen_seqs: VecDeque::with_capacity(1024),
             partials: HashMap::new(),
             cum_ack_seq: 0,
             reorder_buf: std::collections::BTreeMap::new(),
@@ -509,11 +509,11 @@ impl DohDownlinkState {
     }
 
     fn check_and_record_seq(&mut self, seq: u32) -> bool {
-        if seq <= self.cum_ack_seq || self.seen_seqs.contains(&seq) {
+        if self.seen_seqs.contains(&seq) || seq.saturating_add(1024) <= self.cum_ack_seq {
             self.update_feedback_atomic();
             return false;
         }
-        if self.seen_seqs.len() >= 256 {
+        if self.seen_seqs.len() >= 1024 {
             self.seen_seqs.pop_front();
         }
         self.seen_seqs.push_back(seq);
@@ -534,6 +534,13 @@ impl DohDownlinkState {
 
     fn insert_and_drain_ordered(&mut self, seq: u32, framed_bytes: BytesMut) -> BytesMut {
         let now = Instant::now();
+        // If a late frame arrives after a gap flush (`seq <= self.cum_ack_seq`) and was not in `seen_seqs`,
+        // deliver it immediately rather than buffering or discarding it!
+        if self.cum_ack_seq > 0 && seq <= self.cum_ack_seq {
+            self.update_feedback_atomic();
+            return framed_bytes;
+        }
+
         if self.cum_ack_seq == 0 && seq == 1 {
             self.cum_ack_seq = 1;
             let mut out = framed_bytes;
@@ -646,10 +653,10 @@ impl DohDownlinkState {
     }
 }
 
-const UPLINK_ARQ_RTO: Duration = Duration::from_millis(750);
-const UPLINK_NACK_FAST_DELAY: Duration = Duration::from_millis(240);
-const UPLINK_MAX_INFLIGHT_PKTS: usize = 96;
-const UPLINK_MAX_CHUNK_RETRIES: u8 = 4;
+const UPLINK_ARQ_RTO: Duration = Duration::from_millis(320);
+const UPLINK_NACK_FAST_DELAY: Duration = Duration::from_millis(90);
+const UPLINK_MAX_INFLIGHT_PKTS: usize = 256;
+const UPLINK_MAX_CHUNK_RETRIES: u8 = 6;
 
 struct InflightUplinkPacket {
     chunks: Vec<Vec<u8>>,
@@ -915,6 +922,7 @@ struct ResolverPool {
     udp_targets: Vec<Option<std::net::SocketAddr>>,
     profile: BrowserProfile,
     cooldown_until_ms: Vec<AtomicU64>,
+    consec_failures: Vec<AtomicU32>,
     ema_rtt_ms: Vec<AtomicU64>,
     total_sent: Vec<AtomicU64>,
     total_failed: Vec<AtomicU64>,
@@ -929,6 +937,7 @@ impl ResolverPool {
     ) -> Self {
         let n = urls.len();
         let cooldown_until_ms = (0..n).map(|_| AtomicU64::new(0)).collect();
+        let consec_failures = (0..n).map(|_| AtomicU32::new(0)).collect();
         let ema_rtt_ms = (0..n).map(|_| AtomicU64::new(120)).collect();
         let total_sent = (0..n).map(|_| AtomicU64::new(0)).collect();
         let total_failed = (0..n).map(|_| AtomicU64::new(0)).collect();
@@ -937,6 +946,7 @@ impl ResolverPool {
             udp_targets,
             profile,
             cooldown_until_ms,
+            consec_failures,
             ema_rtt_ms,
             total_sent,
             total_failed,
@@ -1022,11 +1032,15 @@ impl ResolverPool {
 
     fn mark_failed(&self, idx: usize) {
         self.total_failed[idx].fetch_add(1, Ordering::Relaxed);
-        let until = now_epoch_ms() + RESOLVER_COOLDOWN_MS;
-        self.cooldown_until_ms[idx].store(until, Ordering::Relaxed);
+        let streak = self.consec_failures[idx].fetch_add(1, Ordering::Relaxed) + 1;
+        if streak >= 2 {
+            let until = now_epoch_ms() + RESOLVER_COOLDOWN_MS;
+            self.cooldown_until_ms[idx].store(until, Ordering::Relaxed);
+        }
     }
 
     fn mark_success(&self, idx: usize, rtt_ms: u64) {
+        self.consec_failures[idx].store(0, Ordering::Relaxed);
         self.cooldown_until_ms[idx].store(0, Ordering::Relaxed);
         let prev = self.ema_rtt_ms[idx].load(Ordering::Relaxed);
         let updated = ((prev * 7) + rtt_ms.clamp(5, 2000)) / 8;
@@ -1287,10 +1301,14 @@ impl ResolverPool {
         tunnel_write: &Arc<Mutex<WriteHalf<tokio::io::DuplexStream>>>,
         burst_notify: &Arc<Notify>,
     ) -> Result<()> {
-        let targets = self.select_distinct_healthy(dup_count);
+        // Always plan for at least 2 candidate resolvers so if dup_count == 1 and the primary takes > 165ms,
+        // we can fire a staggered speculative backup copy without waiting for a full timeout!
+        let candidate_count = dup_count.max(2);
+        let targets = self.select_distinct_healthy(candidate_count);
+        let immediate_count = dup_count.clamp(1, targets.len().max(1));
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<()>>(targets.len().max(1));
 
-        for (copy_idx, (res_idx, url)) in targets.into_iter().enumerate() {
+        for (copy_idx, &(res_idx, ref url)) in targets.iter().take(immediate_count).enumerate() {
             let salt = if copy_idx == 0 && !initial_salt {
                 0
             } else {
@@ -1299,6 +1317,7 @@ impl ResolverPool {
             let q = build_salted_data_query(chunk, domain_zone, salt);
             let pool = self.clone();
             let c = client.clone();
+            let url_c = url.clone();
             let cip = cipher.clone();
             let dl = dl_state.clone();
             let ul = ul_arq.clone();
@@ -1308,7 +1327,58 @@ impl ResolverPool {
 
             tokio::spawn(async move {
                 match pool
-                    .send_once_to_resolver(&c, res_idx, &url, &q, attempt_timeout)
+                    .send_once_to_resolver(&c, res_idx, &url_c, &q, attempt_timeout)
+                    .await
+                {
+                    Ok(body) => {
+                        let _ = process_downlink_dns_body(
+                            &body,
+                            &cip,
+                            session_id,
+                            &dl,
+                            &ul,
+                            &tw,
+                            &bn,
+                        )
+                        .await;
+                        let _ = tx_c.send(Ok(())).await;
+                    }
+                    Err(e) => {
+                        let _ = tx_c.send(Err(e)).await;
+                    }
+                }
+            });
+        }
+
+        // If dup_count == 1 and we have a second candidate resolver, wait up to 165ms for the primary
+        // before launching a speculative backup copy on the second resolver.
+        if immediate_count == 1 && targets.len() >= 2 {
+            tokio::select! {
+                first_res = rx.recv() => {
+                    if let Some(Ok(())) = first_res {
+                        return Ok(());
+                    }
+                }
+                _ = tokio::time::sleep(Duration::from_millis(165)) => {}
+            }
+
+            // Launch staggered backup copy on second resolver
+            let (backup_idx, ref backup_url) = targets[1];
+            let salt = rand::random::<u16>() | 1;
+            let q = build_salted_data_query(chunk, domain_zone, salt);
+            let pool = self.clone();
+            let c = client.clone();
+            let url_c = backup_url.clone();
+            let cip = cipher.clone();
+            let dl = dl_state.clone();
+            let ul = ul_arq.clone();
+            let tw = tunnel_write.clone();
+            let bn = burst_notify.clone();
+            let tx_c = tx.clone();
+
+            tokio::spawn(async move {
+                match pool
+                    .send_once_to_resolver(&c, backup_idx, &url_c, &q, attempt_timeout)
                     .await
                 {
                     Ok(body) => {
@@ -1807,7 +1877,7 @@ impl ClientTransport for DohTransport {
             let tx_shutdown_flag = shutdown_flag.clone();
             let tx_shutdown_notify = shutdown_notify.clone();
 
-            // Background Uplink ARQ / NACK retransmission worker (runs every 120ms)
+            // Background Uplink ARQ / NACK retransmission worker (runs every 60ms)
             if arq_enabled {
                 let rto_client = http_client.clone();
                 let rto_cipher = cipher.clone();
@@ -1824,7 +1894,7 @@ impl ClientTransport for DohTransport {
                 tokio::spawn(async move {
                     loop {
                         tokio::select! {
-                            _ = tokio::time::sleep(Duration::from_millis(120)) => {}
+                            _ = tokio::time::sleep(Duration::from_millis(60)) => {}
                             _ = rto_shutdown_notify.notified() => break,
                         }
                         if rto_shutdown_flag.load(Ordering::Acquire) {
@@ -1849,7 +1919,7 @@ impl ClientTransport for DohTransport {
                                         &c,
                                         &chunk,
                                         &z,
-                                        Duration::from_millis(950),
+                                        Duration::from_millis(550),
                                         dup_count.max(2),
                                         true, // always salt retransmissions so cached SERVFAIL is bypassed
                                         &cip,
@@ -1879,6 +1949,10 @@ impl ClientTransport for DohTransport {
                     let chunks = split_into_chunks(session_id, seq, &packet_buf, max_payload);
                     let total_chunks = chunks.len();
                     ul_arq.lock().unwrap().record_sent_packet(seq, &chunks);
+
+                    // Wake poll workers immediately when we send an uplink packet (e.g. ICMP Echo Request, DNS query, HTTP GET)
+                    // so a poll query is already in-flight to catch the server's reply with minimal latency!
+                    burst_notify.notify_one();
 
                     let pkt_dup = if is_prio || total_chunks == 1 {
                         dup_count
@@ -1920,7 +1994,7 @@ impl ClientTransport for DohTransport {
                                     &client,
                                     &chunk,
                                     &zone_c,
-                                    Duration::from_millis(1050),
+                                    Duration::from_millis(550),
                                     pkt_dup,
                                     false,
                                     &cipher_c,
@@ -1947,9 +2021,9 @@ impl ClientTransport for DohTransport {
             });
         }
 
-        // 2. Downlink Poller: Adaptive Poll Pacer with 6 concurrent poll workers and immediate MORE_DATA_PENDING burst wakeup
+        // 2. Downlink Poller: Adaptive Poll Pacer with 10 concurrent poll workers and immediate MORE_DATA_PENDING burst wakeup
         {
-            let poll_concurrency = 6;
+            let poll_concurrency = 10;
             for worker_id in 0..poll_concurrency {
                 let http_client = rx_http_client.clone();
                 let cipher = cipher.clone();
@@ -1965,7 +2039,7 @@ impl ClientTransport for DohTransport {
 
                 tokio::spawn(async move {
                     debug!("[DoH RX-{}] Adaptive poll worker initialized", worker_id);
-                    let mut backoff_ms = 12;
+                    let mut backoff_ms = 8;
 
                     loop {
                         if rx_shutdown_flag.load(Ordering::Acquire) {
@@ -1986,14 +2060,14 @@ impl ClientTransport for DohTransport {
                             res = pool.send_query_reliable(
                                 &http_client,
                                 &query_bytes,
-                                Duration::from_millis(1150),
+                                Duration::from_millis(550),
                             ) => res,
                             _ = rx_shutdown_notify.notified() => break,
                         };
 
                         match query_res {
                             Ok(body) => {
-                                backoff_ms = 12;
+                                backoff_ms = 8;
                                 match process_downlink_dns_body(
                                     &body,
                                     &cipher,
@@ -2009,9 +2083,9 @@ impl ClientTransport for DohTransport {
                                         // Received data or MORE_DATA_PENDING: immediately poll again for next batch
                                     }
                                     Ok(false) => {
-                                        // Empty poll: sleep up to 12ms or wake immediately on MORE_DATA_PENDING signal
+                                        // Empty poll: sleep up to 8ms or wake immediately on MORE_DATA_PENDING / uplink send signal
                                         tokio::select! {
-                                            _ = tokio::time::sleep(Duration::from_millis(12)) => {}
+                                            _ = tokio::time::sleep(Duration::from_millis(8)) => {}
                                             _ = burst_notify.notified() => {}
                                             _ = rx_shutdown_notify.notified() => break,
                                         }
@@ -2030,7 +2104,7 @@ impl ClientTransport for DohTransport {
                                     _ = tokio::time::sleep(Duration::from_millis(backoff_ms)) => {}
                                     _ = rx_shutdown_notify.notified() => break,
                                 }
-                                backoff_ms = (backoff_ms * 2).min(250);
+                                backoff_ms = (backoff_ms * 2).min(200);
                             }
                         }
                     }

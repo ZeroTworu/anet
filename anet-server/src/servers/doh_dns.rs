@@ -21,18 +21,18 @@ use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Mutex};
 
-const DOH_TCP_MAX_MSS: u16 = 240;
-const MAX_SINGLE_DOWNLINK_PKT: usize = 300;
+const DOH_TCP_MAX_MSS: u16 = 260;
+const MAX_SINGLE_DOWNLINK_PKT: usize = 310;
 const DOWNLINK_FRAG_DATA_LEN: usize = 260;
-const CODEL_MAX_SOJOURN: Duration = Duration::from_millis(600);
-const MAX_BULK_QUEUE_LEN: usize = 64;
-const MAX_PRIO_QUEUE_LEN: usize = 128;
-const DOWNLINK_ARQ_RTO: Duration = Duration::from_millis(800);
-const DOWNLINK_SACK_FAST_RTO: Duration = Duration::from_millis(240);
-const DOWNLINK_MAX_INFLIGHT: usize = 64;
-const DOWNLINK_MAX_RETRIES: u8 = 5;
+const CODEL_MAX_SOJOURN: Duration = Duration::from_secs(15);
+const MAX_BULK_QUEUE_LEN: usize = 1024;
+const MAX_PRIO_QUEUE_LEN: usize = 256;
+const DOWNLINK_ARQ_RTO: Duration = Duration::from_millis(300);
+const DOWNLINK_SACK_FAST_RTO: Duration = Duration::from_millis(85);
+const DOWNLINK_MAX_INFLIGHT: usize = 512;
+const DOWNLINK_MAX_RETRIES: u8 = 7;
 const RECENT_DNS_CACHE_TTL: Duration = Duration::from_secs(8);
-const RECENT_DNS_CACHE_MAX: usize = 256;
+const RECENT_DNS_CACHE_MAX: usize = 512;
 
 #[derive(Clone)]
 struct InflightDownlinkFrame {
@@ -803,13 +803,13 @@ async fn handle_dns_datagram(
                     .value()
                     .clone();
 
-                let effective_hold_ms = poll_hold_timeout_ms.min(25);
-                // Cap poll payload at 300 raw bytes (408B Base64 -> <= 485B total UDP DNS response, strictly <= 512B!)
+                let effective_hold_ms = poll_hold_timeout_ms.min(10);
+                // Cap poll payload at 310 raw bytes (416B Base64 -> <= 495B total UDP DNS response, strictly <= 512B!)
                 if let Some(b64) = pop_downlink_payload(
                     &session,
                     &client_info,
                     session_id,
-                    300,
+                    MAX_SINGLE_DOWNLINK_PKT,
                     Duration::from_millis(effective_hold_ms),
                     Some(qhash),
                     dl_ack,
@@ -821,7 +821,18 @@ async fn handle_dns_datagram(
                     let _ = socket.send_to(&resp, remote_addr).await;
                     return Ok(());
                 } else {
-                    let resp = build_dns_txt_response(&raw_query, &parsed_q, None, 0);
+                    // When no downlink data is pending, return current Uplink ARQ cumulative ACK + NACKs
+                    // so poll responses double as a continuous ACK channel for the client's UplinkArqState!
+                    let (ul_cum_ack, ul_nacks) = {
+                        let mut reasm = reassembler.lock().await;
+                        reasm.get_session_feedback(session_id)
+                    };
+                    let mut ack_txt = format!("OK:{:x}", ul_cum_ack);
+                    for (nseq, nmask) in ul_nacks {
+                        ack_txt.push_str(&format!(":{:x}:{:x}", nseq, nmask));
+                    }
+                    let resp =
+                        build_dns_txt_response(&raw_query, &parsed_q, Some(ack_txt.as_bytes()), 0);
                     let _ = socket.send_to(&resp, remote_addr).await;
                     return Ok(());
                 }
@@ -1004,9 +1015,7 @@ async fn handle_dns_datagram(
             (res, fb)
         };
 
-        let mut completed_uplink = false;
         if let Some((session_id, seq, full_payload)) = assembled_opt {
-            completed_uplink = true;
             client_info.last_activity.store(
                 std::time::SystemTime::now()
                     .duration_since(std::time::SystemTime::UNIX_EPOCH)
@@ -1044,31 +1053,8 @@ async fn handle_dns_datagram(
             }
         }
 
-        // Piggyback small downlink replies (such as in-tunnel ICMP Echo Reply, DNS A reply, or TCP SYN-ACK/ACK <= 140B)
-        // directly in the TXT response of the uplink query so total UDP DNS packet stays <= 512 bytes even with a 245B Question!
-        let piggyback_wait = if completed_uplink {
-            Duration::from_millis(3)
-        } else {
-            Duration::ZERO
-        };
-        if let Some(b64) = pop_downlink_payload(
-            &session,
-            &client_info,
-            hdr.session_id,
-            140,
-            piggyback_wait,
-            Some(qhash),
-            None,
-        )
-        .await
-        {
-            let resp = build_dns_txt_response(&raw_query, &parsed_q, Some(b64.as_bytes()), 0);
-            let _ = socket.send_to(&resp, remote_addr).await;
-            return Ok(());
-        }
-
-        // Encode Uplink ARQ cumulative ACK + selective chunk NACK mask in the TXT ACK response:
-        // Format: "OK:<ul_cum_ack_hex>[:<pkt_seq_hex>:<recv_mask_hex>]"
+        // Always return immediate Uplink ARQ cumulative ACK + selective chunk NACK mask ("OK:<ul_cum_ack>[:<seq>:<mask>]")
+        // so UplinkArqState is never starved of ACKs during heavy downloads and UDP DNS responses stay tiny (~290B).
         let mut ack_txt = format!("OK:{:x}", ul_cum_ack);
         for (nseq, nmask) in ul_nacks {
             ack_txt.push_str(&format!(":{:x}:{:x}", nseq, nmask));

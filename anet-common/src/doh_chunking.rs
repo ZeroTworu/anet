@@ -118,12 +118,13 @@ pub fn calculate_max_chunk_payload(domain_zone: &str) -> usize {
     let clean_zone = domain_zone.trim_start_matches('.');
     // 1 dot for root separator + zone length
     let zone_overhead = clean_zone.len() + 1;
-    let max_encoded_chars = MAX_DNS_FQDN_LEN.saturating_sub(zone_overhead + 6); // margin for dots every 63 chars
+    // Reserve 10 chars margin for dots every 63 chars and optional hyphen salts
+    let max_encoded_chars = MAX_DNS_FQDN_LEN.saturating_sub(zone_overhead + 10);
 
     // Base36: 7 bytes per 11 chars
     let max_raw_bytes = (max_encoded_chars * 7) / 11;
     // Minus 7 bytes of compact DohChunkHeader
-    max_raw_bytes.saturating_sub(DOH_HEADER_LEN).clamp(32, 146)
+    max_raw_bytes.saturating_sub(DOH_HEADER_LEN).clamp(32, 140)
 }
 
 /// Splits a raw IP packet (or payload) into chunk buffers ready for Base36/Base32 encoding.
@@ -167,11 +168,15 @@ struct PartialPacket {
     created_at: Instant,
 }
 
+const UPLINK_GAP_SKIP_TIMEOUT: Duration = Duration::from_millis(2600);
+
 /// Reassembly queue for multi-chunk DNS packets with selective repeat tracking and deduplication.
 pub struct DohReassemblyQueue {
     packets: HashMap<(u32, u32), PartialPacket>,
     completed: HashMap<(u32, u32), Instant>,
+    gap_seen_at: HashMap<(u32, u32), Instant>,
     highest_contiguous: HashMap<u32, u32>,
+    highest_seen: HashMap<u32, u32>,
     timeout: Duration,
 }
 
@@ -180,7 +185,9 @@ impl DohReassemblyQueue {
         Self {
             packets: HashMap::new(),
             completed: HashMap::new(),
+            gap_seen_at: HashMap::new(),
             highest_contiguous: HashMap::new(),
+            highest_seen: HashMap::new(),
             timeout,
         }
     }
@@ -191,29 +198,37 @@ impl DohReassemblyQueue {
 
     fn advance_contiguous(&mut self, session_id: u32) {
         let now = Instant::now();
+        let high_seen = self.highest_seen.get(&session_id).copied().unwrap_or(0);
         let cur = self.highest_contiguous.entry(session_id).or_insert(0);
         loop {
             let next = cur.wrapping_add(1);
             if self.completed.contains_key(&(session_id, next)) {
+                self.gap_seen_at.remove(&(session_id, next));
                 *cur = next;
                 continue;
             }
-            // If next is in packets and still fresh (< 550ms), wait for its missing chunks
+            if next > high_seen {
+                break;
+            }
+            // Wait up to UPLINK_GAP_SKIP_TIMEOUT (2600ms) for client NACK/RTO retransmission
+            // before ever skipping a missing or partially received sequence number.
             if let Some(partial) = self.packets.get(&(session_id, next)) {
-                if now.duration_since(partial.created_at) < Duration::from_millis(550) {
+                if now.duration_since(partial.created_at) < UPLINK_GAP_SKIP_TIMEOUT {
+                    break;
+                }
+            } else {
+                let first_gap_ts = *self
+                    .gap_seen_at
+                    .entry((session_id, next))
+                    .or_insert(now);
+                if now.duration_since(first_gap_ts) < UPLINK_GAP_SKIP_TIMEOUT {
                     break;
                 }
             }
-            // Check if any higher sequence is already completed while `next` is missing/stale (> 550ms)
-            let has_higher_completed = self
-                .completed
-                .iter()
-                .any(|(&(sid, seq), ts)| sid == session_id && seq > next && now.duration_since(*ts) < Duration::from_secs(3));
-            if has_higher_completed && !self.packets.contains_key(&(session_id, next)) {
-                *cur = next;
-                continue;
-            }
-            break;
+            // Gap has timed out (> 2600ms) while higher sequences were received: advance past dead gap
+            self.gap_seen_at.remove(&(session_id, next));
+            self.packets.remove(&(session_id, next));
+            *cur = next;
         }
     }
 
@@ -222,6 +237,11 @@ impl DohReassemblyQueue {
     pub fn feed(&mut self, chunk_raw: &[u8]) -> anyhow::Result<Option<(u32, u32, Bytes)>> {
         let (header, hdr_len) = DohChunkHeader::decode_with_len(chunk_raw)?;
         let key = (header.session_id, header.sequence);
+
+        let high_entry = self.highest_seen.entry(header.session_id).or_insert(0);
+        if header.sequence > *high_entry {
+            *high_entry = header.sequence;
+        }
 
         // Ignore duplicate chunks for packets that were already reassembled recently
         if self.completed.contains_key(&key) {
@@ -246,6 +266,7 @@ impl DohReassemblyQueue {
 
         if entry.received_count == entry.total_chunks {
             let completed = self.packets.remove(&key).unwrap();
+            self.gap_seen_at.remove(&key);
             self.completed.insert(key, Instant::now());
             self.advance_contiguous(header.session_id);
             let mut assembled = BytesMut::new();
@@ -262,22 +283,32 @@ impl DohReassemblyQueue {
     }
 
     /// Returns `(cum_ack_seq, partial_nacks)` for a session, where each entry in `partial_nacks`
-    /// is `(pkt_seq, received_chunk_bitmask_u16)` for up to 2 incomplete multi-chunk packets.
+    /// is `(pkt_seq, received_chunk_bitmask_u16)` for up to 4 incomplete or missing packets above `cum_ack_seq`.
     pub fn get_session_feedback(&mut self, session_id: u32) -> (u32, Vec<(u32, u16)>) {
         self.advance_contiguous(session_id);
         let cum_ack = self.highest_contiguous.get(&session_id).copied().unwrap_or(0);
+        let high_seen = self.highest_seen.get(&session_id).copied().unwrap_or(cum_ack);
         let mut nacks = Vec::new();
 
-        for (&(sid, seq), partial) in &self.packets {
-            if sid == session_id && seq > cum_ack {
-                let mut mask = 0u16;
-                for (i, c) in partial.chunks.iter().enumerate().take(16) {
-                    if c.is_some() {
-                        mask |= 1u16 << i;
-                    }
+        if high_seen > cum_ack {
+            let max_scan = high_seen.min(cum_ack.saturating_add(32));
+            for seq in (cum_ack + 1)..=max_scan {
+                if self.completed.contains_key(&(session_id, seq)) {
+                    continue;
                 }
-                nacks.push((seq, mask));
-                if nacks.len() >= 2 {
+                if let Some(partial) = self.packets.get(&(session_id, seq)) {
+                    let mut mask = 0u16;
+                    for (i, c) in partial.chunks.iter().enumerate().take(16) {
+                        if c.is_some() {
+                            mask |= 1u16 << i;
+                        }
+                    }
+                    nacks.push((seq, mask));
+                } else {
+                    // Completely missing sequence (e.g. lost 1-chunk packet while higher seq arrived): mask = 0
+                    nacks.push((seq, 0));
+                }
+                if nacks.len() >= 4 {
                     break;
                 }
             }
@@ -292,6 +323,7 @@ impl DohReassemblyQueue {
         let timeout = self.timeout;
         self.packets.retain(|_, v| now.duration_since(v.created_at) <= timeout);
         self.completed.retain(|_, created_at| now.duration_since(*created_at) <= timeout);
+        self.gap_seen_at.retain(|_, created_at| now.duration_since(*created_at) <= timeout);
     }
 
     /// Returns a list of missing chunk indices for a specific in-progress packet (used for Selective Repeat ARQ).
