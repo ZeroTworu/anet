@@ -2,7 +2,6 @@ use crate::consts::{CHANNEL_BUFFER_SIZE, MAX_PACKET_SIZE};
 use crate::tun_params::TunParams;
 use anyhow::Result;
 use bytes::{Bytes, BytesMut};
-#[cfg(target_os = "macos")]
 use log::warn;
 use log::{error, info};
 #[cfg(target_os = "macos")]
