@@ -24,7 +24,7 @@ pub struct XmppSession {
     pub remote_ip: Option<std::net::IpAddr>,
     pub occupants: Arc<Mutex<HashSet<String>>>,
     pub discovered_ice_servers: Arc<Mutex<Vec<XmppIceServer>>>,
-    active_jingle: Arc<Mutex<Option<(String, String)>>>,
+    active_jingle: Arc<Mutex<Option<(String, String, u32, u32)>>>,
     write_tx: mpsc::Sender<String>,
     read_rx: mpsc::Receiver<String>,
     writer_handle: tokio::task::JoinHandle<()>,
@@ -578,8 +578,14 @@ impl XmppSession {
             has_video,
         );
 
+        let effective_video_ssrc = if has_video { video_ssrc } else { 0 };
         if let Ok(mut guard) = self.active_jingle.lock() {
-            *guard = Some((sid.to_string(), focus_jid.to_string()));
+            *guard = Some((
+                sid.to_string(),
+                focus_jid.to_string(),
+                ssrc,
+                effective_video_ssrc,
+            ));
         }
         log::info!("[XMPP] Sending Jingle session-accept (sid: {sid}) to Jicofo ({focus_jid})...");
         self.send_stanza(stanza).await
@@ -640,7 +646,22 @@ impl XmppSession {
 
     pub async fn leave_room(&self) {
         if let Ok(mut guard) = self.active_jingle.lock() {
-            if let Some((sid, focus_jid)) = guard.take() {
+            if let Some((sid, focus_jid, ssrc, video_ssrc)) = guard.take() {
+                if ssrc != 0 || video_ssrc != 0 {
+                    let rm_id = format!("src_rm_{:08x}", rand::random::<u32>());
+                    let rm_stanza = XmppBuilder::jingle_source_remove(
+                        &focus_jid,
+                        &rm_id,
+                        &self.jid,
+                        &sid,
+                        ssrc,
+                        video_ssrc,
+                    );
+                    log::info!(
+                        "[XMPP] Sending Jingle source-remove (sid: {sid}, audio_ssrc: {ssrc}, video_ssrc: {video_ssrc}) to Jicofo ({focus_jid})..."
+                    );
+                    let _ = self.write_tx.try_send(rm_stanza);
+                }
                 let req_id = format!("term_{:08x}", rand::random::<u32>());
                 let term_stanza = XmppBuilder::jingle_session_terminate(
                     &focus_jid,
@@ -662,6 +683,9 @@ impl XmppSession {
             leave_stanza
         );
         let _ = self.write_tx.try_send(leave_stanza);
+        // Даём Prosody 120 мс на доставку IQ source-remove, session-terminate и presence unavailable в Jicofo
+        // до отправки <close/> и закрытия WebSocket-соединения.
+        tokio::time::sleep(Duration::from_millis(120)).await;
         let _ = self.write_tx.try_send(XmppBuilder::close().to_string());
         let _ = self.write_tx.try_send("__CLOSE__".to_string());
         for _ in 0..25 {
@@ -678,7 +702,19 @@ impl XmppSession {
 impl Drop for XmppSession {
     fn drop(&mut self) {
         if let Ok(mut guard) = self.active_jingle.lock() {
-            if let Some((sid, focus_jid)) = guard.take() {
+            if let Some((sid, focus_jid, ssrc, video_ssrc)) = guard.take() {
+                if ssrc != 0 || video_ssrc != 0 {
+                    let rm_id = format!("src_rm_{:08x}", rand::random::<u32>());
+                    let rm_stanza = XmppBuilder::jingle_source_remove(
+                        &focus_jid,
+                        &rm_id,
+                        &self.jid,
+                        &sid,
+                        ssrc,
+                        video_ssrc,
+                    );
+                    let _ = self.write_tx.try_send(rm_stanza);
+                }
                 let req_id = format!("term_{:08x}", rand::random::<u32>());
                 let term_stanza = XmppBuilder::jingle_session_terminate(
                     &focus_jid,
@@ -697,7 +733,7 @@ impl Drop for XmppSession {
         let writer_abort = self.writer_handle.abort_handle();
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
-                tokio::time::sleep(Duration::from_millis(250)).await;
+                tokio::time::sleep(Duration::from_millis(350)).await;
                 writer_abort.abort();
             });
         } else {

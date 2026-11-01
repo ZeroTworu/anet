@@ -609,6 +609,40 @@ impl XmppBuilder {
         )
     }
 
+    pub fn jingle_source_remove(
+        focus_jid: &str,
+        req_id: &str,
+        my_jid: &str,
+        sid: &str,
+        ssrc: u32,
+        video_ssrc: u32,
+    ) -> String {
+        let audio_content = if ssrc != 0 {
+            format!(
+                r#"<content creator="initiator" name="audio"><description xmlns="urn:xmpp:jingle:apps:rtp:1" media="audio"><source xmlns="urn:xmpp:jingle:apps:rtp:ssma:0" ssrc="{ssrc}"/></description></content>"#
+            )
+        } else {
+            String::new()
+        };
+        let video_content = if video_ssrc != 0 {
+            format!(
+                r#"<content creator="initiator" name="video"><description xmlns="urn:xmpp:jingle:apps:rtp:1" media="video"><source xmlns="urn:xmpp:jingle:apps:rtp:ssma:0" ssrc="{video_ssrc}"/></description></content>"#
+            )
+        } else {
+            String::new()
+        };
+        format!(
+            r#"<iq to="{to}" type="set" id="{id}"><jingle xmlns="urn:xmpp:jingle:1" action="source-remove" initiator="{init}" responder="{resp}" sid="{sid}">{audio_content}{video_content}</jingle></iq>"#,
+            to = escape_xml_attr(focus_jid),
+            id = escape_xml_attr(req_id),
+            init = escape_xml_attr(focus_jid),
+            resp = escape_xml_attr(my_jid),
+            sid = escape_xml_attr(sid),
+            audio_content = audio_content,
+            video_content = video_content,
+        )
+    }
+
     pub fn jingle_session_terminate(
         focus_jid: &str,
         req_id: &str,
@@ -616,9 +650,10 @@ impl XmppBuilder {
         sid: &str,
     ) -> String {
         format!(
-            r#"<iq to="{to}" type="set" id="{id}"><jingle xmlns="urn:xmpp:jingle:1" action="session-terminate" responder="{resp}" sid="{sid}"><reason><success/></reason></jingle></iq>"#,
+            r#"<iq to="{to}" type="set" id="{id}"><jingle xmlns="urn:xmpp:jingle:1" action="session-terminate" initiator="{init}" responder="{resp}" sid="{sid}"><reason><success/></reason></jingle></iq>"#,
             to = escape_xml_attr(focus_jid),
             id = escape_xml_attr(req_id),
+            init = escape_xml_attr(focus_jid),
             resp = escape_xml_attr(my_jid),
             sid = escape_xml_attr(sid),
         )
