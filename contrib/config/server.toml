@@ -23,9 +23,13 @@ self_ip = "172.122.222.2"
 if_name = "anet-server"
 
 # Максимальный размер пакета (MTU) для TUN-интерфейса. Этот параметр
-# критически важен для производительности. Зажат на 1400 для создания запаса
-# под заголовки QUIC/UDP/IP и предотвращения IP-фрагментации на сетевом адаптере.
+# критически важен для производительности.
+#   - На чистом коннекте (1400): оставляет запас под заголовки QUIC/WebRTC/UDP/IP при стандартном канальном MTU 1500.
+#   - При работе через CF WARP (1100): интерфейс WireGuard WARP (wgcf-profile) имеет жесткий MTU = 1280.
+#     Снижение серверного MTU до 1100 (в паре с min_tun_mtu = 900 и max_video_batch_bytes = 960 в [wrtc])
+#     гарантирует, что пакеты WebRTC/SRTP/VP8 (990 + 110 = 1100 Б) легко помещаются внутрь wgcf-profile без фрагментации и потерь.
 mtu = 1400
+# mtu = 1100 # для CF WARP (под узкий MTU 1280 интерфейса wgcf-profile, чтобы исключить дроп крупных пакетов на скачивании)
 
 # =========================================================================
 # ANET Server: Основные настройки сервера
@@ -49,10 +53,11 @@ ssh_host_key = "/opt/anet/anet_ssh_host_key"
 # Маскированный транспорт WebRTC поверх Контур.Толк (Ktalk / Jitsi SFU)
 # wrtc_room_url = "wrtc://example.ktalk.ru/example-room-id"
 # wrtc_mode = "media_video"              # Режим транспорта: "media_video" (Fake Video Track over DTLS-SRTP / JVB) | "p2p_direct" | "jvb_datachannel" | "ws" | "auto"
-wrtc_media_keepalive_interval_ms = 20 # Эмуляция Opus тишины (мс) для предотвращения таймаута JVB
-wrtc_ping_interval_secs = 30          # Двойной пинг WebSocket и XMPP (сек)
-wrtc_fallback_jvb_ip = "89.169.16.6"  # Fallback IP медиасервера JVB при отсутствии в Jingle
-wrtc_fallback_jvb_port = 10002        # Fallback UDP порт JVB
+wrtc_media_keepalive_interval_ms = 20  # Эмуляция Opus тишины (мс) для предотвращения таймаута JVB
+wrtc_ping_interval_secs = 25           # Двойной пинг WebSocket и XMPP (сек) — для чистого коннекта
+# wrtc_ping_interval_secs = 10         # для CF WARP (частый пинг XMPP/Colibri-WS не дает NAT Cloudflare WARP и Prosody закрыть сигнальный сокет во время нагрузок)
+wrtc_fallback_jvb_ip = "89.169.16.6"   # Fallback IP медиасервера JVB при отсутствии в Jingle
+wrtc_fallback_jvb_port = 10002         # Fallback UDP порт JVB
 
 [ahttp]
 # Пути, соответствующие путям в client.toml
@@ -337,23 +342,43 @@ enabled = false
 # Тонкая настройка транспорта WebRTC / Jitsi (секция [wrtc])
 # =========================================================================
 # Эти параметры управляют тайм-аутами сигнализации KTalk/XMPP, буферами
-# сокетов UDP/SCTP, лимитами MTU для медиа-потока VP8 и сторожевыми
-# таймерами (watchdog) при работе WebRTC-сервера (если задан `wrtc_domain`).
+# сокетов UDP/SCTP, использованием TURN до медиасервера JVB, лимитами MTU
+# и микро-батчинга для видео-потока VP8 (`media_video`), а также сторожевыми
+# таймерами (watchdog) при работе WebRTC-сервера (если задан `wrtc_room_url`).
+#
+# Секция содержит два профиля значений (по аналогии с секцией [ahttp] у клиента):
+#   1. Активные значения по умолчанию — оптимизированы для ЧИСТОГО (прямого)
+#      коннекта сервера к инфраструктуре Контур.Толк (стандартный канальный MTU 1500, `[network] mtu = 1400`).
+#   2. Закомментированные значения рядом (`# ... # для CF WARP`) — предназначены
+#      для сценария, когда IP зарубежного сервера заблокирован на ТСПУ (трафик из/в РФ
+#      напрямую не идет), и сервер выходит в контур KTalk через WireGuard-туннель
+#      Cloudflare WARP (`wgcf-profile` с MTU = 1280 и policy-based роутингом).
 [wrtc]
+
+# --- Тайм-ауты сигнализации KTalk HTTP API и XMPP/Colibri WebSocket (в секундах) ---
+
 # Тайм-аут TCP/TLS-подключения к HTTP API KTalk при создании/входе в комнату (сек).
 http_connect_timeout_secs = 10
+# http_connect_timeout_secs = 15 # для CF WARP (запас времени на установку TCP/TLS через дополнительный хоп wgcf-profile)
 
 # Общий тайм-аут выполнения HTTP-запросов к API KTalk (сек).
 http_request_timeout_secs = 15
+# http_request_timeout_secs = 20 # для CF WARP (предотвращает таймаут авторизации сессии KTalk через WARP)
 
-# Тайм-аут установки XMPP WebSocket соединения и входа в MUC-комнату Jitsi (сек).
+# Тайм-аут установки XMPP WebSocket соединения, SASL-авторизации, входа в MUC-комнату Jitsi
+# и получения списка STUN/TURN серверов по XEP-0215 extdisco (сек).
 xmpp_handshake_timeout_secs = 15
+# xmpp_handshake_timeout_secs = 20 # для CF WARP (запас на полный цикл XMPP-сигнализации через WARP)
 
 # Тайм-аут записи одного фрейма в WebSocket (XMPP или резервный Colibri-WS) (сек).
 ws_write_timeout_secs = 5
+# ws_write_timeout_secs = 15 # для CF WARP (предотвращает обрыв XMPP/Colibri-WS при кратковременных очередях в wgcf-profile под нагрузкой)
 
-# Тайм-аут подключения резервного канала управления Colibri-WS (сек).
+# Тайм-аут подключения резервного и управляющего канала Colibri-WS к медиасерверу JVB (сек).
 colibri_ws_connect_timeout_secs = 10
+# colibri_ws_connect_timeout_secs = 15 # для CF WARP (запас на установку TLS WebSocket до JVB через туннель WARP)
+
+# --- Системные буферы UDP, реактор и параметры ICE / STUN / TURN ---
 
 # Размер системных буферов сокета UDP (SO_RCVBUF / SO_SNDBUF) для медиа-трафика (в байтах).
 # 8 МБ предотвращают потерю пакетов (packet drop) ядром ОС при микровсплесках видеопотока.
@@ -364,21 +389,43 @@ reactor_pool_size = 4
 
 # Время отсутствия ответов STUN/ICE до перехода соединения в статус Disconnected (мс).
 ice_disconnected_timeout_ms = 10000
+# ice_disconnected_timeout_ms = 15000 # для CF WARP (устойчивость к кратковременному джиттеру STUN внутри UDP-туннеля WARP)
 
 # Время до полного разрыва ICE-соединения (статус Failed) после потери связности (мс).
 ice_failed_timeout_ms = 25000
+# ice_failed_timeout_ms = 35000 # для CF WARP (защита от преждевременного сброса ICE при пиковой нагрузке на WARP)
 
 # Интервал отправки проверочных STUN Binding Request (ICE keep-alive) (мс).
 ice_keepalive_interval_ms = 2000
+# ice_keepalive_interval_ms = 1500 # для CF WARP (более частый прогрев UDP-трансляции в NAT Cloudflare WARP)
 
 # Интервал проактивного обновления TURN/TURNS-аллокации (Refresh) и nonce (сек).
 turn_refresh_interval_secs = 90
+
+# Разрешить ли использование TURN/TURNS релеев (включая локальные TCP-прокси `turns_proxy` на порт 443)
+# при подключении сервера к центральному медиасерверу JVB (`WrtcPeer::create`).
+# Примечание: в режиме `p2p_direct` TURN-релеи используются всегда независимо от этого флага.
+#
+# ЗАЧЕМ ЭТО НУЖНО:
+#   - На чистом коннекте (`true`): служит страховкой, если хостинг-провайдер фильтрует прямой UDP до JVB.
+#   - При работе через CF WARP (`false`): прямой UDP от сервера до JVB уже беспрепятственно идет внутри
+#     WireGuard-туннеля `wgcf-profile`. Если оставить `true`, WebRTC поднимает локальные TCP-to-TLS прокси
+#     (`turns_proxy -> *:443`) и собирает `relay`-кандидаты на TURN-узлах Контура. Так как TURN и JVB находятся
+#     в одной подсети Яндекс.Облака, ICE часто переключает медиапоток на TCP-TURN прокси, что:
+#       1) Уроняет скорость отдачи сервера (Download у клиента) в 5–7 раз из-за TCP Head-of-Line blocking;
+#       2) Приводит к разрыву сессии через ~90–115 секунд по ошибке `TURN transaction timed out` и закрытию
+#          JVB-канала с кодом `CloseFrame { code: Away, reason: "endpoint closed" }`.
+jvb_use_turn = true
+# jvb_use_turn = false # для CF WARP (ОТКЛЮЧАЕТ TURN/TCP-прокси до JVB, оставляя только прямой высокоскоростной UDP через wgcf-profile)
+
+# --- Параметры буферов, MTU и микро-батчинга VP8 (`media_video`) ---
 
 # Максимальный размер приемного буфера SCTP (для транспорта `dc` / DataChannel) (в байтах).
 sctp_max_receive_buffer_size = 8388608
 
 # Максимальный размер полезной нагрузки SCTP-пакета внутри DTLS (в байтах).
 sctp_mtu = 1200
+# sctp_mtu = 1000 # для CF WARP (уменьшенный SCTP-чанк под MTU 1280 интерфейса wgcf-profile)
 
 # Размер буфера чтения одного входящего UDP/RTP пакета в движке WebRTC (в байтах).
 receive_mtu = 1600
@@ -389,26 +436,71 @@ receive_mtu = 1600
 # VP8 Payload Descriptor/Header (24B) + тег маршрутизации JVB (2B) + заголовок ASTP (28B) = 110 байт.
 # Гарантирует отсутствие IP-фрагментации и черных дыр PMTU на магистралях хостинг-провайдеров.
 video_mtu_overhead = 110
+# video_mtu_overhead = 110 # для CF WARP (при [network] mtu = 1100 дает эффективный MTU туннеля 990 Б)
+
+# Нижний допустимый предел автоматического расчета эффективного MTU туннеля (`network.mtu - video_mtu_overhead`) в байтах.
+#
+# ЗАЧЕМ ЭТО НУЖНО:
+#   - На чистом коннекте (`1200`): при `[network] mtu = 1400` эффективный MTU равен `1400 - 110 = 1290 Б`.
+#   - При работе через CF WARP (`900`): интерфейс `wgcf-profile` имеет жесткий MTU = 1280 Б.
+#     Если оставить порог `1200`, то даже при `[network] mtu = 1100` нижний ограничитель `.max(1200)` не даст
+#     опустить эффективный MTU ниже 1200 Б, из-за чего сервер продолжит слать слишком крупные кадры, которые
+#     режутся на `wgcf-profile`. Значение `900` позволяет опустить эффективный MTU до `990 Б` (`1100 - 110`).
+min_tun_mtu = 1200
+# min_tun_mtu = 900 # для CF WARP (разрешает опустить эффективный MTU туннеля до 990 Б при [network] mtu = 1100 под MTU 1280 у wgcf-profile)
+
+# Жесткий верхний предел размера одного склеенного VP8 RTP микро-батча (в байтах).
+#
+# ЗАЧЕМ ЭТО НУЖНО:
+#   - На чистом коннекте (`1260`): обеспечивает максимальную пропускную способность при стандартном MTU 1500.
+#   - При работе через CF WARP (`960`): ограничивает размер склеенной пачки IP-пакетов внутри одного VP8-кадра
+#     до 960 байт. В сумме с заголовками WebRTC/SRTP/UDP/IPv4 (110 Б) и заголовками WireGuard WARP (60–80 Б)
+#     пакет весит ~1150 Б и свободно проходит в `wgcf-profile` (MTU 1280) без фрагментации, потерь и просадок Download.
+max_video_batch_bytes = 1260
+# max_video_batch_bytes = 960 # для CF WARP (исключает переполнение MTU 1280 на wgcf-profile и поднимает скорость Download до уровня Upload)
+
+# Максимальное количество мелких IP-пакетов, склеиваемых сервером в один VP8 RTP кадр без задержки (`1` отключает склейку).
+video_batch_max_packets = 16
+# video_batch_max_packets = 12 # для CF WARP (умеренное число пакетов в одном VP8-кадре для минимального джиттера через WARP)
+
+# Максимальное количество пакетов за один цикл чтения из TUN (используется при общих настройках с клиентом).
+uplink_burst_max_packets = 64
+# uplink_burst_max_packets = 32 # для CF WARP
+
+# Максимальный размер пачки пакетов (в байтах) для резервного батчера `Colibri-WS` (используется в режиме `ws` и при стартовом прогреве видео).
+ws_batcher_max_bytes = 4096
+# ws_batcher_max_bytes = 2048 # для CF WARP (компактные фреймы WebSocket быстрее проходят через TCP внутри wgcf-profile)
+
+# Максимальная задержка накопления пачки в резервном батчере `Colibri-WS` (в миллисекундах).
+ws_batcher_max_delay_ms = 2
+# ws_batcher_max_delay_ms = 2 # для CF WARP
 
 # Интервал отправки фоновых холостых VP8-кадров (keep-alive) при отсутствии трафика (мс).
 # Необходим, чтобы медиа-мост Jitsi (JVB) не замораживал и не отключал видео-трек.
 video_keepalive_interval_ms = 1000
+# video_keepalive_interval_ms = 500 # для CF WARP (частый прогрев UDP-сессии на JVB и в таблице NAT Cloudflare WARP)
+
+# --- Сторожевые таймеры (watchdog) и ротация комнат (в секундах) ---
 
 # Время нахождения PeerConnection в состоянии Disconnected до пересоздания пира (сек).
 watchdog_disconnected_timeout_secs = 8
+# watchdog_disconnected_timeout_secs = 12 # для CF WARP (дает ICE время пережить кратковременный сбой маршрута WARP без пересоздания комнаты)
 
 # Льготный период на открытие хотя бы одного канала управления (DataChannel или Colibri-WS)
 # после старта сессии до срабатывания сторожевого таймера (сек).
 watchdog_channel_grace_secs = 12
+# watchdog_channel_grace_secs = 15 # для CF WARP (дополнительный запас на инициализацию каналов через WARP)
 
 # Тайм-аут ожидания штатного закрытия PeerConnection при завершении сессии (сек).
 peer_close_timeout_secs = 3
 
 # Интервал отправки внутритуннельных пингов (ASTP Keep-Alive) для проверки живого тракта (сек).
 tunnel_ping_interval_secs = 15
+# tunnel_ping_interval_secs = 10 # для CF WARP (частый контроль связности туннеля)
 
 # Тайм-аут отсутствия входящих пакетов от клиента до закрытия его WRTC-сессии (сек).
 tunnel_ping_timeout_secs = 45
+# tunnel_ping_timeout_secs = 60 # для CF WARP (защита от сброса клиентской сессии при кратковременных задержках в WARP)
 
 # Интервал профилактической ротации пустой комнаты на сервере при отсутствии клиентов (сек).
 # По умолчанию: 1800 (30 минут).
