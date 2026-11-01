@@ -774,6 +774,9 @@ pub async fn run_wrtc_server(
                                                 .saturating_sub(config.wrtc.video_mtu_overhead)
                                                 .max(WRTC_MIN_TUN_MTU as u16)
                                                 as usize;
+                                            let max_single_video_pkt_bytes = server_tun_mtu
+                                                .max(config.network.mtu as usize)
+                                                .min(MAX_VIDEO_BATCH_BYTES);
                                             let max_video_batch_bytes = server_tun_mtu
                                                 .saturating_sub(30)
                                                 .min(MAX_VIDEO_BATCH_BYTES);
@@ -860,7 +863,7 @@ pub async fn run_wrtc_server(
                                                                         && matches!(client_pref_mode.as_str(), "media_video" | "auto")
                                                                         && has_video;
 
-                                                                    if client_uses_video && is_v2 && packet.len() <= server_tun_mtu {
+                                                                    if client_uses_video && is_v2 && packet.len() <= max_single_video_pkt_bytes {
                                                                         if video_warmed_up && packet.len() + 3 < max_video_batch_bytes {
                                                                             batch_buf.clear();
                                                                             batch_buf.put_u8(VIDEO_BATCH_MARKER);
@@ -1021,13 +1024,13 @@ pub async fn run_wrtc_server(
 
                                                                                 // 1. Приоритет №1: Прямой P2P DataChannel с клиентом (для p2p_direct и auto)
                                                                                 if let Some(ref p2p_entry) = p2p_session {
-                                                                                    if pkt_len <= server_tun_mtu && p2p_entry.send_packet(&enc_bytes).await.is_ok() {
+                                                                                    if pkt_len <= max_single_video_pkt_bytes && p2p_entry.send_packet(&enc_bytes).await.is_ok() {
                                                                                         sent = true;
                                                                                     }
                                                                                 }
 
                                                                                 // 2. Приоритет №2: Режим MediaVideo (Fake Video Track over DTLS-SRTP / JVB), только если пакет помещается в PMTU
-                                                                                if !sent && client_uses_video && pkt_len <= server_tun_mtu {
+                                                                                if !sent && client_uses_video && pkt_len <= max_single_video_pkt_bytes {
                                                                                     if peer_downlink.send_video_frame_tagged(client_tag, &enc_bytes).await.is_ok() {
                                                                                         // До подтверждения приема видео от клиента дублируем в WS
                                                                                         if video_warmed_up {

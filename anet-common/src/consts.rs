@@ -72,7 +72,7 @@ pub const MAX_VIDEO_BATCH_BYTES: usize = 1260;
 pub const WRTC_VIDEO_MTU_OVERHEAD: u16 = 110;
 
 /// Минимально допустимый MTU TUN-интерфейса после вычета заголовков WebRTC Video.
-pub const WRTC_MIN_TUN_MTU: i32 = 1200;
+pub const WRTC_MIN_TUN_MTU: i32 = 900;
 
 /// Размер префикса VP8 + Client Tag перед зашифрованным ASTP-кадром в RTP-пакете:
 /// 4B (VP8 Payload Descriptor) + 20B (VP8 Frame Header) + 2B (Client Tag) = 26 байт.
