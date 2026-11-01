@@ -816,9 +816,9 @@ fn build_ice_server_tiers(
 
     let mut tiers: Vec<IceTierEntry> = Vec::with_capacity(4);
     for (tier_label, inc_turn, inc_tcp) in [
-        ("Tier 0: STUN + TURN + TURNS", true, true),
+        ("Tier 0: STUN", false, false),
         ("Tier 1: UDP STUN + UDP TURN", true, false),
-        ("Tier 2: STUN", false, false),
+        ("Tier 2: STUN + TURN + TURNS", true, true),
     ] {
         if inc_turn && !allow_turn {
             continue;
@@ -1668,6 +1668,10 @@ impl WrtcPeer {
                             );
                             local_candidates_summary = cand_summary;
 
+                            let include_video_in_accept = matches!(
+                                mode,
+                                WrtcMode::MediaVideo | WrtcMode::Auto
+                            ) && (session.has_video || local_video_ssrc != 0);
                             let _ = xmpp
                                 .accept_session(
                                     &session.sid,
@@ -1681,7 +1685,7 @@ impl WrtcPeer {
                                     &local_params.fingerprint_hash,
                                     &local_params.candidates,
                                     session.has_data_channel,
-                                    session.has_video || local_video_ssrc != 0,
+                                    include_video_in_accept,
                                 )
                                 .await;
                         }
@@ -2157,7 +2161,11 @@ impl WrtcPeer {
     }
 
     pub async fn add_remote_video_ssrc(&self, ssrc: u32) {
-        if self.mode == WrtcMode::Ws || ssrc == 0 || ssrc == self.video_ssrc || ssrc == 10002 {
+        if !matches!(self.mode, WrtcMode::MediaVideo | WrtcMode::Auto)
+            || ssrc == 0
+            || ssrc == self.video_ssrc
+            || ssrc == 10002
+        {
             return;
         }
         let Some(ref pc) = self.peer_connection else {
