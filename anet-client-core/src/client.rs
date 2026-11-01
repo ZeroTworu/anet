@@ -864,7 +864,8 @@ impl AnetClient {
         #[cfg(all(windows, feature = "per-app"))]
         let app_filter_bypass_t2 = _app_filter.as_ref().map(|f| f.bypass_set());
 
-        let is_wrtc_proto = server.proto == crate::config::TransportProto::Wrtc;
+        let is_wrtc_proto = matches!(server.mode(), Ok(crate::config::TransportMode::Wrtc));
+        let client_clamp_mtu = (result.auth_response.mtu as usize).clamp(576, 1500);
 
         let t1 = spawn(async move {
             let mut write_buf = BytesMut::with_capacity(COALESCE_BUDGET_BYTES);
@@ -1003,6 +1004,7 @@ impl AnetClient {
                 if is_probe {
                     frame_packet_into(&mut write_buf, &packet);
                 } else if should_forward_to_tunnel(&packet) {
+                    let packet = anet_common::icmp_probe::clamp_tcp_mss_bytes(packet, client_clamp_mtu);
                     let len = packet.len() as u64;
                     tx_bytes.fetch_add(len, Ordering::Relaxed);
                     tx_packets.fetch_add(1, Ordering::Relaxed);
@@ -1017,6 +1019,7 @@ impl AnetClient {
                     match rx_from_tun.try_recv() {
                         Ok(p) => {
                             if should_forward_to_tunnel(&p) {
+                                let p = anet_common::icmp_probe::clamp_tcp_mss_bytes(p, client_clamp_mtu);
                                 let len = p.len() as u64;
                                 tx_bytes.fetch_add(len, Ordering::Relaxed);
                                 tx_packets.fetch_add(1, Ordering::Relaxed);
@@ -1112,6 +1115,7 @@ impl AnetClient {
                                         }
                                     }
 
+                                    let packet = anet_common::icmp_probe::clamp_tcp_mss_bytes(packet, client_clamp_mtu);
                                     let len = packet.len() as u64;
                                     rx_bytes.fetch_add(len, Ordering::Relaxed);
                                     rx_packets.fetch_add(1, Ordering::Relaxed);

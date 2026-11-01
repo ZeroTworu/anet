@@ -594,8 +594,11 @@ fn call_configure_tun_jni(
         let _ = env.exception_clear();
     }
 
-    // Передаём честный расчётный MTU от транспорта/сервера (TCP MSS дополнительно зажимается в userspace)
-    let mtu_jint = (auth.mtu as i32).clamp(576, 1500);
+    // Для Android VpnService с IPv6-маршрутом (2000::/3 -> fd00:ec54:1::2) ядро Linux требует
+    // канальный MTU интерфейса >= 1280 (RFC 8200 IPV6_MIN_MTU), иначе ядро отключает IPv6 на tun0.
+    // При этом реальный размер сегментов (например, 1260 на чистом сервере или 960 на CF WARP)
+    // автоматически зажимается на лету через динамический TCP MSS Clamping (auth.mtu - 40).
+    let mtu_jint = (auth.mtu as i32).clamp(1280, 1500);
     let prefix = ip_mask_to_prefix(&auth.netmask)?;
 
     let res = env.with_local_frame(16, |env| -> jni::errors::Result<i32> {
@@ -698,7 +701,7 @@ fn open_async_tun(fd: i32, auth: &AuthResponse) -> Result<tun::AsyncDevice> {
     if let Ok(mask) = auth.netmask.parse::<Ipv4Addr>() {
         config.netmask(mask);
     }
-    config.mtu(auth.mtu as u16);
+    config.mtu((auth.mtu as u16).clamp(1280, 1500));
     config.up();
 
     match tun::create_as_async(&config) {
