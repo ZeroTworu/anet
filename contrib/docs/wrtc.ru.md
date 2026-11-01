@@ -761,7 +761,26 @@ ANet Client                        JVB / Prosody                      ANet Serve
    * Пока от клиента приходят `AstpBatch` (и в течение 500 мс после последнего батча), сервер также отдаёт весь Downlink-трафик этому клиенту через `Colibri-WS` (`AstpBatch`), что гарантирует двустороннюю связность даже при односторонней фильтрации UDP-пакетов.
 
 ### 9.4. Подавление лишнего SDP Renegotiation после старта туннеля
-* При приходе фоновых станз Jingle (`source-add`, `description-info`) метод `WrtcPeer::add_remote_video_ssrc()` пропускает вызов `set_remote_description` / `set_local_description`, если активен режим `ws` либо если входящий видеопоток от JVB уже успешно принимается (`!first_video_rx`), ограничиваясь запросом ключевого кадра (`force_next_keyframe()`). Это исключает сброс рабочей DTLS/ICE сессии после активации маршрутов TUN.
+* При приходе фоновых станз Jingle (`source-add`, `description-info`) метод `WrtcPeer::add_remote_video_ssrc()` пропускает вызов `set_remote_description` / `set_local_description`, если активен режим `ws` / `jvb_datachannel` / `p2p_direct` либо если данный SSRC уже привязан к своему `Recvonly`-трансиверу (`a=mid:v_{ssrc}`), ограничиваясь запросом ключевого кадра (`force_next_keyframe()`). Это исключает сброс рабочей DTLS/ICE сессии после активации маршрутов TUN.
 
+### 9.5. Изоляция невизуальных режимов (`jvb_datachannel` / `ws`) от видеопотоков JVB и коалесценция `PacketBatcher`
+* **Строгая коалесценция `PacketBatcher` (12 КБ / 2 мс):** В режимах `jvb_datachannel` и `ws` пакеты из TUN агрегируются в `PacketBatcher` (`WRTC_BATCHER_MAX_BYTES = 12288`, `WRTC_BATCHER_MAX_DELAY_MS = 2`) без принудительного сброса (`flush()`) после каждого одиночного чтения из сокета ядра. Это позволяет упаковывать по 8–10 IP-пакетов в один кадр `AstpBatch` и достигать 40+ Мбит/с при лимите JVB ~500 сообщений/с на канал управления.
+* **Отключение входящего видео в `jvb_datachannel` / `ws`:** Если клиент работает в режиме `jvb_datachannel`, `ws` или `p2p_direct`:
+  1. В `Jingle session-accept` не анонсируется секция `<content name="video">`, чтобы не регистрировать лишние видео-SSRC в Jicofo.
+  2. На любые станзы `source-add` / `description-info` / `JingleAck` клиент отправляет `ReceiverVideoConstraints` с `defaultConstraints: {"maxHeight": 0}` и не вызывает `add_remote_video_ssrc()`, предотвращая пересылку мостом JVB чужих 2160p видеопотоков и забивание `Colibri-WS` / `DataChannel`.
 
+### 9.6. Гарантированная очистка Jingle-источников в Jicofo (`source-remove` + `session-terminate`)
+* При штатном завершении сессии или реконнекте метод `XmppSession::leave_room()` перед отправкой `<presence type="unavailable"/>` и `<close/>` отправляет в Jicofo:
+  1. `<jingle action="source-remove" initiator="..." responder="..." sid="...">` с явно перечисленными локальными `audio` и `video` SSRC;
+  2. `<jingle action="session-terminate" initiator="..." responder="..." sid="..."><reason><success/></reason></jingle>`;
+  3. Выдерживает паузу `120 мс` перед отправкой `<close xmlns="urn:ietf:params:xml:ns:xmpp-framing"/>`, чтобы Prosody гарантированно доставил IQ-станзы в Jicofo до разрыва WebSocket-соединения, предотвращая накопление «призрачных» `<source>` в комнате.
 
+### 9.7. Одновременная совместимость ПК и Android (Wi-Fi + мобильные сети с CGNAT)
+1. **Приоритет ICE-эшелонов (`build_ice_server_tiers`):**
+   * `Tier 0: STUN` (прямой UDP до белого IP медиамоста JVB без TURN-прокси) всегда пробуется первым — это обеспечивает максимальную скорость (40+ Мбит/с в `jvb_datachannel`/`ws` и до 180+ Мбит/с в `media_video`) на ПК и Android в сетях с прямым UDP.
+   * `Tier 1: UDP STUN + UDP TURN` и `Tier 2: STUN + TURN + TURNS (TCP:443)` автоматически подхватывают соединение, если прямой UDP к порту JVB `10000` заблокирован мобильным оператором или строгим файрволом.
+   * В `[[servers]]` поддерживается индивидуальное переопределение `wrtc_use_turn = true | false` для конкретного сервера.
+2. **Защита серверного TUN от дропа пакетов Android (`mtu.max(1420)`):**
+   * Поскольку системный `VpnService` на Android принудительно зажимает MTU интерфейса `tun0` в диапазон `[1280, 1500]`, физический интерфейс TUN на сервере (`anet-server`) всегда создаётся с системным MTU не менее `1420` байт (`cfg_ref.network.mtu.max(1420)`), тогда как в `AuthResponse` и TCP MSS Clamping используется расчётный туннельный MTU. Это исключает отбрасывание ядром Linux входящих пакетов 1251–1280 байт от Android-клиентов.
+3. **Прозрачное прохождение DNS-запросов для `RuleAction::Proxy`:**
+   * DNS-перехватчик клиента пропускает все типы запросов (`A`, `AAAA`, `HTTPS/SVCB`) для проксируемых доменов напрямую через туннель без подмены на синтетические `NODATA`-ответы без `EDNS0 OPT`, что обеспечивает мгновенное открытие YouTube и Telegram в браузерах и приложениях на Android.

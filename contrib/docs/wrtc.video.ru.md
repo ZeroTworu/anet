@@ -120,7 +120,15 @@ $$\text{TUN\_MTU} = \max(\text{server\_mtu} - 60, 1200)$$
   2. `PeerConnection` находится в состоянии `Disconnected` дольше 8 секунд.
   3. Спустя 12 секунд после старта одновременно закрыты и `Colibri-WS`, и `SCTP DataChannel`.
 * На клиенте дополнительно действует watchdog по `keepalive` / `keepalive-ack` (`WrtcMessage::Ping` / `WrtcMessage::Pong`), а сервер отвечает `keepalive-ack` только при условии, что сессия клиента числится активной в реестре (`reg_clone.is_session_active(&client_info.session_id)`).
-* При любом выходе из цикла комнаты сервер гарантированно прерывает `video_uplink_task`, вызывает `reg_clone.remove_client()` для всех клиентов комнаты, закрывает `WrtcPeer` (`pc.close()` с таймаутом 3 с, в том числе в `Drop for WrtcPeer`) и отправляет `<presence type="unavailable">` в MUC.
+* При любом выходе из цикла комнаты сервер и клиент гарантированно выполняют `XmppSession::leave_room()`: отправляют Jingle `source-remove` (удаляя свои аудио/видео SSRC из Jicofo), `session-terminate` (с атрибутом `initiator`), `<presence type="unavailable">` в MUC, выдерживают 120 мс на пересылку станз через Prosody в Jicofo и лишь затем закрывают XMPP-поток `<close/>`.
+
+### 4.4. Защита от гонки `source-add` и `anet_discover` при входе клиента (`room_jingle_video_ssrcs`)
+* Jicofo рассылает станзу `source-add` с видео-SSRC нового участника сразу после получения от него `session-accept`, зачастую на 50–200 мс раньше, чем клиент успевает отправить `e2ee-ping` (`WrtcMessage::Discover`) внутри `Colibri-WS` / `DataChannel`.
+* Сервер сохраняет все анонсированные Jicofo видео-SSRC комнаты в `room_jingle_video_ssrcs` и при получении `WrtcMessage::Discover` от клиента в режиме `media_video` / `auto` немедленно привязывает `c_v_ssrc` к выделенному `Recvonly`-трансиверу (`mid=v_{ssrc}`) и запрашивает поток через `ReceiverVideoConstraints`, исключая потерю Uplink-видеопотока.
+
+### 4.5. Изоляция `jvb_datachannel` / `ws` клиентов и совместимость Android + ПК
+* Клиенты в режимах `jvb_datachannel` и `ws` не анонсируют `<content name="video">` в `session-accept`, не вызывают `add_remote_video_ssrc()` и отправляют `ReceiverVideoConstraints` с `maxHeight: 0`, чтобы мост JVB не маршрутизировал им 2160p видеопоток сервера.
+* Сервер применяет вычет `video_mtu_overhead` в `dl_tcp_clamp_mtu` только для клиентов, реально использующих `media_video` или `p2p_direct`, сохраняя полный MTU для `jvb_datachannel` и `ws`.
 
 ---
 
@@ -147,3 +155,4 @@ sudo tcpdump -ni any "udp and (net 89.169.16.0/24 or port 34788)" -w /tmp/wrtc_v
    * **Audio Keepalive:** Пакеты Payload Type `111` (Opus silence `0xf8, 0xff, 0xfe`) размером ~70–90 байт с интервалом 20 мс (48 кГц).
 
 Для внешнего наблюдателя и систем DPI трафик полностью идентичен штатному видеозвонку в сервисе Ktalk / Jitsi.
+
