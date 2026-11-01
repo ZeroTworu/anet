@@ -239,6 +239,11 @@ pub async fn run_wrtc_server(
             Arc::new(DashSet::new());
         let known_client_video_ssrcs: Arc<DashSet<u32>> =
             Arc::new(DashSet::new());
+        let room_jingle_video_ssrcs: Arc<DashSet<u32>> =
+            Arc::new(DashSet::new());
+        for &v_ssrc in &session.video_sources {
+            room_jingle_video_ssrcs.insert(v_ssrc);
+        }
         let downlink_tasks_by_tag: Arc<DashMap<u16, tokio::task::AbortHandle>> =
             Arc::new(DashMap::new());
         let downlink_tasks_by_ep: Arc<DashMap<String, tokio::task::AbortHandle>> =
@@ -399,6 +404,7 @@ pub async fn run_wrtc_server(
                                 {
                                     let mut any_video_updated = false;
                                     for v_ssrc in jingle.video_sources {
+                                        room_jingle_video_ssrcs.insert(v_ssrc);
                                         if known_client_video_ssrcs.contains(&v_ssrc) {
                                             info!("[WRTC Server] Jingle stanza ({}) announced authorized client video SSRC: {v_ssrc}", jingle.action);
                                             let _ = tokio::time::timeout(
@@ -407,7 +413,7 @@ pub async fn run_wrtc_server(
                                             ).await;
                                             any_video_updated = true;
                                         } else {
-                                            log::debug!("[WRTC Server] Ignoring Jingle ({}) SSRC {v_ssrc} from non-ANET room occupant", jingle.action);
+                                            log::debug!("[WRTC Server] Recorded Jingle ({}) SSRC {v_ssrc} in room_jingle_video_ssrcs (awaiting anet_discover)", jingle.action);
                                         }
                                     }
                                     if any_video_updated || !client_video_endpoints.is_empty() {
@@ -550,8 +556,11 @@ pub async fn run_wrtc_server(
                     if let Some(c_v_ssrc) = video_ssrc {
                         if matches!(pref_mode.as_str(), "media_video" | "auto") {
                             known_client_video_ssrcs.insert(c_v_ssrc);
+                            let already_in_jingle = room_jingle_video_ssrcs.contains(&c_v_ssrc);
                             shared_peer.set_expected_peer_video_ssrc(c_v_ssrc);
-                            info!("[WRTC Server] Set expected client video SSRC: {c_v_ssrc} for {from_endpoint}");
+                            info!(
+                                "[WRTC Server] Set expected client video SSRC: {c_v_ssrc} for {from_endpoint} (already_in_jingle={already_in_jingle})"
+                            );
 
                             // Привязываем видео SSRC клиента к выделенному Recvonly трансиверу
                             let _ = tokio::time::timeout(
@@ -794,19 +803,19 @@ pub async fn run_wrtc_server(
                                             let video_batch_max_packets = config.wrtc.video_batch_max_packets.clamp(1, 64);
                                             let ws_batcher_max_bytes = config.wrtc.ws_batcher_max_bytes.clamp(512, 65536);
                                             let ws_batcher_max_delay_ms = config.wrtc.ws_batcher_max_delay_ms.clamp(1, 50);
-                                            let server_tun_mtu = config
+                                            let video_tun_mtu = config
                                                 .network
                                                 .mtu
                                                 .saturating_sub(config.wrtc.video_mtu_overhead)
                                                 .max(min_tun_mtu)
                                                 as usize;
-                                            let max_single_video_pkt_bytes = server_tun_mtu
+                                            let ws_tun_mtu = (config.network.mtu as usize).max(min_tun_mtu as usize);
+                                            let max_single_video_pkt_bytes = video_tun_mtu
                                                 .max(config.network.mtu as usize)
                                                 .max(1500);
-                                            let max_video_batch_bytes = server_tun_mtu
+                                            let max_video_batch_bytes = video_tun_mtu
                                                 .saturating_sub(30)
                                                 .min(cfg_max_video_batch_bytes);
-                                            let dl_tcp_clamp_mtu = server_tun_mtu;
 
                                             let downlink_handle = tokio::spawn(async move {
                                                 const VIDEO_WARMUP_PAYLOAD: [u8; 16] = [
@@ -861,10 +870,6 @@ pub async fn run_wrtc_server(
 
                                                             loop {
                                                                 if packet.len() >= WRTC_MIN_IP_PACKET_LEN {
-                                                                    packet = anet_common::icmp_probe::clamp_tcp_mss_bytes(
-                                                                        packet,
-                                                                        dl_tcp_clamp_mtu,
-                                                                    );
                                                                     let client_pref_mode = client_modes_dl
                                                                         .get(&target_client_id)
                                                                         .map(|m| m.clone())
@@ -893,6 +898,15 @@ pub async fn run_wrtc_server(
                                                                             || srv_mode == anet_common::wrtc::colibri::WrtcMode::Auto)
                                                                         && matches!(client_pref_mode.as_str(), "media_video" | "auto")
                                                                         && has_video;
+                                                                    let dl_tcp_clamp_mtu = if client_uses_video || p2p_active {
+                                                                        video_tun_mtu
+                                                                    } else {
+                                                                        ws_tun_mtu
+                                                                    };
+                                                                    packet = anet_common::icmp_probe::clamp_tcp_mss_bytes(
+                                                                        packet,
+                                                                        dl_tcp_clamp_mtu,
+                                                                    );
 
                                                                     if client_uses_video && is_v2 && packet.len() <= max_single_video_pkt_bytes {
                                                                         if video_warmed_up && packet.len() + 3 < max_video_batch_bytes {
@@ -1109,21 +1123,6 @@ pub async fn run_wrtc_server(
                                                                     packet = next_p;
                                                                 } else {
                                                                     break;
-                                                                }
-                                                            }
-
-                                                            // Немедленно отправляем накопленный батч по окончании текущего бурста из rx_router,
-                                                            // не дожидаясь срабатывания 3-миллисекундного таймера batch_interval!
-                                                            if !batcher.is_empty() {
-                                                                if let Some(batch_data) = batcher.flush() {
-                                                                    let b64 = BASE64_STANDARD.encode(&batch_data);
-                                                                    let msg = ColibriMessage::astp_batch(
-                                                                        target_client_id.clone(),
-                                                                        b64,
-                                                                    );
-                                                                    if peer_downlink.send(msg).await.is_err() {
-                                                                        break;
-                                                                    }
                                                                 }
                                                             }
                                                         }
