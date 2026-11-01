@@ -251,7 +251,6 @@ pub async fn run_wrtc_server(
         let srv_id = server_endpoint_id.clone();
         let padding_step = config.stealth.padding_step;
         let min_tun_mtu_global = config.wrtc.min_tun_mtu.clamp(576, 1500);
-        let cfg_max_video_batch_global = config.wrtc.max_video_batch_bytes.clamp(400, 1400);
         let server_tun_mtu_global = config
             .network
             .mtu
