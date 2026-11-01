@@ -414,7 +414,10 @@ pub async fn run_wrtc_server(
                                     }
                                 }
                             }
-                            anet_common::wrtc::xmpp_xml::InboundXmpp::JingleAck(ack_id) => {
+                            anet_common::wrtc::xmpp_xml::InboundXmpp::JingleAck {
+                                id: ack_id,
+                                ..
+                            } => {
                                 info!("[WRTC Server] Jicofo acknowledged Jingle IQ {ack_id}");
                                 let video_eps: Vec<String> = client_video_endpoints
                                     .iter()

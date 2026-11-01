@@ -550,7 +550,10 @@ impl ClientTransport for WrtcTransport {
                                         }
                                     }
                                 }
-                                anet_common::wrtc::xmpp_xml::InboundXmpp::JingleAck(ack_id) => {
+                                anet_common::wrtc::xmpp_xml::InboundXmpp::JingleAck {
+                                    id: ack_id,
+                                    ..
+                                } => {
                                     log::info!("[WRTC Client] Jicofo acknowledged Jingle IQ {ack_id}");
                                     let constraints = anet_common::wrtc::colibri::ReceiverVideoConstraints::for_endpoint(
                                         &target_srv_xmpp,

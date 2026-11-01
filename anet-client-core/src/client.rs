@@ -1200,7 +1200,6 @@ impl AnetClient {
                 for h in dns_aborts.lock().unwrap().drain(..) {
                     h.abort();
                 }
-                drop(tx_to_tun);
                 if let Some(hook) = result.shutdown_hook.take() {
                     let _ = tokio::time::timeout(Duration::from_millis(1200), hook).await;
                 }
