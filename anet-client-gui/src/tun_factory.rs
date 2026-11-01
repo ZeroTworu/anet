@@ -75,49 +75,47 @@ mod windows_impl {
                 anyhow::bail!("CRITICAL: wintun.dll not found in current directory!");
             }
 
-            // Внутри async fn create_tun:
-let tun_name_init = self.tun_name.clone();
+            let tun_name_init = self.tun_name.clone();
+            let (adapter, session) = tokio::task::spawn_blocking(move || -> Result<(Arc<wintun::Adapter>, Arc<wintun::Session>)> {
+                let wintun = unsafe {
+                    wintun::load_from_path("wintun.dll")
+                        .context("Failed to load wintun.dll")?
+                };
 
-// 1. При создании возвращаем не Arc<Adapter>, а сам Adapter:
-let (adapter, session) = tokio::task::spawn_blocking(move || -> Result<(Arc<wintun::Adapter>, Arc<wintun::Session>)> {
-    let wintun = unsafe { 
-        wintun::load_from_path("wintun.dll")
-            .context("Failed to load wintun.dll")? 
-    };
+                // 1. Предварительная очистка: если адаптер с таким именем (или суффиксами) остался в системе,
+                // принудительно удаляем его перед созданием нового.
+                for name_candidate in [
+                    tun_name_init.clone(),
+                    format!("{} 1", tun_name_init),
+                    format!("{} 2", tun_name_init),
+                    format!("{} 3", tun_name_init),
+                ] {
+                    if let Ok(existing) = wintun::Adapter::open(&wintun, &name_candidate) {
+                        log::info!("[WinTun] Found existing/stale adapter '{}', deleting...", name_candidate);
+                        if let Ok(raw_adapter) = Arc::try_unwrap(existing) {
+                            let _ = raw_adapter.delete();
+                        }
+                        std::thread::sleep(Duration::from_millis(150));
+                    }
+                }
 
-    // Предварительная очистка зависших адаптеров
-    for name_candidate in [
-        tun_name_init.clone(),
-        format!("{} 1", tun_name_init),
-        format!("{} 2", tun_name_init),
-        format!("{} 3", tun_name_init),
-    ] {
-        if let Ok(existing) = wintun::Adapter::open(&wintun, &name_candidate) {
-            log::info!("[WinTun] Found stale adapter '{}', deleting...", name_candidate);
-            // existing - это Arc<Adapter>, распаковываем и вызываем delete()
-            if let Ok(raw_adapter) = Arc::try_unwrap(existing) {
-                let _ = raw_adapter.delete();
-            }
-            std::thread::sleep(Duration::from_millis(150));
-        }
-    }
+                // 2. Создание чистого Wintun адаптера
+                let adapter = match wintun::Adapter::create(&wintun, &tun_name_init, &tun_name_init, None) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        log::warn!("Wintun Adapter::create('{}') failed ({}). Retrying after cleanup pause...", tun_name_init, e);
+                        std::thread::sleep(Duration::from_millis(500));
+                        wintun::Adapter::create(&wintun, &tun_name_init, &tun_name_init, None)
+                            .context("Failed to create Wintun adapter after orphan cleanup")?
+                    }
+                };
 
-    let adapter = match wintun::Adapter::create(&wintun, &tun_name_init, &tun_name_init, None) {
-        Ok(a) => a,
-        Err(e) => {
-            log::warn!("Wintun Adapter::create('{}') failed ({}). Retrying...", tun_name_init, e);
-            std::thread::sleep(Duration::from_millis(500));
-            wintun::Adapter::create(&wintun, &tun_name_init, &tun_name_init, None)
-                .context("Failed to create Wintun adapter")?
-        }
-    };
-
-    info!("Step 3: Starting session...");
-    let session = Arc::new(adapter.start_session(wintun::MAX_RING_CAPACITY)?);
-    Ok((adapter, session))
-})
-.await
-.context("Wintun initialization task panicked")??;
+                info!("Step 3: Starting session...");
+                let session = Arc::new(adapter.start_session(wintun::MAX_RING_CAPACITY)?);
+                Ok((adapter, session))
+            })
+            .await
+            .context("Wintun initialization task panicked")??;
 
             info!("Step 4: Waiting for Windows to register interface...");
             let start = std::time::Instant::now();
@@ -237,7 +235,7 @@ let (adapter, session) = tokio::task::spawn_blocking(move || -> Result<(Arc<wint
                                 break;
                             }
                         }
-                        Err(_) => break, // Выход при закрытии адаптера
+                        Err(_) => break, // Выход при закрытии сессии/адаптера
                     }
                 }
                 info!("Wintun reader thread exited normally.");
@@ -257,41 +255,29 @@ let (adapter, session) = tokio::task::spawn_blocking(move || -> Result<(Arc<wint
 
             // Асинхронный монитор жизни адаптера.
             // Ждет закрытия канала tx_from_tun (когда клиент завершает сессию),
-            // пробуждает блокирующий поток чтения через session.shutdown() и уничтожает Wintun-адаптер.
-let tx_monitor = tx_from_tun.clone();
-let monitor_session = session.clone();
-let monitor_adapter = adapter.clone();
+            // глушит сессию Wintun и удаляет адаптер из Windows Network Stack.
+            let tx_monitor = tx_from_tun.clone();
 
-tokio::spawn(async move {
-    tx_monitor.closed().await;
-    
-    // 1. Принудительно глушим сессию (прерывает receive_blocking в reader_thread)
-    let _ = monitor_session.shutdown();
-    
-    // 2. Небольшая пауза, чтобы reader_thread успел завершиться и сбросить ссылки
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    
-    // 3. Сбрасываем monitor_session и исходный session/adapter
-    drop(monitor_session);
-    drop(session);
-    drop(adapter);
+            tokio::spawn(async move {
+                tx_monitor.closed().await;
 
-    // 4. Теперь monitor_adapter - единственная оставшаяся ссылка, можно забрать ее через try_unwrap:
-    tokio::task::spawn_blocking(move || {
-        match Arc::try_unwrap(monitor_adapter) {
-            Ok(raw_adapter) => {
-                if let Err(e) = raw_adapter.delete() {
-                    log::debug!("[WinTun] Adapter delete returned: {:?}", e);
-                } else {
-                    log::info!("[WinTun] Adapter deleted cleanly from Windows.");
+                // Область видимости сессии: после выхода из скобок `session` автоматически дропается
+                {
+                    let _ = session.shutdown();
+                    tokio::time::sleep(Duration::from_millis(100)).await;
                 }
-            }
-            Err(arc) => {
-                log::warn!("[WinTun] Could not unwrap Adapter (strong_count={}), skipping delete.", Arc::strong_count(&arc));
-            }
-        }
-    }).await.ok();
-});
+
+                // Теперь `adapter` — единственная оставшаяся ссылка, можно забрать ее через try_unwrap:
+                tokio::task::spawn_blocking(move || {
+                    if let Ok(raw_adapter) = Arc::try_unwrap(adapter) {
+                        if let Err(e) = raw_adapter.delete() {
+                            log::debug!("[WinTun] Adapter delete returned: {:?}", e);
+                        } else {
+                            info!("[WinTun] Adapter deleted cleanly from Windows.");
+                        }
+                    }
+                }).await.ok();
+            });
 
             Ok((tx_to_tun, rx_from_tun, target_name))
         }
