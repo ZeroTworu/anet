@@ -160,7 +160,7 @@ impl Default for WrtcConfig {
             ice_failed_timeout_ms: 25_000,
             ice_keepalive_interval_ms: 2_000,
             turn_refresh_interval_secs: 90,
-            jvb_use_turn: true,
+            jvb_use_turn: false,
             sctp_max_receive_buffer_size: 8 * 1024 * 1024,
             sctp_mtu: 1200,
             receive_mtu: 1600,

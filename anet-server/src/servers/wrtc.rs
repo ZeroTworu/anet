@@ -257,7 +257,7 @@ pub async fn run_wrtc_server(
             .mtu
             .saturating_sub(config.wrtc.video_mtu_overhead)
             .max(min_tun_mtu_global) as usize;
-        let tcp_clamp_mtu = server_tun_mtu_global.min(cfg_max_video_batch_global);
+        let tcp_clamp_mtu = server_tun_mtu_global;
 
         // Воркер Uplink из Fake Video Track (VP8 over DTLS-SRTP / JVB)
         let peer_video_rx = shared_peer.clone();
@@ -807,7 +807,7 @@ pub async fn run_wrtc_server(
                                             let max_video_batch_bytes = server_tun_mtu
                                                 .saturating_sub(30)
                                                 .min(cfg_max_video_batch_bytes);
-                                            let dl_tcp_clamp_mtu = server_tun_mtu.min(cfg_max_video_batch_bytes);
+                                            let dl_tcp_clamp_mtu = server_tun_mtu;
 
                                             let downlink_handle = tokio::spawn(async move {
                                                 const VIDEO_WARMUP_PAYLOAD: [u8; 16] = [

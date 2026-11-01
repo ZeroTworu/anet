@@ -458,19 +458,17 @@ impl ClientTransport for WrtcTransport {
             let min_tun_mtu = i32::from(self.config.wrtc.min_tun_mtu.clamp(576, 1500));
             let adjusted_mtu = server_mtu
                 .saturating_sub(video_overhead)
-                .max(min_tun_mtu)
-                .min(cfg_max_video_batch_bytes as i32);
+                .max(min_tun_mtu);
             info!(
-                "[WRTC] Adjusted TUN MTU to {} (server MTU {} - {}B WebRTC RTP/SCTP overhead, min_tun_mtu={}, max_video_batch_bytes={})",
+                "[WRTC] Adjusted TUN MTU to {} (server MTU {} - {}B WebRTC RTP/SCTP overhead, min_tun_mtu={})",
                 adjusted_mtu,
                 server_mtu,
                 self.config.wrtc.video_mtu_overhead,
-                min_tun_mtu,
-                cfg_max_video_batch_bytes
+                min_tun_mtu
             );
             auth_response.mtu = adjusted_mtu;
         }
-        let tcp_clamp_mtu = (auth_response.mtu as usize).min(cfg_max_video_batch_bytes);
+        let tcp_clamp_mtu = (auth_response.mtu as usize).clamp(576, 1500);
         let max_video_batch_bytes = (auth_response.mtu as usize)
             .saturating_sub(30)
             .min(cfg_max_video_batch_bytes);
