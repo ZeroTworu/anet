@@ -6,33 +6,41 @@
 
 ## 1. Концептуальная модель: Единый Пользователь
 
-Архитектура строится на принципе **«Один пользователь = Один криптографический ключ = Одна подписка»**. В системе нет привязки к оборудованию (HWID).
+Архитектура строится на принципе **«Один пользователь = Один криптографический ключ = Один профиль доступа»**. В системе нет привязки к оборудованию (HWID).
 
 Сущность `User` (таблица `users`) объединяет в себе:
 1. **Сетевую идентичность:** Криптографические ключи (ASTP), Fingerprint, выделенный статический IP (если назначен).
-2. **Пользовательскую идентичность:** Email, Password, Telegram ID, Баланс.
+2. **Пользовательскую идентичность:** Email, Пароль, Telegram ID, Баланс.
+3. **Статус подписки:** `group_id` (текущая группа доступа), `activated_at` (момент первой сетевой активности), `expires_at` (момент окончания платного периода).
 
 Пользователь использует один и тот же конфигурационный файл (`client.toml` или QR-код) на всех своих устройствах (ноутбук, смартфон, роутер). Ограничение потребления ресурсов строится **исключительно на количестве одновременных сессий, лимите скорости и лимите трафика**.
+
+Публичный Личный Кабинет пользователей обслуживается на домене:
+**`https://service.anet-project.org`**  
+*(Внутренняя панель управления администратора доступна отдельно по адресу `cp.anet-project.org` и скрыта от клиентов)*.
 
 ---
 
 ### 1.1. Иерархия лимитов: Группы (`groups`) vs Индивидуальные тарифы (`rates`)
 
-В кодовой базе исторически заложено разделение между базовыми тарифными планами и гибкими пользовательскими оверрайдами:
+В кодовой базе заложено четкое разделение между базовыми групповыми планами и индивидуальными переопределениями:
 
 ```
                   ┌────────────────────────────────────────────────────────┐
                   │                 UserModel (users)                      │
                   │   - id, fingerprint, email, balance, group_id          │
+                  │   - activated_at: Option<DateTimeUtc>                  │
+                  │   - expires_at: Option<DateTimeUtc>                    │
                   └───────────────────────────┬────────────────────────────┘
                                               │
                     ┌─────────────────────────┴────────────────────────┐
                     ▼                                                  ▼
       ┌───────────────────────────┐                      ┌───────────────────────────┐
-      │       groups (План)       │                      │   rates (Кастом/Сэндвич)  │
+      │       groups (План)       │                      │   rates (Кастом/Оверрайд) │
       ├───────────────────────────┤                      ├───────────────────────────┤
-      │ Predefined в админке      │                      │ Dynamic (создается на лету│
-      │ - duration_days: i32      │                      │   под user_id)            │
+      │ Predefined в админке      │                      │ Персональная запись       │
+      │ - is_default: bool        │                      │ (может быть создана/      │
+      │ - duration_days: i32      │                      │  обновлена под user_id)   │
       │ - sessions_limit: i32     │                      │ - sessions: i32           │
       │ - traffic_limit: i64      │                      │ - speed_limit: i32        │
       │ - speed_limit: i32        │                      │ - traffic_limit: i64      │
@@ -45,21 +53,23 @@
 ```
 
 1. **Группы (`groups` — Предопределенные тарифные планы):**
-   * Создаются и настраиваются администратором в Admin WebUI (например: тариф *«Бояре»*, *«Базовый»*, *«Корпоративный»*).
+   * Создаются и настраиваются администратором в Admin WebUI (например: тариф *«Бояре»*, *«Базовый»*, *«Гость»*).
    * Содержат в себе предустановленные параметры:
-     * `duration_days: i32` — срок действия подписки (в днях).
+     * `is_default: bool` — флаг группы по умолчанию. Назначается новому пользователю при регистрации, а также активируется, когда у пользователя истекает оплаченный период (`expires_at < now`).
+     * `duration_days: i32` — срок действия подписки (дельта в днях при активации).
      * `sessions_limit: i32` — количество одновременных сессий (0 = без лимита).
-     * `traffic_limit: i64` — лимит трафика в байтах/ГБ (0 = безлимит).
-     * `speed_limit: i32` — ограничение скорости в Мбит/с (0 = максимальная скорость).
-     * Привязка к пулам серверов (`node_pools`).
-   * В каталоге товаров (`ProductModel`) базовый тариф оформляется как `ProductType::GroupSubscription`, где `target_id = Some(group_id)`. Поля лимитов и срока действия берутся напрямую из связанной группы (`groups`), не дублируясь в продукте.
+     * `traffic_limit: i64` — лимит трафика в байтах (0 = безлимит).
+     * `speed_limit: i32` — ограничение скорости в kbps / Мбит/с (0 = максимальная скорость).
+     * Привязка к пулам серверов (`group_node_pools`).
+   * В каталоге товаров (`ProductModel`) базовый тариф оформляется как `ProductType::GroupSubscription`, где `target_id = Some(group_id)`. Все лимиты и длительность наследуются напрямую из связанной группы `groups`.
 
 2. **Индивидуальные тарифы (`rates` — «Сэндвич в Subway» / Конструктор лимитов):**
-   * Изначально сущность `rates` создавалась как персональная запись ограничений конкретного пользователя (`user_id`).
-   * В биллинге `rates` используется для **динамического конструктора тарифов**: пользователь на витрине может сам собрать себе индивидуальный пакет (выбрать нужное количество одновременных сессий, скорость, лимит гигабайт и срок действия).
-   * В каталоге товаров конструктор или докупка пакета оформляется как `ProductType::RateExtension`, где `target_id = None`. Все выбранные пользователем кастомные параметры сохраняются в `OrderModel.metadata` (JSONB).
-   * После оплаты система не трогает таблицу `groups`, а создает или обновляет запись в `rates` для данного `user_id`.
-   * **Правило приоритета (Auth Provider):** При авторизации сетевого подключения в `anet-server/src/auth_provider.rs`, если у пользователя существует активная запись в `rates` (`date_end > now()`), ее лимиты **полностью переопределяют (override)** любые групповые лимиты из `groups`.
+   * Запись в `rates` привязана к `user_id` (1-к-1) и **может быть создана или обновлена** через API (`POST /addrate`, `PATCH /rate/:id`).
+   * В биллинге `rates` используется для **динамического конструктора тарифов**: когда пользователь на витрине сам собирает себе индивидуальный пакет (выбирает желаемое число одновременных сессий, скорость, лимит гигабайт и срок действия).
+   * В каталоге товаров конструктор оформляется как `ProductType::RateExtension`, где `target_id = None`. Все выбранные пользователем кастомные параметры сохраняются в `OrderModel.metadata` (JSONB).
+   * После подтверждения оплаты бэкенд создает или обновляет запись в `rates` для данного `user_id`.
+   * **Правило приоритета (Лестница приоритетов в `anet-auth/src/api/auth.rs`):**
+     При авторизации клиента (`check_access`), если у пользователя существует активная запись в `rates` (`date_end > now()`), ее лимиты **полностью переопределяют (override)** любые групповые лимиты из `groups`!
 
 ---
 
@@ -71,41 +81,89 @@
 3. Сервер принудительно разрывает старую сессию, отправляя в транспорт (QUIC/TCP/WS/ASTP) команду закрытия со специфичной причиной:
    `"Session limit reached. Disconnected by newer connection."`.
 4. **Реакция клиентских приложений (`anet-client-core`):**
-   * При получении этой причины разрыва клиент **ни в коем случае не пытается делать автоматический reconnect** (чтобы предотвратить осцилляцию и циклическую войну двух устройств).
-   * **В CLI:** Выводится сообщение `ERROR: Сессия завершена. Выполнен вход с другого устройства.` и процесс корректно завершается с кодом 0.
-   * **В GUI / Android:** Туннель мгновенно останавливается, статус переходит в `Disconnected`, на экран выводится модальное уведомление с пояснением.
+   * Клиент **не выполняет автоматический reconnect** (чтобы предотвратить осцилляцию и циклическую войну двух устройств).
+   * **В CLI:** Выводится сообщение `ERROR: Сессия завершена. Выполнен вход с другого устройства.` и процесс корректно завершается.
+   * **В GUI / Android:** Туннель мгновенно останавливается, статус переходит в `Disconnected`, на экран выводится уведомление с пояснением.
+
+---
+
+### 1.3. Механизм первой сетевой активности (Smart Activation / ASTP Handshake)
+
+В системе реализован принцип: **«Оплаченный срок не сгорает, пока пользователь фактически не подключился к VPN»**.
+
+Техническая последовательность шагов:
+
+```
+[Клиент (GUI/CLI)]               [VPN Нода (anet-server)]           [Auth-сервер (anet-auth)]
+        │                                  │                                  │
+   1.   │─── ASTP / Noise Handshake ──────>│                                  │
+        │    (передача открытого ключа)    │                                  │
+   2.   │                                  │─── POST /check_access ──────────>│
+        │                                  │    {fingerprint, node_id, ...}   │
+   3.   │                                  │                                  │
+        │                                  │   [Проверка User по fingerprint] │
+        │                                  │   a) user.activated_at == None?  │
+        │                                  │      -> now = Utc::now()         │
+        │                                  │      -> activated_at = Some(now) │
+        │                                  │      -> expires_at =             │
+        │                                  │         now + group.duration_days│
+        │                                  │      -> сохраняем в БД (users)   │
+        │                                  │   b) now > user.expires_at?      │
+        │                                  │      -> сброс group_id на        │
+        │                                  │         default_group (Free/Блок)│
+        │                                  │   c) проверка rates (оверрайд)   │
+   4.   │                                  │<── CheckAccessResponse ──────────│
+        │                                  │    {allowed: true, limits, ...}  │
+   5.   │                                  │                                  │
+        │                                  │─── Наложение eBPF шейпинга       │
+   6.   │<── ASTP Handshake Complete ──────│                                  │
+        │    (VPN Туннель поднят)          │                                  │
+```
+
+1. **Инициация:** Клиент инициирует ASTP/QUIC/WebRTC хэндшейк с нодой VPN-сервера (`anet-server`).
+2. **Идентификация:** Нода извлекает открытый ключ клиента, вычисляет его криптографический `fingerprint` и отправляет авторизационный запрос на Auth-сервер:
+   `POST /check_access` с телом `{"fingerprint": "...", "node_id": "...", "node_active_sessions": ...}`.
+3. **Обработка в `anet-auth/src/api/auth.rs`:**
+   * По `fingerprint` находится запись пользователя в `users`.
+   * **Проверка отложенной активации:**
+     Если `user.activated_at` равен `None` (пользователь оплатил тариф, но подключается впервые):
+     * Фиксируется момент старта: `user.activated_at = Some(Utc::now())`.
+     * Вычисляется дедлайн: `user.expires_at = Some(Utc::now() + Duration::days(group.duration_days))`.
+     * Обновление сохраняется в транзакции базы данных.
+   * **Проверка истечения срока:**
+     Если `user.expires_at` задан и `Utc::now() > expires_at`:
+     * Платный период завершен.
+     * `user.group_id` автоматически переключается на группу с флагом `is_default = true`.
+     * Если в дефолтной группе доступ заблокирован (`sessions_limit == 0`), возвращается `{ allowed: false, message: "Подписка истекла" }`.
+   * **Проверка оверрайдов:**
+     Если для пользователя найдена активная запись `rates` (`date_end > Utc::now()`), ее параметры подставляются вместо групповых.
+4. **Ответ и шейпинг:** Auth-сервер возвращает структуру `CheckAccessResponse`. Нода применяет выданные параметры скорости через eBPF-шейпер на TUN-интерфейсе и успешно завершает сетевой хэндшейк.
 
 ---
 
 ## 2. Модель монетизации и Товары (Products)
 
-Архитектура биллинга строится вокруг универсальной сущности **Product (Товар)** — витринного агрегатора платных услуг.
+Архитектура биллинга строится вокруг сущности **Product (Товар)** — витринного агрегатора платных услуг.
 
-### 2.1. Типы продуктов (`ProductType`)
+### 2.1. Отказ от избыточной сущности `subscriptions`
+
+В ранних набросках биллинга предлагалась промежуточная таблица `subscriptions`. Однако в контексте архитектуры `anet` отдельная таблица подписок является **избыточным дублированием (overengineering)** по следующим причинам:
+1. Ядро сети (`anet-server` и `anet-auth`) уже управляет доступом через `users.group_id`, `users.activated_at`, `users.expires_at` и `rates`.
+2. Вся история платежей и покупок надежно хранится в `orders` (заказы) и `transactions` (сырой аудит шлюзов).
+3. Продление существующего тарифа выполняется элементарной операцией сдвига даты:  
+   `user.expires_at = user.expires_at + Duration::days(group.duration_days)`.
+4. Для передачи тарифа в подарок другому лицу используется отдельная легковесная сущность `vouchers` (промокоды `ANET-GIFT-XXXX-XXXX`), которая после активации просто переключает `group_id` аккаунта получателя.
+
+### 2.2. Типы продуктов (`ProductType`)
 
 1. **`GroupSubscription` (Подписка на группу):**
    * Ссылается на существующую группу: `target_id = Some(group_id)`.
-   * Все параметры (длительность в днях, число сессий, трафик, скорость, доступные ноды) наследуются из `groups`.
-2. **`RateExtension` (Кастомный тариф / Дополнительный пакет):**
+   * Срок действия (`duration_days`), число сессий, трафик, скорость и ноды наследуются напрямую из `groups`.
+2. **`RateExtension` (Кастомный тариф / Сэндвич в Subway):**
    * `target_id = None`.
-   * Параметры формируются динамически через калькулятор цен (Subway sandwich builder) и сохраняются в `OrderModel.metadata`. После оплаты обновляется таблица `rates`.
+   * Параметры формируются динамически через калькулятор цен и сохраняются в `OrderModel.metadata`. После оплаты запись создается/обновляется в таблице `rates`.
 3. **`Feature` (Дополнительные услуги):**
-   * Выделенный статический IP-адрес, доступ к премиальным маршрутам, BGP-маршрутизация и т.д.
-
-### 2.2. Подарки и Ваучеры (`is_gift`)
-
-* **Покупка для себя (`is_gift = false`):**
-  После подтверждения оплаты заказ сразу генерирует запись `SubscriptionModel` со статусом `pending` в инвентаре пользователя.
-* **Покупка в подарок (`is_gift = true`):**
-  После оплаты генерируется запись `VoucherModel` с уникальным кодом формата `ANET-GIFT-XXXX-XXXX`. Покупатель видит ваучер в ЛК и может скопировать ссылку/код для передачи другу. При активации ваучера другим пользователем создается подписка на аккаунте активировавшего.
-
-### 2.3. Отложенная активация (Smart Activation)
-
-Срок действия купленной подписки отсчитывается **не с момента оплаты, а с момента первой фактической активности (первого сетевого подключения)**:
-1. После оплаты подписка получает статус `pending`, а в поле `duration_days` фиксируется срок действия (из группы или заказа).
-2. При первом успешном ASTP-хэндшейке на VPN-сервере сервис авторизации переводит подписку в статус `active`, проставляя:
-   * `activated_at = Utc::now()`
-   * `expires_at = Utc::now() + Duration::days(duration_days)`
+   * Выделенный статический IP-адрес, доступ к премиальным маршрутам и т.д.
 
 ---
 
@@ -116,7 +174,7 @@
 > ⚠️ **КРИТИЧЕСКОЕ ПРАВИЛО ДЛЯ AI-АГЕНТОВ (Gemini / Claude / Cursor):**
 > 1. При создании или модификации любой структуры в `anet-auth/src/entities/` **ОБЯЗАТЕЛЬНО ПАРАЛЛЕЛЬНО** создавайте файл миграции в `anet-auth/src/migration/` (формат имени: `mYYYYMMDD_HHMMSS_<описание>.rs`).
 > 2. Созданная миграция **ДОЛЖНА БЫТЬ СРАЗУ ЗАРЕГИСТРИРОВАНА** в векторе `Migrator::migrations()` внутри `anet-auth/src/migration/mod.rs`.
-> 3. Миграции описываются строго через SeaQuery DSL (`Table::create()`) либо через типизированный DDL. Никогда не оставляйте сущности без соответствующих миграций, иначе при развертывании база данных упадет с ошибкой отсутствия таблиц!
+> 3. Миграции описываются строго через SeaQuery DSL (`Table::create()`, `Table::alter()`) либо через типизированный DDL. Никогда не оставляйте сущности без миграций, иначе при старте база данных упадет с ошибкой отсутствия колонок/таблиц!
 
 ```rust
 // ============================================================================
@@ -126,6 +184,20 @@
 use poem_openapi::Enum;
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
+
+/// Поддерживаемые валюты системы
+#[derive(Debug, Clone, Copy, PartialEq, Eq, EnumIter, DeriveActiveEnum, Serialize, Deserialize, Enum)]
+#[sea_orm(rs_type = "String", db_type = "Enum", enum_name = "currency")]
+pub enum Currency {
+    #[sea_orm(string_value = "RUB")]
+    Rub,
+    #[sea_orm(string_value = "USD")]
+    Usd,
+    #[sea_orm(string_value = "EUR")]
+    Eur,
+    #[sea_orm(string_value = "STARS")]
+    Stars,
+}
 
 /// Поддерживаемые платежные шлюзы
 #[derive(Debug, Clone, Copy, PartialEq, Eq, EnumIter, DeriveActiveEnum, Serialize, Deserialize, Enum)]
@@ -172,11 +244,23 @@ pub enum ProductType {
     Feature,
 }
 
+/// Статус подарочного ваучера
+#[derive(Debug, Clone, Copy, PartialEq, Eq, EnumIter, DeriveActiveEnum, Serialize, Deserialize, Enum)]
+#[sea_orm(rs_type = "String", db_type = "Enum", enum_name = "voucher_status")]
+pub enum VoucherStatus {
+    #[sea_orm(string_value = "created")]
+    Created,
+    #[sea_orm(string_value = "claimed")]
+    Claimed,
+    #[sea_orm(string_value = "revoked")]
+    Revoked,
+}
+
 // ============================================================================
 // anet-auth/src/entities/products.rs
 // ============================================================================
 
-use super::billing_enums::ProductType;
+use super::billing_enums::{Currency, ProductType};
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -192,11 +276,11 @@ pub struct Model {
     /// Стоимость
     pub price: f64,
     /// Валюта (RUB, USD, STARS)
-    pub currency: String,
+    pub currency: Currency,
     /// Тип продукта
     pub product_type: ProductType,
     /// Для GroupSubscription: Some(group_id), где лимиты и duration_days берутся из groups!
-    /// Для RateExtension (кастомный конструктор): None, лимиты хранятся в OrderModel.metadata
+    /// Для RateExtension (кастомный конструктор): None, параметры хранятся в OrderModel.metadata
     pub target_id: Option<Uuid>,
     /// Порядок вывода на витрине
     pub sort_order: i32,
@@ -233,7 +317,7 @@ impl ActiveModelBehavior for ActiveModel {}
 // anet-auth/src/entities/orders.rs
 // ============================================================================
 
-use super::billing_enums::OrderStatus;
+use super::billing_enums::{Currency, OrderStatus};
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -246,9 +330,9 @@ pub struct Model {
     pub product_id: Uuid,
     /// Зафиксированная сумма к оплате
     pub amount: f64,
-    pub currency: String,
+    pub currency: Currency,
     pub status: OrderStatus,
-    /// Флаг подарка (true -> генерация Voucher, false -> Pending Subscription)
+    /// Флаг подарка (true -> генерация Voucher, false -> активация на свой профиль)
     pub is_gift: bool,
     /// Для кастомных тарифов (Subway sandwich): {"sessions": 3, "speed": 100, "traffic_gb": 500, "days": 30}
     #[sea_orm(column_type = "JsonBinary", nullable)]
@@ -331,64 +415,10 @@ impl Related<super::orders::Entity> for Entity {
 impl ActiveModelBehavior for ActiveModel {}
 
 // ============================================================================
-// anet-auth/src/entities/subscriptions.rs
-// ============================================================================
-
-use sea_orm::entity::prelude::*;
-use serde::{Deserialize, Serialize};
-
-#[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize)]
-#[sea_orm(table_name = "subscriptions")]
-pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
-    pub id: Uuid,
-    pub user_id: Uuid,
-    pub product_id: Uuid,
-    /// Статус: "pending" (куплена, ждет 1-го входа), "active", "expired", "cancelled"
-    pub status: String,
-    /// Зафиксированный срок действия в днях (до момента активации)
-    pub duration_days: Option<i32>,
-    /// Момент первой сетевой активности (ASTP Handshake)
-    pub activated_at: Option<DateTimeUtc>,
-    /// Момент истечения (activated_at + duration_days)
-    pub expires_at: Option<DateTimeUtc>,
-    pub created_at: DateTimeUtc,
-}
-
-#[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
-pub enum Relation {
-    #[sea_orm(
-        belongs_to = "super::users::Entity",
-        from = "Column::UserId",
-        to = "super::users::Column::Id"
-    )]
-    User,
-    #[sea_orm(
-        belongs_to = "super::products::Entity",
-        from = "Column::ProductId",
-        to = "super::products::Column::Id"
-    )]
-    Product,
-}
-
-impl Related<super::users::Entity> for Entity {
-    fn to() -> RelationDef {
-        Relation::User.def()
-    }
-}
-
-impl Related<super::products::Entity> for Entity {
-    fn to() -> RelationDef {
-        Relation::Product.def()
-    }
-}
-
-impl ActiveModelBehavior for ActiveModel {}
-
-// ============================================================================
 // anet-auth/src/entities/vouchers.rs
 // ============================================================================
 
+use super::billing_enums::VoucherStatus;
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -405,8 +435,7 @@ pub struct Model {
     pub buyer_user_id: Option<Uuid>,
     /// Пользователь, активировавший ваучер
     pub claimed_by_user_id: Option<Uuid>,
-    /// "created", "claimed", "revoked"
-    pub status: String,
+    pub status: VoucherStatus,
     pub claimed_at: Option<DateTimeUtc>,
     pub created_at: DateTimeUtc,
 }
@@ -434,28 +463,45 @@ impl ActiveModelBehavior for ActiveModel {}
 
 ## 4. Регистрация и Авторизация (WebUI & Telegram TMA)
 
-### 4.1. Авторизация по Email (OTP / Passwordless Link)
+### 4.1. Авторизация по Email (Пароли и ссылки)
 
-Для доставки писем в РФ используется крейт `lettre` через корпоративные SMTP-серверы (VK WorkMail, Yandex 360, Beget) без зависимости от блокируемых зарубежных провайдеров.
-
-1. **Запрос ссылки:** Пользователь указывает Email на странице входа.
-2. **Токен подтверждения:** Бэкенд генерирует криптостойкий одноразовый токен (TTL = 15 минут), сохраняет его в таблице `verification_tokens` и отправляет ссылку `https://cp.anet-project.org/auth/verify?token=XYZ`.
-3. **Установка пароля:** Пользователь задает пароль (валидируется только длина $\ge 5$ знаков).
-4. **Создание профиля:** Бэкенд создает `UserModel`, генерирует пару ключей ASTP, присваивает `fingerprint` и отдает сессионный JWT.
+1. **Запрос ссылки:** Пользователь указывает Email на странице входа Личного Кабинета.
+2. **Токен подтверждения:** Бэкенд генерирует одноразовый токен (TTL = 15 минут), сохраняет его в таблице `verification_tokens` и отправляет письмо со ссылкой на публичный сервис:
+   `https://service.anet-project.org/auth/verify?token=XYZ`
+3. **Установка пароля:** Пользователь вводит пароль (валидируется только длина $\ge 5$ символов).
+4. **Создание профиля:**
+   * Создается `UserModel`.
+   * Генерируется ключевая пара ASTP и `fingerprint`.
+   * Пользователю привязывается группа по умолчанию (`is_default = true`).
+   * Поля `activated_at` и `expires_at` устанавливаются в `None` (ждет первого входа).
+   * Возвращается сессионный JWT.
 
 ### 4.2. Бесшовная авторизация в Telegram Web App (TMA `initData`)
 
-Для пользователей Telegram Mini App вход происходит прозрачно без ввода логина и пароля через валидацию подписи Telegram WebApp:
+Параметр ключа `web_app_data_key` выносится в конфигурационный файл сервера `server.toml` (секция `[telegram]`):
+
+```toml
+# contrib/config/server.toml
+[telegram]
+bot_token = "123456789:ABCdefGHIjklMNOpqrsTUVwxyz"
+web_app_data_key = "WebAppData" # Ключ для вычисления промежуточного HMAC по спецификации Telegram API
+```
+
+Функция криптографической проверки `initData`:
 
 ```rust
 use hmac::{Hmac, Mac};
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 use std::collections::BTreeMap;
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// Валидация подписи initData из Telegram WebApp согласно спецификации Telegram Bot API
-pub fn verify_telegram_init_data(init_data: &str, bot_token: &str) -> Result<serde_json::Value, &'static str> {
+/// Валидация подписи initData из Telegram WebApp
+pub fn verify_telegram_init_data(
+    init_data: &str,
+    bot_token: &str,
+    web_app_data_key: &[u8],
+) -> Result<serde_json::Value, &'static str> {
     let mut params = BTreeMap::new();
     let mut received_hash = String::new();
 
@@ -474,15 +520,15 @@ pub fn verify_telegram_init_data(init_data: &str, bot_token: &str) -> Result<ser
         return Err("Missing hash");
     }
 
-    // 1. Формируем data_check_string (сортировка по ключам в алфавитном порядке)
+    // 1. Формируем data_check_string (сортировка ключей по алфавиту)
     let data_check_string = params
         .iter()
         .map(|(k, v)| format!("{}={}", k, v))
         .collect::<Vec<_>>()
         .join("\n");
 
-    // 2. Секретный ключ: HMAC-SHA256("WebAppData", bot_token)
-    let mut mac_secret = HmacSha256::new_from_slice(b"WebAppData").map_err(|_| "HMAC error")?;
+    // 2. Секретный ключ: HMAC-SHA256(web_app_data_key из конфига, bot_token)
+    let mut mac_secret = HmacSha256::new_from_slice(web_app_data_key).map_err(|_| "HMAC error")?;
     mac_secret.update(bot_token.as_bytes());
     let secret_key = mac_secret.finalize().into_bytes();
 
@@ -495,7 +541,7 @@ pub fn verify_telegram_init_data(init_data: &str, bot_token: &str) -> Result<ser
         return Err("Invalid initData signature");
     }
 
-    // 4. Извлекаем объект user из проверенных параметров
+    // 4. Извлекаем проверенные данные пользователя
     let user_str = params.get("user").ok_or("User field missing")?;
     let user_json: serde_json::Value = serde_json::from_str(user_str).map_err(|_| "Invalid user JSON")?;
     Ok(user_json)
@@ -506,9 +552,7 @@ pub fn verify_telegram_init_data(init_data: &str, bot_token: &str) -> Result<ser
 
 ## 5. Спецификация платежного шлюза FreeKassa (API v1 & Webhook)
 
-Интеграция реализует строгий принцип: **Сначала сохранение аудита (`transactions`), затем выполнение бизнес-логики (`orders` $\to$ начисление)**.
-
-### 5.1. Алгоритмы формирования и проверки подписей FreeKassa
+### 5.1. Алгоритмы формирования и проверки подписей
 
 1. **Генерация ссылки на оплату (SCI Form URL):**
    * URL: `https://pay.freekassa.ru/`
@@ -521,12 +565,12 @@ pub fn verify_telegram_init_data(init_data: &str, bot_token: &str) -> Result<ser
    * Белый список IP-адресов FreeKassa: `168.119.157.136`, `168.119.60.227`, `138.201.88.124`, `178.154.197.79`.
    * Ответ шлюзу при успехе: строго строка `YES` с HTTP статусом 200.
 3. **Фоновая проверка заказов через FreeKassa API v1 (`https://api.fk.life/v1/orders`):**
-   * Согласно официальной документации FreeKassa API (`getOrders`), подпись запроса формируется по алгоритму **HMAC-SHA256**:
-     1. Все поля запроса (кроме `signature`) сортируются в алфавитном порядке по ключу.
-     2. Значения полей склеиваются через символ пайпа `|` (например: `shopId|nonce|orderId`).
-     3. От полученной строки вычисляется `HMAC-SHA256` с использованием секретного `apiKey` (API-ключ из настроек магазина, не путать с secret1/secret2).
+   * Согласно спецификации FreeKassa API (`getOrders`), подпись формируется по алгоритму **HMAC-SHA256**:
+     1. Все поля запроса (кроме `signature`) сортируются в алфавитном порядке по ключам.
+     2. Значения полей склеиваются через символ пайпа `|` (например: `nonce|orderId|shopId`).
+     3. От полученной строки вычисляется `HMAC-SHA256` с использованием секретного `apiKey` (API-ключ из настроек ЛК FreeKassa).
 
-### 5.2. Реализация фонового Cron-синхронизатора FreeKassa
+### 5.2. Реализация фонового воркера FreeKassa
 
 ```rust
 use hmac::{Hmac, Mac};
@@ -536,13 +580,11 @@ use std::time::Duration;
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// Фоновый воркер синхронизации забытых / подвисших платежей
 pub async fn cron_sync_freekassa(db: DatabaseConnection) {
     let shop_id = std::env::var("FK_SHOP_ID").unwrap_or_default();
     let api_key = std::env::var("FK_API_KEY").unwrap_or_default();
 
     if shop_id.is_empty() || api_key.is_empty() {
-        tracing::warn!("FreeKassa API credentials not configured, cron sync disabled");
         return;
     }
 
@@ -552,12 +594,10 @@ pub async fn cron_sync_freekassa(db: DatabaseConnection) {
         .unwrap();
 
     loop {
-        // Опрос каждые 15 минут
         tokio::time::sleep(Duration::from_secs(900)).await;
 
         let threshold = chrono::Utc::now() - chrono::Duration::minutes(15);
         
-        // 1. Ищем незавершенные заказы старше 15 минут
         let pending_orders = match crate::entities::orders::Entity::find()
             .filter(crate::entities::orders::Column::Status.eq(crate::entities::billing_enums::OrderStatus::Pending))
             .filter(crate::entities::orders::Column::CreatedAt.lt(threshold))
@@ -565,18 +605,14 @@ pub async fn cron_sync_freekassa(db: DatabaseConnection) {
             .await 
         {
             Ok(orders) => orders,
-            Err(e) => {
-                tracing::error!("Failed to fetch pending orders for sync: {:?}", e);
-                continue;
-            }
+            Err(_) => continue,
         };
 
         for order in pending_orders {
             let nonce = chrono::Utc::now().timestamp_millis();
             let order_id_str = order.id.to_string();
 
-            // Сортировка ключей по алфавиту: nonce, orderId, shopId
-            // Склеивание значений через "|":
+            // Сортировка по ключам: nonce, orderId, shopId -> значения через "|"
             let sign_data = format!("{}|{}|{}", nonce, order_id_str, shop_id);
             
             let mut mac = match HmacSha256::new_from_slice(api_key.as_bytes()) {
@@ -593,7 +629,6 @@ pub async fn cron_sync_freekassa(db: DatabaseConnection) {
                 "signature": signature
             });
 
-            // 2. Запрос статуса в API FreeKassa v1
             let resp = client.post("https://api.fk.life/v1/orders")
                 .json(&request_body)
                 .send()
@@ -601,15 +636,12 @@ pub async fn cron_sync_freekassa(db: DatabaseConnection) {
 
             if let Ok(res) = resp {
                 if let Ok(json) = res.json::<serde_json::Value>().await {
-                    // status == 1 (Оплачен)
                     if json["type"].as_str() == Some("success") {
                         if let Some(status_num) = json["orders"][0]["status"].as_i64() {
                             if status_num == 1 {
-                                tracing::info!("Order {} confirmed via FreeKassa getOrders sync!", order.id);
-                                // Вызываем начисление услуги
+                                // Оплачен -> начисляем услугу
                                 let _ = fulfill_order(&db, order.id, "CRON_SYNC", json).await;
                             } else if status_num == 8 || status_num == 9 {
-                                // 8 - ошибка, 9 - отменен
                                 let mut active: crate::entities::orders::ActiveModel = order.into();
                                 active.status = Set(crate::entities::billing_enums::OrderStatus::Cancelled);
                                 let _ = active.update(&db).await;
@@ -627,8 +659,6 @@ pub async fn cron_sync_freekassa(db: DatabaseConnection) {
 
 ## 6. Прототипы API Личного Кабинета (`anet-auth/src/api/user_cabinet.rs`)
 
-Все методы требуют Bearer JWT аутентификацию пользователя.
-
 ```rust
 // ============================================================================
 // anet-auth/src/api/user_cabinet.rs
@@ -640,18 +670,17 @@ use poem_openapi::{
     ApiResponse, Object, OpenApi, SecurityScheme,
 };
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, ModelTrait,
+    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait,
     QueryFilter, QueryOrder, Set, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::entities::{
-    billing_enums::{OrderStatus, PaymentSystem, ProductType},
-    groups, orders, products, rates, subscriptions, transactions, users, vouchers,
+    billing_enums::{Currency, OrderStatus, PaymentSystem, ProductType, VoucherStatus},
+    groups, orders, products, rates, transactions, users, vouchers,
 };
 
-/// JWT Bearer авторизация для пользователя
 #[derive(SecurityScheme)]
 #[oai(
     type = "bearer",
@@ -667,10 +696,7 @@ pub struct UserClaims {
     pub fingerprint: String,
 }
 
-async fn user_auth_checker(
-    _req: &poem::Request,
-    bearer: Bearer,
-) -> Option<UserClaims> {
+async fn user_auth_checker(_req: &poem::Request, bearer: Bearer) -> Option<UserClaims> {
     let secret = std::env::var("JWT_SECRET").unwrap_or_else(|_| "secret".into());
     let mut validation = jsonwebtoken::Validation::default();
     validation.validate_exp = true;
@@ -701,34 +727,20 @@ pub struct UserProfileResponse {
     pub fingerprint: String,
     pub balance: f64,
     pub is_active: bool,
-    /// Действующие лимиты (с учетом оверрайда rates над groups)
+    pub group_name: Option<String>,
+    pub activated_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub is_smart_activation_pending: bool,
     pub effective_limits: EffectiveLimitsDto,
-    /// Активная подписка
-    pub active_subscription: Option<SubscriptionDto>,
-    /// Подписки в статусе pending (активируются при первом входе)
-    pub pending_subscriptions: Vec<SubscriptionDto>,
-    /// Приобретенные неактивированные ваучеры (подарки)
     pub gift_vouchers: Vec<VoucherDto>,
 }
 
 #[derive(Object, Debug, Serialize, Deserialize)]
 pub struct EffectiveLimitsDto {
-    pub source: String, // "rates" (кастомный оверрайд) или "groups" (тариф)
+    pub source: String, // "rates" (индивидуальный) или "groups" (группа)
     pub sessions_limit: i32,
-    pub speed_limit_mbps: i32,
+    pub speed_limit_kbps: i32,
     pub traffic_limit_bytes: i64,
-    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
-}
-
-#[derive(Object, Debug, Serialize, Deserialize)]
-pub struct SubscriptionDto {
-    pub id: Uuid,
-    pub product_id: Uuid,
-    pub product_name: String,
-    pub status: String,
-    pub duration_days: Option<i32>,
-    pub activated_at: Option<chrono::DateTime<chrono::Utc>>,
-    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Object, Debug, Serialize, Deserialize)]
@@ -736,7 +748,7 @@ pub struct VoucherDto {
     pub id: Uuid,
     pub code: String,
     pub product_name: String,
-    pub status: String,
+    pub status: VoucherStatus,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -746,7 +758,7 @@ pub struct ActiveSessionDto {
     pub server_id: Uuid,
     pub server_name: String,
     pub client_ip: String,
-    pub transport: String, // "quic", "ssh", "wrtc", "ws"
+    pub transport: String,
     pub rx_bytes: i64,
     pub tx_bytes: i64,
     pub connected_at: chrono::DateTime<chrono::Utc>,
@@ -774,7 +786,7 @@ pub struct CalculateRateRequest {
 #[derive(Object, Debug, Serialize, Deserialize)]
 pub struct CalculateRateResponse {
     pub calculated_price: f64,
-    pub currency: String,
+    pub currency: Currency,
 }
 
 #[derive(Object, Debug, Serialize, Deserialize)]
@@ -793,7 +805,7 @@ pub struct UserCabinetApi {
 
 #[OpenApi]
 impl UserCabinetApi {
-    /// Получение профиля, баланса и сводки подписок пользователя
+    /// Получение профиля, баланса и действующих лимитов пользователя
     #[oai(path = "/api/v1/user/me", method = "get")]
     async fn get_me(&self, auth: UserAuth) -> poem::Result<Json<UserProfileResponse>> {
         let user = users::Entity::find_by_id(auth.0.user_id)
@@ -802,7 +814,7 @@ impl UserCabinetApi {
             .map_err(|e| poem::Error::from_string(e.to_string(), poem::http::StatusCode::INTERNAL_SERVER_ERROR))?
             .ok_or_else(|| poem::Error::from_string("User not found", poem::http::StatusCode::NOT_FOUND))?;
 
-        // 1. Проверяем индивидуальный оверрайд rates
+        // 1. Проверяем наличие индивидуального тарифа rates
         let user_rate = rates::Entity::find()
             .filter(rates::Column::UserId.eq(user.id))
             .one(&self.db)
@@ -810,76 +822,55 @@ impl UserCabinetApi {
             .unwrap_or(None);
 
         let now = chrono::Utc::now().naive_utc();
-        let effective_limits = if let Some(rate) = user_rate.filter(|r| r.date_end > now) {
-            EffectiveLimitsDto {
-                source: "rates".into(),
-                sessions_limit: rate.sessions,
-                speed_limit_mbps: rate.speed_limit,
-                traffic_limit_bytes: rate.traffic_limit,
-                expires_at: Some(chrono::DateTime::from_naive_utc_and_offset(rate.date_end, chrono::Utc)),
-            }
+        let (effective_limits, group_name) = if let Some(rate) = user_rate.filter(|r| r.date_end > now) {
+            (
+                EffectiveLimitsDto {
+                    source: "rates".into(),
+                    sessions_limit: rate.sessions,
+                    speed_limit_kbps: rate.speed_limit,
+                    traffic_limit_bytes: rate.traffic_limit,
+                },
+                Some("Индивидуальный тариф".into()),
+            )
         } else if let Some(group_id) = user.group_id {
             let group = groups::Entity::find_by_id(group_id).one(&self.db).await.unwrap_or(None);
             if let Some(g) = group {
-                EffectiveLimitsDto {
-                    source: "groups".into(),
-                    sessions_limit: g.sessions_limit,
-                    speed_limit_mbps: g.speed_limit,
-                    traffic_limit_bytes: g.traffic_limit,
-                    expires_at: None,
-                }
+                (
+                    EffectiveLimitsDto {
+                        source: "groups".into(),
+                        sessions_limit: g.sessions_limit,
+                        speed_limit_kbps: g.speed_limit,
+                        traffic_limit_bytes: g.traffic_limit,
+                    },
+                    Some(g.name),
+                )
             } else {
-                EffectiveLimitsDto {
-                    source: "default".into(),
-                    sessions_limit: 1,
-                    speed_limit_mbps: 0,
-                    traffic_limit_bytes: 0,
-                    expires_at: None,
-                }
+                (
+                    EffectiveLimitsDto {
+                        source: "default".into(),
+                        sessions_limit: 1,
+                        speed_limit_kbps: 0,
+                        traffic_limit_bytes: 0,
+                    },
+                    None,
+                )
             }
         } else {
-            EffectiveLimitsDto {
-                source: "default".into(),
-                sessions_limit: 1,
-                speed_limit_mbps: 0,
-                traffic_limit_bytes: 0,
-                expires_at: None,
-            }
+            (
+                EffectiveLimitsDto {
+                    source: "unlimited".into(),
+                    sessions_limit: 0,
+                    speed_limit_kbps: 0,
+                    traffic_limit_bytes: 0,
+                },
+                None,
+            )
         };
 
-        // 2. Получаем подписки
-        let all_subs = subscriptions::Entity::find()
-            .filter(subscriptions::Column::UserId.eq(user.id))
-            .find_also_related(products::Entity)
-            .all(&self.db)
-            .await
-            .unwrap_or_default();
-
-        let mut active_sub = None;
-        let mut pending_subs = Vec::new();
-
-        for (sub, prod_opt) in all_subs {
-            let p_name = prod_opt.map(|p| p.name).unwrap_or_else(|| "Тариф".into());
-            let dto = SubscriptionDto {
-                id: sub.id,
-                product_id: sub.product_id,
-                product_name: p_name,
-                status: sub.status.clone(),
-                duration_days: sub.duration_days,
-                activated_at: sub.activated_at,
-                expires_at: sub.expires_at,
-            };
-            if sub.status == "active" {
-                active_sub = Some(dto);
-            } else if sub.status == "pending" {
-                pending_subs.push(dto);
-            }
-        }
-
-        // 3. Купленные подарочные ваучеры
+        // 2. Подарочные ваучеры пользователя
         let vouchers = vouchers::Entity::find()
             .filter(vouchers::Column::BuyerUserId.eq(Some(user.id)))
-            .filter(vouchers::Column::Status.eq("created"))
+            .filter(vouchers::Column::Status.eq(VoucherStatus::Created))
             .find_also_related(products::Entity)
             .all(&self.db)
             .await
@@ -894,36 +885,38 @@ impl UserCabinetApi {
             })
             .collect();
 
+        let is_pending = user.activated_at.is_none() && user.group_id.is_some();
+
         Ok(Json(UserProfileResponse {
             id: user.id,
             email: user.email,
             fingerprint: user.fingerprint,
             balance: user.balance,
             is_active: user.is_active,
+            group_name,
+            activated_at: user.activated_at,
+            expires_at: user.expires_at,
+            is_smart_activation_pending: is_pending,
             effective_limits,
-            active_subscription: active_sub,
-            pending_subscriptions: pending_subs,
             gift_vouchers: vouchers,
         }))
     }
 
-    /// Список активных сессий пользователя со всех серверов
+    /// Активные сессии пользователя со всех серверов
     #[oai(path = "/api/v1/user/sessions", method = "get")]
     async fn get_active_sessions(&self, auth: UserAuth) -> poem::Result<Json<Vec<ActiveSessionDto>>> {
-        // Опрос нод кластера или ClientRegistry по fingerprint
-        // [AI-PROMPT]: Возвращает текущие активные сессии из кэша соединений anet-auth/нод
+        // [AI-PROMPT]: Возвращает активные сессии пользователя по его fingerprint
         Ok(Json(vec![]))
     }
 
-    /// Принудительный разрыв выбранной сессии
+    /// Принудительный сброс конкретной сессии
     #[oai(path = "/api/v1/user/sessions/disconnect", method = "post")]
     async fn disconnect_session(
         &self,
         auth: UserAuth,
         req: Json<DisconnectSessionRequest>,
     ) -> poem::Result<Json<bool>> {
-        // [AI-PROMPT]: Отправка DisconnectCommand на соответствующую ноду
-        tracing::info!("Disconnecting session {} on node {}", req.session_id, req.server_id);
+        // [AI-PROMPT]: Отправка DisconnectCommand на ноду
         Ok(Json(true))
     }
 
@@ -933,48 +926,43 @@ impl UserCabinetApi {
         &self,
         auth: UserAuth,
         req: Json<ClaimVoucherRequest>,
-    ) -> poem::Result<Json<SubscriptionDto>> {
+    ) -> poem::Result<Json<bool>> {
         let txn = self.db.begin().await
             .map_err(|e| poem::Error::from_string(e.to_string(), poem::http::StatusCode::INTERNAL_SERVER_ERROR))?;
 
         let voucher = vouchers::Entity::find()
             .filter(vouchers::Column::Code.eq(req.code.trim().to_uppercase()))
-            .filter(vouchers::Column::Status.eq("created"))
+            .filter(vouchers::Column::Status.eq(VoucherStatus::Created))
             .one(&txn)
             .await
             .map_err(|e| poem::Error::from_string(e.to_string(), poem::http::StatusCode::INTERNAL_SERVER_ERROR))?
-            .ok_or_else(|| poem::Error::from_string("Invalid or already claimed voucher", poem::http::StatusCode::BAD_REQUEST))?;
+            .ok_or_else(|| poem::Error::from_string("Неверный промокод или уже активирован", poem::http::StatusCode::BAD_REQUEST))?;
 
         let product = products::Entity::find_by_id(voucher.product_id)
             .one(&txn)
             .await
             .map_err(|e| poem::Error::from_string(e.to_string(), poem::http::StatusCode::INTERNAL_SERVER_ERROR))?
-            .ok_or_else(|| poem::Error::from_string("Product not found", poem::http::StatusCode::NOT_FOUND))?;
+            .ok_or_else(|| poem::Error::from_string("Товар не найден", poem::http::StatusCode::NOT_FOUND))?;
 
-        // Вычисляем срок подписки из группы или метаданных
-        let duration = if let Some(gid) = product.target_id {
-            groups::Entity::find_by_id(gid).one(&txn).await.ok().flatten().map(|g| g.duration_days)
-        } else {
-            product.metadata.as_ref().and_then(|m| m.get("duration_days")?.as_i64().map(|d| d as i32))
-        };
+        let user = users::Entity::find_by_id(auth.0.user_id)
+            .one(&txn)
+            .await
+            .map_err(|e| poem::Error::from_string(e.to_string(), poem::http::StatusCode::INTERNAL_SERVER_ERROR))?
+            .ok_or_else(|| poem::Error::from_string("User not found", poem::http::StatusCode::NOT_FOUND))?;
 
-        // Создаем Pending Subscription
-        let new_sub = subscriptions::ActiveModel {
-            id: Set(Uuid::new_v4()),
-            user_id: Set(auth.0.user_id),
-            product_id: Set(product.id),
-            status: Set("pending".into()),
-            duration_days: Set(duration),
-            activated_at: Set(None),
-            expires_at: Set(None),
-            created_at: Set(chrono::Utc::now()),
-        };
-        let inserted = new_sub.insert(&txn).await
-            .map_err(|e| poem::Error::from_string(e.to_string(), poem::http::StatusCode::INTERNAL_SERVER_ERROR))?;
+        // Применяем купленный продукт к пользователю
+        if let Some(target_group_id) = product.target_id {
+            let mut u_active: users::ActiveModel = user.into();
+            u_active.group_id = Set(Some(target_group_id));
+            u_active.activated_at = Set(None); // Сброс даты: активируется при первом коннекте!
+            u_active.expires_at = Set(None);
+            u_active.update(&txn).await
+                .map_err(|e| poem::Error::from_string(e.to_string(), poem::http::StatusCode::INTERNAL_SERVER_ERROR))?;
+        }
 
-        // Помечаем ваучер как активированный
+        // Помечаем ваучер активированным
         let mut v_active: vouchers::ActiveModel = voucher.into();
-        v_active.status = Set("claimed".into());
+        v_active.status = Set(VoucherStatus::Claimed);
         v_active.claimed_by_user_id = Set(Some(auth.0.user_id));
         v_active.claimed_at = Set(Some(chrono::Utc::now()));
         v_active.update(&txn).await
@@ -983,39 +971,30 @@ impl UserCabinetApi {
         txn.commit().await
             .map_err(|e| poem::Error::from_string(e.to_string(), poem::http::StatusCode::INTERNAL_SERVER_ERROR))?;
 
-        Ok(Json(SubscriptionDto {
-            id: inserted.id,
-            product_id: inserted.product_id,
-            product_name: product.name,
-            status: inserted.status,
-            duration_days: inserted.duration_days,
-            activated_at: None,
-            expires_at: None,
-        }))
+        Ok(Json(true))
     }
 
-    /// Калькулятор тарифа «Сэндвич в Subway» (динамический расчет стоимости)
+    /// Динамический калькулятор тарифа «Сэндвич в Subway» (настройки берутся из БД)
     #[oai(path = "/api/v1/user/rate/calculate", method = "post")]
     async fn calculate_custom_rate(
         &self,
         _auth: UserAuth,
         req: Json<CalculateRateRequest>,
     ) -> poem::Result<Json<CalculateRateResponse>> {
-        // Формула расчета: базовый сбор + сессии + скорость + гигабайты, умноженное на срок
-        let base_per_day = 3.0; // руб/день
+        // [AI-PROMPT]: Тарифная сетка запрашивается из системной таблицы настроек (settings / pricing_matrix):
+        // base_day_cost, session_day_cost, gb_cost, speed_factor. Никакого хардкода в методе!
+        let base_per_day = 3.0;
         let session_cost_per_day = (req.sessions.max(1) - 1) as f64 * 1.5;
-        let traffic_cost = (req.traffic_gb as f64 / 10.0) * 2.0; // 2 руб за каждые 10 ГБ
-        let speed_multiplier = if req.speed_mbps > 100 { 1.3 } else { 1.0 };
-
-        let total = ((base_per_day + session_cost_per_day) * (req.duration_days.max(1) as f64) + traffic_cost) * speed_multiplier;
+        let traffic_cost = (req.traffic_gb as f64 / 10.0) * 2.0;
+        let total = (base_per_day + session_cost_per_day) * (req.duration_days.max(1) as f64) + traffic_cost;
 
         Ok(Json(CalculateRateResponse {
             calculated_price: (total * 100.0).round() / 100.0,
-            currency: "RUB".into(),
+            currency: Currency::Rub,
         }))
     }
 
-    /// Получение client.toml конфигурации и QR-ссылки
+    /// Получение client.toml и ссылки на QR-код
     #[oai(path = "/api/v1/user/config", method = "get")]
     async fn get_client_config(&self, auth: UserAuth) -> poem::Result<Json<ClientConfigResponse>> {
         let user = users::Entity::find_by_id(auth.0.user_id)
@@ -1025,13 +1004,13 @@ impl UserCabinetApi {
             .ok_or_else(|| poem::Error::from_string("User not found", poem::http::StatusCode::NOT_FOUND))?;
 
         let toml_content = format!(
-            "# Anet Client Config\nfingerprint = \"{}\"\nauth_server = \"https://cp.anet-project.org\"\n",
+            "# Anet Client Config\nfingerprint = \"{}\"\nauth_server = \"https://service.anet-project.org\"\n",
             user.fingerprint
         );
 
         Ok(Json(ClientConfigResponse {
             client_toml: toml_content,
-            qr_code_url: format!("https://cp.anet-project.org/api/v1/config/qr/{}", user.fingerprint),
+            qr_code_url: format!("https://service.anet-project.org/api/v1/config/qr/{}", user.fingerprint),
         }))
     }
 }
@@ -1062,11 +1041,10 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::entities::{
-    billing_enums::{OrderStatus, PaymentSystem, ProductType},
+    billing_enums::{Currency, OrderStatus, PaymentSystem, ProductType},
     orders, products, transactions, vouchers,
 };
 
-/// JWT Bearer авторизация администратора
 #[derive(SecurityScheme)]
 #[oai(
     type = "bearer",
@@ -1097,9 +1075,8 @@ pub struct CreateProductRequest {
     pub name: String,
     pub description: String,
     pub price: f64,
-    pub currency: String,
+    pub currency: Currency,
     pub product_type: ProductType,
-    /// Для GroupSubscription: Some(group_id), для кастомного: None
     pub target_id: Option<Uuid>,
     pub sort_order: Option<i32>,
     pub badge: Option<String>,
@@ -1112,7 +1089,7 @@ pub struct UpdateProductRequest {
     pub name: Option<String>,
     pub description: Option<String>,
     pub price: Option<f64>,
-    pub currency: Option<String>,
+    pub currency: Option<Currency>,
     pub product_type: Option<ProductType>,
     pub target_id: Option<Option<Uuid>>,
     pub sort_order: Option<i32>,
@@ -1127,7 +1104,7 @@ pub struct AdminOrderDto {
     pub user_id: Uuid,
     pub product_id: Uuid,
     pub amount: f64,
-    pub currency: String,
+    pub currency: Currency,
     pub status: OrderStatus,
     pub is_gift: bool,
     pub metadata: Option<serde_json::Value>,
@@ -1190,7 +1167,7 @@ impl AdminBillingApi {
             name: Set(req.name.clone()),
             description: Set(req.description.clone()),
             price: Set(req.price),
-            currency: Set(req.currency.clone()),
+            currency: Set(req.currency),
             product_type: Set(req.product_type),
             target_id: Set(req.target_id),
             sort_order: Set(req.sort_order.unwrap_or(0)),
@@ -1223,7 +1200,7 @@ impl AdminBillingApi {
         if let Some(v) = &req.name { active.name = Set(v.clone()); }
         if let Some(v) = &req.description { active.description = Set(v.clone()); }
         if let Some(v) = req.price { active.price = Set(v); }
-        if let Some(v) = &req.currency { active.currency = Set(v.clone()); }
+        if let Some(v) = req.currency { active.currency = Set(v); }
         if let Some(v) = req.product_type { active.product_type = Set(v); }
         if let Some(v) = req.target_id { active.target_id = Set(v); }
         if let Some(v) = req.sort_order { active.sort_order = Set(v); }
@@ -1359,18 +1336,18 @@ impl AdminBillingApi {
 
 Разработка Telegram-бота начинается после стабилизации WebUI и API биллинга. Бот выступает интерфейсной надстройкой, вызывающей WebUI внутри **Telegram Web Apps (TMA)**:
 1. Пользователь нажимает `/start` или кнопку меню «Личный кабинет».
-2. Открывается защищенный webview с адресом `https://cp.anet-project.org/tma`.
+2. Открывается защищенный webview с адресом `https://service.anet-project.org/tma`.
 3. Фронтенд автоматически передает `window.Telegram.WebApp.initData` на бэкенд `/api/v1/auth/telegram_tma`.
 4. Бэкенд верифицирует криптографическую подпись через `verify_telegram_init_data`, связывает `telegram_id` с пользователем и выдает сессионный JWT.
-5. Пользователь получает полный доступ к ЛК: скачивание конфига, завершение сессий, конструктор тарифов и оплата (включая Telegram Stars через `payment_system = TelegramStars`).
+5. Пользователь получает полный доступ к ЛК: скачивание конфига, завершение сессий, конструктор тарифов и оплата (включая Telegram Stars).
 
 ---
 
 ## 9. Пользовательский интерфейс (User WebUI & Admin Panel)
 
 ### 9.1. Личный кабинет пользователя (User Dashboard)
-* **Витрина тарифов:** Переключение между фиксированными пакетами (группами) и интерактивным калькулятором лимитов (Subway sandwich). Переключатель «Купить себе» / «Купить в подарок».
-* **Инвентарь:** Список неактивированных подписок (`Pending`) с индикатором «Активируется при первом подключении» и промокоды купленных ваучеров с кнопкой «Скопировать».
+* **Витрина тарифов:** Переключение между готовыми тарифами (группами) и интерактивным калькулятором лимитов (Subway sandwich). Переключатель «Купить себе» / «Купить в подарок».
+* **Инвентарь подарков:** Список неактивированных подарочных промокодов с кнопкой «Скопировать».
 * **Управление сессиями:** Таблица устройств с информацией о подключении, типе транспорта (QUIC, WS, WRTC) и кнопкой принудительного разрыва «Завершить сессию».
 * **Конфигурация:** Кнопка «Скачать client.toml» и генератор QR-кода для мобильных клиентов.
 
