@@ -17,6 +17,29 @@ pub enum AppPolicy {
 }
 
 impl AppPolicy {
+
+        #[inline]
+    pub fn is_dns_flow(&self, dport: u16, protocol: u8) -> bool {
+        protocol == 17 && dport == 53
+    }
+
+       pub fn should_tunnel_packet(&self, owner: Option<&FlowOwner>, dport: u16, protocol: u8) -> bool {
+        // Для UDP:53, если это системный svchost, направляем в туннель для безопасного резолвинга
+        if self.is_dns_flow(dport, protocol) {
+            if let Some(owner) = owner {
+                if let Some(ref img) = owner.image_name {
+                    if img.as_ref() == "svchost.exe" {
+                        // В режиме Exclude всегда туннелируем DNS
+                        // В режиме Include туннелируем, чтобы dns_interceptor применил AdBlock/Direct правила
+                        return true;
+                    }
+                }
+            }
+        }
+        self.should_tunnel(owner)
+    }
+
+
     /// Строит include-политику из списка имён (регистр не важен).
     pub fn include<I, S>(names: I) -> Self
     where
@@ -66,6 +89,9 @@ impl AppPolicy {
                 .is_none_or(|name| !set.contains(name)),
         }
     }
+
+
+
 }
 
 fn normalize<I, S>(names: I) -> HashSet<Arc<str>>

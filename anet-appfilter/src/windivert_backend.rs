@@ -49,6 +49,20 @@ fn nat_key_inbound(k: &NetworkPacketKey) -> NatKey {
 }
 
 #[inline]
+fn is_tcp_syn(data: &[u8]) -> bool {
+    if data.len() < 20 || (data[0] >> 4) != 4 {
+        return false;
+    }
+    let ihl = ((data[0] & 0x0F) * 4) as usize;
+    if data.len() < ihl + 20 || data[9] != 6 {
+        return false;
+    }
+    let flags = data[ihl + 13];
+    // SYN = 1, ACK = 0
+    (flags & 0x12) == 0x02
+}
+
+#[inline]
 fn is_ignored_ip(ip: &IpAddr) -> bool {
     match ip.to_canonical() {
         IpAddr::V4(v4) => {
@@ -408,10 +422,10 @@ pub fn run_socket_tracker(
                 }
 
                 // Планируем отложенную очистку flow и порта через фоновый sweeper
-                closing_flows.insert(flow_key, now + FLOW_CLOSE_GRACE_PERIOD);
-                if local_port != 0 && remote_addr.is_unspecified() {
-                    closing_ports.insert((protocol, local_port), now + FLOW_CLOSE_GRACE_PERIOD);
-                }
+               closing_flows.insert(flow_key, now + FLOW_CLOSE_GRACE_PERIOD);
+if local_port != 0 {
+    closing_ports.insert((protocol, local_port), now + FLOW_CLOSE_GRACE_PERIOD);
+}
             }
 
             _ => {}
@@ -523,7 +537,7 @@ pub fn run_packet_router(
         }
 
         // Проверка явного bypass списка (VPN сервер, TURN/Ktalk, прямые маршруты и CIDR)
-        if bypass.contains_blocking(&key.src_addr) || bypass.contains_blocking(&key.dst_addr) {
+        if bypass.contains_blocking(&key.dst_addr) {
             let flow_key = FlowKey::new(
                 key.protocol,
                 key.src_addr,
@@ -566,8 +580,12 @@ pub fn run_packet_router(
             (v, map.lookup(&flow_key), false)
         } else {
             let mut owner_opt = map.lookup(&flow_key);
+            
+            // Если процесс не найден сразу:
             if owner_opt.is_none() {
-                for _ in 0..FLOW_RACE_RETRIES {
+                // Для TCP SYN (начало сессии) даём трекеру больше времени (до 40 мс)
+                let retries = if is_tcp_syn(&packet.data) { 40 } else { FLOW_RACE_RETRIES };
+                for _ in 0..retries {
                     std::thread::sleep(FLOW_RACE_STEP);
                     owner_opt = map.lookup(&flow_key);
                     if owner_opt.is_some() {
@@ -576,15 +594,16 @@ pub fn run_packet_router(
                 }
             }
 
-            // Никогда не заворачиваем в туннель собственные сокеты самого процесса VPN-клиента
+            // Никогда не заворачиваем сокеты самого VPN-клиента
             if owner_opt.as_ref().is_some_and(|o| o.process_id == self_pid) {
                 decisions.insert(flow_key, false);
                 nat_map.remove(&nat_key);
                 (false, owner_opt, true)
             } else {
-                let result = policy.should_tunnel(owner_opt.as_ref());
-                let can_lock_decision = owner_opt.is_some()
-                    || matches!(policy, AppPolicy::Include(_) | AppPolicy::All);
+                let result = policy.should_tunnel_packet(owner_opt.as_ref(), key.dport, key.protocol);
+                
+                // Фиксируем решение в decisions только если владелец достоверно известен
+                let can_lock_decision = owner_opt.is_some();
                 if can_lock_decision {
                     decisions.insert(flow_key, result);
                     if !result {

@@ -751,16 +751,29 @@ impl AnetClient {
 
         #[cfg(all(windows, feature = "per-app"))]
         if let Some(ref filter) = _app_filter {
+            // 1. IP адреса серверов и контрольных точек
             for ip in &bypass_ips {
                 filter.add_bypass_sync(*ip);
             }
+            
+            // 2. Исключения exclude_route_for из конфига
             if !config_clone.main.exclude_route_for.is_empty() {
                 for net in self.resolve_list(&config_clone.main.exclude_route_for).await {
                     filter.add_bypass_net(net);
                 }
             }
+            
+            // 3. Пользовательские исключения [routing.overrides] direct
             if !config_clone.routing.overrides.direct.is_empty() {
                 for net in self.resolve_list(&config_clone.routing.overrides.direct).await {
+                    filter.add_bypass_net(net);
+                }
+            }
+
+            // 4. [ИСПРАВЛЕНИЕ] Добавляем все статические Direct-подсети из скомпилированной базы rules.abc
+            let abc_direct_routes = rule_cache.collect_direct_routes();
+            for (ip, prefix) in abc_direct_routes {
+                if let Ok(net) = IpNet::new(ip, prefix) {
                     filter.add_bypass_net(net);
                 }
             }

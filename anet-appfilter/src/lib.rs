@@ -88,13 +88,13 @@ impl AppFilter {
         // Когда мы возвращаем пакет из туннеля в Windows, он помечается как "impostor" (самозванец).
         // Этот флаг в правиле гарантирует, что мы не будем перехватывать собственные реинжектированные пакеты по бесконечному кругу.
         let network_handle = Arc::new(
-            WinDivert::<NetworkLayer>::network(
-                "(ip || ipv6) && !impostor",
-                0,
-                WinDivertFlags::new(),
-            )
-            .context("failed to open WinDivert network layer")?,
-        );
+    WinDivert::<NetworkLayer>::network(
+        "outbound && (ip || ipv6) && !impostor",
+        0,
+        WinDivertFlags::new(),
+    )
+    .context("failed to open WinDivert network layer")?,
+);
         let network_shutdown = network_handle.shutdown_handle();
 
         // Поток 1: Отслеживание сокетов (Строгий контроль открытий/закрытий портов)
