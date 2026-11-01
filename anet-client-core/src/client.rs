@@ -864,13 +864,38 @@ impl AnetClient {
         #[cfg(all(windows, feature = "per-app"))]
         let app_filter_bypass_t2 = _app_filter.as_ref().map(|f| f.bypass_set());
 
+        let is_wrtc_proto = server.proto == crate::config::TransportProto::Wrtc;
+
         let t1 = spawn(async move {
             let mut write_buf = BytesMut::with_capacity(COALESCE_BUDGET_BYTES);
 
             // Возвращает true, если пакет должен идти в VPN-туннель, или false, если он перехвачен/отброшен
             let should_forward_to_tunnel = |pkt: &Bytes| -> bool {
-                // Блокируем оппортунистический DoH/DoT к публичным резолверам, чтобы браузеры использовали UDP:53
+                // 1. Мгновенно отклоняем IPv6-пакеты (TCP RST / ICMPv6 Unreachable за 0.05 мс),
+                // чтобы Telegram и браузеры на мобильных сетях (МегаФон/МТС/Tele2) без задержки шли по IPv4
+                if pkt.first().map(|b| b >> 4) == Some(6) {
+                    if let Some(reject) = anet_common::icmp_probe::build_reject_packet(pkt) {
+                        let _ = tx_to_tun_dns.try_send(reject);
+                    }
+                    return false;
+                }
+
+                // 2. Отклоняем DoH/DoT (порты 853 и 443 к DNS-резолверам) с активным TCP RST / ICMP Unreachable,
+                // чтобы Android Private DNS (netd) и Firefox мгновенно переключались на UDP:53 без зависания «Адрес не найден»
                 if crate::dns_interceptor::is_encrypted_dns_packet(pkt) {
+                    if let Some(reject) = anet_common::icmp_probe::build_reject_packet(pkt) {
+                        let _ = tx_to_tun_dns.try_send(reject);
+                    }
+                    return false;
+                }
+
+                // 3. В режиме WRTC отклоняем QUIC (UDP:443) через ICMP Port Unreachable,
+                // чтобы YouTube и браузеры за 0.05 мс переходили на TCP:443 (HTTP/2) с автоматическим TCP MSS Clamping
+                // и не слали 1250-байтные QUIC Initial пакеты поверх VP8 / Colibri-WS
+                if is_wrtc_proto && anet_common::icmp_probe::is_quic_udp_443_packet(pkt) {
+                    if let Some(reject) = anet_common::icmp_probe::build_reject_packet(pkt) {
+                        let _ = tx_to_tun_dns.try_send(reject);
+                    }
                     return false;
                 }
 

@@ -250,6 +250,14 @@ pub async fn run_wrtc_server(
         let clients_map = active_clients.clone();
         let srv_id = server_endpoint_id.clone();
         let padding_step = config.stealth.padding_step;
+        let min_tun_mtu_global = config.wrtc.min_tun_mtu.clamp(576, 1500);
+        let cfg_max_video_batch_global = config.wrtc.max_video_batch_bytes.clamp(400, 1400);
+        let server_tun_mtu_global = config
+            .network
+            .mtu
+            .saturating_sub(config.wrtc.video_mtu_overhead)
+            .max(min_tun_mtu_global) as usize;
+        let tcp_clamp_mtu = server_tun_mtu_global.min(cfg_max_video_batch_global);
 
         // Воркер Uplink из Fake Video Track (VP8 over DTLS-SRTP / JVB)
         let peer_video_rx = shared_peer.clone();
@@ -313,6 +321,10 @@ pub async fn run_wrtc_server(
                                         }
                                         continue;
                                     }
+                                    let sub_pkt = anet_common::icmp_probe::clamp_tcp_mss_bytes(
+                                        sub_pkt,
+                                        tcp_clamp_mtu,
+                                    );
                                     if tun_clone_video.try_send(sub_pkt).is_ok() {
                                         reg_clone_video.record_rx(client_info.value(), pkt_len, "wrtc_video");
                                     } else {
@@ -340,7 +352,11 @@ pub async fn run_wrtc_server(
                                 }
                             } else {
                                 let packet_len = decrypted.len();
-                                if tun_clone_video.try_send(decrypted).is_ok() {
+                                let clamped = anet_common::icmp_probe::clamp_tcp_mss_bytes(
+                                    decrypted,
+                                    tcp_clamp_mtu,
+                                );
+                                if tun_clone_video.try_send(clamped).is_ok() {
                                     reg_clone_video.record_rx(client_info.value(), packet_len, "wrtc_video");
                                 }
                             }
@@ -634,7 +650,11 @@ pub async fn run_wrtc_server(
                                                         }
                                                     } else {
                                                         let packet_len = pkt.len();
-                                                        if tun_clone.try_send(pkt).is_ok() {
+                                                        let clamped = anet_common::icmp_probe::clamp_tcp_mss_bytes(
+                                                            pkt,
+                                                            tcp_clamp_mtu,
+                                                        );
+                                                        if tun_clone.try_send(clamped).is_ok() {
                                                             reg_clone.record_rx(&client_info, packet_len, "wrtc");
                                                         }
                                                     }
@@ -661,7 +681,11 @@ pub async fn run_wrtc_server(
                                                 }
                                             } else {
                                                 let packet_len = packet.len();
-                                                match tun_clone.try_send(packet) {
+                                                let clamped = anet_common::icmp_probe::clamp_tcp_mss_bytes(
+                                                    packet,
+                                                    tcp_clamp_mtu,
+                                                );
+                                                match tun_clone.try_send(clamped) {
                                                     Ok(_) => {
                                                         reg_clone.record_rx(&client_info, packet_len, "wrtc");
                                                         log::debug!("[WRTC Server] Injected {} bytes into TUN for {}", packet_len, client_info.assigned_ip);
@@ -779,10 +803,11 @@ pub async fn run_wrtc_server(
                                                 as usize;
                                             let max_single_video_pkt_bytes = server_tun_mtu
                                                 .max(config.network.mtu as usize)
-                                                .min(cfg_max_video_batch_bytes);
+                                                .max(1500);
                                             let max_video_batch_bytes = server_tun_mtu
                                                 .saturating_sub(30)
                                                 .min(cfg_max_video_batch_bytes);
+                                            let dl_tcp_clamp_mtu = server_tun_mtu.min(cfg_max_video_batch_bytes);
 
                                             let downlink_handle = tokio::spawn(async move {
                                                 const VIDEO_WARMUP_PAYLOAD: [u8; 16] = [
@@ -837,6 +862,10 @@ pub async fn run_wrtc_server(
 
                                                             loop {
                                                                 if packet.len() >= WRTC_MIN_IP_PACKET_LEN {
+                                                                    packet = anet_common::icmp_probe::clamp_tcp_mss_bytes(
+                                                                        packet,
+                                                                        dl_tcp_clamp_mtu,
+                                                                    );
                                                                     let client_pref_mode = client_modes_dl
                                                                         .get(&target_client_id)
                                                                         .map(|m| m.clone())
@@ -885,6 +914,10 @@ pub async fn run_wrtc_server(
                                                                                 if next_p.len() < WRTC_MIN_IP_PACKET_LEN {
                                                                                     continue;
                                                                                 };
+                                                                                let next_p = anet_common::icmp_probe::clamp_tcp_mss_bytes(
+                                                                                    next_p,
+                                                                                    dl_tcp_clamp_mtu,
+                                                                                );
                                                                                 if batch_buf.len() + 2 + next_p.len() <= max_video_batch_bytes {
                                                                                     batch_buf.put_u16(next_p.len() as u16);
                                                                                     batch_buf.extend_from_slice(&next_p);
@@ -1232,7 +1265,11 @@ pub async fn run_wrtc_server(
                                                                 continue;
                                                             }
                                                             let packet_len = pkt.len();
-                                                            if let Err(e) = tun_clone.try_send(pkt) {
+                                                            let clamped = anet_common::icmp_probe::clamp_tcp_mss_bytes(
+                                                                pkt,
+                                                                tcp_clamp_mtu,
+                                                            );
+                                                            if let Err(e) = tun_clone.try_send(clamped) {
                                                                 warn!("[WRTC Server] TUN queue error for {}: {e}", client_info.assigned_ip);
                                                                 break;
                                                             } else {
@@ -1264,7 +1301,11 @@ pub async fn run_wrtc_server(
                                                         continue;
                                                     }
                                                     let packet_len = packet.len();
-                                                    match tun_clone.try_send(packet) {
+                                                    let clamped = anet_common::icmp_probe::clamp_tcp_mss_bytes(
+                                                        packet,
+                                                        tcp_clamp_mtu,
+                                                    );
+                                                    match tun_clone.try_send(clamped) {
                                                         Ok(_) => {
                                                             reg_clone.record_rx(&client_info, packet_len, "wrtc");
                                                         }
@@ -1385,7 +1426,11 @@ pub async fn run_wrtc_server(
                                                                                             continue;
                                                                                         }
                                                                                         let pkt_len = pkt.len();
-                                                                                        if tun_tx_c.try_send(pkt).is_ok() {
+                                                                                        let clamped = anet_common::icmp_probe::clamp_tcp_mss_bytes(
+                                                                                            pkt,
+                                                                                            tcp_clamp_mtu,
+                                                                                        );
+                                                                                        if tun_tx_c.try_send(clamped).is_ok() {
                                                                                             reg_c.record_rx(&c_info, pkt_len, "wrtc");
                                                                                         }
                                                                                     }
@@ -1408,7 +1453,11 @@ pub async fn run_wrtc_server(
                                                                                     }
                                                                                 } else {
                                                                                     let packet_len = decrypted.len();
-                                                                                    if tun_tx_c.try_send(decrypted).is_ok() {
+                                                                                    let clamped = anet_common::icmp_probe::clamp_tcp_mss_bytes(
+                                                                                        decrypted,
+                                                                                        tcp_clamp_mtu,
+                                                                                    );
+                                                                                    if tun_tx_c.try_send(clamped).is_ok() {
                                                                                         reg_c.record_rx(&c_info, packet_len, "wrtc");
                                                                                         log::trace!("[P2P Direct IN] {} bytes from {}", packet_len, c_info.assigned_ip);
                                                                                     }

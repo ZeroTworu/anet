@@ -594,8 +594,8 @@ fn call_configure_tun_jni(
         let _ = env.exception_clear();
     }
 
-    // На Android 11+ при наличии IPv6 минимально допустимый MTU для VpnService.Builder равен 1280 (RFC 8200)
-    let mtu_jint = (auth.mtu as i32).max(1280);
+    // Передаём честный расчётный MTU от транспорта/сервера (TCP MSS дополнительно зажимается в userspace)
+    let mtu_jint = (auth.mtu as i32).clamp(576, 1500);
     let prefix = ip_mask_to_prefix(&auth.netmask)?;
 
     let res = env.with_local_frame(16, |env| -> jni::errors::Result<i32> {
@@ -786,8 +786,16 @@ fn spawn_tun_io_worker(
                                 return;
                             };
                             loop {
-                                if writer.write_all(&pkt).await.is_err() {
-                                    return;
+                                if let Err(e) = writer.write_all(&pkt).await {
+                                    let raw_os = e.raw_os_error();
+                                    if matches!(raw_os, Some(9 | 6 | 19 | 5)) {
+                                        return;
+                                    }
+                                    log::debug!(
+                                        "Android TUN skipped packet write (len={}): {}",
+                                        pkt.len(),
+                                        e
+                                    );
                                 }
                                 match rx_from_core.try_recv() {
                                     Ok(next) => pkt = next,

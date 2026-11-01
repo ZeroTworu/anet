@@ -179,8 +179,19 @@ impl TunManager {
                 // это один пакет на write() без IFF_VNET_HDR.)
                 loop {
                     if let Err(e) = writer.write_all(&packet).await {
-                        error!("Failed to write to TUN: {}, bytes: {:?}", e, packet);
-                        break 'outer;
+                        let raw_os = e.raw_os_error();
+                        // Выходим из цикла только при закрытии дескриптора устройства (EBADF=9, ENXIO=6, ENODEV=19, EIO=5).
+                        // Ошибки отдельного пакета (EMSGSIZE=90, EINVAL=22, EAFNOSUPPORT=97, ENOBUFS=105) пропускаем,
+                        // чтобы один нестандартный пакет от клиента не убивал TUN-интерфейс сервера!
+                        if matches!(raw_os, Some(9 | 6 | 19 | 5)) {
+                            error!("Fatal TUN write error (device closed): {}", e);
+                            break 'outer;
+                        }
+                        log::debug!(
+                            "Skipped packet on TUN write (len={}): {}",
+                            packet.len(),
+                            e
+                        );
                     }
                     match rx_to_tun.try_recv() {
                         Ok(next) => packet = next,

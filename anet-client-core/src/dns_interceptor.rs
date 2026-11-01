@@ -244,6 +244,15 @@ impl DnsInterceptor {
                 InterceptResult::DirectQuery
             }
             RuleAction::Proxy => {
+                // Отсекаем AAAA (IPv6, type=28) и HTTPS/SVCB (HTTP/3 QUIC, type=65) для проксируемых доменов,
+                // чтобы приложения (YouTube, Telegram, браузеры) мгновенно шли по IPv4 внутри туннеля
+                // и не утекали через IPv6 мобильного оператора (МегаФон/МТС/Tele2).
+                if query_info.qtype == 28 || query_info.qtype == 65 {
+                    if let Some(resp) = self.build_nodata_dns_response(packet, &query_info) {
+                        return InterceptResult::Handled(resp);
+                    }
+                    return InterceptResult::Drop;
+                }
                 trace!("[DNS] Domain '{}' marked PROXY", query_info.qname);
                 InterceptResult::PassThrough
             }

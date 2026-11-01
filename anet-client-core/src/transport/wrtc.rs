@@ -448,6 +448,7 @@ impl ClientTransport for WrtcTransport {
             }
         };
 
+        let cfg_max_video_batch_bytes = self.config.wrtc.max_video_batch_bytes.clamp(400, 1400);
         if wrtc_mode == anet_common::wrtc::colibri::WrtcMode::MediaVideo
             || wrtc_mode == anet_common::wrtc::colibri::WrtcMode::P2pDirect
             || wrtc_mode == anet_common::wrtc::colibri::WrtcMode::Auto
@@ -457,17 +458,19 @@ impl ClientTransport for WrtcTransport {
             let min_tun_mtu = i32::from(self.config.wrtc.min_tun_mtu.clamp(576, 1500));
             let adjusted_mtu = server_mtu
                 .saturating_sub(video_overhead)
-                .max(min_tun_mtu);
+                .max(min_tun_mtu)
+                .min(cfg_max_video_batch_bytes as i32);
             info!(
-                "[WRTC] Adjusted TUN MTU to {} (server MTU {} - {}B WebRTC RTP/SCTP overhead, min_tun_mtu={})",
+                "[WRTC] Adjusted TUN MTU to {} (server MTU {} - {}B WebRTC RTP/SCTP overhead, min_tun_mtu={}, max_video_batch_bytes={})",
                 adjusted_mtu,
                 server_mtu,
                 self.config.wrtc.video_mtu_overhead,
-                min_tun_mtu
+                min_tun_mtu,
+                cfg_max_video_batch_bytes
             );
             auth_response.mtu = adjusted_mtu;
         }
-        let cfg_max_video_batch_bytes = self.config.wrtc.max_video_batch_bytes.clamp(400, 1400);
+        let tcp_clamp_mtu = (auth_response.mtu as usize).min(cfg_max_video_batch_bytes);
         let max_video_batch_bytes = (auth_response.mtu as usize)
             .saturating_sub(30)
             .min(cfg_max_video_batch_bytes);
@@ -850,6 +853,10 @@ impl ClientTransport for WrtcTransport {
 
                         for _burst_idx in 0..uplink_burst_max_packets {
                             if packet.len() >= WRTC_MIN_IP_PACKET_LEN {
+                                packet = anet_common::icmp_probe::clamp_tcp_mss_bytes(
+                                    packet,
+                                    tcp_clamp_mtu,
+                                );
                                 // Zero-delay micro-batching мелких пакетов (TCP ACK, DNS) в единый VP8 RTP кадр
                                 let mut batch_capable = p2p_active;
                                 if use_video {
@@ -872,6 +879,10 @@ impl ClientTransport for WrtcTransport {
                                         if next_pkt.len() < WRTC_MIN_IP_PACKET_LEN {
                                             continue;
                                         }
+                                        let next_pkt = anet_common::icmp_probe::clamp_tcp_mss_bytes(
+                                            next_pkt,
+                                            tcp_clamp_mtu,
+                                        );
                                         let current_len = if batched_payload {
                                             video_batch_buf.len()
                                         } else {
@@ -1147,11 +1158,19 @@ impl ClientTransport for WrtcTransport {
                                                     let packets = unpack_batch(&decrypted[1..]);
                                                     for pkt in packets {
                                                         if pkt.len() >= WRTC_MIN_IP_PACKET_LEN {
-                                                            let _ = tun_inject_ws.send(pkt).await;
+                                                            let clamped = anet_common::icmp_probe::clamp_tcp_mss_bytes(
+                                                                pkt,
+                                                                tcp_clamp_mtu,
+                                                            );
+                                                            let _ = tun_inject_ws.send(clamped).await;
                                                         }
                                                     }
                                                 } else if decrypted.len() >= WRTC_MIN_IP_PACKET_LEN {
-                                                    let _ = tun_inject_ws.send(decrypted).await;
+                                                    let clamped = anet_common::icmp_probe::clamp_tcp_mss_bytes(
+                                                        decrypted,
+                                                        tcp_clamp_mtu,
+                                                    );
+                                                    let _ = tun_inject_ws.send(clamped).await;
                                                 }
                                             }
                                             Err(e) => {
@@ -1175,11 +1194,19 @@ impl ClientTransport for WrtcTransport {
                                                         let inner_pkts = unpack_batch(&decrypted[1..]);
                                                         for pkt in inner_pkts {
                                                             if pkt.len() >= WRTC_MIN_IP_PACKET_LEN {
-                                                                let _ = tun_inject_ws.send(pkt).await;
+                                                                let clamped = anet_common::icmp_probe::clamp_tcp_mss_bytes(
+                                                                    pkt,
+                                                                    tcp_clamp_mtu,
+                                                                );
+                                                                let _ = tun_inject_ws.send(clamped).await;
                                                             }
                                                         }
                                                     } else if decrypted.len() >= WRTC_MIN_IP_PACKET_LEN {
-                                                        let _ = tun_inject_ws.send(decrypted).await;
+                                                        let clamped = anet_common::icmp_probe::clamp_tcp_mss_bytes(
+                                                            decrypted,
+                                                            tcp_clamp_mtu,
+                                                        );
+                                                        let _ = tun_inject_ws.send(clamped).await;
                                                     }
                                                 }
                                                 Err(e) => {
@@ -1227,14 +1254,22 @@ impl ClientTransport for WrtcTransport {
                                             let packets = unpack_batch(&decrypted[1..]);
                                             for pkt in packets {
                                                 if pkt.len() >= WRTC_MIN_IP_PACKET_LEN {
-                                                    if tun_inject_p2p.send(pkt).await.is_err() {
+                                                    let clamped = anet_common::icmp_probe::clamp_tcp_mss_bytes(
+                                                        pkt,
+                                                        tcp_clamp_mtu,
+                                                    );
+                                                    if tun_inject_p2p.send(clamped).await.is_err() {
                                                         return;
                                                     }
                                                 }
                                             }
                                         } else if decrypted.len() >= WRTC_MIN_IP_PACKET_LEN {
                                             log::trace!("[P2P Direct IN] Decrypted packet ({} bytes)", decrypted.len());
-                                            if tun_inject_p2p.send(decrypted).await.is_err() {
+                                            let clamped = anet_common::icmp_probe::clamp_tcp_mss_bytes(
+                                                decrypted,
+                                                tcp_clamp_mtu,
+                                            );
+                                            if tun_inject_p2p.send(clamped).await.is_err() {
                                                 return;
                                             }
                                         }
@@ -1313,14 +1348,22 @@ impl ClientTransport for WrtcTransport {
                                         let packets = unpack_batch(&decrypted[1..]);
                                         for pkt in packets {
                                             if pkt.len() >= WRTC_MIN_IP_PACKET_LEN {
-                                                if tun_inject_video.send(pkt).await.is_err() {
+                                                let clamped = anet_common::icmp_probe::clamp_tcp_mss_bytes(
+                                                    pkt,
+                                                    tcp_clamp_mtu,
+                                                );
+                                                if tun_inject_video.send(clamped).await.is_err() {
                                                     break 'outer;
                                                 }
                                             }
                                         }
                                     } else if decrypted.len() >= WRTC_MIN_IP_PACKET_LEN {
                                         log::trace!("[WRTC Media Video IN] Decrypted packet ({} bytes)", decrypted.len());
-                                        if tun_inject_video.send(decrypted).await.is_err() {
+                                        let clamped = anet_common::icmp_probe::clamp_tcp_mss_bytes(
+                                            decrypted,
+                                            tcp_clamp_mtu,
+                                        );
+                                        if tun_inject_video.send(clamped).await.is_err() {
                                             break 'outer;
                                         }
                                     }
