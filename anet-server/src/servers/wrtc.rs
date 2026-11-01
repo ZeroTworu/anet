@@ -801,7 +801,7 @@ pub async fn run_wrtc_server(
                                             let min_tun_mtu = config.wrtc.min_tun_mtu.clamp(576, 1500);
                                             let cfg_max_video_batch_bytes = config.wrtc.max_video_batch_bytes.clamp(400, 1400);
                                             let video_batch_max_packets = config.wrtc.video_batch_max_packets.clamp(1, 64);
-                                            let ws_batcher_max_bytes = config.wrtc.ws_batcher_max_bytes.clamp(512, 65536);
+                                            let ws_batcher_max_bytes = config.wrtc.ws_batcher_max_bytes.clamp(512, 4096);
                                             let ws_batcher_max_delay_ms = config.wrtc.ws_batcher_max_delay_ms.clamp(1, 50);
                                             let video_tun_mtu = config
                                                 .network
@@ -975,7 +975,7 @@ pub async fn run_wrtc_server(
                                                                                     if !video_warmed_up {
                                                                                         // До прогрева видео дублируем ASTP-срез в WS батчер без копирования
                                                                                         batcher.push(frozen.slice(VP8_ASTP_PREFIX_LEN..));
-                                                                                        if batcher.should_flush() {
+                                                                                        while batcher.should_flush() {
                                                                                             if let Some(batch_data) = batcher.flush() {
                                                                                                 let b64 = BASE64_STANDARD.encode(&batch_data);
                                                                                                 let msg = ColibriMessage::astp_batch(
@@ -985,6 +985,8 @@ pub async fn run_wrtc_server(
                                                                                                 if peer_downlink.send(msg).await.is_err() {
                                                                                                     break;
                                                                                                 }
+                                                                                            } else {
+                                                                                                break;
                                                                                             }
                                                                                         }
                                                                                     }
@@ -1041,7 +1043,7 @@ pub async fn run_wrtc_server(
                                                                                 }
                                                                                 if !sent_p2p {
                                                                                     batcher.push(enc_bytes);
-                                                                                    if batcher.should_flush() {
+                                                                                    while batcher.should_flush() {
                                                                                         if let Some(batch_data) = batcher.flush() {
                                                                                             let b64 = BASE64_STANDARD.encode(&batch_data);
                                                                                             let msg = ColibriMessage::astp_batch(
@@ -1051,6 +1053,8 @@ pub async fn run_wrtc_server(
                                                                                             if peer_downlink.send(msg).await.is_err() {
                                                                                                 break;
                                                                                             }
+                                                                                        } else {
+                                                                                            break;
                                                                                         }
                                                                                     }
                                                                                 }
@@ -1093,7 +1097,7 @@ pub async fn run_wrtc_server(
                                                                                 // 3. Если P2P и Video не сработали (или пакет > server_tun_mtu / клиент в WS режиме), шлем через батчер (Colibri-WS)
                                                                                 if !sent {
                                                                                     batcher.push(enc_bytes);
-                                                                                    if batcher.should_flush() {
+                                                                                    while batcher.should_flush() {
                                                                                         if let Some(batch_data) = batcher.flush() {
                                                                                             let b64 = BASE64_STANDARD.encode(&batch_data);
                                                                                             let msg = ColibriMessage::astp_batch(
@@ -1103,6 +1107,8 @@ pub async fn run_wrtc_server(
                                                                                             if peer_downlink.send(msg).await.is_err() {
                                                                                                 break;
                                                                                             }
+                                                                                        } else {
+                                                                                            break;
                                                                                         }
                                                                                     }
                                                                                 }
@@ -1127,13 +1133,17 @@ pub async fn run_wrtc_server(
                                                             }
                                                         }
                                                         _ = batch_interval.tick(), if !batcher.is_empty() => {
-                                                            if let Some(batch_data) = batcher.flush() {
-                                                                let b64 = BASE64_STANDARD.encode(&batch_data);
-                                                                let msg = ColibriMessage::astp_batch(
-                                                                    target_client_id.clone(),
-                                                                    b64,
-                                                                );
-                                                                if peer_downlink.send(msg).await.is_err() {
+                                                            while !batcher.is_empty() {
+                                                                if let Some(batch_data) = batcher.flush() {
+                                                                    let b64 = BASE64_STANDARD.encode(&batch_data);
+                                                                    let msg = ColibriMessage::astp_batch(
+                                                                        target_client_id.clone(),
+                                                                        b64,
+                                                                    );
+                                                                    if peer_downlink.send(msg).await.is_err() {
+                                                                        break;
+                                                                    }
+                                                                } else {
                                                                     break;
                                                                 }
                                                             }

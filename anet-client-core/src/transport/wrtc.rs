@@ -489,7 +489,7 @@ impl ClientTransport for WrtcTransport {
             .min(cfg_max_video_batch_bytes);
         let video_batch_max_packets = self.config.wrtc.video_batch_max_packets.clamp(1, 64);
         let uplink_burst_max_packets = self.config.wrtc.uplink_burst_max_packets.clamp(1, 256);
-        let ws_batcher_max_bytes = self.config.wrtc.ws_batcher_max_bytes.clamp(512, 65536);
+        let ws_batcher_max_bytes = self.config.wrtc.ws_batcher_max_bytes.clamp(512, 4096);
         let ws_batcher_max_delay_ms = self.config.wrtc.ws_batcher_max_delay_ms.clamp(1, 50);
 
         info!(
@@ -817,6 +817,7 @@ impl ClientTransport for WrtcTransport {
         watchdog_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut batch_interval =
             tokio::time::interval(Duration::from_millis(ws_batcher_max_delay_ms));
+        batch_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let last_pong = Arc::new(AtomicU64::new(current_timestamp_secs()));
         let last_pong_tx = last_pong.clone();
         let mut batcher = PacketBatcher::new(ws_batcher_max_bytes, ws_batcher_max_delay_ms);
@@ -968,17 +969,16 @@ impl ClientTransport for WrtcTransport {
                                                     // в WS-батчер без копирования, чтобы не терять первые пакеты во время прогрева SFU.
                                                     if !video_warmed_up {
                                                         batcher.push(frozen.slice(VP8_ASTP_PREFIX_LEN..));
-                                                        if batcher.should_flush() {
-                                                            if let Some(batch_data) = batcher.flush() {
-                                                                let b64 = BASE64_STANDARD.encode(&batch_data);
-                                                                let msg = ColibriMessage::astp_batch(
-                                                                    target_srv_tx.clone(),
-                                                                    b64,
-                                                                );
-                                                                if let Err(e) = peer_tx.send(msg).await {
-                                                                    warn!("[WRTC Client] Peer send batch error: {e}");
-                                                                    return;
-                                                                }
+                                                        while batcher.should_flush() {
+                                                            let Some(batch_data) = batcher.flush() else { break; };
+                                                            let b64 = BASE64_STANDARD.encode(&batch_data);
+                                                            let msg = ColibriMessage::astp_batch(
+                                                                target_srv_tx.clone(),
+                                                                b64,
+                                                            );
+                                                            if let Err(e) = peer_tx.send(msg).await {
+                                                                warn!("[WRTC Client] Peer send batch error: {e}");
+                                                                return;
                                                             }
                                                         }
                                                     }
@@ -1019,17 +1019,16 @@ impl ClientTransport for WrtcTransport {
 
                                             if !sent_p2p {
                                                 batcher.push(enc_bytes);
-                                                if batcher.should_flush() {
-                                                    if let Some(batch_data) = batcher.flush() {
-                                                        let b64 = BASE64_STANDARD.encode(&batch_data);
-                                                        let msg = ColibriMessage::astp_batch(
-                                                            target_srv_tx.clone(),
-                                                            b64,
-                                                        );
-                                                        if let Err(e) = peer_tx.send(msg).await {
-                                                            warn!("[WRTC Client] Peer send batch error: {e}");
-                                                            return;
-                                                        }
+                                                while batcher.should_flush() {
+                                                    let Some(batch_data) = batcher.flush() else { break; };
+                                                    let b64 = BASE64_STANDARD.encode(&batch_data);
+                                                    let msg = ColibriMessage::astp_batch(
+                                                        target_srv_tx.clone(),
+                                                        b64,
+                                                    );
+                                                    if let Err(e) = peer_tx.send(msg).await {
+                                                        warn!("[WRTC Client] Peer send batch error: {e}");
+                                                        return;
                                                     }
                                                 }
                                             }
@@ -1052,15 +1051,14 @@ impl ClientTransport for WrtcTransport {
                         }
                     }
                     _ = batch_interval.tick() => {
-                        if !batcher.is_empty() {
-                            if let Some(batch_data) = batcher.flush() {
-                                let b64 = BASE64_STANDARD.encode(&batch_data);
-                                let msg = ColibriMessage::astp_batch(target_srv_tx.clone(), b64);
-                                if let Err(e) = peer_tx.send(msg).await {
-                                    warn!("[WRTC Client] Peer flush batch send error: {e}");
-                                    warn(format!("[WRTC Client] Peer send batch error: {e}"));
-                                    break;
-                                }
+                        while !batcher.is_empty() {
+                            let Some(batch_data) = batcher.flush() else { break; };
+                            let b64 = BASE64_STANDARD.encode(&batch_data);
+                            let msg = ColibriMessage::astp_batch(target_srv_tx.clone(), b64);
+                            if let Err(e) = peer_tx.send(msg).await {
+                                warn!("[WRTC Client] Peer flush batch send error: {e}");
+                                warn(format!("[WRTC Client] Peer send batch error: {e}"));
+                                return;
                             }
                         }
                     }

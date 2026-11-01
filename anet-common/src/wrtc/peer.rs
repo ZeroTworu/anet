@@ -1668,10 +1668,6 @@ impl WrtcPeer {
                             );
                             local_candidates_summary = cand_summary;
 
-                            let include_video_in_accept = matches!(
-                                mode,
-                                WrtcMode::MediaVideo | WrtcMode::Auto
-                            ) && (session.has_video || local_video_ssrc != 0);
                             let _ = xmpp
                                 .accept_session(
                                     &session.sid,
@@ -1685,7 +1681,7 @@ impl WrtcPeer {
                                     &local_params.fingerprint_hash,
                                     &local_params.candidates,
                                     session.has_data_channel,
-                                    include_video_in_accept,
+                                    session.has_video || local_video_ssrc != 0,
                                 )
                                 .await;
                         }

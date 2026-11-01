@@ -52,21 +52,32 @@ impl PacketBatcher {
         self.queue.is_empty()
     }
 
-    /// Собрать накопившиеся пакеты в единый агрегированный буфер.
+    /// Собрать накопившиеся пакеты в единый агрегированный буфер,
+    /// строго не превышающий `max_batch_bytes` (за исключением случая одного пакета > max_batch_bytes).
     pub fn flush(&mut self) -> Option<Vec<u8>> {
         if self.queue.is_empty() {
             return None;
         }
 
-        let mut out = Vec::with_capacity(self.current_bytes);
-        while let Some(pkt) = self.queue.pop_front() {
+        let mut out = Vec::with_capacity(self.current_bytes.min(self.max_batch_bytes + 2048));
+        while let Some(pkt) = self.queue.front() {
+            let entry_len = 2 + pkt.len();
+            if !out.is_empty() && out.len() + entry_len > self.max_batch_bytes {
+                break;
+            }
+            let pkt = self.queue.pop_front().unwrap();
+            self.current_bytes = self.current_bytes.saturating_sub(entry_len);
             let len = pkt.len() as u16;
             out.extend_from_slice(&len.to_be_bytes());
             out.extend_from_slice(&pkt);
         }
 
-        self.current_bytes = 0;
-        self.first_packet_time = None;
+        if self.queue.is_empty() {
+            self.current_bytes = 0;
+            self.first_packet_time = None;
+        } else {
+            self.first_packet_time = Some(Instant::now());
+        }
         Some(out)
     }
 }

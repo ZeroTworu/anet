@@ -293,9 +293,10 @@ video_batch_max_packets = 16
 uplink_burst_max_packets = 64
 # uplink_burst_max_packets = 32 # для CF WARP (более плавная отправка пакетов без переполнения буфера очереди wgcf-profile)
 
-# Максимальный размер пачки в байтах для резервного WebSocket-батчера (Colibri-WS / DataChannel / прогрев сессии до старта видеопотока)
-ws_batcher_max_bytes = 12288
-# ws_batcher_max_bytes = 4096 # для CF WARP (компактные WS-фреймы быстрее проходят через TCP-стек внутри туннеля WARP)
+# Максимальный размер пачки в байтах для резервного WebSocket-батчера (Colibri-WS / DataChannel / прогрев сессии до старта видеопотока).
+# Строго <= 4096 байт (чтобы после Base64 + JSON не превысить 8192-байтный лимит Jetty WebSocket на JVB).
+ws_batcher_max_bytes = 4096
+# ws_batcher_max_bytes = 4096 # для CF WARP (компактные WS-фреймы гарантированно укладываются в лимит 8 КБ Jetty на JVB)
 
 # Максимальная задержка накопления пачки в резервном WebSocket-батчере (в миллисекундах)
 ws_batcher_max_delay_ms = 2

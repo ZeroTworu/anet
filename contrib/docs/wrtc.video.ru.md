@@ -127,7 +127,7 @@ $$\text{TUN\_MTU} = \max(\text{server\_mtu} - 60, 1200)$$
 * Сервер сохраняет все анонсированные Jicofo видео-SSRC комнаты в `room_jingle_video_ssrcs` и при получении `WrtcMessage::Discover` от клиента в режиме `media_video` / `auto` немедленно привязывает `c_v_ssrc` к выделенному `Recvonly`-трансиверу (`mid=v_{ssrc}`) и запрашивает поток через `ReceiverVideoConstraints`, исключая потерю Uplink-видеопотока.
 
 ### 4.5. Изоляция `jvb_datachannel` / `ws` клиентов и совместимость Android + ПК
-* Клиенты в режимах `jvb_datachannel` и `ws` не анонсируют `<content name="video">` в `session-accept`, не вызывают `add_remote_video_ssrc()` и отправляют `ReceiverVideoConstraints` с `maxHeight: 0`, чтобы мост JVB не маршрутизировал им 2160p видеопоток сервера.
+* Клиенты в режимах `jvb_datachannel` и `ws` не вызывают `add_remote_video_ssrc()` и отправляют `ReceiverVideoConstraints` с `maxHeight: 0`, чтобы мост JVB не маршрутизировал им 2160p видеопоток сервера, а размер каждого `AstpBatch` в `PacketBatcher::flush()` жёстко ограничен `4096` бинарными байтами (`~5.5 КБ` в Base64+JSON) под 8192-байтный лимит Jetty WebSocket на `Colibri-WS`.
 * Сервер применяет вычет `video_mtu_overhead` в `dl_tcp_clamp_mtu` только для клиентов, реально использующих `media_video` или `p2p_direct`, сохраняя полный MTU для `jvb_datachannel` и `ws`.
 
 ---
