@@ -104,7 +104,12 @@ impl ClientTransport for WrtcTransport {
             room_name, domain, guest_name
         );
 
-        let ktalk = KtalkClient::new(browser_profile.clone(), &self.config.wrtc)
+        let mut wrtc_cfg = self.config.wrtc.clone();
+        if let Some(use_turn) = self.server.wrtc_use_turn {
+            wrtc_cfg.jvb_use_turn = use_turn;
+        }
+
+        let ktalk = KtalkClient::new(browser_profile.clone(), &wrtc_cfg)
             .context("Failed to initialize WRTC Ktalk client with BoringSSL TLS")?;
         let anon_secret = KtalkClient::generate_anonymous_secret();
         let auth_res = ktalk
@@ -125,7 +130,7 @@ impl ClientTransport for WrtcTransport {
             Some(&guest_name),
             &browser_profile,
             ping_secs,
-            &self.config.wrtc,
+            &wrtc_cfg,
         )
             .await
             .context("Failed to establish XMPP session and join conference MUC")?;
@@ -279,7 +284,7 @@ impl ClientTransport for WrtcTransport {
             fallback_port,
             audio_keepalive_ms,
             wrtc_mode,
-            &self.config.wrtc,
+            &wrtc_cfg,
         )
             .await
         {
@@ -289,6 +294,16 @@ impl ClientTransport for WrtcTransport {
                 return Err(e).context("Failed to initialize WebRTC PeerConnection and DataChannel");
             }
         };
+
+        if !matches!(
+            wrtc_mode,
+            anet_common::wrtc::colibri::WrtcMode::MediaVideo
+                | anet_common::wrtc::colibri::WrtcMode::Auto
+        ) {
+            let mute_constraints =
+                anet_common::wrtc::colibri::ReceiverVideoConstraints::new_all(0);
+            let _ = peer.send_video_constraints(&mute_constraints).await;
+        }
 
         info!(
             "[WRTC] WebRTC Peer ICE configuration: {} | Local candidates: {:?}",
@@ -507,7 +522,7 @@ impl ClientTransport for WrtcTransport {
                 }
                 let recv_res = {
                     let mut guard = xmpp_bg.lock().await;
-                    tokio::time::timeout(Duration::from_millis(250), guard.recv_stanza()).await
+                    tokio::time::timeout(Duration::from_millis(50), guard.recv_stanza()).await
                 };
                 match recv_res {
                     Ok(Some(stanza)) => {
@@ -534,25 +549,35 @@ impl ClientTransport for WrtcTransport {
                                         || jingle.action == "description-info"
                                         || jingle.action == "session-initiate"
                                     {
-                                        let expected_srv_ssrc = peer_xmpp
-                                            .expected_peer_video_ssrc
-                                            .load(Ordering::Relaxed);
-                                        let mut updated_ssrc = false;
-                                        for v_ssrc in jingle.video_sources {
-                                            // На клиенте привязываем только видео-SSRC сервера, игнорируя SSRC других клиентов в комнате
-                                            if expected_srv_ssrc == 0 || v_ssrc == expected_srv_ssrc
-                                            {
-                                                peer_xmpp.add_remote_video_ssrc(v_ssrc).await;
-                                                updated_ssrc = true;
+                                        if matches!(
+                                            wrtc_mode,
+                                            anet_common::wrtc::colibri::WrtcMode::MediaVideo
+                                                | anet_common::wrtc::colibri::WrtcMode::Auto
+                                        ) {
+                                            let expected_srv_ssrc = peer_xmpp
+                                                .expected_peer_video_ssrc
+                                                .load(Ordering::Relaxed);
+                                            let mut updated_ssrc = false;
+                                            for v_ssrc in jingle.video_sources {
+                                                // На клиенте привязываем строго известный видео-SSRC сервера
+                                                if expected_srv_ssrc != 0
+                                                    && v_ssrc == expected_srv_ssrc
+                                                {
+                                                    peer_xmpp.add_remote_video_ssrc(v_ssrc).await;
+                                                    updated_ssrc = true;
+                                                }
                                             }
-                                        }
-                                        if updated_ssrc {
-                                            let constraints = anet_common::wrtc::colibri::ReceiverVideoConstraints::for_endpoint(
-                                                &target_srv_xmpp,
-                                                WRTC_DEFAULT_MAX_VIDEO_HEIGHT,
-                                            );
-                                            let _ = peer_xmpp.send_video_constraints(&constraints).await;
-                                            peer_xmpp.force_next_keyframe();
+                                            if updated_ssrc {
+                                                let constraints = anet_common::wrtc::colibri::ReceiverVideoConstraints::for_endpoint(
+                                                    &target_srv_xmpp,
+                                                    WRTC_DEFAULT_MAX_VIDEO_HEIGHT,
+                                                );
+                                                let _ = peer_xmpp.send_video_constraints(&constraints).await;
+                                                peer_xmpp.force_next_keyframe();
+                                            }
+                                        } else {
+                                            let mute_constraints = anet_common::wrtc::colibri::ReceiverVideoConstraints::new_all(0);
+                                            let _ = peer_xmpp.send_video_constraints(&mute_constraints).await;
                                         }
                                     }
                                 }
@@ -561,12 +586,21 @@ impl ClientTransport for WrtcTransport {
                                     ..
                                 } => {
                                     log::info!("[WRTC Client] Jicofo acknowledged Jingle IQ {ack_id}");
-                                    let constraints = anet_common::wrtc::colibri::ReceiverVideoConstraints::for_endpoint(
-                                        &target_srv_xmpp,
-                                        WRTC_DEFAULT_MAX_VIDEO_HEIGHT,
-                                    );
-                                    let _ = peer_xmpp.send_video_constraints(&constraints).await;
-                                    peer_xmpp.force_next_keyframe();
+                                    if matches!(
+                                        wrtc_mode,
+                                        anet_common::wrtc::colibri::WrtcMode::MediaVideo
+                                            | anet_common::wrtc::colibri::WrtcMode::Auto
+                                    ) {
+                                        let constraints = anet_common::wrtc::colibri::ReceiverVideoConstraints::for_endpoint(
+                                            &target_srv_xmpp,
+                                            WRTC_DEFAULT_MAX_VIDEO_HEIGHT,
+                                        );
+                                        let _ = peer_xmpp.send_video_constraints(&constraints).await;
+                                        peer_xmpp.force_next_keyframe();
+                                    } else {
+                                        let mute_constraints = anet_common::wrtc::colibri::ReceiverVideoConstraints::new_all(0);
+                                        let _ = peer_xmpp.send_video_constraints(&mute_constraints).await;
+                                    }
                                 }
                                 anet_common::wrtc::xmpp_xml::InboundXmpp::ExtdiscoServices(
                                     fresh_ice,
@@ -1016,22 +1050,6 @@ impl ClientTransport for WrtcTransport {
                                 break;
                             }
                         }
-
-                        // Сбрасываем накопленный в этом бурсте батч сразу после осушения буфера,
-                        // не дожидаясь 3-миллисекундного таймера batch_interval!
-                        if !batcher.is_empty() && pending_packet.is_none() {
-                            if let Some(batch_data) = batcher.flush() {
-                                let b64 = BASE64_STANDARD.encode(&batch_data);
-                                let msg = ColibriMessage::astp_batch(
-                                    target_srv_tx.clone(),
-                                    b64,
-                                );
-                                if let Err(e) = peer_tx.send(msg).await {
-                                    warn!("[WRTC Client] Peer send batch error: {e}");
-                                    return;
-                                }
-                            }
-                        }
                     }
                     _ = batch_interval.tick() => {
                         if !batcher.is_empty() {
@@ -1419,6 +1437,7 @@ impl ClientTransport for WrtcTransport {
                     h.abort();
                 }
             }
+            tokio::task::yield_now().await;
             let p2p_opt = p2p_shutdown.lock().await.take();
             let p2p_fut = async move {
                 if let Some(p2p) = p2p_opt {
@@ -1426,11 +1445,11 @@ impl ClientTransport for WrtcTransport {
                 }
             };
             let xmpp_fut = async move {
-                if let Ok(xmpp) = tokio::time::timeout(Duration::from_millis(200), xmpp_shutdown.lock()).await {
-                    let _ = tokio::time::timeout(Duration::from_millis(350), xmpp.leave_room()).await;
+                if let Ok(xmpp) = tokio::time::timeout(Duration::from_millis(500), xmpp_shutdown.lock()).await {
+                    let _ = tokio::time::timeout(Duration::from_millis(800), xmpp.leave_room()).await;
                 }
             };
-            let peer_fut = tokio::time::timeout(Duration::from_millis(350), peer_shutdown.close());
+            let peer_fut = tokio::time::timeout(Duration::from_millis(500), peer_shutdown.close());
             let _ = tokio::join!(p2p_fut, xmpp_fut, peer_fut);
         });
 
