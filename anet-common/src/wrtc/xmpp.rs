@@ -133,6 +133,11 @@ impl XmppSession {
         .map_err(|_| anyhow::anyhow!("XMPP TCP connect to {domain}:443 timed out"))??;
         let remote_ip = tcp_stream.peer_addr().ok().map(|a| a.ip());
         let _ = tcp_stream.set_nodelay(true);
+        let sock_ref = socket2::SockRef::from(&tcp_stream);
+        let ka = socket2::TcpKeepalive::new()
+            .with_time(Duration::from_secs(10))
+            .with_interval(Duration::from_secs(5));
+        let _ = sock_ref.set_tcp_keepalive(&ka);
 
         let tls_stream = tokio::time::timeout(
             Duration::from_secs(handshake_timeout_secs),
@@ -297,9 +302,9 @@ impl XmppSession {
         let (raw_ws_tx, mut raw_ws_rx) = mpsc::channel::<Message>(WRTC_XMPP_RAW_WS_CHANNEL_CAPACITY);
 
         let ping_secs = if ping_interval_secs > 0 {
-            ping_interval_secs.clamp(5, 25)
+            ping_interval_secs.clamp(3, 25)
         } else {
-            20
+            15
         };
         let read_timeout_dur = Duration::from_secs(ping_secs * 2 + handshake_timeout_secs);
         let write_timeout_dur = Duration::from_secs(wrtc_cfg.ws_write_timeout_secs.max(1));

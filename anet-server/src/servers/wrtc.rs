@@ -2,13 +2,11 @@ use crate::auth_handler::ServerAuthHandler;
 use crate::client_registry::{ClientRegistry, ClientTransportInfo};
 use crate::config::Config;
 use anet_common::consts::{
-    MAX_PACKET_SIZE, MAX_VIDEO_BATCH_BYTES, VIDEO_BATCH_MARKER, VP8_ASTP_PREFIX_LEN,
-    WRTC_BATCHER_MAX_BYTES, WRTC_BATCHER_MAX_DELAY_MS, WRTC_COLIBRI_CHANNEL_CAPACITY,
+    MAX_PACKET_SIZE, VIDEO_BATCH_MARKER, VP8_ASTP_PREFIX_LEN, WRTC_COLIBRI_CHANNEL_CAPACITY,
     WRTC_DEFAULT_MAX_VIDEO_HEIGHT, WRTC_HANDSHAKE_PROCESS_TIMEOUT_SECS,
     WRTC_ICE_GATHER_POLL_ATTEMPTS, WRTC_MIN_ASTP_VIDEO_FRAME_LEN, WRTC_MIN_IP_PACKET_LEN,
-    WRTC_MIN_TUN_MTU, WRTC_P2P_ICE_GATHER_POLL_INTERVAL_MS, WRTC_SDP_RENEGOTIATE_TIMEOUT_SECS,
-    WRTC_SERVER_RECONNECT_PAUSE_SECS, WRTC_SERVER_RETRY_DELAY_SECS, WRTC_VIDEO_BATCH_MAX_PACKETS,
-    WRTC_WATCHDOG_TICK_SECS,
+    WRTC_P2P_ICE_GATHER_POLL_INTERVAL_MS, WRTC_SDP_RENEGOTIATE_TIMEOUT_SECS,
+    WRTC_SERVER_RECONNECT_PAUSE_SECS, WRTC_SERVER_RETRY_DELAY_SECS, WRTC_WATCHDOG_TICK_SECS,
 };
 use anet_common::http_help::BrowserProfile;
 use anet_common::transport::{
@@ -768,18 +766,23 @@ pub async fn run_wrtc_server(
                                             let client_video_ep_dl = client_video_endpoints.clone();
                                             let client_v2_ep_dl = client_v2_endpoints.clone();
                                             let client_video_warmed_dl = client_video_warmed_up.clone();
+                                            let min_tun_mtu = config.wrtc.min_tun_mtu.clamp(576, 1500);
+                                            let cfg_max_video_batch_bytes = config.wrtc.max_video_batch_bytes.clamp(400, 1400);
+                                            let video_batch_max_packets = config.wrtc.video_batch_max_packets.clamp(1, 64);
+                                            let ws_batcher_max_bytes = config.wrtc.ws_batcher_max_bytes.clamp(512, 65536);
+                                            let ws_batcher_max_delay_ms = config.wrtc.ws_batcher_max_delay_ms.clamp(1, 50);
                                             let server_tun_mtu = config
                                                 .network
                                                 .mtu
                                                 .saturating_sub(config.wrtc.video_mtu_overhead)
-                                                .max(WRTC_MIN_TUN_MTU as u16)
+                                                .max(min_tun_mtu)
                                                 as usize;
                                             let max_single_video_pkt_bytes = server_tun_mtu
                                                 .max(config.network.mtu as usize)
-                                                .min(MAX_VIDEO_BATCH_BYTES);
+                                                .min(cfg_max_video_batch_bytes);
                                             let max_video_batch_bytes = server_tun_mtu
                                                 .saturating_sub(30)
-                                                .min(MAX_VIDEO_BATCH_BYTES);
+                                                .min(cfg_max_video_batch_bytes);
 
                                             let downlink_handle = tokio::spawn(async move {
                                                 const VIDEO_WARMUP_PAYLOAD: [u8; 16] = [
@@ -789,11 +792,11 @@ pub async fn run_wrtc_server(
                                                     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                                                 ];
                                                 let mut batcher = PacketBatcher::new(
-                                                    WRTC_BATCHER_MAX_BYTES,
-                                                    WRTC_BATCHER_MAX_DELAY_MS,
+                                                    ws_batcher_max_bytes,
+                                                    ws_batcher_max_delay_ms,
                                                 );
                                                 let mut batch_interval = tokio::time::interval(
-                                                    Duration::from_millis(WRTC_BATCHER_MAX_DELAY_MS),
+                                                    Duration::from_millis(ws_batcher_max_delay_ms),
                                                 );
                                                 batch_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                                                 let mut warmup_probe_interval = tokio::time::interval(
@@ -871,7 +874,7 @@ pub async fn run_wrtc_server(
                                                                             batch_buf.extend_from_slice(&packet);
                                                                             let mut count = 1usize;
 
-                                                                            while count < WRTC_VIDEO_BATCH_MAX_PACKETS {
+                                                                            while count < video_batch_max_packets {
                                                                                 let next_p = if let Some(p) = pending_packet.take() {
                                                                                     p
                                                                                 } else if let Ok(p) = rx_router.try_recv() {
@@ -950,7 +953,7 @@ pub async fn run_wrtc_server(
                                                                             batch_buf.extend_from_slice(&packet);
                                                                             let mut count = 1usize;
 
-                                                                            while count < WRTC_VIDEO_BATCH_MAX_PACKETS {
+                                                                            while count < video_batch_max_packets {
                                                                                 let next_p = if let Some(p) = pending_packet.take() {
                                                                                     p
                                                                                 } else if let Ok(p) = rx_router.try_recv() {

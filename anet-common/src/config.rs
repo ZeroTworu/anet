@@ -1,5 +1,8 @@
 use crate::boring_tls::{TlsClientConfig, TlsFingerprint};
-use crate::consts::WRTC_VIDEO_MTU_OVERHEAD;
+use crate::consts::{
+    MAX_VIDEO_BATCH_BYTES, WRTC_BATCHER_MAX_BYTES, WRTC_BATCHER_MAX_DELAY_MS, WRTC_MIN_TUN_MTU,
+    WRTC_UPLINK_BURST_MAX_PACKETS, WRTC_VIDEO_BATCH_MAX_PACKETS, WRTC_VIDEO_MTU_OVERHEAD,
+};
 use serde::{Deserialize, Serialize};
 
 fn default_tls_verify_peer() -> bool {
@@ -97,6 +100,10 @@ pub struct WrtcConfig {
     pub ice_keepalive_interval_ms: u64,
     /// Максимальный интервал проактивного обновления TURN-аллокации и учётных данных (Refresh) (в секундах).
     pub turn_refresh_interval_secs: u64,
+    /// Разрешить использование TURN и TURNS (`turns_proxy`) релеев для `PeerConnection` к медиасерверу JVB.
+    /// При `false` для связи с JVB используются только прямые UDP кандидаты (`host` + STUN `srflx`),
+    /// что исключает двойной релей через TURN/TCP-прокси и таймауты `TURN transaction timed out` при работе через WARP.
+    pub jvb_use_turn: bool,
 
     /// Максимальный размер буфера приёма SCTP DataChannel (в байтах).
     pub sctp_max_receive_buffer_size: u32,
@@ -106,8 +113,20 @@ pub struct WrtcConfig {
     pub receive_mtu: usize,
 
     /// Суммарный сетевой оверхед инкапсуляции `media_video` (IPv4 + UDP + SRTP + RTP + VP8 + Tag + ASTP, в байтах),
-    /// вычитаемый из MTU сервера для предотвращения фрагментации и дропов на пограничных каналах с PMTU 1400.
+    /// вычитаемый из MTU сервера для предотвращения фрагментации и дропов на пограничных каналах.
     pub video_mtu_overhead: u16,
+    /// Минимально допустимый MTU TUN-интерфейса после вычета `video_mtu_overhead` (в байтах).
+    pub min_tun_mtu: u16,
+    /// Верхний предел размера полезной нагрузки микро-батча для одного VP8 RTP кадра (в байтах).
+    pub max_video_batch_bytes: usize,
+    /// Максимальное количество IP-пакетов, склеиваемых в один VP8 RTP микро-батч (`1` отключает склейку).
+    pub video_batch_max_packets: usize,
+    /// Максимальное число пакетов, вычитываемых из TUN за один цикл отправки.
+    pub uplink_burst_max_packets: usize,
+    /// Максимальный размер пачки пакетов (в байтах) для `PacketBatcher` (Colibri-WS / DataChannel).
+    pub ws_batcher_max_bytes: usize,
+    /// Максимальная задержка накопления пачки (в миллисекундах) для `PacketBatcher`.
+    pub ws_batcher_max_delay_ms: u64,
     /// Интервал отправки фоновых пустых ключевых кадров VP8 во время простоя туннеля (в миллисекундах).
     pub video_keepalive_interval_ms: u64,
 
@@ -141,10 +160,17 @@ impl Default for WrtcConfig {
             ice_failed_timeout_ms: 25_000,
             ice_keepalive_interval_ms: 2_000,
             turn_refresh_interval_secs: 90,
+            jvb_use_turn: true,
             sctp_max_receive_buffer_size: 8 * 1024 * 1024,
             sctp_mtu: 1200,
             receive_mtu: 1600,
             video_mtu_overhead: WRTC_VIDEO_MTU_OVERHEAD,
+            min_tun_mtu: WRTC_MIN_TUN_MTU as u16,
+            max_video_batch_bytes: MAX_VIDEO_BATCH_BYTES,
+            video_batch_max_packets: WRTC_VIDEO_BATCH_MAX_PACKETS,
+            uplink_burst_max_packets: WRTC_UPLINK_BURST_MAX_PACKETS,
+            ws_batcher_max_bytes: WRTC_BATCHER_MAX_BYTES,
+            ws_batcher_max_delay_ms: WRTC_BATCHER_MAX_DELAY_MS,
             video_keepalive_interval_ms: 1000,
             watchdog_disconnected_timeout_secs: 8,
             watchdog_channel_grace_secs: 12,

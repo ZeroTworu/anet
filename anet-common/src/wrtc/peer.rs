@@ -717,6 +717,7 @@ struct IceTierEntry {
 fn build_ice_server_tiers(
     discovered: &[XmppIceServer],
     wrtc_cfg: &WrtcConfig,
+    allow_turn: bool,
 ) -> (Vec<IceTierEntry>, Vec<TurnsProxyHandle>) {
     let mut proxies: Vec<TurnsProxyHandle> = Vec::new();
     let connect_timeout = Duration::from_secs(wrtc_cfg.http_connect_timeout_secs.max(5));
@@ -727,7 +728,7 @@ fn build_ice_server_tiers(
     // ChannelData через TLS 1.3 TCP:443 (bst-talk-stun7.ktalk.host:443, dtl-talk-stun5.ktalk.host:443).
     let mut proxy_by_idx: Vec<Option<(String, String)>> = Vec::with_capacity(discovered.len());
     for s in discovered {
-        if s.is_turn && s.is_tcp_or_tls {
+        if allow_turn && s.is_turn && s.is_tcp_or_tls {
             let use_tls = s
                 .urls
                 .iter()
@@ -819,6 +820,9 @@ fn build_ice_server_tiers(
         ("Tier 1: UDP STUN + UDP TURN", true, false),
         ("Tier 2: STUN", false, false),
     ] {
+        if inc_turn && !allow_turn {
+            continue;
+        }
         let (list, display_urls, has_turn) = filter_tier(inc_turn, inc_tcp);
         if !list.is_empty() {
             let urls_flat: Vec<&str> = list
@@ -873,7 +877,7 @@ pub async fn create_p2p_channel(
         "[P2P Direct] Pinned P2P UDP socket to physical interface: {effective_bind_addr}"
     );
 
-    let (tiers, turns_proxies) = build_ice_server_tiers(ice_servers_info, wrtc_cfg);
+    let (tiers, turns_proxies) = build_ice_server_tiers(ice_servers_info, wrtc_cfg, true);
     let mut last_err = None;
     let mut built_pc = None;
     let mut active_ice_servers: Vec<RTCIceServer> = Vec::new();
@@ -1169,6 +1173,11 @@ impl WrtcPeer {
                                 let tcp = tokio::net::TcpStream::connect((target_host.as_str(), target_port)).await?;
                                 let peer_ip = tcp.peer_addr().ok().map(|a| a.ip());
                                 let _ = tcp.set_nodelay(true);
+                                let sock_ref = socket2::SockRef::from(&tcp);
+                                let ka = socket2::TcpKeepalive::new()
+                                    .with_time(Duration::from_secs(10))
+                                    .with_interval(Duration::from_secs(5));
+                                let _ = sock_ref.set_tcp_keepalive(&ka);
                                 let stream: Box<dyn crate::transport_trait::VpnStream> = if is_wss {
                                     let tls = ws_profile.connect_ws_tls(&target_host, tcp).await?;
                                     Box::new(tls)
@@ -1213,7 +1222,7 @@ impl WrtcPeer {
                                 }
                             }
 
-                            let mut ws_ping_interval = tokio::time::interval(Duration::from_secs(15));
+                            let mut ws_ping_interval = tokio::time::interval(Duration::from_secs(10));
                             ws_ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                             let mut channel_closed = false;
 
@@ -1388,7 +1397,8 @@ impl WrtcPeer {
             let dc_open_notify = Arc::new(tokio::sync::Notify::new());
 
             let discovered_ice = xmpp.get_ice_servers();
-            let (tiers, built_proxies) = build_ice_server_tiers(&discovered_ice, wrtc_cfg);
+            let (tiers, built_proxies) =
+                build_ice_server_tiers(&discovered_ice, wrtc_cfg, wrtc_cfg.jvb_use_turn);
             turns_proxies = built_proxies;
             let mut built_pc = None;
             let mut has_turn_configured = false;

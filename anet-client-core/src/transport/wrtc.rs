@@ -2,13 +2,11 @@ use super::{ClientTransport, ConnectionResult};
 use crate::auth::{AuthChannel, AuthHandler};
 use crate::config::{CoreConfig, ServerConfig};
 use anet_common::consts::{
-    COALESCE_BUDGET_BYTES, MAX_VIDEO_BATCH_BYTES, VIDEO_BATCH_MARKER, VP8_ASTP_PREFIX_LEN,
-    WRTC_BATCHER_MAX_BYTES, WRTC_BATCHER_MAX_DELAY_MS, WRTC_CLIENT_CONSTRAINTS_REASSERT_COUNT,
-    WRTC_CLIENT_CONSTRAINTS_REASSERT_INTERVAL_SECS, WRTC_DEFAULT_FALLBACK_JVB_IP,
-    WRTC_DEFAULT_FALLBACK_JVB_PORT, WRTC_DEFAULT_MAX_VIDEO_HEIGHT,
+    COALESCE_BUDGET_BYTES, VIDEO_BATCH_MARKER, VP8_ASTP_PREFIX_LEN,
+    WRTC_CLIENT_CONSTRAINTS_REASSERT_COUNT, WRTC_CLIENT_CONSTRAINTS_REASSERT_INTERVAL_SECS,
+    WRTC_DEFAULT_FALLBACK_JVB_IP, WRTC_DEFAULT_FALLBACK_JVB_PORT, WRTC_DEFAULT_MAX_VIDEO_HEIGHT,
     WRTC_DISCOVER_BROADCAST_INTERVAL_SECS, WRTC_DUPLEX_BUFFER_SIZE, WRTC_ICE_GATHER_POLL_ATTEMPTS,
-    WRTC_MIN_ASTP_VIDEO_FRAME_LEN, WRTC_MIN_IP_PACKET_LEN, WRTC_MIN_TUN_MTU,
-    WRTC_P2P_ICE_GATHER_POLL_INTERVAL_MS, WRTC_UPLINK_BURST_MAX_PACKETS,
+    WRTC_MIN_ASTP_VIDEO_FRAME_LEN, WRTC_MIN_IP_PACKET_LEN, WRTC_P2P_ICE_GATHER_POLL_INTERVAL_MS,
     WRTC_VIDEO_CHANNEL_CAPACITY, WRTC_WATCHDOG_TICK_SECS,
 };
 use anet_common::encryption::Cipher;
@@ -456,20 +454,27 @@ impl ClientTransport for WrtcTransport {
         {
             let server_mtu = auth_response.mtu;
             let video_overhead = i32::from(self.config.wrtc.video_mtu_overhead);
+            let min_tun_mtu = i32::from(self.config.wrtc.min_tun_mtu.clamp(576, 1500));
             let adjusted_mtu = server_mtu
                 .saturating_sub(video_overhead)
-                .max(WRTC_MIN_TUN_MTU);
+                .max(min_tun_mtu);
             info!(
-                "[WRTC] Adjusted TUN MTU to {} (server MTU {} - {}B WebRTC RTP/SCTP overhead)",
+                "[WRTC] Adjusted TUN MTU to {} (server MTU {} - {}B WebRTC RTP/SCTP overhead, min_tun_mtu={})",
                 adjusted_mtu,
                 server_mtu,
-                self.config.wrtc.video_mtu_overhead
+                self.config.wrtc.video_mtu_overhead,
+                min_tun_mtu
             );
             auth_response.mtu = adjusted_mtu;
         }
+        let cfg_max_video_batch_bytes = self.config.wrtc.max_video_batch_bytes.clamp(400, 1400);
         let max_video_batch_bytes = (auth_response.mtu as usize)
             .saturating_sub(30)
-            .min(MAX_VIDEO_BATCH_BYTES);
+            .min(cfg_max_video_batch_bytes);
+        let video_batch_max_packets = self.config.wrtc.video_batch_max_packets.clamp(1, 64);
+        let uplink_burst_max_packets = self.config.wrtc.uplink_burst_max_packets.clamp(1, 256);
+        let ws_batcher_max_bytes = self.config.wrtc.ws_batcher_max_bytes.clamp(512, 65536);
+        let ws_batcher_max_delay_ms = self.config.wrtc.ws_batcher_max_delay_ms.clamp(1, 50);
 
         info!(
             "[WRTC] ASTP Authentication succeeded! Assigned VPN IP: {}",
@@ -776,10 +781,10 @@ impl ClientTransport for WrtcTransport {
             tokio::time::interval(Duration::from_secs(WRTC_WATCHDOG_TICK_SECS));
         watchdog_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut batch_interval =
-            tokio::time::interval(Duration::from_millis(WRTC_BATCHER_MAX_DELAY_MS));
+            tokio::time::interval(Duration::from_millis(ws_batcher_max_delay_ms));
         let last_pong = Arc::new(AtomicU64::new(current_timestamp_secs()));
         let last_pong_tx = last_pong.clone();
-        let mut batcher = PacketBatcher::new(WRTC_BATCHER_MAX_BYTES, WRTC_BATCHER_MAX_DELAY_MS);
+        let mut batcher = PacketBatcher::new(ws_batcher_max_bytes, ws_batcher_max_delay_ms);
 
         let uplink_task = tokio::spawn(async move {
             const VIDEO_WARMUP_PAYLOAD: [u8; 16] = [
@@ -843,7 +848,7 @@ impl ClientTransport for WrtcTransport {
                             && (wrtc_mode == anet_common::wrtc::colibri::WrtcMode::MediaVideo
                                 || wrtc_mode == anet_common::wrtc::colibri::WrtcMode::Auto);
 
-                        for _burst_idx in 0..WRTC_UPLINK_BURST_MAX_PACKETS {
+                        for _burst_idx in 0..uplink_burst_max_packets {
                             if packet.len() >= WRTC_MIN_IP_PACKET_LEN {
                                 // Zero-delay micro-batching мелких пакетов (TCP ACK, DNS) в единый VP8 RTP кадр
                                 let mut batch_capable = p2p_active;
@@ -859,7 +864,11 @@ impl ClientTransport for WrtcTransport {
                                 let mut batched_payload = false;
 
                                 if batch_capable && (packet.len() + 3 < max_video_batch_bytes) {
-                                    while let Ok(Some(next_pkt)) = frame_reader.try_next_packet() {
+                                    let mut batch_count = 1usize;
+                                    while batch_count < video_batch_max_packets {
+                                        let Ok(Some(next_pkt)) = frame_reader.try_next_packet() else {
+                                            break;
+                                        };
                                         if next_pkt.len() < WRTC_MIN_IP_PACKET_LEN {
                                             continue;
                                         }
@@ -878,6 +887,7 @@ impl ClientTransport for WrtcTransport {
                                             }
                                             video_batch_buf.put_u16(next_pkt.len() as u16);
                                             video_batch_buf.put_slice(&next_pkt);
+                                            batch_count += 1;
                                         } else {
                                             pending_packet = Some(next_pkt);
                                             break;
