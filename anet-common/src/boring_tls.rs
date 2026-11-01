@@ -212,18 +212,34 @@ fn load_platform_root_certs() -> Vec<X509> {
     let mut certs = Vec::new();
     let mut seen_der = std::collections::HashSet::new();
 
-    let mut push_unique_der = |der_bytes: &[u8]| {
+    fn push_unique_der(
+        certs: &mut Vec<X509>,
+        seen_der: &mut std::collections::HashSet<Vec<u8>>,
+        der_bytes: &[u8],
+    ) {
         if seen_der.insert(der_bytes.to_vec()) {
             if let Ok(x509) = X509::from_der(der_bytes) {
                 certs.push(x509);
             }
         }
-    };
+    }
+
+    fn push_unique_cert(
+        certs: &mut Vec<X509>,
+        seen_der: &mut std::collections::HashSet<Vec<u8>>,
+        cert: X509,
+    ) {
+        if let Ok(der) = cert.to_der() {
+            if seen_der.insert(der) {
+                certs.push(cert);
+            }
+        }
+    }
 
     // 1. Нативное хранилище ОС (Windows CryptoAPI/schannel, macOS/iOS Keychain, Linux openssl-probe)
     let native_result = rustls_native_certs::load_native_certs();
     for der in native_result.certs {
-        push_unique_der(der.as_ref());
+        push_unique_der(&mut certs, &mut seen_der, der.as_ref());
     }
 
     // 2. Встроенный бандл корневых сертификатов Mozilla WebPKI (CCADB).
@@ -231,7 +247,7 @@ fn load_platform_root_certs() -> Vec<X509> {
     // из Windows Update только при обращениях через Schannel/Edge, поэтому в локальном системном хранилище ROOT
     // при прямой проверке через BoringSSL часть корневых сертификатов может отсутствовать.
     for root_der in webpki_root_certs::TLS_SERVER_ROOT_CERTS {
-        push_unique_der(root_der.as_ref());
+        push_unique_der(&mut certs, &mut seen_der, root_der.as_ref());
     }
 
     // 3. Стандартные пути к PEM-бандлам в Linux / BSD / macOS
@@ -247,11 +263,7 @@ fn load_platform_root_certs() -> Vec<X509> {
         if let Ok(pem_bytes) = std::fs::read(path) {
             if let Ok(stack) = X509::stack_from_pem(&pem_bytes) {
                 for cert in stack {
-                    if let Ok(der) = cert.to_der() {
-                        if seen_der.insert(der) {
-                            certs.push(cert);
-                        }
-                    }
+                    push_unique_cert(&mut certs, &mut seen_der, cert);
                 }
                 break;
             }
@@ -268,14 +280,10 @@ fn load_platform_root_certs() -> Vec<X509> {
                 if let Ok(bytes) = std::fs::read(entry.path()) {
                     if let Ok(stack) = X509::stack_from_pem(&bytes) {
                         for cert in stack {
-                            if let Ok(der) = cert.to_der() {
-                                if seen_der.insert(der) {
-                                    certs.push(cert);
-                                }
-                            }
+                            push_unique_cert(&mut certs, &mut seen_der, cert);
                         }
                     } else {
-                        push_unique_der(&bytes);
+                        push_unique_der(&mut certs, &mut seen_der, &bytes);
                     }
                 }
             }
