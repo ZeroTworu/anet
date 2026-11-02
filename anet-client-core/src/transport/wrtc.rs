@@ -2,7 +2,7 @@ use super::{ClientTransport, ConnectionResult};
 use crate::auth::{AuthChannel, AuthHandler};
 use crate::config::{CoreConfig, ServerConfig};
 use anet_common::consts::{
-    COALESCE_BUDGET_BYTES, VIDEO_BATCH_MARKER, VP8_ASTP_PREFIX_LEN,
+    COALESCE_BUDGET_BYTES, VIDEO_BATCH_MARKER, VIDEO_WARMUP_PAYLOAD, VP8_ASTP_PREFIX_LEN,
     WRTC_CLIENT_CONSTRAINTS_REASSERT_COUNT, WRTC_CLIENT_CONSTRAINTS_REASSERT_INTERVAL_SECS,
     WRTC_DEFAULT_FALLBACK_JVB_IP, WRTC_DEFAULT_FALLBACK_JVB_PORT, WRTC_DEFAULT_MAX_VIDEO_HEIGHT,
     WRTC_DISCOVER_BROADCAST_INTERVAL_SECS, WRTC_DUPLEX_BUFFER_SIZE, WRTC_ICE_GATHER_POLL_ATTEMPTS,
@@ -21,9 +21,9 @@ use anet_common::wrtc::{
     colibri::{
         compute_server_endpoint_suffix_from_b64, verify_beacon, ColibriMessage, WrtcMessage,
     },
-    jingle::{filter_p2p_sdp_relay_only, parse_jingle_session},
-    ktalk::KtalkClient,
+    jingle::{filter_p2p_sdp_relay_only, parse_jingle_session, JingleAction},
     peer::{create_p2p_channel, P2pSession, WrtcPeer},
+    providers::WrtcProviderRegistry,
     stealth::generate_random_guest_name,
     xmpp::XmppSession,
 };
@@ -99,41 +99,38 @@ impl ClientTransport for WrtcTransport {
         let browser_profile = BrowserProfile::with_tls_config(tls_cfg);
         let guest_name = generate_random_guest_name();
 
-        info!(
-            "[WRTC] Connecting to Ktalk room '{}' at domain '{}' as '{}'...",
-            room_name, domain, guest_name
-        );
-
         let mut wrtc_cfg = self.config.wrtc.clone();
         if let Some(use_turn) = self.server.wrtc_use_turn {
             wrtc_cfg.jvb_use_turn = use_turn;
         }
 
-        let ktalk = KtalkClient::new(browser_profile.clone(), &wrtc_cfg)
-            .context("Failed to initialize WRTC Ktalk client with BoringSSL TLS")?;
-        let anon_secret = KtalkClient::generate_anonymous_secret();
-        let auth_res = ktalk
-            .authorize_session(&domain, &room_name, Some(&guest_name), &anon_secret)
-            .await
-            .context("Failed to authorize Ktalk session")?;
+        let provider_kind = WrtcProviderRegistry::detect(&domain);
+        info!(
+            "[WRTC] Connecting to {:?} room '{}' at domain '{}' as '{}'...",
+            provider_kind, room_name, domain, guest_name
+        );
 
-        let room_info = ktalk
-            .resolve_room(&domain, &room_name, &auth_res.token)
-            .await
-            .context("Failed to resolve Ktalk room")?;
+        let bootstrap = WrtcProviderRegistry::bootstrap_room(
+            &domain,
+            &room_name,
+            Some(&guest_name),
+            &browser_profile,
+            &wrtc_cfg,
+        )
+        .await
+        .context("Failed to bootstrap WRTC conference room")?;
 
         let ping_secs = self.server.wrtc_ping_interval_secs.unwrap_or(30);
-        let mut xmpp = XmppSession::connect(
-            &domain,
-            &room_info.conference_id,
-            &auth_res.token,
+        let mut xmpp = XmppSession::connect_from_bootstrap(
+            &bootstrap,
             Some(&guest_name),
+            None,
             &browser_profile,
             ping_secs,
             &wrtc_cfg,
         )
-            .await
-            .context("Failed to establish XMPP session and join conference MUC")?;
+        .await
+        .context("Failed to establish XMPP session and join conference MUC")?;
 
         let fallback_ip = self
             .server
@@ -145,7 +142,9 @@ impl ClientTransport for WrtcTransport {
             .wrtc_fallback_jvb_port
             .unwrap_or(WRTC_DEFAULT_FALLBACK_JVB_PORT);
 
-        let _ = xmpp.request_conference_allocation().await;
+        if !bootstrap.pre_allocate_before_muc {
+            let _ = xmpp.request_conference_allocation().await;
+        }
 
         let timeout_secs = self.server.timeout_secs.max(15);
         let mut parsed_session = None;
@@ -336,19 +335,18 @@ impl ClientTransport for WrtcTransport {
             });
 
         let expected_srv_suffix = server_pub_key
-            .and_then(|pk| compute_server_endpoint_suffix_from_b64(pk, &room_info.conference_id));
+            .and_then(|pk| compute_server_endpoint_suffix_from_b64(pk, &bootstrap.conference_id));
 
         let mut verified_server_id = None;
         while tokio::time::Instant::now() < deadline {
             tokio::select! {
                 _ = interval.tick() => {
-                    let (c_video_ssrc, c_mode_str) = match wrtc_mode {
-                        anet_common::wrtc::colibri::WrtcMode::Ws => (None, "ws"),
-                        anet_common::wrtc::colibri::WrtcMode::MediaVideo => (Some(peer.video_ssrc), "media_video"),
-                        anet_common::wrtc::colibri::WrtcMode::P2pDirect => (None, "p2p_direct"),
-                        anet_common::wrtc::colibri::WrtcMode::JvbDatachannel => (None, "jvb_datachannel"),
-                        anet_common::wrtc::colibri::WrtcMode::Auto => (Some(peer.video_ssrc), "auto"),
+                    let c_video_ssrc = match wrtc_mode {
+                        anet_common::wrtc::colibri::WrtcMode::MediaVideo
+                        | anet_common::wrtc::colibri::WrtcMode::Auto => Some(peer.video_ssrc),
+                        _ => None,
                     };
+                    let c_mode_str = wrtc_mode.as_str();
 
                     let current_occupants = xmpp.get_other_occupants();
                     let target_occupants: Vec<String> = match expected_srv_suffix {
@@ -533,22 +531,23 @@ impl ClientTransport for WrtcTransport {
                         ) {
                             match parsed {
                                 anet_common::wrtc::xmpp_xml::InboundXmpp::Jingle(jingle) => {
-                                    if jingle.action == "session-terminate" {
-                                        warn!(
-                                            "[WRTC Client] Jicofo sent session-terminate (sid: {}, reason: {:?}). Triggering reconnect...",
-                                            jingle.sid, jingle.reason
-                                        );
-                                        warn(format!(
-                                            "[WRTC Client] Jingle session terminated ({:?}). Reconnecting...",
-                                            jingle.reason
-                                        ));
-                                        peer_xmpp.failed_notify.notify_waiters();
-                                        peer_xmpp.failed_notify.notify_one();
-                                        return;
-                                    } else if jingle.action == "source-add"
-                                        || jingle.action == "description-info"
-                                        || jingle.action == "session-initiate"
-                                    {
+                                    match jingle.action_kind() {
+                                        JingleAction::SessionTerminate => {
+                                            warn!(
+                                                "[WRTC Client] Jicofo sent session-terminate (sid: {}, reason: {:?}). Triggering reconnect...",
+                                                jingle.sid, jingle.reason
+                                            );
+                                            warn(format!(
+                                                "[WRTC Client] Jingle session terminated ({:?}). Reconnecting...",
+                                                jingle.reason
+                                            ));
+                                            peer_xmpp.failed_notify.notify_waiters();
+                                            peer_xmpp.failed_notify.notify_one();
+                                            return;
+                                        }
+                                        JingleAction::SourceAdd
+                                        | JingleAction::DescriptionInfo
+                                        | JingleAction::SessionInitiate => {
                                         if matches!(
                                             wrtc_mode,
                                             anet_common::wrtc::colibri::WrtcMode::MediaVideo
@@ -579,6 +578,8 @@ impl ClientTransport for WrtcTransport {
                                             let mute_constraints = anet_common::wrtc::colibri::ReceiverVideoConstraints::new_all(0);
                                             let _ = peer_xmpp.send_video_constraints(&mute_constraints).await;
                                         }
+                                        }
+                                        _ => {}
                                     }
                                 }
                                 anet_common::wrtc::xmpp_xml::InboundXmpp::JingleAck {
@@ -820,15 +821,11 @@ impl ClientTransport for WrtcTransport {
         batch_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let last_pong = Arc::new(AtomicU64::new(current_timestamp_secs()));
         let last_pong_tx = last_pong.clone();
+        let last_pong_p2p = last_pong.clone();
+        let last_pong_video = last_pong.clone();
         let mut batcher = PacketBatcher::new(ws_batcher_max_bytes, ws_batcher_max_delay_ms);
 
         let uplink_task = tokio::spawn(async move {
-            const VIDEO_WARMUP_PAYLOAD: [u8; 16] = [
-                VIDEO_BATCH_MARKER,
-                0xFF,
-                0xFF,
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            ];
             let mut frame_reader = FrameReader::new();
             let mut pending_packet: Option<Bytes> = None;
             let mut video_batch_buf = BytesMut::with_capacity(max_video_batch_bytes + 64);
@@ -1168,6 +1165,7 @@ impl ClientTransport for WrtcTransport {
                                             Bytes::from(raw_encrypted),
                                         ) {
                                             Ok(decrypted) => {
+                                                last_pong.store(current_timestamp_secs(), Ordering::Relaxed);
                                                 if decrypted.first() == Some(&VIDEO_BATCH_MARKER) {
                                                     let packets = unpack_batch(&decrypted[1..]);
                                                     for pkt in packets {
@@ -1204,6 +1202,7 @@ impl ClientTransport for WrtcTransport {
                                         for enc_pkt in packets {
                                             match unwrap_packet_bytes(&cipher_rx, enc_pkt) {
                                                 Ok(decrypted) => {
+                                                    last_pong.store(current_timestamp_secs(), Ordering::Relaxed);
                                                     if decrypted.first() == Some(&VIDEO_BATCH_MARKER) {
                                                         let inner_pkts = unpack_batch(&decrypted[1..]);
                                                         for pkt in inner_pkts {
@@ -1264,6 +1263,7 @@ impl ClientTransport for WrtcTransport {
                             while let Some(raw_bytes) = current_raw.take() {
                                 match unwrap_packet_bytes(&cipher_p2p, raw_bytes) {
                                     Ok(decrypted) => {
+                                        last_pong_p2p.store(current_timestamp_secs(), Ordering::Relaxed);
                                         if decrypted.first() == Some(&VIDEO_BATCH_MARKER) {
                                             let packets = unpack_batch(&decrypted[1..]);
                                             for pkt in packets {
@@ -1350,7 +1350,9 @@ impl ClientTransport for WrtcTransport {
                             let raw_len = raw_astp.len();
                             match unwrap_packet_bytes(&cipher_video, raw_astp) {
                                 Ok(decrypted) => {
-                                    last_video_rx_secs.store(current_timestamp_secs(), Ordering::Relaxed);
+                                    let now_secs = current_timestamp_secs();
+                                    last_video_rx_secs.store(now_secs, Ordering::Relaxed);
+                                    last_pong_video.store(now_secs, Ordering::Relaxed);
                                     if first_client_rx.swap(false, Ordering::Relaxed) {
                                         info!(
                                             "[WRTC Client Video IN] First video frame decrypted from server (len: {} bytes, tag: 0x{:04X})",

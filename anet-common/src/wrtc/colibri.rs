@@ -117,6 +117,18 @@ impl Default for WrtcMode {
     }
 }
 
+impl WrtcMode {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            WrtcMode::Auto => "auto",
+            WrtcMode::P2pDirect => "p2p_direct",
+            WrtcMode::JvbDatachannel => "jvb_datachannel",
+            WrtcMode::Ws => "ws",
+            WrtcMode::MediaVideo => "media_video",
+        }
+    }
+}
+
 impl std::str::FromStr for WrtcMode {
     type Err = std::convert::Infallible;
 

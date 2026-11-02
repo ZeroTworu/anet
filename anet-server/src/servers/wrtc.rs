@@ -2,11 +2,12 @@ use crate::auth_handler::ServerAuthHandler;
 use crate::client_registry::{ClientRegistry, ClientTransportInfo};
 use crate::config::Config;
 use anet_common::consts::{
-    MAX_PACKET_SIZE, VIDEO_BATCH_MARKER, VP8_ASTP_PREFIX_LEN, WRTC_COLIBRI_CHANNEL_CAPACITY,
-    WRTC_DEFAULT_MAX_VIDEO_HEIGHT, WRTC_HANDSHAKE_PROCESS_TIMEOUT_SECS,
-    WRTC_ICE_GATHER_POLL_ATTEMPTS, WRTC_MIN_ASTP_VIDEO_FRAME_LEN, WRTC_MIN_IP_PACKET_LEN,
-    WRTC_P2P_ICE_GATHER_POLL_INTERVAL_MS, WRTC_SDP_RENEGOTIATE_TIMEOUT_SECS,
-    WRTC_SERVER_RECONNECT_PAUSE_SECS, WRTC_SERVER_RETRY_DELAY_SECS, WRTC_WATCHDOG_TICK_SECS,
+    MAX_PACKET_SIZE, VIDEO_BATCH_MARKER, VIDEO_WARMUP_PAYLOAD, VP8_ASTP_PREFIX_LEN,
+    WRTC_COLIBRI_CHANNEL_CAPACITY, WRTC_DEFAULT_MAX_VIDEO_HEIGHT,
+    WRTC_HANDSHAKE_PROCESS_TIMEOUT_SECS, WRTC_ICE_GATHER_POLL_ATTEMPTS,
+    WRTC_MIN_ASTP_VIDEO_FRAME_LEN, WRTC_MIN_IP_PACKET_LEN, WRTC_P2P_ICE_GATHER_POLL_INTERVAL_MS,
+    WRTC_SDP_RENEGOTIATE_TIMEOUT_SECS, WRTC_SERVER_RECONNECT_PAUSE_SECS,
+    WRTC_SERVER_RETRY_DELAY_SECS, WRTC_WATCHDOG_TICK_SECS,
 };
 use anet_common::http_help::BrowserProfile;
 use anet_common::transport::{
@@ -15,9 +16,9 @@ use anet_common::transport::{
 use anet_common::wrtc::{
     batcher::{unpack_batch, PacketBatcher},
     colibri::{generate_server_endpoint_id, sign_beacon, ColibriMessage, WrtcMessage},
-    jingle::{filter_p2p_sdp_relay_only, parse_jingle_session},
-    ktalk::KtalkClient,
+    jingle::{filter_p2p_sdp_relay_only, parse_jingle_session, JingleAction},
     peer::{create_p2p_channel, P2pSession, WrtcPeer},
+    providers::WrtcProviderRegistry,
     stealth::generate_random_guest_name,
     xmpp::XmppSession,
 };
@@ -70,39 +71,29 @@ pub async fn run_wrtc_server(
         "[WRTC Server] Server Public Key (must match client.toml server_pub_key): {server_pub_key_b64}"
     );
 
+    let provider_kind = WrtcProviderRegistry::detect(&domain);
     info!(
-        "[WRTC Server] Starting worker for Ktalk room '{}' at domain '{}'...",
-        room_name, domain
+        "[WRTC Server] Starting worker for {:?} room '{}' at domain '{}'...",
+        provider_kind, room_name, domain
     );
 
     loop {
         let browser_profile = BrowserProfile::with_tls_config(config.stealth.to_tls_client_config());
         let guest_name = generate_random_guest_name();
 
-        let ktalk = KtalkClient::new(browser_profile.clone(), &config.wrtc)
-        .context("Failed to initialize WRTC Ktalk client on server with BoringSSL TLS")?;
-        let anon_secret = KtalkClient::generate_anonymous_secret();
-
-        let auth_res = match ktalk
-            .authorize_session(&domain, &room_name, Some(&guest_name), &anon_secret)
-            .await
+        let bootstrap = match WrtcProviderRegistry::bootstrap_room(
+            &domain,
+            &room_name,
+            Some(&guest_name),
+            &browser_profile,
+            &config.wrtc,
+        )
+        .await
         {
-            Ok(res) => res,
+            Ok(b) => b,
             Err(e) => {
                 warn!(
-                    "[WRTC Server] Ktalk authorization failed: {e}. Retrying in {}s...",
-                    WRTC_SERVER_RETRY_DELAY_SECS
-                );
-                tokio::time::sleep(Duration::from_secs(WRTC_SERVER_RETRY_DELAY_SECS)).await;
-                continue;
-            }
-        };
-
-        let room_info = match ktalk.resolve_room(&domain, &room_name, &auth_res.token).await {
-            Ok(info) => info,
-            Err(e) => {
-                warn!(
-                    "[WRTC Server] Resolving room failed: {e}. Retrying in {}s...",
+                    "[WRTC Server] Conference room bootstrap failed: {e:#}. Retrying in {}s...",
                     WRTC_SERVER_RETRY_DELAY_SECS
                 );
                 tokio::time::sleep(Duration::from_secs(WRTC_SERVER_RETRY_DELAY_SECS)).await;
@@ -113,18 +104,16 @@ pub async fn run_wrtc_server(
         let ping_secs = config.server.wrtc_ping_interval_secs;
         let pub_key_bytes = signing_key.verifying_key().to_bytes();
         let deterministic_ep =
-            generate_server_endpoint_id(&pub_key_bytes, &room_info.conference_id);
-        let mut xmpp = match XmppSession::connect_with_endpoint(
-            &domain,
-            &room_info.conference_id,
-            &auth_res.token,
+            generate_server_endpoint_id(&pub_key_bytes, &bootstrap.conference_id);
+        let mut xmpp = match XmppSession::connect_from_bootstrap(
+            &bootstrap,
             Some(&guest_name),
             Some(deterministic_ep),
             &browser_profile,
             ping_secs,
             &config.wrtc,
         )
-            .await
+        .await
         {
             Ok(session) => session,
             Err(e) => {
@@ -146,7 +135,9 @@ pub async fn run_wrtc_server(
         let fallback_ip = &config.server.wrtc_fallback_jvb_ip;
         let fallback_port = config.server.wrtc_fallback_jvb_port;
 
-        let _ = xmpp.request_conference_allocation().await;
+        if !bootstrap.pre_allocate_before_muc {
+            let _ = xmpp.request_conference_allocation().await;
+        }
 
         info!("[WRTC Server] Waiting for Jicofo session-initiate (client arrival)...");
         let mut parsed_session = None;
@@ -186,8 +177,8 @@ pub async fn run_wrtc_server(
 
         if session.sources.len() > 50 || session.video_sources.len() > 50 {
             warn!(
-                "[WRTC Server] Ktalk room '{}' contains {} audio / {} video Jingle sources in Jicofo (stale ghost endpoints). If WRTC VIDEO fails to warm up due to multi-bridge JVB split, switch to a fresh Ktalk room URL.",
-                room_info.conference_id,
+                "[WRTC Server] Conference room '{}' contains {} audio / {} video Jingle sources in Jicofo (stale ghost endpoints). If WRTC VIDEO fails to warm up due to multi-bridge JVB split, switch to a fresh room URL.",
+                bootstrap.conference_id,
                 session.sources.len(),
                 session.video_sources.len()
             );
@@ -293,6 +284,11 @@ pub async fn run_wrtc_server(
                     if let Ok(decrypted) = unwrap_packet_bytes(&client_info.cipher, raw_astp) {
                         let now_ms = peer_video_rx.start_instant.elapsed().as_millis() as u64;
                         client_last_video_rx_rx.insert(client_tag, now_ms);
+                        let now_epoch = std::time::SystemTime::now()
+                            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        client_info.last_activity.store(now_epoch, Ordering::Relaxed);
                         if client_video_warmed_rx.insert(client_tag) {
                             peer_video_rx.force_next_keyframe();
                             info!(
@@ -392,45 +388,48 @@ pub async fn run_wrtc_server(
                     for parsed in anet_common::wrtc::xmpp_xml::parse_xmpp_stanzas(&stanza, fallback_ip, fallback_port) {
                         match parsed {
                             anet_common::wrtc::xmpp_xml::InboundXmpp::Jingle(jingle) => {
-                                if jingle.action == "session-terminate" {
-                                    info!(
-                                        "[WRTC Server] Jicofo terminated Jingle session {} (reason: {:?}). Rotating server room session...",
-                                        jingle.sid, jingle.reason
-                                    );
-                                    self_removed = true;
-                                } else if jingle.action == "source-add"
-                                    || jingle.action == "description-info"
-                                    || jingle.action == "session-initiate"
-                                {
-                                    let mut any_video_updated = false;
-                                    for v_ssrc in jingle.video_sources {
-                                        room_jingle_video_ssrcs.insert(v_ssrc);
-                                        if known_client_video_ssrcs.contains(&v_ssrc) {
-                                            info!("[WRTC Server] Jingle stanza ({}) announced authorized client video SSRC: {v_ssrc}", jingle.action);
-                                            let _ = tokio::time::timeout(
-                                                Duration::from_secs(WRTC_SDP_RENEGOTIATE_TIMEOUT_SECS),
-                                                shared_peer.add_remote_video_ssrc(v_ssrc),
-                                            ).await;
-                                            any_video_updated = true;
-                                        } else {
-                                            log::debug!("[WRTC Server] Recorded Jingle ({}) SSRC {v_ssrc} in room_jingle_video_ssrcs (awaiting anet_discover)", jingle.action);
+                                match jingle.action_kind() {
+                                    JingleAction::SessionTerminate => {
+                                        info!(
+                                            "[WRTC Server] Jicofo terminated Jingle session {} (reason: {:?}). Rotating server room session...",
+                                            jingle.sid, jingle.reason
+                                        );
+                                        self_removed = true;
+                                    }
+                                    JingleAction::SourceAdd
+                                    | JingleAction::DescriptionInfo
+                                    | JingleAction::SessionInitiate => {
+                                        let mut any_video_updated = false;
+                                        for v_ssrc in jingle.video_sources {
+                                            room_jingle_video_ssrcs.insert(v_ssrc);
+                                            if known_client_video_ssrcs.contains(&v_ssrc) {
+                                                info!("[WRTC Server] Jingle stanza ({}) announced authorized client video SSRC: {v_ssrc}", jingle.action);
+                                                let _ = tokio::time::timeout(
+                                                    Duration::from_secs(WRTC_SDP_RENEGOTIATE_TIMEOUT_SECS),
+                                                    shared_peer.add_remote_video_ssrc(v_ssrc),
+                                                ).await;
+                                                any_video_updated = true;
+                                            } else {
+                                                log::debug!("[WRTC Server] Recorded Jingle ({}) SSRC {v_ssrc} in room_jingle_video_ssrcs (awaiting anet_discover)", jingle.action);
+                                            }
+                                        }
+                                        if any_video_updated || !client_video_endpoints.is_empty() {
+                                            let video_eps: Vec<String> = client_video_endpoints
+                                                .iter()
+                                                .map(|e| e.key().clone())
+                                                .collect();
+                                            if !video_eps.is_empty() {
+                                                let constraints =
+                                                    anet_common::wrtc::colibri::ReceiverVideoConstraints::for_endpoints(
+                                                        &video_eps,
+                                                        WRTC_DEFAULT_MAX_VIDEO_HEIGHT,
+                                                    );
+                                                let _ = shared_peer.send_video_constraints(&constraints).await;
+                                                shared_peer.force_next_keyframe();
+                                            }
                                         }
                                     }
-                                    if any_video_updated || !client_video_endpoints.is_empty() {
-                                        let video_eps: Vec<String> = client_video_endpoints
-                                            .iter()
-                                            .map(|e| e.key().clone())
-                                            .collect();
-                                        if !video_eps.is_empty() {
-                                            let constraints =
-                                                anet_common::wrtc::colibri::ReceiverVideoConstraints::for_endpoints(
-                                                    &video_eps,
-                                                    WRTC_DEFAULT_MAX_VIDEO_HEIGHT,
-                                                );
-                                            let _ = shared_peer.send_video_constraints(&constraints).await;
-                                            shared_peer.force_next_keyframe();
-                                        }
-                                    }
+                                    _ => {}
                                 }
                             }
                             anet_common::wrtc::xmpp_xml::InboundXmpp::JingleAck {
@@ -818,12 +817,6 @@ pub async fn run_wrtc_server(
                                                 .min(cfg_max_video_batch_bytes);
 
                                             let downlink_handle = tokio::spawn(async move {
-                                                const VIDEO_WARMUP_PAYLOAD: [u8; 16] = [
-                                                    VIDEO_BATCH_MARKER,
-                                                    0xFF,
-                                                    0xFF,
-                                                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                                                ];
                                                 let mut batcher = PacketBatcher::new(
                                                     ws_batcher_max_bytes,
                                                     ws_batcher_max_delay_ms,

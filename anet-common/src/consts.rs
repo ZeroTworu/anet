@@ -139,6 +139,37 @@ pub const WRTC_SERVER_RECONNECT_PAUSE_SECS: u64 = 2;
 pub const WRTC_HANDSHAKE_PROCESS_TIMEOUT_SECS: u64 = 10;
 pub const WRTC_SDP_RENEGOTIATE_TIMEOUT_SECS: u64 = 5;
 
+/// Таймаут чтения входящих кадров из канала Colibri WebSocket до его фонового переподключения (в секундах).
+pub const WRTC_COLIBRI_WS_READ_TIMEOUT_SECS: u64 = 25;
+
+/// Параметры обхода L4 ECMP / LAG Hash Slicing (Fast TCP Ephemeral Port Hopping и Multi-Socket UDP ICE).
+pub const WRTC_TCP_PORT_HOP_ATTEMPTS: usize = 8;
+pub const WRTC_TCP_PORT_HOP_TIMEOUT_MS: u64 = 1000;
+pub const WRTC_UDP_ICE_SOCKET_COUNT: usize = 6;
+
+/// Специальный 16-байтный холостой кадр прогрева видеоканала (`media_video`),
+/// распознаваемый клиентом и сервером как внутритуннельный keepalive без декодирования IP-пакета.
+pub const VIDEO_WARMUP_MARKER_HI: u8 = 0xFF;
+pub const VIDEO_WARMUP_MARKER_LO: u8 = 0xFF;
+pub const VIDEO_WARMUP_PAYLOAD: [u8; 16] = [
+    VIDEO_BATCH_MARKER,
+    VIDEO_WARMUP_MARKER_HI,
+    VIDEO_WARMUP_MARKER_LO,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+];
+
 /// Дефолтные резервные реквизиты JVB при отсутствии кандидатов в Jingle.
 pub const WRTC_DEFAULT_FALLBACK_JVB_IP: &str = "89.169.16.6";
 pub const WRTC_DEFAULT_FALLBACK_JVB_PORT: u16 = 10002;

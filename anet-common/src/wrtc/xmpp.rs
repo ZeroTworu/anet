@@ -1,10 +1,11 @@
 use crate::config::WrtcConfig;
 use crate::consts::WRTC_XMPP_CHANNEL_CAPACITY;
 use crate::http_help::BrowserProfile;
+use crate::transport_trait::VpnStream;
+use crate::wrtc::providers::ktalk::KonturTalkProvider;
+use crate::wrtc::providers::{ProviderKind, RoomBootstrapInfo, WrtcProviderRegistry};
 use crate::wrtc::stealth::generate_random_guest_name;
-use crate::wrtc::xmpp_xml::{
-    escape_xml_attr, parse_xmpp_stanzas, InboundXmpp, XmppBuilder, XmppIceServer,
-};
+use crate::wrtc::xmpp_xml::{parse_xmpp_stanzas, InboundXmpp, XmppBuilder, XmppIceServer};
 use futures::{SinkExt, StreamExt};
 use rand::Rng;
 use std::collections::HashSet;
@@ -13,6 +14,14 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::WebSocketStream;
+
+/// Внутренняя типизированная команда исходящей очереди XMPP I/O (без строковых сентинелов).
+#[derive(Debug, Clone)]
+enum XmppOutboundCmd {
+    Stanza(String),
+    Close,
+}
 
 pub struct XmppSession {
     pub endpoint_id: String,
@@ -24,13 +33,216 @@ pub struct XmppSession {
     pub remote_ip: Option<std::net::IpAddr>,
     pub occupants: Arc<Mutex<HashSet<String>>>,
     pub discovered_ice_servers: Arc<Mutex<Vec<XmppIceServer>>>,
+    default_ice_servers: Vec<XmppIceServer>,
     active_jingle: Arc<Mutex<Option<(String, String, u32, u32)>>>,
-    write_tx: mpsc::Sender<String>,
+    write_tx: mpsc::Sender<XmppOutboundCmd>,
     read_rx: mpsc::Receiver<String>,
     io_handle: tokio::task::JoinHandle<()>,
 }
 
-use crate::transport_trait::VpnStream;
+/// Устанавливает TCP + BoringSSL TLS + WebSocket соединение к одному из URL сигналинга XMPP
+/// с поддержкой быстрого перебора эфемерных исходных TCP-портов (Fast Ephemeral Port Hopping)
+/// для обхода L4 ECMP / LAG фильтрации.
+async fn open_xmpp_ws_stream(
+    domain: &str,
+    ws_urls: &[String],
+    origin: &str,
+    profile: &BrowserProfile,
+    wrtc_cfg: &WrtcConfig,
+) -> anyhow::Result<(WebSocketStream<Box<dyn VpnStream>>, Option<std::net::IpAddr>, String)> {
+    let handshake_timeout_secs = wrtc_cfg.xmpp_handshake_timeout_secs.max(1);
+    let hop_attempts = wrtc_cfg.tcp_port_hop_attempts.clamp(1, 16);
+    let hop_timeout = Duration::from_millis(wrtc_cfg.tcp_port_hop_timeout_ms.clamp(300, 10_000));
+
+    let mut last_err = None;
+    for ws_url in ws_urls {
+        for attempt in 1..=hop_attempts {
+            let connect_timeout = if attempt == hop_attempts {
+                Duration::from_secs(handshake_timeout_secs)
+            } else {
+                hop_timeout
+            };
+
+            let tcp_res = tokio::time::timeout(
+                connect_timeout,
+                tokio::net::TcpStream::connect((domain, 443)),
+            )
+            .await;
+
+            let tcp_stream = match tcp_res {
+                Ok(Ok(s)) => s,
+                Ok(Err(e)) => {
+                    log::debug!(
+                        "[XMPP] TCP connect attempt {}/{} to {}:443 failed: {}",
+                        attempt,
+                        hop_attempts,
+                        domain,
+                        e
+                    );
+                    last_err = Some(anyhow::anyhow!("XMPP TCP connect to {domain}:443 failed: {e}"));
+                    continue;
+                }
+                Err(_) => {
+                    log::debug!(
+                        "[XMPP] TCP connect attempt {}/{} to {}:443 timed out after {:?} (hopping source port)",
+                        attempt,
+                        hop_attempts,
+                        domain,
+                        connect_timeout
+                    );
+                    last_err = Some(anyhow::anyhow!("XMPP TCP connect to {domain}:443 timed out"));
+                    continue;
+                }
+            };
+
+            let remote_ip = tcp_stream.peer_addr().ok().map(|a| a.ip());
+            let local_port = tcp_stream.local_addr().ok().map(|a| a.port()).unwrap_or(0);
+            let _ = tcp_stream.set_nodelay(true);
+            let sock_ref = socket2::SockRef::from(&tcp_stream);
+            let ka = socket2::TcpKeepalive::new()
+                .with_time(Duration::from_secs(10))
+                .with_interval(Duration::from_secs(5));
+            let _ = sock_ref.set_tcp_keepalive(&ka);
+
+            let tls_res = tokio::time::timeout(
+                Duration::from_secs(handshake_timeout_secs),
+                profile.connect_ws_tls(domain, tcp_stream),
+            )
+            .await;
+
+            let tls_stream = match tls_res {
+                Ok(Ok(s)) => s,
+                Ok(Err(e)) => {
+                    last_err = Some(anyhow::anyhow!(
+                        "XMPP BoringSSL TLS handshake with {domain} failed: {e}"
+                    ));
+                    continue;
+                }
+                Err(_) => {
+                    last_err = Some(anyhow::anyhow!(
+                        "XMPP BoringSSL TLS handshake with {domain} timed out"
+                    ));
+                    continue;
+                }
+            };
+
+            let mut request = profile.build_ws_request(ws_url, Some(origin))?;
+            request.headers_mut().insert(
+                "Sec-WebSocket-Protocol",
+                HeaderValue::from_static("xmpp"),
+            );
+
+            let stream: Box<dyn VpnStream> = Box::new(tls_stream);
+            match tokio::time::timeout(
+                Duration::from_secs(handshake_timeout_secs),
+                tokio_tungstenite::client_async_with_config(request, stream, None),
+            )
+            .await
+            {
+                Ok(Ok((ws_stream, response))) => {
+                    log::info!(
+                        "[XMPP] WebSocket connected to {} (HTTP status: {:?}, remote_ip: {:?}, src_port: {}, attempt: {}/{})",
+                        ws_url,
+                        response.status(),
+                        remote_ip,
+                        local_port,
+                        attempt,
+                        hop_attempts
+                    );
+                    return Ok((ws_stream, remote_ip, ws_url.clone()));
+                }
+                Ok(Err(e)) => {
+                    log::debug!(
+                        "[XMPP] WebSocket upgrade to {} failed: {} (trying next candidate URL)",
+                        ws_url,
+                        e
+                    );
+                    last_err = Some(anyhow::anyhow!(
+                        "XMPP WebSocket handshake with {ws_url} failed: {e}"
+                    ));
+                    break;
+                }
+                Err(_) => {
+                    last_err = Some(anyhow::anyhow!(
+                        "XMPP WebSocket handshake with {ws_url} timed out"
+                    ));
+                    break;
+                }
+            }
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("XMPP WebSocket connection failed")))
+}
+
+/// Выполняет прозрачное переподключение и возобновление потока по XEP-0198 (`<resume xmlns="urn:xmpp:sm:3" .../>`)
+/// внутри фоновой задачи `io_handle` без сброса MUC-комнаты и медиа-сессии.
+async fn try_resume_xmpp_stream(
+    domain: &str,
+    ws_url: &str,
+    origin: &str,
+    profile: &BrowserProfile,
+    wrtc_cfg: &WrtcConfig,
+    previd: &str,
+    inbound_h: u32,
+) -> anyhow::Result<WebSocketStream<Box<dyn VpnStream>>> {
+    let urls = vec![ws_url.to_string()];
+    let (mut ws_stream, _remote_ip, _) =
+        open_xmpp_ws_stream(domain, &urls, origin, profile, wrtc_cfg).await?;
+
+    let handshake_timeout = Duration::from_secs(wrtc_cfg.xmpp_handshake_timeout_secs.max(5));
+    let resume_fut = async {
+        ws_stream.send(Message::text(XmppBuilder::open())).await?;
+        let mut authed = false;
+        let mut resume_sent = false;
+
+        while let Some(msg_res) = ws_stream.next().await {
+            let msg = msg_res?;
+            if let Message::Text(text) = msg {
+                log::info!("[XMPP RESUME IN]: {text}");
+                let stanzas = parse_xmpp_stanzas(text.as_str(), "0.0.0.0", 0);
+                for parsed in stanzas {
+                    match parsed {
+                        InboundXmpp::SaslMechanisms if !authed => {
+                            ws_stream
+                                .send(Message::text(XmppBuilder::auth_anonymous()))
+                                .await?;
+                        }
+                        InboundXmpp::SaslSuccess => {
+                            authed = true;
+                            ws_stream.send(Message::text(XmppBuilder::open())).await?;
+                        }
+                        InboundXmpp::Features { .. } if authed && !resume_sent => {
+                            resume_sent = true;
+                            let resume_xml = XmppBuilder::sm_resume(previd, inbound_h);
+                            log::info!("[XMPP RESUME OUT]: {resume_xml}");
+                            ws_stream.send(Message::text(resume_xml)).await?;
+                        }
+                        InboundXmpp::SmResumed { previd: pid, h } => {
+                            log::info!(
+                                "[XMPP] XEP-0198 stream successfully resumed in-place (previd={pid}, server_h={h}, client_h={inbound_h})"
+                            );
+                            let ack_xml = XmppBuilder::sm_ack(inbound_h);
+                            ws_stream.send(Message::text(ack_xml)).await?;
+                            return Ok(());
+                        }
+                        InboundXmpp::SmFailed | InboundXmpp::SaslFailure(_) => {
+                            anyhow::bail!("XEP-0198 stream resume rejected by server");
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        anyhow::bail!("WebSocket closed before XEP-0198 <resumed/>")
+    };
+
+    tokio::time::timeout(handshake_timeout, resume_fut)
+        .await
+        .map_err(|_| anyhow::anyhow!("XEP-0198 stream resume timed out"))??;
+
+    Ok(ws_stream)
+}
 
 impl XmppSession {
     pub fn generate_endpoint_id() -> String {
@@ -48,6 +260,8 @@ impl XmppSession {
         let servers = self.discovered_ice_servers.lock().unwrap();
         if !servers.is_empty() {
             servers.clone()
+        } else if !self.default_ice_servers.is_empty() {
+            self.default_ice_servers.clone()
         } else {
             vec![
                 XmppIceServer {
@@ -111,53 +325,91 @@ impl XmppSession {
         ping_interval_secs: u64,
         wrtc_cfg: &WrtcConfig,
     ) -> anyhow::Result<Self> {
-        let ws_url = format!(
-            "wss://{domain}/jitsi/xmpp-websocket?room={conference_id}&sessionToken={session_token}"
-        );
-        let origin = format!("https://{domain}");
-        log::info!("[XMPP] Connecting to signaling WebSocket: {ws_url}");
+        let clean_domain = WrtcProviderRegistry::normalize_domain(domain);
+        let is_ktalk = KonturTalkProvider::is_ktalk_domain(&clean_domain);
+        let ws_urls = if is_ktalk {
+            vec![
+                format!(
+                    "wss://{clean_domain}/jitsi/xmpp-websocket?room={conference_id}&sessionToken={session_token}"
+                ),
+                format!(
+                    "wss://{clean_domain}/xmpp-websocket?room={conference_id}&token={session_token}& Lists=true"
+                ),
+            ]
+        } else {
+            vec![
+                format!("wss://{clean_domain}/xmpp-websocket?room={conference_id}"),
+                format!(
+                    "wss://{clean_domain}/{conference_id}/xmpp-websocket?room={conference_id}"
+                ),
+                format!("wss://{clean_domain}/xmpp-websocket"),
+            ]
+        };
 
-        let mut request = profile.build_ws_request(&ws_url, Some(&origin))?;
-        request.headers_mut().insert(
-            "Sec-WebSocket-Protocol",
-            HeaderValue::from_static("xmpp"),
+        let bootstrap = RoomBootstrapInfo {
+            provider_kind: if is_ktalk {
+                ProviderKind::KonturTalk
+            } else {
+                ProviderKind::StandardJitsi
+            },
+            domain: clean_domain,
+            room_name: conference_id.to_string(),
+            conference_id: conference_id.to_string(),
+            session_token: session_token.to_string(),
+            ws_urls,
+            pre_allocate_before_muc: !is_ktalk,
+            default_ice_servers: Vec::new(),
+        };
+
+        Self::connect_from_bootstrap(
+            &bootstrap,
+            client_name_opt,
+            custom_endpoint_id,
+            profile,
+            ping_interval_secs,
+            wrtc_cfg,
+        )
+        .await
+    }
+
+    /// Подключается к XMPP WebSocket на основе подготовленного `RoomBootstrapInfo`.
+    pub async fn connect_from_bootstrap(
+        bootstrap: &RoomBootstrapInfo,
+        client_name_opt: Option<&str>,
+        custom_endpoint_id: Option<String>,
+        profile: &BrowserProfile,
+        ping_interval_secs: u64,
+        wrtc_cfg: &WrtcConfig,
+    ) -> anyhow::Result<Self> {
+        let domain = bootstrap.domain.as_str();
+        let conference_id = bootstrap.conference_id.as_str();
+        let origin = format!("https://{domain}");
+
+        // Для Контур.Толк сохраняем приоритетным проверенный URL `/jitsi/xmpp-websocket?...&sessionToken=...`
+        let mut candidate_urls = Vec::with_capacity(bootstrap.ws_urls.len() + 1);
+        if bootstrap.provider_kind == ProviderKind::KonturTalk && !bootstrap.session_token.is_empty()
+        {
+            let primary_ktalk_url = format!(
+                "wss://{domain}/jitsi/xmpp-websocket?room={conference_id}&sessionToken={}",
+                bootstrap.session_token
+            );
+            candidate_urls.push(primary_ktalk_url);
+        }
+        for u in &bootstrap.ws_urls {
+            if !candidate_urls.contains(u) {
+                candidate_urls.push(u.clone());
+            }
+        }
+
+        log::info!(
+            "[XMPP] Connecting to signaling WebSocket on {} (candidates: {})",
+            domain,
+            candidate_urls.len()
         );
 
         let handshake_timeout_secs = wrtc_cfg.xmpp_handshake_timeout_secs.max(1);
-        let tcp_stream = tokio::time::timeout(
-            Duration::from_secs(handshake_timeout_secs),
-            tokio::net::TcpStream::connect((domain, 443)),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("XMPP TCP connect to {domain}:443 timed out"))??;
-        let remote_ip = tcp_stream.peer_addr().ok().map(|a| a.ip());
-        let _ = tcp_stream.set_nodelay(true);
-        let sock_ref = socket2::SockRef::from(&tcp_stream);
-        let ka = socket2::TcpKeepalive::new()
-            .with_time(Duration::from_secs(10))
-            .with_interval(Duration::from_secs(5));
-        let _ = sock_ref.set_tcp_keepalive(&ka);
-
-        let tls_stream = tokio::time::timeout(
-            Duration::from_secs(handshake_timeout_secs),
-            profile.connect_ws_tls(domain, tcp_stream),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("XMPP BoringSSL TLS handshake with {domain} timed out"))??;
-
-        let stream: Box<dyn VpnStream> = Box::new(tls_stream);
-        let (mut ws_stream, response) = tokio::time::timeout(
-            Duration::from_secs(handshake_timeout_secs),
-            tokio_tungstenite::client_async_with_config(request, stream, None),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("XMPP WebSocket handshake timed out"))?
-        .map_err(|e| anyhow::anyhow!("XMPP WebSocket handshake failed: {e}"))?;
-        log::info!(
-            "[XMPP] WebSocket connected (HTTP status: {:?}, remote_ip: {:?})",
-            response.status(),
-            remote_ip
-        );
+        let (mut ws_stream, remote_ip, connected_ws_url) =
+            open_xmpp_ws_stream(domain, &candidate_urls, &origin, profile, wrtc_cfg).await?;
 
         let open_xml = XmppBuilder::open();
         log::info!("[XMPP OUT]: {open_xml}");
@@ -166,6 +418,11 @@ impl XmppSession {
         let mut authed = false;
         let mut bind_sent = false;
         let mut bound = false;
+        let mut server_supports_sm = false;
+        let mut sm_enabled = false;
+        let mut sm_resume_id: Option<String> = None;
+        let mut inbound_h: u32 = 0;
+
         let mut jid = String::new();
         let endpoint_id = custom_endpoint_id
             .filter(|ep| !ep.is_empty())
@@ -183,6 +440,7 @@ impl XmppSession {
         let discovered_ice_hs = discovered_ice_servers.clone();
         let my_ep = endpoint_id.clone();
         let conf_muc = format!("{conference_id}@muc.meet.jitsi/");
+        let pre_allocate_before_muc = bootstrap.pre_allocate_before_muc;
 
         let handshake_fut = async {
             let mut joined = false;
@@ -192,7 +450,26 @@ impl XmppSession {
                     log::info!("[XMPP IN]: {text}");
                     let stanzas = parse_xmpp_stanzas(text.as_str(), "0.0.0.0", 0);
                     for parsed in stanzas {
+                        if sm_enabled && parsed.is_counted_stanza() {
+                            inbound_h = inbound_h.wrapping_add(1);
+                        }
                         match parsed {
+                            InboundXmpp::SmEnabled { id, resume } => {
+                                sm_enabled = true;
+                                inbound_h = 0;
+                                if resume {
+                                    sm_resume_id = id.clone();
+                                }
+                                log::info!(
+                                    "[XMPP] XEP-0198 Stream Management enabled (resume={}, id={:?})",
+                                    resume,
+                                    sm_resume_id
+                                );
+                            }
+                            InboundXmpp::SmRequest => {
+                                let ack = XmppBuilder::sm_ack(inbound_h);
+                                ws_stream.send(Message::text(ack)).await?;
+                            }
                             InboundXmpp::Presence {
                                 from,
                                 is_unavailable,
@@ -222,7 +499,7 @@ impl XmppSession {
                                     .flat_map(|s| s.urls.clone())
                                     .collect();
                                 log::info!(
-                                    "[XMPP] Discovered Ktalk ICE services (STUN/TURN/TURNS): {:?}",
+                                    "[XMPP] Discovered ICE services (STUN/TURN/TURNS): {:?}",
                                     urls
                                 );
                                 *discovered_ice_hs.lock().unwrap() = ice_servers;
@@ -238,11 +515,15 @@ impl XmppSession {
                                 authed = true;
                                 ws_stream.send(Message::text(XmppBuilder::open())).await?;
                             }
-                            InboundXmpp::Features { has_bind }
+                            InboundXmpp::Features { has_bind, has_sm }
                                 if authed && has_bind && !bind_sent =>
                             {
                                 bind_sent = true;
-                                log::info!("[XMPP] Binding resource...");
+                                server_supports_sm = has_sm;
+                                log::info!(
+                                    "[XMPP] Binding resource (server_supports_sm={})...",
+                                    server_supports_sm
+                                );
                                 ws_stream
                                     .send(Message::text(XmppBuilder::bind_resource("_bind_auth_2")))
                                     .await?;
@@ -255,11 +536,26 @@ impl XmppSession {
                                 jid = bound_jid;
                                 log::info!("[XMPP] Bound JID: {jid}");
 
-                                // Запрашиваем STUN/TURN/TURNS-серверы Контура по XEP-0215 extdisco сразу после бинда,
-                                // чтобы ответ гарантированно пришёл параллельно с входом в комнату MUC до session-initiate.
+                                if server_supports_sm {
+                                    let sm_req = XmppBuilder::sm_enable();
+                                    log::info!("[XMPP OUT]: {sm_req}");
+                                    ws_stream.feed(Message::text(sm_req)).await?;
+                                }
+
                                 let extdisco_req = XmppBuilder::extdisco_services("extdisco_1");
                                 log::info!("[XMPP OUT]: {extdisco_req}");
                                 ws_stream.feed(Message::text(extdisco_req)).await?;
+
+                                if pre_allocate_before_muc {
+                                    let alloc_id = format!("conf_pre_{endpoint_id}");
+                                    let alloc_iq = XmppBuilder::conference_allocation(
+                                        conference_id,
+                                        &endpoint_id,
+                                        &alloc_id,
+                                    );
+                                    log::info!("[XMPP OUT]: {alloc_iq}");
+                                    ws_stream.feed(Message::text(alloc_iq)).await?;
+                                }
 
                                 log::info!(
                                     "[XMPP] Entering MUC room {conference_id} with occupant {endpoint_id} (name: {effective_client_name})..."
@@ -295,7 +591,7 @@ impl XmppSession {
                 anyhow::anyhow!("XMPP MUC handshake timed out after {}s", handshake_timeout_secs)
             })??;
 
-        let (write_tx, mut write_rx) = mpsc::channel::<String>(WRTC_XMPP_CHANNEL_CAPACITY);
+        let (write_tx, mut write_rx) = mpsc::channel::<XmppOutboundCmd>(WRTC_XMPP_CHANNEL_CAPACITY);
         let (read_tx, read_rx) = mpsc::channel::<String>(WRTC_XMPP_CHANNEL_CAPACITY);
 
         let ping_secs = if ping_interval_secs > 0 {
@@ -308,11 +604,13 @@ impl XmppSession {
 
         let occ_track_bg = occupants.clone();
         let discovered_ice_bg = discovered_ice_servers.clone();
+        let domain_owned = domain.to_string();
+        let origin_owned = origin.clone();
+        let profile_bg = profile.clone();
+        let wrtc_cfg_bg = wrtc_cfg.clone();
 
         // Единая задача I/O без ws_stream.split() (BiLock):
-        // В tokio_boring::SslStream<TcpStream> чтение и запись делят один SSL state machine,
-        // а конкурентный опрос SplitSink + SplitStream из двух разных tokio::spawn при коллизии
-        // входящего Pong и второго ws_sink.send() затирает waker чтения.
+        // Поддерживает XEP-0198 Stream Management и прозрачное переподключение при зависании TCP поверх WARP.
         let io_handle = tokio::spawn(async move {
             let mut ping_interval = tokio::time::interval_at(
                 tokio::time::Instant::now() + Duration::from_secs(ping_secs),
@@ -328,28 +626,50 @@ impl XmppSession {
             let mut last_inbound_at = tokio::time::Instant::now();
 
             loop {
+                let mut stream_broken = false;
+
                 tokio::select! {
                     _ = tokio::time::sleep_until(last_inbound_at + read_timeout_dur) => {
                         log::warn!(
                             "[XMPP] WebSocket read timed out after {:?} without incoming frames (half-open connection)",
                             read_timeout_dur
                         );
-                        break;
+                        stream_broken = true;
                     }
                     msg_opt = ws_stream.next() => {
-                        let Some(msg_res) = msg_opt else {
-                            log::warn!("[XMPP] WebSocket stream ended (EOF)");
-                            break;
-                        };
-                        if msg_res.is_ok() {
-                            last_inbound_at = tokio::time::Instant::now();
-                        }
-                        match msg_res {
+                        match msg_opt {
+                            None => {
+                                log::warn!("[XMPP] WebSocket stream ended (EOF)");
+                                stream_broken = true;
+                            }
+                            Some(msg_res) => {
+                                if msg_res.is_ok() {
+                                    last_inbound_at = tokio::time::Instant::now();
+                                }
+                                match msg_res {
                             Ok(Message::Text(text)) => {
                                 let stanzas = parse_xmpp_stanzas(text.as_str(), "0.0.0.0", 0);
                                 let mut ack_replies: Vec<String> = Vec::new();
                                 for parsed in stanzas {
+                                    if sm_enabled && parsed.is_counted_stanza() {
+                                        inbound_h = inbound_h.wrapping_add(1);
+                                    }
                                     match parsed {
+                                        InboundXmpp::SmEnabled { id, resume } => {
+                                            sm_enabled = true;
+                                            inbound_h = 0;
+                                            if resume {
+                                                sm_resume_id = id.clone();
+                                            }
+                                            log::info!(
+                                                "[XMPP] XEP-0198 Stream Management enabled in I/O loop (resume={}, id={:?})",
+                                                resume,
+                                                sm_resume_id
+                                            );
+                                        }
+                                        InboundXmpp::SmRequest => {
+                                            ack_replies.push(XmppBuilder::sm_ack(inbound_h));
+                                        }
                                         InboundXmpp::Presence {
                                             from,
                                             is_unavailable,
@@ -392,7 +712,7 @@ impl XmppSession {
                                                 .flat_map(|s| s.urls.clone())
                                                 .collect();
                                             log::info!(
-                                                "[XMPP] Discovered Ktalk ICE services (STUN/TURN/TURNS): {:?}",
+                                                "[XMPP] Discovered ICE services (STUN/TURN/TURNS): {:?}",
                                                 urls
                                             );
                                             let mut guard = discovered_ice_bg.lock().unwrap();
@@ -413,8 +733,8 @@ impl XmppSession {
                                         .await
                                         .map_or(true, |r| r.is_err())
                                     {
-                                        log::warn!("[XMPP] Failed or timed out flushing IQ ACK replies");
-                                        break;
+                                        log::warn!("[XMPP] Failed or timed out flushing IQ/SM ACK replies");
+                                        stream_broken = true;
                                     }
                                 }
 
@@ -426,40 +746,36 @@ impl XmppSession {
                                     .map_or(true, |r| r.is_err())
                                 {
                                     log::warn!("[XMPP] Failed or timed out sending WebSocket Pong");
-                                    break;
+                                    stream_broken = true;
                                 }
                             }
                             Ok(Message::Close(frame)) => {
                                 log::warn!("[XMPP] WebSocket closed by server: {frame:?}");
-                                break;
+                                stream_broken = true;
                             }
                             Err(e) => {
                                 log::warn!("[XMPP] WebSocket read error: {e}");
-                                break;
+                                stream_broken = true;
                             }
                             _ => {}
+                                }
+                            }
                         }
                     }
-                    stanza_opt = write_rx.recv() => {
-                        let Some(first_stanza) = stanza_opt else {
+                    cmd_opt = write_rx.recv() => {
+                        let Some(first_cmd) = cmd_opt else {
                             break;
                         };
                         let mut batch = Vec::with_capacity(8);
                         let mut should_close = false;
-                        if first_stanza == "__CLOSE__" {
-                            should_close = true;
-                        } else {
-                            batch.push(first_stanza);
+                        match first_cmd {
+                            XmppOutboundCmd::Stanza(s) => batch.push(s),
+                            XmppOutboundCmd::Close => should_close = true,
                         }
                         while batch.len() < 8 && !should_close {
                             match write_rx.try_recv() {
-                                Ok(next_stanza) => {
-                                    if next_stanza == "__CLOSE__" {
-                                        should_close = true;
-                                    } else {
-                                        batch.push(next_stanza);
-                                    }
-                                }
+                                Ok(XmppOutboundCmd::Stanza(s)) => batch.push(s),
+                                Ok(XmppOutboundCmd::Close) => should_close = true,
                                 Err(_) => break,
                             }
                         }
@@ -475,11 +791,11 @@ impl XmppSession {
                                 Ok(Ok(())) => {}
                                 Ok(Err(e)) => {
                                     log::warn!("[XMPP] Error sending stanza over WebSocket: {e}");
-                                    break;
+                                    stream_broken = true;
                                 }
                                 Err(_) => {
                                     log::warn!("[XMPP] Timeout sending stanza over WebSocket");
-                                    break;
+                                    stream_broken = true;
                                 }
                             }
                         }
@@ -491,13 +807,21 @@ impl XmppSession {
                         }
                     }
                     _ = ping_interval.tick() => {
-                        // Коалесцируем WebSocket Ping и XMPP IQ ping в один TLS-запрос через feed() + flush()
+                        // Коалесцируем WebSocket Ping, XMPP IQ ping и XEP-0198 <a/> в один TLS-запрос через feed() + flush()
                         let ping_iq = XmppBuilder::ping("meet.jitsi", &format!("ping_{:08x}", rand::random::<u32>()));
+                        let sm_ack_opt = if sm_enabled {
+                            Some(XmppBuilder::sm_ack(inbound_h))
+                        } else {
+                            None
+                        };
                         let send_keepalive = async {
                             ws_stream
                                 .feed(Message::Ping(bytes::Bytes::from_static(&[0x01, 0x02])))
                                 .await?;
                             ws_stream.feed(Message::text(ping_iq)).await?;
+                            if let Some(ack_xml) = sm_ack_opt {
+                                ws_stream.feed(Message::text(ack_xml)).await?;
+                            }
                             ws_stream.flush().await
                         };
                         if tokio::time::timeout(write_timeout_dur, send_keepalive)
@@ -505,13 +829,45 @@ impl XmppSession {
                             .map_or(true, |r| r.is_err())
                         {
                             log::warn!("[XMPP] Failed or timed out sending coalesced WebSocket + XMPP keepalive ping");
-                            break;
+                            stream_broken = true;
                         }
                     }
                     _ = extdisco_interval.tick() => {
-                        // Периодическое обновление динамических TURN/TURNS credentials по XEP-0215
                         let extdisco_iq = XmppBuilder::extdisco_services(&format!("extdisco_{:08x}", rand::random::<u32>()));
                         let _ = tokio::time::timeout(write_timeout_dur, ws_stream.send(Message::text(extdisco_iq))).await;
+                    }
+                }
+
+                if stream_broken {
+                    if let Some(ref previd) = sm_resume_id {
+                        log::info!(
+                            "[XMPP] Attempting in-place XEP-0198 stream resumption (previd={}, h={})...",
+                            previd,
+                            inbound_h
+                        );
+                        match try_resume_xmpp_stream(
+                            &domain_owned,
+                            &connected_ws_url,
+                            &origin_owned,
+                            &profile_bg,
+                            &wrtc_cfg_bg,
+                            previd,
+                            inbound_h,
+                        )
+                        .await
+                        {
+                            Ok(new_ws) => {
+                                ws_stream = new_ws;
+                                last_inbound_at = tokio::time::Instant::now();
+                                continue;
+                            }
+                            Err(e) => {
+                                log::warn!("[XMPP] XEP-0198 stream resumption failed: {e}");
+                                break;
+                            }
+                        }
+                    } else {
+                        break;
                     }
                 }
             }
@@ -528,6 +884,7 @@ impl XmppSession {
             remote_ip,
             occupants,
             discovered_ice_servers,
+            default_ice_servers: bootstrap.default_ice_servers.clone(),
             active_jingle: Arc::new(Mutex::new(None)),
             write_tx,
             read_rx,
@@ -555,39 +912,59 @@ impl XmppSession {
         let msid = crate::wrtc::stealth::generate_random_uuid_v4();
 
         let mut candidate_xml = String::new();
+        let mut seen_candidates = HashSet::new();
         for (i, c_line) in candidates.iter().enumerate() {
             let parts: Vec<&str> = c_line.split_whitespace().collect();
             if parts.len() >= 8 && parts[6] == "typ" {
-                let foundation = escape_xml_attr(parts[0]);
+                let foundation = parts[0];
                 let component = parts[1];
                 if component != "1" {
                     continue;
                 }
-                let protocol = escape_xml_attr(&parts[2].to_lowercase());
+                let protocol = parts[2].to_lowercase();
                 let priority = parts[3];
-                let ip = escape_xml_attr(parts[4]);
+                let ip = parts[4];
                 let port = parts[5];
-                let c_type = escape_xml_attr(parts[7]);
-                if ip == "0.0.0.0" || ip == "127.0.0.1" || ip.starts_with("127.") || ip.starts_with("172.112.") {
+                let c_type = parts[7];
+                if ip == "0.0.0.0"
+                    || ip == "127.0.0.1"
+                    || ip.starts_with("127.")
+                    || ip.starts_with("172.112.")
+                {
                     continue;
                 }
-                let mut rel_attr = String::new();
+                let dedup_key = format!("{ip}:{port}:{protocol}:{c_type}");
+                if !seen_candidates.insert(dedup_key) {
+                    continue;
+                }
+
+                let mut rel_addr_opt: Option<&str> = None;
+                let mut rel_port_opt: Option<&str> = None;
                 let mut idx = 8;
                 while idx + 1 < parts.len() {
                     if parts[idx] == "raddr" {
-                        let raddr = escape_xml_attr(parts[idx + 1]);
-                        rel_attr.push_str(&format!(r#" rel-addr="{raddr}""#));
+                        rel_addr_opt = Some(parts[idx + 1]);
                         idx += 2;
                     } else if parts[idx] == "rport" {
-                        let rport = escape_xml_attr(parts[idx + 1]);
-                        rel_attr.push_str(&format!(r#" rel-port="{rport}""#));
+                        rel_port_opt = Some(parts[idx + 1]);
                         idx += 2;
                     } else {
                         idx += 1;
                     }
                 }
-                candidate_xml.push_str(&format!(
-                    r#"<candidate component="1" foundation="{foundation}" generation="0" id="c_{i}" ip="{ip}" port="{port}" priority="{priority}" protocol="{protocol}" type="{c_type}"{rel_attr} network="0"/>"#
+
+                let cid = format!("c_{i}");
+                candidate_xml.push_str(&XmppBuilder::jingle_candidate(
+                    component,
+                    foundation,
+                    &cid,
+                    ip,
+                    port,
+                    priority,
+                    &protocol,
+                    c_type,
+                    rel_addr_opt,
+                    rel_port_opt,
                 ));
             }
         }
@@ -668,7 +1045,7 @@ impl XmppSession {
     pub async fn send_stanza(&self, stanza: String) -> anyhow::Result<()> {
         log::info!("[XMPP OUT]: {stanza}");
         self.write_tx
-            .send(stanza)
+            .send(XmppOutboundCmd::Stanza(stanza))
             .await
             .map_err(|_| anyhow::anyhow!("XMPP write channel closed"))
     }
@@ -697,7 +1074,7 @@ impl XmppSession {
                     log::info!(
                         "[XMPP] Sending Jingle source-remove (sid: {sid}, audio_ssrc: {ssrc}, video_ssrc: {video_ssrc}) to Jicofo ({focus_jid})..."
                     );
-                    let _ = self.write_tx.try_send(rm_stanza);
+                    let _ = self.write_tx.try_send(XmppOutboundCmd::Stanza(rm_stanza));
                 }
                 let req_id = format!("term_{:08x}", rand::random::<u32>());
                 let term_stanza = XmppBuilder::jingle_session_terminate(
@@ -709,7 +1086,7 @@ impl XmppSession {
                 log::info!(
                     "[XMPP] Sending Jingle session-terminate (sid: {sid}) to Jicofo ({focus_jid})..."
                 );
-                let _ = self.write_tx.try_send(term_stanza);
+                let _ = self.write_tx.try_send(XmppOutboundCmd::Stanza(term_stanza));
             }
         }
         let leave_stanza = XmppBuilder::muc_leave(&self.conference_id, &self.endpoint_id);
@@ -719,12 +1096,12 @@ impl XmppSession {
             self.endpoint_id,
             leave_stanza
         );
-        let _ = self.write_tx.try_send(leave_stanza);
-        // Даём Prosody 120 мс на доставку IQ source-remove, session-terminate и presence unavailable в Jicofo
-        // до отправки <close/> и закрытия WebSocket-соединения.
+        let _ = self.write_tx.try_send(XmppOutboundCmd::Stanza(leave_stanza));
         tokio::time::sleep(Duration::from_millis(120)).await;
-        let _ = self.write_tx.try_send(XmppBuilder::close().to_string());
-        let _ = self.write_tx.try_send("__CLOSE__".to_string());
+        let _ = self
+            .write_tx
+            .try_send(XmppOutboundCmd::Stanza(XmppBuilder::close().to_string()));
+        let _ = self.write_tx.try_send(XmppOutboundCmd::Close);
         for _ in 0..25 {
             if self.io_handle.is_finished() {
                 break;
@@ -749,7 +1126,7 @@ impl Drop for XmppSession {
                         ssrc,
                         video_ssrc,
                     );
-                    let _ = self.write_tx.try_send(rm_stanza);
+                    let _ = self.write_tx.try_send(XmppOutboundCmd::Stanza(rm_stanza));
                 }
                 let req_id = format!("term_{:08x}", rand::random::<u32>());
                 let term_stanza = XmppBuilder::jingle_session_terminate(
@@ -758,13 +1135,15 @@ impl Drop for XmppSession {
                     &self.jid,
                     &sid,
                 );
-                let _ = self.write_tx.try_send(term_stanza);
+                let _ = self.write_tx.try_send(XmppOutboundCmd::Stanza(term_stanza));
             }
         }
         let leave_stanza = XmppBuilder::muc_leave(&self.conference_id, &self.endpoint_id);
-        let _ = self.write_tx.try_send(leave_stanza);
-        let _ = self.write_tx.try_send(XmppBuilder::close().to_string());
-        let _ = self.write_tx.try_send("__CLOSE__".to_string());
+        let _ = self.write_tx.try_send(XmppOutboundCmd::Stanza(leave_stanza));
+        let _ = self
+            .write_tx
+            .try_send(XmppOutboundCmd::Stanza(XmppBuilder::close().to_string()));
+        let _ = self.write_tx.try_send(XmppOutboundCmd::Close);
         let io_abort = self.io_handle.abort_handle();
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {

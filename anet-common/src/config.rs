@@ -1,7 +1,9 @@
 use crate::boring_tls::{TlsClientConfig, TlsFingerprint};
 use crate::consts::{
-    MAX_VIDEO_BATCH_BYTES, WRTC_BATCHER_MAX_BYTES, WRTC_BATCHER_MAX_DELAY_MS, WRTC_MIN_TUN_MTU,
-    WRTC_UPLINK_BURST_MAX_PACKETS, WRTC_VIDEO_BATCH_MAX_PACKETS, WRTC_VIDEO_MTU_OVERHEAD,
+    MAX_VIDEO_BATCH_BYTES, WRTC_BATCHER_MAX_BYTES, WRTC_BATCHER_MAX_DELAY_MS,
+    WRTC_COLIBRI_WS_READ_TIMEOUT_SECS, WRTC_MIN_TUN_MTU, WRTC_TCP_PORT_HOP_ATTEMPTS,
+    WRTC_TCP_PORT_HOP_TIMEOUT_MS, WRTC_UDP_ICE_SOCKET_COUNT, WRTC_UPLINK_BURST_MAX_PACKETS,
+    WRTC_VIDEO_BATCH_MAX_PACKETS, WRTC_VIDEO_MTU_OVERHEAD,
 };
 use serde::{Deserialize, Serialize};
 
@@ -76,7 +78,7 @@ impl StealthConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct WrtcConfig {
-    /// Таймаут установки TCP/TLS-соединения к HTTP API Контур.Толк (в секундах).
+    /// Таймаут установки TCP/TLS-соединения к HTTP API ВКС-провайдера (в секундах).
     pub http_connect_timeout_secs: u64,
     /// Общий таймаут выполнения HTTP-запросов авторизации и резолва комнаты (в секундах).
     pub http_request_timeout_secs: u64,
@@ -86,6 +88,15 @@ pub struct WrtcConfig {
     pub ws_write_timeout_secs: u64,
     /// Таймаут установки параллельного канала Colibri WebSocket до медиасервера JVB (в секундах).
     pub colibri_ws_connect_timeout_secs: u64,
+    /// Таймаут чтения входящих кадров из Colibri WebSocket до его фонового переподключения (в секундах, по умолчанию 25 с).
+    pub colibri_ws_read_timeout_secs: u64,
+
+    /// Количество быстрых попыток смены эфемерного исходного TCP-порта (`src_port`) при обходе L4 ECMP / LAG фильтрации.
+    pub tcp_port_hop_attempts: usize,
+    /// Таймаут одной попытки `TcpStream::connect` при быстром переборе эфемерных TCP-портов (в миллисекундах).
+    pub tcp_port_hop_timeout_ms: u64,
+    /// Количество параллельных локальных UDP-сокетов (`0.0.0.0:0`) для сбора множественных ICE `host` кандидатов.
+    pub udp_ice_socket_count: usize,
 
     /// Размер системных буферов приёма и отправки (`SO_RCVBUF` / `SO_SNDBUF`) UDP-сокета WebRTC (в байтах).
     pub udp_socket_buffer_size: usize,
@@ -142,7 +153,7 @@ pub struct WrtcConfig {
     pub tunnel_ping_interval_secs: u64,
     /// Таймаут ожидания `anet_pong` от сервера до разрыва и переподключения клиента (в секундах).
     pub tunnel_ping_timeout_secs: u64,
-    /// Время ожидания клиентов в пустой комнате Контур.Толк на сервере до плановой ротации сессии (в секундах).
+    /// Время ожидания клиентов в пустой комнате ВКС на сервере до плановой ротации сессии (в секундах).
     pub server_idle_room_rotation_secs: u64,
 }
 
@@ -154,6 +165,10 @@ impl Default for WrtcConfig {
             xmpp_handshake_timeout_secs: 15,
             ws_write_timeout_secs: 15,
             colibri_ws_connect_timeout_secs: 10,
+            colibri_ws_read_timeout_secs: WRTC_COLIBRI_WS_READ_TIMEOUT_SECS,
+            tcp_port_hop_attempts: WRTC_TCP_PORT_HOP_ATTEMPTS,
+            tcp_port_hop_timeout_ms: WRTC_TCP_PORT_HOP_TIMEOUT_MS,
+            udp_ice_socket_count: WRTC_UDP_ICE_SOCKET_COUNT,
             udp_socket_buffer_size: 8 * 1024 * 1024,
             reactor_pool_size: 4,
             ice_disconnected_timeout_ms: 10_000,

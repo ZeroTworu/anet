@@ -926,7 +926,10 @@ pub async fn create_p2p_channel(
                 inner: TokioRuntime,
                 udp_socket_buffer_size: wrtc_cfg.udp_socket_buffer_size,
             }))
-            .with_udp_addrs(vec![effective_bind_addr.clone()])
+            .with_udp_addrs(vec![
+                effective_bind_addr.clone();
+                wrtc_cfg.udp_ice_socket_count.clamp(1, 16)
+            ])
             .with_dedicated_reactor_pool_size(wrtc_cfg.reactor_pool_size.max(1))
             .build()
             .await
@@ -1128,10 +1131,16 @@ impl WrtcPeer {
                 let colibri_ws_ip_c = colibri_ws_ip.clone();
                 let active_constraints_ws = active_video_constraints.clone();
                 let dc_open_ws = dc_is_open.clone();
+                let is_connected_ws = is_connected.clone();
                 let is_failed_ws = is_failed.clone();
                 let failed_notify_ws = failed_notify.clone();
                 let colibri_connect_timeout = wrtc_cfg.colibri_ws_connect_timeout_secs.max(1);
+                let colibri_read_timeout =
+                    Duration::from_secs(wrtc_cfg.colibri_ws_read_timeout_secs.max(5));
                 let ws_write_timeout = wrtc_cfg.ws_write_timeout_secs.max(1);
+                let hop_attempts = wrtc_cfg.tcp_port_hop_attempts.clamp(1, 32);
+                let hop_timeout =
+                    Duration::from_millis(wrtc_cfg.tcp_port_hop_timeout_ms.max(200));
                 let ws_task = tokio::spawn(async move {
                     let mut reconnect_attempts = 0u32;
                     loop {
@@ -1142,7 +1151,9 @@ impl WrtcPeer {
                             Ok(r) => r,
                             Err(e) => {
                                 log::warn!("[WRTC WS] Failed to build Colibri-WS request: {e}");
-                                if !dc_open_ws.load(Ordering::SeqCst) {
+                                if !dc_open_ws.load(Ordering::SeqCst)
+                                    && !(has_video_flag && is_connected_ws.load(Ordering::SeqCst))
+                                {
                                     is_failed_ws.store(true, Ordering::SeqCst);
                                     failed_notify_ws.notify_waiters();
                                     failed_notify_ws.notify_one();
@@ -1170,7 +1181,44 @@ impl WrtcPeer {
                         let connect_res = tokio::time::timeout(
                             Duration::from_secs(colibri_connect_timeout),
                             async {
-                                let tcp = tokio::net::TcpStream::connect((target_host.as_str(), target_port)).await?;
+                                let mut connected_tcp = None;
+                                for attempt in 1..=hop_attempts {
+                                    match tokio::time::timeout(
+                                        hop_timeout,
+                                        tokio::net::TcpStream::connect((
+                                            target_host.as_str(),
+                                            target_port,
+                                        )),
+                                    )
+                                    .await
+                                    {
+                                        Ok(Ok(s)) => {
+                                            connected_tcp = Some(s);
+                                            break;
+                                        }
+                                        Ok(Err(e)) => {
+                                            log::debug!(
+                                                "[WRTC WS] Colibri TCP connect attempt {attempt}/{hop_attempts} error: {e}"
+                                            );
+                                        }
+                                        Err(_) => {
+                                            log::debug!(
+                                                "[WRTC WS] Colibri TCP port-hop attempt {attempt}/{hop_attempts} timed out after {:?}, hopping port...",
+                                                hop_timeout
+                                            );
+                                        }
+                                    }
+                                }
+                                let tcp = match connected_tcp {
+                                    Some(s) => s,
+                                    None => {
+                                        tokio::net::TcpStream::connect((
+                                            target_host.as_str(),
+                                            target_port,
+                                        ))
+                                        .await?
+                                    }
+                                };
                                 let peer_ip = tcp.peer_addr().ok().map(|a| a.ip());
                                 let _ = tcp.set_nodelay(true);
                                 let sock_ref = socket2::SockRef::from(&tcp);
@@ -1224,6 +1272,7 @@ impl WrtcPeer {
 
                             let mut ws_ping_interval = tokio::time::interval(Duration::from_secs(10));
                             ws_ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                            let mut last_inbound_at = tokio::time::Instant::now();
                             let mut channel_closed = false;
 
                             loop {
@@ -1231,16 +1280,19 @@ impl WrtcPeer {
                                     msg_opt = ws_stream.next() => {
                                         match msg_opt {
                                             Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) => {
+                                                last_inbound_at = tokio::time::Instant::now();
                                                 if let Ok(c_msg) = serde_json::from_str::<ColibriMessage>(&text) {
                                                     let _ = in_tx_ws.send(c_msg).await;
                                                 }
                                             }
                                             Some(Ok(tokio_tungstenite::tungstenite::Message::Binary(bin))) => {
+                                                last_inbound_at = tokio::time::Instant::now();
                                                 if let Ok(c_msg) = serde_json::from_slice::<ColibriMessage>(&bin) {
                                                     let _ = in_tx_ws.send(c_msg).await;
                                                 }
                                             }
                                             Some(Ok(tokio_tungstenite::tungstenite::Message::Ping(data))) => {
+                                                last_inbound_at = tokio::time::Instant::now();
                                                 let pong_res = tokio::time::timeout(
                                                     Duration::from_secs(ws_write_timeout),
                                                     ws_stream.send(tokio_tungstenite::tungstenite::Message::Pong(data)),
@@ -1250,6 +1302,9 @@ impl WrtcPeer {
                                                     log::warn!("[WRTC WS] Colibri-WS pong write failed or timed out");
                                                     break;
                                                 }
+                                            }
+                                            Some(Ok(tokio_tungstenite::tungstenite::Message::Pong(_))) => {
+                                                last_inbound_at = tokio::time::Instant::now();
                                             }
                                             Some(Ok(tokio_tungstenite::tungstenite::Message::Close(frame))) => {
                                                 log::warn!("[WRTC WS] Colibri-WS closed by JVB: {frame:?}");
@@ -1315,6 +1370,13 @@ impl WrtcPeer {
                                             break;
                                         }
                                     }
+                                    _ = tokio::time::sleep_until(last_inbound_at + colibri_read_timeout) => {
+                                        log::warn!(
+                                            "[WRTC WS] Colibri-WS read timeout ({:?} without inbound frames); reconnecting background socket...",
+                                            colibri_read_timeout
+                                        );
+                                        break;
+                                    }
                                 }
                             }
 
@@ -1331,15 +1393,22 @@ impl WrtcPeer {
                         }
                         reconnect_attempts += 1;
                         if reconnect_attempts > 5 {
-                            if !dc_open_ws.load(Ordering::SeqCst) {
+                            if !dc_open_ws.load(Ordering::SeqCst)
+                                && !(has_video_flag && is_connected_ws.load(Ordering::SeqCst))
+                            {
                                 log::warn!(
-                                    "[WRTC WS] Colibri-WS reconnect attempts exhausted ({reconnect_attempts}) and no SCTP DataChannel is open; marking peer failed"
+                                    "[WRTC WS] Colibri-WS reconnect attempts exhausted ({reconnect_attempts}) and no active UDP media/SCTP channel; marking peer failed"
                                 );
                                 is_failed_ws.store(true, Ordering::SeqCst);
                                 failed_notify_ws.notify_waiters();
                                 failed_notify_ws.notify_one();
+                                break;
                             }
-                            break;
+                            log::info!(
+                                "[WRTC WS] Colibri-WS still unreachable (attempt {reconnect_attempts}), but UDP media/SCTP tunnel is active; retrying in 2s..."
+                            );
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                            continue;
                         }
 
                         log::info!(
@@ -1477,7 +1546,10 @@ impl WrtcPeer {
                         inner: TokioRuntime,
                         udp_socket_buffer_size: wrtc_cfg.udp_socket_buffer_size,
                     }))
-                    .with_udp_addrs(vec![bind_addr.clone()])
+                    .with_udp_addrs(vec![
+                        bind_addr.clone();
+                        wrtc_cfg.udp_ice_socket_count.clamp(1, 16)
+                    ])
                     .with_dedicated_reactor_pool_size(wrtc_cfg.reactor_pool_size.max(1))
                     .build()
                     .await
@@ -1547,7 +1619,9 @@ impl WrtcPeer {
                     .await;
 
                 let mut data_channel_res = None;
-                if session.has_data_channel && mode != WrtcMode::Ws {
+                if session.has_data_channel
+                    && (mode != WrtcMode::Ws || session.transport.colibri_ws_url.is_none())
+                {
                     let dc_init = RTCDataChannelInit {
                         ordered: false,
                         max_packet_life_time: None,
@@ -1696,9 +1770,15 @@ impl WrtcPeer {
                 let has_ws_out = has_ws.clone();
                 let ws_fallback_tx_out = ws_fallback_tx.clone();
 
+                let has_colibri_ws_cfg = session.transport.colibri_ws_url.is_some();
                 let sender_task = tokio::spawn(async move {
                     if dc_opt_out.is_some() && !dc_is_open_out.load(Ordering::SeqCst) {
-                        let _ = tokio::time::timeout(Duration::from_secs(2), dc_open_notify_out.notified()).await;
+                        let wait_secs = if has_colibri_ws_cfg { 2 } else { 6 };
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(wait_secs),
+                            dc_open_notify_out.notified(),
+                        )
+                        .await;
                     }
                     log::info!(
                         "[WRTC DataChannel] Outgoing sender loop active (is_open={})",
@@ -1783,6 +1863,21 @@ impl WrtcPeer {
                                 }
                             } else {
                                 sent = true;
+                            }
+                        } else if !sent && !has_colibri_ws_cfg {
+                            if let Some(ref dc_out) = dc_opt_out {
+                                if !dc_is_open_out.load(Ordering::SeqCst) {
+                                    let _ = tokio::time::timeout(
+                                        Duration::from_secs(2),
+                                        dc_open_notify_out.notified(),
+                                    )
+                                    .await;
+                                }
+                                if dc_is_open_out.load(Ordering::SeqCst)
+                                    && dc_out.send_text(&json_str).await.is_ok()
+                                {
+                                    sent = true;
+                                }
                             }
                         }
 
@@ -2056,11 +2151,19 @@ impl WrtcPeer {
                 }
             }
         }
+        let video_media_alive = matches!(self.mode, WrtcMode::MediaVideo | WrtcMode::Auto)
+            && self.video_track.is_some()
+            && self.is_connected.load(Ordering::SeqCst);
+        let sctp_dc_alive =
+            self.dc_is_open.load(Ordering::SeqCst) && self.is_connected.load(Ordering::SeqCst);
         if self.start_instant.elapsed() > Duration::from_secs(self.watchdog_channel_grace_secs)
             && !self.has_ws.load(Ordering::SeqCst)
-            && (!self.dc_is_open.load(Ordering::SeqCst) || !self.is_connected.load(Ordering::SeqCst))
+            && !sctp_dc_alive
+            && !video_media_alive
         {
-            return Some("Both Colibri-WS and DataChannel are closed/disconnected");
+            return Some(
+                "All WRTC channels (Colibri-WS, DataChannel, and MediaVideo ICE) are closed/disconnected",
+            );
         }
         None
     }
