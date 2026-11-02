@@ -571,9 +571,9 @@ async fn run_mailbox_worker_pair(
                                     );
 
                                     // Запускаем фоновую задачу Self-Clocking Downlink-батчера для этого клиента
+                                    // (учёт исходящего трафика tx_bytes выполняется автоматически в ClientRegistry::route_packet_to_ipv4)
                                     let writer_tx = notes_data_tx.clone();
                                     let c_info = client_info.clone();
-                                    let reg_dl = registry.clone();
                                     let max_batch_bytes =
                                         (config.imap.max_batch_kb.clamp(8, 128)) * 1024;
                                     let coalesce_ms = config.imap.batch_coalesce_ms.clamp(5, 50);
@@ -583,7 +583,6 @@ async fn run_mailbox_worker_pair(
                                         run_client_downlink_batcher(
                                             rx_router,
                                             c_info,
-                                            reg_dl,
                                             writer_tx,
                                             max_batch_bytes,
                                             coalesce_ms,
@@ -648,7 +647,6 @@ async fn run_mailbox_worker_pair(
 async fn run_client_downlink_batcher(
     mut rx_router: mpsc::Receiver<Bytes>,
     client_info: Arc<ClientTransportInfo>,
-    registry: Arc<ClientRegistry>,
     notes_data_tx: mpsc::Sender<DownlinkMessage>,
     max_batch_bytes: usize,
     coalesce_ms: u64,
@@ -712,7 +710,6 @@ async fn run_client_downlink_batcher(
 
         // 4. Шифруем собранный батч одним вызовом wrap_packet_slice и отправляем через SRV_WRITER
         if let Some(raw_batch) = batcher.flush() {
-            let raw_len = raw_batch.len();
             let seq = client_info.sequence.fetch_add(1, Ordering::Relaxed);
             if let Ok(encrypted_bytes) = wrap_packet_slice(
                 &client_info.cipher,
@@ -721,7 +718,6 @@ async fn run_client_downlink_batcher(
                 &raw_batch,
                 0,
             ) {
-                registry.record_tx(&client_info, raw_len, "imap");
                 permit.send(DownlinkMessage {
                     subject: subject.clone(),
                     payload: encrypted_bytes,
