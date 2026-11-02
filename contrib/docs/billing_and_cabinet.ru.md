@@ -279,28 +279,43 @@ pub enum LimitSource {
     Unlimited,
 }
 
-/// Сетевые протоколы подключения клиентов к нодам
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Enum)]
-pub enum TransportProtocol {
-    #[oai(rename = "quic")]
+// ============================================================================
+// anet-auth/src/entities/protocol_type.rs (Уже существует в кодовой базе)
+// ============================================================================
+
+/// Сетевые протоколы подключения клиентов к нодам (PostgreSQL ENUM: `protocol_type`).
+/// Единый источник правды: используется в `node_pool_members`, `traffic_hourly`, 
+/// `traffic_totals`, генерации конфигов и `ActiveSessionDto`.
+/// При добавлении новых вариантов протокола обязательно параллельно создается SeaORM миграция 
+/// (`ALTER TYPE protocol_type ADD VALUE IF NOT EXISTS '...';`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, EnumIter, DeriveActiveEnum, Serialize, Deserialize, Enum)]
+#[sea_orm(rs_type = "String", db_type = "Enum", enum_name = "protocol_type")]
+#[oai(rename_all = "lowercase")]
+#[serde(rename_all = "lowercase")]
+pub enum ProtocolType {
+    #[sea_orm(string_value = "quic")]
     Quic,
-    #[oai(rename = "ssh")]
+    #[sea_orm(string_value = "ssh")]
     Ssh,
-    #[oai(rename = "vnc")]
+    #[sea_orm(string_value = "vnc")]
     Vnc,
-    #[oai(rename = "ws")]
-    Websocket,
-    #[oai(rename = "ahttp")]
+    #[sea_orm(string_value = "ws")]
+    Ws,
+    #[sea_orm(string_value = "ahttp")]
     Ahttp,
-    #[oai(rename = "wrtc_ws")]
-    WrtcWs,
-    #[oai(rename = "wrtc_video")]
-    WrtcVideo,
-    #[oai(rename = "wrtc_dc")]
-    WrtcDc,
-    #[oai(rename = "wrtc_p2p")]
-    WrtcDirectP2p,
+    #[sea_orm(string_value = "wrtc")]
+    Wrtc,
+    // При необходимости гранулярного выделения режимов WebRTC:
+    // #[sea_orm(string_value = "wrtc_ws")]
+    // WrtcWs,
+    // #[sea_orm(string_value = "wrtc_video")]
+    // WrtcVideo,
+    // #[sea_orm(string_value = "wrtc_dc")]
+    // WrtcDc,
+    // #[sea_orm(string_value = "wrtc_p2p")]
+    // WrtcDirectP2p,
 }
+
 
 // ============================================================================
 // anet-auth/src/entities/products.rs
@@ -778,8 +793,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::entities::{
-    billing_enums::{Currency, LimitSource, OrderStatus, PaymentSystem, ProductType, TransportProtocol, VoucherStatus},
-    groups, orders, products, rates, transactions, users, vouchers,
+    billing_enums::{Currency, LimitSource, OrderStatus, PaymentSystem, ProductType, VoucherStatus},
+    groups, orders, products, rates, transactions, users, vouchers, ProtocolType,
 };
 
 #[derive(SecurityScheme)]
@@ -849,7 +864,7 @@ pub struct ActiveSessionDto {
     pub server_id: Uuid,
     pub server_name: String,
     pub client_ip: String,
-    pub transport: TransportProtocol,
+    pub protocol: ProtocolType,
     pub rx_bytes: i64,
     pub tx_bytes: i64,
     pub connected_at: chrono::DateTime<chrono::Utc>,
