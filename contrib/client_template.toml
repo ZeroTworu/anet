@@ -220,6 +220,24 @@ ws_write_timeout_secs = 5
 colibri_ws_connect_timeout_secs = 10
 # colibri_ws_connect_timeout_secs = 15 # для CF WARP (запас на установку TLS WebSocket до JVB через WARP)
 
+# Тайм-аут чтения входящих кадров из Colibri-WS до тихого фонового переподключения сокета без разрыва видео-тракта (сек)
+colibri_ws_read_timeout_secs = 25
+# colibri_ws_read_timeout_secs = 25 # для CF WARP (тихое переоткрытие зависшего в WARP TCP-сокета Colibri-WS без сброса UDP/RTP)
+
+# --- Обход L4 ECMP / LAG фильтрации ТСПУ (Fast TCP Port Hopping и Multi-Socket UDP ICE) ---
+
+# Количество быстрых попыток перебора исходных TCP-портов (src_port) при установке HTTP API, XMPP-WS и Colibri-WS соединений
+tcp_port_hop_attempts = 8
+# tcp_port_hop_attempts = 8 # для CF WARP
+
+# Тайм-аут одной быстрой попытки TCP-соединения при переборе исходных портов (в миллисекундах)
+tcp_port_hop_timeout_ms = 1000
+# tcp_port_hop_timeout_ms = 1500 # для CF WARP
+
+# Количество параллельных локальных UDP-сокетов (0.0.0.0:0) для сбора множественных ICE host-кандидатов с разными src_port
+udp_ice_socket_count = 6
+# udp_ice_socket_count = 6 # для CF WARP
+
 # --- Системные буферы UDP, реактор и параметры ICE / STUN / TURN ---
 
 # Размер системных буферов UDP-сокета (SO_RCVBUF / SO_SNDBUF) в байтах (8 МБ исключают дропы пакетов ядром ОС на пиках скорости)
@@ -389,6 +407,7 @@ ws_headers_order = [
     "Sec-WebSocket-Version",
     "Accept-Encoding",
     "Accept-Language",
+    "Cookie",
     "Sec-WebSocket-Key",
     "Sec-WebSocket-Extensions",
 ]
@@ -428,6 +447,7 @@ ws_headers_order = [
     "Origin",
     "Sec-WebSocket-Extensions",
     "Sec-WebSocket-Key",
+    "Cookie",
     "Connection",
     "Pragma",
     "Cache-Control",
@@ -468,6 +488,7 @@ ws_headers_order = [
     "User-Agent",
     "Accept-Language",
     "Accept-Encoding",
+    "Cookie",
     "Sec-WebSocket-Extensions",
 ]
 user_agents = [
