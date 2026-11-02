@@ -121,9 +121,9 @@ pub const WRTC_BATCHER_MAX_BYTES: usize = 12288;
 pub const WRTC_BATCHER_MAX_DELAY_MS: u64 = 2;
 pub const WRTC_VIDEO_BATCH_MAX_PACKETS: usize = 16;
 pub const WRTC_UPLINK_BURST_MAX_PACKETS: usize = 64;
-pub const WRTC_UPLINK_PACING_NS_PER_BYTE: u64 = 40;
-pub const WRTC_DOWNLINK_PACING_NS_PER_BYTE: u64 = 32;
-pub const WRTC_PACING_HORIZON_NS: u64 = 800_000;
+pub const WRTC_UPLINK_PACING_NS_PER_BYTE: u64 = 45;
+pub const WRTC_DOWNLINK_PACING_NS_PER_BYTE: u64 = 38;
+pub const WRTC_PACING_HORIZON_NS: u64 = 2_500_000;
 
 /// Внутренние интервалы опроса ICE, ретраев DataChannel и фоновых задач.
 pub const WRTC_ICE_GATHER_POLL_ATTEMPTS: usize = 50;

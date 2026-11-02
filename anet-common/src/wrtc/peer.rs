@@ -930,7 +930,12 @@ pub async fn create_p2p_channel(
                 effective_bind_addr.clone();
                 wrtc_cfg.udp_ice_socket_count.clamp(1, 16)
             ])
-            .with_dedicated_reactor_pool_size(wrtc_cfg.reactor_pool_size.max(1))
+            .with_dedicated_reactor_pool_size(
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(1)
+                    .clamp(1, wrtc_cfg.reactor_pool_size.max(1)),
+            )
             .build()
             .await
         {
@@ -1552,7 +1557,12 @@ impl WrtcPeer {
                         bind_addr.clone();
                         wrtc_cfg.udp_ice_socket_count.clamp(1, 16)
                     ])
-                    .with_dedicated_reactor_pool_size(wrtc_cfg.reactor_pool_size.max(1))
+                    .with_dedicated_reactor_pool_size(
+                        std::thread::available_parallelism()
+                            .map(|n| n.get())
+                            .unwrap_or(1)
+                            .clamp(1, wrtc_cfg.reactor_pool_size.max(1)),
+                    )
                     .build()
                     .await
                 {
