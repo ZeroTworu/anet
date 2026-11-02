@@ -869,8 +869,6 @@ where
         .await
         .map_err(|e| anyhow::anyhow!("BoringSSL Email IMAPS TLS handshake failed for {domain}: {e}"))
 }
-    connect_ws_tls_with_config(domain, stream, &cfg).await
-}
 
 #[cfg(test)]
 mod tests {
