@@ -15,9 +15,8 @@
 
 Пользователь использует один и тот же конфигурационный файл (`client.toml` или QR-код) на всех своих устройствах (ноутбук, смартфон, роутер). Ограничение потребления ресурсов строится **исключительно на количестве одновременных сессий, лимите скорости и лимите трафика**.
 
-Публичный Личный Кабинет пользователей обслуживается на домене:
-**`https://service.anet-project.org`**  
-*(Внутренняя панель управления администратора доступна отдельно по адресу `cp.anet-project.org` и скрыта от клиентов)*.
+Публичный Личный Кабинет пользователей обслуживается на домене сервиса (задается в конфигурации `server.toml` как `public_domain`, например: `https://service.example.com`).
+*(Внутренняя панель управления администратора доступна на отдельном поддомене `cp.example.com` и закрыта от обычных пользователей)*.
 
 ---
 
@@ -467,7 +466,7 @@ impl ActiveModelBehavior for ActiveModel {}
 
 1. **Запрос ссылки:** Пользователь указывает Email на странице входа Личного Кабинета.
 2. **Токен подтверждения:** Бэкенд генерирует одноразовый токен (TTL = 15 минут), сохраняет его в таблице `verification_tokens` и отправляет письмо со ссылкой на публичный сервис:
-   `https://service.anet-project.org/auth/verify?token=XYZ`
+   `https://service.example.com/auth/verify?token=XYZ`
 3. **Установка пароля:** Пользователь вводит пароль (валидируется только длина $\ge 5$ символов).
 4. **Создание профиля:**
    * Создается `UserModel`.
@@ -1003,14 +1002,15 @@ impl UserCabinetApi {
             .map_err(|e| poem::Error::from_string(e.to_string(), poem::http::StatusCode::INTERNAL_SERVER_ERROR))?
             .ok_or_else(|| poem::Error::from_string("User not found", poem::http::StatusCode::NOT_FOUND))?;
 
+        let auth_host = std::env::var("PUBLIC_DOMAIN").unwrap_or_else(|_| "https://service.example.com".into());
         let toml_content = format!(
-            "# Anet Client Config\nfingerprint = \"{}\"\nauth_server = \"https://service.anet-project.org\"\n",
-            user.fingerprint
+            "# Anet Client Config\nfingerprint = \"{}\"\nauth_server = \"{}\"\n",
+            user.fingerprint, auth_host
         );
 
         Ok(Json(ClientConfigResponse {
             client_toml: toml_content,
-            qr_code_url: format!("https://service.anet-project.org/api/v1/config/qr/{}", user.fingerprint),
+            qr_code_url: format!("{}/api/v1/config/qr/{}", auth_host, user.fingerprint),
         }))
     }
 }
@@ -1336,7 +1336,7 @@ impl AdminBillingApi {
 
 Разработка Telegram-бота начинается после стабилизации WebUI и API биллинга. Бот выступает интерфейсной надстройкой, вызывающей WebUI внутри **Telegram Web Apps (TMA)**:
 1. Пользователь нажимает `/start` или кнопку меню «Личный кабинет».
-2. Открывается защищенный webview с адресом `https://service.anet-project.org/tma`.
+2. Открывается защищенный webview с адресом `https://service.example.com/tma`.
 3. Фронтенд автоматически передает `window.Telegram.WebApp.initData` на бэкенд `/api/v1/auth/telegram_tma`.
 4. Бэкенд верифицирует криптографическую подпись через `verify_telegram_init_data`, связывает `telegram_id` с пользователем и выдает сессионный JWT.
 5. Пользователь получает полный доступ к ЛК: скачивание конфига, завершение сессий, конструктор тарифов и оплата (включая Telegram Stars).
