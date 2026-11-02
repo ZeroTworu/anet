@@ -1049,6 +1049,7 @@ pub struct WrtcPeer {
     pub last_video_tx_ms: Arc<AtomicU64>,
     pub video_v2_enabled: Arc<AtomicBool>,
     pub force_keyframe_remaining: Arc<AtomicU32>,
+    pub video_write_lock: Arc<Mutex<()>>,
     pub remote_sdp: Mutex<String>,
     pub colibri_ws_ip: Arc<std::sync::Mutex<Option<std::net::IpAddr>>>,
     pub active_video_constraints: Arc<std::sync::Mutex<Option<ReceiverVideoConstraints>>>,
@@ -1106,6 +1107,7 @@ impl WrtcPeer {
         let last_video_tx_ms = Arc::new(AtomicU64::new(0));
         let video_v2_enabled = Arc::new(AtomicBool::new(false));
         let force_keyframe_remaining = Arc::new(AtomicU32::new(WRTC_INITIAL_FORCE_KEYFRAMES));
+        let video_write_lock = Arc::new(Mutex::new(()));
         let mut initial_remote_sdp = String::new();
 
         let (ws_fallback_tx, mut ws_fallback_rx) =
@@ -1996,6 +1998,7 @@ impl WrtcPeer {
                 let video_ts_c = Arc::clone(&video_ts);
                 let last_video_tx_c = Arc::clone(&last_video_tx_ms);
                 let video_v2_c = Arc::clone(&video_v2_enabled);
+                let video_write_lock_c = Arc::clone(&video_write_lock);
                 let start_instant_c = start_instant;
                 let v_pt = video_pt;
                 let v_ssrc = local_video_ssrc;
@@ -2031,6 +2034,14 @@ impl WrtcPeer {
                             < video_idle_suppress_ms
                         {
                             // Не инжектируем пустые кадры посреди активного потока данных
+                            continue;
+                        }
+
+                        let _write_guard = video_write_lock_c.lock().await;
+                        let elapsed_ms = start_instant_c.elapsed().as_millis() as u64;
+                        if elapsed_ms.saturating_sub(last_video_tx_c.load(Ordering::Relaxed))
+                            < video_idle_suppress_ms
+                        {
                             continue;
                         }
 
@@ -2113,6 +2124,7 @@ impl WrtcPeer {
             last_video_tx_ms,
             video_v2_enabled,
             force_keyframe_remaining,
+            video_write_lock,
             remote_sdp: Mutex::new(initial_remote_sdp),
             colibri_ws_ip,
             active_video_constraints,
@@ -2179,50 +2191,71 @@ impl WrtcPeer {
     pub fn force_next_keyframe(&self) {
         self.force_keyframe_remaining
             .store(WRTC_REASSERT_FORCE_KEYFRAMES, Ordering::Relaxed);
+        let elapsed_ms = self.start_instant.elapsed().as_millis() as u64;
+        if elapsed_ms.saturating_sub(self.last_video_tx_ms.load(Ordering::Relaxed)) < 50 {
+            // Если по видеоканалу уже идёт активный поток данных (каждый пакет — 1080p Keyframe),
+            // не запускаем фоновую задачу с холостыми нетегированными кадрами, чтобы не конкурировать за сокет.
+            return;
+        }
         if let Some(ref track) = self.video_track {
             let track_c = Arc::clone(track);
             let video_seq_c = Arc::clone(&self.video_seq);
             let video_ts_c = Arc::clone(&self.video_ts);
             let video_v2_c = Arc::clone(&self.video_v2_enabled);
+            let video_write_lock_c = Arc::clone(&self.video_write_lock);
+            let last_video_tx_c = Arc::clone(&self.last_video_tx_ms);
+            let start_instant_c = self.start_instant;
             let v_pt = self.video_payload_type;
             let v_ssrc = self.video_ssrc;
             let kf_task = tokio::spawn(async move {
                 for _ in 0..WRTC_BURST_KEYFRAME_COUNT {
-                    let frame_num = video_ts_c.fetch_add(1, Ordering::Relaxed);
-                    let seq = (frame_num & 0xFFFF) as u16;
-                    video_seq_c.store(seq.wrapping_add(1), Ordering::Relaxed);
-                    let pic_id = (frame_num & 0x7FFF) as u16;
-                    let ts = frame_num.wrapping_mul(WRTC_VP8_RTP_TS_STEP);
-
-                    let mut keepalive_payload = BytesMut::with_capacity(4 + VP8_KEYFRAME_HEADER.len());
-                    keepalive_payload.put_u8(0x90);
-                    keepalive_payload.put_u8(0x80);
-                    keepalive_payload.put_u8(0x80 | ((pic_id >> 8) as u8));
-                    keepalive_payload.put_u8((pic_id & 0xFF) as u8);
-                    if video_v2_c.load(Ordering::Relaxed) {
-                        keepalive_payload.put_slice(&VP8_KEYFRAME_1080P_HEADER);
-                    } else {
-                        keepalive_payload.put_slice(&VP8_KEYFRAME_HEADER);
+                    let now_ms = start_instant_c.elapsed().as_millis() as u64;
+                    if now_ms.saturating_sub(last_video_tx_c.load(Ordering::Relaxed)) < 50 {
+                        break;
                     }
+                    {
+                        let _write_guard = video_write_lock_c.lock().await;
+                        let now_ms = start_instant_c.elapsed().as_millis() as u64;
+                        if now_ms.saturating_sub(last_video_tx_c.load(Ordering::Relaxed)) < 50 {
+                            break;
+                        }
+                        let frame_num = video_ts_c.fetch_add(1, Ordering::Relaxed);
+                        let seq = (frame_num & 0xFFFF) as u16;
+                        video_seq_c.store(seq.wrapping_add(1), Ordering::Relaxed);
+                        let pic_id = (frame_num & 0x7FFF) as u16;
+                        let ts = frame_num.wrapping_mul(WRTC_VP8_RTP_TS_STEP);
 
-                    let rtp_packet = RtpPacket {
-                        header: RtpHeader {
-                            version: 2,
-                            padding: false,
-                            extension: false,
-                            marker: true,
-                            payload_type: v_pt,
-                            sequence_number: seq,
-                            timestamp: ts,
-                            ssrc: v_ssrc,
-                            csrc: vec![],
-                            extension_profile: 0,
-                            extensions: vec![],
-                            extensions_padding: 0,
-                        },
-                        payload: keepalive_payload.freeze(),
-                    };
-                    let _ = track_c.write_rtp(rtp_packet).await;
+                        let mut keepalive_payload =
+                            BytesMut::with_capacity(4 + VP8_KEYFRAME_HEADER.len());
+                        keepalive_payload.put_u8(0x90);
+                        keepalive_payload.put_u8(0x80);
+                        keepalive_payload.put_u8(0x80 | ((pic_id >> 8) as u8));
+                        keepalive_payload.put_u8((pic_id & 0xFF) as u8);
+                        if video_v2_c.load(Ordering::Relaxed) {
+                            keepalive_payload.put_slice(&VP8_KEYFRAME_1080P_HEADER);
+                        } else {
+                            keepalive_payload.put_slice(&VP8_KEYFRAME_HEADER);
+                        }
+
+                        let rtp_packet = RtpPacket {
+                            header: RtpHeader {
+                                version: 2,
+                                padding: false,
+                                extension: false,
+                                marker: true,
+                                payload_type: v_pt,
+                                sequence_number: seq,
+                                timestamp: ts,
+                                ssrc: v_ssrc,
+                                csrc: vec![],
+                                extension_profile: 0,
+                                extensions: vec![],
+                                extensions_padding: 0,
+                            },
+                            payload: keepalive_payload.freeze(),
+                        };
+                        let _ = track_c.write_rtp(rtp_packet).await;
+                    }
                     tokio::time::sleep(Duration::from_millis(WRTC_BURST_KEYFRAME_INTERVAL_MS)).await;
                 }
             });
@@ -2355,8 +2388,11 @@ impl WrtcPeer {
             );
         }
 
-        // Единый монотонный атомарный счетчик кадров: гарантирует уникальную тройку (seq, pic_id, ts)
-        // для каждого пакета и полностью исключает коллизии timestamp в Vp8FrameMap JVB при бурстах >1 пакета/мс.
+        // Сериализуем инкремент (seq, pic_id, ts) и вызов write_rtp через video_write_lock,
+        // чтобы при параллельной отправке (например, основной поток трафика + ICMP Echo Reply / keepalive)
+        // кадры гарантированно попадали в сокет и JVB строго в порядке возрастания seq и timestamp.
+        let _write_guard = self.video_write_lock.lock().await;
+
         let frame_num = self.video_ts.fetch_add(1, Ordering::Relaxed);
         let seq = (frame_num & 0xFFFF) as u16;
         self.video_seq.store(seq.wrapping_add(1), Ordering::Relaxed);

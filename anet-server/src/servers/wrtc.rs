@@ -3,10 +3,10 @@ use crate::client_registry::{ClientRegistry, ClientTransportInfo};
 use crate::config::Config;
 use anet_common::consts::{
     MAX_PACKET_SIZE, VIDEO_BATCH_MARKER, VIDEO_WARMUP_PAYLOAD, VP8_ASTP_PREFIX_LEN,
-    WRTC_COLIBRI_CHANNEL_CAPACITY, WRTC_DEFAULT_MAX_VIDEO_HEIGHT,
+    WRTC_COLIBRI_CHANNEL_CAPACITY, WRTC_DEFAULT_MAX_VIDEO_HEIGHT, WRTC_DOWNLINK_PACING_NS_PER_BYTE,
     WRTC_HANDSHAKE_PROCESS_TIMEOUT_SECS, WRTC_ICE_GATHER_POLL_ATTEMPTS,
     WRTC_MIN_ASTP_VIDEO_FRAME_LEN, WRTC_MIN_IP_PACKET_LEN, WRTC_P2P_ICE_GATHER_POLL_INTERVAL_MS,
-    WRTC_SDP_RENEGOTIATE_TIMEOUT_SECS, WRTC_SERVER_RECONNECT_PAUSE_SECS,
+    WRTC_PACING_HORIZON_NS, WRTC_SDP_RENEGOTIATE_TIMEOUT_SECS, WRTC_SERVER_RECONNECT_PAUSE_SECS,
     WRTC_SERVER_RETRY_DELAY_SECS, WRTC_WATCHDOG_TICK_SECS,
 };
 use anet_common::http_help::BrowserProfile;
@@ -275,7 +275,10 @@ pub async fn run_wrtc_server(
                         continue;
                     }
                     let client_tag = u16::from_be_bytes([raw_frame[0], raw_frame[1]]);
-                    let Some(client_info) = clients_by_tag_rx.get(&client_tag) else {
+                    let Some(client_info) = clients_by_tag_rx
+                        .get(&client_tag)
+                        .map(|entry| entry.value().clone())
+                    else {
                         current_frame = peer_video_rx.try_recv_video_frame();
                         continue;
                     };
@@ -325,8 +328,8 @@ pub async fn run_wrtc_server(
                                         sub_pkt,
                                         tcp_clamp_mtu,
                                     );
-                                    if tun_clone_video.try_send(sub_pkt).is_ok() {
-                                        reg_clone_video.record_rx(client_info.value(), pkt_len, "wrtc_video");
+                                    if tun_clone_video.send(sub_pkt).await.is_ok() {
+                                        reg_clone_video.record_rx(client_info.as_ref(), pkt_len, "wrtc_video");
                                     } else {
                                         break;
                                     }
@@ -356,8 +359,8 @@ pub async fn run_wrtc_server(
                                     decrypted,
                                     tcp_clamp_mtu,
                                 );
-                                if tun_clone_video.try_send(clamped).is_ok() {
-                                    reg_clone_video.record_rx(client_info.value(), packet_len, "wrtc_video");
+                                if tun_clone_video.send(clamped).await.is_ok() {
+                                    reg_clone_video.record_rx(client_info.as_ref(), packet_len, "wrtc_video");
                                 }
                             }
                         }
@@ -831,6 +834,7 @@ pub async fn run_wrtc_server(
                                                 warmup_probe_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                                                 let mut batch_buf = BytesMut::with_capacity(MAX_PACKET_SIZE);
                                                 let mut pending_packet: Option<Bytes> = None;
+                                                let mut next_send_time = tokio::time::Instant::now();
 
                                                 if (srv_mode == anet_common::wrtc::colibri::WrtcMode::MediaVideo
                                                     || srv_mode == anet_common::wrtc::colibri::WrtcMode::Auto)
@@ -859,43 +863,47 @@ pub async fn run_wrtc_server(
                                                         biased;
                                                         packet_opt = rx_router.recv() => {
                                                             let Some(mut packet) = packet_opt else { break; };
-                                                            let mut burst_sent = 0usize;
+
+                                                            let is_p2p_pref = client_modes_dl
+                                                                .get(&target_client_id)
+                                                                .map(|m| m.as_str() == "p2p_direct")
+                                                                .unwrap_or(false);
+                                                            let is_video_or_auto_pref = client_modes_dl
+                                                                .get(&target_client_id)
+                                                                .map(|m| matches!(m.as_str(), "media_video" | "auto"))
+                                                                .unwrap_or(true);
+                                                            let has_video = client_video_ep_dl.contains(&target_client_id);
+                                                            let is_v2 = client_v2_ep_dl.contains(&target_client_id);
+                                                            let video_warmed_up = client_video_warmed_dl.contains(&client_tag);
+
+                                                            let p2p_session = if is_p2p_pref {
+                                                                p2p_clients_dl
+                                                                    .get(&target_client_id)
+                                                                    .and_then(|entry| {
+                                                                        if entry.is_ready() {
+                                                                            Some(entry.value().clone())
+                                                                        } else {
+                                                                            None
+                                                                        }
+                                                                    })
+                                                            } else {
+                                                                None
+                                                            };
+                                                            let p2p_active = p2p_session.is_some();
+
+                                                            let client_uses_video = !p2p_active
+                                                                && (srv_mode == anet_common::wrtc::colibri::WrtcMode::MediaVideo
+                                                                    || srv_mode == anet_common::wrtc::colibri::WrtcMode::Auto)
+                                                                && is_video_or_auto_pref
+                                                                && has_video;
+                                                            let dl_tcp_clamp_mtu = if client_uses_video || p2p_active {
+                                                                video_tun_mtu
+                                                            } else {
+                                                                ws_tun_mtu
+                                                            };
 
                                                             loop {
                                                                 if packet.len() >= WRTC_MIN_IP_PACKET_LEN {
-                                                                    let client_pref_mode = client_modes_dl
-                                                                        .get(&target_client_id)
-                                                                        .map(|m| m.clone())
-                                                                        .unwrap_or_else(|| "auto".to_string());
-                                                                    let has_video = client_video_ep_dl.contains(&target_client_id);
-                                                                    let is_v2 = client_v2_ep_dl.contains(&target_client_id);
-                                                                    let video_warmed_up = client_video_warmed_dl.contains(&client_tag);
-
-                                                                    let p2p_session = if client_pref_mode == "p2p_direct" {
-                                                                        p2p_clients_dl
-                                                                            .get(&target_client_id)
-                                                                            .and_then(|entry| {
-                                                                                if entry.is_ready() {
-                                                                                    Some(entry.value().clone())
-                                                                                } else {
-                                                                                    None
-                                                                                }
-                                                                            })
-                                                                    } else {
-                                                                        None
-                                                                    };
-                                                                    let p2p_active = p2p_session.is_some();
-
-                                                                    let client_uses_video = !p2p_active
-                                                                        && (srv_mode == anet_common::wrtc::colibri::WrtcMode::MediaVideo
-                                                                            || srv_mode == anet_common::wrtc::colibri::WrtcMode::Auto)
-                                                                        && matches!(client_pref_mode.as_str(), "media_video" | "auto")
-                                                                        && has_video;
-                                                                    let dl_tcp_clamp_mtu = if client_uses_video || p2p_active {
-                                                                        video_tun_mtu
-                                                                    } else {
-                                                                        ws_tun_mtu
-                                                                    };
                                                                     packet = anet_common::icmp_probe::clamp_tcp_mss_bytes(
                                                                         packet,
                                                                         dl_tcp_clamp_mtu,
@@ -940,6 +948,7 @@ pub async fn run_wrtc_server(
                                                                             } else {
                                                                                 &batch_buf[..]
                                                                             };
+                                                                            let wire_bytes = (payload_slice.len() + 64) as u64;
                                                                             if let Ok(enc_buf) = wrap_packet_slice_with_headroom(
                                                                                 &c_info.cipher,
                                                                                 &c_info.nonce_prefix,
@@ -950,10 +959,22 @@ pub async fn run_wrtc_server(
                                                                                 let _ = peer_downlink
                                                                                     .send_video_frame_preallocated(client_tag, enc_buf)
                                                                                     .await;
+                                                                                let now = tokio::time::Instant::now();
+                                                                                let cost = Duration::from_nanos(wire_bytes * WRTC_DOWNLINK_PACING_NS_PER_BYTE);
+                                                                                let earliest = if next_send_time > now { next_send_time } else { now };
+                                                                                next_send_time = earliest + cost;
+                                                                                let horizon = now + Duration::from_nanos(WRTC_PACING_HORIZON_NS);
+                                                                                if next_send_time > horizon {
+                                                                                    tokio::time::sleep_until(
+                                                                                        next_send_time - Duration::from_nanos(WRTC_PACING_HORIZON_NS / 2),
+                                                                                    )
+                                                                                    .await;
+                                                                                }
                                                                             }
                                                                         } else {
                                                                             // Одиночный пакет без stealth-паддинга в едином преаллоцированном буфере VP8+ASTP
                                                                             let seq = c_info.sequence.fetch_add(1, Ordering::Relaxed);
+                                                                            let wire_bytes = (packet.len() + 64) as u64;
                                                                             if let Ok(enc_buf) = wrap_packet_slice_with_headroom(
                                                                                 &c_info.cipher,
                                                                                 &c_info.nonce_prefix,
@@ -981,6 +1002,18 @@ pub async fn run_wrtc_server(
                                                                                             } else {
                                                                                                 break;
                                                                                             }
+                                                                                        }
+                                                                                    } else {
+                                                                                        let now = tokio::time::Instant::now();
+                                                                                        let cost = Duration::from_nanos(wire_bytes * WRTC_DOWNLINK_PACING_NS_PER_BYTE);
+                                                                                        let earliest = if next_send_time > now { next_send_time } else { now };
+                                                                                        next_send_time = earliest + cost;
+                                                                                        let horizon = now + Duration::from_nanos(WRTC_PACING_HORIZON_NS);
+                                                                                        if next_send_time > horizon {
+                                                                                            tokio::time::sleep_until(
+                                                                                                next_send_time - Duration::from_nanos(WRTC_PACING_HORIZON_NS / 2),
+                                                                                            )
+                                                                                            .await;
                                                                                         }
                                                                                     }
                                                                                 }
@@ -1108,12 +1141,6 @@ pub async fn run_wrtc_server(
                                                                             }
                                                                         }
                                                                     }
-                                                                }
-
-                                                                burst_sent += 1;
-                                                                if burst_sent >= 32 {
-                                                                    burst_sent = 0;
-                                                                    tokio::task::yield_now().await;
                                                                 }
 
                                                                 if let Some(next_p) = pending_packet.take() {

@@ -7,7 +7,8 @@ use anet_common::consts::{
     WRTC_DEFAULT_FALLBACK_JVB_IP, WRTC_DEFAULT_FALLBACK_JVB_PORT, WRTC_DEFAULT_MAX_VIDEO_HEIGHT,
     WRTC_DISCOVER_BROADCAST_INTERVAL_SECS, WRTC_DUPLEX_BUFFER_SIZE, WRTC_ICE_GATHER_POLL_ATTEMPTS,
     WRTC_MIN_ASTP_VIDEO_FRAME_LEN, WRTC_MIN_IP_PACKET_LEN, WRTC_P2P_ICE_GATHER_POLL_INTERVAL_MS,
-    WRTC_VIDEO_CHANNEL_CAPACITY, WRTC_WATCHDOG_TICK_SECS,
+    WRTC_PACING_HORIZON_NS, WRTC_UPLINK_PACING_NS_PER_BYTE, WRTC_VIDEO_CHANNEL_CAPACITY,
+    WRTC_WATCHDOG_TICK_SECS,
 };
 use anet_common::encryption::Cipher;
 use anet_common::handshake_fragmentation::FragmentConfig;
@@ -830,6 +831,7 @@ impl ClientTransport for WrtcTransport {
             let mut pending_packet: Option<Bytes> = None;
             let mut video_batch_buf = BytesMut::with_capacity(max_video_batch_bytes + 64);
             let mut cached_p2p: Option<Arc<P2pSession>> = None;
+            let mut next_send_time = tokio::time::Instant::now();
 
             if (wrtc_mode == anet_common::wrtc::colibri::WrtcMode::MediaVideo
                 || wrtc_mode == anet_common::wrtc::colibri::WrtcMode::Auto)
@@ -880,6 +882,17 @@ impl ClientTransport for WrtcTransport {
                         let use_video = !p2p_active
                             && (wrtc_mode == anet_common::wrtc::colibri::WrtcMode::MediaVideo
                                 || wrtc_mode == anet_common::wrtc::colibri::WrtcMode::Auto);
+                        let is_v2 = peer_tx.is_video_v2();
+                        let last_v_rx = last_video_rx_tx.load(Ordering::Relaxed);
+                        let video_warmed_up = !first_client_rx_tx.load(Ordering::Relaxed)
+                            && peer_tx.is_connected.load(Ordering::Relaxed)
+                            && (last_v_rx > 0
+                                && current_timestamp_secs().saturating_sub(last_v_rx) <= 5);
+                        let batch_capable = if use_video {
+                            is_v2 && video_warmed_up
+                        } else {
+                            p2p_active
+                        };
 
                         for _burst_idx in 0..uplink_burst_max_packets {
                             if packet.len() >= WRTC_MIN_IP_PACKET_LEN {
@@ -888,16 +901,6 @@ impl ClientTransport for WrtcTransport {
                                     tcp_clamp_mtu,
                                 );
                                 // Zero-delay micro-batching мелких пакетов (TCP ACK, DNS) в единый VP8 RTP кадр
-                                let mut batch_capable = p2p_active;
-                                if use_video {
-                                    let is_v2 = peer_tx.is_video_v2();
-                                    let last_v_rx = last_video_rx_tx.load(Ordering::Relaxed);
-                                    let video_warmed_up = !first_client_rx_tx.load(Ordering::Relaxed)
-                                        && peer_tx.is_connected.load(Ordering::Relaxed)
-                                        && (last_v_rx > 0
-                                            && current_timestamp_secs().saturating_sub(last_v_rx) <= 5);
-                                    batch_capable = is_v2 && video_warmed_up;
-                                }
                                 let mut batched_payload = false;
 
                                 if batch_capable && (packet.len() + 3 < max_video_batch_bytes) {
@@ -939,16 +942,12 @@ impl ClientTransport for WrtcTransport {
                                 let seq = sequence_tx.fetch_add(1, Ordering::Relaxed);
 
                                 if use_video {
-                                    let last_v_rx = last_video_rx_tx.load(Ordering::Relaxed);
-                                    let video_warmed_up = !first_client_rx_tx.load(Ordering::Relaxed)
-                                        && peer_tx.is_connected.load(Ordering::Relaxed)
-                                        && (last_v_rx > 0
-                                            && current_timestamp_secs().saturating_sub(last_v_rx) <= 5);
                                     let payload_slice: &[u8] = if batched_payload {
                                         &video_batch_buf
                                     } else {
                                         &packet
                                     };
+                                    let wire_bytes = (payload_slice.len() + 64) as u64;
                                     match wrap_packet_slice_with_headroom(
                                         &cipher_tx,
                                         &nonce_prefix,
@@ -977,6 +976,18 @@ impl ClientTransport for WrtcTransport {
                                                                 warn!("[WRTC Client] Peer send batch error: {e}");
                                                                 return;
                                                             }
+                                                        }
+                                                    } else {
+                                                        let now = tokio::time::Instant::now();
+                                                        let cost = Duration::from_nanos(wire_bytes * WRTC_UPLINK_PACING_NS_PER_BYTE);
+                                                        let earliest = if next_send_time > now { next_send_time } else { now };
+                                                        next_send_time = earliest + cost;
+                                                        let horizon = now + Duration::from_nanos(WRTC_PACING_HORIZON_NS);
+                                                        if next_send_time > horizon {
+                                                            tokio::time::sleep_until(
+                                                                next_send_time - Duration::from_nanos(WRTC_PACING_HORIZON_NS / 2),
+                                                            )
+                                                            .await;
                                                         }
                                                     }
                                                 }

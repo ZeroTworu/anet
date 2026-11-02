@@ -114,13 +114,16 @@ pub const WRTC_WS_FALLBACK_CHANNEL_CAPACITY: usize = 8192;
 pub const WRTC_P2P_CHANNEL_CAPACITY: usize = 4096;
 pub const WRTC_XMPP_CHANNEL_CAPACITY: usize = 128;
 pub const WRTC_XMPP_RAW_WS_CHANNEL_CAPACITY: usize = 32;
-pub const WRTC_DUPLEX_BUFFER_SIZE: usize = 4 * 1024 * 1024;
+pub const WRTC_DUPLEX_BUFFER_SIZE: usize = 256 * 1024;
 
-/// Параметры микро-батчирования и коалесценции пакетов в WebRTC.
+/// Параметры микро-батчирования, коалесценции и EDT-пейсинга пакетов в WebRTC.
 pub const WRTC_BATCHER_MAX_BYTES: usize = 12288;
 pub const WRTC_BATCHER_MAX_DELAY_MS: u64 = 2;
 pub const WRTC_VIDEO_BATCH_MAX_PACKETS: usize = 16;
 pub const WRTC_UPLINK_BURST_MAX_PACKETS: usize = 64;
+pub const WRTC_UPLINK_PACING_NS_PER_BYTE: u64 = 40;
+pub const WRTC_DOWNLINK_PACING_NS_PER_BYTE: u64 = 32;
+pub const WRTC_PACING_HORIZON_NS: u64 = 800_000;
 
 /// Внутренние интервалы опроса ICE, ретраев DataChannel и фоновых задач.
 pub const WRTC_ICE_GATHER_POLL_ATTEMPTS: usize = 50;
