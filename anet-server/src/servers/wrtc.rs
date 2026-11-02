@@ -801,7 +801,7 @@ pub async fn run_wrtc_server(
                                             let min_tun_mtu = config.wrtc.min_tun_mtu.clamp(576, 1500);
                                             let cfg_max_video_batch_bytes = config.wrtc.max_video_batch_bytes.clamp(400, 1400);
                                             let video_batch_max_packets = config.wrtc.video_batch_max_packets.clamp(1, 64);
-                                            let ws_batcher_max_bytes = config.wrtc.ws_batcher_max_bytes.clamp(512, 4096);
+                                            let ws_batcher_max_bytes = config.wrtc.ws_batcher_max_bytes.clamp(512, 65536);
                                             let ws_batcher_max_delay_ms = config.wrtc.ws_batcher_max_delay_ms.clamp(1, 50);
                                             let video_tun_mtu = config
                                                 .network

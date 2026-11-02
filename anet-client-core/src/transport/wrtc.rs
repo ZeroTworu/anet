@@ -489,7 +489,7 @@ impl ClientTransport for WrtcTransport {
             .min(cfg_max_video_batch_bytes);
         let video_batch_max_packets = self.config.wrtc.video_batch_max_packets.clamp(1, 64);
         let uplink_burst_max_packets = self.config.wrtc.uplink_burst_max_packets.clamp(1, 256);
-        let ws_batcher_max_bytes = self.config.wrtc.ws_batcher_max_bytes.clamp(512, 4096);
+        let ws_batcher_max_bytes = self.config.wrtc.ws_batcher_max_bytes.clamp(512, 65536);
         let ws_batcher_max_delay_ms = self.config.wrtc.ws_batcher_max_delay_ms.clamp(1, 50);
 
         info!(
