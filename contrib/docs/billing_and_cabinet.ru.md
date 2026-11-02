@@ -286,8 +286,10 @@ pub enum LimitSource {
 /// Сетевые протоколы подключения клиентов к нодам (PostgreSQL ENUM: `protocol_type`).
 /// Единый источник правды: используется в `node_pool_members`, `traffic_hourly`, 
 /// `traffic_totals`, генерации конфигов и `ActiveSessionDto`.
-/// При добавлении новых вариантов протокола обязательно параллельно создается SeaORM миграция 
-/// (`ALTER TYPE protocol_type ADD VALUE IF NOT EXISTS '...';`).
+/// 
+/// Базовое значение `Wrtc` сохраняется:
+/// 1. Для 100% обратной совместимости с существующими строками в БД (ALTER TYPE protocol_type ADD VALUE 'wrtc').
+/// 2. Для удобной группировки и агрегации всех wrtc_* протоколов в одну общую выборку на графиках и в биллинге.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, EnumIter, DeriveActiveEnum, Serialize, Deserialize, Enum)]
 #[sea_orm(rs_type = "String", db_type = "Enum", enum_name = "protocol_type")]
 #[oai(rename_all = "lowercase")]
@@ -303,18 +305,63 @@ pub enum ProtocolType {
     Ws,
     #[sea_orm(string_value = "ahttp")]
     Ahttp,
+    /// Базовый WebRTC (legacy / агрегатор)
     #[sea_orm(string_value = "wrtc")]
     Wrtc,
-    // При необходимости гранулярного выделения режимов WebRTC:
-    // #[sea_orm(string_value = "wrtc_ws")]
-    // WrtcWs,
-    // #[sea_orm(string_value = "wrtc_video")]
-    // WrtcVideo,
-    // #[sea_orm(string_value = "wrtc_dc")]
-    // WrtcDc,
-    // #[sea_orm(string_value = "wrtc_p2p")]
-    // WrtcDirectP2p,
+    /// WebRTC через WebSocket сигнальный канал
+    #[sea_orm(string_value = "wrtc_ws")]
+    WrtcWs,
+    /// WebRTC Video RTP/SRTP медиа-канал
+    #[sea_orm(string_value = "wrtc_video")]
+    WrtcVideo,
+    /// WebRTC DataChannel (SCTP)
+    #[sea_orm(string_value = "wrtc_dc")]
+    WrtcDc,
+    /// WebRTC Direct P2P (прямой туннель)
+    #[sea_orm(string_value = "wrtc_p2p")]
+    WrtcDirectP2p,
 }
+
+impl ProtocolType {
+    /// Проверка, относится ли протокол к семейству WebRTC
+    pub fn is_wrtc(&self) -> bool {
+        matches!(
+            self,
+            Self::Wrtc | Self::WrtcWs | Self::WrtcVideo | Self::WrtcDc | Self::WrtcDirectP2p
+        )
+    }
+
+    pub fn from_str(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "ssh" => Self::Ssh,
+            "vnc" => Self::Vnc,
+            "ws" | "wss" => Self::Ws,
+            "ahttp" => Self::Ahttp,
+            "wrtc" => Self::Wrtc,
+            "wrtc_ws" => Self::WrtcWs,
+            "wrtc_video" => Self::WrtcVideo,
+            "wrtc_dc" => Self::WrtcDc,
+            "wrtc_p2p" => Self::WrtcDirectP2p,
+            _ => Self::Quic,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Quic => "quic",
+            Self::Ssh => "ssh",
+            Self::Vnc => "vnc",
+            Self::Ws => "ws",
+            Self::Ahttp => "ahttp",
+            Self::Wrtc => "wrtc",
+            Self::WrtcWs => "wrtc_ws",
+            Self::WrtcVideo => "wrtc_video",
+            Self::WrtcDc => "wrtc_dc",
+            Self::WrtcDirectP2p => "wrtc_p2p",
+        }
+    }
+}
+
 
 
 // ============================================================================
@@ -550,25 +597,25 @@ impl ActiveModelBehavior for ActiveModel {}
 Все таймауты, длительности токенов и ключи выносятся в конфигурационный файл сервера (никакого хардкода в коде):
 
 ```toml
-[auth]
+[cabinet.web]
+# Публичный домен веб-кабинета для генерации ссылок в письмах
+public_domain = "https://service.example.com"
 # Время жизни одноразового токена подтверждения Email (в минутах)
 verification_token_ttl_mins = 15
 # Минимальная длина пароля при регистрации
 min_password_length = 5
-# Публичный домен веб-кабинета для генерации ссылок в письмах
-public_domain = "https://service.example.com"
+
+[cabinet.telegram]
+# Токен бота Telegram для валидации TMA
+bot_token = ""
+# Ключ для вычисления промежуточного HMAC по спецификации Telegram API
+web_app_data_key = "WebAppData"
 
 [billing.freekassa]
 # Интервал запуска фонового опроса незавершенных заказов (в секундах)
 sync_interval_secs = 900
 # Возраст заказа со статусом Pending для начала проверки через getOrders (в минутах)
 pending_threshold_mins = 15
-
-[telegram]
-# Токен бота Telegram для валидации TMA
-bot_token = ""
-# Ключ для вычисления промежуточного HMAC по спецификации Telegram API
-web_app_data_key = "WebAppData"
 ```
 
 ### 4.2. Авторизация по Email (Пароли и ссылки)
@@ -633,11 +680,18 @@ web_app_data_key = "WebAppData"
 ### 5.2. Строго типизированный воркер FreeKassa
 
 ```rust
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
-use sea_orm::{DatabaseConnection, EntityTrait, QueryFilter, ColumnTrait, ActiveModelTrait, Set};
-use serde::{Deserialize, Serialize};
 use std::time::Duration;
+use chrono::{Duration as ChronoDuration, Utc};
+use hmac::{Hmac, Mac};
+use sea_orm::{ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set};
+use serde::{Deserialize, Serialize};
+use sha2::Sha256;
+use tokio::time::sleep;
+
+use crate::entities::billing_enums::OrderStatus;
+use crate::entities::orders::{
+    ActiveModel as OrderActiveModel, Column as OrderColumn, Entity as Orders,
+};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -688,13 +742,13 @@ pub async fn cron_sync_freekassa(db: DatabaseConnection) {
         .unwrap();
 
     loop {
-        tokio::time::sleep(Duration::from_secs(sync_interval_secs)).await;
+        sleep(Duration::from_secs(sync_interval_secs)).await;
 
-        let threshold = chrono::Utc::now() - chrono::Duration::minutes(pending_threshold_mins);
+        let threshold = Utc::now() - ChronoDuration::minutes(pending_threshold_mins);
         
-        let pending_orders = match crate::entities::orders::Entity::find()
-            .filter(crate::entities::orders::Column::Status.eq(crate::entities::billing_enums::OrderStatus::Pending))
-            .filter(crate::entities::orders::Column::CreatedAt.lt(threshold))
+        let pending_orders = match Orders::find()
+            .filter(OrderColumn::Status.eq(OrderStatus::Pending))
+            .filter(OrderColumn::CreatedAt.lt(threshold))
             .all(&db)
             .await 
         {
@@ -706,7 +760,7 @@ pub async fn cron_sync_freekassa(db: DatabaseConnection) {
         };
 
         for order in pending_orders {
-            let nonce = chrono::Utc::now().timestamp_millis();
+            let nonce = Utc::now().timestamp_millis();
             let order_id_str = order.id.to_string();
 
             // Сортировка по ключам: nonce, orderId, shopId -> значения через "|"
@@ -744,8 +798,8 @@ pub async fn cron_sync_freekassa(db: DatabaseConnection) {
                                         let _ = fulfill_order(&db, order.id, "CRON_SYNC", raw_json).await;
                                     } else if record.status == FkApiOrderStatus::Error as i32 || record.status == FkApiOrderStatus::Cancelled as i32 {
                                         tracing::warn!("[FreeKassa Sync] Order {} cancelled (status {})", order.id, record.status);
-                                        let mut active: crate::entities::orders::ActiveModel = order.into();
-                                        active.status = Set(crate::entities::billing_enums::OrderStatus::Cancelled);
+                                        let mut active: OrderActiveModel = order.into();
+                                        active.status = Set(OrderStatus::Cancelled);
                                         let _ = active.update(&db).await;
                                     }
                                 }
@@ -779,10 +833,11 @@ pub async fn cron_sync_freekassa(db: DatabaseConnection) {
 // anet-auth/src/api/user_cabinet.rs
 // ============================================================================
 
+use chrono::{DateTime, Utc};
 use poem::http::StatusCode;
 use poem_openapi::{
     auth::Bearer,
-    payload::Json,
+    payload::{Binary, Json},
     ApiResponse, Object, OpenApi, SecurityScheme,
 };
 use sea_orm::{
@@ -844,8 +899,8 @@ pub struct UserProfileResponse {
     pub balance: f64,
     pub is_active: bool,
     pub group_name: Option<String>,
-    pub activated_at: Option<chrono::DateTime<chrono::Utc>>,
-    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub activated_at: Option<DateTime<Utc>>,
+    pub expires_at: Option<DateTime<Utc>>,
     pub is_smart_activation_pending: bool,
     pub effective_limits: EffectiveLimitsDto,
 }
@@ -867,7 +922,7 @@ pub struct ActiveSessionDto {
     pub protocol: ProtocolType,
     pub rx_bytes: i64,
     pub tx_bytes: i64,
-    pub connected_at: chrono::DateTime<chrono::Utc>,
+    pub connected_at: DateTime<Utc>,
 }
 
 #[derive(Object, Debug, Serialize, Deserialize)]
@@ -878,7 +933,7 @@ pub struct DisconnectSessionRequest {
 
 #[derive(Object, Debug, Serialize, Deserialize)]
 pub struct TrafficHistoryPointDto {
-    pub timestamp: chrono::DateTime<chrono::Utc>,
+    pub timestamp: DateTime<Utc>,
     pub rx_bytes: i64,
     pub tx_bytes: i64,
 }
@@ -921,7 +976,7 @@ impl UserCabinetApi {
             .await
             .unwrap_or(None);
 
-        let now = chrono::Utc::now().naive_utc();
+        let now = Utc::now().naive_utc();
         let (effective_limits, group_name) = if let Some(rate) = user_rate.filter(|r| r.date_end > now) {
             (
                 EffectiveLimitsDto {
@@ -1042,6 +1097,7 @@ impl UserCabinetApi {
 // anet-auth/src/api/admin_billing.rs
 // ============================================================================
 
+use chrono::{DateTime, Utc};
 use poem::http::StatusCode;
 use poem_openapi::{
     auth::Bearer,
@@ -1124,8 +1180,8 @@ pub struct AdminOrderDto {
     pub status: OrderStatus,
     pub is_gift: bool,
     pub metadata: Option<serde_json::Value>,
-    pub created_at: chrono::DateTime<chrono::Utc>,
-    pub updated_at: chrono::DateTime<chrono::Utc>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 
 #[derive(Object, Debug, Serialize, Deserialize)]
@@ -1144,7 +1200,7 @@ pub struct AdminTransactionDto {
     pub external_tx_id: String,
     pub amount_received: f64,
     pub raw_request: serde_json::Value,
-    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub created_at: DateTime<Utc>,
 }
 
 // ----------------------------------------------------------------------------
@@ -1183,7 +1239,7 @@ impl AdminBillingApi {
         _auth: AdminAuth,
         req: Json<CreateProductRequest>,
     ) -> poem::Result<Json<products::Model>> {
-        let now = chrono::Utc::now();
+        let now = Utc::now();
         let new_prod = products::ActiveModel {
             id: Set(Uuid::new_v4()),
             name: Set(req.name.clone()),
@@ -1229,7 +1285,7 @@ impl AdminBillingApi {
         if let Some(v) = &req.badge { active.badge = Set(v.clone()); }
         if let Some(v) = &req.metadata { active.metadata = Set(v.clone()); }
         if let Some(v) = req.is_active { active.is_active = Set(v); }
-        active.updated_at = Set(chrono::Utc::now());
+        active.updated_at = Set(Utc::now());
 
         let updated = active.update(&self.db).await
             .map_err(|e| poem::Error::from_string(e.to_string(), StatusCode::INTERNAL_SERVER_ERROR))?;
