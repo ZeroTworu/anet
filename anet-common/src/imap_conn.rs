@@ -3,7 +3,7 @@
 //!
 //! Разработан строго по спецификации `contrib/docs/imap.ru.md` и верифицирован эталоном
 //! `contrib/scripts/imap_soak_test.py`:
-//! - Работает напрямую поверх `tokio` и `tokio_boring::SslStream` (BoringSSL Email TLS Mimicry);
+//! - Работает напрямую поверх `tokio::io::BufReader<tokio_boring::SslStream<TcpStream>>` (BoringSSL Email TLS Mimicry, без `tokio::io::split` / `BiLock`);
 //! - Отслеживает нетегированные ответы `* <N> EXISTS` в реальном времени (`pending_exists`),
 //!   устраняя проблему «Слепого окна» (Blind Window);
 //! - Побайтово считывает литералы RFC 3501 через `read_exact(len)` и корректно парсит постфиксный
@@ -15,14 +15,12 @@
 use anyhow::{anyhow, Context, Result};
 use base64::prelude::*;
 use bytes::Bytes;
+use rand::RngCore;
+use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::io::{
-    AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, ReadHalf,
-    WriteHalf,
-};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
-use sha2::{Digest, Sha256};
 
 /// Вычисляет 8-символьный hex-идентификатор узла (первые 4 байта SHA-256)
 pub fn compute_hex_id(bytes: &[u8]) -> String {
@@ -31,6 +29,55 @@ pub fn compute_hex_id(bytes: &[u8]) -> String {
         "{:02x}{:02x}{:02x}{:02x}",
         hash[0], hash[1], hash[2], hash[3]
     )
+}
+
+/// Форматирует текущее системное время в валидную строку RFC 2822 / RFC 5322 (`Mon, 02 Nov 2026 22:26:14 +0000`)
+/// без внешних зависимостей для заголовка `Date:` письма.
+pub fn format_rfc2822_now() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let hour = rem / 3600;
+    let min = (rem % 3600) / 60;
+    let sec = rem % 60;
+
+    // 1970-01-01 — четверг (4)
+    const WDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    let wday = WDAYS[(days + 4).rem_euclid(7) as usize];
+
+    // Алгоритм Howard Hinnant (civil_from_days)
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let mon_str = MONTHS[(m as usize).saturating_sub(1).min(11)];
+
+    format!("{wday}, {d:02} {mon_str} {year:04} {hour:02}:{min:02}:{sec:02} +0000")
+}
+
+/// Генерирует 16-символьный случайный hex для `Message-ID`
+fn random_message_id_hex() -> String {
+    let mut bytes = [0u8; 8];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    let mut s = String::with_capacity(16);
+    for b in bytes {
+        let _ = write!(&mut s, "{b:02x}");
+    }
+    s
 }
 
 /// Результат выборки сообщений из папки
@@ -57,7 +104,6 @@ pub fn is_exists_line(line: &str) -> bool {
         return false;
     }
     let mut parts = trimmed.split_whitespace();
-    // Ожидаемый формат: ["*", "<number>", "EXISTS"]
     match (parts.next(), parts.next(), parts.next()) {
         (Some("*"), Some(num), Some(kw)) if kw.eq_ignore_ascii_case("EXISTS") => {
             num.chars().all(|c| c.is_ascii_digit())
@@ -82,7 +128,6 @@ pub fn extract_uid_from_fetch_meta(meta: &str) -> Option<u32> {
         let clean = token.trim_matches(|c: char| !c.is_ascii_alphanumeric());
         if clean.eq_ignore_ascii_case("UID") {
             if let Some(num_str) = iter.next() {
-                // Очищаем от возможных завершающих скобок: "123)" -> "123"
                 let clean_num = num_str.trim_matches(|c: char| !c.is_ascii_digit());
                 if let Ok(uid) = clean_num.parse::<u32>() {
                     return Some(uid);
@@ -97,13 +142,14 @@ pub fn extract_uid_from_fetch_meta(meta: &str) -> Option<u32> {
 /// после чего напрямую декодирует Base64 без промежуточного UTF-8.
 pub fn parse_rfc822_message(raw_bytes: &[u8]) -> Result<(String, Bytes)> {
     // 1. Ищем границу заголовков и тела (\r\n\r\n или \n\n)
-    let (header_bytes, body_bytes) = if let Some(pos) = raw_bytes.windows(4).position(|w| w == b"\r\n\r\n") {
-        (&raw_bytes[..pos], &raw_bytes[pos + 4..])
-    } else if let Some(pos) = raw_bytes.windows(2).position(|w| w == b"\n\n") {
-        (&raw_bytes[..pos], &raw_bytes[pos + 2..])
-    } else {
-        (&raw_bytes[..], &[][..])
-    };
+    let (header_bytes, body_bytes) =
+        if let Some(pos) = raw_bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+            (&raw_bytes[..pos], &raw_bytes[pos + 4..])
+        } else if let Some(pos) = raw_bytes.windows(2).position(|w| w == b"\n\n") {
+            (&raw_bytes[..pos], &raw_bytes[pos + 2..])
+        } else {
+            (&raw_bytes[..], &[][..])
+        };
 
     // 2. Извлекаем Subject из заголовков (латинский безопасный поиск)
     let header_str = String::from_utf8_lossy(header_bytes);
@@ -133,10 +179,9 @@ pub fn parse_rfc822_message(raw_bytes: &[u8]) -> Result<(String, Bytes)> {
     Ok((subject, Bytes::from(decoded)))
 }
 
-/// Асинхронное IMAP-соединение с разделенным вводом-выводом для высокой производительности.
-pub struct ImapConn<R = ReadHalf<tokio_boring::SslStream<TcpStream>>, W = WriteHalf<tokio_boring::SslStream<TcpStream>>> {
-    reader: BufReader<R>,
-    writer: W,
+/// Асинхронное IMAP-соединение напрямую поверх `tokio::io::BufReader<S>` (раздел 3.1 / 7.1 спецификации).
+pub struct ImapConn<S = tokio_boring::SslStream<TcpStream>> {
+    stream: BufReader<S>,
     tag_counter: u64,
     /// Флаг «Слепого окна»: взводится при получении `* <N> EXISTS` вне или внутри IDLE.
     pub pending_exists: bool,
@@ -146,15 +191,13 @@ pub struct ImapConn<R = ReadHalf<tokio_boring::SslStream<TcpStream>>, W = WriteH
     line_buf: String,
 }
 
-impl<R, W> ImapConn<R, W>
+impl<S> ImapConn<S>
 where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin,
 {
-    pub fn new(reader: R, writer: W) -> Self {
+    pub fn new(stream: S) -> Self {
         Self {
-            reader: BufReader::with_capacity(64 * 1024, reader),
-            writer,
+            stream: BufReader::with_capacity(64 * 1024, stream),
             tag_counter: 0,
             pending_exists: false,
             in_idle: false,
@@ -170,16 +213,17 @@ where
 
     /// Отправляет сырую строку в сокет с добавлением `\r\n` и выполняет `flush()`.
     pub async fn send_line(&mut self, line: &str) -> Result<()> {
-        self.writer.write_all(line.as_bytes()).await?;
-        self.writer.write_all(b"\r\n").await?;
-        self.writer.flush().await?;
+        let inner = self.stream.get_mut();
+        inner.write_all(line.as_bytes()).await?;
+        inner.write_all(b"\r\n").await?;
+        inner.flush().await?;
         Ok(())
     }
 
     /// Считывает одну строку ответа от IMAP-сервера с автоматической фиксацией `* <N> EXISTS`.
     pub async fn read_line(&mut self) -> Result<String> {
         self.line_buf.clear();
-        let bytes_read = self.reader.read_line(&mut self.line_buf).await?;
+        let bytes_read = self.stream.read_line(&mut self.line_buf).await?;
         if bytes_read == 0 {
             return Err(anyhow!("Connection closed by IMAP server (Unexpected EOF)"));
         }
@@ -283,17 +327,20 @@ where
             b64_chunked.push_str("\r\n");
         }
 
-        let now_sec = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let rfc2822_date = format_rfc2822_now();
+        let domain = account_email
+            .split_once('@')
+            .map(|(_, d)| d)
+            .unwrap_or("mail.ru");
+        let msg_id_hex = random_message_id_hex();
 
-        // Формируем RFC 5322 тело черновика
+        // Формируем строго валидное RFC 5322 тело черновика (раздел 3.5 спецификации)
         let msg_raw = format!(
             "From: <{account_email}>\r\n\
              To: <{account_email}>\r\n\
              Subject: {subject}\r\n\
-             Date: {now_sec}\r\n\
+             Date: {rfc2822_date}\r\n\
+             Message-ID: <{msg_id_hex}@{domain}>\r\n\
              MIME-Version: 1.0\r\n\
              Content-Type: text/plain; charset=utf-8\r\n\
              Content-Transfer-Encoding: base64\r\n\r\n\
@@ -333,13 +380,22 @@ where
         }
 
         // Шаг 2: передаем тело литерала + \r\n
-        self.writer.write_all(msg_raw.as_bytes()).await?;
-        self.writer.write_all(b"\r\n").await?;
-        self.writer.flush().await?;
+        {
+            let inner = self.stream.get_mut();
+            inner.write_all(msg_raw.as_bytes()).await?;
+            inner.write_all(b"\r\n").await?;
+            inner.flush().await?;
+        }
 
         let resp = self.read_until_tagged(&tag, timeout_dur).await?;
         let last_line = resp.last().ok_or_else(|| anyhow!("Empty APPEND response"))?;
         if !last_line.starts_with(&format!("{tag} OK")) {
+            if last_line.contains("THROTTLED") {
+                return Err(anyhow!("IMAP APPEND rejected: THROTTLED rate-limit hit"));
+            }
+            if last_line.contains("OVERQUOTA") {
+                return Err(anyhow!("IMAP APPEND rejected: OVERQUOTA storage limit hit"));
+            }
             return Err(anyhow!("IMAP APPEND step 2 failed: {}", last_line.trim()));
         }
 
@@ -387,11 +443,12 @@ where
         Ok(())
     }
 
-    /// Активное ожидание новых писем в IDLE.
+    /// Активное ожидание новых писем в IDLE с проверкой `pending_exists` ДО входа в IDLE
+    /// и СРАЗУ ПОСЛЕ выхода из IDLE (раздел 3.1 и раздел 8 п. 3 спецификации).
     /// Если `pending_exists` уже взведён (событие пришло во время FETCH), мгновенно возвращает `true`
     /// без входа в IDLE, экономя ~250 мс задержки!
-    pub async fn wait_idle_or_event(&mut self, timeout_dur: Duration) -> Result<bool> {
-        // 1. Проверяем флаг «Слепого окна»
+    pub async fn wait_idle_or_pending(&mut self, timeout_dur: Duration) -> Result<bool> {
+        // 1. Проверяем флаг «Слепого окна» ДО входа в IDLE
         if self.pending_exists {
             self.pending_exists = false;
             return Ok(true);
@@ -399,6 +456,14 @@ where
 
         // 2. Входим в IDLE
         self.enter_idle(Duration::from_secs(5)).await?;
+
+        // Если `* <N> EXISTS` пришло между отправкой `IDLE` и ответом `+ idling`
+        if self.pending_exists {
+            self.pending_exists = false;
+            self.exit_idle(Duration::from_secs(5)).await?;
+            return Ok(true);
+        }
+
         let mut got_event = false;
         let deadline = Instant::now() + timeout_dur;
 
@@ -411,6 +476,7 @@ where
             match tokio::time::timeout(remaining.min(Duration::from_secs(5)), self.read_line()).await {
                 Ok(Ok(line)) => {
                     if is_exists_line(&line) {
+                        self.pending_exists = false;
                         got_event = true;
                         break;
                     }
@@ -420,7 +486,6 @@ where
                     return Err(e);
                 }
                 Err(_) => {
-                    // Короткий таймаут тика: продолжаем ждать до общего дедлайна
                     continue;
                 }
             }
@@ -428,7 +493,20 @@ where
 
         // 3. Выходим из IDLE
         self.exit_idle(Duration::from_secs(5)).await?;
+
+        // 4. Проверяем флаг «Слепого окна» ПОСЛЕ выхода из IDLE (на случай прихода EXISTS во время DONE)
+        if self.pending_exists {
+            self.pending_exists = false;
+            got_event = true;
+        }
+
         Ok(got_event)
+    }
+
+    /// Синоним `wait_idle_or_pending` (раздел 3.8 спецификации).
+    #[inline]
+    pub async fn wait_idle_or_event(&mut self, timeout_dur: Duration) -> Result<bool> {
+        self.wait_idle_or_pending(timeout_dur).await
     }
 
     /// Универсальный побайтовый парсер `UID FETCH <last_uid + 1>:* (UID BODY.PEEK[])`:
@@ -475,7 +553,7 @@ where
 
             // 1. Считываем ровно literal_len байт тела сообщения
             let mut msg_bytes = vec![0u8; literal_len];
-            self.reader.read_exact(&mut msg_bytes).await?;
+            self.stream.read_exact(&mut msg_bytes).await?;
 
             // 2. Считываем остаток строки ответа сервера (закрывающая скобка и UID)
             let rest_line = self.read_line().await?;
@@ -552,7 +630,7 @@ where
     }
 }
 
-impl ImapConn<ReadHalf<tokio_boring::SslStream<TcpStream>>, WriteHalf<tokio_boring::SslStream<TcpStream>>> {
+impl ImapConn<tokio_boring::SslStream<TcpStream>> {
     /// Устанавливает защищенное IMAPS-соединение на порт 993 с использованием профиля
     /// BoringSSL Email Mimicry (KMail / OpenSSL 3.x).
     pub async fn connect(
@@ -579,8 +657,7 @@ impl ImapConn<ReadHalf<tokio_boring::SslStream<TcpStream>>, WriteHalf<tokio_bori
         .context("TLS handshake timeout to IMAP server")?
         .with_context(|| format!("TLS handshake failed with IMAP server {host}:{port}"))?;
 
-        let (reader, writer) = tokio::io::split(tls_stream);
-        let mut conn = Self::new(reader, writer);
+        let mut conn = Self::new(tls_stream);
 
         // Считываем приветственный баннер сервера: "* OK ..."
         let banner = tokio::time::timeout(timeout_dur, conn.read_line())
@@ -612,6 +689,13 @@ mod tests {
     }
 
     #[test]
+    fn test_rfc2822_date_format() {
+        let date = format_rfc2822_now();
+        assert!(date.ends_with(" +0000"), "Invalid RFC2822 date: {date}");
+        assert!(date.contains(", "), "Missing weekday comma: {date}");
+    }
+
+    #[test]
     fn test_parse_literal_length() {
         assert_eq!(
             parse_literal_length("* 1 FETCH (BODY[] {1024}\r\n"),
@@ -626,22 +710,18 @@ mod tests {
 
     #[test]
     fn test_extract_trailing_and_prefix_uid() {
-        // Формат Mail.ru (UID в хвосте после литерала):
         assert_eq!(
             extract_uid_from_fetch_meta("* 1 FETCH (BODY[] {50} UID 88412)\r\n"),
             Some(88412)
         );
-        // Стандартный формат RFC 3501 (UID в заголовке):
         assert_eq!(
             extract_uid_from_fetch_meta("* 2 FETCH (UID 5510 BODY[] {100})\r\n"),
             Some(5510)
         );
-        // Одиночный UID из get_max_uid:
         assert_eq!(
             extract_uid_from_fetch_meta("* 5 FETCH (UID 105)\r\n"),
             Some(105)
         );
-        // С флагами:
         assert_eq!(
             extract_uid_from_fetch_meta("* 1 FETCH (FLAGS (\\Seen) UID 42 BODY[] {10})\r\n"),
             Some(42)
@@ -657,6 +737,8 @@ mod tests {
             "From: <node@mail.ru>\r\n\
              To: <node@mail.ru>\r\n\
              Subject: ANet-Data [ID: srv01:sess_abc123]\r\n\
+             Date: Mon, 02 Nov 2026 22:26:14 +0000\r\n\
+             Message-ID: <0123456789abcdef@mail.ru>\r\n\
              MIME-Version: 1.0\r\n\
              Content-Type: text/plain; charset=utf-8\r\n\
              Content-Transfer-Encoding: base64\r\n\r\n\
@@ -671,49 +753,43 @@ mod tests {
     #[tokio::test]
     async fn test_mock_imap_protocol_exchange() {
         let (client_io, mut server_io) = tokio::io::duplex(64 * 1024);
-        let (c_reader, c_writer) = tokio::io::split(client_io);
-        let mut conn = ImapConn::new(c_reader, c_writer);
+        let mut conn = ImapConn::new(client_io);
 
         let server_task = tokio::spawn(async move {
-            // 1. Отправляем приветственный баннер
             server_io.write_all(b"* OK Mock IMAP Server ready\r\n").await.unwrap();
 
-            // 2. Читаем LOGIN
             let mut line = String::new();
             let mut s_buf = BufReader::new(server_io);
             s_buf.read_line(&mut line).await.unwrap();
             assert!(line.contains("LOGIN \"user@example.com\" \"pass123\""));
             s_buf.get_mut().write_all(b"A0001 OK LOGIN completed\r\n").await.unwrap();
 
-            // 3. Читаем SELECT
             line.clear();
             s_buf.read_line(&mut line).await.unwrap();
             assert!(line.contains("SELECT \"Drafts\""));
             s_buf.get_mut().write_all(b"* 5 EXISTS\r\n* 0 RECENT\r\nA0002 OK [READ-WRITE] SELECT completed\r\n").await.unwrap();
 
-            // 4. get_max_uid: UID FETCH * (UID)
             line.clear();
             s_buf.read_line(&mut line).await.unwrap();
             assert!(line.contains("UID FETCH * (UID)"));
             s_buf.get_mut().write_all(b"* 5 FETCH (UID 105)\r\nA0003 OK UID FETCH completed\r\n").await.unwrap();
 
-            // 5. APPEND
             line.clear();
             s_buf.read_line(&mut line).await.unwrap();
             assert!(line.contains("APPEND \"Drafts\" (\\Seen \\Draft)"));
             let literal_len = parse_literal_length(&line).expect("APPEND literal length");
             s_buf.get_mut().write_all(b"+ Ready for literal data\r\n").await.unwrap();
 
-            // Читаем тело черновика ровно literal_len байт
             let mut msg_body = vec![0u8; literal_len];
             s_buf.read_exact(&mut msg_body).await.unwrap();
+            let msg_body_str = String::from_utf8_lossy(&msg_body);
+            assert!(msg_body_str.contains("Message-ID: <"));
+            assert!(msg_body_str.contains("+0000\r\n"));
 
-            // Читаем завершающий CRLF строки команды APPEND
             line.clear();
             s_buf.read_line(&mut line).await.unwrap();
             s_buf.get_mut().write_all(b"A0004 OK [APPENDUID 1 106] APPEND completed\r\n").await.unwrap();
 
-            // 6. IDLE с активным пробуждением через * EXISTS
             line.clear();
             s_buf.read_line(&mut line).await.unwrap();
             assert!(line.contains("IDLE"));
@@ -727,7 +803,6 @@ mod tests {
             assert_eq!(line.trim(), "DONE");
             s_buf.get_mut().write_all(b"A0005 OK IDLE completed\r\n").await.unwrap();
 
-            // 7. UID FETCH (с постфиксным UID в стиле Mail.ru)
             line.clear();
             s_buf.read_line(&mut line).await.unwrap();
             assert!(line.contains("UID FETCH 106:* (UID BODY.PEEK[])"));
@@ -745,7 +820,6 @@ mod tests {
             );
             s_buf.get_mut().write_all(fetch_resp.as_bytes()).await.unwrap();
 
-            // 8. UID EXPUNGE
             line.clear();
             s_buf.read_line(&mut line).await.unwrap();
             assert!(line.contains("UID STORE 106 +FLAGS.SILENT (\\Deleted)"));
@@ -757,7 +831,6 @@ mod tests {
             s_buf.get_mut().write_all(b"A0008 OK UID EXPUNGE completed\r\n").await.unwrap();
         });
 
-        // Тестируем клиентские вызовы:
         let banner = conn.read_line().await.unwrap();
         assert!(banner.contains("Mock IMAP Server ready"));
 
@@ -779,7 +852,7 @@ mod tests {
             .unwrap();
         assert!(append_lat.as_millis() < 500);
 
-        let event = conn.wait_idle_or_event(Duration::from_secs(2)).await.unwrap();
+        let event = conn.wait_idle_or_pending(Duration::from_secs(2)).await.unwrap();
         assert!(event);
 
         let fetch_res = conn.fetch_messages_robust(105, Duration::from_secs(2)).await.unwrap();

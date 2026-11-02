@@ -869,3 +869,528 @@ where
         .await
         .map_err(|e| anyhow::anyhow!("BoringSSL Email IMAPS TLS handshake failed for {domain}: {e}"))
 }
+    connect_ws_tls_with_config(domain, stream, &cfg).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use boring::asn1::Asn1Time;
+    use boring::bn::{BigNum, MsbOption};
+    use boring::hash::MessageDigest;
+    use boring::nid::Nid;
+    use boring::pkey::{PKey, Private};
+    use boring::rsa::Rsa;
+    use boring::ssl::{SslAcceptor, SslMethod};
+    use boring::x509::extension::{BasicConstraints, KeyUsage, SubjectAlternativeName};
+    use boring::x509::{X509Builder, X509NameBuilder};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    #[derive(Debug, Clone)]
+    struct ParsedClientHello {
+        cipher_suites: Vec<u16>,
+        extensions: Vec<u16>,
+        alpn_protocols: Vec<String>,
+        supported_groups: Vec<u16>,
+        sni: Option<String>,
+    }
+
+    fn is_grease_u16(val: u16) -> bool {
+        let hi = (val >> 8) as u8;
+        let lo = (val & 0xff) as u8;
+        hi == lo && (lo & 0x0f) == 0x0a
+    }
+
+    /// Парсит сырой TLS Record с ClientHello для проверки реальных байтов на проводе.
+    fn parse_client_hello_record(buf: &[u8]) -> anyhow::Result<ParsedClientHello> {
+        anyhow::ensure!(buf.len() >= 9, "Buffer too short for TLS record");
+        anyhow::ensure!(buf[0] == 0x16, "Not a TLS Handshake record");
+        let record_len = u16::from_be_bytes([buf[3], buf[4]]) as usize;
+        anyhow::ensure!(buf.len() >= 5 + record_len, "Incomplete TLS record");
+
+        let hs = &buf[5..5 + record_len];
+        anyhow::ensure!(hs[0] == 0x01, "Not a ClientHello handshake message");
+        let ch_len = ((hs[1] as usize) << 16) | ((hs[2] as usize) << 8) | (hs[3] as usize);
+        anyhow::ensure!(hs.len() >= 4 + ch_len, "Incomplete ClientHello body");
+
+        let body = &hs[4..4 + ch_len];
+        // client_version (2) + random (32)
+        let mut pos = 34;
+        anyhow::ensure!(body.len() > pos, "Truncated at session_id");
+        let session_id_len = body[pos] as usize;
+        pos += 1 + session_id_len;
+
+        anyhow::ensure!(body.len() >= pos + 2, "Truncated at cipher_suites");
+        let cs_len = u16::from_be_bytes([body[pos], body[pos + 1]]) as usize;
+        pos += 2;
+        anyhow::ensure!(body.len() >= pos + cs_len, "Truncated inside cipher_suites");
+        let mut cipher_suites = Vec::with_capacity(cs_len / 2);
+        for chunk in body[pos..pos + cs_len].chunks_exact(2) {
+            cipher_suites.push(u16::from_be_bytes([chunk[0], chunk[1]]));
+        }
+        pos += cs_len;
+
+        anyhow::ensure!(body.len() > pos, "Truncated at compression_methods");
+        let comp_len = body[pos] as usize;
+        pos += 1 + comp_len;
+
+        let mut extensions = Vec::new();
+        let mut alpn_protocols = Vec::new();
+        let mut supported_groups = Vec::new();
+        let mut sni = None;
+
+        if body.len() >= pos + 2 {
+            let ext_total_len = u16::from_be_bytes([body[pos], body[pos + 1]]) as usize;
+            pos += 2;
+            let ext_end = (pos + ext_total_len).min(body.len());
+            while pos + 4 <= ext_end {
+                let ext_type = u16::from_be_bytes([body[pos], body[pos + 1]]);
+                let ext_len = u16::from_be_bytes([body[pos + 2], body[pos + 3]]) as usize;
+                pos += 4;
+                if pos + ext_len > ext_end {
+                    break;
+                }
+                let ext_data = &body[pos..pos + ext_len];
+                extensions.push(ext_type);
+
+                match ext_type {
+                    // server_name (SNI)
+                    0x0000 if ext_data.len() >= 5 => {
+                        let name_len = u16::from_be_bytes([ext_data[3], ext_data[4]]) as usize;
+                        if ext_data.len() >= 5 + name_len {
+                            sni = std::str::from_utf8(&ext_data[5..5 + name_len])
+                                .ok()
+                                .map(str::to_string);
+                        }
+                    }
+                    // supported_groups (elliptic_curves)
+                    0x000a if ext_data.len() >= 2 => {
+                        let list_len = u16::from_be_bytes([ext_data[0], ext_data[1]]) as usize;
+                        let groups_raw = &ext_data[2..(2 + list_len).min(ext_data.len())];
+                        for g in groups_raw.chunks_exact(2) {
+                            supported_groups.push(u16::from_be_bytes([g[0], g[1]]));
+                        }
+                    }
+                    // application_layer_protocol_negotiation (ALPN)
+                    0x0010 if ext_data.len() >= 2 => {
+                        let list_len = u16::from_be_bytes([ext_data[0], ext_data[1]]) as usize;
+                        let mut p = 2;
+                        let end = (2 + list_len).min(ext_data.len());
+                        while p < end {
+                            let proto_len = ext_data[p] as usize;
+                            p += 1;
+                            if p + proto_len <= end {
+                                if let Ok(proto) = std::str::from_utf8(&ext_data[p..p + proto_len])
+                                {
+                                    alpn_protocols.push(proto.to_string());
+                                }
+                                p += proto_len;
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+
+                pos += ext_len;
+            }
+        }
+
+        Ok(ParsedClientHello {
+            cipher_suites,
+            extensions,
+            alpn_protocols,
+            supported_groups,
+            sni,
+        })
+    }
+
+    async fn capture_client_hello(
+        connector_builder: SslConnectorBuilder,
+        sni_domain: &str,
+    ) -> ParsedClientHello {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_task = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let n = sock.read(&mut buf).await.unwrap();
+            buf.truncate(n);
+            buf
+        });
+
+        let domain = sni_domain.to_string();
+        let _ = tokio::spawn(async move {
+            let tcp = TcpStream::connect(addr).await.unwrap();
+            let ssl_cfg = connector_builder.build().configure().unwrap();
+            let _ = tokio_boring::connect(ssl_cfg, &domain, tcp).await;
+        })
+        .await;
+
+        let raw_bytes = server_task.await.unwrap();
+        parse_client_hello_record(&raw_bytes).expect("Failed to parse captured ClientHello")
+    }
+
+    fn generate_test_cert(domain: &str) -> (X509, PKey<Private>, String) {
+        let rsa = Rsa::generate(2048).unwrap();
+        let pkey = PKey::from_rsa(rsa).unwrap();
+
+        let mut name_builder = X509NameBuilder::new().unwrap();
+        name_builder.append_entry_by_nid(Nid::COMMONNAME, domain).unwrap();
+        let name = name_builder.build();
+
+        let mut builder = X509Builder::new().unwrap();
+        builder.set_version(2).unwrap();
+        let mut serial = BigNum::new().unwrap();
+        serial.rand(64, MsbOption::MAYBE_ZERO, false).unwrap();
+        let serial_asn1 = serial.to_asn1_integer().unwrap();
+        builder.set_serial_number(&serial_asn1).unwrap();
+        builder.set_subject_name(&name).unwrap();
+        builder.set_issuer_name(&name).unwrap();
+        builder.set_pubkey(&pkey).unwrap();
+
+        let not_before = Asn1Time::days_from_now(0).unwrap();
+        let not_after = Asn1Time::days_from_now(30).unwrap();
+        builder.set_not_before(&not_before).unwrap();
+        builder.set_not_after(&not_after).unwrap();
+
+        let bc = BasicConstraints::new().critical().ca().build().unwrap();
+        builder.append_extension(&bc).unwrap();
+
+        let ku = KeyUsage::new()
+            .critical()
+            .digital_signature()
+            .key_encipherment()
+            .key_cert_sign()
+            .build()
+            .unwrap();
+        builder.append_extension(&ku).unwrap();
+
+        let san = SubjectAlternativeName::new()
+            .dns(domain)
+            .build(&builder.x509v3_context(None, None))
+            .unwrap();
+        builder.append_extension(&san).unwrap();
+
+        builder.sign(&pkey, MessageDigest::sha256()).unwrap();
+        let cert = builder.build();
+        let pem = String::from_utf8(cert.to_pem().unwrap()).unwrap();
+        (cert, pkey, pem)
+    }
+
+    #[tokio::test]
+    async fn test_chrome_firefox_safari_randomized_client_hello_wire_format() {
+        // 1. Профиль Chrome (HTTP/2 + HTTP/1.1): GREASE есть, SCT (0x0012) есть, AES256 (0xc02c) перед ChaCha20 (0xcca9)
+        let chrome_cfg = TlsClientConfig {
+            fingerprint: TlsFingerprint::Chrome,
+            random_seed: 42,
+            verify_peer: false,
+            pin_sha256: None,
+            ca_cert: None,
+        };
+        let ch_chrome = capture_client_hello(
+            build_ssl_connector_with_config(&chrome_cfg).unwrap(),
+            "cdn.example.com",
+        )
+        .await;
+
+        assert_eq!(ch_chrome.sni.as_deref(), Some("cdn.example.com"));
+        assert_eq!(ch_chrome.alpn_protocols, vec!["h2", "http/1.1"]);
+        assert!(
+            ch_chrome.cipher_suites.iter().any(|&c| is_grease_u16(c)),
+            "Chrome profile must include GREASE cipher suite"
+        );
+        assert!(
+            ch_chrome.extensions.iter().any(|&e| is_grease_u16(e)),
+            "Chrome profile must include GREASE extensions"
+        );
+        assert!(
+            ch_chrome.extensions.contains(&0x0005),
+            "Chrome profile must include status_request (OCSP)"
+        );
+        assert!(
+            ch_chrome.extensions.contains(&0x0012),
+            "Chrome profile must include signed_certificate_timestamp (SCT)"
+        );
+        let pos_aes256_c = ch_chrome
+            .cipher_suites
+            .iter()
+            .position(|&c| c == 0xc02c)
+            .expect("Chrome must have ECDHE_ECDSA_WITH_AES_256_GCM_SHA384");
+        let pos_chacha_c = ch_chrome
+            .cipher_suites
+            .iter()
+            .position(|&c| c == 0xcca9)
+            .expect("Chrome must have ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256");
+        assert!(
+            pos_aes256_c < pos_chacha_c,
+            "Chrome must place AES_256_GCM before CHACHA20_POLY1305"
+        );
+
+        // 2. Профиль Firefox (WebSocket http/1.1): GREASE отсутствует, SCT отсутствует, P-521 (0x0019) присутствует, ChaCha20 перед AES256
+        let ff_cfg = TlsClientConfig {
+            fingerprint: TlsFingerprint::Firefox,
+            random_seed: 42,
+            verify_peer: false,
+            pin_sha256: None,
+            ca_cert: None,
+        };
+        let ch_ff = capture_client_hello(
+            build_ws_ssl_connector_with_config(&ff_cfg).unwrap(),
+            "ws.example.com",
+        )
+        .await;
+
+        assert_eq!(ch_ff.sni.as_deref(), Some("ws.example.com"));
+        assert_eq!(ch_ff.alpn_protocols, vec!["http/1.1"]);
+        assert!(
+            !ch_ff.cipher_suites.iter().any(|&c| is_grease_u16(c)),
+            "Firefox NSS profile must NOT contain GREASE cipher suites"
+        );
+        assert!(
+            !ch_ff.extensions.iter().any(|&e| is_grease_u16(e)),
+            "Firefox NSS profile must NOT contain GREASE extensions"
+        );
+        assert!(
+            !ch_ff.extensions.contains(&0x0012),
+            "Firefox profile must NOT include SCT extension (0x0012)"
+        );
+        assert!(
+            ch_ff.supported_groups.contains(&0x0019),
+            "Firefox profile must include secp521r1 (P-521 = 0x0019) in supported_groups"
+        );
+        let pos_aes256_ff = ch_ff.cipher_suites.iter().position(|&c| c == 0xc02c).unwrap();
+        let pos_chacha_ff = ch_ff.cipher_suites.iter().position(|&c| c == 0xcca9).unwrap();
+        assert!(
+            pos_chacha_ff < pos_aes256_ff,
+            "Firefox must place CHACHA20_POLY1305 before AES_256_GCM"
+        );
+
+        // 3. Профиль Safari: GREASE есть, P-521 (0x0019) есть, AES256 (0xc02c) перед AES128 (0xc02b)
+        let safari_cfg = TlsClientConfig {
+            fingerprint: TlsFingerprint::Safari,
+            random_seed: 42,
+            verify_peer: false,
+            pin_sha256: None,
+            ca_cert: None,
+        };
+        let ch_safari = capture_client_hello(
+            build_ssl_connector_with_config(&safari_cfg).unwrap(),
+            "apple.example.com",
+        )
+        .await;
+
+        assert!(
+            ch_safari.cipher_suites.iter().any(|&c| is_grease_u16(c)),
+            "Safari profile must include GREASE"
+        );
+        assert!(
+            ch_safari.supported_groups.contains(&0x0019),
+            "Safari profile must include P-521 (0x0019)"
+        );
+        let pos_aes256_saf = ch_safari
+            .cipher_suites
+            .iter()
+            .position(|&c| c == 0xc02c)
+            .unwrap();
+        let pos_aes128_saf = ch_safari
+            .cipher_suites
+            .iter()
+            .position(|&c| c == 0xc02b)
+            .unwrap();
+        assert!(
+            pos_aes256_saf < pos_aes128_saf,
+            "Safari must place ECDHE_ECDSA_AES256_GCM before ECDHE_ECDSA_AES128_GCM"
+        );
+
+        // 4. Профиль Randomized: разные seed дают валидные, но различающиеся отпечатки
+        let mut distinct_signatures = std::collections::HashSet::new();
+        for seed in 1..=12 {
+            let rand_cfg = TlsClientConfig {
+                fingerprint: TlsFingerprint::Randomized,
+                random_seed: seed * 10007,
+                verify_peer: false,
+                pin_sha256: None,
+                ca_cert: None,
+            };
+            let ch = capture_client_hello(
+                build_ssl_connector_with_config(&rand_cfg).unwrap(),
+                "poly.example.com",
+            )
+            .await;
+            let non_grease_cs: Vec<u16> = ch
+                .cipher_suites
+                .into_iter()
+                .filter(|&c| !is_grease_u16(c))
+                .collect();
+            let non_grease_groups: Vec<u16> = ch
+                .supported_groups
+                .into_iter()
+                .filter(|&g| !is_grease_u16(g))
+                .collect();
+            distinct_signatures.insert((non_grease_cs, non_grease_groups));
+        }
+        assert!(
+            distinct_signatures.len() >= 3,
+            "Randomized TLS profile must produce multiple distinct cipher/curve combinations across seeds"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_active_spoofing_protection_blocks_mitm_before_payload() {
+        let (real_cert, real_key, real_pem) = generate_test_cert("secure.example.com");
+        let (spoof_cert, spoof_key, _spoof_pem) = generate_test_cert("secure.example.com");
+
+        let (real_cert_sha256, real_spki_sha256) = cert_and_spki_sha256(&real_cert);
+        let real_spki_hex = hex_encode(&real_spki_sha256.unwrap());
+        let real_cert_b64 = BASE64_STANDARD.encode(real_cert_sha256.unwrap());
+
+        // Поднимаем локальный TLS-сервер, имитирующий активный спуфинг ТСПУ (поддельный сертификат)
+        let spoof_payload_bytes = Arc::new(AtomicUsize::new(0));
+        let spoof_bytes_clone = spoof_payload_bytes.clone();
+
+        let mut spoof_acceptor_builder = SslAcceptor::mozilla_intermediate(SslMethod::tls()).unwrap();
+        spoof_acceptor_builder.set_private_key(&spoof_key).unwrap();
+        spoof_acceptor_builder.set_certificate(&spoof_cert).unwrap();
+        let spoof_acceptor = Arc::new(spoof_acceptor_builder.build());
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let spoof_addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            while let Ok((tcp, _)) = listener.accept().await {
+                let acc = spoof_acceptor.clone();
+                let counter = spoof_bytes_clone.clone();
+                tokio::spawn(async move {
+                    if let Ok(mut tls) = tokio_boring::accept(&acc, tcp).await {
+                        let mut buf = [0u8; 1024];
+                        if let Ok(n) = tls.read(&mut buf).await {
+                            counter.fetch_add(n, Ordering::SeqCst);
+                        }
+                    }
+                });
+            }
+        });
+
+        // Сценарий 1: Защита по умолчанию включена (verify_peer = true) -> поддельный сертификат ТСПУ отвергается на этапе TLS Handshake, 0 байт отправлено!
+        let default_cfg = TlsClientConfig {
+            fingerprint: TlsFingerprint::Chrome,
+            random_seed: 1,
+            verify_peer: true,
+            pin_sha256: None,
+            ca_cert: None,
+        };
+        let tcp = TcpStream::connect(spoof_addr).await.unwrap();
+        let res = connect_ws_tls_with_config("secure.example.com", tcp, &default_cfg).await;
+        assert!(
+            res.is_err(),
+            "Default verify_peer=true MUST reject untrusted/spoofed certificate during handshake"
+        );
+        assert_eq!(
+            spoof_payload_bytes.load(Ordering::SeqCst),
+            0,
+            "Zero application payload bytes may be transmitted to active spoofer"
+        );
+
+        // Сценарий 2: Задан SHA-256 пин настоящего сервера, но ТСПУ подсовывает свой сертификат -> отказ!
+        let pinned_cfg = TlsClientConfig {
+            fingerprint: TlsFingerprint::Firefox,
+            random_seed: 2,
+            verify_peer: true,
+            pin_sha256: Some(real_spki_hex.clone()),
+            ca_cert: None,
+        };
+        let tcp = TcpStream::connect(spoof_addr).await.unwrap();
+        let res = connect_ws_tls_with_config("secure.example.com", tcp, &pinned_cfg).await;
+        assert!(
+            res.is_err(),
+            "Pinned verify_peer=true MUST reject spoofed certificate with non-matching SPKI SHA-256"
+        );
+        assert_eq!(spoof_payload_bytes.load(Ordering::SeqCst), 0);
+
+        // Сценарий 3: Настоящий сервер с валидным сертификатом: проверяем и SPKI pin, и CA + SNI hostname!
+        let mut real_acceptor_builder = SslAcceptor::mozilla_intermediate(SslMethod::tls()).unwrap();
+        real_acceptor_builder.set_private_key(&real_key).unwrap();
+        real_acceptor_builder.set_certificate(&real_cert).unwrap();
+        real_acceptor_builder.set_alpn_select_callback(|_ssl, client_protos| {
+            boring::ssl::select_next_proto(b"\x08http/1.1", client_protos)
+                .ok_or(boring::ssl::AlpnError::NOACK)
+        });
+        let real_acceptor = Arc::new(real_acceptor_builder.build());
+
+        let real_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let real_addr = real_listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            while let Ok((tcp, _)) = real_listener.accept().await {
+                let acc = real_acceptor.clone();
+                tokio::spawn(async move {
+                    if let Ok(mut tls) = tokio_boring::accept(&acc, tcp).await {
+                        let mut buf = [0u8; 4];
+                        if tls.read_exact(&mut buf).await.is_ok() && &buf == b"PING" {
+                            let _ = tls.write_all(b"PONG").await;
+                        }
+                    }
+                });
+            }
+        });
+
+        // 3a. Подключение к настоящему серверу по SPKI SHA-256 пину (Hex)
+        let tcp = TcpStream::connect(real_addr).await.unwrap();
+        let mut tls_stream = connect_ws_tls_with_config("secure.example.com", tcp, &pinned_cfg)
+            .await
+            .expect("Handshake with matching SPKI SHA-256 pin must succeed");
+        tls_stream.write_all(b"PING").await.unwrap();
+        let mut pong = [0u8; 4];
+        tls_stream.read_exact(&mut pong).await.unwrap();
+        assert_eq!(&pong, b"PONG");
+
+        // 3b. Подключение к настоящему серверу по Cert SHA-256 пину (Base64)
+        let pinned_b64_cfg = TlsClientConfig {
+            pin_sha256: Some(real_cert_b64),
+            ..pinned_cfg.clone()
+        };
+        let tcp = TcpStream::connect(real_addr).await.unwrap();
+        let _ = connect_ws_tls_with_config("secure.example.com", tcp, &pinned_b64_cfg)
+            .await
+            .expect("Handshake with matching Base64 cert SHA-256 pin must succeed");
+
+        // 3c. Подключение к настоящему серверу по доверенному CA и совпадающему SNI (secure.example.com)
+        let ca_cfg = TlsClientConfig {
+            fingerprint: TlsFingerprint::Safari,
+            random_seed: 3,
+            verify_peer: true,
+            pin_sha256: None,
+            ca_cert: Some(real_pem),
+        };
+        let tcp = TcpStream::connect(real_addr).await.unwrap();
+        let _ = connect_ws_tls_with_config("secure.example.com", tcp, &ca_cfg)
+            .await
+            .expect("Handshake with trusted CA and matching SNI hostname must succeed");
+
+        // 3d. Подключение к тому же серверу, но с чужим SNI (имитация подстановки ТСПУ чужого валидного сертификата от другого домена) -> ОТКАЗ по HOSTNAME_MISMATCH!
+        let tcp = TcpStream::connect(real_addr).await.unwrap();
+        let wrong_sni_res = connect_ws_tls_with_config("another-domain.example.org", tcp, &ca_cfg).await;
+        assert!(
+            wrong_sni_res.is_err(),
+            "verify_peer=true MUST reject certificate when SNI hostname does not match SAN"
+        );
+
+        // 3e. Явное отключение проверки в конфиге (verify_peer = false) -> пропускает самоподписанный сертификат
+        let disabled_verify_cfg = TlsClientConfig {
+            verify_peer: false,
+            pin_sha256: None,
+            ca_cert: None,
+            ..default_cfg
+        };
+        let tcp = TcpStream::connect(real_addr).await.unwrap();
+        let _ = connect_ws_tls_with_config("unverified.local", tcp, &disabled_verify_cfg)
+            .await
+            .expect("verify_peer=false must allow self-signed certificate when explicitly disabled");
+    }
+}

@@ -31,7 +31,7 @@ impl ANetServer {
         let t_prm = TunParams {
             netmask: cfg_ref.network.mask.parse()?, gateway: cfg_ref.network.gateway.parse()?,
             address: cfg_ref.network.self_ip.parse()?, name: cfg_ref.network.if_name.clone(),
-            mtu: cfg_ref.network.mtu, network: Some(cfg_ref.network.net.parse()?),
+            mtu: cfg_ref.network.mtu.max(1420), network: Some(cfg_ref.network.net.parse()?),
         };
 
         let pl = IpPool::new(

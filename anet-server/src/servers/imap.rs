@@ -1,16 +1,19 @@
 // anet-server/src/servers/imap.rs
 //! Транспорт IMAP на стороне сервера (ASTP over IMAPS:993).
 //!
-//! Реализует разделы 5 и 7.3 документа `contrib/docs/imap.ru.md`:
+//! Реализует разделы 3, 4, 5, 7.3 и 8 документа `contrib/docs/imap.ru.md`:
 //! - Супервизор пула почтовых ящиков из `imap_dsn`;
 //! - Архитектура «Cross-Selected Writer» на стороне сервера:
-//!   - `SRV_READER` делает `SELECT "Drafts"`, читает Uplink-сообщения клиентов через `wait_idle_or_event()`
+//!   - `SRV_READER` делает `SELECT "Drafts"`, читает Uplink-сообщения клиентов через `wait_idle_or_pending()`
 //!     и передает прочитанные UIDs в локальный канал очистки;
 //!   - `SRV_WRITER` делает `SELECT "Drafts"` один раз при старте, отправляет Downlink-сообщения
 //!     через `APPEND "Notes" (\Seen \Draft)`, а в паузах удаляет прочитанные письма в `"Drafts"`
 //!     через `UID STORE` + `UID EXPUNGE` без переключения папок;
-//! - Виртуальные сокеты через `fake_addr_from_cli_id` для безопасного связывания с `ServerAuthHandler`;
-//! - Fast-path для установленных сессий (`session_id`) и Auth-plane для фаз рукопожатия (`Client_TempID`).
+//! - Честная Self-Clocking коалесценция Downlink-батчей (раздел 3.3): пока `SRV_WRITER` выполняет сетевой
+//!   `APPEND` (~450 мс), пакеты из TUN накапливаются в `rx_router` и сливаются одним вызовом `wrap_packet_slice`
+//!   непосредственно в момент освобождения `SRV_WRITER`;
+//! - Управление переполнением (Backpressure `MAX_INFLIGHT_DOWNLINK = 15`, раздел 3.7) без риска взаимной блокировки;
+//! - Периодическая очистка неактивных сессий (`cleanup_interval_ms` / `session_ttl_ms`, раздел 7.4).
 
 use crate::auth_handler::ServerAuthHandler;
 use crate::client_registry::{ClientRegistry, ClientTransportInfo};
@@ -23,11 +26,11 @@ use anyhow::{anyhow, Context, Result};
 use base64::prelude::*;
 use bytes::Bytes;
 use dashmap::DashMap;
-use log::{debug, error, info, warn};
+use log::{debug, info, warn};
 use sha2::{Digest, Sha256};
-use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs};
+use std::net::{Ipv4Addr, SocketAddr};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Mutex};
@@ -180,8 +183,28 @@ pub async fn run_imap_server(
         srv_id, safe_base_ip
     );
 
-    // Локальная карта активных сессий (session_id -> ClientTransportInfo)
-    let local_sessions: Arc<DashMap<String, Arc<ClientTransportInfo>>> = Arc::new(DashMap::new());
+    // Локальная карта активных сессий (session_id -> (ClientTransportInfo, Instant последней активности))
+    let local_sessions: Arc<DashMap<String, (Arc<ClientTransportInfo>, Instant)>> =
+        Arc::new(DashMap::new());
+
+    // Фоновая задача периодической очистки неактивных сессий (cleanup_interval_ms и session_ttl_ms из раздела 7.4)
+    let cleanup_interval = Duration::from_millis(config.imap.cleanup_interval_ms.max(5000));
+    let session_ttl = Duration::from_millis(config.imap.session_ttl_ms.max(30000));
+    let sessions_for_gc = local_sessions.clone();
+    let registry_for_gc = registry.clone();
+
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(cleanup_interval);
+        loop {
+            ticker.tick().await;
+            let now = Instant::now();
+            sessions_for_gc.retain(|sid, (_, last_active)| {
+                let alive_in_reg = registry_for_gc.get_by_session(sid).is_some();
+                let not_expired = now.saturating_duration_since(*last_active) <= session_ttl;
+                alive_in_reg && not_expired
+            });
+        }
+    });
 
     // Запускаем независимую пару воркеров (Reader + Writer) для каждого почтового ящика параллельно
     let mut worker_handles = Vec::new();
@@ -229,7 +252,7 @@ async fn run_mailbox_worker_pair(
     registry: Arc<ClientRegistry>,
     tun_tx: mpsc::Sender<Bytes>,
     auth_handler: ServerAuthHandler,
-    local_sessions: Arc<DashMap<String, Arc<ClientTransportInfo>>>,
+    local_sessions: Arc<DashMap<String, (Arc<ClientTransportInfo>, Instant)>>,
 ) {
     let email = account.email.clone();
     let command_timeout = Duration::from_millis(config.imap.command_timeout_ms.max(5000));
@@ -240,12 +263,16 @@ async fn run_mailbox_worker_pair(
     info!("[IMAP Mailbox] Starting worker pair for account {}", email);
 
     loop {
-        // Канал очереди сообщений на отправку через SRV_WRITER в папку "Notes"
-        let (notes_append_tx, mut notes_append_rx) =
-            mpsc::channel::<DownlinkMessage>(CHANNEL_BUFFER_SIZE);
+        // Приоритетный канал ответов рукопожатия (Фаза 2 / Фаза 4)
+        let (notes_auth_tx, mut notes_auth_rx) = mpsc::channel::<DownlinkMessage>(64);
+        // Канал с емкостью 1 для честной Self-Clocking коалесценции Downlink-данных (раздел 3.3):
+        // пока SRV_WRITER выполняет APPEND (~450 мс), клиентский батчер копит пакеты в rx_router
+        // и формирует один крупный батч ровно в момент освобождения SRV_WRITER!
+        let (notes_data_tx, mut notes_data_rx) = mpsc::channel::<DownlinkMessage>(1);
 
         // Список UIDs сообщений в папке "Drafts", прочитанных SRV_READER и готовых к удалению
         let cleanup_uids: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
+        let inflight_downlink = Arc::new(AtomicUsize::new(0));
         let stop_flag = Arc::new(AtomicBool::new(false));
 
         // 1. Подключаем SRV_READER (Архитектура Cross-Selected: делает SELECT "Drafts"!)
@@ -280,10 +307,7 @@ async fn run_mailbox_worker_pair(
             continue;
         }
 
-        let initial_max_uid = srv_reader
-            .get_max_uid(command_timeout)
-            .await
-            .unwrap_or(0);
+        let initial_max_uid = srv_reader.get_max_uid(command_timeout).await.unwrap_or(0);
         info!(
             "[IMAP Server] SRV_READER initialized for {} (SELECT 'Drafts', baseline UID: {})",
             email, initial_max_uid
@@ -331,19 +355,69 @@ async fn run_mailbox_worker_pair(
         let writer_for_task = writer_mutex.clone();
         let email_writer = email.clone();
         let cleanup_uids_writer = cleanup_uids.clone();
+        let inflight_writer = inflight_downlink.clone();
         let stop_flag_writer = stop_flag.clone();
 
         let writer_task = tokio::spawn(async move {
             info!("[IMAP Server] SRV_WRITER loop active for {}", email_writer);
 
             while !stop_flag_writer.load(Ordering::Relaxed) {
-                // 1. Ожидаем очередное сообщение Downlink с таймаутом 20 мс для проверки очереди очистки
+                // Шаг 1: Неблокирующая сборка мусора в текущей выбранной папке "Drafts"
+                // ВСЕГДА выполняется перед проверкой Backpressure, чтобы исключить Deadlock!
+                let to_clean = {
+                    let mut guard = cleanup_uids_writer.lock().await;
+                    let force_clean = guard.len() >= 20
+                        || inflight_writer.load(Ordering::Relaxed) >= MAX_INFLIGHT_DOWNLINK;
+                    let idle_clean =
+                        notes_auth_rx.is_empty() && notes_data_rx.is_empty() && !guard.is_empty();
+                    if force_clean || idle_clean {
+                        let list = guard.clone();
+                        guard.clear();
+                        list
+                    } else {
+                        Vec::new()
+                    }
+                };
+
+                if !to_clean.is_empty() {
+                    let mut writer_guard = writer_for_task.lock().await;
+                    if let Err(e) = writer_guard.expunge_uids(&to_clean, command_timeout).await {
+                        warn!(
+                            "[IMAP Cleanup] Non-blocking UID EXPUNGE in Drafts failed for {}: {e:#}",
+                            email_writer
+                        );
+                        stop_flag_writer.store(true, Ordering::SeqCst);
+                        break;
+                    } else {
+                        debug!(
+                            "[IMAP Cleanup] Expunged {} read UIDs in Drafts for {}",
+                            to_clean.len(),
+                            email_writer
+                        );
+                        let cur = inflight_writer.load(Ordering::Relaxed);
+                        inflight_writer.fetch_sub(to_clean.len().min(cur), Ordering::Relaxed);
+                    }
+                }
+
+                // Шаг 2: Управление переполнением (Backpressure раздел 3.7):
+                if inflight_writer.load(Ordering::Relaxed) >= MAX_INFLIGHT_DOWNLINK {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    let cur = inflight_writer.load(Ordering::Relaxed);
+                    if cur > 0 {
+                        inflight_writer.fetch_sub(1, Ordering::Relaxed);
+                    }
+                }
+
+                // Шаг 3: Приоритетно отправляем ответы Auth Handshake, затем батчи Data Plane
                 let msg_opt = tokio::select! {
-                    msg = notes_append_rx.recv() => msg,
+                    biased;
+                    auth_msg = notes_auth_rx.recv() => auth_msg,
+                    data_msg = notes_data_rx.recv() => data_msg,
                     _ = tokio::time::sleep(Duration::from_millis(20)) => None,
                 };
 
                 if let Some(msg) = msg_opt {
+                    inflight_writer.fetch_add(1, Ordering::Relaxed);
                     let mut writer_guard = writer_for_task.lock().await;
                     let append_res = writer_guard
                         .append_message(
@@ -364,35 +438,13 @@ async fn run_mailbox_worker_pair(
                             );
                         }
                         Err(e) => {
-                            warn!("[IMAP Downlink] APPEND Notes failed for {}: {e:#}", email_writer);
+                            warn!(
+                                "[IMAP Downlink] APPEND Notes failed for {}: {e:#}",
+                                email_writer
+                            );
+                            stop_flag_writer.store(true, Ordering::SeqCst);
+                            break;
                         }
-                    }
-                }
-
-                // 2. Неблокирующая сборка мусора в паузах:
-                // Выполняем точечный UID EXPUNGE в текущей выбранной папке "Drafts",
-                // когда очередь отправки пуста, либо накопилось >= 20 прочитанных UIDs
-                let to_clean = {
-                    let mut guard = cleanup_uids_writer.lock().await;
-                    if (notes_append_rx.is_empty() && !guard.is_empty()) || guard.len() >= 20 {
-                        let list = guard.clone();
-                        guard.clear();
-                        list
-                    } else {
-                        Vec::new()
-                    }
-                };
-
-                if !to_clean.is_empty() {
-                    let mut writer_guard = writer_for_task.lock().await;
-                    if let Err(e) = writer_guard.expunge_uids(&to_clean, command_timeout).await {
-                        debug!("[IMAP Cleanup] Non-blocking UID EXPUNGE in Drafts: {e}");
-                    } else {
-                        debug!(
-                            "[IMAP Cleanup] Expunged {} read UIDs in Drafts for {}",
-                            to_clean.len(),
-                            email_writer
-                        );
                     }
                 }
             }
@@ -405,12 +457,12 @@ async fn run_mailbox_worker_pair(
 
         while !stop_flag.load(Ordering::Relaxed) {
             // Шаг 1: Активное ожидание через IDLE (или мгновенный пропуск, если pending_exists == true)
-            if let Err(e) = srv_reader.wait_idle_or_event(idle_timeout).await {
+            if let Err(e) = srv_reader.wait_idle_or_pending(idle_timeout).await {
                 warn!(
-                    "[IMAP Server] SRV_READER wait_idle_or_event error for {}: {e:#}",
+                    "[IMAP Server] SRV_READER wait_idle_or_pending error for {}: {e:#}",
                     reader_email
                 );
-                tokio::time::sleep(Duration::from_millis(200)).await;
+                break;
             }
 
             if stop_flag.load(Ordering::Relaxed) {
@@ -427,15 +479,12 @@ async fn run_mailbox_worker_pair(
                     last_seen_uid = res.new_max_uid;
 
                     for msg in res.messages {
-                        // Извлекаем srv_id и cli_token из темы:
-                        // Subject: {Prefix} [ID: <srv_id>:<cli_token>]
                         let Some((msg_srv_id, cli_token)) = extract_srv_and_cli_token(&msg.subject)
                         else {
                             continue;
                         };
 
                         if msg_srv_id != srv_id {
-                            // Сообщение адресовано другому серверу в общем ящике
                             continue;
                         }
 
@@ -445,21 +494,31 @@ async fn run_mailbox_worker_pair(
                             guard.push(msg.uid);
                         }
 
+                        // Подтверждение живого входящего трафика от клиента снижает счетчик in-flight Downlink
+                        let cur_inf = inflight_downlink.load(Ordering::Relaxed);
+                        if cur_inf > 0 {
+                            inflight_downlink.fetch_sub(1, Ordering::Relaxed);
+                        }
+
                         // 1. FAST PATH (Установленная сессия Data Plane, cli_token == session_id)
                         let client_info_opt = local_sessions
-                            .get(cli_token)
-                            .map(|e| e.value().clone())
+                            .get_mut(cli_token)
+                            .map(|mut entry| {
+                                entry.value_mut().1 = Instant::now();
+                                entry.value().0.clone()
+                            })
                             .or_else(|| {
                                 let info = registry.get_by_session(cli_token)?;
-                                local_sessions.insert(cli_token.to_string(), info.clone());
+                                local_sessions.insert(
+                                    cli_token.to_string(),
+                                    (info.clone(), Instant::now()),
+                                );
                                 Some(info)
                             });
 
                         if let Some(client_info) = client_info_opt {
-                            // Обновляем таймер последней активности для сторожевого таймера
                             registry.touch_client(&client_info);
 
-                            // Дешифруем ASTP батч
                             if let Ok(decrypted_batch) =
                                 unwrap_packet(&client_info.cipher, &msg.payload)
                             {
@@ -494,12 +553,13 @@ async fn run_mailbox_worker_pair(
                             .await
                         {
                             Ok((response_opt, auth_tuple_opt)) => {
-                                // Если завершилась Фаза 3 (получена регистрация клиента):
                                 if let Some((client_info, _auth_response)) = auth_tuple_opt {
                                     let assigned_ip = client_info.assigned_ip.clone();
                                     let session_id = client_info.session_id.clone();
-                                    local_sessions
-                                        .insert(session_id.clone(), client_info.clone());
+                                    local_sessions.insert(
+                                        session_id.clone(),
+                                        (client_info.clone(), Instant::now()),
+                                    );
 
                                     let (tx_router, rx_router) =
                                         mpsc::channel::<Bytes>(CHANNEL_BUFFER_SIZE);
@@ -510,19 +570,20 @@ async fn run_mailbox_worker_pair(
                                         cli_token, assigned_ip, session_id
                                     );
 
-                                    // Запускаем фоновую задачу Downlink-батчера для этого клиента
-                                    let writer_tx = notes_append_tx.clone();
+                                    // Запускаем фоновую задачу Self-Clocking Downlink-батчера для этого клиента
+                                    let writer_tx = notes_data_tx.clone();
                                     let c_info = client_info.clone();
+                                    let reg_dl = registry.clone();
                                     let max_batch_bytes =
                                         (config.imap.max_batch_kb.clamp(8, 128)) * 1024;
-                                    let coalesce_ms =
-                                        config.imap.batch_coalesce_ms.clamp(5, 50);
+                                    let coalesce_ms = config.imap.batch_coalesce_ms.clamp(5, 50);
                                     let stop_flag_client = stop_flag.clone();
 
                                     tokio::spawn(async move {
                                         run_client_downlink_batcher(
                                             rx_router,
                                             c_info,
+                                            reg_dl,
                                             writer_tx,
                                             max_batch_bytes,
                                             coalesce_ms,
@@ -532,11 +593,12 @@ async fn run_mailbox_worker_pair(
                                     });
                                 }
 
-                                // Отправляем ответ хендшейка (Фаза 2 или Фаза 4) в папку "Notes":
+                                // Отправляем ответ хендшейка (Фаза 2 или Фаза 4) в папку "Notes"
+                                // через приоритетный канал notes_auth_tx:
                                 // Тема: Subject: [ID: <Client_TempID>]
                                 if let Some(response_bytes) = response_opt {
                                     let reply_subject = format!("[ID: {}]", cli_token);
-                                    let _ = notes_append_tx
+                                    let _ = notes_auth_tx
                                         .send(DownlinkMessage {
                                             subject: reply_subject,
                                             payload: response_bytes,
@@ -558,7 +620,7 @@ async fn run_mailbox_worker_pair(
                         "[IMAP Server] SRV_READER UID FETCH error for {}: {e:#}",
                         reader_email
                     );
-                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    break;
                 }
             }
         }
@@ -576,68 +638,94 @@ async fn run_mailbox_worker_pair(
     }
 }
 
-/// Фоновая задача сборки Downlink-пакетов из `rx_router` (TUN) в `PacketBatcher`
-/// и отправка их через `notes_append_tx` в `SRV_WRITER` (APPEND "Notes")
+/// Фоновая задача Self-Clocking сборки Downlink-пакетов из `rx_router` (TUN) в `PacketBatcher`
+/// (раздел 3.3 спецификации):
+/// 1. Ждет первый пакет из `rx_router`;
+/// 2. Дожидается освобождения слота `SRV_WRITER` (`notes_data_tx.reserve().await`);
+/// 3. Выгребает ВСЕ накопившиеся за время предыдущего `APPEND` (~450 мс) пакеты из `rx_router`
+///    до `max_batch_bytes = 32 КБ`;
+/// 4. Шифрует весь буфер одним вызовом `wrap_packet_slice` и передает в `SRV_WRITER`.
 async fn run_client_downlink_batcher(
     mut rx_router: mpsc::Receiver<Bytes>,
     client_info: Arc<ClientTransportInfo>,
-    notes_append_tx: mpsc::Sender<DownlinkMessage>,
+    registry: Arc<ClientRegistry>,
+    notes_data_tx: mpsc::Sender<DownlinkMessage>,
     max_batch_bytes: usize,
     coalesce_ms: u64,
     stop_flag: Arc<AtomicBool>,
 ) {
     let mut batcher = PacketBatcher::new(max_batch_bytes, coalesce_ms);
-    let mut coalesce_interval = tokio::time::interval(Duration::from_millis(coalesce_ms));
-    coalesce_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
     let subject = format!("[ID: {}]", client_info.session_id);
 
     while !stop_flag.load(Ordering::Relaxed) {
-        tokio::select! {
-            biased;
-            packet_opt = rx_router.recv() => {
-                match packet_opt {
-                    Some(packet) => {
-                        if packet.len() >= 20 {
-                            batcher.push(packet);
-                            // Выгребаем все доступные пакеты текущего бурста
-                            while let Ok(next_p) = rx_router.try_recv() {
-                                if next_p.len() >= 20 {
-                                    batcher.push(next_p);
-                                }
-                                if batcher.should_flush() {
-                                    break;
-                                }
-                            }
+        // 1. Если батчер пуст — ждем первый пакет из rx_router
+        if batcher.is_empty() {
+            match rx_router.recv().await {
+                Some(first_pkt) => {
+                    if first_pkt.len() >= 20 {
+                        batcher.push(first_pkt);
+                    } else {
+                        continue;
+                    }
+                }
+                None => break, // Клиент отключен
+            }
+
+            // Ждем микро-окно coalesce_ms (10–15 мс) для сбора стартового бурста
+            let coalesce_deadline = Instant::now() + Duration::from_millis(coalesce_ms);
+            loop {
+                if batcher.should_flush() {
+                    break;
+                }
+                let rem = coalesce_deadline.saturating_duration_since(Instant::now());
+                if rem.is_zero() {
+                    break;
+                }
+                match tokio::time::timeout(rem, rx_router.recv()).await {
+                    Ok(Some(pkt)) => {
+                        if pkt.len() >= 20 {
+                            batcher.push(pkt);
                         }
                     }
-                    None => break, // Клиент отключен
+                    Ok(None) => break,
+                    Err(_) => break,
                 }
             }
-            _ = coalesce_interval.tick() => {}
         }
 
-        if !batcher.is_empty() {
-            if let Some(raw_batch) = batcher.flush() {
-                let seq = client_info.sequence.fetch_add(1, Ordering::Relaxed);
-                if let Ok(encrypted_bytes) = wrap_packet_slice(
-                    &client_info.cipher,
-                    &client_info.nonce_prefix,
-                    seq,
-                    &raw_batch,
-                    0,
-                ) {
-                    if notes_append_tx
-                        .send(DownlinkMessage {
-                            subject: subject.clone(),
-                            payload: encrypted_bytes,
-                        })
-                        .await
-                        .is_err()
-                    {
-                        break;
+        // 2. Ждем готовности SRV_WRITER (пока идет текущий APPEND ~450 мс, новые пакеты копятся в rx_router!)
+        let Ok(permit) = notes_data_tx.reserve().await else {
+            break;
+        };
+
+        // 3. Как только SRV_WRITER освободился — выгребаем все накопившиеся за эти ~450 мс пакеты до max_batch_bytes!
+        while batcher.current_bytes() < max_batch_bytes {
+            match rx_router.try_recv() {
+                Ok(pkt) => {
+                    if pkt.len() >= 20 {
+                        batcher.push(pkt);
                     }
                 }
+                Err(_) => break,
+            }
+        }
+
+        // 4. Шифруем собранный батч одним вызовом wrap_packet_slice и отправляем через SRV_WRITER
+        if let Some(raw_batch) = batcher.flush() {
+            let raw_len = raw_batch.len();
+            let seq = client_info.sequence.fetch_add(1, Ordering::Relaxed);
+            if let Ok(encrypted_bytes) = wrap_packet_slice(
+                &client_info.cipher,
+                &client_info.nonce_prefix,
+                seq,
+                &raw_batch,
+                0,
+            ) {
+                registry.record_tx(&client_info, raw_len, "imap");
+                permit.send(DownlinkMessage {
+                    subject: subject.clone(),
+                    payload: encrypted_bytes,
+                });
             }
         }
     }
@@ -693,9 +781,7 @@ mod tests {
         let addr2 = fake_addr_from_cli_id("client_abc", base);
         let addr3 = fake_addr_from_cli_id("client_xyz", base);
 
-        // Детерминированность: одинаковый ID дает одинаковый SocketAddr
         assert_eq!(addr1, addr2);
-        // Разные ID дают разные адреса
         assert_ne!(addr1, addr3);
 
         match addr1.ip() {

@@ -329,6 +329,18 @@ tunnel_ping_timeout_secs = 45
 # Интервал профилактической ротации пустой комнаты Контур.Толк на сервере при отсутствии активных клиентов
 server_idle_room_rotation_secs = 1800
 
+[imap]
+# =========================================================================
+# Тонкая настройка транспорта IMAP (Mail.ru / VK Cloud, порт 993/TLS)
+# =========================================================================
+uplink_folder = "Drafts"
+downlink_folder = "Notes"
+max_batch_bytes = 32768
+batch_max_delay_ms = 0
+idle_reissue_secs = 60
+command_timeout_secs = 15
+throttle_backoff_ms = 2000
+
 [connectivity]
 # Включить фоновую диагностику состояния сети и линейный индикатор пульса (true / false)
 enabled = true
