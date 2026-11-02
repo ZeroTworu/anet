@@ -22,6 +22,8 @@ pub mod wrtc;
 pub mod icmp_probe;
 pub mod connectivity;
 pub mod probe_nodes;
+pub mod imap_conn;
+pub mod batcher;
 
 pub use generated::*;
 pub mod protocol {

@@ -4,7 +4,6 @@ pub use anet_common::config::{
 use anet_common::quic_settings::QuicConfig;
 use serde::{Deserialize, Serialize};
 
-
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PerAppMode {
@@ -129,6 +128,7 @@ pub enum TransportMode {
     Websocket,
     Ahttp,
     Wrtc,
+    Imap,
 }
 
 impl Default for TransportMode {
@@ -149,6 +149,38 @@ impl Default for TransportConfig {
         Self {
             ssh_user: Some("hanyuu".to_string()),
             ssh_banner: None,
+        }
+    }
+}
+
+// Конфигурация транспорта IMAP (секция [imap] в client.toml)
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ImapConfig {
+    /// Интервал перевхода в IDLE (keepalive) для проверки живости соединения (мс).
+    pub idle_refresh_interval_ms: u64,
+
+    /// Таймаут ожидания ответа на команду IMAP (APPEND, FETCH, DONE) (мс).
+    pub command_timeout_ms: u64,
+
+    /// Максимальная задержка накопления микро-батча перед первым APPEND (мс).
+    pub batch_coalesce_ms: u64,
+
+    /// Максимальный размер одного зашифрованного пакета-черновика (КБ).
+    pub max_batch_kb: usize,
+
+    /// Таймаут переподключения при получении THROTTLED/OVERQUOTA (мс).
+    pub throttle_backoff_ms: u64,
+}
+
+impl Default for ImapConfig {
+    fn default() -> Self {
+        Self {
+            idle_refresh_interval_ms: 120_000,
+            command_timeout_ms: 15_000,
+            batch_coalesce_ms: 15,
+            max_batch_kb: 32,
+            throttle_backoff_ms: 30_000,
         }
     }
 }
@@ -207,7 +239,8 @@ pub struct ServerConfig {
     /// WebRTC Data Transport mode: "auto" | "p2p_direct" | "jvb_datachannel" | "ws" | "media_video"
     #[serde(default)]
     pub wrtc_mode: Option<String>,
-    /// Опциональное переопределение использования TURN для конкретного сервера (перекрывает [wrtc].jvb_use_turn)
+
+    /// Принудительное включение/отключение TURN релея в WebRTC
     #[serde(default)]
     pub wrtc_use_turn: Option<bool>,
 
@@ -271,6 +304,7 @@ impl ServerConfig {
             Some("ws") | Some("wss") => Ok(TransportMode::Websocket),
             Some("http") | Some("https") => Ok(TransportMode::Ahttp),
             Some("wrtc") => Ok(TransportMode::Wrtc),
+            Some("imap") | Some("imaps") => Ok(TransportMode::Imap),
             Some(scheme) => anyhow::bail!("unsupported server DSN scheme '{scheme}'"),
             None => anyhow::bail!("server DSN '{}' has no scheme", self.dsn),
         }
@@ -384,6 +418,7 @@ impl ServerConfig {
             "http" | "ws" => 80,
             "ssh" => 22,
             "vnc" => 5900,
+            "imap" | "imaps" => 993,
             "quic" => 443,
             _ => 0,
         });
@@ -403,6 +438,7 @@ impl ServerConfig {
                 TransportMode::Websocket => "WS",
                 TransportMode::Ahttp => "AHTTP",
                 TransportMode::Wrtc => "WRTC",
+                TransportMode::Imap => "IMAP",
             };
 
             format!("{}:{}", host, mode_str)
@@ -561,6 +597,9 @@ pub struct CoreConfig {
 
     #[serde(default)]
     pub browser_profiles: Vec<BrowserProfileConfig>,
+
+    #[serde(default)]
+    pub imap: ImapConfig,
 }
 
 impl CoreConfig {
@@ -661,6 +700,20 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(ws_no_port.endpoint().unwrap(), "vpn.example.com:443");
+
+        let imap_server = ServerConfig {
+            dsn: "imap://imap.mail.ru:993?acc=user1%40mail.ru:pass1".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(imap_server.mode().unwrap(), TransportMode::Imap);
+        assert_eq!(imap_server.endpoint().unwrap(), "imap.mail.ru:993");
+
+        let imaps_no_port = ServerConfig {
+            dsn: "imaps://imap.yandex.ru".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(imaps_no_port.mode().unwrap(), TransportMode::Imap);
+        assert_eq!(imaps_no_port.endpoint().unwrap(), "imap.yandex.ru:993");
     }
 
     #[test]
