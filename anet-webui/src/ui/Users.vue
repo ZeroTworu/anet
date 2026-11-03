@@ -26,6 +26,7 @@ const headers = [
   { title: 'Группа', key: 'group_name', sortable: false }, // По этой связи сортировка отключена
   { title: 'UUID (ID)', key: 'id', sortable: true },
   { title: 'Status', key: 'is_active', sortable: true, align: 'center' as const },
+  { title: 'Действия', key: 'actions', sortable: false, align: 'center' as const },
 ]
 
 const items = computed(() => data.value?.items ?? [])
@@ -102,75 +103,81 @@ onMounted(() => {
 </script>
 
 <template>
-  <v-container max-width="1200" class="users-page">
-    <div class="d-flex justify-space-between align-center flex-wrap ga-4 mb-5">
+  <v-container fluid class="users-page">
+    <div class="d-flex justify-space-between align-center flex-wrap ga-4 mb-4">
       <v-list-item
-          class="px-0"
-          subtitle="Управление учетными записями пользователей"
+        class="px-0"
+        subtitle="Управление учетными записями пользователей, тарифами и привязками к группам"
       >
         <template #title>
-          <h1 class="text-h5 font-weight-bold">ANet VPN Clients</h1>
+          <h1 class="text-h5 font-weight-bold">ANet VPN Clients (Пользователи)</h1>
         </template>
       </v-list-item>
-      <div class="d-flex align-center flex-wrap flex-sm-nowrap ga-3">
-        <v-select
-            v-model="selectedGroupIds"
-            multiple
-            clearable
-            chips
-            collapse-chips
-            :items="groupOptions"
-            item-title="title"
-            item-value="value"
-            label="Фильтр по группам"
-            placeholder="Выберите группы"
-            variant="outlined"
-            density="compact"
-            hide-details
-            style="width: 280px"
+    </div>
+
+    <div class="d-flex justify-space-between align-center flex-wrap ga-3 mb-4">
+      <div class="d-flex align-center flex-wrap ga-3 flex-grow-1">
+        <v-text-field
+          v-model="searchQuery"
+          prepend-inner-icon="mdi-magnify"
+          label="Поиск по UID..."
+          variant="outlined"
+          density="compact"
+          hide-details
+          single-line
+          style="max-width: 280px"
         />
 
-        <v-text-field
-            v-model="searchQuery"
-            prepend-inner-icon="mdi-magnify"
-            label="Поиск по UID..."
-            variant="outlined"
-            density="compact"
-            hide-details
-            single-line
-            style="width: 240px"
+        <v-select
+          v-model="selectedGroupIds"
+          multiple
+          clearable
+          chips
+          collapse-chips
+          :items="groupOptions"
+          item-title="title"
+          item-value="value"
+          label="Фильтр по группам"
+          placeholder="Все группы"
+          variant="outlined"
+          density="compact"
+          hide-details
+          style="max-width: 320px"
         />
-        <v-btn color="primary" @click="showCreate = true"> Add User </v-btn>
       </div>
+
+      <v-btn color="primary" prepend-icon="mdi-plus" @click="showCreate = true">
+        + ДОБАВИТЬ КЛИЕНТА
+      </v-btn>
     </div>
 
     <v-data-table-server
-        v-model:items-per-page="options.itemsPerPage"
-        v-model:page="options.page"
-        :headers="headers"
-        :items="items"
-        :items-length="total"
-        :loading="loading"
-        :items-per-page-options="[10, 20, 50, 100]"
-        items-per-page-text="Строк на странице"
-        loading-text="Загрузка пользователей…"
-        no-data-text="Пользователи не найдены"
-        density="comfortable"
-        class="users-table"
-        hover
-        @update:options="handleOptions"
-        @click:row="(_: unknown, data: { item: { id: string } }) => openEdit(data.item.id)"
+      v-model:items-per-page="options.itemsPerPage"
+      v-model:page="options.page"
+      :headers="headers"
+      :items="items"
+      :items-length="total"
+      :loading="loading"
+      :items-per-page-options="[10, 20, 50, 100]"
+      items-per-page-text="Items per page:"
+      loading-text="Загрузка пользователей…"
+      no-data-text="Пользователи не найдены"
+      density="comfortable"
+      class="border rounded-lg"
+      hover
+      @update:options="handleOptions"
+      @click:row="(_: unknown, data: { item: { id: string } }) => openEdit(data.item.id)"
     >
       <template #item.uid="{ item }">
-        <span class="uid-col">{{ item.uid || 'No Name' }}</span>
+        <span class="font-weight-bold">{{ item.uid || 'No Name' }}</span>
       </template>
 
       <template #item.group_name="{ item }">
         <v-chip
-            v-if="item.group_id && groupMap.has(item.group_id)"
-            size="small"
-            variant="flat"
-            color="secondary"
+          v-if="item.group_id && groupMap.has(item.group_id)"
+          size="small"
+          variant="tonal"
+          color="secondary"
         >
           {{ groupMap.get(item.group_id)?.name }}
         </v-chip>
@@ -178,21 +185,33 @@ onMounted(() => {
       </template>
 
       <template #item.id="{ item }">
-        <span class="uuid-col">{{ item.id }}</span>
+        <code class="text-caption text-medium-emphasis">{{ item.id }}</code>
       </template>
 
       <template #item.is_active="{ item }">
         <v-chip :color="item.is_active ? 'success' : 'error'" size="small">
-          {{ item.is_active ? 'Active' : 'Banned' }}
+          {{ item.is_active ? 'ACTIVE' : 'BANNED' }}
         </v-chip>
+      </template>
+
+      <template #item.actions="{ item }">
+        <div class="d-flex ga-1 justify-center flex-nowrap" @click.stop>
+          <v-btn
+            icon="mdi-pencil"
+            size="small"
+            variant="text"
+            title="Редактировать клиента"
+            @click="openEdit(item.id)"
+          />
+        </div>
       </template>
     </v-data-table-server>
 
     <UserModal
-        v-model="showModal"
-        :user-id="selectedUserId"
-        @updated="loadUsers"
-        @close="closeModal"
+      v-model="showModal"
+      :user-id="selectedUserId"
+      @updated="loadUsers"
+      @close="closeModal"
     />
 
     <CreateUserModal v-model="showCreate" @created="loadUsers" />
@@ -200,10 +219,7 @@ onMounted(() => {
 </template>
 
 <style scoped>
-.users-page { padding: 24px; }
-.users-table { border-radius: 10px; }
-.users-table :deep(tbody tr) { cursor: pointer; }
-.users-table :deep(tbody tr:hover) { background: rgba(43, 184, 148, .07) !important; }
-.uid-col { font-weight: 600; font-size: 15px; }
-.uuid-col { font-family: 'Fira Code', 'Courier New', Courier, monospace; color: #9aa5a0; font-size: 13.5px; }
+.users-page {
+  padding: 24px;
+}
 </style>
