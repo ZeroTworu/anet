@@ -938,7 +938,8 @@ impl UsersApi {
                                         None
                                     };
                                     ("imap", dsn)
-                                }
+                                },
+                                _ => ("", None)
                             };
 
                             let Some(port_or_url) = port_or_url else {

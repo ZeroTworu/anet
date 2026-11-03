@@ -21,6 +21,8 @@ pub enum ProtocolType {
     Wrtc,
     #[sea_orm(string_value = "imap")]
     Imap,
+    #[sea_orm(string_value = "doh")]
+    Doh,
 }
 
 impl ProtocolType {
@@ -45,6 +47,7 @@ impl ProtocolType {
             Self::Ahttp => "ahttp",
             Self::Wrtc => "wrtc",
             Self::Imap => "imap",
+            Self::Doh => "doh",
         }
     }
 }
