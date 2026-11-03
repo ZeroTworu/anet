@@ -21,6 +21,7 @@ use anet_common::wrtc::{
     providers::WrtcProviderRegistry,
     stealth::generate_random_guest_name,
     xmpp::XmppSession,
+    xmpp_xml::{parse_xmpp_stanzas, InboundXmpp},
 };
 use anyhow::{Context, Result};
 use base64::prelude::*;
@@ -144,12 +145,45 @@ pub async fn run_wrtc_server(
         let idle_rotation_secs = config.wrtc.server_idle_room_rotation_secs.max(60);
         let idle_deadline = tokio::time::Instant::now() + Duration::from_secs(idle_rotation_secs);
 
+        let conf_muc_prefix = format!("{}@muc.meet.jitsi/", bootstrap.conference_id);
         loop {
             match tokio::time::timeout_at(idle_deadline, xmpp.recv_stanza()).await {
                 Ok(Some(stanza)) => {
-                    if let Some(session) = parse_jingle_session(&stanza, fallback_ip, fallback_port) {
-                        parsed_session = Some(session);
+                    let mut should_realloc = false;
+                    for parsed in parse_xmpp_stanzas(&stanza, fallback_ip, fallback_port) {
+                        match parsed {
+                            InboundXmpp::Jingle(session) => {
+                                parsed_session = Some(session);
+                                break;
+                            }
+                            InboundXmpp::Presence {
+                                from,
+                                is_unavailable,
+                                ..
+                            } => {
+                                if let Some(occ) = from.strip_prefix(&conf_muc_prefix) {
+                                    if occ == "focus" && is_unavailable {
+                                        info!(
+                                            "[WRTC Server] Jicofo focus left room '{}' before session-initiate; re-requesting conference allocation...",
+                                            bootstrap.conference_id
+                                        );
+                                        should_realloc = true;
+                                    } else if occ != "focus"
+                                        && occ != xmpp.endpoint_id
+                                        && !is_unavailable
+                                    {
+                                        should_realloc = true;
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    if parsed_session.is_some() {
                         break;
+                    }
+                    if should_realloc {
+                        let _ = xmpp.request_conference_allocation().await;
                     }
                 }
                 Ok(None) => {

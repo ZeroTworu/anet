@@ -302,12 +302,7 @@ fn detect_physical_bind_addr(
             s.transport
                 .candidates
                 .iter()
-                .find(|c| {
-                    !c.ip.is_empty()
-                        && c.ip != "0.0.0.0"
-                        && !c.ip.starts_with("127.")
-                        && !c.ip.starts_with("172.112.")
-                })
+                .find(|c| crate::wrtc::jingle::is_valid_jvb_candidate_ip(&c.ip))
                 .map(|c| (c.ip.as_str(), c.port))
         })
         .unwrap_or((fallback_ip, fallback_port));
@@ -331,6 +326,32 @@ fn detect_physical_bind_addr(
         }
     }
     "0.0.0.0:0".to_string()
+}
+
+/// Выделяет `count` уникальных локальных эфемерных UDP-портов на заданном адресе интерфейса (`ip:0`),
+/// чтобы ICE-агент `webrtc-rs` создавал `count` независимых UDP-сокетов с различными исходными портами
+/// для равномерного распределения по сетевым маршрутам.
+fn allocate_distinct_udp_bind_addrs(bind_addr: &str, count: usize) -> Vec<String> {
+    let target_count = count.clamp(1, 16);
+    if target_count <= 1 {
+        return vec![bind_addr.to_string()];
+    }
+    let mut held_sockets = Vec::with_capacity(target_count);
+    let mut addrs = Vec::with_capacity(target_count);
+    for _ in 0..target_count {
+        if let Ok(sock) = std::net::UdpSocket::bind(bind_addr) {
+            if let Ok(local_addr) = sock.local_addr() {
+                addrs.push(local_addr.to_string());
+                held_sockets.push(sock);
+            }
+        }
+    }
+    drop(held_sockets);
+    if addrs.is_empty() {
+        vec![bind_addr.to_string()]
+    } else {
+        addrs
+    }
 }
 
 struct PeerEvents {
@@ -926,10 +947,10 @@ pub async fn create_p2p_channel(
                 inner: TokioRuntime,
                 udp_socket_buffer_size: wrtc_cfg.udp_socket_buffer_size,
             }))
-            .with_udp_addrs(vec![
-                effective_bind_addr.clone();
-                wrtc_cfg.udp_ice_socket_count.clamp(1, 16)
-            ])
+            .with_udp_addrs(allocate_distinct_udp_bind_addrs(
+                &effective_bind_addr,
+                wrtc_cfg.udp_ice_socket_count.clamp(1, 16),
+            ))
             .with_dedicated_reactor_pool_size(
                 std::thread::available_parallelism()
                     .map(|n| n.get())
@@ -1443,6 +1464,8 @@ impl WrtcPeer {
         let mut active_ice_servers: Vec<RTCIceServer> = Vec::new();
 
         if let (Some(session), Some(xmpp)) = (session_opt, xmpp_opt) {
+            xmpp.set_colibri_sink(incoming_tx.clone());
+            let xmpp_json_sender = xmpp.muc_json_sender();
             log::info!("[WRTC Media] Initializing WebRTC PeerConnection with Audio (Opus) and Video (VP8)...");
 
             let audio_codec = RTCRtpCodecParameters {
@@ -1553,10 +1576,10 @@ impl WrtcPeer {
                         inner: TokioRuntime,
                         udp_socket_buffer_size: wrtc_cfg.udp_socket_buffer_size,
                     }))
-                    .with_udp_addrs(vec![
-                        bind_addr.clone();
-                        wrtc_cfg.udp_ice_socket_count.clamp(1, 16)
-                    ])
+                    .with_udp_addrs(allocate_distinct_udp_bind_addrs(
+                        &bind_addr,
+                        wrtc_cfg.udp_ice_socket_count.clamp(1, 16),
+                    ))
                     .with_dedicated_reactor_pool_size(
                         std::thread::available_parallelism()
                             .map(|n| n.get())
@@ -1699,7 +1722,7 @@ impl WrtcPeer {
                         }
                     }
                 } else {
-                    log::info!("[WRTC DataChannel] JVB bridge does not announce SCTP DataChannel in session-initiate. Operating over Colibri-WS with PacketBatcher.");
+                    log::info!("[WRTC DataChannel] JVB bridge does not announce SCTP DataChannel in session-initiate. Operating over Colibri-WS / XMPP with PacketBatcher.");
                 }
 
                 let sdp_str = session.to_sdp(fallback_ip, fallback_port, 0, local_video_ssrc);
@@ -1785,9 +1808,8 @@ impl WrtcPeer {
                 let has_colibri_ws_cfg = session.transport.colibri_ws_url.is_some();
                 let sender_task = tokio::spawn(async move {
                     if dc_opt_out.is_some() && !dc_is_open_out.load(Ordering::SeqCst) {
-                        let wait_secs = if has_colibri_ws_cfg { 2 } else { 6 };
                         let _ = tokio::time::timeout(
-                            Duration::from_secs(wait_secs),
+                            Duration::from_millis(800),
                             dc_open_notify_out.notified(),
                         )
                         .await;
@@ -1798,21 +1820,22 @@ impl WrtcPeer {
                     );
 
                     loop {
-                        let (json_str, is_batch, is_astp) = tokio::select! {
+                        let (json_str, msg_to_opt, is_batch, is_astp) = tokio::select! {
                             msg_opt = outgoing_rx.recv() => {
                                 match msg_opt {
                                     Some(msg) => {
                                         let is_batch = matches!(msg.msg_payload, WrtcMessage::AstpBatch { .. });
                                         let is_astp = matches!(msg.msg_payload, WrtcMessage::Astp { .. });
+                                        let msg_to_opt = msg.to.clone();
                                         let Ok(json_str) = serde_json::to_string(&msg) else { continue; };
-                                        (json_str, is_batch, is_astp)
+                                        (json_str, msg_to_opt, is_batch, is_astp)
                                     }
                                     None => break,
                                 }
                             }
                             raw_opt = raw_outgoing_rx.recv() => {
                                 match raw_opt {
-                                    Some(raw) => (raw, false, false),
+                                    Some(raw) => (raw, None, false, false),
                                     None => break,
                                 }
                             }
@@ -1866,7 +1889,7 @@ impl WrtcPeer {
                             } else {
                                 log::info!("[JVB WS OUT]: {json_str}");
                             }
-                            if let Err(e) = ws_fallback_tx_out.try_send(json_str) {
+                            if let Err(e) = ws_fallback_tx_out.try_send(json_str.clone()) {
                                 match e {
                                     tokio::sync::mpsc::error::TrySendError::Full(_) => {
                                         log::warn!("[WRTC WS] Fallback queue full, frame dropped");
@@ -1880,7 +1903,7 @@ impl WrtcPeer {
                             if let Some(ref dc_out) = dc_opt_out {
                                 if !dc_is_open_out.load(Ordering::SeqCst) {
                                     let _ = tokio::time::timeout(
-                                        Duration::from_secs(2),
+                                        Duration::from_millis(250),
                                         dc_open_notify_out.notified(),
                                     )
                                     .await;
@@ -1890,6 +1913,20 @@ impl WrtcPeer {
                                 {
                                     sent = true;
                                 }
+                            }
+                        }
+
+                        // Резервная доставка управляющих сообщений (discover, beacon, ASTP-рукопожатие, ping/pong)
+                        // через XMPP MUC `<json-message>`, когда на стандартном Jitsi-сервере отсутствует Colibri-WS
+                        // или SCTP DataChannel ещё не открылся.
+                        if !sent && !is_constraints {
+                            if is_astp || is_batch {
+                                log::trace!("[XMPP MUC JSON OUT ASTP]");
+                            } else {
+                                log::info!("[XMPP MUC JSON OUT]: {json_str}");
+                            }
+                            if xmpp_json_sender.try_send_json(msg_to_opt.as_deref(), &json_str) {
+                                sent = true;
                             }
                         }
 

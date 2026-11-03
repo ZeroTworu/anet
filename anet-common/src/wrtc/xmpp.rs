@@ -23,6 +23,24 @@ enum XmppOutboundCmd {
     Close,
 }
 
+/// Легковесный отправитель управляющих JSON-сообщений (`<json-message/>`) через XMPP MUC,
+/// используемый `WrtcPeer` как резервный канал сигнализации при отсутствии Colibri-WS / SCTP.
+#[derive(Clone)]
+pub struct XmppJsonSender {
+    conference_id: String,
+    write_tx: mpsc::Sender<XmppOutboundCmd>,
+}
+
+impl XmppJsonSender {
+    pub fn try_send_json(&self, to_occupant: Option<&str>, json_payload: &str) -> bool {
+        let stanza = XmppBuilder::muc_json_message(&self.conference_id, to_occupant, json_payload);
+        log::debug!("[XMPP OUT JSON]: {stanza}");
+        self.write_tx
+            .try_send(XmppOutboundCmd::Stanza(stanza))
+            .is_ok()
+    }
+}
+
 pub struct XmppSession {
     pub endpoint_id: String,
     pub conference_id: String,
@@ -33,6 +51,7 @@ pub struct XmppSession {
     pub remote_ip: Option<std::net::IpAddr>,
     pub occupants: Arc<Mutex<HashSet<String>>>,
     pub discovered_ice_servers: Arc<Mutex<Vec<XmppIceServer>>>,
+    colibri_sink: Arc<Mutex<Option<mpsc::Sender<crate::wrtc::colibri::ColibriMessage>>>>,
     default_ice_servers: Vec<XmppIceServer>,
     active_jingle: Arc<Mutex<Option<(String, String, u32, u32)>>>,
     write_tx: mpsc::Sender<XmppOutboundCmd>,
@@ -429,6 +448,8 @@ impl XmppSession {
             .unwrap_or_else(Self::generate_endpoint_id);
         let occupants = Arc::new(Mutex::new(HashSet::new()));
         let discovered_ice_servers = Arc::new(Mutex::new(Vec::new()));
+        let colibri_sink: Arc<Mutex<Option<mpsc::Sender<crate::wrtc::colibri::ColibriMessage>>>> =
+            Arc::new(Mutex::new(None));
 
         let effective_client_name = match client_name_opt {
             Some(name) if !name.is_empty() && name != "ANet-Node" => name.to_string(),
@@ -446,6 +467,7 @@ impl XmppSession {
             let mut joined = false;
             let mut waiting_pre_alloc = false;
             let mut presence_sent = false;
+            let mut focus_in_room = false;
             let alloc_id = format!("conf_pre_{endpoint_id}");
             let mut pending_jingle_frames: Vec<String> = Vec::new();
 
@@ -517,7 +539,9 @@ impl XmppSession {
                                 is_self_110,
                             } => {
                                 if let Some(occupant) = from.strip_prefix(&conf_muc) {
-                                    if occupant != my_ep && occupant != "focus" {
+                                    if occupant == "focus" {
+                                        focus_in_room = !is_unavailable;
+                                    } else if occupant != my_ep {
                                         if is_unavailable {
                                             occ_track.lock().unwrap().remove(occupant);
                                         } else {
@@ -530,6 +554,19 @@ impl XmppSession {
                                     log::info!(
                                         "[XMPP] Successfully joined MUC room {conference_id} as occupant {endpoint_id}"
                                     );
+                                    if pre_allocate_before_muc && !focus_in_room {
+                                        let post_alloc_id = format!("conf_post_{endpoint_id}");
+                                        let post_alloc_iq = XmppBuilder::conference_allocation(
+                                            conference_id,
+                                            &endpoint_id,
+                                            &post_alloc_id,
+                                        );
+                                        log::info!(
+                                            "[XMPP] Focus not yet in room {conference_id} after MUC join; sending post-join conference allocation..."
+                                        );
+                                        log::info!("[XMPP OUT]: {post_alloc_iq}");
+                                        ws_stream.send(Message::text(post_alloc_iq)).await?;
+                                    }
                                     joined = true;
                                 }
                             }
@@ -658,6 +695,7 @@ impl XmppSession {
 
         let occ_track_bg = occupants.clone();
         let discovered_ice_bg = discovered_ice_servers.clone();
+        let colibri_sink_bg = colibri_sink.clone();
         let domain_owned = domain.to_string();
         let origin_owned = origin.clone();
         let profile_bg = profile.clone();
@@ -771,6 +809,21 @@ impl XmppSession {
                                             );
                                             let mut guard = discovered_ice_bg.lock().unwrap();
                                             *guard = ice_servers;
+                                        }
+                                        InboundXmpp::EndpointMessage(c_msg) => {
+                                            if c_msg.from.as_deref() != Some(my_ep.as_str()) {
+                                                let for_me = match c_msg.to.as_deref() {
+                                                    None | Some("") => true,
+                                                    Some(target) => target == my_ep,
+                                                };
+                                                if for_me {
+                                                    if let Ok(guard) = colibri_sink_bg.lock() {
+                                                        if let Some(ref tx) = *guard {
+                                                            let _ = tx.try_send(c_msg);
+                                                        }
+                                                    }
+                                                }
+                                            }
                                         }
                                         _ => {}
                                     }
@@ -938,12 +991,26 @@ impl XmppSession {
             remote_ip,
             occupants,
             discovered_ice_servers,
+            colibri_sink,
             default_ice_servers: bootstrap.default_ice_servers.clone(),
             active_jingle: Arc::new(Mutex::new(None)),
             write_tx,
             read_rx,
             io_handle,
         })
+    }
+
+    pub fn set_colibri_sink(&self, tx: mpsc::Sender<crate::wrtc::colibri::ColibriMessage>) {
+        if let Ok(mut guard) = self.colibri_sink.lock() {
+            *guard = Some(tx);
+        }
+    }
+
+    pub fn muc_json_sender(&self) -> XmppJsonSender {
+        XmppJsonSender {
+            conference_id: self.conference_id.clone(),
+            write_tx: self.write_tx.clone(),
+        }
     }
 
     pub async fn accept_session(

@@ -444,7 +444,10 @@ pub fn parse_sdp_answer(sdp: &str) -> LocalJingleParams {
                 fingerprint = parts[1].to_string();
             }
         } else if let Some(rest) = line.strip_prefix("a=candidate:") {
-            candidates.push(rest.to_string());
+            let cand_str = rest.to_string();
+            if !candidates.contains(&cand_str) {
+                candidates.push(cand_str);
+            }
         }
     }
 

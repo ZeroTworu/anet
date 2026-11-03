@@ -221,9 +221,11 @@ impl ClientTransport for WrtcTransport {
         }
 
         for candidate in &session.transport.candidates {
-            if let Ok(ip) = candidate.ip.parse::<std::net::IpAddr>() {
-                if !ip.is_loopback() {
-                    bypass_ips.push(ip);
+            if anet_common::wrtc::jingle::is_valid_jvb_candidate_ip(&candidate.ip) {
+                if let Ok(ip) = candidate.ip.parse::<std::net::IpAddr>() {
+                    if !ip.is_loopback() {
+                        bypass_ips.push(ip);
+                    }
                 }
             }
         }
@@ -367,6 +369,25 @@ impl ClientTransport for WrtcTransport {
                             Some(c_mode_str.to_string()),
                         );
                         let _ = peer.send(unicast_discover).await;
+                    }
+                }
+                stanza_opt = xmpp.recv_stanza() => {
+                    if let Some(stanza) = stanza_opt {
+                        for parsed in parse_xmpp_stanzas(&stanza, fallback_ip, fallback_port) {
+                            if let InboundXmpp::Jingle(j_sess) = parsed {
+                                let action = JingleAction::from(j_sess.action.as_str());
+                                if matches!(action, JingleAction::SourceAdd | JingleAction::DescriptionInfo) {
+                                    if wrtc_mode == anet_common::wrtc::colibri::WrtcMode::MediaVideo
+                                        || wrtc_mode == anet_common::wrtc::colibri::WrtcMode::Auto
+                                    {
+                                        for &v_ssrc in &j_sess.video_sources {
+                                            info!("[WRTC Client] Jicofo announced remote video SSRC during discovery: {v_ssrc}");
+                                            peer.add_remote_video_ssrc(v_ssrc).await;
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 msg_opt = peer.recv() => {
