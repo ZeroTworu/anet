@@ -631,6 +631,64 @@ where
 }
 
 impl ImapConn<tokio_boring::SslStream<TcpStream>> {
+    /// Возвращает фактический удаленный IP-адрес открытого TCP-соединения.
+    pub fn peer_ip(&self) -> Option<std::net::IpAddr> {
+        self.stream
+            .get_ref()
+            .get_ref()
+            .peer_addr()
+            .ok()
+            .map(|a| a.ip())
+    }
+
+    /// Устанавливает защищенное IMAPS-соединение напрямую по заранее разрешенному `target_addr` (без повторного DNS-запроса)
+    /// с использованием `host` в качестве TLS SNI и профиля BoringSSL Email Mimicry (KMail / OpenSSL 3.x).
+    /// Исключает рассинхронизацию Round-Robin DNS с `bypass_ips` и зависание DNS внутри TUN при Failover.
+    pub async fn connect_addr(
+        target_addr: std::net::SocketAddr,
+        host: &str,
+        email: &str,
+        password: &str,
+        tls_cfg: &crate::boring_tls::TlsClientConfig,
+        timeout_dur: Duration,
+    ) -> Result<Self> {
+        let tcp = tokio::time::timeout(timeout_dur, TcpStream::connect(target_addr))
+            .await
+            .context("TCP connect timeout to IMAP server")?
+            .with_context(|| {
+                format!("Failed to connect to IMAP TCP socket at {target_addr} ({host})")
+            })?;
+
+        let _ = tcp.set_nodelay(true);
+
+        let tls_stream = tokio::time::timeout(
+            timeout_dur,
+            crate::boring_tls::connect_email_tls_with_config(host, tcp, tls_cfg),
+        )
+        .await
+        .context("TLS handshake timeout to IMAP server")?
+        .with_context(|| {
+            format!("TLS handshake failed with IMAP server {host} ({target_addr})")
+        })?;
+
+        let mut conn = Self::new(tls_stream);
+
+        // Считываем приветственный баннер сервера: "* OK ..."
+        let banner = tokio::time::timeout(timeout_dur, conn.read_line())
+            .await
+            .context("Timeout waiting for IMAP banner")??;
+        log::info!(
+            "[IMAP] Connected to {host} ({target_addr}), banner: {}",
+            banner.trim()
+        );
+
+        // Выполняем LOGIN
+        conn.login(email, password, timeout_dur).await?;
+        log::info!("[IMAP] Logged in successfully as {email}");
+
+        Ok(conn)
+    }
+
     /// Устанавливает защищенное IMAPS-соединение на порт 993 с использованием профиля
     /// BoringSSL Email Mimicry (KMail / OpenSSL 3.x).
     pub async fn connect(

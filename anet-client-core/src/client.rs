@@ -574,19 +574,23 @@ impl AnetClient {
         // ГАРАНТИЯ: если транспорт закрепил конкретный IP CDN (Round-Robin),
         // обязательно добавляем его в обход туннеля, чтобы избежать петли маршрутизации!
         if let Some(pinned_ip) = result.remote_ip {
-            let prefix = if pinned_ip.is_ipv4() { 32 } else { 128 };
-            self.route_manager
-                .add_bypass_route(pinned_ip, prefix)
-                .await?;
-            bypass_ips.push(pinned_ip);
+            if !bypass_ips.contains(&pinned_ip) {
+                let prefix = if pinned_ip.is_ipv4() { 32 } else { 128 };
+                self.route_manager
+                    .add_bypass_route(pinned_ip, prefix)
+                    .await?;
+                bypass_ips.push(pinned_ip);
+            }
         }
 
         for bypass_ip in result.bypass_ips {
-            let prefix = if bypass_ip.is_ipv4() { 32 } else { 128 };
-            self.route_manager
-                .add_bypass_route(bypass_ip, prefix)
-                .await?;
-            bypass_ips.push(bypass_ip);
+            if !bypass_ips.contains(&bypass_ip) {
+                let prefix = if bypass_ip.is_ipv4() { 32 } else { 128 };
+                self.route_manager
+                    .add_bypass_route(bypass_ip, prefix)
+                    .await?;
+                bypass_ips.push(bypass_ip);
+            }
         }
 
         // Гарантируем, что прямые DNS-резолверы для Direct-правил всегда идут в обход туннеля

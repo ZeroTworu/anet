@@ -134,28 +134,42 @@ impl ImapTransport {
         Ok(accounts)
     }
 
-    /// Резолвит хост IMAP-сервера и возвращает основной `SocketAddr` + полный список всех IP для `bypass_ips` (раздел 7.2 п. 1).
-    fn resolve_target_addresses(&self) -> Result<(String, u16, SocketAddr, Vec<IpAddr>)> {
+    /// Резолвит хост IMAP-сервера и возвращает основной `SocketAddr`, список `SocketAddr` и полный список всех IP для `bypass_ips` (раздел 7.2 п. 1).
+    /// Для `imap.mail.ru` гарантированно включает оба балансировочных IPv4-адреса Mail.ru (`94.100.180.90` и `217.69.139.90`),
+    /// чтобы исключить петлю маршрутизации при Round-Robin DNS и работу Failover без обращения к DNS внутри TUN.
+    fn resolve_target_addresses(&self) -> Result<(String, u16, SocketAddr, Vec<SocketAddr>, Vec<IpAddr>)> {
         let (host, port) = self.server.host_port()?;
         let port = if port == 0 { DEFAULT_IMAP_PORT } else { port };
 
-        let addrs: Vec<SocketAddr> = format!("{}:{}", host, port)
+        let mut addrs: Vec<SocketAddr> = format!("{}:{}", host, port)
             .to_socket_addrs()
             .with_context(|| format!("Failed to resolve IMAP host {}:{}", host, port))?
             .collect();
+
+        if host.eq_ignore_ascii_case("imap.mail.ru") {
+            for known_ip in [
+                IpAddr::V4(std::net::Ipv4Addr::new(94, 100, 180, 90)),
+                IpAddr::V4(std::net::Ipv4Addr::new(217, 69, 139, 90)),
+            ] {
+                let sa = SocketAddr::new(known_ip, port);
+                if !addrs.contains(&sa) {
+                    addrs.push(sa);
+                }
+            }
+        }
 
         let primary = *addrs
             .first()
             .ok_or_else(|| anyhow!("No IP addresses found for {}:{}", host, port))?;
 
         let mut bypass_ips = Vec::with_capacity(addrs.len());
-        for a in addrs {
+        for a in &addrs {
             if !bypass_ips.contains(&a.ip()) {
                 bypass_ips.push(a.ip());
             }
         }
 
-        Ok((host, port, primary, bypass_ips))
+        Ok((host, port, primary, addrs, bypass_ips))
     }
 }
 
@@ -231,9 +245,36 @@ impl AuthChannel for ImapAuthChannel {
     }
 }
 
+/// Подключает одно IMAP-соединение напрямую по заранее разрешенным адресам `target_addrs` (с фолбэком по списку IP)
+async fn connect_imap_with_addrs(
+    target_addrs: &[SocketAddr],
+    host: &str,
+    port: u16,
+    email: &str,
+    password: &str,
+    tls_cfg: &anet_common::boring_tls::TlsClientConfig,
+    command_timeout: Duration,
+) -> Result<ImapConn> {
+    let mut last_err = None;
+    for &addr in target_addrs {
+        match ImapConn::connect_addr(addr, host, email, password, tls_cfg, command_timeout).await {
+            Ok(conn) => return Ok(conn),
+            Err(e) => {
+                last_err = Some(e);
+            }
+        }
+    }
+    if let Some(e) = last_err {
+        Err(e)
+    } else {
+        ImapConn::connect(host, port, email, password, tls_cfg, command_timeout).await
+    }
+}
+
 /// Устанавливает пару соединений `CLI_WRITER` + `CLI_READER` (Cross-Selected на папку `"Notes"`)
 /// и выполняет ASTP-рукопожатие (с поддержкой `resume_session_id` при бесшовном Failover ящика).
 async fn establish_mailbox_session(
+    target_addrs: &[SocketAddr],
     host: &str,
     port: u16,
     account: &ImapAccount,
@@ -252,8 +293,9 @@ async fn establish_mailbox_session(
     anet_common::protocol::AuthResponse,
     [u8; 32],
 )> {
-    // 1. Подключаем CLI_WRITER (Архитектура Cross-Selected: делает SELECT "Notes" один раз!)
-    let mut cli_writer = ImapConn::connect(
+    // 1. Подключаем CLI_WRITER напрямую по заранее разрешенному SocketAddr (Архитектура Cross-Selected: делает SELECT "Notes" один раз!)
+    let mut cli_writer = connect_imap_with_addrs(
+        target_addrs,
         host,
         port,
         &account.email,
@@ -269,8 +311,15 @@ async fn establish_mailbox_session(
         .await
         .with_context(|| format!("CLI_WRITER failed to SELECT 'Notes' for {}", account.email))?;
 
-    // 2. Подключаем CLI_READER (делает SELECT "Notes" и замеряет baseline max_uid через UID FETCH * (UID))
-    let mut cli_reader = ImapConn::connect(
+    // 2. Подключаем CLI_READER на тот же/разрешенный IP (делает SELECT "Notes" и замеряет baseline max_uid через UID FETCH * (UID))
+    let writer_addrs: Vec<SocketAddr> = if let Some(ip) = cli_writer.peer_ip() {
+        vec![SocketAddr::new(ip, port)]
+    } else {
+        target_addrs.to_vec()
+    };
+
+    let mut cli_reader = connect_imap_with_addrs(
+        &writer_addrs,
         host,
         port,
         &account.email,
@@ -318,7 +367,8 @@ async fn establish_mailbox_session(
 impl ClientTransport for ImapTransport {
     async fn connect(&self) -> Result<ConnectionResult> {
         let accounts = self.parse_accounts()?;
-        let (host, port, target_addr, bypass_ips) = self.resolve_target_addresses()?;
+        let (host, port, target_addr, target_addrs, mut bypass_ips) =
+            self.resolve_target_addresses()?;
 
         let tls_cfg = self.server.effective_tls_config(&self.config.stealth);
         let command_timeout = Duration::from_millis(self.config.imap.command_timeout_ms.max(5000));
@@ -366,6 +416,7 @@ impl ClientTransport for ImapTransport {
                 acc.email
             );
             match establish_mailbox_session(
+                &target_addrs,
                 &host,
                 port,
                 acc,
@@ -403,6 +454,16 @@ impl ClientTransport for ImapTransport {
                     }))
                 }
             };
+
+        let pinned_ip = cli_writer.peer_ip().unwrap_or(target_addr.ip());
+        if !bypass_ips.contains(&pinned_ip) {
+            bypass_ips.push(pinned_ip);
+        }
+        if let Some(r_ip) = cli_reader.peer_ip() {
+            if !bypass_ips.contains(&r_ip) {
+                bypass_ips.push(r_ip);
+            }
+        }
 
         let session_id = auth_response.session_id.clone();
         info!(
@@ -478,6 +539,7 @@ impl ClientTransport for ImapTransport {
         let inflight_sup = inflight_count.clone();
         let session_state_sup = session_state.clone();
         let accounts_sup = accounts.clone();
+        let target_addrs_sup = target_addrs.clone();
         let host_sup = host.clone();
         let tls_cfg_sup = tls_cfg.clone();
         let srv_id_sup = srv_id.clone();
@@ -520,6 +582,7 @@ impl ClientTransport for ImapTransport {
                     );
 
                     match establish_mailbox_session(
+                        &target_addrs_sup,
                         &host_sup,
                         port,
                         next_acc,
@@ -876,7 +939,7 @@ impl ClientTransport for ImapTransport {
             endpoint: None,
             connection: None,
             health_pause: None,
-            remote_ip: Some(target_addr.ip()),
+            remote_ip: Some(pinned_ip),
             bypass_ips,
             effective_mode: Some("IMAP".to_string()),
             shutdown_hook: Some(shutdown_hook),
