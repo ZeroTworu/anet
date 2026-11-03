@@ -292,7 +292,7 @@ impl JingleSession {
             for &extra_ssrc in self.video_sources.iter().skip(1) {
                 if extra_ssrc != 0
                     && extra_ssrc != primary_video_ssrc
-                    && extra_ssrc != local_video_ssrc
+                    && extra_ssrc != _video_ssrc
                 {
                     sdp = append_remote_video_ssrc_to_sdp(&sdp, extra_ssrc, self.video_payload_type);
                 }
