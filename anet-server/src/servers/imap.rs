@@ -19,7 +19,6 @@ use crate::auth_handler::ServerAuthHandler;
 use crate::client_registry::{ClientRegistry, ClientTransportInfo};
 use crate::config::Config;
 use anet_common::batcher::{unpack_batch, PacketBatcher};
-use anet_common::consts::CHANNEL_BUFFER_SIZE;
 use anet_common::imap_conn::ImapConn;
 use anet_common::transport::{unwrap_packet, wrap_packet_slice};
 use anyhow::{anyhow, Context, Result};
@@ -30,13 +29,20 @@ use log::{debug, info, warn};
 use sha2::{Digest, Sha256};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::{mpsc, Mutex, Notify};
 
 const DEFAULT_IMAP_PORT: u16 = 993;
-const MAX_INFLIGHT_DOWNLINK: usize = 15;
+
+#[inline]
+fn now_epoch_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
 
 #[derive(Debug, Clone)]
 pub struct ImapAccount {
@@ -167,10 +173,13 @@ pub async fn run_imap_server(
 
     let (host, port, accounts) = parse_imap_server_dsn(imap_dsn)?;
     info!(
-        "[IMAP Server] Initializing IMAP Transport on {}:{} with {} mailbox(es)...",
+        "[IMAP Server] Initializing IMAP Transport on {}:{} with {} mailbox(es) (Batch: {} KB, ActiveIDLE: {} ms, ExpungeBatch: {})...",
         host,
         port,
-        accounts.len()
+        accounts.len(),
+        config.imap.max_batch_kb.clamp(8, 512),
+        config.imap.idle_active_poll_ms.clamp(150, 5000),
+        config.imap.expunge_batch_size.clamp(5, 200)
     );
 
     let sk_bytes = BASE64_STANDARD.decode(&config.crypto.server_signing_key)?;
@@ -256,7 +265,14 @@ async fn run_mailbox_worker_pair(
 ) {
     let email = account.email.clone();
     let command_timeout = Duration::from_millis(config.imap.command_timeout_ms.max(5000));
-    let idle_timeout = Duration::from_millis(config.imap.idle_refresh_interval_ms.max(10000));
+    let idle_quiet_timeout = Duration::from_millis(config.imap.idle_refresh_interval_ms.max(2000));
+    let idle_active_timeout = Duration::from_millis(config.imap.idle_active_poll_ms.clamp(150, 5000));
+    let idle_active_window_ms = config.imap.idle_active_window_ms.clamp(1000, 60_000);
+    let expunge_batch_size = config.imap.expunge_batch_size.clamp(5, 200);
+    let expunge_idle_delay = Duration::from_millis(config.imap.expunge_idle_delay_ms.clamp(250, 30_000));
+    let max_inflight_batches = config.imap.max_inflight_batches.clamp(5, 250);
+    let tx_queue_capacity = config.imap.tx_queue_capacity.clamp(32, 2048);
+    let literal_plus_auto = config.imap.literal_plus_auto;
     let throttle_backoff = Duration::from_millis(config.imap.throttle_backoff_ms.max(5000));
     let tls_cfg = config.stealth.to_tls_client_config();
 
@@ -274,6 +290,8 @@ async fn run_mailbox_worker_pair(
         let cleanup_uids: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
         let inflight_downlink = Arc::new(AtomicUsize::new(0));
         let stop_flag = Arc::new(AtomicBool::new(false));
+        let last_activity_ms = Arc::new(AtomicU64::new(now_epoch_ms()));
+        let reader_wake_notify = Arc::new(Notify::new());
 
         // 1. Подключаем SRV_READER (Архитектура Cross-Selected: делает SELECT "Drafts"!)
         let reader_conn_res = ImapConn::connect(
@@ -287,7 +305,10 @@ async fn run_mailbox_worker_pair(
         .await;
 
         let mut srv_reader = match reader_conn_res {
-            Ok(conn) => conn,
+            Ok(mut conn) => {
+                conn.set_literal_plus_enabled(literal_plus_auto);
+                conn
+            }
             Err(e) => {
                 warn!(
                     "[IMAP Server] SRV_READER connect failed for {}: {e:#}. Backing off {:?}...",
@@ -325,7 +346,10 @@ async fn run_mailbox_worker_pair(
         .await;
 
         let mut srv_writer = match writer_conn_res {
-            Ok(conn) => conn,
+            Ok(mut conn) => {
+                conn.set_literal_plus_enabled(literal_plus_auto);
+                conn
+            }
             Err(e) => {
                 warn!(
                     "[IMAP Server] SRV_WRITER connect failed for {}: {e:#}. Backing off {:?}...",
@@ -351,25 +375,34 @@ async fn run_mailbox_worker_pair(
 
         let writer_mutex = Arc::new(Mutex::new(srv_writer));
 
-        // 3. Запуск SRV_WRITER (Downlink APPEND "Notes" + Неблокирующий UID EXPUNGE в "Drafts")
+        // 3. Запуск SRV_WRITER (Downlink APPEND "Notes" + Ленивый пакетный UID EXPUNGE в "Drafts")
         let writer_for_task = writer_mutex.clone();
         let email_writer = email.clone();
         let cleanup_uids_writer = cleanup_uids.clone();
         let inflight_writer = inflight_downlink.clone();
         let stop_flag_writer = stop_flag.clone();
+        let last_activity_writer = last_activity_ms.clone();
+        let reader_wake_writer = reader_wake_notify.clone();
 
         let writer_task = tokio::spawn(async move {
-            info!("[IMAP Server] SRV_WRITER loop active for {}", email_writer);
+            let mut last_tx_instant = Instant::now();
+            info!(
+                "[IMAP Server] SRV_WRITER loop active for {} (Expunge batch: {}, idle delay: {:?})",
+                email_writer, expunge_batch_size, expunge_idle_delay
+            );
 
             while !stop_flag_writer.load(Ordering::Relaxed) {
-                // Шаг 1: Неблокирующая сборка мусора в текущей выбранной папке "Drafts"
-                // ВСЕГДА выполняется перед проверкой Backpressure, чтобы исключить Deadlock!
+                // Шаг 1: Ленивая пакетная сборка мусора в текущей выбранной папке "Drafts"
+                // Выполняется только при накоплении >= expunge_batch_size писем, достижении max_inflight_batches,
+                // ИЛИ после паузы трафика >= expunge_idle_delay (1500 мс)!
                 let to_clean = {
                     let mut guard = cleanup_uids_writer.lock().await;
-                    let force_clean = guard.len() >= 20
-                        || inflight_writer.load(Ordering::Relaxed) >= MAX_INFLIGHT_DOWNLINK;
-                    let idle_clean =
-                        notes_auth_rx.is_empty() && notes_data_rx.is_empty() && !guard.is_empty();
+                    let force_clean = guard.len() >= expunge_batch_size
+                        || inflight_writer.load(Ordering::Relaxed) >= max_inflight_batches;
+                    let idle_clean = notes_auth_rx.is_empty()
+                        && notes_data_rx.is_empty()
+                        && !guard.is_empty()
+                        && last_tx_instant.elapsed() >= expunge_idle_delay;
                     if force_clean || idle_clean {
                         let list = guard.clone();
                         guard.clear();
@@ -400,8 +433,8 @@ async fn run_mailbox_worker_pair(
                 }
 
                 // Шаг 2: Управление переполнением (Backpressure раздел 3.7):
-                if inflight_writer.load(Ordering::Relaxed) >= MAX_INFLIGHT_DOWNLINK {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
+                if inflight_writer.load(Ordering::Relaxed) >= max_inflight_batches {
+                    tokio::time::sleep(Duration::from_millis(40)).await;
                     let cur = inflight_writer.load(Ordering::Relaxed);
                     if cur > 0 {
                         inflight_writer.fetch_sub(1, Ordering::Relaxed);
@@ -413,7 +446,7 @@ async fn run_mailbox_worker_pair(
                     biased;
                     auth_msg = notes_auth_rx.recv() => auth_msg,
                     data_msg = notes_data_rx.recv() => data_msg,
-                    _ = tokio::time::sleep(Duration::from_millis(20)) => None,
+                    _ = tokio::time::sleep(Duration::from_millis(40)) => None,
                 };
 
                 if let Some(msg) = msg_opt {
@@ -431,6 +464,9 @@ async fn run_mailbox_worker_pair(
 
                     match append_res {
                         Ok(lat) => {
+                            last_tx_instant = Instant::now();
+                            last_activity_writer.store(now_epoch_ms(), Ordering::Relaxed);
+                            reader_wake_writer.notify_one();
                             debug!(
                                 "[IMAP Downlink] APPEND Notes OK in {:.1} ms ({} B)",
                                 lat.as_secs_f64() * 1000.0,
@@ -450,33 +486,61 @@ async fn run_mailbox_worker_pair(
             }
         });
 
-        // 4. Запуск SRV_READER (IDLE / FETCH "Drafts" -> Fast Path & Auth Plane)
+        // 4. Запуск SRV_READER (Adaptive Short-IDLE + Greedy Fetch Drain "Drafts" -> Fast Path & Auth Plane)
         let mut last_seen_uid = initial_max_uid;
+        let mut force_immediate_fetch = false;
         let reader_email = email.clone();
-        info!("[IMAP Server] SRV_READER loop active for {}", reader_email);
+        info!(
+            "[IMAP Server] SRV_READER loop active for {} (Active IDLE: {:?}, Quiet IDLE: {:?})",
+            reader_email, idle_active_timeout, idle_quiet_timeout
+        );
 
         while !stop_flag.load(Ordering::Relaxed) {
-            // Шаг 1: Активное ожидание через IDLE (или мгновенный пропуск, если pending_exists == true)
-            if let Err(e) = srv_reader.wait_idle_or_pending(idle_timeout).await {
-                warn!(
-                    "[IMAP Server] SRV_READER wait_idle_or_pending error for {}: {e:#}",
-                    reader_email
-                );
-                break;
+            // Шаг 1: Адаптивное ожидание через IDLE (или мгновенный пропуск при Greedy Drain / pending_exists)
+            if !force_immediate_fetch {
+                let since_active_ms =
+                    now_epoch_ms().saturating_sub(last_activity_ms.load(Ordering::Relaxed));
+                let is_active = since_active_ms <= idle_active_window_ms;
+                let cur_idle_timeout = if is_active {
+                    idle_active_timeout
+                } else {
+                    idle_quiet_timeout
+                };
+                let wake_opt = if is_active {
+                    None
+                } else {
+                    Some(reader_wake_notify.as_ref())
+                };
+
+                if let Err(e) = srv_reader.wait_idle_or_wake(cur_idle_timeout, wake_opt).await {
+                    warn!(
+                        "[IMAP Server] SRV_READER wait_idle_or_wake error for {}: {e:#}",
+                        reader_email
+                    );
+                    break;
+                }
             }
+            force_immediate_fetch = false;
 
             if stop_flag.load(Ordering::Relaxed) {
                 break;
             }
 
-            // Шаг 2: Выборка новых сообщений из папки "Drafts"
+            // Шаг 2: Выборка новых сообщений из папки "Drafts" (Greedy Fetch Drain)
             let fetch_res = srv_reader
                 .fetch_messages_robust(last_seen_uid, command_timeout)
                 .await;
+            if srv_reader.pending_exists {
+                srv_reader.pending_exists = false;
+                force_immediate_fetch = true;
+            }
 
             match fetch_res {
                 Ok(res) => {
                     last_seen_uid = res.new_max_uid;
+                    if !res.messages.is_empty() {
+                        last_activity_ms.store(now_epoch_ms(), Ordering::Relaxed);
+                    }
 
                     for msg in res.messages {
                         let Some((msg_srv_id, cli_token)) = extract_srv_and_cli_token(&msg.subject)
@@ -538,7 +602,19 @@ async fn run_mailbox_worker_pair(
                                     }
 
                                     let pkt_len = pkt.len();
-                                    if tun_tx.try_send(pkt).is_ok() {
+                                    let sent_ok = match tun_tx.try_send(pkt) {
+                                        Ok(()) => true,
+                                        Err(mpsc::error::TrySendError::Full(deferred_pkt)) => {
+                                            tokio::time::timeout(
+                                                Duration::from_millis(150),
+                                                tun_tx.send(deferred_pkt),
+                                            )
+                                            .await
+                                            .is_ok_and(|r| r.is_ok())
+                                        }
+                                        Err(mpsc::error::TrySendError::Closed(_)) => false,
+                                    };
+                                    if sent_ok {
                                         registry.record_rx(&client_info, pkt_len, "imap");
                                     }
                                 }
@@ -562,7 +638,7 @@ async fn run_mailbox_worker_pair(
                                     );
 
                                     let (tx_router, rx_router) =
-                                        mpsc::channel::<Bytes>(CHANNEL_BUFFER_SIZE);
+                                        mpsc::channel::<Bytes>(tx_queue_capacity);
                                     registry.finalize_client(&assigned_ip, tx_router);
 
                                     info!(
@@ -575,8 +651,8 @@ async fn run_mailbox_worker_pair(
                                     let writer_tx = notes_data_tx.clone();
                                     let c_info = client_info.clone();
                                     let max_batch_bytes =
-                                        (config.imap.max_batch_kb.clamp(8, 128)) * 1024;
-                                    let coalesce_ms = config.imap.batch_coalesce_ms.clamp(5, 50);
+                                        (config.imap.max_batch_kb.clamp(8, 512)) * 1024;
+                                    let coalesce_ms = config.imap.batch_coalesce_ms.clamp(5, 100);
                                     let stop_flag_client = stop_flag.clone();
 
                                     tokio::spawn(async move {
@@ -642,7 +718,7 @@ async fn run_mailbox_worker_pair(
 /// 1. Ждет первый пакет из `rx_router`;
 /// 2. Дожидается освобождения слота `SRV_WRITER` (`notes_data_tx.reserve().await`);
 /// 3. Выгребает ВСЕ накопившиеся за время предыдущего `APPEND` (~450 мс) пакеты из `rx_router`
-///    до `max_batch_bytes = 32 КБ`;
+///    до `max_batch_bytes` (включая крупные батчи 128..512 КБ, приоритезируя ICMP/DNS/ACK в начало батча);
 /// 4. Шифрует весь буфер одним вызовом `wrap_packet_slice` и передает в `SRV_WRITER`.
 async fn run_client_downlink_batcher(
     mut rx_router: mpsc::Receiver<Bytes>,

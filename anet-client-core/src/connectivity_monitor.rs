@@ -156,6 +156,7 @@ impl NodeProbeMonitor {
                         "http" | "ws" => 80,
                         "ssh" => 22,
                         "vnc" => 5900,
+                        "imap" | "imaps" => 993,
                         _ => 443,
                     });
                     out.push((host.to_string(), port));
@@ -514,15 +515,27 @@ impl ConnectivityMonitor {
             }
 
             let vpn_on = self.vpn_connected.load(Ordering::Relaxed);
-            let prober = ConnectivityProber::new(cfg.clone());
-
             let tunnel_rtt = if vpn_on {
                 self.current_tunnel_rtt()
             } else {
                 None
             };
 
-            let outer_timeout = Duration::from_millis(cfg.timeout_ms.clamp(1000, 4500) * 2 + 2500);
+            let is_high_latency_tunnel = vpn_on && tunnel_rtt.is_some_and(|rtt| rtt >= 600);
+            let mut effective_cfg = cfg.clone();
+            if let Some(rtt) = tunnel_rtt {
+                if is_high_latency_tunnel {
+                    effective_cfg.timeout_ms =
+                        effective_cfg.timeout_ms.max((rtt * 4).clamp(6000, 12000));
+                }
+            }
+            let prober = ConnectivityProber::new(effective_cfg.clone());
+
+            let outer_timeout = if is_high_latency_tunnel {
+                Duration::from_millis(effective_cfg.timeout_ms * 2 + 3000)
+            } else {
+                Duration::from_millis(cfg.timeout_ms.clamp(1000, 4500) * 2 + 2500)
+            };
             let snapshot = tokio::select! {
                 res = tokio::time::timeout(outer_timeout, prober.probe_once(vpn_on, tunnel_rtt)) => {
                     match res {
@@ -579,7 +592,12 @@ impl ConnectivityMonitor {
             }
             emit(AnetEvent::ConnectivityUpdated(final_snapshot));
 
-            let interval_secs = cfg.probe_interval_secs.clamp(2, 60);
+            let base_interval = cfg.probe_interval_secs.clamp(2, 60);
+            let interval_secs = if vpn_now && tunnel_rtt_now.is_some_and(|rtt| rtt >= 600) {
+                base_interval.max(45)
+            } else {
+                base_interval
+            };
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs(interval_secs)) => {}
                 _ = self.wake_notify.notified() => {}

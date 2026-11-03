@@ -157,8 +157,15 @@ impl Default for TransportConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct ImapConfig {
-    /// Интервал перевхода в IDLE (keepalive) для проверки живости соединения (мс).
+    /// Интервал перевхода в IDLE (keepalive) в состоянии покоя (мс).
     pub idle_refresh_interval_ms: u64,
+
+    /// Короткий интервал ожидания IDLE во время активного обмена трафиком (мс).
+    /// Устраняет 5–10 секундные провалы скорости при попадании уведомления EXISTS в «Слепое окно».
+    pub idle_active_poll_ms: u64,
+
+    /// Время удержания быстрого режима опроса после последнего переданного/принятого пакета (мс).
+    pub idle_active_window_ms: u64,
 
     /// Таймаут ожидания ответа на команду IMAP (APPEND, FETCH, DONE) (мс).
     pub command_timeout_ms: u64,
@@ -166,8 +173,23 @@ pub struct ImapConfig {
     /// Максимальная задержка накопления микро-батча перед первым APPEND (мс).
     pub batch_coalesce_ms: u64,
 
-    /// Максимальный размер одного зашифрованного пакета-черновика (КБ).
+    /// Максимальный размер одного зашифрованного пакета-черновика (КБ, до 512 КБ без переполнения u16).
     pub max_batch_kb: usize,
+
+    /// Порог количества прочитанных писем для принудительного пакетного удаления (UID STORE + UID EXPUNGE).
+    pub expunge_batch_size: usize,
+
+    /// Пауза отсутствия исходящего трафика перед ленивой очисткой прочитанных писем (мс).
+    pub expunge_idle_delay_ms: u64,
+
+    /// Максимальное окно неподтвержденных батчей до срабатывания Backpressure.
+    pub max_inflight_batches: usize,
+
+    /// Емкость очереди bulk-пакетов из TUN (защита от Bufferbloat).
+    pub tx_queue_capacity: usize,
+
+    /// Автоматическое определение и использование расширения LITERAL+ (1-RTT APPEND) при подключении.
+    pub literal_plus_auto: bool,
 
     /// Таймаут переподключения при получении THROTTLED/OVERQUOTA (мс).
     pub throttle_backoff_ms: u64,
@@ -176,10 +198,17 @@ pub struct ImapConfig {
 impl Default for ImapConfig {
     fn default() -> Self {
         Self {
-            idle_refresh_interval_ms: 120_000,
+            idle_refresh_interval_ms: 10_000,
+            idle_active_poll_ms: 400,
+            idle_active_window_ms: 5_000,
             command_timeout_ms: 15_000,
             batch_coalesce_ms: 15,
-            max_batch_kb: 32,
+            max_batch_kb: 128,
+            expunge_batch_size: 25,
+            expunge_idle_delay_ms: 1_500,
+            max_inflight_batches: 35,
+            tx_queue_capacity: 256,
+            literal_plus_auto: true,
             throttle_backoff_ms: 30_000,
         }
     }

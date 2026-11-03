@@ -179,6 +179,24 @@ pub fn parse_rfc822_message(raw_bytes: &[u8]) -> Result<(String, Bytes)> {
     Ok((subject, Bytes::from(decoded)))
 }
 
+/// Проверяет наличие токенов `LITERAL+` и `LITERAL-` в строке ответа `CAPABILITY`.
+pub fn parse_capability_flags(line: &str) -> (bool, bool) {
+    let upper = line.to_ascii_uppercase();
+    if !upper.contains("CAPABILITY") {
+        return (false, false);
+    }
+    let mut lit_plus = false;
+    let mut lit_minus = false;
+    for raw_tok in upper.split(|c: char| c.is_ascii_whitespace() || c == '[' || c == ']') {
+        if raw_tok == "LITERAL+" {
+            lit_plus = true;
+        } else if raw_tok == "LITERAL-" {
+            lit_minus = true;
+        }
+    }
+    (lit_plus, lit_minus)
+}
+
 /// Асинхронное IMAP-соединение напрямую поверх `tokio::io::BufReader<S>` (раздел 3.1 / 7.1 спецификации).
 pub struct ImapConn<S = tokio_boring::SslStream<TcpStream>> {
     stream: BufReader<S>,
@@ -187,6 +205,13 @@ pub struct ImapConn<S = tokio_boring::SslStream<TcpStream>> {
     pub pending_exists: bool,
     /// Находится ли соединение в состоянии IMAP IDLE в данный момент.
     pub in_idle: bool,
+    /// Обнаружена ли поддержка RFC 2088 / 7888 `LITERAL+` у сервера.
+    pub supports_literal_plus: bool,
+    /// Обнаружена ли поддержка RFC 7888 `LITERAL-` (несессионные литералы <= 4096 байт).
+    pub supports_literal_minus: bool,
+    /// Разрешено ли использование `LITERAL+` / `LITERAL-` конфигурацией (`literal_plus_auto`).
+    pub use_literal_plus: bool,
+    capabilities_received: bool,
     idle_tag: String,
     line_buf: String,
 }
@@ -201,9 +226,17 @@ where
             tag_counter: 0,
             pending_exists: false,
             in_idle: false,
+            supports_literal_plus: false,
+            supports_literal_minus: false,
+            use_literal_plus: true,
+            capabilities_received: false,
             idle_tag: String::new(),
             line_buf: String::with_capacity(1024),
         }
+    }
+
+    pub fn set_literal_plus_enabled(&mut self, enabled: bool) {
+        self.use_literal_plus = enabled;
     }
 
     pub fn next_tag(&mut self) -> String {
@@ -220,7 +253,7 @@ where
         Ok(())
     }
 
-    /// Считывает одну строку ответа от IMAP-сервера с автоматической фиксацией `* <N> EXISTS`.
+    /// Считывает одну строку ответа от IMAP-сервера с автоматической фиксацией `* <N> EXISTS` и `CAPABILITY`.
     pub async fn read_line(&mut self) -> Result<String> {
         self.line_buf.clear();
         let bytes_read = self.stream.read_line(&mut self.line_buf).await?;
@@ -231,6 +264,16 @@ where
         let line = self.line_buf.clone();
         if is_exists_line(&line) {
             self.pending_exists = true;
+        }
+        if line.contains("CAPABILITY") || line.contains("capability") {
+            let (lp, lm) = parse_capability_flags(&line);
+            if lp {
+                self.supports_literal_plus = true;
+            }
+            if lm {
+                self.supports_literal_minus = true;
+            }
+            self.capabilities_received = true;
         }
 
         Ok(line)
@@ -267,6 +310,8 @@ where
 
     /// Выполняет команду LOGIN.
     pub async fn login(&mut self, email: &str, pass: &str, timeout_dur: Duration) -> Result<()> {
+        // Сбрасываем pre-auth флаг, чтобы проверить post-login CAPABILITY
+        self.capabilities_received = false;
         let tag = self.next_tag();
         self.send_line(&format!("{tag} LOGIN \"{email}\" \"{pass}\"")).await?;
         let resp = self.read_until_tagged(&tag, timeout_dur).await?;
@@ -274,6 +319,17 @@ where
         let last_line = resp.last().ok_or_else(|| anyhow!("Empty LOGIN response"))?;
         if !last_line.starts_with(&format!("{tag} OK")) {
             return Err(anyhow!("IMAP LOGIN failed: {}", last_line.trim()));
+        }
+        Ok(())
+    }
+
+    /// Запрашивает `CAPABILITY` у сервера после `LOGIN` (если сервер не прислал их автоматически в `OK [CAPABILITY ...]`),
+    /// чтобы определить поддержку `LITERAL+` / `LITERAL-`.
+    pub async fn detect_capabilities(&mut self, timeout_dur: Duration) -> Result<()> {
+        if !self.capabilities_received {
+            let tag = self.next_tag();
+            self.send_line(&format!("{tag} CAPABILITY")).await?;
+            let _ = self.read_until_tagged(&tag, timeout_dur).await?;
         }
         Ok(())
     }
@@ -308,7 +364,10 @@ where
         Ok(max_uid)
     }
 
-    /// Отправляет сообщение в указанную папку через 2-шаговый APPEND с флагами `(\Seen \Draft)`.
+    /// Отправляет сообщение в указанную папку через APPEND с флагами `(\Seen \Draft)`:
+    /// - Если сервер поддерживает `LITERAL+` (или `LITERAL-` при `msg_len <= 4096`) и `use_literal_plus == true`,
+    ///   отправляет команду `{size+}\r\n` и тело письма в одном буфере за **1 RTT** без ожидания `+`;
+    /// - В противном случае выполняет классический 2-шаговый `APPEND` с ожиданием `+`.
     pub async fn append_message(
         &mut self,
         folder: &str,
@@ -350,41 +409,55 @@ where
         let msg_len = msg_raw.len();
         let tag = self.next_tag();
 
-        // Шаг 1: отправляем заголовок APPEND с размером литерала
-        self.send_line(&format!("{tag} APPEND \"{folder}\" (\\Seen \\Draft) {{{msg_len}}}")).await?;
+        let can_non_sync_literal = self.use_literal_plus
+            && (self.supports_literal_plus || (self.supports_literal_minus && msg_len <= 4096));
 
-        // Ожидаем строку продолжения '+' от сервера
-        let deadline = Instant::now() + timeout_dur;
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(anyhow!("Timeout waiting for '+' continuation prompt in APPEND"));
-            }
-
-            let line = tokio::time::timeout(remaining, self.read_line())
-                .await
-                .context("Timeout reading APPEND prompt line")??;
-
-            if line.starts_with('+') {
-                break;
-            }
-            if line.starts_with(&format!("{tag} NO")) || line.starts_with(&format!("{tag} BAD")) {
-                if line.contains("THROTTLED") {
-                    return Err(anyhow!("IMAP APPEND rejected: THROTTLED rate-limit hit"));
-                }
-                if line.contains("OVERQUOTA") {
-                    return Err(anyhow!("IMAP APPEND rejected: OVERQUOTA storage limit hit"));
-                }
-                return Err(anyhow!("IMAP APPEND step 1 rejected: {}", line.trim()));
-            }
-        }
-
-        // Шаг 2: передаем тело литерала + \r\n
-        {
+        if can_non_sync_literal {
+            // 1-RTT Non-Synchronizing Literal (RFC 2088 / RFC 7888):
+            // отправляем заголовок команды с `{msg_len+}` и тело письма одним TCP/TLS-буфером
+            let cmd_header = format!("{tag} APPEND \"{folder}\" (\\Seen \\Draft) {{{msg_len}+}}\r\n");
             let inner = self.stream.get_mut();
+            inner.write_all(cmd_header.as_bytes()).await?;
             inner.write_all(msg_raw.as_bytes()).await?;
             inner.write_all(b"\r\n").await?;
             inner.flush().await?;
+        } else {
+            // Классический 2-шаговый APPEND с синхронизирующим литералом
+            self.send_line(&format!("{tag} APPEND \"{folder}\" (\\Seen \\Draft) {{{msg_len}}}")).await?;
+
+            // Ожидаем строку продолжения '+' от сервера
+            let deadline = Instant::now() + timeout_dur;
+            loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(anyhow!("Timeout waiting for '+' continuation prompt in APPEND"));
+                }
+
+                let line = tokio::time::timeout(remaining, self.read_line())
+                    .await
+                    .context("Timeout reading APPEND prompt line")??;
+
+                if line.starts_with('+') {
+                    break;
+                }
+                if line.starts_with(&format!("{tag} NO")) || line.starts_with(&format!("{tag} BAD")) {
+                    if line.contains("THROTTLED") {
+                        return Err(anyhow!("IMAP APPEND rejected: THROTTLED rate-limit hit"));
+                    }
+                    if line.contains("OVERQUOTA") {
+                        return Err(anyhow!("IMAP APPEND rejected: OVERQUOTA storage limit hit"));
+                    }
+                    return Err(anyhow!("IMAP APPEND step 1 rejected: {}", line.trim()));
+                }
+            }
+
+            // Шаг 2: передаем тело литерала + \r\n
+            {
+                let inner = self.stream.get_mut();
+                inner.write_all(msg_raw.as_bytes()).await?;
+                inner.write_all(b"\r\n").await?;
+                inner.flush().await?;
+            }
         }
 
         let resp = self.read_until_tagged(&tag, timeout_dur).await?;
@@ -444,10 +517,13 @@ where
     }
 
     /// Активное ожидание новых писем в IDLE с проверкой `pending_exists` ДО входа в IDLE
-    /// и СРАЗУ ПОСЛЕ выхода из IDLE (раздел 3.1 и раздел 8 п. 3 спецификации).
-    /// Если `pending_exists` уже взведён (событие пришло во время FETCH), мгновенно возвращает `true`
-    /// без входа в IDLE, экономя ~250 мс задержки!
-    pub async fn wait_idle_or_pending(&mut self, timeout_dur: Duration) -> Result<bool> {
+    /// и СРАЗУ ПОСЛЕ выхода из IDLE (раздел 3.1 и раздел 8 п. 3 спецификации),
+    /// а также с опциональным сигналом раннего пробуждения `wake_notify` (например, при отправке Uplink-пакета).
+    pub async fn wait_idle_or_wake(
+        &mut self,
+        timeout_dur: Duration,
+        wake_notify: Option<&tokio::sync::Notify>,
+    ) -> Result<bool> {
         // 1. Проверяем флаг «Слепого окна» ДО входа в IDLE
         if self.pending_exists {
             self.pending_exists = false;
@@ -473,20 +549,48 @@ where
                 break;
             }
 
-            match tokio::time::timeout(remaining.min(Duration::from_secs(5)), self.read_line()).await {
-                Ok(Ok(line)) => {
-                    if is_exists_line(&line) {
-                        self.pending_exists = false;
-                        got_event = true;
+            let step_wait = remaining.min(Duration::from_secs(5));
+            if let Some(notify) = wake_notify {
+                tokio::select! {
+                    biased;
+                    res = tokio::time::timeout(step_wait, self.read_line()) => {
+                        match res {
+                            Ok(Ok(line)) => {
+                                if is_exists_line(&line) {
+                                    self.pending_exists = false;
+                                    got_event = true;
+                                    break;
+                                }
+                            }
+                            Ok(Err(e)) => {
+                                self.in_idle = false;
+                                return Err(e);
+                            }
+                            Err(_) => continue,
+                        }
+                    }
+                    _ = notify.notified() => {
+                        // Локальный Writer отправил пакет во время долгого IDLE — просыпаемся,
+                        // чтобы переключиться на короткий адаптивный цикл опроса!
                         break;
                     }
                 }
-                Ok(Err(e)) => {
-                    self.in_idle = false;
-                    return Err(e);
-                }
-                Err(_) => {
-                    continue;
+            } else {
+                match tokio::time::timeout(step_wait, self.read_line()).await {
+                    Ok(Ok(line)) => {
+                        if is_exists_line(&line) {
+                            self.pending_exists = false;
+                            got_event = true;
+                            break;
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        self.in_idle = false;
+                        return Err(e);
+                    }
+                    Err(_) => {
+                        continue;
+                    }
                 }
             }
         }
@@ -503,10 +607,16 @@ where
         Ok(got_event)
     }
 
+    /// Активное ожидание новых писем в IDLE с проверкой `pending_exists` ДО входа в IDLE
+    /// и СРАЗУ ПОСЛЕ выхода из IDLE (раздел 3.1 и раздел 8 п. 3 спецификации).
+    pub async fn wait_idle_or_pending(&mut self, timeout_dur: Duration) -> Result<bool> {
+        self.wait_idle_or_wake(timeout_dur, None).await
+    }
+
     /// Синоним `wait_idle_or_pending` (раздел 3.8 спецификации).
     #[inline]
     pub async fn wait_idle_or_event(&mut self, timeout_dur: Duration) -> Result<bool> {
-        self.wait_idle_or_pending(timeout_dur).await
+        self.wait_idle_or_wake(timeout_dur, None).await
     }
 
     /// Универсальный побайтовый парсер `UID FETCH <last_uid + 1>:* (UID BODY.PEEK[])`:
@@ -682,9 +792,14 @@ impl ImapConn<tokio_boring::SslStream<TcpStream>> {
             banner.trim()
         );
 
-        // Выполняем LOGIN
+        // Выполняем LOGIN и авто-детект CAPABILITY (LITERAL+ / LITERAL-)
         conn.login(email, password, timeout_dur).await?;
-        log::info!("[IMAP] Logged in successfully as {email}");
+        let _ = conn.detect_capabilities(timeout_dur).await;
+        log::info!(
+            "[IMAP] Logged in successfully as {email} (LITERAL+: {}, LITERAL-: {})",
+            conn.supports_literal_plus,
+            conn.supports_literal_minus
+        );
 
         Ok(conn)
     }
@@ -723,9 +838,14 @@ impl ImapConn<tokio_boring::SslStream<TcpStream>> {
             .context("Timeout waiting for IMAP banner")??;
         log::info!("[IMAP] Connected to {host}:{port}, banner: {}", banner.trim());
 
-        // Выполняем LOGIN
+        // Выполняем LOGIN и авто-детект CAPABILITY (LITERAL+ / LITERAL-)
         conn.login(email, password, timeout_dur).await?;
-        log::info!("[IMAP] Logged in successfully as {email}");
+        let _ = conn.detect_capabilities(timeout_dur).await;
+        log::info!(
+            "[IMAP] Logged in successfully as {email} (LITERAL+: {}, LITERAL-: {})",
+            conn.supports_literal_plus,
+            conn.supports_literal_minus
+        );
 
         Ok(conn)
     }
@@ -744,6 +864,22 @@ mod tests {
         assert!(!is_exists_line("* 12 EXPUNGE\r\n"));
         assert!(!is_exists_line("A0001 OK IDLE completed\r\n"));
         assert!(!is_exists_line("+ idling\r\n"));
+    }
+
+    #[test]
+    fn test_parse_capability_flags() {
+        assert_eq!(
+            parse_capability_flags("* CAPABILITY IMAP4rev1 LITERAL+ IDLE UIDPLUS\r\n"),
+            (true, false)
+        );
+        assert_eq!(
+            parse_capability_flags("A0001 OK [CAPABILITY IMAP4rev1 LITERAL- IDLE] Logged in\r\n"),
+            (false, true)
+        );
+        assert_eq!(
+            parse_capability_flags("* CAPABILITY IMAP4rev1 ID XLIST UIDPLUS UNSELECT MOVE LIST-STATUS IDLE\r\n"),
+            (false, false)
+        );
     }
 
     #[test]
@@ -922,6 +1058,58 @@ mod tests {
 
         conn.expunge_uids(&[106], Duration::from_secs(2)).await.unwrap();
 
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_literal_plus_auto_detect_and_1rtt_append() {
+        let (client_io, mut server_io) = tokio::io::duplex(64 * 1024);
+        let mut conn = ImapConn::new(client_io);
+
+        let server_task = tokio::spawn(async move {
+            server_io.write_all(b"* OK Dovecot ready\r\n").await.unwrap();
+            let mut s_buf = BufReader::new(server_io);
+            let mut line = String::new();
+
+            s_buf.read_line(&mut line).await.unwrap();
+            assert!(line.contains("LOGIN"));
+            s_buf.get_mut().write_all(b"A0001 OK Logged in\r\n").await.unwrap();
+
+            line.clear();
+            s_buf.read_line(&mut line).await.unwrap();
+            assert!(line.contains("CAPABILITY"));
+            s_buf
+                .get_mut()
+                .write_all(b"* CAPABILITY IMAP4rev1 LITERAL+ UIDPLUS IDLE\r\nA0002 OK CAPABILITY completed\r\n")
+                .await
+                .unwrap();
+
+            line.clear();
+            s_buf.read_line(&mut line).await.unwrap();
+            assert!(line.contains("+}\r\n"), "Expected non-synchronizing literal {{N+}}, got: {line}");
+            let start = line.rfind('{').unwrap();
+            let end = line[start + 1..].find('+').unwrap() + start + 1;
+            let lit_len: usize = line[start + 1..end].parse().unwrap();
+
+            let mut msg_body = vec![0u8; lit_len];
+            s_buf.read_exact(&mut msg_body).await.unwrap();
+            line.clear();
+            s_buf.read_line(&mut line).await.unwrap();
+            s_buf
+                .get_mut()
+                .write_all(b"A0003 OK [APPENDUID 1 200] APPEND completed\r\n")
+                .await
+                .unwrap();
+        });
+
+        let _ = conn.read_line().await.unwrap();
+        conn.login("u@e.com", "p", Duration::from_secs(2)).await.unwrap();
+        conn.detect_capabilities(Duration::from_secs(2)).await.unwrap();
+        assert!(conn.supports_literal_plus);
+
+        conn.append_message("Notes", "Subj", b"1RTT_DATA", "u@e.com", Duration::from_secs(2))
+            .await
+            .unwrap();
         server_task.await.unwrap();
     }
 }
