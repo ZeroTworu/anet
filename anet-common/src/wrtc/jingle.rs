@@ -262,7 +262,7 @@ impl JingleSession {
             String::new()
         };
 
-        let sdp = format!(
+        let mut sdp = format!(
             "v=0\r\n\
              o=- 123456789 2 IN IP4 0.0.0.0\r\n\
              s=-\r\n\
@@ -287,6 +287,17 @@ impl JingleSession {
              {video_section}\
              {data_section}"
         );
+
+        if include_video && self.video_sources.len() > 1 {
+            for &extra_ssrc in self.video_sources.iter().skip(1) {
+                if extra_ssrc != 0
+                    && extra_ssrc != primary_video_ssrc
+                    && extra_ssrc != local_video_ssrc
+                {
+                    sdp = append_remote_video_ssrc_to_sdp(&sdp, extra_ssrc, self.video_payload_type);
+                }
+            }
+        }
 
         sdp
     }

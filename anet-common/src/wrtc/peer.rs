@@ -1664,13 +1664,14 @@ impl WrtcPeer {
                     .await;
 
                 let mut data_channel_res = None;
+                let local_ep_for_dc = xmpp_opt.map(|x| x.endpoint_id.clone()).unwrap_or_default();
                 if session.has_data_channel
                     && (mode != WrtcMode::Ws || session.transport.colibri_ws_url.is_none())
                 {
                     let dc_init = RTCDataChannelInit {
-                        ordered: false,
+                        ordered: true,
                         max_packet_life_time: None,
-                        max_retransmits: Some(0),
+                        max_retransmits: None,
                         protocol: "http://jitsi.org/protocols/colibri".to_string(),
                         negotiated: None,
                     };
@@ -1689,15 +1690,29 @@ impl WrtcPeer {
                                             log::info!("[WRTC DataChannel] 'JVB data channel' state is now OPEN!");
                                             dc_is_open_in.store(true, Ordering::SeqCst);
                                             dc_open_notify_in.notify_waiters();
+                                            let _ = dc_in
+                                                .send_text(r#"{"colibriClass":"ClientHello"}"#)
+                                                .await;
                                             if has_video_flag {
-                                                let saved_constraints = active_constraints_dc
+                                                if !local_ep_for_dc.is_empty() {
+                                                    let vtype_msg = format!(
+                                                        r#"{{"colibriClass":"SourceVideoTypeMessage","sourceName":"{}-v0","videoType":"camera"}}"#,
+                                                        local_ep_for_dc
+                                                    );
+                                                    let _ = dc_in.send_text(&vtype_msg).await;
+                                                }
+                                                let constraints = active_constraints_dc
                                                     .lock()
                                                     .ok()
-                                                    .and_then(|g| g.clone());
-                                                if let Some(constraints) = saved_constraints {
-                                                    if let Ok(json) = serde_json::to_string(&constraints) {
-                                                        let _ = dc_in.send_text(&json).await;
-                                                    }
+                                                    .and_then(|g| g.clone())
+                                                    .unwrap_or_else(|| {
+                                                        crate::wrtc::colibri::ReceiverVideoConstraints::new_all(1080)
+                                                    });
+                                                if let Ok(json) = serde_json::to_string(&constraints) {
+                                                    log::info!(
+                                                        "[WRTC DataChannel] Sent initial ReceiverVideoConstraints on open: {json}"
+                                                    );
+                                                    let _ = dc_in.send_text(&json).await;
                                                 }
                                             }
                                         }

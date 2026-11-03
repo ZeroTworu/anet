@@ -41,12 +41,18 @@ pub struct ReceiverVideoConstraints {
     pub colibri_class: String,
     #[serde(rename = "lastN")]
     pub last_n: i32,
+    #[serde(rename = "assumedBandwidthBps", skip_serializing_if = "Option::is_none")]
+    pub assumed_bandwidth_bps: Option<i64>,
     #[serde(rename = "defaultConstraints")]
     pub default_constraints: VideoConstraint,
     #[serde(rename = "selectedEndpoints", skip_serializing_if = "Option::is_none")]
     pub selected_endpoints: Option<Vec<String>>,
     #[serde(rename = "onStageEndpoints", skip_serializing_if = "Option::is_none")]
     pub on_stage_endpoints: Option<Vec<String>>,
+    #[serde(rename = "selectedSources", skip_serializing_if = "Option::is_none")]
+    pub selected_sources: Option<Vec<String>>,
+    #[serde(rename = "onStageSources", skip_serializing_if = "Option::is_none")]
+    pub on_stage_sources: Option<Vec<String>>,
     #[serde(rename = "constraints", skip_serializing_if = "Option::is_none")]
     pub constraints: Option<std::collections::HashMap<String, VideoConstraint>>,
 }
@@ -55,10 +61,17 @@ impl ReceiverVideoConstraints {
     pub fn new_all(max_height: u32) -> Self {
         Self {
             colibri_class: "ReceiverVideoConstraints".to_string(),
-            last_n: -1,
+            last_n: if max_height > 0 { -1 } else { 0 },
+            assumed_bandwidth_bps: if max_height > 0 {
+                Some(10_000_000)
+            } else {
+                None
+            },
             default_constraints: VideoConstraint { max_height },
             selected_endpoints: None,
             on_stage_endpoints: None,
+            selected_sources: None,
+            on_stage_sources: None,
             constraints: None,
         }
     }
@@ -69,15 +82,30 @@ impl ReceiverVideoConstraints {
 
     pub fn for_endpoints(endpoints: &[String], max_height: u32) -> Self {
         let mut map = std::collections::HashMap::new();
+        let mut sources = Vec::with_capacity(endpoints.len());
         for ep in endpoints {
             map.insert(ep.clone(), VideoConstraint { max_height });
+            let src_name = if ep.ends_with("-v0") {
+                ep.clone()
+            } else {
+                format!("{ep}-v0")
+            };
+            map.insert(src_name.clone(), VideoConstraint { max_height });
+            sources.push(src_name);
         }
         Self {
             colibri_class: "ReceiverVideoConstraints".to_string(),
-            last_n: -1,
-            default_constraints: VideoConstraint { max_height: 0 },
+            last_n: if max_height > 0 { -1 } else { 0 },
+            assumed_bandwidth_bps: if max_height > 0 {
+                Some(10_000_000)
+            } else {
+                None
+            },
+            default_constraints: VideoConstraint { max_height },
             selected_endpoints: Some(endpoints.to_vec()),
             on_stage_endpoints: Some(endpoints.to_vec()),
+            selected_sources: Some(sources.clone()),
+            on_stage_sources: Some(sources),
             constraints: Some(map),
         }
     }

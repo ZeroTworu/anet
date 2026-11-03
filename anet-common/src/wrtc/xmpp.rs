@@ -441,9 +441,11 @@ impl XmppSession {
         let my_ep = endpoint_id.clone();
         let conf_muc = format!("{conference_id}@muc.meet.jitsi/");
         let pre_allocate_before_muc = bootstrap.pre_allocate_before_muc;
+        let is_ktalk = bootstrap.provider_kind == ProviderKind::KonturTalk;
 
         let handshake_fut = async {
             let mut joined = false;
+            let mut disco_answered = false;
             let mut waiting_pre_alloc = false;
             let mut presence_sent = false;
             let mut focus_in_room = false;
@@ -478,8 +480,13 @@ impl XmppSession {
                                 ws_stream.send(Message::text(ack)).await?;
                             }
                             InboundXmpp::DiscoInfo { id, from, node } => {
-                                let disco_reply =
-                                    XmppBuilder::disco_info_result(&from, &id, node.as_deref());
+                                disco_answered = true;
+                                let disco_reply = XmppBuilder::disco_info_result_ext(
+                                    &from,
+                                    &id,
+                                    node.as_deref(),
+                                    is_ktalk,
+                                );
                                 log::info!("[XMPP OUT]: {disco_reply}");
                                 ws_stream.send(Message::text(disco_reply)).await?;
                             }
@@ -504,10 +511,11 @@ impl XmppSession {
                                 log::info!(
                                     "[XMPP] Conference focus ready; entering MUC room {conference_id} with occupant {endpoint_id} (name: {effective_client_name})..."
                                 );
-                                let presence = XmppBuilder::muc_presence(
+                                let presence = XmppBuilder::muc_presence_ext(
                                     conference_id,
                                     &endpoint_id,
                                     &effective_client_name,
+                                    is_ktalk,
                                 );
                                 log::info!("[XMPP OUT]: {presence}");
                                 ws_stream.send(Message::text(presence)).await?;
@@ -622,10 +630,11 @@ impl XmppSession {
                                     log::info!(
                                         "[XMPP] Entering MUC room {conference_id} with occupant {endpoint_id} (name: {effective_client_name})..."
                                     );
-                                    let presence = XmppBuilder::muc_presence(
+                                    let presence = XmppBuilder::muc_presence_ext(
                                         conference_id,
                                         &endpoint_id,
                                         &effective_client_name,
+                                        is_ktalk,
                                     );
                                     log::info!("[XMPP OUT]: {presence}");
                                     ws_stream.feed(Message::text(presence)).await?;
@@ -642,6 +651,78 @@ impl XmppSession {
                         pending_jingle_frames.push(text.to_string());
                     }
                     if joined {
+                        if !disco_answered && pending_jingle_frames.is_empty() && !is_ktalk {
+                            // Даём Jicofo до 250 мс прислать disco#info после входа в комнату,
+                            // чтобы ответ ушёл до того, как второй участник инициирует аллокацию моста.
+                            let post_join_deadline =
+                                tokio::time::Instant::now() + Duration::from_millis(250);
+                            while let Ok(Some(Ok(Message::Text(extra_txt)))) =
+                                tokio::time::timeout_at(post_join_deadline, ws_stream.next()).await
+                            {
+                                log::info!("[XMPP IN (post-join)]: {extra_txt}");
+                                let extra_stanzas =
+                                    parse_xmpp_stanzas(extra_txt.as_str(), "0.0.0.0", 0);
+                                let mut extra_has_jingle = false;
+                                for p in extra_stanzas {
+                                    if sm_enabled && p.is_counted_stanza() {
+                                        inbound_h = inbound_h.wrapping_add(1);
+                                    }
+                                    match p {
+                                        InboundXmpp::DiscoInfo { id, from, node } => {
+                                            disco_answered = true;
+                                            let disco_reply = XmppBuilder::disco_info_result_ext(
+                                                &from,
+                                                &id,
+                                                node.as_deref(),
+                                                is_ktalk,
+                                            );
+                                            log::info!("[XMPP OUT]: {disco_reply}");
+                                            ws_stream.send(Message::text(disco_reply)).await?;
+                                        }
+                                        InboundXmpp::Ping { id, from } => {
+                                            let pong = XmppBuilder::iq_result(&from, &id);
+                                            ws_stream.send(Message::text(pong)).await?;
+                                        }
+                                        InboundXmpp::SmRequest => {
+                                            let ack = XmppBuilder::sm_ack(inbound_h);
+                                            ws_stream.send(Message::text(ack)).await?;
+                                        }
+                                        InboundXmpp::Jingle(ref sess) => {
+                                            if let Some(ref iq_id) = sess.iq_id {
+                                                let ack = XmppBuilder::iq_result(&sess.from, iq_id);
+                                                ws_stream.send(Message::text(ack)).await?;
+                                            }
+                                            extra_has_jingle = true;
+                                        }
+                                        InboundXmpp::Presence {
+                                            from,
+                                            is_unavailable,
+                                            ..
+                                        } => {
+                                            if let Some(occupant) = from.strip_prefix(&conf_muc) {
+                                                if occupant != my_ep && occupant != "focus" {
+                                                    if is_unavailable {
+                                                        occ_track.lock().unwrap().remove(occupant);
+                                                    } else {
+                                                        occ_track
+                                                            .lock()
+                                                            .unwrap()
+                                                            .insert(occupant.to_string());
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                if extra_has_jingle {
+                                    pending_jingle_frames.push(extra_txt.to_string());
+                                }
+                                if disco_answered || !pending_jingle_frames.is_empty() {
+                                    break;
+                                }
+                            }
+                        }
                         break;
                     }
                 }
@@ -760,8 +841,12 @@ impl XmppSession {
                                             }
                                         }
                                         InboundXmpp::DiscoInfo { id, from, node } => {
-                                            let disco_reply =
-                                                XmppBuilder::disco_info_result(&from, &id, node.as_deref());
+                                            let disco_reply = XmppBuilder::disco_info_result_ext(
+                                                &from,
+                                                &id,
+                                                node.as_deref(),
+                                                is_ktalk,
+                                            );
                                             log::info!("[XMPP OUT]: {disco_reply}");
                                             ack_replies.push(disco_reply);
                                         }
@@ -1073,10 +1158,11 @@ impl XmppSession {
             log::warn!("[XMPP] No valid ICE candidates gathered for session-accept");
         }
 
-        let stanza = XmppBuilder::jingle_session_accept(
+        let stanza = XmppBuilder::jingle_session_accept_with_endpoint(
             focus_jid,
             &req_id,
             &self.jid,
+            &self.endpoint_id,
             sid,
             ssrc,
             video_ssrc,

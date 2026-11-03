@@ -575,6 +575,56 @@ pub fn parse_jingle_node(
         }
     }
 
+    // Поддержка http://jitsi.org/json-encoded-sources (Jicofo 1.0.1100+ упаковывает SSRCs в <json-message> внутри <jingle>)
+    for json_node in jingle_node
+        .children()
+        .filter(|n| n.has_tag_name("json-message"))
+    {
+        if let Some(txt) = json_node.text() {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(txt.trim()) {
+                if let Some(sources_obj) = val.get("sources").and_then(|v| v.as_object()) {
+                    for (_ep, ep_arr) in sources_obj {
+                        if let Some(arr) = ep_arr.as_array() {
+                            if let Some(v_list) = arr.first().and_then(|v| v.as_array()) {
+                                for item in v_list {
+                                    if let Some(ssrc) = item
+                                        .get("s")
+                                        .and_then(|s| {
+                                            s.as_u64()
+                                                .or_else(|| s.as_str()?.parse::<u64>().ok())
+                                        })
+                                        .map(|s| s as u32)
+                                    {
+                                        if ssrc != 0 && !video_sources.contains(&ssrc) {
+                                            video_sources.push(ssrc);
+                                            has_video = true;
+                                        }
+                                    }
+                                }
+                            }
+                            if let Some(a_list) = arr.get(2).and_then(|v| v.as_array()) {
+                                for item in a_list {
+                                    if let Some(ssrc) = item
+                                        .get("s")
+                                        .and_then(|s| {
+                                            s.as_u64()
+                                                .or_else(|| s.as_str()?.parse::<u64>().ok())
+                                        })
+                                        .map(|s| s as u32)
+                                    {
+                                        if ssrc != 0 && !sources.contains(&ssrc) {
+                                            sources.push(ssrc);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     if transport_info.candidates.is_empty()
         && crate::wrtc::jingle::JingleAction::from(action.as_str())
             != crate::wrtc::jingle::JingleAction::SessionTerminate
@@ -654,11 +704,30 @@ impl XmppBuilder {
         endpoint_id: &str,
         client_name: &str,
     ) -> String {
+        Self::muc_presence_ext(conference_id, endpoint_id, client_name, false)
+    }
+
+    pub fn muc_presence_ext(
+        conference_id: &str,
+        endpoint_id: &str,
+        client_name: &str,
+        is_ktalk: bool,
+    ) -> String {
         let conf_esc = escape_xml_attr(conference_id);
         let ep_esc = escape_xml_attr(endpoint_id);
         let name_esc = escape_xml_attr(client_name);
+        // Строго валидные XEP-0115 SHA-1 ver-хэши, соответствующие ответам disco_info_result_ext:
+        // - StandardJitsi (без colibri#websocket, чтобы Jicofo включал SCTP <content name="data">):
+        //   "iq2Xb+PmZO0D5MqzDGVz03QCSB4="
+        // - KonturTalk (с поддержкой colibri#websocket):
+        //   "9A8Bz4n6d14d6299fgc9c3fceb52f9d183f023eb"
+        let caps_ver = if is_ktalk {
+            "9A8Bz4n6d14d6299fgc9c3fceb52f9d183f023eb"
+        } else {
+            "iq2Xb+PmZO0D5MqzDGVz03QCSB4="
+        };
         format!(
-            r#"<presence to="{conf_esc}@muc.meet.jitsi/{ep_esc}" xmlns="jabber:client"><x xmlns="http://jabber.org/protocol/muc"/><nick xmlns="http://jabber.org/protocol/nick">{name_esc}</nick><c xmlns="http://jabber.org/protocol/caps" hash="sha-1" node="https://jitsi.org/jitsi-meet" ver="9A8Bz4n6d14d6299fgc9c3fceb52f9d183f023eb"/><jitsi_participant_id>{ep_esc}</jitsi_participant_id></presence>"#
+            r#"<presence to="{conf_esc}@muc.meet.jitsi/{ep_esc}" xmlns="jabber:client"><x xmlns="http://jabber.org/protocol/muc"/><nick xmlns="http://jabber.org/protocol/nick">{name_esc}</nick><c xmlns="http://jabber.org/protocol/caps" hash="sha-1" node="https://jitsi.org/jitsi-meet" ver="{caps_ver}"/><SourceInfo>{{&quot;{ep_esc}-a0&quot;:{{&quot;muted&quot;:false}},&quot;{ep_esc}-v0&quot;:{{&quot;muted&quot;:false}}}}</SourceInfo><audiomuted>false</audiomuted><videomuted>false</videomuted><videoType>camera</videoType><jitsi_participant_id>{ep_esc}</jitsi_participant_id></presence>"#
         )
     }
 
@@ -706,16 +775,37 @@ impl XmppBuilder {
     }
 
     pub fn disco_info_result(to: &str, id: &str, node: Option<&str>) -> String {
+        Self::disco_info_result_ext(to, id, node, false)
+    }
+
+    pub fn disco_info_result_ext(
+        to: &str,
+        id: &str,
+        node: Option<&str>,
+        is_ktalk: bool,
+    ) -> String {
         let node_attr = match node {
             Some(n) if !n.is_empty() => format!(r#" node="{}""#, escape_xml_attr(n)),
             _ => String::new(),
         };
-        format!(
-            r#"<iq type="result" to="{to}" id="{id}" xmlns="jabber:client"><query xmlns="http://jabber.org/protocol/disco#info"{node_attr}><identity category="client" type="web" name="jitsi-meet"/><feature var="urn:xmpp:jingle:1"/><feature var="urn:xmpp:jingle:apps:rtp:1"/><feature var="urn:xmpp:jingle:apps:rtp:audio"/><feature var="urn:xmpp:jingle:apps:rtp:video"/><feature var="urn:xmpp:jingle:apps:dtls:0"/><feature var="urn:xmpp:jingle:transports:dtls-sctp:1"/><feature var="urn:xmpp:jingle:apps:sctp:1"/><feature var="http://jitsi.org/protocols/sctp"/><feature var="urn:xmpp:jingle:transports:ice-udp:1"/><feature var="http://jitsi.org/protocols/colibri"/><feature var="http://jitsi.org/protocol/colibri#websocket"/><feature var="urn:xmpp:jingle:apps:grouping:0"/><feature var="urn:ietf:rfc:3264"/><feature var="urn:ietf:rfc:5576"/><feature var="urn:ietf:rfc:5761"/><feature var="urn:ietf:rfc:5888"/><feature var="http://jabber.org/protocol/caps"/></query></iq>"#,
-            to = escape_xml_attr(to),
-            id = escape_xml_attr(id),
-            node_attr = node_attr
-        )
+        if is_ktalk {
+            format!(
+                r#"<iq type="result" to="{to}" id="{id}" xmlns="jabber:client"><query xmlns="http://jabber.org/protocol/disco#info"{node_attr}><identity category="client" type="web" name="jitsi-meet"/><feature var="urn:xmpp:jingle:1"/><feature var="urn:xmpp:jingle:apps:rtp:1"/><feature var="urn:xmpp:jingle:apps:rtp:audio"/><feature var="urn:xmpp:jingle:apps:rtp:video"/><feature var="urn:xmpp:jingle:apps:dtls:0"/><feature var="urn:xmpp:jingle:transports:dtls-sctp:1"/><feature var="urn:xmpp:jingle:apps:sctp:1"/><feature var="http://jitsi.org/protocols/sctp"/><feature var="urn:xmpp:jingle:transports:ice-udp:1"/><feature var="http://jitsi.org/protocols/colibri"/><feature var="http://jitsi.org/protocol/colibri#websocket"/><feature var="urn:xmpp:jingle:apps:grouping:0"/><feature var="urn:ietf:rfc:3264"/><feature var="urn:ietf:rfc:5576"/><feature var="urn:ietf:rfc:5761"/><feature var="urn:ietf:rfc:5888"/><feature var="http://jabber.org/protocol/caps"/></query></iq>"#,
+                to = escape_xml_attr(to),
+                id = escape_xml_attr(id),
+                node_attr = node_attr
+            )
+        } else {
+            // Строго отсортированный набор фич lib-jitsi-meet (XEP-0115 SHA-1 ver = "iq2Xb+PmZO0D5MqzDGVz03QCSB4=")
+            // без http://jitsi.org/protocol/colibri#websocket и без ssrc-rewriting-1, чтобы стандартный Jicofo
+            // гарантированно включал SCTP DataChannel (<content name="data">) и пробрасывал SSRCs напрямую.
+            format!(
+                r#"<iq type="result" to="{to}" id="{id}" xmlns="jabber:client"><query xmlns="http://jabber.org/protocol/disco#info"{node_attr}><identity category="client" type="web" name="jitsi-meet"/><feature var="http://jabber.org/protocol/caps"/><feature var="http://jabber.org/protocol/disco#info"/><feature var="http://jitsi.org/json-encoded-sources"/><feature var="http://jitsi.org/opus-red"/><feature var="http://jitsi.org/receive-multiple-video-streams"/><feature var="http://jitsi.org/remb"/><feature var="http://jitsi.org/source-name"/><feature var="http://jitsi.org/start-muted-room-metadata"/><feature var="http://jitsi.org/tcc"/><feature var="http://jitsi.org/visitors-1"/><feature var="urn:ietf:rfc:4588"/><feature var="urn:xmpp:jingle:1"/><feature var="urn:xmpp:jingle:apps:dtls:0"/><feature var="urn:xmpp:jingle:apps:rtp:1"/><feature var="urn:xmpp:jingle:apps:rtp:audio"/><feature var="urn:xmpp:jingle:apps:rtp:video"/><feature var="urn:xmpp:jingle:transports:dtls-sctp:1"/><feature var="urn:xmpp:jingle:transports:ice-udp:1"/></query></iq>"#,
+                to = escape_xml_attr(to),
+                id = escape_xml_attr(id),
+                node_attr = node_attr
+            )
+        }
     }
 
     pub fn conference_allocation(
@@ -782,8 +872,62 @@ impl XmppBuilder {
         include_data_content: bool,
         include_video_content: bool,
     ) -> String {
+        Self::jingle_session_accept_with_endpoint(
+            focus_jid,
+            req_id,
+            my_jid,
+            "",
+            sid,
+            ssrc,
+            video_ssrc,
+            video_payload_type,
+            cname,
+            msid,
+            ufrag,
+            pwd,
+            fingerprint_hash,
+            fingerprint,
+            candidate_xml,
+            include_data_content,
+            include_video_content,
+        )
+    }
+
+    pub fn jingle_session_accept_with_endpoint(
+        focus_jid: &str,
+        req_id: &str,
+        my_jid: &str,
+        endpoint_id: &str,
+        sid: &str,
+        ssrc: u32,
+        video_ssrc: u32,
+        video_payload_type: u8,
+        cname: &str,
+        msid: &str,
+        ufrag: &str,
+        pwd: &str,
+        fingerprint_hash: &str,
+        fingerprint: &str,
+        candidate_xml: &str,
+        include_data_content: bool,
+        include_video_content: bool,
+    ) -> String {
         let vtrack_id = crate::wrtc::stealth::generate_random_uuid_v4();
         let atrack_id = crate::wrtc::stealth::generate_random_uuid_v4();
+        let ep_clean = if !endpoint_id.trim().is_empty() {
+            escape_xml_attr(endpoint_id.trim())
+        } else {
+            escape_xml_attr(
+                my_jid
+                    .split('@')
+                    .next()
+                    .and_then(|u| u.split('-').next())
+                    .unwrap_or("peer"),
+            )
+        };
+        let audio_src_name_attr = format!(r#" name="{ep_clean}-a0""#);
+        let video_src_name_attr = format!(r#" name="{ep_clean}-v0" videoType="camera""#);
+
         let video_section = if include_video_content && video_ssrc != 0 {
             let pt = if video_payload_type != 0 {
                 video_payload_type
@@ -792,13 +936,14 @@ impl XmppBuilder {
             };
             let rtcp_fb = r#"<rtcp-fb xmlns="urn:xmpp:jingle:apps:rtp:rtcp-fb:0" type="goog-remb"/><rtcp-fb xmlns="urn:xmpp:jingle:apps:rtp:rtcp-fb:0" type="ccm" subtype="fir"/><rtcp-fb xmlns="urn:xmpp:jingle:apps:rtp:rtcp-fb:0" type="nack"/><rtcp-fb xmlns="urn:xmpp:jingle:apps:rtp:rtcp-fb:0" type="nack" subtype="pli"/>"#;
             format!(
-                r#"<content creator="initiator" name="video" senders="both"><description xmlns="urn:xmpp:jingle:apps:rtp:1" media="video"><payload-type id="{pt}" name="VP8" clockrate="90000">{rtcp_fb}</payload-type><rtcp-mux/><source xmlns="urn:xmpp:jingle:apps:rtp:ssma:0" ssrc="{video_ssrc}"><parameter xmlns="urn:xmpp:jingle:apps:rtp:1" name="cname" value="{cname}"/><parameter xmlns="urn:xmpp:jingle:apps:rtp:1" name="msid" value="{msid} {vtrack_id}"/></source></description><transport xmlns="urn:xmpp:jingle:transports:ice-udp:1" ufrag="{ufrag}" pwd="{pwd}"><rtcp-mux/><fingerprint xmlns="urn:xmpp:jingle:apps:dtls:0" hash="{fingerprint_hash}" setup="active">{fingerprint}</fingerprint>{candidate_xml}</transport></content>"#,
+                r#"<content creator="initiator" name="video" senders="both"><description xmlns="urn:xmpp:jingle:apps:rtp:1" media="video"><payload-type id="{pt}" name="VP8" clockrate="90000">{rtcp_fb}</payload-type><rtcp-mux/><source xmlns="urn:xmpp:jingle:apps:rtp:ssma:0" ssrc="{video_ssrc}"{video_src_name_attr}><parameter xmlns="urn:xmpp:jingle:apps:rtp:1" name="cname" value="{cname}"/><parameter xmlns="urn:xmpp:jingle:apps:rtp:1" name="msid" value="{msid} {vtrack_id}"/></source></description><transport xmlns="urn:xmpp:jingle:transports:ice-udp:1" ufrag="{ufrag}" pwd="{pwd}"><rtcp-mux/><fingerprint xmlns="urn:xmpp:jingle:apps:dtls:0" hash="{fingerprint_hash}" setup="active">{fingerprint}</fingerprint>{candidate_xml}</transport></content>"#,
                 ufrag = escape_xml_attr(ufrag),
                 pwd = escape_xml_attr(pwd),
                 fingerprint_hash = escape_xml_attr(fingerprint_hash),
                 fingerprint = escape_xml_attr(fingerprint),
                 candidate_xml = candidate_xml,
                 video_ssrc = video_ssrc,
+                video_src_name_attr = video_src_name_attr,
                 cname = escape_xml_attr(cname),
                 msid = escape_xml_attr(msid),
                 vtrack_id = vtrack_id,
@@ -834,7 +979,7 @@ impl XmppBuilder {
         );
 
         format!(
-            r#"<iq to="{to}" type="set" id="{id}" xmlns="jabber:client"><jingle xmlns="urn:xmpp:jingle:1" action="session-accept" initiator="{init}" responder="{resp}" sid="{sid}">{group_section}<content creator="initiator" name="audio" senders="both"><description xmlns="urn:xmpp:jingle:apps:rtp:1" media="audio"><payload-type id="111" name="opus" clockrate="48000" channels="2"/><rtcp-mux/><source xmlns="urn:xmpp:jingle:apps:rtp:ssma:0" ssrc="{ssrc}"><parameter xmlns="urn:xmpp:jingle:apps:rtp:1" name="cname" value="{cname}"/><parameter xmlns="urn:xmpp:jingle:apps:rtp:1" name="msid" value="{msid} {atrack_id}"/></source></description><transport xmlns="urn:xmpp:jingle:transports:ice-udp:1" ufrag="{ufrag}" pwd="{pwd}"><rtcp-mux/><fingerprint xmlns="urn:xmpp:jingle:apps:dtls:0" hash="{fp_hash}" setup="active">{fp}</fingerprint>{candidate_xml}</transport></content>{video_section}{data_section}</jingle></iq>"#,
+            r#"<iq to="{to}" type="set" id="{id}" xmlns="jabber:client"><jingle xmlns="urn:xmpp:jingle:1" action="session-accept" initiator="{init}" responder="{resp}" sid="{sid}">{group_section}<content creator="initiator" name="audio" senders="both"><description xmlns="urn:xmpp:jingle:apps:rtp:1" media="audio"><payload-type id="111" name="opus" clockrate="48000" channels="2"/><rtcp-mux/><source xmlns="urn:xmpp:jingle:apps:rtp:ssma:0" ssrc="{ssrc}"{audio_src_name_attr}><parameter xmlns="urn:xmpp:jingle:apps:rtp:1" name="cname" value="{cname}"/><parameter xmlns="urn:xmpp:jingle:apps:rtp:1" name="msid" value="{msid} {atrack_id}"/></source></description><transport xmlns="urn:xmpp:jingle:transports:ice-udp:1" ufrag="{ufrag}" pwd="{pwd}"><rtcp-mux/><fingerprint xmlns="urn:xmpp:jingle:apps:dtls:0" hash="{fp_hash}" setup="active">{fp}</fingerprint>{candidate_xml}</transport></content>{video_section}{data_section}</jingle></iq>"#,
             to = escape_xml_attr(focus_jid),
             id = escape_xml_attr(req_id),
             init = escape_xml_attr(focus_jid),
@@ -842,6 +987,7 @@ impl XmppBuilder {
             sid = escape_xml_attr(sid),
             group_section = group_section,
             ssrc = ssrc,
+            audio_src_name_attr = audio_src_name_attr,
             cname = escape_xml_attr(cname),
             msid = escape_xml_attr(msid),
             atrack_id = atrack_id,
