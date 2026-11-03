@@ -791,3 +791,126 @@ ANet Client                        JVB / Prosody                      ANet Serve
   * WebSocket `Ping` и XMPP IQ `ping` коалесцируются через `ws_stream.feed(...)` + `ws_stream.flush()` в одну TLS-запись без конкуренции чтения и записи;
   * Ответы IQ `result` на входящие `disco#info`, `ping` и `jingle` отправляются в том же цикле через `feed()` + `flush()`;
   * Сторожевой таймер входящего трафика (`last_inbound_at + read_timeout_dur`) отслеживается через `tokio::time::sleep_until`, не сбрасываясь при срабатывании локальных таймеров отправки.
+
+---
+
+## 10. Пост-мортем блокировки серверов (NL 30.10 и FN 31.10) через 5 дней после внедрения `turns_proxy.rs` и чек-лист харденинга (для ветки WRTC + CF WARP)
+
+### 10.1. Хронология и корневая причина: почему чистый WebRTC работал месяцами, а после `turns_proxy.rs` оба сервера улетели в бан за 5 суток
+
+1. **Как работал `wrtc` до 25 октября (до коммита `348995d`):**
+   * Движок `webrtc-rs` (`rtc-turn 0.21`) нативно поддерживает только UDP-сокеты и **не умеет** работать с `turns:...:443?transport=tcp`.
+   * Когда `PeerConnectionBuilder::build()` перебирал эшелоны ICE (`Tier 0: STUN + TURN + TURNS`), `webrtc-rs` отвергал `turns:` URL с ошибкой и автоматически откатывался на чистый UDP (`STUN` / прямой `host` кандидат медиамоста JVB `*.ktalk.host:10000–10010`).
+   * Трафик между зарубежным `anet-server` и РФ шёл либо по UDP напрямую на порт `10002–10004` медиамоста JVB (валидные заголовки DTLS/SRTP/STUN, которые ТСПУ пропускает по белому списку ВКС), либо через WebSocket `Colibri-WS` с валидным HTTP Upgrade. Никаких TCP:443 соединений к TURN-серверам `bst-talk-stun7.ktalk.host:443` и `dtl-talk-stun5.ktalk.host:443` сервер не открывал.
+
+2. **Что изменилось 25 октября в коммите `348995d` (`feat(wrtc): add TURNS (TLS 1.3 TCP:443) UDP bridge...`):**
+   * В `build_ice_server_tiers()` (`anet-common/src/wrtc/peer.rs`) для каждого `turns:*.ktalk.host:443?transport=tcp` начал подниматься локальный мост `spawn_turns_udp_proxy` (`turn:127.0.0.1:<port>`), а сам эшелон `"Tier 0: STUN + TURN + TURNS"` стоял **первым в списке**.
+   * Поскольку `webrtc-rs` увидел локальный UDP-адрес `turn:127.0.0.1:<port>`, `PeerConnectionBuilder::build()` **перестал отвергать `Tier 0`** и начал выбирать `Tier 0: STUN + TURN + TURNS` при **каждом** создании `WrtcPeer` — в том числе **на самом зарубежном `anet-server` (NL и FN)**!
+   * Одновременно в `peer.rs:791–800` были синтезированы прямые UDP TURN-адреса `turn:bst-talk-stun7.ktalk.host:34788` и `turn:dtl-talk-stun5.ktalk.host:34788`, а 26 октября в коммите `f5e61d2` добавлен агрессивный цикл `refresh_permissions` + `channel_bind` каждые 90–120 секунд.
+   * **Итог:** Начиная с 25 октября оба зарубежных VPS (`NL` и `FN`) начали круглосуточно открывать трансграничные **TCP:443 TLS-соединения (`turns_proxy.rs`)** к российским узлам `coturn` (`bst-talk-stun7.ktalk.host:443`, `dtl-talk-stun5.ktalk.host:443` в AS49675) и гнать через них бинарный STUN/TURN трафик. Ровно через 5 дней накопления телеметрии ТСПУ (30 октября — NL, 31 октября днём — FN) оба IP-адреса серверов были заблокированы.
+
+---
+
+### 10.2. Критические демаскирующие факторы в текущей кодовой базе (Must-Fix)
+
+#### 1. Фатальная аномалия протокола на TCP:443 в `turns_proxy.rs:155`: `ALPN: ["http/1.1"]` + бинарный STUN вместо HTTP
+* **Где в коде (`origin/master`):** `anet-common/src/wrtc/turns_proxy.rs:155`:
+  ```rust
+  crate::http_help::BrowserProfile::random().connect_ws_tls(&host, tcp_stream)
+  // (а в коммите 348995d вызывался crate::boring_tls::connect_tls(&host, tcp_stream))
+  ```
+* **В чём прокол:**
+  * И `connect_tls`, и `connect_ws_tls` принудительно записывают в TLS `ClientHello` расширение **`ALPN: ["http/1.1"]`** (`b"\x08http/1.1"`).
+  * Сразу после завершения TLS Handshake на порту `TCP:443` функция `bridge_turn_stream` (`turns_proxy.rs:226`) отправляет в TLS-поток **сырой бинарный кадр STUN Allocate (`0x00 0x03 ...`) и TURN `ChannelData` (`0x40 0x00 ...`)** вместо HTTP/1.1-запроса (`GET / POST ...`)!
+  * При этом сервер `coturn` в `ServerHello` не подтверждает `http/1.1`, а настоящий браузерный стек `libwebrtc` (Chrome / Firefox / Safari) при подключении к `turns:...:443?transport=tcp` **никогда не отправляет `ALPN: http/1.1`** (отправляется либо `ClientHello` вообще без ALPN, либо `stun.turn` по RFC 7443).
+  * **Почему на это триггерится ТСПУ:** Порт `TCP:443` на трансграничных линках инспектируется самыми жёсткими классификаторами ТСПУ (поиск Trojan, ShadowTLS, VLESS и кастомных TLS-туннелей). Когда зарубежный дата-центровый IP открывает длительное TLS-соединение на `TCP:443`, заявляет в открытом `ClientHello` протокол `ALPN: http/1.1`, но первой же TLS Application Data записью шлёт не-HTTP бинарный заголовок, за которым следует бесконечный поток мелких TLS-фреймов фиксированной длины каждые 20 мс / 2000 мс — эвристика ТСПУ однозначно помечает IP как нелегитимный TLS-прокси.
+* **Как исправить:**
+  * В `anet-common/src/boring_tls.rs` использовать коннектор **без ALPN** (`connect_raw_tls_with_config(&host, tcp_stream, &tls_cfg)` / `build_raw_ssl_connector_with_config`, уже добавлен в ветке `dev/imap` в коммите `86a439a`) либо явно выставлять `builder.set_alpn_protos(b"\x09stun.turn")` (проверив, что `coturn` Контура принимает `stun.turn`). Ни в коем случае не отправлять `ALPN: http/1.1` на сокетах `turns_proxy`!
+  * Прокинуть `TlsClientConfig` из `StealthConfig` в `spawn_turns_udp_proxy`, чтобы `turns_proxy` соблюдал настройки `[stealth]` (`tls_fingerprint`, `tls_verify_peer`), а не создавал рандомный профиль с дефолтами.
+
+---
+
+#### 2. Безусловный запуск `spawn_turns_udp_proxy` в `build_ice_server_tiers` и включённый по умолчанию `jvb_use_turn = true` на сервере
+* **Где в коде:**
+  * `anet-common/src/config.rs:163`: в `WrtcConfig::default()` стоит `jvb_use_turn: true`.
+  * `anet-common/src/wrtc/peer.rs:730–765`: цикл `for s in discovered` внутри `build_ice_server_tiers()` вызывает `spawn_turns_udp_proxy(...)` **до** выбора эшелона ICE, просто при `allow_turn == true`.
+* **В чём проблема:**
+  1. **Зарубежному серверу (`anet-server`) TURN/TURNS к медиамосту JVB не нужен вообще!** Медиамост JVB (`*.ktalk.host:10000–10010`) всегда имеет белый публичный IP в РФ. Когда `anet-server` (напрямую или через Cloudflare WARP) общается с JVB, ему нужен **только прямой UDP (`Tier 0: STUN` / `Tier 3: host`)**. Использование `turns_proxy` на стороне сервера:
+     * переводит медиатрафик из UDP `:10002` в инспектируемый ТСПУ пайплайн `TCP:443`;
+     * создаёт двойной релей (`anet-server` $\xrightarrow{\text{TCP:443}}$ `coturn` $\xrightarrow{\text{UDP}}$ `JVB`) и убивает производительность из-за TCP-over-TCP;
+     * при работе через Cloudflare WARP вызывает таймауты `TURN transaction timed out` и лишнюю нагрузку на `coturn`.
+  2. Даже после того как в коммите `e594209` (1 ноября) `"Tier 0: STUN"` поставили первым, при `jvb_use_turn = true` функция `build_ice_server_tiers` всё равно спавнит фоновые задачи `TurnsProxyHandle` в `proxies`.
+* **Как исправить:**
+  1. На стороне **`anet-server`** (`anet-server/src/servers/wrtc.rs`) для `WrtcPeer::create` принудительно передавать `allow_turn = false` (или сделать дефолт `jvb_use_turn: false` для сервера), чтобы сервер **никогда** не аллоцировал TURN/TURNS для связи с JVB.
+  2. В `build_ice_server_tiers` (`peer.rs:730`) **не запускать** `spawn_turns_udp_proxy` заранее, если выбран `Tier 0: STUN`! Создавать `TurnsProxyHandle` лениво (только если `Tier 0` и `Tier 1` не смогли собраться и реально дошла очередь до `Tier 2: STUN + TURN + TURNS`, либо при вызове `create_p2p_channel`).
+
+---
+
+#### 3. Статические таймеры-метрономы (поведенческий фингерпринт 24/7)
+Даже при выходе сервера через Cloudflare WARP или российский релей статические интервалы выдают автоматизированного бота как для DPI, так и для антифрода самого Контур.Толка:
+
+1. **Топорный таймер ротации комнаты `server_idle_room_rotation_secs = 1800` + фиксированная пауза `2s` (`anet-server/src/servers/wrtc.rs:153, 183`):**
+   * **Проблема:** Когда клиентов нет, `anet-server` выходит из комнаты и заново авторизуется через `/api/authorize/session` ровно каждые **1800.0 секунд + 2.0 секунды** (48 раз в сутки секунда в секунду).
+   * **Как исправить (джиттер по аналогии со `stealth`):**
+     * Вычислять дедлайн каждой итерации со случайным разбросом $\pm 30\%$ от базового `server_idle_room_rotation_secs`:
+       ```rust
+       let base_ms = config.wrtc.server_idle_room_rotation_secs.max(60) * 1000;
+       let jitter_range = (base_ms * 30) / 100; // ±30%
+       let actual_idle_ms = (base_ms - jitter_range)
+           + (rand::random::<u64>() % (jitter_range * 2 + 1));
+       let idle_deadline = tokio::time::Instant::now() + Duration::from_millis(actual_idle_ms);
+       ```
+     * Паузу перед повторным входом (`WRTC_SERVER_RECONNECT_PAUSE_SECS`) также рандомизировать в диапазоне `1500..6500 мс` вместо константы `2s`.
+
+2. **Метроном медиа-keepalive Opus (`20 мс` = 50 pkt/s одинакового размера) и VP8 (`1000 мс`) в простое (`peer.rs:1863, 1926`):**
+   * **Проблема:** В `peer.rs:1863` каждую 20-ю миллисекунду отправляется ровно 3 байта `WRTC_OPUS_SILENCE_FRAME` (`[0xf8, 0xff, 0xfe]`), а в `peer.rs:1926` ровно каждые 1000.0 мс отправляется идентичный по размеру VP8 keyframe. В шифрованном канале (особенно если трафик идёт через TURN-TCP/TLS) это выглядит как идеальный генератор пакетов одинаковой длины 50 Гц + 1 Гц сутками напролёт.
+   * **Как исправить:**
+     * В `vp8_task` (`peer.rs:1929`) заменить `tokio::time::interval(Duration::from_millis(video_keepalive_ms))` на `tokio::time::sleep` со случайным джиттером интервала (например, `750..1350 мс`) и добавлять в конец тестового VP8-кадра случайный хвост от `0` до `32` байт (либо варьировать RTP padding), чтобы размеры keepalive-пакетов не были константными.
+     * В `opus_task` (`peer.rs:1863`) при полном простое (когда нет активных клиентов или нет трафика дольше 10 с) можно имитировать режим Opus DTX (Discontinuous Transmission, штатный для WebRTC при молчании): передавать пакет комфортного шума раз в `160..400 мс` (с джиттером) и переходить на `20 мс` только при наличии активности, либо варьировать длину фрейма тишины (`3..15` байт валидного Opus silence/CNG).
+
+3. **Фиксированные интервалы пингов `Colibri-WS` (`10s` в `peer.rs:1225`) и `XMPP-WS` (`wrtc_ping_interval_secs` в `xmpp.rs`):**
+   * **Проблема:** `tokio::time::interval(Duration::from_secs(10))` бьёт ровно каждые 10.000 с без отклонений.
+   * **Как исправить:** Использовать `tokio::time::sleep` с пересчётом случайной задержки на каждом шаге: `base_ms ± 25%` (например, `7500..12500 мс` для 10-секундного пинга).
+
+---
+
+#### 4. Нюансы работы поверх Cloudflare WARP (`wgcf` / policy routing) и утечка IP в ICE/SDP
+
+При выводе трафика `anet-server` (на забаненных NL/FN) в сторону `*.ktalk.ru` и `*.ktalk.host` через интерфейс Cloudflare WARP необходимо учесть **четыре критических места в коде**:
+
+1. **Проблема выбора интерфейса в `create_p2p_channel` (`peer.rs:874`):**
+   * В `WrtcPeer::create` (`peer.rs:1362`) вызывается `detect_physical_bind_addr(session_opt, fallback_ip, fallback_port)`. Он делает пробный `UdpSocket::connect` к IP кандидата JVB из `session_opt` (например, `89.169.16.x`). Если подсеть Контура завернута в таблицу маршрутизации WARP, ядро Linux вернёт локальный IP интерфейса WARP (например, `172.16.0.2`), и UDP-сокет WebRTC корректно привяжется к WARP.
+   * **НО** в `create_p2p_channel` (`peer.rs:874`), если `bind_addr` пустой, вызывается:
+     ```rust
+     detect_physical_bind_addr(None, "1.1.1.1", 443)
+     ```
+     Если на сервере включён split-tunneling (в WARP завёрнуты только подсети РФ / Контура, а `1.1.1.1` идёт напрямую через `ens3`), то `detect_physical_bind_addr(None, "1.1.1.1", 443)` вернёт **забаненный публичный IP интерфейса `ens3`** вместо интерфейса WARP!
+   * **Как исправить:** В `detect_physical_bind_addr` при отсутствии `session_opt` использовать `fallback_ip` (`wrtc_fallback_jvb_ip`) или IP первого сервера из `ice_servers_info`, а не захардкоженный `"1.1.1.1"`.
+
+2. **Полнота маршрутизации подсетей Контура в интерфейс WARP на сервере:**
+   * Инфраструктура Ktalk использует не только основной домен комнаты (`*.ktalk.ru`) и медиамосты JVB, но и пул серверов из `extdisco` (`bst-talk-stun7.ktalk.host`, `dtl-talk-stun5.ktalk.host` и др.).
+   * Если маршрутизировать в WARP отдельные IP по списку, при смене IP балансировщиком или `extdisco` пакеты `STUN`/`Colibri-WS`/`JVB` пойдут мимо `warp` напрямую с забаненного `ens3`.
+   * **Рекомендация:** Заворачивать в таблицу маршрутизации интерфейса WARP целиком автономную систему Контура **AS49675** (включая `89.169.16.0/20`, `46.17.200.0/21`, `193.232.166.0/24` и все префиксы AS49675) либо использовать `fwmark` / `SO_BINDTODEVICE` для исходящих сокетов воркера `wrtc` на сервере.
+
+3. **Фильтрация локальных ICE-кандидатов в `WrtcPeer::create` (`peer.rs:1647–1686`):**
+   * В `WrtcPeer::create` при отправке `Jingle session-accept` в `xmpp.accept_session(...)` передаются все собранные кандидаты `local_params.candidates`.
+   * Если на сервере поднят интерфейс `ens3` (с реальным IP VPS), Docker-мосты или `wgcf`, в SDP могут попасть лишние `typ host` кандидаты. Хотя `with_udp_addrs(vec![bind_addr])` ограничивает сокет одним IP, при `bind_addr == "0.0.0.0:0"` стек `webrtc-rs` перечислит **все** сетевые интерфейсы сервера (включая реальный внешний IP `ens3`!) и отправит их открытым текстом в XMPP Jingle `session-accept`.
+   * **Как исправить:**
+     * Добавить в `[wrtc]` конфига сервера опциональный параметр `bind_interface` / `bind_ip` (например, IP интерфейса `wgcf` / `warp`), чтобы `anet-server` гарантированно биндил все сокеты (`KtalkClient`, `XmppSession`, `Colibri-WS`, `WrtcPeer` UDP) только к интерфейсу WARP и никогда не откатывался на `"0.0.0.0:0"`.
+     * Перед вызовом `xmpp.accept_session` в `peer.rs:1671` отфильтровывать из `local_params.candidates` любые кандидаты с приватными/туннельными подсетями (`172.112.x.x`, `10.x.x.x`, `172.16.x.x`), если уже присутствует валидный кандидат для связи с JVB, либо оставлять только нужный кандидат.
+
+4. **Учет MTU интерфейса Cloudflare WARP (`1280` / `1420` байт) для режима `media_video`:**
+   * Интерфейс WireGuard / Cloudflare WARP имеет собственный оверхед (60–80 байт поверх внешнего IPv4/IPv6). Обычно MTU на `wgcf` составляет `1280` или `1420` байт.
+   * Если `anet-server` отправляет UDP-пакеты RTP (Fake Video VP8) в сторону JVB через интерфейс `wgcf` с MTU `1280`, а размер RTP-пакета после обёртки DTLS-SRTP + UDP + IPv4 превышает `1280` байт, возникнет IP-фрагментация внутри WireGuard или дроп пакета по `EMSGSIZE`.
+   * **Рекомендация:** При работе сервера через WARP убедиться, что `network.mtu` (например, `1100` в `server.toml`) и `wrtc.max_video_batch_bytes` гарантируют итоговый размер внешнего UDP-пакета $\le 1220$ байт (с учётом `video_mtu_overhead = 60`), чтобы каждый RTP-кадр помещался в один нефрагментированный пакет WireGuard WARP.
+
+---
+
+### 10.3. Краткий сводный чек-лист задач для применения в ветке WRTC
+
+- [ ] **`anet-common/src/boring_tls.rs` & `turns_proxy.rs`:** Заменить `connect_ws_tls` в `turns_proxy.rs:155` на `connect_raw_tls_with_config` (без `ALPN: http/1.1`), пробросить `TlsClientConfig` из `StealthConfig`.
+- [ ] **`anet-common/src/wrtc/peer.rs` (`build_ice_server_tiers`):** Отключить использование TURN/TURNS для соединения `anet-server <-> JVB` (`jvb_use_turn = false` на сервере) и сделать спавн `spawn_turns_udp_proxy` ленивым (только когда реально выбран эшелон с `TURNS`).
+- [ ] **`anet-common/src/wrtc/peer.rs` (`detect_physical_bind_addr`):** В `create_p2p_channel` (`peer.rs:874`) заменить пробный коннект к `"1.1.1.1":443` на IP из `ice_servers_info` / `fallback_ip`, чтобы при policy-маршрутизации через CF WARP сокет биндился на IP интерфейса WARP, а не на забаненный `ens3`.
+- [ ] **`anet-server/src/servers/wrtc.rs`:** Добавить случайный джиттер $\pm 30\%$ к `server_idle_room_rotation_secs` (`1800s`) и рандомизировать паузу переподключения (`1.5..6.5s` вместо фиксированных `2s`).
+- [ ] **`anet-common/src/wrtc/peer.rs` & `xmpp.rs`:** Добавить случайный джиттер $\pm 25\%$ к интервалам пингов `Colibri-WS` (`10s`), `XMPP-WS` (`10–20s`) и `VP8 video keepalive` (`1000ms`), а также вариативный размер payload для фоновых keepalive-пакетов.
+
