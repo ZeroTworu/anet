@@ -108,7 +108,9 @@ pub fn parse_xmpp_stanzas(
         return Vec::new();
     }
 
-    let wrapped = format!("<stream>{trimmed}</stream>");
+    let wrapped = format!(
+        r#"<stream xmlns:stream="http://etherx.jabber.org/streams">{trimmed}</stream>"#
+    );
     let doc = match roxmltree::Document::parse(&wrapped) {
         Ok(d) => d,
         Err(_) => return Vec::new(),
@@ -583,7 +585,7 @@ impl XmppBuilder {
 
     pub fn bind_resource(id: &str) -> String {
         format!(
-            r#"<iq type="set" id="{}"><bind xmlns="urn:ietf:params:xml:ns:xmpp-bind"/></iq>"#,
+            r#"<iq type="set" id="{}" xmlns="jabber:client"><bind xmlns="urn:ietf:params:xml:ns:xmpp-bind"/></iq>"#,
             escape_xml_attr(id)
         )
     }
@@ -620,7 +622,7 @@ impl XmppBuilder {
         let ep_esc = escape_xml_attr(endpoint_id);
         let name_esc = escape_xml_attr(client_name);
         format!(
-            r#"<presence to="{conf_esc}@muc.meet.jitsi/{ep_esc}"><x xmlns="http://jabber.org/protocol/muc"/><nick xmlns="http://jabber.org/protocol/nick">{name_esc}</nick><c xmlns="http://jabber.org/protocol/caps" hash="sha-1" node="https://jitsi.org/jitsi-meet" ver="7Y4Yx3m5c03c5188efb8b2ebda41e8c072e912da"/><jitsi_participant_id>{ep_esc}</jitsi_participant_id></presence>"#
+            r#"<presence to="{conf_esc}@muc.meet.jitsi/{ep_esc}" xmlns="jabber:client"><x xmlns="http://jabber.org/protocol/muc"/><nick xmlns="http://jabber.org/protocol/nick">{name_esc}</nick><c xmlns="http://jabber.org/protocol/caps" hash="sha-1" node="https://jitsi.org/jitsi-meet" ver="7Y4Yx3m5c03c5188efb8b2ebda41e8c072e912da"/><jitsi_participant_id>{ep_esc}</jitsi_participant_id></presence>"#
         )
     }
 
@@ -628,7 +630,7 @@ impl XmppBuilder {
         let conf_esc = escape_xml_attr(conference_id);
         let ep_esc = escape_xml_attr(endpoint_id);
         format!(
-            r#"<presence to="{conf_esc}@muc.meet.jitsi/{ep_esc}" type="unavailable"/>"#
+            r#"<presence to="{conf_esc}@muc.meet.jitsi/{ep_esc}" type="unavailable" xmlns="jabber:client"/>"#
         )
     }
 
@@ -638,7 +640,7 @@ impl XmppBuilder {
 
     pub fn iq_result(to: &str, id: &str) -> String {
         format!(
-            r#"<iq type="result" to="{}" id="{}"/>"#,
+            r#"<iq type="result" to="{}" id="{}" xmlns="jabber:client"/>"#,
             escape_xml_attr(to),
             escape_xml_attr(id)
         )
@@ -650,7 +652,7 @@ impl XmppBuilder {
             _ => String::new(),
         };
         format!(
-            r#"<iq type="result" to="{to}" id="{id}"><query xmlns="http://jabber.org/protocol/disco#info"{node_attr}><identity category="client" type="web" name="jitsi-meet"/><feature var="urn:xmpp:jingle:1"/><feature var="urn:xmpp:jingle:apps:rtp:1"/><feature var="urn:xmpp:jingle:apps:rtp:audio"/><feature var="urn:xmpp:jingle:apps:rtp:video"/><feature var="urn:xmpp:jingle:apps:dtls:0"/><feature var="urn:xmpp:jingle:apps:sctp:1"/><feature var="http://jitsi.org/protocols/sctp"/><feature var="urn:xmpp:jingle:transports:ice-udp:1"/><feature var="http://jitsi.org/protocols/colibri"/><feature var="urn:ietf:rfc:5761"/><feature var="urn:ietf:rfc:5888"/><feature var="http://jabber.org/protocol/caps"/></query></iq>"#,
+            r#"<iq type="result" to="{to}" id="{id}" xmlns="jabber:client"><query xmlns="http://jabber.org/protocol/disco#info"{node_attr}><identity category="client" type="web" name="jitsi-meet"/><feature var="urn:xmpp:jingle:1"/><feature var="urn:xmpp:jingle:apps:rtp:1"/><feature var="urn:xmpp:jingle:apps:rtp:audio"/><feature var="urn:xmpp:jingle:apps:rtp:video"/><feature var="urn:xmpp:jingle:apps:dtls:0"/><feature var="urn:xmpp:jingle:apps:sctp:1"/><feature var="http://jitsi.org/protocols/sctp"/><feature var="urn:xmpp:jingle:transports:ice-udp:1"/><feature var="http://jitsi.org/protocols/colibri"/><feature var="urn:ietf:rfc:5761"/><feature var="urn:ietf:rfc:5888"/><feature var="http://jabber.org/protocol/caps"/></query></iq>"#,
             to = escape_xml_attr(to),
             id = escape_xml_attr(id),
             node_attr = node_attr
@@ -666,7 +668,7 @@ impl XmppBuilder {
         let ep_esc = escape_xml_attr(endpoint_id);
         let id_esc = escape_xml_attr(iq_id);
         format!(
-            r#"<iq to="focus.meet.jitsi" type="set" id="{id_esc}"><conference xmlns="http://jitsi.org/protocol/focus" room="{conf_room}" machine-uid="{ep_esc}"/></iq>"#
+            r#"<iq to="focus.meet.jitsi" type="set" id="{id_esc}" xmlns="jabber:client"><conference xmlns="http://jitsi.org/protocol/focus" room="{conf_room}" machine-uid="{ep_esc}"/></iq>"#
         )
     }
 
@@ -762,7 +764,7 @@ impl XmppBuilder {
         };
 
         format!(
-            r#"<iq to="{to}" type="set" id="{id}"><jingle xmlns="urn:xmpp:jingle:1" action="session-accept" initiator="{init}" responder="{resp}" sid="{sid}"><content creator="initiator" name="audio" senders="both"><description xmlns="urn:xmpp:jingle:apps:rtp:1" media="audio"><payload-type id="111" name="opus" clockrate="48000" channels="2"/><rtcp-mux/><source xmlns="urn:xmpp:jingle:apps:rtp:ssma:0" ssrc="{ssrc}"><parameter xmlns="urn:xmpp:jingle:apps:rtp:1" name="cname" value="{cname}"/><parameter xmlns="urn:xmpp:jingle:apps:rtp:1" name="msid" value="{msid} {atrack_id}"/></source></description><transport xmlns="urn:xmpp:jingle:transports:ice-udp:1" ufrag="{ufrag}" pwd="{pwd}"><rtcp-mux/><fingerprint xmlns="urn:xmpp:jingle:apps:dtls:0" hash="{fp_hash}" setup="active">{fp}</fingerprint>{candidate_xml}</transport></content>{video_section}{data_section}</jingle></iq>"#,
+            r#"<iq to="{to}" type="set" id="{id}" xmlns="jabber:client"><jingle xmlns="urn:xmpp:jingle:1" action="session-accept" initiator="{init}" responder="{resp}" sid="{sid}"><content creator="initiator" name="audio" senders="both"><description xmlns="urn:xmpp:jingle:apps:rtp:1" media="audio"><payload-type id="111" name="opus" clockrate="48000" channels="2"/><rtcp-mux/><source xmlns="urn:xmpp:jingle:apps:rtp:ssma:0" ssrc="{ssrc}"><parameter xmlns="urn:xmpp:jingle:apps:rtp:1" name="cname" value="{cname}"/><parameter xmlns="urn:xmpp:jingle:apps:rtp:1" name="msid" value="{msid} {atrack_id}"/></source></description><transport xmlns="urn:xmpp:jingle:transports:ice-udp:1" ufrag="{ufrag}" pwd="{pwd}"><rtcp-mux/><fingerprint xmlns="urn:xmpp:jingle:apps:dtls:0" hash="{fp_hash}" setup="active">{fp}</fingerprint>{candidate_xml}</transport></content>{video_section}{data_section}</jingle></iq>"#,
             to = escape_xml_attr(focus_jid),
             id = escape_xml_attr(req_id),
             init = escape_xml_attr(focus_jid),
@@ -805,7 +807,7 @@ impl XmppBuilder {
             String::new()
         };
         format!(
-            r#"<iq to="{to}" type="set" id="{id}"><jingle xmlns="urn:xmpp:jingle:1" action="source-remove" initiator="{init}" responder="{resp}" sid="{sid}">{audio_content}{video_content}</jingle></iq>"#,
+            r#"<iq to="{to}" type="set" id="{id}" xmlns="jabber:client"><jingle xmlns="urn:xmpp:jingle:1" action="source-remove" initiator="{init}" responder="{resp}" sid="{sid}">{audio_content}{video_content}</jingle></iq>"#,
             to = escape_xml_attr(focus_jid),
             id = escape_xml_attr(req_id),
             init = escape_xml_attr(focus_jid),
@@ -823,7 +825,7 @@ impl XmppBuilder {
         sid: &str,
     ) -> String {
         format!(
-            r#"<iq to="{to}" type="set" id="{id}"><jingle xmlns="urn:xmpp:jingle:1" action="session-terminate" initiator="{init}" responder="{resp}" sid="{sid}"><reason><success/></reason></jingle></iq>"#,
+            r#"<iq to="{to}" type="set" id="{id}" xmlns="jabber:client"><jingle xmlns="urn:xmpp:jingle:1" action="session-terminate" initiator="{init}" responder="{resp}" sid="{sid}"><reason><success/></reason></jingle></iq>"#,
             to = escape_xml_attr(focus_jid),
             id = escape_xml_attr(req_id),
             init = escape_xml_attr(focus_jid),
@@ -842,7 +844,7 @@ impl XmppBuilder {
     ) -> String {
         let atrack_id = crate::wrtc::stealth::generate_random_uuid_v4();
         format!(
-            r#"<iq to="{to}" type="set" id="{id}"><jingle xmlns="urn:xmpp:jingle:1" action="source-add" initiator="{init}" sid="{sid}"><content name="audio"><description xmlns="urn:xmpp:jingle:apps:rtp:1" media="audio"><source xmlns="urn:xmpp:jingle:apps:rtp:ssma:0" ssrc="{ssrc}"><parameter name="cname" value="{cname}"/><parameter name="msid" value="{msid} {atrack_id}"/></source></description></content></jingle></iq>"#,
+            r#"<iq to="{to}" type="set" id="{id}" xmlns="jabber:client"><jingle xmlns="urn:xmpp:jingle:1" action="source-add" initiator="{init}" sid="{sid}"><content name="audio"><description xmlns="urn:xmpp:jingle:apps:rtp:1" media="audio"><source xmlns="urn:xmpp:jingle:apps:rtp:ssma:0" ssrc="{ssrc}"><parameter name="cname" value="{cname}"/><parameter name="msid" value="{msid} {atrack_id}"/></source></description></content></jingle></iq>"#,
             to = escape_xml_attr(focus_jid),
             id = escape_xml_attr(req_id),
             init = escape_xml_attr(focus_jid),
@@ -856,7 +858,7 @@ impl XmppBuilder {
 
     pub fn ping(to: &str, id: &str) -> String {
         format!(
-            r#"<iq to="{}" type="get" id="{}"><ping xmlns="urn:xmpp:ping"/></iq>"#,
+            r#"<iq to="{}" type="get" id="{}" xmlns="jabber:client"><ping xmlns="urn:xmpp:ping"/></iq>"#,
             escape_xml_attr(to),
             escape_xml_attr(id)
         )
@@ -864,7 +866,7 @@ impl XmppBuilder {
 
     pub fn extdisco_services(id: &str) -> String {
         format!(
-            r#"<iq to="meet.jitsi" type="get" id="{}"><services xmlns="urn:xmpp:extdisco:2"/></iq>"#,
+            r#"<iq to="meet.jitsi" type="get" id="{}" xmlns="jabber:client"><services xmlns="urn:xmpp:extdisco:2"/></iq>"#,
             escape_xml_attr(id)
         )
     }

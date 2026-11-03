@@ -444,11 +444,17 @@ impl XmppSession {
 
         let handshake_fut = async {
             let mut joined = false;
+            let mut waiting_pre_alloc = false;
+            let mut presence_sent = false;
+            let alloc_id = format!("conf_pre_{endpoint_id}");
+            let mut pending_jingle_frames: Vec<String> = Vec::new();
+
             while let Some(msg_res) = ws_stream.next().await {
                 let msg = msg_res?;
                 if let Message::Text(text) = msg {
                     log::info!("[XMPP IN]: {text}");
                     let stanzas = parse_xmpp_stanzas(text.as_str(), "0.0.0.0", 0);
+                    let mut frame_has_jingle = false;
                     for parsed in stanzas {
                         if sm_enabled && parsed.is_counted_stanza() {
                             inbound_h = inbound_h.wrapping_add(1);
@@ -470,6 +476,41 @@ impl XmppSession {
                                 let ack = XmppBuilder::sm_ack(inbound_h);
                                 ws_stream.send(Message::text(ack)).await?;
                             }
+                            InboundXmpp::DiscoInfo { id, from, node } => {
+                                let disco_reply =
+                                    XmppBuilder::disco_info_result(&from, &id, node.as_deref());
+                                log::info!("[XMPP OUT]: {disco_reply}");
+                                ws_stream.send(Message::text(disco_reply)).await?;
+                            }
+                            InboundXmpp::Ping { id, from } => {
+                                let pong = XmppBuilder::iq_result(&from, &id);
+                                log::info!("[XMPP OUT]: {pong}");
+                                ws_stream.send(Message::text(pong)).await?;
+                            }
+                            InboundXmpp::Jingle(ref sess) => {
+                                if let Some(ref iq_id) = sess.iq_id {
+                                    let ack = XmppBuilder::iq_result(&sess.from, iq_id);
+                                    log::info!("[XMPP OUT]: {ack}");
+                                    ws_stream.send(Message::text(ack)).await?;
+                                }
+                                frame_has_jingle = true;
+                            }
+                            InboundXmpp::JingleAck { ref id, .. }
+                                if waiting_pre_alloc && !presence_sent && id == &alloc_id =>
+                            {
+                                waiting_pre_alloc = false;
+                                presence_sent = true;
+                                log::info!(
+                                    "[XMPP] Conference focus ready; entering MUC room {conference_id} with occupant {endpoint_id} (name: {effective_client_name})..."
+                                );
+                                let presence = XmppBuilder::muc_presence(
+                                    conference_id,
+                                    &endpoint_id,
+                                    &effective_client_name,
+                                );
+                                log::info!("[XMPP OUT]: {presence}");
+                                ws_stream.send(Message::text(presence)).await?;
+                            }
                             InboundXmpp::Presence {
                                 from,
                                 is_unavailable,
@@ -490,7 +531,6 @@ impl XmppSession {
                                         "[XMPP] Successfully joined MUC room {conference_id} as occupant {endpoint_id}"
                                     );
                                     joined = true;
-                                    break;
                                 }
                             }
                             InboundXmpp::ExtdiscoServices(ice_servers) => {
@@ -506,14 +546,16 @@ impl XmppSession {
                             }
                             InboundXmpp::SaslMechanisms if !authed => {
                                 log::info!("[XMPP] SASL mechanisms received, sending ANONYMOUS auth");
-                                ws_stream
-                                    .send(Message::text(XmppBuilder::auth_anonymous()))
-                                    .await?;
+                                let auth_xml = XmppBuilder::auth_anonymous();
+                                log::info!("[XMPP OUT]: {auth_xml}");
+                                ws_stream.send(Message::text(auth_xml)).await?;
                             }
                             InboundXmpp::SaslSuccess => {
                                 log::info!("[XMPP] SASL auth success, resetting stream");
                                 authed = true;
-                                ws_stream.send(Message::text(XmppBuilder::open())).await?;
+                                let open_xml = XmppBuilder::open();
+                                log::info!("[XMPP OUT]: {open_xml}");
+                                ws_stream.send(Message::text(open_xml)).await?;
                             }
                             InboundXmpp::Features { has_bind, has_sm }
                                 if authed && has_bind && !bind_sent =>
@@ -524,9 +566,9 @@ impl XmppSession {
                                     "[XMPP] Binding resource (server_supports_sm={})...",
                                     server_supports_sm
                                 );
-                                ws_stream
-                                    .send(Message::text(XmppBuilder::bind_resource("_bind_auth_2")))
-                                    .await?;
+                                let bind_xml = XmppBuilder::bind_resource("_bind_auth_2");
+                                log::info!("[XMPP OUT]: {bind_xml}");
+                                ws_stream.send(Message::text(bind_xml)).await?;
                             }
                             InboundXmpp::BindResult {
                                 id,
@@ -547,32 +589,41 @@ impl XmppSession {
                                 ws_stream.feed(Message::text(extdisco_req)).await?;
 
                                 if pre_allocate_before_muc {
-                                    let alloc_id = format!("conf_pre_{endpoint_id}");
+                                    waiting_pre_alloc = true;
                                     let alloc_iq = XmppBuilder::conference_allocation(
                                         conference_id,
                                         &endpoint_id,
                                         &alloc_id,
                                     );
+                                    log::info!(
+                                        "[XMPP] Pre-allocating conference room {conference_id} via Jicofo before MUC join..."
+                                    );
                                     log::info!("[XMPP OUT]: {alloc_iq}");
                                     ws_stream.feed(Message::text(alloc_iq)).await?;
+                                    ws_stream.flush().await?;
+                                } else {
+                                    presence_sent = true;
+                                    log::info!(
+                                        "[XMPP] Entering MUC room {conference_id} with occupant {endpoint_id} (name: {effective_client_name})..."
+                                    );
+                                    let presence = XmppBuilder::muc_presence(
+                                        conference_id,
+                                        &endpoint_id,
+                                        &effective_client_name,
+                                    );
+                                    log::info!("[XMPP OUT]: {presence}");
+                                    ws_stream.feed(Message::text(presence)).await?;
+                                    ws_stream.flush().await?;
                                 }
-
-                                log::info!(
-                                    "[XMPP] Entering MUC room {conference_id} with occupant {endpoint_id} (name: {effective_client_name})..."
-                                );
-                                let presence = XmppBuilder::muc_presence(
-                                    conference_id,
-                                    &endpoint_id,
-                                    &effective_client_name,
-                                );
-                                ws_stream.feed(Message::text(presence)).await?;
-                                ws_stream.flush().await?;
                             }
                             InboundXmpp::SaslFailure(err) => {
                                 anyhow::bail!("XMPP SASL authentication failed: {err}");
                             }
                             _ => {}
                         }
+                    }
+                    if frame_has_jingle {
+                        pending_jingle_frames.push(text.to_string());
                     }
                     if joined {
                         break;
@@ -582,10 +633,10 @@ impl XmppSession {
             if !joined {
                 anyhow::bail!("XMPP stream closed before MUC room join completed");
             }
-            Ok::<(), anyhow::Error>(())
+            Ok::<Vec<String>, anyhow::Error>(pending_jingle_frames)
         };
 
-        tokio::time::timeout(timeout, handshake_fut)
+        let pending_jingle_frames = tokio::time::timeout(timeout, handshake_fut)
             .await
             .map_err(|_| {
                 anyhow::anyhow!("XMPP MUC handshake timed out after {}s", handshake_timeout_secs)
@@ -593,6 +644,9 @@ impl XmppSession {
 
         let (write_tx, mut write_rx) = mpsc::channel::<XmppOutboundCmd>(WRTC_XMPP_CHANNEL_CAPACITY);
         let (read_tx, read_rx) = mpsc::channel::<String>(WRTC_XMPP_CHANNEL_CAPACITY);
+        for frame in pending_jingle_frames {
+            let _ = read_tx.try_send(frame);
+        }
 
         let ping_secs = if ping_interval_secs > 0 {
             ping_interval_secs.clamp(3, 25)
