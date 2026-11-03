@@ -696,8 +696,8 @@ throttle_backoff_ms = 30000
    }
 
    /// Готовый к отправке зашифрованный батч Uplink
-   struct EncryptedUplinkBatch {
-       pub session_id: String,
+   pub struct EncryptedUplinkBatch {
+       pub subject: String,
        pub encrypted_payload: Bytes,
    }
    ```
@@ -706,34 +706,38 @@ throttle_backoff_ms = 30000
    * `downlink_tun_tx: mpsc::Sender<Bytes>` — общий канал, куда все $N$ задач `CLI_READER[i]` отправляют расфреймированные IP-пакеты для записи в `tunnel_write` единой задачей `tun_writer_task`;
    * `retry_uplink_tx / retry_uplink_rx` — канал возврата батча: если `CLI_WRITER[i]` получил сетевую ошибку во время `APPEND`, он возвращает `EncryptedUplinkBatch` обратно диспетчеру, который мгновенно перенаправляет его через другой живой ящик $j \ne i$ без потери ни одного пакета!
 
-2. **Локальное состояние воркера конкретного ящика (`ClientMailboxWorker`, изолированное для каждого $i \in 0..N$):**
+2. **Локальное состояние воркера конкретного ящика (`ClientMailboxSlot`, изолированное для каждого $i \in 0..N$):**
    ```rust
-   struct ClientMailboxSlot {
+   #[derive(Clone)]
+   pub struct ClientMailboxSlot {
        pub index: usize,
        pub account: ImapAccount,
-       /// Канал ёмкостью 1 для передачи зашифрованного батча от центрального диспетчера конкретному CLI_WRITER[i]
-       pub uplink_tx: mpsc::Sender<EncryptedUplinkBatch>,
+       /// Канал ёмкостью 1 для передачи зашифрованного батча и разрешения семафора конкретному CLI_WRITER[i]
+       pub uplink_tx: mpsc::Sender<(EncryptedUplinkBatch, OwnedSemaphorePermit)>,
+       /// Семафор занятости CLI_WRITER[i] (1 разрешение: удерживается на всё время сетевого APPEND или UID EXPUNGE)
+       pub writer_sem: Arc<Semaphore>,
        /// Флаг готовности и здоровья пары (CLI_WRITER[i] + CLI_READER[i])
        pub healthy: Arc<AtomicBool>,
        /// Локальный счётчик неподтверждённых батчей именно этого ящика
        pub inflight: Arc<AtomicUsize>,
    }
    ```
-   Внутри каждого воркера ящика $i$ хранятся **только его собственные**:
-   * `last_seen_uid: u32` — последний прочитанный `UID` в папке `"Notes"` ящика $i$;
-   * `cleanup_uids: Arc<Mutex<Vec<u32>>>` — список прочитанных `UID` в `"Notes"` ящика $i$, который очищается через `UID STORE` + `UID EXPUNGE` исключительно `CLI_WRITER[i]` этого же ящика!
+   * **Почему используется `writer_sem: Arc<Semaphore>` (`Semaphore::new(1)`) вместе с `mpsc::channel(1)`:**
+     Обычный `mpsc::channel(1)` освобождает место в буфере сразу в момент вызова `uplink_rx.recv().await` (до начала выполнения `append_message`), из-за чего `try_reserve_owned()` ошибочно считал бы слот свободным, пока сокет ещё 850 мс занят сетевым `APPEND`. Передача `OwnedSemaphorePermit` вместе с батчем гарантирует, что разрешение освобождается (`drop(permit)`) **строго после завершения `append_message`**, а на время выполнения `expunge_uids` воркер захватывает `writer_sem.acquire().await`, чтобы диспетчер автоматически обходил занятый сборкой мусора ящик!
+   * Внутри каждого воркера ящика $i$ хранятся **только его собственные**:
+     * `last_seen_uid: u32` — последний прочитанный `UID` в папке `"Notes"` ящика $i$;
+     * `cleanup_uids: Arc<Mutex<Vec<u32>>>` — список прочитанных `UID` в `"Notes"` ящика $i$, который очищается через `UID STORE` + `UID EXPUNGE` исключительно `CLI_WRITER[i]` этого же ящика!
 
 #### 9.4.2. Алгоритм центрального диспетчера Uplink (`Self-Clocking Round-Robin Uplink Dispatcher`)
-Вместо того чтобы раздавать сырые пакеты по разным `PacketBatcher` заранее (что привело бы к застреванию пакетов в очереди медленного ящика), на клиенте работает **один центральный `UplinkDispatcher`**, владеющий `prio_rx`, `bulk_rx` и единым `PacketBatcher`:
+Вместо того чтобы раздавать сырые пакеты по разным `PacketBatcher` заранее (что привело бы к застреванию пакетов в очереди медленного ящика), на клиенте работает **один центральный `run_client_uplink_dispatcher`**, владеющий `prio_rx`, `bulk_rx`, `retry_uplink_rx` и единым `PacketBatcher`:
 
 1. **Коалесценция стартового бурста:**
    Диспетчер ждёт первый пакет из `prio_rx` или `bulk_rx` (или проверяет `retry_uplink_rx`) и добирает пакеты в течение микро-окна `coalesce_ms` (`15 мс`).
-2. **Фаза 1 диспетчеризации — Мгновенный неблокирующий Round-Robin (`Fast Path`):**
+2. **Фаза 1 диспетчеризации — Мгновенный неблокирующий Round-Robin (`Fast Path` в `acquire_client_slot_self_clocking`):**
    Диспетчер проверяет $N$ слотов начиная с курсора `rr_cursor`:
    ```rust
-   let mut selected_permit = None;
    for offset in 0..slots.len() {
-       let idx = (rr_cursor + offset) % slots.len();
+       let idx = (*rr_cursor + offset) % slots.len();
        let slot = &slots[idx];
        if !slot.healthy.load(Ordering::Acquire) {
            continue;
@@ -741,25 +745,24 @@ throttle_backoff_ms = 30000
        if slot.inflight.load(Ordering::Relaxed) >= max_inflight_batches {
            continue;
        }
-       if let Ok(permit) = slot.uplink_tx.clone().try_reserve_owned() {
-           rr_cursor = (idx + 1) % slots.len();
-           selected_permit = Some((idx, permit));
-           break;
+       if let Ok(permit) = slot.writer_sem.clone().try_acquire_owned() {
+           *rr_cursor = (idx + 1) % slots.len();
+           return Some((idx, permit));
        }
    }
    ```
 3. **Фаза 2 диспетчеризации — Ожидание первого освободившегося воркера (`All-Busy Self-Clocking Path`):**
-   Если в данный момент все здоровые воркеры заняты выполнением `APPEND` (`selected_permit.is_none()`):
-   * Диспетчер собирает фьючерсы `slot.uplink_tx.clone().reserve_owned()` для всех здоровых слотов (в порядке от `rr_cursor`) и ожидает **первого завершившегося** через `futures::future::select_all(...)`.
+   Если в данный момент все здоровые воркеры заняты выполнением `APPEND` (или `UID EXPUNGE`):
+   * Диспетчер собирает фьючерсы `slot.writer_sem.clone().acquire_owned()` для всех здоровых слотов (в порядке от `rr_cursor`) и ожидает **первого завершившегося** через `futures::future::select_all(...)`.
    * **Критическое преимущество:** Пока все $N$ ящиков заняты в сети, новые пакеты из TUN не отправляются полупустыми, а продолжают накапливаться в `prio_rx` и `bulk_rx`!
-   * Как только самый быстрый из $N$ ящиков завершил свой `APPEND` и освободил `reserve_owned()`, диспетчер **добирает все накопившиеся за это время пакеты** из `prio_rx` и `bulk_rx` до `max_batch_bytes` (приоритетные ICMP/DNS/ACK всегда встают в начало батча), шифрует весь буфер одним вызовом `wrap_packet_slice` и отправляет готовый `EncryptedUplinkBatch` именно в этот освободившийся `OwnedPermit`!
+   * Как только самый быстрый из $N$ ящиков завершил свой `APPEND` и освободил `OwnedSemaphorePermit`, диспетчер **добирает все накопившиеся за это время пакеты** из `prio_rx` и `bulk_rx` до `max_batch_bytes` (приоритетные ICMP/DNS/ACK всегда встают в начало батча), шифрует весь буфер одним вызовом `wrap_packet_slice` и отправляет `(EncryptedUplinkBatch, permit)` в освободившийся слот!
 
 #### 9.4.3. Изолированное самовосстановление ящиков (`Per-Mailbox Auto-Heal` vs `Full Session Failover`)
 * Если на ящике $i$ возникает ошибка `APPEND`, `UID FETCH` или `UID EXPUNGE`:
   1. Воркер ящика $i$ немедленно выставляет `slot.healthy.store(false, Ordering::Release)`.
-  2. Если в руках у `CLI_WRITER[i]` был неотправленный `EncryptedUplinkBatch`, он передаёт его в `retry_uplink_tx`, и диспетчер тут же отправляет его через соседний здоровый ящик $j \ne i$.
-  3. Пока хотя бы один другой ящик в пуле остаётся здоровым (`slots.iter().any(|s| s.healthy.load(Ordering::Acquire))`), **туннель не прерывается ни на миллисекунду**, а воркер ящика $i$ в собственной фоновой задаче ждёт паузу (`2000 мс` при сетевом обрыве или `throttle_backoff` при `THROTTLED`/`OVERQUOTA`), переподключает `CLI_WRITER[i]` + `CLI_READER[i]`, отправляет `Mailbox Binding Frame` и возвращает `slot.healthy.store(true, Ordering::Release)`.
-* Если же **все $N$ ящиков одновременно** потеряли связь (`healthy == false` у всех слотов), активируется глобальный координатор восстановления сессии с `resume_session_id`, который заново проходит `establish_mailbox_session` на первом ожившем ящике и обновляет `ActiveImapSessionState`.
+  2. Если в руках у `CLI_WRITER[i]` (или в буфере `uplink_rx`) был неотправленный `EncryptedUplinkBatch`, он передаёт его в `retry_uplink_tx` и освобождает `permit`, а диспетчер тут же отправляет батч через соседний здоровый ящик $j \ne i$.
+  3. Пока хотя бы один другой ящик в пуле остаётся здоровым (`slots.iter().any(|s| s.healthy.load(Ordering::Acquire))`), **туннель не прерывается ни на миллисекунду**, а воркер ящика $i$ в собственной фоновой задаче ждёт паузу (`2000 мс` при сетевом обрыве или `throttle_backoff` при `THROTTLED`/`OVERQUOTA`), переподключает `CLI_WRITER[i]` + `CLI_READER[i]` через `connect_data_only_mailbox_pair`, отправляет `Mailbox Binding Frame` и возвращает `slot.healthy.store(true, Ordering::Release)`.
+* Если же **все $N$ ящиков одновременно** потеряли связь (`healthy == false` у всех слотов), активируется глобальный координатор восстановления сессии (`full_resume_mutex`) с `resume_session_id`, который заново проходит `establish_mailbox_session` на первом ожившем ящике и обновляет `ActiveImapSessionState`.
 
 ---
 
@@ -777,7 +780,8 @@ throttle_backoff_ms = 30000
 pub struct ServerMailboxHandle {
     pub mailbox_idx: usize,
     pub email: String,
-    pub notes_data_tx: mpsc::Sender<DownlinkMessage>,
+    pub notes_data_tx: mpsc::Sender<(DownlinkMessage, OwnedSemaphorePermit)>,
+    pub writer_sem: Arc<Semaphore>,
     pub healthy: Arc<AtomicBool>,
     pub inflight: Arc<AtomicUsize>,
 }
@@ -787,33 +791,31 @@ pub struct SessionMailboxPool {
     pub active_mailboxes: RwLock<Vec<ServerMailboxHandle>>,
     /// Курсор Round-Robin для балансировки Downlink-батчей этой сессии
     pub rr_cursor: AtomicUsize,
-    /// Сигнал о добавлении нового ящика в пул сессии
+    /// Сигнал о добавлении нового ящика или освобождении слота в пуле сессии
     pub pool_updated: Notify,
 }
 ```
 
 **Как работает привязка и маршрутизация на сервере:**
 1. **Инициализация пула воркеров сервера (`run_imap_server`):**
-   * При старте каждого `run_mailbox_worker_pair(mailbox_idx, ...)` создаются долговечные каналы `notes_auth_tx` и `notes_data_tx` и дескриптор `ServerMailboxHandle` с флагом `healthy: Arc<AtomicBool>`.
-   * Когда `SRV_READER` и `SRV_WRITER` успешно подключились и выполнили `SELECT "Drafts"`, воркер выставляет `healthy.store(true, Ordering::Release)`. При обрыве соединения и уходе на реконнект флаг временно сбрасывается в `false`.
+   * При старте каждого `run_mailbox_worker_pair(mailbox_idx, ...)` создаются долговечные каналы `notes_auth_tx` и `notes_data_tx` и дескриптор `ServerMailboxHandle` с семафором занятости `writer_sem: Arc<Semaphore>` (`Semaphore::new(1)`) и флагом `healthy: Arc<AtomicBool>`.
+   * Когда `SRV_READER` и `SRV_WRITER` успешно подключились и выполнили `SELECT "Drafts"`, воркер выставляет `healthy.store(true, Ordering::Release)` и будит все активные пулы `pool_updated.notify_waiters()`. При обрыве соединения и уходе на реконнект флаг временно сбрасывается в `false`.
 2. **Регистрация первого ящика при ASTP Handshake (Фаза 3):**
-   * Когда клиент завершает Фазу 3 рукопожатия на ящике `M_primary`, сервер создаёт `SessionMailboxPool`, сразу добавляет в него `ServerMailboxHandle` ящика `M_primary`, сохраняет `Arc<SessionMailboxPool>` в глобальной карте `session_pools: Arc<DashMap<String, Arc<SessionMailboxPool>>>` и запускает одну задачу `run_client_downlink_batcher(rx_router, client_info, session_pool, ...)`.
+   * Когда клиент завершает Фазу 3 рукопожатия на ящике `M_primary`, сервер создаёт `SessionMailboxPool`, сразу добавляет в него `ServerMailboxHandle` ящика `M_primary` через `session_pool.register_mailbox(...)`, сохраняет `Arc<SessionMailboxPool>` в глобальной карте `session_pools: Arc<DashMap<String, Arc<SessionMailboxPool>>>` и запускает задачу `run_client_downlink_batcher(rx_router, client_info, session_pool, ...)`.
 3. **Автоматическое подключение дополнительных ящиков ($M_1 \dots M_{N-1}$) по входящему Uplink / Binding Frame:**
    * Когда `SRV_READER` любого другого ящика `M_i` получает сообщение в `"Drafts"` с темой `[ID: <srv_id>:<session_id>]` и **успешно расшифровывает его** через `unwrap_packet(&client_info.cipher, &msg.payload)`:
-   * Воркер `M_i` проверяет `session_pools.get(session_id)`: если `mailbox_idx` ящика `M_i` ещё не входит в `session_pool.active_mailboxes`, он добавляет свой `ServerMailboxHandle` в `active_mailboxes` и вызывает `session_pool.pool_updated.notify_waiters()`!
+   * Воркер `M_i` вызывает `session_pool.register_mailbox(mailbox_handle.clone()).await`: если `mailbox_idx` ящика `M_i` ещё не входит в `session_pool.active_mailboxes`, он добавляет свой `ServerMailboxHandle` в `active_mailboxes` и вызывает `session_pool.pool_updated.notify_waiters()`!
    * Если расшифрованный батч содержал `0` IP-пакетов (`Mailbox Binding Frame`), `SRV_READER` просто фиксирует привязку ящика и обновляет `touch_client(&client_info)` без записи в `tun_tx`. Если батч содержал IP-пакеты — они штатно отправляются в `tun_tx`.
-4. **Бесшовное обновление при `resume_session_id`:**
-   * Если клиент переподключился с `resume_session_id`, сервер не убивает существующий `SessionMailboxPool`, а обновляет список его активных ящиков по мере прихода новых пакетов с новым ключом.
 
 #### 9.5.3. Балансировка Downlink в `run_client_downlink_batcher` на сервере
-Задача `run_client_downlink_batcher` для клиента работает по точно такому же алгоритму **Self-Clocking Round-Robin**, как и клиентский Uplink-диспетчер:
+Задача `run_client_downlink_batcher` для клиента работает по алгоритму **Self-Clocking Round-Robin** (`acquire_server_slot_self_clocking`):
 1. Собирает стартовый пакет из `rx_router` и ждёт микро-окно `coalesce_ms` (`15 мс`).
 2. Читает текущий список `handles = session_pool.active_mailboxes.read().await.clone()`.
 3. **Fast Path (Неблокирующий Round-Robin):**
-   Ищет первый здоровый ящик (`handle.healthy.load(Ordering::Acquire)`), у которого свободен канал `handle.notes_data_tx.clone().try_reserve_owned()`, начиная с `rr_cursor = session_pool.rr_cursor.fetch_add(1, Ordering::Relaxed) % handles.len()`.
+   Ищет первый здоровый ящик (`handle.healthy.load(Ordering::Acquire)`), у которого свободен семафор записи `handle.writer_sem.clone().try_acquire_owned()`, начиная с `rr_cursor`.
 4. **All-Busy Path (Гонка `select_all` по всем активным ящикам клиента):**
-   Если все привязанные ящики клиента сейчас заняты выполнением `APPEND "Notes"`, батчер ждёт освобождения **первого любого** из здоровых `notes_data_tx` через `futures::future::select_all` (параллельно слушая `session_pool.pool_updated.notified()`, чтобы мгновенно подхватить только что привязавшийся новый ящик!).
-5. В момент получения `OwnedPermit` от первого освободившегося `SRV_WRITER[k]`, батчер добирает из `rx_router` все накопившиеся за время ожидания пакеты до `max_batch_bytes`, шифрует их одним вызовом `wrap_packet_slice` (с атомарным `client_info.sequence.fetch_add(1, Ordering::Relaxed)`) и отправляет в `permit.send(DownlinkMessage { subject, payload })`.
+   Если все привязанные ящики клиента сейчас заняты выполнением `APPEND "Notes"` (или `UID EXPUNGE`), батчер ждёт освобождения **первого любого** из здоровых `writer_sem.clone().acquire_owned()` через `futures::future::select_all` (параллельно слушая `session_pool.pool_updated.notified()`, чтобы мгновенно подхватить только что привязавшийся новый ящик!).
+5. В момент получения `(handle, permit)` от первого освободившегося `SRV_WRITER[k]`, батчер добирает из `rx_router` все накопившиеся за время ожидания пакеты до `max_batch_bytes`, шифрует их одним вызовом `wrap_packet_slice` (с атомарным `client_info.sequence.fetch_add(1, Ordering::Relaxed)`) и отправляет `(DownlinkMessage { subject, payload }, permit)` в `handle.notes_data_tx`.
 
 ---
 
