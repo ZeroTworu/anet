@@ -5,25 +5,26 @@
 ## 1. Введение и архитектурная концепция
 
 ### 1.1. Назначение
-Транспорт `wrtc` предназначен для скрытной и отказоустойчивой передачи туннелированного IP-трафика ANet через корпоративную инфраструктуру видеоконференцсвязи (ВКС) сервиса **Ktalk (Контур.Толк)**. Сервис функционирует на базе стека **Jitsi (Prosody + Jicofo + Jitsi Videobridge / JVB)**. Трафик полностью маскируется под легитимного участника видеоконференции в браузере:
-1. **HTTP/REST и WSS уровень:** полная маскировка под современные браузеры (Chrome / Firefox / Safari) со случайным профилем (`BrowserProfile`), валидными Client Hints (`sec-ch-ua`, `sec-ch-ua-mobile`, `sec-ch-ua-platform`), Fetch Metadata (`Sec-Fetch-*`), языковыми заголовками и естественными именами гостей («Пользователь 248», «Гость 5433», «Денис»).
-2. **Сигнальный транспорт (XMPP over WebSocket):** взаимодействие по RFC 7395 с сервером Prosody на базе синтаксического DOM/AST-парсера (`roxmltree`) и строгого XML-билдера с экранированием спецсимволов.
-3. **Транспорт данных (Colibri-WS):** передача управляющих и зашифрованных сетевых пакетов через выделенный полнодуплексный WebSocket моста JVB (`wss://.../colibri-ws/...`), исключающий фрагментацию и проблемы с блокировкой UDP/SCTP.
-4. **Медиауровень (WebRTC keep-alive):** эмуляция реального медиапотока (Opus silence) через библиотеку `webrtc = "0.21.0"`. Непрерывная передача аудиотрека тишины каждые 20 мс переводит эндпоинт на стороне JVB в состояние `Connected` и предотвращает отключение участника по неактивности.
+Транспорт `wrtc` предназначен для отказоустойчивой передачи туннелированного IP-трафика ANet через облачную и корпоративную инфраструктуру видеоконференцсвязи (ВКС) сервисов **Ktalk (Контур.Толк)** и стандартных инстансов **Jitsi Meet**. Сервисы функционируют на базе стека **Jitsi (Prosody + Jicofo + Jitsi Videobridge / JVB)**. Трафик полностью соответствует профилю стандартного участника видеоконференции в браузере:
+1. **HTTP/REST и WSS уровень (`http_help.rs` + `providers/`):** единый профиль браузера (`BrowserProfile`: Chrome / Firefox / Safari / Randomized) с общим хранилищем `CookieJar`, синхронизированным TLS-отпечатком BoringSSL, валидными Client Hints (`sec-ch-ua`, `sec-ch-ua-mobile`, `sec-ch-ua-platform`), Fetch Metadata (`Sec-Fetch-*`), языковыми заголовками и естественными именами гостей («Пользователь 248», «Гость 5433», «Денис»).
+2. **Мульти-провайдерный реестр (`WrtcProviderRegistry`):** автоматическое определение платформы ВКС по домену (`ProviderKind::KonturTalk` для `*.ktalk.ru` / `*.kontur.ru` и `ProviderKind::StandardJitsi` для стандартных серверов Jitsi Meet) с индивидуальной пред-сигнальной подготовкой (`bootstrap_room`).
+3. **Сигнальный транспорт (XMPP over WebSocket, RFC 7395 + XEP-0198):** взаимодействие по протоколу RFC 7395 с сервером Prosody на базе синтаксического DOM/AST-парсера (`roxmltree`), строгого XML-билдера с явным пространством имён `xmlns="jabber:client"` на каждой станзе и поддержкой бесшовного возобновления потока по **XEP-0198 Stream Management** (`urn:xmpp:sm:3`).
+4. **Высокоскоростной медиауровень (`media_video` / VP8 over DTLS-SRTP) и резервный канал (`Colibri-WS`):** передача сетевых пакетов внутри видеопотока VP8 (с микро-батчингом и микро-пейсером EDT) либо через выделенный полнодуплексный WebSocket моста JVB (`wss://.../colibri-ws/...`) при нестабильном прохождении UDP.
+5. **Аудио-активность (WebRTC keep-alive):** непрерывная передача фреймов тишины Opus (`0xf8, 0xff, 0xfe`) каждые 20 мс переводит эндпоинт на стороне JVB в состояние `Connected` и предотвращает отключение участника по неактивности.
 
 ### 1.2. Базовая топология
-* **Топология сети:** Клиент-серверное соединение поверх топологии **SFU (Selective Forwarding Unit)**. Прямое соединение (P2P) между пирами не требуется; все участники взаимодействуют через медиамост JVB.
+* **Топология сети:** Клиент-серверное соединение поверх топологии **SFU (Selective Forwarding Unit)**. Прямое соединение (P2P) между узлами по умолчанию не требуется; все участники взаимодействуют через медиамост JVB.
 * **Среда встречи (Rendezvous):** Клиенты и сервер подключаются в одну заранее подготовленную постоянную комнату с фиксированным коротким именем (например, `example-room-id`).
 * **Роли в парадигме ANet:**
   * `anet-server` выступает в роли дежурного участника ВКС, непрерывно присутствующего в комнате.
-  * `anet-client` подключается к комнате по требованию, находит сервер посредством криптографического механизма Discovery и инициирует внутреннее рукопожатие ASTP.
-* **Канал передачи данных:** Протокол **Colibri** поверх защищенного WebSocket соединения к JVB. Сообщения упаковываются в типизированную структуру `colibriClass: ColibriClass::EndpointMessage` с адресной маршрутизацией через поле `to`.
+  * `anet-client` подключается к комнате по требованию, находит сервер посредством криптографического механизма Unicast Discovery и инициирует внутреннее рукопожатие ASTP.
+* **Управляющий канал:** Протокол **Colibri** поверх защищенного WebSocket соединения к JVB (`Colibri-WS`) или SCTP DataChannel. Сообщения упаковываются в типизированную структуру `colibriClass: ColibriClass::EndpointMessage` с адресной маршрутизацией через поле `to`.
 
 ---
 
-## 2. Этап 1. Авторизация и предстартовое согласование (REST API)
+## 2. Этап 1. Авторизация и пред-сигнальная инициализация (`WrtcProviderRegistry`)
 
-Подключение к WebSockets и сигнальной сети Jitsi требует предварительного получения сессионного токена гостя и внутреннего идентификатора конференции (`conferenceId`). Выполняется клиентом и сервером единообразно через REST API Ktalk.
+Перед открытием сигнального WebSocket-соединения модуль `wrtc::providers::WrtcProviderRegistry::bootstrap_room()` выполняет подготовку комнаты в зависимости от типа ВКС-платформы, используя переданный `BrowserProfile` (все полученные заголовки `Set-Cookie` автоматически сохраняются в `profile.cookie_jar` и подставляются в последующий `wss://` запрос).
 
 ```
 +-------------+                     +----------------------+
@@ -32,7 +33,7 @@
 +-------------+                     +----------------------+
        |                                       |
        | 1. POST /api/authorize/session        |
-       |    Headers: Browser Stealth + Hints   |
+       |    Headers: BrowserProfile + Cookies  |
        |    Body: { name: "Гость ...", ... }   |
        |-------------------------------------->|
        |                                       |
@@ -40,7 +41,7 @@
        |<--------------------------------------|
        |                                       |
        | 3. GET /api/rooms/{short_name}        |
-       |    Headers: Browser Stealth           |
+       |    Headers: BrowserProfile + Cookies  |
        |             Authorization: Session {t}|
        |-------------------------------------->|
        |                                       |
@@ -48,61 +49,36 @@
        |<--------------------------------------|
        |                                       |
        v                                       v
-   [Готовность к открытию WSS сигналинга XMPP]
+   [Формирование RoomBootstrapInfo и открытие WSS сигналинга XMPP]
 ```
 
-### 2.1. Получение сессионного токена гостя
-Клиент формирует запрос на создание анонимной сессии.
+### 2.1. Провайдер `KonturTalkProvider` (`*.ktalk.ru`, `*.kontur.ru`)
+1. **Получение сессионного токена гостя (`POST https://{domain}/api/authorize/session`):**
+   * Выполняется через `http_help.rs` с профилем `BrowserProfile` и поддержкой быстрого перебора исходных TCP-портов (`tcp_port_hop_attempts`) при нестабильной связности на балансировщиках маршрута.
+   * **Тело запроса (JSON):**
+     ```json
+     {
+       "name": "Гость 4821",
+       "anonymousSecret": "EXAMPLE15SECRET",
+       "consentOnCreate": true
+     }
+     ```
+   * **Ответ Ktalk API:** возвращает `token` и `anonymousId`.
+2. **Разрешение внутреннего имени конференции (`GET https://{domain}/api/rooms/{room_short_name}`):**
+   * Передаётся заголовок `Authorization: Session {token}`.
+   * **Ответ Ktalk API:** возвращает внутренний идентификатор `conferenceId` вида `"{room_short_name}_{hex_hash}"`.
+3. **Параметры `RoomBootstrapInfo` для Контур.Толк:**
+   * Приоритетный URL сигнализации: `wss://{domain}/jitsi/xmpp-websocket?room={conferenceId}&sessionToken={token}` (с резервным `wss://{domain}/xmpp-websocket?room={conferenceId}&token={token}& Lists=true`).
+   * Внутренний флаг провайдера `pre_allocate_before_muc = false` (вход в MUC выполняется строго до обращения к `focus.meet.jitsi`).
 
-* **HTTP Метод:** `POST`
-* **URL:** `https://{domain}/api/authorize/session`
-* **Заголовки маскировки под браузер:**
-  * `Content-Type: application/json`
-  * `Origin: https://{domain}`
-  * `Referer: https://{domain}/{room_short_name}`
-  * `User-Agent: Mozilla/5.0 ... Chrome/124.0.0.0 Safari/537.36` (выбирается из пула `BrowserProfile`)
-  * `Accept-Language: ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7`
-  * `sec-ch-ua: "Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"`
-  * `sec-ch-ua-mobile: ?0`
-  * `sec-ch-ua-platform: "Windows"`
-  * `Sec-Fetch-Dest: empty`, `Sec-Fetch-Mode: cors`, `Sec-Fetch-Site: same-origin`
-  * `Cache-Control: no-cache`, `Pragma: no-cache`
-* **Тело запроса (JSON):**
-  ```json
-  {
-    "name": "Гость 4821",
-    "anonymousSecret": "EXAMPLE_ANONYMOUS_SECRET",
-    "consentOnCreate": true
-  }
-  ```
-* **Ответ Ktalk API:**
-  ```json
-  {
-    "token": "example_session_token_abc123",
-    "expiresAt": "2026-10-01T02:00:00Z",
-    "expiresIn": 543740,
-    "anonymousId": "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF"
-  }
-  ```
-
-### 2.2. Разрешение внутреннего имени конференции Jitsi
-Короткое имя комнаты транслируется во внутренний хэшированный идентификатор комнаты Jicofo.
-
-* **HTTP Метод:** `GET`
-* **URL:** `https://{domain}/api/rooms/{room_short_name}`
-* **Заголовки:** `Authorization: Session {token}`, браузерные Client Hints и `Accept: application/json`.
-* **Ответ Ktalk API:**
-  ```json
-  {
-    "roomName": "example-room-id",
-    "conferenceId": "example-room-id_a1b2c3d4e5f607182930415263748596a7b8c9d0e1f2a3b4c5d6e7f8091a2b3c",
-    "allowAnonymous": true
-  }
-  ```
+### 2.2. Провайдер `JitsiMeetProvider` (стандартный Jitsi Meet)
+1. Приводит имя комнаты к нижнему регистру (требование Prosody MUC).
+2. Выполняет быстрый предварительный HTTP-запрос (`GET https://{domain}/xmpp-websocket?room={conference_id}`) через `BrowserProfile`, сохраняя балансировочные cookie (такие как `session-cookie`) в `profile.cookie_jar`.
+3. Устанавливает внутренний флаг `pre_allocate_before_muc = true`, чтобы перед отправкой `<presence>` в MUC гарантированно инициализировать комнату через IQ `<conference xmlns="http://jitsi.org/protocol/focus" .../>`.
 
 ---
 
-## 3. Этап 2. Сигналинг XMPP и запуск медиамоста
+## 3. Этап 2. Сигналинг XMPP (RFC 7395 + XEP-0198) и запуск медиамоста
 
 ```
 +-------------+                 +-----------------+                 +---------------+
@@ -111,106 +87,78 @@
        |                                 |                                  |
        | 1. Connect WebSocket            |                                  |
        |    /jitsi/xmpp-websocket        |                                  |
-       |    (Browser Stealth Headers)    |                                  |
+       |    (BrowserProfile + Cookies)   |                                  |
        |-------------------------------->|                                  |
        | 2. SASL ANONYMOUS Auth          |                                  |
        |<------------------------------->|                                  |
-       | 3. Resource Bind                |                                  |
+       | 3. Resource Bind + XEP-0198 SM  |                                  |
+       |    + XEP-0215 extdisco          |                                  |
        |<------------------------------->|                                  |
        | 4. MUC Presence (Enter Room)    |                                  |
-       |    with random guest nickname   |                                  |
+       |    xmlns="jabber:client"        |                                  |
        |-------------------------------->|                                  |
-       |                                 | 5. Conference allocation request |
-       |                                 |    <iq type="set" ... />         |
-       |                                 |--------------------------------->|
-       |                                 | 6. Jingle Offer (session-initiate)|
-       | 7. Jingle Offer (Dynamic ICE)   |<---------------------------------|
+       | 5. Self Presence (status 110)   |                                  |
+       |<--------------------------------|                                  |
+       |                                 | 6. Jicofo detects participant    |
+       |                                 |    (or fallback focus IQ after   |
+       |                                 |     4s in wait_jingle_offer)     |
+       |                                 |<-------------------------------->|
+       | 7. Jingle Offer (session-init)  |<---------------------------------|
        |<--------------------------------|                                  |
        | 8. Parse colibri-ws url, ICE,   |                                  |
        |    DTLS, fingerprint, ufrag/pwd |                                  |
        |                                 |                                  |
        | 9. Jingle session-accept        |                                  |
+       |    (xmlns="jabber:client")      |                                  |
        |-------------------------------->|                                  |
        |                                 |                                  |
        | 10. Open Colibri WebSocket      |                                  |
        |<==================================================================>|
-       |     (Primary data channel)      |                                  |
-       |                                 |                                  |
-       | 11. ICE / DTLS Handshake to JVB |                                  |
+       | 11. Multi-Socket UDP ICE / DTLS |                                  |
        |<==================================================================>|
-       | 12. Background Keep-Alive:                                         |
+       | 12. Media & Control Plane Active:                                  |
+       |     - VP8 RTP Video Track (EDT Micro-Pacer + Batching)             |
        |     - Opus Audio silence frame every 20ms                          |
-       |     - WebSocket Colibri Ping every 10s                             |
-       |     - XMPP WS ping / whitespace every 20s                          |
+       |     - WebSocket Colibri Ping & XMPP Ping / XEP-0198 Ack            |
 ```
 
-### 3.1. Параметры WebSocket-сигналинга и маскировка
-* **Endpoint:** `wss://{domain}/jitsi/xmpp-websocket?room={conferenceId}&sessionToken={token}`
-* **Subprotocol:** `xmpp`
-* **Маскировка WS Handshake:** Установка полного комплекта браузерных заголовков (`User-Agent`, `Origin: https://{domain}`, `Accept-Language`, `sec-ch-ua`, `Cache-Control`, `Pragma`).
+### 3.1. Архитектура XML-парсера и требования RFC 7395 (`xmpp_xml.rs`)
+Входящий XMPP-поток разбирается синтаксическим DOM-парсером `roxmltree`:
+1. **Явное пространство имён `xmlns="jabber:client"` (RFC 7395 §3.3.3):**
+   * В классическом XMPP поверх TCP (RFC 6120) корневой тег `<stream:stream xmlns="jabber:client">` задаёт пространство имён для всей сессии. В XMPP поверх WebSocket (RFC 7395) каждый WebSocket-фрейм парсится сервером Prosody как отдельный независимый XML-документ.
+   * Поэтому **все** станзы верхнего уровня в `XmppBuilder` (`<iq ... xmlns="jabber:client">`, `<presence ... xmlns="jabber:client">`) в обязательном порядке содержат атрибут `xmlns="jabber:client"`. Без этого атрибута Prosody игнорирует станзы привязки ресурса и входа в комнату.
+2. **Мульти-станзы в одном фрейме:** парсер оборачивает входящий буфер в виртуальный `<stream>...</stream>` и разбирает каждую станзу отдельно (`parse_xmpp_stanzas`).
+3. **Разделение порядка входа в MUC для Ktalk и стандартного Jitsi:**
+   * В инфраструктуре Контур.Толк компонент `focus.meet.jitsi` не принимает прямые IQ-запросы `<conference>` до того, как участник вошёл в комнату MUC (возвращая `<error type="cancel"><service-unavailable/></error>`). Поэтому на Ktalk узел сразу после `BindResult` отправляет `<presence to="{conf}@muc.meet.jitsi/{ep}" xmlns="jabber:client">`, дожидается собственного отражённого присутствия (`<status code="110"/>`), а если Jicofo не присылает `session-initiate` в течение 4 секунд в `wait_jingle_offer`, отправляет резервный запрос аллокации.
+4. **Бесшовное управление потоком XEP-0198 Stream Management (`urn:xmpp:sm:3`):**
+   * Если Prosody анонсирует поддержку `<sm xmlns="urn:xmpp:sm:3"/>` в `<features>`, клиент включает управление потоком (`<enable xmlns="urn:xmpp:sm:3" resume="true"/>`), ведёт подсчёт входящих станз (`inbound_h`) и отвечает `<a xmlns="urn:xmpp:sm:3" h="..."/>` на запросы `<r/>`.
+   * При кратковременном разрыве TCP-соединения сигналинга фоновая задача `io_handle` автоматически вызывает `try_resume_xmpp_stream()` и восстанавливает сессию на месте (`<resume xmlns="urn:xmpp:sm:3" previd="..." h="..."/>`) без выхода из комнаты MUC и без прерывания медиапотока.
 
-### 3.2. Архитектура XML-парсера (`xmpp_xml.rs`)
-Входящий XMPP-поток разбирается синтаксическим DOM-парсером `roxmltree` без хрупкого строкового поиска:
-1. **Мульти-станзы (RFC 7395):** Prosody может присылать несколько станз в одном WebSocket фрейме (например, `<open .../><features ...>`). Парсер оборачивает входящий буфер в виртуальный `<stream>...</stream>` и разбирает каждую станзу отдельно (`parse_xmpp_stanzas`).
-2. **SASL Mechanisms:** Обрабатывается вложенность `<features><mechanisms><mechanism>ANONYMOUS</mechanism></mechanisms></features>`.
-3. **Автоматическое экранирование:** Все исходящие станзы строятся через `XmppBuilder` с валидацией и экранированием спецсимволов (`&`, `<`, `>`, `"`, `'`).
-4. **Обработка системных IQ:** В фоновом воркере автоматически подтверждаются запросы Jicofo:
-   * `urn:xmpp:ping` -> ответ `<iq type="result"/>`.
-   * `http://jabber.org/protocol/disco#info` -> ответ со списком поддерживаемых фичей Jitsi Meet (jingle, colibri, audio/video).
-   * `urn:xmpp:jingle:1` (акты `session-` и `source-`) -> немедленный ACK `<iq type="result"/>`.
-
-### 3.3. Архитектура ICE-соединения с JVB, привязка к физическому интерфейсу и обход CGNAT
+### 3.2. Архитектура ICE-соединения с JVB, привязка к интерфейсу и Multi-Socket UDP ICE
 1. **Топология «клиент-сервер» через SFU вместо P2P:**
-   * Медиамост JVB всегда имеет **публичный белый IP-адрес** (например, `203.0.113.12:10000`, тип `host` в Jingle Offer).
-   * При отправке первых пакетов ICE Connectivity Check клиент инициирует исходящий UDP-поток на белый адрес JVB. Любой сетевой экран (NAT домашнего роутера, CGNAT мобильных операторов) мгновенно открывает двустороннюю трансляцию портов (NAT hole punching), и статус WebRTC переходит в `Connected` за считанные миллисекунды.
-2. **Строгая привязка UDP-сокета WebRTC к физическому сетевому адаптеру (`detect_physical_bind_addr`):**
-   * Привязка к универсальному адресу `0.0.0.0:0` опасна тем, что после поднятия TUN-интерфейса (`172.112.x.x`) с маршрутом `0.0.0.0/0` стек `webrtc-rs` начинает собирать локальные кандидаты со всех интерфейсов ОС, включая сам виртуальный адаптер TUN, и при переоценке путей пытается слать STUN/RTP пакеты с IP туннеля в самого себя.
-   * Поэтому ещё **до создания TUN-интерфейса** функция `detect_physical_bind_addr()` открывает пробный `std::net::UdpSocket` к IP медиамоста JVB (или к `1.1.1.1:80`), определяет точный локальный IPv4-адрес физического интерфейса (например, `192.168.1.x:0`) и передаёт его в `PeerConnectionBuilder::with_udp_addrs(vec![bind_addr])`.
-3. **Отключение встроенного STUN Gatherer:**
-   * В текущей архитектуре библиотеки `rtc` (v0.21.0) внутренний `stun_gatherer` отправляет запросы с того же сокета, который слушает `rtc_ice::agent`.
-   * Ответы публичных STUN-серверов ВКС соответствуют стандарту RFC 5389 (`XOR-MAPPED-ADDRESS`), но не содержат специфичных для ICE атрибутов связности (`USERNAME`). Из-за этого ICE-агент ошибочно классифицирует их как поврежденные проверки связности (`discard message ..., attribute not found`) и вызывает ложный таймаут `TransactionTimeOut`.
-   * Для предотвращения предупреждений и таймаутов `PeerConnection` конфигурируется с `with_ice_servers(vec![])`. Прямого обмена с JVB достаточно для надежного соединения.
-4. **Обнаружение сервисов XEP-0215 (`extdisco:2`) и маршрутизация:**
-   * Узлы запрашивают доступные STUN/TURN сервисы по протоколу XEP-0215 для актуализации инфраструктурных адресов и построения прямого P2P-канала (в режиме `p2p_direct`).
+   * Медиамост JVB всегда имеет **публичный белый IP-адрес** (например, `89.169.16.6:10002`, тип `host` в Jingle Offer).
+   * При отправке первых пакетов ICE Connectivity Check узел инициирует исходящий UDP-поток на адрес JVB, мгновенно открывая двустороннюю трансляцию портов на роутере или CGNAT оператора.
+2. **Привязка UDP-сокетов WebRTC к физическому сетевому адаптеру (`detect_physical_bind_addr`) и пул сокетов (`udp_ice_socket_count = 6`):**
+   * До создания маршрутов TUN функция `detect_physical_bind_addr()` открывает пробный UDP-сокет к IP медиамоста JVB, определяя точный локальный IPv4-адрес исходящего интерфейса (например, `192.168.1.x` или адрес туннельного интерфейса `172.16.0.2` при табличной маршрутизации через WARP).
+   * В `PeerConnectionBuilder::with_udp_addrs` передаётся сразу `udp_ice_socket_count` (по умолчанию `6`) локальных адресов `ip:0`. Стек `webrtc-rs` открывает 6 независимых UDP-сокетов с разными эфемерными портами источника (`src_port`), что позволяет ICE-агенту автоматически выбрать наиболее стабильный L4-маршрут при наличии ECMP/LAG-балансировки на промежуточных узлах сети.
+3. **Приоритет прямого UDP к JVB (`jvb_use_turn = false`):**
+   * По умолчанию параметр `jvb_use_turn` установлен в `false`: для связи с медиамостом JVB используются прямые UDP-кандидаты (`Tier 0: STUN` и `host`-кандидаты моста). Это исключает двойное релейное проксирование через TCP-TURN (`turns_proxy`), предотвращает просадку скорости из-за TCP Head-of-Line blocking и исключает таймауты `TURN transaction timed out`.
 
-### 3.4. Разделение каналов: Colibri-WS и WebRTC Media Plane
-1. **Канал управления и резервной передачи данных (Colibri-WS over TCP/443):**
-   * Из входящего Jingle Offer извлекается тег `<web-socket xmlns="http://jitsi.org/protocol/colibri" url="..."/>`.
-   * Клиент и сервер подключаются к указанному URL с браузерными заголовками. Через этот сокет передаются `EndpointMessage` с протоколами Discovery, ASTP и (в режиме `ws` или при блокировке UDP) батчи пакетов `AstpBatch`.
-2. **Медиаканал WebRTC (Opus Keepalive + Fake Video Track VP8):**
-   * Для предотвращения перевода эндпоинта мостом JVB в состояние `inactive` поднимается `RTCPeerConnection` с аудио-дорожкой Opus (48000 Hz, 2 channels) и видео-дорожкой VP8 (90000 Hz).
-   * Фоновый таймер отправляет 3-байтовый фрейм тишины Opus (`0xf8, 0xff, 0xfe`) каждые 20 мс (`wrtc_media_keepalive_interval_ms`) и фоновый видео-keyframe раз в секунду при отсутствии трафика.
-
-### 3.5. Гарантированное определение Bypass IP (защита от петли маршрутизации)
+### 3.3. Защита от петли маршрутизации (`bypass_ips`)
 Чтобы туннель не перехватил собственный сигнальный или медиатрафик после поднятия маршрутов `0.0.0.0/0`, модуль WebRTC собирает `bypass_ips` сразу из нескольких независимых источников:
-* **Фактические `peer_addr()` уже открытых TCP/TLS сокетов:** напрямую из дескрипторов установленного соединения `XmppSession` (`xmpp.remote_ip`) и сокета `Colibri-WS` (`peer.colibri_ws_ip()`). Это гарантирует, что даже если в условиях «Белых Списков» (БС) DNS-резолв вернёт ошибку или другой IP из пула Round-Robin, реальные IP текущих WebSocket-соединений всегда будут добавлены в таблицу маршрутизации в обход TUN;
+* Фактические `peer_addr()` уже открытых TCP/TLS сокетов (`xmpp.remote_ip` и `peer.colibri_ws_ip()`);
 * Все IP-адреса сигнального домена (`domain:443`) и хоста `colibri-ws`;
 * Все `host`/`srflx` кандидаты из Jingle Offer и резервный IP JVB (`wrtc_fallback_jvb_ip`);
 * Обнаруженные STUN/TURN серверы из ответа XEP-0215 (`extdisco`).
 
-Список обнаруженных адресов (`Discovered media bypass IPs: [...]`) передается в ядро клиента и автоматически регистрируется в `RouteManager` до активации туннеля.
-
 ---
 
-## 4. Этап 3. Строгая типизация Colibri, обнаружение и авторизация
+## 4. Этап 3. Строгая типизация Colibri, Unicast Discovery и авторизация ASTP
 
-### 4.1. Схема протокола сообщений (мимикрия под сервисные сообщения Jitsi)
-
-Все управляющие и туннельные сообщения внутри `EndpointMessage` маскируются под штатные системные события Jitsi Meet (с сохранением обратной совместимости при десериализации через `#[serde(alias = "...")]`), а идентификаторы медиапотоков и треков (`msid` / `cname`) генерируются как случайные RFC 4122 UUIDv4:
+### 4.1. Схема протокола сообщений
+Все управляющие и туннельные сообщения внутри `EndpointMessage` оформлены в соответствии со структурой сервисных событий Jitsi Meet:
 
 ```rust
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ColibriClass {
-    #[serde(rename = "EndpointMessage")]
-    EndpointMessage,
-    #[serde(rename = "DominantSpeakerEndpointChangeEvent")]
-    DominantSpeaker,
-    #[serde(rename = "ReceiverVideoConstraints")]
-    ReceiverVideoConstraints,
-    #[serde(other)]
-    Unknown,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum WrtcMessage {
@@ -251,666 +199,205 @@ pub enum WrtcMessage {
     #[serde(other)]
     Unknown,
 }
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ColibriMessage {
-    #[serde(rename = "colibriClass")]
-    pub colibri_class: ColibriClass,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub to: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub from: Option<String>,
-    #[serde(rename = "msgPayload", default = "default_wrtc_message")]
-    pub msg_payload: WrtcMessage,
-}
 ```
 
-```
-       [Клиент]                    [JVB Мост]                  [Сервер]
-          |                            |                          |
-          |                            |<--- Сервер в комнате     |
-          |                            |     endpoint_id:         |
-          |                            |     [rnd:2B][tag:2B]     |
-          |                            |                          |
- 1. Вошел в комнату, вычислил          |                          |
-    server_ep_suffix =                 |                          |
-    SHA256(pub_key || conf_id)[0..2]   |                          |
-    Шлет строго unicast Discovery      |                          |
-    ("type": "e2ee-ping", "to": srv_id)|                          |
-    ---------------------------------->|                          |
-                                       |--- forwards to Server -->| 2. Принял Discovery
-                                       |                          |    Подписал (Nonce + SrvId)
-                                       |                          |    ключом server_signing_key
-                                       |                          |
-                                       |<--- Beacon (to: Client) -| 3. Отправил Beacon
- 4. Проверил подпись                   |<-------------------------|    {"type":"e2ee-ack",
-    по server_pub_key.                 |                               "signature":"..."}
-    Сервер верифицирован!              |
-                                       |
- 5. ASTP Handshake (Phase 1-4)         |
-    Таймаут: 6 секунд                  |
-    unicast ("to": ServerId)           |
- <===============================================================>| 6. Вызов Control Plane API
-                                       |                          |    Выдача IP (172.112.224.X)
-                                       |                          |    Финализация сессии
-                                       |                          |
- 7. Туннелирование трафика             |                          |
-    {"to": ServerId, payload: ...}     |                          |
- ================================================================>| 8. Маршрутизация в TUN
-```
-
-### 4.2. Детерминированный механизм обнаружения сервера без Broadcast (Unicast Discovery)
-1. При подключении к MUC-комнате сервер формирует свой 8-символьный hex `endpoint_id` (`generate_server_endpoint_id`) таким образом, чтобы старшие 2 байта были случайными, а младшие 2 байта (4 hex-символа) детерминированно вычислялись от публичного ключа Ed25519 и идентификатора конференции:
+### 4.2. Детерминированный механизм обнаружения сервера (Unicast Discovery)
+1. При подключении к MUC-комнате сервер формирует свой 8-символьный hex `endpoint_id` (`generate_server_endpoint_id`) так, чтобы старшие 2 байта были случайными, а младшие 2 байта (4 hex-символа) детерминированно вычислялись от публичного ключа Ed25519 и идентификатора конференции:
    $$\text{server\_ep\_suffix} = \text{hex}\big(\text{SHA256}(\text{server\_pub\_key\_bytes} \parallel \text{conference\_id})[0..2]\big)$$
-2. Клиент, зная `server_pub_key` и `conference_id`, вычисляет этот же 4-символьный суффикс (`compute_server_endpoint_suffix_from_b64`) и фильтрует список присутствующих в MUC участников (`get_other_occupants`) по совпадению суффикса.
-3. Клиент отправляет `WrtcMessage::Discover` (`"type": "e2ee-ping"`) с криптографическим нонсом (`client_nonce`) **строго unicast (`to: Some(server_occupant_id)`)**, полностью исключая широковещательный опрос (`to: None`) и рассылку пакетов сторонним участникам комнаты.
-4. Сервер, получив запрос, подписывает `(client_nonce + server_id)` своим `server_signing_key` (Ed25519) и отправляет `WrtcMessage::Beacon` (`"type": "e2ee-ack"`) строго в адрес клиента (`to: client_endpoint`).
-5. Клиент верифицирует подпись открытым ключом `server_pub_key`. При успехе `server_id` фиксируется как целевой адрес для ASTP.
-
-### 4.3. Рукопожатие ASTP и предотвращение рассинхронизации ключей
-1. В Phase III клиент передает зашифрованные авторизационные данные серверу.
-2. Сервер при обработке Phase III регистрирует клиента и параллельно отчитывается в Control Plane (`auth_provider.report_session_start`). Сетевой вызов может занимать до 2–4 секунд.
-3. **Таймауты ASTP (`INITIAL_DELAY = 6s`):**
-   * Таймаут ожидания Phase IV на клиенте установлен на **6 секунд** (с ростом до 60 с при сетевых сбоях).
-   * Это предотвращает срыв клиента в повторный ретрай до завершения серверной авторизации, устраняя рассинхрон сессионных ключей X25519 (`Decryption failed`) и утечку виртуальных IP-адресов.
-4. **Фильтрация шума:** В циклах ожидания Phase II и Phase IV реализована безопасная фильтрация некорректных/старых пакетов без аварийного сброса рукопожатия.
+2. Клиент вычисляет этот же 4-символьный суффикс и фильтрует список присутствующих в MUC участников (`get_other_occupants`) по совпадению суффикса.
+3. Клиент отправляет `WrtcMessage::Discover` (`"type": "e2ee-ping"`) **строго адресно (`to: Some(server_occupant_id)`)**, исключая широковещательную рассылку сторонним участникам комнаты.
+4. Сервер подписывает `(client_nonce + server_id)` своим ключом `server_signing_key` (Ed25519) и отправляет `WrtcMessage::Beacon` (`"type": "e2ee-ack"`) в адрес клиента.
 
 ---
 
 ## 5. Этап 4. Лимит 40 минут и бесшовное восстановление сессии
 
-### 5.1. Условия работы таймера Ktalk
-* При нахождении в комнате **одного** участника (дежурный `anet-server`) счетчик 40 минут остановлен.
-* Счетчик запускается в момент входа второго участника.
-* По истечении 40 минут комната расформировывается Контуром: WebSockets и WebRTC закрываются у всех участников.
-
-### 5.2. Процедура реконнекта и защита от сбоев
-1. При получении `CloseFrame` (например, `endpoint closed` от JVB) клиент и сервер немедленно прерывают циклы передачи без выжидания длинных таймаутов пинга.
-2. При разрыве сервер переводит активные клиентские контексты в `suspended` через `registry.suspend_client`.
-3. При входе в комнату клиент выполняет новый Discovery, связываясь с актуальным `endpoint_id` сервера (исключая отправку пингов на старый ID).
-4. Клиент отправляет ASTP с флагом возобновления и сохраненным `resume_session_id`.
-5. Сервер синхронно регистрирует сессию в `clients_map` до отправки ответа Phase 4, исключая ложную интерпретацию первых пакетов VPN-трафика как некорректного хэндшейка.
-6. Вызов `ClientRegistry::take_suspended`:
-   * Связывает **новый** `endpoint_id` клиента со старым выделенным IP.
-   * Сессия восстанавливается мгновенно без сброса пользовательских TCP-соединений.
+* При нахождении в комнате одного участника (дежурный `anet-server`) 40-минутный таймер комнаты не активен и запускается только при входе второго участника.
+* При плановом закрытии комнаты или переподключении сервер переводит активные клиентские контексты в `suspended` через `registry.suspend_client`.
+* При повторном входе клиент выполняет быстрый Discovery и отправляет ASTP с сохранённым `resume_session_id`. Вызов `ClientRegistry::take_suspended` мгновенно перепривязывает новый `endpoint_id` клиента к ранее выделенному туннельному IP без разрыва открытых пользовательских TCP-соединений.
 
 ---
 
-## 6. Конфигурация узлов
+## 6. Актуальная конфигурация узлов (`client.toml` и `server.toml`)
 
-### В `client.toml`:
-```toml
-[stealth]
-# Синхронизированный профиль TLS (BoringSSL) и HTTP/WS заголовков для Ktalk REST API, XMPP-WS, Colibri-WS и TURNS:
-# "auto" (по умолчанию) | "chrome" | "firefox" | "safari" | "randomized"
-tls_fingerprint = "auto"
-# Защита от активного спуфинга ТСПУ (верифкация сертификатов *.ktalk.ru / *.ktalk.host, по умолчанию: true)
-tls_verify_peer = true
-
-[[servers]]
-name = "Ktalk Node [WRTC]"
-dsn = "wrtc://example.ktalk.ru/example-room-id"
-timeout_secs = 15
-server_pub_key = "<BASE64_ED25519_PUBLIC_KEY>"
-wrtc_media_keepalive_interval_ms = 20 # Эмуляция Opus тишины (мс)
-wrtc_ping_interval_secs = 20          # Пинг сигнального WSS (сек)
-wrtc_fallback_jvb_ip = "203.0.113.7"  # Fallback IP медиасервера JVB
-wrtc_fallback_jvb_port = 10004        # Fallback UDP порт JVB
-# Опциональное переопределение TLS-профиля для этой ноды:
-# tls_fingerprint = "chrome"
-
-# Режим транспорта данных: "media_video" | "p2p_direct" | "jvb_datachannel" | "ws" | "auto"
-wrtc_mode = "media_video"
-
-# Глобальная секция тонкой настройки WebRTC (опционально)
-[wrtc]
-http_timeout_secs = 10
-xmpp_handshake_timeout_secs = 15
-colibri_ws_connect_timeout_secs = 10
-ws_write_timeout_secs = 5
-ice_disconnected_timeout_ms = 10000
-ice_failed_timeout_ms = 25000
-ice_keepalive_interval_ms = 2000
-turn_refresh_interval_secs = 90
-sdp_renegotiate_timeout_secs = 5
-watchdog_disconnected_timeout_secs = 8
-watchdog_channel_grace_secs = 12
-peer_close_timeout_secs = 3
-tunnel_ping_interval_secs = 10
-tunnel_ping_timeout_secs = 30
-video_keepalive_interval_ms = 1000
-video_mtu_overhead = 60
-udp_socket_buffer_size = 4194304
-reactor_pool_size = 4
-```
+Конфигурация секции `[wrtc]` полностью синхронизирована со структурой `WrtcConfig` (`anet-common/src/config.rs`) и содержит два профиля: для прямого подключения и для работы через туннель стабилизации маршрута Cloudflare WARP (`wgcf-profile`).
 
 ### В `server.toml`:
 ```toml
+[network]
+net = "172.112.224.0"
+mask = "255.255.255.0"
+gateway = "172.112.224.1"
+self_ip = "172.112.224.2"
+if_name = "anet-server"
+# На прямом соединении: 1400. При работе через CF WARP (MTU 1280): 1100
+mtu = 1100
+
 [server]
 wrtc_room_url = "wrtc://example.ktalk.ru/example-room-id"
-wrtc_media_keepalive_interval_ms = 20 # Эмуляция Opus тишины (мс)
-wrtc_ping_interval_secs = 20          # Пинг сигнального WSS (сек)
-wrtc_fallback_jvb_ip = "203.0.113.7"  # Fallback IP медиасервера JVB
-wrtc_fallback_jvb_port = 10004        # Fallback UDP порт JVB
-
-# Режим транспорта данных: "media_video" | "p2p_direct" | "jvb_datachannel" | "ws" | "auto"
 wrtc_mode = "media_video"
+wrtc_media_keepalive_interval_ms = 20
+wrtc_ping_interval_secs = 10          # 25 на прямом соединении, 10 для CF WARP
+wrtc_fallback_jvb_ip = "89.169.16.6"
+wrtc_fallback_jvb_port = 10002
 
-[crypto]
-server_signing_key = "<BASE64_ED25519_PRIVATE_KEY>"
+[wrtc]
+# --- Тайм-ауты сигнализации HTTP API и XMPP/Colibri WebSocket (сек) ---
+http_connect_timeout_secs = 15        # 10 (прямой) | 15 (CF WARP)
+http_request_timeout_secs = 20        # 15 (прямой) | 20 (CF WARP)
+xmpp_handshake_timeout_secs = 20      # 15 (прямой) | 20 (CF WARP)
+ws_write_timeout_secs = 15            # 5  (прямой) | 15 (CF WARP)
+colibri_ws_connect_timeout_secs = 15  # 10 (прямой) | 15 (CF WARP)
+colibri_ws_read_timeout_secs = 25
+
+# --- Стабилизация L4 ECMP / LAG маршрутов (Fast TCP Port Hopping и Multi-Socket UDP ICE) ---
+tcp_port_hop_attempts = 8
+tcp_port_hop_timeout_ms = 1000
+udp_ice_socket_count = 6
+
+# --- Системные буферы UDP, реактор и параметры ICE / STUN / TURN ---
+udp_socket_buffer_size = 8388608
+reactor_pool_size = 4
+ice_disconnected_timeout_ms = 15000   # 10000 (прямой) | 15000 (CF WARP)
+ice_failed_timeout_ms = 35000         # 25000 (прямой) | 35000 (CF WARP)
+ice_keepalive_interval_ms = 1500      # 2000  (прямой) | 1500  (CF WARP)
+turn_refresh_interval_secs = 90
+jvb_use_turn = false
+
+# --- Параметры MTU, микро-батчинга VP8 (media_video) и коалесценции пакетов ---
+sctp_max_receive_buffer_size = 8388608
+sctp_mtu = 1000                       # 1200 (прямой) | 1000 (CF WARP)
+receive_mtu = 1600
+video_mtu_overhead = 110
+min_tun_mtu = 900
+max_video_batch_bytes = 960           # 1260 (прямой) | 960  (CF WARP)
+video_batch_max_packets = 12          # 16   (прямой) | 12   (CF WARP)
+uplink_burst_max_packets = 32         # 64   (прямой) | 32   (CF WARP)
+ws_batcher_max_bytes = 4096           # 12288 (прямой)| 4096 (CF WARP)
+ws_batcher_max_delay_ms = 2
+video_keepalive_interval_ms = 500     # 1000 (прямой) | 500  (CF WARP)
+
+# --- Сторожевые таймеры (watchdog) и проверка живого тракта (сек) ---
+watchdog_disconnected_timeout_secs = 12 # 8  (прямой) | 12 (CF WARP)
+watchdog_channel_grace_secs = 15        # 12 (прямой) | 15 (CF WARP)
+peer_close_timeout_secs = 3
+tunnel_ping_interval_secs = 10          # 15 (прямой) | 10 (CF WARP)
+tunnel_ping_timeout_secs = 60           # 45 (прямой) | 60 (CF WARP)
+server_idle_room_rotation_secs = 1800
 ```
 
 ---
 
-## 7. Высокопроизводительный транспорт данных: WebRTC DataChannel и P2P Direct
+## 7. Трехуровневая архитектура передачи данных (Tiered Data Plane)
 
-### 7.1. Анализ узких мест базового транспорта (Colibri-WS)
-В базовом режиме трафик туннеля ANet упаковывается в `EndpointMessage` и передается через полнодуплексный WebSocket моста JVB (`wss://.../colibri-ws/...`). Этот подход обеспечивает 100% проходимость через корпоративные прокси, однако имеет объективные физические ограничения:
-1. **TCP-over-TCP Meltdown:** Пользовательский трафик (TCP-сессии браузера, загрузок) заворачивается внутрь TLS/TCP WebSocket соединения. При малейшей потере пакета во внешней сети накладываются два независимых алгоритма контроля перегрузки (BBR/Cubic), замораживая окно передачи. Пинг под нагрузкой подскакивает с 50 до 150–250 мс (Bufferbloat в сокетах ОС).
-2. **Накладные расходы сериализации:** Каждый IP-пакет оборачивается в JSON-объект и кодируется в Base64 (+33% паразитного трафика).
-3. **Ограничения PPS в JVB (Packets Per Second):** На скорости 50 Мбит/с клиенту и серверу требуется передавать до 5 000–6 000 JSON-сообщений в секунду. Java-процесс Jitsi Videobridge парсит каждый JSON фрейм в памяти, что приводит к перегрузке CPU и задержкам очередей.
+1. **Основной высокоскоростной режим `media_video` (Fake Video Track VP8 over DTLS-SRTP):**
+   * Трафик упаковывается в RTP-пакеты видеокодека VP8 (`1920x1080`) с 26-байтным префиксом (`VP8_ASTP_PREFIX_LEN`), микро-батчингом и микро-пейсером EDT (подробная спецификация приведена в `contrib/docs/wrtc.video.ru.md`).
+2. **Режим `jvb_datachannel` / `ws` (Colibri WebSocket с микробатчингом `PacketBatcher`):**
+   * Пакеты из TUN коалесцируются в буфере до `ws_batcher_max_bytes` (`12288` байт на прямом соединении или `4096` байт через WARP) либо по таймеру `2 мс` и отправляются одним фреймом `WrtcMessage::AstpBatch`.
+3. **Режим `p2p_direct` (Relay-Only WebRTC P2P DataChannel):**
+   * Создаёт прямое соединение `RTCDataChannel` (`ordered: false`, `max_retransmits: Some(0)`) исключительно через инфраструктурные TURN/TURNS релеи (`filter_p2p_sdp_relay_only`), скрывая реальные IP-адреса клиента и сервера.
 
-### 7.2. Трехуровневая гибридная архитектура (Tiered Data Plane)
+---
 
-Для достижения максимальной пропускной способности (100–300+ Мбит/с) и минимального пинга (15–30 мс) архитектура транспорта разделяется на три уровня с автоматическим согласованием:
+## 8. Механизмы поддержания стабильного соединения в сложных сетевых условиях
 
+### 8.1. Быстрый перебор исходных TCP-портов (`tcp_port_hop_attempts = 8`)
+На магистральных каналах с балансировкой нагрузки по хешу заголовков L4 (ECMP / LAG) отдельные пары `(src_ip, dst_ip, src_port, dst_port)` могут попадать на перегруженные или деградировавшие линки.
+* При установке HTTP-сессии в `KonturTalkProvider` / `JitsiMeetProvider`, открытии `XMPP-WS` (`open_xmpp_ws_stream`) и подключении `Colibri-WS` выполняется до `tcp_port_hop_attempts` (8) быстрых попыток подключения с коротким таймаутом `tcp_port_hop_timeout_ms` (`1000 мс`).
+* Каждая новая попытка `TcpStream::connect` выделяет в ОС новый эфемерный порт источника (`src_port`), мгновенно переводя поток на соседний рабочий линк балансировщика.
+
+### 8.2. Развязка жизнеспособности видеоканала от состояния `Colibri-WS` и UDP ICE
+* **Независимое переоткрытие `Colibri-WS` (`colibri_ws_read_timeout_secs = 25`):** если управляющий WebSocket к JVB перестаёт получать кадры дольше 25 секунд, он тихо переоткрывается в фоновой задаче без остановки видеопотока `media_video`.
+* **Автоматическое резервирование `MediaVideo` $\leftrightarrow$ `Colibri-WS`:** если на клиентской сети возникают потери UDP-пакетов до порта JVB `10000–10010` и входящие видеокадры не поступают дольше 5 секунд, клиент и сервер синхронно переключают передачу пакетов в `Colibri-WS` (`AstpBatch`) без разрыва туннельной сессии.
+
+### 8.3. Неразделённый цикл ввода-вывода в `XMPP-WS` поверх `tokio_boring::SslStream`
+* Поток `ws_stream` в `XmppSession` обрабатывается в **единой задаче `io_handle` через `tokio::select!`** без разделения через `ws_stream.split()` (`BiLock`). Это исключает потерю уведомлений (`Waker`) чтения в `tokio_boring::SslStream` при одновременной отправке пингов и приёме входящих станз от сервера Prosody.
+
+---
+
+## 9. Инженерный разбор реального эксплуатационного кейса (узлы `NL` и `FN`) и стабилизация работы через Cloudflare WARP
+
+В данном разделе задокументирован реальный производственный кейс потери связности зарубежных серверных узлов (`NL` и `FN`) с инфраструктурой ВКС и пошаговая методика полной стабилизации соединения.
+
+### 9.1. Хронология и диагностика: почему до внедрения `turns_proxy.rs` соединение работало стабильно, а после — деградировало через 5 суток
+
+1. **Режим работы до 25 октября (до коммита `348995d`):**
+   * Движок `webrtc-rs` (`rtc-turn 0.21`) нативно поддерживает только UDP-сокеты и не устанавливает соединения по схемам `turns:...:443?transport=tcp`.
+   * Когда `PeerConnectionBuilder::build()` перебирал эшелоны ICE, он пропускал `turns:` URL и автоматически выбирал прямой обмен по UDP с публичным адресом медиамоста JVB (`*.ktalk.host:10000–10010`).
+   * Трафик между зарубежным `anet-server` и медиамостом шёл исключительно по штатному протоколу DTLS/SRTP/STUN поверх UDP на порт JVB, а сигнализация шла по стандартному WebSocket с валидным HTTP Upgrade. Никаких длительных соединений на порт `TCP:443` к узлам `coturn` (`bst-talk-stun7.ktalk.host:443`, `dtl-talk-stun5.ktalk.host:443`) сервер не создавал.
+
+2. **Что изменилось после включения `turns_proxy.rs` и `jvb_use_turn = true`:**
+   * Для каждого `turns:*.ktalk.host:443?transport=tcp` начал подниматься локальный мост `spawn_turns_udp_proxy` (`turn:127.0.0.1:<port>`), который вызывал `connect_ws_tls` на порт `TCP:443` серверов `coturn`.
+   * При этом функция `connect_ws_tls` указывала в открытом заголовке TLS `ClientHello` расширение **`ALPN: ["http/1.1"]`**, однако сразу после завершения TLS Handshake функция `bridge_turn_stream` отправляла внутри TLS-потока **бинарные фреймы STUN Allocate (`0x00 0x03 ...`) и TURN `ChannelData` (`0x40 0x00 ...`)** вместо HTTP/1.1-запроса.
+   * Одновременно из-за `jvb_use_turn = true` зарубежный сервер `anet-server` начал круглосуточно удерживать эти нестандартные TLS-сессии на порту `443` к узлам `coturn` и обновлять их каждые 90 секунд.
+   * **Результат:** через 5 суток непрерывной передачи не-HTTP бинарного потока внутри TLS-сессии с заявленным `ALPN: http/1.1` на порту `TCP:443` маршруты между IP-адресами серверов `NL`/`FN` и подсетями ВКС попали под автоматическое ограничение связности на промежуточных магистральных шлюзах.
+
+---
+
+### 9.2. Практическая стабилизация маршрута на сервере `FN` через Cloudflare WARP (`setup_warp_ktalk.sh`)
+
+Для восстановления стабильной связи зарубежного сервера `FN` с серверами ВКС без замены самого VPS был применён избирательный вывод трафика к подсетям Контур.Толк и медиамостов JVB через туннельный интерфейс Cloudflare WARP (`wgcf-profile`). В ходе развёртывания на живом сервере были выявлены и решены **пять практических проблем**:
+
+#### Проблема 1. Захват маршрута по умолчанию стандартным профилем `wg-quick`
+* **Симптом:** При запуске `wg-quick up wgcf-profile` со стандартным конфигом весь исходящий трафик сервера уходит в интерфейс WARP, из-за чего пропадает доступ к серверу по SSH и перестают работать прямые клиентские подключения на внешний интерфейс `ens3`.
+* **Решение:** В конфигурацию `/etc/wireguard/wgcf-profile.conf` принудительно добавляются директивы `Table = off` и `MTU = 1280`. Маршрут в `wgcf-profile` создаётся в отдельной таблице маршрутизации `100` (`ip route replace default dev wgcf-profile table 100`), а через `ip -4 rule add to <CIDR> table 100 priority 100` в неё направляются только целевые подсети ВКС и облачных медиамостов JVB (`46.17.200.0/21`, `89.169.16.0/24`, `84.201.128.0/18`, `51.250.0.0/17`, `158.160.0.0/16`, `130.193.32.0/19`, `178.154.128.0/17`, `91.209.56.0/22`, `91.197.180.0/23`, `193.160.208.0/22`, `193.232.166.0/24`).
+
+#### Проблема 2. Сброс пакетов фильтром обратного пути (`rp_filter`) и отсутствие форвардинга из `anet+`
+* **Симптом:** Даже после поднятия `wgcf-profile` и добавления `iptables -t nat -A POSTROUTING -o ens3 -j MASQUERADE` трафик клиентов внутри туннеля (`172.112.224.x`) не проходил во внешнюю сеть, либо терялись пакеты при асимметричной маршрутизации между `ens3` и `wgcf-profile`.
+* **Решение:**
+  1. Перевод проверки обратного пути ядра Linux в режим Loose (`rp_filter = 2`) на всех интерфейсах (`all`, `default`, `wgcf-profile`, `ens3`) и включение `net.ipv4.ip_forward = 1`.
+  2. Явное разрешение транзита пакетов для всех туннельных интерфейсов `anet+` в начале цепочки `FORWARD`:
+     ```bash
+     iptables -I FORWARD 1 -i anet+ -j ACCEPT
+     iptables -I FORWARD 2 -o anet+ -m state --state RELATED,ESTABLISHED -j ACCEPT
+     ```
+
+#### Проблема 3. Фрагментация UDP/RTP пакетов внутри `wgcf-profile` (MTU 1280) и просадка скорости через `turns_proxy`
+* **Симптом:** На стандартном серверном `[network] mtu = 1400` и `max_video_batch_bytes = 1260` размер исходящих RTP-кадров превышал MTU `1280` интерфейса `wgcf-profile`, вызывая фрагментацию и потери пакетов при скачивании. Кроме того, при `jvb_use_turn = true` ICE переключал медиапоток на TCP-релей `turns_proxy`, что роняло скорость и вызывало разрыв сессии через ~90 секунд по `TURN transaction timed out`.
+* **Решение:**
+  1. В `server.toml` отключено использование TURN для соединения с JVB: `jvb_use_turn = false`.
+  2. Выстроен согласованный каскад MTU:
+     * На интерфейсе `wgcf-profile`: `MTU = 1280`, планировщик `fq_codel` и `TCPMSS --set-mss 1080`.
+     * В `server.toml`: `[network] mtu = 1100`, `video_mtu_overhead = 110`, `min_tun_mtu = 900`, `max_video_batch_bytes = 960`. В результате клиент получает эффективный MTU туннеля `990` байт, а каждый зашифрованный VP8 RTP-кадр укладывается в `~1070–1150` байт и проходит через WireGuard WARP без единого фрагментированного пакета.
+
+#### Проблема 4. Ошибка `XMPP MUC handshake timed out after 20s` при входе сервера `FN` в комнату Ktalk
+* **Симптом:** При запуске `RUST_LOG=debug ./anet-server` на сервере `FN` HTTP-авторизация (`POST /api/authorize/session` и `GET /api/rooms/...`) и TLS WebSocket handshake проходили успешно (`HTTP status: 101 Switching Protocols`), однако после `SASL ANONYMOUS` хендшейк зависал и обрывался по таймауту 20 секунд.
+* **Корневая причина (две особенности Prosody и Jicofo на Ktalk):**
+  1. В WebSocket-фреймах RFC 7395 станзы `<iq type="set" id="_bind_auth_2"><bind.../></iq>` и `<presence.../>` отправлялись без атрибута `xmlns="jabber:client"` на внешнем теге. Модуль `mod_websocket` в Prosody отбрасывал такие станзы без ответа.
+  2. Отправка `<iq to="focus.meet.jitsi" type="set"><conference .../></iq>` до завершения входа в комнату MUC вызывала ответ `<error type="cancel"><service-unavailable/></error>` от Prosody/Jicofo.
+* **Решение (коммит `dc984ea`):**
+  1. Во все методы `XmppBuilder` (`xmpp_xml.rs`) добавлен обязательный атрибут `xmlns="jabber:client"` для каждой станзы `<iq>` и `<presence>`.
+  2. Для провайдера `KonturTalk` установлен порядок `pre_allocate_before_muc = false` (сначала вход в MUC и получение `status code="110"`), а резервный запрос `conference_allocation` в `wait_jingle_offer` отправляется автоматически через 4 секунды, если Jicofo ещё не прислал `session-initiate`.
+
+### 9.3. Автоматическая настройка маршрутизации WARP скриптами `./contrib/scripts/cf_ktalk_setup.sh` и `./contrib/scripts/setup_warp_ktalk.sh`
+
+В директории `./contrib/scripts/` находятся два скрипта автоматической настройки маршрутизации Cloudflare WARP на сервере:
+1. **`./contrib/scripts/cf_ktalk_setup.sh` (полная установка «под ключ» с сохранением после перезагрузки):**
+   * Автоматически устанавливает системные пакеты (`wireguard-tools`, `iproute2`, `iptables-persistent`, `jq`) и скачивает бинарник `wgcf`;
+   * Автоматически регистрирует аккаунт Cloudflare WARP и генерирует `/etc/wireguard/wgcf-profile.conf` (если профиль ещё не создан);
+   * Создаёт постоянный конфиг `/etc/sysctl.d/99-anet-warp-ktalk.conf` (`ip_forward=1`, `rp_filter=2`) и идемпотентный хук `/etc/wireguard/anet-warp-ktalk-hook.sh` (`PostUp`/`PostDown`), настраивающий маршруты с `mtu 1240 advmss 1160` (для беспрепятственного прохождения крупных пакетов TLS 1.3 `ClientHello` с постквантовым гибридным ключом `X25519MLKEM768`), таблицу `100`, `fq_codel`, правила `FORWARD` (включая перевод браузерного трафика с транзитного `UDP:443` на TCP с зажатым MSS) и `TCPMSS`;
+   * Активирует автозапуск через `systemctl enable --now wg-quick@wgcf-profile.service`.
+2. **`./contrib/scripts/setup_warp_ktalk.sh` (облегчённый скрипт быстрой перенастройки уже установленного профиля `wgcf-profile.conf`):**
+```bash
+sudo ./contrib/scripts/cf_ktalk_setup.sh
+# или для быстрой ручной перенастройки существующего профиля:
+sudo ./contrib/scripts/setup_warp_ktalk.sh
 ```
-                          [ Сигнальный брокер ]
-                     XMPP MUC (Prosody) + Colibri-WS
-                                    |
-          +-------------------------+-------------------------+
-          | (Обмен ICE-кандидатами, Beacon/Discovery, SDP)    |
-          v                                                   v
-+-------------------+                               +-------------------+
-|    anet-client    |                               |    anet-server    |
-+-------------------+                               +-------------------+
-  |   |           ^                                   |   |           ^
-  |   |           |                                   |   |           |
-  |   |   Tier 1: Прямой WebRTC P2P DataChannel       |   |           |
-  |   |   (SCTP over DTLS/UDP напрямую Client ⇄ Server)|   |           |
-  |   +===============================================>+   |           |
-  |       (Чистый UDP, 0% Base64, 0% JSON, MTU 1280+)      |           |
-  |                                                        |           |
-  |       Tier 2: Colibri-WS с микробатчингом / JVB DC     |           |
-  |       (Агрегация фреймов: 10–15 пакетов в 1 Msg)       |           |
-  |       +-----------------> [ JVB ] ---------------------+           |
-  |                                                                    |
-  |       Tier 3: Базовый Colibri WebSocket Fallback                   |
-  +-------------------------> [ JVB ] ---------------------------------+
-               (Резервный канал при блокировке UDP/SCTP)
-```
+Что делает скрипт:
+1. Прописывает `Table = off` и `MTU = 1280` в `/etc/wireguard/wgcf-profile.conf`.
+2. Перезапускает интерфейс `wgcf-profile` и очищает старые правила маршрутизации.
+3. Устанавливает `mtu 1280`, `txqueuelen 1000` и дисциплину очереди `fq_codel` на `wgcf-profile`.
+4. Включает `net.ipv4.ip_forward=1` и `rp_filter=2` (Loose Reverse Path Filtering) на всех сетевых адаптерах.
+5. Настраивает таблицу маршрутизации `100` (`default dev wgcf-profile table 100`) и направляет в неё префиксы Контур.Толк (AS49675) и облачных медиамостов JVB.
+6. Добавляет правила `iptables` (`FORWARD` для `anet+`, `MASQUERADE` для `ens3` и `wgcf-profile`, а также `TCPMSS --set-mss 1080` и `--clamp-mss-to-pmtu`).
 
 ---
 
-### 7.3. Tier 1: Relay-Only WebRTC P2P (`p2p_direct` через TURN/TURNS Ktalk)
-
-#### 7.3.1. Концепция и изоляция IP-адресов
-В режиме `wrtc_mode = "auto"` автоматическая инициация P2P-канала **отключена** — автопереключение работает исключительно между JVB-опосредованными режимами (`media_video` $\leftrightarrow$ `jvb_datachannel` $\leftrightarrow$ `ws`), чтобы реальные IP-адреса клиента и сервера никогда не раскрывались автоматически.
-Если в конфигурации явно задан режим `wrtc_mode = "p2p_direct"`, устанавливается выделенный DataChannel между узлами строго в режиме **Relay-Only** через инфраструктурные TURN/TURNS-серверы Контура (`bst-talk-stun7.ktalk.host:443`, `dtl-talk-stun5.ktalk.host:443`).
-
-#### 7.3.2. Сигналинг через комнату Ktalk и фильтрация кандидатов (`filter_p2p_sdp_relay_only`)
-1. После завершения Discovery и ASTP-авторизации клиент (при `wrtc_mode = "p2p_direct"`) инициирует создание P2P-сессии (`P2pSession`):
-   * Клиент вызывает `create_p2p_channel(&ice_servers, ...)` и ожидает сбора релейных кандидатов (`typ relay`).
-   * Функция `filter_p2p_sdp_relay_only(&sdp)` принудительно удаляет из SDP все локальные (`typ host`) и STUN (`typ srflx`) кандидаты, а также маскирует адрес в `c=IN IP4 0.0.0.0`, оставляя только `typ relay`.
-   * Клиент отправляет серверу сообщение `ColibriMessage` с типом `WrtcMessage::P2pOffer` (`"type": "ice-offer"`).
-2. Сервер, получив `P2pOffer`, также фильтрует входящий SDP через `filter_p2p_sdp_relay_only`, вызывает `create_p2p_channel(&ice_servers, ...)`, генерирует SDP Answer, очищает его от `host`/`srflx` кандидатов через `filter_p2p_sdp_relay_only` и отсылает `WrtcMessage::P2pAnswer` (`"type": "ice-answer"`) обратно клиенту.
-3. Клиент применяет ответ через `set_remote_description`, и соединение устанавливается через TURN/TURNS релей без раскрытия прямых IP-адресов сторон.
-
-#### 7.3.3. Конфигурация DataChannel (`webrtc-rs` / `rtc`)
-В P2P-соединении создается выделенный неблокирующий канал данных:
-```rust
-let dc_init = RTCDataChannelInit {
-    ordered: false,              // Отключение Head-of-Line Blocking
-    max_retransmits: Some(0),    // Чистая семантика ненадежного UDP для IP-пакетов
-    protocol: "anet-tunnel-v1".to_string(),
-    negotiated: Some(0),         // Статический stream ID = 0 (без DCEP хэндшейка)
-    max_packet_life_time: None,
-};
-let dc = pc.create_data_channel("anet-data", Some(dc_init)).await?;
-```
-* **Формат кадра:** сырой бинарный IP-пакет или микро-батч (`send_packet(&enc_bytes)`).
-* **Маркеры в логах:** `[P2P Direct] established: DataChannel 'anet-data' is now OPEN!`, `[P2P Direct OUT]`, `[P2P Direct IN]`.
-* **Накладные расходы:** 0% JSON, 0% Base64.
-* **Отказоустойчивость:** Если P2P-соединение через релей недоступно, трафик прозрачно передается через Colibri-WS с микробатчингом без потери пакетов.
-
----
-
-### 7.4. Tier 2: Colibri WebSocket с микробатчингом (Packet Batching) и особенности JVB Ktalk
-
-#### 7.4.1. Реалии инфраструктуры Контур.Толк (Ktalk SFU)
-В публичной облачной инфраструктуре Контур.Толк компонент Jicofo конфигурирует сессии Jingle исключительно для аудио/видео (`<content name="audio">`, `<content name="video">`).
-* Секция `<content name="data">` (SCTP DataChannel на мосте JVB) со стороны Jicofo **не создается**; вместо этого для сигналов и данных предоставляется выделенный Colibri WebSocket (`wss://.../colibri-ws/...`).
-* Клиент ANet автоматически определяет наличие секции `name="data"` в `session-initiate` (`session.has_data_channel`):
-  * Если секция данных отсутствует, клиент не форсирует пустые запросы к порту JVB, а мгновенно переходит на работу через высокопроизводительный Colibri-WS с модулем `PacketBatcher`.
-  * Для предотвращения ложных ошибок `STUN error: TransactionTimeOut` соединение с JVB конфигурируется с `with_ice_servers(vec![])`, так как медиамост JVB всегда доступен напрямую по публичному IP.
-
-#### 7.4.2. Механизм агрегации пакетов (Packet Coalescing / Batching)
-Чтобы полностью устранить узкое место базового WebSocket (TCP-in-TCP Meltdown и перегрузку CPU JVB из-за высокого PPS), применяется буферизация с микротаймером (Nagle-like для туннеля):
-1. **Воркер отправки (Egress Batcher):**
-   * Пакеты из TUN-интерфейса накапливаются во внутреннем кольцевом буфере до достижения размера **16 КБ** либо по истечении таймаута **2.0 мс**.
-   * Несколько IP-пакетов склеиваются в один непрерывный бинарный фрейм с 2-байтовыми заголовками длины:
-     `[Len1: u16][Packet 1][Len2: u16][Packet 2]...`
-2. **Сериализация:**
-   * Полученный агрегированный блок кодируется в Base64 и упаковывается в **одно** сообщение `WrtcMessage::AstpBatch { data: "..." }`.
-   * **Результат:** При полосе 50–100 Мбит/с PPS на мосте JVB снижается с 5000 msg/sec до **200–350 msg/sec**. Нагрузка на CPU JVB падает на порядок, очередь сокетов не переполняется, Bufferbloat полностью исчезает.
-
----
-
-### 7.5. Tier 3: Colibri WebSocket Fallback
-* Используется как резервный канал при жестких сетевых блокировках UDP-трафика либо в фазе первоначального соединения.
-* Все критические управляющие сигналы (XMPP ping, Discovery, Beacon, P2P Offer/Answer) передаются параллельно через WebSocket, гарантируя мгновенный реконнект без ожидания завершения фазы ICE.
-
----
-
-### 7.6. Матрица сравнения режимов транспорта
-
-| Характеристика | Базовый Colibri-WS | Tier 2: Colibri-WS + PacketBatcher | Tier 1: P2P DataChannel (Direct) |
-| :--- | :--- | :--- | :--- |
-| **Сетевой протокол** | TCP / TLS (порт 443) | TCP / TLS (порт 443, батчинг) | SCTP / DTLS / UDP (Direct) |
-| **Пропускная способность** | ~40–47 Мбит/с | **120–180 Мбит/с** | **300+ Мбит/с** (Wire speed) |
-| **Задержка под нагрузкой**| 150–250 мс (Meltdown) | 45–65 мс | **15–30 мс** (Физический RTT) |
-| **Оверхед кодирования** | JSON + Base64 (+35%)| JSON + Base64 (Батчинг, +34%)| **0% (Raw Binary Frames)** |
-| **Устойчивость к потерям**| Низкая (TCP заморозка)| Высокая (микробатчинг 2мс)| Абсолютная (`ordered: false`)|
-| **Требования к NAT** | Любой (даже HTTP Proxy)| Любой (Исходящий TCP на 443)| Белый IP у сервера или Cone NAT|
-
----
-
-### 7.7. Локальное тестирование и проверка режимов (Инструкция разработчика)
-
-Для проверки работы режимов транспорта используется параметр `wrtc_mode` в `client.toml` и консольные утилиты `tcpdump`, `ss` и логи самого клиента/сервера.
-
-#### 1. Сводная таблица физических маркеров проверки
-
-| Режим (`wrtc_mode`) | Сетевой сокет | Фильтр `tcpdump` | Маркер в логах | Поведение пинга под нагрузкой |
-| :--- | :--- | :--- | :--- | :--- |
-| **`p2p_direct`** | UDP между клиентом и сервером | `tcpdump -nn -i any udp portrange 10000-65535` | `[P2P Direct] established`, `[P2P Direct OUT]`, `[P2P Direct IN]` | Минимальный (физический RTT) |
-| **`jvb_datachannel` / `auto`** | TCP к Ktalk (порт 443/tcp) + UDP к JVB (keepalive) | `tcpdump -nn -i any tcp port 443` | `[WRTC DataChannel] JVB bridge does not announce SCTP...`, `AstpBatch` | Ровный (~40–60 мс) |
-| **`ws`** | TCP к Ktalk (порт 443/tcp) | `tcpdump -nn -i any tcp port 443` | `[WRTC Transport] Mode is set to 'ws'. Connecting directly via Colibri-WS...` | 40–80 мс без нагрузки |
-
-#### 2. Пошаговая проверка каждого режима
-
-##### Шаг А. Проверка режима `ws` / `jvb_datachannel` (Colibri WebSocket с микробатчингом)
-1. В `client.toml` выставляем:
-   ```toml
-   wrtc_mode = "jvb_datachannel" # или "ws"
-   ```
-2. Подключаем клиент и пускаем трафик через туннель: `ping 172.112.224.1`.
-3. **Что наблюдаем:**
-   * В логах клиента появляется: `[WRTC DataChannel] JVB bridge does not announce SCTP DataChannel in session-initiate. Operating over Colibri-WS with PacketBatcher.`.
-   * При передаче трафика пакеты агрегируются модулем `PacketBatcher` и передаются через `AstpBatch`.
-   * Отсутствуют ошибки STUN `TransactionTimeOut`.
-
-##### Шаг Б. Проверка режима `p2p_direct` (Relay-Only WebRTC P2P DataChannel)
-1. В `client.toml` выставляем:
-   ```toml
-   wrtc_mode = "p2p_direct"
-   ```
-2. Подключаем клиент.
-3. **Что наблюдаем:**
-   * В логах клиента появляется: `[P2P Direct] Initiating Relay-Only WebRTC P2P DataChannel with server...` и `[P2P Direct] Sent Relay-Only ice-offer to server`.
-   * В логах сервера появляется: `[P2P Direct] Received ice-offer from client ...! Setting up Relay-Only P2P DataChannel...` и `[P2P Direct] Sent Relay-Only ice-answer to client`.
-   * Клиент применяет ответ сервера: `[P2P Direct] Applied remote answer successfully. Awaiting DataChannel open...`.
-   * Канал переходит в открытое состояние: `[P2P Direct] established: DataChannel 'anet-data' is now OPEN!`.
-   * При передаче сетевого трафика пакеты идут с нулевым JSON/Base64 оверхедом через TURN/TURNS релей: в логах клиента фиксируются маркеры `[P2P Direct OUT]`, а на сервере `[P2P Direct IN]`.
-
----
-
-## 8. Ограничения в условиях нестабильной сотовой сети и архитектура передачи через Fake Video Track (VP8 over DTLS-SRTP)
-
-### 8.1. Контекст: работа в нестабильной сотовой сети и специфика P2P-подхода
-В условиях нестабильной сотовой сети, жесткого симметричного CGNAT мобильных операторов и корпоративных шлюзов:
-1. **Неработоспособность P2P Direct:** 
-   * Публичные STUN-серверы (`stun.l.google.com` и др.) возвращают `STUN error: TransactionTimeOut` или фильтруются сетью.
-   * Прямой обмен UDP-пакетами между клиентом и внешним сервером сбрасывается сотовым оператором из-за жесткого CGNAT.
-2. **Единственный гарантированный канал связи:** Весь туннельный трафик передается **строго через медиамост JVB (`203.0.113.x:10003` UDP)**, маскируясь под легитимный медиапоток видеоконференции (DTLS-SRTP).
-
----
-
-### 8.2. Ретроспективный анализ: почему Audio (Opus) непригодно для Data Plane
-
-Попытка использовать аудиотрек (Opus, Payload Type 111) для передачи VPN-пакетов через JVB принципиально неработоспособна в силу архитектуры SFU:
-1. **Жесткие лимиты битрейта и PPS:**
-   * Аудиотрек рассчитан на человеческую речь с битрейтом 32–64 кбит/с и частотой 50 пакетов/сек (шаг 20 мс).
-   * Попытка передать VPN-трафик на скорости 5–20 Мбит/с (500–2000 пакетов/сек) приводит к переполнению джиттер-буфера JVB и отбрасыванию до 90% пакетов встроенным шейпером.
-2. **Алгоритм Dominant Speaker Identification (DSI):**
-   * JVB непрерывно анализирует уровень звукового сигнала участников.
-   * Если в комнате говорит другой участник (или пакеты данных не распознаются как валидная речь), JVB «заглушает» поток и прекращает его форвардинг остальным подписчикам для экономии серверной полосы.
-3. **Шторм ошибок дешифрации:**
-   * JVB транслирует аудиопакеты всех присутствующих в комнате (включая зомби-сессии после `Ctrl+C`).
-   * Без строгой привязки и фильтрации SSRC на приёме криптомодуль пытается дешифровать чужие голоса ключами ASTP, вызывая лавину ошибок `Decryption failed`.
-
-**Вывод:** Аудиотрек Opus используется **исключительно как фоновый keepalive** (отправка 3-байтовой тишины `0xf8, 0xff, 0xfe` каждые 20 мс) для предотвращения отключения эндпоинта Jicofo по неактивности микрофона.
-
----
-
-### 8.3. Архитектурное решение: Fake Video Track (VP8) и опыт `olcrtc`
-
-Для передачи данных на скоростях 100+ Мбит/с используется **Fake Video Track (кодек VP8, Payload Type 96)**. Данный подход подтверждён практикой распределённых видеоконференций (включая реализацию `openlibrecommunity/olcrtc`, использующую транспорты `vp8channel` и `seichannel` для передачи данных поверх SFU Jitsi Meet, Yandex Telemost и WbStream в условиях нестабильной сотовой сети).
-
-#### Почему JVB пропускает трафик Fake Video:
-1. **Выделенная полоса:** JVB конфигурирует видеопотоки под высокое разрешение (720p/1080p) с динамическим бюджетом полосы от 2 до 5+ Мбит/с на поток.
-2. **Отсутствие DSI:** Видеопоток не глушится детекторами речи и форвардится мостом на основе подписок эндпоинтов.
-3. **Прозрачный SFU-роутинг:** JVB не выполняет декодирование пикселей; мост инспектирует лишь RTP-заголовок (SSRC, Sequence Number, Timestamp) и 1-байтовый дескриптор полезной нагрузки VP8 (RFC 7741), после чего мгновенно направляет пакет целевому пиру.
-
----
-
-### 8.4. Диаграммы и структура инкапсуляции
-
-#### Схема 1: Формат кадра и побайтовая инкапсуляция
-
-```
-+---------------------------------------------------------------------------------------+
-| 1. IP-датаграмма из TUN-интерфейса (MTU <= 1240 байт)                                |
-|    [ IPv4 Header (20B) ] [ TCP/UDP Header ] [ Payload ]                               |
-+---------------------------------------------------------------------------------------+
-                                           |
-                                           v
-+---------------------------------------------------------------------------------------+
-| 2. Защищённый слой ASTP (ChaCha20-Poly1305)                                           |
-|    [ IV (12B) ] [ ASTP Flags (1B) ] [ Encrypted IP Datagram ] [ Poly1305 Tag (16B) ]  |
-|    (Размер: <= 1269 байт)                                                             |
-+---------------------------------------------------------------------------------------+
-                                           |
-                                           v
-+---------------------------------------------------------------------------------------+
-| 3. Fake VP8 Payload Descriptor (RFC 7741) — 1 байт:                                   |
-|    0x10 = [X=0, R=0, N=0, S=1, PartID=0]                                              |
-|    (S=1: Start of partition / начало кадра, предотвращает ожидание склейки в JVB)    |
-+---------------------------------------------------------------------------------------+
-                                           |
-                                           v
-+---------------------------------------------------------------------------------------+
-| 4. RTP Заголовок (12 байт):                                                           |
-|    - Payload Type = 96 (VP8)                                                          |
-|    - Marker = 1 (Конец кадра; JVB немедленно отправляет фрейм без задержки)          |
-|    - SSRC = peer_video_ssrc (Уникальный идентификатор видеопотока)                    |
-|    - Sequence Number = монотонный u16 (seq++)                                         |
-|    - Timestamp = монотонный u32 с шагом 3000 (эмуляция 30 fps при clock rate 90 кГц) |
-+---------------------------------------------------------------------------------------+
-                                           |
-                                           v
-                    UDP / DTLS-SRTP на IP моста JVB (порт 10003)
-                    (Итоговый размер пакета в проводе: <= 1282 байт)
-```
-
-#### Схема 2: Разделение Control Plane (Colibri-WS) и Data Plane (Fake Video RTP)
-
-```
-ANet Client                        JVB / Prosody                      ANet Server
-    |                                    |                                 |
-    |==== 1. XMPP/Jingle Session =======>|                                 |
-    |     - Согласование Audio (Opus)    |                                 |
-    |     - Согласование Video (VP8)     |                                 |
-    |     - Подключение Colibri-WS       |<==== 1. XMPP/Jingle Session ====|
-    |                                    |                                 |
-    |==== 2. WebRTC Media Init =========>|                                 |
-    |     (ICE Direct -> DTLS Connected) |<==== 2. WebRTC Media Init ======|
-    |     порт UDP 10003                 |      порт UDP 10003             |
-    |     (Фоновый Opus silence 20ms)    |      (Фоновый Opus silence 20ms)|
-    |                                    |                                 |
-    | [Control Plane over Colibri-WS]    |                                 |
-    |---- 3. e2ee-ping (Discover) ------>|---- forwards ------------------>|
-    |<--- 4. e2ee-ack (Beacon) ----------|<--- forwards -------------------|
-    |     (Сервер сообщил:               |     (Сервер сохранил контекст)  |
-    |      server_video_ssrc)            |                                 |
-    |                                    |                                 |
-    |---- 5. ASTP Phase I-III (DH+Auth)->|---- forwards ------------------>|
-    |     (Клиент передал:               |                                 |
-    |      client_video_ssrc)            |                                 |
-    |<--- 6. ASTP Phase IV (OK) ---------|<--- forwards -------------------|
-    |                                    |                                 |
-    | [Data Plane over Fake Video Track] |                                 |
-    |==== 7. VP8 RTP (PT=96, M=1) ======>|==== forwards to Server ========>|
-    |     SSRC: client_video_ssrc        |     (1. SSRC совпал)            |
-    |                                    |     (2. Срез 1 байта VP8 0x10)  |
-    |                                    |     (3. Дешифрация ASTP -> TUN) |
-    |                                    |                                 |
-    |<=== 8. VP8 RTP (PT=96, M=1) =======|<=== forwards to Client =========|
-    |     SSRC: server_video_ssrc        |     (Клиент: SSRC валиден)      |
-    |     (Дешифрация ASTP -> TUN)       |                                 |
-```
-
----
-
-### 8.5. Детализированный Roadmap внедрения Fake Video Media Plane
-
-#### Этап 1: Доработка сигналинга и структуры SSRC
-* Добавление полей видео-SSRC в сигнальные структуры:
-  * В `WrtcMessage::Beacon`: поле `video_ssrc: u32`.
-  * В запрос ASTP Phase III: поле `video_ssrc: u32`.
-* Клиент и сервер привязывают сессионный контекст пира к кортежу `(endpoint_id, expected_peer_video_ssrc)`.
-
-#### Этап 2: Регистрация Video Track в `anet-common` (`webrtc-rs` / `rtc` 0.21.0)
-* **Конфигурация `MediaEngine`:**
-  * Регистрация Opus для аудио: `RtpCodecKind::Audio`, `MIME_TYPE_OPUS`, PT=111, clock rate 48000.
-  * Регистрация VP8 для видео: `RtpCodecKind::Video`, MIME `video/VP8`, PT=96, clock rate 90000.
-* **Инициализация `TrackLocalStaticRTP`:**
-  * Создание видео-трека с `RtpCodecKind::Video` и локальным `video_ssrc`.
-  * Добавление видео-трека в `PeerConnection`.
-* **Формирование SDP Answer:**
-  * В секцию `m=video` Jingle Answer добавляются параметры кодека VP8 (PT 96) и атрибуты направления `a=sendrecv`.
-
-#### Этап 3: Воркеры отправки и приёма Fake Video RTP
-* **Egress (Отправка / `Vp8Transmitter`):**
-  * Поступающий из TUN IP-пакет шифруется ASTP.
-  * Формируется буфер полезной нагрузки: `[0x10][ASTP ciphertext]`.
-  * Создаётся `RtpPacket`:
-    * `payload_type: 96`
-    * `marker: true`
-    * `ssrc: local_video_ssrc`
-    * `sequence_number: seq.fetch_add(1, Ordering::Relaxed)`
-    * `timestamp: ts.fetch_add(3000, Ordering::Relaxed)` (3000 тиков = 1/30 сек при 90 кГц)
-  * Отправка через `video_track.write_rtp(packet).await`.
-* **Ingress (Приём / `Vp8Receiver`):**
-  * В `PeerConnectionEventHandler` реализуется `on_track(track: Arc<TrackRemote>, ...)`.
-  * Если `track.kind() == RtpCodecKind::Video`:
-    * Запускается асинхронный цикл чтения `track.read_rtp().await`.
-    * **Аппаратная фильтрация SSRC:**
-      ```rust
-      if rtp_packet.header.ssrc != expected_peer_video_ssrc {
-          // Мгновенный сброс без дешифрации: чужие видеопотоки, камеры, старые участники
-          continue;
-      }
-      ```
-    * Проверка и снятие 1 байта VP8 Payload Descriptor (`0x10`).
-    * Передача оставшегося буфера в `ASTP Decryptor` и запись расшифрованного IP-пакета в интерфейс TUN.
-
-#### Этап 4: Защита от штормов, сброс зомби-сессий и MTU
-* **Старт передачи:** Клиент начинает отправку пакетов данных в видео-трек строго после получения ответа ASTP Phase IV и перехода WebRTC в статус `Connected`.
-* **Инвалидация старых потоков:** При получении повторного `e2ee-ping` (`WrtcMessage::Discover`) сервер обновляет `expected_peer_video_ssrc` и привязывает его к трансиверу.
-* **Расчёт безопасного MTU:**
-  * WebRTC safe UDP MTU = 1280 байт.
-  * Заголовок RTP = 12 байт.
-  * VP8 Descriptor + Frame Header + Client Tag = 26 байт (`VP8_ASTP_PREFIX_LEN`).
-  * Заголовок ASTP (IV + Ciphertext + AuthTag) = 28 байт.
-  * **Итоговый запас `video_mtu_overhead`: 60 байт** (с нижней границей 1200 байт для полного исключения фрагментации на уровне JVB).
-
-#### Этап 5: Режимы конфигурации `wrtc_mode`
-* Добавление режима `media_video` в `WrtcMode`:
-  ```toml
-  # Режим транспорта: "media_video" | "p2p_direct" | "jvb_datachannel" | "ws" | "auto"
-  wrtc_mode = "media_video"
-  ```
-* В режиме `auto` клиент автоматически согласует передачу через мост JVB (`media_video` $\leftrightarrow$ `jvb_datachannel` $\leftrightarrow$ `ws`) без запуска прямого P2P, сохраняя полную изоляцию IP-адресов клиента и сервера.
-
----
-
-## 9. Устойчивость в условиях активных «Белых Списков» (БС) и блокировки UDP
-
-При включении оператором связи режима «Белых Списков» (БС) TCP-соединения на порт `443` к инфраструктуре ВКС (`XMPP` и `Colibri-WS`) проходят штатно, тогда как нестандартные UDP-порты медиамостов JVB (`10000–10010`) или STUN (`34788`) могут полностью блокироваться или отбрасываться ТСПУ спустя несколько секунд после начала передачи.
-
-Для обеспечения непрерывной работы без обрывов каждые 15–30 секунд в `wrtc` реализованы четыре защитных механизма:
-
-### 9.1. Изоляция жизнеспособности `Colibri-WS` от состояния UDP ICE (`has_ws == true`)
-* В базовой реализации WebRTC отсутствие входящих STUN Binding Response по UDP переводит `PeerConnection` в состояние `Disconnected` через `10 с` (`ice_disconnected_timeout_ms`), после чего через `8 с` (`watchdog_disconnected_timeout_secs`, суммарно **18 с**) срабатывает сторожевой таймер, либо через **25 с** (`ice_failed_timeout_ms`) — переход в `Failed`.
-* В `WrtcPeer::check_dead_reason()` и обработчике `on_connection_state_change()`:
-  * Если активен TCP/TLS канал `Colibri-WS` (`has_ws == true`), переход UDP `PeerConnection` в состояние `Disconnected` или `Failed` **не считается фатальным отказом** и не вызывает разрыв туннеля.
-  * Сессия перезапускается только в том случае, если одновременно недоступны и `Colibri-WS`, и `SCTP DataChannel`.
-
-### 9.2. Мгновенное переключение управляющих сообщений при проседании UDP (`dc_is_open && is_connected`)
-* Если `SCTP DataChannel` был открыт в начале сессии, но затем UDP-поток был заблокирован фильтрами оператора, флаг `dc_is_open` может оставаться `true` до истечения SCTP RTO, из-за чего отправка `anet_ping` и `ReceiverVideoConstraints` зависала бы в мёртвом SCTP-буфере.
-* В цикле отправки `WrtcPeer` использование `DataChannel` разрешено только при одновременном выполнении `dc_is_open && is_connected`. Как только UDP ICE теряет связность (`is_connected == false`), все пакеты управления и `AstpBatch` без задержек маршрутизируются через живой `Colibri-WS`.
-
-### 9.3. Двусторонний самовосстанавливающийся фоллбэк `MediaVideo` $\leftrightarrow$ `Colibri-WS`
-Даже если в конфиге жёстко задан `wrtc_mode = "media_video"` (или `"auto"`), транспорт автоматически адаптируется к блокировке UDP в любом направлении:
-1. **На стороне клиента:**
-   * Признак прогретого видеоканала (`video_warmed_up`) требует одновременного выполнения трёх условий: получен хотя бы один видеокадр от сервера (`!first_client_rx`), активно UDP ICE-соединение (`peer.is_connected == true`) и с момента последнего входящего UDP-видеокадра прошло не более **5 секунд**.
-   * Если UDP заблокирован со старта или обрывается посреди сессии, `video_warmed_up` становится `false`, и клиент автоматически дублирует/направляет исходящие пакеты в `PacketBatcher` поверх `Colibri-WS` (`WrtcMessage::AstpBatch`).
-2. **На стороне сервера (защита от асимметричной блокировки UDP):**
-   * При получении от клиента любого пакета `WrtcMessage::AstpBatch` по `Colibri-WS` сервер фиксирует метку времени `client_last_ws_batch_ms` и немедленно сбрасывает флаг `client_video_warmed_up` для данного `client_tag`.
-   * Пока от клиента приходят `AstpBatch` (и в течение 500 мс после последнего батча), сервер также отдаёт весь Downlink-трафик этому клиенту через `Colibri-WS` (`AstpBatch`), что гарантирует двустороннюю связность даже при односторонней фильтрации UDP-пакетов.
-
-### 9.4. Подавление лишнего SDP Renegotiation после старта туннеля
-* При приходе фоновых станз Jingle (`source-add`, `description-info`) метод `WrtcPeer::add_remote_video_ssrc()` пропускает вызов `set_remote_description` / `set_local_description`, если активен режим `ws` / `jvb_datachannel` / `p2p_direct` либо если данный SSRC уже привязан к своему `Recvonly`-трансиверу (`a=mid:v_{ssrc}`), ограничиваясь запросом ключевого кадра (`force_next_keyframe()`). Это исключает сброс рабочей DTLS/ICE сессии после активации маршрутов TUN.
-
-### 9.5. Изоляция невизуальных режимов (`jvb_datachannel` / `ws`) от видеопотоков JVB и коалесценция `PacketBatcher`
-* **Строгая коалесценция `PacketBatcher` (12 КБ / 2 мс):** В режимах `jvb_datachannel` и `ws` пакеты из TUN агрегируются в `PacketBatcher` (`WRTC_BATCHER_MAX_BYTES = 12288`, `WRTC_BATCHER_MAX_DELAY_MS = 2`) без принудительного сброса (`flush()`) после каждого одиночного чтения из сокета ядра. При этом `PacketBatcher::flush()` строго соблюдает верхнюю границу `ws_batcher_max_bytes` на каждый фрейм `AstpBatch`.
-* **Согласование BUNDLE `<content name="video">` и отключение входящего видео в `jvb_datachannel` / `ws`:**
-  1. В `Jingle session-accept` всегда подтверждается секция `<content name="video">` из `BUNDLE`-предложения Jicofo, чтобы медиа-мост JVB корректно инициализировал DTLS/ICE транспорт.
-  2. Если клиент работает в режиме `jvb_datachannel`, `ws` или `p2p_direct`, на любые станзы `source-add` / `description-info` / `JingleAck` клиент отправляет `ReceiverVideoConstraints` с `defaultConstraints: {"maxHeight": 0}` и не вызывает `add_remote_video_ssrc()`, предотвращая пересылку мостом JVB чужих 2160p видеопотоков и забивание `Colibri-WS` / `DataChannel`.
-
-### 9.6. Гарантированная очистка Jingle-источников в Jicofo (`source-remove` + `session-terminate`)
-* При штатном завершении сессии или реконнекте метод `XmppSession::leave_room()` перед отправкой `<presence type="unavailable"/>` и `<close/>` отправляет в Jicofo:
-  1. `<jingle action="source-remove" initiator="..." responder="..." sid="...">` с явно перечисленными локальными `audio` и `video` SSRC;
-  2. `<jingle action="session-terminate" initiator="..." responder="..." sid="..."><reason><success/></reason></jingle>`;
-  3. Выдерживает паузу `120 мс` перед отправкой `<close xmlns="urn:ietf:params:xml:ns:xmpp-framing"/>`, чтобы Prosody гарантированно доставил IQ-станзы в Jicofo до разрыва WebSocket-соединения, предотвращая накопление «призрачных» `<source>` в комнате.
-
-### 9.7. Одновременная совместимость ПК и Android (Wi-Fi + мобильные сети с CGNAT)
-1. **Приоритет ICE-эшелонов (`build_ice_server_tiers`):**
-   * `Tier 0: STUN` (прямой UDP до белого IP медиамоста JVB без TURN-прокси) всегда пробуется первым — это обеспечивает максимальную скорость (40+ Мбит/с в `jvb_datachannel`/`ws` и до 180+ Мбит/с в `media_video`) на ПК и Android в сетях с прямым UDP.
-   * `Tier 1: UDP STUN + UDP TURN` и `Tier 2: STUN + TURN + TURNS (TCP:443)` автоматически подхватывают соединение, если прямой UDP к порту JVB `10000` заблокирован мобильным оператором или строгим файрволом.
-   * В `[[servers]]` поддерживается индивидуальное переопределение `wrtc_use_turn = true | false` для конкретного сервера.
-2. **Защита серверного TUN от дропа пакетов Android (`mtu.max(1420)`):**
-   * Поскольку системный `VpnService` на Android принудительно зажимает MTU интерфейса `tun0` в диапазон `[1280, 1500]`, физический интерфейс TUN на сервере (`anet-server`) всегда создаётся с системным MTU не менее `1420` байт (`cfg_ref.network.mtu.max(1420)`), тогда как в `AuthResponse` и TCP MSS Clamping используется расчётный туннельный MTU. Это исключает отбрасывание ядром Linux входящих пакетов 1251–1280 байт от Android-клиентов.
-3. **Прозрачное прохождение DNS-запросов для `RuleAction::Proxy`:**
-   * DNS-перехватчик клиента пропускает все типы запросов (`A`, `AAAA`, `HTTPS/SVCB`) для проксируемых доменов напрямую через туннель без подмены на синтетические `NODATA`-ответы без `EDNS0 OPT`, что обеспечивает мгновенное открытие YouTube и Telegram в браузерах и приложениях на Android.
-
-### 9.8. Единый неразделённый цикл I/O в `XMPP-WS` (`XmppSession`) поверх `tokio_boring::SslStream`
-* При разделении `WebSocketStream<Box<dyn VpnStream>>` (обёртывающего `tokio_boring::SslStream<TcpStream>`) через `ws_stream.split()` (`futures::stream::BiLock`) на две независимые задачи `reader_handle` и `writer_handle` возникала гонка waker'ов: в момент отправки двух подряд фреймов (`ws_sink.send(Message::Ping)` и `ws_sink.send(Message::text(ping_iq))`) приходящий от сервера `Pong` вызывал одновременный опрос `SSL_read` и `SSL_write` из разных задач и затирал `Waker` чтения, из-за чего `XMPP-WS` переставал пробуждаться на входящих станзах (срабатывал 35-секундный watchdog `half-open connection`), тогда как неразделённый `Colibri-WS` в `peer.rs` продолжал работать без единого сбоя.
-* В `XmppSession::connect_with_endpoint()` поток `ws_stream` обрабатывается в **единой задаче `io_handle` через `tokio::select!`** (аналогично `Colibri-WS`):
-  * WebSocket `Ping` и XMPP IQ `ping` коалесцируются через `ws_stream.feed(...)` + `ws_stream.flush()` в одну TLS-запись без конкуренции чтения и записи;
-  * Ответы IQ `result` на входящие `disco#info`, `ping` и `jingle` отправляются в том же цикле через `feed()` + `flush()`;
-  * Сторожевой таймер входящего трафика (`last_inbound_at + read_timeout_dur`) отслеживается через `tokio::time::sleep_until`, не сбрасываясь при срабатывании локальных таймеров отправки.
-
----
-
-## 10. Пост-мортем блокировки серверов (NL 30.10 и FN 31.10) через 5 дней после внедрения `turns_proxy.rs` и чек-лист харденинга (для ветки WRTC + CF WARP)
-
-### 10.1. Хронология и корневая причина: почему чистый WebRTC работал месяцами, а после `turns_proxy.rs` оба сервера улетели в бан за 5 суток
-
-1. **Как работал `wrtc` до 25 октября (до коммита `348995d`):**
-    * Движок `webrtc-rs` (`rtc-turn 0.21`) нативно поддерживает только UDP-сокеты и **не умеет** работать с `turns:...:443?transport=tcp`.
-    * Когда `PeerConnectionBuilder::build()` перебирал эшелоны ICE (`Tier 0: STUN + TURN + TURNS`), `webrtc-rs` отвергал `turns:` URL с ошибкой и автоматически откатывался на чистый UDP (`STUN` / прямой `host` кандидат медиамоста JVB `*.ktalk.host:10000–10010`).
-    * Трафик между зарубежным `anet-server` и РФ шёл либо по UDP напрямую на порт `10002–10004` медиамоста JVB (валидные заголовки DTLS/SRTP/STUN, которые ТСПУ пропускает по белому списку ВКС), либо через WebSocket `Colibri-WS` с валидным HTTP Upgrade. Никаких TCP:443 соединений к TURN-серверам `bst-talk-stun7.ktalk.host:443` и `dtl-talk-stun5.ktalk.host:443` сервер не открывал.
-
-2. **Что изменилось 25 октября в коммите `348995d` (`feat(wrtc): add TURNS (TLS 1.3 TCP:443) UDP bridge...`):**
-    * В `build_ice_server_tiers()` (`anet-common/src/wrtc/peer.rs`) для каждого `turns:*.ktalk.host:443?transport=tcp` начал подниматься локальный мост `spawn_turns_udp_proxy` (`turn:127.0.0.1:<port>`), а сам эшелон `"Tier 0: STUN + TURN + TURNS"` стоял **первым в списке**.
-    * Поскольку `webrtc-rs` увидел локальный UDP-адрес `turn:127.0.0.1:<port>`, `PeerConnectionBuilder::build()` **перестал отвергать `Tier 0`** и начал выбирать `Tier 0: STUN + TURN + TURNS` при **каждом** создании `WrtcPeer` — в том числе **на самом зарубежном `anet-server` (NL и FN)**!
-    * Одновременно в `peer.rs:791–800` были синтезированы прямые UDP TURN-адреса `turn:bst-talk-stun7.ktalk.host:34788` и `turn:dtl-talk-stun5.ktalk.host:34788`, а 26 октября в коммите `f5e61d2` добавлен агрессивный цикл `refresh_permissions` + `channel_bind` каждые 90–120 секунд.
-    * **Итог:** Начиная с 25 октября оба зарубежных VPS (`NL` и `FN`) начали круглосуточно открывать трансграничные **TCP:443 TLS-соединения (`turns_proxy.rs`)** к российским узлам `coturn` (`bst-talk-stun7.ktalk.host:443`, `dtl-talk-stun5.ktalk.host:443` в AS49675) и гнать через них бинарный STUN/TURN трафик. Ровно через 5 дней накопления телеметрии ТСПУ (30 октября — NL, 31 октября днём — FN) оба IP-адреса серверов были заблокированы.
-
----
-
-### 10.2. Критические демаскирующие факторы в текущей кодовой базе (Must-Fix)
-
-#### 1. Фатальная аномалия протокола на TCP:443 в `turns_proxy.rs:155`: `ALPN: ["http/1.1"]` + бинарный STUN вместо HTTP
-* **Где в коде (`origin/master`):** `anet-common/src/wrtc/turns_proxy.rs:155`:
-  ```rust
-  crate::http_help::BrowserProfile::random().connect_ws_tls(&host, tcp_stream)
-  // (а в коммите 348995d вызывался crate::boring_tls::connect_tls(&host, tcp_stream))
-  ```
-* **В чём прокол:**
-    * И `connect_tls`, и `connect_ws_tls` принудительно записывают в TLS `ClientHello` расширение **`ALPN: ["http/1.1"]`** (`b"\x08http/1.1"`).
-    * Сразу после завершения TLS Handshake на порту `TCP:443` функция `bridge_turn_stream` (`turns_proxy.rs:226`) отправляет в TLS-поток **сырой бинарный кадр STUN Allocate (`0x00 0x03 ...`) и TURN `ChannelData` (`0x40 0x00 ...`)** вместо HTTP/1.1-запроса (`GET / POST ...`)!
-    * При этом сервер `coturn` в `ServerHello` не подтверждает `http/1.1`, а настоящий браузерный стек `libwebrtc` (Chrome / Firefox / Safari) при подключении к `turns:...:443?transport=tcp` **никогда не отправляет `ALPN: http/1.1`** (отправляется либо `ClientHello` вообще без ALPN, либо `stun.turn` по RFC 7443).
-    * **Почему на это триггерится ТСПУ:** Порт `TCP:443` на трансграничных линках инспектируется самыми жёсткими классификаторами ТСПУ (поиск Trojan, ShadowTLS, VLESS и кастомных TLS-туннелей). Когда зарубежный дата-центровый IP открывает длительное TLS-соединение на `TCP:443`, заявляет в открытом `ClientHello` протокол `ALPN: http/1.1`, но первой же TLS Application Data записью шлёт не-HTTP бинарный заголовок, за которым следует бесконечный поток мелких TLS-фреймов фиксированной длины каждые 20 мс / 2000 мс — эвристика ТСПУ однозначно помечает IP как нелегитимный TLS-прокси.
-* **Как исправить:**
-    * В `anet-common/src/boring_tls.rs` использовать коннектор **без ALPN** (`connect_raw_tls_with_config(&host, tcp_stream, &tls_cfg)` / `build_raw_ssl_connector_with_config`, уже добавлен в ветке `dev/imap` в коммите `86a439a`) либо явно выставлять `builder.set_alpn_protos(b"\x09stun.turn")` (проверив, что `coturn` Контура принимает `stun.turn`). Ни в коем случае не отправлять `ALPN: http/1.1` на сокетах `turns_proxy`!
-    * Прокинуть `TlsClientConfig` из `StealthConfig` в `spawn_turns_udp_proxy`, чтобы `turns_proxy` соблюдал настройки `[stealth]` (`tls_fingerprint`, `tls_verify_peer`), а не создавал рандомный профиль с дефолтами.
-
----
-
-#### 2. Безусловный запуск `spawn_turns_udp_proxy` в `build_ice_server_tiers` и включённый по умолчанию `jvb_use_turn = true` на сервере
-* **Где в коде:**
-    * `anet-common/src/config.rs:163`: в `WrtcConfig::default()` стоит `jvb_use_turn: true`.
-    * `anet-common/src/wrtc/peer.rs:730–765`: цикл `for s in discovered` внутри `build_ice_server_tiers()` вызывает `spawn_turns_udp_proxy(...)` **до** выбора эшелона ICE, просто при `allow_turn == true`.
-* **В чём проблема:**
-    1. **Зарубежному серверу (`anet-server`) TURN/TURNS к медиамосту JVB не нужен вообще!** Медиамост JVB (`*.ktalk.host:10000–10010`) всегда имеет белый публичный IP в РФ. Когда `anet-server` (напрямую или через Cloudflare WARP) общается с JVB, ему нужен **только прямой UDP (`Tier 0: STUN` / `Tier 3: host`)**. Использование `turns_proxy` на стороне сервера:
-        * переводит медиатрафик из UDP `:10002` в инспектируемый ТСПУ пайплайн `TCP:443`;
-        * создаёт двойной релей (`anet-server` $\xrightarrow{\text{TCP:443}}$ `coturn` $\xrightarrow{\text{UDP}}$ `JVB`) и убивает производительность из-за TCP-over-TCP;
-        * при работе через Cloudflare WARP вызывает таймауты `TURN transaction timed out` и лишнюю нагрузку на `coturn`.
-    2. Даже после того как в коммите `e594209` (1 ноября) `"Tier 0: STUN"` поставили первым, при `jvb_use_turn = true` функция `build_ice_server_tiers` всё равно спавнит фоновые задачи `TurnsProxyHandle` в `proxies`.
-* **Как исправить:**
-    1. На стороне **`anet-server`** (`anet-server/src/servers/wrtc.rs`) для `WrtcPeer::create` принудительно передавать `allow_turn = false` (или сделать дефолт `jvb_use_turn: false` для сервера), чтобы сервер **никогда** не аллоцировал TURN/TURNS для связи с JVB.
-    2. В `build_ice_server_tiers` (`peer.rs:730`) **не запускать** `spawn_turns_udp_proxy` заранее, если выбран `Tier 0: STUN`! Создавать `TurnsProxyHandle` лениво (только если `Tier 0` и `Tier 1` не смогли собраться и реально дошла очередь до `Tier 2: STUN + TURN + TURNS`, либо при вызове `create_p2p_channel`).
-
----
-
-#### 3. Статические таймеры-метрономы (поведенческий фингерпринт 24/7)
-Даже при выходе сервера через Cloudflare WARP или российский релей статические интервалы выдают автоматизированного бота как для DPI, так и для антифрода самого Контур.Толка:
-
-1. **Топорный таймер ротации комнаты `server_idle_room_rotation_secs = 1800` + фиксированная пауза `2s` (`anet-server/src/servers/wrtc.rs:153, 183`):**
-    * **Проблема:** Когда клиентов нет, `anet-server` выходит из комнаты и заново авторизуется через `/api/authorize/session` ровно каждые **1800.0 секунд + 2.0 секунды** (48 раз в сутки секунда в секунду).
-    * **Как исправить (джиттер по аналогии со `stealth`):**
-        * Вычислять дедлайн каждой итерации со случайным разбросом $\pm 30\%$ от базового `server_idle_room_rotation_secs`:
-          ```rust
-          let base_ms = config.wrtc.server_idle_room_rotation_secs.max(60) * 1000;
-          let jitter_range = (base_ms * 30) / 100; // ±30%
-          let actual_idle_ms = (base_ms - jitter_range)
-              + (rand::random::<u64>() % (jitter_range * 2 + 1));
-          let idle_deadline = tokio::time::Instant::now() + Duration::from_millis(actual_idle_ms);
-          ```
-        * Паузу перед повторным входом (`WRTC_SERVER_RECONNECT_PAUSE_SECS`) также рандомизировать в диапазоне `1500..6500 мс` вместо константы `2s`.
-
-2. **Метроном медиа-keepalive Opus (`20 мс` = 50 pkt/s одинакового размера) и VP8 (`1000 мс`) в простое (`peer.rs:1863, 1926`):**
-    * **Проблема:** В `peer.rs:1863` каждую 20-ю миллисекунду отправляется ровно 3 байта `WRTC_OPUS_SILENCE_FRAME` (`[0xf8, 0xff, 0xfe]`), а в `peer.rs:1926` ровно каждые 1000.0 мс отправляется идентичный по размеру VP8 keyframe. В шифрованном канале (особенно если трафик идёт через TURN-TCP/TLS) это выглядит как идеальный генератор пакетов одинаковой длины 50 Гц + 1 Гц сутками напролёт.
-    * **Как исправить:**
-        * В `vp8_task` (`peer.rs:1929`) заменить `tokio::time::interval(Duration::from_millis(video_keepalive_ms))` на `tokio::time::sleep` со случайным джиттером интервала (например, `750..1350 мс`) и добавлять в конец тестового VP8-кадра случайный хвост от `0` до `32` байт (либо варьировать RTP padding), чтобы размеры keepalive-пакетов не были константными.
-        * В `opus_task` (`peer.rs:1863`) при полном простое (когда нет активных клиентов или нет трафика дольше 10 с) можно имитировать режим Opus DTX (Discontinuous Transmission, штатный для WebRTC при молчании): передавать пакет комфортного шума раз в `160..400 мс` (с джиттером) и переходить на `20 мс` только при наличии активности, либо варьировать длину фрейма тишины (`3..15` байт валидного Opus silence/CNG).
-
-3. **Фиксированные интервалы пингов `Colibri-WS` (`10s` в `peer.rs:1225`) и `XMPP-WS` (`wrtc_ping_interval_secs` в `xmpp.rs`):**
-    * **Проблема:** `tokio::time::interval(Duration::from_secs(10))` бьёт ровно каждые 10.000 с без отклонений.
-    * **Как исправить:** Использовать `tokio::time::sleep` с пересчётом случайной задержки на каждом шаге: `base_ms ± 25%` (например, `7500..12500 мс` для 10-секундного пинга).
-
----
-
-#### 4. Нюансы работы поверх Cloudflare WARP (`wgcf` / policy routing) и утечка IP в ICE/SDP
-
-При выводе трафика `anet-server` (на забаненных NL/FN) в сторону `*.ktalk.ru` и `*.ktalk.host` через интерфейс Cloudflare WARP необходимо учесть **четыре критических места в коде**:
-
-1. **Проблема выбора интерфейса в `create_p2p_channel` (`peer.rs:874`):**
-    * В `WrtcPeer::create` (`peer.rs:1362`) вызывается `detect_physical_bind_addr(session_opt, fallback_ip, fallback_port)`. Он делает пробный `UdpSocket::connect` к IP кандидата JVB из `session_opt` (например, `89.169.16.x`). Если подсеть Контура завернута в таблицу маршрутизации WARP, ядро Linux вернёт локальный IP интерфейса WARP (например, `172.16.0.2`), и UDP-сокет WebRTC корректно привяжется к WARP.
-    * **НО** в `create_p2p_channel` (`peer.rs:874`), если `bind_addr` пустой, вызывается:
-      ```rust
-      detect_physical_bind_addr(None, "1.1.1.1", 443)
-      ```
-      Если на сервере включён split-tunneling (в WARP завёрнуты только подсети РФ / Контура, а `1.1.1.1` идёт напрямую через `ens3`), то `detect_physical_bind_addr(None, "1.1.1.1", 443)` вернёт **забаненный публичный IP интерфейса `ens3`** вместо интерфейса WARP!
-    * **Как исправить:** В `detect_physical_bind_addr` при отсутствии `session_opt` использовать `fallback_ip` (`wrtc_fallback_jvb_ip`) или IP первого сервера из `ice_servers_info`, а не захардкоженный `"1.1.1.1"`.
-
-2. **Полнота маршрутизации подсетей Контура в интерфейс WARP на сервере:**
-    * Инфраструктура Ktalk использует не только основной домен комнаты (`*.ktalk.ru`) и медиамосты JVB, но и пул серверов из `extdisco` (`bst-talk-stun7.ktalk.host`, `dtl-talk-stun5.ktalk.host` и др.).
-    * Если маршрутизировать в WARP отдельные IP по списку, при смене IP балансировщиком или `extdisco` пакеты `STUN`/`Colibri-WS`/`JVB` пойдут мимо `warp` напрямую с забаненного `ens3`.
-    * **Рекомендация:** Заворачивать в таблицу маршрутизации интерфейса WARP целиком автономную систему Контура **AS49675** (включая `89.169.16.0/20`, `46.17.200.0/21`, `193.232.166.0/24` и все префиксы AS49675) либо использовать `fwmark` / `SO_BINDTODEVICE` для исходящих сокетов воркера `wrtc` на сервере.
-
-3. **Фильтрация локальных ICE-кандидатов в `WrtcPeer::create` (`peer.rs:1647–1686`):**
-    * В `WrtcPeer::create` при отправке `Jingle session-accept` в `xmpp.accept_session(...)` передаются все собранные кандидаты `local_params.candidates`.
-    * Если на сервере поднят интерфейс `ens3` (с реальным IP VPS), Docker-мосты или `wgcf`, в SDP могут попасть лишние `typ host` кандидаты. Хотя `with_udp_addrs(vec![bind_addr])` ограничивает сокет одним IP, при `bind_addr == "0.0.0.0:0"` стек `webrtc-rs` перечислит **все** сетевые интерфейсы сервера (включая реальный внешний IP `ens3`!) и отправит их открытым текстом в XMPP Jingle `session-accept`.
-    * **Как исправить:**
-        * Добавить в `[wrtc]` конфига сервера опциональный параметр `bind_interface` / `bind_ip` (например, IP интерфейса `wgcf` / `warp`), чтобы `anet-server` гарантированно биндил все сокеты (`KtalkClient`, `XmppSession`, `Colibri-WS`, `WrtcPeer` UDP) только к интерфейсу WARP и никогда не откатывался на `"0.0.0.0:0"`.
-        * Перед вызовом `xmpp.accept_session` в `peer.rs:1671` отфильтровывать из `local_params.candidates` любые кандидаты с приватными/туннельными подсетями (`172.112.x.x`, `10.x.x.x`, `172.16.x.x`), если уже присутствует валидный кандидат для связи с JVB, либо оставлять только нужный кандидат.
-
-4. **Учет MTU интерфейса Cloudflare WARP (`1280` / `1420` байт) для режима `media_video`:**
-    * Интерфейс WireGuard / Cloudflare WARP имеет собственный оверхед (60–80 байт поверх внешнего IPv4/IPv6). Обычно MTU на `wgcf` составляет `1280` или `1420` байт.
-    * Если `anet-server` отправляет UDP-пакеты RTP (Fake Video VP8) в сторону JVB через интерфейс `wgcf` с MTU `1280`, а размер RTP-пакета после обёртки DTLS-SRTP + UDP + IPv4 превышает `1280` байт, возникнет IP-фрагментация внутри WireGuard или дроп пакета по `EMSGSIZE`.
-    * **Рекомендация:** При работе сервера через WARP убедиться, что `network.mtu` (например, `1100` в `server.toml`) и `wrtc.max_video_batch_bytes` гарантируют итоговый размер внешнего UDP-пакета $\le 1220$ байт (с учётом `video_mtu_overhead = 60`), чтобы каждый RTP-кадр помещался в один нефрагментированный пакет WireGuard WARP.
-
----
-
-### 10.3. Краткий сводный чек-лист задач для применения в ветке WRTC
-
-- [ ] **`anet-common/src/boring_tls.rs` & `turns_proxy.rs`:** Заменить `connect_ws_tls` в `turns_proxy.rs:155` на `connect_raw_tls_with_config` (без `ALPN: http/1.1`), пробросить `TlsClientConfig` из `StealthConfig`.
-- [ ] **`anet-common/src/wrtc/peer.rs` (`build_ice_server_tiers`):** Отключить использование TURN/TURNS для соединения `anet-server <-> JVB` (`jvb_use_turn = false` на сервере) и сделать спавн `spawn_turns_udp_proxy` ленивым (только когда реально выбран эшелон с `TURNS`).
-- [ ] **`anet-common/src/wrtc/peer.rs` (`detect_physical_bind_addr`):** В `create_p2p_channel` (`peer.rs:874`) заменить пробный коннект к `"1.1.1.1":443` на IP из `ice_servers_info` / `fallback_ip`, чтобы при policy-маршрутизации через CF WARP сокет биндился на IP интерфейса WARP, а не на забаненный `ens3`.
-- [ ] **`anet-server/src/servers/wrtc.rs`:** Добавить случайный джиттер $\pm 30\%$ к `server_idle_room_rotation_secs` (`1800s`) и рандомизировать паузу переподключения (`1.5..6.5s` вместо фиксированных `2s`).
-- [ ] **`anet-common/src/wrtc/peer.rs` & `xmpp.rs`:** Добавить случайный джиттер $\pm 25\%$ к интервалам пингов `Colibri-WS` (`10s`), `XMPP-WS` (`10–20s`) и `VP8 video keepalive` (`1000ms`), а также вариативный размер payload для фоновых keepalive-пакетов.
-
+## 10. Рекомендации по дальнейшему повышению эксплуатационной надёжности
+
+1. **Использование коннектора без `ALPN: http/1.1` в `turns_proxy.rs`:**
+   * При использовании `turns_proxy` на клиентских устройствах в сетях с ограниченным UDP следует устанавливать TLS-соединение к серверам `coturn` без HTTP ALPN (либо с `ALPN: stun.turn` по RFC 7443) и передавать в `spawn_turns_udp_proxy` настройки `TlsClientConfig` из секции `[stealth]`.
+2. **Ленивая инициализация `spawn_turns_udp_proxy`:**
+   * Запускать локальный мост `TurnsProxyHandle` только в том случае, если прямой UDP-эшелон (`Tier 0: STUN`) недоступен или явно выбран режим `p2p_direct`.
+3. **Добавление случайного фазового сдвига (джиттера) к сервисным таймерам:**
+   * Варьировать интервал профилактической ротации пустой комнаты `server_idle_room_rotation_secs` в пределах $\pm 30\%$, а интервалы фоновых пингов `Colibri-WS`, `XMPP-WS` и тестовых кадров `video_keepalive_interval_ms` — в пределах $\pm 25\%$, исключая строго периодические сетевые паттерны при длительном дежурстве сервера в комнате.
