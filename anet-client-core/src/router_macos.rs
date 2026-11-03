@@ -212,9 +212,24 @@ impl RouteManager for MacOSRouteManager {
     async fn add_bypass_route(&self, target: IpAddr, prefix: u8) -> Result<()> {
         let gateway = {
             let state = self.state.lock().await;
-            state
+            let gw = state
                 .original_gateway
-                .context("Gateway not backed up - call backup_routes() first")?
+                .context("Gateway not backed up - call backup_routes() first")?;
+            if target.is_ipv4() != gw.is_ipv4() {
+                debug!(
+                    "Skipping BYPASS route: {}/{} (address family mismatch with gateway {})",
+                    target, prefix, gw
+                );
+                return Ok(());
+            }
+            if state
+                .added_routes
+                .iter()
+                .any(|r| r.destination == target && r.prefix == prefix)
+            {
+                return Ok(());
+            }
+            gw
         };
 
         info!(

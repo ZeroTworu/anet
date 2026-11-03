@@ -203,7 +203,17 @@ impl WrtcRuntime for TunedTokioRuntime {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = std::io::Result<Vec<std::net::SocketAddr>>> + Send + 'a>,
     > {
-        self.inner.resolve_host(host)
+        let fut = self.inner.resolve_host(host);
+        Box::pin(async move {
+            let addrs = fut.await?;
+            let ipv4_addrs: Vec<std::net::SocketAddr> =
+                addrs.iter().copied().filter(|a| a.is_ipv4()).collect();
+            if !ipv4_addrs.is_empty() {
+                Ok(ipv4_addrs)
+            } else {
+                Ok(addrs)
+            }
+        })
     }
 
     fn now(&self) -> std::time::Instant {

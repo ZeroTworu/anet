@@ -186,17 +186,17 @@ impl ClientTransport for WrtcTransport {
         let mut bypass_ips: Vec<std::net::IpAddr> = Vec::new();
 
         if let Some(ip) = xmpp.remote_ip {
-            if !ip.is_loopback() {
+            if ip.is_ipv4() && !ip.is_loopback() {
                 bypass_ips.push(ip);
             }
         }
         if let Ok(ip) = domain.parse::<std::net::IpAddr>() {
-            if !ip.is_loopback() {
+            if ip.is_ipv4() && !ip.is_loopback() {
                 bypass_ips.push(ip);
             }
         } else if let Ok(resolved) = tokio::net::lookup_host((domain.as_str(), 443)).await {
             for addr in resolved {
-                if !addr.ip().is_loopback() {
+                if addr.ip().is_ipv4() && !addr.ip().is_loopback() {
                     bypass_ips.push(addr.ip());
                 }
             }
@@ -207,12 +207,12 @@ impl ClientTransport for WrtcTransport {
                 if let Some(host) = uri.host() {
                     let port = uri.port_u16().unwrap_or(443);
                     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-                        if !ip.is_loopback() {
+                        if ip.is_ipv4() && !ip.is_loopback() {
                             bypass_ips.push(ip);
                         }
                     } else if let Ok(resolved) = tokio::net::lookup_host((host, port)).await {
                         for addr in resolved {
-                            if !addr.ip().is_loopback() {
+                            if addr.ip().is_ipv4() && !addr.ip().is_loopback() {
                                 bypass_ips.push(addr.ip());
                             }
                         }
@@ -224,7 +224,7 @@ impl ClientTransport for WrtcTransport {
         for candidate in &session.transport.candidates {
             if anet_common::wrtc::jingle::is_valid_jvb_candidate_ip(&candidate.ip) {
                 if let Ok(ip) = candidate.ip.parse::<std::net::IpAddr>() {
-                    if !ip.is_loopback() {
+                    if ip.is_ipv4() && !ip.is_loopback() {
                         bypass_ips.push(ip);
                     }
                 }
@@ -232,7 +232,7 @@ impl ClientTransport for WrtcTransport {
         }
 
         if let Ok(ip) = fallback_ip.parse::<std::net::IpAddr>() {
-            if !ip.is_loopback() {
+            if ip.is_ipv4() && !ip.is_loopback() {
                 bypass_ips.push(ip);
             }
         }
@@ -241,13 +241,13 @@ impl ClientTransport for WrtcTransport {
         for ice in xmpp.get_ice_servers() {
             let mut host_ips = Vec::new();
             if let Ok(ip) = ice.host.parse::<std::net::IpAddr>() {
-                if !ip.is_loopback() {
+                if ip.is_ipv4() && !ip.is_loopback() {
                     bypass_ips.push(ip);
                     host_ips.push(ip);
                 }
             } else if let Ok(resolved) = tokio::net::lookup_host((ice.host.as_str(), ice.port)).await {
                 for addr in resolved {
-                    if !addr.ip().is_loopback() {
+                    if addr.ip().is_ipv4() && !addr.ip().is_loopback() {
                         bypass_ips.push(addr.ip());
                         host_ips.push(addr.ip());
                     }

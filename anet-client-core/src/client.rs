@@ -553,14 +553,35 @@ impl AnetClient {
                 break;
             }
             if let Ok(ip) = IpAddr::from_str(&h) {
-                bypass_ips.push(ip);
+                if ip.is_ipv4() && !ip.is_loopback() {
+                    bypass_ips.push(ip);
+                }
             } else if let Ok(Ok(resolved)) =
                 tokio::time::timeout(Duration::from_millis(1500), lookup_host((h.as_str(), p)))
                     .await
             {
-                bypass_ips.extend(resolved.map(|addr| addr.ip()));
+                bypass_ips.extend(
+                    resolved
+                        .map(|addr| addr.ip())
+                        .filter(|ip| ip.is_ipv4() && !ip.is_loopback()),
+                );
             }
         }
+
+        // ГАРАНТИЯ: если транспорт закрепил конкретный IP CDN (Round-Robin),
+        // обязательно добавляем его в обход туннеля, чтобы избежать петли маршрутизации!
+        if let Some(pinned_ip) = result.remote_ip {
+            if pinned_ip.is_ipv4() && !pinned_ip.is_loopback() {
+                bypass_ips.push(pinned_ip);
+            }
+        }
+
+        for bypass_ip in result.bypass_ips {
+            if bypass_ip.is_ipv4() && !bypass_ip.is_loopback() {
+                bypass_ips.push(bypass_ip);
+            }
+        }
+
         bypass_ips.sort_unstable();
         bypass_ips.dedup();
 
@@ -569,24 +590,6 @@ impl AnetClient {
             self.route_manager
                 .add_bypass_route(*server_ip, prefix)
                 .await?;
-        }
-
-        // ГАРАНТИЯ: если транспорт закрепил конкретный IP CDN (Round-Robin),
-        // обязательно добавляем его в обход туннеля, чтобы избежать петли маршрутизации!
-        if let Some(pinned_ip) = result.remote_ip {
-            let prefix = if pinned_ip.is_ipv4() { 32 } else { 128 };
-            self.route_manager
-                .add_bypass_route(pinned_ip, prefix)
-                .await?;
-            bypass_ips.push(pinned_ip);
-        }
-
-        for bypass_ip in result.bypass_ips {
-            let prefix = if bypass_ip.is_ipv4() { 32 } else { 128 };
-            self.route_manager
-                .add_bypass_route(bypass_ip, prefix)
-                .await?;
-            bypass_ips.push(bypass_ip);
         }
 
         // Гарантируем, что прямые DNS-резолверы для Direct-правил всегда идут в обход туннеля
@@ -616,16 +619,18 @@ impl AnetClient {
                         80
                     });
                     if let Ok(ip) = IpAddr::from_str(host) {
-                        let prefix = if ip.is_ipv4() { 32 } else { 128 };
-                        let _ = self.route_manager.add_bypass_route(ip, prefix).await;
+                        if ip.is_ipv4() && !ip.is_loopback() {
+                            let _ = self.route_manager.add_bypass_route(ip, 32).await;
+                        }
                     } else if let Ok(Ok(addrs)) =
                         tokio::time::timeout(Duration::from_millis(1500), lookup_host((host, port)))
                             .await
                     {
                         for addr in addrs {
                             let ip = addr.ip();
-                            let prefix = if ip.is_ipv4() { 32 } else { 128 };
-                            let _ = self.route_manager.add_bypass_route(ip, prefix).await;
+                            if ip.is_ipv4() && !ip.is_loopback() {
+                                let _ = self.route_manager.add_bypass_route(ip, 32).await;
+                            }
                         }
                     }
                 }

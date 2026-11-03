@@ -140,6 +140,22 @@ pub mod desktop {
                 .original_ifindex
                 .context("Interface index not backed up")?;
 
+            if target.is_ipv4() != gateway.is_ipv4() {
+                debug!(
+                    "Skipping BYPASS route for {}/{} (address family mismatch with physical gateway {})",
+                    target, prefix, gateway
+                );
+                return Ok(());
+            }
+
+            if state
+                .added_routes
+                .iter()
+                .any(|r| r.destination == target && r.prefix == prefix)
+            {
+                return Ok(());
+            }
+
             info!(
                 "Adding BYPASS route for {}/{} via physical gateway {}",
                 target, prefix, gateway
