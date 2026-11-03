@@ -744,7 +744,7 @@ async def run_server_mailbox_worker(
     stop_event: asyncio.Event,
     use_literal_plus: bool,
     expunge_batch_size: int = 25,
-    expunge_idle_delay_sec: float = 1.5,
+    expunge_idle_delay_sec: float = 15.0,
 ):
     """
     Серверная пара воркеров (SRV_READER[i] + SRV_WRITER[i]) для одного ящика `account.index`.
@@ -943,7 +943,7 @@ async def run_client_mailbox_worker(
     session_id: str,
     use_literal_plus: bool,
     expunge_batch_size: int = 25,
-    expunge_idle_delay_sec: float = 1.5,
+    expunge_idle_delay_sec: float = 15.0,
 ):
     """
     Клиентская пара воркеров (CLI_READER[i] + CLI_WRITER[i]) для одного ящика `account.index`.
@@ -1115,7 +1115,7 @@ async def run_client_uplink_dispatcher(
     stop_event: asyncio.Event,
     session_id: str,
     batch_kb: int,
-    max_inflight_per_box: int = 12,
+    max_inflight_per_box: int = 5,
 ):
     """
     Центральный диспетчер Uplink на клиенте (`Self-Clocking Round-Robin Uplink Dispatcher`, Раздел 9.4.2).
@@ -1171,6 +1171,7 @@ async def run_phase(
     duration_secs: float,
     batch_kb: int,
     use_literal_plus: bool,
+    max_inflight_per_box: int = 5,
 ) -> MultiSoakStats:
     stats = MultiSoakStats(
         phase_label=phase_label,
@@ -1257,6 +1258,7 @@ async def run_phase(
                 stop_event,
                 session_id,
                 batch_kb,
+                max_inflight_per_box,
             )
         )
     )
@@ -1423,6 +1425,12 @@ async def main():
         help="Принудительно отключить 1-RTT LITERAL+ (использовать классический 2-шаговый APPEND)",
     )
     parser.add_argument(
+        "--max-inflight-per-box",
+        type=int,
+        default=5,
+        help="Лимит неподтверждённых батчей в полёте на 1 ящик (по умолчанию: 5, под реальный BDP ~4.3 батча)",
+    )
+    parser.add_argument(
         "--ab-test",
         action="store_true",
         help="Автоматически провести A/B сравнение: сначала прогон на 1 ящике (N=1), затем на всех N ящиках (Active-Active Striping)",
@@ -1453,6 +1461,7 @@ async def main():
             duration_secs,
             args.batch_kb,
             use_literal_plus,
+            args.max_inflight_per_box,
         )
         await asyncio.sleep(3.0)
         stats_multi = await run_phase(
@@ -1463,6 +1472,7 @@ async def main():
             duration_secs,
             args.batch_kb,
             use_literal_plus,
+            args.max_inflight_per_box,
         )
         print_ab_comparison(stats_single, stats_multi)
         results = {
@@ -1478,6 +1488,7 @@ async def main():
             duration_secs,
             args.batch_kb,
             use_literal_plus,
+            args.max_inflight_per_box,
         )
         results = stats_run.to_summary_dict()
 
