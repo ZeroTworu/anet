@@ -569,8 +569,8 @@ throttle_backoff_ms = 30000
 7. **Ленивый пакетный `UID EXPUNGE`:** Не слать `STORE + EXPUNGE` после каждого письма. Накапливать прочитанные UID и вычищать их пачками по `expunge_batch_size = 25`, либо при простое более `1500 мс`, либо в момент, когда очередь передачи пуста.
 8. **Автодетект `LITERAL+`:** По отклику команды `CAPABILITY` после `LOGIN` проверять поддержку `LITERAL+`/`LITERAL-`. Если поддерживается — выполнять `APPEND` в 1 RTT (`{len+}\r\n<body_bytes>`), экономя один сетевой round-trip на каждую отправку.
 9. **Управление переполнением (Backpressure) и защита от Bufferbloat:** Ограничивать окно неподтвержденных батчей `max_inflight_batches = 35` (с паузой 40 мс при насыщении), ограничивать буферы очередей TUN `tx_queue_capacity = 256`.
-10. **Failover ящиков (Клиент):** Если клиент получает ошибку авторизации, разрыв соединения или лимит от провайдера на текущем ящике, он переключается на следующий аккаунт `(index + 1) % accounts.len()` с сохранением `resume_session_id` (бесшовный реконнект без пересоздания TUN).
-11. **Мультиплексирование и живучесть Downlink при реконнекте (Сервер):** Сервер спавнит независимые пары воркеров (`SRV_READER` + `SRV_WRITER`) для каждого почтового ящика из `imap_dsn` параллельно, разделяя единый `ClientRegistry`. Каналы `notes_auth_tx`/`notes_data_tx` и буфер `pending_retry_msg` создаются **вне** цикла переподключения IMAP-воркера, благодаря чему клиентские задачи `run_client_downlink_batcher` и не успевший уйти перед обрывом сокета батч переживают переподключение `SRV_READER`/`SRV_WRITER` без потери Downlink-маршрутизации. При смене клиентом DH-ключа (`resume_session_id`) быстрый путь `SRV_READER` автоматически синхронизирует свежий `ClientTransportInfo` из `ClientRegistry`.
+10. **Active-Active Multi-Mailbox Striping & Self-Healing (Клиент):** Если в `dsn` передано $N \ge 2$ почтовых ящиков (`?acc=box1&acc=box2...`), клиент выполняет первичный ASTP-хендшейк через первый доступный ящик для получения единого `session_id`, `assigned_ip`, `cipher` и `nonce_prefix`, после чего параллельно поднимает пары воркеров (`CLI_WRITER[i]` + `CLI_READER[i]`) на всех $N$ ящиках. Исходящие батчи распределяются диспетчером по всем здоровым `CLI_WRITER[i]` в режиме **Self-Clocking Round-Robin** (первый свободный слот по кругу). Отказ одного ящика изолированно переводит только его воркер в фоновый реконнект без прерывания потока данных на оставшихся $N - 1$ ящиках; полный `Session Resume` запускается только при одновременной недоступности всех $N$ ящиков.
+11. **Мультиплексирование, Dynamic Mailbox Affinity и Downlink Round-Robin (Сервер):** Сервер спавнит независимые пары воркеров (`SRV_READER[i]` + `SRV_WRITER[i]`) для каждого почтового ящика из `imap_dsn` параллельно, разделяя единый `ClientRegistry` и карту `session_mailboxes`. Каналы `notes_auth_tx`/`notes_data_tx` и буфер `pending_retry_msg` создаются **вне** цикла переподключения IMAP-воркера, благодаря чему клиентские задачи `run_client_downlink_batcher` и не успевший уйти перед обрывом сокета батч переживают переподключение `SRV_READER`/`SRV_WRITER` без потери Downlink-маршрутизации. При получении криптографически валидного пакета сессии `session_id` на ящике $i$ сервер автоматически регистрирует `notes_data_tx[i]` в активном пуле ящиков этой сессии (`SessionMailboxPool`), а `run_client_downlink_batcher` балансирует Downlink-батчи по всем активным здоровым ящикам клиента в режиме **Self-Clocking Round-Robin**.
 12. **Инициализация базового UID (`UID FETCH * (UID)`):** Сразу после `SELECT` выполнять быстрый запрос максимального UID в папке и начинать выборку строго с `last_seen_uid = current_max_uid`, предотвращая загрузку сотен мегабайт исторических сообщений прошлых сессий.
 13. **Разделение пространств AEAD-нонсов C2S и S2C (`CLIENT_SEQUENCE_START`):** Поскольку `Uplink` (клиент $\to$ сервер) и `Downlink` (сервер $\to$ клиент) используют общий сессионный ключ `shared_key` и 4-байтовый `nonce_prefix`, счётчик пакетов клиента инициализируется с установленным старшим битом `CLIENT_SEQUENCE_START = 1u64 << 63` (`0x8000_0000_0000_0000`), а счётчик сервера — с `SERVER_SEQUENCE_START = 0`. Это гарантирует нулевое пересечение пар `(Key, Nonce)` в ChaCha20-Poly1305 при сохранении 100% совместимости с форматом заголовка ASTP.
 14. **Защита `fetch_messages_robust` от зависаний, `NO/BAD` и OOM:**
@@ -580,4 +580,250 @@ throttle_backoff_ms = 30000
 15. **Адаптация `ConnectivityMonitor` / `ConnectivityProber` под высоколатентный туннель:**
     * При поднятии VPN монитор связности даёт до `1200 мс` форы легковесному внутритуннельному ICMP-пингу (`0x414E`) до запуска параллельных HTTPS-проверок.
     * При `tunnel_rtt >= 300 мс` (или отсутствии ICMP-отклика за 1200 мс) таймаут `ConnectivityProber::probe_group` расширяется до `8000..12000 мс` (верхний предел `per_target_timeout` поднят до `15000 мс`), повторный «тёплый» HTTP-запрос (`warm_req`) отключается при `first_ms >= 500 мс`, а интервал фонового опроса автоматически увеличивается минимум до `45 секунд`.
+
+---
+
+## 9. Архитектура Active-Active Multi-Mailbox Round-Robin / Striping (Масштабирование полосы и снижение RTT пулом ящиков)
+
+### 9.1. Физика узкого места одиночного ящика и математическая модель пула $N$ ящиков
+На публичных почтовых серверах (`imap.mail.ru:993`, `imap.yandex.ru:993`) каждая команда `APPEND` требует эксклюзивной блокировки индекса папки конкретного почтового аккаунта (`mailbox lock`) и синхронного сброса данных на диск (`fsync`).
+* В результате медианное время выполнения одного `APPEND` составляет $T_{\text{append}} \approx 320\text{–}450\text{ мс}$ (до `700 мс` на 128 КБ батчах с Base64).
+* При работе через **один** почтовый ящик (`N = 1`, либо при использовании остальных ящиков из `imap_dsn` только в качестве холодного резерва `Active-Passive Failover`):
+  1. **Потолок частоты батчей:** один `Writer` физически не может выполнять более $\approx 1.5\text{–}2.5$ операций `APPEND` в секунду ($\sim 0.8\text{–}1.5\text{ Мбит/с}$).
+  2. **Head-of-Line (HoL) блокировка интерактивного трафика:** если крупный батч только что ушёл в `APPEND` на $450\text{ мс}$, любой пришедший следом приоритетный пакет (ICMP, DNS, TCP SYN/ACK) вынужден ждать освобождения единственного сокета записи в среднем $T_{\text{wait}} = \frac{T_{\text{append}}}{2} \approx 225\text{ мс}$.
+  3. **Простой серверных воркеров:** на стороне `anet-server` функция `run_imap_server` изначально поднимает независимые воркеры для всех ящиков из `imap_dsn`, но при `Active-Passive` клиенте $N - 1$ серверных воркеров простаивают впустую.
+
+При объединении $N$ почтовых ящиков из `imap_dsn` (`?acc=box1:pass1&acc=box2:pass2&...&acc=boxN:passN`) в **Active-Active пул с параллельным страйпингом (Self-Clocking Round-Robin)** достигается:
+1. **Линейное масштабирование пропускной способности ($N\times$):**
+   Независимые почтовые аккаунты обслуживаются разными шардами хранилища почтового провайдера и имеют раздельные `mailbox lock` и анти-спам счётчики. Суммарная частота записи возрастает до $N \times \frac{1}{T_{\text{append}}}$ батчей/с:
+   * $N = 1$: $\sim 0.8\text{–}1.2\text{ Мбит/с}$
+   * $N = 2$: $\sim 1.6\text{–}2.4\text{ Мбит/с}$
+   * $N = 3$: $\sim 2.4\text{–}3.6\text{ Мбит/с}$
+   * $N = 4$: $\sim 3.2\text{–}4.8\text{ Мбит/с}$
+2. **Кратное снижение джиттера и задержки ожидания ($\div N$):**
+   Пока `Writer #0` ждёт ответа `OK [APPENDUID ...]` от первого ящика, `Writer #1` свободен и немедленно отправляет следующий батч через второй ящик. Среднее время ожидания свободного канала записи сокращается до:
+   $$T_{\text{wait}}(N) \approx \frac{T_{\text{append}}}{2 \cdot N}$$
+3. **Кратное снижение риска `NO [THROTTLED]` / `NO [OVERQUOTA]`:**
+   При фиксированной скорости потока частота операций `APPEND` и `UID EXPUNGE` на каждый отдельный ящик падает в $N$ раз.
+
+---
+
+### 9.2. Топология потоков данных при Active-Active страйпинге ($N$ ящиков)
+
+```text
+                       КЛИЕНТ (anet-client-core)                                   СЕРВЕР (anet-server)
++-------------------------------------------------------------------+     +-------------------------------------------------------------------+
+| TUN -> FrameReader -> [prio_rx / bulk_rx]                         |     |ClientRegistry (assigned_ip -> tx_router -> rx_router)             |
+|                              |                                    |     |                              |                                    |
+|                     +--------v--------+                           |     |                     +--------v--------+                           |
+|                     | Uplink Batcher  | (Единый PacketBatcher     |     |                     | DownlinkBatcher | (Единый PacketBatcher     |
+|                     |  & RR Dispatch  |  + общий AtomicU64 seq)   |     |                     |  & RR Dispatch  |  + общий AtomicU64 seq)   |
+|                     +--+-----+-----+--+                           |     |                     +--+-----+-----+--+                           |
+|                        |     |     |  Self-Clocking Round-Robin   |     |                        |     |     |  Self-Clocking Round-Robin   |
+|       +----------------+     |     +----------------+             |     |       +----------------+     |     +----------------+             |
+|       v                      v                      v             |     |       v                      v                      v             |
+| [CLI_WRITER #0]        [CLI_WRITER #1]        [CLI_WRITER #N-1]   |     | [SRV_WRITER #0]        [SRV_WRITER #1]        [SRV_WRITER #N-1]   |
+| APPEND "Drafts"        APPEND "Drafts"        APPEND "Drafts"     |     | APPEND "Notes"         APPEND "Notes"         APPEND "Notes"      |
+| (box1@mail.ru)         (box2@mail.ru)         (boxN@mail.ru)      |     | (box1@mail.ru)         (box2@mail.ru)         (boxN@mail.ru)      |
++-------+----------------------+----------------------+-------------+     +-------+----------------------+----------------------+-------------+
+        |                      |                      |                           |                      |                      |
+        |   IMAPS :993         |   IMAPS :993         |   IMAPS :993              |   IMAPS :993         |   IMAPS :993         |   IMAPS :993
+        v                      v                      v                           v                      v                      v
++-------+----------------------+----------------------+-------------+     +-------+----------------------+----------------------+-------------+
+| [SRV_READER #0]        [SRV_READER #1]        [SRV_READER #N-1]   |     | [CLI_READER #0]        [CLI_READER #1]        [CLI_READER #N-1]   |
+| IDLE/FETCH "Drafts"    IDLE/FETCH "Drafts"    IDLE/FETCH "Drafts" |     | IDLE/FETCH "Notes"     IDLE/FETCH "Notes"     IDLE/FETCH "Notes"  |
+|       |                      |                      |             |     |       |                      |                      |             |
+|       +----------------+     |     +----------------+             |     |       +----------------+     |     +----------------+             |
+|                        v     v     v                              |     |                        v     v     v                              |
+|                 Общий tun_tx -> Server TUN                        |     |               Общий downlink_tun_tx -> Client TUN                 |
++-------------------------------------------------------------------+     +-------------------------------------------------------------------+
+```
+
+---
+
+### 9.3. Жизненный цикл сессии и криптографическая синхронизация
+
+#### 9.3.1. Единый ASTP-хендшейк через Primary-ящик (Без дублирования IP и сессий)
+Клиент **не выполняет** $N$ отдельных ASTP-рукопожатий и не запрашивает $N$ виртуальных IP-адресов:
+1. При вызове `ImapTransport::connect()` клиент перебирает `accounts[0..N]` до первого успешно ответившего ящика `primary_idx` и выполняет на нём полный 4-фазный ASTP-хендшейк через `establish_mailbox_session(...)`.
+2. В результате хендшейка клиент получает единый криптографический контекст туннеля (`ActiveImapSessionState`):
+   * `session_id: String` — уникальный идентификатор сессии в `ClientRegistry` сервера;
+   * `assigned_ip: String` — выделенный клиенту IPv4-адрес внутри VPN;
+   * `cipher: Arc<Cipher>` — общий сессионный шифр `ChaCha20Poly1305`;
+   * `nonce_prefix: [u8; 4]` — 4-байтовый префикс нонса сессии;
+   * `sequence: Arc<AtomicU64>` — единый атомарный счётчик исходящих батчей клиента, инициализированный значением `CLIENT_SEQUENCE_START` (`1u64 << 63`).
+
+#### 9.3.2. Безопасность при параллельной и внепорядковой доставке (Out-of-Order AEAD Safety)
+Поскольку батчи $k$ и $k+1$ отправляются параллельно через разные почтовые ящики (например, `box1` и `box2`), батч $k+1$ может быть прочитан принимающей стороной раньше батча $k$:
+* В протоколе ASTP (`anet-common/src/transport.rs`) функция `wrap_packet_slice(&cipher, &nonce_prefix, seq, &raw_batch, 0)` формирует 12-байтный нонс `[nonce_prefix (4 B) | seq.to_be_bytes() (8 B)]` и **явно записывает его в первые 12 байт заголовка пакета**.
+* Принимающая сторона в `unwrap_packet(&cipher, &payload)` извлекает 12-байтный нонс непосредственно из заголовка пришедшего батча и верифицирует 16-байтный тег `Poly1305` без привязки к порядку прихода пакетов.
+* Атомарное приращение `sequence.fetch_add(1, Ordering::Relaxed)` перед каждым `wrap_packet_slice` гарантирует абсолютную уникальность нонса каждого батча независимо от того, какой именно воркер (`#0..#N-1`) выполняет отправку.
+* Стек TCP и QUIC внутри TUN-интерфейса штатно обрабатывает переупорядочивание IP-пакетов в пределах окна нескольких сотен миллисекунд, а благодаря уменьшению джиттера в $N$ раз итоговый TCP RTT и число дублирующихся ACK существенно снижаются.
+
+#### 9.3.3. Подключение вторичных ящиков (`Secondary Mailbox Workers`) и `Mailbox Binding Frame`
+Сразу после успешного рукопожатия на `primary_idx`:
+1. Ящик `primary_idx` немедленно переводится в рабочий режим Data Plane (пакеты начинают ходить с нулевой задержкой).
+2. Для всех остальных ящиков $i \in \{0 \dots N-1\} \setminus \{\text{primary\_idx}\}$ параллельно запускаются фоновые задачи инициализации `connect_data_only_mailbox_pair(...)`:
+   * Подключается `CLI_WRITER[i]` $\to$ `SELECT "Notes"`;
+   * Подключается `CLI_READER[i]` $\to$ `SELECT "Notes"` $\to$ запрашивается `initial_max_uid = cli_reader.get_max_uid()`;
+   * Все IP-адреса сокетов заранее добавляются в `bypass_ips` при резолвинге хоста.
+3. **Анонсирование ящика серверу (`Mailbox Binding Frame`):**
+   * Чтобы сервер узнал, что клиент с данным `session_id` теперь активно слушает папку `"Notes"` и на ящике $i$ (даже если клиент в этот момент только скачивает данные и не шлёт Uplink-трафик), `CLI_WRITER[i]` сразу после подключения отправляет в `"Drafts"` ящика $i$ один легковесный управляющий фрейм привязки — пустой зашифрованный ASTP-батч:
+     ```rust
+     let seq = sequence.fetch_add(1, Ordering::Relaxed);
+     let binding_frame = wrap_packet_slice(&cipher, &nonce_prefix, seq, &[], 0)?;
+     let subject = format!("ANet-Data [ID: {}:{}]", srv_id, session_id);
+     cli_writer.append_message("Drafts", &subject, &binding_frame, &account.email, command_timeout).await?;
+     ```
+   * На сервере `SRV_READER[i]` ящика $i$ получает письмо с `[ID: <srv_id>:<session_id>]`, успешно проверяет AEAD-тег через `unwrap_packet(&client_info.cipher, &msg.payload)` (распаковка `unpack_batch(&[])` даёт 0 IP-пакетов, ничего в TUN не пишется) и **мгновенно регистрирует ящик $i$ в пуле активных Downlink-каналов этой сессии**!
+
+---
+
+### 9.4. Детальная архитектура Клиента (`anet-client-core/src/transport/imap.rs`)
+
+#### 9.4.1. Строгое разделение глобального состояния сессии и локального состояния ящика
+Поскольку нумерация `UID` писем в папке `"Notes"` у каждого почтового ящика `box1..boxN` своя собственная, структуры данных делятся на два уровня:
+
+1. **Глобальное состояние туннеля (`SharedImapTunnelState`, единое на все $N$ ящиков):**
+   ```rust
+   struct ActiveImapSessionState {
+       pub session_id: String,
+       pub cipher: Arc<Cipher>,
+       pub nonce_prefix: [u8; 4],
+   }
+
+   /// Готовый к отправке зашифрованный батч Uplink
+   struct EncryptedUplinkBatch {
+       pub session_id: String,
+       pub encrypted_payload: Bytes,
+   }
+   ```
+   * `session_state: Arc<RwLock<ActiveImapSessionState>>` — текущий ключ и `session_id`;
+   * `sequence: Arc<AtomicU64>` — общий счётчик исходящих батчей (`CLIENT_SEQUENCE_START`);
+   * `downlink_tun_tx: mpsc::Sender<Bytes>` — общий канал, куда все $N$ задач `CLI_READER[i]` отправляют расфреймированные IP-пакеты для записи в `tunnel_write` единой задачей `tun_writer_task`;
+   * `retry_uplink_tx / retry_uplink_rx` — канал возврата батча: если `CLI_WRITER[i]` получил сетевую ошибку во время `APPEND`, он возвращает `EncryptedUplinkBatch` обратно диспетчеру, который мгновенно перенаправляет его через другой живой ящик $j \ne i$ без потери ни одного пакета!
+
+2. **Локальное состояние воркера конкретного ящика (`ClientMailboxWorker`, изолированное для каждого $i \in 0..N$):**
+   ```rust
+   struct ClientMailboxSlot {
+       pub index: usize,
+       pub account: ImapAccount,
+       /// Канал ёмкостью 1 для передачи зашифрованного батча от центрального диспетчера конкретному CLI_WRITER[i]
+       pub uplink_tx: mpsc::Sender<EncryptedUplinkBatch>,
+       /// Флаг готовности и здоровья пары (CLI_WRITER[i] + CLI_READER[i])
+       pub healthy: Arc<AtomicBool>,
+       /// Локальный счётчик неподтверждённых батчей именно этого ящика
+       pub inflight: Arc<AtomicUsize>,
+   }
+   ```
+   Внутри каждого воркера ящика $i$ хранятся **только его собственные**:
+   * `last_seen_uid: u32` — последний прочитанный `UID` в папке `"Notes"` ящика $i$;
+   * `cleanup_uids: Arc<Mutex<Vec<u32>>>` — список прочитанных `UID` в `"Notes"` ящика $i$, который очищается через `UID STORE` + `UID EXPUNGE` исключительно `CLI_WRITER[i]` этого же ящика!
+
+#### 9.4.2. Алгоритм центрального диспетчера Uplink (`Self-Clocking Round-Robin Uplink Dispatcher`)
+Вместо того чтобы раздавать сырые пакеты по разным `PacketBatcher` заранее (что привело бы к застреванию пакетов в очереди медленного ящика), на клиенте работает **один центральный `UplinkDispatcher`**, владеющий `prio_rx`, `bulk_rx` и единым `PacketBatcher`:
+
+1. **Коалесценция стартового бурста:**
+   Диспетчер ждёт первый пакет из `prio_rx` или `bulk_rx` (или проверяет `retry_uplink_rx`) и добирает пакеты в течение микро-окна `coalesce_ms` (`15 мс`).
+2. **Фаза 1 диспетчеризации — Мгновенный неблокирующий Round-Robin (`Fast Path`):**
+   Диспетчер проверяет $N$ слотов начиная с курсора `rr_cursor`:
+   ```rust
+   let mut selected_permit = None;
+   for offset in 0..slots.len() {
+       let idx = (rr_cursor + offset) % slots.len();
+       let slot = &slots[idx];
+       if !slot.healthy.load(Ordering::Acquire) {
+           continue;
+       }
+       if slot.inflight.load(Ordering::Relaxed) >= max_inflight_batches {
+           continue;
+       }
+       if let Ok(permit) = slot.uplink_tx.clone().try_reserve_owned() {
+           rr_cursor = (idx + 1) % slots.len();
+           selected_permit = Some((idx, permit));
+           break;
+       }
+   }
+   ```
+3. **Фаза 2 диспетчеризации — Ожидание первого освободившегося воркера (`All-Busy Self-Clocking Path`):**
+   Если в данный момент все здоровые воркеры заняты выполнением `APPEND` (`selected_permit.is_none()`):
+   * Диспетчер собирает фьючерсы `slot.uplink_tx.clone().reserve_owned()` для всех здоровых слотов (в порядке от `rr_cursor`) и ожидает **первого завершившегося** через `futures::future::select_all(...)`.
+   * **Критическое преимущество:** Пока все $N$ ящиков заняты в сети, новые пакеты из TUN не отправляются полупустыми, а продолжают накапливаться в `prio_rx` и `bulk_rx`!
+   * Как только самый быстрый из $N$ ящиков завершил свой `APPEND` и освободил `reserve_owned()`, диспетчер **добирает все накопившиеся за это время пакеты** из `prio_rx` и `bulk_rx` до `max_batch_bytes` (приоритетные ICMP/DNS/ACK всегда встают в начало батча), шифрует весь буфер одним вызовом `wrap_packet_slice` и отправляет готовый `EncryptedUplinkBatch` именно в этот освободившийся `OwnedPermit`!
+
+#### 9.4.3. Изолированное самовосстановление ящиков (`Per-Mailbox Auto-Heal` vs `Full Session Failover`)
+* Если на ящике $i$ возникает ошибка `APPEND`, `UID FETCH` или `UID EXPUNGE`:
+  1. Воркер ящика $i$ немедленно выставляет `slot.healthy.store(false, Ordering::Release)`.
+  2. Если в руках у `CLI_WRITER[i]` был неотправленный `EncryptedUplinkBatch`, он передаёт его в `retry_uplink_tx`, и диспетчер тут же отправляет его через соседний здоровый ящик $j \ne i$.
+  3. Пока хотя бы один другой ящик в пуле остаётся здоровым (`slots.iter().any(|s| s.healthy.load(Ordering::Acquire))`), **туннель не прерывается ни на миллисекунду**, а воркер ящика $i$ в собственной фоновой задаче ждёт паузу (`2000 мс` при сетевом обрыве или `throttle_backoff` при `THROTTLED`/`OVERQUOTA`), переподключает `CLI_WRITER[i]` + `CLI_READER[i]`, отправляет `Mailbox Binding Frame` и возвращает `slot.healthy.store(true, Ordering::Release)`.
+* Если же **все $N$ ящиков одновременно** потеряли связь (`healthy == false` у всех слотов), активируется глобальный координатор восстановления сессии с `resume_session_id`, который заново проходит `establish_mailbox_session` на первом ожившем ящике и обновляет `ActiveImapSessionState`.
+
+---
+
+### 9.5. Детальная архитектура Сервера (`anet-server/src/servers/imap.rs`)
+
+#### 9.5.1. Проблема привязки ящиков на сервере и почему нельзя слепо слать во все ящики `imap_dsn`
+На сервере в `server.toml` (`imap_dsn`) может быть сконфигурирован общий пул из $M$ почтовых ящиков (например, 6 ящиков для разных пулов в `anet-auth`), из которых конкретному клиенту выданы $N \le M$ ящиков (например, 2 или 3 ящика).
+Кроме того, в существующей одноящичной реализации при завершении рукопожатия на ящике `box1` сервер запускал `run_client_downlink_batcher` с жёстко привязанным `notes_data_tx` только одного ящика `box1`, из-за чего весь Downlink шёл в один поток.
+
+#### 9.5.2. Динамический пул ящиков клиентской сессии (`SessionMailboxPool` / Dynamic Affinity)
+Для каждой активной клиентской сессии `session_id` на сервере создаётся потокобезопасный реестр подтверждённых ящиков этого клиента:
+
+```rust
+#[derive(Clone)]
+pub struct ServerMailboxHandle {
+    pub mailbox_idx: usize,
+    pub email: String,
+    pub notes_data_tx: mpsc::Sender<DownlinkMessage>,
+    pub healthy: Arc<AtomicBool>,
+    pub inflight: Arc<AtomicUsize>,
+}
+
+pub struct SessionMailboxPool {
+    /// Список ящиков, с которых данный session_id прислал криптографически валидные пакеты
+    pub active_mailboxes: RwLock<Vec<ServerMailboxHandle>>,
+    /// Курсор Round-Robin для балансировки Downlink-батчей этой сессии
+    pub rr_cursor: AtomicUsize,
+    /// Сигнал о добавлении нового ящика в пул сессии
+    pub pool_updated: Notify,
+}
+```
+
+**Как работает привязка и маршрутизация на сервере:**
+1. **Инициализация пула воркеров сервера (`run_imap_server`):**
+   * При старте каждого `run_mailbox_worker_pair(mailbox_idx, ...)` создаются долговечные каналы `notes_auth_tx` и `notes_data_tx` и дескриптор `ServerMailboxHandle` с флагом `healthy: Arc<AtomicBool>`.
+   * Когда `SRV_READER` и `SRV_WRITER` успешно подключились и выполнили `SELECT "Drafts"`, воркер выставляет `healthy.store(true, Ordering::Release)`. При обрыве соединения и уходе на реконнект флаг временно сбрасывается в `false`.
+2. **Регистрация первого ящика при ASTP Handshake (Фаза 3):**
+   * Когда клиент завершает Фазу 3 рукопожатия на ящике `M_primary`, сервер создаёт `SessionMailboxPool`, сразу добавляет в него `ServerMailboxHandle` ящика `M_primary`, сохраняет `Arc<SessionMailboxPool>` в глобальной карте `session_pools: Arc<DashMap<String, Arc<SessionMailboxPool>>>` и запускает одну задачу `run_client_downlink_batcher(rx_router, client_info, session_pool, ...)`.
+3. **Автоматическое подключение дополнительных ящиков ($M_1 \dots M_{N-1}$) по входящему Uplink / Binding Frame:**
+   * Когда `SRV_READER` любого другого ящика `M_i` получает сообщение в `"Drafts"` с темой `[ID: <srv_id>:<session_id>]` и **успешно расшифровывает его** через `unwrap_packet(&client_info.cipher, &msg.payload)`:
+   * Воркер `M_i` проверяет `session_pools.get(session_id)`: если `mailbox_idx` ящика `M_i` ещё не входит в `session_pool.active_mailboxes`, он добавляет свой `ServerMailboxHandle` в `active_mailboxes` и вызывает `session_pool.pool_updated.notify_waiters()`!
+   * Если расшифрованный батч содержал `0` IP-пакетов (`Mailbox Binding Frame`), `SRV_READER` просто фиксирует привязку ящика и обновляет `touch_client(&client_info)` без записи в `tun_tx`. Если батч содержал IP-пакеты — они штатно отправляются в `tun_tx`.
+4. **Бесшовное обновление при `resume_session_id`:**
+   * Если клиент переподключился с `resume_session_id`, сервер не убивает существующий `SessionMailboxPool`, а обновляет список его активных ящиков по мере прихода новых пакетов с новым ключом.
+
+#### 9.5.3. Балансировка Downlink в `run_client_downlink_batcher` на сервере
+Задача `run_client_downlink_batcher` для клиента работает по точно такому же алгоритму **Self-Clocking Round-Robin**, как и клиентский Uplink-диспетчер:
+1. Собирает стартовый пакет из `rx_router` и ждёт микро-окно `coalesce_ms` (`15 мс`).
+2. Читает текущий список `handles = session_pool.active_mailboxes.read().await.clone()`.
+3. **Fast Path (Неблокирующий Round-Robin):**
+   Ищет первый здоровый ящик (`handle.healthy.load(Ordering::Acquire)`), у которого свободен канал `handle.notes_data_tx.clone().try_reserve_owned()`, начиная с `rr_cursor = session_pool.rr_cursor.fetch_add(1, Ordering::Relaxed) % handles.len()`.
+4. **All-Busy Path (Гонка `select_all` по всем активным ящикам клиента):**
+   Если все привязанные ящики клиента сейчас заняты выполнением `APPEND "Notes"`, батчер ждёт освобождения **первого любого** из здоровых `notes_data_tx` через `futures::future::select_all` (параллельно слушая `session_pool.pool_updated.notified()`, чтобы мгновенно подхватить только что привязавшийся новый ящик!).
+5. В момент получения `OwnedPermit` от первого освободившегося `SRV_WRITER[k]`, батчер добирает из `rx_router` все накопившиеся за время ожидания пакеты до `max_batch_bytes`, шифрует их одним вызовом `wrap_packet_slice` (с атомарным `client_info.sequence.fetch_add(1, Ordering::Relaxed)`) и отправляет в `permit.send(DownlinkMessage { subject, payload })`.
+
+---
+
+### 9.6. План верификации и модульного тестирования (Unit & Integration Tests)
+
+При реализации раздела 9 в кодовую базу обязательно добавляются следующие автоматические тесты:
+1. **`test_multi_mailbox_uplink_round_robin_distribution` (`anet-client-core`):**
+   * Проверяет, что при наличии $N = 3$ здоровых слотов `ClientMailboxSlot` последовательные батчи распределяются диспетчером равномерно (`0 -> 1 -> 2 -> 0 -> 1 -> 2`).
+2. **`test_multi_mailbox_self_clocking_bypass_slow_worker` (`anet-client-core` & `anet-server`):**
+   * Имитирует ситуацию, когда ящик `#0` заблокирован долгим `APPEND` (`500 мс`), а ящики `#1` и `#2` освобождаются каждые `50 мс`. Проверяет, что диспетчер не блокируется на ящике `#0`, а прокачивает все очереди через ящики `#1` и `#2` без простоев.
+3. **`test_multi_mailbox_zero_loss_on_single_worker_failure` (`anet-client-core`):**
+   * Имитирует обрыв `APPEND` на ящике `#1` во время передачи батча. Проверяет, что `EncryptedUplinkBatch` возвращается через `retry_uplink_tx` и мгновенно доставляется через ящик `#2` без потерь и без разрыва VPN-сессии.
+4. **`test_server_session_mailbox_pool_dynamic_binding_and_striping` (`anet-server/src/servers/imap.rs`):**
+   * Проверяет регистрацию `M_0` при хендшейке, динамическое добавление `M_1` и `M_2` при приходе `Mailbox Binding Frame` (`wrap_packet_slice(..., &[], 0)`), и равномерную балансировку Downlink-трафика по всем 3 ящикам с выживанием при отключении любого из воркеров.
+
 ````
