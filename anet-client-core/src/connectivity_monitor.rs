@@ -605,11 +605,6 @@ impl ConnectivityMonitor {
                 final_snapshot.domestic_total
             );
 
-            {
-                *self.last_snapshot.lock().unwrap() = Some(final_snapshot.clone());
-            }
-            emit(AnetEvent::ConnectivityUpdated(final_snapshot));
-
             let base_interval = cfg.probe_interval_secs.clamp(2, 60);
             let is_high_latency_now = vpn_now
                 && (tunnel_rtt_now.map_or(true, |rtt| rtt >= 300)
@@ -621,6 +616,11 @@ impl ConnectivityMonitor {
             } else {
                 base_interval
             };
+
+            {
+                *self.last_snapshot.lock().unwrap() = Some(final_snapshot.clone());
+            }
+            emit(AnetEvent::ConnectivityUpdated(final_snapshot));
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs(interval_secs)) => {}
                 _ = self.wake_notify.notified() => {}
