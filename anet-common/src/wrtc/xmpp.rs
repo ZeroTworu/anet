@@ -279,29 +279,8 @@ impl XmppSession {
         let servers = self.discovered_ice_servers.lock().unwrap();
         if !servers.is_empty() {
             servers.clone()
-        } else if !self.default_ice_servers.is_empty() {
-            self.default_ice_servers.clone()
         } else {
-            vec![
-                XmppIceServer {
-                    urls: vec!["stun:stun1.ktalk.host:34788".to_string()],
-                    username: String::new(),
-                    credential: String::new(),
-                    host: "stun1.ktalk.host".to_string(),
-                    port: 34788,
-                    is_turn: false,
-                    is_tcp_or_tls: false,
-                },
-                XmppIceServer {
-                    urls: vec!["stun:stun3.ktalk.host:34788".to_string()],
-                    username: String::new(),
-                    credential: String::new(),
-                    host: "stun3.ktalk.host".to_string(),
-                    port: 34788,
-                    is_turn: false,
-                    is_tcp_or_tls: false,
-                },
-            ]
+            self.default_ice_servers.clone()
         }
     }
 

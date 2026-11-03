@@ -133,7 +133,18 @@ pub async fn run_wrtc_server(
             server_endpoint_id
         );
 
-        let fallback_ip = &config.server.wrtc_fallback_jvb_ip;
+        let fallback_ip_owned = if bootstrap.provider_kind
+            == anet_common::wrtc::providers::ProviderKind::StandardJitsi
+            && config.server.wrtc_fallback_jvb_ip
+                == anet_common::consts::WRTC_DEFAULT_FALLBACK_JVB_IP
+        {
+            xmpp.remote_ip
+                .map(|ip| ip.to_string())
+                .unwrap_or_else(|| config.server.wrtc_fallback_jvb_ip.clone())
+        } else {
+            config.server.wrtc_fallback_jvb_ip.clone()
+        };
+        let fallback_ip = fallback_ip_owned.as_str();
         let fallback_port = config.server.wrtc_fallback_jvb_port;
 
         if !bootstrap.pre_allocate_before_muc {

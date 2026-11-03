@@ -134,11 +134,19 @@ impl ClientTransport for WrtcTransport {
         .await
         .context("Failed to establish XMPP session and join conference MUC")?;
 
-        let fallback_ip = self
+        let fallback_ip_owned = self
             .server
             .wrtc_fallback_jvb_ip
-            .as_deref()
-            .unwrap_or(WRTC_DEFAULT_FALLBACK_JVB_IP);
+            .clone()
+            .or_else(|| {
+                if provider_kind == anet_common::wrtc::providers::ProviderKind::StandardJitsi {
+                    xmpp.remote_ip.map(|ip| ip.to_string())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| WRTC_DEFAULT_FALLBACK_JVB_IP.to_string());
+        let fallback_ip = fallback_ip_owned.as_str();
         let fallback_port = self
             .server
             .wrtc_fallback_jvb_port
@@ -231,9 +239,11 @@ impl ClientTransport for WrtcTransport {
             }
         }
 
-        if let Ok(ip) = fallback_ip.parse::<std::net::IpAddr>() {
-            if ip.is_ipv4() && !ip.is_loopback() {
-                bypass_ips.push(ip);
+        if session.transport.candidates.is_empty() {
+            if let Ok(ip) = fallback_ip.parse::<std::net::IpAddr>() {
+                if ip.is_ipv4() && !ip.is_loopback() {
+                    bypass_ips.push(ip);
+                }
             }
         }
 

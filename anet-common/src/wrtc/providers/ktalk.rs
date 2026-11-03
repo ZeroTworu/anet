@@ -259,6 +259,27 @@ impl KonturTalkProvider {
             "wss://{domain}/xmpp-websocket?room={conference_id}&token={session_token}& Lists=true"
         )];
 
+        let default_ice_servers = vec![
+            crate::wrtc::xmpp_xml::XmppIceServer {
+                urls: vec!["stun:stun1.ktalk.host:34788".to_string()],
+                username: String::new(),
+                credential: String::new(),
+                host: "stun1.ktalk.host".to_string(),
+                port: 34788,
+                is_turn: false,
+                is_tcp_or_tls: false,
+            },
+            crate::wrtc::xmpp_xml::XmppIceServer {
+                urls: vec!["stun:stun3.ktalk.host:34788".to_string()],
+                username: String::new(),
+                credential: String::new(),
+                host: "stun3.ktalk.host".to_string(),
+                port: 34788,
+                is_turn: false,
+                is_tcp_or_tls: false,
+            },
+        ];
+
         Ok(RoomBootstrapInfo {
             provider_kind: ProviderKind::KonturTalk,
             domain: domain.to_string(),
@@ -267,7 +288,7 @@ impl KonturTalkProvider {
             session_token,
             ws_urls,
             pre_allocate_before_muc: false,
-            default_ice_servers: Vec::new(),
+            default_ice_servers,
         })
     }
 }

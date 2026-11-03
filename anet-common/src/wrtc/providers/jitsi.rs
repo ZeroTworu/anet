@@ -75,26 +75,13 @@ impl JitsiMeetProvider {
             format!("wss://{domain}/xmpp-websocket"),
         ];
 
-        let default_ice_servers = vec![
-            XmppIceServer {
-                urls: vec!["stun:meet-jit-si-turnrelay.jitsi.net:443".to_string()],
-                username: String::new(),
-                credential: String::new(),
-                host: "meet-jit-si-turnrelay.jitsi.net".to_string(),
-                port: 443,
-                is_turn: false,
-                is_tcp_or_tls: false,
-            },
-            XmppIceServer {
-                urls: vec!["stun:stun.l.google.com:19302".to_string()],
-                username: String::new(),
-                credential: String::new(),
-                host: "stun.l.google.com".to_string(),
-                port: 19302,
-                is_turn: false,
-                is_tcp_or_tls: false,
-            },
-        ];
+        // Для стандартного Jitsi Meet (meet.riddlerx.org, meet.egovm.ru и др.) НЕ используем
+        // сторонние внешние STUN-серверы (stun.l.google.com / jitsi.net), которые недоступны в БС:
+        // - В режиме JVB (MediaVideo) сам видеомост JVB на публичном IP сервера отвечает на ICE
+        //   Binding Request напрямую (host -> prflx) в пределах IP самого Jitsi-сервера.
+        // - Если у инстанса Jitsi настроен собственный coturn (например, meet.egovm.ru),
+        //   он автоматически получается через XEP-0215 extdisco на том же домене.
+        let default_ice_servers: Vec<XmppIceServer> = Vec::new();
 
         Ok(RoomBootstrapInfo {
             provider_kind: ProviderKind::StandardJitsi,
