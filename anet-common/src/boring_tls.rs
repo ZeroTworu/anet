@@ -814,7 +814,7 @@ const EMAIL_CIPHERS: &str = "\
 pub fn build_email_ssl_connector_with_config(
     cfg: &TlsClientConfig,
 ) -> anyhow::Result<SslConnectorBuilder> {
-    let mut builder = SslConnector::builder(SslMethod::tls())?;
+    let mut builder = SslConnector::builder(SslMethod::tls_client())?;
 
     builder.set_min_proto_version(Some(SslVersion::TLS1_2))?;
     builder.set_max_proto_version(Some(SslVersion::TLS1_3))?;
@@ -1390,5 +1390,94 @@ mod tests {
         let _ = connect_ws_tls_with_config("unverified.local", tcp, &disabled_verify_cfg)
             .await
             .expect("verify_peer=false must allow self-signed certificate when explicitly disabled");
+    }
+
+    #[tokio::test]
+    async fn test_email_kmail_client_hello_wire_format() {
+        // Проверяем, что профиль почтового клиента (разделы 7.1.1 и 7.1.2)
+        // генерирует строго детерминированный KMail / OpenSSL 3.x ClientHello на 993 порту
+        // независимо от того, какой браузерный tls_fingerprint задан в [stealth] (Chrome/Firefox/Safari/Randomized).
+        let mut baseline_ext: Option<Vec<u16>> = None;
+        let mut baseline_cs: Option<Vec<u16>> = None;
+        let mut baseline_groups: Option<Vec<u16>> = None;
+
+        for (fp, seed) in [
+            (TlsFingerprint::Chrome, 101),
+            (TlsFingerprint::Firefox, 202),
+            (TlsFingerprint::Safari, 303),
+            (TlsFingerprint::Randomized, 404),
+        ] {
+            let cfg = TlsClientConfig {
+                fingerprint: fp,
+                random_seed: seed,
+                verify_peer: false,
+                pin_sha256: None,
+                ca_cert: None,
+            };
+            let ch = capture_client_hello(
+                build_email_ssl_connector_with_config(&cfg).unwrap(),
+                "imap.mail.ru",
+            )
+            .await;
+
+            assert_eq!(ch.sni.as_deref(), Some("imap.mail.ru"));
+            assert!(
+                ch.alpn_protocols.is_empty() && !ch.extensions.contains(&0x0010),
+                "Email IMAPS profile on port 993 MUST NOT include ALPN (0x0010)"
+            );
+            assert!(
+                !ch.cipher_suites.iter().any(|&c| is_grease_u16(c)),
+                "Email IMAPS profile MUST NOT include GREASE cipher suites"
+            );
+            assert!(
+                !ch.extensions.iter().any(|&e| is_grease_u16(e)),
+                "Email IMAPS profile MUST NOT include GREASE extensions"
+            );
+            assert!(
+                !ch.supported_groups.iter().any(|&g| is_grease_u16(g)),
+                "Email IMAPS profile MUST NOT include GREASE supported_groups"
+            );
+            assert!(
+                !ch.extensions.contains(&0x0015),
+                "Email IMAPS profile MUST NOT include Chromium Padding extension (0x0015)"
+            );
+            assert!(
+                !ch.extensions.contains(&0x0005) && !ch.extensions.contains(&0x0012),
+                "Email IMAPS profile MUST NOT include browser OCSP (0x0005) or SCT (0x0012)"
+            );
+
+            // Пост-квантовая группа X25519MLKEM768 (0x11ec) должна быть первой, если поддерживается сборкой BoringSSL
+            assert!(
+                ch.supported_groups.first().copied() == Some(0x11ec)
+                    || ch.supported_groups.first().copied() == Some(0x001d),
+                "Email IMAPS profile must place X25519MLKEM768 (0x11ec) or X25519 (0x001d) first"
+            );
+
+            // Приоритет AES-256-GCM (0xc02c) перед ChaCha20-Poly1305 (0xcca9) и AES-128-GCM (0xc02b)
+            let pos_aes256 = ch.cipher_suites.iter().position(|&c| c == 0xc02c).unwrap();
+            let pos_chacha = ch.cipher_suites.iter().position(|&c| c == 0xcca9).unwrap();
+            let pos_aes128 = ch.cipher_suites.iter().position(|&c| c == 0xc02b).unwrap();
+            assert!(
+                pos_aes256 < pos_chacha && pos_chacha < pos_aes128,
+                "Email IMAPS profile must prioritize AES-256 before ChaCha20 before AES-128"
+            );
+
+            // Строгая детерминированность (нулевая перестановка расширений и независимость от [stealth].tls_fingerprint)
+            if let Some(ref ext) = baseline_ext {
+                assert_eq!(&ch.extensions, ext, "Extension order must be 100% deterministic");
+            } else {
+                baseline_ext = Some(ch.extensions);
+            }
+            if let Some(ref cs) = baseline_cs {
+                assert_eq!(&ch.cipher_suites, cs, "Cipher suite order must be 100% deterministic");
+            } else {
+                baseline_cs = Some(ch.cipher_suites);
+            }
+            if let Some(ref grp) = baseline_groups {
+                assert_eq!(&ch.supported_groups, grp, "Supported groups order must be 100% deterministic");
+            } else {
+                baseline_groups = Some(ch.supported_groups);
+            }
+        }
     }
 }
