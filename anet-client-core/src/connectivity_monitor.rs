@@ -515,19 +515,37 @@ impl ConnectivityMonitor {
             }
 
             let vpn_on = self.vpn_connected.load(Ordering::Relaxed);
+            // Если VPN только что подключился и первый внутритуннельный ICMP-пинг ещё в полёте,
+            // даём ему до 1200 мс форы в свободном канале, чтобы:
+            // 1) не забивать стартовый батч шестью параллельными TLS-хендшейками;
+            // 2) сразу узнать реальный RTT туннеля (например, IMAP ~400..900 мс) и выбрать адекватный таймаут.
+            if vpn_on && self.current_tunnel_rtt().is_none() {
+                for _ in 0..8 {
+                    if !self.vpn_connected.load(Ordering::Relaxed)
+                        || self.current_tunnel_rtt().is_some()
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                }
+            }
+
+            let vpn_on = self.vpn_connected.load(Ordering::Relaxed);
             let tunnel_rtt = if vpn_on {
                 self.current_tunnel_rtt()
             } else {
                 None
             };
 
-            let is_high_latency_tunnel = vpn_on && tunnel_rtt.is_some_and(|rtt| rtt >= 600);
+            // Туннель считается высоколатентным (IMAP / медленный фолбэк), если его RTT >= 300 мс
+            // либо если за 1200 мс ожидания ICMP-ответ ещё не вернулся.
+            let is_high_latency_tunnel =
+                vpn_on && tunnel_rtt.map_or(true, |rtt| rtt >= 300);
             let mut effective_cfg = cfg.clone();
-            if let Some(rtt) = tunnel_rtt {
-                if is_high_latency_tunnel {
-                    effective_cfg.timeout_ms =
-                        effective_cfg.timeout_ms.max((rtt * 4).clamp(6000, 12000));
-                }
+            if is_high_latency_tunnel {
+                let rtt_est = tunnel_rtt.unwrap_or(1500);
+                effective_cfg.timeout_ms =
+                    effective_cfg.timeout_ms.max((rtt_est * 5).clamp(8000, 12000));
             }
             let prober = ConnectivityProber::new(effective_cfg.clone());
 
@@ -593,7 +611,12 @@ impl ConnectivityMonitor {
             emit(AnetEvent::ConnectivityUpdated(final_snapshot));
 
             let base_interval = cfg.probe_interval_secs.clamp(2, 60);
-            let interval_secs = if vpn_now && tunnel_rtt_now.is_some_and(|rtt| rtt >= 600) {
+            let is_high_latency_now = vpn_now
+                && (tunnel_rtt_now.map_or(true, |rtt| rtt >= 300)
+                    || final_snapshot
+                        .global_rtt_ms
+                        .is_some_and(|http_rtt| http_rtt >= 600));
+            let interval_secs = if is_high_latency_now {
                 base_interval.max(45)
             } else {
                 base_interval

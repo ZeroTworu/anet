@@ -295,4 +295,29 @@ mod in_place_tests {
             assert_eq!(in_place.as_ref(), data.as_slice());
         }
     }
+
+    #[test]
+    fn test_directional_nonce_separation_c2s_vs_s2c() {
+        use crate::consts::{CLIENT_SEQUENCE_START, NONCE_LEN, SERVER_SEQUENCE_START};
+
+        let key = [0x55u8; 32];
+        let cipher = Cipher::new(&key);
+        let prefix = [0xAA, 0xBB, 0xCC, 0xDD];
+
+        let c2s_pkt = wrap_packet_slice(&cipher, &prefix, CLIENT_SEQUENCE_START, b"uplink", 0)
+            .expect("wrap c2s");
+        let s2c_pkt = wrap_packet_slice(&cipher, &prefix, SERVER_SEQUENCE_START, b"downlink", 0)
+            .expect("wrap s2c");
+
+        assert_eq!(&c2s_pkt[..4], &prefix);
+        assert_eq!(&s2c_pkt[..4], &prefix);
+        assert_ne!(&c2s_pkt[..NONCE_LEN], &s2c_pkt[..NONCE_LEN]);
+        assert_eq!(c2s_pkt[4] & 0x80, 0x80);
+        assert_eq!(s2c_pkt[4] & 0x80, 0x00);
+
+        let dec_c2s = unwrap_packet(&cipher, &c2s_pkt).expect("unwrap c2s");
+        let dec_s2c = unwrap_packet(&cipher, &s2c_pkt).expect("unwrap s2c");
+        assert_eq!(dec_c2s.as_ref(), b"uplink");
+        assert_eq!(dec_s2c.as_ref(), b"downlink");
+    }
 }

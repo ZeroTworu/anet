@@ -22,6 +22,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
+/// Максимально допустимый размер одного литерала сообщения при `UID FETCH` (2 МиБ).
+/// Защищает парсер от OOM-аллокаций и зависания при попадании в почтовый ящик стороннего
+/// письма с крупным вложением (максимальный легитимный ASTP-батч 512 КБ в Base64 занимает ~700 КБ).
+pub const MAX_IMAP_LITERAL_BYTES: usize = 2 * 1024 * 1024;
+
 /// Вычисляет 8-символьный hex-идентификатор узла (первые 4 байта SHA-256)
 pub fn compute_hex_id(bytes: &[u8]) -> String {
     let hash = Sha256::digest(bytes);
@@ -649,11 +654,13 @@ where
                 .await
                 .context("Timeout reading FETCH line")??;
 
-            if line.starts_with(&format!("{tag} OK"))
-                || line.starts_with(&format!("{tag} NO"))
+            if line.starts_with(&format!("{tag} OK")) {
+                break;
+            }
+            if line.starts_with(&format!("{tag} NO"))
                 || line.starts_with(&format!("{tag} BAD"))
             {
-                break;
+                return Err(anyhow!("IMAP UID FETCH failed: {}", line.trim()));
             }
 
             // Ищем размер литерала `{<len>}`
@@ -661,12 +668,32 @@ where
                 continue;
             };
 
-            // 1. Считываем ровно literal_len байт тела сообщения
-            let mut msg_bytes = vec![0u8; literal_len];
-            self.stream.read_exact(&mut msg_bytes).await?;
+            if literal_len > MAX_IMAP_LITERAL_BYTES {
+                return Err(anyhow!(
+                    "IMAP FETCH literal size {} exceeds safety cap {} bytes",
+                    literal_len,
+                    MAX_IMAP_LITERAL_BYTES
+                ));
+            }
 
-            // 2. Считываем остаток строки ответа сервера (закрывающая скобка и UID)
-            let rest_line = self.read_line().await?;
+            // 1. Считываем ровно literal_len байт тела сообщения с контролем общего дедлайна
+            let rem_body = deadline.saturating_duration_since(Instant::now());
+            if rem_body.is_zero() {
+                return Err(anyhow!("Timeout waiting for UID FETCH literal body"));
+            }
+            let mut msg_bytes = vec![0u8; literal_len];
+            tokio::time::timeout(rem_body, self.stream.read_exact(&mut msg_bytes))
+                .await
+                .context("Timeout reading FETCH literal body")??;
+
+            // 2. Считываем остаток строки ответа сервера (закрывающая скобка и UID) с контролем дедлайна
+            let rem_tail = deadline.saturating_duration_since(Instant::now());
+            if rem_tail.is_zero() {
+                return Err(anyhow!("Timeout waiting for UID FETCH trailing line"));
+            }
+            let rest_line = tokio::time::timeout(rem_tail, self.read_line())
+                .await
+                .context("Timeout reading FETCH trailing line")??;
 
             // 3. Извлекаем UID из объединенной строки метаданных
             let full_meta = format!("{line} {rest_line}");
@@ -721,7 +748,13 @@ where
         // Шаг 1: помечаем письма удаленными (\Deleted)
         let tag1 = self.next_tag();
         self.send_line(&format!("{tag1} UID STORE {uid_str} +FLAGS.SILENT (\\Deleted)")).await?;
-        let _ = self.read_until_tagged(&tag1, timeout_dur).await?;
+        let resp1 = self.read_until_tagged(&tag1, timeout_dur).await?;
+        if !resp1.last().is_some_and(|l| l.starts_with(&format!("{tag1} OK"))) {
+            return Err(anyhow!(
+                "IMAP UID STORE \\Deleted failed: {}",
+                resp1.last().map(|s| s.trim()).unwrap_or_default()
+            ));
+        }
 
         // Шаг 2: точечное удаление через UID EXPUNGE (RFC 4315)
         let tag2 = self.next_tag();
@@ -733,7 +766,13 @@ where
             // Фолбэк на стандартный EXPUNGE
             let tag3 = self.next_tag();
             self.send_line(&format!("{tag3} EXPUNGE")).await?;
-            let _ = self.read_until_tagged(&tag3, timeout_dur).await?;
+            let resp3 = self.read_until_tagged(&tag3, timeout_dur).await?;
+            if !resp3.last().is_some_and(|l| l.starts_with(&format!("{tag3} OK"))) {
+                return Err(anyhow!(
+                    "IMAP fallback EXPUNGE failed: {}",
+                    resp3.last().map(|s| s.trim()).unwrap_or_default()
+                ));
+            }
         }
 
         Ok(())
@@ -1110,6 +1149,96 @@ mod tests {
         conn.append_message("Notes", "Subj", b"1RTT_DATA", "u@e.com", Duration::from_secs(2))
             .await
             .unwrap();
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_fetch_messages_robust_rejects_tagged_no_and_bad() {
+        let (client_io, mut server_io) = tokio::io::duplex(16 * 1024);
+        let mut conn = ImapConn::new(client_io);
+
+        let server_task = tokio::spawn(async move {
+            let mut s_buf = BufReader::new(&mut server_io);
+            let mut line = String::new();
+
+            s_buf.read_line(&mut line).await.unwrap();
+            assert!(line.contains("UID FETCH 11:*"));
+            s_buf
+                .get_mut()
+                .write_all(b"A0001 NO [CANNOT] Temporary mailbox storage error\r\n")
+                .await
+                .unwrap();
+
+            line.clear();
+            s_buf.read_line(&mut line).await.unwrap();
+            assert!(line.contains("UID FETCH 11:*"));
+            s_buf
+                .get_mut()
+                .write_all(b"A0002 BAD Command syntax error\r\n")
+                .await
+                .unwrap();
+        });
+
+        let err_no = conn
+            .fetch_messages_robust(10, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert!(format!("{err_no:#}").contains("A0001 NO"));
+
+        let err_bad = conn
+            .fetch_messages_robust(10, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert!(format!("{err_bad:#}").contains("A0002 BAD"));
+
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_fetch_messages_robust_rejects_oversized_literal() {
+        let (client_io, mut server_io) = tokio::io::duplex(16 * 1024);
+        let mut conn = ImapConn::new(client_io);
+
+        let server_task = tokio::spawn(async move {
+            let mut s_buf = BufReader::new(&mut server_io);
+            let mut line = String::new();
+            s_buf.read_line(&mut line).await.unwrap();
+            let oversized = MAX_IMAP_LITERAL_BYTES + 1024;
+            let resp = format!("* 1 FETCH (UID 50 BODY[] {{{oversized}}}\r\n");
+            s_buf.get_mut().write_all(resp.as_bytes()).await.unwrap();
+        });
+
+        let err = conn
+            .fetch_messages_robust(10, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("exceeds safety cap"));
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_fetch_messages_robust_times_out_on_stalled_literal_body() {
+        let (client_io, mut server_io) = tokio::io::duplex(16 * 1024);
+        let mut conn = ImapConn::new(client_io);
+
+        let server_task = tokio::spawn(async move {
+            let mut s_buf = BufReader::new(&mut server_io);
+            let mut line = String::new();
+            s_buf.read_line(&mut line).await.unwrap();
+            // Объявляем литерал в 256 байт, но отправляем только 10 байт и замолкаем
+            s_buf
+                .get_mut()
+                .write_all(b"* 1 FETCH (UID 50 BODY[] {256}\r\n0123456789")
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        });
+
+        let err = conn
+            .fetch_messages_robust(10, Duration::from_millis(120))
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("Timeout"));
         server_task.await.unwrap();
     }
 }

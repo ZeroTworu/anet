@@ -6,6 +6,13 @@ pub const MAX_PACKET_SIZE: usize = 2048;
 pub const CHANNEL_BUFFER_SIZE: usize = 4096;
 pub const NONCE_PREFIX_LEN: usize = 4;
 pub const NONCE_LEN: usize = 12;
+/// Начальное значение 64-битного счётчика пакетов (`sequence`) на стороне сервера (бит 63 = 0).
+pub const SERVER_SEQUENCE_START: u64 = 0;
+/// Начальное значение 64-битного счётчика пакетов (`sequence`) на стороне клиента (бит 63 = 1).
+/// Разводит полупространства 12-байтовых AEAD-нонсов `[nonce_prefix (4B)][sequence (8B)]`
+/// между потоками Client -> Server (`>= 2^63`) и Server -> Client (`< 2^63`) при общем
+/// сессионном ключе `shared_key` и `nonce_prefix`, полностью исключая коллизию `(Key, Nonce)`.
+pub const CLIENT_SEQUENCE_START: u64 = 1u64 << 63;
 pub const PADDING_MTU: usize = 1450;
 /// Nonce (12) + Poly1305 tag (16) + sequence (8) + payload length (2).
 pub const TRANSPORT_ENVELOPE_OVERHEAD: usize = 38;

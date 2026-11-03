@@ -2,7 +2,7 @@ use super::{ClientTransport, ConnectionResult};
 use crate::auth::{AuthChannel, AuthHandler};
 use crate::config::{CoreConfig, ImapConfig, ServerConfig};
 use anet_common::batcher::{is_priority_ip_packet, unpack_batch, PacketBatcher};
-use anet_common::consts::COALESCE_BUDGET_BYTES;
+use anet_common::consts::{CLIENT_SEQUENCE_START, COALESCE_BUDGET_BYTES};
 use anet_common::encryption::Cipher;
 use anet_common::handshake_fragmentation::FragmentConfig;
 use anet_common::imap_conn::{compute_hex_id, ImapConn};
@@ -592,7 +592,7 @@ impl ClientTransport for ImapTransport {
         let active_email = Arc::new(RwLock::new(accounts[active_idx].email.clone()));
         let last_seen_uid_shared = Arc::new(AtomicU64::new(initial_max_uid as u64));
 
-        let sequence = Arc::new(AtomicU64::new(0));
+        let sequence = Arc::new(AtomicU64::new(CLIENT_SEQUENCE_START));
         let cleanup_uids = Arc::new(Mutex::new(initial_hs_uids));
         let inflight_count = Arc::new(AtomicUsize::new(0));
         let stop_flag = Arc::new(AtomicBool::new(false));
@@ -656,6 +656,7 @@ impl ClientTransport for ImapTransport {
         let uid_sup = last_seen_uid_shared.clone();
         let cleanup_sup = cleanup_uids.clone();
         let inflight_sup = inflight_count.clone();
+        let seq_sup = sequence.clone();
         let session_state_sup = session_state.clone();
         let accounts_sup = accounts.clone();
         let target_addrs_sup = target_addrs.clone();
@@ -730,6 +731,7 @@ impl ClientTransport for ImapTransport {
                                 uid_sup.store(new_uid as u64, Ordering::SeqCst);
                                 *cleanup_sup.lock().await = new_hs_uids;
                                 inflight_sup.store(0, Ordering::SeqCst);
+                                seq_sup.store(CLIENT_SEQUENCE_START, Ordering::SeqCst);
                                 current_idx = next_idx;
                                 failover_flag_sup.store(false, Ordering::Release);
                                 info!(
