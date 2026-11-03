@@ -339,7 +339,23 @@ where
         Ok(())
     }
 
+    /// Создает почтовую папку (`CREATE "<folder>"`), если она еще не существует на свежезарегистрированном ящике.
+    pub async fn create_folder(&mut self, folder: &str, timeout_dur: Duration) -> Result<()> {
+        let tag = self.next_tag();
+        self.send_line(&format!("{tag} CREATE \"{folder}\"")).await?;
+        let resp = self.read_until_tagged(&tag, timeout_dur).await?;
+        if let Some(last_line) = resp.last() {
+            if last_line.starts_with(&format!("{tag} OK")) {
+                log::info!("[IMAP] Created missing folder '{folder}'");
+            }
+        }
+        Ok(())
+    }
+
     /// Выполняет команду SELECT "<folder>".
+    /// Если на новом почтовом ящике (например, в русскоязычной локали Mail.ru, где системная папка
+    /// черновиков закодирована в modified UTF-7, а папка "Notes" еще не создана) папка отсутствует (`tag NO`),
+    /// автоматически выполняет `CREATE "<folder>"` и повторяет `SELECT "<folder>"`.
     pub async fn select(&mut self, folder: &str, timeout_dur: Duration) -> Result<()> {
         let tag = self.next_tag();
         self.send_line(&format!("{tag} SELECT \"{folder}\"")).await?;
@@ -347,7 +363,24 @@ where
 
         let last_line = resp.last().ok_or_else(|| anyhow!("Empty SELECT response"))?;
         if !last_line.starts_with(&format!("{tag} OK")) {
-            return Err(anyhow!("IMAP SELECT '{folder}' failed: {}", last_line.trim()));
+            log::warn!(
+                "[IMAP] SELECT '{}' returned '{}' — attempting CREATE \"{}\"...",
+                folder,
+                last_line.trim(),
+                folder
+            );
+            let _ = self.create_folder(folder, timeout_dur).await;
+
+            let tag2 = self.next_tag();
+            self.send_line(&format!("{tag2} SELECT \"{folder}\"")).await?;
+            let resp2 = self.read_until_tagged(&tag2, timeout_dur).await?;
+            let last_line2 = resp2.last().ok_or_else(|| anyhow!("Empty SELECT retry response"))?;
+            if !last_line2.starts_with(&format!("{tag2} OK")) {
+                return Err(anyhow!(
+                    "IMAP SELECT '{folder}' failed after CREATE: {}",
+                    last_line2.trim()
+                ));
+            }
         }
         // Сбрасываем статический счетчик EXISTS, возвращаемый сервером при начальном SELECT
         self.pending_exists = false;
@@ -1239,6 +1272,52 @@ mod tests {
             .await
             .unwrap_err();
         assert!(format!("{err:#}").contains("Timeout"));
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_select_auto_creates_missing_folder_on_new_mailbox() {
+        let (client_io, mut server_io) = tokio::io::duplex(16 * 1024);
+        let mut conn = ImapConn::new(client_io);
+
+        let server_task = tokio::spawn(async move {
+            let mut s_buf = BufReader::new(&mut server_io);
+            let mut line = String::new();
+
+            // 1. Первая попытка SELECT "Notes" на свежем ящике возвращает NO [NONEXISTENT]
+            s_buf.read_line(&mut line).await.unwrap();
+            assert!(line.contains("SELECT \"Notes\""));
+            s_buf
+                .get_mut()
+                .write_all(b"A0001 NO [NONEXISTENT] Unknown Mailbox: Notes\r\n")
+                .await
+                .unwrap();
+
+            // 2. Клиент автоматически отправляет CREATE "Notes"
+            line.clear();
+            s_buf.read_line(&mut line).await.unwrap();
+            assert!(line.contains("CREATE \"Notes\""));
+            s_buf
+                .get_mut()
+                .write_all(b"A0002 OK CREATE completed\r\n")
+                .await
+                .unwrap();
+
+            // 3. Повторный SELECT "Notes" проходит успешно
+            line.clear();
+            s_buf.read_line(&mut line).await.unwrap();
+            assert!(line.contains("SELECT \"Notes\""));
+            s_buf
+                .get_mut()
+                .write_all(b"* 0 EXISTS\r\nA0003 OK [READ-WRITE] SELECT completed\r\n")
+                .await
+                .unwrap();
+        });
+
+        conn.select("Notes", Duration::from_secs(1))
+            .await
+            .expect("select should auto-create missing folder");
+        assert!(!conn.pending_exists);
         server_task.await.unwrap();
     }
 }

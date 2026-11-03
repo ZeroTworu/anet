@@ -362,6 +362,8 @@ async fn run_mailbox_worker_pair(
             }
         };
 
+        // Гарантируем наличие обеих папок ("Notes" и "Drafts") на свежезарегистрированных ящиках
+        let _ = srv_writer.select("Notes", command_timeout).await;
         if let Err(e) = srv_writer.select("Drafts", command_timeout).await {
             warn!(
                 "[IMAP Server] SRV_WRITER SELECT 'Drafts' failed for {}: {e:#}. Backing off {:?}...",

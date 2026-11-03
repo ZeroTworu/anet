@@ -116,9 +116,15 @@ class MultiSoakStats:
     uid_fetch_duplicate_hits: int = 0
     errors: List[str] = field(default_factory=list)
     mailboxes: Dict[int, PerMailboxMetrics] = field(default_factory=dict)
+    end_time: Optional[float] = None
+
+    def mark_finished(self):
+        if self.end_time is None:
+            self.end_time = time.time()
 
     def to_summary_dict(self) -> dict:
-        elapsed = max(0.1, time.time() - self.start_time)
+        now_or_end = self.end_time if self.end_time is not None else time.time()
+        elapsed = max(0.1, now_or_end - self.start_time)
         rtt_s = sorted(self.rtt_samples_ms)
         up_wait_s = sorted(self.uplink_hol_wait_ms)
         dn_wait_s = sorted(self.downlink_hol_wait_ms)
@@ -353,14 +359,38 @@ class RobustImapClient:
                 break
         return lines
 
+    async def create_folder(self, folder: str):
+        tag = self.next_tag()
+        await self.send_line(f'{tag} CREATE "{folder}"')
+        resp = await self.read_until_tagged(tag)
+        if resp[-1].startswith(f"{tag} OK"):
+            self.logger.info(f"Created folder '{folder}' on {self.email_addr}")
+        else:
+            self.logger.debug(f"CREATE '{folder}' response on {self.email_addr}: {resp[-1].strip()}")
+
     async def select(self, folder: str):
         tag = self.next_tag()
         await self.send_line(f'{tag} SELECT "{folder}"')
         resp = await self.read_until_tagged(tag)
         if not resp[-1].startswith(f"{tag} OK"):
-            raise RuntimeError(f"SELECT {folder} failed: {resp[-1].strip()}")
+            self.logger.warning(
+                f"SELECT '{folder}' returned '{resp[-1].strip()}' on {self.email_addr} "
+                f"(new mailbox without '{folder}' folder) -> sending CREATE \"{folder}\"..."
+            )
+            await self.create_folder(folder)
+            tag2 = self.next_tag()
+            await self.send_line(f'{tag2} SELECT "{folder}"')
+            resp2 = await self.read_until_tagged(tag2)
+            if not resp2[-1].startswith(f"{tag2} OK"):
+                raise RuntimeError(
+                    f"SELECT {folder} failed after CREATE on {self.email_addr}: {resp2[-1].strip()}"
+                )
+        # Сбрасываем статический EXISTS от начального SELECT
+        self.pending_exists = False
 
-    async def append_message(self, folder: str, subject: str, payload_bytes: bytes) -> float:
+    async def append_message(
+        self, folder: str, subject: str, payload_bytes: bytes, _retried_create: bool = False
+    ) -> float:
         t0 = time.time()
         b64_content = base64.b64encode(payload_bytes).decode("ascii")
         b64_chunked = "\r\n".join(
@@ -400,6 +430,19 @@ class RobustImapClient:
                     break
                 if line.startswith(f"{tag} NO") or line.startswith(f"{tag} BAD"):
                     self._check_throttle(line)
+                    if (
+                        not _retried_create
+                        and line.startswith(f"{tag} NO")
+                        and "THROTTLED" not in line.upper()
+                        and "OVERQUOTA" not in line.upper()
+                    ):
+                        self.logger.warning(
+                            f"APPEND step 1 to '{folder}' returned '{line.strip()}', creating folder '{folder}' and retrying..."
+                        )
+                        await self.create_folder(folder)
+                        return await self.append_message(
+                            folder, subject, payload_bytes, _retried_create=True
+                        )
                     raise RuntimeError(f"APPEND step 1 rejected: {line.strip()}")
             self.writer.write(msg_raw + b"\r\n")
             await self.writer.drain()
@@ -410,6 +453,19 @@ class RobustImapClient:
 
         if not resp[-1].startswith(f"{tag} OK"):
             self._check_throttle(resp[-1])
+            if (
+                not _retried_create
+                and resp[-1].startswith(f"{tag} NO")
+                and "THROTTLED" not in resp[-1].upper()
+                and "OVERQUOTA" not in resp[-1].upper()
+            ):
+                self.logger.warning(
+                    f"APPEND step 2 to '{folder}' returned '{resp[-1].strip()}', creating folder '{folder}' and retrying..."
+                )
+                await self.create_folder(folder)
+                return await self.append_message(
+                    folder, subject, payload_bytes, _retried_create=True
+                )
             raise RuntimeError(f"APPEND failed: {resp[-1].strip()}")
 
         return t_append
@@ -696,132 +752,151 @@ async def run_server_mailbox_worker(
     """
     idx = account.index
     mb_metrics = stats.mailboxes[idx]
-    srv_reader = RobustImapClient(
-        host, port, account.email, account.srv_pass, f"SRV_R#{idx}", mb_metrics, stats, use_literal_plus
-    )
-    srv_writer = RobustImapClient(
-        host, port, account.email, account.srv_pass, f"SRV_W#{idx}", mb_metrics, stats, use_literal_plus
-    )
 
-    await srv_reader.connect()
-    await srv_reader.select("Drafts")
+    while not stop_event.is_set():
+        srv_reader = RobustImapClient(
+            host, port, account.email, account.srv_pass, f"SRV_R#{idx}", mb_metrics, stats, use_literal_plus
+        )
+        srv_writer = RobustImapClient(
+            host, port, account.email, account.srv_pass, f"SRV_W#{idx}", mb_metrics, stats, use_literal_plus
+        )
+        writer_task: Optional[asyncio.Task] = None
+        cleanup_uids: List[int] = []
 
-    await srv_writer.connect()
-    await srv_writer.select("Drafts")
+        try:
+            await srv_reader.connect()
+            await srv_reader.select("Drafts")
 
-    last_seen_uid = await srv_reader.get_max_uid()
-    srv_reader.logger.info(f"[Mailbox #{idx}] Initial 'Drafts' baseline UID: {last_seen_uid}")
+            await srv_writer.connect()
+            # Гарантируем наличие обеих папок ("Notes" и "Drafts") на свежезарегистрированных ящиках
+            await srv_writer.select("Notes")
+            await srv_writer.select("Drafts")
 
-    cleanup_uids: List[int] = []
-    last_rx_time = time.time()
+            last_seen_uid = await srv_reader.get_max_uid()
+            srv_reader.logger.info(f"[Mailbox #{idx}] Initial 'Drafts' baseline UID: {last_seen_uid}")
 
-    slot.healthy = True
-    slot.idle_event.set()
+            last_rx_time = time.time()
 
-    async def srv_writer_loop():
-        while not stop_event.is_set():
-            try:
-                # Проверяем, нужно ли выполнить ленивый пакетный EXPUNGE прочитанных писем в "Drafts"
-                should_expunge = len(cleanup_uids) >= expunge_batch_size or (
-                    len(cleanup_uids) > 0 and (time.time() - last_rx_time) >= expunge_idle_delay_sec
-                )
-                if should_expunge and slot.batch_queue.empty():
-                    slot.idle_event.clear()
-                    to_clean = cleanup_uids[:]
-                    cleanup_uids.clear()
-                    await srv_writer.expunge_uids(to_clean)
-                    slot.idle_event.set()
+            slot.healthy = True
+            slot.idle_event.set()
 
+            async def srv_writer_loop():
+                while not stop_event.is_set():
+                    try:
+                        # Проверяем, нужно ли выполнить ленивый пакетный EXPUNGE прочитанных писем в "Drafts"
+                        should_expunge = len(cleanup_uids) >= expunge_batch_size or (
+                            len(cleanup_uids) > 0 and (time.time() - last_rx_time) >= expunge_idle_delay_sec
+                        )
+                        if should_expunge and slot.batch_queue.empty():
+                            slot.idle_event.clear()
+                            to_clean = cleanup_uids[:]
+                            cleanup_uids.clear()
+                            await srv_writer.expunge_uids(to_clean)
+                            slot.idle_event.set()
+
+                        try:
+                            subj, payload, _ = await asyncio.wait_for(
+                                slot.batch_queue.get(), timeout=0.05
+                            )
+                        except asyncio.TimeoutError:
+                            continue
+
+                        try:
+                            await srv_writer.append_message("Notes", subj, payload)
+                            stats.srv_tx_batches += 1
+                            stats.srv_tx_bytes += len(payload)
+                            mb_metrics.srv_tx_batches += 1
+                            mb_metrics.srv_tx_bytes += len(payload)
+
+                            # Если накопился полный батч на очистку — чистим попутно после APPEND
+                            if len(cleanup_uids) >= expunge_batch_size:
+                                to_clean = cleanup_uids[:]
+                                cleanup_uids.clear()
+                                await srv_writer.expunge_uids(to_clean)
+                        except Exception as e:
+                            srv_writer.logger.error(
+                                f"APPEND error on SRV_W#{idx}, re-queuing downlink batch: {e}"
+                            )
+                            stats.errors.append(f"SRV_W#{idx}: {e}")
+                            mb_metrics.retry_requeued += 1
+                            # Возвращаем батч в центральную очередь Downlink без потерь!
+                            await downlink_echo_queue.put((subj, payload))
+                            await asyncio.sleep(0.3)
+                        finally:
+                            slot.idle_event.set()
+
+                    except asyncio.CancelledError:
+                        break
+                    except Exception as e:
+                        srv_writer.logger.error(f"Unexpected SRV_W#{idx} loop error: {e}")
+                        await asyncio.sleep(0.5)
+
+            writer_task = asyncio.create_task(srv_writer_loop())
+            last_activity_ts = time.time()
+
+            while not stop_event.is_set():
+                if not srv_reader.pending_exists:
+                    in_active_window = (time.time() - last_activity_ts) < 5.0
+                    idle_timeout = 0.4 if in_active_window else 10.0
+                    got_evt = await srv_reader.wait_idle_or_event(timeout_sec=idle_timeout)
+                    if stop_event.is_set():
+                        break
+                    if not got_evt and not srv_reader.pending_exists and not in_active_window:
+                        continue
+
+                srv_reader.pending_exists = False
+                msgs, new_max, _ = await srv_reader.fetch_messages_robust(last_seen_uid)
+                last_seen_uid = new_max
+
+                if msgs:
+                    last_activity_ts = time.time()
+                    last_rx_time = last_activity_ts
+
+                for uid, subject, payload in msgs:
+                    cleanup_uids.append(uid)
+                    id_match = re.search(r"\[ID:\s*([^\]]+)\]", subject)
+                    if not id_match:
+                        continue
+
+                    # Любой валидный фрейм с [ID: srv01:<session_id>] регистрирует этот ящик в SessionMailboxPool!
+                    session_pool.register_mailbox(idx, account.email)
+
+                    if len(payload) == 0:
+                        # Это управляющий Mailbox Binding Frame (Раздел 9.3.3)
+                        mb_metrics.binding_frames_rx += 1
+                        continue
+
+                    stats.srv_rx_batches += 1
+                    stats.srv_rx_bytes += len(payload)
+                    mb_metrics.srv_rx_batches += 1
+                    mb_metrics.srv_rx_bytes += len(payload)
+
+                    cli_target = id_match.group(1).split(":")[-1]
+                    echo_subj = f"[ID: {cli_target}]"
+                    await downlink_echo_queue.put((echo_subj, payload))
+
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(
+                f"[SRV Mailbox #{idx} ({account.email})] Worker error: {e}", exc_info=True
+            )
+            stats.errors.append(f"SRV#{idx} ({account.email}): {e}")
+            mb_metrics.reconnect_events += 1
+        finally:
+            slot.healthy = False
+            if writer_task is not None:
+                writer_task.cancel()
+            if cleanup_uids:
                 try:
-                    subj, payload, _ = await asyncio.wait_for(
-                        slot.batch_queue.get(), timeout=0.05
-                    )
-                except asyncio.TimeoutError:
-                    continue
+                    await srv_writer.expunge_uids(cleanup_uids)
+                except Exception:
+                    pass
+            await srv_reader.close()
+            await srv_writer.close()
 
-                try:
-                    await srv_writer.append_message("Notes", subj, payload)
-                    stats.srv_tx_batches += 1
-                    stats.srv_tx_bytes += len(payload)
-                    mb_metrics.srv_tx_batches += 1
-                    mb_metrics.srv_tx_bytes += len(payload)
-
-                    # Если накопился полный батч на очистку — чистим попутно после APPEND
-                    if len(cleanup_uids) >= expunge_batch_size:
-                        to_clean = cleanup_uids[:]
-                        cleanup_uids.clear()
-                        await srv_writer.expunge_uids(to_clean)
-                except Exception as e:
-                    srv_writer.logger.error(f"APPEND error on SRV_W#{idx}, re-queuing downlink batch: {e}")
-                    stats.errors.append(f"SRV_W#{idx}: {e}")
-                    mb_metrics.retry_requeued += 1
-                    # Возвращаем батч в центральную очередь Downlink без потерь!
-                    await downlink_echo_queue.put((subj, payload))
-                    await asyncio.sleep(0.3)
-                finally:
-                    slot.idle_event.set()
-
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                srv_writer.logger.error(f"Unexpected SRV_W#{idx} loop error: {e}")
-                await asyncio.sleep(0.5)
-
-    writer_task = asyncio.create_task(srv_writer_loop())
-    last_activity_ts = time.time()
-
-    try:
-        while not stop_event.is_set():
-            if not srv_reader.pending_exists:
-                in_active_window = (time.time() - last_activity_ts) < 5.0
-                idle_timeout = 0.4 if in_active_window else 10.0
-                got_evt = await srv_reader.wait_idle_or_event(timeout_sec=idle_timeout)
-                if stop_event.is_set():
-                    break
-                if not got_evt and not srv_reader.pending_exists and not in_active_window:
-                    continue
-
-            srv_reader.pending_exists = False
-            msgs, new_max, _ = await srv_reader.fetch_messages_robust(last_seen_uid)
-            last_seen_uid = new_max
-
-            if msgs:
-                last_activity_ts = time.time()
-                last_rx_time = last_activity_ts
-
-            for uid, subject, payload in msgs:
-                cleanup_uids.append(uid)
-                id_match = re.search(r"\[ID:\s*([^\]]+)\]", subject)
-                if not id_match:
-                    continue
-
-                # Любой валидный фрейм с [ID: srv01:<session_id>] регистрирует этот ящик в SessionMailboxPool!
-                session_pool.register_mailbox(idx, account.email)
-
-                if len(payload) == 0:
-                    # Это управляющий Mailbox Binding Frame (Раздел 9.3.3)
-                    mb_metrics.binding_frames_rx += 1
-                    continue
-
-                stats.srv_rx_batches += 1
-                stats.srv_rx_bytes += len(payload)
-                mb_metrics.srv_rx_batches += 1
-                mb_metrics.srv_rx_bytes += len(payload)
-
-                cli_target = id_match.group(1).split(":")[-1]
-                echo_subj = f"[ID: {cli_target}]"
-                await downlink_echo_queue.put((echo_subj, payload))
-
-    finally:
-        slot.healthy = False
-        writer_task.cancel()
-        if cleanup_uids:
-            try:
-                await srv_writer.expunge_uids(cleanup_uids)
-            except Exception:
-                pass
-        await srv_reader.close()
-        await srv_writer.close()
+        if not stop_event.is_set():
+            await asyncio.sleep(2.0)
 
 
 async def run_server_downlink_dispatcher(
@@ -876,143 +951,160 @@ async def run_client_mailbox_worker(
     """
     idx = account.index
     mb_metrics = stats.mailboxes[idx]
-    cli_reader = RobustImapClient(
-        host, port, account.email, account.cli_pass, f"CLI_R#{idx}", mb_metrics, stats, use_literal_plus
-    )
-    cli_writer = RobustImapClient(
-        host, port, account.email, account.cli_pass, f"CLI_W#{idx}", mb_metrics, stats, use_literal_plus
-    )
 
-    await cli_reader.connect()
-    await cli_reader.select("Notes")
+    while not stop_event.is_set():
+        cli_reader = RobustImapClient(
+            host, port, account.email, account.cli_pass, f"CLI_R#{idx}", mb_metrics, stats, use_literal_plus
+        )
+        cli_writer = RobustImapClient(
+            host, port, account.email, account.cli_pass, f"CLI_W#{idx}", mb_metrics, stats, use_literal_plus
+        )
+        writer_task: Optional[asyncio.Task] = None
+        cleanup_uids: List[int] = []
 
-    await cli_writer.connect()
-    await cli_writer.select("Notes")
+        try:
+            await cli_reader.connect()
+            await cli_reader.select("Notes")
 
-    last_seen_uid = await cli_reader.get_max_uid()
-    cli_reader.logger.info(f"[Mailbox #{idx}] Initial 'Notes' baseline UID: {last_seen_uid}")
+            await cli_writer.connect()
+            # Гарантируем наличие обеих папок ("Drafts" и "Notes") на свежезарегистрированных ящиках
+            await cli_writer.select("Drafts")
+            await cli_writer.select("Notes")
 
-    # Отправляем Mailbox Binding Frame (Раздел 9.3.3), чтобы сервер сразу привязал ящик #idx к пулу сессии!
-    binding_subj = f"ANet-Data [ID: srv01:{session_id}]"
-    await cli_writer.append_message("Drafts", binding_subj, b"")
-    cli_writer.logger.info(f"[Mailbox #{idx}] Sent Mailbox Binding Frame for session {session_id}")
+            last_seen_uid = await cli_reader.get_max_uid()
+            cli_reader.logger.info(f"[Mailbox #{idx}] Initial 'Notes' baseline UID: {last_seen_uid}")
 
-    cleanup_uids: List[int] = []
-    last_rx_time = time.time()
+            # Отправляем Mailbox Binding Frame (Раздел 9.3.3), чтобы сервер сразу привязал ящик #idx к пулу сессии!
+            binding_subj = f"ANet-Data [ID: srv01:{session_id}]"
+            await cli_writer.append_message("Drafts", binding_subj, b"")
+            cli_writer.logger.info(f"[Mailbox #{idx}] Sent Mailbox Binding Frame for session {session_id}")
 
-    slot.healthy = True
-    slot.idle_event.set()
+            last_rx_time = time.time()
 
-    async def cli_writer_loop():
-        while not stop_event.is_set():
-            try:
-                should_expunge = len(cleanup_uids) >= expunge_batch_size or (
-                    len(cleanup_uids) > 0 and (time.time() - last_rx_time) >= expunge_idle_delay_sec
-                )
-                if should_expunge and slot.batch_queue.empty():
-                    slot.idle_event.clear()
-                    to_clean = cleanup_uids[:]
-                    cleanup_uids.clear()
-                    await cli_writer.expunge_uids(to_clean)
-                    slot.idle_event.set()
+            slot.healthy = True
+            slot.idle_event.set()
 
-                try:
-                    subj, payload, _ = await asyncio.wait_for(
-                        slot.batch_queue.get(), timeout=0.05
-                    )
-                except asyncio.TimeoutError:
-                    continue
+            async def cli_writer_loop():
+                while not stop_event.is_set():
+                    try:
+                        should_expunge = len(cleanup_uids) >= expunge_batch_size or (
+                            len(cleanup_uids) > 0 and (time.time() - last_rx_time) >= expunge_idle_delay_sec
+                        )
+                        if should_expunge and slot.batch_queue.empty():
+                            slot.idle_event.clear()
+                            to_clean = cleanup_uids[:]
+                            cleanup_uids.clear()
+                            await cli_writer.expunge_uids(to_clean)
+                            slot.idle_event.set()
 
-                try:
-                    await cli_writer.append_message("Drafts", subj, payload)
-                    stats.cli_tx_batches += 1
-                    stats.cli_tx_bytes += len(payload)
-                    mb_metrics.cli_tx_batches += 1
-                    mb_metrics.cli_tx_bytes += len(payload)
-
-                    if len(cleanup_uids) >= expunge_batch_size:
-                        to_clean = cleanup_uids[:]
-                        cleanup_uids.clear()
-                        await cli_writer.expunge_uids(to_clean)
-                except Exception as e:
-                    cli_writer.logger.error(
-                        f"APPEND error on CLI_W#{idx}, returning batch to retry_uplink_queue: {e}"
-                    )
-                    stats.errors.append(f"CLI_W#{idx}: {e}")
-                    mb_metrics.retry_requeued += 1
-                    # Zero-Loss Retry (Раздел 9.4.3): возвращаем батч центральному диспетчеру!
-                    await retry_uplink_queue.put((subj, payload))
-                    await asyncio.sleep(0.3)
-                finally:
-                    slot.idle_event.set()
-
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                cli_writer.logger.error(f"Unexpected CLI_W#{idx} loop error: {e}")
-                await asyncio.sleep(0.5)
-
-    writer_task = asyncio.create_task(cli_writer_loop())
-    last_activity_ts = time.time()
-
-    try:
-        while not stop_event.is_set():
-            if not cli_reader.pending_exists:
-                in_active_window = (time.time() - last_activity_ts) < 5.0
-                idle_timeout = 0.4 if in_active_window else 10.0
-                got_evt = await cli_reader.wait_idle_or_event(timeout_sec=idle_timeout)
-                if stop_event.is_set():
-                    break
-                if not got_evt and not cli_reader.pending_exists and not in_active_window:
-                    continue
-
-            cli_reader.pending_exists = False
-            msgs, new_max, _ = await cli_reader.fetch_messages_robust(last_seen_uid)
-            last_seen_uid = new_max
-
-            if msgs:
-                last_activity_ts = time.time()
-                last_rx_time = last_activity_ts
-
-            for uid, subject, payload in msgs:
-                cleanup_uids.append(uid)
-                if not payload:
-                    continue
-
-                stats.cli_rx_batches += 1
-                stats.cli_rx_bytes += len(payload)
-                mb_metrics.cli_rx_batches += 1
-                mb_metrics.cli_rx_bytes += len(payload)
-
-                if len(payload) >= 16:
-                    seq = int.from_bytes(payload[0:8], "big")
-                    if seq < stats.max_seq_seen:
-                        stats.out_of_order_deliveries += 1
-                    else:
-                        stats.max_seq_seen = seq
-
-                    if seq in sent_timestamps:
-                        rtt = (time.time() - sent_timestamps.pop(seq)) * 1000.0
-                        stats.rtt_samples_ms.append(rtt)
-                        if stats.cli_rx_batches == 1 or stats.cli_rx_batches % 10 == 0:
-                            elapsed = max(0.1, time.time() - stats.start_time)
-                            cur_mbps = (stats.cli_rx_bytes * 8) / (elapsed * 1_000_000)
-                            logger.info(
-                                f"[ECHO #{seq} via Box#{idx}] RTT: {rtt:.1f} ms | "
-                                f"Total RX: {stats.cli_rx_bytes / (1024 * 1024):.2f} MiB ({cur_mbps:.2f} Mbps) | "
-                                f"InFlight: {len(sent_timestamps)}"
+                        try:
+                            subj, payload, _ = await asyncio.wait_for(
+                                slot.batch_queue.get(), timeout=0.05
                             )
+                        except asyncio.TimeoutError:
+                            continue
 
-    finally:
-        slot.healthy = False
-        writer_task.cancel()
-        if cleanup_uids:
-            try:
-                await cli_writer.expunge_uids(cleanup_uids)
-            except Exception:
-                pass
-        await cli_reader.close()
-        await cli_writer.close()
+                        try:
+                            await cli_writer.append_message("Drafts", subj, payload)
+                            stats.cli_tx_batches += 1
+                            stats.cli_tx_bytes += len(payload)
+                            mb_metrics.cli_tx_batches += 1
+                            mb_metrics.cli_tx_bytes += len(payload)
+
+                            if len(cleanup_uids) >= expunge_batch_size:
+                                to_clean = cleanup_uids[:]
+                                cleanup_uids.clear()
+                                await cli_writer.expunge_uids(to_clean)
+                        except Exception as e:
+                            cli_writer.logger.error(
+                                f"APPEND error on CLI_W#{idx}, returning batch to retry_uplink_queue: {e}"
+                            )
+                            stats.errors.append(f"CLI_W#{idx}: {e}")
+                            mb_metrics.retry_requeued += 1
+                            # Zero-Loss Retry (Раздел 9.4.3): возвращаем батч центральному диспетчеру!
+                            await retry_uplink_queue.put((subj, payload))
+                            await asyncio.sleep(0.3)
+                        finally:
+                            slot.idle_event.set()
+
+                    except asyncio.CancelledError:
+                        break
+                    except Exception as e:
+                        cli_writer.logger.error(f"Unexpected CLI_W#{idx} loop error: {e}")
+                        await asyncio.sleep(0.5)
+
+            writer_task = asyncio.create_task(cli_writer_loop())
+            last_activity_ts = time.time()
+
+            while not stop_event.is_set():
+                if not cli_reader.pending_exists:
+                    in_active_window = (time.time() - last_activity_ts) < 5.0
+                    idle_timeout = 0.4 if in_active_window else 10.0
+                    got_evt = await cli_reader.wait_idle_or_event(timeout_sec=idle_timeout)
+                    if stop_event.is_set():
+                        break
+                    if not got_evt and not cli_reader.pending_exists and not in_active_window:
+                        continue
+
+                cli_reader.pending_exists = False
+                msgs, new_max, _ = await cli_reader.fetch_messages_robust(last_seen_uid)
+                last_seen_uid = new_max
+
+                if msgs:
+                    last_activity_ts = time.time()
+                    last_rx_time = last_activity_ts
+
+                for uid, subject, payload in msgs:
+                    cleanup_uids.append(uid)
+                    if not payload:
+                        continue
+
+                    stats.cli_rx_batches += 1
+                    stats.cli_rx_bytes += len(payload)
+                    mb_metrics.cli_rx_batches += 1
+                    mb_metrics.cli_rx_bytes += len(payload)
+
+                    if len(payload) >= 16:
+                        seq = int.from_bytes(payload[0:8], "big")
+                        if seq < stats.max_seq_seen:
+                            stats.out_of_order_deliveries += 1
+                        else:
+                            stats.max_seq_seen = seq
+
+                        if seq in sent_timestamps:
+                            rtt = (time.time() - sent_timestamps.pop(seq)) * 1000.0
+                            stats.rtt_samples_ms.append(rtt)
+                            if stats.cli_rx_batches == 1 or stats.cli_rx_batches % 10 == 0:
+                                elapsed = max(0.1, time.time() - stats.start_time)
+                                cur_mbps = (stats.cli_rx_bytes * 8) / (elapsed * 1_000_000)
+                                logger.info(
+                                    f"[ECHO #{seq} via Box#{idx}] RTT: {rtt:.1f} ms | "
+                                    f"Total RX: {stats.cli_rx_bytes / (1024 * 1024):.2f} MiB ({cur_mbps:.2f} Mbps) | "
+                                    f"InFlight: {len(sent_timestamps)}"
+                                )
+
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(
+                f"[CLI Mailbox #{idx} ({account.email})] Worker error: {e}", exc_info=True
+            )
+            stats.errors.append(f"CLI#{idx} ({account.email}): {e}")
+            mb_metrics.reconnect_events += 1
+        finally:
+            slot.healthy = False
+            if writer_task is not None:
+                writer_task.cancel()
+            if cleanup_uids:
+                try:
+                    await cli_writer.expunge_uids(cleanup_uids)
+                except Exception:
+                    pass
+            await cli_reader.close()
+            await cli_writer.close()
+
+        if not stop_event.is_set():
+            await asyncio.sleep(2.0)
 
 
 async def run_client_uplink_dispatcher(
@@ -1199,6 +1291,7 @@ async def run_phase(
         for t in tasks:
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        stats.mark_finished()
 
     logger.info(stats.format_report())
     return stats

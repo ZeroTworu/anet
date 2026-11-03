@@ -392,6 +392,8 @@ async fn establish_mailbox_session(
     .await
     .with_context(|| format!("Failed to connect CLI_WRITER for {}", account.email))?;
 
+    // Гарантируем наличие обеих папок ("Drafts" и "Notes") на свежезарегистрированных ящиках
+    let _ = cli_writer.select("Drafts", command_timeout).await;
     cli_writer
         .select("Notes", command_timeout)
         .await
