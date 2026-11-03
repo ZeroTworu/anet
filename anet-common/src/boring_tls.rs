@@ -794,6 +794,52 @@ where
     connect_ws_tls_with_config(domain, stream, &cfg).await
 }
 
+/// Создает конфигурацию BoringSSL для сырых TLS-потоков (например, `TURNS` RFC 5766 поверх TCP:443)
+/// с текущим браузерным профилем TLS, но без HTTP ALPN (`h2`/`http/1.1`).
+pub fn build_raw_ssl_connector_with_config(
+    cfg: &TlsClientConfig,
+) -> anyhow::Result<SslConnectorBuilder> {
+    build_ssl_connector_base_with_config(cfg)
+}
+
+/// Выполняет асинхронный клиентский TLS-хендшейк через `tokio-boring` без HTTP ALPN
+/// с явно заданной конфигурацией профиля и защиты от активного спуфинга.
+pub async fn connect_raw_tls_with_config<S>(
+    domain: &str,
+    stream: S,
+    cfg: &TlsClientConfig,
+) -> anyhow::Result<tokio_boring::SslStream<S>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let ssl_connector = build_raw_ssl_connector_with_config(cfg)?.build();
+    let mut ssl_config = ssl_connector.configure()?;
+    let is_ip = domain.parse::<std::net::IpAddr>().is_ok();
+    if is_ip {
+        ssl_config.set_use_server_name_indication(false);
+    }
+    let verify_hostname = !is_ip
+        && cfg.verify_peer
+        && cfg.pin_sha256.as_ref().is_none_or(|p| p.trim().is_empty());
+    ssl_config.set_verify_hostname(verify_hostname);
+    tokio_boring::connect(ssl_config, domain, stream)
+        .await
+        .map_err(|e| anyhow::anyhow!("BoringSSL raw TLS handshake failed: {e}"))
+}
+
+/// Выполняет асинхронный клиентский TLS-хендшейк через `tokio-boring` без HTTP ALPN
+/// с использованием глобальной конфигурации TLS.
+pub async fn connect_raw_tls<S>(
+    domain: &str,
+    stream: S,
+) -> anyhow::Result<tokio_boring::SslStream<S>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let cfg = get_default_tls_config();
+    connect_raw_tls_with_config(domain, stream, &cfg).await
+}
+
 // =========================================================================
 // ЭТАЛОННЫЙ EMAIL TLS-КОННЕКТОР (IMAPS:993, KMail / OpenSSL 3.x)
 // =========================================================================
@@ -814,7 +860,7 @@ const EMAIL_CIPHERS: &str = "\
 pub fn build_email_ssl_connector_with_config(
     cfg: &TlsClientConfig,
 ) -> anyhow::Result<SslConnectorBuilder> {
-    let mut builder = SslConnector::builder(SslMethod::tls_client())?;
+    let mut builder = SslConnector::builder(SslMethod::tls())?;
 
     builder.set_min_proto_version(Some(SslVersion::TLS1_2))?;
     builder.set_max_proto_version(Some(SslVersion::TLS1_3))?;
