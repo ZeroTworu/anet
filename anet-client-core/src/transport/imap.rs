@@ -161,13 +161,14 @@ impl ImapTransport {
 
 /// Адаптер `AuthChannel` для выполнения ASTP Handshake через IMAP (Фазы 1–4)
 struct ImapAuthChannel {
-    writer: Arc<Mutex<ImapConn>>,
-    reader: Arc<Mutex<ImapConn>>,
+    writer: Mutex<ImapConn>,
+    reader: Mutex<ImapConn>,
     account_email: String,
     srv_id: String,
     client_temp_id: String,
     timeout_dur: Duration,
-    last_reader_uid: Arc<Mutex<u32>>,
+    last_reader_uid: Mutex<u32>,
+    handshake_uids: Mutex<Vec<u32>>,
 }
 
 #[async_trait]
@@ -218,6 +219,7 @@ impl AuthChannel for ImapAuthChannel {
                         msg.uid,
                         msg.payload.len()
                     );
+                    self.handshake_uids.lock().await.push(msg.uid);
                     return Ok(msg.payload);
                 }
             }
@@ -246,6 +248,7 @@ async fn establish_mailbox_session(
     ImapConn,
     ImapConn,
     u32,
+    Vec<u32>,
     anet_common::protocol::AuthResponse,
     [u8; 32],
 )> {
@@ -289,32 +292,26 @@ async fn establish_mailbox_session(
         account.email, initial_max_uid
     );
 
-    let writer_mutex = Arc::new(Mutex::new(cli_writer));
-    let reader_mutex = Arc::new(Mutex::new(cli_reader));
-    let last_uid_mutex = Arc::new(Mutex::new(initial_max_uid));
-
     let auth_channel = ImapAuthChannel {
-        writer: writer_mutex.clone(),
-        reader: reader_mutex.clone(),
+        writer: Mutex::new(cli_writer),
+        reader: Mutex::new(cli_reader),
         account_email: account.email.clone(),
         srv_id: srv_id.to_string(),
         client_temp_id: client_temp_id.to_string(),
         timeout_dur: command_timeout,
-        last_reader_uid: last_uid_mutex.clone(),
+        last_reader_uid: Mutex::new(initial_max_uid),
+        handshake_uids: Mutex::new(Vec::with_capacity(2)),
     };
 
     let auth_handler = AuthHandler::new_with_resume(core_cfg, server_pub_key_override, resume_session_id)?;
     let (auth_response, shared_key) = auth_handler.authenticate_once(&auth_channel).await?;
-    let final_uid = *last_uid_mutex.lock().await;
 
-    let cli_writer = Arc::try_unwrap(writer_mutex)
-        .map_err(|_| anyhow!("Writer mutex still referenced"))?
-        .into_inner();
-    let cli_reader = Arc::try_unwrap(reader_mutex)
-        .map_err(|_| anyhow!("Reader mutex still referenced"))?
-        .into_inner();
+    let final_uid = auth_channel.last_reader_uid.into_inner();
+    let hs_uids = auth_channel.handshake_uids.into_inner();
+    let cli_writer = auth_channel.writer.into_inner();
+    let cli_reader = auth_channel.reader.into_inner();
 
-    Ok((cli_writer, cli_reader, final_uid, auth_response, shared_key))
+    Ok((cli_writer, cli_reader, final_uid, hs_uids, auth_response, shared_key))
 }
 
 #[async_trait]
@@ -397,7 +394,7 @@ impl ClientTransport for ImapTransport {
             }
         }
 
-        let (cli_writer, cli_reader, initial_max_uid, auth_response, shared_key) =
+        let (cli_writer, cli_reader, initial_max_uid, initial_hs_uids, auth_response, shared_key) =
             match initial_session {
                 Some(s) => s,
                 None => {
@@ -435,7 +432,7 @@ impl ClientTransport for ImapTransport {
         let last_seen_uid_shared = Arc::new(AtomicU64::new(initial_max_uid as u64));
 
         let sequence = Arc::new(AtomicU64::new(0));
-        let cleanup_uids = Arc::new(Mutex::new(Vec::<u32>::new()));
+        let cleanup_uids = Arc::new(Mutex::new(initial_hs_uids));
         let inflight_count = Arc::new(AtomicUsize::new(0));
         let stop_flag = Arc::new(AtomicBool::new(false));
         let failover_needed = Arc::new(AtomicBool::new(false));
@@ -536,7 +533,7 @@ impl ClientTransport for ImapTransport {
                     )
                     .await
                     {
-                        Ok((new_w, new_r, new_uid, new_auth, new_key)) => {
+                        Ok((new_w, new_r, new_uid, new_hs_uids, new_auth, new_key)) => {
                             if let Ok(new_prefix) = new_auth.nonce_prefix.as_slice().try_into() {
                                 {
                                     let mut st = session_state_sup.write().await;
@@ -548,7 +545,7 @@ impl ClientTransport for ImapTransport {
                                 *reader_sup.lock().await = new_r;
                                 *email_sup.write().await = next_acc.email.clone();
                                 uid_sup.store(new_uid as u64, Ordering::SeqCst);
-                                cleanup_sup.lock().await.clear();
+                                *cleanup_sup.lock().await = new_hs_uids;
                                 inflight_sup.store(0, Ordering::SeqCst);
                                 current_idx = next_idx;
                                 failover_flag_sup.store(false, Ordering::Release);
