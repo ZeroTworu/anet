@@ -16,7 +16,7 @@ use anet_common::transport::{
 use anet_common::wrtc::{
     batcher::{unpack_batch, PacketBatcher},
     colibri::{generate_server_endpoint_id, sign_beacon, ColibriMessage, WrtcMessage},
-    jingle::{filter_p2p_sdp_relay_only, parse_jingle_session, JingleAction},
+    jingle::{filter_p2p_sdp_relay_only, JingleAction},
     peer::{create_p2p_channel, P2pSession, WrtcPeer},
     providers::WrtcProviderRegistry,
     stealth::generate_random_guest_name,

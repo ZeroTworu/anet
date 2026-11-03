@@ -27,6 +27,7 @@ use anet_common::wrtc::{
     providers::WrtcProviderRegistry,
     stealth::generate_random_guest_name,
     xmpp::XmppSession,
+    xmpp_xml::{parse_xmpp_stanzas, InboundXmpp},
 };
 use anyhow::{Context, Result};
 use async_trait::async_trait;
