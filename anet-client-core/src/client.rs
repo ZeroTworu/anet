@@ -807,16 +807,22 @@ impl AnetClient {
         let last_reply_us = Arc::new(AtomicU64::new(0));
         let (tx_probe, mut rx_probe) = tokio::sync::mpsc::channel::<Bytes>(64);
 
+        let is_wrtc_proto = matches!(server.mode(), Ok(crate::config::TransportMode::Wrtc));
+        let is_imap_proto = matches!(server.mode(), Ok(crate::config::TransportMode::Imap));
+
         // Внутритуннельный генератор ICMP Echo Request для универсального измерения честного RTT.
-        // Работает для ВСЕХ видов транспорта (QUIC, SSH, VNC, AHTTP, WS, WRTC) прямо внутри шифрованного потока.
+        // Работает для ВСЕХ видов транспорта (QUIC, SSH, VNC, AHTTP, WS, WRTC, IMAP) прямо внутри шифрованного потока.
         // Не требует raw-сокетов и повышенных прав ОС (полная совместимость с Linux, Windows, macOS, Android, iOS).
         if let (Some(client_ip), Some(gateway_ip)) = (client_ip_opt, gateway_ip_opt) {
             let tx_probe_c = tx_probe.clone();
             let probe_shutdown = shutdown_notify.clone();
             let probe_start_time = session_start;
-            let ping_interval = Duration::from_secs(
-                config_clone.connectivity.ping_interval_secs.clamp(1, 30),
-            );
+            let ping_interval = if is_imap_proto {
+                // В режиме IMAP не шлем холостые письма каждые 2 секунды, чтобы не триггерить анти-спам лимит THROTTLED
+                Duration::from_secs(config_clone.connectivity.ping_interval_secs.clamp(15, 60))
+            } else {
+                Duration::from_secs(config_clone.connectivity.ping_interval_secs.clamp(1, 30))
+            };
 
             let icmp_probe_task = tokio::spawn(async move {
                 let mut seq: u16 = 0;
@@ -877,7 +883,6 @@ impl AnetClient {
         #[cfg(all(windows, feature = "per-app"))]
         let app_filter_bypass_t2 = _app_filter.as_ref().map(|f| f.bypass_set());
 
-        let is_wrtc_proto = matches!(server.mode(), Ok(crate::config::TransportMode::Wrtc));
         let client_clamp_mtu = (result.auth_response.mtu as usize).clamp(576, 1500);
 
         let t1 = spawn(async move {
@@ -903,10 +908,10 @@ impl AnetClient {
                     return false;
                 }
 
-                // 3. В режиме WRTC отклоняем QUIC (UDP:443) через ICMP Port Unreachable,
+                // 3. В режимах WRTC и IMAP отклоняем QUIC (UDP:443) через ICMP Port Unreachable,
                 // чтобы YouTube и браузеры за 0.05 мс переходили на TCP:443 (HTTP/2) с автоматическим TCP MSS Clamping
-                // и не слали 1250-байтные QUIC Initial пакеты поверх VP8 / Colibri-WS
-                if is_wrtc_proto && anet_common::icmp_probe::is_quic_udp_443_packet(pkt) {
+                // и коалесценцией батчей
+                if (is_wrtc_proto || is_imap_proto) && anet_common::icmp_probe::is_quic_udp_443_packet(pkt) {
                     if let Some(reject) = anet_common::icmp_probe::build_reject_packet(pkt) {
                         let _ = tx_to_tun_dns.try_send(reject);
                     }
