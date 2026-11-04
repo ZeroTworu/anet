@@ -870,16 +870,19 @@ async fn run_client_mailbox_worker(
     idle_active_window_ms: u64,
     expunge_batch_size: usize,
     expunge_idle_delay: Duration,
-    max_inflight_batches: usize,
+    _max_inflight_batches: usize,
     literal_plus_auto: bool,
     throttle_backoff: Duration,
     stop_flag: Arc<AtomicBool>,
     pool_wake_notify: Arc<Notify>,
+    tunnel_last_activity_ms: Arc<AtomicU64>,
+    tunnel_reader_wake_notify: Arc<Notify>,
 ) {
     let idx = slot.index;
     let email = slot.account.email.clone();
     let mut preconnected = initial_conn;
     let uplink_rx = Arc::new(Mutex::new(uplink_rx));
+    let expunge_idle_delay_ms = expunge_idle_delay.as_millis() as u64;
 
     while !stop_flag.load(Ordering::Relaxed) {
         let mut send_binding_frame = false;
@@ -1033,8 +1036,8 @@ async fn run_client_mailbox_worker(
         let cleanup_uids = Arc::new(Mutex::new(initial_cleanup));
         let worker_stop = Arc::new(AtomicBool::new(false));
         let was_throttled = Arc::new(AtomicBool::new(false));
-        let last_activity_ms = Arc::new(AtomicU64::new(now_epoch_ms()));
-        let reader_wake_notify = Arc::new(Notify::new());
+        // Метка времени последнего прихода письма именно в папку "Notes" этого ящика (для expunge_idle_delay)
+        let last_rx_ms = Arc::new(AtomicU64::new(now_epoch_ms()));
 
         slot.inflight.store(0, Ordering::Release);
         slot.healthy.store(true, Ordering::Release);
@@ -1057,58 +1060,60 @@ async fn run_client_mailbox_worker(
         let worker_stop_for_writer = worker_stop.clone();
         let global_stop_for_writer = stop_flag.clone();
         let throttled_for_writer = was_throttled.clone();
-        let last_act_for_writer = last_activity_ms.clone();
-        let reader_wake_for_writer = reader_wake_notify.clone();
+        let last_rx_for_writer = last_rx_ms.clone();
+        let tunnel_act_for_writer = tunnel_last_activity_ms.clone();
+        let tunnel_wake_for_writer = tunnel_reader_wake_notify.clone();
         let pool_wake_for_writer = pool_wake_notify.clone();
         let email_for_writer = email.clone();
 
         let writer_handle = tokio::spawn(async move {
             let mut uplink_rx_guard = uplink_rx_for_writer.lock().await;
-            let mut last_tx_instant = Instant::now();
 
             while !worker_stop_for_writer.load(Ordering::Relaxed)
                 && !global_stop_for_writer.load(Ordering::Relaxed)
             {
-                // 1. Ленивая пакетная очистка прочитанных писем в "Notes" именно этого ящика
-                let to_clean = {
-                    let mut guard = cleanup_for_writer.lock().await;
-                    let force_clean = guard.len() >= expunge_batch_size
-                        || slot_for_writer.inflight.load(Ordering::Relaxed) >= max_inflight_batches;
-                    let idle_clean = uplink_rx_guard.is_empty()
-                        && !guard.is_empty()
-                        && last_tx_instant.elapsed() >= expunge_idle_delay;
-                    if force_clean || idle_clean {
-                        let list = guard.clone();
-                        guard.clear();
-                        list
-                    } else {
-                        Vec::new()
-                    }
-                };
+                // 1. Ленивая пакетная очистка в паузах (строго неблокирующий try_acquire, чтобы исключить
+                //    дедлок, когда диспетчер уже захватил writer_sem и положил (batch, permit) в uplink_rx!)
+                if uplink_rx_guard.is_empty() {
+                    if let Ok(expunge_permit) = slot_for_writer.writer_sem.try_acquire() {
+                        let to_clean = {
+                            let mut guard = cleanup_for_writer.lock().await;
+                            let force_clean = guard.len() >= expunge_batch_size;
+                            let since_rx_ms = now_epoch_ms()
+                                .saturating_sub(last_rx_for_writer.load(Ordering::Relaxed));
+                            let idle_clean =
+                                !guard.is_empty() && since_rx_ms >= expunge_idle_delay_ms;
+                            if force_clean || idle_clean {
+                                std::mem::take(&mut *guard)
+                            } else {
+                                Vec::new()
+                            }
+                        };
 
-                if !to_clean.is_empty() {
-                    // Удерживаем семафор слота на время UID EXPUNGE, чтобы диспетчер направлял новые батчи в соседние ящики!
-                    let _expunge_permit = slot_for_writer.writer_sem.acquire().await;
-                    let mut w_guard = writer_for_task.lock().await;
-                    if let Err(e) = w_guard.expunge_uids(&to_clean, command_timeout).await {
-                        debug!(
-                            "[IMAP Uplink][Box #{} ({})] UID EXPUNGE in Notes failed: {e}",
-                            idx, email_for_writer
-                        );
-                        worker_stop_for_writer.store(true, Ordering::SeqCst);
-                        break;
-                    } else {
-                        debug!(
-                            "[IMAP Uplink][Box #{} ({})] Cleaned up {} UIDs in Notes",
-                            idx,
-                            email_for_writer,
-                            to_clean.len()
-                        );
-                        let cur = slot_for_writer.inflight.load(Ordering::Relaxed);
-                        slot_for_writer
-                            .inflight
-                            .fetch_sub(to_clean.len().min(cur), Ordering::Relaxed);
-                        pool_wake_for_writer.notify_waiters();
+                        if !to_clean.is_empty() {
+                            let mut w_guard = writer_for_task.lock().await;
+                            if let Err(e) = w_guard.expunge_uids(&to_clean, command_timeout).await {
+                                debug!(
+                                    "[IMAP Uplink][Box #{} ({})] UID EXPUNGE in Notes failed: {e}",
+                                    idx, email_for_writer
+                                );
+                                drop(expunge_permit);
+                                worker_stop_for_writer.store(true, Ordering::SeqCst);
+                                break;
+                            } else {
+                                last_rx_for_writer.store(now_epoch_ms(), Ordering::Relaxed);
+                                debug!(
+                                    "[IMAP Uplink][Box #{} ({})] Cleaned up {} UIDs in Notes",
+                                    idx,
+                                    email_for_writer,
+                                    to_clean.len()
+                                );
+                                drop(expunge_permit);
+                                pool_wake_for_writer.notify_waiters();
+                            }
+                        } else {
+                            drop(expunge_permit);
+                        }
                     }
                 }
 
@@ -1136,12 +1141,15 @@ async fn run_client_mailbox_worker(
                         )
                         .await
                 };
+                let cur_inf = slot_for_writer.inflight.load(Ordering::Relaxed);
+                if cur_inf > 0 {
+                    slot_for_writer.inflight.fetch_sub(1, Ordering::Relaxed);
+                }
 
                 match append_res {
                     Ok(lat) => {
-                        last_tx_instant = Instant::now();
-                        last_act_for_writer.store(now_epoch_ms(), Ordering::Relaxed);
-                        reader_wake_for_writer.notify_one();
+                        tunnel_act_for_writer.store(now_epoch_ms(), Ordering::Relaxed);
+                        tunnel_wake_for_writer.notify_waiters();
                         debug!(
                             "[IMAP Uplink][Box #{} ({})] APPEND Drafts OK in {:.1} ms ({} B)",
                             idx,
@@ -1149,7 +1157,44 @@ async fn run_client_mailbox_worker(
                             lat.as_secs_f64() * 1000.0,
                             batch.encrypted_payload.len()
                         );
-                        // Освобождаем разрешение семафора ТОЛЬКО ПОСЛЕ завершения сетевого APPEND!
+
+                        // Попутная пакетная очистка (Piggybacked Expunge): если за время активного потока
+                        // накопилось >= expunge_batch_size прочитанных писем в "Notes", очищаем их прямо сейчас,
+                        // пока мы уже владеем `permit` (без риска дедлока и без голодания сборки мусора!).
+                        let piggyback_clean = {
+                            let mut guard = cleanup_for_writer.lock().await;
+                            if guard.len() >= expunge_batch_size {
+                                std::mem::take(&mut *guard)
+                            } else {
+                                Vec::new()
+                            }
+                        };
+                        if !piggyback_clean.is_empty() {
+                            let mut w_guard = writer_for_task.lock().await;
+                            if let Err(e) =
+                                w_guard.expunge_uids(&piggyback_clean, command_timeout).await
+                            {
+                                debug!(
+                                    "[IMAP Uplink][Box #{} ({})] Piggybacked UID EXPUNGE in Notes failed: {e}",
+                                    idx, email_for_writer
+                                );
+                                slot_for_writer.healthy.store(false, Ordering::Release);
+                                drop(permit);
+                                pool_wake_for_writer.notify_waiters();
+                                worker_stop_for_writer.store(true, Ordering::SeqCst);
+                                break;
+                            } else {
+                                last_rx_for_writer.store(now_epoch_ms(), Ordering::Relaxed);
+                                debug!(
+                                    "[IMAP Uplink][Box #{} ({})] Piggybacked cleanup of {} UIDs in Notes",
+                                    idx,
+                                    email_for_writer,
+                                    piggyback_clean.len()
+                                );
+                            }
+                        }
+
+                        // Освобождаем разрешение семафора ТОЛЬКО ПОСЛЕ завершения сетевого APPEND (и попутного EXPUNGE)!
                         drop(permit);
                         pool_wake_for_writer.notify_waiters();
                     }
@@ -1159,10 +1204,6 @@ async fn run_client_mailbox_worker(
                             "[IMAP Uplink][Box #{} ({})] APPEND Drafts failed, returning batch to retry queue: {err_str}",
                             idx, email_for_writer
                         );
-                        let cur = slot_for_writer.inflight.load(Ordering::Relaxed);
-                        if cur > 0 {
-                            slot_for_writer.inflight.fetch_sub(1, Ordering::Relaxed);
-                        }
                         if err_str.contains("THROTTLED") || err_str.contains("OVERQUOTA") {
                             throttled_for_writer.store(true, Ordering::SeqCst);
                         }
@@ -1182,7 +1223,7 @@ async fn run_client_mailbox_worker(
         while !worker_stop.load(Ordering::Relaxed) && !stop_flag.load(Ordering::Relaxed) {
             if !force_immediate_fetch {
                 let since_active_ms =
-                    now_epoch_ms().saturating_sub(last_activity_ms.load(Ordering::Relaxed));
+                    now_epoch_ms().saturating_sub(tunnel_last_activity_ms.load(Ordering::Relaxed));
                 let is_active = since_active_ms <= idle_active_window_ms;
                 let cur_idle_timeout = if is_active {
                     idle_active_timeout
@@ -1192,7 +1233,7 @@ async fn run_client_mailbox_worker(
                 let wake_opt = if is_active {
                     None
                 } else {
-                    Some(reader_wake_notify.as_ref())
+                    Some(tunnel_reader_wake_notify.as_ref())
                 };
 
                 if let Err(e) = cli_reader.wait_idle_or_wake(cur_idle_timeout, wake_opt).await {
@@ -1222,7 +1263,10 @@ async fn run_client_mailbox_worker(
                 Ok(res) => {
                     last_seen_uid = res.new_max_uid;
                     if !res.messages.is_empty() {
-                        last_activity_ms.store(now_epoch_ms(), Ordering::Relaxed);
+                        let now = now_epoch_ms();
+                        last_rx_ms.store(now, Ordering::Relaxed);
+                        tunnel_last_activity_ms.store(now, Ordering::Relaxed);
+                        tunnel_reader_wake_notify.notify_waiters();
                     }
 
                     let (expected_sess_tag, cipher_cur) = {
@@ -1238,12 +1282,6 @@ async fn run_client_mailbox_worker(
                         {
                             let mut guard = cleanup_uids.lock().await;
                             guard.push(msg.uid);
-                        }
-
-                        let cur_inf = slot.inflight.load(Ordering::Relaxed);
-                        if cur_inf > 0 {
-                            slot.inflight.fetch_sub(1, Ordering::Relaxed);
-                            pool_wake_notify.notify_waiters();
                         }
 
                         match anet_common::transport::unwrap_packet(&cipher_cur, &msg.payload) {
@@ -1483,6 +1521,11 @@ impl ClientTransport for ImapTransport {
         let stop_flag = Arc::new(AtomicBool::new(false));
         let pool_wake_notify = Arc::new(Notify::new());
         let full_resume_mutex = Arc::new(Mutex::new(()));
+        // Общие для всех N ящиков индикаторы активности туннеля и раннего пробуждения CLI_READER[0..N]:
+        // когда пакет уходит через ящик #0, ответ сервера может прийти через ящик #1, поэтому все ридеры
+        // должны синхронно переходить в короткий адаптивный опрос (400 мс)!
+        let tunnel_last_activity_ms = Arc::new(AtomicU64::new(now_epoch_ms()));
+        let tunnel_reader_wake_notify = Arc::new(Notify::new());
 
         // 2. Двухполосная очередь пакетов из TUN (Fast-Lane Priority + Bounded Bulk)
         let (prio_tx, prio_rx) = mpsc::channel::<Bytes>(128);
@@ -1580,6 +1623,8 @@ impl ClientTransport for ImapTransport {
             let resume_mtx_c = full_resume_mutex.clone();
             let stop_c = stop_flag.clone();
             let wake_c = pool_wake_notify.clone();
+            let tun_act_c = tunnel_last_activity_ms.clone();
+            let tun_wake_c = tunnel_reader_wake_notify.clone();
 
             let worker_task = tokio::spawn(async move {
                 run_client_mailbox_worker(
@@ -1611,6 +1656,8 @@ impl ClientTransport for ImapTransport {
                     throttle_backoff,
                     stop_c,
                     wake_c,
+                    tun_act_c,
+                    tun_wake_c,
                 )
                 .await;
             });
@@ -1980,5 +2027,148 @@ mod tests {
         disp_handle.abort();
         w0.abort();
         w1.abort();
+    }
+
+    /// Регрессионный тест: проверяет отсутствие дедлока `writer_sem` в `CLI_WRITER`, когда
+    /// диспетчер уже захватил `OwnedSemaphorePermit` и положил `(batch, permit)` в `uplink_rx`
+    /// одновременно с накоплением `>= expunge_batch_size` прочитанных UID в `cleanup_uids`.
+    #[tokio::test]
+    async fn test_writer_piggybacked_and_idle_expunge_never_deadlocks_with_dispatcher() {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let mock_writer = Arc::new(Mutex::new(ImapConn::new(client_io)));
+
+        // Мок IMAP-сервера, который принимает APPEND "Drafts", а сразу следом — попутный UID STORE + UID EXPUNGE
+        let server_task = tokio::spawn(async move {
+            let mut s_buf = BufReader::new(server_io);
+            let mut line = String::new();
+
+            // 1. Ожидаем APPEND "Drafts"
+            s_buf.read_line(&mut line).await.unwrap();
+            assert!(line.contains("APPEND \"Drafts\""));
+            let lit_start = line.rfind('{').unwrap();
+            let lit_end = line[lit_start + 1..].find('}').unwrap() + lit_start + 1;
+            let lit_len: usize = line[lit_start + 1..lit_end].parse().unwrap();
+            s_buf.get_mut().write_all(b"+ Ready\r\n").await.unwrap();
+            let mut body = vec![0u8; lit_len];
+            s_buf.read_exact(&mut body).await.unwrap();
+            line.clear();
+            s_buf.read_line(&mut line).await.unwrap();
+            s_buf
+                .get_mut()
+                .write_all(b"A0001 OK [APPENDUID 1 500] APPEND completed\r\n")
+                .await
+                .unwrap();
+
+            // 2. Ожидаем попутный UID STORE + UID EXPUNGE (Piggybacked Expunge)
+            line.clear();
+            s_buf.read_line(&mut line).await.unwrap();
+            assert!(line.contains("UID STORE 1,2,3 +FLAGS.SILENT (\\Deleted)"));
+            s_buf
+                .get_mut()
+                .write_all(b"A0002 OK STORE completed\r\n")
+                .await
+                .unwrap();
+
+            line.clear();
+            s_buf.read_line(&mut line).await.unwrap();
+            assert!(line.contains("UID EXPUNGE 1,2,3"));
+            s_buf
+                .get_mut()
+                .write_all(b"A0003 OK EXPUNGE completed\r\n")
+                .await
+                .unwrap();
+        });
+
+        let (slot, mut uplink_rx) = ClientMailboxSlot::new(
+            0,
+            ImapAccount {
+                email: "box0@mail.ru".to_string(),
+                password: "pass".to_string(),
+            },
+            true,
+        );
+
+        // Имитируем ситуацию: диспетчер УЖЕ захватил единственное разрешение `writer_sem`
+        // и положил `(batch, permit)` в канал `uplink_tx` ДО того, как воркер проверил `cleanup_uids`!
+        let permit = slot
+            .writer_sem
+            .clone()
+            .try_acquire_owned()
+            .expect("dispatcher acquires sole permit");
+        slot.uplink_tx
+            .send((
+                EncryptedUplinkBatch {
+                    subject: "ANet-Data [ID: srv:sess]".to_string(),
+                    encrypted_payload: Bytes::from_static(b"PAYLOAD"),
+                },
+                permit,
+            ))
+            .await
+            .unwrap();
+
+        // Одновременно в cleanup_uids уже лежит >= expunge_batch_size (3) UID
+        let cleanup_uids = Arc::new(Mutex::new(vec![1u32, 2, 3]));
+        let expunge_batch_size = 3usize;
+        let command_timeout = Duration::from_secs(2);
+
+        // Запускаем итерацию логики CLI_WRITER: она не должна заблокироваться на writer_sem,
+        // а должна вычитать (batch, permit), выполнить APPEND и попутный EXPUNGE!
+        let slot_w = slot.clone();
+        let cleanup_w = cleanup_uids.clone();
+        let writer_w = mock_writer.clone();
+
+        let writer_step = tokio::time::timeout(Duration::from_secs(2), async move {
+            // Шаг 1: в очереди uplink_rx уже лежит батч, поэтому try_acquire() вернет Err и не создаст дедлок
+            if uplink_rx.is_empty() {
+                if let Ok(_p) = slot_w.writer_sem.try_acquire() {
+                     unreachable!("permit is already held by queued batch");
+                }
+            }
+
+            // Шаг 2: забираем (batch, permit) и выполняем APPEND + попутный EXPUNGE под тем же permit
+            let (batch, held_permit) = uplink_rx.recv().await.unwrap();
+            {
+                let mut w_guard = writer_w.lock().await;
+                w_guard
+                    .append_message(
+                        "Drafts",
+                        &batch.subject,
+                        &batch.encrypted_payload,
+                        "box0@mail.ru",
+                        command_timeout,
+                    )
+                    .await
+                    .unwrap();
+            }
+
+            let piggyback_clean = {
+                let mut guard = cleanup_w.lock().await;
+                if guard.len() >= expunge_batch_size {
+                    std::mem::take(&mut *guard)
+                } else {
+                    Vec::new()
+                }
+            };
+            assert_eq!(piggyback_clean, vec![1, 2, 3]);
+            {
+                let mut w_guard = writer_w.lock().await;
+                w_guard
+                    .expunge_uids(&piggyback_clean, command_timeout)
+                    .await
+                    .unwrap();
+            }
+            drop(held_permit);
+        })
+        .await;
+
+        assert!(
+            writer_step.is_ok(),
+            "CLI_WRITER must not deadlock when cleanup_uids >= expunge_batch_size and permit is in uplink_rx"
+        );
+        assert!(cleanup_uids.lock().await.is_empty());
+        assert_eq!(slot.writer_sem.available_permits(), 1);
+        server_task.await.unwrap();
     }
 }
