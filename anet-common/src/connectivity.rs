@@ -291,6 +291,7 @@ pub struct ConnectivityProber {
 impl ConnectivityProber {
     pub fn new(config: ConnectivityConfig) -> Self {
         let timeout = Duration::from_millis(config.timeout_ms.clamp(500, 15_000));
+        let connect_timeout = Duration::from_millis((config.timeout_ms / 2).clamp(800, 1500));
         let mut tls_cfg = crate::boring_tls::get_default_tls_config();
         tls_cfg.verify_peer = false;
         let profile = BrowserProfile::with_tls_config(tls_cfg);
@@ -300,8 +301,9 @@ impl ConnectivityProber {
             .build_reqwest_builder(cookie_jar.clone())
             .and_then(|builder| {
                 Ok(builder
+                    .local_address(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
                     .timeout(timeout)
-                    .connect_timeout(timeout)
+                    .connect_timeout(connect_timeout)
                     .redirect(reqwest::redirect::Policy::none())
                     .pool_max_idle_per_host(1)
                     .pool_idle_timeout(Duration::from_secs(2))
@@ -413,43 +415,89 @@ async fn probe_single_target(
     None
 }
 
+async fn measure_url_tcp_1rtt(url: &str, max_wait: Duration) -> Option<u64> {
+    let uri: http::Uri = url.parse().ok()?;
+    let host = uri.host()?.to_string();
+    let is_https = uri
+        .scheme_str()
+        .map(|s| s.eq_ignore_ascii_case("https"))
+        .unwrap_or(true);
+    let port = uri.port_u16().unwrap_or(if is_https { 443 } else { 80 });
+
+    let addrs: Vec< std::net::SocketAddr> = tokio::time::timeout(
+        max_wait,
+        tokio::net::lookup_host((host.as_str(), port)),
+    )
+    .await
+    .ok()?
+    .ok()?
+    .filter(|a| a.is_ipv4())
+    .take(2)
+    .collect();
+
+    if addrs.is_empty() {
+        return None;
+    }
+
+    let mut futs = futures::stream::FuturesUnordered::new();
+    for addr in addrs {
+        for _ in 0..2 {
+            futs.push(async move {
+                let started = Instant::now();
+                match tokio::time::timeout(max_wait, tokio::net::TcpStream::connect(addr)).await {
+                    Ok(Ok(_stream)) => Some((started.elapsed().as_millis() as u64).max(1)),
+                    _ => None,
+                }
+            });
+        }
+    }
+    use futures::StreamExt;
+    while let Some(res) = futs.next().await {
+        if let Some(rtt) = res {
+            return Some(rtt);
+        }
+    }
+    None
+}
+
 async fn probe_url_once(
     client: &reqwest::Client,
     profile: &BrowserProfile,
     url: &str,
     timeout: Duration,
 ) -> Option<u64> {
-    let start = Instant::now();
-    let req = profile.apply_to_reqwest(client.get(url), None, None);
-    let resp = tokio::time::timeout(timeout, req.send()).await.ok()?.ok()?;
+    let tcp_1rtt_fut = measure_url_tcp_1rtt(url, Duration::from_millis(850));
+    let http_fut = async {
+        let total_ms = timeout.as_millis() as u64;
+        let first_budget = Duration::from_millis((total_ms * 3 / 5).clamp(900, 1800));
+        let second_budget = timeout
+            .checked_sub(first_budget)
+            .unwrap_or(Duration::from_millis(900))
+            .max(Duration::from_millis(800));
 
-    // Любой осмысленный HTTP-ответ от целевого сервера (2xx, 3xx, 401/403/404)
-    // подтверждает успешное прохождение DNS + TCP + TLS хендшейка.
-    let status = resp.status().as_u16();
-    let _ = tokio::time::timeout(Duration::from_millis(500), resp.bytes()).await;
-    if (100..600).contains(&status) {
-        let first_ms = (start.elapsed().as_millis() as u64).max(1);
-        // Если первый запрос шёл по холодному соединению (включал TCP + TLS хендшейк),
-        // сразу делаем короткий повторный запрос по уже прогретому keep-alive сокету,
-        // чтобы «Пульс канала» показывал чистый 1-RTT, а не сумму 3×RTT рукопожатий.
-        if first_ms > 90 {
-            let warm_started = Instant::now();
-            let warm_req = profile.apply_to_reqwest(client.get(url), None, None);
-            if let Ok(Ok(warm_resp)) =
-                tokio::time::timeout(Duration::from_millis(750), warm_req.send()).await
-            {
-                let warm_status = warm_resp.status().as_u16();
-                let _ = tokio::time::timeout(Duration::from_millis(400), warm_resp.bytes()).await;
-                if (100..600).contains(&warm_status) {
-                    let warm_ms = (warm_started.elapsed().as_millis() as u64).max(1);
-                    return Some(first_ms.min(warm_ms));
+        for attempt_timeout in [first_budget, second_budget] {
+            let start = Instant::now();
+            let req = profile.apply_to_reqwest(client.get(url), None, None);
+            if let Ok(Ok(resp)) = tokio::time::timeout(attempt_timeout, req.send()).await {
+                let status = resp.status().as_u16();
+                if (100..600).contains(&status) {
+                    // Замеряем время сразу по приходу заголовков ответа, НЕ ожидая скачивания
+                    // 200 КБ HTML-тела (ya.ru / vk.com / dzen.ru), чтобы не добавлять +500 мс к RTT!
+                    let first_ms = (start.elapsed().as_millis() as u64).max(1);
+                    drop(resp);
+                    return Some(first_ms);
                 }
             }
         }
-        Some(first_ms)
-    } else {
         None
-    }
+    };
+
+    let (tcp_1rtt_opt, http_ms_opt) = tokio::join!(tcp_1rtt_fut, http_fut);
+    let http_ms = http_ms_opt?;
+    Some(match tcp_1rtt_opt {
+        Some(tcp_ms) => http_ms.min(tcp_ms),
+        None => http_ms,
+    })
 }
 
 /// Одна точка замера скорости для построения сглаженного графика (sparkline) в карточке «СКОРОСТЬ / ТРАФИК».

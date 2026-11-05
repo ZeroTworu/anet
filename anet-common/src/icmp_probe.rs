@@ -1,8 +1,29 @@
 use bytes::Bytes;
 use std::net::Ipv4Addr;
 
-/// Уникальный идентификатор зонда ANet (ASCII "AN" = 0x414E)
+/// Уникальный идентификатор зонда ANet до шлюза (ASCII "AN" = 0x414E)
 pub const PROBE_IDENTIFIER: u16 = 0x414E;
+
+/// Идентификатор внутритуннельного ICMP-зонда глобальной связности (ASCII "AW" = 0x4157).
+/// Сервер не перехватывает его в userspace (т.к. ident != PROBE_IDENTIFIER), а маршрутизирует через NAT во внешний мир.
+pub const PROBE_WORLD_IDENTIFIER: u16 = 0x4157;
+
+/// Идентификатор внутритуннельного ICMP-зонда доступности РФ-узлов (ASCII "AD" = 0x4144).
+pub const PROBE_DOMESTIC_IDENTIFIER: u16 = 0x4144;
+
+/// Глобальные публичные IPv4-узлы для проверки выхода в мировой интернет сквозь туннель.
+pub const TUNNEL_WORLD_PROBE_IPS: [Ipv4Addr; 3] = [
+    Ipv4Addr::new(1, 1, 1, 1),
+    Ipv4Addr::new(8, 8, 8, 8),
+    Ipv4Addr::new(9, 9, 9, 9),
+];
+
+/// Российские публичные IPv4-узлы (Яндекс.DNS) для проверки связности с РФ сквозь туннель.
+pub const TUNNEL_DOMESTIC_PROBE_IPS: [Ipv4Addr; 3] = [
+    Ipv4Addr::new(77, 88, 8, 8),
+    Ipv4Addr::new(77, 88, 8, 1),
+    Ipv4Addr::new(87, 250, 250, 242),
+];
 
 /// Вычисление стандартной 16-битной контрольной суммы Интернета (RFC 1071).
 pub fn internet_checksum(buf: &[u8]) -> u16 {

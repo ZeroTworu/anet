@@ -846,6 +846,41 @@ impl AnetClient {
                         break;
                     }
 
+                    // Каждые 3 такта (и на самом первом такте после старта туннеля) отправляем
+                    // легковесные 36-байтные ICMP Echo Request сквозь туннель к публичным узлам
+                    // Мира (1.1.1.1, 8.8.8.8, 9.9.9.9) и РФ (77.88.8.8, 77.88.8.1, 87.250.250.242).
+                    // На Android (где сокеты процесса org.alco.anet исключены из tun0 через addDisallowedApplication)
+                    // это даёт честный индикатор работы маршрутизации и NAT на VPN-сервере (РФ 3/3 • Мир 3/3).
+                    if seq == 1 || seq % 3 == 0 {
+                        let round_seq = (seq / 3).wrapping_shl(2);
+                        for (idx, dst_ip) in anet_common::icmp_probe::TUNNEL_WORLD_PROBE_IPS
+                            .iter()
+                            .enumerate()
+                        {
+                            let world_pkt = build_ipv4_icmp_echo_request(
+                                client_ip,
+                                *dst_ip,
+                                anet_common::icmp_probe::PROBE_WORLD_IDENTIFIER,
+                                round_seq | ((idx as u16) & 0b11),
+                                probe_start_time.elapsed().as_micros() as u64,
+                            );
+                            let _ = tx_probe_c.try_send(world_pkt);
+                        }
+                        for (idx, dst_ip) in anet_common::icmp_probe::TUNNEL_DOMESTIC_PROBE_IPS
+                            .iter()
+                            .enumerate()
+                        {
+                            let dom_pkt = build_ipv4_icmp_echo_request(
+                                client_ip,
+                                *dst_ip,
+                                anet_common::icmp_probe::PROBE_DOMESTIC_IDENTIFIER,
+                                round_seq | ((idx as u16) & 0b11),
+                                probe_start_time.elapsed().as_micros() as u64,
+                            );
+                            let _ = tx_probe_c.try_send(dom_pkt);
+                        }
+                    }
+
                     tokio::select! {
                         _ = tokio::time::sleep(ping_interval) => {}
                         _ = probe_shutdown.notified() => break,
@@ -918,7 +953,21 @@ impl AnetClient {
                     return false;
                 }
 
-                match dns_interceptor_tx.handle_packet(pkt, |domain| rule_cache_tx.lookup_domain(domain)) {
+                // На Android VpnService не позволяет динамически добавлять /32 bypass-маршруты после поднятия tun0
+                // (AndroidRouteManager::add_bypass_routes — no-op), а под мобильными Белыми Списками попытка
+                // резолвить Direct-домены из rules.abc мимо туннеля вешает DNS и блокирует сайты вне БС.
+                let domain_lookup = |domain: &str| {
+                    let act = rule_cache_tx.lookup_domain(domain);
+                    if cfg!(target_os = "android")
+                        && matches!(act, Some(anet_filter_core::RuleAction::Direct))
+                    {
+                        Some(anet_filter_core::RuleAction::Proxy)
+                    } else {
+                        act
+                    }
+                };
+
+                match dns_interceptor_tx.handle_packet(pkt, domain_lookup) {
                     crate::dns_interceptor::InterceptResult::Handled(synth_reply) => {
                         let _ = tx_to_tun_dns.try_send(synth_reply);
                         return false;
@@ -1131,6 +1180,58 @@ impl AnetClient {
                                                 }
                                             }
                                         }
+
+                                        if let Some((seq_val, sent_ts_us)) = parse_ipv4_icmp_echo_reply(
+                                            &packet,
+                                            c_ip,
+                                            anet_common::icmp_probe::PROBE_WORLD_IDENTIFIER,
+                                        ) {
+                                            let sample_ms =
+                                                (batch_rx_us.saturating_sub(sent_ts_us) / 1000).max(1);
+                                            crate::connectivity_monitor::ConnectivityMonitor::record_tunnel_probe_reply(
+                                                true,
+                                                (seq_val & 0b11) as usize,
+                                                sample_ms,
+                                            );
+                                            match frame_reader.try_next_packet() {
+                                                Ok(next_opt) => {
+                                                    current_pkt = next_opt;
+                                                    continue;
+                                                }
+                                                Err(e) => {
+                                                    warn!("[Tunnel/Rx] Failed reading frame/packet from VPN stream: {e:#}");
+                                                    *reason_t2.lock().unwrap() = format!("Failed reading frame/packet from VPN stream: {e:#}");
+                                                    sig_t2.notify_one();
+                                                    break 'rx_loop;
+                                                }
+                                            }
+                                        }
+
+                                        if let Some((seq_val, sent_ts_us)) = parse_ipv4_icmp_echo_reply(
+                                            &packet,
+                                            c_ip,
+                                            anet_common::icmp_probe::PROBE_DOMESTIC_IDENTIFIER,
+                                        ) {
+                                            let sample_ms =
+                                                (batch_rx_us.saturating_sub(sent_ts_us) / 1000).max(1);
+                                            crate::connectivity_monitor::ConnectivityMonitor::record_tunnel_probe_reply(
+                                                false,
+                                                (seq_val & 0b11) as usize,
+                                                sample_ms,
+                                            );
+                                            match frame_reader.try_next_packet() {
+                                                Ok(next_opt) => {
+                                                    current_pkt = next_opt;
+                                                    continue;
+                                                }
+                                                Err(e) => {
+                                                    warn!("[Tunnel/Rx] Failed reading frame/packet from VPN stream: {e:#}");
+                                                    *reason_t2.lock().unwrap() = format!("Failed reading frame/packet from VPN stream: {e:#}");
+                                                    sig_t2.notify_one();
+                                                    break 'rx_loop;
+                                                }
+                                            }
+                                        }
                                     }
 
                                     let packet = anet_common::icmp_probe::clamp_tcp_mss_bytes(packet, client_clamp_mtu);
@@ -1140,9 +1241,10 @@ impl AnetClient {
 
                                     // Если из туннеля пришел DNS-ответ для Direct-домена, регистрируем bypass-маршруты асинхронно,
                                     // не блокируя горячий цикл приёма пакетов 'rx_loop
-                                    if let Some((qname, resolved_ips)) = dns_interceptor_rx
-                                        .inspect_dns_response(&packet, |domain| rule_cache_rx.lookup_domain(domain))
-                                    {
+                                    if !cfg!(target_os = "android") {
+                                        if let Some((qname, resolved_ips)) = dns_interceptor_rx
+                                            .inspect_dns_response(&packet, |domain| rule_cache_rx.lookup_domain(domain))
+                                        {
                                         if !resolved_ips.is_empty() {
                                             #[cfg(all(windows, feature = "per-app"))]
                                             if let Some(ref bp) = app_filter_bypass_t2 {
@@ -1168,6 +1270,7 @@ impl AnetClient {
                                                 guard.retain(|h| !h.is_finished());
                                                 guard.push(dns_rx_task.abort_handle());
                                             }
+                                        }
                                         }
                                     }
 

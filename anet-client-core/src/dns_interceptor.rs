@@ -302,22 +302,24 @@ impl DnsInterceptor {
         let socket = UdpSocket::bind("0.0.0.0:0").await.ok()?;
         let mut recv_buf = vec![0u8; 1500];
 
-        let mut received_len = None;
+        let mut sent_any = false;
         for upstream_ip in DIRECT_UPSTREAM_DNS_IPS {
             let upstream_addr = SocketAddr::new(IpAddr::V4(upstream_ip), 53);
-            if socket.send_to(dns_query_payload, upstream_addr).await.is_err() {
-                continue;
-            }
-            if let Ok(Ok((n, _))) =
-                tokio::time::timeout(Duration::from_millis(1200), socket.recv_from(&mut recv_buf))
-                    .await
-            {
-                received_len = Some(n);
-                break;
+            if socket.send_to(dns_query_payload, upstream_addr).await.is_ok() {
+                sent_any = true;
             }
         }
+        if !sent_any {
+            return None;
+        }
 
-        let n = received_len?;
+        let (n, _) = tokio::time::timeout(
+            Duration::from_millis(650),
+            socket.recv_from(&mut recv_buf),
+        )
+        .await
+        .ok()?
+        .ok()?;
         let dns_resp = &recv_buf[..n];
         let (resolved_ips, min_ttl) = parse_dns_answers_ips_and_ttl(dns_resp);
 

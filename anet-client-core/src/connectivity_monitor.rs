@@ -265,10 +265,20 @@ impl NodeProbeMonitor {
     }
 }
 
+const TUNNEL_PROBE_FRESHNESS_MS: u64 = 15_000;
+
+#[derive(Clone, Copy, Default)]
+struct TunnelProbeSlot {
+    last_ok_instant: Option<std::time::Instant>,
+    rtt_ms: Option<u64>,
+}
+
 pub struct ConnectivityMonitor {
     config: Mutex<ConnectivityConfig>,
     vpn_connected: AtomicBool,
     tunnel_rtt_ms: AtomicU64,
+    tunnel_world_slots: Mutex<[TunnelProbeSlot; 3]>,
+    tunnel_domestic_slots: Mutex<[TunnelProbeSlot; 3]>,
     last_snapshot: Mutex<Option<ConnectivitySnapshot>>,
     wake_notify: Notify,
     task_running: AtomicBool,
@@ -283,6 +293,8 @@ impl ConnectivityMonitor {
             config: Mutex::new(config),
             vpn_connected: AtomicBool::new(false),
             tunnel_rtt_ms: AtomicU64::new(NO_RTT_MARKER),
+            tunnel_world_slots: Mutex::new([TunnelProbeSlot::default(); 3]),
+            tunnel_domestic_slots: Mutex::new([TunnelProbeSlot::default(); 3]),
             last_snapshot: Mutex::new(None),
             wake_notify: Notify::new(),
             task_running: AtomicBool::new(false),
@@ -368,6 +380,8 @@ impl ConnectivityMonitor {
         let prev = monitor.vpn_connected.swap(connected, Ordering::SeqCst);
         if !connected {
             monitor.tunnel_rtt_ms.store(NO_RTT_MARKER, Ordering::Relaxed);
+            *monitor.tunnel_world_slots.lock().unwrap() = [TunnelProbeSlot::default(); 3];
+            *monitor.tunnel_domestic_slots.lock().unwrap() = [TunnelProbeSlot::default(); 3];
         }
         if prev != connected {
             let updated_opt = {
@@ -387,6 +401,110 @@ impl ConnectivityMonitor {
             }
             monitor.wake_notify.notify_one();
         }
+    }
+
+    /// Фиксирует ответ на внутритуннельный ICMP-зонд до глобальных (`is_world = true`) или российских (`is_world = false`) узлов.
+    /// Критично для Android (`addDisallowedApplication(packageName)`), где сокеты `reqwest` внутри процесса ANet
+    /// идут мимо `tun0` по физической SIM-карте и под Белыми Списками видят 0/3.
+    pub fn record_tunnel_probe_reply(is_world: bool, slot_idx: usize, rtt_ms: u64) {
+        let monitor = Self::global();
+        if !monitor.vpn_connected.load(Ordering::Relaxed) {
+            return;
+        }
+        let idx = slot_idx % 3;
+        let now = std::time::Instant::now();
+        if is_world {
+            let mut slots = monitor.tunnel_world_slots.lock().unwrap();
+            slots[idx] = TunnelProbeSlot {
+                last_ok_instant: Some(now),
+                rtt_ms: Some(rtt_ms.max(1)),
+            };
+        } else {
+            let mut slots = monitor.tunnel_domestic_slots.lock().unwrap();
+            slots[idx] = TunnelProbeSlot {
+                last_ok_instant: Some(now),
+                rtt_ms: Some(rtt_ms.max(1)),
+            };
+        }
+
+        let (world_ok, world_rtt) = monitor.fresh_tunnel_probe_stats(true);
+        let (dom_ok, dom_rtt) = monitor.fresh_tunnel_probe_stats(false);
+        let tunnel_rtt = monitor.current_tunnel_rtt();
+        let (global_total, domestic_total) = {
+            let cfg = monitor.config.lock().unwrap();
+            (cfg.global_targets.len().max(1), cfg.domestic_targets.len().max(1))
+        };
+
+        let updated_opt = {
+            let mut guard = monitor.last_snapshot.lock().unwrap();
+            if let Some(ref current) = *guard {
+                let merged_global_ok = current.global_ok.max(world_ok).min(global_total);
+                let merged_dom_ok = current.domestic_ok.max(dom_ok).min(domestic_total);
+                let merged_global_rtt = match (current.global_rtt_ms, world_rtt) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (Some(a), None) => Some(a),
+                    (None, Some(b)) => Some(b),
+                    (None, None) => None,
+                };
+                let merged_dom_rtt = match (current.domestic_rtt_ms, dom_rtt) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (Some(a), None) => Some(a),
+                    (None, Some(b)) => Some(b),
+                    (None, None) => None,
+                };
+                let updated = ConnectivitySnapshot::evaluate(
+                    true,
+                    tunnel_rtt.or(current.tunnel_rtt_ms),
+                    anet_common::connectivity::ProbeGroupResult {
+                        ok_count: merged_global_ok,
+                        total_count: global_total,
+                        min_rtt_ms: merged_global_rtt,
+                    },
+                    anet_common::connectivity::ProbeGroupResult {
+                        ok_count: merged_dom_ok,
+                        total_count: domestic_total,
+                        min_rtt_ms: merged_dom_rtt,
+                    },
+                );
+                let changed = updated.condition != current.condition
+                    || updated.pulse_color != current.pulse_color
+                    || updated.global_ok != current.global_ok
+                    || updated.domestic_ok != current.domestic_ok;
+                *guard = Some(updated.clone());
+                if changed {
+                    Some(updated)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+        if let Some(updated) = updated_opt {
+            emit(AnetEvent::ConnectivityUpdated(updated));
+        }
+    }
+
+    fn fresh_tunnel_probe_stats(&self, is_world: bool) -> (usize, Option<u64>) {
+        let slots = if is_world {
+            *self.tunnel_world_slots.lock().unwrap()
+        } else {
+            *self.tunnel_domestic_slots.lock().unwrap()
+        };
+        let now = std::time::Instant::now();
+        let mut ok_count = 0usize;
+        let mut min_rtt: Option<u64> = None;
+        for slot in slots {
+            if let Some(ts) = slot.last_ok_instant {
+                if now.duration_since(ts).as_millis() as u64 <= TUNNEL_PROBE_FRESHNESS_MS {
+                    ok_count += 1;
+                    if let Some(r) = slot.rtt_ms {
+                        min_rtt = Some(min_rtt.map_or(r, |prev| prev.min(r)));
+                    }
+                }
+            }
+        }
+        (ok_count, min_rtt)
     }
 
     /// Обновляет замер внутритуннельного ICMP RTT (вызывается раз в 1–2 с при активном туннеле)
@@ -557,7 +675,40 @@ impl ConnectivityMonitor {
             } else {
                 None
             };
-            let final_snapshot = if vpn_now != vpn_on || tunnel_rtt_now != tunnel_rtt {
+            let final_snapshot = if vpn_now {
+                let (world_ok, world_rtt) = self.fresh_tunnel_probe_stats(true);
+                let (dom_ok, dom_rtt) = self.fresh_tunnel_probe_stats(false);
+                let global_total = cfg.global_targets.len().max(1);
+                let domestic_total = cfg.domestic_targets.len().max(1);
+                let merged_global_ok = snapshot.global_ok.max(world_ok).min(global_total);
+                let merged_dom_ok = snapshot.domestic_ok.max(dom_ok).min(domestic_total);
+                let merged_global_rtt = match (snapshot.global_rtt_ms, world_rtt) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (Some(a), None) => Some(a),
+                    (None, Some(b)) => Some(b),
+                    (None, None) => None,
+                };
+                let merged_dom_rtt = match (snapshot.domestic_rtt_ms, dom_rtt) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (Some(a), None) => Some(a),
+                    (None, Some(b)) => Some(b),
+                    (None, None) => None,
+                };
+                ConnectivitySnapshot::evaluate(
+                    true,
+                    tunnel_rtt_now,
+                    anet_common::connectivity::ProbeGroupResult {
+                        ok_count: merged_global_ok,
+                        total_count: global_total,
+                        min_rtt_ms: merged_global_rtt,
+                    },
+                    anet_common::connectivity::ProbeGroupResult {
+                        ok_count: merged_dom_ok,
+                        total_count: domestic_total,
+                        min_rtt_ms: merged_dom_rtt,
+                    },
+                )
+            } else if vpn_now != vpn_on || tunnel_rtt_now != tunnel_rtt {
                 snapshot.with_updated_tunnel_rtt(vpn_now, tunnel_rtt_now)
             } else {
                 snapshot

@@ -486,22 +486,57 @@ async fn resolve_socket_addr(host_port: &str) -> Result<SocketAddr> {
     if let Ok(addr) = normalized.parse::<SocketAddr>() {
         return Ok(addr);
     }
-    let mut addrs = lookup_host(normalized)
+    let addrs: Vec<SocketAddr> = lookup_host(normalized)
         .await
-        .with_context(|| format!("DNS lookup failed for {}", normalized))?;
+        .with_context(|| format!("DNS lookup failed for {}", normalized))?
+        .collect();
     addrs
-        .next()
+        .iter()
+        .copied()
+        .find(|a| a.is_ipv4())
+        .or_else(|| addrs.into_iter().next())
         .ok_or_else(|| anyhow!("No addresses resolved for {}", normalized))
 }
 
 async fn measure_tcp_connect_rtt(host_port: &str, max_wait: Duration) -> Option<u32> {
-    let addr = timeout(max_wait, resolve_socket_addr(host_port)).await.ok()?.ok()?;
-    let started = Instant::now();
-    let rtt = {
-        let _stream = timeout(max_wait, TcpStream::connect(addr)).await.ok()?.ok()?;
-        started.elapsed().as_millis().max(1) as u32
+    let normalized = host_port.trim();
+    let addrs: Vec<SocketAddr> = if let Ok(addr) = normalized.parse::<SocketAddr>() {
+        vec![addr]
+    } else {
+        let resolved: Vec<SocketAddr> = timeout(max_wait, lookup_host(normalized))
+            .await
+            .ok()?
+            .ok()?
+            .collect();
+        let v4: Vec<SocketAddr> = resolved.iter().copied().filter(|a| a.is_ipv4()).take(2).collect();
+        if !v4.is_empty() {
+            v4
+        } else {
+            resolved.into_iter().take(2).collect()
+        }
     };
-    Some(rtt)
+    if addrs.is_empty() {
+        return None;
+    }
+
+    let mut futs = FuturesUnordered::new();
+    for addr in addrs {
+        for _ in 0..2 {
+            futs.push(async move {
+                let started = Instant::now();
+                match timeout(max_wait, TcpStream::connect(addr)).await {
+                    Ok(Ok(_stream)) => Some(started.elapsed().as_millis().max(1) as u32),
+                    _ => None,
+                }
+            });
+        }
+    }
+    while let Some(res) = futs.next().await {
+        if let Some(rtt) = res {
+            return Some(rtt);
+        }
+    }
+    None
 }
 
 async fn measure_host_pure_rtt(addr: SocketAddr, max_wait: Duration) -> Option<u32> {
@@ -1015,36 +1050,90 @@ async fn probe_wrtc(target: &ProbeTarget, timeout_dur: Duration) -> Result<(u32,
     tls_cfg.verify_peer = false;
     let profile = BrowserProfile::with_tls_config(tls_cfg);
 
-    let mut wrtc_cfg = WrtcConfig::default();
-    let secs = (timeout_dur.as_secs()).max(2);
-    wrtc_cfg.http_connect_timeout_secs = secs;
-    wrtc_cfg.http_request_timeout_secs = secs;
-
-    let ktalk = KtalkClient::new(profile, &wrtc_cfg)?;
-    let secret = KtalkClient::generate_anonymous_secret();
     let host_port = format!("{}:443", domain);
+    let room_url = format!("https://{}/{}", domain, room_short_name);
+    let origin = format!("https://{}", domain);
+
+    let http_client = profile
+        .build_reqwest_builder(profile.cookie_jar.clone())?
+        .local_address(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
+        .connect_timeout(Duration::from_millis(1000))
+        .timeout(timeout_dur)
+        .pool_max_idle_per_host(2)
+        .no_proxy()
+        .build()?;
 
     let fut = async {
-        // Сначала измеряем чистый 1-RTT TCP SYN->SYN-ACK до шлюза сигналинга без конкуренции с TLS
-        let tcp_rtt_opt = measure_tcp_connect_rtt(&host_port, Duration::from_millis(900)).await;
+        // Параллельно измеряем чистый 1-RTT TCP SYN->SYN-ACK и L7 HTTPS доступность страницы комнаты
+        // (как `curl https://ycs3y048.ktalk.ru/<room>`), не создавая фантомных гостей через /api/authorize/session
+        let tcp_fut = measure_tcp_connect_rtt(&host_port, Duration::from_millis(1100));
+        let https_fut = async {
+            let mut last_err = None;
+            for _attempt in 0..3 {
+                let full_started = Instant::now();
+                let req = profile.apply_to_reqwest(
+                    http_client.get(&room_url),
+                    Some(&origin),
+                    Some(&room_url),
+                );
+                match timeout(Duration::from_millis(1200), req.send()).await {
+                    Ok(Ok(resp)) => {
+                        let status = resp.status();
+                        if status.is_success() || status.is_redirection() {
+                            let full_rtt = full_started.elapsed().as_millis().max(1) as u32;
+                            drop(resp);
 
-        let full_started = Instant::now();
-        let session = ktalk
-            .authorize_session(&domain, &room_short_name, None, &secret)
-            .await?;
+                            let warm_started = Instant::now();
+                            let warm_req = profile.apply_to_reqwest(
+                                http_client.head(&room_url),
+                                Some(&origin),
+                                Some(&room_url),
+                            );
+                            let warm_rtt = match timeout(Duration::from_millis(650), warm_req.send()).await {
+                                Ok(Ok(w_resp)) if w_resp.status().as_u16() < 500 => {
+                                    (warm_started.elapsed().as_millis().max(1) as u32).min(full_rtt)
+                                }
+                                _ => full_rtt,
+                            };
+                            return Ok::<(u32, u32), anyhow::Error>((warm_rtt, full_rtt));
+                        }
+                        last_err = Some(anyhow!("WRTC room HTTP status {}", status));
+                    }
+                    Ok(Err(e)) => {
+                        last_err = Some(anyhow::Error::from(e));
+                    }
+                    Err(_) => {
+                        last_err = Some(anyhow!("WRTC HTTPS connect attempt timed out"));
+                    }
+                }
+            }
 
-        // Соединение в пуле ktalk.http уже установлено (TCP + TLS прогреты) — замеряем одиночный запрос
-        let warm_started = Instant::now();
-        let room = ktalk
-            .resolve_room(&domain, &room_short_name, &session.token)
-            .await?;
-        let warm_rtt = warm_started.elapsed().as_millis().max(1) as u32;
-        let full_rtt = full_started.elapsed().as_millis().max(1) as u32;
+            // Fallback на Ktalk API, если веб-страница комнаты закрыта редиректом/403
+            let mut wrtc_cfg = WrtcConfig::default();
+            let secs = (timeout_dur.as_secs()).max(2);
+            wrtc_cfg.http_connect_timeout_secs = secs;
+            wrtc_cfg.http_request_timeout_secs = secs;
+            let ktalk = KtalkClient::new(profile.clone(), &wrtc_cfg)?;
+            let secret = KtalkClient::generate_anonymous_secret();
+            let full_started = Instant::now();
+            let session = ktalk
+                .authorize_session(&domain, &room_short_name, None, &secret)
+                .await
+                .or_else(|e| Err(last_err.unwrap_or(e)))?;
+            let warm_started = Instant::now();
+            let room = ktalk
+                .resolve_room(&domain, &room_short_name, &session.token)
+                .await?;
+            if room.conference_id.is_empty() {
+                return Err(anyhow!("Empty Ktalk conferenceId"));
+            }
+            let warm_rtt = warm_started.elapsed().as_millis().max(1) as u32;
+            let full_rtt = full_started.elapsed().as_millis().max(1) as u32;
+            Ok((warm_rtt, full_rtt))
+        };
 
-        if room.conference_id.is_empty() {
-            return Err(anyhow!("Empty Ktalk conferenceId"));
-        }
-
+        let (tcp_rtt_opt, https_res) = tokio::join!(tcp_fut, https_fut);
+        let (warm_rtt, full_rtt) = https_res?;
         let pure_rtt = match tcp_rtt_opt {
             Some(tcp_ms) => warm_rtt.min(tcp_ms),
             None => warm_rtt,
@@ -1174,7 +1263,40 @@ where
     let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_NODE_PROBES));
     let mut futures = FuturesUnordered::new();
 
+    // Дедуплицируем идентичные физические точки (например, 3 профиля WRTC VIDEO / WS / P2P,
+    // смотрящие на одну и ту же комнату ycs3y048.ktalk.ru/<room>), чтобы не устраивать
+    // параллельный self-DDoS из 3–6 одновременных сессий в один шлюз по мобильной сети.
+    let mut dedup_map: HashMap<(ProbeProtocol, String, String, String), Vec<usize>> =
+        HashMap::new();
+    let mut unique_targets: Vec<(ProbeTarget, Vec<usize>)> = Vec::new();
     for (pos, target) in targets.iter().cloned().enumerate() {
+        let key = (
+            target.protocol,
+            target.dsn.trim().to_ascii_lowercase(),
+            target.host_port.trim().to_ascii_lowercase(),
+            target.server_pub_key.trim().to_string(),
+        );
+        if let Some(indices) = dedup_map.get_mut(&key) {
+            indices.push(pos);
+        } else {
+            dedup_map.insert(key, vec![pos]);
+        }
+    }
+    for (pos, target) in targets.iter().cloned().enumerate() {
+        let key = (
+            target.protocol,
+            target.dsn.trim().to_ascii_lowercase(),
+            target.host_port.trim().to_ascii_lowercase(),
+            target.server_pub_key.trim().to_string(),
+        );
+        if let Some(positions) = dedup_map.remove(&key) {
+            unique_targets.push((target, positions));
+        } else {
+            let _ = pos;
+        }
+    }
+
+    for (target, positions) in unique_targets {
         let sem = semaphore.clone();
         futures.push(async move {
             let mut res = {
@@ -1189,17 +1311,30 @@ where
                     res = retry_res;
                 }
             }
-            (pos, res)
+            (positions, res)
         });
     }
 
     let mut completed_endpoints = 0usize;
-    while let Some((pos, res)) = futures.next().await {
+    while let Some((positions, res)) = futures.next().await {
         {
-            if pos < current_endpoints.len() {
-                current_endpoints[pos] = res;
+            for pos in positions {
+                if pos < current_endpoints.len() {
+                    let t = &targets[pos];
+                    current_endpoints[pos] = EndpointProbeResult {
+                        endpoint_index: t.endpoint_index,
+                        group_id: t.group_id.clone(),
+                        group_name: t.group_name.clone(),
+                        server_name: t.server_name.clone(),
+                        protocol: t.protocol,
+                        status: res.status,
+                        rtt_ms: res.rtt_ms,
+                        full_rtt_ms: res.full_rtt_ms,
+                        detail: res.detail.clone(),
+                    };
+                    completed_endpoints += 1;
+                }
             }
-            completed_endpoints += 1;
             let now_ms = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
