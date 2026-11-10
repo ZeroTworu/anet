@@ -1021,7 +1021,7 @@ async fn probe_wrtc(target: &ProbeTarget, timeout_dur: Duration) -> Result<(u32,
     wrtc_cfg.http_request_timeout_secs = secs;
 
     let host_port = format!("{}:443", domain);
-    let is_ktalk = crate::wrtc::provider::WrtcProviderRegistry::is_ktalk_domain(&domain);
+    let is_ktalk = crate::wrtc::providers::WrtcProviderRegistry::is_ktalk_domain(&domain);
 
     let fut = async {
         if is_ktalk {
