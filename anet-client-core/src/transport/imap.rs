@@ -275,18 +275,13 @@ pub async fn run_client_uplink_dispatcher(
             continue;
         }
 
-        // Выгребаем доступные пакеты (сначала приоритетные Fast-Lane, затем bulk)
-        while batcher.current_bytes() < max_batch_bytes {
-            match prio_rx.try_recv() {
-                Ok(pkt) => batcher.push_priority(pkt),
-                Err(_) => break,
-            }
+        // Выгребаем ВСЕ доступные пакеты из каналов (сначала приоритетные Fast-Lane, затем bulk с Head-Drop AQM внутри батчера),
+        // чтобы tun_reader_task и задача t1 никогда не блокировались на переполнении буферов.
+        while let Ok(pkt) = prio_rx.try_recv() {
+            batcher.push_priority(pkt);
         }
-        while batcher.current_bytes() < max_batch_bytes {
-            match bulk_rx.try_recv() {
-                Ok(pkt) => batcher.push_bulk(pkt),
-                Err(_) => break,
-            }
+        while let Ok(pkt) = bulk_rx.try_recv() {
+            batcher.push_bulk(pkt);
         }
 
         // Если батчер пуст — ждём первый пакет (или возврат батча из retry_uplink_rx)
@@ -330,11 +325,11 @@ pub async fn run_client_uplink_dispatcher(
         if !batcher.should_flush() && coalesce_ms > 0 {
             let coalesce_deadline = Instant::now() + Duration::from_millis(coalesce_ms);
             loop {
-                while batcher.current_bytes() < max_batch_bytes {
-                    match prio_rx.try_recv() {
-                        Ok(pkt) => batcher.push_priority(pkt),
-                        Err(_) => break,
-                    }
+                while let Ok(pkt) = prio_rx.try_recv() {
+                    batcher.push_priority(pkt);
+                }
+                while let Ok(pkt) = bulk_rx.try_recv() {
+                    batcher.push_bulk(pkt);
                 }
                 if batcher.should_flush() {
                     break;
@@ -364,17 +359,43 @@ pub async fn run_client_uplink_dispatcher(
             }
         }
 
-        // Ждём освобождения первого доступного здорового ящика по алгоритму Self-Clocking Round-Robin.
-        // Пока все N ящиков заняты выполнением APPEND в сети, новые пакеты продолжают копиться в prio_rx / bulk_rx!
-        let Some((slot_idx, permit)) = acquire_client_slot_self_clocking(
-            &slots,
-            &mut rr_cursor,
-            max_inflight_batches,
-            &stop_flag,
-            &pool_wake_notify,
-        )
-        .await
-        else {
+        // Ждём освобождения первого доступного здорового ящика по алгоритму Self-Clocking Round-Robin,
+        // непрерывно выгребая новые пакеты из prio_rx и bulk_rx в batcher (с Head-Drop AQM для bulk),
+        // чтобы каналы TUN никогда не переполнялись и не задерживали приоритетный трафик.
+        let slot_permit_opt = {
+            let acquire_fut = acquire_client_slot_self_clocking(
+                &slots,
+                &mut rr_cursor,
+                max_inflight_batches,
+                &stop_flag,
+                &pool_wake_notify,
+            );
+            tokio::pin!(acquire_fut);
+
+            loop {
+                tokio::select! {
+                    biased;
+                    res = &mut acquire_fut => break res,
+                    Some(pkt) = prio_rx.recv() => {
+                        batcher.push_priority(pkt);
+                        while let Ok(more) = prio_rx.try_recv() {
+                            batcher.push_priority(more);
+                        }
+                    }
+                    Some(pkt) = bulk_rx.recv() => {
+                        batcher.push_bulk(pkt);
+                        while let Ok(more) = prio_rx.try_recv() {
+                            batcher.push_priority(more);
+                        }
+                        while let Ok(more) = bulk_rx.try_recv() {
+                            batcher.push_bulk(more);
+                        }
+                    }
+                }
+            }
+        };
+
+        let Some((slot_idx, permit)) = slot_permit_opt else {
             break;
         };
 
@@ -385,18 +406,13 @@ pub async fn run_client_uplink_dispatcher(
             continue;
         }
 
-        // Добираем ВСЕ накопившиеся за время ожидания пакеты (приоритетные ICMP/DNS/ACK всегда встают в начало батча)
-        while batcher.current_bytes() < max_batch_bytes {
-            match prio_rx.try_recv() {
-                Ok(pkt) => batcher.push_priority(pkt),
-                Err(_) => break,
-            }
+        // Добираем ВСЕ накопившиеся к моменту пробуждения пакеты (приоритетные ICMP/DNS/ACK всегда встают в начало батча,
+        // а избыток bulk-трафика свыше окна BDP автоматически регулируется Head-Drop AQM внутри батчера).
+        while let Ok(pkt) = prio_rx.try_recv() {
+            batcher.push_priority(pkt);
         }
-        while batcher.current_bytes() < max_batch_bytes {
-            match bulk_rx.try_recv() {
-                Ok(pkt) => batcher.push_bulk(pkt),
-                Err(_) => break,
-            }
+        while let Ok(pkt) = bulk_rx.try_recv() {
+            batcher.push_bulk(pkt);
         }
 
         if let Some(raw_batch) = batcher.flush() {
@@ -1072,52 +1088,8 @@ async fn run_client_mailbox_worker(
             while !worker_stop_for_writer.load(Ordering::Relaxed)
                 && !global_stop_for_writer.load(Ordering::Relaxed)
             {
-                // 1. Ленивая пакетная очистка в паузах (строго неблокирующий try_acquire, чтобы исключить
-                //    дедлок, когда диспетчер уже захватил writer_sem и положил (batch, permit) в uplink_rx!)
-                if uplink_rx_guard.is_empty() {
-                    if let Ok(expunge_permit) = slot_for_writer.writer_sem.try_acquire() {
-                        let to_clean = {
-                            let mut guard = cleanup_for_writer.lock().await;
-                            let force_clean = guard.len() >= expunge_batch_size;
-                            let since_rx_ms = now_epoch_ms()
-                                .saturating_sub(last_rx_for_writer.load(Ordering::Relaxed));
-                            let idle_clean =
-                                !guard.is_empty() && since_rx_ms >= expunge_idle_delay_ms;
-                            if force_clean || idle_clean {
-                                std::mem::take(&mut *guard)
-                            } else {
-                                Vec::new()
-                            }
-                        };
-
-                        if !to_clean.is_empty() {
-                            let mut w_guard = writer_for_task.lock().await;
-                            if let Err(e) = w_guard.expunge_uids(&to_clean, command_timeout).await {
-                                debug!(
-                                    "[IMAP Uplink][Box #{} ({})] UID EXPUNGE in Notes failed: {e}",
-                                    idx, email_for_writer
-                                );
-                                drop(expunge_permit);
-                                worker_stop_for_writer.store(true, Ordering::SeqCst);
-                                break;
-                            } else {
-                                last_rx_for_writer.store(now_epoch_ms(), Ordering::Relaxed);
-                                debug!(
-                                    "[IMAP Uplink][Box #{} ({})] Cleaned up {} UIDs in Notes",
-                                    idx,
-                                    email_for_writer,
-                                    to_clean.len()
-                                );
-                                drop(expunge_permit);
-                                pool_wake_for_writer.notify_waiters();
-                            }
-                        } else {
-                            drop(expunge_permit);
-                        }
-                    }
-                }
-
-                // 2. Ожидаем следующий батч от центрального диспетчера
+                // 1. Сначала ожидаем следующий батч от центрального диспетчера (чтобы не перехватывать
+                //    writer_sem на микросекундном стыке между drop(permit) и пробуждением диспетчера!).
                 let next_item = tokio::select! {
                     biased;
                     item = uplink_rx_guard.recv() => item,
@@ -1125,6 +1097,54 @@ async fn run_client_mailbox_worker(
                 };
 
                 let Some((batch, permit)) = next_item else {
+                    // 2. Ленивая пакетная очистка строго в реальных паузах (когда очередь пуста >= 40 мс
+                    //    и весь туннель неактивен >= expunge_idle_delay_ms, либо накопился полный батч).
+                    if uplink_rx_guard.is_empty() {
+                        if let Ok(expunge_permit) = slot_for_writer.writer_sem.try_acquire() {
+                            let to_clean = {
+                                let mut guard = cleanup_for_writer.lock().await;
+                                let force_clean = guard.len() >= expunge_batch_size;
+                                let last_act = last_rx_for_writer
+                                    .load(Ordering::Relaxed)
+                                    .max(tunnel_act_for_writer.load(Ordering::Relaxed));
+                                let since_act_ms = now_epoch_ms().saturating_sub(last_act);
+                                let idle_clean =
+                                    !guard.is_empty() && since_act_ms >= expunge_idle_delay_ms;
+                                if force_clean || idle_clean {
+                                    std::mem::take(&mut *guard)
+                                } else {
+                                    Vec::new()
+                                }
+                            };
+
+                            if !to_clean.is_empty() {
+                                let mut w_guard = writer_for_task.lock().await;
+                                if let Err(e) =
+                                    w_guard.expunge_uids(&to_clean, command_timeout).await
+                                {
+                                    debug!(
+                                        "[IMAP Uplink][Box #{} ({})] UID EXPUNGE in Notes failed: {e}",
+                                        idx, email_for_writer
+                                    );
+                                    drop(expunge_permit);
+                                    worker_stop_for_writer.store(true, Ordering::SeqCst);
+                                    break;
+                                } else {
+                                    last_rx_for_writer.store(now_epoch_ms(), Ordering::Relaxed);
+                                    debug!(
+                                        "[IMAP Uplink][Box #{} ({})] Cleaned up {} UIDs in Notes",
+                                        idx,
+                                        email_for_writer,
+                                        to_clean.len()
+                                    );
+                                    drop(expunge_permit);
+                                    pool_wake_for_writer.notify_waiters();
+                                }
+                            } else {
+                                drop(expunge_permit);
+                            }
+                        }
+                    }
                     continue;
                 };
 
@@ -1150,6 +1170,14 @@ async fn run_client_mailbox_worker(
                     Ok(lat) => {
                         tunnel_act_for_writer.store(now_epoch_ms(), Ordering::Relaxed);
                         tunnel_wake_for_writer.notify_waiters();
+                        if crate::connectivity_monitor::ConnectivityMonitor::get_tunnel_rtt_ms()
+                            .is_none()
+                        {
+                            let est_rtt = (lat.as_millis() as u64).clamp(1, 30_000);
+                            crate::connectivity_monitor::ConnectivityMonitor::update_tunnel_rtt_ms(
+                                Some(est_rtt),
+                            );
+                        }
                         debug!(
                             "[IMAP Uplink][Box #{} ({})] APPEND Drafts OK in {:.1} ms ({} B)",
                             idx,
@@ -1221,10 +1249,12 @@ async fn run_client_mailbox_worker(
 
         // Цикл CLI_READER[i]: Adaptive Short-IDLE + Greedy Fetch Drain "Notes" -> unpack_batch -> downlink_tun_tx
         while !worker_stop.load(Ordering::Relaxed) && !stop_flag.load(Ordering::Relaxed) {
+            let since_active_ms =
+                now_epoch_ms().saturating_sub(tunnel_last_activity_ms.load(Ordering::Relaxed));
+            let is_active = since_active_ms <= idle_active_window_ms;
+            let mut got_event = true;
+
             if !force_immediate_fetch {
-                let since_active_ms =
-                    now_epoch_ms().saturating_sub(tunnel_last_activity_ms.load(Ordering::Relaxed));
-                let is_active = since_active_ms <= idle_active_window_ms;
                 let cur_idle_timeout = if is_active {
                     idle_active_timeout
                 } else {
@@ -1236,19 +1266,46 @@ async fn run_client_mailbox_worker(
                     Some(tunnel_reader_wake_notify.as_ref())
                 };
 
-                if let Err(e) = cli_reader.wait_idle_or_wake(cur_idle_timeout, wake_opt).await {
-                    warn!(
-                        "[IMAP Downlink][Box #{} ({})] wait_idle_or_wake error: {e:#}",
-                        idx, email
-                    );
-                    worker_stop.store(true, Ordering::SeqCst);
-                    break;
+                match cli_reader.wait_idle_or_wake(cur_idle_timeout, wake_opt).await {
+                    Ok(ev) => got_event = ev,
+                    Err(e) => {
+                        warn!(
+                            "[IMAP Downlink][Box #{} ({})] wait_idle_or_wake error: {e:#}",
+                            idx, email
+                        );
+                        worker_stop.store(true, Ordering::SeqCst);
+                        break;
+                    }
                 }
             }
+            let was_forced = force_immediate_fetch;
             force_immediate_fetch = false;
 
             if worker_stop.load(Ordering::Relaxed) || stop_flag.load(Ordering::Relaxed) {
                 break;
+            }
+
+            // Защита от холостого повторного скачивания 175 КБ тела last_seen_uid по RFC 3501 (`UID FETCH <last+1>:*`):
+            // если выход из IDLE произошел по тайм-ауту без `* <N> EXISTS`, сначала проверяем легковесный `UID FETCH * (UID)` (40 байт).
+            if !was_forced && !got_event && !cli_reader.pending_exists {
+                if !is_active {
+                    continue;
+                }
+                match cli_reader.get_max_uid(command_timeout).await {
+                    Ok(max_uid) => {
+                        if max_uid <= last_seen_uid && !cli_reader.pending_exists {
+                            continue;
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            "[IMAP Downlink][Box #{} ({})] get_max_uid check failed: {e:#}",
+                            idx, email
+                        );
+                        worker_stop.store(true, Ordering::SeqCst);
+                        break;
+                    }
+                }
             }
 
             let fetch_res = cli_reader
@@ -1527,8 +1584,10 @@ impl ClientTransport for ImapTransport {
         let tunnel_last_activity_ms = Arc::new(AtomicU64::new(now_epoch_ms()));
         let tunnel_reader_wake_notify = Arc::new(Notify::new());
 
-        // 2. Двухполосная очередь пакетов из TUN (Fast-Lane Priority + Bounded Bulk)
-        let (prio_tx, prio_rx) = mpsc::channel::<Bytes>(128);
+        // 2. Двухполосная очередь пакетов из TUN (Fast-Lane Priority + Bounded Bulk).
+        // Важно: tun_reader_task никогда не блокируется надолго на bulk_tx, чтобы не останавливать
+        // чтение приоритетных пакетов (ICMP-зондов, DNS, TCP SYN/ACK) и не замораживать задачу t1.
+        let (prio_tx, prio_rx) = mpsc::channel::<Bytes>(512);
         let (bulk_tx, bulk_rx) = mpsc::channel::<Bytes>(tx_queue_capacity);
         let stop_tun_reader = stop_flag.clone();
 
@@ -1544,14 +1603,16 @@ impl ClientTransport for ImapTransport {
                             match prio_tx.try_send(packet) {
                                 Ok(()) => {}
                                 Err(mpsc::error::TrySendError::Full(pkt)) => {
-                                    if bulk_tx.send(pkt).await.is_err() {
-                                        break;
-                                    }
+                                    let _ = bulk_tx.try_send(pkt);
                                 }
                                 Err(mpsc::error::TrySendError::Closed(_)) => break,
                             }
-                        } else if bulk_tx.send(packet).await.is_err() {
-                            break;
+                        } else {
+                            match bulk_tx.try_send(packet) {
+                                Ok(()) => {}
+                                Err(mpsc::error::TrySendError::Full(_)) => {}
+                                Err(mpsc::error::TrySendError::Closed(_)) => break,
+                            }
                         }
                     }
                     Ok(None) => {

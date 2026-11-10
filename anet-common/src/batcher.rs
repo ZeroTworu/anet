@@ -54,18 +54,23 @@ pub struct PacketBatcher {
     prio_queue: VecDeque<Bytes>,
     queue: VecDeque<Bytes>,
     current_bytes: usize,
+    bulk_bytes: usize,
     max_batch_bytes: usize,
+    max_bulk_bytes: usize,
     max_delay: Duration,
     first_packet_time: Option<Instant>,
 }
 
 impl PacketBatcher {
     pub fn new(max_batch_bytes: usize, max_delay_ms: u64) -> Self {
+        let max_bulk_bytes = (max_batch_bytes.saturating_mul(4)).max(256 * 1024);
         Self {
             prio_queue: VecDeque::new(),
             queue: VecDeque::new(),
             current_bytes: 0,
+            bulk_bytes: 0,
             max_batch_bytes,
+            max_bulk_bytes,
             max_delay: Duration::from_millis(max_delay_ms),
             first_packet_time: None,
         }
@@ -95,8 +100,23 @@ impl PacketBatcher {
         if self.first_packet_time.is_none() {
             self.first_packet_time = Some(Instant::now());
         }
-        self.current_bytes += packet.len() + 2;
+        let entry_len = packet.len() + 2;
+        self.current_bytes += entry_len;
+        self.bulk_bytes += entry_len;
         self.queue.push_back(packet);
+
+        // Активное управление очередью (Head-Drop AQM): не допускаем накопления многомегабайтного
+        // Bufferbloat в очереди bulk-трафика, сохраняя свежие сегменты и мгновенно сигнализируя
+        // TCP Congestion Control (3 DupACK / Fast Retransmit вместо многосекундного RTO-таймаута).
+        while self.bulk_bytes > self.max_bulk_bytes && self.queue.len() > 1 {
+            if let Some(dropped) = self.queue.pop_front() {
+                let dropped_len = dropped.len() + 2;
+                self.current_bytes = self.current_bytes.saturating_sub(dropped_len);
+                self.bulk_bytes = self.bulk_bytes.saturating_sub(dropped_len);
+            } else {
+                break;
+            }
+        }
     }
 
     pub fn should_flush(&self) -> bool {
@@ -155,6 +175,7 @@ impl PacketBatcher {
             }
             let pkt = self.queue.pop_front().unwrap();
             self.current_bytes = self.current_bytes.saturating_sub(entry_len);
+            self.bulk_bytes = self.bulk_bytes.saturating_sub(entry_len);
             let len = pkt.len() as u16;
             out.extend_from_slice(&len.to_be_bytes());
             out.extend_from_slice(&pkt);
@@ -162,6 +183,7 @@ impl PacketBatcher {
 
         if self.is_empty() {
             self.current_bytes = 0;
+            self.bulk_bytes = 0;
             self.first_packet_time = None;
         } else {
             self.first_packet_time = Some(Instant::now());

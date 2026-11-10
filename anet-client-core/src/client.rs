@@ -821,9 +821,10 @@ impl AnetClient {
             let tx_probe_c = tx_probe.clone();
             let probe_shutdown = shutdown_notify.clone();
             let probe_start_time = session_start;
+            let probe_last_rtt = last_rtt_us.clone();
             let ping_interval = if is_imap_proto {
                 // В режиме IMAP не шлем холостые письма каждые 2 секунды, чтобы не триггерить анти-спам лимит THROTTLED
-                Duration::from_secs(config_clone.connectivity.ping_interval_secs.clamp(15, 60))
+                Duration::from_secs(config_clone.connectivity.ping_interval_secs.clamp(10, 30))
             } else {
                 Duration::from_secs(config_clone.connectivity.ping_interval_secs.clamp(1, 30))
             };
@@ -851,8 +852,16 @@ impl AnetClient {
                         break;
                     }
 
+                    // Если самый первый зонд ещё не успел получить ответ (например, завершалась привязка второго ящика),
+                    // повторяем зонд через 2.5 с, чтобы метрика RTT в UI и [STATS] появлялась сразу после старта сессии.
+                    let wait_dur = if seq <= 2 && probe_last_rtt.load(Ordering::Relaxed) == u64::MAX {
+                        Duration::from_millis(2500).min(ping_interval)
+                    } else {
+                        ping_interval
+                    };
+
                     tokio::select! {
-                        _ = tokio::time::sleep(ping_interval) => {}
+                        _ = tokio::time::sleep(wait_dur) => {}
                         _ = probe_shutdown.notified() => break,
                     }
                 }

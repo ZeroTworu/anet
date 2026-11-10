@@ -735,6 +735,10 @@ where
                 continue;
             };
 
+            // Любое уведомление `* <N> EXISTS`, пришедшее до этой строки FETCH, уже учтено в текущем ответе;
+            // если же новое `* <M> EXISTS` придёт после последнего FETCH перед `tag OK`, read_line() снова взведёт флаг.
+            self.pending_exists = false;
+
             // Защита от дублей RFC 3501 (при запросе <last+1>:* сервер может вернуть last_seen_uid)
             if uid <= last_seen_uid {
                 continue;
