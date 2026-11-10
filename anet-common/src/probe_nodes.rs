@@ -36,7 +36,7 @@ use tokio_tungstenite::{
 };
 use x25519_dalek::{PublicKey, StaticSecret};
 
-pub const DEFAULT_PROBE_TIMEOUT_MS: u64 = 2800;
+pub const DEFAULT_PROBE_TIMEOUT_MS: u64 = 4500;
 pub const MAX_CONCURRENT_NODE_PROBES: usize = 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1016,49 +1016,107 @@ async fn probe_wrtc(target: &ProbeTarget, timeout_dur: Duration) -> Result<(u32,
     let profile = BrowserProfile::with_tls_config(tls_cfg);
 
     let mut wrtc_cfg = WrtcConfig::default();
-    let secs = (timeout_dur.as_secs()).max(2);
+    let secs = (timeout_dur.as_secs()).max(3);
     wrtc_cfg.http_connect_timeout_secs = secs;
     wrtc_cfg.http_request_timeout_secs = secs;
 
-    let ktalk = KtalkClient::new(profile, &wrtc_cfg)?;
-    let secret = KtalkClient::generate_anonymous_secret();
     let host_port = format!("{}:443", domain);
+    let is_ktalk = crate::wrtc::provider::WrtcProviderRegistry::is_ktalk_domain(&domain);
 
     let fut = async {
-        // Сначала измеряем чистый 1-RTT TCP SYN->SYN-ACK до шлюза сигналинга без конкуренции с TLS
-        let tcp_rtt_opt = measure_tcp_connect_rtt(&host_port, Duration::from_millis(900)).await;
+        if is_ktalk {
+            let ktalk = KtalkClient::new(profile, &wrtc_cfg)?;
+            let secret = KtalkClient::generate_anonymous_secret();
 
-        let full_started = Instant::now();
-        let session = ktalk
-            .authorize_session(&domain, &room_short_name, None, &secret)
-            .await?;
+            let tcp_fut = measure_tcp_connect_rtt(&host_port, Duration::from_millis(900));
+            let sig_fut = async {
+                let full_started = Instant::now();
+                let session = ktalk
+                    .authorize_session(&domain, &room_short_name, None, &secret)
+                    .await?;
 
-        // Соединение в пуле ktalk.http уже установлено (TCP + TLS прогреты) — замеряем одиночный запрос
-        let warm_started = Instant::now();
-        let room = ktalk
-            .resolve_room(&domain, &room_short_name, &session.token)
-            .await?;
-        let warm_rtt = warm_started.elapsed().as_millis().max(1) as u32;
-        let full_rtt = full_started.elapsed().as_millis().max(1) as u32;
+                // Соединение в пуле ktalk.http уже установлено (TCP + TLS прогреты) — замеряем одиночный запрос
+                let warm_started = Instant::now();
+                let room = ktalk
+                    .resolve_room(&domain, &room_short_name, &session.token)
+                    .await?;
+                let warm_rtt = warm_started.elapsed().as_millis().max(1) as u32;
+                let full_rtt = full_started.elapsed().as_millis().max(1) as u32;
 
-        if room.conference_id.is_empty() {
-            return Err(anyhow!("Empty Ktalk conferenceId"));
-        }
+                if room.conference_id.is_empty() {
+                    return Err(anyhow!("Empty Ktalk conferenceId"));
+                }
+                Ok::<(u32, u32), anyhow::Error>((warm_rtt, full_rtt))
+            };
 
-        let pure_rtt = match tcp_rtt_opt {
-            Some(tcp_ms) => warm_rtt.min(tcp_ms),
-            None => warm_rtt,
-        };
+            let (tcp_rtt_opt, sig_res) = tokio::join!(tcp_fut, sig_fut);
+            let (warm_rtt, full_rtt) = sig_res?;
+            let pure_rtt = match tcp_rtt_opt {
+                Some(tcp_ms) => warm_rtt.min(tcp_ms),
+                None => warm_rtt,
+            };
 
-        Ok((
-            pure_rtt,
-            full_rtt.max(pure_rtt),
-            format!(
-                "WRTC Signaling OK ({} / {} ms)",
+            Ok((
+                pure_rtt,
                 full_rtt.max(pure_rtt),
-                pure_rtt
-            ),
-        ))
+                format!(
+                    "WRTC Signaling OK ({} / {} ms)",
+                    full_rtt.max(pure_rtt),
+                    pure_rtt
+                ),
+            ))
+        } else {
+            let client = profile
+                .build_reqwest_builder(Arc::new(reqwest::cookie::Jar::default()))?
+                .timeout(timeout_dur)
+                .connect_timeout(timeout_dur)
+                .pool_max_idle_per_host(2)
+                .no_proxy()
+                .build()?;
+            let room_url = format!("https://{}/{}", domain, room_short_name);
+            let ws_probe_url = format!(
+                "https://{}/xmpp-websocket?room={}",
+                domain, room_short_name
+            );
+
+            let tcp_fut = measure_tcp_connect_rtt(&host_port, Duration::from_millis(900));
+            let http_fut = async {
+                let full_started = Instant::now();
+                let req1 = profile.apply_to_reqwest(client.get(&room_url), None, None);
+                let resp1 = req1.send().await.context("Jitsi HTTPS room probe failed")?;
+                let status1 = resp1.status().as_u16();
+                drop(resp1);
+                if !(100..500).contains(&status1) {
+                    return Err(anyhow!("Jitsi room HTTP status {}", status1));
+                }
+
+                let warm_started = Instant::now();
+                let req2 = profile.apply_to_reqwest(client.get(&ws_probe_url), None, None);
+                if let Ok(resp2) = req2.send().await {
+                    drop(resp2);
+                }
+                let warm_rtt = warm_started.elapsed().as_millis().max(1) as u32;
+                let full_rtt = full_started.elapsed().as_millis().max(1) as u32;
+                Ok::<(u32, u32), anyhow::Error>((warm_rtt, full_rtt))
+            };
+
+            let (tcp_rtt_opt, http_res) = tokio::join!(tcp_fut, http_fut);
+            let (warm_rtt, full_rtt) = http_res?;
+            let pure_rtt = match tcp_rtt_opt {
+                Some(tcp_ms) => warm_rtt.min(tcp_ms),
+                None => warm_rtt,
+            };
+
+            Ok((
+                pure_rtt,
+                full_rtt.max(pure_rtt),
+                format!(
+                    "WRTC Jitsi OK ({} / {} ms)",
+                    full_rtt.max(pure_rtt),
+                    pure_rtt
+                ),
+            ))
+        }
     };
 
     timeout(timeout_dur, fut)
@@ -1171,50 +1229,83 @@ where
         })
         .collect();
 
+    // Группируем таргеты с идентичным сетевым назначением (protocol + dsn + host_port + websocket_url),
+    // чтобы несколько профилей одного WRTC-сервера (VIDEO / WS / DC / P2P на одной комнате ktalk/jitsi)
+    // не устраивали 4 одновременных TLS+HTTP рукопожатия к одному хосту на мобильной сети 4G+.
+    let mut dedup_groups: Vec<(ProbeTarget, Vec<usize>)> = Vec::new();
+    let mut key_to_group: HashMap<(ProbeProtocol, String, String, Option<String>), usize> =
+        HashMap::new();
+    for (pos, target) in targets.iter().cloned().enumerate() {
+        let key = (
+            target.protocol,
+            target.dsn.trim().to_string(),
+            target.host_port.trim().to_string(),
+            target.websocket_url.clone(),
+        );
+        if let Some(&g_idx) = key_to_group.get(&key) {
+            dedup_groups[g_idx].1.push(pos);
+        } else {
+            let g_idx = dedup_groups.len();
+            key_to_group.insert(key, g_idx);
+            dedup_groups.push((target, vec![pos]));
+        }
+    }
+
     let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_NODE_PROBES));
     let mut futures = FuturesUnordered::new();
 
-    for (pos, target) in targets.iter().cloned().enumerate() {
+    for (rep_target, positions) in dedup_groups {
         let sem = semaphore.clone();
         futures.push(async move {
             let mut res = {
                 let _permit = sem.clone().acquire_owned().await.ok();
-                probe_single_target(&target, timeout_dur).await
+                probe_single_target(&rep_target, timeout_dur).await
             };
             if res.status == NodeProbeStatus::Unavailable {
-                tokio::time::sleep(Duration::from_millis(120)).await;
+                tokio::time::sleep(Duration::from_millis(150)).await;
                 let _permit = sem.acquire_owned().await.ok();
-                let retry_res = probe_single_target(&target, timeout_dur).await;
+                let retry_res = probe_single_target(&rep_target, timeout_dur).await;
                 if retry_res.status != NodeProbeStatus::Unavailable {
                     res = retry_res;
                 }
             }
-            (pos, res)
+            (positions, res)
         });
     }
 
     let mut completed_endpoints = 0usize;
-    while let Some((pos, res)) = futures.next().await {
-        {
+    while let Some((positions, res)) = futures.next().await {
+        for pos in positions {
             if pos < current_endpoints.len() {
-                current_endpoints[pos] = res;
+                let t = &targets[pos];
+                current_endpoints[pos] = EndpointProbeResult {
+                    endpoint_index: t.endpoint_index,
+                    group_id: t.group_id.clone(),
+                    group_name: t.group_name.clone(),
+                    server_name: t.server_name.clone(),
+                    protocol: t.protocol,
+                    status: res.status,
+                    rtt_ms: res.rtt_ms,
+                    full_rtt_ms: res.full_rtt_ms,
+                    detail: res.detail.clone(),
+                };
             }
             completed_endpoints += 1;
-            let now_ms = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
-            let groups = aggregate_groups(targets, &current_endpoints, true);
-            let partial = NodeProbeSnapshot {
-                checked_at_unix_ms: now_ms,
-                is_checking: true,
-                completed_endpoints,
-                total_endpoints,
-                endpoints: current_endpoints.clone(),
-                groups,
-            };
-            on_progress(partial);
         }
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let groups = aggregate_groups(targets, &current_endpoints, true);
+        let partial = NodeProbeSnapshot {
+            checked_at_unix_ms: now_ms,
+            is_checking: true,
+            completed_endpoints,
+            total_endpoints,
+            endpoints: current_endpoints.clone(),
+            groups,
+        };
+        on_progress(partial);
     }
 
     let now_ms = SystemTime::now()

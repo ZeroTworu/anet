@@ -218,6 +218,15 @@ impl DnsInterceptor {
             action = RuleAction::Proxy;
         }
 
+        // На Android системный VpnService не позволяет динамически добавлять /32 маршруты исключений
+        // (excludeRoute) после поднятия tun0, а прямой UDP:53 в мобильных сетях при активных Белых Списках
+        // часто дропается оператором (из-за чего зависает `ping ya.ru` и открытие сайтов из rules.abc).
+        // Поэтому на Android все не-заблокированные домены (включая Direct) резолвятся и маршрутизируются
+        // через защищённый VPN-туннель, сохраняя при этом полную работу AdBlock (RuleAction::Block).
+        if cfg!(target_os = "android") && action == RuleAction::Direct {
+            action = RuleAction::Proxy;
+        }
+
         match action {
             RuleAction::Block => {
                 log::info!(
@@ -257,6 +266,9 @@ impl DnsInterceptor {
         packet: &[u8],
         abc_domain_lookup: impl Fn(&str) -> Option<RuleAction>,
     ) -> Option<(String, Vec<IpAddr>)> {
+        if cfg!(target_os = "android") {
+            return None;
+        }
         if !Self::is_dns_response(packet) {
             return None;
         }
@@ -302,20 +314,26 @@ impl DnsInterceptor {
         let socket = UdpSocket::bind("0.0.0.0:0").await.ok()?;
         let mut recv_buf = vec![0u8; 1500];
 
-        let mut received_len = None;
+        let mut any_sent = false;
         for upstream_ip in DIRECT_UPSTREAM_DNS_IPS {
             let upstream_addr = SocketAddr::new(IpAddr::V4(upstream_ip), 53);
-            if socket.send_to(dns_query_payload, upstream_addr).await.is_err() {
-                continue;
-            }
-            if let Ok(Ok((n, _))) =
-                tokio::time::timeout(Duration::from_millis(1200), socket.recv_from(&mut recv_buf))
-                    .await
-            {
-                received_len = Some(n);
-                break;
+            if socket.send_to(dns_query_payload, upstream_addr).await.is_ok() {
+                any_sent = true;
             }
         }
+        if !any_sent {
+            return None;
+        }
+
+        let received_len = match tokio::time::timeout(
+            Duration::from_millis(650),
+            socket.recv_from(&mut recv_buf),
+        )
+        .await
+        {
+            Ok(Ok((n, _))) => Some(n),
+            _ => None,
+        };
 
         let n = received_len?;
         let dns_resp = &recv_buf[..n];

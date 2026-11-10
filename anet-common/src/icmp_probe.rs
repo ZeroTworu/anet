@@ -1,8 +1,31 @@
 use bytes::Bytes;
 use std::net::Ipv4Addr;
 
-/// Уникальный идентификатор зонда ANet (ASCII "AN" = 0x414E)
+/// Уникальный идентификатор зонда ANet до VPN-шлюза (ASCII "AN" = 0x414E)
 pub const PROBE_IDENTIFIER: u16 = 0x414E;
+
+/// Идентификатор внутритуннельного зонда связности «Мир» (ASCII "AW" = 0x4157).
+/// Сервер НЕ перехватывает этот идентификатор в userspace, поэтому пакет выходит через NAT сервера
+/// к глобальным узлам (1.1.1.1, 8.8.8.8, 9.9.9.9) и возвращается реальным ICMP Echo Reply.
+pub const PROBE_WORLD_IDENTIFIER: u16 = 0x4157;
+
+/// Идентификатор внутритуннельного зонда связности «РФ» (ASCII "AD" = 0x4144).
+/// Проходит сквозь туннель и NAT сервера к российским узлам (77.88.8.8, 77.88.8.1, 87.250.250.242).
+pub const PROBE_DOMESTIC_IDENTIFIER: u16 = 0x4144;
+
+/// Глобальные IPv4-адреса для проверки внешней связности внутри туннеля (Cloudflare, Google, Quad9)
+pub const WORLD_PROBE_IPS: [Ipv4Addr; 3] = [
+    Ipv4Addr::new(1, 1, 1, 1),
+    Ipv4Addr::new(8, 8, 8, 8),
+    Ipv4Addr::new(9, 9, 9, 9),
+];
+
+/// Российские IPv4-адреса для проверки связности внутри туннеля (Яндекс.DNS Primary/Secondary, ya.ru)
+pub const DOMESTIC_PROBE_IPS: [Ipv4Addr; 3] = [
+    Ipv4Addr::new(77, 88, 8, 8),
+    Ipv4Addr::new(77, 88, 8, 1),
+    Ipv4Addr::new(87, 250, 250, 242),
+];
 
 /// Вычисление стандартной 16-битной контрольной суммы Интернета (RFC 1071).
 pub fn internet_checksum(buf: &[u8]) -> u16 {

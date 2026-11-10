@@ -695,22 +695,15 @@ impl AnetClient {
             }
 
             // Применяем статические CIDR-маршруты Direct из скомпилированного rules.abc:
-            // - На Android маршруты передаются единым списком в VpnService.Builder.excludeRoute при создании TUN.
-            // - На Desktop (Linux/Windows/macOS) добавление 5200+ маршрутов через системные утилиты ip/route/netsh
-            //   блокирует старт на десятки секунд, поэтому на Desktop точечные /32 bypass-маршруты добавляются
-            //   динамически через DnsInterceptor при разрешении Direct-доменов.
+            // На Android при активных мобильных Белых Списках (или DPI) провайдер может блокировать/замедлять
+            // прямые обращения к части подсетей вне БС, а системный DNS идёт через туннель, поэтому
+            // на Android не исключаем 5200+ подсетей из tun0 по умолчанию (пользовательские exclude_route_for
+            // и [routing.overrides] direct выше при этом продолжают работать штатно).
             let abc_direct_routes = rule_cache.collect_direct_routes();
             if !abc_direct_routes.is_empty() {
                 let count = abc_direct_routes.len();
-                #[cfg(target_os = "android")]
-                {
-                    let _ = self
-                        .route_manager
-                        .add_bypass_routes(&abc_direct_routes)
-                        .await;
-                }
                 let msg = format!(
-                    "[RuleCache] Loaded {} static Direct CIDR bypass routes from rules.abc",
+                    "[RuleCache] Loaded {} static Direct CIDR rules from rules.abc",
                     count
                 );
                 info!("{msg}");
@@ -812,9 +805,9 @@ impl AnetClient {
         let last_reply_us = Arc::new(AtomicU64::new(0));
         let (tx_probe, mut rx_probe) = tokio::sync::mpsc::channel::<Bytes>(64);
 
-        // Внутритуннельный генератор ICMP Echo Request для универсального измерения честного RTT.
+        // Внутритуннельный генератор ICMP Echo Request для универсального измерения честного RTT
+        // и реальной сквозной связности «РФ / Мир» внутри туннеля (включая Android с addDisallowedApplication).
         // Работает для ВСЕХ видов транспорта (QUIC, SSH, VNC, AHTTP, WS, WRTC) прямо внутри шифрованного потока.
-        // Не требует raw-сокетов и повышенных прав ОС (полная совместимость с Linux, Windows, macOS, Android, iOS).
         if let (Some(client_ip), Some(gateway_ip)) = (client_ip_opt, gateway_ip_opt) {
             let tx_probe_c = tx_probe.clone();
             let probe_shutdown = shutdown_notify.clone();
@@ -844,6 +837,37 @@ impl AnetClient {
 
                     if tx_probe_c.send(probe_packet).await.is_err() {
                         break;
+                    }
+
+                    // На первом цикле и далее каждые 2 цикла отправляем легковесные 36-байтные
+                    // внутритуннельные ICMP-зонды к глобальным (1.1.1.1, 8.8.8.8, 9.9.9.9)
+                    // и российским (77.88.8.8, 77.88.8.1, 87.250.250.242) узлам через NAT сервера.
+                    if seq == 1 || seq % 2 == 0 {
+                        let now_ext_us = probe_start_time.elapsed().as_micros() as u64;
+                        for (idx, &world_ip) in
+                            anet_common::icmp_probe::WORLD_PROBE_IPS.iter().enumerate()
+                        {
+                            let pkt = build_ipv4_icmp_echo_request(
+                                client_ip,
+                                world_ip,
+                                anet_common::icmp_probe::PROBE_WORLD_IDENTIFIER,
+                                (idx as u16) + 1,
+                                now_ext_us,
+                            );
+                            let _ = tx_probe_c.try_send(pkt);
+                        }
+                        for (idx, &dom_ip) in
+                            anet_common::icmp_probe::DOMESTIC_PROBE_IPS.iter().enumerate()
+                        {
+                            let pkt = build_ipv4_icmp_echo_request(
+                                client_ip,
+                                dom_ip,
+                                anet_common::icmp_probe::PROBE_DOMESTIC_IDENTIFIER,
+                                (idx as u16) + 1,
+                                now_ext_us,
+                            );
+                            let _ = tx_probe_c.try_send(pkt);
+                        }
                     }
 
                     tokio::select! {
@@ -1085,8 +1109,10 @@ impl AnetClient {
                                 rx_time.store(batch_rx_us, Ordering::Relaxed);
                                 let mut current_pkt = Some(first_packet);
                                 while let Some(packet) = current_pkt.take() {
-                                    // Перехватываем внутритуннельный ICMP Echo Reply (замер честного RTT)
-                                    // Не учитываем служебные 40-байтные пинг-зонды в пользовательском трафике rx_bytes
+                                    // Перехватываем внутритуннельные ICMP Echo Reply:
+                                    // 1) PROBE_IDENTIFIER (0x414E) — замер RTT до VPN-узла
+                                    // 2) PROBE_WORLD_IDENTIFIER (0x4157) — проверка связности «Мир» сквозь туннель
+                                    // 3) PROBE_DOMESTIC_IDENTIFIER (0x4144) — проверка связности «РФ» сквозь туннель
                                     if let Some(c_ip) = client_ip_opt {
                                         if let Some((_seq, sent_ts_us)) = parse_ipv4_icmp_echo_reply(
                                             &packet,
@@ -1118,6 +1144,50 @@ impl AnetClient {
                                                 sample_us as f64 / 1000.0,
                                                 _seq
                                             );
+                                            match frame_reader.try_next_packet() {
+                                                Ok(next_opt) => {
+                                                    current_pkt = next_opt;
+                                                    continue;
+                                                }
+                                                Err(e) => {
+                                                    warn!("[Tunnel/Rx] Failed reading frame/packet from VPN stream: {e:#}");
+                                                    *reason_t2.lock().unwrap() = format!("Failed reading frame/packet from VPN stream: {e:#}");
+                                                    sig_t2.notify_one();
+                                                    break 'rx_loop;
+                                                }
+                                            }
+                                        }
+
+                                        if let Some((seq_idx, sent_ts_us)) = parse_ipv4_icmp_echo_reply(
+                                            &packet,
+                                            c_ip,
+                                            anet_common::icmp_probe::PROBE_WORLD_IDENTIFIER,
+                                        ) {
+                                            let rtt_ms = (batch_rx_us.saturating_sub(sent_ts_us) / 1000).max(1);
+                                            let idx = seq_idx.saturating_sub(1) as usize;
+                                            crate::connectivity_monitor::ConnectivityMonitor::record_in_tunnel_global_probe(idx, rtt_ms);
+                                            match frame_reader.try_next_packet() {
+                                                Ok(next_opt) => {
+                                                    current_pkt = next_opt;
+                                                    continue;
+                                                }
+                                                Err(e) => {
+                                                    warn!("[Tunnel/Rx] Failed reading frame/packet from VPN stream: {e:#}");
+                                                    *reason_t2.lock().unwrap() = format!("Failed reading frame/packet from VPN stream: {e:#}");
+                                                    sig_t2.notify_one();
+                                                    break 'rx_loop;
+                                                }
+                                            }
+                                        }
+
+                                        if let Some((seq_idx, sent_ts_us)) = parse_ipv4_icmp_echo_reply(
+                                            &packet,
+                                            c_ip,
+                                            anet_common::icmp_probe::PROBE_DOMESTIC_IDENTIFIER,
+                                        ) {
+                                            let rtt_ms = (batch_rx_us.saturating_sub(sent_ts_us) / 1000).max(1);
+                                            let idx = seq_idx.saturating_sub(1) as usize;
+                                            crate::connectivity_monitor::ConnectivityMonitor::record_in_tunnel_domestic_probe(idx, rtt_ms);
                                             match frame_reader.try_next_packet() {
                                                 Ok(next_opt) => {
                                                     current_pkt = next_opt;

@@ -303,8 +303,8 @@ impl ConnectivityProber {
                     .timeout(timeout)
                     .connect_timeout(timeout)
                     .redirect(reqwest::redirect::Policy::none())
-                    .pool_max_idle_per_host(1)
-                    .pool_idle_timeout(Duration::from_secs(2))
+                    .pool_max_idle_per_host(2)
+                    .pool_idle_timeout(Duration::from_secs(30))
                     .no_proxy()
                     .build()?)
             })
@@ -327,16 +327,21 @@ impl ConnectivityProber {
         &self.config
     }
 
+    /// Одновременно опрашивает все глобальные и локальные контрольные точки и возвращает сырые результаты групп.
+    pub async fn probe_groups_raw(&self) -> (ProbeGroupResult, ProbeGroupResult) {
+        tokio::join!(
+            self.probe_group(&self.config.global_targets),
+            self.probe_group(&self.config.domestic_targets),
+        )
+    }
+
     /// Одновременно опрашивает все глобальные и локальные контрольные точки и формирует снимок состояния.
     pub async fn probe_once(
         &self,
         vpn_connected: bool,
         tunnel_rtt_ms: Option<u64>,
     ) -> ConnectivitySnapshot {
-        let (global_res, domestic_res) = tokio::join!(
-            self.probe_group(&self.config.global_targets),
-            self.probe_group(&self.config.domestic_targets),
-        );
+        let (global_res, domestic_res) = self.probe_groups_raw().await;
 
         ConnectivitySnapshot::evaluate(vpn_connected, tunnel_rtt_ms, global_res, domestic_res)
     }
@@ -346,8 +351,8 @@ impl ConnectivityProber {
             return ProbeGroupResult::default();
         }
 
-        let per_target_timeout = Duration::from_millis(self.config.timeout_ms.clamp(800, 4_000));
-        let hard_cap = per_target_timeout + Duration::from_millis(1200);
+        let per_target_timeout = Duration::from_millis(self.config.timeout_ms.clamp(1200, 4_500));
+        let hard_cap = per_target_timeout + Duration::from_millis(1500);
         let futures = targets.iter().map(|url| {
             let client = &self.client;
             let profile = &self.profile;
@@ -403,11 +408,23 @@ async fn probe_single_target(
         return Some(rtt);
     }
 
-    // Если в старом сохранённом конфиге осталась точка gosuslugi.ru, которая режет
-    // зарубежные выходные IP (например, при включённом VPN через Нидерланды/Финляндию),
-    // страхуем её проверкой dzen.ru, чтобы индикатор РФ 3/3 не ловил ложный серый сегмент.
+    let fb_timeout = Duration::from_millis(1500);
     if trimmed.contains("gosuslugi.ru") {
-        return probe_url_once(client, profile, "https://dzen.ru", primary_timeout).await;
+        if let Some(rtt) = probe_url_once(client, profile, "https://dzen.ru/favicon.ico", fb_timeout).await {
+            return Some(rtt);
+        }
+    } else if trimmed.contains("ya.ru") {
+        if let Some(rtt) = probe_url_once(client, profile, "https://ya.ru/favicon.ico", fb_timeout).await {
+            return Some(rtt);
+        }
+    } else if trimmed.contains("vk.com") {
+        if let Some(rtt) = probe_url_once(client, profile, "https://vk.com/favicon.ico", fb_timeout).await {
+            return Some(rtt);
+        }
+    } else if trimmed.contains("dzen.ru") {
+        if let Some(rtt) = probe_url_once(client, profile, "https://max.ru/favicon.ico", fb_timeout).await {
+            return Some(rtt);
+        }
     }
 
     None
@@ -425,21 +442,22 @@ async fn probe_url_once(
 
     // Любой осмысленный HTTP-ответ от целевого сервера (2xx, 3xx, 401/403/404)
     // подтверждает успешное прохождение DNS + TCP + TLS хендшейка.
+    // ВАЖНО: НЕ вызываем resp.bytes().await! Выкачивание 200-400 КБ HTML главных страниц
+    // ya.ru / vk.com / dzen.ru на мобильной сети 4G+ съедает весь таймаут и даёт ложный РФ 0/3.
     let status = resp.status().as_u16();
-    let _ = tokio::time::timeout(Duration::from_millis(500), resp.bytes()).await;
+    drop(resp);
     if (100..600).contains(&status) {
         let first_ms = (start.elapsed().as_millis() as u64).max(1);
-        // Если первый запрос шёл по холодному соединению (включал TCP + TLS хендшейк),
-        // сразу делаем короткий повторный запрос по уже прогретому keep-alive сокету,
-        // чтобы «Пульс канала» показывал чистый 1-RTT, а не сумму 3×RTT рукопожатий.
-        if first_ms > 90 {
+        // Если первый запрос шёл по холодному соединению, но сеть достаточно быстрая (< 750 мс),
+        // делаем короткий повторный запрос по прогретому HTTP/2 сокету для замера чистого 1-RTT.
+        if first_ms > 90 && first_ms < 750 {
             let warm_started = Instant::now();
             let warm_req = profile.apply_to_reqwest(client.get(url), None, None);
             if let Ok(Ok(warm_resp)) =
-                tokio::time::timeout(Duration::from_millis(750), warm_req.send()).await
+                tokio::time::timeout(Duration::from_millis(600), warm_req.send()).await
             {
                 let warm_status = warm_resp.status().as_u16();
-                let _ = tokio::time::timeout(Duration::from_millis(400), warm_resp.bytes()).await;
+                drop(warm_resp);
                 if (100..600).contains(&warm_status) {
                     let warm_ms = (warm_started.elapsed().as_millis() as u64).max(1);
                     return Some(first_ms.min(warm_ms));
