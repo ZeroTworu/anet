@@ -46,10 +46,15 @@ impl WrtcProviderRegistry {
         Self::detect_provider(domain)
     }
 
+    /// Проверяет, относится ли домен к платформе Контур.Толк (`*.ktalk.ru`, `*.kontur.ru`).
+    pub fn is_ktalk_domain(domain: &str) -> bool {
+        let host = Self::normalize_domain(domain);
+        ktalk::KonturTalkProvider::is_ktalk_domain(&host)
+    }
+
     /// Определяет тип провайдера по домену.
     pub fn detect_provider(domain: &str) -> ProviderKind {
-        let host = Self::normalize_domain(domain);
-        if ktalk::KonturTalkProvider::is_ktalk_domain(&host) {
+        if Self::is_ktalk_domain(domain) {
             ProviderKind::KonturTalk
         } else {
             ProviderKind::StandardJitsi
