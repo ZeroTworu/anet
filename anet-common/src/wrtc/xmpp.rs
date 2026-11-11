@@ -806,6 +806,7 @@ impl XmppSession {
                             Ok(Message::Text(text)) => {
                                 let stanzas = parse_xmpp_stanzas(text.as_str(), "0.0.0.0", 0);
                                 let mut ack_replies: Vec<String> = Vec::new();
+                                let mut forward_to_app = false;
                                 for parsed in stanzas {
                                     if sm_enabled && parsed.is_counted_stanza() {
                                         inbound_h = inbound_h.wrapping_add(1);
@@ -831,6 +832,7 @@ impl XmppSession {
                                             is_unavailable,
                                             ..
                                         } => {
+                                            forward_to_app = true;
                                             if let Some(occupant) = from.strip_prefix(&conf_muc) {
                                                 if occupant != my_ep && occupant != "focus" {
                                                     if is_unavailable {
@@ -858,22 +860,30 @@ impl XmppSession {
                                                 node.as_deref(),
                                                 is_ktalk,
                                             );
-                                            log::info!("[XMPP OUT]: {disco_reply}");
+                                            log::debug!("[XMPP OUT]: {disco_reply}");
                                             ack_replies.push(disco_reply);
                                         }
                                         InboundXmpp::Ping { id, from } => {
                                             let pong = XmppBuilder::iq_result(&from, &id);
-                                            log::info!("[XMPP OUT]: {pong}");
+                                            log::debug!("[XMPP OUT]: {pong}");
                                             ack_replies.push(pong);
                                         }
                                         InboundXmpp::Jingle(ref sess) => {
+                                            forward_to_app = true;
                                             if let Some(ref iq_id) = sess.iq_id {
                                                 let ack = XmppBuilder::iq_result(&sess.from, iq_id);
                                                 log::info!("[XMPP OUT]: {ack}");
                                                 ack_replies.push(ack);
                                             }
                                         }
+                                        InboundXmpp::JingleAck { .. }
+                                        | InboundXmpp::ConferenceReady { .. }
+                                        | InboundXmpp::RoomConfigRequired { .. }
+                                        | InboundXmpp::IqError { .. } => {
+                                            forward_to_app = true;
+                                        }
                                         InboundXmpp::ExtdiscoServices(ice_servers) => {
+                                            forward_to_app = true;
                                             let urls: Vec<String> = ice_servers
                                                 .iter()
                                                 .flat_map(|s| s.urls.clone())
@@ -929,7 +939,9 @@ impl XmppSession {
                                     }
                                 }
 
-                                let _ = read_tx.try_send(text.to_string());
+                                if forward_to_app {
+                                    let _ = read_tx.try_send(text.to_string());
+                                }
                             }
                             Ok(Message::Ping(data)) => {
                                 if tokio::time::timeout(write_timeout_dur, ws_stream.send(Message::Pong(data)))

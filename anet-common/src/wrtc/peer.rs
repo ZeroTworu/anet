@@ -1921,22 +1921,23 @@ impl WrtcPeer {
                     );
 
                     loop {
-                        let (json_str, msg_to_opt, is_batch, is_astp) = tokio::select! {
+                        let (json_str, msg_to_opt, is_batch, is_astp, is_keepalive) = tokio::select! {
                             msg_opt = outgoing_rx.recv() => {
                                 match msg_opt {
                                     Some(msg) => {
                                         let is_batch = matches!(msg.msg_payload, WrtcMessage::AstpBatch { .. });
                                         let is_astp = matches!(msg.msg_payload, WrtcMessage::Astp { .. });
+                                        let is_keepalive = matches!(msg.msg_payload, WrtcMessage::Ping | WrtcMessage::Pong);
                                         let msg_to_opt = msg.to.clone();
                                         let Ok(json_str) = serde_json::to_string(&msg) else { continue; };
-                                        (json_str, msg_to_opt, is_batch, is_astp)
+                                        (json_str, msg_to_opt, is_batch, is_astp, is_keepalive)
                                     }
                                     None => break,
                                 }
                             }
                             raw_opt = raw_outgoing_rx.recv() => {
                                 match raw_opt {
-                                    Some(raw) => (raw, None, false, false),
+                                    Some(raw) => (raw, None, false, false, false),
                                     None => break,
                                 }
                             }
@@ -1965,6 +1966,8 @@ impl WrtcPeer {
                                     log::debug!("[JVB DC OUT Batch]");
                                 } else if is_astp {
                                     log::trace!("[JVB DC OUT ASTP]");
+                                } else if is_keepalive {
+                                    log::debug!("[JVB DC OUT]: {json_str}");
                                 } else {
                                     log::info!("[JVB DC OUT]: {json_str}");
                                 }
@@ -1995,12 +1998,14 @@ impl WrtcPeer {
                             }
                         }
 
-                        let is_constraints = !is_astp && !is_batch && json_str.contains("ReceiverVideoConstraints");
+                        let is_constraints = !is_astp && !is_batch && !is_keepalive && json_str.contains("ReceiverVideoConstraints");
                         let constraints_copy = if is_constraints { Some(json_str.clone()) } else { None };
 
                         if !sent && !target_is_xmpp_only && has_ws_out.load(Ordering::SeqCst) {
                             if is_astp || is_batch {
                                 log::trace!("[JVB WS OUT ASTP]");
+                            } else if is_keepalive {
+                                log::debug!("[JVB WS OUT]: {json_str}");
                             } else {
                                 log::info!("[JVB WS OUT]: {json_str}");
                             }
@@ -2037,6 +2042,8 @@ impl WrtcPeer {
                         if !sent && !is_constraints {
                             if is_astp || is_batch {
                                 log::trace!("[XMPP MUC JSON OUT ASTP]");
+                            } else if is_keepalive {
+                                log::debug!("[XMPP MUC JSON OUT]: {json_str}");
                             } else {
                                 log::info!("[XMPP MUC JSON OUT]: {json_str}");
                             }

@@ -693,6 +693,10 @@ impl AnetClient {
             let abc_direct_routes = rule_cache.collect_direct_routes();
             if !abc_direct_routes.is_empty() {
                 let count = abc_direct_routes.len();
+                #[cfg(not(target_os = "android"))]
+                {
+                    let _ = self.route_manager.add_bypass_routes(&abc_direct_routes).await;
+                }
                 let msg = format!(
                     "[RuleCache] Loaded {} static Direct CIDR rules from rules.abc",
                     count

@@ -2,9 +2,10 @@ use super::{ClientTransport, ConnectionResult};
 use crate::auth::{AuthChannel, AuthHandler};
 use crate::config::{CoreConfig, ServerConfig};
 use anet_common::consts::{
-    COALESCE_BUDGET_BYTES, VIDEO_BATCH_MARKER, VIDEO_WARMUP_PAYLOAD, VP8_ASTP_PREFIX_LEN,
-    WRTC_CLIENT_CONSTRAINTS_REASSERT_COUNT, WRTC_CLIENT_CONSTRAINTS_REASSERT_INTERVAL_SECS,
-    WRTC_DEFAULT_FALLBACK_JVB_IP, WRTC_DEFAULT_FALLBACK_JVB_PORT, WRTC_DEFAULT_MAX_VIDEO_HEIGHT,
+    COALESCE_BUDGET_BYTES, VIDEO_BATCH_MARKER, VIDEO_WARMUP_MARKER_HI, VIDEO_WARMUP_MARKER_LO,
+    VIDEO_WARMUP_PAYLOAD, VP8_ASTP_PREFIX_LEN, WRTC_CLIENT_CONSTRAINTS_REASSERT_COUNT,
+    WRTC_CLIENT_CONSTRAINTS_REASSERT_INTERVAL_SECS, WRTC_DEFAULT_FALLBACK_JVB_IP,
+    WRTC_DEFAULT_FALLBACK_JVB_PORT, WRTC_DEFAULT_MAX_VIDEO_HEIGHT,
     WRTC_DISCOVER_BROADCAST_INTERVAL_SECS, WRTC_DUPLEX_BUFFER_SIZE, WRTC_ICE_GATHER_POLL_ATTEMPTS,
     WRTC_MIN_ASTP_VIDEO_FRAME_LEN, WRTC_MIN_IP_PACKET_LEN, WRTC_P2P_ICE_GATHER_POLL_INTERVAL_MS,
     WRTC_PACING_HORIZON_NS, WRTC_UPLINK_PACING_NS_PER_BYTE, WRTC_VIDEO_CHANNEL_CAPACITY,
@@ -156,9 +157,25 @@ impl ClientTransport for WrtcTransport {
             let _ = xmpp.request_conference_allocation().await;
         }
 
+        let server_pub_key = self
+            .server
+            .server_pub_key
+            .as_deref()
+            .or_else(|| {
+                if !self.config.keys.server_pub_key.is_empty() {
+                    Some(self.config.keys.server_pub_key.as_str())
+                } else {
+                    None
+                }
+            });
+
+        let expected_srv_suffix = server_pub_key
+            .and_then(|pk| compute_server_endpoint_suffix_from_b64(pk, &bootstrap.conference_id));
+
         let timeout_secs = self.server.timeout_secs.max(15);
         let mut parsed_session = None;
-        let jingle_deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+        let jingle_wait_start = tokio::time::Instant::now();
+        let jingle_deadline = jingle_wait_start + Duration::from_secs(timeout_secs);
 
         while tokio::time::Instant::now() < jingle_deadline {
             match tokio::time::timeout(Duration::from_millis(400), xmpp.recv_stanza()).await {
@@ -172,7 +189,23 @@ impl ClientTransport for WrtcTransport {
                     xmpp.leave_room().await;
                     anyhow::bail!("XMPP WebSocket closed while waiting for Jicofo session-initiate");
                 }
-                Err(_) => {}
+                Err(_) => {
+                    if jingle_wait_start.elapsed() >= Duration::from_secs(4) {
+                        let occupants = xmpp.get_other_occupants();
+                        let has_srv_occupant = match expected_srv_suffix {
+                            Some(ref suffix) => {
+                                occupants.iter().any(|occ| occ.ends_with(suffix.as_str()))
+                            }
+                            None => !occupants.is_empty(),
+                        };
+                        if !has_srv_occupant {
+                            xmpp.leave_room().await;
+                            anyhow::bail!(
+                                "No active server occupant in room '{room_name}' after 4s (fast failover)"
+                            );
+                        }
+                    }
+                }
             }
         }
 
@@ -335,21 +368,6 @@ impl ClientTransport for WrtcTransport {
         let mut interval = tokio::time::interval(Duration::from_secs(
             WRTC_DISCOVER_BROADCAST_INTERVAL_SECS,
         ));
-
-        let server_pub_key = self
-            .server
-            .server_pub_key
-            .as_deref()
-            .or_else(|| {
-                if !self.config.keys.server_pub_key.is_empty() {
-                    Some(self.config.keys.server_pub_key.as_str())
-                } else {
-                    None
-                }
-            });
-
-        let expected_srv_suffix = server_pub_key
-            .and_then(|pk| compute_server_endpoint_suffix_from_b64(pk, &bootstrap.conference_id));
 
         let mut verified_server_id = None;
         while tokio::time::Instant::now() < deadline {
@@ -1362,21 +1380,71 @@ impl ClientTransport for WrtcTransport {
             let first_rx_clone = first_client_rx.clone();
             let peer_reassert = shared_peer.clone();
             let srv_ep_reassert = target_server_id.clone();
+            let cipher_warmup = cipher.clone();
+            let seq_warmup = sequence.clone();
             Some(tokio::spawn(async move {
-                for _ in 0..WRTC_CLIENT_CONSTRAINTS_REASSERT_COUNT {
-                    tokio::time::sleep(Duration::from_secs(
-                        WRTC_CLIENT_CONSTRAINTS_REASSERT_INTERVAL_SECS,
-                    ))
-                    .await;
+                // Как только ICE/DTLS переходит в состояние Connected — мгновенно пробиваем
+                // RTP Video Uplink (Client -> Server) серией ключевых кадров VIDEO_WARMUP_PAYLOAD,
+                // не дожидаясь 2-секундного тика watchdog.
+                for _ in 0..50 {
+                    if peer_reassert.is_connected.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                if peer_reassert.is_video_v2() && peer_reassert.is_connected.load(Ordering::Relaxed)
+                {
+                    peer_reassert.force_next_keyframe();
+                    for _ in 0..3 {
+                        let seq = seq_warmup.fetch_add(1, Ordering::Relaxed);
+                        if let Ok(enc_buf) = wrap_packet_slice_with_headroom(
+                            &cipher_warmup,
+                            &nonce_prefix,
+                            seq,
+                            &VIDEO_WARMUP_PAYLOAD,
+                            VP8_ASTP_PREFIX_LEN,
+                        ) {
+                            let _ = peer_reassert
+                                .send_video_frame_preallocated(my_client_tag, enc_buf)
+                                .await;
+                        }
+                    }
+                }
+                let ticks_per_reassert =
+                    (WRTC_CLIENT_CONSTRAINTS_REASSERT_INTERVAL_SECS * 2).max(1) as usize;
+                for tick in 0..(WRTC_CLIENT_CONSTRAINTS_REASSERT_COUNT * ticks_per_reassert) {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
                     if !first_rx_clone.load(Ordering::Relaxed) {
                         break;
                     }
-                    let constraints = anet_common::wrtc::colibri::ReceiverVideoConstraints::for_endpoint(
-                        &srv_ep_reassert,
-                        WRTC_DEFAULT_MAX_VIDEO_HEIGHT,
-                    );
-                    let _ = peer_reassert.send_video_constraints(&constraints).await;
-                    log::debug!("[WRTC Client] Periodic re-assertion of ReceiverVideoConstraints for server endpoint {srv_ep_reassert}");
+                    if peer_reassert.is_video_v2()
+                        && peer_reassert.is_connected.load(Ordering::Relaxed)
+                    {
+                        peer_reassert.force_next_keyframe();
+                        let seq = seq_warmup.fetch_add(1, Ordering::Relaxed);
+                        if let Ok(enc_buf) = wrap_packet_slice_with_headroom(
+                            &cipher_warmup,
+                            &nonce_prefix,
+                            seq,
+                            &VIDEO_WARMUP_PAYLOAD,
+                            VP8_ASTP_PREFIX_LEN,
+                        ) {
+                            let _ = peer_reassert
+                                .send_video_frame_preallocated(my_client_tag, enc_buf)
+                                .await;
+                        }
+                    }
+                    if (tick + 1) % ticks_per_reassert == 0 {
+                        let constraints =
+                            anet_common::wrtc::colibri::ReceiverVideoConstraints::for_endpoint(
+                                &srv_ep_reassert,
+                                WRTC_DEFAULT_MAX_VIDEO_HEIGHT,
+                            );
+                        let _ = peer_reassert.send_video_constraints(&constraints).await;
+                        log::debug!(
+                            "[WRTC Client] Periodic re-assertion of ReceiverVideoConstraints for server endpoint {srv_ep_reassert}"
+                        );
+                    }
                 }
             }))
         } else {
@@ -1394,36 +1462,67 @@ impl ClientTransport for WrtcTransport {
                             match unwrap_packet_bytes(&cipher_video, raw_astp) {
                                 Ok(decrypted) => {
                                     let now_secs = current_timestamp_secs();
-                                    last_video_rx_secs.store(now_secs, Ordering::Relaxed);
                                     last_pong_video.store(now_secs, Ordering::Relaxed);
-                                    if first_client_rx.swap(false, Ordering::Relaxed) {
-                                        info!(
-                                            "[WRTC Client Video IN] First video frame decrypted from server (len: {} bytes, tag: 0x{:04X})",
-                                            decrypted.len(), tag
-                                        );
-                                        status(format!("[WRTC Client Video IN] First video frame decrypted from server (len: {} bytes, tag: 0x{:04X})", decrypted.len(), tag));
-                                    }
-                                    if decrypted.first() == Some(&VIDEO_BATCH_MARKER) {
-                                        let packets = unpack_batch(&decrypted[1..]);
-                                        for pkt in packets {
-                                            if pkt.len() >= WRTC_MIN_IP_PACKET_LEN {
-                                                let clamped = anet_common::icmp_probe::clamp_tcp_mss_bytes(
-                                                    pkt,
-                                                    tcp_clamp_mtu,
+
+                                    let is_warmup_frame = decrypted.len()
+                                        == VIDEO_WARMUP_PAYLOAD.len()
+                                        && decrypted.starts_with(&[
+                                            VIDEO_BATCH_MARKER,
+                                            VIDEO_WARMUP_MARKER_HI,
+                                            VIDEO_WARMUP_MARKER_LO,
+                                        ]);
+
+                                    if is_warmup_frame {
+                                        let server_confirmed_client_video =
+                                            decrypted.get(3).copied().unwrap_or(0) == 1;
+                                        if server_confirmed_client_video {
+                                            last_video_rx_secs.store(now_secs, Ordering::Relaxed);
+                                            if first_client_rx.swap(false, Ordering::Relaxed) {
+                                                info!(
+                                                    "[WRTC Client Video IN] Bidirectional RTP Video confirmed by server (tag: 0x{:04X})",
+                                                    tag
                                                 );
-                                                if tun_inject_video.send(clamped).await.is_err() {
-                                                    break 'outer;
+                                                status(format!(
+                                                    "[WRTC Client Video IN] Bidirectional RTP Video confirmed by server (tag: 0x{:04X})",
+                                                    tag
+                                                ));
+                                            }
+                                        } else {
+                                            // Server -> Client видео работает, но сервер ещё НЕ получил наш Client -> Server видеокадр!
+                                            // Не отключаем дублирование в Colibri-WS, пока сервер не пришлёт подтверждение (byte[3] == 1).
+                                            peer_video_rx.force_next_keyframe();
+                                        }
+                                    } else {
+                                        last_video_rx_secs.store(now_secs, Ordering::Relaxed);
+                                        if first_client_rx.swap(false, Ordering::Relaxed) {
+                                            info!(
+                                                "[WRTC Client Video IN] First video frame decrypted from server (len: {} bytes, tag: 0x{:04X})",
+                                                decrypted.len(), tag
+                                            );
+                                            status(format!("[WRTC Client Video IN] First video frame decrypted from server (len: {} bytes, tag: 0x{:04X})", decrypted.len(), tag));
+                                        }
+                                        if decrypted.first() == Some(&VIDEO_BATCH_MARKER) {
+                                            let packets = unpack_batch(&decrypted[1..]);
+                                            for pkt in packets {
+                                                if pkt.len() >= WRTC_MIN_IP_PACKET_LEN {
+                                                    let clamped = anet_common::icmp_probe::clamp_tcp_mss_bytes(
+                                                        pkt,
+                                                        tcp_clamp_mtu,
+                                                    );
+                                                    if tun_inject_video.send(clamped).await.is_err() {
+                                                        break 'outer;
+                                                    }
                                                 }
                                             }
-                                        }
-                                    } else if decrypted.len() >= WRTC_MIN_IP_PACKET_LEN {
-                                        log::trace!("[WRTC Media Video IN] Decrypted packet ({} bytes)", decrypted.len());
-                                        let clamped = anet_common::icmp_probe::clamp_tcp_mss_bytes(
-                                            decrypted,
-                                            tcp_clamp_mtu,
-                                        );
-                                        if tun_inject_video.send(clamped).await.is_err() {
-                                            break 'outer;
+                                        } else if decrypted.len() >= WRTC_MIN_IP_PACKET_LEN {
+                                            log::trace!("[WRTC Media Video IN] Decrypted packet ({} bytes)", decrypted.len());
+                                            let clamped = anet_common::icmp_probe::clamp_tcp_mss_bytes(
+                                                decrypted,
+                                                tcp_clamp_mtu,
+                                            );
+                                            if tun_inject_video.send(clamped).await.is_err() {
+                                                break 'outer;
+                                            }
                                         }
                                     }
                                 }

@@ -173,6 +173,27 @@ pub const VIDEO_WARMUP_PAYLOAD: [u8; 16] = [
     0,
 ];
 
+/// Подтверждающий 16-байтный кадр прогрева видеоканала от сервера к клиенту (`byte[3] == 1`),
+/// сигнализирующий, что сервер успешно принял и расшифровал входящий RTP Video поток от клиента.
+pub const VIDEO_WARMUP_ACK_PAYLOAD: [u8; 16] = [
+    VIDEO_BATCH_MARKER,
+    VIDEO_WARMUP_MARKER_HI,
+    VIDEO_WARMUP_MARKER_LO,
+    1,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+];
+
 /// Дефолтные резервные реквизиты JVB при отсутствии кандидатов в Jingle.
 pub const WRTC_DEFAULT_FALLBACK_JVB_IP: &str = "89.169.16.6";
 pub const WRTC_DEFAULT_FALLBACK_JVB_PORT: u16 = 10002;
