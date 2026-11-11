@@ -382,6 +382,7 @@ struct PeerEvents {
     first_video_rx: Arc<AtomicBool>,
     local_video_ssrc: u32,
     bg_tasks: Arc<std::sync::Mutex<Vec<tokio::task::AbortHandle>>>,
+    xmpp_endpoints: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 #[async_trait::async_trait]
@@ -411,10 +412,11 @@ impl PeerConnectionEventHandler for PeerEvents {
                 self.failed_notify.notify_waiters();
                 self.failed_notify.notify_one();
             } else if state == RTCPeerConnectionState::Failed {
-                if self.has_ws.load(Ordering::SeqCst) {
+                if self.has_ws.load(Ordering::SeqCst) || self.mode == WrtcMode::Ws {
                     log::warn!(
-                        "[WRTC Media] UDP PeerConnection entered Failed state, but Colibri-WS is active (mode={:?}). Continuing over Colibri-WS without tearing session.",
-                        self.mode
+                        "[WRTC Media] UDP PeerConnection entered Failed state, but WebSocket transport is active (mode={:?}, has_ws={}). Continuing without tearing session.",
+                        self.mode,
+                        self.has_ws.load(Ordering::SeqCst)
                     );
                 } else {
                     self.is_failed.store(true, Ordering::SeqCst);
@@ -525,6 +527,7 @@ impl PeerConnectionEventHandler for PeerEvents {
         let in_tx = self.incoming_tx.clone();
         let dc_is_open_c = self.dc_is_open.clone();
         let dc_poll = Arc::clone(&data_channel);
+        let xmpp_eps_dc = self.xmpp_endpoints.clone();
 
         let t = tokio::spawn(async move {
             while let Some(event) = dc_poll.poll().await {
@@ -540,9 +543,19 @@ impl PeerConnectionEventHandler for PeerEvents {
                     }
                     DataChannelEvent::OnMessage(msg) => {
                         if let Ok(c_msg) = serde_json::from_slice::<ColibriMessage>(&msg.data) {
+                            if let Some(ref sender) = c_msg.from {
+                                if let Ok(mut set) = xmpp_eps_dc.lock() {
+                                    set.remove(sender);
+                                }
+                            }
                             let _ = in_tx.send(c_msg).await;
                         } else if let Ok(text) = std::str::from_utf8(&msg.data) {
                             if let Ok(c_msg) = serde_json::from_str::<ColibriMessage>(text) {
+                                if let Some(ref sender) = c_msg.from {
+                                    if let Ok(mut set) = xmpp_eps_dc.lock() {
+                                        set.remove(sender);
+                                    }
+                                }
                                 let _ = in_tx.send(c_msg).await;
                             }
                         }
@@ -1154,6 +1167,9 @@ impl WrtcPeer {
         let (ws_fallback_tx, mut ws_fallback_rx) =
             mpsc::channel::<String>(WRTC_WS_FALLBACK_CHANNEL_CAPACITY);
         let has_ws = Arc::new(AtomicBool::new(false));
+        let ws_open_notify = Arc::new(tokio::sync::Notify::new());
+        let xmpp_endpoints: Arc<std::sync::Mutex<std::collections::HashSet<String>>> =
+            Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
         let colibri_ws_ip: Arc<std::sync::Mutex<Option<std::net::IpAddr>>> =
             Arc::new(std::sync::Mutex::new(None));
         let active_video_constraints: Arc<std::sync::Mutex<Option<ReceiverVideoConstraints>>> =
@@ -1169,8 +1185,11 @@ impl WrtcPeer {
                     .map(|x| x.profile.clone())
                     .unwrap_or_else(crate::http_help::BrowserProfile::random);
                 let ws_origin = xmpp_opt.map(|x| x.origin.clone());
+                let has_xmpp_fallback = xmpp_opt.is_some();
                 let in_tx_ws = incoming_tx.clone();
                 let has_ws_c = has_ws.clone();
+                let ws_open_notify_c = ws_open_notify.clone();
+                let xmpp_eps_ws = xmpp_endpoints.clone();
                 let colibri_ws_ip_c = colibri_ws_ip.clone();
                 let active_constraints_ws = active_video_constraints.clone();
                 let dc_open_ws = dc_is_open.clone();
@@ -1196,6 +1215,7 @@ impl WrtcPeer {
                                 log::warn!("[WRTC WS] Failed to build Colibri-WS request: {e}");
                                 if !dc_open_ws.load(Ordering::SeqCst)
                                     && !(has_video_flag && is_connected_ws.load(Ordering::SeqCst))
+                                    && !has_xmpp_fallback
                                 {
                                     is_failed_ws.store(true, Ordering::SeqCst);
                                     failed_notify_ws.notify_waiters();
@@ -1290,6 +1310,7 @@ impl WrtcPeer {
                                 }
                             }
                             has_ws_c.store(true, Ordering::SeqCst);
+                            ws_open_notify_c.notify_waiters();
                             log::info!(
                                 "[WRTC WS] Parallel Colibri-WS fallback connected (remote_ip: {:?})",
                                 peer_ip
@@ -1339,12 +1360,22 @@ impl WrtcPeer {
                                             Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) => {
                                                 last_inbound_at = tokio::time::Instant::now();
                                                 if let Ok(c_msg) = serde_json::from_str::<ColibriMessage>(&text) {
+                                                    if let Some(ref sender) = c_msg.from {
+                                                        if let Ok(mut set) = xmpp_eps_ws.lock() {
+                                                            set.remove(sender);
+                                                        }
+                                                    }
                                                     let _ = in_tx_ws.send(c_msg).await;
                                                 }
                                             }
                                             Some(Ok(tokio_tungstenite::tungstenite::Message::Binary(bin))) => {
                                                 last_inbound_at = tokio::time::Instant::now();
                                                 if let Ok(c_msg) = serde_json::from_slice::<ColibriMessage>(&bin) {
+                                                    if let Some(ref sender) = c_msg.from {
+                                                        if let Ok(mut set) = xmpp_eps_ws.lock() {
+                                                            set.remove(sender);
+                                                        }
+                                                    }
                                                     let _ = in_tx_ws.send(c_msg).await;
                                                 }
                                             }
@@ -1452,9 +1483,10 @@ impl WrtcPeer {
                         if reconnect_attempts > 5 {
                             if !dc_open_ws.load(Ordering::SeqCst)
                                 && !(has_video_flag && is_connected_ws.load(Ordering::SeqCst))
+                                && !has_xmpp_fallback
                             {
                                 log::warn!(
-                                    "[WRTC WS] Colibri-WS reconnect attempts exhausted ({reconnect_attempts}) and no active UDP media/SCTP channel; marking peer failed"
+                                    "[WRTC WS] Colibri-WS reconnect attempts exhausted ({reconnect_attempts}) and no active UDP media/SCTP/XMPP channel; marking peer failed"
                                 );
                                 is_failed_ws.store(true, Ordering::SeqCst);
                                 failed_notify_ws.notify_waiters();
@@ -1462,9 +1494,9 @@ impl WrtcPeer {
                                 break;
                             }
                             log::info!(
-                                "[WRTC WS] Colibri-WS still unreachable (attempt {reconnect_attempts}), but UDP media/SCTP tunnel is active; retrying in 2s..."
+                                "[WRTC WS] Colibri-WS still unreachable (attempt {reconnect_attempts}), continuing over active tunnel/XMPP fallback and retrying in 5s..."
                             );
-                            tokio::time::sleep(Duration::from_secs(2)).await;
+                            tokio::time::sleep(Duration::from_secs(5)).await;
                             continue;
                         }
 
@@ -1493,7 +1525,7 @@ impl WrtcPeer {
         let mut active_ice_servers: Vec<RTCIceServer> = Vec::new();
 
         if let (Some(session), Some(xmpp)) = (session_opt, xmpp_opt) {
-            xmpp.set_colibri_sink(incoming_tx.clone());
+            xmpp.set_colibri_sink_with_tracker(incoming_tx.clone(), xmpp_endpoints.clone());
             let xmpp_json_sender = xmpp.muc_json_sender();
             log::info!("[WRTC Media] Initializing WebRTC PeerConnection with Audio (Opus) and Video (VP8)...");
 
@@ -1593,6 +1625,7 @@ impl WrtcPeer {
                     first_video_rx: first_video_rx.clone(),
                     local_video_ssrc,
                     bg_tasks: bg_tasks.clone(),
+                    xmpp_endpoints: xmpp_endpoints.clone(),
                 });
 
                 match PeerConnectionBuilder::new()
@@ -1699,6 +1732,7 @@ impl WrtcPeer {
                             let dc_in = Arc::clone(&dc);
                             let in_tx = incoming_tx.clone();
                             let active_constraints_dc = active_video_constraints.clone();
+                            let xmpp_eps_dc_in = xmpp_endpoints.clone();
 
                             let dc_poll_task = tokio::spawn(async move {
                                 while let Some(event) = dc_in.poll().await {
@@ -1743,9 +1777,19 @@ impl WrtcPeer {
                                         }
                                         DataChannelEvent::OnMessage(msg) => {
                                             if let Ok(colibri_msg) = serde_json::from_slice::<ColibriMessage>(&msg.data) {
+                                                if let Some(ref sender) = colibri_msg.from {
+                                                    if let Ok(mut set) = xmpp_eps_dc_in.lock() {
+                                                        set.remove(sender);
+                                                    }
+                                                }
                                                 let _ = in_tx.send(colibri_msg).await;
                                             } else if let Ok(text) = std::str::from_utf8(&msg.data) {
                                                 if let Ok(colibri_msg) = serde_json::from_str::<ColibriMessage>(text) {
+                                                    if let Some(ref sender) = colibri_msg.from {
+                                                        if let Ok(mut set) = xmpp_eps_dc_in.lock() {
+                                                            set.remove(sender);
+                                                        }
+                                                    }
                                                     let _ = in_tx.send(colibri_msg).await;
                                                 }
                                             }
@@ -1850,7 +1894,9 @@ impl WrtcPeer {
                 let is_connected_out = is_connected.clone();
                 let dc_open_notify_out = dc_open_notify.clone();
                 let has_ws_out = has_ws.clone();
+                let ws_open_notify_out = ws_open_notify.clone();
                 let ws_fallback_tx_out = ws_fallback_tx.clone();
+                let xmpp_eps_out = xmpp_endpoints.clone();
 
                 let has_colibri_ws_cfg = session.transport.colibri_ws_url.is_some();
                 let sender_task = tokio::spawn(async move {
@@ -1860,10 +1906,17 @@ impl WrtcPeer {
                             dc_open_notify_out.notified(),
                         )
                         .await;
+                    } else if !use_sctp_dc && has_colibri_ws_cfg && !has_ws_out.load(Ordering::SeqCst) {
+                        let _ = tokio::time::timeout(
+                            Duration::from_millis(1200),
+                            ws_open_notify_out.notified(),
+                        )
+                        .await;
                     }
                     log::info!(
-                        "[WRTC DataChannel] Outgoing sender loop active (is_open={}, use_sctp_dc={})",
+                        "[WRTC DataChannel] Outgoing sender loop active (is_open={}, has_ws={}, use_sctp_dc={})",
                         dc_is_open_out.load(Ordering::SeqCst),
+                        has_ws_out.load(Ordering::SeqCst),
                         use_sctp_dc
                     );
 
@@ -1889,10 +1942,21 @@ impl WrtcPeer {
                             }
                         };
 
+                        let target_is_xmpp_only = msg_to_opt
+                            .as_deref()
+                            .map(|to_ep| {
+                                xmpp_eps_out
+                                    .lock()
+                                    .map(|set| set.contains(to_ep))
+                                    .unwrap_or(false)
+                            })
+                            .unwrap_or(false);
+
                         let mut sent = false;
-                        // Используем SCTP DataChannel ТОЛЬКО когда разрешён SCTP (use_sctp_dc), живы и SCTP (dc_is_open), и UDP ICE (is_connected).
-                        // Если под БС UDP просел (Disconnected/Failed) или выбран режим WrtcMode::Ws, отправляем через живой Colibri-WS!
-                        if use_sctp_dc
+                        // Используем SCTP DataChannel ТОЛЬКО когда разрешён SCTP (use_sctp_dc), живы и SCTP (dc_is_open), и UDP ICE (is_connected),
+                        // И при этом удалённый пир НЕ находится в режиме только XMPP MUC (target_is_xmpp_only == false).
+                        if !target_is_xmpp_only
+                            && use_sctp_dc
                             && dc_is_open_out.load(Ordering::SeqCst)
                             && is_connected_out.load(Ordering::SeqCst)
                         {
@@ -1934,7 +1998,7 @@ impl WrtcPeer {
                         let is_constraints = !is_astp && !is_batch && json_str.contains("ReceiverVideoConstraints");
                         let constraints_copy = if is_constraints { Some(json_str.clone()) } else { None };
 
-                        if !sent && (has_ws_out.load(Ordering::SeqCst) || (mode == WrtcMode::Ws && has_colibri_ws_cfg)) {
+                        if !sent && !target_is_xmpp_only && has_ws_out.load(Ordering::SeqCst) {
                             if is_astp || is_batch {
                                 log::trace!("[JVB WS OUT ASTP]");
                             } else {
@@ -1950,7 +2014,7 @@ impl WrtcPeer {
                             } else {
                                 sent = true;
                             }
-                        } else if !sent && !has_colibri_ws_cfg && use_sctp_dc {
+                        } else if !sent && !target_is_xmpp_only && !has_colibri_ws_cfg && use_sctp_dc {
                             if let Some(ref dc_out) = dc_opt_out {
                                 if !dc_is_open_out.load(Ordering::SeqCst) {
                                     let _ = tokio::time::timeout(
@@ -1967,11 +2031,11 @@ impl WrtcPeer {
                             }
                         }
 
-                        // Резервная доставка ТОЛЬКО управляющих и одиночных рукопожатных сообщений (discover, beacon, ASTP handshake, ping/pong)
-                        // через XMPP MUC `<json-message>`. Крупные пакетные батчи (`is_batch` / AstpBatch) НИКОГДА не отправляются в XMPP-чат,
-                        // чтобы не вызвать лимит станз (policy-violation / resource-constraint) на Prosody!
-                        if !sent && !is_constraints && !is_batch {
-                            if is_astp {
+                        // Резервная доставка через XMPP MUC `<json-message>`, когда ни SCTP DataChannel, ни Colibri-WS
+                        // недоступны (например, под Белыми Списками, когда `*.ktalk.host` заблокирован, а сигналинг `*.ktalk.ru` жив),
+                        // либо когда целевой пир (`target_is_xmpp_only`) общается через XMPP MUC.
+                        if !sent && !is_constraints {
+                            if is_astp || is_batch {
                                 log::trace!("[XMPP MUC JSON OUT ASTP]");
                             } else {
                                 log::info!("[XMPP MUC JSON OUT]: {json_str}");

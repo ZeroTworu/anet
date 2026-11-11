@@ -52,6 +52,7 @@ pub struct XmppSession {
     pub occupants: Arc<Mutex<HashSet<String>>>,
     pub discovered_ice_servers: Arc<Mutex<Vec<XmppIceServer>>>,
     colibri_sink: Arc<Mutex<Option<mpsc::Sender<crate::wrtc::colibri::ColibriMessage>>>>,
+    xmpp_endpoints_tracker: Arc<Mutex<Option<Arc<Mutex<HashSet<String>>>>>>,
     default_ice_servers: Vec<XmppIceServer>,
     active_jingle: Arc<Mutex<Option<(String, String, u32, u32)>>>,
     write_tx: mpsc::Sender<XmppOutboundCmd>,
@@ -429,6 +430,8 @@ impl XmppSession {
         let discovered_ice_servers = Arc::new(Mutex::new(Vec::new()));
         let colibri_sink: Arc<Mutex<Option<mpsc::Sender<crate::wrtc::colibri::ColibriMessage>>>> =
             Arc::new(Mutex::new(None));
+        let xmpp_endpoints_tracker: Arc<Mutex<Option<Arc<Mutex<HashSet<String>>>>>> =
+            Arc::new(Mutex::new(None));
 
         let effective_client_name = match client_name_opt {
             Some(name) if !name.is_empty() && name != "ANet-Node" => name.to_string(),
@@ -756,6 +759,7 @@ impl XmppSession {
         let occ_track_bg = occupants.clone();
         let discovered_ice_bg = discovered_ice_servers.clone();
         let colibri_sink_bg = colibri_sink.clone();
+        let xmpp_tracker_bg = xmpp_endpoints_tracker.clone();
         let domain_owned = domain.to_string();
         let origin_owned = origin.clone();
         let profile_bg = profile.clone();
@@ -831,6 +835,13 @@ impl XmppSession {
                                                 if occupant != my_ep && occupant != "focus" {
                                                     if is_unavailable {
                                                         occ_track_bg.lock().unwrap().remove(occupant);
+                                                        if let Ok(t_guard) = xmpp_tracker_bg.lock() {
+                                                            if let Some(ref set_arc) = *t_guard {
+                                                                if let Ok(mut set) = set_arc.lock() {
+                                                                    set.remove(occupant);
+                                                                }
+                                                            }
+                                                        }
                                                     } else {
                                                         occ_track_bg
                                                             .lock()
@@ -881,6 +892,15 @@ impl XmppSession {
                                                     Some(target) => target == my_ep,
                                                 };
                                                 if for_me {
+                                                    if let Some(ref from_ep) = c_msg.from {
+                                                        if let Ok(t_guard) = xmpp_tracker_bg.lock() {
+                                                            if let Some(ref set_arc) = *t_guard {
+                                                                if let Ok(mut set) = set_arc.lock() {
+                                                                    set.insert(from_ep.clone());
+                                                                }
+                                                            }
+                                                        }
+                                                    }
                                                     if let Ok(guard) = colibri_sink_bg.lock() {
                                                         if let Some(ref tx) = *guard {
                                                             let _ = tx.try_send(c_msg);
@@ -952,6 +972,7 @@ impl XmppSession {
                         }
 
                         if !batch.is_empty() {
+                            let batch_len = batch.len();
                             let send_batch = async {
                                 for stanza in batch {
                                     ws_stream.feed(Message::text(stanza)).await?;
@@ -959,7 +980,11 @@ impl XmppSession {
                                 ws_stream.flush().await
                             };
                             match tokio::time::timeout(write_timeout_dur, send_batch).await {
-                                Ok(Ok(())) => {}
+                                Ok(Ok(())) => {
+                                    if batch_len >= 4 && !should_close {
+                                        tokio::time::sleep(Duration::from_millis(12)).await;
+                                    }
+                                }
                                 Ok(Err(e)) => {
                                     log::warn!("[XMPP] Error sending stanza over WebSocket: {e}");
                                     stream_broken = true;
@@ -1056,6 +1081,7 @@ impl XmppSession {
             occupants,
             discovered_ice_servers,
             colibri_sink,
+            xmpp_endpoints_tracker,
             default_ice_servers: bootstrap.default_ice_servers.clone(),
             active_jingle: Arc::new(Mutex::new(None)),
             write_tx,
@@ -1067,6 +1093,19 @@ impl XmppSession {
     pub fn set_colibri_sink(&self, tx: mpsc::Sender<crate::wrtc::colibri::ColibriMessage>) {
         if let Ok(mut guard) = self.colibri_sink.lock() {
             *guard = Some(tx);
+        }
+    }
+
+    pub fn set_colibri_sink_with_tracker(
+        &self,
+        tx: mpsc::Sender<crate::wrtc::colibri::ColibriMessage>,
+        tracker: Arc<Mutex<HashSet<String>>>,
+    ) {
+        if let Ok(mut guard) = self.colibri_sink.lock() {
+            *guard = Some(tx);
+        }
+        if let Ok(mut t_guard) = self.xmpp_endpoints_tracker.lock() {
+            *t_guard = Some(tracker);
         }
     }
 

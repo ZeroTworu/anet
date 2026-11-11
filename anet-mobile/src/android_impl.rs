@@ -887,11 +887,7 @@ impl TunFactory for AndroidCallbackTunFactory {
         };
 
         let dns_str = if self.config.main.dns_server_list.is_empty() {
-            if !auth.gateway.trim().is_empty() {
-                auth.gateway.trim().to_string()
-            } else {
-                "1.1.1.1".to_string()
-            }
+            "1.1.1.1,8.8.8.8".to_string()
         } else {
             self.config.main.dns_server_list.join(",")
         };
