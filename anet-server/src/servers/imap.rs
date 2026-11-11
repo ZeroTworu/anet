@@ -517,10 +517,13 @@ async fn run_mailbox_worker_pair(
     let notes_auth_rx = Arc::new(Mutex::new(notes_auth_rx));
     let notes_data_rx = Arc::new(Mutex::new(notes_data_rx));
     let pending_retry_msg: Arc<Mutex<Option<DownlinkMessage>>> = Arc::new(Mutex::new(None));
+    // Сохраняем last_seen_uid и очередь cleanup_uids ВНЕ цикла реконнекта,
+    // чтобы при переподключении SRV_READER/SRV_WRITER не пропускать Uplink-батчи,
+    // пришедшие за 2 секунды реконнекта, и не терять накопленные UID на удаление!
+    let mut persisted_last_seen_uid: Option<u32> = None;
+    let cleanup_uids: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
 
     loop {
-        // Список UIDs сообщений в папке "Drafts" именно этого ящика, прочитанных SRV_READER и готовых к удалению
-        let cleanup_uids: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
         let stop_flag = Arc::new(AtomicBool::new(false));
         let was_throttled = Arc::new(AtomicBool::new(false));
         // Метка времени последнего прихода письма именно в папку "Drafts" этого ящика (для expunge_idle_delay)
@@ -607,6 +610,36 @@ async fn run_mailbox_worker_pair(
             "[IMAP Server][Box #{}] SRV_WRITER initialized for {} (SELECT 'Drafts')",
             mailbox_idx, email
         );
+
+        let (mut last_seen_uid, mut force_immediate_fetch) = match persisted_last_seen_uid {
+            None => {
+                if initial_max_uid > 0 {
+                    if let Err(e) = srv_writer
+                        .expunge_all_up_to(initial_max_uid, command_timeout)
+                        .await
+                    {
+                        debug!(
+                            "[IMAP Server][Box #{}] Initial Drafts cleanup (1:{}) failed for {}: {e}",
+                            mailbox_idx, initial_max_uid, email
+                        );
+                    } else {
+                        info!(
+                            "[IMAP Server][Box #{}] Purged stale Drafts messages up to UID {} for {}",
+                            mailbox_idx, initial_max_uid, email
+                        );
+                    }
+                }
+                persisted_last_seen_uid = Some(initial_max_uid);
+                (initial_max_uid, false)
+            }
+            Some(prev_uid) => {
+                info!(
+                    "[IMAP Server][Box #{}] Reconnected worker pair for {} preserving last_seen_uid={} (folder max_uid={})",
+                    mailbox_idx, email, prev_uid, initial_max_uid
+                );
+                (prev_uid, true)
+            }
+        };
 
         let writer_mutex = Arc::new(Mutex::new(srv_writer));
 
@@ -803,8 +836,6 @@ async fn run_mailbox_worker_pair(
         });
 
         // 4. Запуск SRV_READER[i] (Adaptive Short-IDLE + Greedy Fetch Drain "Drafts" -> Fast Path & Auth Plane)
-        let mut last_seen_uid = initial_max_uid;
-        let mut force_immediate_fetch = false;
         let reader_email = email.clone();
         let server_clamp_mtu = (config.network.mtu as usize).clamp(576, 1500);
         info!(
@@ -874,10 +905,10 @@ async fn run_mailbox_worker_pair(
                     else {
                         return;
                     };
+                    streamed_uids.push(msg.uid);
                     if msg_srv_id != srv_id {
                         return;
                     }
-                    streamed_uids.push(msg.uid);
 
                     // Если сессия уже в local_sessions, обрабатываем пакет синхронно и мгновенно пишем в tun_tx
                     // прямо во время чтения ответа FETCH!
@@ -973,6 +1004,7 @@ async fn run_mailbox_worker_pair(
             match fetch_res {
                 Ok(res) => {
                     last_seen_uid = res.new_max_uid;
+                    persisted_last_seen_uid = Some(last_seen_uid);
                     if !res.messages.is_empty() {
                         let now = now_epoch_ms();
                         last_rx_ms.store(now, Ordering::Relaxed);

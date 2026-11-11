@@ -903,12 +903,16 @@ async fn run_client_mailbox_worker(
     let mut preconnected = initial_conn;
     let uplink_rx = Arc::new(Mutex::new(uplink_rx));
     let expunge_idle_delay_ms = expunge_idle_delay.as_millis() as u64;
+    let mut persisted_last_seen_uid: Option<u32> = None;
+    let cleanup_uids: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
 
     while !stop_flag.load(Ordering::Relaxed) {
         let mut send_binding_frame = false;
+        let is_new_session_baseline: bool;
 
         let (cli_writer, mut cli_reader, initial_max_uid, initial_cleanup) =
             if let Some(conn_tuple) = preconnected.take() {
+                is_new_session_baseline = true;
                 conn_tuple
             } else {
                 // Проверяем, есть ли в пуле хотя бы один другой здоровый ящик
@@ -930,6 +934,7 @@ async fn run_client_mailbox_worker(
                     {
                         Ok((w, r, max_uid)) => {
                             send_binding_frame = true;
+                            is_new_session_baseline = persisted_last_seen_uid.is_none();
                             (w, r, max_uid, Vec::new())
                         }
                         Err(e) => {
@@ -986,6 +991,7 @@ async fn run_client_mailbox_worker(
                                     st.nonce_prefix = new_prefix;
                                 }
                                 sequence.store(CLIENT_SEQUENCE_START, Ordering::SeqCst);
+                                is_new_session_baseline = true;
                                 (w, r, max_uid, hs_uids)
                             } else {
                                 tokio::time::sleep(Duration::from_secs(2)).await;
@@ -1005,6 +1011,42 @@ async fn run_client_mailbox_worker(
             };
 
         let mut cli_writer = cli_writer;
+
+        // На холодном старте ящика (или после полного пересоздания сессии) очищаем старые письма
+        // `1:initial_max_uid` в папке "Notes", оставшиеся от предыдущих прерванных сессий и хендшейка.
+        // При обычном реконнекте внутри живой сессии (`!is_new_session_baseline`) НЕ трогаем
+        // `1:initial_max_uid`, так как там лежат новые Downlink-батчи, пришедшие за 2 секунды реконнекта!
+        let (mut last_seen_uid, mut force_immediate_fetch) = if is_new_session_baseline {
+            if initial_max_uid > 0 {
+                if let Err(e) = cli_writer
+                    .expunge_all_up_to(initial_max_uid, command_timeout)
+                    .await
+                {
+                    debug!(
+                        "[IMAP Client][Box #{} ({})] Initial Notes cleanup (1:{}) failed: {e}",
+                        idx, email, initial_max_uid
+                    );
+                    if !initial_cleanup.is_empty() {
+                        let mut guard = cleanup_uids.lock().await;
+                        guard.extend(initial_cleanup);
+                    }
+                } else {
+                    info!(
+                        "[IMAP Client][Box #{} ({})] Purged stale/handshake Notes messages up to UID {}",
+                        idx, email, initial_max_uid
+                    );
+                }
+            }
+            persisted_last_seen_uid = Some(initial_max_uid);
+            (initial_max_uid, false)
+        } else {
+            let prev_uid = persisted_last_seen_uid.unwrap_or(initial_max_uid);
+            info!(
+                "[IMAP Client][Box #{} ({})] Reconnected data-plane pair preserving last_seen_uid={} (folder max_uid={})",
+                idx, email, prev_uid, initial_max_uid
+            );
+            (prev_uid, true)
+        };
 
         // Для вторичных ящиков (и после переподключения) отправляем Mailbox Binding Frame (раздел 9.3.3),
         // чтобы сервер мгновенно привязал этот ящик к SessionMailboxPool клиента!
@@ -1053,7 +1095,6 @@ async fn run_client_mailbox_worker(
         }
 
         let writer_mutex = Arc::new(Mutex::new(cli_writer));
-        let cleanup_uids = Arc::new(Mutex::new(initial_cleanup));
         let worker_stop = Arc::new(AtomicBool::new(false));
         let was_throttled = Arc::new(AtomicBool::new(false));
         // Метка времени последнего прихода письма именно в папку "Notes" этого ящика (для expunge_idle_delay)
@@ -1067,8 +1108,6 @@ async fn run_client_mailbox_worker(
             idx, email
         );
 
-        let mut last_seen_uid = initial_max_uid;
-        let mut force_immediate_fetch = false;
         let mut write_buf = BytesMut::with_capacity(COALESCE_BUDGET_BYTES);
 
         // Запускаем параллельную задачу CLI_WRITER[i]
@@ -1310,10 +1349,12 @@ async fn run_client_mailbox_worker(
             //   после чтения его литерала `read_exact`, еще до чтения следующего письма из TLS-сокета!
             let fetch_res = cli_reader
                 .fetch_messages_streaming(last_seen_uid, command_timeout, |msg| {
+                    if msg.subject.contains("[ID:") {
+                        streamed_uids.push(msg.uid);
+                    }
                     if !msg.subject.contains(&expected_sess_tag) {
                         return;
                     }
-                    streamed_uids.push(msg.uid);
 
                     match anet_common::transport::unwrap_packet(&cipher_cur, &msg.payload) {
                         Ok(decrypted_batch) => {
@@ -1376,6 +1417,7 @@ async fn run_client_mailbox_worker(
             match fetch_res {
                 Ok(res) => {
                     last_seen_uid = res.new_max_uid;
+                    persisted_last_seen_uid = Some(last_seen_uid);
                     if !res.messages.is_empty() {
                         let now = now_epoch_ms();
                         last_rx_ms.store(now, Ordering::Relaxed);
@@ -1421,8 +1463,17 @@ async fn run_client_mailbox_worker(
             let _ = cli_reader.send_line("A9999 LOGOUT").await;
         })
         .await;
-        let _ = tokio::time::timeout(Duration::from_millis(250), async {
+        let _ = tokio::time::timeout(Duration::from_millis(1200), async {
             let mut w = writer_mutex.lock().await;
+            if stop_flag.load(Ordering::Relaxed) {
+                let rem_clean = {
+                    let mut guard = cleanup_uids.lock().await;
+                    std::mem::take(&mut *guard)
+                };
+                if !rem_clean.is_empty() {
+                    let _ = w.expunge_uids(&rem_clean, Duration::from_millis(900)).await;
+                }
+            }
             let _ = w.send_line("A9999 LOGOUT").await;
         })
         .await;

@@ -987,6 +987,56 @@ where
 
         Ok(())
     }
+
+    /// Пакетно удаляет все сообщения с `UID 1:<max_uid>` в текущей выбранной папке за 1 RTT
+    /// (`NOOP` + `UID STORE 1:<max_uid> +FLAGS.SILENT (\Deleted)` + `UID EXPUNGE 1:<max_uid>`).
+    /// Используется при холодном старте клиента и сервера для очистки старых писем от прерванных сессий.
+    pub async fn expunge_all_up_to(&mut self, max_uid: u32, timeout_dur: Duration) -> Result<()> {
+        if max_uid == 0 {
+            return Ok(());
+        }
+
+        let tag1 = self.next_tag();
+        let tag2 = self.next_tag();
+        let tag3 = self.next_tag();
+        let pipelined_cmd = format!(
+            "{tag1} NOOP\r\n{tag2} UID STORE 1:{max_uid} +FLAGS.SILENT (\\Deleted)\r\n{tag3} UID EXPUNGE 1:{max_uid}\r\n"
+        );
+
+        let prev_pending = self.pending_exists;
+        {
+            let inner = self.stream.get_mut();
+            inner.write_all(pipelined_cmd.as_bytes()).await?;
+            inner.flush().await?;
+        }
+
+        let _ = self.read_until_tagged(&tag1, timeout_dur).await?;
+        self.pending_exists = prev_pending;
+
+        let resp2 = self.read_until_tagged(&tag2, timeout_dur).await?;
+        if !resp2.last().is_some_and(|l| l.starts_with(&format!("{tag2} OK"))) {
+            return Err(anyhow!(
+                "IMAP UID STORE 1:{max_uid} \\Deleted failed: {}",
+                resp2.last().map(|s| s.trim()).unwrap_or_default()
+            ));
+        }
+
+        let resp3 = self.read_until_tagged(&tag3, timeout_dur).await?;
+        let ok = resp3.last().is_some_and(|l| l.starts_with(&format!("{tag3} OK")));
+        if !ok {
+            let tag4 = self.next_tag();
+            self.send_line(&format!("{tag4} EXPUNGE")).await?;
+            let resp4 = self.read_until_tagged(&tag4, timeout_dur).await?;
+            if !resp4.last().is_some_and(|l| l.starts_with(&format!("{tag4} OK"))) {
+                return Err(anyhow!(
+                    "IMAP fallback EXPUNGE 1:{max_uid} failed: {}",
+                    resp4.last().map(|s| s.trim()).unwrap_or_default()
+                ));
+            }
+        }
+
+        Ok(())
+    }
 }
 
 impl ImapConn<tokio_boring::SslStream<TcpStream>> {
@@ -1643,4 +1693,60 @@ mod tests {
 
         server_task.await.unwrap();
     }
+
+    #[tokio::test]
+    async fn test_pipelined_expunge_uids_and_expunge_all_up_to() {
+        let (client_io, mut server_io) = tokio::io::duplex(32 * 1024);
+        let mut conn = ImapConn::new(client_io);
+
+        let server_task = tokio::spawn(async move {
+            let mut s_buf = BufReader::new(&mut server_io);
+            let mut l1 = String::new();
+            let mut l2 = String::new();
+            let mut l3 = String::new();
+
+            // 1. expunge_uids(&[10, 12])
+            s_buf.read_line(&mut l1).await.unwrap();
+            s_buf.read_line(&mut l2).await.unwrap();
+            s_buf.read_line(&mut l3).await.unwrap();
+            assert_eq!(l1.trim(), "A0001 NOOP");
+            assert_eq!(l2.trim(), "A0002 UID STORE 10,12 +FLAGS.SILENT (\\Deleted)");
+            assert_eq!(l3.trim(), "A0003 UID EXPUNGE 10,12");
+            s_buf
+                .get_mut()
+                .write_all(
+                    b"* 12 EXISTS\r\nA0001 OK NOOP completed\r\nA0002 OK UID STORE completed\r\n* 10 EXPUNGE\r\n* 11 EXPUNGE\r\nA0003 OK UID EXPUNGE completed\r\n",
+                )
+                .await
+                .unwrap();
+
+            // 2. expunge_all_up_to(50)
+            l1.clear();
+            l2.clear();
+            l3.clear();
+            s_buf.read_line(&mut l1).await.unwrap();
+            s_buf.read_line(&mut l2).await.unwrap();
+            s_buf.read_line(&mut l3).await.unwrap();
+            assert_eq!(l1.trim(), "A0004 NOOP");
+            assert_eq!(l2.trim(), "A0005 UID STORE 1:50 +FLAGS.SILENT (\\Deleted)");
+            assert_eq!(l3.trim(), "A0006 UID EXPUNGE 1:50");
+            s_buf
+                .get_mut()
+                .write_all(
+                    b"A0004 OK NOOP completed\r\nA0005 OK UID STORE completed\r\nA0006 OK UID EXPUNGE completed\r\n",
+                )
+                .await
+                .unwrap();
+        });
+
+        conn.expunge_uids(&[10, 12], Duration::from_secs(1))
+            .await
+            .unwrap();
+        conn.expunge_all_up_to(50, Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        server_task.await.unwrap();
+    }
 }
+
