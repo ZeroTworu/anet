@@ -269,6 +269,13 @@ pub struct ConnectivityMonitor {
     config: Mutex<ConnectivityConfig>,
     vpn_connected: AtomicBool,
     tunnel_rtt_ms: AtomicU64,
+    in_tunnel_global_mask: AtomicU64,
+    in_tunnel_global_rtt_ms: AtomicU64,
+    in_tunnel_global_updated_ms: AtomicU64,
+    in_tunnel_domestic_mask: AtomicU64,
+    in_tunnel_domestic_rtt_ms: AtomicU64,
+    in_tunnel_domestic_updated_ms: AtomicU64,
+    start_instant: std::time::Instant,
     last_snapshot: Mutex<Option<ConnectivitySnapshot>>,
     wake_notify: Notify,
     task_running: AtomicBool,
@@ -283,6 +290,13 @@ impl ConnectivityMonitor {
             config: Mutex::new(config),
             vpn_connected: AtomicBool::new(false),
             tunnel_rtt_ms: AtomicU64::new(NO_RTT_MARKER),
+            in_tunnel_global_mask: AtomicU64::new(0),
+            in_tunnel_global_rtt_ms: AtomicU64::new(NO_RTT_MARKER),
+            in_tunnel_global_updated_ms: AtomicU64::new(0),
+            in_tunnel_domestic_mask: AtomicU64::new(0),
+            in_tunnel_domestic_rtt_ms: AtomicU64::new(NO_RTT_MARKER),
+            in_tunnel_domestic_updated_ms: AtomicU64::new(0),
+            start_instant: std::time::Instant::now(),
             last_snapshot: Mutex::new(None),
             wake_notify: Notify::new(),
             task_running: AtomicBool::new(false),
@@ -302,6 +316,56 @@ impl ConnectivityMonitor {
             NodeProbeMonitor::set_runtime_handle(handle);
         }
         mon
+    }
+
+    /// Регистрирует успешный внутритуннельный ICMP Echo Reply от глобального узла (1.1.1.1 / 8.8.8.8 / 9.9.9.9).
+    /// На Android, где процесс VPN-клиента исключён из `tun0` через `addDisallowedApplication`,
+    /// это позволяет `ConnectivityMonitor` видеть реальную связность «Мир 3/3» сквозь туннель.
+    pub fn record_in_tunnel_global_probe(target_idx: usize, rtt_ms: u64) {
+        let monitor = Self::global();
+        let bit = 1u64 << (target_idx.min(7));
+        let prev_mask = monitor.in_tunnel_global_mask.fetch_or(bit, Ordering::Relaxed);
+        let now_ms = monitor.start_instant.elapsed().as_millis() as u64;
+        monitor
+            .in_tunnel_global_updated_ms
+            .store(now_ms, Ordering::Relaxed);
+        let prev_rtt = monitor.in_tunnel_global_rtt_ms.load(Ordering::Relaxed);
+        let next_rtt = if prev_rtt == NO_RTT_MARKER {
+            rtt_ms.max(1)
+        } else {
+            prev_rtt.min(rtt_ms.max(1))
+        };
+        monitor
+            .in_tunnel_global_rtt_ms
+            .store(next_rtt, Ordering::Relaxed);
+        if prev_mask == 0 {
+            monitor.wake_notify.notify_one();
+        }
+    }
+
+    /// Регистрирует успешный внутритуннельный ICMP Echo Reply от российского узла (77.88.8.8 / 77.88.8.1 / 87.250.250.242).
+    pub fn record_in_tunnel_domestic_probe(target_idx: usize, rtt_ms: u64) {
+        let monitor = Self::global();
+        let bit = 1u64 << (target_idx.min(7));
+        let prev_mask = monitor
+            .in_tunnel_domestic_mask
+            .fetch_or(bit, Ordering::Relaxed);
+        let now_ms = monitor.start_instant.elapsed().as_millis() as u64;
+        monitor
+            .in_tunnel_domestic_updated_ms
+            .store(now_ms, Ordering::Relaxed);
+        let prev_rtt = monitor.in_tunnel_domestic_rtt_ms.load(Ordering::Relaxed);
+        let next_rtt = if prev_rtt == NO_RTT_MARKER {
+            rtt_ms.max(1)
+        } else {
+            prev_rtt.min(rtt_ms.max(1))
+        };
+        monitor
+            .in_tunnel_domestic_rtt_ms
+            .store(next_rtt, Ordering::Relaxed);
+        if prev_mask == 0 {
+            monitor.wake_notify.notify_one();
+        }
     }
 
     /// Обновляет конфигурацию секции `[connectivity]` и запускает фоновый цикл опроса,
@@ -368,6 +432,20 @@ impl ConnectivityMonitor {
         let prev = monitor.vpn_connected.swap(connected, Ordering::SeqCst);
         if !connected {
             monitor.tunnel_rtt_ms.store(NO_RTT_MARKER, Ordering::Relaxed);
+            monitor.in_tunnel_global_mask.store(0, Ordering::Relaxed);
+            monitor
+                .in_tunnel_global_rtt_ms
+                .store(NO_RTT_MARKER, Ordering::Relaxed);
+            monitor
+                .in_tunnel_global_updated_ms
+                .store(0, Ordering::Relaxed);
+            monitor.in_tunnel_domestic_mask.store(0, Ordering::Relaxed);
+            monitor
+                .in_tunnel_domestic_rtt_ms
+                .store(NO_RTT_MARKER, Ordering::Relaxed);
+            monitor
+                .in_tunnel_domestic_updated_ms
+                .store(0, Ordering::Relaxed);
         }
         if prev != connected {
             let updated_opt = {
@@ -502,7 +580,66 @@ impl ConnectivityMonitor {
         }
     }
 
+    fn merge_in_tunnel_probes(
+        &self,
+        mut global_res: anet_common::connectivity::ProbeGroupResult,
+        mut domestic_res: anet_common::connectivity::ProbeGroupResult,
+    ) -> (
+        anet_common::connectivity::ProbeGroupResult,
+        anet_common::connectivity::ProbeGroupResult,
+    ) {
+        let now_ms = self.start_instant.elapsed().as_millis() as u64;
+        let max_age_ms = 20_000u64;
+
+        let g_updated = self.in_tunnel_global_updated_ms.load(Ordering::Relaxed);
+        if g_updated > 0 && now_ms.saturating_sub(g_updated) <= max_age_ms {
+            let g_ok = (self.in_tunnel_global_mask.load(Ordering::Relaxed).count_ones() as usize)
+                .min(global_res.total_count.max(3));
+            if g_ok > global_res.ok_count {
+                global_res.ok_count = g_ok.min(global_res.total_count);
+            }
+            let g_rtt = self.in_tunnel_global_rtt_ms.load(Ordering::Relaxed);
+            if g_rtt != NO_RTT_MARKER {
+                global_res.min_rtt_ms = Some(match global_res.min_rtt_ms {
+                    Some(prev) => prev.min(g_rtt),
+                    None => g_rtt,
+                });
+            }
+        } else if g_updated > 0 {
+            self.in_tunnel_global_mask.store(0, Ordering::Relaxed);
+            self.in_tunnel_global_rtt_ms
+                .store(NO_RTT_MARKER, Ordering::Relaxed);
+        }
+
+        let d_updated = self.in_tunnel_domestic_updated_ms.load(Ordering::Relaxed);
+        if d_updated > 0 && now_ms.saturating_sub(d_updated) <= max_age_ms {
+            let d_ok = (self
+                .in_tunnel_domestic_mask
+                .load(Ordering::Relaxed)
+                .count_ones() as usize)
+                .min(domestic_res.total_count.max(3));
+            if d_ok > domestic_res.ok_count {
+                domestic_res.ok_count = d_ok.min(domestic_res.total_count);
+            }
+            let d_rtt = self.in_tunnel_domestic_rtt_ms.load(Ordering::Relaxed);
+            if d_rtt != NO_RTT_MARKER {
+                domestic_res.min_rtt_ms = Some(match domestic_res.min_rtt_ms {
+                    Some(prev) => prev.min(d_rtt),
+                    None => d_rtt,
+                });
+            }
+        } else if d_updated > 0 {
+            self.in_tunnel_domestic_mask.store(0, Ordering::Relaxed);
+            self.in_tunnel_domestic_rtt_ms
+                .store(NO_RTT_MARKER, Ordering::Relaxed);
+        }
+
+        (global_res, domestic_res)
+    }
+
     async fn run_loop(self: Arc<Self>) {
+        let mut cached_prober: Option<ConnectivityProber> = None;
+
         loop {
             let cfg = self.config.lock().unwrap().clone();
             if !cfg.enabled {
@@ -513,23 +650,28 @@ impl ConnectivityMonitor {
                 continue;
             }
 
-            let vpn_on = self.vpn_connected.load(Ordering::Relaxed);
-            let prober = ConnectivityProber::new(cfg.clone());
+            let prober = match cached_prober {
+                Some(ref p) if *p.config() == cfg => p.clone(),
+                _ => {
+                    let p = ConnectivityProber::new(cfg.clone());
+                    cached_prober = Some(p.clone());
+                    p
+                }
+            };
 
+            let vpn_on = self.vpn_connected.load(Ordering::Relaxed);
             let tunnel_rtt = if vpn_on {
                 self.current_tunnel_rtt()
             } else {
                 None
             };
 
-            let outer_timeout = Duration::from_millis(cfg.timeout_ms.clamp(1000, 4500) * 2 + 2500);
-            let snapshot = tokio::select! {
-                res = tokio::time::timeout(outer_timeout, prober.probe_once(vpn_on, tunnel_rtt)) => {
+            let outer_timeout = Duration::from_millis(cfg.timeout_ms.clamp(1200, 4500) * 2 + 2500);
+            let (mut global_res, mut domestic_res) = tokio::select! {
+                res = tokio::time::timeout(outer_timeout, prober.probe_groups_raw()) => {
                     match res {
-                        Ok(snap) => snap,
-                        Err(_) => ConnectivitySnapshot::evaluate(
-                            vpn_on,
-                            tunnel_rtt,
+                        Ok(pair) => pair,
+                        Err(_) => (
                             anet_common::connectivity::ProbeGroupResult {
                                 ok_count: 0,
                                 total_count: cfg.global_targets.len(),
@@ -544,24 +686,25 @@ impl ConnectivityMonitor {
                     }
                 }
                 _ = self.wake_notify.notified() => {
-                    // Внеочередное пробуждение (смена конфига, переключение VPN или ручной клик "Перепроверить")
-                    // немедленно перезапускает опрос с актуальными параметрами.
                     continue;
                 }
             };
 
-            // Если во время HTTP-опроса статус VPN успел измениться, пересчитываем актуальный флаг
             let vpn_now = self.vpn_connected.load(Ordering::Relaxed);
             let tunnel_rtt_now = if vpn_now {
                 self.current_tunnel_rtt()
             } else {
                 None
             };
-            let final_snapshot = if vpn_now != vpn_on || tunnel_rtt_now != tunnel_rtt {
-                snapshot.with_updated_tunnel_rtt(vpn_now, tunnel_rtt_now)
-            } else {
-                snapshot
-            };
+
+            if vpn_now {
+                let merged = self.merge_in_tunnel_probes(global_res, domestic_res);
+                global_res = merged.0;
+                domestic_res = merged.1;
+            }
+
+            let final_snapshot =
+                ConnectivitySnapshot::evaluate(vpn_now, tunnel_rtt_now, global_res, domestic_res);
 
             debug!(
                 "[Connectivity] Condition={:?}, Color={:?}, RTT={:?}ms, Global={}/{}, Domestic={}/{}",

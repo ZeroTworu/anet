@@ -95,10 +95,20 @@ impl ANetServer {
         // 1. Дешифратор маршрутов: от ядра ОС к внутренним регистрам UDP/TCP транспорта
         let rx_reg = self.registry.clone();
         tokio::spawn(async move {
-            while let Some(packet) = rx_tun.recv().await {
-                if packet.len() < 20 { continue; }
-                if let Some(dst_ip) = crate::utils::extract_ip_dst(&packet) {
-                    rx_reg.route_packet_to_ipv4(dst_ip, packet).await;
+            while let Some(first_pkt) = rx_tun.recv().await {
+                let mut current_pkt = Some(first_pkt);
+                let mut batch = 0usize;
+                while let Some(packet) = current_pkt.take() {
+                    if packet.len() >= 20 {
+                        if let Some(dst_ip) = crate::utils::extract_ip_dst(&packet) {
+                            rx_reg.route_packet_to_ipv4(dst_ip, packet).await;
+                        }
+                    }
+                    batch += 1;
+                    if batch >= 64 {
+                        break;
+                    }
+                    current_pkt = rx_tun.try_recv().ok();
                 }
             }
         });
@@ -127,16 +137,25 @@ impl ANetServer {
         let probe_registry = self.registry.clone();
         let tun_writer = tx_tun.clone();
         tokio::spawn(async move {
-            while let Some(packet) = client_pkt_rx.recv().await {
-                if let Some(reply) = anet_common::icmp_probe::handle_in_tunnel_icmp_probe(&packet) {
-                    if let Some(dst_ip) = crate::utils::extract_ip_dst(&reply) {
-                        probe_registry
-                            .route_packet_to_ipv4(dst_ip, reply)
-                            .await;
+            while let Some(first_pkt) = client_pkt_rx.recv().await {
+                let mut current_pkt = Some(first_pkt);
+                let mut batch = 0usize;
+                while let Some(packet) = current_pkt.take() {
+                    if let Some(reply) = anet_common::icmp_probe::handle_in_tunnel_icmp_probe(&packet) {
+                        if let Some(dst_ip) = crate::utils::extract_ip_dst(&reply) {
+                            probe_registry
+                                .route_packet_to_ipv4(dst_ip, reply)
+                                .await;
+                        }
+                    } else if tun_writer.send(packet).await.is_err() {
+                        return;
                     }
-                    continue;
+                    batch += 1;
+                    if batch >= 64 {
+                        break;
+                    }
+                    current_pkt = client_pkt_rx.try_recv().ok();
                 }
-                let _ = tun_writer.try_send(packet);
             }
         });
 

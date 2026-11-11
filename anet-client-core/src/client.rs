@@ -553,14 +553,35 @@ impl AnetClient {
                 break;
             }
             if let Ok(ip) = IpAddr::from_str(&h) {
-                bypass_ips.push(ip);
+                if ip.is_ipv4() && !ip.is_loopback() {
+                    bypass_ips.push(ip);
+                }
             } else if let Ok(Ok(resolved)) =
                 tokio::time::timeout(Duration::from_millis(1500), lookup_host((h.as_str(), p)))
                     .await
             {
-                bypass_ips.extend(resolved.map(|addr| addr.ip()));
+                bypass_ips.extend(
+                    resolved
+                        .map(|addr| addr.ip())
+                        .filter(|ip| ip.is_ipv4() && !ip.is_loopback()),
+                );
             }
         }
+
+        // ГАРАНТИЯ: если транспорт закрепил конкретный IP CDN (Round-Robin),
+        // обязательно добавляем его в обход туннеля, чтобы избежать петли маршрутизации!
+        if let Some(pinned_ip) = result.remote_ip {
+            if pinned_ip.is_ipv4() && !pinned_ip.is_loopback() {
+                bypass_ips.push(pinned_ip);
+            }
+        }
+
+        for bypass_ip in result.bypass_ips {
+            if bypass_ip.is_ipv4() && !bypass_ip.is_loopback() {
+                bypass_ips.push(bypass_ip);
+            }
+        }
+
         bypass_ips.sort_unstable();
         bypass_ips.dedup();
 
@@ -569,33 +590,6 @@ impl AnetClient {
             self.route_manager
                 .add_bypass_route(*server_ip, prefix)
                 .await?;
-        }
-
-        // ГАРАНТИЯ: если транспорт закрепил конкретный IP CDN (Round-Robin),
-        // обязательно добавляем его в обход туннеля, чтобы избежать петли маршрутизации!
-        if let Some(pinned_ip) = result.remote_ip {
-            let prefix = if pinned_ip.is_ipv4() { 32 } else { 128 };
-            self.route_manager
-                .add_bypass_route(pinned_ip, prefix)
-                .await?;
-            bypass_ips.push(pinned_ip);
-        }
-
-        for bypass_ip in result.bypass_ips {
-            let prefix = if bypass_ip.is_ipv4() { 32 } else { 128 };
-            self.route_manager
-                .add_bypass_route(bypass_ip, prefix)
-                .await?;
-            bypass_ips.push(bypass_ip);
-        }
-
-        // Гарантируем, что прямые DNS-резолверы для Direct-правил всегда идут в обход туннеля
-        for direct_dns_ip in crate::dns_interceptor::DIRECT_UPSTREAM_DNS_IPS {
-            let _ = self
-                .route_manager
-                .add_bypass_route(IpAddr::V4(direct_dns_ip), 32)
-                .await;
-            bypass_ips.push(IpAddr::V4(direct_dns_ip));
         }
 
         // Инициализация и синхронизация движка Smart DNS, Geo-Routing и AdBlock (.abc + Local Overrides)
@@ -616,16 +610,18 @@ impl AnetClient {
                         80
                     });
                     if let Ok(ip) = IpAddr::from_str(host) {
-                        let prefix = if ip.is_ipv4() { 32 } else { 128 };
-                        let _ = self.route_manager.add_bypass_route(ip, prefix).await;
+                        if ip.is_ipv4() && !ip.is_loopback() {
+                            let _ = self.route_manager.add_bypass_route(ip, 32).await;
+                        }
                     } else if let Ok(Ok(addrs)) =
                         tokio::time::timeout(Duration::from_millis(1500), lookup_host((host, port)))
                             .await
                     {
                         for addr in addrs {
                             let ip = addr.ip();
-                            let prefix = if ip.is_ipv4() { 32 } else { 128 };
-                            let _ = self.route_manager.add_bypass_route(ip, prefix).await;
+                            if ip.is_ipv4() && !ip.is_loopback() {
+                                let _ = self.route_manager.add_bypass_route(ip, 32).await;
+                            }
                         }
                     }
                 }
@@ -690,22 +686,19 @@ impl AnetClient {
             }
 
             // Применяем статические CIDR-маршруты Direct из скомпилированного rules.abc:
-            // - На Android маршруты передаются единым списком в VpnService.Builder.excludeRoute при создании TUN.
-            // - На Desktop (Linux/Windows/macOS) добавление 5200+ маршрутов через системные утилиты ip/route/netsh
-            //   блокирует старт на десятки секунд, поэтому на Desktop точечные /32 bypass-маршруты добавляются
-            //   динамически через DnsInterceptor при разрешении Direct-доменов.
+            // На Android при активных мобильных Белых Списках (или DPI) провайдер может блокировать/замедлять
+            // прямые обращения к части подсетей вне БС, а системный DNS идёт через туннель, поэтому
+            // на Android не исключаем 5200+ подсетей из tun0 по умолчанию (пользовательские exclude_route_for
+            // и [routing.overrides] direct выше при этом продолжают работать штатно).
             let abc_direct_routes = rule_cache.collect_direct_routes();
             if !abc_direct_routes.is_empty() {
                 let count = abc_direct_routes.len();
-                #[cfg(target_os = "android")]
+                #[cfg(not(target_os = "android"))]
                 {
-                    let _ = self
-                        .route_manager
-                        .add_bypass_routes(&abc_direct_routes)
-                        .await;
+                    let _ = self.route_manager.add_bypass_routes(&abc_direct_routes).await;
                 }
                 let msg = format!(
-                    "[RuleCache] Loaded {} static Direct CIDR bypass routes from rules.abc",
+                    "[RuleCache] Loaded {} static Direct CIDR rules from rules.abc",
                     count
                 );
                 info!("{msg}");
@@ -807,9 +800,9 @@ impl AnetClient {
         let last_reply_us = Arc::new(AtomicU64::new(0));
         let (tx_probe, mut rx_probe) = tokio::sync::mpsc::channel::<Bytes>(64);
 
-        // Внутритуннельный генератор ICMP Echo Request для универсального измерения честного RTT.
+        // Внутритуннельный генератор ICMP Echo Request для универсального измерения честного RTT
+        // и реальной сквозной связности «РФ / Мир» внутри туннеля (включая Android с addDisallowedApplication).
         // Работает для ВСЕХ видов транспорта (QUIC, SSH, VNC, AHTTP, WS, WRTC) прямо внутри шифрованного потока.
-        // Не требует raw-сокетов и повышенных прав ОС (полная совместимость с Linux, Windows, macOS, Android, iOS).
         if let (Some(client_ip), Some(gateway_ip)) = (client_ip_opt, gateway_ip_opt) {
             let tx_probe_c = tx_probe.clone();
             let probe_shutdown = shutdown_notify.clone();
@@ -841,6 +834,37 @@ impl AnetClient {
                         break;
                     }
 
+                    // На первом цикле и далее каждые 2 цикла отправляем легковесные 36-байтные
+                    // внутритуннельные ICMP-зонды к глобальным (1.1.1.1, 8.8.8.8, 9.9.9.9)
+                    // и российским (77.88.8.8, 77.88.8.1, 87.250.250.242) узлам через NAT сервера.
+                    if seq == 1 || seq % 2 == 0 {
+                        let now_ext_us = probe_start_time.elapsed().as_micros() as u64;
+                        for (idx, &world_ip) in
+                            anet_common::icmp_probe::WORLD_PROBE_IPS.iter().enumerate()
+                        {
+                            let pkt = build_ipv4_icmp_echo_request(
+                                client_ip,
+                                world_ip,
+                                anet_common::icmp_probe::PROBE_WORLD_IDENTIFIER,
+                                (idx as u16) + 1,
+                                now_ext_us,
+                            );
+                            let _ = tx_probe_c.try_send(pkt);
+                        }
+                        for (idx, &dom_ip) in
+                            anet_common::icmp_probe::DOMESTIC_PROBE_IPS.iter().enumerate()
+                        {
+                            let pkt = build_ipv4_icmp_echo_request(
+                                client_ip,
+                                dom_ip,
+                                anet_common::icmp_probe::PROBE_DOMESTIC_IDENTIFIER,
+                                (idx as u16) + 1,
+                                now_ext_us,
+                            );
+                            let _ = tx_probe_c.try_send(pkt);
+                        }
+                    }
+
                     tokio::select! {
                         _ = tokio::time::sleep(ping_interval) => {}
                         _ = probe_shutdown.notified() => break,
@@ -852,7 +876,6 @@ impl AnetClient {
 
         let dns_aborts: Arc<Mutex<Vec<tokio::task::AbortHandle>>> =
             Arc::new(Mutex::new(Vec::new()));
-        let dns_aborts_t1 = dns_aborts.clone();
         let dns_aborts_t2 = dns_aborts.clone();
 
         let (mut stream_reader, mut stream_writer) = io_split(result.vpn_stream);
@@ -864,16 +887,11 @@ impl AnetClient {
         let sig_t1 = reconnect_signal.clone();
         let reason_t1 = disconnect_reason.clone();
         let tx_to_tun_dns = tx_to_tun.clone();
-        let tx_probe_dns = tx_probe.clone();
-        let route_manager_dns = self.route_manager.clone();
-        let dns_servers_list = config_clone.main.dns_server_list.clone();
         let dns_interceptor_tx = dns_interceptor.clone();
         let rule_cache_tx = rule_cache.clone();
         let local_overrides_tx = local_overrides.clone();
         let direct_ip_cache_tx = direct_ip_cache.clone();
 
-        #[cfg(all(windows, feature = "per-app"))]
-        let app_filter_bypass_t1 = _app_filter.as_ref().map(|f| f.bypass_set());
         #[cfg(all(windows, feature = "per-app"))]
         let app_filter_bypass_t2 = _app_filter.as_ref().map(|f| f.bypass_set());
 
@@ -921,51 +939,12 @@ impl AnetClient {
                     crate::dns_interceptor::InterceptResult::Drop => {
                         return false;
                     }
-                    crate::dns_interceptor::InterceptResult::DirectQuery => {
-                        let interceptor_c = dns_interceptor_tx.clone();
-                        let pkt_c = pkt.clone();
-                        let dns_c = dns_servers_list.clone();
-                        let tun_tx_c = tx_to_tun_dns.clone();
-                        let probe_tx_c = tx_probe_dns.clone();
-                        let rm_c = route_manager_dns.clone();
-                        #[cfg(all(windows, feature = "per-app"))]
-                        let af_bypass = app_filter_bypass_t1.clone();
-                        let dns_task = tokio::spawn(async move {
-                            if let Some((reply_pkt, resolved_ips)) =
-                                interceptor_c.resolve_direct_dns_packet(&pkt_c, &dns_c).await
-                            {
-                                if !resolved_ips.is_empty() {
-                                    #[cfg(all(windows, feature = "per-app"))]
-                                    if let Some(ref bp) = af_bypass {
-                                        for ip in &resolved_ips {
-                                            bp.add_sync(*ip);
-                                        }
-                                    }
-                                    let routes: Vec<(IpAddr, u8)> = resolved_ips
-                                        .iter()
-                                        .map(|ip| (*ip, if ip.is_ipv4() { 32 } else { 128 }))
-                                        .collect();
-                                    let _ = rm_c.add_bypass_routes(&routes).await;
-                                    log::info!(
-                                        "[DNS/Direct] Added OS bypass routes for {:?}",
-                                        resolved_ips
-                                    );
-                                }
-                                let _ = tun_tx_c.send(reply_pkt).await;
-                            } else {
-                                // Fallback: если прямой UDP:53 заблокирован провайдером, отправляем запрос в туннель
-                                // (ответ будет перехвачен в t2 и IP-адреса также получат bypass-маршруты до отдачи браузеру)
-                                let _ = probe_tx_c.send(pkt_c).await;
-                            }
-                        });
-                        {
-                            let mut guard = dns_aborts_t1.lock().unwrap();
-                            guard.retain(|h| !h.is_finished());
-                            guard.push(dns_task.abort_handle());
-                        }
-                        return false;
-                    }
-                    crate::dns_interceptor::InterceptResult::PassThrough => {}
+                    // Все разрешённые DNS-запросы (и Proxy, и Direct IPv4 A) идут строго внутри
+                    // зашифрованного VPN-туннеля (0% DNS Leak наружу). Для Direct-доменов ответ
+                    // перехватывается в t2 (`inspect_dns_response`), который прописывает /32 bypass-маршруты
+                    // до передачи DNS-ответа приложению.
+                    crate::dns_interceptor::InterceptResult::DirectQuery
+                    | crate::dns_interceptor::InterceptResult::PassThrough => {}
                 }
 
                 if let Some(dst_ip) = crate::dns_interceptor::extract_packet_dst_ip(pkt) {
@@ -1080,8 +1059,10 @@ impl AnetClient {
                                 rx_time.store(batch_rx_us, Ordering::Relaxed);
                                 let mut current_pkt = Some(first_packet);
                                 while let Some(packet) = current_pkt.take() {
-                                    // Перехватываем внутритуннельный ICMP Echo Reply (замер честного RTT)
-                                    // Не учитываем служебные 40-байтные пинг-зонды в пользовательском трафике rx_bytes
+                                    // Перехватываем внутритуннельные ICMP Echo Reply:
+                                    // 1) PROBE_IDENTIFIER (0x414E) — замер RTT до VPN-узла
+                                    // 2) PROBE_WORLD_IDENTIFIER (0x4157) — проверка связности «Мир» сквозь туннель
+                                    // 3) PROBE_DOMESTIC_IDENTIFIER (0x4144) — проверка связности «РФ» сквозь туннель
                                     if let Some(c_ip) = client_ip_opt {
                                         if let Some((_seq, sent_ts_us)) = parse_ipv4_icmp_echo_reply(
                                             &packet,
@@ -1126,6 +1107,50 @@ impl AnetClient {
                                                 }
                                             }
                                         }
+
+                                        if let Some((seq_idx, sent_ts_us)) = parse_ipv4_icmp_echo_reply(
+                                            &packet,
+                                            c_ip,
+                                            anet_common::icmp_probe::PROBE_WORLD_IDENTIFIER,
+                                        ) {
+                                            let rtt_ms = (batch_rx_us.saturating_sub(sent_ts_us) / 1000).max(1);
+                                            let idx = seq_idx.saturating_sub(1) as usize;
+                                            crate::connectivity_monitor::ConnectivityMonitor::record_in_tunnel_global_probe(idx, rtt_ms);
+                                            match frame_reader.try_next_packet() {
+                                                Ok(next_opt) => {
+                                                    current_pkt = next_opt;
+                                                    continue;
+                                                }
+                                                Err(e) => {
+                                                    warn!("[Tunnel/Rx] Failed reading frame/packet from VPN stream: {e:#}");
+                                                    *reason_t2.lock().unwrap() = format!("Failed reading frame/packet from VPN stream: {e:#}");
+                                                    sig_t2.notify_one();
+                                                    break 'rx_loop;
+                                                }
+                                            }
+                                        }
+
+                                        if let Some((seq_idx, sent_ts_us)) = parse_ipv4_icmp_echo_reply(
+                                            &packet,
+                                            c_ip,
+                                            anet_common::icmp_probe::PROBE_DOMESTIC_IDENTIFIER,
+                                        ) {
+                                            let rtt_ms = (batch_rx_us.saturating_sub(sent_ts_us) / 1000).max(1);
+                                            let idx = seq_idx.saturating_sub(1) as usize;
+                                            crate::connectivity_monitor::ConnectivityMonitor::record_in_tunnel_domestic_probe(idx, rtt_ms);
+                                            match frame_reader.try_next_packet() {
+                                                Ok(next_opt) => {
+                                                    current_pkt = next_opt;
+                                                    continue;
+                                                }
+                                                Err(e) => {
+                                                    warn!("[Tunnel/Rx] Failed reading frame/packet from VPN stream: {e:#}");
+                                                    *reason_t2.lock().unwrap() = format!("Failed reading frame/packet from VPN stream: {e:#}");
+                                                    sig_t2.notify_one();
+                                                    break 'rx_loop;
+                                                }
+                                            }
+                                        }
                                     }
 
                                     let packet = anet_common::icmp_probe::clamp_tcp_mss_bytes(packet, client_clamp_mtu);
@@ -1133,8 +1158,9 @@ impl AnetClient {
                                     rx_bytes.fetch_add(len, Ordering::Relaxed);
                                     rx_packets.fetch_add(1, Ordering::Relaxed);
 
-                                    // Если из туннеля пришел DNS-ответ для Direct-домена, регистрируем bypass-маршруты асинхронно,
-                                    // не блокируя горячий цикл приёма пакетов 'rx_loop
+                                    // Если из туннеля пришел DNS-ответ для Direct-домена, прописываем /32 bypass-маршруты
+                                    // в таблицу маршрутизации ОС и сразу после этого отдаём DNS-ответ в TUN,
+                                    // чтобы первый же TCP SYN браузера пошёл в обход туннеля (и без блокировки 'rx_loop).
                                     if let Some((qname, resolved_ips)) = dns_interceptor_rx
                                         .inspect_dns_response(&packet, |domain| rule_cache_rx.lookup_domain(domain))
                                     {
@@ -1150,6 +1176,8 @@ impl AnetClient {
                                                 .map(|ip| (*ip, if ip.is_ipv4() { 32 } else { 128 }))
                                                 .collect();
                                             let rm_bg = route_manager_rx.clone();
+                                            let tun_tx_bg = tx_to_tun.clone();
+                                            let pkt_bg = packet.clone();
                                             let dns_rx_task = tokio::spawn(async move {
                                                 let _ = rm_bg.add_bypass_routes(&routes).await;
                                                 log::info!(
@@ -1157,11 +1185,24 @@ impl AnetClient {
                                                     qname,
                                                     resolved_ips
                                                 );
+                                                let _ = tun_tx_bg.send(pkt_bg).await;
                                             });
                                             {
                                                 let mut guard = dns_aborts_t2.lock().unwrap();
                                                 guard.retain(|h| !h.is_finished());
                                                 guard.push(dns_rx_task.abort_handle());
+                                            }
+                                            match frame_reader.try_next_packet() {
+                                                Ok(next_opt) => {
+                                                    current_pkt = next_opt;
+                                                    continue;
+                                                }
+                                                Err(e) => {
+                                                    warn!("[Tunnel/Rx] Failed reading frame/packet from VPN stream: {e:#}");
+                                                    *reason_t2.lock().unwrap() = format!("Failed reading frame/packet from VPN stream: {e:#}");
+                                                    sig_t2.notify_one();
+                                                    break 'rx_loop;
+                                                }
                                             }
                                         }
                                     }

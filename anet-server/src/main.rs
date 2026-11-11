@@ -3,24 +3,31 @@ use anet_server::server;
 use anyhow::Result;
 use server::ANetServer;
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
-async fn main() -> Result<()> {
-    if let Err(e) = rustls::crypto::ring::default_provider()
-        .install_default()
-        .map_err(|e| anyhow::anyhow!("Failed to install crypto provider: {:?}", e))
-    {
-        log::warn!("{}", e);
-        // Можно запустить процесс дальше, но проблема в том, что build() падает
-        // Return Err(e) if crucial. Here, we must prevent panic.
-    }
-    env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("info,rtc::peer_connection::handler=error"),
-    )
-    .init();
-    let cfg = load().await?;
+fn main() -> Result<()> {
+    let worker_threads = std::thread::available_parallelism()
+        .map(|n| n.get().clamp(2, 4))
+        .unwrap_or(2);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
+        .enable_all()
+        .build()?;
 
-    let mut server = ANetServer::new(&cfg)?;
-    server.run().await?;
+    runtime.block_on(async move {
+        if let Err(e) = rustls::crypto::ring::default_provider()
+            .install_default()
+            .map_err(|e| anyhow::anyhow!("Failed to install crypto provider: {:?}", e))
+        {
+            log::warn!("{}", e);
+        }
+        env_logger::Builder::from_env(
+            env_logger::Env::default().default_filter_or("info,rtc::peer_connection::handler=error"),
+        )
+        .init();
+        let cfg = load().await?;
 
-    Ok(())
+        let mut server = ANetServer::new(&cfg)?;
+        server.run().await?;
+
+        Ok(())
+    })
 }

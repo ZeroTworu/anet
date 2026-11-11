@@ -203,7 +203,17 @@ impl WrtcRuntime for TunedTokioRuntime {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = std::io::Result<Vec<std::net::SocketAddr>>> + Send + 'a>,
     > {
-        self.inner.resolve_host(host)
+        let fut = self.inner.resolve_host(host);
+        Box::pin(async move {
+            let addrs = fut.await?;
+            let ipv4_addrs: Vec<std::net::SocketAddr> =
+                addrs.iter().copied().filter(|a| a.is_ipv4()).collect();
+            if !ipv4_addrs.is_empty() {
+                Ok(ipv4_addrs)
+            } else {
+                Ok(addrs)
+            }
+        })
     }
 
     fn now(&self) -> std::time::Instant {
@@ -302,12 +312,7 @@ fn detect_physical_bind_addr(
             s.transport
                 .candidates
                 .iter()
-                .find(|c| {
-                    !c.ip.is_empty()
-                        && c.ip != "0.0.0.0"
-                        && !c.ip.starts_with("127.")
-                        && !c.ip.starts_with("172.112.")
-                })
+                .find(|c| crate::wrtc::jingle::is_valid_jvb_candidate_ip(&c.ip))
                 .map(|c| (c.ip.as_str(), c.port))
         })
         .unwrap_or((fallback_ip, fallback_port));
@@ -333,6 +338,32 @@ fn detect_physical_bind_addr(
     "0.0.0.0:0".to_string()
 }
 
+/// Выделяет `count` уникальных локальных эфемерных UDP-портов на заданном адресе интерфейса (`ip:0`),
+/// чтобы ICE-агент `webrtc-rs` создавал `count` независимых UDP-сокетов с различными исходными портами
+/// для равномерного распределения по сетевым маршрутам.
+fn allocate_distinct_udp_bind_addrs(bind_addr: &str, count: usize) -> Vec<String> {
+    let target_count = count.clamp(1, 16);
+    if target_count <= 1 {
+        return vec![bind_addr.to_string()];
+    }
+    let mut held_sockets = Vec::with_capacity(target_count);
+    let mut addrs = Vec::with_capacity(target_count);
+    for _ in 0..target_count {
+        if let Ok(sock) = std::net::UdpSocket::bind(bind_addr) {
+            if let Ok(local_addr) = sock.local_addr() {
+                addrs.push(local_addr.to_string());
+                held_sockets.push(sock);
+            }
+        }
+    }
+    drop(held_sockets);
+    if addrs.is_empty() {
+        vec![bind_addr.to_string()]
+    } else {
+        addrs
+    }
+}
+
 struct PeerEvents {
     connected_tx: mpsc::Sender<()>,
     is_connected: Arc<AtomicBool>,
@@ -351,6 +382,7 @@ struct PeerEvents {
     first_video_rx: Arc<AtomicBool>,
     local_video_ssrc: u32,
     bg_tasks: Arc<std::sync::Mutex<Vec<tokio::task::AbortHandle>>>,
+    xmpp_endpoints: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 #[async_trait::async_trait]
@@ -380,10 +412,11 @@ impl PeerConnectionEventHandler for PeerEvents {
                 self.failed_notify.notify_waiters();
                 self.failed_notify.notify_one();
             } else if state == RTCPeerConnectionState::Failed {
-                if self.has_ws.load(Ordering::SeqCst) {
+                if self.has_ws.load(Ordering::SeqCst) || self.mode == WrtcMode::Ws {
                     log::warn!(
-                        "[WRTC Media] UDP PeerConnection entered Failed state, but Colibri-WS is active (mode={:?}). Continuing over Colibri-WS without tearing session.",
-                        self.mode
+                        "[WRTC Media] UDP PeerConnection entered Failed state, but WebSocket transport is active (mode={:?}, has_ws={}). Continuing without tearing session.",
+                        self.mode,
+                        self.has_ws.load(Ordering::SeqCst)
                     );
                 } else {
                     self.is_failed.store(true, Ordering::SeqCst);
@@ -478,6 +511,10 @@ impl PeerConnectionEventHandler for PeerEvents {
     }
 
     async fn on_data_channel(&self, data_channel: Arc<dyn DataChannel>) {
+        if self.mode == WrtcMode::Ws {
+            log::debug!("[WRTC DataChannel] Ignoring inbound SCTP DataChannel in strict WrtcMode::Ws");
+            return;
+        }
         let label = data_channel.label().await.unwrap_or_default();
         let proto = data_channel.protocol().await.unwrap_or_default();
         log::info!(
@@ -490,6 +527,7 @@ impl PeerConnectionEventHandler for PeerEvents {
         let in_tx = self.incoming_tx.clone();
         let dc_is_open_c = self.dc_is_open.clone();
         let dc_poll = Arc::clone(&data_channel);
+        let xmpp_eps_dc = self.xmpp_endpoints.clone();
 
         let t = tokio::spawn(async move {
             while let Some(event) = dc_poll.poll().await {
@@ -505,9 +543,19 @@ impl PeerConnectionEventHandler for PeerEvents {
                     }
                     DataChannelEvent::OnMessage(msg) => {
                         if let Ok(c_msg) = serde_json::from_slice::<ColibriMessage>(&msg.data) {
+                            if let Some(ref sender) = c_msg.from {
+                                if let Ok(mut set) = xmpp_eps_dc.lock() {
+                                    set.remove(sender);
+                                }
+                            }
                             let _ = in_tx.send(c_msg).await;
                         } else if let Ok(text) = std::str::from_utf8(&msg.data) {
                             if let Ok(c_msg) = serde_json::from_str::<ColibriMessage>(text) {
+                                if let Some(ref sender) = c_msg.from {
+                                    if let Ok(mut set) = xmpp_eps_dc.lock() {
+                                        set.remove(sender);
+                                    }
+                                }
                                 let _ = in_tx.send(c_msg).await;
                             }
                         }
@@ -926,8 +974,16 @@ pub async fn create_p2p_channel(
                 inner: TokioRuntime,
                 udp_socket_buffer_size: wrtc_cfg.udp_socket_buffer_size,
             }))
-            .with_udp_addrs(vec![effective_bind_addr.clone()])
-            .with_dedicated_reactor_pool_size(wrtc_cfg.reactor_pool_size.max(1))
+            .with_udp_addrs(allocate_distinct_udp_bind_addrs(
+                &effective_bind_addr,
+                wrtc_cfg.udp_ice_socket_count.clamp(1, 16),
+            ))
+            .with_dedicated_reactor_pool_size(
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(1)
+                    .clamp(1, wrtc_cfg.reactor_pool_size.max(1)),
+            )
             .build()
             .await
         {
@@ -1046,6 +1102,7 @@ pub struct WrtcPeer {
     pub last_video_tx_ms: Arc<AtomicU64>,
     pub video_v2_enabled: Arc<AtomicBool>,
     pub force_keyframe_remaining: Arc<AtomicU32>,
+    pub video_write_lock: Arc<Mutex<()>>,
     pub remote_sdp: Mutex<String>,
     pub colibri_ws_ip: Arc<std::sync::Mutex<Option<std::net::IpAddr>>>,
     pub active_video_constraints: Arc<std::sync::Mutex<Option<ReceiverVideoConstraints>>>,
@@ -1093,8 +1150,9 @@ impl WrtcPeer {
         let video_pt = session_opt
             .map(|s| s.video_payload_type)
             .unwrap_or(WRTC_VP8_PRIMARY_PAYLOAD_TYPE);
-        let has_video_flag =
-            session_opt.map(|s| s.has_video).unwrap_or(false) || mode == WrtcMode::MediaVideo;
+        let has_video_flag = matches!(mode, WrtcMode::MediaVideo | WrtcMode::Auto)
+            && (session_opt.map(|s| s.has_video).unwrap_or(false) || mode == WrtcMode::MediaVideo);
+        let use_sctp_dc = !matches!(mode, WrtcMode::Ws);
         let video_seq = Arc::new(AtomicU16::new(0));
         let video_ts = Arc::new(AtomicU32::new(0));
         let expected_peer_video_ssrc = Arc::new(AtomicU32::new(0));
@@ -1103,11 +1161,15 @@ impl WrtcPeer {
         let last_video_tx_ms = Arc::new(AtomicU64::new(0));
         let video_v2_enabled = Arc::new(AtomicBool::new(false));
         let force_keyframe_remaining = Arc::new(AtomicU32::new(WRTC_INITIAL_FORCE_KEYFRAMES));
+        let video_write_lock = Arc::new(Mutex::new(()));
         let mut initial_remote_sdp = String::new();
 
         let (ws_fallback_tx, mut ws_fallback_rx) =
             mpsc::channel::<String>(WRTC_WS_FALLBACK_CHANNEL_CAPACITY);
         let has_ws = Arc::new(AtomicBool::new(false));
+        let ws_open_notify = Arc::new(tokio::sync::Notify::new());
+        let xmpp_endpoints: Arc<std::sync::Mutex<std::collections::HashSet<String>>> =
+            Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
         let colibri_ws_ip: Arc<std::sync::Mutex<Option<std::net::IpAddr>>> =
             Arc::new(std::sync::Mutex::new(None));
         let active_video_constraints: Arc<std::sync::Mutex<Option<ReceiverVideoConstraints>>> =
@@ -1123,15 +1185,24 @@ impl WrtcPeer {
                     .map(|x| x.profile.clone())
                     .unwrap_or_else(crate::http_help::BrowserProfile::random);
                 let ws_origin = xmpp_opt.map(|x| x.origin.clone());
+                let has_xmpp_fallback = xmpp_opt.is_some();
                 let in_tx_ws = incoming_tx.clone();
                 let has_ws_c = has_ws.clone();
+                let ws_open_notify_c = ws_open_notify.clone();
+                let xmpp_eps_ws = xmpp_endpoints.clone();
                 let colibri_ws_ip_c = colibri_ws_ip.clone();
                 let active_constraints_ws = active_video_constraints.clone();
                 let dc_open_ws = dc_is_open.clone();
+                let is_connected_ws = is_connected.clone();
                 let is_failed_ws = is_failed.clone();
                 let failed_notify_ws = failed_notify.clone();
                 let colibri_connect_timeout = wrtc_cfg.colibri_ws_connect_timeout_secs.max(1);
+                let colibri_read_timeout =
+                    Duration::from_secs(wrtc_cfg.colibri_ws_read_timeout_secs.max(5));
                 let ws_write_timeout = wrtc_cfg.ws_write_timeout_secs.max(1);
+                let hop_attempts = wrtc_cfg.tcp_port_hop_attempts.clamp(1, 32);
+                let hop_timeout =
+                    Duration::from_millis(wrtc_cfg.tcp_port_hop_timeout_ms.max(200));
                 let ws_task = tokio::spawn(async move {
                     let mut reconnect_attempts = 0u32;
                     loop {
@@ -1142,7 +1213,10 @@ impl WrtcPeer {
                             Ok(r) => r,
                             Err(e) => {
                                 log::warn!("[WRTC WS] Failed to build Colibri-WS request: {e}");
-                                if !dc_open_ws.load(Ordering::SeqCst) {
+                                if !dc_open_ws.load(Ordering::SeqCst)
+                                    && !(has_video_flag && is_connected_ws.load(Ordering::SeqCst))
+                                    && !has_xmpp_fallback
+                                {
                                     is_failed_ws.store(true, Ordering::SeqCst);
                                     failed_notify_ws.notify_waiters();
                                     failed_notify_ws.notify_one();
@@ -1170,7 +1244,44 @@ impl WrtcPeer {
                         let connect_res = tokio::time::timeout(
                             Duration::from_secs(colibri_connect_timeout),
                             async {
-                                let tcp = tokio::net::TcpStream::connect((target_host.as_str(), target_port)).await?;
+                                let mut connected_tcp = None;
+                                for attempt in 1..=hop_attempts {
+                                    match tokio::time::timeout(
+                                        hop_timeout,
+                                        tokio::net::TcpStream::connect((
+                                            target_host.as_str(),
+                                            target_port,
+                                        )),
+                                    )
+                                    .await
+                                    {
+                                        Ok(Ok(s)) => {
+                                            connected_tcp = Some(s);
+                                            break;
+                                        }
+                                        Ok(Err(e)) => {
+                                            log::debug!(
+                                                "[WRTC WS] Colibri TCP connect attempt {attempt}/{hop_attempts} error: {e}"
+                                            );
+                                        }
+                                        Err(_) => {
+                                            log::debug!(
+                                                "[WRTC WS] Colibri TCP port-hop attempt {attempt}/{hop_attempts} timed out after {:?}, hopping port...",
+                                                hop_timeout
+                                            );
+                                        }
+                                    }
+                                }
+                                let tcp = match connected_tcp {
+                                    Some(s) => s,
+                                    None => {
+                                        tokio::net::TcpStream::connect((
+                                            target_host.as_str(),
+                                            target_port,
+                                        ))
+                                        .await?
+                                    }
+                                };
                                 let peer_ip = tcp.peer_addr().ok().map(|a| a.ip());
                                 let _ = tcp.set_nodelay(true);
                                 let sock_ref = socket2::SockRef::from(&tcp);
@@ -1199,31 +1310,47 @@ impl WrtcPeer {
                                 }
                             }
                             has_ws_c.store(true, Ordering::SeqCst);
+                            ws_open_notify_c.notify_waiters();
                             log::info!(
                                 "[WRTC WS] Parallel Colibri-WS fallback connected (remote_ip: {:?})",
                                 peer_ip
                             );
 
-                            if has_video_flag {
-                                let saved_constraints = active_constraints_ws
+                            // Активируем endpoint message transport в JVB отправкой ClientHello
+                            let _ = tokio::time::timeout(
+                                Duration::from_secs(ws_write_timeout),
+                                ws_stream.send(tokio_tungstenite::tungstenite::Message::Text(
+                                    r#"{"colibriClass":"ClientHello"}"#.into(),
+                                )),
+                            )
+                            .await;
+
+                            let initial_constraints = if has_video_flag {
+                                active_constraints_ws
                                     .lock()
                                     .ok()
-                                    .and_then(|g| g.clone());
-                                if let Some(constraints) = saved_constraints {
-                                    if let Ok(json) = serde_json::to_string(&constraints) {
-                                        let _ = tokio::time::timeout(
-                                            Duration::from_secs(ws_write_timeout),
-                                            ws_stream.send(
-                                                tokio_tungstenite::tungstenite::Message::Text(json.into()),
-                                            ),
-                                        )
-                                        .await;
-                                    }
+                                    .and_then(|g| g.clone())
+                                    .or_else(|| {
+                                        Some(crate::wrtc::colibri::ReceiverVideoConstraints::new_all(1080))
+                                    })
+                            } else {
+                                Some(crate::wrtc::colibri::ReceiverVideoConstraints::new_all(0))
+                            };
+                            if let Some(constraints) = initial_constraints {
+                                if let Ok(json) = serde_json::to_string(&constraints) {
+                                    let _ = tokio::time::timeout(
+                                        Duration::from_secs(ws_write_timeout),
+                                        ws_stream.send(
+                                            tokio_tungstenite::tungstenite::Message::Text(json.into()),
+                                        ),
+                                    )
+                                    .await;
                                 }
                             }
 
                             let mut ws_ping_interval = tokio::time::interval(Duration::from_secs(10));
                             ws_ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                            let mut last_inbound_at = tokio::time::Instant::now();
                             let mut channel_closed = false;
 
                             loop {
@@ -1231,16 +1358,29 @@ impl WrtcPeer {
                                     msg_opt = ws_stream.next() => {
                                         match msg_opt {
                                             Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) => {
+                                                last_inbound_at = tokio::time::Instant::now();
                                                 if let Ok(c_msg) = serde_json::from_str::<ColibriMessage>(&text) {
+                                                    if let Some(ref sender) = c_msg.from {
+                                                        if let Ok(mut set) = xmpp_eps_ws.lock() {
+                                                            set.remove(sender);
+                                                        }
+                                                    }
                                                     let _ = in_tx_ws.send(c_msg).await;
                                                 }
                                             }
                                             Some(Ok(tokio_tungstenite::tungstenite::Message::Binary(bin))) => {
+                                                last_inbound_at = tokio::time::Instant::now();
                                                 if let Ok(c_msg) = serde_json::from_slice::<ColibriMessage>(&bin) {
+                                                    if let Some(ref sender) = c_msg.from {
+                                                        if let Ok(mut set) = xmpp_eps_ws.lock() {
+                                                            set.remove(sender);
+                                                        }
+                                                    }
                                                     let _ = in_tx_ws.send(c_msg).await;
                                                 }
                                             }
                                             Some(Ok(tokio_tungstenite::tungstenite::Message::Ping(data))) => {
+                                                last_inbound_at = tokio::time::Instant::now();
                                                 let pong_res = tokio::time::timeout(
                                                     Duration::from_secs(ws_write_timeout),
                                                     ws_stream.send(tokio_tungstenite::tungstenite::Message::Pong(data)),
@@ -1250,6 +1390,9 @@ impl WrtcPeer {
                                                     log::warn!("[WRTC WS] Colibri-WS pong write failed or timed out");
                                                     break;
                                                 }
+                                            }
+                                            Some(Ok(tokio_tungstenite::tungstenite::Message::Pong(_))) => {
+                                                last_inbound_at = tokio::time::Instant::now();
                                             }
                                             Some(Ok(tokio_tungstenite::tungstenite::Message::Close(frame))) => {
                                                 log::warn!("[WRTC WS] Colibri-WS closed by JVB: {frame:?}");
@@ -1315,6 +1458,13 @@ impl WrtcPeer {
                                             break;
                                         }
                                     }
+                                    _ = tokio::time::sleep_until(last_inbound_at + colibri_read_timeout) => {
+                                        log::warn!(
+                                            "[WRTC WS] Colibri-WS read timeout ({:?} without inbound frames); reconnecting background socket...",
+                                            colibri_read_timeout
+                                        );
+                                        break;
+                                    }
                                 }
                             }
 
@@ -1331,15 +1481,23 @@ impl WrtcPeer {
                         }
                         reconnect_attempts += 1;
                         if reconnect_attempts > 5 {
-                            if !dc_open_ws.load(Ordering::SeqCst) {
+                            if !dc_open_ws.load(Ordering::SeqCst)
+                                && !(has_video_flag && is_connected_ws.load(Ordering::SeqCst))
+                                && !has_xmpp_fallback
+                            {
                                 log::warn!(
-                                    "[WRTC WS] Colibri-WS reconnect attempts exhausted ({reconnect_attempts}) and no SCTP DataChannel is open; marking peer failed"
+                                    "[WRTC WS] Colibri-WS reconnect attempts exhausted ({reconnect_attempts}) and no active UDP media/SCTP/XMPP channel; marking peer failed"
                                 );
                                 is_failed_ws.store(true, Ordering::SeqCst);
                                 failed_notify_ws.notify_waiters();
                                 failed_notify_ws.notify_one();
+                                break;
                             }
-                            break;
+                            log::info!(
+                                "[WRTC WS] Colibri-WS still unreachable (attempt {reconnect_attempts}), continuing over active tunnel/XMPP fallback and retrying in 5s..."
+                            );
+                            tokio::time::sleep(Duration::from_secs(5)).await;
+                            continue;
                         }
 
                         log::info!(
@@ -1367,6 +1525,8 @@ impl WrtcPeer {
         let mut active_ice_servers: Vec<RTCIceServer> = Vec::new();
 
         if let (Some(session), Some(xmpp)) = (session_opt, xmpp_opt) {
+            xmpp.set_colibri_sink_with_tracker(incoming_tx.clone(), xmpp_endpoints.clone());
+            let xmpp_json_sender = xmpp.muc_json_sender();
             log::info!("[WRTC Media] Initializing WebRTC PeerConnection with Audio (Opus) and Video (VP8)...");
 
             let audio_codec = RTCRtpCodecParameters {
@@ -1465,6 +1625,7 @@ impl WrtcPeer {
                     first_video_rx: first_video_rx.clone(),
                     local_video_ssrc,
                     bg_tasks: bg_tasks.clone(),
+                    xmpp_endpoints: xmpp_endpoints.clone(),
                 });
 
                 match PeerConnectionBuilder::new()
@@ -1477,8 +1638,16 @@ impl WrtcPeer {
                         inner: TokioRuntime,
                         udp_socket_buffer_size: wrtc_cfg.udp_socket_buffer_size,
                     }))
-                    .with_udp_addrs(vec![bind_addr.clone()])
-                    .with_dedicated_reactor_pool_size(wrtc_cfg.reactor_pool_size.max(1))
+                    .with_udp_addrs(allocate_distinct_udp_bind_addrs(
+                        &bind_addr,
+                        wrtc_cfg.udp_ice_socket_count.clamp(1, 16),
+                    ))
+                    .with_dedicated_reactor_pool_size(
+                        std::thread::available_parallelism()
+                            .map(|n| n.get())
+                            .unwrap_or(1)
+                            .clamp(1, wrtc_cfg.reactor_pool_size.max(1)),
+                    )
                     .build()
                     .await
                 {
@@ -1547,11 +1716,12 @@ impl WrtcPeer {
                     .await;
 
                 let mut data_channel_res = None;
-                if session.has_data_channel && mode != WrtcMode::Ws {
+                let local_ep_for_dc = xmpp_opt.map(|x| x.endpoint_id.clone()).unwrap_or_default();
+                if session.has_data_channel && use_sctp_dc {
                     let dc_init = RTCDataChannelInit {
-                        ordered: false,
+                        ordered: true,
                         max_packet_life_time: None,
-                        max_retransmits: Some(0),
+                        max_retransmits: None,
                         protocol: "http://jitsi.org/protocols/colibri".to_string(),
                         negotiated: None,
                     };
@@ -1562,6 +1732,7 @@ impl WrtcPeer {
                             let dc_in = Arc::clone(&dc);
                             let in_tx = incoming_tx.clone();
                             let active_constraints_dc = active_video_constraints.clone();
+                            let xmpp_eps_dc_in = xmpp_endpoints.clone();
 
                             let dc_poll_task = tokio::spawn(async move {
                                 while let Some(event) = dc_in.poll().await {
@@ -1570,15 +1741,29 @@ impl WrtcPeer {
                                             log::info!("[WRTC DataChannel] 'JVB data channel' state is now OPEN!");
                                             dc_is_open_in.store(true, Ordering::SeqCst);
                                             dc_open_notify_in.notify_waiters();
+                                            let _ = dc_in
+                                                .send_text(r#"{"colibriClass":"ClientHello"}"#)
+                                                .await;
                                             if has_video_flag {
-                                                let saved_constraints = active_constraints_dc
+                                                if !local_ep_for_dc.is_empty() {
+                                                    let vtype_msg = format!(
+                                                        r#"{{"colibriClass":"SourceVideoTypeMessage","sourceName":"{}-v0","videoType":"camera"}}"#,
+                                                        local_ep_for_dc
+                                                    );
+                                                    let _ = dc_in.send_text(&vtype_msg).await;
+                                                }
+                                                let constraints = active_constraints_dc
                                                     .lock()
                                                     .ok()
-                                                    .and_then(|g| g.clone());
-                                                if let Some(constraints) = saved_constraints {
-                                                    if let Ok(json) = serde_json::to_string(&constraints) {
-                                                        let _ = dc_in.send_text(&json).await;
-                                                    }
+                                                    .and_then(|g| g.clone())
+                                                    .unwrap_or_else(|| {
+                                                        crate::wrtc::colibri::ReceiverVideoConstraints::new_all(1080)
+                                                    });
+                                                if let Ok(json) = serde_json::to_string(&constraints) {
+                                                    log::info!(
+                                                        "[WRTC DataChannel] Sent initial ReceiverVideoConstraints on open: {json}"
+                                                    );
+                                                    let _ = dc_in.send_text(&json).await;
                                                 }
                                             }
                                         }
@@ -1592,9 +1777,19 @@ impl WrtcPeer {
                                         }
                                         DataChannelEvent::OnMessage(msg) => {
                                             if let Ok(colibri_msg) = serde_json::from_slice::<ColibriMessage>(&msg.data) {
+                                                if let Some(ref sender) = colibri_msg.from {
+                                                    if let Ok(mut set) = xmpp_eps_dc_in.lock() {
+                                                        set.remove(sender);
+                                                    }
+                                                }
                                                 let _ = in_tx.send(colibri_msg).await;
                                             } else if let Ok(text) = std::str::from_utf8(&msg.data) {
                                                 if let Ok(colibri_msg) = serde_json::from_str::<ColibriMessage>(text) {
+                                                    if let Some(ref sender) = colibri_msg.from {
+                                                        if let Ok(mut set) = xmpp_eps_dc_in.lock() {
+                                                            set.remove(sender);
+                                                        }
+                                                    }
                                                     let _ = in_tx.send(colibri_msg).await;
                                                 }
                                             }
@@ -1613,7 +1808,7 @@ impl WrtcPeer {
                         }
                     }
                 } else {
-                    log::info!("[WRTC DataChannel] JVB bridge does not announce SCTP DataChannel in session-initiate. Operating over Colibri-WS with PacketBatcher.");
+                    log::info!("[WRTC DataChannel] Operating strictly over Colibri-WS / XMPP with PacketBatcher (use_sctp_dc={use_sctp_dc}).");
                 }
 
                 let sdp_str = session.to_sdp(fallback_ip, fallback_port, 0, local_video_ssrc);
@@ -1624,7 +1819,12 @@ impl WrtcPeer {
                             let _ = pc.set_local_description(answer.clone()).await;
 
                             let mut final_sdp = answer.sdp.clone();
-                            for attempt in 0..WRTC_ICE_GATHER_POLL_ATTEMPTS {
+                            let gather_attempts = if mode == WrtcMode::Ws {
+                                4
+                            } else {
+                                WRTC_ICE_GATHER_POLL_ATTEMPTS
+                            };
+                            for attempt in 0..gather_attempts {
                                 if let Some(desc) = pc.local_description().await {
                                     if desc.sdp.contains("a=candidate:") {
                                         final_sdp = desc.sdp;
@@ -1680,8 +1880,8 @@ impl WrtcPeer {
                                     &local_params.fingerprint,
                                     &local_params.fingerprint_hash,
                                     &local_params.candidates,
-                                    session.has_data_channel,
-                                    session.has_video || local_video_ssrc != 0,
+                                    session.has_data_channel && use_sctp_dc,
+                                    has_video_flag,
                                 )
                                 .await;
                         }
@@ -1694,47 +1894,80 @@ impl WrtcPeer {
                 let is_connected_out = is_connected.clone();
                 let dc_open_notify_out = dc_open_notify.clone();
                 let has_ws_out = has_ws.clone();
+                let ws_open_notify_out = ws_open_notify.clone();
                 let ws_fallback_tx_out = ws_fallback_tx.clone();
+                let xmpp_eps_out = xmpp_endpoints.clone();
 
+                let has_colibri_ws_cfg = session.transport.colibri_ws_url.is_some();
                 let sender_task = tokio::spawn(async move {
-                    if dc_opt_out.is_some() && !dc_is_open_out.load(Ordering::SeqCst) {
-                        let _ = tokio::time::timeout(Duration::from_secs(2), dc_open_notify_out.notified()).await;
+                    if use_sctp_dc && dc_opt_out.is_some() && !dc_is_open_out.load(Ordering::SeqCst) {
+                        let _ = tokio::time::timeout(
+                            Duration::from_millis(800),
+                            dc_open_notify_out.notified(),
+                        )
+                        .await;
+                    } else if !use_sctp_dc && has_colibri_ws_cfg && !has_ws_out.load(Ordering::SeqCst) {
+                        let _ = tokio::time::timeout(
+                            Duration::from_millis(1200),
+                            ws_open_notify_out.notified(),
+                        )
+                        .await;
                     }
                     log::info!(
-                        "[WRTC DataChannel] Outgoing sender loop active (is_open={})",
-                        dc_is_open_out.load(Ordering::SeqCst)
+                        "[WRTC DataChannel] Outgoing sender loop active (is_open={}, has_ws={}, use_sctp_dc={})",
+                        dc_is_open_out.load(Ordering::SeqCst),
+                        has_ws_out.load(Ordering::SeqCst),
+                        use_sctp_dc
                     );
 
                     loop {
-                        let (json_str, is_batch, is_astp) = tokio::select! {
+                        let (json_str, msg_to_opt, is_batch, is_astp, is_keepalive) = tokio::select! {
                             msg_opt = outgoing_rx.recv() => {
                                 match msg_opt {
                                     Some(msg) => {
                                         let is_batch = matches!(msg.msg_payload, WrtcMessage::AstpBatch { .. });
                                         let is_astp = matches!(msg.msg_payload, WrtcMessage::Astp { .. });
+                                        let is_keepalive = matches!(msg.msg_payload, WrtcMessage::Ping | WrtcMessage::Pong);
+                                        let msg_to_opt = msg.to.clone();
                                         let Ok(json_str) = serde_json::to_string(&msg) else { continue; };
-                                        (json_str, is_batch, is_astp)
+                                        (json_str, msg_to_opt, is_batch, is_astp, is_keepalive)
                                     }
                                     None => break,
                                 }
                             }
                             raw_opt = raw_outgoing_rx.recv() => {
                                 match raw_opt {
-                                    Some(raw) => (raw, false, false),
+                                    Some(raw) => (raw, None, false, false, false),
                                     None => break,
                                 }
                             }
                         };
 
+                        let target_is_xmpp_only = msg_to_opt
+                            .as_deref()
+                            .map(|to_ep| {
+                                xmpp_eps_out
+                                    .lock()
+                                    .map(|set| set.contains(to_ep))
+                                    .unwrap_or(false)
+                            })
+                            .unwrap_or(false);
+
                         let mut sent = false;
-                        // Используем SCTP DataChannel ТОЛЬКО когда живы и SCTP (dc_is_open), и UDP ICE (is_connected).
-                        // Если под БС UDP просел (Disconnected/Failed), мгновенно отправляем ping/constraints/батчи через живой Colibri-WS!
-                        if dc_is_open_out.load(Ordering::SeqCst) && is_connected_out.load(Ordering::SeqCst) {
+                        // Используем SCTP DataChannel ТОЛЬКО когда разрешён SCTP (use_sctp_dc), живы и SCTP (dc_is_open), и UDP ICE (is_connected),
+                        // И при этом удалённый пир НЕ находится в режиме только XMPP MUC (target_is_xmpp_only == false).
+                        if !target_is_xmpp_only
+                            && use_sctp_dc
+                            && dc_is_open_out.load(Ordering::SeqCst)
+                            && is_connected_out.load(Ordering::SeqCst)
+                        {
                             if let Some(ref dc_out) = dc_opt_out {
                                 if is_batch {
                                     log::debug!("[JVB DC OUT Batch]");
                                 } else if is_astp {
                                     log::trace!("[JVB DC OUT ASTP]");
+                                } else if is_keepalive {
+                                    log::debug!("[JVB DC OUT]: {json_str}");
                                 } else {
                                     log::info!("[JVB DC OUT]: {json_str}");
                                 }
@@ -1765,16 +1998,18 @@ impl WrtcPeer {
                             }
                         }
 
-                        let is_constraints = !is_astp && !is_batch && json_str.contains("ReceiverVideoConstraints");
+                        let is_constraints = !is_astp && !is_batch && !is_keepalive && json_str.contains("ReceiverVideoConstraints");
                         let constraints_copy = if is_constraints { Some(json_str.clone()) } else { None };
 
-                        if !sent && has_ws_out.load(Ordering::SeqCst) {
+                        if !sent && !target_is_xmpp_only && has_ws_out.load(Ordering::SeqCst) {
                             if is_astp || is_batch {
                                 log::trace!("[JVB WS OUT ASTP]");
+                            } else if is_keepalive {
+                                log::debug!("[JVB WS OUT]: {json_str}");
                             } else {
                                 log::info!("[JVB WS OUT]: {json_str}");
                             }
-                            if let Err(e) = ws_fallback_tx_out.try_send(json_str) {
+                            if let Err(e) = ws_fallback_tx_out.try_send(json_str.clone()) {
                                 match e {
                                     tokio::sync::mpsc::error::TrySendError::Full(_) => {
                                         log::warn!("[WRTC WS] Fallback queue full, frame dropped");
@@ -1782,6 +2017,37 @@ impl WrtcPeer {
                                     tokio::sync::mpsc::error::TrySendError::Closed(_) => {}
                                 }
                             } else {
+                                sent = true;
+                            }
+                        } else if !sent && !target_is_xmpp_only && !has_colibri_ws_cfg && use_sctp_dc {
+                            if let Some(ref dc_out) = dc_opt_out {
+                                if !dc_is_open_out.load(Ordering::SeqCst) {
+                                    let _ = tokio::time::timeout(
+                                        Duration::from_millis(250),
+                                        dc_open_notify_out.notified(),
+                                    )
+                                    .await;
+                                }
+                                if dc_is_open_out.load(Ordering::SeqCst)
+                                    && dc_out.send_text(&json_str).await.is_ok()
+                                {
+                                    sent = true;
+                                }
+                            }
+                        }
+
+                        // Резервная доставка через XMPP MUC `<json-message>`, когда ни SCTP DataChannel, ни Colibri-WS
+                        // недоступны (например, под Белыми Списками, когда `*.ktalk.host` заблокирован, а сигналинг `*.ktalk.ru` жив),
+                        // либо когда целевой пир (`target_is_xmpp_only`) общается через XMPP MUC.
+                        if !sent && !is_constraints {
+                            if is_astp || is_batch {
+                                log::trace!("[XMPP MUC JSON OUT ASTP]");
+                            } else if is_keepalive {
+                                log::debug!("[XMPP MUC JSON OUT]: {json_str}");
+                            } else {
+                                log::info!("[XMPP MUC JSON OUT]: {json_str}");
+                            }
+                            if xmpp_json_sender.try_send_json(msg_to_opt.as_deref(), &json_str) {
                                 sent = true;
                             }
                         }
@@ -1802,7 +2068,7 @@ impl WrtcPeer {
                                         WRTC_CONSTRAINTS_RETRY_INTERVAL_MS,
                                     ))
                                     .await;
-                                    if dc_is_open_bg.load(Ordering::SeqCst) && is_connected_bg.load(Ordering::SeqCst) {
+                                    if use_sctp_dc && dc_is_open_bg.load(Ordering::SeqCst) && is_connected_bg.load(Ordering::SeqCst) {
                                         if let Some(ref dc_out) = dc_opt_bg {
                                             if dc_out.send_text(&json_str_bg).await.is_ok() {
                                                 log::info!("[WRTC Constraints] Sent delayed video constraints via DataChannel");
@@ -1832,161 +2098,195 @@ impl WrtcPeer {
                     g.push(sender_task.abort_handle());
                 }
 
-                let track_keepalive = Arc::clone(&audio_track);
-                let seq_c = Arc::new(AtomicU16::new(0));
-                let ts_c = Arc::new(AtomicU32::new(0));
-                let interval_ms = if audio_keepalive_ms > 0 && audio_keepalive_ms <= 100 {
-                    audio_keepalive_ms as u64
-                } else {
-                    20
-                };
-                let samples_per_packet =
-                    (u64::from(WRTC_OPUS_CLOCK_RATE) * interval_ms / 1000) as u32;
-                let is_connected_a = Arc::clone(&is_connected);
-                let is_failed_a = Arc::clone(&is_failed);
-                let ice_failed_wait_ms = wrtc_cfg.ice_failed_timeout_ms;
+                // В режиме WrtcMode::Ws НЕ запускаем генераторы UDP RTP (Opus / VP8 keepalive),
+                // чтобы случайный пробившийся UDP-пакет под мобильными БС не переключил JVB с живого
+                // TCP/TLS Colibri-WS на полуживой UDP-транспорт.
+                if mode != WrtcMode::Ws {
+                    let track_keepalive = Arc::clone(&audio_track);
+                    let seq_c = Arc::new(AtomicU16::new(0));
+                    let ts_c = Arc::new(AtomicU32::new(0));
+                    // Если активен видеопоток (has_video_flag), не спамим 50 пакетов/сек пустого Opus-аудио,
+                    // так как VP8 RTP и ICE STUN уже поддерживают NAT-маппинг, а 50 pps аудио в стандартном Jitsi
+                    // вызывают форвардинг немаппированного аудио-SSRC и спам в логах webrtc::peer_connection::driver.
+                    let interval_ms = if has_video_flag {
+                        5000
+                    } else if audio_keepalive_ms > 0 && audio_keepalive_ms <= 100 {
+                        audio_keepalive_ms as u64
+                    } else {
+                        20
+                    };
+                    let samples_per_packet =
+                        (u64::from(WRTC_OPUS_CLOCK_RATE) * interval_ms.min(100) / 1000) as u32;
+                    let is_connected_a = Arc::clone(&is_connected);
+                    let is_failed_a = Arc::clone(&is_failed);
+                    let ice_failed_wait_ms = wrtc_cfg.ice_failed_timeout_ms;
 
-                let opus_task = tokio::spawn(async move {
-                    let start = std::time::Instant::now();
-                    while !is_connected_a.load(Ordering::SeqCst) {
-                        if is_failed_a.load(Ordering::SeqCst)
-                            || start.elapsed() > Duration::from_millis(ice_failed_wait_ms)
-                        {
-                            return;
+                    let opus_task = tokio::spawn(async move {
+                        let start = std::time::Instant::now();
+                        while !is_connected_a.load(Ordering::SeqCst) {
+                            if is_failed_a.load(Ordering::SeqCst)
+                                || start.elapsed() > Duration::from_millis(ice_failed_wait_ms)
+                            {
+                                return;
+                            }
+                            tokio::time::sleep(Duration::from_millis(50)).await;
                         }
-                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        log::info!(
+                            "[WRTC Media] Starting Opus silence keepalive (interval: {}ms, samples: {})",
+                            interval_ms, samples_per_packet
+                        );
+                        let mut interval = tokio::time::interval(Duration::from_millis(interval_ms));
+                        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                        let silence_payload = Bytes::from_static(&WRTC_OPUS_SILENCE_FRAME);
+                        loop {
+                            interval.tick().await;
+                            if is_failed_a.load(Ordering::SeqCst) {
+                                break;
+                            }
+                            let seq = seq_c.fetch_add(1, Ordering::Relaxed);
+                            let ts = ts_c.fetch_add(samples_per_packet, Ordering::Relaxed);
+                            let rtp_packet = RtpPacket {
+                                header: RtpHeader {
+                                    version: 2,
+                                    padding: false,
+                                    extension: false,
+                                    marker: false,
+                                    payload_type: WRTC_OPUS_PAYLOAD_TYPE,
+                                    sequence_number: seq,
+                                    timestamp: ts,
+                                    ssrc: local_ssrc,
+                                    csrc: vec![],
+                                    extension_profile: 0,
+                                    extensions: vec![],
+                                    extensions_padding: 0,
+                                },
+                                payload: silence_payload.clone(),
+                            };
+                            if let Err(e) = track_keepalive.write_rtp(rtp_packet).await {
+                                log::trace!("[WRTC Media] Opus silence write_rtp transient error: {e}");
+                            }
+                        }
+                    });
+                    if let Ok(mut g) = bg_tasks.lock() {
+                        g.push(opus_task.abort_handle());
                     }
-                    log::info!(
-                        "[WRTC Media] Starting Opus silence keepalive (interval: {}ms, samples: {})",
-                        interval_ms, samples_per_packet
-                    );
-                    let mut interval = tokio::time::interval(Duration::from_millis(interval_ms));
-                    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                    let silence_payload = Bytes::from_static(&WRTC_OPUS_SILENCE_FRAME);
-                    loop {
-                        interval.tick().await;
-                        if is_failed_a.load(Ordering::SeqCst) {
-                            break;
-                        }
-                        let seq = seq_c.fetch_add(1, Ordering::Relaxed);
-                        let ts = ts_c.fetch_add(samples_per_packet, Ordering::Relaxed);
-                        let rtp_packet = RtpPacket {
-                            header: RtpHeader {
-                                version: 2,
-                                padding: false,
-                                extension: false,
-                                marker: false,
-                                payload_type: WRTC_OPUS_PAYLOAD_TYPE,
-                                sequence_number: seq,
-                                timestamp: ts,
-                                ssrc: local_ssrc,
-                                csrc: vec![],
-                                extension_profile: 0,
-                                extensions: vec![],
-                                extensions_padding: 0,
-                            },
-                            payload: silence_payload.clone(),
-                        };
-                        if let Err(e) = track_keepalive.write_rtp(rtp_packet).await {
-                            log::trace!("[WRTC Media] Opus silence write_rtp transient error: {e}");
+
+                    if has_video_flag {
+                        let video_track_keepalive = Arc::clone(&video_track);
+                        let video_seq_c = Arc::clone(&video_seq);
+                        let video_ts_c = Arc::clone(&video_ts);
+                        let last_video_tx_c = Arc::clone(&last_video_tx_ms);
+                        let video_v2_c = Arc::clone(&video_v2_enabled);
+                        let video_write_lock_c = Arc::clone(&video_write_lock);
+                        let start_instant_c = start_instant;
+                        let v_pt = video_pt;
+                        let v_ssrc = local_video_ssrc;
+                        let is_connected_v = Arc::clone(&is_connected);
+                        let is_failed_v = Arc::clone(&is_failed);
+                        let video_keepalive_ms = wrtc_cfg.video_keepalive_interval_ms.max(100);
+                        let video_idle_suppress_ms = (video_keepalive_ms * 4) / 5;
+                        let vp8_task = tokio::spawn(async move {
+                            let start = std::time::Instant::now();
+                            while !is_connected_v.load(Ordering::SeqCst) {
+                                if is_failed_v.load(Ordering::SeqCst)
+                                    || start.elapsed() > Duration::from_millis(ice_failed_wait_ms)
+                                {
+                                    return;
+                                }
+                                tokio::time::sleep(Duration::from_millis(50)).await;
+                            }
+                            log::info!(
+                                "[WRTC Media] Starting VP8 video keepalive (interval: {}ms)",
+                                video_keepalive_ms
+                            );
+                            let mut interval =
+                                tokio::time::interval(Duration::from_millis(video_keepalive_ms));
+                            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+                            loop {
+                                interval.tick().await;
+                                if is_failed_v.load(Ordering::SeqCst) {
+                                    break;
+                                }
+                                let elapsed_ms = start_instant_c.elapsed().as_millis() as u64;
+                                if elapsed_ms.saturating_sub(last_video_tx_c.load(Ordering::Relaxed))
+                                    < video_idle_suppress_ms
+                                {
+                                    // Не инжектируем пустые кадры посреди активного потока данных
+                                    continue;
+                                }
+
+                                let _write_guard = video_write_lock_c.lock().await;
+                                let elapsed_ms = start_instant_c.elapsed().as_millis() as u64;
+                                if elapsed_ms.saturating_sub(last_video_tx_c.load(Ordering::Relaxed))
+                                    < video_idle_suppress_ms
+                                {
+                                    continue;
+                                }
+
+                                let frame_num = video_ts_c.fetch_add(1, Ordering::Relaxed);
+                                let seq = (frame_num & 0xFFFF) as u16;
+                                video_seq_c.store(seq.wrapping_add(1), Ordering::Relaxed);
+                                let pic_id = (frame_num & 0x7FFF) as u16;
+                                let ts = frame_num.wrapping_mul(WRTC_VP8_RTP_TS_STEP);
+
+                                let mut keepalive_payload = BytesMut::with_capacity(4 + VP8_KEYFRAME_HEADER.len());
+
+                                keepalive_payload.put_u8(0x90);
+                                keepalive_payload.put_u8(0x80);
+                                keepalive_payload.put_u8(0x80 | ((pic_id >> 8) as u8));
+                                keepalive_payload.put_u8((pic_id & 0xFF) as u8);
+                                if video_v2_c.load(Ordering::Relaxed) {
+                                    keepalive_payload.put_slice(&VP8_KEYFRAME_1080P_HEADER);
+                                } else {
+                                    keepalive_payload.put_slice(&VP8_KEYFRAME_HEADER);
+                                }
+
+                                let rtp_packet = RtpPacket {
+                                    header: RtpHeader {
+                                        version: 2,
+                                        padding: false,
+                                        extension: false,
+                                        marker: true,
+                                        payload_type: v_pt,
+                                        sequence_number: seq,
+                                        timestamp: ts,
+                                        ssrc: v_ssrc,
+                                        csrc: vec![],
+                                        extension_profile: 0,
+                                        extensions: vec![],
+                                        extensions_padding: 0,
+                                    },
+                                    payload: keepalive_payload.freeze(),
+                                };
+                                if let Err(e) = video_track_keepalive.write_rtp(rtp_packet).await {
+                                    log::trace!("[WRTC Media] VP8 video keepalive transient error: {e}");
+                                }
+                            }
+                        });
+                        if let Ok(mut g) = bg_tasks.lock() {
+                            g.push(vp8_task.abort_handle());
                         }
                     }
-                });
-                if let Ok(mut g) = bg_tasks.lock() {
-                    g.push(opus_task.abort_handle());
-                }
-
-                let video_track_keepalive = Arc::clone(&video_track);
-                let video_seq_c = Arc::clone(&video_seq);
-                let video_ts_c = Arc::clone(&video_ts);
-                let last_video_tx_c = Arc::clone(&last_video_tx_ms);
-                let video_v2_c = Arc::clone(&video_v2_enabled);
-                let start_instant_c = start_instant;
-                let v_pt = video_pt;
-                let v_ssrc = local_video_ssrc;
-                let is_connected_v = Arc::clone(&is_connected);
-                let is_failed_v = Arc::clone(&is_failed);
-                let video_keepalive_ms = wrtc_cfg.video_keepalive_interval_ms.max(100);
-                let video_idle_suppress_ms = (video_keepalive_ms * 4) / 5;
-                let vp8_task = tokio::spawn(async move {
-                    let start = std::time::Instant::now();
-                    while !is_connected_v.load(Ordering::SeqCst) {
-                        if is_failed_v.load(Ordering::SeqCst)
-                            || start.elapsed() > Duration::from_millis(ice_failed_wait_ms)
-                        {
-                            return;
-                        }
-                        tokio::time::sleep(Duration::from_millis(50)).await;
-                    }
-                    log::info!(
-                        "[WRTC Media] Starting VP8 video keepalive (interval: {}ms)",
-                        video_keepalive_ms
-                    );
-                    let mut interval =
-                        tokio::time::interval(Duration::from_millis(video_keepalive_ms));
-                    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-                    loop {
-                        interval.tick().await;
-                        if is_failed_v.load(Ordering::SeqCst) {
-                            break;
-                        }
-                        let elapsed_ms = start_instant_c.elapsed().as_millis() as u64;
-                        if elapsed_ms.saturating_sub(last_video_tx_c.load(Ordering::Relaxed))
-                            < video_idle_suppress_ms
-                        {
-                            // Не инжектируем пустые кадры посреди активного потока данных
-                            continue;
-                        }
-
-                        let frame_num = video_ts_c.fetch_add(1, Ordering::Relaxed);
-                        let seq = (frame_num & 0xFFFF) as u16;
-                        video_seq_c.store(seq.wrapping_add(1), Ordering::Relaxed);
-                        let pic_id = (frame_num & 0x7FFF) as u16;
-                        let ts = frame_num.wrapping_mul(WRTC_VP8_RTP_TS_STEP);
-
-                        let mut keepalive_payload = BytesMut::with_capacity(4 + VP8_KEYFRAME_HEADER.len());
-
-                        keepalive_payload.put_u8(0x90);
-                        keepalive_payload.put_u8(0x80);
-                        keepalive_payload.put_u8(0x80 | ((pic_id >> 8) as u8));
-                        keepalive_payload.put_u8((pic_id & 0xFF) as u8);
-                        if video_v2_c.load(Ordering::Relaxed) {
-                            keepalive_payload.put_slice(&VP8_KEYFRAME_1080P_HEADER);
-                        } else {
-                            keepalive_payload.put_slice(&VP8_KEYFRAME_HEADER);
-                        }
-
-                        let rtp_packet = RtpPacket {
-                            header: RtpHeader {
-                                version: 2,
-                                padding: false,
-                                extension: false,
-                                marker: true,
-                                payload_type: v_pt,
-                                sequence_number: seq,
-                                timestamp: ts,
-                                ssrc: v_ssrc,
-                                csrc: vec![],
-                                extension_profile: 0,
-                                extensions: vec![],
-                                extensions_padding: 0,
-                            },
-                            payload: keepalive_payload.freeze(),
-                        };
-                        if let Err(e) = video_track_keepalive.write_rtp(rtp_packet).await {
-                            log::trace!("[WRTC Media] VP8 video keepalive transient error: {e}");
-                        }
-                    }
-                });
-                if let Ok(mut g) = bg_tasks.lock() {
-                    g.push(vp8_task.abort_handle());
                 }
 
                 peer_connection_opt = Some(pc);
                 data_channel_opt = data_channel_res;
                 audio_track_opt = Some(audio_track);
-                video_track_opt = Some(video_track);
+                video_track_opt = if has_video_flag { Some(video_track) } else { None };
+            }
+        }
+
+        if mode == WrtcMode::Ws
+            && session_opt
+                .and_then(|s| s.transport.colibri_ws_url.as_ref())
+                .is_some()
+        {
+            for _ in 0..80 {
+                if has_ws.load(Ordering::SeqCst) || is_failed.load(Ordering::SeqCst) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
             }
         }
 
@@ -2018,6 +2318,7 @@ impl WrtcPeer {
             last_video_tx_ms,
             video_v2_enabled,
             force_keyframe_remaining,
+            video_write_lock,
             remote_sdp: Mutex::new(initial_remote_sdp),
             colibri_ws_ip,
             active_video_constraints,
@@ -2056,11 +2357,19 @@ impl WrtcPeer {
                 }
             }
         }
+        let video_media_alive = matches!(self.mode, WrtcMode::MediaVideo | WrtcMode::Auto)
+            && self.video_track.is_some()
+            && self.is_connected.load(Ordering::SeqCst);
+        let sctp_dc_alive =
+            self.dc_is_open.load(Ordering::SeqCst) && self.is_connected.load(Ordering::SeqCst);
         if self.start_instant.elapsed() > Duration::from_secs(self.watchdog_channel_grace_secs)
             && !self.has_ws.load(Ordering::SeqCst)
-            && (!self.dc_is_open.load(Ordering::SeqCst) || !self.is_connected.load(Ordering::SeqCst))
+            && !sctp_dc_alive
+            && !video_media_alive
         {
-            return Some("Both Colibri-WS and DataChannel are closed/disconnected");
+            return Some(
+                "All WRTC channels (Colibri-WS, DataChannel, and MediaVideo ICE) are closed/disconnected",
+            );
         }
         None
     }
@@ -2076,50 +2385,71 @@ impl WrtcPeer {
     pub fn force_next_keyframe(&self) {
         self.force_keyframe_remaining
             .store(WRTC_REASSERT_FORCE_KEYFRAMES, Ordering::Relaxed);
+        let elapsed_ms = self.start_instant.elapsed().as_millis() as u64;
+        if elapsed_ms.saturating_sub(self.last_video_tx_ms.load(Ordering::Relaxed)) < 50 {
+            // Если по видеоканалу уже идёт активный поток данных (каждый пакет — 1080p Keyframe),
+            // не запускаем фоновую задачу с холостыми нетегированными кадрами, чтобы не конкурировать за сокет.
+            return;
+        }
         if let Some(ref track) = self.video_track {
             let track_c = Arc::clone(track);
             let video_seq_c = Arc::clone(&self.video_seq);
             let video_ts_c = Arc::clone(&self.video_ts);
             let video_v2_c = Arc::clone(&self.video_v2_enabled);
+            let video_write_lock_c = Arc::clone(&self.video_write_lock);
+            let last_video_tx_c = Arc::clone(&self.last_video_tx_ms);
+            let start_instant_c = self.start_instant;
             let v_pt = self.video_payload_type;
             let v_ssrc = self.video_ssrc;
             let kf_task = tokio::spawn(async move {
                 for _ in 0..WRTC_BURST_KEYFRAME_COUNT {
-                    let frame_num = video_ts_c.fetch_add(1, Ordering::Relaxed);
-                    let seq = (frame_num & 0xFFFF) as u16;
-                    video_seq_c.store(seq.wrapping_add(1), Ordering::Relaxed);
-                    let pic_id = (frame_num & 0x7FFF) as u16;
-                    let ts = frame_num.wrapping_mul(WRTC_VP8_RTP_TS_STEP);
-
-                    let mut keepalive_payload = BytesMut::with_capacity(4 + VP8_KEYFRAME_HEADER.len());
-                    keepalive_payload.put_u8(0x90);
-                    keepalive_payload.put_u8(0x80);
-                    keepalive_payload.put_u8(0x80 | ((pic_id >> 8) as u8));
-                    keepalive_payload.put_u8((pic_id & 0xFF) as u8);
-                    if video_v2_c.load(Ordering::Relaxed) {
-                        keepalive_payload.put_slice(&VP8_KEYFRAME_1080P_HEADER);
-                    } else {
-                        keepalive_payload.put_slice(&VP8_KEYFRAME_HEADER);
+                    let now_ms = start_instant_c.elapsed().as_millis() as u64;
+                    if now_ms.saturating_sub(last_video_tx_c.load(Ordering::Relaxed)) < 50 {
+                        break;
                     }
+                    {
+                        let _write_guard = video_write_lock_c.lock().await;
+                        let now_ms = start_instant_c.elapsed().as_millis() as u64;
+                        if now_ms.saturating_sub(last_video_tx_c.load(Ordering::Relaxed)) < 50 {
+                            break;
+                        }
+                        let frame_num = video_ts_c.fetch_add(1, Ordering::Relaxed);
+                        let seq = (frame_num & 0xFFFF) as u16;
+                        video_seq_c.store(seq.wrapping_add(1), Ordering::Relaxed);
+                        let pic_id = (frame_num & 0x7FFF) as u16;
+                        let ts = frame_num.wrapping_mul(WRTC_VP8_RTP_TS_STEP);
 
-                    let rtp_packet = RtpPacket {
-                        header: RtpHeader {
-                            version: 2,
-                            padding: false,
-                            extension: false,
-                            marker: true,
-                            payload_type: v_pt,
-                            sequence_number: seq,
-                            timestamp: ts,
-                            ssrc: v_ssrc,
-                            csrc: vec![],
-                            extension_profile: 0,
-                            extensions: vec![],
-                            extensions_padding: 0,
-                        },
-                        payload: keepalive_payload.freeze(),
-                    };
-                    let _ = track_c.write_rtp(rtp_packet).await;
+                        let mut keepalive_payload =
+                            BytesMut::with_capacity(4 + VP8_KEYFRAME_HEADER.len());
+                        keepalive_payload.put_u8(0x90);
+                        keepalive_payload.put_u8(0x80);
+                        keepalive_payload.put_u8(0x80 | ((pic_id >> 8) as u8));
+                        keepalive_payload.put_u8((pic_id & 0xFF) as u8);
+                        if video_v2_c.load(Ordering::Relaxed) {
+                            keepalive_payload.put_slice(&VP8_KEYFRAME_1080P_HEADER);
+                        } else {
+                            keepalive_payload.put_slice(&VP8_KEYFRAME_HEADER);
+                        }
+
+                        let rtp_packet = RtpPacket {
+                            header: RtpHeader {
+                                version: 2,
+                                padding: false,
+                                extension: false,
+                                marker: true,
+                                payload_type: v_pt,
+                                sequence_number: seq,
+                                timestamp: ts,
+                                ssrc: v_ssrc,
+                                csrc: vec![],
+                                extension_profile: 0,
+                                extensions: vec![],
+                                extensions_padding: 0,
+                            },
+                            payload: keepalive_payload.freeze(),
+                        };
+                        let _ = track_c.write_rtp(rtp_packet).await;
+                    }
                     tokio::time::sleep(Duration::from_millis(WRTC_BURST_KEYFRAME_INTERVAL_MS)).await;
                 }
             });
@@ -2252,8 +2582,11 @@ impl WrtcPeer {
             );
         }
 
-        // Единый монотонный атомарный счетчик кадров: гарантирует уникальную тройку (seq, pic_id, ts)
-        // для каждого пакета и полностью исключает коллизии timestamp в Vp8FrameMap JVB при бурстах >1 пакета/мс.
+        // Сериализуем инкремент (seq, pic_id, ts) и вызов write_rtp через video_write_lock,
+        // чтобы при параллельной отправке (например, основной поток трафика + ICMP Echo Reply / keepalive)
+        // кадры гарантированно попадали в сокет и JVB строго в порядке возрастания seq и timestamp.
+        let _write_guard = self.video_write_lock.lock().await;
+
         let frame_num = self.video_ts.fetch_add(1, Ordering::Relaxed);
         let seq = (frame_num & 0xFFFF) as u16;
         self.video_seq.store(seq.wrapping_add(1), Ordering::Relaxed);

@@ -32,7 +32,7 @@ pub struct MainConfig {
     #[serde(default)]
     pub exclude_route_for: Vec<String>,
 
-    #[serde(default)]
+    #[serde(default = "default_dns_server_list")]
     pub dns_server_list: Vec<String>,
 
     /// Windows per-app split tunneling: список имён процессов ("firefox.exe").
@@ -58,6 +58,10 @@ pub struct MainConfig {
     pub subscription_url: Option<String>,
 }
 
+fn default_dns_server_list() -> Vec<String> {
+    vec!["1.1.1.1".to_string(), "8.8.8.8".to_string()]
+}
+
 fn default_update_url() -> String {
     "https://api.github.com/repos/ZeroTworu/anet/releases/latest".to_string()
 }
@@ -79,7 +83,7 @@ impl Default for MainConfig {
             tun_name: "anet-client".to_string(),
             route_for: vec![],
             exclude_route_for: vec![],
-            dns_server_list: vec!["1.1.1.1".to_string(), "8.8.8.8".to_string()],
+            dns_server_list: default_dns_server_list(),
             manual_routing: false,
             per_app: vec![],
             per_app_mode: PerAppMode::All,
@@ -598,6 +602,10 @@ impl CoreConfig {
     pub fn sanitize(&mut self) -> anyhow::Result<()> {
         if self.servers.is_empty() {
             anyhow::bail!("No servers defined in [[servers]]");
+        }
+
+        if self.main.dns_server_list.is_empty() {
+            self.main.dns_server_list = default_dns_server_list();
         }
 
         if self.main.per_app_mode == PerAppMode::Include && self.main.per_app.is_empty() {

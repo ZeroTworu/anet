@@ -114,13 +114,16 @@ pub const WRTC_WS_FALLBACK_CHANNEL_CAPACITY: usize = 8192;
 pub const WRTC_P2P_CHANNEL_CAPACITY: usize = 4096;
 pub const WRTC_XMPP_CHANNEL_CAPACITY: usize = 128;
 pub const WRTC_XMPP_RAW_WS_CHANNEL_CAPACITY: usize = 32;
-pub const WRTC_DUPLEX_BUFFER_SIZE: usize = 4 * 1024 * 1024;
+pub const WRTC_DUPLEX_BUFFER_SIZE: usize = 256 * 1024;
 
-/// Параметры микро-батчирования и коалесценции пакетов в WebRTC.
+/// Параметры микро-батчирования, коалесценции и EDT-пейсинга пакетов в WebRTC.
 pub const WRTC_BATCHER_MAX_BYTES: usize = 12288;
 pub const WRTC_BATCHER_MAX_DELAY_MS: u64 = 2;
 pub const WRTC_VIDEO_BATCH_MAX_PACKETS: usize = 16;
 pub const WRTC_UPLINK_BURST_MAX_PACKETS: usize = 64;
+pub const WRTC_UPLINK_PACING_NS_PER_BYTE: u64 = 45;
+pub const WRTC_DOWNLINK_PACING_NS_PER_BYTE: u64 = 38;
+pub const WRTC_PACING_HORIZON_NS: u64 = 2_500_000;
 
 /// Внутренние интервалы опроса ICE, ретраев DataChannel и фоновых задач.
 pub const WRTC_ICE_GATHER_POLL_ATTEMPTS: usize = 50;
@@ -138,6 +141,58 @@ pub const WRTC_SERVER_RETRY_DELAY_SECS: u64 = 5;
 pub const WRTC_SERVER_RECONNECT_PAUSE_SECS: u64 = 2;
 pub const WRTC_HANDSHAKE_PROCESS_TIMEOUT_SECS: u64 = 10;
 pub const WRTC_SDP_RENEGOTIATE_TIMEOUT_SECS: u64 = 5;
+
+/// Таймаут чтения входящих кадров из канала Colibri WebSocket до его фонового переподключения (в секундах).
+pub const WRTC_COLIBRI_WS_READ_TIMEOUT_SECS: u64 = 25;
+
+/// Параметры обхода L4 ECMP / LAG Hash Slicing (Fast TCP Ephemeral Port Hopping и Multi-Socket UDP ICE).
+pub const WRTC_TCP_PORT_HOP_ATTEMPTS: usize = 8;
+pub const WRTC_TCP_PORT_HOP_TIMEOUT_MS: u64 = 1000;
+pub const WRTC_UDP_ICE_SOCKET_COUNT: usize = 6;
+
+/// Специальный 16-байтный холостой кадр прогрева видеоканала (`media_video`),
+/// распознаваемый клиентом и сервером как внутритуннельный keepalive без декодирования IP-пакета.
+pub const VIDEO_WARMUP_MARKER_HI: u8 = 0xFF;
+pub const VIDEO_WARMUP_MARKER_LO: u8 = 0xFF;
+pub const VIDEO_WARMUP_PAYLOAD: [u8; 16] = [
+    VIDEO_BATCH_MARKER,
+    VIDEO_WARMUP_MARKER_HI,
+    VIDEO_WARMUP_MARKER_LO,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+];
+
+/// Подтверждающий 16-байтный кадр прогрева видеоканала от сервера к клиенту (`byte[3] == 1`),
+/// сигнализирующий, что сервер успешно принял и расшифровал входящий RTP Video поток от клиента.
+pub const VIDEO_WARMUP_ACK_PAYLOAD: [u8; 16] = [
+    VIDEO_BATCH_MARKER,
+    VIDEO_WARMUP_MARKER_HI,
+    VIDEO_WARMUP_MARKER_LO,
+    1,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+];
 
 /// Дефолтные резервные реквизиты JVB при отсутствии кандидатов в Jingle.
 pub const WRTC_DEFAULT_FALLBACK_JVB_IP: &str = "89.169.16.6";

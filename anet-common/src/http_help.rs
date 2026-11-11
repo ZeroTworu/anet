@@ -5,11 +5,13 @@ use crate::boring_tls::{
 use http::{HeaderMap, HeaderName, HeaderValue, Request};
 use rand::seq::SliceRandom;
 use rand::Rng;
+use reqwest::cookie::CookieStore;
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
+use std::sync::Arc;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
-/// Профиль браузера, жёстко синхронизирующий L7 (HTTP/1.1, HTTP/2 SETTINGS, WebSocket заголовки)
+/// Профиль браузера, жёстко синхронизирующий L7 (HTTP/1.1, HTTP/2 SETTINGS, WebSocket заголовки, сессионный Cookie Jar)
 /// и L4 (TLS-отпечаток BoringSSL ClientHello и защиту от активного спуфинга ТСПУ).
 #[derive(Debug, Clone)]
 pub struct BrowserProfile {
@@ -25,6 +27,8 @@ pub struct BrowserProfile {
     pub h2_initial_connection_window_size: u32,
     pub h2_max_header_list_size: u32,
     pub tls_config: TlsClientConfig,
+    /// Общее сессионное хранилище Cookie (`Set-Cookie` из HTTP-запросов автоматически передаются в WebSocket Upgrade).
+    pub cookie_jar: Arc<reqwest::cookie::Jar>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -276,6 +280,7 @@ fn default_ws_headers_order(family: TlsFingerprint) -> Vec<String> {
             "Origin".to_string(),
             "Sec-WebSocket-Extensions".to_string(),
             "Sec-WebSocket-Key".to_string(),
+            "Cookie".to_string(),
             "Connection".to_string(),
             "Pragma".to_string(),
             "Cache-Control".to_string(),
@@ -291,6 +296,7 @@ fn default_ws_headers_order(family: TlsFingerprint) -> Vec<String> {
             "User-Agent".to_string(),
             "Accept-Language".to_string(),
             "Accept-Encoding".to_string(),
+            "Cookie".to_string(),
             "Sec-WebSocket-Extensions".to_string(),
         ],
         _ => vec![
@@ -304,6 +310,7 @@ fn default_ws_headers_order(family: TlsFingerprint) -> Vec<String> {
             "Sec-WebSocket-Version".to_string(),
             "Accept-Encoding".to_string(),
             "Accept-Language".to_string(),
+            "Cookie".to_string(),
             "Sec-WebSocket-Key".to_string(),
             "Sec-WebSocket-Extensions".to_string(),
         ],
@@ -464,6 +471,7 @@ impl BrowserProfile {
             h2_initial_connection_window_size: h2_conn_win,
             h2_max_header_list_size: h2_max_headers,
             tls_config,
+            cookie_jar: Arc::new(reqwest::cookie::Jar::default()),
         }
     }
 
@@ -473,7 +481,7 @@ impl BrowserProfile {
     /// Это ЕДИНСТВЕННАЯ разрешенная точка создания HTTP-клиентов `reqwest` во всей системе.
     pub fn build_reqwest_builder(
         &self,
-        cookie_jar: std::sync::Arc<reqwest::cookie::Jar>,
+        cookie_jar: Arc<reqwest::cookie::Jar>,
     ) -> anyhow::Result<reqwest::ClientBuilder> {
         let ssl_builder = build_ssl_connector_with_config(&self.tls_config)?;
         let verify_hostname = self.tls_config.verify_peer
@@ -551,8 +559,9 @@ impl BrowserProfile {
         req
     }
 
-    /// Строит WebSocket Upgrade-запрос с полным комплектом браузерных заголовков
-    /// и порядком следования (`ws_headers_order`), строго соответствующим выбранному профилю браузера.
+    /// Строит WebSocket Upgrade-запрос с полным комплектом браузерных заголовков,
+    /// сессионными Cookie из `self.cookie_jar` и порядком следования (`ws_headers_order`),
+    /// строго соответствующим выбранному профилю браузера.
     pub fn build_ws_request(&self, url: &str, origin: Option<&str>) -> anyhow::Result<Request<()>> {
         let mut req = url.into_client_request()?;
         let uri = req.uri().clone();
@@ -609,6 +618,21 @@ impl BrowserProfile {
 
         if let Ok(val) = HeaderValue::from_str(&effective_origin) {
             headers.insert("Origin", val);
+        }
+
+        if !headers.contains_key(http::header::COOKIE) {
+            let http_cookie_url = if let Some(rest) = url.strip_prefix("wss://") {
+                format!("https://{rest}")
+            } else if let Some(rest) = url.strip_prefix("ws://") {
+                format!("http://{rest}")
+            } else {
+                url.to_string()
+            };
+            if let Ok(parsed_url) = reqwest::Url::parse(&http_cookie_url) {
+                if let Some(cookie_val) = self.cookie_jar.cookies(&parsed_url) {
+                    headers.insert(http::header::COOKIE, cookie_val);
+                }
+            }
         }
 
         if !self.ws_headers_order.is_empty() {

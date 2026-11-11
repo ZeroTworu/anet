@@ -1,5 +1,48 @@
 use serde::{Deserialize, Serialize};
 
+/// Строго типизированное действие Jingle-станции (`action="..."`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum JingleAction {
+    SessionInitiate,
+    SessionAccept,
+    SessionTerminate,
+    SourceAdd,
+    SourceRemove,
+    DescriptionInfo,
+    TransportInfo,
+    Other,
+}
+
+impl JingleAction {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::SessionInitiate => "session-initiate",
+            Self::SessionAccept => "session-accept",
+            Self::SessionTerminate => "session-terminate",
+            Self::SourceAdd => "source-add",
+            Self::SourceRemove => "source-remove",
+            Self::DescriptionInfo => "description-info",
+            Self::TransportInfo => "transport-info",
+            Self::Other => "other",
+        }
+    }
+}
+
+impl<'a> From<&'a str> for JingleAction {
+    fn from(s: &'a str) -> Self {
+        match s.trim() {
+            "session-initiate" => Self::SessionInitiate,
+            "session-accept" => Self::SessionAccept,
+            "session-terminate" => Self::SessionTerminate,
+            "source-add" => Self::SourceAdd,
+            "source-remove" => Self::SourceRemove,
+            "description-info" => Self::DescriptionInfo,
+            "transport-info" => Self::TransportInfo,
+            _ => Self::Other,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JingleCandidate {
     pub ip: String,
@@ -9,6 +52,10 @@ pub struct JingleCandidate {
     pub priority: u32,
     pub foundation: String,
     pub component: u16,
+    #[serde(default)]
+    pub rel_addr: Option<String>,
+    #[serde(default)]
+    pub rel_port: Option<u16>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -67,6 +114,11 @@ pub struct JingleSession {
 }
 
 impl JingleSession {
+    /// Возвращает строго типизированный вид Jingle-действия.
+    pub fn action_kind(&self) -> JingleAction {
+        JingleAction::from(self.action.as_str())
+    }
+
     pub fn to_sdp(
         &self,
         fallback_ip: &str,
@@ -105,10 +157,41 @@ impl JingleSession {
                 continue;
             }
             let proto_lower = c.protocol.to_lowercase();
-            candidate_lines.push_str(&format!(
-                "a=candidate:{} {} {} {} {} {} typ {}\r\n",
-                c.foundation, c.component, proto_lower, c.priority, c.ip, c.port, c.candidate_type
-            ));
+            let ctype_lower = c.candidate_type.to_lowercase();
+            if ctype_lower == "srflx" || ctype_lower == "prflx" || ctype_lower == "relay" {
+                let raddr = c.rel_addr.as_deref().unwrap_or(c.ip.as_str());
+                let rport = c.rel_port.unwrap_or(c.port);
+                candidate_lines.push_str(&format!(
+                    "a=candidate:{} {} {} {} {} {} typ {} raddr {} rport {}\r\n",
+                    c.foundation,
+                    c.component,
+                    proto_lower,
+                    c.priority,
+                    c.ip,
+                    c.port,
+                    ctype_lower,
+                    raddr,
+                    rport
+                ));
+                // Для Docker-инстансов Jitsi (где JVB за внутренним NAT отдаёт только srflx с raddr 172.x.0.x)
+                // дублируем внешний IP:port как host-кандидат, чтобы ICE-движок гарантированно сформировал пару.
+                if ctype_lower == "srflx" {
+                    candidate_lines.push_str(&format!(
+                        "a=candidate:{}h {} {} {} {} {} typ host\r\n",
+                        c.foundation,
+                        c.component,
+                        proto_lower,
+                        c.priority.saturating_add(1),
+                        c.ip,
+                        c.port
+                    ));
+                }
+            } else {
+                candidate_lines.push_str(&format!(
+                    "a=candidate:{} {} {} {} {} {} typ {}\r\n",
+                    c.foundation, c.component, proto_lower, c.priority, c.ip, c.port, ctype_lower
+                ));
+            }
         }
         if candidate_lines.is_empty() {
             candidate_lines.push_str(&format!(
@@ -128,29 +211,27 @@ impl JingleSession {
         let bundle_str = bundle_groups.join(" ");
 
         let remote_audio_ssrc = self.sources.first().copied().unwrap_or(10001);
-        let primary_video_ssrc = 10002u32;
+        let primary_video_ssrc = self.video_sources.first().copied().unwrap_or(10002);
         let vstream_id = crate::wrtc::stealth::generate_random_uuid_v4();
         let vtrack_id = crate::wrtc::stealth::generate_random_uuid_v4();
         let astream_id = crate::wrtc::stealth::generate_random_uuid_v4();
         let atrack_id = crate::wrtc::stealth::generate_random_uuid_v4();
 
         let video_section = if include_video {
-            let pt = self.video_payload_type;
-            let alt_pt = if pt == 100 { 96 } else { 100 };
+            let pt = if self.video_payload_type != 0 {
+                self.video_payload_type
+            } else {
+                100
+            };
             format!(
-                "m=video {primary_port} UDP/TLS/RTP/SAVPF {pt} {alt_pt}\r\n\
+                "m=video {primary_port} UDP/TLS/RTP/SAVPF {pt}\r\n\
                  c=IN IP4 {primary_ip}\r\n\
                  a=rtcp-mux\r\n\
                  a=rtpmap:{pt} VP8/90000\r\n\
-                 a=rtpmap:{alt_pt} VP8/90000\r\n\
                  a=rtcp-fb:{pt} goog-remb\r\n\
                  a=rtcp-fb:{pt} ccm fir\r\n\
                  a=rtcp-fb:{pt} nack\r\n\
                  a=rtcp-fb:{pt} nack pli\r\n\
-                 a=rtcp-fb:{alt_pt} goog-remb\r\n\
-                 a=rtcp-fb:{alt_pt} ccm fir\r\n\
-                 a=rtcp-fb:{alt_pt} nack\r\n\
-                 a=rtcp-fb:{alt_pt} nack pli\r\n\
                  a=ice-ufrag:{ufrag}\r\n\
                  a=ice-pwd:{pwd}\r\n\
                  a=fingerprint:{fp_hash} {fp}\r\n\
@@ -181,7 +262,7 @@ impl JingleSession {
             String::new()
         };
 
-        let sdp = format!(
+        let mut sdp = format!(
             "v=0\r\n\
              o=- 123456789 2 IN IP4 0.0.0.0\r\n\
              s=-\r\n\
@@ -206,6 +287,17 @@ impl JingleSession {
              {video_section}\
              {data_section}"
         );
+
+        if include_video && self.video_sources.len() > 1 {
+            for &extra_ssrc in self.video_sources.iter().skip(1) {
+                if extra_ssrc != 0
+                    && extra_ssrc != primary_video_ssrc
+                    && extra_ssrc != _video_ssrc
+                {
+                    sdp = append_remote_video_ssrc_to_sdp(&sdp, extra_ssrc, self.video_payload_type);
+                }
+            }
+        }
 
         sdp
     }
@@ -262,7 +354,6 @@ pub fn append_remote_video_ssrc_to_sdp(current_sdp: &str, new_ssrc: u32, video_p
     }
 
     let pt = if video_pt != 0 { video_pt } else { 100 };
-    let alt_pt = if pt == 100 { 96 } else { 100 };
     let stream_uuid = crate::wrtc::stealth::generate_random_uuid_v4();
     let track_uuid = crate::wrtc::stealth::generate_random_uuid_v4();
 
@@ -278,19 +369,14 @@ pub fn append_remote_video_ssrc_to_sdp(current_sdp: &str, new_ssrc: u32, video_p
     }
 
     updated.push_str(&format!(
-        "m=video {primary_port} UDP/TLS/RTP/SAVPF {pt} {alt_pt}\r\n\
+        "m=video {primary_port} UDP/TLS/RTP/SAVPF {pt}\r\n\
          {c_line}\r\n\
          a=rtcp-mux\r\n\
          a=rtpmap:{pt} VP8/90000\r\n\
-         a=rtpmap:{alt_pt} VP8/90000\r\n\
          a=rtcp-fb:{pt} goog-remb\r\n\
          a=rtcp-fb:{pt} ccm fir\r\n\
          a=rtcp-fb:{pt} nack\r\n\
          a=rtcp-fb:{pt} nack pli\r\n\
-         a=rtcp-fb:{alt_pt} goog-remb\r\n\
-         a=rtcp-fb:{alt_pt} ccm fir\r\n\
-         a=rtcp-fb:{alt_pt} nack\r\n\
-         a=rtcp-fb:{alt_pt} nack pli\r\n\
          a=ice-ufrag:{ufrag}\r\n\
          a=ice-pwd:{pwd}\r\n\
          a=fingerprint:{fingerprint}\r\n\
@@ -369,7 +455,10 @@ pub fn parse_sdp_answer(sdp: &str) -> LocalJingleParams {
                 fingerprint = parts[1].to_string();
             }
         } else if let Some(rest) = line.strip_prefix("a=candidate:") {
-            candidates.push(rest.to_string());
+            let cand_str = rest.to_string();
+            if !candidates.contains(&cand_str) {
+                candidates.push(cand_str);
+            }
         }
     }
 

@@ -32,23 +32,72 @@ pub enum InboundXmpp {
     SaslMechanisms,
     SaslSuccess,
     SaslFailure(String),
-    Features { has_bind: bool },
-    BindResult { id: String, jid: String },
+    Features {
+        has_bind: bool,
+        has_sm: bool,
+    },
+    BindResult {
+        id: String,
+        jid: String,
+    },
+    SmEnabled {
+        id: Option<String>,
+        resume: bool,
+    },
+    SmResumed {
+        previd: String,
+        h: u32,
+    },
+    SmRequest,
+    SmAck {
+        h: u32,
+    },
+    SmFailed,
     Presence {
         from: String,
         is_unavailable: bool,
         is_self_110: bool,
     },
-    Ping { id: String, from: String },
+    Ping {
+        id: String,
+        from: String,
+    },
     DiscoInfo {
         id: String,
         from: String,
         node: Option<String>,
     },
-    JingleAck { id: String, from: String },
+    JingleAck {
+        id: String,
+        from: String,
+    },
     Jingle(JingleSession),
     ExtdiscoServices(Vec<XmppIceServer>),
+    EndpointMessage(crate::wrtc::colibri::ColibriMessage),
+    IqOther,
+    Message,
+    Close,
     Other,
+}
+
+impl InboundXmpp {
+    /// Возвращает `true`, если элемент является XMPP-станзой (`<iq/>`, `<presence/>`, `<message/>`),
+    /// увеличивающей счётчик входящих станз `h` по стандарту XEP-0198 (`urn:xmpp:sm:3`).
+    pub const fn is_counted_stanza(&self) -> bool {
+        matches!(
+            self,
+            Self::BindResult { .. }
+                | Self::Presence { .. }
+                | Self::Ping { .. }
+                | Self::DiscoInfo { .. }
+                | Self::JingleAck { .. }
+                | Self::Jingle(_)
+                | Self::ExtdiscoServices(_)
+                | Self::EndpointMessage(_)
+                | Self::IqOther
+                | Self::Message
+        )
+    }
 }
 
 pub fn parse_xmpp_stanzas(
@@ -61,7 +110,9 @@ pub fn parse_xmpp_stanzas(
         return Vec::new();
     }
 
-    let wrapped = format!("<stream>{trimmed}</stream>");
+    let wrapped = format!(
+        r#"<stream xmlns:stream="http://etherx.jabber.org/streams">{trimmed}</stream>"#
+    );
     let doc = match roxmltree::Document::parse(&wrapped) {
         Ok(d) => d,
         Err(_) => return Vec::new(),
@@ -92,6 +143,11 @@ pub enum XmppElementTag {
     Mechanisms,
     Success,
     Failure,
+    Enabled,
+    Resumed,
+    SmR,
+    SmA,
+    Failed,
     Presence,
     Iq,
     Message,
@@ -107,6 +163,11 @@ impl<'a> From<&'a str> for XmppElementTag {
             "mechanisms" => Self::Mechanisms,
             "success" => Self::Success,
             "failure" => Self::Failure,
+            "enabled" => Self::Enabled,
+            "resumed" => Self::Resumed,
+            "r" => Self::SmR,
+            "a" => Self::SmA,
+            "failed" => Self::Failed,
             "presence" => Self::Presence,
             "iq" => Self::Iq,
             "message" => Self::Message,
@@ -145,19 +206,48 @@ fn parse_single_element(
 
     match tag {
         XmppElementTag::Open => Some(InboundXmpp::Open),
+        XmppElementTag::Close => Some(InboundXmpp::Close),
         XmppElementTag::Mechanisms => Some(InboundXmpp::SaslMechanisms),
         XmppElementTag::Features => {
             if root.descendants().any(|n| n.has_tag_name("mechanisms")) {
                 Some(InboundXmpp::SaslMechanisms)
             } else {
                 let has_bind = root.descendants().any(|n| n.has_tag_name("bind"));
-                Some(InboundXmpp::Features { has_bind })
+                let has_sm = root.descendants().any(|n| n.has_tag_name("sm"));
+                Some(InboundXmpp::Features { has_bind, has_sm })
             }
         }
         XmppElementTag::Success => Some(InboundXmpp::SaslSuccess),
         XmppElementTag::Failure => {
             Some(InboundXmpp::SaslFailure("SASL authentication failed".to_string()))
         }
+        XmppElementTag::Enabled => {
+            let id = root.attribute("id").map(|s| s.to_string());
+            let resume = matches!(
+                root.attribute("resume")
+                    .map(|s| s.trim().to_ascii_lowercase())
+                    .as_deref(),
+                Some("true" | "1")
+            );
+            Some(InboundXmpp::SmEnabled { id, resume })
+        }
+        XmppElementTag::Resumed => {
+            let previd = root.attribute("previd").unwrap_or_default().to_string();
+            let h = root
+                .attribute("h")
+                .and_then(|s| s.trim().parse::<u32>().ok())
+                .unwrap_or(0);
+            Some(InboundXmpp::SmResumed { previd, h })
+        }
+        XmppElementTag::SmR => Some(InboundXmpp::SmRequest),
+        XmppElementTag::SmA => {
+            let h = root
+                .attribute("h")
+                .and_then(|s| s.trim().parse::<u32>().ok())
+                .unwrap_or(0);
+            Some(InboundXmpp::SmAck { h })
+        }
+        XmppElementTag::Failed => Some(InboundXmpp::SmFailed),
         XmppElementTag::Presence => {
             let from = root.attribute("from").unwrap_or_default().to_string();
             let p_type = root.attribute("type").unwrap_or_default();
@@ -276,15 +366,48 @@ fn parse_single_element(
                 }
             }
 
-            if iq_type == IqType::Result {
+            if iq_type == IqType::Result
+                && !iq_id.starts_with("ping_")
+                && !iq_id.starts_with("extdisco_")
+                && !iq_id.starts_with("conf_alloc_")
+                && !iq_id.starts_with("conf_post_")
+                && (iq_id.starts_with("conf_pre_")
+                    || iq_id.starts_with("accept_")
+                    || iq_id.starts_with("src_add_")
+                    || iq_id.starts_with("src_rm_")
+                    || iq_id.starts_with("term_")
+                    || from.contains("/focus"))
+            {
                 return Some(InboundXmpp::JingleAck { id: iq_id, from });
             }
 
-            Some(InboundXmpp::Other)
+            Some(InboundXmpp::IqOther)
         }
-        XmppElementTag::Close | XmppElementTag::Message | XmppElementTag::Other => {
-            Some(InboundXmpp::Other)
+        XmppElementTag::Message => {
+            let from = root.attribute("from").unwrap_or_default();
+            let sender_occupant = from
+                .split_once('/')
+                .map(|(_, occ)| occ.trim().to_string())
+                .filter(|s| !s.is_empty() && s != "focus");
+            if let Some(json_node) = root
+                .children()
+                .find(|n| n.has_tag_name("json-message"))
+            {
+                if let Some(txt) = json_node.text() {
+                    let trimmed = txt.trim();
+                    if let Ok(mut c_msg) =
+                        serde_json::from_str::<crate::wrtc::colibri::ColibriMessage>(trimmed)
+                    {
+                        if c_msg.from.as_deref().unwrap_or("").is_empty() {
+                            c_msg.from = sender_occupant;
+                        }
+                        return Some(InboundXmpp::EndpointMessage(c_msg));
+                    }
+                }
+            }
+            Some(InboundXmpp::Message)
         }
+        XmppElementTag::Other => Some(InboundXmpp::Other),
     }
 }
 
@@ -298,6 +421,17 @@ pub fn parse_jingle_node(
     let action = jingle_node.attribute("action")?.to_string();
     let iq_id = iq_node.attribute("id").map(|s| s.to_string());
     let from = iq_node.attribute("from").unwrap_or_default().to_string();
+
+    // Фильтруем Jingle-станции только от контроллера конференции Jicofo (`focus`),
+    // игнорируя P2P Jingle-офферы от обычных браузерных участников в публичных комнатах Jitsi.
+    if !from.is_empty() && !from.to_ascii_lowercase().contains("focus") {
+        log::debug!(
+            "[XMPP XML] Ignoring non-focus Jingle stanza (action={}, from={})",
+            action,
+            from
+        );
+        return None;
+    }
 
     let reason = jingle_node
         .children()
@@ -329,8 +463,9 @@ pub fn parse_jingle_node(
     let mut has_video = false;
 
     for content in jingle_node.children().filter(|n| n.has_tag_name("content")) {
-        let is_video = content.attribute("name") == Some("video");
-        let is_data = content.attribute("name") == Some("data");
+        let content_name = content.attribute("name").unwrap_or_default();
+        let is_video = content_name == "video";
+        let is_data = content_name == "data" || content_name == "application";
         if is_data {
             has_data_channel = true;
         }
@@ -339,10 +474,18 @@ pub fn parse_jingle_node(
         }
 
         for desc in content.children().filter(|n| n.has_tag_name("description")) {
-            if is_video {
+            if desc.tag_name().namespace() == Some("urn:xmpp:jingle:apps:sctp:1") {
+                has_data_channel = true;
+            }
+            if is_video || desc.attribute("media") == Some("video") {
+                has_video = true;
                 let mut vp8_pt_found = false;
                 for pt in desc.children().filter(|n| n.has_tag_name("payload-type")) {
-                    if pt.attribute("name").map(|s| s.eq_ignore_ascii_case("vp8")).unwrap_or(false) {
+                    if pt
+                        .attribute("name")
+                        .map(|s| s.eq_ignore_ascii_case("vp8"))
+                        .unwrap_or(false)
+                    {
                         if let Some(id_str) = pt.attribute("id") {
                             if let Ok(id) = id_str.parse::<u8>() {
                                 if !vp8_pt_found {
@@ -358,7 +501,7 @@ pub fn parse_jingle_node(
             for src in desc.children().filter(|n| n.has_tag_name("source")) {
                 if let Some(ssrc_str) = src.attribute("ssrc") {
                     if let Ok(ssrc) = ssrc_str.parse::<u32>() {
-                        if is_video {
+                        if is_video || desc.attribute("media") == Some("video") {
                             video_sources.push(ssrc);
                         } else {
                             sources.push(ssrc);
@@ -383,6 +526,8 @@ pub fn parse_jingle_node(
                         child.attribute("hash").map(|s| s.to_string());
                     transport_info.fingerprint_setup =
                         child.attribute("setup").map(|s| s.to_string());
+                } else if child.has_tag_name("sctpmap") {
+                    has_data_channel = true;
                 } else if child.has_tag_name("web-socket") {
                     transport_info.colibri_ws_url =
                         child.attribute("url").map(|s| s.to_string());
@@ -408,15 +553,32 @@ pub fn parse_jingle_node(
                                 .attribute("component")
                                 .and_then(|c| c.parse().ok())
                                 .unwrap_or(1);
-                            transport_info.candidates.push(JingleCandidate {
-                                ip: ip.to_string(),
-                                port,
-                                protocol,
-                                candidate_type,
-                                priority,
-                                foundation,
-                                component,
+                            let rel_addr = child
+                                .attribute("rel-addr")
+                                .map(|s| s.trim().to_string())
+                                .filter(|s| !s.is_empty());
+                            let rel_port = child
+                                .attribute("rel-port")
+                                .and_then(|p| p.trim().parse::<u16>().ok());
+                            let already_exists = transport_info.candidates.iter().any(|c| {
+                                c.ip == ip
+                                    && c.port == port
+                                    && c.protocol.eq_ignore_ascii_case(&protocol)
+                                    && c.component == component
                             });
+                            if !already_exists {
+                                transport_info.candidates.push(JingleCandidate {
+                                    ip: ip.to_string(),
+                                    port,
+                                    protocol,
+                                    candidate_type,
+                                    priority,
+                                    foundation,
+                                    component,
+                                    rel_addr,
+                                    rel_port,
+                                });
+                            }
                         }
                     }
                 }
@@ -424,7 +586,60 @@ pub fn parse_jingle_node(
         }
     }
 
-    if transport_info.candidates.is_empty() && action != "session-terminate" {
+    // Поддержка http://jitsi.org/json-encoded-sources (Jicofo 1.0.1100+ упаковывает SSRCs в <json-message> внутри <jingle>)
+    for json_node in jingle_node
+        .children()
+        .filter(|n| n.has_tag_name("json-message"))
+    {
+        if let Some(txt) = json_node.text() {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(txt.trim()) {
+                if let Some(sources_obj) = val.get("sources").and_then(|v| v.as_object()) {
+                    for (_ep, ep_arr) in sources_obj {
+                        if let Some(arr) = ep_arr.as_array() {
+                            if let Some(v_list) = arr.first().and_then(|v| v.as_array()) {
+                                for item in v_list {
+                                    if let Some(ssrc) = item
+                                        .get("s")
+                                        .and_then(|s| {
+                                            s.as_u64()
+                                                .or_else(|| s.as_str()?.parse::<u64>().ok())
+                                        })
+                                        .map(|s| s as u32)
+                                    {
+                                        if ssrc != 0 && !video_sources.contains(&ssrc) {
+                                            video_sources.push(ssrc);
+                                            has_video = true;
+                                        }
+                                    }
+                                }
+                            }
+                            if let Some(a_list) = arr.get(2).and_then(|v| v.as_array()) {
+                                for item in a_list {
+                                    if let Some(ssrc) = item
+                                        .get("s")
+                                        .and_then(|s| {
+                                            s.as_u64()
+                                                .or_else(|| s.as_str()?.parse::<u64>().ok())
+                                        })
+                                        .map(|s| s as u32)
+                                    {
+                                        if ssrc != 0 && !sources.contains(&ssrc) {
+                                            sources.push(ssrc);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if transport_info.candidates.is_empty()
+        && crate::wrtc::jingle::JingleAction::from(action.as_str())
+            != crate::wrtc::jingle::JingleAction::SessionTerminate
+    {
         transport_info.candidates.push(JingleCandidate {
             ip: fallback_ip.to_string(),
             port: fallback_port,
@@ -433,6 +648,8 @@ pub fn parse_jingle_node(
             priority: 2130706431,
             foundation: "1".to_string(),
             component: 1,
+            rel_addr: None,
+            rel_port: None,
         });
     }
 
@@ -464,9 +681,33 @@ impl XmppBuilder {
 
     pub fn bind_resource(id: &str) -> String {
         format!(
-            r#"<iq type="set" id="{}"><bind xmlns="urn:ietf:params:xml:ns:xmpp-bind"/></iq>"#,
+            r#"<iq type="set" id="{}" xmlns="jabber:client"><bind xmlns="urn:ietf:params:xml:ns:xmpp-bind"/></iq>"#,
             escape_xml_attr(id)
         )
+    }
+
+    /// Включает XEP-0198 Stream Management (`urn:xmpp:sm:3`) без гибернации отсоединенных сессий (`resume="false"`),
+    /// чтобы Prosody мгновенно освобождал комнату при закрытии сокета и не оставлял неактивных участников.
+    pub fn sm_enable() -> &'static str {
+        r#"<enable xmlns="urn:xmpp:sm:3" resume="false"/>"#
+    }
+
+    /// Возобновляет прерванный XMPP-поток по `previd` и счётчику обработанных станз `h` (XEP-0198).
+    pub fn sm_resume(previd: &str, h: u32) -> String {
+        format!(
+            r#"<resume xmlns="urn:xmpp:sm:3" previd="{}" h="{h}"/>"#,
+            escape_xml_attr(previd)
+        )
+    }
+
+    /// Подтверждает количество принятых от сервера XMPP-станз `h` (XEP-0198 `<a/>`).
+    pub fn sm_ack(h: u32) -> String {
+        format!(r#"<a xmlns="urn:xmpp:sm:3" h="{h}"/>"#)
+    }
+
+    /// Запрашивает у сервера подтверждение доставленных станз (XEP-0198 `<r/>`).
+    pub fn sm_request() -> &'static str {
+        r#"<r xmlns="urn:xmpp:sm:3"/>"#
     }
 
     pub fn muc_presence(
@@ -474,11 +715,30 @@ impl XmppBuilder {
         endpoint_id: &str,
         client_name: &str,
     ) -> String {
+        Self::muc_presence_ext(conference_id, endpoint_id, client_name, false)
+    }
+
+    pub fn muc_presence_ext(
+        conference_id: &str,
+        endpoint_id: &str,
+        client_name: &str,
+        is_ktalk: bool,
+    ) -> String {
         let conf_esc = escape_xml_attr(conference_id);
         let ep_esc = escape_xml_attr(endpoint_id);
         let name_esc = escape_xml_attr(client_name);
+        // Строго валидные XEP-0115 SHA-1 ver-хэши, соответствующие ответам disco_info_result_ext:
+        // - StandardJitsi (без colibri#websocket, чтобы Jicofo включал SCTP <content name="data">):
+        //   "iq2Xb+PmZO0D5MqzDGVz03QCSB4="
+        // - KonturTalk (с поддержкой colibri#websocket):
+        //   "9A8Bz4n6d14d6299fgc9c3fceb52f9d183f023eb"
+        let caps_ver = if is_ktalk {
+            "9A8Bz4n6d14d6299fgc9c3fceb52f9d183f023eb"
+        } else {
+            "iq2Xb+PmZO0D5MqzDGVz03QCSB4="
+        };
         format!(
-            r#"<presence to="{conf_esc}@muc.meet.jitsi/{ep_esc}"><x xmlns="http://jabber.org/protocol/muc"/><nick xmlns="http://jabber.org/protocol/nick">{name_esc}</nick><c xmlns="http://jabber.org/protocol/caps" hash="sha-1" node="https://jitsi.org/jitsi-meet" ver="7Y4Yx3m5c03c5188efb8b2ebda41e8c072e912da"/><jitsi_participant_id>{ep_esc}</jitsi_participant_id></presence>"#
+            r#"<presence to="{conf_esc}@muc.meet.jitsi/{ep_esc}" xmlns="jabber:client"><x xmlns="http://jabber.org/protocol/muc"/><nick xmlns="http://jabber.org/protocol/nick">{name_esc}</nick><c xmlns="http://jabber.org/protocol/caps" hash="sha-1" node="https://jitsi.org/jitsi-meet" ver="{caps_ver}"/><SourceInfo>{{&quot;{ep_esc}-a0&quot;:{{&quot;muted&quot;:false}},&quot;{ep_esc}-v0&quot;:{{&quot;muted&quot;:false}}}}</SourceInfo><audiomuted>false</audiomuted><videomuted>false</videomuted><videoType>camera</videoType><jitsi_participant_id>{ep_esc}</jitsi_participant_id></presence>"#
         )
     }
 
@@ -486,8 +746,31 @@ impl XmppBuilder {
         let conf_esc = escape_xml_attr(conference_id);
         let ep_esc = escape_xml_attr(endpoint_id);
         format!(
-            r#"<presence to="{conf_esc}@muc.meet.jitsi/{ep_esc}" type="unavailable"/>"#
+            r#"<presence to="{conf_esc}@muc.meet.jitsi/{ep_esc}" type="unavailable" xmlns="jabber:client"/>"#
         )
+    }
+
+    /// Формирует XMPP MUC `<message>` с `<json-message xmlns="http://jitsi.org/jitmeet">`
+    /// для резервной доставки управляющих пакетов (`EndpointMessage`) через сигнализацию,
+    /// когда прямой Colibri WebSocket или SCTP DataChannel недоступен на сервере JVB.
+    pub fn muc_json_message(
+        conference_id: &str,
+        to_occupant: Option<&str>,
+        json_payload: &str,
+    ) -> String {
+        let conf_esc = escape_xml_attr(conference_id);
+        let payload_esc = escape_xml_attr(json_payload);
+        match to_occupant.filter(|s| !s.trim().is_empty()) {
+            Some(target) => {
+                let target_esc = escape_xml_attr(target.trim());
+                format!(
+                    r#"<message to="{conf_esc}@muc.meet.jitsi/{target_esc}" type="chat" xmlns="jabber:client"><json-message xmlns="http://jitsi.org/jitmeet">{payload_esc}</json-message></message>"#
+                )
+            }
+            None => format!(
+                r#"<message to="{conf_esc}@muc.meet.jitsi" type="groupchat" xmlns="jabber:client"><json-message xmlns="http://jitsi.org/jitmeet">{payload_esc}</json-message></message>"#
+            ),
+        }
     }
 
     pub fn close() -> &'static str {
@@ -496,23 +779,44 @@ impl XmppBuilder {
 
     pub fn iq_result(to: &str, id: &str) -> String {
         format!(
-            r#"<iq type="result" to="{}" id="{}"/>"#,
+            r#"<iq type="result" to="{}" id="{}" xmlns="jabber:client"/>"#,
             escape_xml_attr(to),
             escape_xml_attr(id)
         )
     }
 
     pub fn disco_info_result(to: &str, id: &str, node: Option<&str>) -> String {
+        Self::disco_info_result_ext(to, id, node, false)
+    }
+
+    pub fn disco_info_result_ext(
+        to: &str,
+        id: &str,
+        node: Option<&str>,
+        is_ktalk: bool,
+    ) -> String {
         let node_attr = match node {
             Some(n) if !n.is_empty() => format!(r#" node="{}""#, escape_xml_attr(n)),
             _ => String::new(),
         };
-        format!(
-            r#"<iq type="result" to="{to}" id="{id}"><query xmlns="http://jabber.org/protocol/disco#info"{node_attr}><identity category="client" type="web" name="jitsi-meet"/><feature var="urn:xmpp:jingle:1"/><feature var="urn:xmpp:jingle:apps:rtp:1"/><feature var="urn:xmpp:jingle:apps:rtp:audio"/><feature var="urn:xmpp:jingle:apps:rtp:video"/><feature var="urn:xmpp:jingle:apps:dtls:0"/><feature var="urn:xmpp:jingle:apps:sctp:1"/><feature var="http://jitsi.org/protocols/sctp"/><feature var="urn:xmpp:jingle:transports:ice-udp:1"/><feature var="http://jitsi.org/protocols/colibri"/><feature var="urn:ietf:rfc:5761"/><feature var="urn:ietf:rfc:5888"/><feature var="http://jabber.org/protocol/caps"/></query></iq>"#,
-            to = escape_xml_attr(to),
-            id = escape_xml_attr(id),
-            node_attr = node_attr
-        )
+        if is_ktalk {
+            format!(
+                r#"<iq type="result" to="{to}" id="{id}" xmlns="jabber:client"><query xmlns="http://jabber.org/protocol/disco#info"{node_attr}><identity category="client" type="web" name="jitsi-meet"/><feature var="urn:xmpp:jingle:1"/><feature var="urn:xmpp:jingle:apps:rtp:1"/><feature var="urn:xmpp:jingle:apps:rtp:audio"/><feature var="urn:xmpp:jingle:apps:rtp:video"/><feature var="urn:xmpp:jingle:apps:dtls:0"/><feature var="urn:xmpp:jingle:transports:dtls-sctp:1"/><feature var="urn:xmpp:jingle:apps:sctp:1"/><feature var="http://jitsi.org/protocols/sctp"/><feature var="urn:xmpp:jingle:transports:ice-udp:1"/><feature var="http://jitsi.org/protocols/colibri"/><feature var="http://jitsi.org/protocol/colibri#websocket"/><feature var="urn:xmpp:jingle:apps:grouping:0"/><feature var="urn:ietf:rfc:3264"/><feature var="urn:ietf:rfc:5576"/><feature var="urn:ietf:rfc:5761"/><feature var="urn:ietf:rfc:5888"/><feature var="http://jabber.org/protocol/caps"/></query></iq>"#,
+                to = escape_xml_attr(to),
+                id = escape_xml_attr(id),
+                node_attr = node_attr
+            )
+        } else {
+            // Строго отсортированный набор фич lib-jitsi-meet (XEP-0115 SHA-1 ver = "iq2Xb+PmZO0D5MqzDGVz03QCSB4=")
+            // без http://jitsi.org/protocol/colibri#websocket и без ssrc-rewriting-1, чтобы стандартный Jicofo
+            // гарантированно включал SCTP DataChannel (<content name="data">) и пробрасывал SSRCs напрямую.
+            format!(
+                r#"<iq type="result" to="{to}" id="{id}" xmlns="jabber:client"><query xmlns="http://jabber.org/protocol/disco#info"{node_attr}><identity category="client" type="web" name="jitsi-meet"/><feature var="http://jabber.org/protocol/caps"/><feature var="http://jabber.org/protocol/disco#info"/><feature var="http://jitsi.org/json-encoded-sources"/><feature var="http://jitsi.org/opus-red"/><feature var="http://jitsi.org/receive-multiple-video-streams"/><feature var="http://jitsi.org/remb"/><feature var="http://jitsi.org/source-name"/><feature var="http://jitsi.org/start-muted-room-metadata"/><feature var="http://jitsi.org/tcc"/><feature var="http://jitsi.org/visitors-1"/><feature var="urn:ietf:rfc:4588"/><feature var="urn:xmpp:jingle:1"/><feature var="urn:xmpp:jingle:apps:dtls:0"/><feature var="urn:xmpp:jingle:apps:rtp:1"/><feature var="urn:xmpp:jingle:apps:rtp:audio"/><feature var="urn:xmpp:jingle:apps:rtp:video"/><feature var="urn:xmpp:jingle:transports:dtls-sctp:1"/><feature var="urn:xmpp:jingle:transports:ice-udp:1"/></query></iq>"#,
+                to = escape_xml_attr(to),
+                id = escape_xml_attr(id),
+                node_attr = node_attr
+            )
+        }
     }
 
     pub fn conference_allocation(
@@ -524,7 +828,40 @@ impl XmppBuilder {
         let ep_esc = escape_xml_attr(endpoint_id);
         let id_esc = escape_xml_attr(iq_id);
         format!(
-            r#"<iq to="focus.meet.jitsi" type="set" id="{id_esc}"><conference xmlns="http://jitsi.org/protocol/focus" room="{conf_room}" machine-uid="{ep_esc}"/></iq>"#
+            r#"<iq to="focus.meet.jitsi" type="set" id="{id_esc}" xmlns="jabber:client"><conference xmlns="http://jitsi.org/protocol/focus" room="{conf_room}" machine-uid="{ep_esc}"/></iq>"#
+        )
+    }
+
+    /// Строит XML-элемент `<candidate xmlns="urn:xmpp:jingle:transports:ice-udp:1" .../>`.
+    pub fn jingle_candidate(
+        component: &str,
+        foundation: &str,
+        id: &str,
+        ip: &str,
+        port: &str,
+        priority: &str,
+        protocol: &str,
+        c_type: &str,
+        rel_addr: Option<&str>,
+        rel_port: Option<&str>,
+    ) -> String {
+        let mut rel_attr = String::new();
+        if let Some(raddr) = rel_addr {
+            rel_attr.push_str(&format!(r#" rel-addr="{}""#, escape_xml_attr(raddr)));
+        }
+        if let Some(rport) = rel_port {
+            rel_attr.push_str(&format!(r#" rel-port="{}""#, escape_xml_attr(rport)));
+        }
+        format!(
+            r#"<candidate component="{}" foundation="{}" generation="0" id="{}" ip="{}" port="{}" priority="{}" protocol="{}" type="{}"{rel_attr} network="0"/>"#,
+            escape_xml_attr(component),
+            escape_xml_attr(foundation),
+            escape_xml_attr(id),
+            escape_xml_attr(ip),
+            escape_xml_attr(port),
+            escape_xml_attr(priority),
+            escape_xml_attr(protocol),
+            escape_xml_attr(c_type)
         )
     }
 
@@ -546,30 +883,84 @@ impl XmppBuilder {
         include_data_content: bool,
         include_video_content: bool,
     ) -> String {
+        Self::jingle_session_accept_with_endpoint(
+            focus_jid,
+            req_id,
+            my_jid,
+            "",
+            sid,
+            ssrc,
+            video_ssrc,
+            video_payload_type,
+            cname,
+            msid,
+            ufrag,
+            pwd,
+            fingerprint_hash,
+            fingerprint,
+            candidate_xml,
+            include_data_content,
+            include_video_content,
+        )
+    }
+
+    pub fn jingle_session_accept_with_endpoint(
+        focus_jid: &str,
+        req_id: &str,
+        my_jid: &str,
+        endpoint_id: &str,
+        sid: &str,
+        ssrc: u32,
+        video_ssrc: u32,
+        video_payload_type: u8,
+        cname: &str,
+        msid: &str,
+        ufrag: &str,
+        pwd: &str,
+        fingerprint_hash: &str,
+        fingerprint: &str,
+        candidate_xml: &str,
+        include_data_content: bool,
+        include_video_content: bool,
+    ) -> String {
         let vtrack_id = crate::wrtc::stealth::generate_random_uuid_v4();
         let atrack_id = crate::wrtc::stealth::generate_random_uuid_v4();
+        let ep_clean = if !endpoint_id.trim().is_empty() {
+            escape_xml_attr(endpoint_id.trim())
+        } else {
+            escape_xml_attr(
+                my_jid
+                    .split('@')
+                    .next()
+                    .and_then(|u| u.split('-').next())
+                    .unwrap_or("peer"),
+            )
+        };
+        let audio_src_name_attr = format!(r#" name="{ep_clean}-a0""#);
+        let video_src_name_attr = format!(r#" name="{ep_clean}-v0" videoType="camera""#);
+
         let video_section = if include_video_content && video_ssrc != 0 {
-            let pt = if video_payload_type != 0 { video_payload_type } else { 100 };
-            let rtcp_fb = r#"<rtcp-fb xmlns="urn:xmpp:jingle:apps:rtp:rtcp-fb:0" type="goog-remb"/><rtcp-fb xmlns="urn:xmpp:jingle:apps:rtp:rtcp-fb:0" type="ccm" subtype="fir"/><rtcp-fb xmlns="urn:xmpp:jingle:apps:rtp:rtcp-fb:0" type="nack"/><rtcp-fb xmlns="urn:xmpp:jingle:apps:rtp:rtcp-fb:0" type="nack" subtype="pli"/>"#;
-            let pt_fallback = if pt != 96 {
-                format!(r#"<payload-type id="96" name="VP8" clockrate="90000">{rtcp_fb}</payload-type>"#)
+            let pt = if video_payload_type != 0 {
+                video_payload_type
             } else {
-                "".to_string()
+                100
             };
+            let rtcp_fb = r#"<rtcp-fb xmlns="urn:xmpp:jingle:apps:rtp:rtcp-fb:0" type="goog-remb"/><rtcp-fb xmlns="urn:xmpp:jingle:apps:rtp:rtcp-fb:0" type="ccm" subtype="fir"/><rtcp-fb xmlns="urn:xmpp:jingle:apps:rtp:rtcp-fb:0" type="nack"/><rtcp-fb xmlns="urn:xmpp:jingle:apps:rtp:rtcp-fb:0" type="nack" subtype="pli"/>"#;
             format!(
-                r#"<content creator="initiator" name="video" senders="both"><description xmlns="urn:xmpp:jingle:apps:rtp:1" media="video"><payload-type id="{pt}" name="VP8" clockrate="90000">{rtcp_fb}</payload-type>{pt_fallback}<rtcp-mux/><source xmlns="urn:xmpp:jingle:apps:rtp:ssma:0" ssrc="{video_ssrc}"><parameter xmlns="urn:xmpp:jingle:apps:rtp:1" name="cname" value="{cname}"/><parameter xmlns="urn:xmpp:jingle:apps:rtp:1" name="msid" value="{msid} {vtrack_id}"/></source></description><transport xmlns="urn:xmpp:jingle:transports:ice-udp:1" ufrag="{ufrag}" pwd="{pwd}"><rtcp-mux/><fingerprint xmlns="urn:xmpp:jingle:apps:dtls:0" hash="{fingerprint_hash}" setup="active">{fingerprint}</fingerprint>{candidate_xml}</transport></content>"#,
+                r#"<content creator="initiator" name="video" senders="both"><description xmlns="urn:xmpp:jingle:apps:rtp:1" media="video"><payload-type id="{pt}" name="VP8" clockrate="90000">{rtcp_fb}</payload-type><rtcp-mux/><source xmlns="urn:xmpp:jingle:apps:rtp:ssma:0" ssrc="{video_ssrc}"{video_src_name_attr}><ssrc-info xmlns="http://jitsi.org/jitmeet" owner="{ep_clean}"/><parameter xmlns="urn:xmpp:jingle:apps:rtp:1" name="cname" value="{cname}"/><parameter xmlns="urn:xmpp:jingle:apps:rtp:1" name="msid" value="{msid} {vtrack_id}"/></source></description><transport xmlns="urn:xmpp:jingle:transports:ice-udp:1" ufrag="{ufrag}" pwd="{pwd}"><rtcp-mux/><fingerprint xmlns="urn:xmpp:jingle:apps:dtls:0" hash="{fingerprint_hash}" setup="active">{fingerprint}</fingerprint>{candidate_xml}</transport></content>"#,
                 ufrag = escape_xml_attr(ufrag),
                 pwd = escape_xml_attr(pwd),
                 fingerprint_hash = escape_xml_attr(fingerprint_hash),
                 fingerprint = escape_xml_attr(fingerprint),
                 candidate_xml = candidate_xml,
                 video_ssrc = video_ssrc,
+                video_src_name_attr = video_src_name_attr,
+                ep_clean = ep_clean,
                 cname = escape_xml_attr(cname),
                 msid = escape_xml_attr(msid),
                 vtrack_id = vtrack_id,
                 pt = pt,
                 rtcp_fb = rtcp_fb,
-                pt_fallback = pt_fallback,
             )
         } else {
             String::new()
@@ -577,7 +968,7 @@ impl XmppBuilder {
 
         let data_section = if include_data_content {
             format!(
-                r#"<content creator="initiator" name="data"><description xmlns="urn:xmpp:jingle:apps:sctp:1"><payload-type id="5000"/></description><transport xmlns="urn:xmpp:jingle:transports:ice-udp:1" ufrag="{ufrag}" pwd="{pwd}"><fingerprint xmlns="urn:xmpp:jingle:apps:dtls:0" hash="{fingerprint_hash}" setup="active">{fingerprint}</fingerprint>{candidate_xml}</transport></content>"#,
+                r#"<content creator="initiator" name="data" senders="both"><description xmlns="urn:xmpp:jingle:apps:sctp:1"><payload-type id="5000"/></description><transport xmlns="urn:xmpp:jingle:transports:ice-udp:1" ufrag="{ufrag}" pwd="{pwd}"><rtcp-mux/><fingerprint xmlns="urn:xmpp:jingle:apps:dtls:0" hash="{fingerprint_hash}" setup="active">{fingerprint}</fingerprint><sctpmap xmlns="urn:xmpp:jingle:transports:dtls-sctp:1" number="5000" protocol="webrtc-datachannel" streams="1024"/>{candidate_xml}</transport></content>"#,
                 ufrag = escape_xml_attr(ufrag),
                 pwd = escape_xml_attr(pwd),
                 fingerprint_hash = escape_xml_attr(fingerprint_hash),
@@ -588,14 +979,28 @@ impl XmppBuilder {
             String::new()
         };
 
+        let mut group_contents = String::from(r#"<content name="audio"/>"#);
+        if include_video_content && video_ssrc != 0 {
+            group_contents.push_str(r#"<content name="video"/>"#);
+        }
+        if include_data_content {
+            group_contents.push_str(r#"<content name="data"/>"#);
+        }
+        let group_section = format!(
+            r#"<group xmlns="urn:xmpp:jingle:apps:grouping:0" semantics="BUNDLE">{group_contents}</group>"#
+        );
+
         format!(
-            r#"<iq to="{to}" type="set" id="{id}"><jingle xmlns="urn:xmpp:jingle:1" action="session-accept" initiator="{init}" responder="{resp}" sid="{sid}"><content creator="initiator" name="audio" senders="both"><description xmlns="urn:xmpp:jingle:apps:rtp:1" media="audio"><payload-type id="111" name="opus" clockrate="48000" channels="2"/><rtcp-mux/><source xmlns="urn:xmpp:jingle:apps:rtp:ssma:0" ssrc="{ssrc}"><parameter xmlns="urn:xmpp:jingle:apps:rtp:1" name="cname" value="{cname}"/><parameter xmlns="urn:xmpp:jingle:apps:rtp:1" name="msid" value="{msid} {atrack_id}"/></source></description><transport xmlns="urn:xmpp:jingle:transports:ice-udp:1" ufrag="{ufrag}" pwd="{pwd}"><rtcp-mux/><fingerprint xmlns="urn:xmpp:jingle:apps:dtls:0" hash="{fp_hash}" setup="active">{fp}</fingerprint>{candidate_xml}</transport></content>{video_section}{data_section}</jingle></iq>"#,
+            r#"<iq to="{to}" type="set" id="{id}" xmlns="jabber:client"><jingle xmlns="urn:xmpp:jingle:1" action="session-accept" initiator="{init}" responder="{resp}" sid="{sid}">{group_section}<content creator="initiator" name="audio" senders="both"><description xmlns="urn:xmpp:jingle:apps:rtp:1" media="audio"><payload-type id="111" name="opus" clockrate="48000" channels="2"/><rtcp-mux/><source xmlns="urn:xmpp:jingle:apps:rtp:ssma:0" ssrc="{ssrc}"{audio_src_name_attr}><ssrc-info xmlns="http://jitsi.org/jitmeet" owner="{ep_clean}"/><parameter xmlns="urn:xmpp:jingle:apps:rtp:1" name="cname" value="{cname}"/><parameter xmlns="urn:xmpp:jingle:apps:rtp:1" name="msid" value="{msid} {atrack_id}"/></source></description><transport xmlns="urn:xmpp:jingle:transports:ice-udp:1" ufrag="{ufrag}" pwd="{pwd}"><rtcp-mux/><fingerprint xmlns="urn:xmpp:jingle:apps:dtls:0" hash="{fp_hash}" setup="active">{fp}</fingerprint>{candidate_xml}</transport></content>{video_section}{data_section}</jingle></iq>"#,
             to = escape_xml_attr(focus_jid),
             id = escape_xml_attr(req_id),
             init = escape_xml_attr(focus_jid),
             resp = escape_xml_attr(my_jid),
             sid = escape_xml_attr(sid),
+            group_section = group_section,
             ssrc = ssrc,
+            audio_src_name_attr = audio_src_name_attr,
+            ep_clean = ep_clean,
             cname = escape_xml_attr(cname),
             msid = escape_xml_attr(msid),
             atrack_id = atrack_id,
@@ -632,7 +1037,7 @@ impl XmppBuilder {
             String::new()
         };
         format!(
-            r#"<iq to="{to}" type="set" id="{id}"><jingle xmlns="urn:xmpp:jingle:1" action="source-remove" initiator="{init}" responder="{resp}" sid="{sid}">{audio_content}{video_content}</jingle></iq>"#,
+            r#"<iq to="{to}" type="set" id="{id}" xmlns="jabber:client"><jingle xmlns="urn:xmpp:jingle:1" action="source-remove" initiator="{init}" responder="{resp}" sid="{sid}">{audio_content}{video_content}</jingle></iq>"#,
             to = escape_xml_attr(focus_jid),
             id = escape_xml_attr(req_id),
             init = escape_xml_attr(focus_jid),
@@ -650,7 +1055,7 @@ impl XmppBuilder {
         sid: &str,
     ) -> String {
         format!(
-            r#"<iq to="{to}" type="set" id="{id}"><jingle xmlns="urn:xmpp:jingle:1" action="session-terminate" initiator="{init}" responder="{resp}" sid="{sid}"><reason><success/></reason></jingle></iq>"#,
+            r#"<iq to="{to}" type="set" id="{id}" xmlns="jabber:client"><jingle xmlns="urn:xmpp:jingle:1" action="session-terminate" initiator="{init}" responder="{resp}" sid="{sid}"><reason><success/></reason></jingle></iq>"#,
             to = escape_xml_attr(focus_jid),
             id = escape_xml_attr(req_id),
             init = escape_xml_attr(focus_jid),
@@ -669,7 +1074,7 @@ impl XmppBuilder {
     ) -> String {
         let atrack_id = crate::wrtc::stealth::generate_random_uuid_v4();
         format!(
-            r#"<iq to="{to}" type="set" id="{id}"><jingle xmlns="urn:xmpp:jingle:1" action="source-add" initiator="{init}" sid="{sid}"><content name="audio"><description xmlns="urn:xmpp:jingle:apps:rtp:1" media="audio"><source xmlns="urn:xmpp:jingle:apps:rtp:ssma:0" ssrc="{ssrc}"><parameter name="cname" value="{cname}"/><parameter name="msid" value="{msid} {atrack_id}"/></source></description></content></jingle></iq>"#,
+            r#"<iq to="{to}" type="set" id="{id}" xmlns="jabber:client"><jingle xmlns="urn:xmpp:jingle:1" action="source-add" initiator="{init}" sid="{sid}"><content name="audio"><description xmlns="urn:xmpp:jingle:apps:rtp:1" media="audio"><source xmlns="urn:xmpp:jingle:apps:rtp:ssma:0" ssrc="{ssrc}"><parameter name="cname" value="{cname}"/><parameter name="msid" value="{msid} {atrack_id}"/></source></description></content></jingle></iq>"#,
             to = escape_xml_attr(focus_jid),
             id = escape_xml_attr(req_id),
             init = escape_xml_attr(focus_jid),
@@ -683,7 +1088,7 @@ impl XmppBuilder {
 
     pub fn ping(to: &str, id: &str) -> String {
         format!(
-            r#"<iq to="{}" type="get" id="{}"><ping xmlns="urn:xmpp:ping"/></iq>"#,
+            r#"<iq to="{}" type="get" id="{}" xmlns="jabber:client"><ping xmlns="urn:xmpp:ping"/></iq>"#,
             escape_xml_attr(to),
             escape_xml_attr(id)
         )
@@ -691,7 +1096,7 @@ impl XmppBuilder {
 
     pub fn extdisco_services(id: &str) -> String {
         format!(
-            r#"<iq to="meet.jitsi" type="get" id="{}"><services xmlns="urn:xmpp:extdisco:2"/></iq>"#,
+            r#"<iq to="meet.jitsi" type="get" id="{}" xmlns="jabber:client"><services xmlns="urn:xmpp:extdisco:2"/></iq>"#,
             escape_xml_attr(id)
         )
     }
