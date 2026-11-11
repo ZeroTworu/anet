@@ -673,6 +673,32 @@ where
             .await
     }
 
+    /// Одношаговая (1-RTT) потоковая выборка новых сообщений
+    /// `UID FETCH <last_seen_uid + 1>:4294967295 (UID BODY.PEEK[])`:
+    /// - Использует явную верхнюю границу `4294967295` (`u32::MAX`) вместо символа `*`:
+    ///   1) На `imap.mail.ru` при отсутствии новых писем сервер мгновенно возвращает `OK` (0 байт),
+    ///      не перекачивая 175 КБ дубликат `last_seen_uid` по правилу раскрытия `*` в RFC 3501;
+    ///   2) Полностью обходит кэширование устаревшего `*` на `imap.mail.ru` в «Слепом окне»
+    ///      (когда письмо пришло вне `IDLE` и запрос `UID FETCH <start>:*` возвращает старый `last_seen_uid`);
+    ///   3) Выполняется за **1 RTT** без предварительного индексного запроса `UID FETCH (UID)`.
+    /// - Вызывает `on_message(&msg)` **немедленно** после вычитывания каждого литерала `read_exact`,
+    ///   чтобы воркер сразу расшифровывал и отправлял пакеты каждого письма в `TUN`, не дожидаясь
+    ///   скачивания остальных писем пачки и финального `tag OK`.
+    pub async fn fetch_messages_streaming<F>(
+        &mut self,
+        last_seen_uid: u32,
+        timeout_dur: Duration,
+        on_message: F,
+    ) -> Result<FetchResult>
+    where
+        F: FnMut(&FetchedMessage),
+    {
+        let start_uid = last_seen_uid.saturating_add(1);
+        let cmd_target = format!("{start_uid}:{}", u32::MAX);
+        self.fetch_messages_by_uid_set_streaming(&cmd_target, last_seen_uid, timeout_dur, on_message)
+            .await
+    }
+
     /// Выборка тел конкретной порции UID (`UID FETCH u1,u2,u3 (UID BODY.PEEK[])`).
     pub async fn fetch_uids_body(
         &mut self,
@@ -705,16 +731,7 @@ where
         Ok(res)
     }
 
-    /// Двухфазная порционная выборка новых сообщений (`Chunked UID Fetch`):
-    /// 1. Если `fetch_max_messages == 0`, выполняет классический `fetch_messages_robust`.
-    /// 2. Если `fetch_max_messages > 0`:
-    ///    - Сначала запрашивает легковесный индекс новых UID: `UID FETCH <last_seen_uid + 1>:* (UID)` (~40 байт).
-    ///      Если новых UID (`> last_seen_uid`) нет, мгновенно возвращает пустой результат без скачивания
-    ///      175 КБ дубликата `last_seen_uid` по RFC 3501 и без слепых зон `UID FETCH *`.
-    ///    - Если новые UID есть, берет первые `fetch_max_messages` (например, 3 шт.) и скачивает их тела
-    ///      командой `UID FETCH u1,u2,u3 (UID BODY.PEEK[])`.
-    ///    - Если в папке остались ещё невычитанные UID после этой порции, взводит `self.pending_exists = true`,
-    ///      чтобы воркер сразу после записи текущих пакетов в TUN мгновенно (без захода в IDLE) забрал следующую порцию.
+    /// Двухфазная порционная выборка новых сообщений (`Chunked UID Fetch`).
     pub async fn fetch_messages_chunked(
         &mut self,
         last_seen_uid: u32,
@@ -729,9 +746,6 @@ where
         let deadline = t0 + timeout_dur;
         let start_uid = last_seen_uid.saturating_add(1);
 
-        // Сбрасываем флаг EXISTS перед отправкой индексного запроса:
-        // все письма, пришедшие до этого момента, попадут в ответ `UID FETCH <start_uid>:* (UID)`.
-        // Если же новое `* <N> EXISTS` придет во время чтения ответа, `read_line()` снова взведет `pending_exists`.
         self.pending_exists = false;
 
         let tag1 = self.next_tag();
@@ -790,6 +804,20 @@ where
         last_seen_uid: u32,
         timeout_dur: Duration,
     ) -> Result<FetchResult> {
+        self.fetch_messages_by_uid_set_streaming(uid_set, last_seen_uid, timeout_dur, |_| {})
+            .await
+    }
+
+    async fn fetch_messages_by_uid_set_streaming<F>(
+        &mut self,
+        uid_set: &str,
+        last_seen_uid: u32,
+        timeout_dur: Duration,
+        mut on_message: F,
+    ) -> Result<FetchResult>
+    where
+        F: FnMut(&FetchedMessage),
+    {
         let t0 = Instant::now();
         let tag = self.next_tag();
 
@@ -801,7 +829,7 @@ where
 
         let mut messages = Vec::new();
         let mut new_max_uid = last_seen_uid;
-        let deadline = Instant::now() + timeout_dur;
+        let mut deadline = Instant::now() + timeout_dur;
 
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -835,7 +863,10 @@ where
                 ));
             }
 
-            // 1. Считываем ровно literal_len байт тела сообщения с контролем общего дедлайна
+            // Продлеваем дедлайн на каждое активно скачиваемое сообщение пачки
+            deadline = Instant::now() + timeout_dur;
+
+            // 1. Считываем ровно literal_len байт тела сообщения с контролем дедлайна
             let rem_body = deadline.saturating_duration_since(Instant::now());
             if rem_body.is_zero() {
                 return Err(anyhow!("Timeout waiting for UID FETCH literal body"));
@@ -867,14 +898,17 @@ where
             }
             new_max_uid = new_max_uid.max(uid);
 
-            // 4. Парсим RFC 5322 сообщение
+            // 4. Парсим RFC 5322 сообщение и МГНОВЕННО передаем его в потоковый обработчик `on_message`
+            // еще до чтения следующего литерала из сокета!
             match parse_rfc822_message(&msg_bytes) {
                 Ok((subject, payload)) => {
-                    messages.push(FetchedMessage {
+                    let fetched = FetchedMessage {
                         uid,
                         subject,
                         payload,
-                    });
+                    };
+                    on_message(&fetched);
+                    messages.push(fetched);
                 }
                 Err(e) => {
                     log::warn!("[IMAP] Failed to parse message UID {uid}: {e}");

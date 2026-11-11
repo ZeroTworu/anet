@@ -851,16 +851,122 @@ async fn run_mailbox_worker_pair(
             if stop_flag.load(Ordering::Relaxed) {
                 break;
             }
-            let _ = (was_forced, got_event);
 
-            // Двухфазная порционная выборка новых сообщений из папки "Drafts" (Chunked UID Fetch):
-            // 1. Запрашивает легковесный индекс `UID FETCH <last_seen_uid + 1>:* (UID)` (~40 байт).
-            //    При отсутствии новых писем не перекачивает 175 КБ дубликат `last_seen_uid` по RFC 3501
-            //    и гарантированно находит письма, попавшие в «Слепое окно» Mail.ru.
-            // 2. Скачивает тела не более `fetch_max_messages` (например, 3 шт.) за раз и сразу отправляет их в TUN.
+            // Если мы вышли из IDLE по таймауту (или по сигналу wake_notify при переходе в активный режим)
+            // и сервер не прислал `* <N> EXISTS` ни во время IDLE, ни в ответе на `DONE`, не тратим лишний RTT.
+            if !was_forced && !got_event && !srv_reader.pending_exists {
+                continue;
+            }
+
+            let mut streamed_uids: Vec<u32> = Vec::new();
+            let mut deferred_messages: Vec<anet_common::imap_conn::FetchedMessage> = Vec::new();
+            let mut deferred_icmp_replies: Vec<(std::net::Ipv4Addr, Bytes)> = Vec::new();
+            let mut deferred_tun_pkts: Vec<(Arc<ClientTransportInfo>, Bytes)> = Vec::new();
+            let mut sessions_to_bind: Vec<String> = Vec::new();
+
+            // Одношаговая (1-RTT) потоковая выборка `UID FETCH <last_seen_uid + 1>:4294967295 (UID BODY.PEEK[])`:
+            // - Явная верхняя граница `4294967295` вместо `*` исключает 175 КБ дубликаты `last_seen_uid` на пустых опросах
+            //   и полностью обходит залипание кэшированного `*` в «Слепом окне» Mail.ru;
+            // - Для привязанных сессий Data Plane каждое скачанное письмо расшифровывается и отправляется в `tun_tx`
+            //   МГНОВЕННО после чтения его литерала `read_exact`, еще до чтения следующего письма из TLS-сокета!
+            let _ = fetch_max_messages;
             let fetch_res = srv_reader
-                .fetch_messages_chunked(last_seen_uid, fetch_max_messages, command_timeout)
+                .fetch_messages_streaming(last_seen_uid, command_timeout, |msg| {
+                    let Some((msg_srv_id, cli_token)) = extract_srv_and_cli_token(&msg.subject)
+                    else {
+                        return;
+                    };
+                    if msg_srv_id != srv_id {
+                        return;
+                    }
+                    streamed_uids.push(msg.uid);
+
+                    // Если сессия уже в local_sessions, обрабатываем пакет синхронно и мгновенно пишем в tun_tx
+                    // прямо во время чтения ответа FETCH!
+                    let fast_client_opt = local_sessions.get_mut(cli_token).map(|mut entry| {
+                        entry.value_mut().1 = Instant::now();
+                        entry.value().0.clone()
+                    });
+
+                    if let Some(client_info) = fast_client_opt {
+                        if let Ok(decrypted_batch) =
+                            unwrap_packet(&client_info.cipher, &msg.payload)
+                        {
+                            registry.touch_client(&client_info);
+                            sessions_to_bind.push(cli_token.to_string());
+                            let packets = unpack_batch(&decrypted_batch);
+                            if packets.is_empty() {
+                                return;
+                            }
+                            for pkt in packets {
+                                if pkt.len() < 20 {
+                                    continue;
+                                }
+                                if let Some(reply) =
+                                    anet_common::icmp_probe::handle_in_tunnel_icmp_probe(&pkt)
+                                {
+                                    if let Some(dst_ip) = crate::utils::extract_ip_dst(&reply) {
+                                        deferred_icmp_replies.push((dst_ip, reply));
+                                    }
+                                    continue;
+                                }
+                                let pkt = anet_common::icmp_probe::clamp_tcp_mss_bytes(
+                                    pkt,
+                                    server_clamp_mtu,
+                                );
+                                let pkt_len = pkt.len();
+                                match tun_tx.try_send(pkt) {
+                                    Ok(()) => {
+                                        registry.record_rx(&client_info, pkt_len, "imap");
+                                    }
+                                    Err(mpsc::error::TrySendError::Full(deferred_pkt)) => {
+                                        deferred_tun_pkts.push((client_info.clone(), deferred_pkt));
+                                    }
+                                    Err(mpsc::error::TrySendError::Closed(_)) => {}
+                                }
+                            }
+                            return;
+                        }
+                    }
+
+                    deferred_messages.push(msg.clone());
+                })
                 .await;
+
+            if !streamed_uids.is_empty() {
+                let mut guard = cleanup_uids.lock().await;
+                guard.extend(streamed_uids);
+            }
+
+            for sess_tok in sessions_to_bind {
+                let pool = session_pools
+                    .entry(sess_tok.clone())
+                    .or_insert_with(|| Arc::new(SessionMailboxPool::new()))
+                    .value()
+                    .clone();
+                if pool.register_mailbox(mailbox_handle.clone()).await {
+                    let active_cnt = pool.active_count().await;
+                    info!(
+                        "[IMAP Server] Dynamically bound mailbox #{} ({}) to session {} (active striping mailboxes: {})",
+                        mailbox_idx, reader_email, sess_tok, active_cnt
+                    );
+                }
+            }
+
+            for (dst_ip, reply) in deferred_icmp_replies {
+                registry.route_packet_to_ipv4(dst_ip, reply).await;
+            }
+
+            for (c_info, deferred_pkt) in deferred_tun_pkts {
+                let pkt_len = deferred_pkt.len();
+                if tokio::time::timeout(Duration::from_millis(150), tun_tx.send(deferred_pkt))
+                    .await
+                    .is_ok_and(|r| r.is_ok())
+                {
+                    registry.record_rx(&c_info, pkt_len, "imap");
+                }
+            }
+
             if srv_reader.pending_exists {
                 srv_reader.pending_exists = false;
                 force_immediate_fetch = true;
@@ -874,9 +980,12 @@ async fn run_mailbox_worker_pair(
                         last_rx_ms.store(now, Ordering::Relaxed);
                         server_last_activity_ms.store(now, Ordering::Relaxed);
                         server_reader_wake_notify.notify_waiters();
+                        // Greedy Fetch Drain: если в этом цикле вычитано хотя бы одно письмо,
+                        // мгновенно делаем повторный 1-RTT опрос на случай писем, упавших во время скачивания!
+                        force_immediate_fetch = true;
                     }
 
-                    for msg in res.messages {
+                    for msg in deferred_messages {
                         let Some((msg_srv_id, cli_token)) = extract_srv_and_cli_token(&msg.subject)
                         else {
                             continue;
@@ -886,13 +995,7 @@ async fn run_mailbox_worker_pair(
                             continue;
                         }
 
-                        // Добавляем UID в локальную очередь очистки этого ящика для SRV_WRITER[i]
-                        {
-                            let mut guard = cleanup_uids.lock().await;
-                            guard.push(msg.uid);
-                        }
-
-                        // 1. FAST PATH (Установленная сессия Data Plane, cli_token == session_id)
+                        // 1. FAST PATH (Установленная сессия Data Plane / привязка вторичного ящика, cli_token == session_id)
                         let client_info_opt = local_sessions
                             .get_mut(cli_token)
                             .map(|mut entry| {
@@ -1142,14 +1245,7 @@ pub async fn run_client_downlink_batcher(
     let subject = format!("[ID: {}]", client_info.session_id);
 
     loop {
-        // 1. Сначала выгребаем всё, что уже лежит в rx_router без ожидания
-        while let Ok(pkt) = rx_router.try_recv() {
-            if pkt.len() >= 20 {
-                batcher.push(pkt);
-            }
-        }
-
-        // Если батчер пуст — ждем первый пакет из rx_router
+        // 1. Если батчер пуст — ждем первый пакет из rx_router
         if batcher.is_empty() {
             match rx_router.recv().await {
                 Some(first_pkt) => {
@@ -1162,15 +1258,8 @@ pub async fn run_client_downlink_batcher(
                 None => break, // Клиент отключен или перерегистрировал rx_router
             }
 
-            // Выгребаем всё, что пришло вместе с первым пакетом
-            while let Ok(pkt) = rx_router.try_recv() {
-                if pkt.len() >= 20 {
-                    batcher.push(pkt);
-                }
-            }
-
             // Ждем микро-окно coalesce_ms (10–15 мс) для сбора стартового бурста
-            if coalesce_ms > 0 && !batcher.should_flush() {
+            if coalesce_ms > 0 {
                 let coalesce_deadline = Instant::now() + Duration::from_millis(coalesce_ms);
                 loop {
                     if batcher.should_flush() {
@@ -1185,11 +1274,6 @@ pub async fn run_client_downlink_batcher(
                             if pkt.len() >= 20 {
                                 batcher.push(pkt);
                             }
-                            while let Ok(more_pkt) = rx_router.try_recv() {
-                                if more_pkt.len() >= 20 {
-                                    batcher.push(more_pkt);
-                                }
-                            }
                         }
                         Ok(None) => break,
                         Err(_) => break,
@@ -1198,48 +1282,22 @@ pub async fn run_client_downlink_batcher(
             }
         }
 
-        // 2. Ждем готовности первого свободного здорового ящика в SessionMailboxPool (Self-Clocking Round-Robin),
-        // НЕПРЕРЫВНО дренируя rx_router в PacketBatcher (с приоритезацией prio_queue и AQM Head-Drop на bulk queue!).
-        // Благодаря этому глобальная очередь rx_tun сервера никогда не забивается старыми пакетами Download,
-        // а свежие TCP SYN-ACK / ACK для клиентского Upload мгновенно попадают в prio_queue текущего батча!
-        let slot_opt = {
-            let acquire_fut =
-                acquire_server_slot_self_clocking(&session_pool, max_inflight_batches);
-            tokio::pin!(acquire_fut);
-            let mut rx_closed = false;
-            loop {
-                tokio::select! {
-                    biased;
-                    res = &mut acquire_fut => break res,
-                    pkt_opt = rx_router.recv(), if !rx_closed => {
-                        match pkt_opt {
-                            Some(pkt) => {
-                                if pkt.len() >= 20 {
-                                    batcher.push(pkt);
-                                }
-                                while let Ok(more_pkt) = rx_router.try_recv() {
-                                    if more_pkt.len() >= 20 {
-                                        batcher.push(more_pkt);
-                                    }
-                                }
-                            }
-                            None => {
-                                rx_closed = true;
-                            }
-                        }
-                    }
-                }
-            }
-        };
-
-        let Some((handle, permit)) = slot_opt else {
+        // 2. Ждем готовности первого свободного здорового ящика в SessionMailboxPool (Self-Clocking Round-Robin)
+        let Some((handle, permit)) =
+            acquire_server_slot_self_clocking(&session_pool, max_inflight_batches).await
+        else {
             break;
         };
 
-        // 3. Как только SRV_WRITER[k] освободился — выгребаем все оставшиеся пакеты из rx_router в батчер!
-        while let Ok(pkt) = rx_router.try_recv() {
-            if pkt.len() >= 20 {
-                batcher.push(pkt);
+        // 3. Как только SRV_WRITER[k] освободился — выгребаем накопившиеся за время ожидания пакеты до max_batch_bytes!
+        while batcher.current_bytes() < max_batch_bytes {
+            match rx_router.try_recv() {
+                Ok(pkt) => {
+                    if pkt.len() >= 20 {
+                        batcher.push(pkt);
+                    }
+                }
+                Err(_) => break,
             }
         }
 

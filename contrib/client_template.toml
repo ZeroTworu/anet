@@ -344,28 +344,28 @@ idle_active_poll_ms = 400
 idle_active_window_ms = 5000
 
 # Тайм-аут выполнения одной IMAP-команды (LOGIN, CAPABILITY, SELECT, APPEND, FETCH, STORE, EXPUNGE) в мс
-command_timeout_ms = 25000
+command_timeout_ms = 15000
 
 # Максимальная задержка накопления микро-батча перед первым APPEND (в мс, 5..50)
 batch_coalesce_ms = 15
 
-# Максимальный размер одной склеенной пачки IP-пакетов до шифрования (в КБ, от 8 до 512 КБ без переполнения u16)
-max_batch_kb = 64
+# Максимальный размер одной склеенной пачки IP-пакетов до шифрования (в КБ, от 4 до 512 КБ без переполнения u16)
+max_batch_kb = 128
 
-# Максимальное число писем, скачиваемых за одну команду `UID FETCH` (Chunked UID Fetch, 0 = без лимита)
+# Максимальное число писем при порционном индексированном FETCH (в основном потоковом 1-RTT режиме используется UID FETCH <last+1>:4294967295)
 fetch_max_messages = 3
 
 # Порог накопления прочитанных писем для попутного пакетного удаления (UID STORE +FLAGS.SILENT (\Deleted) + UID EXPUNGE)
 expunge_batch_size = 25
 
-# Пауза отсутствия новых входящих писем перед фоновой очисткой накопленных прочитанных UID (в мс, 15 сек)
-expunge_idle_delay_ms = 15000
+# Пауза отсутствия новых входящих писем перед фоновой очисткой накопленных прочитанных UID (в мс, 1.5 сек)
+expunge_idle_delay_ms = 1500
 
 # Максимальное окно неподтвержденных батчей в полете на один ящик до срабатывания Backpressure
-max_inflight_batches = 5
+max_inflight_batches = 35
 
-# Емкость очереди bulk-пакетов из TUN (защита от Bufferbloat; ICMP, DNS и мелкие пакеты <= 256 Б идут в приоритетную Fast-Lane очередь)
-tx_queue_capacity = 64
+# Емкость очереди bulk-пакетов из TUN (вместе с Linux TCP Small Queues обеспечивает плавный pacing без потерь пакетов; ICMP, DNS и мелкие пакеты <= 256 Б идут в приоритетную Fast-Lane очередь)
+tx_queue_capacity = 256
 
 # Автоматическое определение поддержки расширения `LITERAL+` / `LITERAL-` по ответу `CAPABILITY` после `LOGIN` (1-RTT APPEND)
 literal_plus_auto = true

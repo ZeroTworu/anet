@@ -275,13 +275,15 @@ pub async fn run_client_uplink_dispatcher(
             continue;
         }
 
-        // Выгребаем ВСЕ доступные пакеты из каналов (сначала приоритетные Fast-Lane, затем bulk с Head-Drop AQM внутри батчера),
-        // чтобы tun_reader_task и задача t1 никогда не блокировались на переполнении буферов.
+        // Выгребаем все приоритетные пакеты и добираем bulk-пакеты до max_batch_bytes
         while let Ok(pkt) = prio_rx.try_recv() {
             batcher.push_priority(pkt);
         }
-        while let Ok(pkt) = bulk_rx.try_recv() {
-            batcher.push_bulk(pkt);
+        while batcher.current_bytes() < max_batch_bytes {
+            match bulk_rx.try_recv() {
+                Ok(pkt) => batcher.push_bulk(pkt),
+                Err(_) => break,
+            }
         }
 
         // Если батчер пуст — ждём первый пакет (или возврат батча из retry_uplink_rx)
@@ -328,8 +330,11 @@ pub async fn run_client_uplink_dispatcher(
                 while let Ok(pkt) = prio_rx.try_recv() {
                     batcher.push_priority(pkt);
                 }
-                while let Ok(pkt) = bulk_rx.try_recv() {
-                    batcher.push_bulk(pkt);
+                while batcher.current_bytes() < max_batch_bytes {
+                    match bulk_rx.try_recv() {
+                        Ok(pkt) => batcher.push_bulk(pkt),
+                        Err(_) => break,
+                    }
                 }
                 if batcher.should_flush() {
                     break;
@@ -360,8 +365,8 @@ pub async fn run_client_uplink_dispatcher(
         }
 
         // Ждём освобождения первого доступного здорового ящика по алгоритму Self-Clocking Round-Robin,
-        // непрерывно выгребая новые пакеты из prio_rx и bulk_rx в batcher (с Head-Drop AQM для bulk),
-        // чтобы каналы TUN никогда не переполнялись и не задерживали приоритетный трафик.
+        // подбирая только приоритетные пакеты из prio_rx, чтобы сохранять естественное обратное давление
+        // (Linux TSQ backpressure) на bulk_rx без дропа сегментов TCP!
         let slot_permit_opt = {
             let acquire_fut = acquire_client_slot_self_clocking(
                 &slots,
@@ -382,15 +387,6 @@ pub async fn run_client_uplink_dispatcher(
                             batcher.push_priority(more);
                         }
                     }
-                    Some(pkt) = bulk_rx.recv() => {
-                        batcher.push_bulk(pkt);
-                        while let Ok(more) = prio_rx.try_recv() {
-                            batcher.push_priority(more);
-                        }
-                        while let Ok(more) = bulk_rx.try_recv() {
-                            batcher.push_bulk(more);
-                        }
-                    }
                 }
             }
         };
@@ -406,13 +402,15 @@ pub async fn run_client_uplink_dispatcher(
             continue;
         }
 
-        // Добираем ВСЕ накопившиеся к моменту пробуждения пакеты (приоритетные ICMP/DNS/ACK всегда встают в начало батча,
-        // а избыток bulk-трафика свыше окна BDP автоматически регулируется Head-Drop AQM внутри батчера).
+        // Добираем все приоритетные ICMP/DNS/ACK в начало батча и заполняем остаток батча из bulk_rx до max_batch_bytes
         while let Ok(pkt) = prio_rx.try_recv() {
             batcher.push_priority(pkt);
         }
-        while let Ok(pkt) = bulk_rx.try_recv() {
-            batcher.push_bulk(pkt);
+        while batcher.current_bytes() < max_batch_bytes {
+            match bulk_rx.try_recv() {
+                Ok(pkt) => batcher.push_bulk(pkt),
+                Err(_) => break,
+            }
         }
 
         if let Some(raw_batch) = batcher.flush() {
@@ -1253,12 +1251,14 @@ async fn run_client_mailbox_worker(
             }
         });
 
-        // Цикл CLI_READER[i]: Adaptive Short-IDLE + Greedy Fetch Drain "Notes" -> unpack_batch -> downlink_tun_tx
+        // Цикл CLI_READER[i]: Adaptive Short-IDLE + 1-RTT Streaming Fetch (`<last+1>:4294967295`) + Greedy Drain
+        let _ = fetch_max_messages;
         while !worker_stop.load(Ordering::Relaxed) && !stop_flag.load(Ordering::Relaxed) {
             let since_active_ms =
                 now_epoch_ms().saturating_sub(tunnel_last_activity_ms.load(Ordering::Relaxed));
             let is_active = since_active_ms <= idle_active_window_ms;
             let mut got_event = true;
+            let was_forced = force_immediate_fetch;
 
             if !force_immediate_fetch {
                 let cur_idle_timeout = if is_active {
@@ -1284,22 +1284,92 @@ async fn run_client_mailbox_worker(
                     }
                 }
             }
-            let _ = got_event;
             force_immediate_fetch = false;
 
             if worker_stop.load(Ordering::Relaxed) || stop_flag.load(Ordering::Relaxed) {
                 break;
             }
 
-            // Двухфазный порционный опрос (Chunked UID Fetch):
-            // 1. Запрашивает легковесный индекс `UID FETCH <last_seen_uid + 1>:* (UID)` (~40 байт).
-            //    Если новых писем нет (включая выход из 400ms/10s IDLE по тайм-ауту), не качает 175 КБ дубликат
-            //    и на 100% закрывает «Слепое окно» Mail.ru.
-            // 2. Если писем накопилось много, скачивает тела не более `fetch_max_messages` (например, 3 шт.) за шаг,
-            //    сразу сбрасывает их в TUN и мгновенно (без входа в IDLE) переходит к следующей порции.
+            // Если мы вышли из IDLE по таймауту (или по сигналу wake_notify при переходе в активный режим)
+            // и сервер не прислал `* <N> EXISTS` ни во время IDLE, ни в ответе на `DONE`, не тратим лишний RTT.
+            if !was_forced && !got_event && !cli_reader.pending_exists {
+                continue;
+            }
+
+            let (expected_sess_tag, cipher_cur) = {
+                let st = session_state.read().await;
+                (format!("[ID: {}]", st.session_id), st.cipher.clone())
+            };
+
+            let mut streamed_uids: Vec<u32> = Vec::new();
+            let mut deferred_tun_chunks: Vec<Bytes> = Vec::new();
+            let mut tun_closed = false;
+
+            // Одношаговая (1-RTT) потоковая выборка `UID FETCH <last_seen_uid + 1>:4294967295 (UID BODY.PEEK[])`:
+            // - Явная верхняя граница `4294967295` вместо `*` исключает 175 КБ дубликаты `last_seen_uid` на пустых опросах
+            //   и полностью обходит залипание кэшированного `*` в «Слепом окне» Mail.ru;
+            // - Каждое скачанное письмо расшифровывается и отправляется в `downlink_tun_tx` МГНОВЕННО
+            //   после чтения его литерала `read_exact`, еще до чтения следующего письма из TLS-сокета!
             let fetch_res = cli_reader
-                .fetch_messages_chunked(last_seen_uid, fetch_max_messages, command_timeout)
+                .fetch_messages_streaming(last_seen_uid, command_timeout, |msg| {
+                    if !msg.subject.contains(&expected_sess_tag) {
+                        return;
+                    }
+                    streamed_uids.push(msg.uid);
+
+                    match anet_common::transport::unwrap_packet(&cipher_cur, &msg.payload) {
+                        Ok(decrypted_batch) => {
+                            let packets = unpack_batch(&decrypted_batch);
+                            write_buf.clear();
+
+                            for pkt in packets {
+                                if pkt.len() >= 20 {
+                                    frame_packet_into(&mut write_buf, &pkt);
+                                }
+                            }
+
+                            if !write_buf.is_empty() {
+                                let framed_chunk = write_buf.split().freeze();
+                                match downlink_tun_tx.try_send(framed_chunk) {
+                                    Ok(()) => {}
+                                    Err(mpsc::error::TrySendError::Full(chunk)) => {
+                                        deferred_tun_chunks.push(chunk);
+                                    }
+                                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                                        tun_closed = true;
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            debug!(
+                                "[IMAP Downlink][Box #{} ({})] unwrap_packet error on UID {}: {e}",
+                                idx, email, msg.uid
+                            );
+                        }
+                    }
+                })
                 .await;
+
+            if !streamed_uids.is_empty() {
+                let mut guard = cleanup_uids.lock().await;
+                guard.extend(streamed_uids);
+            }
+
+            if tun_closed {
+                stop_flag.store(true, Ordering::SeqCst);
+                worker_stop.store(true, Ordering::SeqCst);
+                break;
+            }
+
+            for chunk in deferred_tun_chunks {
+                if downlink_tun_tx.send(chunk).await.is_err() {
+                    stop_flag.store(true, Ordering::SeqCst);
+                    worker_stop.store(true, Ordering::SeqCst);
+                    break;
+                }
+            }
+
             if cli_reader.pending_exists {
                 cli_reader.pending_exists = false;
                 force_immediate_fetch = true;
@@ -1313,50 +1383,10 @@ async fn run_client_mailbox_worker(
                         last_rx_ms.store(now, Ordering::Relaxed);
                         tunnel_last_activity_ms.store(now, Ordering::Relaxed);
                         tunnel_reader_wake_notify.notify_waiters();
-                    }
-
-                    let (expected_sess_tag, cipher_cur) = {
-                        let st = session_state.read().await;
-                        (format!("[ID: {}]", st.session_id), st.cipher.clone())
-                    };
-
-                    for msg in res.messages {
-                        if !msg.subject.contains(&expected_sess_tag) {
-                            continue;
-                        }
-
-                        {
-                            let mut guard = cleanup_uids.lock().await;
-                            guard.push(msg.uid);
-                        }
-
-                        match anet_common::transport::unwrap_packet(&cipher_cur, &msg.payload) {
-                            Ok(decrypted_batch) => {
-                                let packets = unpack_batch(&decrypted_batch);
-                                write_buf.clear();
-
-                                for pkt in packets {
-                                    if pkt.len() >= 20 {
-                                        frame_packet_into(&mut write_buf, &pkt);
-                                    }
-                                }
-
-                                if !write_buf.is_empty() {
-                                    let framed_chunk = write_buf.split().freeze();
-                                    if downlink_tun_tx.send(framed_chunk).await.is_err() {
-                                        stop_flag.store(true, Ordering::SeqCst);
-                                        worker_stop.store(true, Ordering::SeqCst);
-                                        break;
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                debug!(
-                                    "[IMAP Downlink][Box #{} ({})] unwrap_packet error on UID {}: {e}",
-                                    idx, email, msg.uid
-                                );
-                            }
-                        }
+                        // Greedy Fetch Drain: если в этом цикле мы вычитали хотя бы одно письмо,
+                        // за время его скачивания (150–300 мс) в папку могло упасть следующее письмо
+                        // без генерации `* EXISTS`. Делаем мгновенный повторный 1-RTT опрос до полного осушения!
+                        force_immediate_fetch = true;
                     }
                 }
                 Err(e) => {
@@ -1594,16 +1624,14 @@ impl ClientTransport for ImapTransport {
                             match prio_tx.try_send(packet) {
                                 Ok(()) => {}
                                 Err(mpsc::error::TrySendError::Full(pkt)) => {
-                                    let _ = bulk_tx.try_send(pkt);
+                                    if bulk_tx.send(pkt).await.is_err() {
+                                        break;
+                                    }
                                 }
                                 Err(mpsc::error::TrySendError::Closed(_)) => break,
                             }
-                        } else {
-                            match bulk_tx.try_send(packet) {
-                                Ok(()) => {}
-                                Err(mpsc::error::TrySendError::Full(_)) => {}
-                                Err(mpsc::error::TrySendError::Closed(_)) => break,
-                            }
+                        } else if bulk_tx.send(packet).await.is_err() {
+                            break;
                         }
                     }
                     Ok(None) => {
