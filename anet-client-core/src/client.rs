@@ -592,26 +592,6 @@ impl AnetClient {
                 .await?;
         }
 
-        // Гарантируем, что прямые DNS-резолверы для Direct-правил идут в обход туннеля на десктопах,
-        // но НИКОГДА не исключаем из туннеля основные DNS-серверы из `dns_server_list` (например, `8.8.4.4` с контрол-плейна),
-        // иначе системные DNS-запросы идут мимо `tun0` и блокируются под мобильными Белыми Списками.
-        #[cfg(not(target_os = "android"))]
-        for direct_dns_ip in crate::dns_interceptor::DIRECT_UPSTREAM_DNS_IPS {
-            let ip_str = direct_dns_ip.to_string();
-            if !config_clone
-                .main
-                .dns_server_list
-                .iter()
-                .any(|d| d.trim() == ip_str)
-            {
-                let _ = self
-                    .route_manager
-                    .add_bypass_route(IpAddr::V4(direct_dns_ip), 32)
-                    .await;
-                bypass_ips.push(IpAddr::V4(direct_dns_ip));
-            }
-        }
-
         // Инициализация и синхронизация движка Smart DNS, Geo-Routing и AdBlock (.abc + Local Overrides)
         // Выполняется ДО acquire_packet_source, чтобы все платформы (Linux, Windows, macOS, Android VpnService, iOS)
         // получили актуальные статические Direct-подсети в RouteManager до поднятия TUN-интерфейса.
@@ -892,7 +872,6 @@ impl AnetClient {
 
         let dns_aborts: Arc<Mutex<Vec<tokio::task::AbortHandle>>> =
             Arc::new(Mutex::new(Vec::new()));
-        let dns_aborts_t1 = dns_aborts.clone();
         let dns_aborts_t2 = dns_aborts.clone();
 
         let (mut stream_reader, mut stream_writer) = io_split(result.vpn_stream);
@@ -904,16 +883,11 @@ impl AnetClient {
         let sig_t1 = reconnect_signal.clone();
         let reason_t1 = disconnect_reason.clone();
         let tx_to_tun_dns = tx_to_tun.clone();
-        let tx_probe_dns = tx_probe.clone();
-        let route_manager_dns = self.route_manager.clone();
-        let dns_servers_list = config_clone.main.dns_server_list.clone();
         let dns_interceptor_tx = dns_interceptor.clone();
         let rule_cache_tx = rule_cache.clone();
         let local_overrides_tx = local_overrides.clone();
         let direct_ip_cache_tx = direct_ip_cache.clone();
 
-        #[cfg(all(windows, feature = "per-app"))]
-        let app_filter_bypass_t1 = _app_filter.as_ref().map(|f| f.bypass_set());
         #[cfg(all(windows, feature = "per-app"))]
         let app_filter_bypass_t2 = _app_filter.as_ref().map(|f| f.bypass_set());
 
@@ -961,51 +935,12 @@ impl AnetClient {
                     crate::dns_interceptor::InterceptResult::Drop => {
                         return false;
                     }
-                    crate::dns_interceptor::InterceptResult::DirectQuery => {
-                        let interceptor_c = dns_interceptor_tx.clone();
-                        let pkt_c = pkt.clone();
-                        let dns_c = dns_servers_list.clone();
-                        let tun_tx_c = tx_to_tun_dns.clone();
-                        let probe_tx_c = tx_probe_dns.clone();
-                        let rm_c = route_manager_dns.clone();
-                        #[cfg(all(windows, feature = "per-app"))]
-                        let af_bypass = app_filter_bypass_t1.clone();
-                        let dns_task = tokio::spawn(async move {
-                            if let Some((reply_pkt, resolved_ips)) =
-                                interceptor_c.resolve_direct_dns_packet(&pkt_c, &dns_c).await
-                            {
-                                if !resolved_ips.is_empty() {
-                                    #[cfg(all(windows, feature = "per-app"))]
-                                    if let Some(ref bp) = af_bypass {
-                                        for ip in &resolved_ips {
-                                            bp.add_sync(*ip);
-                                        }
-                                    }
-                                    let routes: Vec<(IpAddr, u8)> = resolved_ips
-                                        .iter()
-                                        .map(|ip| (*ip, if ip.is_ipv4() { 32 } else { 128 }))
-                                        .collect();
-                                    let _ = rm_c.add_bypass_routes(&routes).await;
-                                    log::info!(
-                                        "[DNS/Direct] Added OS bypass routes for {:?}",
-                                        resolved_ips
-                                    );
-                                }
-                                let _ = tun_tx_c.send(reply_pkt).await;
-                            } else {
-                                // Fallback: если прямой UDP:53 заблокирован провайдером, отправляем запрос в туннель
-                                // (ответ будет перехвачен в t2 и IP-адреса также получат bypass-маршруты до отдачи браузеру)
-                                let _ = probe_tx_c.send(pkt_c).await;
-                            }
-                        });
-                        {
-                            let mut guard = dns_aborts_t1.lock().unwrap();
-                            guard.retain(|h| !h.is_finished());
-                            guard.push(dns_task.abort_handle());
-                        }
-                        return false;
-                    }
-                    crate::dns_interceptor::InterceptResult::PassThrough => {}
+                    // Все разрешённые DNS-запросы (и Proxy, и Direct IPv4 A) идут строго внутри
+                    // зашифрованного VPN-туннеля (0% DNS Leak наружу). Для Direct-доменов ответ
+                    // перехватывается в t2 (`inspect_dns_response`), который прописывает /32 bypass-маршруты
+                    // до передачи DNS-ответа приложению.
+                    crate::dns_interceptor::InterceptResult::DirectQuery
+                    | crate::dns_interceptor::InterceptResult::PassThrough => {}
                 }
 
                 if let Some(dst_ip) = crate::dns_interceptor::extract_packet_dst_ip(pkt) {
@@ -1219,8 +1154,9 @@ impl AnetClient {
                                     rx_bytes.fetch_add(len, Ordering::Relaxed);
                                     rx_packets.fetch_add(1, Ordering::Relaxed);
 
-                                    // Если из туннеля пришел DNS-ответ для Direct-домена, регистрируем bypass-маршруты асинхронно,
-                                    // не блокируя горячий цикл приёма пакетов 'rx_loop
+                                    // Если из туннеля пришел DNS-ответ для Direct-домена, прописываем /32 bypass-маршруты
+                                    // в таблицу маршрутизации ОС и сразу после этого отдаём DNS-ответ в TUN,
+                                    // чтобы первый же TCP SYN браузера пошёл в обход туннеля (и без блокировки 'rx_loop).
                                     if let Some((qname, resolved_ips)) = dns_interceptor_rx
                                         .inspect_dns_response(&packet, |domain| rule_cache_rx.lookup_domain(domain))
                                     {
@@ -1236,6 +1172,8 @@ impl AnetClient {
                                                 .map(|ip| (*ip, if ip.is_ipv4() { 32 } else { 128 }))
                                                 .collect();
                                             let rm_bg = route_manager_rx.clone();
+                                            let tun_tx_bg = tx_to_tun.clone();
+                                            let pkt_bg = packet.clone();
                                             let dns_rx_task = tokio::spawn(async move {
                                                 let _ = rm_bg.add_bypass_routes(&routes).await;
                                                 log::info!(
@@ -1243,11 +1181,24 @@ impl AnetClient {
                                                     qname,
                                                     resolved_ips
                                                 );
+                                                let _ = tun_tx_bg.send(pkt_bg).await;
                                             });
                                             {
                                                 let mut guard = dns_aborts_t2.lock().unwrap();
                                                 guard.retain(|h| !h.is_finished());
                                                 guard.push(dns_rx_task.abort_handle());
+                                            }
+                                            match frame_reader.try_next_packet() {
+                                                Ok(next_opt) => {
+                                                    current_pkt = next_opt;
+                                                    continue;
+                                                }
+                                                Err(e) => {
+                                                    warn!("[Tunnel/Rx] Failed reading frame/packet from VPN stream: {e:#}");
+                                                    *reason_t2.lock().unwrap() = format!("Failed reading frame/packet from VPN stream: {e:#}");
+                                                    sig_t2.notify_one();
+                                                    break 'rx_loop;
+                                                }
                                             }
                                         }
                                     }
