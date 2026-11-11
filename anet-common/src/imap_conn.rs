@@ -1481,14 +1481,20 @@ mod tests {
         server_task.await.unwrap();
     }
 
+    fn build_test_rfc822(email: &str, subject: &str, payload: &[u8]) -> Vec<u8> {
+        let b64 = BASE64_STANDARD.encode(payload);
+        format!("From: <{email}>\r\nTo: <{email}>\r\nSubject: {subject}\r\n\r\n{b64}\r\n")
+            .into_bytes()
+    }
+
     #[tokio::test]
     async fn test_fetch_messages_chunked_splits_backlog_and_sets_pending_exists() {
         let (client_io, mut server_io) = tokio::io::duplex(32 * 1024);
         let mut conn = ImapConn::new(client_io);
 
-        let raw_m1 = build_rfc822_message("a@b.c", "[ID: s1]", b"pkt1", [1u8; 16]);
-        let raw_m2 = build_rfc822_message("a@b.c", "[ID: s1]", b"pkt2", [2u8; 16]);
-        let raw_m3 = build_rfc822_message("a@b.c", "[ID: s1]", b"pkt3", [3u8; 16]);
+        let raw_m1 = build_test_rfc822("a@b.c", "[ID: s1]", b"pkt1");
+        let raw_m2 = build_test_rfc822("a@b.c", "[ID: s1]", b"pkt2");
+        let raw_m3 = build_test_rfc822("a@b.c", "[ID: s1]", b"pkt3");
 
         let server_task = tokio::spawn(async move {
             let mut s_buf = BufReader::new(&mut server_io);
@@ -1564,6 +1570,54 @@ mod tests {
         assert_eq!(res2.messages.len(), 1);
         assert_eq!(res2.messages[0].payload.as_ref(), b"pkt3");
         assert!(!conn.pending_exists);
+
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_fetch_messages_streaming_upper_bound_and_callback() {
+        let (client_io, mut server_io) = tokio::io::duplex(32 * 1024);
+        let mut conn = ImapConn::new(client_io);
+
+        let raw_m1 = build_test_rfc822("a@b.c", "[ID: s1]", b"stream_pkt_1");
+        let raw_m2 = build_test_rfc822("a@b.c", "[ID: s1]", b"stream_pkt_2");
+
+        let server_task = tokio::spawn(async move {
+            let mut s_buf = BufReader::new(&mut server_io);
+            let mut line = String::new();
+
+            s_buf.read_line(&mut line).await.unwrap();
+            assert!(line.contains("UID FETCH 101:4294967295 (UID BODY.PEEK[])"));
+
+            let mut resp = Vec::new();
+            resp.extend_from_slice(
+                format!("* 1 FETCH (BODY[] {{{}}}\r\n", raw_m1.len()).as_bytes(),
+            );
+            resp.extend_from_slice(&raw_m1);
+            resp.extend_from_slice(b" UID 101)\r\n");
+            resp.extend_from_slice(
+                format!("* 2 FETCH (BODY[] {{{}}}\r\n", raw_m2.len()).as_bytes(),
+            );
+            resp.extend_from_slice(&raw_m2);
+            resp.extend_from_slice(b" UID 105)\r\nA0001 OK UID FETCH completed\r\n");
+            s_buf.get_mut().write_all(&resp).await.unwrap();
+        });
+
+        let mut callback_uids = Vec::new();
+        let res = conn
+            .fetch_messages_streaming(100, Duration::from_secs(1), |msg| {
+                callback_uids.push((msg.uid, msg.payload.clone()));
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(res.new_max_uid, 105);
+        assert_eq!(res.messages.len(), 2);
+        assert_eq!(callback_uids.len(), 2);
+        assert_eq!(callback_uids[0].0, 101);
+        assert_eq!(callback_uids[0].1.as_ref(), b"stream_pkt_1");
+        assert_eq!(callback_uids[1].0, 105);
+        assert_eq!(callback_uids[1].1.as_ref(), b"stream_pkt_2");
 
         server_task.await.unwrap();
     }
