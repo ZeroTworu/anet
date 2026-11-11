@@ -15,6 +15,7 @@ const navigation = [
   { label: 'Users', path: '/users', icon: 'mdi-account-multiple-outline', group: 'Management' },
   { label: 'Nodes', path: '/servers', icon: 'mdi-server', group: 'Management' },
   { label: 'Node Pools', path: '/pools', icon: 'mdi-lan', group: 'Management' },
+  { label: 'IMAP Mailboxes', path: '/mailboxes', icon: 'mdi-email-outline', group: 'Management' },
   { label: 'Route Maps', path: '/route-maps', icon: 'mdi-map-marker-path', group: 'Management' },
   { label: 'User Groups', path: '/groups', icon: 'mdi-wallet-membership', group: 'Management' },
   { label: 'Traffic', path: '/statistics', icon: 'mdi-chart-line', group: 'Observability' },

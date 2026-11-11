@@ -25,6 +25,7 @@ const headers = [
   { title: 'Connections', key: 'runtime.active_connections', sortable: true, align: 'end' as const },
   { title: 'Admission', key: 'runtime.accepting_connections', sortable: true, align: 'center' as const },
   { title: 'Uptime', key: 'runtime.uptime_seconds', sortable: true, align: 'end' as const },
+  { title: 'Действия', key: 'actions', sortable: false, align: 'center' as const },
 ]
 
 const formatUptime = (seconds?: number) => {
@@ -65,112 +66,126 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <v-container max-width="1400" class="servers-page">
-    <div class="d-flex justify-space-between align-center flex-wrap ga-4 mb-5">
-      <div>
-        <h2 class="text-h6 font-weight-bold ma-0">VPN Nodes (Servers)</h2>
-        <span class="text-caption text-medium-emphasis">Управление физическими серверами и нодами доступа</span>
-      </div>
-      <div class="d-flex align-center ga-3">
-        <v-text-field
-            v-model="searchQuery"
-            prepend-inner-icon="mdi-magnify"
-            label="Поиск по названию или IP..."
-            variant="outlined"
-            density="compact"
-            hide-details
-            single-line
-            style="width: 280px"
-        />
-        <v-btn color="primary" @click="showCreateModal = true"> Add Server </v-btn>
-      </div>
+  <v-container fluid class="servers-page">
+    <div class="d-flex justify-space-between align-center flex-wrap ga-4 mb-4">
+      <v-list-item
+        class="px-0"
+        subtitle="Управление физическими серверами, токенами управления и состоянием нод доступа"
+      >
+        <template #title>
+          <h1 class="text-h5 font-weight-bold">VPN Nodes (Серверы)</h1>
+        </template>
+      </v-list-item>
+    </div>
+
+    <div class="d-flex justify-space-between align-center mb-4">
+      <v-text-field
+        v-model="searchQuery"
+        prepend-inner-icon="mdi-magnify"
+        label="Поиск по названию или IP..."
+        variant="outlined"
+        density="compact"
+        hide-details
+        single-line
+        style="width: 280px"
+      />
+      <v-btn color="primary" prepend-icon="mdi-plus" @click="showCreateModal = true">
+        + ДОБАВИТЬ СЕРВЕР
+      </v-btn>
     </div>
 
     <v-data-table
-        :headers="headers"
-        :items="data"
-        :search="searchQuery"
-        :loading="loading"
-        :items-per-page="10"
-        :items-per-page-options="[10, 20, 50]"
-        items-per-page-text="Строк на странице"
-        loading-text="Загрузка нод…"
-        no-data-text="Серверов пока нет — добавьте первую ноду!"
-        density="comfortable"
-        class="servers-table"
-        hover
-        @click:row="(_: unknown, data: { item: Server }) => openEdit(data.item)"
+      :headers="headers"
+      :items="data"
+      :search="searchQuery"
+      :loading="loading"
+      :items-per-page="10"
+      :items-per-page-options="[10, 20, 50]"
+      items-per-page-text="Items per page:"
+      loading-text="Загрузка нод…"
+      no-data-text="Серверов пока нет — добавьте первую ноду!"
+      density="comfortable"
+      class="border rounded-lg"
+      hover
+      @click:row="(_: unknown, data: { item: Server }) => openEdit(data.item)"
     >
       <template #item.name="{ item }">
-        <span class="name-col">{{ item.name }}</span>
+        <span class="font-weight-bold">{{ item.name }}</span>
       </template>
 
-      <!-- Выводим адрес вместо dsn -->
       <template #item.address="{ item }">
-        <span class="addr-col">{{ item.address }}</span>
+        <code class="font-weight-medium text-primary">{{ item.address }}</code>
       </template>
 
       <template #item.is_active="{ item }">
-        <v-chip :color="item.is_active ? 'success' : 'error'" size="small">
-          {{ item.is_active ? 'ВКЛ' : 'ВЫКЛ' }}
+        <v-chip :color="item.is_active ? 'success' : 'default'" size="small">
+          {{ item.is_active ? 'ACTIVE' : 'OFF' }}
         </v-chip>
       </template>
 
       <template #item.runtime.status="{ item }">
-        <div class="state-cell">
+        <div class="d-flex flex-column align-center ga-1">
           <v-chip :color="item.runtime?.status === 'online' ? 'success' : 'error'" size="small">
             {{ item.runtime?.status === 'online' ? 'ONLINE' : 'OFFLINE' }}
           </v-chip>
-          <div v-if="item.runtime" class="runtime-version">v{{ item.runtime.version }}</div>
+          <div v-if="item.runtime" class="text-caption text-medium-emphasis">v{{ item.runtime.version }}</div>
         </div>
       </template>
 
       <template #item.has_control_credential="{ item }">
-        <v-chip :color="item.has_control_credential ? 'success' : 'warning'" size="small">
-          {{ item.has_control_credential ? 'READY' : 'SETUP REQUIRED' }}
+        <v-chip :color="item.has_control_credential ? 'success' : 'warning'" variant="tonal" size="small">
+          {{ item.has_control_credential ? 'READY' : 'REQUIRED' }}
         </v-chip>
       </template>
 
       <template #item.runtime.active_connections="{ item }">
-        <span class="metric-col">{{ item.runtime?.active_connections ?? 0 }}</span>
+        <v-chip size="small" variant="tonal" color="success" prepend-icon="mdi-account-multiple">
+          {{ item.runtime?.active_connections ?? 0 }}
+        </v-chip>
       </template>
 
       <template #item.runtime.accepting_connections="{ item }">
         <v-chip
-            :color="item.runtime ? (item.runtime.accepting_connections ? 'success' : 'warning') : 'default'"
-            size="small"
+          :color="item.runtime ? (item.runtime.accepting_connections ? 'success' : 'warning') : 'default'"
+          size="small"
         >
           {{ !item.runtime ? 'UNKNOWN' : item.runtime.accepting_connections ? 'OPEN' : 'CLOSED' }}
         </v-chip>
       </template>
 
       <template #item.runtime.uptime_seconds="{ item }">
-        <span class="metric-col">{{ formatUptime(item.runtime?.uptime_seconds) }}</span>
+        <span class="text-caption text-medium-emphasis">{{ formatUptime(item.runtime?.uptime_seconds) }}</span>
+      </template>
+
+      <template #item.actions="{ item }">
+        <div class="d-flex ga-1 justify-center flex-nowrap" @click.stop>
+          <v-btn
+            icon="mdi-pencil"
+            size="small"
+            variant="text"
+            title="Редактировать сервер"
+            @click="openEdit(item)"
+          />
+        </div>
       </template>
     </v-data-table>
 
     <CreateServerModal
-        v-model="showCreateModal"
-        @created="loadServers"
+      v-model="showCreateModal"
+      @created="loadServers"
     />
 
     <ServerModal
-        v-model="showEditModal"
-        :server="selectedServer"
-        @updated="loadServers"
-        @close="closeEditModal"
+      v-model="showEditModal"
+      :server="selectedServer"
+      @updated="loadServers"
+      @close="closeEditModal"
     />
   </v-container>
 </template>
 
 <style scoped>
-.servers-page { padding: 24px; }
-.servers-table { border-radius: 10px; }
-.servers-table :deep(tbody tr) { cursor: pointer; }
-.servers-table :deep(tbody tr:hover) { background: rgba(43, 184, 148, .07) !important; }
-.name-col { font-weight: 600; font-size: 15px; }
-.addr-col { font-family: 'Fira Code', 'Courier New', Courier, monospace; color: #9aa5a0; }
-.metric-col { font-family: 'Fira Code', 'Courier New', Courier, monospace; white-space: nowrap; }
-.state-cell { display: flex; flex-direction: column; align-items: center; gap: 4px; }
-.runtime-version { color: #7a857f; font-family: monospace; font-size: 11px; }
+.servers-page {
+  padding: 24px;
+}
 </style>

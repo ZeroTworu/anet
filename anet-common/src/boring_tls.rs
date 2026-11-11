@@ -243,9 +243,6 @@ fn load_platform_root_certs() -> Vec<X509> {
     }
 
     // 2. Встроенный бандл корневых сертификатов Mozilla WebPKI (CCADB).
-    // Критично для Windows 10/11: CryptoAPI лениво подгружает новые корневые УЦ (например, GlobalSign Root R46)
-    // из Windows Update только при обращениях через Schannel/Edge, поэтому в локальном системном хранилище ROOT
-    // при прямой проверке через BoringSSL часть корневых сертификатов может отсутствовать.
     for root_der in webpki_root_certs::TLS_SERVER_ROOT_CERTS {
         push_unique_der(&mut certs, &mut seen_der, root_der.as_ref());
     }
@@ -442,8 +439,6 @@ const SAFARI_SIGALGS: &str = "\
     ecdsa_sha1:rsa_pkcs1_sha1";
 
 fn set_chrome_curves(builder: &mut SslConnectorBuilder) -> anyhow::Result<()> {
-    // Современный Chrome 131+ анонсирует гибридную постквантовую группу X25519MLKEM768.
-    // Если текущая сборка BoringSSL её поддерживает — включаем, иначе используем классический набор Chrome.
     if builder
         .set_curves_list("X25519MLKEM768:X25519:P-256:P-384")
         .is_err()
@@ -693,8 +688,6 @@ fn configure_verification(
 
     builder.set_verify_callback(SslVerifyMode::PEER, move |preverify_ok, x509_ctx| {
         if let Some(ref pin) = expected_pin {
-            // При заданном SHA-256 пине пропускаем промежуточные уровни цепочки и строго
-            // сверяем листовой сертификат сервера (depth == 0) по DER SHA-256 или SPKI SHA-256.
             if x509_ctx.error_depth() > 0 {
                 return true;
             }
@@ -708,7 +701,7 @@ fn configure_verification(
             let matched = cert_hash.as_ref() == Some(pin) || spki_hash.as_ref() == Some(pin);
             if !matched {
                 log::warn!(
-                    "[TLS Anti-Spoof] Certificate SHA-256 pin mismatch! Expected {}, got cert={:?} spki={:?}. Aborting handshake before sending payload (possible TSPU active spoofing / MITM).",
+                    "[TLS Anti-Spoof] Certificate SHA-256 pin mismatch! Expected {}, got cert={:?} spki={:?}.",
                     hex_encode(pin),
                     cert_hash.map(|h| hex_encode(&h)),
                     spki_hash.map(|h| hex_encode(&h)),
@@ -719,7 +712,7 @@ fn configure_verification(
 
         if !preverify_ok {
             log::warn!(
-                "[TLS Anti-Spoof] Peer certificate verification failed at depth {} ({:?}): aborting handshake before sending payload (possible TSPU active spoofing / MITM or untrusted certificate).",
+                "[TLS Anti-Spoof] Peer certificate verification failed at depth {} ({:?})",
                 x509_ctx.error_depth(),
                 x509_ctx.verify_result()
             );
@@ -779,7 +772,6 @@ where
     if is_ip {
         ssl_config.set_use_server_name_indication(false);
     }
-    // Включаем проверку соответствия домена в сертификате (SAN/CN), если целевой хост — домен и активна WebPKI-верификация без ручного пина.
     let verify_hostname = !is_ip
         && cfg.verify_peer
         && cfg.pin_sha256.as_ref().is_none_or(|p| p.trim().is_empty());
@@ -800,6 +792,128 @@ where
 {
     let cfg = get_default_tls_config();
     connect_ws_tls_with_config(domain, stream, &cfg).await
+}
+
+/// Создает конфигурацию BoringSSL для сырых TLS-потоков (например, `TURNS` RFC 5766 поверх TCP:443)
+/// с текущим браузерным профилем TLS, но без HTTP ALPN (`h2`/`http/1.1`).
+pub fn build_raw_ssl_connector_with_config(
+    cfg: &TlsClientConfig,
+) -> anyhow::Result<SslConnectorBuilder> {
+    build_ssl_connector_base_with_config(cfg)
+}
+
+/// Выполняет асинхронный клиентский TLS-хендшейк через `tokio-boring` без HTTP ALPN
+/// с явно заданной конфигурацией профиля и защиты от активного спуфинга.
+pub async fn connect_raw_tls_with_config<S>(
+    domain: &str,
+    stream: S,
+    cfg: &TlsClientConfig,
+) -> anyhow::Result<tokio_boring::SslStream<S>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let ssl_connector = build_raw_ssl_connector_with_config(cfg)?.build();
+    let mut ssl_config = ssl_connector.configure()?;
+    let is_ip = domain.parse::<std::net::IpAddr>().is_ok();
+    if is_ip {
+        ssl_config.set_use_server_name_indication(false);
+    }
+    let verify_hostname = !is_ip
+        && cfg.verify_peer
+        && cfg.pin_sha256.as_ref().is_none_or(|p| p.trim().is_empty());
+    ssl_config.set_verify_hostname(verify_hostname);
+    tokio_boring::connect(ssl_config, domain, stream)
+        .await
+        .map_err(|e| anyhow::anyhow!("BoringSSL raw TLS handshake failed: {e}"))
+}
+
+/// Выполняет асинхронный клиентский TLS-хендшейк через `tokio-boring` без HTTP ALPN
+/// с использованием глобальной конфигурации TLS.
+pub async fn connect_raw_tls<S>(
+    domain: &str,
+    stream: S,
+) -> anyhow::Result<tokio_boring::SslStream<S>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let cfg = get_default_tls_config();
+    connect_raw_tls_with_config(domain, stream, &cfg).await
+}
+
+// =========================================================================
+// ЭТАЛОННЫЙ EMAIL TLS-КОННЕКТОР (IMAPS:993, KMail / OpenSSL 3.x)
+// =========================================================================
+
+/// Список шифров OpenSSL 3.x с приоритетом TLS 1.3 AES-256 для почтовых клиентов
+const EMAIL_CIPHERS: &str = "\
+    TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256:\
+    ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:\
+    DHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:\
+    ECDHE-RSA-CHACHA20-POLY1305:ECDHE-ECDSA-AES128-GCM-SHA256:\
+    ECDHE-RSA-AES128-GCM-SHA256";
+
+/// Создает конфигуратор BoringSSL с идеальной мимикрией под почтовый клиент (KMail / OpenSSL 3.x):
+/// - Строго отключены GREASE и случайная перестановка расширений (Permutation);
+/// - На 993 порту НЕ отправляется ALPN (никаких h2 или http/1.1);
+/// - Выставлен приоритет AES-256-GCM в TLS 1.3 и поддержка X25519MLKEM768;
+/// - Настроена WebPKI и анти-спуфинг валидация сертификатов.
+pub fn build_email_ssl_connector_with_config(
+    cfg: &TlsClientConfig,
+) -> anyhow::Result<SslConnectorBuilder> {
+    let mut builder = SslConnector::builder(SslMethod::tls())?;
+
+    builder.set_min_proto_version(Some(SslVersion::TLS1_2))?;
+    builder.set_max_proto_version(Some(SslVersion::TLS1_3))?;
+
+    // Отключаем браузерный GREASE и случайную перестановку расширений
+    builder.set_grease_enabled(false);
+    builder.set_permute_extensions(false);
+
+    // ВАЖНО: На 993 порту расширение ALPN НЕ отправляется вовсе!
+    // (Не вызываем builder.set_alpn_protos)
+
+    // Приоритет AES-256 в TLS 1.3 и классический OpenSSL стек
+    builder.set_cipher_list(EMAIL_CIPHERS)?;
+
+    // Пост-квантовые группы обмена ключами
+    if builder
+        .set_curves_list("X25519MLKEM768:X25519:P-256:P-384")
+        .is_err()
+    {
+        let _ = builder.set_curves_list("X25519:P-256:P-384");
+    }
+
+    configure_verification(&mut builder, cfg)?;
+
+    Ok(builder)
+}
+
+/// Выполняет асинхронный клиентский TLS-хендшейк для IMAPS (порт 993)
+/// с профилем почтового клиента (KMail / OpenSSL 3.x) через `tokio-boring`.
+pub async fn connect_email_tls_with_config<S>(
+    domain: &str,
+    stream: S,
+    cfg: &TlsClientConfig,
+) -> anyhow::Result<tokio_boring::SslStream<S>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let ssl_connector = build_email_ssl_connector_with_config(cfg)?.build();
+    let mut ssl_config = ssl_connector.configure()?;
+
+    let is_ip = domain.parse::<std::net::IpAddr>().is_ok();
+    if is_ip {
+        ssl_config.set_use_server_name_indication(false);
+    }
+
+    let verify_hostname = !is_ip
+        && cfg.verify_peer
+        && cfg.pin_sha256.as_ref().is_none_or(|p| p.trim().is_empty());
+    ssl_config.set_verify_hostname(verify_hostname);
+
+    tokio_boring::connect(ssl_config, domain, stream)
+        .await
+        .map_err(|e| anyhow::anyhow!("BoringSSL Email IMAPS TLS handshake failed for {domain}: {e}"))
 }
 
 #[cfg(test)]
@@ -1322,5 +1436,94 @@ mod tests {
         let _ = connect_ws_tls_with_config("unverified.local", tcp, &disabled_verify_cfg)
             .await
             .expect("verify_peer=false must allow self-signed certificate when explicitly disabled");
+    }
+
+    #[tokio::test]
+    async fn test_email_kmail_client_hello_wire_format() {
+        // Проверяем, что профиль почтового клиента (разделы 7.1.1 и 7.1.2)
+        // генерирует строго детерминированный KMail / OpenSSL 3.x ClientHello на 993 порту
+        // независимо от того, какой браузерный tls_fingerprint задан в [stealth] (Chrome/Firefox/Safari/Randomized).
+        let mut baseline_ext: Option<Vec<u16>> = None;
+        let mut baseline_cs: Option<Vec<u16>> = None;
+        let mut baseline_groups: Option<Vec<u16>> = None;
+
+        for (fp, seed) in [
+            (TlsFingerprint::Chrome, 101),
+            (TlsFingerprint::Firefox, 202),
+            (TlsFingerprint::Safari, 303),
+            (TlsFingerprint::Randomized, 404),
+        ] {
+            let cfg = TlsClientConfig {
+                fingerprint: fp,
+                random_seed: seed,
+                verify_peer: false,
+                pin_sha256: None,
+                ca_cert: None,
+            };
+            let ch = capture_client_hello(
+                build_email_ssl_connector_with_config(&cfg).unwrap(),
+                "imap.mail.ru",
+            )
+            .await;
+
+            assert_eq!(ch.sni.as_deref(), Some("imap.mail.ru"));
+            assert!(
+                ch.alpn_protocols.is_empty() && !ch.extensions.contains(&0x0010),
+                "Email IMAPS profile on port 993 MUST NOT include ALPN (0x0010)"
+            );
+            assert!(
+                !ch.cipher_suites.iter().any(|&c| is_grease_u16(c)),
+                "Email IMAPS profile MUST NOT include GREASE cipher suites"
+            );
+            assert!(
+                !ch.extensions.iter().any(|&e| is_grease_u16(e)),
+                "Email IMAPS profile MUST NOT include GREASE extensions"
+            );
+            assert!(
+                !ch.supported_groups.iter().any(|&g| is_grease_u16(g)),
+                "Email IMAPS profile MUST NOT include GREASE supported_groups"
+            );
+            assert!(
+                !ch.extensions.contains(&0x0015),
+                "Email IMAPS profile MUST NOT include Chromium Padding extension (0x0015)"
+            );
+            assert!(
+                !ch.extensions.contains(&0x0005) && !ch.extensions.contains(&0x0012),
+                "Email IMAPS profile MUST NOT include browser OCSP (0x0005) or SCT (0x0012)"
+            );
+
+            // Пост-квантовая группа X25519MLKEM768 (0x11ec) должна быть первой, если поддерживается сборкой BoringSSL
+            assert!(
+                ch.supported_groups.first().copied() == Some(0x11ec)
+                    || ch.supported_groups.first().copied() == Some(0x001d),
+                "Email IMAPS profile must place X25519MLKEM768 (0x11ec) or X25519 (0x001d) first"
+            );
+
+            // Приоритет AES-256-GCM (0xc02c) перед ChaCha20-Poly1305 (0xcca9) и AES-128-GCM (0xc02b)
+            let pos_aes256 = ch.cipher_suites.iter().position(|&c| c == 0xc02c).unwrap();
+            let pos_chacha = ch.cipher_suites.iter().position(|&c| c == 0xcca9).unwrap();
+            let pos_aes128 = ch.cipher_suites.iter().position(|&c| c == 0xc02b).unwrap();
+            assert!(
+                pos_aes256 < pos_chacha && pos_chacha < pos_aes128,
+                "Email IMAPS profile must prioritize AES-256 before ChaCha20 before AES-128"
+            );
+
+            // Строгая детерминированность (нулевая перестановка расширений и независимость от [stealth].tls_fingerprint)
+            if let Some(ref ext) = baseline_ext {
+                assert_eq!(&ch.extensions, ext, "Extension order must be 100% deterministic");
+            } else {
+                baseline_ext = Some(ch.extensions);
+            }
+            if let Some(ref cs) = baseline_cs {
+                assert_eq!(&ch.cipher_suites, cs, "Cipher suite order must be 100% deterministic");
+            } else {
+                baseline_cs = Some(ch.cipher_suites);
+            }
+            if let Some(ref grp) = baseline_groups {
+                assert_eq!(&ch.supported_groups, grp, "Supported groups order must be 100% deterministic");
+            } else {
+                baseline_groups = Some(ch.supported_groups);
+            }
+        }
     }
 }

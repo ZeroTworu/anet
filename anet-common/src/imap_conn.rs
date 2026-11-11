@@ -17,7 +17,6 @@ use base64::prelude::*;
 use bytes::Bytes;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
-use std::net::{Ipv4Addr, SocketAddr};
 use std::fmt::Write as _;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
@@ -27,45 +26,6 @@ use tokio::net::TcpStream;
 /// Защищает парсер от OOM-аллокаций и зависания при попадании в почтовый ящик стороннего
 /// письма с крупным вложением (максимальный легитимный ASTP-батч 512 КБ в Base64 занимает ~700 КБ).
 pub const MAX_IMAP_LITERAL_BYTES: usize = 2 * 1024 * 1024;
-
-/// Декодирование процентного кодирования URL (например %40 -> @) без внешних крейтов
-pub fn percent_decode(input: &str) -> String {
-    let mut bytes = Vec::with_capacity(input.len());
-    let mut chars = input.bytes();
-    while let Some(b) = chars.next() {
-        if b == b'%' {
-            if let (Some(h1), Some(h2)) = (chars.next(), chars.next()) {
-                let hex = [h1, h2];
-                if let Ok(s) = std::str::from_utf8(&hex) {
-                    if let Ok(byte) = u8::from_str_radix(s, 16) {
-                        bytes.push(byte);
-                        continue;
-                    }
-                }
-                bytes.push(b'%');
-                bytes.push(h1);
-                bytes.push(h2);
-            } else {
-                bytes.push(b'%');
-            }
-        } else if b == b'+' {
-            bytes.push(b' ');
-        } else {
-            bytes.push(b);
-        }
-    }
-    String::from_utf8_lossy(&bytes).to_string()
-}
-
-/// Превращает строковый TempID клиента из темы письма в детерминированный виртуальный SocketAddr
-/// для использования в качестве ключа во внутреннем temp_dh_map (ServerAuthHandler).
-pub fn fake_addr_from_cli_id(cli_id: &str, safe_base: Ipv4Addr) -> SocketAddr {
-    let hash = Sha256::digest(cli_id.as_bytes());
-    let base = safe_base.octets();
-    let ip = Ipv4Addr::new(base[0], base[1], hash[2], hash[3]);
-    let port = (u16::from_be_bytes([hash[4], hash[5]]) | 0x8000).max(1024);
-    SocketAddr::new(std::net::IpAddr::V4(ip), port)
-}
 
 /// Вычисляет 8-символьный hex-идентификатор узла (первые 4 байта SHA-256)
 pub fn compute_hex_id(bytes: &[u8]) -> String {
@@ -707,15 +667,169 @@ where
         last_seen_uid: u32,
         timeout_dur: Duration,
     ) -> Result<FetchResult> {
+        let start_uid = last_seen_uid.saturating_add(1);
+        let cmd_target = format!("{start_uid}:*");
+        self.fetch_messages_by_uid_set(&cmd_target, last_seen_uid, timeout_dur)
+            .await
+    }
+
+    /// Одношаговая (1-RTT) потоковая выборка новых сообщений
+    /// `UID FETCH <last_seen_uid + 1>:4294967295 (UID BODY.PEEK[])`:
+    /// - Использует явную верхнюю границу `4294967295` (`u32::MAX`) вместо символа `*`:
+    ///   1) На `imap.mail.ru` при отсутствии новых писем сервер мгновенно возвращает `OK` (0 байт),
+    ///      не перекачивая 175 КБ дубликат `last_seen_uid` по правилу раскрытия `*` в RFC 3501;
+    ///   2) Полностью обходит кэширование устаревшего `*` на `imap.mail.ru` в «Слепом окне»
+    ///      (когда письмо пришло вне `IDLE` и запрос `UID FETCH <start>:*` возвращает старый `last_seen_uid`);
+    ///   3) Выполняется за **1 RTT** без предварительного индексного запроса `UID FETCH (UID)`.
+    /// - Вызывает `on_message(&msg)` **немедленно** после вычитывания каждого литерала `read_exact`,
+    ///   чтобы воркер сразу расшифровывал и отправлял пакеты каждого письма в `TUN`, не дожидаясь
+    ///   скачивания остальных писем пачки и финального `tag OK`.
+    pub async fn fetch_messages_streaming<F>(
+        &mut self,
+        last_seen_uid: u32,
+        timeout_dur: Duration,
+        on_message: F,
+    ) -> Result<FetchResult>
+    where
+        F: FnMut(&FetchedMessage),
+    {
+        let start_uid = last_seen_uid.saturating_add(1);
+        let cmd_target = format!("{start_uid}:{}", u32::MAX);
+        self.fetch_messages_by_uid_set_streaming(&cmd_target, last_seen_uid, timeout_dur, on_message)
+            .await
+    }
+
+    /// Выборка тел конкретной порции UID (`UID FETCH u1,u2,u3 (UID BODY.PEEK[])`).
+    pub async fn fetch_uids_body(
+        &mut self,
+        uids: &[u32],
+        last_seen_uid: u32,
+        timeout_dur: Duration,
+    ) -> Result<FetchResult> {
+        if uids.is_empty() {
+            return Ok(FetchResult {
+                messages: Vec::new(),
+                new_max_uid: last_seen_uid,
+                latency_ms: 0.0,
+            });
+        }
+
+        let mut uid_set = String::new();
+        for (i, &u) in uids.iter().enumerate() {
+            if i > 0 {
+                uid_set.push(',');
+            }
+            let _ = write!(&mut uid_set, "{u}");
+        }
+
+        let mut res = self
+            .fetch_messages_by_uid_set(&uid_set, last_seen_uid, timeout_dur)
+            .await?;
+        if let Some(&max_requested) = uids.iter().max() {
+            res.new_max_uid = res.new_max_uid.max(max_requested);
+        }
+        Ok(res)
+    }
+
+    /// Двухфазная порционная выборка новых сообщений (`Chunked UID Fetch`).
+    pub async fn fetch_messages_chunked(
+        &mut self,
+        last_seen_uid: u32,
+        fetch_max_messages: usize,
+        timeout_dur: Duration,
+    ) -> Result<FetchResult> {
+        if fetch_max_messages == 0 {
+            return self.fetch_messages_robust(last_seen_uid, timeout_dur).await;
+        }
+
+        let t0 = Instant::now();
+        let deadline = t0 + timeout_dur;
+        let start_uid = last_seen_uid.saturating_add(1);
+
+        self.pending_exists = false;
+
+        let tag1 = self.next_tag();
+        self.send_line(&format!("{tag1} UID FETCH {start_uid}:* (UID)"))
+            .await?;
+        let idx_lines = self.read_until_tagged(&tag1, timeout_dur).await?;
+
+        if let Some(last) = idx_lines.last() {
+            if last.starts_with(&format!("{tag1} NO"))
+                || last.starts_with(&format!("{tag1} BAD"))
+            {
+                return Err(anyhow!("IMAP UID FETCH index failed: {}", last.trim()));
+            }
+        }
+
+        let mut new_uids = Vec::new();
+        for line in &idx_lines {
+            if let Some(uid) = extract_uid_from_fetch_meta(line) {
+                if uid > last_seen_uid {
+                    new_uids.push(uid);
+                }
+            }
+        }
+        new_uids.sort_unstable();
+        new_uids.dedup();
+
+        if new_uids.is_empty() {
+            return Ok(FetchResult {
+                messages: Vec::new(),
+                new_max_uid: last_seen_uid,
+                latency_ms: t0.elapsed().as_secs_f64() * 1000.0,
+            });
+        }
+
+        let take_count = new_uids.len().min(fetch_max_messages);
+        let chunk = &new_uids[..take_count];
+        let has_more_in_folder = new_uids.len() > take_count;
+
+        let rem_timeout = deadline
+            .saturating_duration_since(Instant::now())
+            .max(Duration::from_secs(5));
+        let exists_during_index = self.pending_exists;
+        let mut res = self.fetch_uids_body(chunk, last_seen_uid, rem_timeout).await?;
+        res.latency_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+        if has_more_in_folder || exists_during_index {
+            self.pending_exists = true;
+        }
+
+        Ok(res)
+    }
+
+    async fn fetch_messages_by_uid_set(
+        &mut self,
+        uid_set: &str,
+        last_seen_uid: u32,
+        timeout_dur: Duration,
+    ) -> Result<FetchResult> {
+        self.fetch_messages_by_uid_set_streaming(uid_set, last_seen_uid, timeout_dur, |_| {})
+            .await
+    }
+
+    async fn fetch_messages_by_uid_set_streaming<F>(
+        &mut self,
+        uid_set: &str,
+        last_seen_uid: u32,
+        timeout_dur: Duration,
+        mut on_message: F,
+    ) -> Result<FetchResult>
+    where
+        F: FnMut(&FetchedMessage),
+    {
         let t0 = Instant::now();
         let tag = self.next_tag();
-        let start_uid = last_seen_uid + 1;
 
-        self.send_line(&format!("{tag} UID FETCH {start_uid}:* (UID BODY.PEEK[])")).await?;
+        // Сбрасываем pending_exists до отправки команды UID FETCH:
+        // если новое уведомление `* <N> EXISTS` придет во время вычитывания ответа, `read_line()` снова взведет его.
+        self.pending_exists = false;
+
+        self.send_line(&format!("{tag} UID FETCH {uid_set} (UID BODY.PEEK[])")).await?;
 
         let mut messages = Vec::new();
         let mut new_max_uid = last_seen_uid;
-        let deadline = Instant::now() + timeout_dur;
+        let mut deadline = Instant::now() + timeout_dur;
 
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -749,7 +863,10 @@ where
                 ));
             }
 
-            // 1. Считываем ровно literal_len байт тела сообщения с контролем общего дедлайна
+            // Продлеваем дедлайн на каждое активно скачиваемое сообщение пачки
+            deadline = Instant::now() + timeout_dur;
+
+            // 1. Считываем ровно literal_len байт тела сообщения с контролем дедлайна
             let rem_body = deadline.saturating_duration_since(Instant::now());
             if rem_body.is_zero() {
                 return Err(anyhow!("Timeout waiting for UID FETCH literal body"));
@@ -781,14 +898,17 @@ where
             }
             new_max_uid = new_max_uid.max(uid);
 
-            // 4. Парсим RFC 5322 сообщение
+            // 4. Парсим RFC 5322 сообщение и МГНОВЕННО передаем его в потоковый обработчик `on_message`
+            // еще до чтения следующего литерала из сокета!
             match parse_rfc822_message(&msg_bytes) {
                 Ok((subject, payload)) => {
-                    messages.push(FetchedMessage {
+                    let fetched = FetchedMessage {
                         uid,
                         subject,
                         payload,
-                    });
+                    };
+                    on_message(&fetched);
+                    messages.push(fetched);
                 }
                 Err(e) => {
                     log::warn!("[IMAP] Failed to parse message UID {uid}: {e}");
@@ -804,7 +924,11 @@ where
         })
     }
 
-    /// Удаляет прочитанные UIDs через `UID EXPUNGE` (RFC 4315) с фолбэком на классический `EXPUNGE`.
+    /// Удаляет прочитанные UIDs за 1 RTT через конвейерный `NOOP` + `UID STORE` + `UID EXPUNGE` (RFC 4315)
+    /// с фолбэком на классический `EXPUNGE`.
+    /// Команда `NOOP` перед `UID STORE` обязательна для `imap.mail.ru`: поскольку соединение `WRITER`
+    /// выполняет только `APPEND` в противоположную папку, без `NOOP` его снимок выбранной папки устаревает,
+    /// и `imap.mail.ru` молча игнорирует `UID STORE` / `UID EXPUNGE` для всех новых писем.
     pub async fn expunge_uids(&mut self, uids: &[u32], timeout_dur: Duration) -> Result<()> {
         if uids.is_empty() {
             return Ok(());
@@ -818,32 +942,95 @@ where
             let _ = write!(&mut uid_str, "{u}");
         }
 
-        // Шаг 1: помечаем письма удаленными (\Deleted)
         let tag1 = self.next_tag();
-        self.send_line(&format!("{tag1} UID STORE {uid_str} +FLAGS.SILENT (\\Deleted)")).await?;
-        let resp1 = self.read_until_tagged(&tag1, timeout_dur).await?;
-        if !resp1.last().is_some_and(|l| l.starts_with(&format!("{tag1} OK"))) {
+        let tag2 = self.next_tag();
+        let tag3 = self.next_tag();
+        let pipelined_cmd = format!(
+            "{tag1} NOOP\r\n{tag2} UID STORE {uid_str} +FLAGS.SILENT (\\Deleted)\r\n{tag3} UID EXPUNGE {uid_str}\r\n"
+        );
+
+        let prev_pending = self.pending_exists;
+        {
+            let inner = self.stream.get_mut();
+            inner.write_all(pipelined_cmd.as_bytes()).await?;
+            inner.flush().await?;
+        }
+
+        // 1. Читаем ответ на NOOP (обновляет снимок UID в выбранной папке на Mail.ru)
+        let _ = self.read_until_tagged(&tag1, timeout_dur).await?;
+        self.pending_exists = prev_pending;
+
+        // 2. Читаем ответ на UID STORE (\Deleted)
+        let resp2 = self.read_until_tagged(&tag2, timeout_dur).await?;
+        if !resp2.last().is_some_and(|l| l.starts_with(&format!("{tag2} OK"))) {
             return Err(anyhow!(
                 "IMAP UID STORE \\Deleted failed: {}",
-                resp1.last().map(|s| s.trim()).unwrap_or_default()
+                resp2.last().map(|s| s.trim()).unwrap_or_default()
             ));
         }
 
-        // Шаг 2: точечное удаление через UID EXPUNGE (RFC 4315)
-        let tag2 = self.next_tag();
-        self.send_line(&format!("{tag2} UID EXPUNGE {uid_str}")).await?;
-        let resp2 = self.read_until_tagged(&tag2, timeout_dur).await?;
-
-        let ok = resp2.last().is_some_and(|l| l.starts_with(&format!("{tag2} OK")));
+        // 3. Читаем ответ на UID EXPUNGE (RFC 4315)
+        let resp3 = self.read_until_tagged(&tag3, timeout_dur).await?;
+        let ok = resp3.last().is_some_and(|l| l.starts_with(&format!("{tag3} OK")));
         if !ok {
             // Фолбэк на стандартный EXPUNGE
-            let tag3 = self.next_tag();
-            self.send_line(&format!("{tag3} EXPUNGE")).await?;
-            let resp3 = self.read_until_tagged(&tag3, timeout_dur).await?;
-            if !resp3.last().is_some_and(|l| l.starts_with(&format!("{tag3} OK"))) {
+            let tag4 = self.next_tag();
+            self.send_line(&format!("{tag4} EXPUNGE")).await?;
+            let resp4 = self.read_until_tagged(&tag4, timeout_dur).await?;
+            if !resp4.last().is_some_and(|l| l.starts_with(&format!("{tag4} OK"))) {
                 return Err(anyhow!(
                     "IMAP fallback EXPUNGE failed: {}",
-                    resp3.last().map(|s| s.trim()).unwrap_or_default()
+                    resp4.last().map(|s| s.trim()).unwrap_or_default()
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Пакетно удаляет все сообщения с `UID 1:<max_uid>` в текущей выбранной папке за 1 RTT
+    /// (`NOOP` + `UID STORE 1:<max_uid> +FLAGS.SILENT (\Deleted)` + `UID EXPUNGE 1:<max_uid>`).
+    /// Используется при холодном старте клиента и сервера для очистки старых писем от прерванных сессий.
+    pub async fn expunge_all_up_to(&mut self, max_uid: u32, timeout_dur: Duration) -> Result<()> {
+        if max_uid == 0 {
+            return Ok(());
+        }
+
+        let tag1 = self.next_tag();
+        let tag2 = self.next_tag();
+        let tag3 = self.next_tag();
+        let pipelined_cmd = format!(
+            "{tag1} NOOP\r\n{tag2} UID STORE 1:{max_uid} +FLAGS.SILENT (\\Deleted)\r\n{tag3} UID EXPUNGE 1:{max_uid}\r\n"
+        );
+
+        let prev_pending = self.pending_exists;
+        {
+            let inner = self.stream.get_mut();
+            inner.write_all(pipelined_cmd.as_bytes()).await?;
+            inner.flush().await?;
+        }
+
+        let _ = self.read_until_tagged(&tag1, timeout_dur).await?;
+        self.pending_exists = prev_pending;
+
+        let resp2 = self.read_until_tagged(&tag2, timeout_dur).await?;
+        if !resp2.last().is_some_and(|l| l.starts_with(&format!("{tag2} OK"))) {
+            return Err(anyhow!(
+                "IMAP UID STORE 1:{max_uid} \\Deleted failed: {}",
+                resp2.last().map(|s| s.trim()).unwrap_or_default()
+            ));
+        }
+
+        let resp3 = self.read_until_tagged(&tag3, timeout_dur).await?;
+        let ok = resp3.last().is_some_and(|l| l.starts_with(&format!("{tag3} OK")));
+        if !ok {
+            let tag4 = self.next_tag();
+            self.send_line(&format!("{tag4} EXPUNGE")).await?;
+            let resp4 = self.read_until_tagged(&tag4, timeout_dur).await?;
+            if !resp4.last().is_some_and(|l| l.starts_with(&format!("{tag4} OK"))) {
+                return Err(anyhow!(
+                    "IMAP fallback EXPUNGE 1:{max_uid} failed: {}",
+                    resp4.last().map(|s| s.trim()).unwrap_or_default()
                 ));
             }
         }
@@ -1128,13 +1315,18 @@ mod tests {
 
             line.clear();
             s_buf.read_line(&mut line).await.unwrap();
+            assert!(line.contains("NOOP"));
+            s_buf.get_mut().write_all(b"A0007 OK NOOP completed\r\n").await.unwrap();
+
+            line.clear();
+            s_buf.read_line(&mut line).await.unwrap();
             assert!(line.contains("UID STORE 106 +FLAGS.SILENT (\\Deleted)"));
-            s_buf.get_mut().write_all(b"A0007 OK STORE completed\r\n").await.unwrap();
+            s_buf.get_mut().write_all(b"A0008 OK STORE completed\r\n").await.unwrap();
 
             line.clear();
             s_buf.read_line(&mut line).await.unwrap();
             assert!(line.contains("UID EXPUNGE 106"));
-            s_buf.get_mut().write_all(b"A0008 OK UID EXPUNGE completed\r\n").await.unwrap();
+            s_buf.get_mut().write_all(b"A0009 OK UID EXPUNGE completed\r\n").await.unwrap();
         });
 
         let banner = conn.read_line().await.unwrap();
@@ -1361,54 +1553,199 @@ mod tests {
         server_task.await.unwrap();
     }
 
-    /// Живой тест сквозного обмена через реальный почтовый сервер Mail.ru.
-    /// Запуск:
-    /// ```bash
-    /// cargo test -p anet-common test_live_mailru_soak -- --ignored --nocapture
-    /// ```
+    fn build_test_rfc822(email: &str, subject: &str, payload: &[u8]) -> Vec<u8> {
+        let b64 = BASE64_STANDARD.encode(payload);
+        format!("From: <{email}>\r\nTo: <{email}>\r\nSubject: {subject}\r\n\r\n{b64}\r\n")
+            .into_bytes()
+    }
+
     #[tokio::test]
-    #[ignore]
-    async fn test_live_mailru_soak() {
-        let email = std::env::var("ANET_IMAP_EMAIL").unwrap_or_else(|_| "furude.hanyuu@mail.ru".to_string());
-        let pass = std::env::var("ANET_IMAP_PASS").unwrap_or_else(|_| "m0DdqXPI1gA7LvaoGnVN".to_string());
-        let host = "imap.mail.ru";
-        let port = 993;
-        let tls_cfg = crate::boring_tls::TlsClientConfig::default();
-        let timeout = Duration::from_secs(15);
+    async fn test_fetch_messages_chunked_splits_backlog_and_sets_pending_exists() {
+        let (client_io, mut server_io) = tokio::io::duplex(32 * 1024);
+        let mut conn = ImapConn::new(client_io);
 
-        println!("\n[1/3] Подключение Reader к {host}:{port} ({email})...");
-        let mut reader = ImapConn::connect(host, port, &email, &pass, &tls_cfg, timeout).await.expect("Reader connect");
-        reader.select("Drafts", timeout).await.expect("Reader select Drafts");
-        let mut baseline_uid = reader.get_max_uid(timeout).await.expect("Reader get_max_uid");
-        println!("      Reader подключен! Текущий baseline max_uid: {baseline_uid}");
+        let raw_m1 = build_test_rfc822("a@b.c", "[ID: s1]", b"pkt1");
+        let raw_m2 = build_test_rfc822("a@b.c", "[ID: s1]", b"pkt2");
+        let raw_m3 = build_test_rfc822("a@b.c", "[ID: s1]", b"pkt3");
 
-        println!("[2/3] Подключение Writer к {host}:{port}...");
-        let mut writer = ImapConn::connect(host, port, &email, &pass, &tls_cfg, timeout).await.expect("Writer connect");
-        writer.select("Drafts", timeout).await.expect("Writer select Drafts");
-        println!("      Writer подключен!");
+        let server_task = tokio::spawn(async move {
+            let mut s_buf = BufReader::new(&mut server_io);
+            let mut line = String::new();
 
-        let payload = vec![0x42u8; 32 * 1024]; // 32 КБ пачка
-        println!("[3/3] Запуск 3 раундов сквозного обмена (APPEND -> IDLE -> FETCH -> EXPUNGE)...");
-        for i in 1..=3 {
-            let t0 = Instant::now();
-            let subject = format!("ANet-Data [ID: srv01:rust_live_{i}]");
-            let append_dur = writer.append_message("Drafts", &subject, &payload, &email, timeout).await.expect("append");
-            print!("  -> Раунд #{i}: APPEND 32 КБ ({:.1} мс), ожидание IDLE ... ", append_dur.as_secs_f64() * 1000.0);
+            // Чанк 1 (fetch_max_messages = 2):
+            // 1. Клиент запрашивает индекс `A0001 UID FETCH 11:* (UID)`
+            s_buf.read_line(&mut line).await.unwrap();
+            assert!(line.contains("UID FETCH 11:* (UID)"));
+            s_buf
+                .get_mut()
+                .write_all(
+                    b"* 1 FETCH (UID 10)\r\n* 2 FETCH (UID 12)\r\n* 3 FETCH (UID 15)\r\n* 4 FETCH (UID 19)\r\nA0001 OK UID FETCH completed\r\n",
+                )
+                .await
+                .unwrap();
 
-            let event = reader.wait_idle_or_event(Duration::from_secs(12)).await.expect("wait_idle");
-            assert!(event, "Сервер должен был прислать * EXISTS");
+            // 2. Клиент запрашивает тела только первых 2 новых UID (12,15): `A0002 UID FETCH 12,15 (UID BODY.PEEK[])`
+            line.clear();
+            s_buf.read_line(&mut line).await.unwrap();
+            assert!(line.contains("UID FETCH 12,15 (UID BODY.PEEK[])"));
+            let mut resp1 = Vec::new();
+            resp1.extend_from_slice(
+                format!("* 2 FETCH (BODY[] {{{}}}\r\n", raw_m1.len()).as_bytes(),
+            );
+            resp1.extend_from_slice(&raw_m1);
+            resp1.extend_from_slice(b" UID 12)\r\n");
+            resp1.extend_from_slice(
+                format!("* 3 FETCH (BODY[] {{{}}}\r\n", raw_m2.len()).as_bytes(),
+            );
+            resp1.extend_from_slice(&raw_m2);
+            resp1.extend_from_slice(b" UID 15)\r\nA0002 OK UID FETCH completed\r\n");
+            s_buf.get_mut().write_all(&resp1).await.unwrap();
 
-            let fetch_res = reader.fetch_messages_robust(baseline_uid, timeout).await.expect("fetch");
-            let rtt = t0.elapsed();
-            println!("FETCH OK (получено {} сообщ.), RTT: {:.1} мс", fetch_res.messages.len(), rtt.as_secs_f64() * 1000.0);
-            assert!(!fetch_res.messages.is_empty(), "Должно быть получено хотя бы 1 сообщение");
-            assert_eq!(fetch_res.messages[0].payload.as_ref(), payload.as_slice(), "Пейлоуд должен совпадать байт-в-байт");
+            // Чанк 2 (оставшийся UID 19):
+            line.clear();
+            s_buf.read_line(&mut line).await.unwrap();
+            assert!(line.contains("UID FETCH 16:* (UID)"));
+            s_buf
+                .get_mut()
+                .write_all(b"* 4 FETCH (UID 19)\r\nA0003 OK UID FETCH completed\r\n")
+                .await
+                .unwrap();
 
-            baseline_uid = fetch_res.new_max_uid;
-            let uids: Vec<u32> = fetch_res.messages.iter().map(|m| m.uid).collect();
-            reader.expunge_uids(&uids, timeout).await.expect("expunge");
-            println!("     EXPUNGE очистил UID(s): {:?}", uids);
-        }
-        println!("\nВсе раунды успешно завершены! Транспорт на чистом Rust работает идеально.\n");
+            line.clear();
+            s_buf.read_line(&mut line).await.unwrap();
+            assert!(line.contains("UID FETCH 19 (UID BODY.PEEK[])"));
+            let mut resp2 = Vec::new();
+            resp2.extend_from_slice(
+                format!("* 4 FETCH (BODY[] {{{}}}\r\n", raw_m3.len()).as_bytes(),
+            );
+            resp2.extend_from_slice(&raw_m3);
+            resp2.extend_from_slice(b" UID 19)\r\nA0004 OK UID FETCH completed\r\n");
+            s_buf.get_mut().write_all(&resp2).await.unwrap();
+        });
+
+        let res1 = conn
+            .fetch_messages_chunked(10, 2, Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(res1.new_max_uid, 15);
+        assert_eq!(res1.messages.len(), 2);
+        assert_eq!(res1.messages[0].payload.as_ref(), b"pkt1");
+        assert_eq!(res1.messages[1].payload.as_ref(), b"pkt2");
+        // В папке остался еще UID 19, поэтому pending_exists должен быть взведен!
+        assert!(conn.pending_exists);
+
+        let res2 = conn
+            .fetch_messages_chunked(res1.new_max_uid, 2, Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(res2.new_max_uid, 19);
+        assert_eq!(res2.messages.len(), 1);
+        assert_eq!(res2.messages[0].payload.as_ref(), b"pkt3");
+        assert!(!conn.pending_exists);
+
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_fetch_messages_streaming_upper_bound_and_callback() {
+        let (client_io, mut server_io) = tokio::io::duplex(32 * 1024);
+        let mut conn = ImapConn::new(client_io);
+
+        let raw_m1 = build_test_rfc822("a@b.c", "[ID: s1]", b"stream_pkt_1");
+        let raw_m2 = build_test_rfc822("a@b.c", "[ID: s1]", b"stream_pkt_2");
+
+        let server_task = tokio::spawn(async move {
+            let mut s_buf = BufReader::new(&mut server_io);
+            let mut line = String::new();
+
+            s_buf.read_line(&mut line).await.unwrap();
+            assert!(line.contains("UID FETCH 101:4294967295 (UID BODY.PEEK[])"));
+
+            let mut resp = Vec::new();
+            resp.extend_from_slice(
+                format!("* 1 FETCH (BODY[] {{{}}}\r\n", raw_m1.len()).as_bytes(),
+            );
+            resp.extend_from_slice(&raw_m1);
+            resp.extend_from_slice(b" UID 101)\r\n");
+            resp.extend_from_slice(
+                format!("* 2 FETCH (BODY[] {{{}}}\r\n", raw_m2.len()).as_bytes(),
+            );
+            resp.extend_from_slice(&raw_m2);
+            resp.extend_from_slice(b" UID 105)\r\nA0001 OK UID FETCH completed\r\n");
+            s_buf.get_mut().write_all(&resp).await.unwrap();
+        });
+
+        let mut callback_uids = Vec::new();
+        let res = conn
+            .fetch_messages_streaming(100, Duration::from_secs(1), |msg| {
+                callback_uids.push((msg.uid, msg.payload.clone()));
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(res.new_max_uid, 105);
+        assert_eq!(res.messages.len(), 2);
+        assert_eq!(callback_uids.len(), 2);
+        assert_eq!(callback_uids[0].0, 101);
+        assert_eq!(callback_uids[0].1.as_ref(), b"stream_pkt_1");
+        assert_eq!(callback_uids[1].0, 105);
+        assert_eq!(callback_uids[1].1.as_ref(), b"stream_pkt_2");
+
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_pipelined_expunge_uids_and_expunge_all_up_to() {
+        let (client_io, mut server_io) = tokio::io::duplex(32 * 1024);
+        let mut conn = ImapConn::new(client_io);
+
+        let server_task = tokio::spawn(async move {
+            let mut s_buf = BufReader::new(&mut server_io);
+            let mut l1 = String::new();
+            let mut l2 = String::new();
+            let mut l3 = String::new();
+
+            // 1. expunge_uids(&[10, 12])
+            s_buf.read_line(&mut l1).await.unwrap();
+            s_buf.read_line(&mut l2).await.unwrap();
+            s_buf.read_line(&mut l3).await.unwrap();
+            assert_eq!(l1.trim(), "A0001 NOOP");
+            assert_eq!(l2.trim(), "A0002 UID STORE 10,12 +FLAGS.SILENT (\\Deleted)");
+            assert_eq!(l3.trim(), "A0003 UID EXPUNGE 10,12");
+            s_buf
+                .get_mut()
+                .write_all(
+                    b"* 12 EXISTS\r\nA0001 OK NOOP completed\r\nA0002 OK UID STORE completed\r\n* 10 EXPUNGE\r\n* 11 EXPUNGE\r\nA0003 OK UID EXPUNGE completed\r\n",
+                )
+                .await
+                .unwrap();
+
+            // 2. expunge_all_up_to(50)
+            l1.clear();
+            l2.clear();
+            l3.clear();
+            s_buf.read_line(&mut l1).await.unwrap();
+            s_buf.read_line(&mut l2).await.unwrap();
+            s_buf.read_line(&mut l3).await.unwrap();
+            assert_eq!(l1.trim(), "A0004 NOOP");
+            assert_eq!(l2.trim(), "A0005 UID STORE 1:50 +FLAGS.SILENT (\\Deleted)");
+            assert_eq!(l3.trim(), "A0006 UID EXPUNGE 1:50");
+            s_buf
+                .get_mut()
+                .write_all(
+                    b"A0004 OK NOOP completed\r\nA0005 OK UID STORE completed\r\nA0006 OK UID EXPUNGE completed\r\n",
+                )
+                .await
+                .unwrap();
+        });
+
+        conn.expunge_uids(&[10, 12], Duration::from_secs(1))
+            .await
+            .unwrap();
+        conn.expunge_all_up_to(50, Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        server_task.await.unwrap();
     }
 }

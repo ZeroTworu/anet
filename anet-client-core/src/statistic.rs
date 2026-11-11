@@ -109,9 +109,13 @@ impl StatsProvider for PingStatsProvider {
             let last_reply = self.last_reply_us.load(Ordering::Relaxed);
             let elapsed_us = self.session_start.elapsed().as_micros() as u64;
 
-            // Если замер существует и с момента последнего ответа прошло не более 10 секунд (TTL)
-            if rtt_us != u64::MAX && elapsed_us.saturating_sub(last_reply) <= 10_000_000 {
+            // Если замер существует и с момента последнего ответа прошло не более 90 секунд (TTL с учетом интервала пинга IMAP 15..60 с)
+            if rtt_us != u64::MAX && elapsed_us.saturating_sub(last_reply) <= 90_000_000 {
                 stats.rtt_ms = Some(rtt_us as f64 / 1000.0);
+            } else if let Some(tunnel_rtt_ms) =
+                crate::connectivity_monitor::ConnectivityMonitor::get_tunnel_rtt_ms()
+            {
+                stats.rtt_ms = Some(tunnel_rtt_ms as f64);
             }
         }
         stats
@@ -220,8 +224,9 @@ pub fn start_stats_monitor(
                         0.0
                     };
 
-                    // Форматируем опциональные QUIC метрики
+                    // Форматируем опциональные QUIC / внутритуннельные метрики
                     let rtt_str = current_stats.rtt_ms
+                        .or_else(|| crate::connectivity_monitor::ConnectivityMonitor::get_tunnel_rtt_ms().map(|r| r as f64))
                         .map(|rtt| format!("{:>6.2}ms", rtt))
                         .unwrap_or_else(|| "N/A".to_string());
 

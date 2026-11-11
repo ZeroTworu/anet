@@ -1,8 +1,10 @@
 <script setup lang="ts">
 import { ref, computed, watch } from 'vue'
 import { CreatePool, UpdatePool } from '@/api/pools'
+import { GetMailboxes } from '@/api/mailboxes'
 import type { NodePool, ProtocolType, SaveNodePoolRequest } from '@/models/pool'
 import type { Server } from '@/models/server'
+import type { ImapMailbox } from '@/models/mailbox'
 import { useAppMessage } from '@/composables/useAppMessage'
 
 const show = defineModel<boolean>()
@@ -27,6 +29,15 @@ const form = ref<SaveNodePoolRequest>({
 })
 
 const loading = ref(false)
+const mailboxes = ref<ImapMailbox[]>([])
+
+const loadMailboxes = async () => {
+  try {
+    mailboxes.value = await GetMailboxes()
+  } catch (err) {
+    console.error('Failed to load mailboxes:', err)
+  }
+}
 
 const strategyOptions = [
   { title: 'Weighted rendezvous', value: 'weighted' },
@@ -35,12 +46,29 @@ const strategyOptions = [
 
 const protocolOptions: { title: string; value: ProtocolType }[] = [
   { title: 'QUIC', value: 'quic' },
+  { title: 'IMAP (Mailbox Tunnel)', value: 'imap' },
   { title: 'WRTC / Jitsi WebRTC', value: 'wrtc' },
   { title: 'AHTTP / HTTP(S)', value: 'ahttp' },
   { title: 'WebSocket (WS/WSS)', value: 'ws' },
   { title: 'SSH', value: 'ssh' },
   { title: 'VNC', value: 'vnc' },
 ]
+
+const mailboxOptions = computed(() =>
+  mailboxes.value.map(m => ({
+    title: `${m.email} (${m.host}:${m.port})${!m.is_active ? ' [OFF]' : ''}`,
+    value: m.id,
+  }))
+)
+
+const getMailboxIds = (portOrUrl?: string | null): string[] => {
+  if (!portOrUrl) return []
+  return portOrUrl.split(',').map(s => s.trim()).filter(Boolean)
+}
+
+const setMailboxIds = (member: any, ids: string[]) => {
+  member.port_or_url = ids.join(',')
+}
 
 const wrtcModeOptions = [
   { title: 'Media Video (Fake Video Track over DTLS-SRTP / JVB) - 4K/Макс. скорость', value: 'media_video' },
@@ -73,6 +101,16 @@ watch(
       }
     },
     { immediate: true }
+)
+
+watch(
+  () => show.value,
+  (isOpen) => {
+    if (isOpen) {
+      loadMailboxes()
+    }
+  },
+  { immediate: true }
 )
 
 const addNode = (serverId: string) => {
@@ -243,6 +281,23 @@ const close = () => {
                       density="compact"
                       variant="outlined"
                       hide-details
+                  />
+                </v-col>
+                <v-col v-if="member.protocol === 'imap'" cols="12" class="mt-2">
+                  <v-select
+                      :model-value="getMailboxIds(member.port_or_url)"
+                      :items="mailboxOptions"
+                      item-title="title"
+                      item-value="value"
+                      label="Почтовые ящики IMAP (acc)"
+                      placeholder="Выберите один или несколько ящиков из справочника"
+                      multiple
+                      chips
+                      closable-chips
+                      density="compact"
+                      variant="outlined"
+                      hide-details
+                      @update:model-value="(val: string[]) => setMailboxIds(member, val)"
                   />
                 </v-col>
               </v-row>

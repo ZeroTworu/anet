@@ -92,59 +92,61 @@ onMounted(() => {
 </script>
 
 <template>
-  <v-container max-width="1400" class="groups-page">
-      <div class="d-flex justify-space-between align-center flex-wrap ga-4 mb-6">
-        <v-list-item
-            class="px-0"
-            subtitle="Группы пользователей и автоматические ограничения ресурсов"
-        >
-          <template #title>
-            <h1 class="text-h5 font-weight-bold">Группы пользователей</h1>
-          </template>
-        </v-list-item>
+  <v-container fluid class="groups-page">
+    <div class="d-flex justify-space-between align-center flex-wrap ga-4 mb-4">
+      <v-list-item
+        class="px-0"
+        subtitle="Группы пользователей и автоматические ограничения ресурсов"
+      >
+        <template #title>
+          <h1 class="text-h5 font-weight-bold">User Groups (Группы пользователей)</h1>
+        </template>
+      </v-list-item>
+    </div>
 
-        <div class="d-flex align-center ga-3">
-        <v-text-field
-            v-model="searchQuery"
-            prepend-inner-icon="mdi-magnify"
-            label="Поиск по группам..."
-            variant="outlined"
-            density="compact"
-            hide-details
-            single-line
-            style="width: 280px"
-        />
-        <v-btn color="primary" @click="openCreate">Создать группу</v-btn>
-      </div>
+    <div class="d-flex justify-space-between align-center mb-4">
+      <v-text-field
+        v-model="searchQuery"
+        prepend-inner-icon="mdi-magnify"
+        label="Поиск по группам..."
+        variant="outlined"
+        density="compact"
+        hide-details
+        single-line
+        style="width: 280px"
+      />
+      <v-btn color="primary" prepend-icon="mdi-plus" @click="openCreate">
+        + ДОБАВИТЬ ГРУППУ
+      </v-btn>
     </div>
 
     <v-data-table
-        :headers="headers"
-        :items="groups"
-        :search="searchQuery"
-        :loading="loading"
-        :items-per-page="10"
-        :items-per-page-options="[10, 20, 50]"
-        items-per-page-text="Строк на странице"
-        loading-text="Загрузка групп пользователей…"
-        no-data-text="Групп пока нет — создайте первую!"
-        density="comfortable"
-        class="groups-table border rounded-lg"
-        hover
-        @click:row="(_: unknown, data: { item: UserGroup }) => goToDetail(data.item.id)"
+      :headers="headers"
+      :items="groups"
+      :search="searchQuery"
+      :loading="loading"
+      :items-per-page="10"
+      :items-per-page-options="[10, 20, 50]"
+      items-per-page-text="Items per page:"
+      loading-text="Загрузка групп пользователей…"
+      no-data-text="Групп пока нет — создайте первую!"
+      density="comfortable"
+      class="border rounded-lg"
+      hover
+      @click:row="(_: unknown, data: { item: UserGroup }) => goToDetail(data.item.id)"
     >
       <template #item.name="{ item }">
-        <span class="group-name-col">{{ item.name }}</span>
+        <span class="font-weight-bold">{{ item.name }}</span>
       </template>
 
       <template #item.pool_ids="{ item }">
         <div class="d-flex flex-wrap ga-1">
           <v-chip
-              v-for="pId in (item.pool_ids || [])"
-              :key="pId"
-              size="x-small"
-              variant="tonal"
-              color="primary"
+            v-for="pId in (item.pool_ids || [])"
+            :key="pId"
+            size="small"
+            variant="tonal"
+            color="primary"
           >
             {{ poolById.get(pId)?.name || pId }}
           </v-chip>
@@ -171,32 +173,45 @@ onMounted(() => {
       </template>
 
       <template #item.duration_days="{ item }">
-        <span>{{ formatDuration(item.duration_days) }}</span>
+        <span class="text-caption text-medium-emphasis">{{ formatDuration(item.duration_days) }}</span>
       </template>
 
       <template #item.user_count="{ item }">
-        <v-chip color="primary" size="small" variant="tonal">
-          Участников: {{ item.user_count }}
+        <v-chip color="primary" size="small" variant="tonal" prepend-icon="mdi-account-multiple">
+          {{ item.user_count }}
         </v-chip>
       </template>
 
       <template #item.actions="{ item }">
-        <v-btn color="error" variant="text" size="small" @click.stop="remove(item.id)">
-          Удалить
-        </v-btn>
+        <div class="d-flex ga-1 justify-center flex-nowrap" @click.stop>
+          <v-btn
+            icon="mdi-pencil"
+            size="small"
+            variant="text"
+            title="Параметры группы"
+            @click="goToDetail(item.id)"
+          />
+          <v-btn
+            icon="mdi-delete"
+            size="small"
+            variant="text"
+            color="error"
+            title="Удалить группу"
+            @click="remove(item.id)"
+          />
+        </div>
       </template>
     </v-data-table>
 
     <GroupModal
-        v-model="showEditor"
-        @saved="load"
+      v-model="showEditor"
+      @saved="load"
     />
   </v-container>
 </template>
 
 <style scoped>
-.groups-page { padding: 24px; }
-.groups-table :deep(tbody tr) { cursor: pointer; }
-.groups-table :deep(tbody tr:hover) { background: rgba(43, 184, 148, .07) !important; }
-.group-name-col { font-weight: 600; font-size: 15px; }
+.groups-page {
+  padding: 24px;
+}
 </style>

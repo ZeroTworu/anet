@@ -1,8 +1,15 @@
 # Changelog
 
-## v0.7.5 — стабилизация транспорта `wrtc` (`MediaVideo` / `Colibri-WS`), обход мобильных Белых Списков (БС) и устранение утечек DNS
+## v0.7.5 — транспорт `imap` (ASTP over IMAPS:993), стабилизация `wrtc` (`MediaVideo` / `Colibri-WS`), обход мобильных Белых Списков (БС) и устранение утечек DNS
 
 ### Добавлено
+- **Транспорт `imap` (ASTP поверх IMAPS:993 для строгих Белых Списков)**:
+  - Инкапсуляция зашифрованных батчей ASTP (до `128..512 КБ` через `LARGE_PACKET_LEN_SENTINEL`) в валидные RFC 5322 черновики (`MIME/Base64`, флаги `\Seen \Draft`) через инфраструктуру публичных почтовых провайдеров (`imap.mail.ru:993`, `imap.yandex.ru:993`) поверх профиля **BoringSSL Email Mimicry** (`KMail / OpenSSL 3.x`, пост-квантовый `X25519MLKEM768`, без ALPN и GREASE).
+  - Архитектура **«Cross-Selected Writer»** (`Drafts` для Uplink, `Notes` для Downlink) и **Active-Active Multi-Mailbox Striping** (`Self-Clocking Round-Robin` по $N$ почтовым ящикам из `imap_dsn` с динамической привязкой `Mailbox Binding Frame` и изолированным самовосстановлением отдельных ящиков без обрыва туннеля).
+  - Одношаговая потоковая выборка за 1 RTT (`UID FETCH <last_seen_uid + 1>:4294967295 (UID BODY.PEEK[])`) с обходом бага кэширования символа `*` в «Слепом окне» Mail.ru, мгновенным стримингом в `TUN` и безусловным жадным сливом (`Greedy Fetch Drain`).
+  - Конвейерная 1-RTT очистка прочитанных писем (`NOOP + UID STORE +FLAGS.SILENT (\Deleted) + UID EXPUNGE`), сохранение `persisted_last_seen_uid` и `cleanup_uids` при реконнектах без потери TCP-сегментов, а также автоматическая зачистка старых писем при старте (`expunge_all_up_to`) и выходе (`Ctrl+C`).
+  - Двухполосный планировщик `PacketBatcher` с приоритетной очередью `QoS Fast-Lane` (ICMP, DNS, TCP SYN/ACK, мелкие пакеты $\le 256$ Б) и плавным пейсингом **Linux TCP Small Queues (`TSQ`)** без дропов пакетов.
+  - Полная интеграция в `anet-auth` и `anet-webui`: справочник почтовых ящиков (`imap_mailboxes`) с шифрованием паролей приложений через `DbEncryptor`, выбор пула ящиков в `PoolModal.vue` и сборка `imap://` DSN «на лету» при скачивании `client.toml`.
 - **Транспорт `wrtc` (WebRTC поверх Контур.Толк и стандартных серверов Jitsi Meet)**:
   - Мульти-провайдерная архитектура `WrtcProviderRegistry` с автоматическим распознаванием `KonturTalk` (`*.ktalk.ru`, `*.kontur.ru`) и `StandardJitsi` (обычные инстансы Jitsi Meet).
   - Высокоскоростной медиа-режим `wrtc_mode = "media_video"` / `"auto"` (протокол `video_v2`): инкапсуляция пакетов и микро-батчей ASTP в поток VP8 1080p поверх DTLS-SRTP с 2-байтным тегом сессии `client_tag`, нулевым копированием (`wrap_packet_slice_with_headroom`) и микро-пейсером EDT.

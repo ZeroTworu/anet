@@ -156,6 +156,7 @@ impl NodeProbeMonitor {
                         "http" | "ws" => 80,
                         "ssh" => 22,
                         "vnc" => 5900,
+                        "imap" | "imaps" => 993,
                         _ => 443,
                     });
                     out.push((host.to_string(), port));
@@ -650,14 +651,21 @@ impl ConnectivityMonitor {
                 continue;
             }
 
-            let prober = match cached_prober {
-                Some(ref p) if *p.config() == cfg => p.clone(),
-                _ => {
-                    let p = ConnectivityProber::new(cfg.clone());
-                    cached_prober = Some(p.clone());
-                    p
+            let vpn_on = self.vpn_connected.load(Ordering::Relaxed);
+            // Если VPN только что подключился и первый внутритуннельный ICMP-пинг ещё в полёте,
+            // даём ему до 1200 мс форы в свободном канале, чтобы:
+            // 1) не забивать стартовый батч шестью параллельными TLS-хендшейками;
+            // 2) сразу узнать реальный RTT туннеля (например, IMAP ~400..900 мс) и выбрать адекватный таймаут.
+            if vpn_on && self.current_tunnel_rtt().is_none() {
+                for _ in 0..8 {
+                    if !self.vpn_connected.load(Ordering::Relaxed)
+                        || self.current_tunnel_rtt().is_some()
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(150)).await;
                 }
-            };
+            }
 
             let vpn_on = self.vpn_connected.load(Ordering::Relaxed);
             let tunnel_rtt = if vpn_on {
@@ -666,7 +674,30 @@ impl ConnectivityMonitor {
                 None
             };
 
-            let outer_timeout = Duration::from_millis(cfg.timeout_ms.clamp(1200, 4500) * 2 + 2500);
+            // Туннель считается высоколатентным (IMAP / медленный фолбэк), если его RTT >= 300 мс
+            // либо если за 1200 мс ожидания ICMP-ответ ещё не вернулся.
+            let is_high_latency_tunnel =
+                vpn_on && tunnel_rtt.map_or(true, |rtt| rtt >= 300);
+            let mut effective_cfg = cfg.clone();
+            if is_high_latency_tunnel {
+                let rtt_est = tunnel_rtt.unwrap_or(1500);
+                effective_cfg.timeout_ms =
+                    effective_cfg.timeout_ms.max((rtt_est * 5).clamp(8000, 12000));
+            }
+            let prober = match cached_prober {
+                Some(ref p) if *p.config() == effective_cfg => p.clone(),
+                _ => {
+                    let p = ConnectivityProber::new(effective_cfg.clone());
+                    cached_prober = Some(p.clone());
+                    p
+                }
+            };
+
+            let outer_timeout = if is_high_latency_tunnel {
+                Duration::from_millis(effective_cfg.timeout_ms * 2 + 3000)
+            } else {
+                Duration::from_millis(cfg.timeout_ms.clamp(1200, 4500) * 2 + 2500)
+            };
             let (mut global_res, mut domestic_res) = tokio::select! {
                 res = tokio::time::timeout(outer_timeout, prober.probe_groups_raw()) => {
                     match res {
@@ -717,12 +748,22 @@ impl ConnectivityMonitor {
                 final_snapshot.domestic_total
             );
 
+            let base_interval = cfg.probe_interval_secs.clamp(2, 60);
+            let is_high_latency_now = vpn_now
+                && (tunnel_rtt_now.map_or(true, |rtt| rtt >= 300)
+                    || final_snapshot
+                        .global_rtt_ms
+                        .is_some_and(|http_rtt| http_rtt >= 600));
+            let interval_secs = if is_high_latency_now {
+                base_interval.max(45)
+            } else {
+                base_interval
+            };
+
             {
                 *self.last_snapshot.lock().unwrap() = Some(final_snapshot.clone());
             }
             emit(AnetEvent::ConnectivityUpdated(final_snapshot));
-
-            let interval_secs = cfg.probe_interval_secs.clamp(2, 60);
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs(interval_secs)) => {}
                 _ = self.wake_notify.notified() => {}

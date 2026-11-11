@@ -131,6 +131,7 @@ pub struct ServerCoreConfig {
     pub wrtc_fallback_jvb_ip: String,
     pub wrtc_fallback_jvb_port: u16,
     pub wrtc_mode: Option<String>,
+    pub imap_dsn: Option<String>,
 }
 
 impl Default for ServerCoreConfig {
@@ -151,6 +152,7 @@ impl Default for ServerCoreConfig {
             wrtc_fallback_jvb_ip: "89.169.16.6".to_string(),
             wrtc_fallback_jvb_port: 10002,
             wrtc_mode: None,
+            imap_dsn: None,
         }
     }
 }
@@ -215,6 +217,68 @@ impl Default for AhttpServerConfig {
     }
 }
 
+// Конфигурация транспорта IMAP на сервере (секция [imap] в server.toml)
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ImapServerConfig {
+    /// Опциональный DSN IMAP-пула (позволяет указывать `imap_dsn` или `dsn` как в `[server]`, так и в `[imap]`).
+    #[serde(default, alias = "dsn")]
+    pub imap_dsn: Option<String>,
+    /// Время жизни неактивной клиентской сессии при отсутствии пакетов (мс).
+    pub session_ttl_ms: u64,
+    /// Интервал перевхода серверного воркера в IDLE в состоянии покоя (мс).
+    pub idle_refresh_interval_ms: u64,
+    /// Короткий интервал ожидания IDLE во время активного обмена трафиком (мс).
+    pub idle_active_poll_ms: u64,
+    /// Время удержания быстрого режима опроса после последнего переданного/принятого пакета (мс).
+    pub idle_active_window_ms: u64,
+    /// Таймаут ожидания команды IMAP (мс).
+    pub command_timeout_ms: u64,
+    /// Интервал проверки и очистки зависших сессий (мс).
+    pub cleanup_interval_ms: u64,
+    /// Таймаут отката при рейт-лимитах провайдера (мс).
+    pub throttle_backoff_ms: u64,
+    /// Максимальный размер одного зашифрованного пакета-черновика (КБ, до 512 КБ без переполнения u16).
+    pub max_batch_kb: usize,
+    /// Задержка микро-коалесценции батчера (мс).
+    pub batch_coalesce_ms: u64,
+    /// Максимальное число писем, скачиваемых за одну команду `UID FETCH` (0 = без лимита).
+    pub fetch_max_messages: usize,
+    /// Порог количества прочитанных писем для принудительного пакетного удаления (UID STORE + UID EXPUNGE).
+    pub expunge_batch_size: usize,
+    /// Пауза отсутствия исходящего трафика перед ленивой очисткой прочитанных писем (мс).
+    pub expunge_idle_delay_ms: u64,
+    /// Максимальное окно неподтвержденных батчей до срабатывания Backpressure.
+    pub max_inflight_batches: usize,
+    /// Емкость очереди клиентского Downlink-роутера (защита от Bufferbloat).
+    pub tx_queue_capacity: usize,
+    /// Автоматическое определение и использование расширения LITERAL+ (1-RTT APPEND) при подключении.
+    pub literal_plus_auto: bool,
+}
+
+impl Default for ImapServerConfig {
+    fn default() -> Self {
+        Self {
+            imap_dsn: None,
+            session_ttl_ms: 180_000,
+            idle_refresh_interval_ms: 10_000,
+            idle_active_poll_ms: 400,
+            idle_active_window_ms: 5_000,
+            command_timeout_ms: 15_000,
+            cleanup_interval_ms: 30_000,
+            throttle_backoff_ms: 30_000,
+            max_batch_kb: 128,
+            batch_coalesce_ms: 15,
+            fetch_max_messages: 3,
+            expunge_batch_size: 25,
+            expunge_idle_delay_ms: 1_500,
+            max_inflight_batches: 35,
+            tx_queue_capacity: 256,
+            literal_plus_auto: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     #[serde(default)]
@@ -249,6 +313,9 @@ pub struct Config {
 
     #[serde(default)]
     pub browser_profiles: Vec<BrowserProfileConfig>,
+
+    #[serde(default)]
+    pub imap: ImapServerConfig,
 }
 
 #[derive(Debug, Parser)]

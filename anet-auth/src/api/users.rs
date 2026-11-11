@@ -23,6 +23,22 @@ use sea_orm::{
 };
 use uuid::Uuid;
 
+fn url_encode(input: &str) -> String {
+    let mut encoded = String::with_capacity(input.len());
+    for byte in input.bytes() {
+        match byte {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char);
+            }
+            _ => {
+                use std::fmt::Write;
+                let _ = write!(encoded, "%{:02X}", byte);
+            }
+        }
+    }
+    encoded
+}
+
 pub struct UsersApi {
     pub db: DatabaseConnection,
     pub client_template_path: String,
@@ -763,6 +779,29 @@ impl UsersApi {
                     if !members.is_empty() {
                         members.sort_by(|a, b| b.weight.cmp(&a.weight));
 
+                        let imap_member_box_ids: Vec<Uuid> = members
+                            .iter()
+                            .filter(|m| m.protocol == ProtocolType::Imap)
+                            .filter_map(|m| m.port_or_url.as_deref())
+                            .flat_map(|s| s.split(','))
+                            .filter_map(|s| Uuid::parse_str(s.trim()).ok())
+                            .collect();
+
+                        let imap_mailbox_map: std::collections::HashMap<Uuid, crate::entities::imap_mailboxes::Model> =
+                            if !imap_member_box_ids.is_empty() {
+                                crate::entities::imap_mailboxes::Entity::find()
+                                    .filter(crate::entities::imap_mailboxes::Column::Id.is_in(imap_member_box_ids))
+                                    .filter(crate::entities::imap_mailboxes::Column::IsActive.eq(true))
+                                    .all(&self.db)
+                                    .await
+                                    .unwrap_or_default()
+                                    .into_iter()
+                                    .map(|m| (m.id, m))
+                                    .collect()
+                            } else {
+                                std::collections::HashMap::new()
+                            };
+
                         let member_server_ids: Vec<Uuid> =
                             members.iter().map(|m| m.server_id).collect();
                         let pool_servers = servers::Entity::find()
@@ -857,6 +896,50 @@ impl UsersApi {
                                     });
                                     ("wrtc", url)
                                 }
+                                ProtocolType::Imap => {
+                                    let dsn = if let Some(custom) = custom_endpoint {
+                                        if custom.starts_with("imap://") {
+                                            Some(custom.to_string())
+                                        } else {
+                                            let ids: Vec<Uuid> = custom
+                                                .split(',')
+                                                .filter_map(|s| Uuid::parse_str(s.trim()).ok())
+                                                .collect();
+                                            let boxes: Vec<&crate::entities::imap_mailboxes::Model> = ids
+                                                .iter()
+                                                .filter_map(|id| imap_mailbox_map.get(id))
+                                                .collect();
+                                            if let Some(first_box) = boxes.first() {
+                                                let mut acc_params = Vec::new();
+                                                for mb in &boxes {
+                                                    if let Ok(decrypted_pwd) = encryptor.decrypt(&mb.client_password_encrypted) {
+                                                        acc_params.push(format!(
+                                                            "acc={}:{}",
+                                                            url_encode(&mb.email),
+                                                            url_encode(&decrypted_pwd)
+                                                        ));
+                                                    }
+                                                }
+                                                if !acc_params.is_empty() {
+                                                    Some(format!(
+                                                        "imap://{}:{}?{}&batch_ms=250",
+                                                        first_box.host,
+                                                        first_box.port,
+                                                        acc_params.join("&")
+                                                    ))
+                                                } else {
+                                                    None
+                                                }
+                                            } else {
+                                                None
+                                            }
+                                        }
+                                    } else {
+                                        None
+                                    };
+                                    ("imap", dsn)
+                                },
+                                _ => ("", None)
                             };
 
                             let Some(port_or_url) = port_or_url else {

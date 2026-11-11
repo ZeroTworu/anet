@@ -351,7 +351,7 @@ impl ConnectivityProber {
             return ProbeGroupResult::default();
         }
 
-        let per_target_timeout = Duration::from_millis(self.config.timeout_ms.clamp(1200, 4_500));
+        let per_target_timeout = Duration::from_millis(self.config.timeout_ms.clamp(800, 15_000));
         let hard_cap = per_target_timeout + Duration::from_millis(1500);
         let futures = targets.iter().map(|url| {
             let client = &self.client;
@@ -448,9 +448,12 @@ async fn probe_url_once(
     drop(resp);
     if (100..600).contains(&status) {
         let first_ms = (start.elapsed().as_millis() as u64).max(1);
-        // Если первый запрос шёл по холодному соединению, но сеть достаточно быстрая (< 750 мс),
-        // делаем короткий повторный запрос по прогретому HTTP/2 сокету для замера чистого 1-RTT.
-        if first_ms > 90 && first_ms < 750 {
+        // Если первый запрос шёл по холодному соединению на быстром канале (90..500 мс),
+        // сразу делаем короткий повторный запрос по уже прогретому keep-alive сокету,
+        // чтобы «Пульс канала» показывал чистый 1-RTT, а не сумму 3×RTT рукопожатий.
+        // На высоколатентных транспортах (IMAP, >= 500 мс) повторный запрос пропускается,
+        // чтобы не удваивать число HTTP-запросов в туннеле.
+        if first_ms > 90 && first_ms < 500 && timeout <= Duration::from_millis(4500) {
             let warm_started = Instant::now();
             let warm_req = profile.apply_to_reqwest(client.get(url), None, None);
             if let Ok(Ok(warm_resp)) =

@@ -47,6 +47,7 @@ pub enum ProbeProtocol {
     Ws,
     Ahttp,
     Wrtc,
+    Imap,
 }
 
 impl ProbeProtocol {
@@ -58,6 +59,7 @@ impl ProbeProtocol {
             ProbeProtocol::Ws => "WS",
             ProbeProtocol::Ahttp => "AHTTP",
             ProbeProtocol::Wrtc => "WRTC",
+            ProbeProtocol::Imap => "IMAP",
         }
     }
 
@@ -68,6 +70,7 @@ impl ProbeProtocol {
             "ws" | "wss" | "websocket" => ProbeProtocol::Ws,
             "ahttp" | "http" | "https" => ProbeProtocol::Ahttp,
             "wrtc" => ProbeProtocol::Wrtc,
+            "imap" | "imaps" => ProbeProtocol::Imap,
             _ => ProbeProtocol::Quic,
         }
     }
@@ -1124,6 +1127,60 @@ async fn probe_wrtc(target: &ProbeTarget, timeout_dur: Duration) -> Result<(u32,
         .context("WRTC signaling timeout")?
 }
 
+async fn probe_imap(target: &ProbeTarget, timeout_dur: Duration) -> Result<(u32, u32, String)> {
+    let addr = timeout(timeout_dur, resolve_socket_addr(&target.host_port)).await??;
+    let host = target
+        .host_port
+        .rsplit_once(':')
+        .map(|(h, _)| h.trim_matches(['[', ']']))
+        .unwrap_or("imap.mail.ru");
+
+    let full_started = Instant::now();
+    let tcp_started = Instant::now();
+    let tcp = timeout(timeout_dur, TcpStream::connect(addr))
+        .await
+        .context("IMAPS TCP connect timeout")??;
+    let _ = tcp.set_nodelay(true);
+    let pure_rtt = tcp_started.elapsed().as_millis().max(1) as u32;
+
+    let tls_cfg = crate::boring_tls::TlsClientConfig::default();
+    let tls_stream = timeout(
+        timeout_dur,
+        crate::boring_tls::connect_email_tls_with_config(host, tcp, &tls_cfg),
+    )
+    .await
+    .context("IMAPS TLS handshake timeout")??;
+
+    let mut reader = tokio::io::BufReader::new(tls_stream);
+    let mut banner = String::new();
+    timeout(
+        timeout_dur,
+        tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut banner),
+    )
+    .await
+    .context("IMAPS banner read timeout")??;
+
+    if !banner.trim_start().starts_with("* OK") {
+        return Err(anyhow!("Unexpected IMAPS banner: {}", banner.trim()));
+    }
+
+    let _ = timeout(
+        Duration::from_millis(200),
+        reader.get_mut().write_all(b"A0001 LOGOUT\r\n"),
+    )
+    .await;
+
+    let full_rtt = full_started
+        .elapsed()
+        .as_millis()
+        .max(pure_rtt as u128) as u32;
+    Ok((
+        pure_rtt,
+        full_rtt,
+        format!("IMAPS OK ({} / {} ms)", full_rtt, pure_rtt),
+    ))
+}
+
 pub async fn probe_single_target(
     target: &ProbeTarget,
     timeout_dur: Duration,
@@ -1137,6 +1194,7 @@ pub async fn probe_single_target(
             ProbeProtocol::Ws => probe_ws(target, timeout_dur).await,
             ProbeProtocol::Ahttp => probe_ahttp(target, timeout_dur).await,
             ProbeProtocol::Wrtc => probe_wrtc(target, timeout_dur).await,
+            ProbeProtocol::Imap => probe_imap(target, timeout_dur).await,
         }
     };
     let res = match timeout(hard_limit, inner_fut).await {
@@ -1517,6 +1575,7 @@ pub fn extract_probe_targets_from_toml(raw_toml: &str) -> Vec<ProbeTarget> {
                 "http" | "ws" => 80,
                 "ssh" => 22,
                 "vnc" => 5900,
+                "imap" | "imaps" => 993,
                 _ => 443,
             });
             let hp = format!("{}:{}", host, port);

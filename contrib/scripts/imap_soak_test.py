@@ -204,7 +204,16 @@ class RobustImapClient:
         await self.send_line(f'{tag} SELECT "{folder}"')
         resp = await self.read_until_tagged(tag)
         if not resp[-1].startswith(f"{tag} OK"):
-            raise RuntimeError(f"SELECT {folder} failed: {resp[-1]}")
+            self.logger.warning(f"SELECT {folder} returned {resp[-1].strip()}, creating folder via CREATE \"{folder}\"...")
+            ctag = self.next_tag()
+            await self.send_line(f'{ctag} CREATE "{folder}"')
+            await self.read_until_tagged(ctag)
+            tag2 = self.next_tag()
+            await self.send_line(f'{tag2} SELECT "{folder}"')
+            resp = await self.read_until_tagged(tag2)
+            if not resp[-1].startswith(f"{tag2} OK"):
+                raise RuntimeError(f"SELECT {folder} failed after CREATE: {resp[-1]}")
+        self.pending_exists = False
         self.logger.info(f'Selected folder "{folder}"')
 
     async def append_message(self, folder: str, subject: str, payload_bytes: bytes) -> float:

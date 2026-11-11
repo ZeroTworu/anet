@@ -10,6 +10,7 @@ pub mod rule_providers;
 pub mod servers;
 pub mod statistics;
 pub mod users;
+pub mod imap_mailboxes;
 
 use poem_openapi::OpenApi;
 use sea_orm::DatabaseConnection;
@@ -32,6 +33,7 @@ pub fn get_api(
         statistics::StatisticsApi { db: db.clone() },
         compiled_rules::CompiledRulesApi { db: db.clone() },
         rule_providers::RuleProvidersApi { db: db.clone() },
-        custom_overrides::CustomOverridesApi { db },
+        custom_overrides::CustomOverridesApi { db: db.clone() },
+        imap_mailboxes::ImapMailboxesApi { db },
     )
 }
