@@ -876,10 +876,7 @@ impl XmppSession {
                                                 ack_replies.push(ack);
                                             }
                                         }
-                                        InboundXmpp::JingleAck { .. }
-                                        | InboundXmpp::ConferenceReady { .. }
-                                        | InboundXmpp::RoomConfigRequired { .. }
-                                        | InboundXmpp::IqError { .. } => {
+                                        InboundXmpp::JingleAck { .. } => {
                                             forward_to_app = true;
                                         }
                                         InboundXmpp::ExtdiscoServices(ice_servers) => {
