@@ -592,13 +592,24 @@ impl AnetClient {
                 .await?;
         }
 
-        // Гарантируем, что прямые DNS-резолверы для Direct-правил всегда идут в обход туннеля
+        // Гарантируем, что прямые DNS-резолверы для Direct-правил идут в обход туннеля на десктопах,
+        // но НИКОГДА не исключаем из туннеля основные DNS-серверы из `dns_server_list` (например, `8.8.4.4` с контрол-плейна),
+        // иначе системные DNS-запросы идут мимо `tun0` и блокируются под мобильными Белыми Списками.
+        #[cfg(not(target_os = "android"))]
         for direct_dns_ip in crate::dns_interceptor::DIRECT_UPSTREAM_DNS_IPS {
-            let _ = self
-                .route_manager
-                .add_bypass_route(IpAddr::V4(direct_dns_ip), 32)
-                .await;
-            bypass_ips.push(IpAddr::V4(direct_dns_ip));
+            let ip_str = direct_dns_ip.to_string();
+            if !config_clone
+                .main
+                .dns_server_list
+                .iter()
+                .any(|d| d.trim() == ip_str)
+            {
+                let _ = self
+                    .route_manager
+                    .add_bypass_route(IpAddr::V4(direct_dns_ip), 32)
+                    .await;
+                bypass_ips.push(IpAddr::V4(direct_dns_ip));
+            }
         }
 
         // Инициализация и синхронизация движка Smart DNS, Geo-Routing и AdBlock (.abc + Local Overrides)

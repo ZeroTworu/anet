@@ -72,7 +72,7 @@ pub const DOH_RESOLVER_IPS: [Ipv4Addr; 8] = [
 /// Выделенные DNS-серверы для прямых запросов (Direct), маршрутизируемые в обход VPN-туннеля
 pub const DIRECT_UPSTREAM_DNS_IPS: [Ipv4Addr; 2] = [
     Ipv4Addr::new(77, 88, 8, 8),
-    Ipv4Addr::new(8, 8, 4, 4),
+    Ipv4Addr::new(77, 88, 8, 1),
 ];
 
 /// Проверяет, является ли пакет попыткой шифрованного DNS (DoT порт 853 или DoH порт 443 к публичным DNS)
