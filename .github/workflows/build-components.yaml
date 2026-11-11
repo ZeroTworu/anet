@@ -36,7 +36,7 @@ on:
 jobs:
   test:
     name: "Run Unit Tests"
-    runs-on: "ubuntu-latest"
+    runs-on: "ubuntu-24.04"
     steps:
       - uses: "actions/checkout@v4"
 
@@ -47,8 +47,21 @@ jobs:
 
       - name: "Install dependencies"
         run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler cmake clang
+          if ! command -v protoc >/dev/null 2>&1 || ! command -v cmake >/dev/null 2>&1 || ! command -v clang >/dev/null 2>&1; then
+            sudo mkdir -p /etc/systemd/resolved.conf.d
+            printf "[Resolve]\nDNS=1.1.1.1 8.8.8.8 1.0.0.1 8.8.4.4\nDNSSEC=no\n" | sudo tee /etc/systemd/resolved.conf.d/99-public-dns.conf >/dev/null
+            sudo systemctl restart systemd-resolved || true
+            for host in azure.archive.ubuntu.com archive.ubuntu.com security.ubuntu.com; do
+              IP=$(curl -fsSL --max-time 5 -H "accept: application/dns-json" "https://1.1.1.1/dns-query?name=${host}&type=A" | jq -r '.Answer[]? | select(.type==1) | .data' | head -n1 || true)
+              [ -z "$IP" ] && IP=$(curl -fsSL --max-time 5 "https://dns.google/resolve?name=${host}&type=A" | jq -r '.Answer[]? | select(.type==1) | .data' | head -n1 || true)
+              [ -n "$IP" ] && echo "$IP $host" | sudo tee -a /etc/hosts >/dev/null
+            done
+            APT_OPTS="-o Acquire::ForceIPv4=true -o Acquire::Retries=5 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15"
+            sudo apt-get $APT_OPTS update
+            sudo apt-get $APT_OPTS install -y protobuf-compiler cmake clang
+          else
+            echo "protoc, cmake, and clang are already installed."
+          fi
 
       - name: "Install Rust Stable"
         uses: dtolnay/rust-toolchain@stable
@@ -81,7 +94,7 @@ jobs:
 
   build-linux-server:
     name: "Build Linux Server & Tools"
-    runs-on: "ubuntu-latest"
+    runs-on: "ubuntu-24.04"
     needs: "test"
     steps:
       - uses: "actions/checkout@v4"
@@ -92,8 +105,17 @@ jobs:
           go-version: '>=1.20'
       - name: "Install dependencies"
         run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools protobuf-compiler gcc-aarch64-linux-gnu mingw-w64 cmake clang
+          sudo mkdir -p /etc/systemd/resolved.conf.d
+          printf "[Resolve]\nDNS=1.1.1.1 8.8.8.8 1.0.0.1 8.8.4.4\nDNSSEC=no\n" | sudo tee /etc/systemd/resolved.conf.d/99-public-dns.conf >/dev/null
+          sudo systemctl restart systemd-resolved || true
+          for host in azure.archive.ubuntu.com archive.ubuntu.com security.ubuntu.com; do
+            IP=$(curl -fsSL --max-time 5 -H "accept: application/dns-json" "https://1.1.1.1/dns-query?name=${host}&type=A" | jq -r '.Answer[]? | select(.type==1) | .data' | head -n1 || true)
+            [ -z "$IP" ] && IP=$(curl -fsSL --max-time 5 "https://dns.google/resolve?name=${host}&type=A" | jq -r '.Answer[]? | select(.type==1) | .data' | head -n1 || true)
+            [ -n "$IP" ] && echo "$IP $host" | sudo tee -a /etc/hosts >/dev/null
+          done
+          APT_OPTS="-o Acquire::ForceIPv4=true -o Acquire::Retries=5 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15"
+          sudo apt-get $APT_OPTS update
+          sudo apt-get $APT_OPTS install -y musl-tools protobuf-compiler gcc-aarch64-linux-gnu mingw-w64 cmake clang
 
       - name: "Install Rust Stable"
         uses: dtolnay/rust-toolchain@stable
@@ -160,7 +182,7 @@ jobs:
 
   build-linux-client:
     name: "Build Linux Client (AMD64 & ARM64)"
-    runs-on: "ubuntu-latest"
+    runs-on: "ubuntu-24.04"
     needs: "test"
     steps:
       - uses: "actions/checkout@v6"
@@ -171,8 +193,17 @@ jobs:
           go-version: '>=1.20'
       - name: "Install dependencies"
         run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools protobuf-compiler cmake clang
+          sudo mkdir -p /etc/systemd/resolved.conf.d
+          printf "[Resolve]\nDNS=1.1.1.1 8.8.8.8 1.0.0.1 8.8.4.4\nDNSSEC=no\n" | sudo tee /etc/systemd/resolved.conf.d/99-public-dns.conf >/dev/null
+          sudo systemctl restart systemd-resolved || true
+          for host in azure.archive.ubuntu.com archive.ubuntu.com security.ubuntu.com; do
+            IP=$(curl -fsSL --max-time 5 -H "accept: application/dns-json" "https://1.1.1.1/dns-query?name=${host}&type=A" | jq -r '.Answer[]? | select(.type==1) | .data' | head -n1 || true)
+            [ -z "$IP" ] && IP=$(curl -fsSL --max-time 5 "https://dns.google/resolve?name=${host}&type=A" | jq -r '.Answer[]? | select(.type==1) | .data' | head -n1 || true)
+            [ -n "$IP" ] && echo "$IP $host" | sudo tee -a /etc/hosts >/dev/null
+          done
+          APT_OPTS="-o Acquire::ForceIPv4=true -o Acquire::Retries=5 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15"
+          sudo apt-get $APT_OPTS update
+          sudo apt-get $APT_OPTS install -y musl-tools protobuf-compiler cmake clang
 
       - name: "Install Rust"
         uses: "actions-rs/toolchain@v1"
@@ -689,7 +720,7 @@ jobs:
 
   build-android-libs:
     name: "Build Rust for Android"
-    runs-on: "ubuntu-latest"
+    runs-on: "ubuntu-24.04"
     needs: "test"
     steps:
       - uses: "actions/checkout@v6"
@@ -701,8 +732,21 @@ jobs:
 
       - name: "Install dependencies"
         run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler cmake clang
+          if ! command -v protoc >/dev/null 2>&1 || ! command -v cmake >/dev/null 2>&1 || ! command -v clang >/dev/null 2>&1; then
+            sudo mkdir -p /etc/systemd/resolved.conf.d
+            printf "[Resolve]\nDNS=1.1.1.1 8.8.8.8 1.0.0.1 8.8.4.4\nDNSSEC=no\n" | sudo tee /etc/systemd/resolved.conf.d/99-public-dns.conf >/dev/null
+            sudo systemctl restart systemd-resolved || true
+            for host in azure.archive.ubuntu.com archive.ubuntu.com security.ubuntu.com; do
+              IP=$(curl -fsSL --max-time 5 -H "accept: application/dns-json" "https://1.1.1.1/dns-query?name=${host}&type=A" | jq -r '.Answer[]? | select(.type==1) | .data' | head -n1 || true)
+              [ -z "$IP" ] && IP=$(curl -fsSL --max-time 5 "https://dns.google/resolve?name=${host}&type=A" | jq -r '.Answer[]? | select(.type==1) | .data' | head -n1 || true)
+              [ -n "$IP" ] && echo "$IP $host" | sudo tee -a /etc/hosts >/dev/null
+            done
+            APT_OPTS="-o Acquire::ForceIPv4=true -o Acquire::Retries=5 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15"
+            sudo apt-get $APT_OPTS update
+            sudo apt-get $APT_OPTS install -y protobuf-compiler cmake clang
+          else
+            echo "protoc, cmake, and clang are already installed."
+          fi
 
       # Установка Android NDK и Rust таргетов
       - name: "Setup Android NDK"
@@ -746,7 +790,7 @@ jobs:
 
   package-android-apk:
     name: "Package Android APK"
-    runs-on: "ubuntu-latest"
+    runs-on: "ubuntu-24.04"
     needs: "build-android-libs"
     steps:
       - name: "Checkout Android UI Repo"
@@ -806,7 +850,7 @@ jobs:
           path: "android-ui/app/build/outputs/apk/release/app-release.apk"
   build-push-webui-docker:
     name: "Build & Push WebUI to GHCR"
-    runs-on: "ubuntu-latest"
+    runs-on: "ubuntu-24.04"
     needs: "test"
     permissions:
       contents: read
@@ -841,7 +885,7 @@ jobs:
 
   build-push-auth-docker:
     name: "Build & Push Auth Backend to GHCR"
-    runs-on: "ubuntu-latest"
+    runs-on: "ubuntu-24.04"
     needs: "test"
     permissions:
       contents: read
@@ -875,7 +919,7 @@ jobs:
           labels: "${{ steps.meta.outputs.labels }}"
   build-linux-gui:
     name: "Build Linux GUI Client (Amd64)"
-    runs-on: "ubuntu-latest"
+    runs-on: "ubuntu-24.04"
     needs: "test"
     steps:
       - uses: "actions/checkout@v6"
@@ -887,8 +931,17 @@ jobs:
 
       - name: "Install dependencies"
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libappindicator3-dev protobuf-compiler libxdo-dev cmake clang
+          sudo mkdir -p /etc/systemd/resolved.conf.d
+          printf "[Resolve]\nDNS=1.1.1.1 8.8.8.8 1.0.0.1 8.8.4.4\nDNSSEC=no\n" | sudo tee /etc/systemd/resolved.conf.d/99-public-dns.conf >/dev/null
+          sudo systemctl restart systemd-resolved || true
+          for host in azure.archive.ubuntu.com archive.ubuntu.com security.ubuntu.com; do
+            IP=$(curl -fsSL --max-time 5 -H "accept: application/dns-json" "https://1.1.1.1/dns-query?name=${host}&type=A" | jq -r '.Answer[]? | select(.type==1) | .data' | head -n1 || true)
+            [ -z "$IP" ] && IP=$(curl -fsSL --max-time 5 "https://dns.google/resolve?name=${host}&type=A" | jq -r '.Answer[]? | select(.type==1) | .data' | head -n1 || true)
+            [ -n "$IP" ] && echo "$IP $host" | sudo tee -a /etc/hosts >/dev/null
+          done
+          APT_OPTS="-o Acquire::ForceIPv4=true -o Acquire::Retries=5 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15"
+          sudo apt-get $APT_OPTS update
+          sudo apt-get $APT_OPTS install -y libgtk-3-dev libappindicator3-dev protobuf-compiler libxdo-dev cmake clang
 
       - name: "Install Rust"
         uses: "actions-rs/toolchain@v1"
@@ -1008,7 +1061,7 @@ jobs:
 
   deploy-beta-artifacts:
     name: "Deploy Beta Artifacts to Server"
-    runs-on: "ubuntu-latest"
+    runs-on: "ubuntu-24.04"
     if: github.ref == 'refs/heads/master'
     needs: [build-windows-client, create-installer, package-android-apk]
     steps:
