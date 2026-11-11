@@ -63,7 +63,7 @@ pub struct PacketBatcher {
 
 impl PacketBatcher {
     pub fn new(max_batch_bytes: usize, max_delay_ms: u64) -> Self {
-        let max_bulk_bytes = (max_batch_bytes.saturating_mul(4)).max(256 * 1024);
+        let max_bulk_bytes = (max_batch_bytes.saturating_mul(2)).max(64 * 1024);
         Self {
             prio_queue: VecDeque::new(),
             queue: VecDeque::new(),

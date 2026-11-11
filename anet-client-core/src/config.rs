@@ -176,6 +176,10 @@ pub struct ImapConfig {
     /// Максимальный размер одного зашифрованного пакета-черновика (КБ, до 512 КБ без переполнения u16).
     pub max_batch_kb: usize,
 
+    /// Максимальное число писем, скачиваемых за одну команду `UID FETCH` (0 = без лимита).
+    /// Предотвращает 5–12 секундные блокировки TUN при накоплении пачки писем в ящике.
+    pub fetch_max_messages: usize,
+
     /// Порог количества прочитанных писем для принудительного пакетного удаления (UID STORE + UID EXPUNGE).
     pub expunge_batch_size: usize,
 
@@ -203,11 +207,12 @@ impl Default for ImapConfig {
             idle_active_window_ms: 5_000,
             command_timeout_ms: 25_000,
             batch_coalesce_ms: 15,
-            max_batch_kb: 128,
+            max_batch_kb: 64,
+            fetch_max_messages: 3,
             expunge_batch_size: 25,
             expunge_idle_delay_ms: 15_000,
             max_inflight_batches: 5,
-            tx_queue_capacity: 256,
+            tx_queue_capacity: 64,
             literal_plus_auto: true,
             throttle_backoff_ms: 30_000,
         }

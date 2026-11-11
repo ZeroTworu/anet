@@ -469,9 +469,14 @@ impl ImapTransport {
                                 cfg.max_batch_kb = val;
                             }
                         }
-                        "batch_coalesce_ms" | "coalesce_ms" => {
+                        "batch_coalesce_ms" | "coalesce_ms" | "batch_ms" => {
                             if let Ok(val) = v.parse::<u64>() {
                                 cfg.batch_coalesce_ms = val;
+                            }
+                        }
+                        "fetch_max_messages" | "fetch_max" => {
+                            if let Ok(val) = v.parse::<usize>() {
+                                cfg.fetch_max_messages = val;
                             }
                         }
                         "idle_active_poll_ms" | "idle_active_ms" => {
@@ -884,6 +889,7 @@ async fn run_client_mailbox_worker(
     idle_quiet_timeout: Duration,
     idle_active_timeout: Duration,
     idle_active_window_ms: u64,
+    fetch_max_messages: usize,
     expunge_batch_size: usize,
     expunge_idle_delay: Duration,
     _max_inflight_batches: usize,
@@ -1278,38 +1284,21 @@ async fn run_client_mailbox_worker(
                     }
                 }
             }
-            let was_forced = force_immediate_fetch;
+            let _ = got_event;
             force_immediate_fetch = false;
 
             if worker_stop.load(Ordering::Relaxed) || stop_flag.load(Ordering::Relaxed) {
                 break;
             }
 
-            // Защита от холостого повторного скачивания 175 КБ тела last_seen_uid по RFC 3501 (`UID FETCH <last+1>:*`):
-            // если выход из IDLE произошел по тайм-ауту без `* <N> EXISTS`, сначала проверяем легковесный `UID FETCH * (UID)` (40 байт).
-            if !was_forced && !got_event && !cli_reader.pending_exists {
-                if !is_active {
-                    continue;
-                }
-                match cli_reader.get_max_uid(command_timeout).await {
-                    Ok(max_uid) => {
-                        if max_uid <= last_seen_uid && !cli_reader.pending_exists {
-                            continue;
-                        }
-                    }
-                    Err(e) => {
-                        warn!(
-                            "[IMAP Downlink][Box #{} ({})] get_max_uid check failed: {e:#}",
-                            idx, email
-                        );
-                        worker_stop.store(true, Ordering::SeqCst);
-                        break;
-                    }
-                }
-            }
-
+            // Двухфазный порционный опрос (Chunked UID Fetch):
+            // 1. Запрашивает легковесный индекс `UID FETCH <last_seen_uid + 1>:* (UID)` (~40 байт).
+            //    Если новых писем нет (включая выход из 400ms/10s IDLE по тайм-ауту), не качает 175 КБ дубликат
+            //    и на 100% закрывает «Слепое окно» Mail.ru.
+            // 2. Если писем накопилось много, скачивает тела не более `fetch_max_messages` (например, 3 шт.) за шаг,
+            //    сразу сбрасывает их в TUN и мгновенно (без входа в IDLE) переходит к следующей порции.
             let fetch_res = cli_reader
-                .fetch_messages_robust(last_seen_uid, command_timeout)
+                .fetch_messages_chunked(last_seen_uid, fetch_max_messages, command_timeout)
                 .await;
             if cli_reader.pending_exists {
                 cli_reader.pending_exists = false;
@@ -1444,6 +1433,7 @@ impl ClientTransport for ImapTransport {
         let idle_active_window_ms = imap_cfg.idle_active_window_ms.clamp(1000, 60_000);
         let coalesce_ms = imap_cfg.batch_coalesce_ms.clamp(5, 100);
         let max_batch_bytes = (imap_cfg.max_batch_kb.clamp(8, 512)) * 1024;
+        let fetch_max_messages = imap_cfg.fetch_max_messages.min(100);
         let expunge_batch_size = imap_cfg.expunge_batch_size.clamp(5, 200);
         let expunge_idle_delay =
             Duration::from_millis(imap_cfg.expunge_idle_delay_ms.clamp(250, 30_000));
@@ -1469,11 +1459,12 @@ impl ClientTransport for ImapTransport {
         let client_temp_id = compute_hex_id(&client_priv_bytes);
 
         info!(
-            "[IMAP Client] Handshake IDs: SRV_ID={}, Client_TempID={} | Active-Active Pool accounts: {} | Batch: {} KB, ActiveIDLE: {} ms, ExpungeBatch: {}",
+            "[IMAP Client] Handshake IDs: SRV_ID={}, Client_TempID={} | Active-Active Pool accounts: {} | Batch: {} KB, FetchMax: {}, ActiveIDLE: {} ms, ExpungeBatch: {}",
             srv_id,
             client_temp_id,
             accounts.len(),
             max_batch_bytes / 1024,
+            fetch_max_messages,
             idle_active_timeout.as_millis(),
             expunge_batch_size
         );
@@ -1710,6 +1701,7 @@ impl ClientTransport for ImapTransport {
                     idle_quiet_timeout,
                     idle_active_timeout,
                     idle_active_window_ms,
+                    fetch_max_messages,
                     expunge_batch_size,
                     expunge_idle_delay,
                     max_inflight_batches,

@@ -359,7 +359,15 @@ pub async fn run_imap_server(
     let imap_dsn = config
         .server
         .imap_dsn
-        .as_ref()
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            config
+                .imap
+                .imap_dsn
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+        })
         .context("IMAP server DSN is not configured")?;
 
     let (host, port, accounts) = parse_imap_server_dsn(imap_dsn)?;
@@ -485,6 +493,7 @@ async fn run_mailbox_worker_pair(
     let idle_active_timeout =
         Duration::from_millis(config.imap.idle_active_poll_ms.clamp(150, 5000));
     let idle_active_window_ms = config.imap.idle_active_window_ms.clamp(1000, 60_000);
+    let fetch_max_messages = config.imap.fetch_max_messages.min(100);
     let expunge_batch_size = config.imap.expunge_batch_size.clamp(5, 200);
     let expunge_idle_delay =
         Duration::from_millis(config.imap.expunge_idle_delay_ms.clamp(250, 30_000));
@@ -801,8 +810,8 @@ async fn run_mailbox_worker_pair(
         let reader_email = email.clone();
         let server_clamp_mtu = (config.network.mtu as usize).clamp(576, 1500);
         info!(
-            "[IMAP Server][Box #{}] SRV_READER loop active for {} (Active IDLE: {:?}, Quiet IDLE: {:?})",
-            mailbox_idx, reader_email, idle_active_timeout, idle_quiet_timeout
+            "[IMAP Server][Box #{}] SRV_READER loop active for {} (Active IDLE: {:?}, Quiet IDLE: {:?}, FetchMax: {})",
+            mailbox_idx, reader_email, idle_active_timeout, idle_quiet_timeout, fetch_max_messages
         );
 
         while !stop_flag.load(Ordering::Relaxed) {
@@ -842,33 +851,15 @@ async fn run_mailbox_worker_pair(
             if stop_flag.load(Ordering::Relaxed) {
                 break;
             }
+            let _ = (was_forced, got_event);
 
-            // Защита от холостого перекачивания 175 КБ последнего письма при истечении таймаута IDLE:
-            // В IMAP `UID FETCH <last+1>:*` при отсутствии новых писем раскрывает `*` как `max_uid == last`,
-            // возвращая тело уже прочитанного `last_seen_uid`!
-            if !was_forced && !got_event && !srv_reader.pending_exists {
-                if !is_active {
-                    continue;
-                }
-                match srv_reader.get_max_uid(command_timeout).await {
-                    Ok(max_uid) => {
-                        if max_uid <= last_seen_uid && !srv_reader.pending_exists {
-                            continue;
-                        }
-                    }
-                    Err(e) => {
-                        warn!(
-                            "[IMAP Server][Box #{}] SRV_READER get_max_uid poll error for {}: {e:#}",
-                            mailbox_idx, reader_email
-                        );
-                        break;
-                    }
-                }
-            }
-
-            // Выборка новых сообщений из папки "Drafts" (Greedy Fetch Drain)
+            // Двухфазная порционная выборка новых сообщений из папки "Drafts" (Chunked UID Fetch):
+            // 1. Запрашивает легковесный индекс `UID FETCH <last_seen_uid + 1>:* (UID)` (~40 байт).
+            //    При отсутствии новых писем не перекачивает 175 КБ дубликат `last_seen_uid` по RFC 3501
+            //    и гарантированно находит письма, попавшие в «Слепое окно» Mail.ru.
+            // 2. Скачивает тела не более `fetch_max_messages` (например, 3 шт.) за раз и сразу отправляет их в TUN.
             let fetch_res = srv_reader
-                .fetch_messages_robust(last_seen_uid, command_timeout)
+                .fetch_messages_chunked(last_seen_uid, fetch_max_messages, command_timeout)
                 .await;
             if srv_reader.pending_exists {
                 srv_reader.pending_exists = false;

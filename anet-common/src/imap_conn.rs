@@ -667,11 +667,137 @@ where
         last_seen_uid: u32,
         timeout_dur: Duration,
     ) -> Result<FetchResult> {
+        let start_uid = last_seen_uid.saturating_add(1);
+        let cmd_target = format!("{start_uid}:*");
+        self.fetch_messages_by_uid_set(&cmd_target, last_seen_uid, timeout_dur)
+            .await
+    }
+
+    /// Выборка тел конкретной порции UID (`UID FETCH u1,u2,u3 (UID BODY.PEEK[])`).
+    pub async fn fetch_uids_body(
+        &mut self,
+        uids: &[u32],
+        last_seen_uid: u32,
+        timeout_dur: Duration,
+    ) -> Result<FetchResult> {
+        if uids.is_empty() {
+            return Ok(FetchResult {
+                messages: Vec::new(),
+                new_max_uid: last_seen_uid,
+                latency_ms: 0.0,
+            });
+        }
+
+        let mut uid_set = String::new();
+        for (i, &u) in uids.iter().enumerate() {
+            if i > 0 {
+                uid_set.push(',');
+            }
+            let _ = write!(&mut uid_set, "{u}");
+        }
+
+        let mut res = self
+            .fetch_messages_by_uid_set(&uid_set, last_seen_uid, timeout_dur)
+            .await?;
+        if let Some(&max_requested) = uids.iter().max() {
+            res.new_max_uid = res.new_max_uid.max(max_requested);
+        }
+        Ok(res)
+    }
+
+    /// Двухфазная порционная выборка новых сообщений (`Chunked UID Fetch`):
+    /// 1. Если `fetch_max_messages == 0`, выполняет классический `fetch_messages_robust`.
+    /// 2. Если `fetch_max_messages > 0`:
+    ///    - Сначала запрашивает легковесный индекс новых UID: `UID FETCH <last_seen_uid + 1>:* (UID)` (~40 байт).
+    ///      Если новых UID (`> last_seen_uid`) нет, мгновенно возвращает пустой результат без скачивания
+    ///      175 КБ дубликата `last_seen_uid` по RFC 3501 и без слепых зон `UID FETCH *`.
+    ///    - Если новые UID есть, берет первые `fetch_max_messages` (например, 3 шт.) и скачивает их тела
+    ///      командой `UID FETCH u1,u2,u3 (UID BODY.PEEK[])`.
+    ///    - Если в папке остались ещё невычитанные UID после этой порции, взводит `self.pending_exists = true`,
+    ///      чтобы воркер сразу после записи текущих пакетов в TUN мгновенно (без захода в IDLE) забрал следующую порцию.
+    pub async fn fetch_messages_chunked(
+        &mut self,
+        last_seen_uid: u32,
+        fetch_max_messages: usize,
+        timeout_dur: Duration,
+    ) -> Result<FetchResult> {
+        if fetch_max_messages == 0 {
+            return self.fetch_messages_robust(last_seen_uid, timeout_dur).await;
+        }
+
+        let t0 = Instant::now();
+        let deadline = t0 + timeout_dur;
+        let start_uid = last_seen_uid.saturating_add(1);
+
+        // Сбрасываем флаг EXISTS перед отправкой индексного запроса:
+        // все письма, пришедшие до этого момента, попадут в ответ `UID FETCH <start_uid>:* (UID)`.
+        // Если же новое `* <N> EXISTS` придет во время чтения ответа, `read_line()` снова взведет `pending_exists`.
+        self.pending_exists = false;
+
+        let tag1 = self.next_tag();
+        self.send_line(&format!("{tag1} UID FETCH {start_uid}:* (UID)"))
+            .await?;
+        let idx_lines = self.read_until_tagged(&tag1, timeout_dur).await?;
+
+        if let Some(last) = idx_lines.last() {
+            if last.starts_with(&format!("{tag1} NO"))
+                || last.starts_with(&format!("{tag1} BAD"))
+            {
+                return Err(anyhow!("IMAP UID FETCH index failed: {}", last.trim()));
+            }
+        }
+
+        let mut new_uids = Vec::new();
+        for line in &idx_lines {
+            if let Some(uid) = extract_uid_from_fetch_meta(line) {
+                if uid > last_seen_uid {
+                    new_uids.push(uid);
+                }
+            }
+        }
+        new_uids.sort_unstable();
+        new_uids.dedup();
+
+        if new_uids.is_empty() {
+            return Ok(FetchResult {
+                messages: Vec::new(),
+                new_max_uid: last_seen_uid,
+                latency_ms: t0.elapsed().as_secs_f64() * 1000.0,
+            });
+        }
+
+        let take_count = new_uids.len().min(fetch_max_messages);
+        let chunk = &new_uids[..take_count];
+        let has_more_in_folder = new_uids.len() > take_count;
+
+        let rem_timeout = deadline
+            .saturating_duration_since(Instant::now())
+            .max(Duration::from_secs(5));
+        let exists_during_index = self.pending_exists;
+        let mut res = self.fetch_uids_body(chunk, last_seen_uid, rem_timeout).await?;
+        res.latency_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+        if has_more_in_folder || exists_during_index {
+            self.pending_exists = true;
+        }
+
+        Ok(res)
+    }
+
+    async fn fetch_messages_by_uid_set(
+        &mut self,
+        uid_set: &str,
+        last_seen_uid: u32,
+        timeout_dur: Duration,
+    ) -> Result<FetchResult> {
         let t0 = Instant::now();
         let tag = self.next_tag();
-        let start_uid = last_seen_uid + 1;
 
-        self.send_line(&format!("{tag} UID FETCH {start_uid}:* (UID BODY.PEEK[])")).await?;
+        // Сбрасываем pending_exists до отправки команды UID FETCH:
+        // если новое уведомление `* <N> EXISTS` придет во время вычитывания ответа, `read_line()` снова взведет его.
+        self.pending_exists = false;
+
+        self.send_line(&format!("{tag} UID FETCH {uid_set} (UID BODY.PEEK[])")).await?;
 
         let mut messages = Vec::new();
         let mut new_max_uid = last_seen_uid;
@@ -734,10 +860,6 @@ where
                 log::warn!("[IMAP] Failed to extract UID from FETCH meta: {}", full_meta.trim());
                 continue;
             };
-
-            // Любое уведомление `* <N> EXISTS`, пришедшее до этой строки FETCH, уже учтено в текущем ответе;
-            // если же новое `* <M> EXISTS` придёт после последнего FETCH перед `tag OK`, read_line() снова взведёт флаг.
-            self.pending_exists = false;
 
             // Защита от дублей RFC 3501 (при запросе <last+1>:* сервер может вернуть last_seen_uid)
             if uid <= last_seen_uid {
@@ -1322,6 +1444,93 @@ mod tests {
             .await
             .expect("select should auto-create missing folder");
         assert!(!conn.pending_exists);
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_fetch_messages_chunked_splits_backlog_and_sets_pending_exists() {
+        let (client_io, mut server_io) = tokio::io::duplex(32 * 1024);
+        let mut conn = ImapConn::new(client_io);
+
+        let raw_m1 = build_rfc822_message("a@b.c", "[ID: s1]", b"pkt1", [1u8; 16]);
+        let raw_m2 = build_rfc822_message("a@b.c", "[ID: s1]", b"pkt2", [2u8; 16]);
+        let raw_m3 = build_rfc822_message("a@b.c", "[ID: s1]", b"pkt3", [3u8; 16]);
+
+        let server_task = tokio::spawn(async move {
+            let mut s_buf = BufReader::new(&mut server_io);
+            let mut line = String::new();
+
+            // Чанк 1 (fetch_max_messages = 2):
+            // 1. Клиент запрашивает индекс `A0001 UID FETCH 11:* (UID)`
+            s_buf.read_line(&mut line).await.unwrap();
+            assert!(line.contains("UID FETCH 11:* (UID)"));
+            s_buf
+                .get_mut()
+                .write_all(
+                    b"* 1 FETCH (UID 10)\r\n* 2 FETCH (UID 12)\r\n* 3 FETCH (UID 15)\r\n* 4 FETCH (UID 19)\r\nA0001 OK UID FETCH completed\r\n",
+                )
+                .await
+                .unwrap();
+
+            // 2. Клиент запрашивает тела только первых 2 новых UID (12,15): `A0002 UID FETCH 12,15 (UID BODY.PEEK[])`
+            line.clear();
+            s_buf.read_line(&mut line).await.unwrap();
+            assert!(line.contains("UID FETCH 12,15 (UID BODY.PEEK[])"));
+            let mut resp1 = Vec::new();
+            resp1.extend_from_slice(
+                format!("* 2 FETCH (BODY[] {{{}}}\r\n", raw_m1.len()).as_bytes(),
+            );
+            resp1.extend_from_slice(&raw_m1);
+            resp1.extend_from_slice(b" UID 12)\r\n");
+            resp1.extend_from_slice(
+                format!("* 3 FETCH (BODY[] {{{}}}\r\n", raw_m2.len()).as_bytes(),
+            );
+            resp1.extend_from_slice(&raw_m2);
+            resp1.extend_from_slice(b" UID 15)\r\nA0002 OK UID FETCH completed\r\n");
+            s_buf.get_mut().write_all(&resp1).await.unwrap();
+
+            // Чанк 2 (оставшийся UID 19):
+            line.clear();
+            s_buf.read_line(&mut line).await.unwrap();
+            assert!(line.contains("UID FETCH 16:* (UID)"));
+            s_buf
+                .get_mut()
+                .write_all(b"* 4 FETCH (UID 19)\r\nA0003 OK UID FETCH completed\r\n")
+                .await
+                .unwrap();
+
+            line.clear();
+            s_buf.read_line(&mut line).await.unwrap();
+            assert!(line.contains("UID FETCH 19 (UID BODY.PEEK[])"));
+            let mut resp2 = Vec::new();
+            resp2.extend_from_slice(
+                format!("* 4 FETCH (BODY[] {{{}}}\r\n", raw_m3.len()).as_bytes(),
+            );
+            resp2.extend_from_slice(&raw_m3);
+            resp2.extend_from_slice(b" UID 19)\r\nA0004 OK UID FETCH completed\r\n");
+            s_buf.get_mut().write_all(&resp2).await.unwrap();
+        });
+
+        let res1 = conn
+            .fetch_messages_chunked(10, 2, Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(res1.new_max_uid, 15);
+        assert_eq!(res1.messages.len(), 2);
+        assert_eq!(res1.messages[0].payload.as_ref(), b"pkt1");
+        assert_eq!(res1.messages[1].payload.as_ref(), b"pkt2");
+        // В папке остался еще UID 19, поэтому pending_exists должен быть взведен!
+        assert!(conn.pending_exists);
+
+        let res2 = conn
+            .fetch_messages_chunked(res1.new_max_uid, 2, Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(res2.new_max_uid, 19);
+        assert_eq!(res2.messages.len(), 1);
+        assert_eq!(res2.messages[0].payload.as_ref(), b"pkt3");
+        assert!(!conn.pending_exists);
+
         server_task.await.unwrap();
     }
 }

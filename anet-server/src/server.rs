@@ -221,18 +221,32 @@ impl ANetServer {
             }
         }
 
-        if let Some(ref imap_dsn) = self.cfg.server.imap_dsn {
-            if !imap_dsn.trim().is_empty() {
-                let c = self.cfg.clone();
-                let rg = self.registry.clone();
-                let tx = client_pkt_tx.clone();
-                let auth = self.auth_handler_core.clone();
-                handle_collection.push(tokio::spawn(async move {
-                    if let Err(e) = imap::run_imap_server(c, rg, tx, auth).await {
-                        error!("Fatal error: [IMAP] Server halted: {}", e);
-                    }
-                }));
-            }
+        let effective_imap_dsn = self
+            .cfg
+            .server
+            .imap_dsn
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                self.cfg
+                    .imap
+                    .imap_dsn
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+            });
+
+        if effective_imap_dsn.is_some() {
+            let c = self.cfg.clone();
+            let rg = self.registry.clone();
+            let tx = client_pkt_tx.clone();
+            let auth = self.auth_handler_core.clone();
+            handle_collection.push(tokio::spawn(async move {
+                if let Err(e) = imap::run_imap_server(c, rg, tx, auth).await {
+                    error!("Fatal error: [IMAP] Server halted: {}", e);
+                }
+            }));
+        } else {
+            log::info!("[IMAP Server] IMAP transport is not configured (no imap_dsn in [server] or [imap])");
         }
 
         futures::future::join_all(handle_collection).await;

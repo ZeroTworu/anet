@@ -221,6 +221,9 @@ impl Default for AhttpServerConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct ImapServerConfig {
+    /// Опциональный DSN IMAP-пула (позволяет указывать `imap_dsn` или `dsn` как в `[server]`, так и в `[imap]`).
+    #[serde(default, alias = "dsn")]
+    pub imap_dsn: Option<String>,
     /// Время жизни неактивной клиентской сессии при отсутствии пакетов (мс).
     pub session_ttl_ms: u64,
     /// Интервал перевхода серверного воркера в IDLE в состоянии покоя (мс).
@@ -239,6 +242,8 @@ pub struct ImapServerConfig {
     pub max_batch_kb: usize,
     /// Задержка микро-коалесценции батчера (мс).
     pub batch_coalesce_ms: u64,
+    /// Максимальное число писем, скачиваемых за одну команду `UID FETCH` (0 = без лимита).
+    pub fetch_max_messages: usize,
     /// Порог количества прочитанных писем для принудительного пакетного удаления (UID STORE + UID EXPUNGE).
     pub expunge_batch_size: usize,
     /// Пауза отсутствия исходящего трафика перед ленивой очисткой прочитанных писем (мс).
@@ -254,6 +259,7 @@ pub struct ImapServerConfig {
 impl Default for ImapServerConfig {
     fn default() -> Self {
         Self {
+            imap_dsn: None,
             session_ttl_ms: 180_000,
             idle_refresh_interval_ms: 10_000,
             idle_active_poll_ms: 400,
@@ -261,12 +267,13 @@ impl Default for ImapServerConfig {
             command_timeout_ms: 25_000,
             cleanup_interval_ms: 30_000,
             throttle_backoff_ms: 30_000,
-            max_batch_kb: 128,
+            max_batch_kb: 64,
             batch_coalesce_ms: 15,
+            fetch_max_messages: 3,
             expunge_batch_size: 25,
             expunge_idle_delay_ms: 15_000,
             max_inflight_batches: 5,
-            tx_queue_capacity: 256,
+            tx_queue_capacity: 64,
             literal_plus_auto: true,
         }
     }
