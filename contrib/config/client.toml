@@ -16,14 +16,14 @@ manual_routing = false
 # Windows per-app split tunneling.
 # include-режим: в туннель идут ТОЛЬКО эти процессы.
 # per_app = ["firefox.exe", "telegram.exe"]
-# per_app_exclude = false
+# per_app_mode = "include"
 
 per_app = []
-per_app_exclude = false
+per_app_mode = "all"
 
 # exclude-режим (в туннель всё, КРОМЕ этих):
 # per_app = ["steam.exe"]
-# per_app_exclude = true
+# per_app_mode = "exclude"
 
 # =========================================================================
 # Настройки Маршрутизации (Split Tunneling)

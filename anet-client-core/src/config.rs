@@ -45,6 +45,11 @@ pub struct MainConfig {
     #[serde(default)]
     pub per_app_mode: PerAppMode,
 
+    /// Устаревший флаг из старых client.toml (при непустом `per_app` и `per_app_mode == All`
+    /// автоматически маппится в `Exclude` при `true` или `Include` при `false`).
+    #[serde(default)]
+    pub per_app_exclude: Option<bool>,
+
     #[serde(default = "default_update_url")]
     pub update_url: String,
 
@@ -70,9 +75,25 @@ impl MainConfig {
         self.config_url.as_deref().or(self.subscription_url.as_deref())
     }
 
+    pub fn effective_per_app_mode(&self) -> PerAppMode {
+        if self.per_app_mode != PerAppMode::All {
+            return self.per_app_mode;
+        }
+        if !self.per_app.is_empty() {
+            if let Some(exclude) = self.per_app_exclude {
+                return if exclude {
+                    PerAppMode::Exclude
+                } else {
+                    PerAppMode::Include
+                };
+            }
+        }
+        PerAppMode::All
+    }
+
     pub fn is_per_app_active(&self) -> bool {
-        self.per_app_mode != PerAppMode::All
-            && !(self.per_app_mode == PerAppMode::Include && self.per_app.is_empty())
+        let mode = self.effective_per_app_mode();
+        mode != PerAppMode::All && !(mode == PerAppMode::Include && self.per_app.is_empty())
     }
 }
 
@@ -86,6 +107,7 @@ impl Default for MainConfig {
             manual_routing: false,
             per_app: vec![],
             per_app_mode: PerAppMode::All,
+            per_app_exclude: None,
             update_url: default_update_url(),
             config_url: None,
             subscription_url: None,
@@ -680,6 +702,8 @@ impl CoreConfig {
         if self.main.dns_server_list.is_empty() {
             self.main.dns_server_list = default_dns_server_list();
         }
+
+        self.main.per_app_mode = self.main.effective_per_app_mode();
 
         if self.main.per_app_mode == PerAppMode::Include && self.main.per_app.is_empty() {
             log::warn!(

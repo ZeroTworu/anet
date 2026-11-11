@@ -62,6 +62,7 @@ netdev = { workspace = true }
 # Заглушка по умолчанию; реальный WinDivert включается фичей `per-app`.
 [target.'cfg(windows)'.dependencies]
 anet-appfilter = { path = "../anet-appfilter" }
+wintun = "0.5.1"
 
 
 

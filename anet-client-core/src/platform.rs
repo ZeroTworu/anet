@@ -8,8 +8,14 @@ use crate::dns::{DnsManager, get_dns_manager};
 use crate::router::desktop::DesktopRouteManager;
 #[cfg(target_os = "macos")]
 use crate::router::macos::MacOSRouteManager;
-use crate::traits::RouteManager;
+use crate::traits::{RouteManager, TunFactory};
+pub use crate::tun_factory::DesktopTunFactory;
 use anyhow::Result;
+
+/// Create a desktop TUN factory (Windows Wintun+netsh, Linux/macOS TunManager)
+pub fn create_tun_factory(tun_name: String, per_app_mode: bool) -> Box<dyn TunFactory> {
+    Box::new(DesktopTunFactory::new(tun_name, per_app_mode))
+}
 
 pub struct NoOpRouteManager;
 

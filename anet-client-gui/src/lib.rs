@@ -11,5 +11,4 @@ pub mod ui;
 pub mod icons;
 pub mod config;
 pub mod tray;
-pub mod tun_factory;
-pub mod secure_store; // <-- Добавить эту строку
+pub mod secure_store;

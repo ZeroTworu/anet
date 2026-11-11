@@ -408,7 +408,7 @@ impl AnetClient {
         Option<AppFilter>,
     )> {
         let (tun_tx, tun_rx, iface_name) = self.tun_factory.create_tun(auth).await?;
-        let mode = self.config.main.per_app_mode;
+        let mode = self.config.main.effective_per_app_mode();
 
         if mode == PerAppMode::All
             || (mode == PerAppMode::Include && self.config.main.per_app.is_empty())
@@ -693,10 +693,6 @@ impl AnetClient {
             let abc_direct_routes = rule_cache.collect_direct_routes();
             if !abc_direct_routes.is_empty() {
                 let count = abc_direct_routes.len();
-                #[cfg(not(target_os = "android"))]
-                {
-                    let _ = self.route_manager.add_bypass_routes(&abc_direct_routes).await;
-                }
                 let msg = format!(
                     "[RuleCache] Loaded {} static Direct CIDR rules from rules.abc",
                     count

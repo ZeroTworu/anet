@@ -9,6 +9,7 @@ pub mod router;
 mod router_macos;
 pub mod socket;
 pub mod traits;
+pub mod tun_factory;
 mod transport;
 pub mod vpn;
 mod statistic;

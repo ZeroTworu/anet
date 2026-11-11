@@ -36,7 +36,6 @@ uuid = { version = "1", features = ["v4"] }
 libc = "0.2.175"
 # Windows-specific dependencies
 [target.'cfg(windows)'.dependencies]
-wintun = "0.5.1"
 windows-sys = {  workspace = true, features = ["Win32_UI_WindowsAndMessaging", "Win32_Foundation"] }
 
 # Platform-specific dependencies for route management

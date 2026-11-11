@@ -16,7 +16,7 @@ use anet_client_core::{
     config::{ CoreConfig, PerAppMode },
     connectivity_monitor::{ ConnectivityMonitor, NodeProbeMonitor },
     events::{ set_handler, AccountInfo, AnetEvent, ClientState },
-    platform::create_route_manager,
+    platform::{ create_route_manager, DesktopTunFactory },
     server_config::{ apply_overrides, SERVER_CONFIG_ID, SERVER_CONFIG_DISPLAY_NAME },
     updater::{ ConfigFetchResult, Updater },
 };
@@ -32,7 +32,6 @@ use crate::{
     secure_store::DesktopSecureStore,
     theme::apply_dark_theme,
     tray::{ TrayBackground, TrayCommand },
-    tun_factory::DesktopTunFactory,
     types::{
         ConfigLoadOutcome,
         ConnectionState,
