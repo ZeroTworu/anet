@@ -924,7 +924,11 @@ where
         })
     }
 
-    /// Удаляет прочитанные UIDs через `UID EXPUNGE` (RFC 4315) с фолбэком на классический `EXPUNGE`.
+    /// Удаляет прочитанные UIDs за 1 RTT через конвейерный `NOOP` + `UID STORE` + `UID EXPUNGE` (RFC 4315)
+    /// с фолбэком на классический `EXPUNGE`.
+    /// Команда `NOOP` перед `UID STORE` обязательна для `imap.mail.ru`: поскольку соединение `WRITER`
+    /// выполняет только `APPEND` в противоположную папку, без `NOOP` его снимок выбранной папки устаревает,
+    /// и `imap.mail.ru` молча игнорирует `UID STORE` / `UID EXPUNGE` для всех новых писем.
     pub async fn expunge_uids(&mut self, uids: &[u32], timeout_dur: Duration) -> Result<()> {
         if uids.is_empty() {
             return Ok(());
@@ -938,32 +942,45 @@ where
             let _ = write!(&mut uid_str, "{u}");
         }
 
-        // Шаг 1: помечаем письма удаленными (\Deleted)
         let tag1 = self.next_tag();
-        self.send_line(&format!("{tag1} UID STORE {uid_str} +FLAGS.SILENT (\\Deleted)")).await?;
-        let resp1 = self.read_until_tagged(&tag1, timeout_dur).await?;
-        if !resp1.last().is_some_and(|l| l.starts_with(&format!("{tag1} OK"))) {
+        let tag2 = self.next_tag();
+        let tag3 = self.next_tag();
+        let pipelined_cmd = format!(
+            "{tag1} NOOP\r\n{tag2} UID STORE {uid_str} +FLAGS.SILENT (\\Deleted)\r\n{tag3} UID EXPUNGE {uid_str}\r\n"
+        );
+
+        let prev_pending = self.pending_exists;
+        {
+            let inner = self.stream.get_mut();
+            inner.write_all(pipelined_cmd.as_bytes()).await?;
+            inner.flush().await?;
+        }
+
+        // 1. Читаем ответ на NOOP (обновляет снимок UID в выбранной папке на Mail.ru)
+        let _ = self.read_until_tagged(&tag1, timeout_dur).await?;
+        self.pending_exists = prev_pending;
+
+        // 2. Читаем ответ на UID STORE (\Deleted)
+        let resp2 = self.read_until_tagged(&tag2, timeout_dur).await?;
+        if !resp2.last().is_some_and(|l| l.starts_with(&format!("{tag2} OK"))) {
             return Err(anyhow!(
                 "IMAP UID STORE \\Deleted failed: {}",
-                resp1.last().map(|s| s.trim()).unwrap_or_default()
+                resp2.last().map(|s| s.trim()).unwrap_or_default()
             ));
         }
 
-        // Шаг 2: точечное удаление через UID EXPUNGE (RFC 4315)
-        let tag2 = self.next_tag();
-        self.send_line(&format!("{tag2} UID EXPUNGE {uid_str}")).await?;
-        let resp2 = self.read_until_tagged(&tag2, timeout_dur).await?;
-
-        let ok = resp2.last().is_some_and(|l| l.starts_with(&format!("{tag2} OK")));
+        // 3. Читаем ответ на UID EXPUNGE (RFC 4315)
+        let resp3 = self.read_until_tagged(&tag3, timeout_dur).await?;
+        let ok = resp3.last().is_some_and(|l| l.starts_with(&format!("{tag3} OK")));
         if !ok {
             // Фолбэк на стандартный EXPUNGE
-            let tag3 = self.next_tag();
-            self.send_line(&format!("{tag3} EXPUNGE")).await?;
-            let resp3 = self.read_until_tagged(&tag3, timeout_dur).await?;
-            if !resp3.last().is_some_and(|l| l.starts_with(&format!("{tag3} OK"))) {
+            let tag4 = self.next_tag();
+            self.send_line(&format!("{tag4} EXPUNGE")).await?;
+            let resp4 = self.read_until_tagged(&tag4, timeout_dur).await?;
+            if !resp4.last().is_some_and(|l| l.starts_with(&format!("{tag4} OK"))) {
                 return Err(anyhow!(
                     "IMAP fallback EXPUNGE failed: {}",
-                    resp3.last().map(|s| s.trim()).unwrap_or_default()
+                    resp4.last().map(|s| s.trim()).unwrap_or_default()
                 ));
             }
         }
@@ -1248,13 +1265,18 @@ mod tests {
 
             line.clear();
             s_buf.read_line(&mut line).await.unwrap();
+            assert!(line.contains("NOOP"));
+            s_buf.get_mut().write_all(b"A0007 OK NOOP completed\r\n").await.unwrap();
+
+            line.clear();
+            s_buf.read_line(&mut line).await.unwrap();
             assert!(line.contains("UID STORE 106 +FLAGS.SILENT (\\Deleted)"));
-            s_buf.get_mut().write_all(b"A0007 OK STORE completed\r\n").await.unwrap();
+            s_buf.get_mut().write_all(b"A0008 OK STORE completed\r\n").await.unwrap();
 
             line.clear();
             s_buf.read_line(&mut line).await.unwrap();
             assert!(line.contains("UID EXPUNGE 106"));
-            s_buf.get_mut().write_all(b"A0008 OK UID EXPUNGE completed\r\n").await.unwrap();
+            s_buf.get_mut().write_all(b"A0009 OK UID EXPUNGE completed\r\n").await.unwrap();
         });
 
         let banner = conn.read_line().await.unwrap();

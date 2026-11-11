@@ -1108,9 +1108,7 @@ async fn run_client_mailbox_worker(
                             let to_clean = {
                                 let mut guard = cleanup_for_writer.lock().await;
                                 let force_clean = guard.len() >= expunge_batch_size;
-                                let last_act = last_rx_for_writer
-                                    .load(Ordering::Relaxed)
-                                    .max(tunnel_act_for_writer.load(Ordering::Relaxed));
+                                let last_act = last_rx_for_writer.load(Ordering::Relaxed);
                                 let since_act_ms = now_epoch_ms().saturating_sub(last_act);
                                 let idle_clean =
                                     !guard.is_empty() && since_act_ms >= expunge_idle_delay_ms;
@@ -2142,13 +2140,22 @@ mod tests {
                 .await
                 .unwrap();
 
-            // 2. Ожидаем попутный UID STORE + UID EXPUNGE (Piggybacked Expunge)
+            // 2. Ожидаем попутный NOOP + UID STORE + UID EXPUNGE (Piggybacked Expunge)
+            line.clear();
+            s_buf.read_line(&mut line).await.unwrap();
+            assert!(line.contains("NOOP"));
+            s_buf
+                .get_mut()
+                .write_all(b"A0002 OK NOOP completed\r\n")
+                .await
+                .unwrap();
+
             line.clear();
             s_buf.read_line(&mut line).await.unwrap();
             assert!(line.contains("UID STORE 1,2,3 +FLAGS.SILENT (\\Deleted)"));
             s_buf
                 .get_mut()
-                .write_all(b"A0002 OK STORE completed\r\n")
+                .write_all(b"A0003 OK STORE completed\r\n")
                 .await
                 .unwrap();
 
@@ -2157,7 +2164,7 @@ mod tests {
             assert!(line.contains("UID EXPUNGE 1,2,3"));
             s_buf
                 .get_mut()
-                .write_all(b"A0003 OK EXPUNGE completed\r\n")
+                .write_all(b"A0004 OK EXPUNGE completed\r\n")
                 .await
                 .unwrap();
         });
