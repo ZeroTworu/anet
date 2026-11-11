@@ -68,10 +68,18 @@ mob:
 		SUB_NDK="$$(ls -1d "$$NDK_HOME_RESOLVED"/* 2>/dev/null | sort -V | tail -n 1)"; \
 		if [ -n "$$SUB_NDK" ] && [ -f "$$SUB_NDK/build/cmake/android.toolchain.cmake" ]; then \
 			NDK_HOME_RESOLVED="$$SUB_NDK"; \
+		else \
+			NDK_HOME_RESOLVED=""; \
+		fi; \
+	fi; \
+	if [ -z "$$NDK_HOME_RESOLVED" ] && command -v ndk-build >/dev/null 2>&1; then \
+		NDK_BIN="$$(readlink -f "$$(command -v ndk-build)")"; \
+		if [ -f "$$(dirname "$$NDK_BIN")/build/cmake/android.toolchain.cmake" ]; then \
+			NDK_HOME_RESOLVED="$$(dirname "$$NDK_BIN")"; \
 		fi; \
 	fi; \
 	if [ -z "$$NDK_HOME_RESOLVED" ]; then \
-		SYSROOT="$$(cargo ndk env 2>/dev/null | sed -n "s/^export CARGO_NDK_SYSROOT_PATH='\(.*\)'$$/\1/p" | head -n 1)"; \
+		SYSROOT="$$(env -u ANDROID_NDK_HOME -u ANDROID_NDK_ROOT -u NDK_HOME cargo ndk env 2>/dev/null | sed -n "s/^export CARGO_NDK_SYSROOT_PATH=['\"]*\([^'\"]*\)['\"]*$$/\1/p" | head -n 1)"; \
 		if [ -n "$$SYSROOT" ]; then \
 			NDK_HOME_RESOLVED="$${SYSROOT%/toolchains/llvm/prebuilt/*}"; \
 		fi; \
@@ -79,16 +87,35 @@ mob:
 	if [ -z "$$NDK_HOME_RESOLVED" ]; then \
 		for base in "$${ANDROID_HOME:+$${ANDROID_HOME}/ndk}" "$${ANDROID_SDK_ROOT:+$${ANDROID_SDK_ROOT}/ndk}" "$${ANDROID_SDK_HOME:+$${ANDROID_SDK_HOME}/ndk}" "$$HOME/Android/Sdk/ndk" "$$HOME/Library/Android/sdk/ndk" "/opt/android-sdk/ndk" "/usr/lib/android-sdk/ndk"; do \
 			if [ -n "$$base" ] && [ -d "$$base" ]; then \
-				NDK_HOME_RESOLVED="$$(ls -1d "$$base"/* 2>/dev/null | sort -V | tail -n 1)"; \
-				[ -n "$$NDK_HOME_RESOLVED" ] && break; \
+				CAND="$$(ls -1d "$$base"/* 2>/dev/null | sort -V | tail -n 1)"; \
+				if [ -n "$$CAND" ] && [ -f "$$CAND/build/cmake/android.toolchain.cmake" ]; then \
+					NDK_HOME_RESOLVED="$$CAND"; \
+					break; \
+				fi; \
 			fi; \
 		done; \
 	fi; \
-	if [ -z "$$NDK_HOME_RESOLVED" ] && [ -d "/opt/android-ndk" ]; then \
-		NDK_HOME_RESOLVED="/opt/android-ndk"; \
+	if [ -z "$$NDK_HOME_RESOLVED" ]; then \
+		for dir in "/opt/android-ndk" "/opt/android-sdk/ndk-bundle" "$$HOME/Android/Sdk/ndk-bundle"; do \
+			if [ -f "$$dir/build/cmake/android.toolchain.cmake" ]; then \
+				NDK_HOME_RESOLVED="$$dir"; \
+				break; \
+			fi; \
+		done; \
+	fi; \
+	if [ -z "$$NDK_HOME_RESOLVED" ]; then \
+		FOUND_CMAKE="$$(find "$$HOME" /opt -maxdepth 5 -path "*/build/cmake/android.toolchain.cmake" 2>/dev/null | sort -V | tail -n 1)"; \
+		if [ -n "$$FOUND_CMAKE" ]; then \
+			NDK_HOME_RESOLVED="$${FOUND_CMAKE%/build/cmake/android.toolchain.cmake}"; \
+		fi; \
+	fi; \
+	if [ -z "$$NDK_HOME_RESOLVED" ]; then \
+		echo "ERROR: Android NDK not found! Install Android NDK (e.g. via Android Studio SDK Manager or 'yay -S android-ndk') or set ANDROID_NDK_HOME=/path/to/ndk"; \
+		exit 1; \
 	fi; \
 	echo "Using ANDROID_NDK_HOME=$$NDK_HOME_RESOLVED"; \
 	ANDROID_NDK_HOME="$$NDK_HOME_RESOLVED" \
+	ANDROID_NDK_ROOT="$$NDK_HOME_RESOLVED" \
 	cargo ndk -t x86_64-linux-android -t aarch64-linux-android -t armv7-linux-androideabi -o ./android-build/jniLibs build --release -p anet-mobile
 
 # run infrastructure
