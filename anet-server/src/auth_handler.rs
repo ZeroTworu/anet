@@ -578,7 +578,8 @@ impl ServerAuthHandler {
 
         let (netmask, gateway, base_mtu) = self.registry.get_network_params();
         let mtu = if protocol == "wrtc" {
-            self.wrtc_mtu_cap.map_or(base_mtu, |cap| base_mtu.min(cap))
+            self.wrtc_mtu_cap
+                .map_or(base_mtu, |cap| base_mtu.min(i32::from(cap)))
         } else {
             base_mtu
         };
