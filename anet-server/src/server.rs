@@ -70,10 +70,15 @@ impl ANetServer {
             .with_node_id(node_id),
         );
 
+        let wrtc_mtu_cap = (cfg_ref.wrtc.max_video_batch_bytes.clamp(400, 1400) + 30)
+            .max(cfg_ref.wrtc.min_tun_mtu.clamp(576, 1500) as usize)
+            .saturating_add(cfg_ref.wrtc.video_mtu_overhead as usize)
+            .min(u16::MAX as usize) as u16;
         let ac = ServerAuthHandler::new(
             reg.clone(), dh.clone(), a_prov, sign_key,
             cfg_ref.crypto.quic_cert.clone(), cfg_ref.stealth.padding_step,
-        );
+        )
+        .with_wrtc_mtu_cap(wrtc_mtu_cap);
 
         Ok(Self { cfg: Arc::new(cfg_ref.clone()), registry: reg, temp_dh_map: dh, tun_manager: TunManager::new(t_prm)?, auth_handler_core: ac })
     }

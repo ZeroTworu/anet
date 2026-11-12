@@ -301,10 +301,13 @@ pub async fn run_wrtc_server(
         let srv_id = server_endpoint_id.clone();
         let padding_step = config.stealth.padding_step;
         let min_tun_mtu_global = config.wrtc.min_tun_mtu.clamp(576, 1500);
+        let wrtc_max_tun_mtu_global =
+            (config.wrtc.max_video_batch_bytes.clamp(400, 1400) + 30) as u16;
         let server_tun_mtu_global = config
             .network
             .mtu
             .saturating_sub(config.wrtc.video_mtu_overhead)
+            .min(wrtc_max_tun_mtu_global)
             .max(min_tun_mtu_global) as usize;
         let tcp_clamp_mtu = server_tun_mtu_global;
 
@@ -883,6 +886,7 @@ pub async fn run_wrtc_server(
                                                 .network
                                                 .mtu
                                                 .saturating_sub(config.wrtc.video_mtu_overhead)
+                                                .min((cfg_max_video_batch_bytes + 30) as u16)
                                                 .max(min_tun_mtu)
                                                 as usize;
                                             let ws_tun_mtu = (config.network.mtu as usize).max(min_tun_mtu as usize);

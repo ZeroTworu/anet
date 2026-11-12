@@ -39,6 +39,7 @@ pub struct ServerAuthHandler {
     handshake_cipher: Arc<Cipher>,
     quic_cert_pem: String,
     padding_step: u16,
+    wrtc_mtu_cap: Option<u16>,
 }
 
 #[cfg(test)]
@@ -187,7 +188,13 @@ impl ServerAuthHandler {
             handshake_cipher,
             quic_cert_pem,
             padding_step,
+            wrtc_mtu_cap: None,
         }
+    }
+
+    pub fn with_wrtc_mtu_cap(mut self, wrtc_mtu_cap: u16) -> Self {
+        self.wrtc_mtu_cap = Some(wrtc_mtu_cap);
+        self
     }
 
     pub fn is_probe_packet(&self, packet: &[u8]) -> bool {
@@ -569,7 +576,12 @@ impl ServerAuthHandler {
 
         self.registry.pre_register_client(client_info.clone());
 
-        let (netmask, gateway, mtu) = self.registry.get_network_params();
+        let (netmask, gateway, base_mtu) = self.registry.get_network_params();
+        let mtu = if protocol == "wrtc" {
+            self.wrtc_mtu_cap.map_or(base_mtu, |cap| base_mtu.min(cap))
+        } else {
+            base_mtu
+        };
 
         let pb_billing = match billing_type.unwrap_or(DtoBillingType::NoTariffNoGroup) {
             DtoBillingType::Unknown => ProtoBillingType::Unknown,
