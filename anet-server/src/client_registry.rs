@@ -1,16 +1,19 @@
 use crate::ip_pool::IpPool;
 use crate::multikey_udp_socket::StreamSender;
+use crate::shaper::Shaper;
+use anet_common::dto::{BillingType, NodeSessionCountItem, TrafficUsageSample};
 use anet_common::encryption::Cipher;
-use anet_common::dto::{TrafficUsageSample, BillingType};
 use arc_swap::{ArcSwap, ArcSwapOption};
 use bytes::Bytes;
 use dashmap::DashMap;
 use log::{info, warn};
+use quinn::Connection;
+use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
-use std::time::SystemTime;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant, SystemTime};
+use tokio::sync::Notify;
 
 fn current_timestamp_secs() -> u64 {
     SystemTime::now()
@@ -48,13 +51,13 @@ pub struct ClientTransportInfo {
     /// Момент создания логической сессии для честного вытеснения самой старой сессии (FIFO)
     pub created_at: u64,
     /// Активное QUIC-соединение (для гарантированной отправки CONNECTION_CLOSE ДО удаления записи из clients_by_addr)
-    pub quic_conn: ArcSwapOption<quinn::Connection>,
+    pub quic_conn: ArcSwapOption<Connection>,
     /// Предкэшированные атомарные счётчики трафика (исключают format! и DashMap write-lock на каждый пакет)
-    pub traffic_counters: std::sync::OnceLock<Arc<TrafficCounters>>,
+    pub traffic_counters: OnceLock<Arc<TrafficCounters>>,
 }
 
 impl ClientTransportInfo {
-    pub fn set_quic_connection(&self, conn: quinn::Connection) {
+    pub fn set_quic_connection(&self, conn: Connection) {
         self.quic_conn.store(Some(Arc::new(conn)));
     }
 }
@@ -104,7 +107,7 @@ mod tests {
             last_activity: Arc::new(AtomicU64::new(current_timestamp_secs())),
             created_at: current_timestamp_secs(),
             quic_conn: ArcSwapOption::empty(),
-            traffic_counters: std::sync::OnceLock::new(),
+            traffic_counters: OnceLock::new(),
         })
     }
 
@@ -194,8 +197,8 @@ pub struct ClientRegistry {
     ip_pool: IpPool,
     accepting_connections: Arc<AtomicBool>,
     traffic_totals: Arc<DashMap<String, Arc<TrafficCounters>>>,
-    shaper: Arc<ArcSwapOption<crate::shaper::Shaper>>,
-    state_changed: Arc<tokio::sync::Notify>,
+    shaper: Arc<ArcSwapOption<Shaper>>,
+    state_changed: Arc<Notify>,
 }
 
 impl ClientRegistry {
@@ -211,7 +214,7 @@ impl ClientRegistry {
             accepting_connections: Arc::new(AtomicBool::new(true)),
             traffic_totals: Arc::new(DashMap::new()),
             shaper: Arc::new(ArcSwapOption::empty()),
-            state_changed: Arc::new(tokio::sync::Notify::new()),
+            state_changed: Arc::new(Notify::new()),
         }
     }
 
@@ -226,7 +229,7 @@ impl ClientRegistry {
             .map(|entry| entry.value().clone())
     }
 
-    pub fn set_shaper(&self, shaper: Arc<crate::shaper::Shaper>) {
+    pub fn set_shaper(&self, shaper: Arc<Shaper>) {
         self.shaper.store(Some(shaper));
     }
 
@@ -273,9 +276,9 @@ impl ClientRegistry {
 
     /// Возвращает декларативный снимок живых логических сессий по каждому fingerprint на этой ноде.
     /// Учитываются только реально обслуживаемые (финализированные) сессии в `quic_router`.
-    pub fn active_session_counts(&self) -> Vec<anet_common::dto::NodeSessionCountItem> {
-        let mut stats: std::collections::HashMap<String, (u32, u64)> = std::collections::HashMap::new();
-        let mut seen_sessions = std::collections::HashSet::new();
+    pub fn active_session_counts(&self) -> Vec<NodeSessionCountItem> {
+        let mut stats: HashMap<String, (u32, u64)> = HashMap::new();
+        let mut seen_sessions = HashSet::new();
 
         for entry in self.clients_by_ip.iter() {
             let info = entry.value();
@@ -295,19 +298,17 @@ impl ClientRegistry {
 
         stats
             .into_iter()
-            .map(|(fingerprint, (count, oldest_created_at))| {
-                anet_common::dto::NodeSessionCountItem {
-                    fingerprint,
-                    count,
-                    oldest_created_at,
-                }
+            .map(|(fingerprint, (count, oldest_created_at))| NodeSessionCountItem {
+                fingerprint,
+                count,
+                oldest_created_at,
             })
             .collect()
     }
 
     /// Возвращает фактическое число живых (финализированных) сессий указанного `fingerprint` на этой ноде.
     pub fn active_session_count_for_fingerprint(&self, fingerprint: &str) -> u32 {
-        let mut seen_sessions = std::collections::HashSet::new();
+        let mut seen_sessions = HashSet::new();
         for entry in self.clients_by_ip.iter() {
             let info = entry.value();
             if info.fingerprint == fingerprint && self.quic_router.contains_key(&info.assigned_ip) {
@@ -388,7 +389,7 @@ impl ClientRegistry {
     }
 
     pub fn traffic_snapshot(&self) -> Vec<TrafficUsageSample> {
-        let active_sessions: std::collections::HashSet<String> = self.clients_by_prefix
+        let active_sessions: HashSet<String> = self.clients_by_prefix
             .iter()
             .map(|entry| format!("{}#{}", entry.value().fingerprint, entry.value().protocol))
             .collect();
@@ -575,26 +576,44 @@ impl ClientRegistry {
                 conn.close(0u32.into(), b"Disconnected by admin");
             }
 
-            self.quic_router.remove(client_ip);
-            if let Ok(ip_addr) = client_ip.parse::<Ipv4Addr>() {
-                self.ipv4_router.remove(&ip_addr);
-            }
-            self.clients_by_prefix.remove(&client_info.nonce_prefix);
-            self.clients_by_addr.remove(&remote_addr);
-            self.clients_by_ip.remove(client_ip);
-            self.clear_shaper_limit(client_ip);
+            if self
+                .clients_by_ip
+                .remove_if(client_ip, |_, current| {
+                    current.session_id == client_info.session_id
+                })
+                .is_some()
+            {
+                self.quic_router.remove(client_ip);
+                if let Ok(ip_addr) = client_ip.parse::<Ipv4Addr>() {
+                    self.ipv4_router.remove(&ip_addr);
+                }
+                self.clients_by_prefix
+                    .remove_if(&client_info.nonce_prefix, |_, current| {
+                        current.session_id == client_info.session_id
+                    });
+                self.clients_by_addr
+                    .remove_if(&remote_addr, |_, current| {
+                        current.session_id == client_info.session_id
+                    });
+                self.clear_shaper_limit(client_ip);
 
-            // Очищаем локальные счетчики трафика только если у этого ключа+протокола больше нет живых сессий
-            self.cleanup_traffic_totals_if_no_active_sessions(
-                &client_info.fingerprint,
-                &client_info.protocol,
-            );
+                // Очищаем локальные счетчики трафика только если у этого ключа+протокола больше нет живых сессий
+                self.cleanup_traffic_totals_if_no_active_sessions(
+                    &client_info.fingerprint,
+                    &client_info.protocol,
+                );
 
-            if let Ok(ip_addr) = client_ip.parse::<Ipv4Addr>() {
-                self.ip_pool.release(ip_addr);
+                if let Ok(ip_addr) = client_ip.parse::<Ipv4Addr>() {
+                    self.ip_pool.release(ip_addr);
+                }
+                self.state_changed.notify_one();
+                info!("[Registry] Client {} removed.", client_ip);
+            } else {
+                info!(
+                    "[Registry] Skip removing IP {} routes: session {} was concurrently replaced",
+                    client_ip, client_info.session_id
+                );
             }
-            self.state_changed.notify_one();
-            info!("[Registry] Client {} removed.", client_ip);
         } else {
             info!(
                 "[Registry] Skip removing IP {} routes: session {} already removed or replaced",
@@ -610,12 +629,14 @@ impl ClientRegistry {
         // АТОМАРНАЯ ЗАЩИТА: очищаем роутер и переводим сессию в suspended ТОЛЬКО если
         // в таблице активных клиентов сейчас действительно числится именно ЭТА сессия,
         // а не более новая (и она ещё не была вытеснена через remove_client).
-        let is_current = self
+        let removed_current = self
             .clients_by_ip
-            .get(&client_ip)
-            .is_some_and(|current| current.session_id == client_info.session_id);
+            .remove_if(&client_ip, |_, current| {
+                current.session_id == client_info.session_id
+            })
+            .is_some();
 
-        if !is_current {
+        if !removed_current {
             info!(
                 "[Registry] Skip suspending IP {}: session {} already removed or superseded",
                 client_ip, client_info.session_id
@@ -627,9 +648,14 @@ impl ClientRegistry {
         if let Ok(ip_addr) = client_ip.parse::<Ipv4Addr>() {
             self.ipv4_router.remove(&ip_addr);
         }
-        self.clients_by_prefix.remove(&client_info.nonce_prefix);
-        self.clients_by_addr.remove(&remote_addr);
-        self.clients_by_ip.remove(&client_ip);
+        self.clients_by_prefix
+            .remove_if(&client_info.nonce_prefix, |_, current| {
+                current.session_id == client_info.session_id
+            });
+        self.clients_by_addr
+            .remove_if(&remote_addr, |_, current| {
+                current.session_id == client_info.session_id
+            });
 
         // ПРИМЕЧАНИЕ: лимит скорости намеренно НЕ снимается — плановая
         // ротация WS-сессии ожидаемо резюмируется на том же assigned_ip, и
@@ -745,7 +771,12 @@ impl ClientRegistry {
             return;
         }
 
-        if let Some((_, client)) = self.clients_by_addr.remove(&old_addr) {
+        if let Some((_, client)) = self
+            .clients_by_addr
+            .remove_if(&old_addr, |_, current| {
+                current.session_id == client_info.session_id
+            })
+        {
             self.clients_by_addr.insert(new_addr, client);
             info!(
                 "[Registry] Client {} roamed from {} to {}",

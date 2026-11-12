@@ -63,7 +63,8 @@
 Сервер `anet-server` реализует минималистичный и защищённый обработчик `russh::server::Handler`:
 * **Запрет интерактивного шелла:** Метод `shell_request` всегда возвращает `session.channel_failure(channel)`, не позволяя открыть терминал.
 * **Строгий фильтр команд в `exec_request`:** Если запрошенная команда отлична от байтовой строки `b"anet-vpn"`, сервер удаляет канал из `pending_channels`, отправляет `channel_failure(channel_id)` и немедленно закрывает канал `session.close(channel_id)`.
-* **Двойная криптографическая верификация:** Хотя `auth_none` на уровне SSH возвращает `Auth::Accept`, а клиентский `ClientHandler::check_server_key` принимает любой SSH-ключ хоста, доступ к VPN-сети невозможен без прохождения 4-фазного рукопожатия **ASTP** (с проверкой подписей Ed25519 обеих сторон и тайм-аутом `ASTP_AUTH_TIMEOUT = 30s`). Если клиент не завершает ASTP за 30 секунд, сессия принудительно разрывается.
+* **Корректная обработка `channel_eof`:** При получении `SSH_MSG_CHANNEL_EOF` от клиента метод `AnetSshHandler::channel_eof` немедленно удаляет канал из `pending_channels` и вызывает `session.close(channel)`, гарантируя освобождение дескрипторов и завершение `handle_ssh_vpn_session` без зависших полуоткрытых потоков.
+* **Двойная криптографическая верификация:** Хотя `auth_none` на уровне SSH возвращает `Auth::Accept`, а клиентский `ClientHandler::check_server_key` принимает любой SSH-ключ хоста (с таймаутом установки TCP-соединения `SSH_CONNECT_TIMEOUT = 15s`), доступ к VPN-сети невозможен без прохождения 4-фазного рукопожатия **ASTP** (с проверкой подписей Ed25519 обеих сторон и тайм-аутом `ASTP_AUTH_TIMEOUT = 30s`). Если клиент не завершает ASTP за 30 секунд, сессия принудительно разрывается.
 
 ### 2.2. Однократная попытка рукопожатия на потоке (`authenticate_once`)
 В отличие от UDP/QUIC, где потеря датаграммы компенсируется повторными попытками (`authenticate`), для SSH используется `auth_handler.authenticate_once(&auth_channel)`:
@@ -119,21 +120,21 @@
 1. Склеенный батч с учётом заголовков гарантированно помещался в `SSH_MAX_PACKET_SIZE (32 КиБ)` и не вызывал лишней фрагментации или паники перераспределения буфера `CryptoVec::resize` внутри `russh`.
 2. Принудительный `stream.flush().await` после каждого `write_all` **удалён** — отправка происходит естественным образом по мере формирования пакетов `russh`, что снижает количество системных вызовов `sendto`/`write`.
 
-### 4.2. Архитектура воркеров на клиенте и устранение `MutexVpnStream`
+### 4.2. Архитектура воркеров на клиенте, жадный `FrameReader` и устранение `MutexVpnStream`
 В `anet-client-core/src/transport/ssh.rs`:
 1. Создаётся внутренний полнодуплексный мост `tokio::io::duplex(MAX_PACKET_SIZE * 10)` между ядром клиента (`client.rs`) и фоновой задачей SSH-транспорта.
 2. Половина `client_stream` передаётся в `ConnectionResult::vpn_stream` **напрямую (`Box::new(client_stream)`) без обёртки `Arc<Mutex<...>>`**, что полностью исключает аллокации `Box::pin(lock())` на каждом `poll_read` / `poll_write`.
 3. Внутри фоновой задачи работают 4 асинхронных воркера под управлением `tokio::select!`:
-   * `tunnel_input`: читает фреймированные IP-пакеты из `tunnel_reader` и передаёт в `packet_tx`.
+   * `tunnel_input`: читает фреймированные IP-пакеты из `tunnel_reader` через жадный `FrameReader` (`64 КиБ` буфер + неблокирующий цикл `Poll::Ready` в `stream_framing.rs`) и передаёт в `packet_tx`, обеспечивая непрерывное наполнение батча до `CRYPTO_COALESCE_BUDGET_BYTES = 16 КБ`.
    * `outbound`: шифрует, выравнивает, коалесцирует (до 16 КБ) и пишет в `writer` SSH-канала (`bridge_crypto_stream_with_jitter`).
    * `inbound`: читает из `reader` SSH-канала, расшифровывает in-place и отправляет в `network_tx` (`receive_crypto_stream`).
    * `tunnel_output`: читает расшифрованные пакеты из `network_rx` и пишет во внутренний `tunnel_writer`.
-4. **Безопасное завершение `tokio::select!`:** Как только любой из 4 воркеров завершается (например, `Inbound` при закрытии канала сервером), его `JoinHandle` помечается как `finished_worker`, а `abort()` и `.await` вызываются **только для трёх остальных воркеров** (предотвращая панику Tokio `"JoinHandle polled after completion"`).
+4. **Безопасное завершение `tokio::select!` (`join_remaining_workers`):** Как только любой из 4 воркеров завершается (например, `Inbound` при закрытии канала сервером), его `JoinHandle` помечается как `finished_worker`, а `abort()` и `.await` вызываются **только для трёх остальных воркеров** (предотвращая панику Tokio `"JoinHandle polled after completion"`).
 5. Сама структура `ssh_session` (`russh::client::Handle`) удерживается внутри задачи (`let _session_guard = ssh_session;`) на всё время жизни туннеля и автоматически закрывает SSH-соединение при завершении задачи.
 
-### 4.3. Защита от переполнения очереди TUN на сервере (Backpressure)
-В `anet-server/src/servers/ssh.rs` (`receive_from_client`) отправка расшифрованного пакета в TUN выполняется через неблокирующий `tun_tx.try_send(packet)`:
-* При переполнении очереди (`TrySendError::Full`) пакет отбрасывается с логом `[SSH] TUN queue full, dropping uplink packet`, что не блокирует чтение TCP/SSH-сокета.
+### 4.3. Защита от переполнения очереди TUN на сервере и изолированный MTU
+* В `anet-server/src/servers/ssh.rs` (`receive_from_client`) отправка расшифрованного пакета в TUN выполняется через неблокирующий `tun_tx.try_send(packet)`. При переполнении очереди (`TrySendError::Full`) пакет отбрасывается с логом `[SSH] TUN queue full, dropping uplink packet`, что не блокирует чтение TCP/SSH-сокета.
+* Сессии `SSH` всегда получают полный серверный `[network] mtu` (например, `1400`), не зависящий от настроек `video_mtu_overhead` секции `[wrtc]`. При завершении или переподключении сессии `ClientRegistry::remove_client` удаляет маршруты атомарно по совпадению `session_id`.
 
 ---
 

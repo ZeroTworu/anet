@@ -1,8 +1,13 @@
 use crate::consts::{TAG_UNTAGGED, VP8_HEADER_TAIL_MAGIC};
-use anyhow::Context;
+use anyhow::{Context, Result, anyhow};
 use base64::prelude::*;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::convert::Infallible;
+use std::net::Ipv4Addr;
+use std::str::FromStr;
 
 /// Проверяет, начинается ли полезная нагрузка VP8 с валидного заголовка ANet (Keyframe 16p/1080p или Interframe).
 #[inline]
@@ -16,7 +21,7 @@ pub fn is_valid_vp8_frame_header(data: &[u8]) -> bool {
 /// Вычисляет уникальный 2-байтный тег клиента из строки с IPv4-адресом.
 /// Для подсетей /16–/24 младшие два байта гарантируют уникальность каждого клиента в пуле.
 pub fn client_tag_from_ip(ip: &str) -> u16 {
-    if let Ok(ipv4) = ip.parse::<std::net::Ipv4Addr>() {
+    if let Ok(ipv4) = ip.parse::<Ipv4Addr>() {
         client_tag_from_ipv4(ipv4)
     } else {
         TAG_UNTAGGED
@@ -24,7 +29,7 @@ pub fn client_tag_from_ip(ip: &str) -> u16 {
 }
 
 /// Вычисляет уникальный 2-байтный тег клиента из структуры Ipv4Addr.
-pub fn client_tag_from_ipv4(ip: std::net::Ipv4Addr) -> u16 {
+pub fn client_tag_from_ipv4(ip: Ipv4Addr) -> u16 {
     let octets = ip.octets();
     u16::from_be_bytes([octets[2], octets[3]])
 }
@@ -54,7 +59,7 @@ pub struct ReceiverVideoConstraints {
     #[serde(rename = "onStageSources", skip_serializing_if = "Option::is_none")]
     pub on_stage_sources: Option<Vec<String>>,
     #[serde(rename = "constraints", skip_serializing_if = "Option::is_none")]
-    pub constraints: Option<std::collections::HashMap<String, VideoConstraint>>,
+    pub constraints: Option<HashMap<String, VideoConstraint>>,
 }
 
 impl ReceiverVideoConstraints {
@@ -81,8 +86,7 @@ impl ReceiverVideoConstraints {
     }
 
     pub fn for_endpoints(endpoints: &[String], max_height: u32) -> Self {
-        let mut map = std::collections::HashMap::new();
-        let mut sources = Vec::with_capacity(endpoints.len());
+        let mut map = HashMap::new();
         for ep in endpoints {
             map.insert(ep.clone(), VideoConstraint { max_height });
             let src_name = if ep.ends_with("-v0") {
@@ -90,8 +94,7 @@ impl ReceiverVideoConstraints {
             } else {
                 format!("{ep}-v0")
             };
-            map.insert(src_name.clone(), VideoConstraint { max_height });
-            sources.push(src_name);
+            map.insert(src_name, VideoConstraint { max_height });
         }
         Self {
             colibri_class: "ReceiverVideoConstraints".to_string(),
@@ -104,8 +107,8 @@ impl ReceiverVideoConstraints {
             default_constraints: VideoConstraint { max_height },
             selected_endpoints: Some(endpoints.to_vec()),
             on_stage_endpoints: Some(endpoints.to_vec()),
-            selected_sources: Some(sources.clone()),
-            on_stage_sources: Some(sources),
+            selected_sources: None,
+            on_stage_sources: None,
             constraints: Some(map),
         }
     }
@@ -157,8 +160,8 @@ impl WrtcMode {
     }
 }
 
-impl std::str::FromStr for WrtcMode {
-    type Err = std::convert::Infallible;
+impl FromStr for WrtcMode {
+    type Err = Infallible;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Ok(match s.trim().to_lowercase().as_str() {
@@ -234,7 +237,6 @@ pub fn compute_server_endpoint_suffix(
     server_pub_key_bytes: &[u8; 32],
     conference_id: &str,
 ) -> String {
-    use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(server_pub_key_bytes);
     hasher.update(conference_id.as_bytes());
@@ -391,23 +393,23 @@ pub fn verify_beacon(
     client_nonce: &str,
     server_id: &str,
     signature_b64: &str,
-) -> anyhow::Result<bool> {
+) -> Result<bool> {
     let pub_bytes = BASE64_STANDARD.decode(server_pub_key_b64.trim())
         .context("Failed to base64 decode server_pub_key")?;
     let pub_array: [u8; 32] = pub_bytes
         .as_slice()
         .try_into()
-        .map_err(|_| anyhow::anyhow!("Invalid server public key length (expected 32 bytes)"))?;
+        .map_err(|_| anyhow!("Invalid server public key length (expected 32 bytes)"))?;
 
     let verifying_key = VerifyingKey::from_bytes(&pub_array)
-        .map_err(|e| anyhow::anyhow!("Invalid Ed25519 verifying key: {e}"))?;
+        .map_err(|e| anyhow!("Invalid Ed25519 verifying key: {e}"))?;
 
     let sig_bytes = BASE64_STANDARD.decode(signature_b64.trim())
         .context("Failed to base64 decode beacon signature")?;
     let sig_array: [u8; 64] = sig_bytes
         .as_slice()
         .try_into()
-        .map_err(|_| anyhow::anyhow!("Invalid signature length (expected 64 bytes)"))?;
+        .map_err(|_| anyhow!("Invalid signature length (expected 64 bytes)"))?;
 
     let signature = Signature::from_bytes(&sig_array);
 

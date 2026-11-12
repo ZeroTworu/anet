@@ -130,16 +130,19 @@
 * При `frag_enabled = false` кадр `ClientCutText` отправляется одним вызовом `write_all` без сигнатурного маркера `[0x00, 0x01]`.
 * При `frag_enabled = true` первый `ClientCutText`-фрейм разрезается на уровне TCP-сегментов (`TCP_NODELAY = true`) в случайных точках с наносекундным джиттером, оставаясь на 100% валидным потоком RFB 3.8 для любого анализатора протокола.
 
-### 4.2. Коалесценция RFB-фреймов (`CRYPTO_COALESCE_BUDGET_BYTES = 16 КБ`)
-Как в `send_to_server` (клиент), так и в `send_to_client` (сервер) реализован высокопроизводительный цикл пакетной отправки:
-1. Каждый IP-пакет шифруется через `anet_common::transport::wrap_packet` с добавлением выравнивающего паддинга (`padding_step`, но не более `PADDING_MTU = 1450` байт).
-2. Зашифрованный конверт оборачивается в RFB-кадр (`encode_cut_text` на клиенте / `encode_framebuffer_update` на сервере) и дописывается в общий буфер `batch_buf: BytesMut`.
-3. В неблокирующем цикле `try_recv()` в этот же `batch_buf` добираются следующие готовые пакеты из очереди до достижения бюджета **`CRYPTO_COALESCE_BUDGET_BYTES = 16 384` байт (16 КиБ)**.
-4. Весь буфер отправляется в `TcpStream` за один системный вызов `writer.write_all(&batch_buf).await` без принудительного `flush()`.
+### 4.2. Правдоподобный стартовый кадр экрана и коалесценция RFB-фреймов (`CRYPTO_COALESCE_BUDGET_BYTES = 16 КБ`)
+Сразу после обмена `ClientInit` / `ServerInit` клиент отправляет стандартные сообщения настройки сессии (`SetPixelFormat`, `SetEncodings`, `FramebufferUpdateRequest` на весь экран `1024x768`), а сервер в `emulate_rfb_server_handshake` отвечает полным первичным кадром `FramebufferUpdate (0x00)` с чёрным экраном (`VNC_RFB_BLACK_SCREEN_TOTAL_BYTES = 1024 * 768 * 4 = 3 145 728` байт, передаваемым чанками по `VNC_RFB_BLACK_SCREEN_CHUNK_SIZE = 65 536` байт).
 
-### 4.3. Zero-Copy дешифрация и Backpressure
+Как в `send_to_server` (клиент), так и в `send_to_client` (сервер) реализован высокопроизводительный цикл пакетной отправки:
+1. Воркер `tunnel_input` на клиенте вычитывает пакеты из внутреннего моста через жадный `FrameReader` (`64 КиБ` буфер + неблокирующий цикл `Poll::Ready` в `anet-common/src/stream_framing.rs`), подавая пачки пакетов в `packet_tx` без искусственного дробления на границах 8 КБ.
+2. Каждый IP-пакет шифруется через `wrap_packet` с добавлением выравнивающего паддинга (`padding_step`, но не более `PADDING_MTU = 1450` байт).
+3. Зашифрованный конверт оборачивается в RFB-кадр (`encode_cut_text` на клиенте / `encode_framebuffer_update` на сервере) и дописывается в общий буфер `batch_buf: BytesMut`.
+4. В неблокирующем цикле `try_recv()` в этот же `batch_buf` добираются следующие готовые пакеты из очереди до достижения бюджета **`CRYPTO_COALESCE_BUDGET_BYTES = 16 384` байт (16 КиБ)**.
+5. Весь буфер отправляется в `TcpStream` за один системный вызов `writer.write_all(&batch_buf).await` без принудительного `flush()`.
+
+### 4.3. Zero-Copy дешифрация, Backpressure и атомарная очистка сессии
 * **На приёме (`receive_from_server` и `receive_from_client`):** Полученный `Bytes` передаётся в `unwrap_packet_bytes_in_place(&cipher, encrypted)`, который расшифровывает `ChaCha20-Poly1305` прямо поверх выделенного буфера без повторной аллокации.
-* **На сервере (`receive_from_client`):** Запись в канал TUN-интерфейса выполняется через неблокирующий `tun_tx.try_send(packet)`. При переполнении очереди TUN пакет отбрасывается (`[VNC] TUN queue full, dropping uplink packet`), исключая взаимную блокировку (Deadlock) TCP-чтения и записи.
+* **На сервере (`receive_from_client`):** Запись в канал TUN-интерфейса выполняется через неблокирующий `tun_tx.try_send(packet)`. При переполнении очереди TUN пакет отбрасывается (`[VNC] TUN queue full, dropping uplink packet`), исключая взаимную блокировку (Deadlock) TCP-чтения и записи. При закрытии соединения `ClientRegistry::remove_client` удаляет записи клиента атомарно с проверкой `session_id`.
 
 ---
 

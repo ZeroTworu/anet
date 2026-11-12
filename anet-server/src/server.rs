@@ -2,34 +2,44 @@ use crate::auth_handler::ServerAuthHandler;
 use crate::auth_provider::AuthProvider;
 use crate::client_registry::ClientRegistry;
 use crate::config::Config;
+use crate::control_plane::run_heartbeat;
 use crate::ip_pool::IpPool;
 use crate::multikey_udp_socket::TempDHInfo;
 use crate::servers::{http_stream, imap, quic, ssh, vnc, websocket, wrtc};
+use crate::shaper::Shaper;
+use crate::utils::extract_ip_dst;
 
 use anet_common::atun::TunManager;
+use anet_common::boring_tls::{set_browser_profiles, set_default_tls_config};
+use anet_common::consts::CHANNEL_BUFFER_SIZE;
+use anet_common::icmp_probe::handle_in_tunnel_icmp_probe;
 use anet_common::tun_params::TunParams;
 use anyhow::Result;
 use base64::prelude::*;
 use bytes::Bytes;
 use dashmap::DashMap;
 use ed25519_dalek::SigningKey;
-use log::error;
+use futures::future::join_all;
+use log::{error, info};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::mpsc;
+use tokio::time::sleep;
 
 pub struct ANetServer {
     cfg: Arc<Config>,
     registry: Arc<ClientRegistry>,
-    temp_dh_map: Arc<DashMap<std::net::SocketAddr, TempDHInfo>>,
+    temp_dh_map: Arc<DashMap<SocketAddr, TempDHInfo>>,
     tun_manager: TunManager,
     auth_handler_core: ServerAuthHandler,
 }
 
 impl ANetServer {
     pub fn new(cfg_ref: &Config) -> Result<Self> {
-        anet_common::boring_tls::set_default_tls_config(cfg_ref.stealth.to_tls_client_config());
+        set_default_tls_config(cfg_ref.stealth.to_tls_client_config());
         if !cfg_ref.browser_profiles.is_empty() {
-            anet_common::boring_tls::set_browser_profiles(cfg_ref.browser_profiles.clone());
+            set_browser_profiles(cfg_ref.browser_profiles.clone());
         }
         let t_prm = TunParams {
             netmask: cfg_ref.network.mask.parse()?, gateway: cfg_ref.network.gateway.parse()?,
@@ -80,7 +90,7 @@ impl ANetServer {
                 .get_actual_name()
                 .unwrap_or(self.cfg.network.if_name.as_str())
                 .to_string();
-            match crate::shaper::Shaper::attach(&iface).await {
+            match Shaper::attach(&iface).await {
                 Ok(shaper) => self.registry.set_shaper(Arc::new(shaper)),
                 Err(e) => error!(
                     "[Shaper] Failed to attach eBPF shaper to '{}': {}. Speed limits will not be enforced.",
@@ -92,7 +102,7 @@ impl ANetServer {
         let control_config = self.cfg.control_plane.clone();
         let control_registry = self.registry.clone();
         tokio::spawn(async move {
-            crate::control_plane::run_heartbeat(control_config, control_registry).await;
+            run_heartbeat(control_config, control_registry).await;
         });
 
         // 1. Дешифратор маршрутов: от ядра ОС к внутренним регистрам UDP/TCP транспорта
@@ -103,7 +113,7 @@ impl ANetServer {
                 let mut batch = 0usize;
                 while let Some(packet) = current_pkt.take() {
                     if packet.len() >= 20 {
-                        if let Some(dst_ip) = crate::utils::extract_ip_dst(&packet) {
+                        if let Some(dst_ip) = extract_ip_dst(&packet) {
                             rx_reg.route_packet_to_ipv4(dst_ip, packet).await;
                         }
                     }
@@ -121,7 +131,7 @@ impl ANetServer {
         let gc_registry = self.registry.clone();
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(Duration::from_secs(10)).await;
+                sleep(Duration::from_secs(10)).await;
                 gcx.retain(|_, v| v.created_at.elapsed() <= Duration::from_secs(30));
                 gc_registry.cleanup_suspended().await;
                 gc_registry.cleanup_inactive_clients(30).await;
@@ -132,10 +142,10 @@ impl ANetServer {
         // Канал входящих пакетов от клиентов (все транспорты шлют сюда).
         // Перехватываем внутритуннельные ICMP Echo Request зонды в userspace
         // и мгновенно отправляем ICMP Echo Reply клиенту через registry.route_packet_to_client.
-        // Это гарантирует точный замер сквозного RTT на всех транспортах (WRTC/SSH/VNC/WS/AHTTP/QUIC/IMAP)
+        // Это гарантирует точный замер сквозного RTT на всех транспортах (WRTC/SSH/VNC/WS/AHTTP/QUIC)
         // без зависимости от ядра ОС сервера, iptables, rp_filter или совпадения IP TUN.
         let (client_pkt_tx, mut client_pkt_rx) =
-            tokio::sync::mpsc::channel::<Bytes>(anet_common::consts::CHANNEL_BUFFER_SIZE);
+            mpsc::channel::<Bytes>(CHANNEL_BUFFER_SIZE);
 
         let probe_registry = self.registry.clone();
         let tun_writer = tx_tun.clone();
@@ -144,8 +154,8 @@ impl ANetServer {
                 let mut current_pkt = Some(first_pkt);
                 let mut batch = 0usize;
                 while let Some(packet) = current_pkt.take() {
-                    if let Some(reply) = anet_common::icmp_probe::handle_in_tunnel_icmp_probe(&packet) {
-                        if let Some(dst_ip) = crate::utils::extract_ip_dst(&reply) {
+                    if let Some(reply) = handle_in_tunnel_icmp_probe(&packet) {
+                        if let Some(dst_ip) = extract_ip_dst(&reply) {
                             probe_registry
                                 .route_packet_to_ipv4(dst_ip, reply)
                                 .await;
@@ -265,10 +275,10 @@ impl ANetServer {
                 }
             }));
         } else {
-            log::info!("[IMAP Server] IMAP transport is not configured (no imap_dsn in [server] or [imap])");
+            info!("[IMAP Server] IMAP transport is not configured (no imap_dsn in [server] or [imap])");
         }
 
-        futures::future::join_all(handle_collection).await;
+        join_all(handle_collection).await;
         Ok(())
     }
 }

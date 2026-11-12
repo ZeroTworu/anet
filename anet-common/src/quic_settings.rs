@@ -1,11 +1,14 @@
 // Файл: anet-common/src/quic_settings.rs
 
+use crate::consts::{PADDING_MTU, TRANSPORT_ENVELOPE_OVERHEAD};
 use anyhow::Result;
 use log::info;
 use quinn::congestion::{BbrConfig, ControllerFactory, CubicConfig};
 use quinn::{IdleTimeout, MtuDiscoveryConfig, TransportConfig, VarInt};
 use serde::Deserialize;
+use socket2::SockRef;
 use std::{sync::Arc, time::Duration};
+use tokio::net::UdpSocket;
 
 const BYTES_IN_MEGABIT: u64 = 125_000;
 
@@ -116,8 +119,7 @@ pub fn build_transport_config(cfg: &QuicConfig, mtu: u16) -> Result<TransportCon
         .send_window(final_send_window);
 
     // Настройка MTU Discovery
-    let envelope_limit =
-        (crate::consts::PADDING_MTU - crate::consts::TRANSPORT_ENVELOPE_OVERHEAD) as u16;
+    let envelope_limit = (PADDING_MTU - TRANSPORT_ENVELOPE_OVERHEAD) as u16;
     let initial_mtu = mtu.min(envelope_limit).max(1200);
     let max_mtu = cfg.max_mtu.min(envelope_limit).max(initial_mtu);
     let mut mtu_config = MtuDiscoveryConfig::default();
@@ -127,9 +129,7 @@ pub fn build_transport_config(cfg: &QuicConfig, mtu: u16) -> Result<TransportCon
         .mtu_discovery_config(Some(mtu_config));
     info!(
         "QUIC MTU: initial {}, discovery ceiling {} ({} bytes reserved for encryption).",
-        initial_mtu,
-        max_mtu,
-        crate::consts::TRANSPORT_ENVELOPE_OVERHEAD
+        initial_mtu, max_mtu, TRANSPORT_ENVELOPE_OVERHEAD
     );
 
     // Таймаут
@@ -160,8 +160,8 @@ pub fn build_transport_config(cfg: &QuicConfig, mtu: u16) -> Result<TransportCon
 
 pub const QUIC_UDP_SOCKET_BUFFER_SIZE: usize = 4 * 1024 * 1024;
 
-pub fn tune_udp_socket_buffers(sock: &tokio::net::UdpSocket, buffer_size: usize) {
-    let sock_ref = socket2::SockRef::from(sock);
+pub fn tune_udp_socket_buffers(sock: &UdpSocket, buffer_size: usize) {
+    let sock_ref = SockRef::from(sock);
     let _ = sock_ref.set_recv_buffer_size(buffer_size);
     let _ = sock_ref.set_send_buffer_size(buffer_size);
     if let (Ok(rcv), Ok(snd)) = (sock_ref.recv_buffer_size(), sock_ref.send_buffer_size()) {

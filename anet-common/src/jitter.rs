@@ -1,29 +1,32 @@
 use crate::config::StealthConfig;
-use crate::consts::{COALESCE_BUDGET_BYTES, CRYPTO_COALESCE_BUDGET_BYTES, MAX_PENDING_JITTER_PACKETS};
+use crate::consts::{
+    COALESCE_BUDGET_BYTES, CRYPTO_COALESCE_BUDGET_BYTES, MAX_PENDING_JITTER_PACKETS, PADDING_MTU,
+};
 use crate::encryption::Cipher;
 use crate::padding_utils::calculate_padding_needed;
-use crate::stream_framing::frame_packet_into;
+use crate::stream_framing::{FrameReader, frame_packet_into};
+use crate::transport::{unwrap_packet_bytes_in_place, wrap_packet};
+use anyhow::{Result, anyhow};
 use bytes::{Bytes, BytesMut};
 use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt, StreamExt};
+use log::{info, warn};
 use rand::Rng;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
-use tokio::io::AsyncWriteExt;
+use std::time::{Duration, Instant};
+use tokio::io::{AsyncRead, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio::time::sleep;
-
-
 
 pub async fn bridge_with_jitter<S>(
     mut rx: mpsc::Receiver<Bytes>,
     mut stream: S,
     config: StealthConfig,
-) -> anyhow::Result<()>
+) -> Result<()>
 where
     S: AsyncWriteExt + Unpin + Send + 'static,
 {
@@ -102,7 +105,7 @@ pub async fn bridge_crypto_stream_with_jitter<S>(
     cipher: Arc<Cipher>,
     sequence: Arc<AtomicU64>,
     nonce_prefix: [u8; 4],
-) -> anyhow::Result<()>
+) -> Result<()>
 where
     S: AsyncWriteExt + Unpin + Send + 'static,
 {
@@ -113,25 +116,24 @@ where
     let mut input_open = true;
     let mut buf = BytesMut::with_capacity(CRYPTO_COALESCE_BUDGET_BYTES);
 
-    let encrypt_into = |packet: Bytes, buf: &mut BytesMut| -> anyhow::Result<()> {
+    let encrypt_into = |packet: Bytes, buf: &mut BytesMut| -> Result<()> {
         let seq = sequence.fetch_add(1, Ordering::Relaxed);
         let total_len = packet.len() + 38;
         let pad = calculate_padding_needed(total_len, padding_step);
-        let safe_pad = if total_len + (pad as usize) > crate::consts::PADDING_MTU {
+        let safe_pad = if total_len + (pad as usize) > PADDING_MTU {
             0
         } else {
             pad
         };
 
-        let encrypted =
-            crate::transport::wrap_packet(&cipher, &nonce_prefix, seq, packet, safe_pad)?;
-        crate::stream_framing::frame_packet_into(buf, &encrypted);
+        let encrypted = wrap_packet(&cipher, &nonce_prefix, seq, packet, safe_pad)?;
+        frame_packet_into(buf, &encrypted);
         Ok(())
     };
 
     let mut pkt_count = 0u64;
     let mut byte_count = 0u64;
-    let start = std::time::Instant::now();
+    let start = Instant::now();
 
     while input_open || !pending.is_empty() {
         let mut packet = if !jitter_enabled {
@@ -191,7 +193,7 @@ where
         if !buf.is_empty() {
             byte_count += buf.len() as u64;
             if let Err(e) = stream.write_all(&buf).await {
-                log::warn!(
+                warn!(
                     "[CryptoStream/Tx] Stream write failed: {e:#}. Sent so far: {} packets, {} bytes in {:.1}s",
                     pkt_count, byte_count, start.elapsed().as_secs_f64()
                 );
@@ -201,7 +203,7 @@ where
         }
     }
 
-    log::info!(
+    info!(
         "[CryptoStream/Tx] Finished outbound crypto stream. Total sent: {} packets, {} bytes in {:.1}s",
         pkt_count, byte_count, start.elapsed().as_secs_f64()
     );
@@ -223,7 +225,7 @@ fn schedule_with_jitter(
             }
             packet
         }
-            .boxed(),
+        .boxed(),
     );
 }
 
@@ -231,28 +233,28 @@ pub async fn receive_crypto_stream<R>(
     mut reader: R,
     tx: mpsc::Sender<Bytes>,
     cipher: Arc<Cipher>,
-) -> anyhow::Result<()>
+) -> Result<()>
 where
-    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    R: AsyncRead + Unpin + Send + 'static,
 {
     let mut pkt_count = 0u64;
     let mut byte_count = 0u64;
-    let start = std::time::Instant::now();
+    let start = Instant::now();
     let mut last_pkt = start;
 
-    let mut frame_reader = crate::stream_framing::FrameReader::new();
+    let mut frame_reader = FrameReader::new();
     while let Some(encrypted) = frame_reader.read_next_packet(&mut reader).await? {
         pkt_count += 1;
         byte_count += encrypted.len() as u64;
-        last_pkt = std::time::Instant::now();
+        last_pkt = Instant::now();
 
-        let packet = crate::transport::unwrap_packet_bytes_in_place(&cipher, encrypted)?;
+        let packet = unwrap_packet_bytes_in_place(&cipher, encrypted)?;
         tx.send(packet)
             .await
-            .map_err(|_| anyhow::anyhow!("очередь входящих пакетов закрыта"))?;
+            .map_err(|_| anyhow!("очередь входящих пакетов закрыта"))?;
     }
 
-    log::info!(
+    info!(
         "[CryptoStream/Rx] Reached EOF on inbound stream. Read: {} packets ({} bytes) in {:.1}s (last packet {:.3}s ago)",
         pkt_count, byte_count, start.elapsed().as_secs_f64(), last_pkt.elapsed().as_secs_f64()
     );

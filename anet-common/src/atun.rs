@@ -2,9 +2,9 @@ use crate::consts::{CHANNEL_BUFFER_SIZE, MAX_PACKET_SIZE};
 use crate::tun_params::TunParams;
 use anyhow::Result;
 use bytes::{Bytes, BytesMut};
+use log::{error, info, warn};
 #[cfg(target_os = "macos")]
-use log::warn;
-use log::{error, info};
+use std::process::Stdio;
 #[cfg(target_os = "macos")]
 use tokio::process::Command;
 
@@ -187,7 +187,7 @@ impl TunManager {
                             error!("Fatal TUN write error (device closed): {}", e);
                             break 'outer;
                         }
-                        log::debug!(
+                        warn!(
                             "Skipped packet on TUN write (len={}): {}",
                             packet.len(),
                             e
@@ -206,8 +206,6 @@ impl TunManager {
 
     #[cfg(target_os = "macos")]
     async fn configure_macos_interface(&self, interface_name: &str) -> Result<()> {
-        use std::process::Stdio;
-
         let output = Command::new("ifconfig")
             .args([
                 interface_name,

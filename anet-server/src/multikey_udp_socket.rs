@@ -1,34 +1,34 @@
 use crate::client_registry::ClientRegistry;
 use anet_common::config::StealthConfig;
 use anet_common::consts::{
-    MAX_PACKET_SIZE, MIN_HANDSHAKE_LEN, NONCE_LEN, PADDING_MTU, TRANSPORT_ENVELOPE_OVERHEAD,
+    MAX_PACKET_SIZE, MIN_HANDSHAKE_LEN, NONCE_LEN, PADDING_MTU, QUIC_REASSEMBLY_TIMEOUT,
+    TRANSPORT_ENVELOPE_OVERHEAD,
 };
+use anet_common::dto::BillingType;
 use anet_common::handshake_fragmentation::DatagramReassembler;
 use anet_common::padding_utils::calculate_padding_needed;
-use anet_common::transport;
+use anet_common::transport::{unwrap_packet_in_place, wrap_packet_slice};
 use anet_common::udp_poller::TokioUdpPoller;
-use anet_common::dto::BillingType;
-
 use bytes::Bytes;
 use dashmap::DashMap;
-use log::{debug, warn};
+use log::warn;
 use quinn::{
-    AsyncUdpSocket, UdpPoller,
     udp::{RecvMeta, Transmit},
+    AsyncUdpSocket, UdpPoller,
 };
-use std::fmt::{Debug, Formatter};
-use std::io;
-use std::io::IoSliceMut;
+use std::fmt::{Debug, Formatter, Result as FmtResult};
+use std::io::{Error as IoError, ErrorKind, IoSliceMut, Result as IoResult};
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::task::{Context as StdContext, Poll};
 use std::time::Instant;
+use tokio::io::ReadBuf;
 use tokio::net::UdpSocket;
-use tokio::sync::mpsc;
+use tokio::sync::mpsc::Sender;
 
-pub type StreamSender = mpsc::Sender<Bytes>;
+pub type StreamSender = Sender<Bytes>;
 
 #[derive(Clone)]
 pub struct TempDHInfo {
@@ -58,7 +58,7 @@ pub type HandshakeData = (Bytes, SocketAddr);
 pub struct MultiKeyAnetUdpSocket {
     io: Arc<UdpSocket>,
     registry: Arc<ClientRegistry>,
-    auth_tx: mpsc::Sender<HandshakeData>,
+    auth_tx: Sender<HandshakeData>,
     stealth_config: StealthConfig,
     // Реассемблер фрагментированных UDP-хендшейков, по адресу источника.
     // Храним вместе с меткой времени первого фрагмента — если сборка не
@@ -68,13 +68,11 @@ pub struct MultiKeyAnetUdpSocket {
     reassemblers: Arc<DashMap<SocketAddr, (Instant, DatagramReassembler)>>,
 }
 
-const REASSEMBLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-
 impl MultiKeyAnetUdpSocket {
     pub fn new(
         io: Arc<UdpSocket>,
         registry: Arc<ClientRegistry>,
-        auth_tx: mpsc::Sender<HandshakeData>,
+        auth_tx: Sender<HandshakeData>,
         stealth_config: StealthConfig,
     ) -> Self {
         Self {
@@ -88,7 +86,7 @@ impl MultiKeyAnetUdpSocket {
 }
 
 impl Debug for MultiKeyAnetUdpSocket {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         f.debug_struct("MultiKeyAnetUdpSocket")
             .field("local_addr", &self.io.local_addr())
             .finish_non_exhaustive()
@@ -103,7 +101,7 @@ impl AsyncUdpSocket for MultiKeyAnetUdpSocket {
     }
 
     #[inline]
-    fn try_send(&self, transmit: &Transmit) -> io::Result<()> {
+    fn try_send(&self, transmit: &Transmit) -> IoResult<()> {
         if let Some(info) = self.registry.get_by_addr(&transmit.destination) {
             let seq = info.sequence.fetch_add(1, Ordering::Relaxed);
 
@@ -115,20 +113,20 @@ impl AsyncUdpSocket for MultiKeyAnetUdpSocket {
                 padding
             };
 
-            let wrapped = transport::wrap_packet_slice(
+            let wrapped = wrap_packet_slice(
                 &info.cipher,
                 &info.nonce_prefix,
                 seq,
                 transmit.contents,
                 safe_padding,
             )
-            .map_err(io::Error::other)?;
+            .map_err(IoError::other)?;
             self.io
                 .try_send_to(&wrapped, transmit.destination)
                 .map(|_| ())
         } else {
-            Err(io::Error::new(
-                io::ErrorKind::NotConnected,
+            Err(IoError::new(
+                ErrorKind::NotConnected,
                 format!("no session for {}", transmit.destination),
             ))
         }
@@ -139,7 +137,7 @@ impl AsyncUdpSocket for MultiKeyAnetUdpSocket {
         cx: &mut StdContext<'_>,
         bufs: &mut [IoSliceMut<'_>],
         meta: &mut [RecvMeta],
-    ) -> Poll<io::Result<usize>> {
+    ) -> Poll<IoResult<usize>> {
         let mut count = 0;
         // Индекс текущего буфера Quinn, который мы хотим заполнить
         let mut i = 0;
@@ -148,7 +146,7 @@ impl AsyncUdpSocket for MultiKeyAnetUdpSocket {
 
         // Читаем, пока есть свободные буферы у Quinn
         while i < bufs.len() {
-            let mut read_buf = tokio::io::ReadBuf::new(&mut recv_buf);
+            let mut read_buf = ReadBuf::new(&mut recv_buf);
 
             match self.io.poll_recv_from(cx, &mut read_buf) {
                 Poll::Ready(Ok(remote_addr)) => {
@@ -167,10 +165,7 @@ impl AsyncUdpSocket for MultiKeyAnetUdpSocket {
                             if let Some(client_info) = self.registry.get_by_prefix(&nonce_prefix) {
                                 self.registry.update_client_addr(&client_info, remote_addr);
 
-                                match transport::unwrap_packet_in_place(
-                                    &client_info.cipher,
-                                    raw_packet_mut,
-                                ) {
+                                match unwrap_packet_in_place(&client_info.cipher, raw_packet_mut) {
                                     Ok(quic_payload) => {
                                         self.registry.touch_client(&client_info);
                                         // УРА! Это пакет для Quinn (данные туннеля)
@@ -213,7 +208,7 @@ impl AsyncUdpSocket for MultiKeyAnetUdpSocket {
                                 .reassemblers
                                 .entry(remote_addr)
                                 .and_modify(|(ts, reassembler)| {
-                                    if ts.elapsed() > REASSEMBLY_TIMEOUT {
+                                    if ts.elapsed() > QUIC_REASSEMBLY_TIMEOUT {
                                         *reassembler = DatagramReassembler::new();
                                     }
                                     *ts = Instant::now();
@@ -223,10 +218,6 @@ impl AsyncUdpSocket for MultiKeyAnetUdpSocket {
                             entry.1.feed(raw_packet_mut)
                         };
 
-                        debug!(
-                            "[Socket] Start reassembling handshake from {}:",
-                            remote_addr
-                        );
                         if let Some(complete) = complete {
                             self.reassemblers.remove(&remote_addr);
 
@@ -267,7 +258,7 @@ impl AsyncUdpSocket for MultiKeyAnetUdpSocket {
         }
     }
 
-    fn local_addr(&self) -> io::Result<SocketAddr> {
+    fn local_addr(&self) -> IoResult<SocketAddr> {
         self.io.local_addr()
     }
 

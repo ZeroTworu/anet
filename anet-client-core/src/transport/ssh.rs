@@ -1,41 +1,49 @@
-use super::{ClientTransport, ConnectionResult};
+use super::{ClientTransport, ConnectionResult, ShutdownHook};
 use crate::auth::{AuthHandler, StreamAuthChannel};
 use crate::config::{CoreConfig, ServerConfig};
+use anet_common::config::StealthConfig;
 use anet_common::consts::{
-    CHANNEL_BUFFER_SIZE, COALESCE_BUDGET_BYTES, CRYPTO_COALESCE_BUDGET_BYTES,
-    MAX_PENDING_JITTER_PACKETS, PADDING_MTU, SSH_CHANNEL_WINDOW_SIZE, SSH_MAX_PACKET_SIZE,
+    normalize_ssh_banner, CHANNEL_BUFFER_SIZE, COALESCE_BUDGET_BYTES, CRYPTO_COALESCE_BUDGET_BYTES,
+    MAX_PENDING_JITTER_PACKETS, PADDING_MTU, SSH_CHANNEL_WINDOW_SIZE, SSH_CONNECT_TIMEOUT,
+    SSH_MAX_PACKET_SIZE, TRANSPORT_ENVELOPE_OVERHEAD, WRTC_MIN_IP_PACKET_LEN,
 };
+use anet_common::encryption::Cipher;
 use anet_common::padding_utils::calculate_padding_needed;
-use anet_common::stream_framing::{FrameReader, frame_packet_into, supervise_bidirectional_workers, FinishedWorker};
-use anyhow::{Context, Result};
+use anet_common::stream_framing::{
+    frame_packet_into, supervise_bidirectional_workers, FinishedWorker, FrameReader,
+};
+use anet_common::transport::{unwrap_packet_bytes_in_place, wrap_packet};
+use anyhow::{anyhow, ensure, Context, Result};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt, StreamExt};
 use log::{info, warn};
-use rand::{Rng, SeedableRng, rngs::StdRng};
-use russh::client::Handler;
+use rand::{rngs::StdRng, Rng, SeedableRng};
+use russh::client::{connect_stream, Config as RusshClientConfig, Handler};
+use russh::keys::PublicKeyOrCertificate;
+use russh::{Error as RusshError, SshId};
 use std::future::ready;
 use std::net::{SocketAddr, ToSocketAddrs};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::io::{
+    duplex, split, AsyncRead, AsyncWrite, AsyncWriteExt, DuplexStream, ReadHalf, WriteHalf,
+};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
-
-const SSH_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
-
+use tokio::time::{sleep, timeout};
 
 struct ClientHandler;
 
 impl Handler for ClientHandler {
-    type Error = russh::Error;
+    type Error = RusshError;
 
     fn check_server_key(
         &mut self,
-        _server_public_key: &russh::keys::PublicKeyOrCertificate,
+        _server_public_key: &PublicKeyOrCertificate,
     ) -> impl Future<Output = Result<bool, Self::Error>> + Send {
         // Подлинность конечного узла дополнительно проверяется подписанным ASTP DH-обменом.
         ready(Ok(true))
@@ -64,15 +72,15 @@ impl ClientTransport for SshTransport {
             .or(self.config.transport.ssh_user.as_deref())
             .unwrap_or("root");
 
-        let banner = anet_common::consts::normalize_ssh_banner(
+        let banner = normalize_ssh_banner(
             self.server
                 .ssh_banner
                 .as_deref()
                 .or(self.config.transport.ssh_banner.as_deref()),
         );
 
-        let ssh_config = Arc::new(russh::client::Config {
-            client_id: russh::SshId::Standard(banner.into()),
+        let ssh_config = Arc::new(RusshClientConfig {
+            client_id: SshId::Standard(banner.into()),
             window_size: SSH_CHANNEL_WINDOW_SIZE,
             maximum_packet_size: SSH_MAX_PACKET_SIZE,
             channel_buffer_size: CHANNEL_BUFFER_SIZE,
@@ -80,7 +88,7 @@ impl ClientTransport for SshTransport {
             ..Default::default()
         });
 
-        let stream = tokio::time::timeout(SSH_CONNECT_TIMEOUT, TcpStream::connect(address))
+        let stream = timeout(SSH_CONNECT_TIMEOUT, TcpStream::connect(address))
             .await
             .context("timed out connecting to the SSH endpoint")??;
         stream.set_nodelay(true)?;
@@ -89,9 +97,9 @@ impl ClientTransport for SshTransport {
             stream.local_addr().ok()
         );
         info!("[SSH] Initiating SSH handshake with user '{user}'");
-        let mut session = russh::client::connect_stream(ssh_config, stream, ClientHandler).await?;
+        let mut session = connect_stream(ssh_config, stream, ClientHandler).await?;
 
-        anyhow::ensure!(
+        ensure!(
             session.authenticate_none(user).await?.success(),
             "SSH none authentication was rejected"
         );
@@ -112,13 +120,13 @@ impl ClientTransport for SshTransport {
         info!("[SSH] ASTP authenticated; assigned IP {}", auth_response.ip);
 
         let stream = Arc::try_unwrap(stream)
-            .map_err(|_| anyhow::anyhow!("SSH authentication stream is still shared"))?
+            .map_err(|_| anyhow!("SSH authentication stream is still shared"))?
             .into_inner();
-        let (reader, writer) = tokio::io::split(stream);
-        let (client_stream, internal_stream) = tokio::io::duplex(512 * 1024);
-        let (tunnel_reader, tunnel_writer) = tokio::io::split(internal_stream);
+        let (reader, writer) = split(stream);
+        let (client_stream, internal_stream) = duplex(512 * 1024);
+        let (tunnel_reader, tunnel_writer) = split(internal_stream);
 
-        let cipher = Arc::new(anet_common::encryption::Cipher::new(&shared_key));
+        let cipher = Arc::new(Cipher::new(&shared_key));
         let nonce_prefix = auth_response
             .nonce_prefix
             .as_slice()
@@ -141,7 +149,7 @@ impl ClientTransport for SshTransport {
         let inbound_abort = inbound.abort_handle();
 
         let supervisor_task = tokio::spawn(async move {
-            let tunnel_start = std::time::Instant::now();
+            let tunnel_start = Instant::now();
             let _session_guard = ssh_session;
 
             let (finished_worker, result) =
@@ -152,7 +160,8 @@ impl ClientTransport for SshTransport {
                 Ok(()) => match finished_worker {
                     FinishedWorker::Inbound => info!(
                         "[SSH] Tunnel closed: remote SSH server closed channel/connection (EOF / session limit or idle timeout). Duration: {:.1}s ({:.2} min)",
-                        duration, duration / 60.0
+                        duration,
+                        duration / 60.0
                     ),
                     FinishedWorker::Outbound => info!(
                         "[SSH] Tunnel closed: client TUN stream or outbound network queue closed. Duration: {:.1}s",
@@ -166,7 +175,7 @@ impl ClientTransport for SshTransport {
             }
         });
         let supervisor_abort = supervisor_task.abort_handle();
-        let shutdown_hook: super::ShutdownHook = Box::pin(async move {
+        let shutdown_hook: ShutdownHook = Box::pin(async move {
             supervisor_abort.abort();
             inbound_abort.abort();
             outbound_abort.abort();
@@ -194,13 +203,11 @@ fn resolve_address(address: &str) -> Result<SocketAddr> {
         .with_context(|| format!("SSH endpoint {address} resolved to no addresses"))
 }
 
-
-
 async fn send_to_server<W>(
-    mut tunnel_reader: tokio::io::ReadHalf<tokio::io::DuplexStream>,
+    mut tunnel_reader: ReadHalf<DuplexStream>,
     mut writer: W,
-    stealth: anet_common::config::StealthConfig,
-    cipher: Arc<anet_common::encryption::Cipher>,
+    stealth: StealthConfig,
+    cipher: Arc<Cipher>,
     sequence: Arc<AtomicU64>,
     nonce_prefix: [u8; 4],
 ) -> Result<()>
@@ -217,15 +224,14 @@ where
 
     let encrypt_into = |packet: Bytes, buf: &mut BytesMut| -> Result<()> {
         let seq = sequence.fetch_add(1, Ordering::Relaxed);
-        let total_len = packet.len() + 38;
+        let total_len = packet.len() + TRANSPORT_ENVELOPE_OVERHEAD;
         let pad = calculate_padding_needed(total_len, padding_step);
         let safe_pad = if total_len + usize::from(pad) > PADDING_MTU {
             0
         } else {
             pad
         };
-        let encrypted =
-            anet_common::transport::wrap_packet(&cipher, &nonce_prefix, seq, packet, safe_pad)?;
+        let encrypted = wrap_packet(&cipher, &nonce_prefix, seq, packet, safe_pad)?;
         frame_packet_into(buf, &encrypted);
         Ok(())
     };
@@ -276,7 +282,7 @@ where
         buf.clear();
 
         loop {
-            if packet.len() >= 20 {
+            if packet.len() >= WRTC_MIN_IP_PACKET_LEN {
                 encrypt_into(packet, &mut buf)?;
             }
 
@@ -308,8 +314,8 @@ where
 
 async fn receive_from_server<R>(
     mut reader: R,
-    mut tunnel_writer: tokio::io::WriteHalf<tokio::io::DuplexStream>,
-    cipher: Arc<anet_common::encryption::Cipher>,
+    mut tunnel_writer: WriteHalf<DuplexStream>,
+    cipher: Arc<Cipher>,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -319,14 +325,13 @@ where
 
     while let Some(encrypted) = frame_reader.read_next_packet(&mut reader).await? {
         write_buf.clear();
-        let packet = anet_common::transport::unwrap_packet_bytes_in_place(&cipher, encrypted)?;
+        let packet = unwrap_packet_bytes_in_place(&cipher, encrypted)?;
         frame_packet_into(&mut write_buf, &packet);
 
         while write_buf.len() < COALESCE_BUDGET_BYTES {
             match frame_reader.try_next_packet()? {
                 Some(next_enc) => {
-                    let next_pkt =
-                        anet_common::transport::unwrap_packet_bytes_in_place(&cipher, next_enc)?;
+                    let next_pkt = unwrap_packet_bytes_in_place(&cipher, next_enc)?;
                     frame_packet_into(&mut write_buf, &next_pkt);
                 }
                 None => break,
@@ -343,14 +348,14 @@ where
 fn schedule_with_jitter(
     pending: &mut FuturesUnordered<BoxFuture<'static, Bytes>>,
     packet: Bytes,
-    stealth: &anet_common::config::StealthConfig,
+    stealth: &StealthConfig,
     rng: &mut StdRng,
 ) {
     let delay = rng.gen_range(stealth.min_jitter_ns..=stealth.max_jitter_ns);
     pending.push(
         async move {
             if delay > 0 {
-                tokio::time::sleep(Duration::from_nanos(delay)).await;
+                sleep(Duration::from_nanos(delay)).await;
             }
             packet
         }

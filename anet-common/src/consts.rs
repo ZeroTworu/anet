@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 // Все константы обсалютно научны, и соответствуют числу тараканов на лолу и кол-ву бычков в пепельнице.
 // Не научные - числу мух на потолке.
 
@@ -79,7 +81,7 @@ pub const MAX_VIDEO_BATCH_BYTES: usize = 1260;
 pub const WRTC_VIDEO_MTU_OVERHEAD: u16 = 110;
 
 /// Минимально допустимый MTU TUN-интерфейса после вычета заголовков WebRTC Video.
-pub const WRTC_MIN_TUN_MTU: i32 = 900;
+pub const WRTC_MIN_TUN_MTU: i32 = 1200;
 
 /// Размер префикса VP8 + Client Tag перед зашифрованным ASTP-кадром в RTP-пакете:
 /// 4B (VP8 Payload Descriptor) + 20B (VP8 Frame Header) + 2B (Client Tag) = 26 байт.
@@ -121,10 +123,10 @@ pub const WRTC_WS_FALLBACK_CHANNEL_CAPACITY: usize = 8192;
 pub const WRTC_P2P_CHANNEL_CAPACITY: usize = 4096;
 pub const WRTC_XMPP_CHANNEL_CAPACITY: usize = 128;
 pub const WRTC_XMPP_RAW_WS_CHANNEL_CAPACITY: usize = 32;
-pub const WRTC_DUPLEX_BUFFER_SIZE: usize = 256 * 1024;
+pub const WRTC_DUPLEX_BUFFER_SIZE: usize = 4 * 1024 * 1024;
 
 /// Параметры микро-батчирования, коалесценции и EDT-пейсинга пакетов в WebRTC.
-pub const WRTC_BATCHER_MAX_BYTES: usize = 12288;
+pub const WRTC_BATCHER_MAX_BYTES: usize = 16384;
 pub const WRTC_BATCHER_MAX_DELAY_MS: u64 = 2;
 pub const WRTC_VIDEO_BATCH_MAX_PACKETS: usize = 16;
 pub const WRTC_UPLINK_BURST_MAX_PACKETS: usize = 64;
@@ -210,10 +212,21 @@ pub const WRTC_DEFAULT_FALLBACK_JVB_PORT: u16 = 10002;
 
 /// Таймаут ASTP-аутентификации для потоковых транспортов (SSH / VNC).
 /// Если клиент не завершает рукопожатие за это время, сессия сбрасывается.
-pub const ASTP_AUTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+pub const ASTP_AUTH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Таймаут TCP-подключения к SSH-серверу.
+pub const SSH_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Таймаут RFB-рукопожатия для VNC-транспорта.
-pub const RFB_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+pub const RFB_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Параметры генерации защитного чёрного кадра RFB Raw 32bpp (1024x768) при зондировании VNC.
+pub const VNC_RFB_BLACK_SCREEN_CHUNK_SIZE: usize = 64 * 1024;
+pub const VNC_RFB_BLACK_SCREEN_TOTAL_BYTES: usize = 1024 * 768 * 4;
+
+/// Таймаут сборки фрагментированного UDP-хендшейка QUIC и лимит параллельных задач авторизации.
+pub const QUIC_REASSEMBLY_TIMEOUT: Duration = Duration::from_secs(5);
+pub const QUIC_HANDSHAKE_CONCURRENCY_LIMIT: usize = 128;
 
 /// Размер окна входящего SSH-канала (4 MB) для обеспечения высокой пропускной способности.
 pub const SSH_CHANNEL_WINDOW_SIZE: u32 = 4 * 1024 * 1024;

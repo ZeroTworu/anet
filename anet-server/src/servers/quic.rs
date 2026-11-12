@@ -2,32 +2,39 @@ use crate::auth_handler::ServerAuthHandler;
 use crate::client_registry::ClientRegistry;
 use crate::config::Config;
 use crate::multikey_udp_socket::{HandshakeData, MultiKeyAnetUdpSocket};
-use anet_common::consts::{CHANNEL_BUFFER_SIZE, PADDING_MTU};
+use anet_common::consts::{
+    CHANNEL_BUFFER_SIZE, PADDING_MTU, QUIC_HANDSHAKE_CONCURRENCY_LIMIT,
+};
 use anet_common::jitter::bridge_with_jitter;
 use anet_common::quic_settings::{
-    QUIC_UDP_SOCKET_BUFFER_SIZE, build_transport_config, tune_udp_socket_buffers,
+    build_transport_config, tune_udp_socket_buffers, QUIC_UDP_SOCKET_BUFFER_SIZE,
 };
 use anet_common::stream_framing::FrameReader;
 use anyhow::{Context, Result};
 use bytes::Bytes;
+use dashmap::DashMap;
 use log::{error, info, warn};
+use quinn::crypto::rustls::QuicServerConfig;
 use quinn::{Endpoint, EndpointConfig, ServerConfig as QuinnServerConfig, TokioRuntime};
-use rustls::ServerConfig as RustlsServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::ServerConfig as RustlsServerConfig;
+use rustls_pemfile::{certs, private_key};
 use std::io::BufReader;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
-use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tokio::sync::Semaphore;
+use tokio::task::AbortHandle;
 
 fn load_cert_and_key(
     cert_pem: &str,
     key_pem: &str,
 ) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
-    let certs = rustls_pemfile::certs(&mut BufReader::new(cert_pem.as_bytes()))
-        .collect::<Result<_, _>>()?;
-    let key = rustls_pemfile::private_key(&mut BufReader::new(key_pem.as_bytes()))?
+    let cert_chain = certs(&mut BufReader::new(cert_pem.as_bytes())).collect::<Result<_, _>>()?;
+    let key = private_key(&mut BufReader::new(key_pem.as_bytes()))?
         .context("No quic private key found")?;
-    Ok((certs, key.into()))
+    Ok((cert_chain, key))
 }
 
 fn build_quinn_config(cfg: &Config) -> Result<QuinnServerConfig> {
@@ -35,9 +42,9 @@ fn build_quinn_config(cfg: &Config) -> Result<QuinnServerConfig> {
     let server_crypto = RustlsServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)?;
-    let mut s_cfg = QuinnServerConfig::with_crypto(Arc::new(
-        quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)?,
-    ));
+    let mut s_cfg = QuinnServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(
+        server_crypto,
+    )?));
     let t_cfg = build_transport_config(&cfg.quic_transport, cfg.network.mtu)?;
     s_cfg.transport_config(Arc::new(t_cfg));
     Ok(s_cfg)
@@ -46,13 +53,19 @@ fn build_quinn_config(cfg: &Config) -> Result<QuinnServerConfig> {
 async fn serve_udp_auth_layer(
     auth_core: ServerAuthHandler,
     socket: Arc<UdpSocket>,
-    mut rx_from_auth: mpsc::Receiver<HandshakeData>,
+    mut rx_from_auth: Receiver<HandshakeData>,
 ) {
     info!("[QUIC Auth Worker] Running isolated UDP DHCP acceptor");
+    let semaphore = Arc::new(Semaphore::new(QUIC_HANDSHAKE_CONCURRENCY_LIMIT));
     while let Some((packet, remote_addr)) = rx_from_auth.recv().await {
+        let Ok(permit) = semaphore.clone().try_acquire_owned() else {
+            warn!("[QUIC Handshake] Auth concurrency limit reached, dropping packet from {remote_addr}");
+            continue;
+        };
         let handler = auth_core.clone();
         let s = socket.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             match handler.process_handshake_packet(packet, remote_addr, "quic").await {
                 Ok((Some(resp), _)) => {
                     let _ = s.send_to(&resp, remote_addr).await;
@@ -69,7 +82,7 @@ async fn serve_udp_auth_layer(
 pub async fn run_quic_server(
     config: Arc<Config>,
     registry: Arc<ClientRegistry>,
-    tun_tx: mpsc::Sender<Bytes>,
+    tun_tx: Sender<Bytes>,
     auth_handler: ServerAuthHandler,
 ) -> Result<()> {
     let bind_to = &config.server.quic_bind_to;
@@ -78,7 +91,7 @@ pub async fn run_quic_server(
     tune_udp_socket_buffers(&udp_socket, QUIC_UDP_SOCKET_BUFFER_SIZE);
     let real_socket = Arc::new(udp_socket);
 
-    let (tx_auth, rx_auth) = mpsc::channel::<HandshakeData>(CHANNEL_BUFFER_SIZE);
+    let (tx_auth, rx_auth) = channel::<HandshakeData>(CHANNEL_BUFFER_SIZE);
 
     // Передаем провайдера в стейт мультисокетного транспорта
     let socket_wrapper = Arc::new(MultiKeyAnetUdpSocket::new(
@@ -98,7 +111,7 @@ pub async fn run_quic_server(
     info!("Starting ASTP[Crypted QUIC] Proxy Layer on {}", bind_to);
     let mut ep_config = EndpointConfig::default();
     // Увеличиваем батчинг UDP-пакетов (sendmmsg/recvmmsg)
-    let _ =ep_config.max_udp_payload_size(PADDING_MTU as u16);
+    let _ = ep_config.max_udp_payload_size(PADDING_MTU as u16);
 
     let endpoint = Endpoint::new_with_abstract_socket(
         ep_config,
@@ -107,10 +120,13 @@ pub async fn run_quic_server(
         Arc::new(TokioRuntime),
     )?;
 
+    let downlink_tasks: Arc<DashMap<String, (String, AbortHandle)>> = Arc::new(DashMap::new());
+
     while let Some(incoming) = endpoint.accept().await {
         let r = registry.clone();
         let c = config.clone();
         let t_tx = tun_tx.clone();
+        let dl_tasks = downlink_tasks.clone();
 
         tokio::spawn(async move {
             let conn = match incoming.await {
@@ -128,10 +144,15 @@ pub async fn run_quic_server(
             client_info.set_quic_connection(conn.clone());
 
             let client_ip = client_info.assigned_ip.clone();
+            let session_id = client_info.session_id.clone();
             info!("QUIC Connected. Routed IP: {}", client_ip);
 
             if let Ok((send, mut recv)) = conn.accept_bi().await {
-                let (tx_router, rx_router) = mpsc::channel::<Bytes>(CHANNEL_BUFFER_SIZE);
+                if let Some((_, (_, old_handle))) = dl_tasks.remove(&client_ip) {
+                    old_handle.abort();
+                }
+
+                let (tx_router, rx_router) = channel::<Bytes>(CHANNEL_BUFFER_SIZE);
                 r.finalize_client(&client_ip, tx_router);
 
                 let stealth_c = c.stealth.clone();
@@ -145,6 +166,10 @@ pub async fn run_quic_server(
                         warn!("Client {} tx abort", ci_tx.assigned_ip);
                     }
                 });
+                dl_tasks.insert(
+                    client_ip.clone(),
+                    (session_id.clone(), writer_task.abort_handle()),
+                );
 
                 let ci_rx = client_info.clone();
                 let rx_registry = r.clone();
@@ -160,10 +185,13 @@ pub async fn run_quic_server(
                             Ok(_) => {
                                 rx_registry.record_rx(&ci_rx, packet_len, "quic");
                             }
-                            Err(mpsc::error::TrySendError::Full(_)) => {
-                                warn!("[QUIC] TUN queue full, dropping uplink packet from {}", ci_rx.assigned_ip);
+                            Err(TrySendError::Full(_)) => {
+                                warn!(
+                                    "[QUIC] TUN queue full, dropping uplink packet from {}",
+                                    ci_rx.assigned_ip
+                                );
                             }
-                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                            Err(TrySendError::Closed(_)) => {
                                 break;
                             }
                         }
@@ -180,6 +208,8 @@ pub async fn run_quic_server(
                         info!("QUIC writer task finished for {}", client_info.assigned_ip);
                     }
                 }
+
+                dl_tasks.remove_if(&client_ip, |_, (sid, _)| sid == &session_id);
 
                 info!(
                     "[QUIC Node] Client disconnected and wiped: {}",

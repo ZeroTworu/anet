@@ -1,26 +1,30 @@
 use anet_server::config::load;
-use anet_server::server;
-use anyhow::Result;
-use server::ANetServer;
+use anet_server::server::ANetServer;
+use anyhow::{anyhow, Result};
+use env_logger::{Builder as EnvLoggerBuilder, Env};
+use log::warn;
+use rustls::crypto::ring::default_provider;
+use std::thread::available_parallelism;
+use tokio::runtime::Builder as RuntimeBuilder;
 
 fn main() -> Result<()> {
-    let worker_threads = std::thread::available_parallelism()
+    let worker_threads = available_parallelism()
         .map(|n| n.get().clamp(2, 4))
         .unwrap_or(2);
-    let runtime = tokio::runtime::Builder::new_multi_thread()
+    let runtime = RuntimeBuilder::new_multi_thread()
         .worker_threads(worker_threads)
         .enable_all()
         .build()?;
 
     runtime.block_on(async move {
-        if let Err(e) = rustls::crypto::ring::default_provider()
+        if let Err(e) = default_provider()
             .install_default()
-            .map_err(|e| anyhow::anyhow!("Failed to install crypto provider: {:?}", e))
+            .map_err(|e| anyhow!("Failed to install crypto provider: {:?}", e))
         {
-            log::warn!("{}", e);
+            warn!("{}", e);
         }
-        env_logger::Builder::from_env(
-            env_logger::Env::default().default_filter_or("info,rtc::peer_connection::handler=error"),
+        EnvLoggerBuilder::from_env(
+            Env::default().default_filter_or("info,rtc::peer_connection::handler=error"),
         )
         .init();
         let cfg = load().await?;

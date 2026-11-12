@@ -1,8 +1,13 @@
 use crate::consts::{COALESCE_BUDGET_BYTES, MAX_PACKET_SIZE};
+use anyhow::{Result, anyhow};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+use futures::task::noop_waker_ref;
 use log::error;
 use std::io;
-use tokio::io::AsyncReadExt;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
+use tokio::task::JoinHandle;
 
 const LENGTH_PREFIX_SIZE: usize = 2; // u16 длина префикса
 
@@ -30,6 +35,43 @@ impl FrameReader {
         Self {
             buf: BytesMut::with_capacity(capacity),
         }
+    }
+
+    /// Неблокирующе вычитывает все уже готовые чанки из `reader` (например, `DuplexStream` или `TcpStream`)
+    /// в `self.buf` до достижения `COALESCE_BUDGET_BYTES`.
+    #[inline]
+    fn poll_drain_ready<R: AsyncRead + Unpin>(&mut self, reader: &mut R) -> io::Result<()> {
+        let waker = noop_waker_ref();
+        let mut cx = Context::from_waker(waker);
+
+        while self.buf.len() < COALESCE_BUDGET_BYTES {
+            if self.buf.capacity().saturating_sub(self.buf.len()) < MAX_PACKET_SIZE * 4 {
+                self.buf.reserve(COALESCE_BUDGET_BYTES + MAX_PACKET_SIZE);
+            }
+            let dst = self.buf.chunk_mut();
+            if dst.len() == 0 {
+                break;
+            }
+            let dst_slice = unsafe {
+                std::slice::from_raw_parts_mut(dst.as_mut_ptr(), dst.len())
+            };
+            let mut read_buf = ReadBuf::new(dst_slice);
+            match Pin::new(&mut *reader).poll_read(&mut cx, &mut read_buf) {
+                Poll::Ready(Ok(())) => {
+                    let filled = read_buf.filled().len();
+                    if filled == 0 {
+                        break;
+                    }
+                    unsafe {
+                        self.buf.advance_mut(filled);
+                    }
+                }
+                Poll::Ready(Err(e)) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Poll::Ready(Err(e)) => return Err(e),
+                Poll::Pending => break,
+            }
+        }
+        Ok(())
     }
 
     /// Пытается синхронно извлечь следующий уже полностью загруженный в буфер фрейм без I/O.
@@ -67,13 +109,32 @@ impl FrameReader {
         }
     }
 
+    /// Пытается извлечь следующий фрейм из `self.buf`, а при нехватке данных неблокирующе
+    /// опрашивает `reader` (позволяя вычитать все 8-КБ чанки `DuplexStream` за один burst).
+    #[inline]
+    pub fn try_next_packet_from<R: AsyncRead + Unpin>(
+        &mut self,
+        reader: &mut R,
+    ) -> io::Result<Option<Bytes>> {
+        if let Some(pkt) = self.try_next_packet()? {
+            return Ok(Some(pkt));
+        }
+        self.poll_drain_ready(reader)?;
+        self.try_next_packet()
+    }
+
     /// Читает следующий фрейм из `reader`, подгружая данные крупными порциями при необходимости.
     #[inline]
-    pub async fn read_next_packet<R: tokio::io::AsyncRead + Unpin>(
+    pub async fn read_next_packet<R: AsyncRead + Unpin>(
         &mut self,
         reader: &mut R,
     ) -> io::Result<Option<Bytes>> {
         loop {
+            if let Some(pkt) = self.try_next_packet()? {
+                return Ok(Some(pkt));
+            }
+
+            self.poll_drain_ready(reader)?;
             if let Some(pkt) = self.try_next_packet()? {
                 return Ok(Some(pkt));
             }
@@ -93,6 +154,7 @@ impl FrameReader {
                     ));
                 }
             }
+            let _ = self.poll_drain_ready(reader);
         }
     }
 }
@@ -125,7 +187,7 @@ pub fn frame_packet_into(buf: &mut BytesMut, payload: &Bytes) {
 /// Возвращает None, если стрим закрыт, или Result<Bytes, io::Error>
 /// Используется в QUIC RX задаче.
 #[inline]
-pub async fn read_next_packet<R: tokio::io::AsyncRead + tokio::io::AsyncReadExt + Unpin>(
+pub async fn read_next_packet<R: AsyncRead + AsyncReadExt + Unpin>(
     reader: &mut R,
 ) -> io::Result<Option<Bytes>> {
     loop {
@@ -173,13 +235,14 @@ pub async fn read_next_packet<R: tokio::io::AsyncRead + tokio::io::AsyncReadExt 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
 
     #[tokio::test]
     async fn test_read_normal_packet() {
         let payload = vec![0xAB; 100];
         let mut data = vec![0u8, 100]; // длина 100 BE
         data.extend_from_slice(&payload);
-        let mut reader = std::io::Cursor::new(data);
+        let mut reader = Cursor::new(data);
 
         let pkt = read_next_packet(&mut reader).await.unwrap().unwrap();
         assert_eq!(pkt.len(), 100);
@@ -194,7 +257,7 @@ mod tests {
         frame_packet_into(&mut batch, &p1);
         frame_packet_into(&mut batch, &p2);
 
-        let mut cursor = std::io::Cursor::new(batch.freeze());
+        let mut cursor = Cursor::new(batch.freeze());
         let mut frame_reader = FrameReader::new();
 
         let out1 = frame_reader.read_next_packet(&mut cursor).await.unwrap().unwrap();
@@ -210,7 +273,7 @@ mod tests {
         // [len=0][len=3][3 байта] — нулевой фрейм должен быть пропущен,
         // а следующий пакет — прочитан (раньше тут возвращался Ok(None) => разрыв туннеля)
         let data = vec![0, 0, 0, 3, 1, 2, 3];
-        let mut reader = std::io::Cursor::new(data);
+        let mut reader = Cursor::new(data);
 
         let pkt = read_next_packet(&mut reader).await.unwrap().unwrap();
         assert_eq!(&pkt[..], &[1, 2, 3]);
@@ -218,7 +281,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_eof_returns_none() {
-        let mut reader = std::io::Cursor::new(Vec::<u8>::new());
+        let mut reader = Cursor::new(Vec::<u8>::new());
         assert!(read_next_packet(&mut reader).await.unwrap().is_none());
     }
 
@@ -226,7 +289,7 @@ mod tests {
     async fn test_oversized_frame_is_error() {
         let len = (MAX_PACKET_SIZE + 1) as u16;
         let data = len.to_be_bytes().to_vec();
-        let mut reader = std::io::Cursor::new(data);
+        let mut reader = Cursor::new(data);
         assert!(read_next_packet(&mut reader).await.is_err());
     }
 
@@ -241,7 +304,6 @@ mod tests {
     }
 }
 
-
 /// Результат ожидания завершения одного из двух воркеров двунаправленного потока (inbound / outbound).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FinishedWorker {
@@ -252,18 +314,18 @@ pub enum FinishedWorker {
 /// Выполняет синхронное ожидание первого завершившегося воркера (`inbound` или `outbound`),
 /// после чего корректно абортит и очищает оставшийся воркер, устраняя дублирование логики в SSH/VNC серверах.
 pub async fn supervise_bidirectional_workers(
-    mut inbound: tokio::task::JoinHandle<anyhow::Result<()>>,
-    mut outbound: tokio::task::JoinHandle<anyhow::Result<()>>,
+    mut inbound: JoinHandle<Result<()>>,
+    mut outbound: JoinHandle<Result<()>>,
     transport_name: &str,
-) -> (FinishedWorker, anyhow::Result<()>) {
+) -> (FinishedWorker, Result<()>) {
     let (finished_worker, result) = tokio::select! {
         result = &mut inbound => (
             FinishedWorker::Inbound,
-            result.map_err(|e| anyhow::anyhow!("{transport_name} reader task panicked: {e}")).and_then(|r| r)
+            result.map_err(|e| anyhow!("{transport_name} reader task panicked: {e}")).and_then(|r| r)
         ),
         result = &mut outbound => (
             FinishedWorker::Outbound,
-            result.map_err(|e| anyhow::anyhow!("{transport_name} writer task panicked: {e}")).and_then(|r| r)
+            result.map_err(|e| anyhow!("{transport_name} writer task panicked: {e}")).and_then(|r| r)
         ),
     };
 

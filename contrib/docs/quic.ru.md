@@ -84,7 +84,7 @@
 
 * Если `frag_enabled = false`, отправляется одна датаграмма с заголовком `[0x00, 0x01]`.
 * Если `frag_enabled = true`, пакет режется в случайных точках (`random_split_points` через `OsRng` без выравнивания по кратным границам) на `frag_min_chunks..=frag_max_chunks` частей с задержкой `min_jitter_ns..=max_jitter_ns` между отправками.
-* На сервере `MultiKeyAnetUdpSocket` хранит `DashMap<SocketAddr, (Instant, DatagramReassembler)>` с таймаутом самоочистки `REASSEMBLY_TIMEOUT = 5s`. Как только все части собраны (`parts.len() == total`) и суммарная длина $\ge \text{MIN\_HANDSHAKE\_LEN}$ (`78` байт), собранный буфер отправляется в асинхронный воркер `serve_udp_auth_layer`.
+* На сервере `MultiKeyAnetUdpSocket` хранит `DashMap<SocketAddr, (Instant, DatagramReassembler)>` с таймаутом самоочистки `QUIC_REASSEMBLY_TIMEOUT = 5s` (`anet-common/src/consts.rs`). Как только все части собраны (`parts.len() == total`) и суммарная длина $\ge \text{MIN\_HANDSHAKE\_LEN}$ (`78` байт), собранный буфер отправляется в асинхронный воркер `serve_udp_auth_layer`.
 * Ответы сервера (Phase II и Phase IV) отправляются одиночными UDP-датаграммами напрямую через `socket.send_to(&resp, remote_addr)`.
 
 ### 3.2. Конверт данных (Data Plane — `AnetUdpSocket` $\leftrightarrow$ `MultiKeyAnetUdpSocket`)
@@ -169,10 +169,13 @@ config.enable_segmentation_offload(false);
 * Весь накопленный батч записывается в `SendStream` одним вызовом `stream.write_all(&buf).await` без принудительного `flush()`, позволяя `quinn` максимально плотно упаковывать QUIC STREAM-фреймы в UDP-датаграммы.
 * Если джиттер включён (`max_jitter_ns > min_jitter_ns`), каждый пакет ставится в очередь задержки `FuturesUnordered` (до `MAX_PENDING_JITTER_PACKETS = 256` пакетов в полёте) на случайное время $\text{delay} \in [\text{min\_jitter\_ns}, \text{max\_jitter\_ns}]$.
 
-### 5.2. Неблокирующий Backpressure на сервере (`servers/quic.rs`)
-В задаче чтения потока от клиента (`reader_task` в `anet-server/src/servers/quic.rs`) запись в очередь TUN-интерфейса выполняется через **`t_tx.try_send(pkt)`**:
-* Если очередь `client_pkt_tx` (`CHANNEL_BUFFER_SIZE = 4096`) заполнена, сервер **отбрасывает** пакет с предупреждением `[QUIC] TUN queue full, dropping uplink packet`, не приостанавливая чтение из QUIC-стрима.
-* Это предотвращает раздувание буферов (Bufferbloat) и позволяет алгоритму BBR внутри туннеля вовремя отреагировать на потерю пакета.
+### 5.2. Неблокирующий Backpressure, лимит конкурентных рукопожатий и вытеснение старых `writer_task` (`servers/quic.rs`)
+1. **Ограничение числа параллельных рукопожатий (`QUIC_HANDSHAKE_CONCURRENCY_LIMIT = 128`):**
+   * В `serve_udp_auth_layer` и в цикле `endpoint.accept().await` используется `Semaphore::new(QUIC_HANDSHAKE_CONCURRENCY_LIMIT)` (`try_acquire_owned()`), защищающий сервер от исчерпания памяти и CPU при всплесках одновременных подключений или UDP-флуде.
+2. **Мгновенная отмена устаревшего `writer_task` при переподключении (`active_writers: DashMap<IpAddr, AbortHandle>`):**
+   * При открытии нового двунаправленного QUIC-стрима для уже выделенного туннельного `assigned_ip` сервер сохраняет `AbortHandle` новой задачи `writer_task` в `active_writers.insert(assigned_ip, writer_abort.clone())` и немедленно вызывает `old_abort.abort()` для предыдущей задачи записи этого же IP. По завершении сессии запись удаляется атомарно через `active_writers.remove_if(&assigned_ip, |_, h| h.id() == writer_abort.id())`. Это полностью исключает ситуацию, когда старая задача `bridge_with_jitter` перехватывает пакеты у нового соединения до срабатывания QUIC idle timeout.
+3. **Неблокирующая запись в TUN (`try_send`):**
+   * В задаче чтения потока от клиента (`reader_task` в `anet-server/src/servers/quic.rs`) запись в очередь TUN-интерфейса выполняется через **`t_tx.try_send(pkt)`**. Если очередь `client_pkt_tx` (`CHANNEL_BUFFER_SIZE = 4096`) заполнена, сервер **отбрасывает** пакет с предупреждением `[QUIC] TUN queue full, dropping uplink packet`, не приостанавливая чтение из QUIC-стрима. Это предотвращает раздувание буферов (Bufferbloat) и позволяет алгоритму BBR внутри туннеля вовремя отреагировать на потерю пакета.
 
 ---
 

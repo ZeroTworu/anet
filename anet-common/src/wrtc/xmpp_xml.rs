@@ -1,4 +1,10 @@
-use crate::wrtc::jingle::{JingleCandidate, JingleSession, JingleTransportInfo};
+use crate::wrtc::colibri::ColibriMessage;
+use crate::wrtc::jingle::{
+    JingleAction, JingleCandidate, JingleSession, JingleTransportInfo, is_valid_jvb_candidate_ip,
+};
+use crate::wrtc::stealth::generate_random_uuid_v4;
+use roxmltree::{Document, Node};
+use serde_json::Value;
 
 pub fn escape_xml_attr(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 16);
@@ -73,7 +79,7 @@ pub enum InboundXmpp {
     },
     Jingle(JingleSession),
     ExtdiscoServices(Vec<XmppIceServer>),
-    EndpointMessage(crate::wrtc::colibri::ColibriMessage),
+    EndpointMessage(ColibriMessage),
     IqOther,
     Message,
     Close,
@@ -113,7 +119,7 @@ pub fn parse_xmpp_stanzas(
     let wrapped = format!(
         r#"<stream xmlns:stream="http://etherx.jabber.org/streams">{trimmed}</stream>"#
     );
-    let doc = match roxmltree::Document::parse(&wrapped) {
+    let doc = match Document::parse(&wrapped) {
         Ok(d) => d,
         Err(_) => return Vec::new(),
     };
@@ -198,7 +204,7 @@ impl<'a> From<&'a str> for IqType {
 }
 
 fn parse_single_element(
-    root: &roxmltree::Node,
+    root: &Node,
     fallback_ip: &str,
     fallback_port: u16,
 ) -> Option<InboundXmpp> {
@@ -395,9 +401,7 @@ fn parse_single_element(
             {
                 if let Some(txt) = json_node.text() {
                     let trimmed = txt.trim();
-                    if let Ok(mut c_msg) =
-                        serde_json::from_str::<crate::wrtc::colibri::ColibriMessage>(trimmed)
-                    {
+                    if let Ok(mut c_msg) = serde_json::from_str::<ColibriMessage>(trimmed) {
                         if c_msg.from.as_deref().unwrap_or("").is_empty() {
                             c_msg.from = sender_occupant;
                         }
@@ -412,8 +416,8 @@ fn parse_single_element(
 }
 
 pub fn parse_jingle_node(
-    iq_node: &roxmltree::Node,
-    jingle_node: &roxmltree::Node,
+    iq_node: &Node,
+    jingle_node: &Node,
     fallback_ip: &str,
     fallback_port: u16,
 ) -> Option<JingleSession> {
@@ -535,7 +539,7 @@ pub fn parse_jingle_node(
                     if let (Some(ip), Some(port_str)) =
                         (child.attribute("ip"), child.attribute("port"))
                     {
-                        if !crate::wrtc::jingle::is_valid_jvb_candidate_ip(ip) {
+                        if !is_valid_jvb_candidate_ip(ip) {
                             continue;
                         }
                         if let Ok(port) = port_str.parse::<u16>() {
@@ -592,7 +596,7 @@ pub fn parse_jingle_node(
         .filter(|n| n.has_tag_name("json-message"))
     {
         if let Some(txt) = json_node.text() {
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(txt.trim()) {
+            if let Ok(val) = serde_json::from_str::<Value>(txt.trim()) {
                 if let Some(sources_obj) = val.get("sources").and_then(|v| v.as_object()) {
                     for (_ep, ep_arr) in sources_obj {
                         if let Some(arr) = ep_arr.as_array() {
@@ -637,8 +641,7 @@ pub fn parse_jingle_node(
     }
 
     if transport_info.candidates.is_empty()
-        && crate::wrtc::jingle::JingleAction::from(action.as_str())
-            != crate::wrtc::jingle::JingleAction::SessionTerminate
+        && JingleAction::from(action.as_str()) != JingleAction::SessionTerminate
     {
         transport_info.candidates.push(JingleCandidate {
             ip: fallback_ip.to_string(),
@@ -801,7 +804,7 @@ impl XmppBuilder {
         };
         if is_ktalk {
             format!(
-                r#"<iq type="result" to="{to}" id="{id}" xmlns="jabber:client"><query xmlns="http://jabber.org/protocol/disco#info"{node_attr}><identity category="client" type="web" name="jitsi-meet"/><feature var="urn:xmpp:jingle:1"/><feature var="urn:xmpp:jingle:apps:rtp:1"/><feature var="urn:xmpp:jingle:apps:rtp:audio"/><feature var="urn:xmpp:jingle:apps:rtp:video"/><feature var="urn:xmpp:jingle:apps:dtls:0"/><feature var="urn:xmpp:jingle:transports:dtls-sctp:1"/><feature var="urn:xmpp:jingle:apps:sctp:1"/><feature var="http://jitsi.org/protocols/sctp"/><feature var="urn:xmpp:jingle:transports:ice-udp:1"/><feature var="http://jitsi.org/protocols/colibri"/><feature var="http://jitsi.org/protocol/colibri#websocket"/><feature var="urn:xmpp:jingle:apps:grouping:0"/><feature var="urn:ietf:rfc:3264"/><feature var="urn:ietf:rfc:5576"/><feature var="urn:ietf:rfc:5761"/><feature var="urn:ietf:rfc:5888"/><feature var="http://jabber.org/protocol/caps"/></query></iq>"#,
+                r#"<iq type="result" to="{to}" id="{id}" xmlns="jabber:client"><query xmlns="http://jabber.org/protocol/disco#info"{node_attr}><identity category="client" type="web" name="jitsi-meet"/><feature var="urn:xmpp:jingle:1"/><feature var="urn:xmpp:jingle:apps:rtp:1"/><feature var="urn:xmpp:jingle:apps:rtp:audio"/><feature var="urn:xmpp:jingle:apps:rtp:video"/><feature var="urn:xmpp:jingle:apps:dtls:0"/><feature var="urn:xmpp:jingle:transports:dtls-sctp:1"/><feature var="urn:xmpp:jingle:apps:sctp:1"/><feature var="http://jitsi.org/protocols/sctp"/><feature var="urn:xmpp:jingle:transports:ice-udp:1"/><feature var="http://jitsi.org/protocols/colibri"/><feature var="http://jitsi.org/protocol/colibri#websocket"/><feature var="http://jitsi.org/receive-multiple-video-streams"/><feature var="http://jitsi.org/remb"/><feature var="http://jitsi.org/source-name"/><feature var="http://jitsi.org/tcc"/><feature var="urn:xmpp:jingle:apps:grouping:0"/><feature var="urn:ietf:rfc:3264"/><feature var="urn:ietf:rfc:4588"/><feature var="urn:ietf:rfc:5576"/><feature var="urn:ietf:rfc:5761"/><feature var="urn:ietf:rfc:5888"/><feature var="http://jabber.org/protocol/caps"/></query></iq>"#,
                 to = escape_xml_attr(to),
                 id = escape_xml_attr(id),
                 node_attr = node_attr
@@ -923,8 +926,8 @@ impl XmppBuilder {
         include_data_content: bool,
         include_video_content: bool,
     ) -> String {
-        let vtrack_id = crate::wrtc::stealth::generate_random_uuid_v4();
-        let atrack_id = crate::wrtc::stealth::generate_random_uuid_v4();
+        let vtrack_id = generate_random_uuid_v4();
+        let atrack_id = generate_random_uuid_v4();
         let ep_clean = if !endpoint_id.trim().is_empty() {
             escape_xml_attr(endpoint_id.trim())
         } else {
@@ -1072,7 +1075,7 @@ impl XmppBuilder {
         cname: &str,
         msid: &str,
     ) -> String {
-        let atrack_id = crate::wrtc::stealth::generate_random_uuid_v4();
+        let atrack_id = generate_random_uuid_v4();
         format!(
             r#"<iq to="{to}" type="set" id="{id}" xmlns="jabber:client"><jingle xmlns="urn:xmpp:jingle:1" action="source-add" initiator="{init}" sid="{sid}"><content name="audio"><description xmlns="urn:xmpp:jingle:apps:rtp:1" media="audio"><source xmlns="urn:xmpp:jingle:apps:rtp:ssma:0" ssrc="{ssrc}"><parameter name="cname" value="{cname}"/><parameter name="msid" value="{msid} {atrack_id}"/></source></description></content></jingle></iq>"#,
             to = escape_xml_attr(focus_jid),

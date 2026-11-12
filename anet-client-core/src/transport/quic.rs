@@ -5,14 +5,16 @@ use crate::socket::AnetUdpSocket;
 use anet_common::consts::PADDING_MTU;
 use anet_common::encryption::Cipher;
 use anet_common::quic_settings::{
-    QUIC_UDP_SOCKET_BUFFER_SIZE, build_transport_config, tune_udp_socket_buffers,
+    build_transport_config, tune_udp_socket_buffers, QUIC_UDP_SOCKET_BUFFER_SIZE,
 };
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use log::info;
+use quinn::crypto::rustls::QuicClientConfig;
 use quinn::{ClientConfig, Endpoint, EndpointConfig, RecvStream, SendStream, TokioRuntime};
-use rustls::RootCertStore;
-use std::io;
+use rustls::{ClientConfig as RustlsClientConfig, RootCertStore};
+use rustls_pemfile::certs;
+use std::io::{Error as IoError, Result as IoResult};
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -30,7 +32,7 @@ impl AsyncRead for QuicDuplexStream {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    ) -> Poll<IoResult<()>> {
         Pin::new(&mut self.recv).poll_read(cx, buf)
     }
 }
@@ -40,20 +42,20 @@ impl AsyncWrite for QuicDuplexStream {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
+    ) -> Poll<IoResult<usize>> {
         Pin::new(&mut self.send)
             .poll_write(cx, buf)
-            .map(|result| result.map_err(io::Error::other))
+            .map(|result| result.map_err(IoError::other))
     }
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<IoResult<()>> {
         Pin::new(&mut self.send)
             .poll_flush(cx)
-            .map(|result| result.map_err(io::Error::other))
+            .map(|result| result.map_err(IoError::other))
     }
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<IoResult<()>> {
         Pin::new(&mut self.send)
             .poll_shutdown(cx)
-            .map(|result| result.map_err(io::Error::other))
+            .map(|result| result.map_err(IoError::other))
     }
 }
 
@@ -76,7 +78,7 @@ impl ClientTransport for QuicTransport {
         let server_addr: SocketAddr = addr_str
             .to_socket_addrs()?
             .next()
-            .ok_or_else(|| anyhow::anyhow!("Invalid server address"))?;
+            .ok_or_else(|| anyhow!("Invalid server address"))?;
         let udp_socket = UdpSocket::bind("0.0.0.0:0").await?;
         tune_udp_socket_buffers(&udp_socket, QUIC_UDP_SOCKET_BUFFER_SIZE);
         let udp_socket = Arc::new(udp_socket);
@@ -89,22 +91,18 @@ impl ClientTransport for QuicTransport {
         let mut quic_cfg = self.config.quic_transport.clone();
         // Берем keep_alive_interval_seconds из конфигурации пользователя без принудительного
         // занижения до 10 секунд (по умолчанию 7s при отсутствии значения в конфиге).
-        quic_cfg.keep_alive_interval_seconds = Some(
-            quic_cfg.keep_alive_interval_seconds.unwrap_or(7)
-        );
-        quic_cfg.idle_timeout_seconds = Some(
-            quic_cfg.idle_timeout_seconds.unwrap_or(60)
-        );
+        quic_cfg.keep_alive_interval_seconds =
+            Some(quic_cfg.keep_alive_interval_seconds.unwrap_or(7));
+        quic_cfg.idle_timeout_seconds = Some(quic_cfg.idle_timeout_seconds.unwrap_or(60));
 
-        let transport_config =
-            build_transport_config(&quic_cfg, auth_response.mtu as u16)?;
+        let transport_config = build_transport_config(&quic_cfg, auth_response.mtu as u16)?;
 
         let cipher = Arc::new(Cipher::new(&shared_key));
         let nonce_prefix: [u8; 4] = auth_response
             .nonce_prefix
             .as_slice()
             .try_into()
-            .map_err(|_| anyhow::anyhow!("Invalid nonce prefix len"))?;
+            .map_err(|_| anyhow!("Invalid nonce prefix len"))?;
 
         let anet_socket = Arc::new(AnetUdpSocket::new(
             udp_socket,
@@ -124,17 +122,17 @@ impl ClientTransport for QuicTransport {
         )?;
 
         let mut root_store = RootCertStore::empty();
-        for cert in rustls_pemfile::certs(&mut auth_response.quic_cert.as_slice()) {
+        for cert in certs(&mut auth_response.quic_cert.as_slice()) {
             root_store.add(cert?)?;
         }
 
-        let client_crypto = rustls::ClientConfig::builder()
+        let client_crypto = RustlsClientConfig::builder()
             .with_root_certificates(root_store)
             .with_no_client_auth();
 
-        let mut client_config = ClientConfig::new(Arc::new(
-            quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)?,
-        ));
+        let mut client_config = ClientConfig::new(Arc::new(QuicClientConfig::try_from(
+            client_crypto,
+        )?));
         client_config.transport_config(Arc::new(transport_config));
         endpoint.set_default_client_config(client_config);
 

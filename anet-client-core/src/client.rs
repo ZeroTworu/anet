@@ -1,47 +1,61 @@
-use crate::statistic;
+use crate::auth::AuthDenyError;
+#[cfg(all(windows, feature = "per-app"))]
+use crate::config::PerAppMode;
+use crate::config::{CoreConfig, ServerConfig, TransportMode};
+use crate::connectivity_monitor::{ConnectivityMonitor, NodeProbeMonitor};
+use crate::direct_ip_cache::DirectIpCache;
+use crate::dns::{get_dns_manager, DnsManager};
+use crate::dns_interceptor::{
+    extract_packet_dst_ip, is_encrypted_dns_packet, DnsInterceptor, InterceptResult,
+};
+use crate::events::{
+    account_info, client_state, err, status, warn as emit_warn_event, AccountInfo, ClientState,
+};
+use crate::rule_updater::{default_rules_cache_path, RuleCacheManager};
+use crate::statistic::{
+    start_fast_stats_monitor, start_stats_monitor, PingStatsProvider, QuicStatsProvider,
+    StatsProvider, StreamStatsProvider,
+};
+use crate::traits::{RouteManager, TunFactory};
+use crate::transport::factory::create_transport;
+use crate::transport::ShutdownHook;
+#[cfg(all(windows, feature = "per-app"))]
+use anet_appfilter::{AppFilter, AppPolicy};
+use anet_common::boring_tls::set_default_tls_config;
+use anet_common::consts::COALESCE_BUDGET_BYTES;
+use anet_common::icmp_probe::{
+    build_ipv4_icmp_echo_request, build_reject_packet, clamp_tcp_mss_bytes,
+    is_quic_udp_443_packet, parse_ipv4_icmp_echo_reply, DOMESTIC_PROBE_IPS,
+    PROBE_DOMESTIC_IDENTIFIER, PROBE_IDENTIFIER, PROBE_WORLD_IDENTIFIER, WORLD_PROBE_IPS,
+};
+use anet_common::protocol::{AuthResponse, BillingType as ProtoBillingType};
+use anet_common::stream_framing::{frame_packet_into, FrameReader};
+use anet_filter_core::{LocalOverrides, RuleAction};
 #[cfg(all(windows, feature = "per-app"))]
 use anyhow::Context;
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Error as AnyhowError, Result};
 use bytes::{Bytes, BytesMut};
-use hickory_resolver::TokioResolver;
 use hickory_resolver::config::{NameServerConfig, ResolverConfig, ResolverOpts};
 use hickory_resolver::name_server::TokioConnectionProvider;
 use hickory_resolver::proto::xfer::Protocol;
+use hickory_resolver::TokioResolver;
+use http::Uri;
 use ipnet::IpNet;
 use log::{error, info, warn};
 use quinn::Endpoint;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
-use tokio::io::{AsyncWriteExt, split as io_split};
+use std::time::{Duration, Instant, SystemTime};
+use tokio::io::{split as io_split, AsyncWriteExt};
 use tokio::net::lookup_host;
 use tokio::select;
 use tokio::spawn;
+use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::Notify;
-use tokio::sync::mpsc::{Receiver, Sender};
-use tokio::task::JoinHandle;
-use tokio::time::sleep;
-
-#[cfg(all(windows, feature = "per-app"))]
-use anet_appfilter::{AppFilter, AppPolicy};
-use anet_common::consts::COALESCE_BUDGET_BYTES;
-use anet_common::icmp_probe::{
-    PROBE_IDENTIFIER, build_ipv4_icmp_echo_request, parse_ipv4_icmp_echo_reply,
-};
-use anet_common::protocol::{AuthResponse, BillingType as ProtoBillingType};
-use anet_common::stream_framing::{FrameReader, frame_packet_into};
-
-#[cfg(all(windows, feature = "per-app"))]
-use crate::config::PerAppMode;
-
-use crate::auth::AuthDenyError;
-use crate::config::{CoreConfig, ServerConfig};
-use crate::dns::{DnsManager, get_dns_manager};
-use crate::events::{AccountInfo, ClientState, account_info, client_state, err, status, warn};
-use crate::traits::{RouteManager, TunFactory};
-use crate::transport::factory::create_transport;
+use tokio::task::{AbortHandle, JoinHandle};
+use tokio::time::{sleep, timeout};
 
 struct RunningSession {
     endpoint: Option<Endpoint>,
@@ -49,13 +63,13 @@ struct RunningSession {
     reconnect_signal: Arc<Notify>,
     disconnect_reason: Arc<Mutex<String>>,
     main_task: JoinHandle<()>,
-    t1_abort: tokio::task::AbortHandle,
-    t2_abort: tokio::task::AbortHandle,
-    health_abort: tokio::task::AbortHandle,
-    aux_aborts: Vec<tokio::task::AbortHandle>,
-    dns_aborts: Arc<Mutex<Vec<tokio::task::AbortHandle>>>,
+    t1_abort: AbortHandle,
+    t2_abort: AbortHandle,
+    health_abort: AbortHandle,
+    aux_aborts: Vec<AbortHandle>,
+    dns_aborts: Arc<Mutex<Vec<AbortHandle>>>,
     iface_name: String,
-    shutdown_hook: Option<crate::transport::ShutdownHook>,
+    shutdown_hook: Option<ShutdownHook>,
 }
 
 pub struct AnetClient {
@@ -63,7 +77,7 @@ pub struct AnetClient {
     tun_factory: Box<dyn TunFactory>,
     route_manager: Arc<dyn RouteManager>,
     dns_manager: Box<dyn DnsManager>,
-    rule_cache: crate::rule_updater::RuleCacheManager,
+    rule_cache: RuleCacheManager,
     session: Mutex<Option<RunningSession>>,
     stop_requested: AtomicBool,
     permanently_cancelled: AtomicBool,
@@ -79,13 +93,9 @@ impl AnetClient {
         route_manager: Box<dyn RouteManager>,
     ) -> Self {
         let dns_manager = get_dns_manager();
-        anet_common::boring_tls::set_default_tls_config(config.stealth.to_tls_client_config());
-        let rule_cache = crate::rule_updater::RuleCacheManager::new(
-            crate::rule_updater::default_rules_cache_path(),
-        );
-        crate::connectivity_monitor::ConnectivityMonitor::ensure_started(
-            config.connectivity.clone(),
-        );
+        set_default_tls_config(config.stealth.to_tls_client_config());
+        let rule_cache = RuleCacheManager::new(default_rules_cache_path());
+        ConnectivityMonitor::ensure_started(config.connectivity.clone());
         Self {
             config,
             tun_factory,
@@ -132,11 +142,11 @@ impl AnetClient {
             } else {
                 Duration::from_secs(5)
             };
-            tokio::select! {
+            select! {
                 _ = self.cancel_signal.notified() => {
                     info!("[RuleCache] Sync cancelled by stop signal.");
                 }
-                res = tokio::time::timeout(
+                res = timeout(
                     sync_timeout,
                     self.rule_cache.update_from_server(&rules_server_url),
                 ) => {
@@ -214,9 +224,9 @@ impl AnetClient {
             if clean.is_empty() {
                 continue;
             }
-            tokio::select! {
+            select! {
                 _ = self.cancel_signal.notified() => break,
-                res = tokio::time::timeout(Duration::from_millis(1500), resolver.lookup_ip(clean)) => {
+                res = timeout(Duration::from_millis(1500), resolver.lookup_ip(clean)) => {
                     match res {
                         Ok(Ok(lookup)) => {
                             for ip in lookup.iter() {
@@ -280,12 +290,10 @@ impl AnetClient {
             self.active_finished_notify.notify_waiters();
             return Ok(());
         }
-        crate::connectivity_monitor::ConnectivityMonitor::ensure_started(
-            config_clone.connectivity.clone(),
-        );
+        ConnectivityMonitor::ensure_started(config_clone.connectivity.clone());
 
         info!("[Core] Starting failover connection loop...");
-        warn("[Core] Starting connection loop...");
+        emit_warn_event("[Core] Starting connection loop...");
         client_state(ClientState::Connecting, "Starting connection loop", None);
 
         let mut current_server_index = 0;
@@ -299,9 +307,7 @@ impl AnetClient {
             let reconnect_signal = Arc::new(Notify::new());
 
             let server = &config_clone.servers[current_server_index];
-            anet_common::boring_tls::set_default_tls_config(
-                server.effective_tls_config(&config_clone.stealth),
-            );
+            set_default_tls_config(server.effective_tls_config(&config_clone.stealth));
 
             let server_name = server.get_name();
             info!(
@@ -326,7 +332,7 @@ impl AnetClient {
                         "[Core] Connection with server '{}' lost. Switching to the next node...",
                         server_name
                     );
-                    warn("Connection lost. Reconnecting...");
+                    emit_warn_event("Connection lost. Reconnecting...");
                     client_state(
                         ClientState::Reconnecting,
                         "Connection lost; reconnecting",
@@ -432,16 +438,14 @@ impl AnetClient {
             PerAppMode::All => AppPolicy::exclude(Vec::<String>::new()),
         };
 
-        let vpn_ip = IpAddr::from_str(&auth.ip).context("Failed to parse assigned VPN IP")?;       
+        let vpn_ip = IpAddr::from_str(&auth.ip).context("Failed to parse assigned VPN IP")?;
 
         let (filter, tx, rx) = AppFilter::start(policy, initial_bypass, vpn_ip)?;
 
         let (server_host, server_port) = _server.host_port()?;
         if let Ok(ip) = IpAddr::from_str(&server_host) {
             filter.add_bypass(ip).await;
-        } else if let Ok(mut addrs) =
-            tokio::net::lookup_host((server_host.as_str(), server_port)).await
-        {
+        } else if let Ok(mut addrs) = lookup_host((server_host.as_str(), server_port)).await {
             if let Some(sa) = addrs.next() {
                 filter.add_bypass(sa.ip()).await;
             }
@@ -463,7 +467,7 @@ impl AnetClient {
             apps_names, mode_str,
         ));
 
-        tokio::spawn(async move {
+        spawn(async move {
             let mut rx = tun_rx;
             while rx.recv().await.is_some() {}
         });
@@ -495,12 +499,12 @@ impl AnetClient {
         let connect_fut = transport.connect();
         let stop_flag = &self.stop_requested;
 
-        let mut result = tokio::select! {
-            res = tokio::time::timeout(conn_timeout, connect_fut) => {
+        let mut result = select! {
+            res = timeout(conn_timeout, connect_fut) => {
                 match res {
                     Ok(Ok(auth_res)) => auth_res,
                     Ok(Err(e)) => return Err(e),
-                    Err(_) => return Err(anyhow::anyhow!("Connection handshake timed out")),
+                    Err(_) => return Err(anyhow!("Connection handshake timed out")),
                 }
             }
             _ = self.cancel_signal.notified() => {
@@ -523,7 +527,7 @@ impl AnetClient {
         if self.stop_requested.load(Ordering::SeqCst) {
             info!("[Core] Connection cancelled before configuring tunnel.");
             if let Some(hook) = result.shutdown_hook.take() {
-                let _ = tokio::time::timeout(Duration::from_millis(800), hook).await;
+                let _ = timeout(Duration::from_millis(800), hook).await;
             }
             if let Some(ref endpoint) = result.endpoint {
                 endpoint.close(0u32.into(), b"cancelled");
@@ -544,7 +548,7 @@ impl AnetClient {
                 hosts_to_bypass.push(hp);
             }
         }
-        hosts_to_bypass.extend(crate::connectivity_monitor::NodeProbeMonitor::configured_hosts_and_ports());
+        hosts_to_bypass.extend(NodeProbeMonitor::configured_hosts_and_ports());
         hosts_to_bypass.sort_unstable();
         hosts_to_bypass.dedup();
 
@@ -557,8 +561,7 @@ impl AnetClient {
                     bypass_ips.push(ip);
                 }
             } else if let Ok(Ok(resolved)) =
-                tokio::time::timeout(Duration::from_millis(1500), lookup_host((h.as_str(), p)))
-                    .await
+                timeout(Duration::from_millis(1500), lookup_host((h.as_str(), p))).await
             {
                 bypass_ips.extend(
                     resolved
@@ -595,14 +598,14 @@ impl AnetClient {
         // Инициализация и синхронизация движка Smart DNS, Geo-Routing и AdBlock (.abc + Local Overrides)
         // Выполняется ДО acquire_packet_source, чтобы все платформы (Linux, Windows, macOS, Android VpnService, iOS)
         // получили актуальные статические Direct-подсети в RouteManager до поднятия TUN-интерфейса.
-        let local_overrides = Arc::new(anet_filter_core::LocalOverrides::from_config(
+        let local_overrides = Arc::new(LocalOverrides::from_config(
             &config_clone.routing.overrides,
         ));
-        let mut aux_aborts: Vec<tokio::task::AbortHandle> = Vec::new();
+        let mut aux_aborts: Vec<AbortHandle> = Vec::new();
         let rule_cache = self.rule_cache.clone();
         if let Some(rules_server_url) = config_clone.get_rules_server_url() {
             // Добавляем IP сервера правил в обход туннеля для фоновых ETag-обновлений
-            if let Ok(uri) = rules_server_url.parse::<http::Uri>() {
+            if let Ok(uri) = rules_server_url.parse::<Uri>() {
                 if let Some(host) = uri.host() {
                     let port = uri.port_u16().unwrap_or(if uri.scheme_str() == Some("https") {
                         443
@@ -614,8 +617,7 @@ impl AnetClient {
                             let _ = self.route_manager.add_bypass_route(ip, 32).await;
                         }
                     } else if let Ok(Ok(addrs)) =
-                        tokio::time::timeout(Duration::from_millis(1500), lookup_host((host, port)))
-                            .await
+                        timeout(Duration::from_millis(1500), lookup_host((host, port))).await
                     {
                         for addr in addrs {
                             let ip = addr.ip();
@@ -630,18 +632,14 @@ impl AnetClient {
             let rc_bg = rule_cache.clone();
             let url_bg = rules_server_url.clone();
             let shutdown_bg = self.cancel_signal.clone();
-            let rules_bg_task = tokio::spawn(async move {
+            let rules_bg_task = spawn(async move {
                 if !rc_bg.is_loaded() {
-                    if let Err(e) = rc_bg.update_from_server(&url_bg).await {
-                        log::debug!("[RuleCache] Initial background rules.abc fetch failed: {e}");
-                    }
+                    let _ = rc_bg.update_from_server(&url_bg).await;
                 }
                 loop {
-                    tokio::select! {
+                    select! {
                         _ = sleep(Duration::from_secs(600)) => {
-                            if let Err(e) = rc_bg.update_from_server(&url_bg).await {
-                                log::debug!("[RuleCache] Periodic rules.abc check failed: {e}");
-                            }
+                            let _ = rc_bg.update_from_server(&url_bg).await;
                         }
                         _ = shutdown_bg.notified() => break,
                     }
@@ -651,8 +649,8 @@ impl AnetClient {
         }
 
         let per_app_requested = cfg!(all(windows, feature = "per-app"))
-            && config_clone.main.per_app_mode != crate::config::PerAppMode::All
-            && !(config_clone.main.per_app_mode == crate::config::PerAppMode::Include
+            && config_clone.main.per_app_mode != PerAppMode::All
+            && !(config_clone.main.per_app_mode == PerAppMode::Include
                 && config_clone.main.per_app.is_empty());
 
         if !per_app_requested && config_clone.main.route_for.is_empty() {
@@ -708,7 +706,7 @@ impl AnetClient {
                 h.abort();
             }
             if let Some(hook) = result.shutdown_hook.take() {
-                let _ = tokio::time::timeout(Duration::from_millis(800), hook).await;
+                let _ = timeout(Duration::from_millis(800), hook).await;
             }
             if let Some(ref endpoint) = result.endpoint {
                 endpoint.close(0u32.into(), b"cancelled");
@@ -728,7 +726,7 @@ impl AnetClient {
                     h.abort();
                 }
                 if let Some(hook) = result.shutdown_hook.take() {
-                    let _ = tokio::time::timeout(Duration::from_millis(1200), hook).await;
+                    let _ = timeout(Duration::from_millis(1200), hook).await;
                 }
                 if let Some(ref endpoint) = result.endpoint {
                     endpoint.close(0u32.into(), b"tun_failed");
@@ -744,14 +742,14 @@ impl AnetClient {
             for ip in &bypass_ips {
                 filter.add_bypass_sync(*ip);
             }
-            
+
             // 2. Исключения exclude_route_for из конфига
             if !config_clone.main.exclude_route_for.is_empty() {
                 for net in self.resolve_list(&config_clone.main.exclude_route_for).await {
                     filter.add_bypass_net(net);
                 }
             }
-            
+
             // 3. Пользовательские исключения [routing.overrides] direct
             if !config_clone.routing.overrides.direct.is_empty() {
                 for net in self.resolve_list(&config_clone.routing.overrides.direct).await {
@@ -768,8 +766,8 @@ impl AnetClient {
             }
         }
 
-        let direct_ip_cache = crate::direct_ip_cache::DirectIpCache::new();
-        let dns_interceptor = crate::dns_interceptor::DnsInterceptor::new(
+        let direct_ip_cache = DirectIpCache::new();
+        let dns_interceptor = DnsInterceptor::new(
             local_overrides.clone(),
             direct_ip_cache.clone(),
         );
@@ -789,15 +787,15 @@ impl AnetClient {
         let notify_tx = shutdown_notify.clone();
         let notify_rx = shutdown_notify.clone();
 
-        let client_ip_opt: Option<std::net::Ipv4Addr> = result.auth_response.ip.parse().ok();
-        let gateway_ip_opt: Option<std::net::Ipv4Addr> = result.auth_response.gateway.parse().ok();
+        let client_ip_opt: Option<Ipv4Addr> = result.auth_response.ip.parse().ok();
+        let gateway_ip_opt: Option<Ipv4Addr> = result.auth_response.gateway.parse().ok();
 
         let last_rtt_us = Arc::new(AtomicU64::new(u64::MAX));
         let last_reply_us = Arc::new(AtomicU64::new(0));
-        let (tx_probe, mut rx_probe) = tokio::sync::mpsc::channel::<Bytes>(64);
+        let (tx_probe, mut rx_probe) = channel::<Bytes>(64);
 
-        let is_wrtc_proto = matches!(server.mode(), Ok(crate::config::TransportMode::Wrtc));
-        let is_imap_proto = matches!(server.mode(), Ok(crate::config::TransportMode::Imap));
+        let is_wrtc_proto = matches!(server.mode(), Ok(TransportMode::Wrtc));
+        let is_imap_proto = matches!(server.mode(), Ok(TransportMode::Imap));
 
         // Внутритуннельный генератор ICMP Echo Request для универсального измерения честного RTT
         // и реальной сквозной связности «РФ / Мир» внутри туннеля (включая Android с addDisallowedApplication).
@@ -814,11 +812,11 @@ impl AnetClient {
                 Duration::from_secs(config_clone.connectivity.ping_interval_secs.clamp(1, 30))
             };
 
-            let icmp_probe_task = tokio::spawn(async move {
+            let icmp_probe_task = spawn(async move {
                 let mut seq: u16 = 0;
                 // Небольшая задержка перед первым зондом для завершения инициализации туннеля
-                tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_millis(150)) => {}
+                select! {
+                    _ = sleep(Duration::from_millis(150)) => {}
                     _ = probe_shutdown.notified() => return,
                 }
 
@@ -842,25 +840,21 @@ impl AnetClient {
                     // и российским (77.88.8.8, 77.88.8.1, 87.250.250.242) узлам через NAT сервера.
                     if seq == 1 || seq % 2 == 0 {
                         let now_ext_us = probe_start_time.elapsed().as_micros() as u64;
-                        for (idx, &world_ip) in
-                            anet_common::icmp_probe::WORLD_PROBE_IPS.iter().enumerate()
-                        {
+                        for (idx, &world_ip) in WORLD_PROBE_IPS.iter().enumerate() {
                             let pkt = build_ipv4_icmp_echo_request(
                                 client_ip,
                                 world_ip,
-                                anet_common::icmp_probe::PROBE_WORLD_IDENTIFIER,
+                                PROBE_WORLD_IDENTIFIER,
                                 (idx as u16) + 1,
                                 now_ext_us,
                             );
                             let _ = tx_probe_c.try_send(pkt);
                         }
-                        for (idx, &dom_ip) in
-                            anet_common::icmp_probe::DOMESTIC_PROBE_IPS.iter().enumerate()
-                        {
+                        for (idx, &dom_ip) in DOMESTIC_PROBE_IPS.iter().enumerate() {
                             let pkt = build_ipv4_icmp_echo_request(
                                 client_ip,
                                 dom_ip,
-                                anet_common::icmp_probe::PROBE_DOMESTIC_IDENTIFIER,
+                                PROBE_DOMESTIC_IDENTIFIER,
                                 (idx as u16) + 1,
                                 now_ext_us,
                             );
@@ -876,8 +870,8 @@ impl AnetClient {
                         ping_interval
                     };
 
-                    tokio::select! {
-                        _ = tokio::time::sleep(wait_dur) => {}
+                    select! {
+                        _ = sleep(wait_dur) => {}
                         _ = probe_shutdown.notified() => break,
                     }
                 }
@@ -885,8 +879,7 @@ impl AnetClient {
             aux_aborts.push(icmp_probe_task.abort_handle());
         }
 
-        let dns_aborts: Arc<Mutex<Vec<tokio::task::AbortHandle>>> =
-            Arc::new(Mutex::new(Vec::new()));
+        let dns_aborts: Arc<Mutex<Vec<AbortHandle>>> = Arc::new(Mutex::new(Vec::new()));
         let dns_aborts_t2 = dns_aborts.clone();
 
         let (mut stream_reader, mut stream_writer) = io_split(result.vpn_stream);
@@ -916,7 +909,7 @@ impl AnetClient {
                 // 1. Мгновенно отклоняем IPv6-пакеты (TCP RST / ICMPv6 Unreachable за 0.05 мс),
                 // чтобы Telegram и браузеры на мобильных сетях (МегаФон/МТС/Tele2) без задержки шли по IPv4
                 if pkt.first().map(|b| b >> 4) == Some(6) {
-                    if let Some(reject) = anet_common::icmp_probe::build_reject_packet(pkt) {
+                    if let Some(reject) = build_reject_packet(pkt) {
                         let _ = tx_to_tun_dns.try_send(reject);
                     }
                     return false;
@@ -924,8 +917,8 @@ impl AnetClient {
 
                 // 2. Отклоняем DoH/DoT (порты 853 и 443 к DNS-резолверам) с активным TCP RST / ICMP Unreachable,
                 // чтобы Android Private DNS (netd) и Firefox мгновенно переключались на UDP:53 без зависания «Адрес не найден»
-                if crate::dns_interceptor::is_encrypted_dns_packet(pkt) {
-                    if let Some(reject) = anet_common::icmp_probe::build_reject_packet(pkt) {
+                if is_encrypted_dns_packet(pkt) {
+                    if let Some(reject) = build_reject_packet(pkt) {
                         let _ = tx_to_tun_dns.try_send(reject);
                     }
                     return false;
@@ -934,36 +927,35 @@ impl AnetClient {
                 // 3. В режимах WRTC и IMAP отклоняем QUIC (UDP:443) через ICMP Port Unreachable,
                 // чтобы YouTube и браузеры за 0.05 мс переходили на TCP:443 (HTTP/2) с автоматическим TCP MSS Clamping
                 // и коалесценцией батчей
-                if (is_wrtc_proto || is_imap_proto) && anet_common::icmp_probe::is_quic_udp_443_packet(pkt) {
-                    if let Some(reject) = anet_common::icmp_probe::build_reject_packet(pkt) {
+                if (is_wrtc_proto || is_imap_proto) && is_quic_udp_443_packet(pkt) {
+                    if let Some(reject) = build_reject_packet(pkt) {
                         let _ = tx_to_tun_dns.try_send(reject);
                     }
                     return false;
                 }
 
                 match dns_interceptor_tx.handle_packet(pkt, |domain| rule_cache_tx.lookup_domain(domain)) {
-                    crate::dns_interceptor::InterceptResult::Handled(synth_reply) => {
+                    InterceptResult::Handled(synth_reply) => {
                         let _ = tx_to_tun_dns.try_send(synth_reply);
                         return false;
                     }
-                    crate::dns_interceptor::InterceptResult::Drop => {
+                    InterceptResult::Drop => {
                         return false;
                     }
                     // Все разрешённые DNS-запросы (и Proxy, и Direct IPv4 A) идут строго внутри
                     // зашифрованного VPN-туннеля (0% DNS Leak наружу). Для Direct-доменов ответ
                     // перехватывается в t2 (`inspect_dns_response`), который прописывает /32 bypass-маршруты
                     // до передачи DNS-ответа приложению.
-                    crate::dns_interceptor::InterceptResult::DirectQuery
-                    | crate::dns_interceptor::InterceptResult::PassThrough => {}
+                    InterceptResult::DirectQuery | InterceptResult::PassThrough => {}
                 }
 
-                if let Some(dst_ip) = crate::dns_interceptor::extract_packet_dst_ip(pkt) {
+                if let Some(dst_ip) = extract_packet_dst_ip(pkt) {
                     let ip_action = local_overrides_tx
                         .lookup_ip(dst_ip)
                         .or_else(|| direct_ip_cache_tx.check(&dst_ip))
                         .or_else(|| rule_cache_tx.lookup_ip(dst_ip));
 
-                    if matches!(ip_action, Some(anet_filter_core::RuleAction::Block)) {
+                    if matches!(ip_action, Some(RuleAction::Block)) {
                         return false;
                     }
                 }
@@ -972,7 +964,7 @@ impl AnetClient {
             };
 
             loop {
-                let (packet, is_probe) = tokio::select! {
+                let (packet, is_probe) = select! {
                     biased;
                     probe_pkt = rx_probe.recv() => {
                         match probe_pkt {
@@ -1006,7 +998,7 @@ impl AnetClient {
                 if is_probe {
                     frame_packet_into(&mut write_buf, &packet);
                 } else if should_forward_to_tunnel(&packet) {
-                    let packet = anet_common::icmp_probe::clamp_tcp_mss_bytes(packet, client_clamp_mtu);
+                    let packet = clamp_tcp_mss_bytes(packet, client_clamp_mtu);
                     let len = packet.len() as u64;
                     tx_bytes.fetch_add(len, Ordering::Relaxed);
                     tx_packets.fetch_add(1, Ordering::Relaxed);
@@ -1021,7 +1013,7 @@ impl AnetClient {
                     match rx_from_tun.try_recv() {
                         Ok(p) => {
                             if should_forward_to_tunnel(&p) {
-                                let p = anet_common::icmp_probe::clamp_tcp_mss_bytes(p, client_clamp_mtu);
+                                let p = clamp_tcp_mss_bytes(p, client_clamp_mtu);
                                 let len = p.len() as u64;
                                 tx_bytes.fetch_add(len, Ordering::Relaxed);
                                 tx_packets.fetch_add(1, Ordering::Relaxed);
@@ -1037,7 +1029,7 @@ impl AnetClient {
                 }
                 tx_time.store(tx_start.elapsed().as_micros() as u64, Ordering::Relaxed);
 
-                // ВНИМАНИЕ: ЗДЕСЬ УДАЛЁН flush().await, ИНАЧЕ QUIC И SSH РАБОТАЮТ КАК STOP-AND-WAIT
+                // ВНИМАНИЕ: ЗДЕСЬ УДАЛЁН flush().await, ИНАЧЕ QUIC И SSH РАБОТАЮЮТ КАК STOP-AND-WAIT
                 if let Err(e) = stream_writer.write_all(&write_buf).await {
                     warn!("[Tunnel/Tx] Failed to write {} bytes to VPN stream: {e:#}", write_buf.len());
                     *reason_t1.lock().unwrap() = format!("Failed to write {} bytes to VPN stream: {e:#}", write_buf.len());
@@ -1095,15 +1087,9 @@ impl AnetClient {
 
                                             last_rtt_rx.store(smoothed_us.max(100), Ordering::Relaxed);
                                             last_reply_rx.store(batch_rx_us, Ordering::Relaxed);
-                                            crate::connectivity_monitor::ConnectivityMonitor::update_tunnel_rtt_ms(
+                                            ConnectivityMonitor::update_tunnel_rtt_ms(
                                                 Some((smoothed_us / 1000).max(1)),
                                             );
-                                            log::debug!(
-                                                "[Probe/RTT] In-tunnel RTT: {:.2} ms (sample: {:.2} ms, seq: {})",
-                                                smoothed_us as f64 / 1000.0,
-                                                sample_us as f64 / 1000.0,
-                                                _seq
-                                            );
                                             match frame_reader.try_next_packet() {
                                                 Ok(next_opt) => {
                                                     current_pkt = next_opt;
@@ -1121,11 +1107,11 @@ impl AnetClient {
                                         if let Some((seq_idx, sent_ts_us)) = parse_ipv4_icmp_echo_reply(
                                             &packet,
                                             c_ip,
-                                            anet_common::icmp_probe::PROBE_WORLD_IDENTIFIER,
+                                            PROBE_WORLD_IDENTIFIER,
                                         ) {
                                             let rtt_ms = (batch_rx_us.saturating_sub(sent_ts_us) / 1000).max(1);
                                             let idx = seq_idx.saturating_sub(1) as usize;
-                                            crate::connectivity_monitor::ConnectivityMonitor::record_in_tunnel_global_probe(idx, rtt_ms);
+                                            ConnectivityMonitor::record_in_tunnel_global_probe(idx, rtt_ms);
                                             match frame_reader.try_next_packet() {
                                                 Ok(next_opt) => {
                                                     current_pkt = next_opt;
@@ -1143,11 +1129,11 @@ impl AnetClient {
                                         if let Some((seq_idx, sent_ts_us)) = parse_ipv4_icmp_echo_reply(
                                             &packet,
                                             c_ip,
-                                            anet_common::icmp_probe::PROBE_DOMESTIC_IDENTIFIER,
+                                            PROBE_DOMESTIC_IDENTIFIER,
                                         ) {
                                             let rtt_ms = (batch_rx_us.saturating_sub(sent_ts_us) / 1000).max(1);
                                             let idx = seq_idx.saturating_sub(1) as usize;
-                                            crate::connectivity_monitor::ConnectivityMonitor::record_in_tunnel_domestic_probe(idx, rtt_ms);
+                                            ConnectivityMonitor::record_in_tunnel_domestic_probe(idx, rtt_ms);
                                             match frame_reader.try_next_packet() {
                                                 Ok(next_opt) => {
                                                     current_pkt = next_opt;
@@ -1163,7 +1149,7 @@ impl AnetClient {
                                         }
                                     }
 
-                                    let packet = anet_common::icmp_probe::clamp_tcp_mss_bytes(packet, client_clamp_mtu);
+                                    let packet = clamp_tcp_mss_bytes(packet, client_clamp_mtu);
                                     let len = packet.len() as u64;
                                     rx_bytes.fetch_add(len, Ordering::Relaxed);
                                     rx_packets.fetch_add(1, Ordering::Relaxed);
@@ -1188,9 +1174,9 @@ impl AnetClient {
                                             let rm_bg = route_manager_rx.clone();
                                             let tun_tx_bg = tx_to_tun.clone();
                                             let pkt_bg = packet.clone();
-                                            let dns_rx_task = tokio::spawn(async move {
+                                            let dns_rx_task = spawn(async move {
                                                 let _ = rm_bg.add_bypass_routes(&routes).await;
-                                                log::info!(
+                                                info!(
                                                     "[DNS/Direct] Domain '{}' resolved via tunnel -> added OS bypass routes for {:?}",
                                                     qname,
                                                     resolved_ips
@@ -1294,7 +1280,7 @@ impl AnetClient {
                     h.abort();
                 }
                 if let Some(hook) = result.shutdown_hook.take() {
-                    let _ = tokio::time::timeout(Duration::from_millis(1200), hook).await;
+                    let _ = timeout(Duration::from_millis(1200), hook).await;
                 }
                 if let Some(ref endpoint) = result.endpoint {
                     endpoint.close(0u32.into(), b"route_failed");
@@ -1310,7 +1296,7 @@ impl AnetClient {
                     .iter()
                     .filter_map(|s| IpAddr::from_str(s).ok())
                     .collect();
-                let dns_ipv4: Vec<std::net::Ipv4Addr> = dns_ips
+                let dns_ipv4: Vec<Ipv4Addr> = dns_ips
                     .iter()
                     .filter_map(|ip| match ip {
                         IpAddr::V4(addr) => Some(*addr),
@@ -1334,24 +1320,24 @@ impl AnetClient {
         let tx_probe_health = tx_probe.clone();
 
         let health_pause = result.health_pause.clone();
-        let health_task = tokio::spawn(async move {
+        let health_task = spawn(async move {
             let check_interval = Duration::from_secs(3);
             let has_probes = client_ip_opt.is_some() && gateway_ip_opt.is_some();
             let mut is_initial_phase = true;
             let mut stalled_counter: u32 = 0;
             let mut probe_seq: u16 = 50000;
-            let mut last_wall_clock = std::time::SystemTime::now();
+            let mut last_wall_clock = SystemTime::now();
             let mut last_mono_instant = Instant::now();
 
             loop {
-                tokio::select! {
+                select! {
                     _ = sleep(check_interval) => {}
                     _ = monitor_shutdown.notified() => {
                         break;
                     }
                 }
 
-                let now_wall = std::time::SystemTime::now();
+                let now_wall = SystemTime::now();
                 let wall_elapsed = now_wall
                     .duration_since(last_wall_clock)
                     .unwrap_or(check_interval);
@@ -1412,7 +1398,7 @@ impl AnetClient {
 
                     let mut alive = false;
                     for _ in 0..16 {
-                        tokio::select! {
+                        select! {
                             _ = sleep(Duration::from_millis(250)) => {}
                             _ = monitor_shutdown.notified() => return,
                         }
@@ -1422,7 +1408,7 @@ impl AnetClient {
                         }
                     }
 
-                    last_wall_clock = std::time::SystemTime::now();
+                    last_wall_clock = SystemTime::now();
                     last_mono_instant = Instant::now();
 
                     if !alive {
@@ -1524,11 +1510,11 @@ impl AnetClient {
 
         let stats_shutdown = shutdown_notify.clone();
         {
-            let provider: Arc<dyn statistic::StatsProvider> =
+            let provider: Arc<dyn StatsProvider> =
                 if let Some(ref conn) = result.connection {
-                    Arc::new(statistic::QuicStatsProvider::new(conn.clone()))
+                    Arc::new(QuicStatsProvider::new(conn.clone()))
                 } else {
-                    Arc::new(statistic::StreamStatsProvider::new(
+                    Arc::new(StreamStatsProvider::new(
                         total_rx_bytes.clone(),
                         total_tx_bytes.clone(),
                         total_rx_packets.clone(),
@@ -1540,8 +1526,8 @@ impl AnetClient {
             // Для QUIC: если Quinn нативно возвращает RTT, он используется в первую очередь.
             // Для всех остальных транспортов (SSH/VNC/AHTTP/WS/WRTC): честный сквозной RTT
             // берется из внутритуннельного замера ICMP Echo Reply от ядра сервера.
-            let full_provider: Arc<dyn statistic::StatsProvider> =
-                statistic::PingStatsProvider::new_with_atomic(
+            let full_provider: Arc<dyn StatsProvider> =
+                PingStatsProvider::new_with_atomic(
                     provider.clone(),
                     last_rtt_us.clone(),
                     last_reply_us.clone(),
@@ -1549,11 +1535,11 @@ impl AnetClient {
                 );
 
             let fast_handle =
-                statistic::start_fast_stats_monitor(full_provider.clone(), stats_shutdown.clone());
+                start_fast_stats_monitor(full_provider.clone(), stats_shutdown.clone());
             aux_aborts.push(fast_handle.abort_handle());
 
             let slow_handle = if config_clone.stats.enabled {
-                let h = statistic::start_stats_monitor(
+                let h = start_stats_monitor(
                     full_provider,
                     config_clone.stats.interval_minutes,
                     stats_shutdown,
@@ -1577,7 +1563,7 @@ impl AnetClient {
         let t1_abort = t1.abort_handle();
         let t2_abort = t2.abort_handle();
         let health_abort = health_task.abort_handle();
-        let main_task = tokio::spawn(async move {
+        let main_task = spawn(async move {
             let _ = tokio::join!(t1, t2);
         });
 
@@ -1724,15 +1710,15 @@ impl AnetClient {
             format!("Connected. Local IP: {}", result.auth_response.ip),
             Some(active_node_name.clone()),
         );
-        crate::connectivity_monitor::ConnectivityMonitor::set_vpn_connected(true);
+        ConnectivityMonitor::set_vpn_connected(true);
 
         if !self.stop_requested.load(Ordering::SeqCst) {
-            tokio::select! {
+            select! {
                 _ = reconnect_signal.notified() => {}
                 _ = self.cancel_signal.notified() => {}
             }
         }
-        crate::connectivity_monitor::ConnectivityMonitor::set_vpn_connected(false);
+        ConnectivityMonitor::set_vpn_connected(false);
 
         let duration = session_start.elapsed();
         let now_us = duration.as_micros() as u64;
@@ -1798,21 +1784,21 @@ impl AnetClient {
         }
 
         if let Some(hook) = running.shutdown_hook.take() {
-            let _ = tokio::time::timeout(Duration::from_millis(450), hook).await;
+            let _ = timeout(Duration::from_millis(450), hook).await;
         }
 
         if let Some(ref endpoint) = running.endpoint {
             endpoint.close(0u32.into(), b"session closed");
         }
 
-        if tokio::time::timeout(Duration::from_millis(150), &mut running.main_task)
+        if timeout(Duration::from_millis(150), &mut running.main_task)
             .await
             .is_err()
         {
             warn!("[Core] Main task did not finish in 150ms, aborting tunnel workers...");
             running.t1_abort.abort();
             running.t2_abort.abort();
-            let _ = tokio::time::timeout(Duration::from_millis(100), &mut running.main_task).await;
+            let _ = timeout(Duration::from_millis(100), &mut running.main_task).await;
         }
 
         let _ = self.dns_manager.restore_dns(&running.iface_name);
@@ -1832,7 +1818,7 @@ impl AnetClient {
         }
     }
 
-    pub async fn stop(&self) -> anyhow::Result<()> {
+    pub async fn stop(&self) -> Result<()> {
         self.stop_requested.store(true, Ordering::SeqCst);
         self.cancel_signal.notify_waiters();
 
@@ -1863,7 +1849,7 @@ impl AnetClient {
         while self.is_active.load(Ordering::SeqCst)
             && wait_start.elapsed() < Duration::from_millis(800)
         {
-            tokio::select! {
+            select! {
                 _ = self.active_finished_notify.notified() => {}
                 _ = sleep(Duration::from_millis(25)) => {}
             }
@@ -1871,7 +1857,7 @@ impl AnetClient {
 
         info!("[Core] VPN Stopped.");
         status("[Core] VPN Stopped.");
-        crate::connectivity_monitor::ConnectivityMonitor::set_vpn_connected(false);
+        ConnectivityMonitor::set_vpn_connected(false);
         client_state(ClientState::Stopped, "VPN stopped", None);
         Ok(())
     }
@@ -1894,7 +1880,7 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-fn should_abort_on_auth_deny(err: &anyhow::Error, server_count: usize) -> Option<&AuthDenyError> {
+fn should_abort_on_auth_deny(err: &AnyhowError, server_count: usize) -> Option<&AuthDenyError> {
     let auth_err = err.downcast_ref::<AuthDenyError>()?;
     if !auth_err.is_node_transient() || server_count <= 1 {
         Some(auth_err)
@@ -1961,26 +1947,26 @@ mod tests {
 
     #[test]
     fn test_should_abort_on_auth_deny_account_errors() {
-        let limit_err: anyhow::Error =
+        let limit_err: AnyhowError =
             AuthDenyError::new("Достигнут лимит одновременных подключений").into();
         assert!(should_abort_on_auth_deny(&limit_err, 1).is_some());
         assert!(should_abort_on_auth_deny(&limit_err, 5).is_some());
 
-        let banned_err: anyhow::Error =
+        let banned_err: AnyhowError =
             AuthDenyError::new("Учетная запись заблокирована").into();
         assert!(should_abort_on_auth_deny(&banned_err, 3).is_some());
     }
 
     #[test]
     fn test_should_abort_on_auth_deny_node_transient_errors() {
-        let drain_err: anyhow::Error =
+        let drain_err: AnyhowError =
             AuthDenyError::new("Node is not accepting new connections").into();
         // Если нода всего одна — останавливаемся, чтобы не крутиться в бесконечном цикле
         assert!(should_abort_on_auth_deny(&drain_err, 1).is_some());
         // Если нод несколько — разрешаем failover на следующую ноду
         assert!(should_abort_on_auth_deny(&drain_err, 2).is_none());
 
-        let auth_down_err: anyhow::Error =
+        let auth_down_err: AnyhowError =
             AuthDenyError::new("Все сервера авторизации недоступны").into();
         assert!(should_abort_on_auth_deny(&auth_down_err, 1).is_some());
         assert!(should_abort_on_auth_deny(&auth_down_err, 3).is_none());
@@ -2006,7 +1992,7 @@ mod tests {
         let packets_received_clone = packets_received.clone();
         let server_pub_clone = server_pub_bytes.clone();
 
-        let server_task = tokio::spawn(async move {
+        let server_task = spawn(async move {
             let mut buf = vec![0u8; 2048];
             if let Ok((_len, peer_addr)) = server_sock.recv_from(&mut buf).await {
                 packets_received_clone.fetch_add(1, Ordering::SeqCst);
@@ -2049,7 +2035,7 @@ mod tests {
         );
 
         // Запускаем start() с жестким таймаутом 1.5с (если бы сработал sleep(2s) реконнекта или ретраи — тест бы упал по таймауту)
-        let res = tokio::time::timeout(Duration::from_millis(1500), client.start())
+        let res = timeout(Duration::from_millis(1500), client.start())
             .await
             .expect("client.start() must not enter reconnect sleep on fatal AuthError");
         assert!(res.is_ok());
@@ -2059,4 +2045,5 @@ mod tests {
         let _ = server_task.await;
     }
 }
+
 

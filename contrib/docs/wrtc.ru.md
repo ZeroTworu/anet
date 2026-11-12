@@ -219,6 +219,7 @@ pub enum WrtcMessage {
 * При нахождении в комнате одного участника (дежурный `anet-server`) 40-минутный таймер комнаты не активен и запускается только при входе второго участника.
 * При плановом закрытии комнаты или переподключении сервер переводит активные клиентские контексты в `suspended` через `registry.suspend_client`.
 * При повторном входе клиент выполняет быстрый Discovery и отправляет ASTP с сохранённым `resume_session_id`. Вызов `ClientRegistry::take_suspended` мгновенно перепривязывает новый `endpoint_id` клиента к ранее выделенному туннельному IP без разрыва открытых пользовательских TCP-соединений.
+* **Защита от гонки закрытия старой сессии (`ClientRegistry` atomic `session_id` check):** Методы `remove_client`, `suspend_client` и `update_client_addr` в `anet-server/src/client_registry.rs` удаляют записи из таблиц маршрутизации `clients_by_ip`, `clients_by_prefix` и `clients_by_addr` строго через атомарное условие `.remove_if(..., |_, current| current.session_id == client_info.session_id)`. Если клиент уже успел переподключиться и получить новый `session_id` на тот же туннельный IP, запоздалое завершение старого таска не затирает маршруты новой активной сессии.
 
 ---
 
@@ -234,8 +235,9 @@ mask = "255.255.255.0"
 gateway = "172.112.224.1"
 self_ip = "172.112.224.2"
 if_name = "anet-server"
-# На прямом соединении: 1400. При работе через CF WARP (MTU 1280): 1100
-mtu = 1100
+# Базовый MTU серверного TUN и классических транспортов (SSH/QUIC/VNC/WS): 1400.
+# Для WRTC эффективный MTU рассчитывается отдельно от [wrtc] max_video_batch_bytes!
+mtu = 1400
 
 [server]
 wrtc_room_url = "wrtc://example.ktalk.ru/example-room-id"
@@ -357,12 +359,12 @@ server_idle_room_rotation_secs = 1800
      ```
 
 #### Проблема 3. Фрагментация UDP/RTP пакетов внутри `wgcf-profile` (MTU 1280) и просадка скорости через `turns_proxy`
-* **Симптом:** На стандартном серверном `[network] mtu = 1400` и `max_video_batch_bytes = 1260` размер исходящих RTP-кадров превышал MTU `1280` интерфейса `wgcf-profile`, вызывая фрагментацию и потери пакетов при скачивании. Кроме того, при `jvb_use_turn = true` ICE переключал медиапоток на TCP-релей `turns_proxy`, что роняло скорость и вызывало разрыв сессии через ~90 секунд по `TURN transaction timed out`.
+* **Симптом:** На стандартном `max_video_batch_bytes = 1260` размер исходящих RTP-кадров превышал MTU `1280` интерфейса `wgcf-profile`, вызывая фрагментацию и потери пакетов при скачивании. Кроме того, при `jvb_use_turn = true` ICE переключал медиапоток на TCP-релей `turns_proxy`, что роняло скорость и вызывало разрыв сессии через ~90 секунд по `TURN transaction timed out`.
 * **Решение:**
   1. В `server.toml` отключено использование TURN для соединения с JVB: `jvb_use_turn = false`.
-  2. Выстроен согласованный каскад MTU:
+  2. Выстроен изолированный каскад MTU для `WRTC` без занижения MTU остальных транспортов (`SSH`, `QUIC`, `VNC`, `WS`):
      * На интерфейсе `wgcf-profile`: `MTU = 1280`, планировщик `fq_codel` и `TCPMSS --set-mss 1080`.
-     * В `server.toml`: `[network] mtu = 1100`, `video_mtu_overhead = 110`, `min_tun_mtu = 900`, `max_video_batch_bytes = 960`. В результате клиент получает эффективный MTU туннеля `990` байт, а каждый зашифрованный VP8 RTP-кадр укладывается в `~1070–1150` байт и проходит через WireGuard WARP без единого фрагментированного пакета.
+     * В `server.toml`: глобальный `[network] mtu = 1400` остаётся полным для `SSH`/`QUIC`/`VNC`, а в секции `[wrtc]` задаются `video_mtu_overhead = 110`, `min_tun_mtu = 900`, `max_video_batch_bytes = 960`. Сервер автоматически вычисляет MTU для `WRTC`-сессий по формуле `(max_video_batch_bytes + 30).max(min_tun_mtu).min(network.mtu) = 990` байт, благодаря чему каждый зашифрованный VP8 RTP-кадр укладывается в `~1070–1150` байт и проходит через WireGuard WARP без единого фрагментированного пакета.
 
 #### Проблема 4. Ошибка `XMPP MUC handshake timed out after 20s` при входе сервера `FN` в комнату Ktalk
 * **Симптом:** При запуске `RUST_LOG=debug ./anet-server` на сервере `FN` HTTP-авторизация (`POST /api/authorize/session` и `GET /api/rooms/...`) и TLS WebSocket handshake проходили успешно (`HTTP status: 101 Switching Protocols`), однако после `SASL ANONYMOUS` хендшейк зависал и обрывался по таймауту 20 секунд.
