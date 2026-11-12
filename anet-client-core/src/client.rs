@@ -1,7 +1,5 @@
 use crate::auth::AuthDenyError;
-#[cfg(all(windows, feature = "per-app"))]
-use crate::config::PerAppMode;
-use crate::config::{CoreConfig, ServerConfig, TransportMode};
+use crate::config::{CoreConfig, PerAppMode, ServerConfig, TransportMode};
 use crate::connectivity_monitor::{ConnectivityMonitor, NodeProbeMonitor};
 use crate::direct_ip_cache::DirectIpCache;
 use crate::dns::{get_dns_manager, DnsManager};
