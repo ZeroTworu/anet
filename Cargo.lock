@@ -384,7 +384,6 @@ dependencies = [
  "serde",
  "tokio",
  "toml 0.9.12+spec-1.1.0",
- "wintun",
 ]
 
 [[package]]
@@ -425,6 +424,7 @@ dependencies = [
  "tokio-tungstenite",
  "toml 0.8.2",
  "webrtc",
+ "wintun",
  "x25519-dalek",
  "zip",
 ]
@@ -461,7 +461,6 @@ dependencies = [
  "uuid",
  "windows-sys 0.61.2",
  "winres",
- "wintun",
 ]
 
 [[package]]
