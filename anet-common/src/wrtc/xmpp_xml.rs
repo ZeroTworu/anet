@@ -462,6 +462,7 @@ pub fn parse_jingle_node(
     let mut transport_info = JingleTransportInfo::default();
     let mut sources = Vec::new();
     let mut video_sources = Vec::new();
+    let mut video_source_owners = Vec::new();
     let mut video_payload_type: u8 = 100;
     let mut has_data_channel = false;
     let mut has_video = false;
@@ -506,8 +507,27 @@ pub fn parse_jingle_node(
                 if let Some(ssrc_str) = src.attribute("ssrc") {
                     if let Ok(ssrc) = ssrc_str.parse::<u32>() {
                         if is_video || desc.attribute("media") == Some("video") {
-                            video_sources.push(ssrc);
-                        } else {
+                            if !video_sources.contains(&ssrc) {
+                                video_sources.push(ssrc);
+                            }
+                            let owner_ep = src
+                                .attribute("name")
+                                .and_then(|n| n.strip_suffix("-v0"))
+                                .map(|s| s.trim().to_string())
+                                .or_else(|| {
+                                    src.children()
+                                        .find(|c| c.has_tag_name("ssrc-info"))
+                                        .and_then(|c| c.attribute("owner"))
+                                        .and_then(|o| o.rsplit('/').next())
+                                        .map(|s| s.trim().to_string())
+                                })
+                                .filter(|s| !s.is_empty() && s != "focus" && s != "jvb");
+                            if let Some(ep) = owner_ep {
+                                if !video_source_owners.iter().any(|(s, _)| *s == ssrc) {
+                                    video_source_owners.push((ssrc, ep));
+                                }
+                            }
+                        } else if !sources.contains(&ssrc) {
                             sources.push(ssrc);
                         }
                     }
@@ -598,7 +618,7 @@ pub fn parse_jingle_node(
         if let Some(txt) = json_node.text() {
             if let Ok(val) = serde_json::from_str::<Value>(txt.trim()) {
                 if let Some(sources_obj) = val.get("sources").and_then(|v| v.as_object()) {
-                    for (_ep, ep_arr) in sources_obj {
+                    for (ep, ep_arr) in sources_obj {
                         if let Some(arr) = ep_arr.as_array() {
                             if let Some(v_list) = arr.first().and_then(|v| v.as_array()) {
                                 for item in v_list {
@@ -613,6 +633,12 @@ pub fn parse_jingle_node(
                                         if ssrc != 0 && !video_sources.contains(&ssrc) {
                                             video_sources.push(ssrc);
                                             has_video = true;
+                                        }
+                                        if ssrc != 0
+                                            && !ep.is_empty()
+                                            && !video_source_owners.iter().any(|(s, _)| *s == ssrc)
+                                        {
+                                            video_source_owners.push((ssrc, ep.clone()));
                                         }
                                     }
                                 }
@@ -665,6 +691,7 @@ pub fn parse_jingle_node(
         transport: transport_info,
         sources,
         video_sources,
+        video_source_owners,
         video_payload_type,
         has_data_channel,
         has_video,

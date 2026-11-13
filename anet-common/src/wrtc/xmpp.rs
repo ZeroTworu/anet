@@ -69,6 +69,7 @@ async fn open_xmpp_ws_stream(
     origin: &str,
     profile: &BrowserProfile,
     wrtc_cfg: &WrtcConfig,
+    fallback_ip: Option<std::net::IpAddr>,
 ) -> anyhow::Result<(WebSocketStream<Box<dyn VpnStream>>, Option<std::net::IpAddr>, String)> {
     let handshake_timeout_secs = wrtc_cfg.xmpp_handshake_timeout_secs.max(1);
     let hop_attempts = wrtc_cfg.tcp_port_hop_attempts.clamp(1, 16);
@@ -92,15 +93,47 @@ async fn open_xmpp_ws_stream(
             let tcp_stream = match tcp_res {
                 Ok(Ok(s)) => s,
                 Ok(Err(e)) => {
-                    log::debug!(
-                        "[XMPP] TCP connect attempt {}/{} to {}:443 failed: {}",
-                        attempt,
-                        hop_attempts,
-                        domain,
-                        e
-                    );
-                    last_err = Some(anyhow::anyhow!("XMPP TCP connect to {domain}:443 failed: {e}"));
-                    continue;
+                    if let Some(ip) = fallback_ip {
+                        if let Ok(Ok(s)) = tokio::time::timeout(
+                            connect_timeout,
+                            tokio::net::TcpStream::connect((ip, 443)),
+                        )
+                        .await
+                        {
+                            log::info!(
+                                "[XMPP] DNS/TCP connect to {}:443 failed ({}), succeeded via cached IP {}:443",
+                                domain,
+                                e,
+                                ip
+                            );
+                            s
+                        } else {
+                            log::debug!(
+                                "[XMPP] TCP connect attempt {}/{} to {}:443 (and fallback {}) failed: {}",
+                                attempt,
+                                hop_attempts,
+                                domain,
+                                ip,
+                                e
+                            );
+                            last_err = Some(anyhow::anyhow!(
+                                "XMPP TCP connect to {domain}:443 failed: {e}"
+                            ));
+                            continue;
+                        }
+                    } else {
+                        log::debug!(
+                            "[XMPP] TCP connect attempt {}/{} to {}:443 failed: {}",
+                            attempt,
+                            hop_attempts,
+                            domain,
+                            e
+                        );
+                        last_err = Some(anyhow::anyhow!(
+                            "XMPP TCP connect to {domain}:443 failed: {e}"
+                        ));
+                        continue;
+                    }
                 }
                 Err(_) => {
                     log::debug!(
@@ -205,10 +238,11 @@ async fn try_resume_xmpp_stream(
     wrtc_cfg: &WrtcConfig,
     previd: &str,
     inbound_h: u32,
+    fallback_ip: Option<std::net::IpAddr>,
 ) -> anyhow::Result<WebSocketStream<Box<dyn VpnStream>>> {
     let urls = vec![ws_url.to_string()];
     let (mut ws_stream, _remote_ip, _) =
-        open_xmpp_ws_stream(domain, &urls, origin, profile, wrtc_cfg).await?;
+        open_xmpp_ws_stream(domain, &urls, origin, profile, wrtc_cfg, fallback_ip).await?;
 
     let handshake_timeout = Duration::from_secs(wrtc_cfg.xmpp_handshake_timeout_secs.max(5));
     let resume_fut = async {
@@ -408,7 +442,7 @@ impl XmppSession {
 
         let handshake_timeout_secs = wrtc_cfg.xmpp_handshake_timeout_secs.max(1);
         let (mut ws_stream, remote_ip, connected_ws_url) =
-            open_xmpp_ws_stream(domain, &candidate_urls, &origin, profile, wrtc_cfg).await?;
+            open_xmpp_ws_stream(domain, &candidate_urls, &origin, profile, wrtc_cfg, None).await?;
 
         let open_xml = XmppBuilder::open();
         log::info!("[XMPP OUT]: {open_xml}");
@@ -1012,12 +1046,12 @@ impl XmppSession {
                         }
                     }
                     _ = ping_interval.tick() => {
-                        // Коалесцируем WebSocket Ping, XMPP IQ ping и XEP-0198 <a/> в один TLS-запрос через feed() + flush()
+                        // Коалесцируем WebSocket Ping, XMPP IQ ping, XEP-0198 <a/> и <r/> в один TLS-запрос через feed() + flush()
                         let ping_iq = XmppBuilder::ping("meet.jitsi", &format!("ping_{:08x}", rand::random::<u32>()));
-                        let sm_ack_opt = if sm_enabled {
-                            Some(XmppBuilder::sm_ack(inbound_h))
+                        let (sm_ack_opt, sm_req_opt) = if sm_enabled {
+                            (Some(XmppBuilder::sm_ack(inbound_h)), Some(XmppBuilder::sm_request()))
                         } else {
-                            None
+                            (None, None)
                         };
                         let send_keepalive = async {
                             ws_stream
@@ -1026,6 +1060,9 @@ impl XmppSession {
                             ws_stream.feed(Message::text(ping_iq)).await?;
                             if let Some(ack_xml) = sm_ack_opt {
                                 ws_stream.feed(Message::text(ack_xml)).await?;
+                            }
+                            if let Some(req_xml) = sm_req_opt {
+                                ws_stream.feed(Message::text(req_xml)).await?;
                             }
                             ws_stream.flush().await
                         };
@@ -1058,6 +1095,7 @@ impl XmppSession {
                             &wrtc_cfg_bg,
                             previd,
                             inbound_h,
+                            remote_ip,
                         )
                         .await
                         {

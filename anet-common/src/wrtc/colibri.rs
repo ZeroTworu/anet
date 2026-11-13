@@ -87,28 +87,34 @@ impl ReceiverVideoConstraints {
 
     pub fn for_endpoints(endpoints: &[String], max_height: u32) -> Self {
         let mut map = HashMap::new();
+        let mut sources = Vec::with_capacity(endpoints.len());
+        let mut clean_eps = Vec::with_capacity(endpoints.len());
         for ep in endpoints {
-            map.insert(ep.clone(), VideoConstraint { max_height });
-            let src_name = if ep.ends_with("-v0") {
-                ep.clone()
-            } else {
-                format!("{ep}-v0")
-            };
-            map.insert(src_name, VideoConstraint { max_height });
+            let clean_ep = ep.strip_suffix("-v0").unwrap_or(ep.as_str()).to_string();
+            let src_name = format!("{clean_ep}-v0");
+            map.insert(clean_ep.clone(), VideoConstraint { max_height });
+            map.insert(src_name.clone(), VideoConstraint { max_height });
+            if !clean_eps.contains(&clean_ep) {
+                clean_eps.push(clean_ep);
+            }
+            if !sources.contains(&src_name) {
+                sources.push(src_name);
+            }
         }
+        let active = max_height > 0 && !clean_eps.is_empty();
         Self {
             colibri_class: "ReceiverVideoConstraints".to_string(),
-            last_n: if max_height > 0 { -1 } else { 0 },
-            assumed_bandwidth_bps: if max_height > 0 {
+            last_n: if active { clean_eps.len() as i32 } else { 0 },
+            assumed_bandwidth_bps: if active {
                 Some(10_000_000)
             } else {
                 None
             },
-            default_constraints: VideoConstraint { max_height },
-            selected_endpoints: Some(endpoints.to_vec()),
-            on_stage_endpoints: Some(endpoints.to_vec()),
-            selected_sources: None,
-            on_stage_sources: None,
+            default_constraints: VideoConstraint { max_height: 0 },
+            selected_endpoints: Some(clean_eps.clone()),
+            on_stage_endpoints: Some(clean_eps),
+            selected_sources: Some(sources.clone()),
+            on_stage_sources: Some(sources),
             constraints: Some(map),
         }
     }
@@ -184,8 +190,6 @@ pub enum WrtcMessage {
         video_ssrc: Option<u32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         mode: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        video_v2: Option<bool>,
     },
     #[serde(rename = "e2ee-ack", alias = "anet_beacon")]
     Beacon {
@@ -194,8 +198,6 @@ pub enum WrtcMessage {
         signature: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         video_ssrc: Option<u32>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        video_v2: Option<bool>,
     },
     #[serde(rename = "ReceiverAudioSubscription", alias = "astp")]
     Astp {
@@ -300,7 +302,6 @@ impl ColibriMessage {
                 client_nonce,
                 video_ssrc,
                 mode,
-                video_v2: Some(true),
             },
         )
     }
@@ -319,7 +320,6 @@ impl ColibriMessage {
                 client_nonce,
                 signature,
                 video_ssrc,
-                video_v2: Some(true),
             },
         )
     }

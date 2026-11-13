@@ -105,6 +105,9 @@ pub struct JingleSession {
     pub sources: Vec<u32>,
     #[serde(default)]
     pub video_sources: Vec<u32>,
+    /// Сопоставление `(video_ssrc, endpoint_id)` из Jingle `<source>` / `<json-message>`
+    #[serde(default)]
+    pub video_source_owners: Vec<(u32, String)>,
     #[serde(default = "default_vp8_pt")]
     pub video_payload_type: u8,
     #[serde(default)]
@@ -288,6 +291,14 @@ impl JingleSession {
              {data_section}"
         );
 
+        if self.sources.len() > 1 {
+            for &extra_a_ssrc in self.sources.iter().skip(1) {
+                if extra_a_ssrc != 0 && extra_a_ssrc != remote_audio_ssrc {
+                    sdp = append_remote_audio_ssrc_to_sdp(&sdp, extra_a_ssrc);
+                }
+            }
+        }
+
         if include_video && self.video_sources.len() > 1 {
             for &extra_ssrc in self.video_sources.iter().skip(1) {
                 if extra_ssrc != 0
@@ -301,6 +312,89 @@ impl JingleSession {
 
         sdp
     }
+}
+
+/// Appends a dedicated `m=audio` (`a=mid:a_<ssrc>`, `a=sendonly`) section to the remote SDP
+/// so `rtc-0.21.1` creates a dedicated `Recvonly` transceiver and `TrackRemote` for `new_ssrc`
+/// without triggering `Failed to get track_remote` on incoming Opus keepalive frames.
+pub fn append_remote_audio_ssrc_to_sdp(current_sdp: &str, new_ssrc: u32) -> String {
+    let mid_tag = format!("a_{new_ssrc}");
+    if current_sdp.contains(&format!("a=mid:{mid_tag}\r\n"))
+        || current_sdp.contains(&format!("a=ssrc:{new_ssrc} "))
+    {
+        return current_sdp.to_string();
+    }
+
+    let mut primary_port = "9";
+    let mut c_line = "c=IN IP4 0.0.0.0";
+    let mut ufrag = "jvb_ufrag";
+    let mut pwd = "jvb_pwd_secret";
+    let mut fingerprint = "sha-256 00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00";
+    let mut setup = "actpass";
+    let mut candidate_lines = String::new();
+    let mut in_first_media = false;
+    let mut past_first_media = false;
+
+    for raw_line in current_sdp.lines() {
+        let line = raw_line.trim();
+        if line.starts_with("m=") {
+            if !in_first_media && !past_first_media {
+                in_first_media = true;
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    primary_port = parts[1];
+                }
+            } else if in_first_media {
+                in_first_media = false;
+                past_first_media = true;
+            }
+        } else if line.starts_with("c=IN IP4 ") {
+            c_line = line;
+        } else if let Some(u) = line.strip_prefix("a=ice-ufrag:") {
+            ufrag = u;
+        } else if let Some(p) = line.strip_prefix("a=ice-pwd:") {
+            pwd = p;
+        } else if let Some(fp) = line.strip_prefix("a=fingerprint:") {
+            fingerprint = fp;
+        } else if let Some(s) = line.strip_prefix("a=setup:") {
+            setup = s;
+        } else if in_first_media && line.starts_with("a=candidate:") {
+            candidate_lines.push_str(line);
+            candidate_lines.push_str("\r\n");
+        }
+    }
+
+    let stream_uuid = crate::wrtc::stealth::generate_random_uuid_v4();
+    let track_uuid = crate::wrtc::stealth::generate_random_uuid_v4();
+
+    let mut updated = String::with_capacity(current_sdp.len() + 512);
+    for raw_line in current_sdp.lines() {
+        let line = raw_line.trim_end_matches('\r');
+        if let Some(bundle_rest) = line.strip_prefix("a=group:BUNDLE ") {
+            updated.push_str(&format!("a=group:BUNDLE {bundle_rest} {mid_tag}\r\n"));
+        } else {
+            updated.push_str(line);
+            updated.push_str("\r\n");
+        }
+    }
+
+    updated.push_str(&format!(
+        "m=audio {primary_port} UDP/TLS/RTP/SAVPF 111\r\n\
+         {c_line}\r\n\
+         a=rtcp-mux\r\n\
+         a=rtpmap:111 opus/48000/2\r\n\
+         a=ice-ufrag:{ufrag}\r\n\
+         a=ice-pwd:{pwd}\r\n\
+         a=fingerprint:{fingerprint}\r\n\
+         a=setup:{setup}\r\n\
+         a=mid:{mid_tag}\r\n\
+         a=sendonly\r\n\
+         a=ssrc:{new_ssrc} cname:{stream_uuid}\r\n\
+         a=ssrc:{new_ssrc} msid:{stream_uuid} {track_uuid}\r\n\
+         {candidate_lines}"
+    ));
+
+    updated
 }
 
 /// Appends a dedicated `m=video` (`a=mid:v_<ssrc>`, `a=sendonly`) section to the remote SDP

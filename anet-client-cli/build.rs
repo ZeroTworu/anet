@@ -65,4 +65,11 @@ fn main() {
     writeln!(f, "pub const BUILD_TYPE: &str = \"{}\";", build_type).unwrap();
 
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=src");
+    println!("cargo:rerun-if-changed=../anet-common/src");
+    println!("cargo:rerun-if-changed=../anet-client-core/src");
+    println!("cargo:rerun-if-changed=../.git/HEAD");
+    println!("cargo:rerun-if-changed=../.git/refs");
+    println!("cargo:rerun-if-changed=../.git/index");
+    println!("cargo:rerun-if-changed=../.git/packed-refs");
 }

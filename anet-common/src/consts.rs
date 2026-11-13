@@ -38,27 +38,12 @@ pub const MAX_UDP_PAYLOAD_SIZE: usize = 1450;
 // Константы транспорта WebRTC (Ktalk / Jitsi JVB / VP8 Media Video)
 // =========================================================================
 
-/// Минимальный валидный заголовок ключевого кадра VP8 (20 байт, 16x16, legacy).
-/// Позволяет мосту JVB / SFU успешно валидировать битовый поток VP8
-/// и форвардить пакеты подписчикам без отсечения по decode-timeout.
-pub const VP8_KEYFRAME_HEADER: [u8; 20] = [
-    0x30, 0x01, 0x00, 0x9d, 0x01, 0x2a, 0x10, 0x00,
-    0x10, 0x00, 0x00, 0x47, 0x08, 0x85, 0x85, 0x88,
-    0x99, 0x84, 0x88, 0xfc,
-];
-
 /// Валидный заголовок ключевого кадра VP8 с разрешением 1920x1080 (FullHD, 20 байт).
-/// Исключает занижение целевого битрейта в BitrateController JVB из-за 16x16 разрешения.
+/// Позволяет мосту JVB / SFU валидировать битовый поток VP8 без занижения целевого битрейта
+/// в BitrateController и гарантирует независимую доставку каждого RTP-пакета без каскадных
+/// дропов в Vp8AdaptiveTrackProjectionContext при одиночных потерях UDP.
 pub const VP8_KEYFRAME_1080P_HEADER: [u8; 20] = [
     0x30, 0x01, 0x00, 0x9d, 0x01, 0x2a, 0x80, 0x07,
-    0x38, 0x04, 0x00, 0x47, 0x08, 0x85, 0x85, 0x88,
-    0x99, 0x84, 0x88, 0xfc,
-];
-
-/// Валидный заголовок межкадрового пакета VP8 (P-frame / Interframe, bit 0 = 1, 20 байт).
-/// Предотвращает сброс Vp8FrameMap и пересоздание контекста проекции на каждом пакете в SFU JVB.
-pub const VP8_INTERFRAME_HEADER: [u8; 20] = [
-    0x31, 0x01, 0x00, 0x9d, 0x01, 0x2a, 0x80, 0x07,
     0x38, 0x04, 0x00, 0x47, 0x08, 0x85, 0x85, 0x88,
     0x99, 0x84, 0x88, 0xfc,
 ];
@@ -85,7 +70,7 @@ pub const WRTC_MIN_TUN_MTU: i32 = 1200;
 
 /// Размер префикса VP8 + Client Tag перед зашифрованным ASTP-кадром в RTP-пакете:
 /// 4B (VP8 Payload Descriptor) + 20B (VP8 Frame Header) + 2B (Client Tag) = 26 байт.
-pub const VP8_ASTP_PREFIX_LEN: usize = 4 + VP8_KEYFRAME_HEADER.len() + 2;
+pub const VP8_ASTP_PREFIX_LEN: usize = 4 + VP8_KEYFRAME_1080P_HEADER.len() + 2;
 
 /// Зарезервированный тег для широковещательных или нетегированных кадров.
 pub const TAG_UNTAGGED: u16 = 0x0000;
@@ -106,15 +91,11 @@ pub const WRTC_OPUS_SILENCE_FRAME: [u8; 3] = [0xf8, 0xff, 0xfe];
 pub const WRTC_VP8_PRIMARY_PAYLOAD_TYPE: u8 = 100;
 pub const WRTC_VP8_FALLBACK_PAYLOAD_TYPE: u8 = 96;
 pub const WRTC_VP8_CLOCK_RATE: u32 = 90000;
-pub const WRTC_VP8_RTP_TS_STEP: u32 = 300;
 pub const WRTC_DEFAULT_MAX_VIDEO_HEIGHT: u32 = 2160;
 
 /// Параметры генерации ключевых кадров VP8 для прохождения фильтрации JVB SFU.
-pub const WRTC_KEYFRAME_INTERVAL_MASK: u32 = 31;
 pub const WRTC_INITIAL_FORCE_KEYFRAMES: u32 = 8;
 pub const WRTC_REASSERT_FORCE_KEYFRAMES: u32 = 16;
-pub const WRTC_BURST_KEYFRAME_COUNT: usize = 4;
-pub const WRTC_BURST_KEYFRAME_INTERVAL_MS: u64 = 25;
 
 /// Размеры внутренних очередей и буферов подсистемы WebRTC.
 pub const WRTC_COLIBRI_CHANNEL_CAPACITY: usize = 16384;
@@ -125,14 +106,11 @@ pub const WRTC_XMPP_CHANNEL_CAPACITY: usize = 128;
 pub const WRTC_XMPP_RAW_WS_CHANNEL_CAPACITY: usize = 32;
 pub const WRTC_DUPLEX_BUFFER_SIZE: usize = 4 * 1024 * 1024;
 
-/// Параметры микро-батчирования, коалесценции и EDT-пейсинга пакетов в WebRTC.
+/// Параметры микро-батчирования и коалесценции пакетов в WebRTC.
 pub const WRTC_BATCHER_MAX_BYTES: usize = 16384;
 pub const WRTC_BATCHER_MAX_DELAY_MS: u64 = 2;
 pub const WRTC_VIDEO_BATCH_MAX_PACKETS: usize = 16;
 pub const WRTC_UPLINK_BURST_MAX_PACKETS: usize = 64;
-pub const WRTC_UPLINK_PACING_NS_PER_BYTE: u64 = 45;
-pub const WRTC_DOWNLINK_PACING_NS_PER_BYTE: u64 = 38;
-pub const WRTC_PACING_HORIZON_NS: u64 = 2_500_000;
 
 /// Внутренние интервалы опроса ICE, ретраев DataChannel и фоновых задач.
 pub const WRTC_ICE_GATHER_POLL_ATTEMPTS: usize = 50;
