@@ -25,7 +25,7 @@ services:
       - BIND_TO=0.0.0.0:3000
       - AUTH_BACKEND_KEY=test_key
       - JWT_SECRET=secret_na_chushpana
-         # --- Личный Кабинет ([cabinet.web]) ---
+      # --- Личный Кабинет ([cabinet.web]) ---
       - APP_ENV=${APP_ENV:-production}
       - USER_JWT_TTL_HOURS=${USER_JWT_TTL_HOURS:-168}
       - PUBLIC_DOMAIN=${PUBLIC_DOMAIN:-https://service.example.com}

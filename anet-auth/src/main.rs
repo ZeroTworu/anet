@@ -260,21 +260,18 @@ async fn run_server(db: DatabaseConnection) -> Result<(), anyhow::Error> {
     let ui = api_service.swagger_ui();
     let spec = api_service.spec_endpoint();
 
-    // Защищенные маршруты OpenAPI (проверка X-Auth-Key для /check_access и /session/*)
-    let protected_api = Route::new()
+    // Открытый маршрут для входящих вебхуков FreeKassa (IP whitelist + MD5 SIGN проверяются внутри);
+    // ApiKeyMiddleware проверяет X-Auth-Key только для /check_access и /session/*
+    let app = Route::new()
         .nest("/api/v1", api_service)
         .nest("/swagger", ui)
         .at("/spec", spec)
-        .with(middleware::ApiKeyMiddleware { key: api_key });
-
-    // Открытый маршрут для входящих вебхуков FreeKassa (IP whitelist + MD5 SIGN проверяются внутри)
-    let app = Route::new()
         .at(
             "/billing/freekassa/notify",
             poem::post(anet_auth::api::freekassa::freekassa_notify_handler).data(db),
         )
-        .nest("/", protected_api)
-        .with(poem::middleware::Cors::new());
+        .with(poem::middleware::Cors::new())
+        .with(middleware::ApiKeyMiddleware { key: api_key });
 
     info!("ANet Auth started on {}", bind_to);
     Server::new(TcpListener::bind(format!("{}", bind_to)))

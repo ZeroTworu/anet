@@ -109,7 +109,7 @@ pub struct DisconnectSessionRequest {
 }
 
 #[derive(Object, Debug, Serialize, Deserialize)]
-pub struct TrafficHistoryPointDto {
+pub struct CabinetTrafficHistoryPointDto {
     pub timestamp: String,
     pub rx_bytes: i64,
     pub tx_bytes: i64,
@@ -647,7 +647,7 @@ impl UserCabinetApi {
         auth: UserAuth,
         hours: Query<Option<u32>>,
         bucket_hours: Query<Option<u32>>,
-    ) -> poem::Result<Json<Vec<TrafficHistoryPointDto>>> {
+    ) -> poem::Result<Json<Vec<CabinetTrafficHistoryPointDto>>> {
         let claims = self.ensure_user(&auth).await?;
 
         let hours = hours.0.unwrap_or(24).clamp(1, 24 * 90);
@@ -700,7 +700,7 @@ impl UserCabinetApi {
             for day_offset in 0..total_days {
                 let bucket = start_day + ChronoDuration::days(day_offset);
                 let (rx_bytes, tx_bytes) = aggregate.get(&bucket).copied().unwrap_or((0, 0));
-                points.push(TrafficHistoryPointDto {
+                points.push(CabinetTrafficHistoryPointDto {
                     timestamp: bucket.and_utc().to_rfc3339(),
                     rx_bytes,
                     tx_bytes,
@@ -717,7 +717,7 @@ impl UserCabinetApi {
             for step in 0..step_count {
                 let bucket = aligned_start + ChronoDuration::hours(step * group_hours);
                 let (rx_bytes, tx_bytes) = aggregate.get(&bucket).copied().unwrap_or((0, 0));
-                points.push(TrafficHistoryPointDto {
+                points.push(CabinetTrafficHistoryPointDto {
                     timestamp: bucket.and_utc().to_rfc3339(),
                     rx_bytes,
                     tx_bytes,
