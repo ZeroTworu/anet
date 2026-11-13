@@ -31,3 +31,4 @@ pub mod orders;
 pub mod products;
 pub mod transactions;
 pub mod vouchers;
+pub mod verification_tokens;

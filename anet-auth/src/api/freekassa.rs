@@ -22,7 +22,7 @@ use crate::entities::{
     orders, products, transactions, users, vouchers,
 };
 
-fn hex_encode(bytes: &[u8]) -> String {
+pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for &b in bytes {
         let _ = write!(&mut out, "{:02x}", b);
@@ -30,8 +30,8 @@ fn hex_encode(bytes: &[u8]) -> String {
     out
 }
 
-/// Чистая реализация RFC 2104 HMAC-SHA256 поверх уже подключённого крейта `sha2`
-fn hmac_sha256_hex(key: &[u8], data: &[u8]) -> String {
+/// Чистая реализация RFC 2104 HMAC-SHA256 (сырые 32 байта) поверх уже подключённого крейта `sha2`
+pub(crate) fn hmac_sha256_bytes(key: &[u8], data: &[u8]) -> [u8; 32] {
     const BLOCK_LEN: usize = 64;
     let mut k0 = [0u8; BLOCK_LEN];
     if key.len() > BLOCK_LEN {
@@ -56,7 +56,15 @@ fn hmac_sha256_hex(key: &[u8], data: &[u8]) -> String {
     let mut outer = Sha256::new();
     outer.update(opad);
     outer.update(inner_hash);
-    hex_encode(&outer.finalize())
+    let digest = outer.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    out
+}
+
+/// HMAC-SHA256 в hex нижнего регистра
+pub(crate) fn hmac_sha256_hex(key: &[u8], data: &[u8]) -> String {
+    hex_encode(&hmac_sha256_bytes(key, data))
 }
 
 /// Чистая реализация RFC 1321 MD5 (для SCI и входящего вебхука FreeKassa)

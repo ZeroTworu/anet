@@ -3,6 +3,7 @@ pub mod m20261019_000031_add_provider_action_and_items_table;
 pub mod m20261103_000032_add_imap_to_protocol_type;
 pub mod m20261103_000033_create_imap_mailboxes;
 pub mod m20261112_000034_create_billing_and_user_cabinet;
+pub mod m20261113_000035_create_verification_tokens;
 pub mod m20240101_000001_create_users;
 pub mod m20240319_000002_create_admins;
 pub mod m20240401_000003_create_rates;
@@ -75,6 +76,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261103_000032_add_imap_to_protocol_type::Migration),
             Box::new(m20261103_000033_create_imap_mailboxes::Migration),
             Box::new(m20261112_000034_create_billing_and_user_cabinet::Migration),
+            Box::new(m20261113_000035_create_verification_tokens::Migration),
         ]
     }
 }

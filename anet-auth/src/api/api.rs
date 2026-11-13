@@ -149,6 +149,23 @@ pub fn get_live_node_sessions_for_fingerprint(node_id: Uuid, fingerprint: &str) 
     Some(cnt as i32)
 }
 
+/// Возвращает список активных узлов с числом живых сессий и timestamp старейшей сессии
+/// для указанного `fingerprint` по актуальным heartbeat-снимкам нод (TTL = 45с).
+pub fn get_live_node_sessions_detail_for_fingerprint(fingerprint: &str) -> Vec<(Uuid, u32, u64)> {
+    let mut guard = live_sessions_map().lock().unwrap();
+    let now = std::time::Instant::now();
+    guard.retain(|_, snap| now.duration_since(snap.updated_at) <= LIVE_NODE_TTL);
+    guard
+        .iter()
+        .filter_map(|(&node_id, snap)| {
+            snap.counts
+                .get(fingerprint)
+                .filter(|&&(cnt, _)| cnt > 0)
+                .map(|&(cnt, oldest_ts)| (node_id, cnt, oldest_ts))
+        })
+        .collect()
+}
+
 /// Точечно обновляет число живых сессий одного `fingerprint` на конкретной ноде `node_id`
 /// (используется при `/check_access` для мгновенной синхронизации до прихода периодического heartbeat).
 pub fn set_live_node_session_for_fingerprint(node_id: Uuid, fingerprint: &str, count: u32) {

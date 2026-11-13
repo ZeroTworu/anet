@@ -2,6 +2,8 @@ use log::{info, warn};
 use std::env;
 use std::sync::OnceLock;
 
+/// Конфигурация коммерческого модуля (ЛК, Email/Telegram auth и FreeKassa).
+/// Читается строго из переменных окружения (.env.example.auth / Docker Compose environment / EnvironmentFile).
 #[derive(Debug, Clone)]
 pub struct BillingRuntimeConfig {
     pub app_env: String,
@@ -20,6 +22,9 @@ pub struct CabinetWebConfig {
     pub public_domain: String,
     pub verification_token_ttl_mins: u64,
     pub min_password_length: usize,
+    pub user_jwt_ttl_hours: i64,
+    pub email_webhook_url: String,
+    pub email_webhook_token: String,
 }
 
 #[derive(Debug, Clone)]
@@ -88,6 +93,9 @@ fn load_from_env() -> BillingRuntimeConfig {
     let public_domain = env_non_empty(&["PUBLIC_DOMAIN", "ANET_PUBLIC_URL"])
         .unwrap_or_else(|| "https://service.example.com".to_string());
 
+    let email_webhook_url = env_non_empty(&["EMAIL_WEBHOOK_URL"]).unwrap_or_default();
+    let email_webhook_token = env_non_empty(&["EMAIL_WEBHOOK_TOKEN"]).unwrap_or_default();
+
     let bot_token = env_non_empty(&["TELEGRAM_BOT_TOKEN"]).unwrap_or_default();
     let web_app_data_key = env_non_empty(&["TELEGRAM_WEB_APP_DATA_KEY"])
         .unwrap_or_else(|| "WebAppData".to_string());
@@ -106,8 +114,11 @@ fn load_from_env() -> BillingRuntimeConfig {
         cabinet: CabinetConfig {
             web: CabinetWebConfig {
                 public_domain,
-                verification_token_ttl_mins: env_parse_u64("VERIFICATION_TOKEN_TTL_MINS", 15),
-                min_password_length: env_parse_usize("MIN_PASSWORD_LENGTH", 5),
+                verification_token_ttl_mins: env_parse_u64("VERIFICATION_TOKEN_TTL_MINS", 15).max(1),
+                min_password_length: env_parse_usize("MIN_PASSWORD_LENGTH", 5).max(1),
+                user_jwt_ttl_hours: env_parse_i64("USER_JWT_TTL_HOURS", 168).max(1),
+                email_webhook_url,
+                email_webhook_token,
             },
             telegram: CabinetTelegramConfig {
                 bot_token,
@@ -131,15 +142,19 @@ fn load_from_env() -> BillingRuntimeConfig {
     if env_non_empty(&["JWT_SECRET"]).is_none() {
         warn!("[Config] JWT_SECRET is not set in .env / EnvironmentFile; using fallback secret (set JWT_SECRET in production!)");
     }
+    if cfg.cabinet.web.email_webhook_url.is_empty() {
+        warn!("[Config] EMAIL_WEBHOOK_URL is not set; email verification links will only be logged/returned in APP_ENV=development");
+    }
     if cfg.billing.freekassa.shop_id.is_empty() || cfg.billing.freekassa.secret2.is_empty() {
         warn!("[Config] FK_SHOP_ID or FK_SECRET2 is not configured; FreeKassa webhooks will return 500 until set");
     } else {
         info!(
-            "[Config] Loaded billing & cabinet env config: public_domain='{}', fk_shop_id='{}', fk_api_key_set={}, tg_bot_set={}",
+            "[Config] Loaded billing & cabinet env config: public_domain='{}', fk_shop_id='{}', fk_api_key_set={}, tg_bot_set={}, email_webhook_set={}",
             cfg.cabinet.web.public_domain,
             cfg.billing.freekassa.shop_id,
             !cfg.billing.freekassa.api_key.is_empty(),
             !cfg.cabinet.telegram.bot_token.is_empty(),
+            !cfg.cabinet.web.email_webhook_url.is_empty(),
         );
     }
 

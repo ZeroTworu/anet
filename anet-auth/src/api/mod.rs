@@ -13,6 +13,7 @@ pub mod users;
 pub mod admin_billing;
 pub mod freekassa;
 pub mod imap_mailboxes;
+pub mod user_auth;
 pub mod user_cabinet;
 
 use poem_openapi::OpenApi;
@@ -27,7 +28,7 @@ pub fn get_api(
         auth::AuthApi { db: db.clone() },
         users::UsersApi {
             db: db.clone(),
-            client_template_path,
+            client_template_path: client_template_path.clone(),
         },
         servers::ServersApi { db: db.clone() },
         pools::PoolsApi { db: db.clone() },
@@ -38,7 +39,8 @@ pub fn get_api(
         rule_providers::RuleProvidersApi { db: db.clone() },
         custom_overrides::CustomOverridesApi { db: db.clone() },
         imap_mailboxes::ImapMailboxesApi { db: db.clone() },
-        user_cabinet::UserCabinetApi::new(db.clone()),
+        user_auth::UserAuthApi { db: db.clone() },
+        user_cabinet::UserCabinetApi::new(db.clone(), client_template_path),
         admin_billing::AdminBillingApi::new(db),
     )
 }
