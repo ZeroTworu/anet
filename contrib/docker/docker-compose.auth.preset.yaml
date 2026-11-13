@@ -25,6 +25,24 @@ services:
       - BIND_TO=0.0.0.0:3000
       - AUTH_BACKEND_KEY=test_key
       - JWT_SECRET=secret_na_chushpana
+      # --- Личный Кабинет ([cabinet.web]) ---
+      - APP_ENV=${APP_ENV:-production}
+      - PUBLIC_DOMAIN=${PUBLIC_DOMAIN:-https://service.example.com}
+      - VERIFICATION_TOKEN_TTL_MINS=${VERIFICATION_TOKEN_TTL_MINS:-15}
+      - MIN_PASSWORD_LENGTH=${MIN_PASSWORD_LENGTH:-5}
+      # --- Telegram Mini App ([cabinet.telegram]) ---
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - TELEGRAM_WEB_APP_DATA_KEY=${TELEGRAM_WEB_APP_DATA_KEY:-WebAppData}
+      # --- FreeKassa ([billing.freekassa]) ---
+      - FK_SHOP_ID=${FK_SHOP_ID:-}
+      - FK_SECRET1=${FK_SECRET1:-}
+      - FK_SECRET2=${FK_SECRET2:-}
+      - FK_API_KEY=${FK_API_KEY:-}
+      - FK_PAY_URL=${FK_PAY_URL:-https://pay.freekassa.ru/}
+      - FK_API_URL=${FK_API_URL:-https://api.fk.life/v1}
+      - FK_SYNC_INTERVAL_SECS=${FK_SYNC_INTERVAL_SECS:-900}
+      - FK_PENDING_THRESHOLD_MINS=${FK_PENDING_THRESHOLD_MINS:-15}
+
     depends_on:
       postgres:
         condition: service_healthy

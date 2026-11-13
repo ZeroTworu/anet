@@ -33,6 +33,10 @@ struct Args {
     /// Добавление Администратора Системы (interactive pass entry)
     #[arg(long = "add-su", value_name = "LOGIN")]
     add_su: Option<String>,
+
+    /// Путь к .env / EnvironmentFile с секретами биллинга и ЛК (опционально)
+    #[arg(long = "env-file", value_name = "PATH")]
+    env_file: Option<String>,
 }
 
 #[tokio::main]
@@ -41,10 +45,22 @@ async fn main() -> Result<(), anyhow::Error> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .filter(Some("sqlx"), log::LevelFilter::Warn) // Игнорировать INFO-логи от sqlx
         .init();
-    dotenvy::dotenv().ok();
-
-    // 2. Парсинг аргументов
+    // 2. Парсинг аргументов и загрузка .env / systemd EnvironmentFile
     let args = Args::parse();
+    if let Some(ref env_path) = args.env_file {
+        dotenvy::from_path(env_path)
+            .map_err(|e| anyhow::anyhow!("Failed to load env file '{}': {}", env_path, e))?;
+    } else if let Ok(env_path) = env::var("ANET_ENV_FILE") {
+        if !env_path.trim().is_empty() {
+            dotenvy::from_path(env_path.trim())
+                .map_err(|e| anyhow::anyhow!("Failed to load ANET_ENV_FILE '{}': {}", env_path, e))?;
+        } else {
+            dotenvy::dotenv().ok();
+        }
+    } else {
+        dotenvy::dotenv().ok();
+    }
+    anet_auth::config::init_config();
 
     // 3. Подключение к БД
     let db_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set");
@@ -128,6 +144,12 @@ async fn handle_add_user(
         public_key: Set(Some(encrypted_public_key)),
         route_map_id: Set(None),
         group_id: Set(None),
+        email: Set(None),
+        password_hash: Set(None),
+        telegram_id: Set(None),
+        balance: Set(0.0),
+        activated_at: Set(None),
+        expires_at: Set(None),
     };
 
     // 3. Сохраняем
@@ -219,6 +241,8 @@ async fn handle_add_admin(db: &DatabaseConnection, login: String) -> Result<(), 
 async fn run_server(db: DatabaseConnection) -> Result<(), anyhow::Error> {
     // Запускаем фоновый воркер загрузки списков и компиляции правил
     tokio::spawn(anet_auth::compiler_worker::run_worker(db.clone()));
+    // Запускаем фоновый воркер сверки зависших заказов FreeKassa (HMAC-SHA256 getOrders)
+    tokio::spawn(anet_auth::api::freekassa::cron_sync_freekassa(db.clone()));
 
     let bind_to = env::var("BIND_TO").unwrap_or_else(|_| "127.0.0.1:3000".to_string());
     let api_key = env::var("AUTH_BACKEND_KEY").expect("AUTH_BACKEND_KEY must be set");
@@ -227,7 +251,7 @@ async fn run_server(db: DatabaseConnection) -> Result<(), anyhow::Error> {
 
     let server_url = env::var("PUBLIC_API_URL").unwrap_or_else(|_| "/api/v1".to_string());
     let api_service = OpenApiService::new(
-        api::get_api(db, client_template_path),
+        api::get_api(db.clone(), client_template_path),
         "ANet Auth API",
         "1.0"
     )
@@ -236,12 +260,21 @@ async fn run_server(db: DatabaseConnection) -> Result<(), anyhow::Error> {
     let ui = api_service.swagger_ui();
     let spec = api_service.spec_endpoint();
 
-    let app = Route::new()
+    // Защищенные маршруты OpenAPI (проверка X-Auth-Key для /check_access и /session/*)
+    let protected_api = Route::new()
         .nest("/api/v1", api_service)
         .nest("/swagger", ui)
         .at("/spec", spec)
-        .with(poem::middleware::Cors::new())
         .with(middleware::ApiKeyMiddleware { key: api_key });
+
+    // Открытый маршрут для входящих вебхуков FreeKassa (IP whitelist + MD5 SIGN проверяются внутри)
+    let app = Route::new()
+        .at(
+            "/billing/freekassa/notify",
+            poem::post(anet_auth::api::freekassa::freekassa_notify_handler).data(db),
+        )
+        .nest("/", protected_api)
+        .with(poem::middleware::Cors::new());
 
     info!("ANet Auth started on {}", bind_to);
     Server::new(TcpListener::bind(format!("{}", bind_to)))

@@ -656,6 +656,8 @@ pub struct ActiveConnectionDto {
 pub struct GroupDto {
     pub id: uuid::Uuid,
     pub name: String,
+    #[oai(default)]
+    pub is_default: bool,
     pub traffic_limit: i64,
     pub speed_limit: i32,
     pub sessions_limit: i32,
@@ -675,6 +677,8 @@ pub struct AddGroupMemberRequest {
 #[derive(Object, Debug, Clone, Serialize, Deserialize)]
 pub struct SaveGroupRequest {
     pub name: String,
+    #[oai(default)]
+    pub is_default: Option<bool>,
     pub traffic_limit: i64,
     pub speed_limit: i32,
     pub sessions_limit: i32,

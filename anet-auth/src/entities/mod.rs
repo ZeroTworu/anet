@@ -25,3 +25,9 @@ pub mod rule_provider_items;
 pub mod admin_custom_overrides;
 pub mod imap_mailboxes;
 
+// Коммерческий модуль и биллинг
+pub mod billing_enums;
+pub mod orders;
+pub mod products;
+pub mod transactions;
+pub mod vouchers;

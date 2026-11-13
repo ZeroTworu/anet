@@ -29,6 +29,7 @@ fn map_group_model_to_dto(group: groups::Model, user_count: i64, pool_ids: Vec<U
     GroupDto {
         id: group.id,
         name: group.name,
+        is_default: group.is_default,
         traffic_limit: group.traffic_limit,
         speed_limit: group.speed_limit,
         sessions_limit: group.sessions_limit,
@@ -328,10 +329,12 @@ impl GroupsApi {
 
         let now = Utc::now().naive_utc();
         let group_id = Uuid::new_v4();
+        let is_default = req.0.is_default.unwrap_or(false);
 
         let new_group = crate::entities::groups::ActiveModel {
             id: Set(group_id),
             name: Set(req.0.name.trim().to_string()),
+            is_default: Set(is_default),
             traffic_limit: Set(req.0.traffic_limit as i64),
             speed_limit: Set(req.0.speed_limit as i32),
             sessions_limit: Set(req.0.sessions_limit as i32),
@@ -344,6 +347,19 @@ impl GroupsApi {
             Ok(t) => t,
             Err(e) => return SaveGroupResponse::Error(Json(e.to_string())),
         };
+
+        if is_default {
+            if let Err(e) = crate::entities::groups::Entity::update_many()
+                .col_expr(
+                    crate::entities::groups::Column::IsDefault,
+                    sea_orm::sea_query::Expr::value(false),
+                )
+                .exec(&txn)
+                .await
+            {
+                return SaveGroupResponse::Error(Json(e.to_string()));
+            }
+        }
 
         let group = match new_group.insert(&txn).await {
             Ok(group) => group,
@@ -399,6 +415,22 @@ impl GroupsApi {
 
         let mut active = existing.into_active_model();
         active.name = Set(req.0.name.trim().to_string());
+        if let Some(is_def) = req.0.is_default {
+            if is_def {
+                if let Err(e) = crate::entities::groups::Entity::update_many()
+                    .col_expr(
+                        crate::entities::groups::Column::IsDefault,
+                        sea_orm::sea_query::Expr::value(false),
+                    )
+                    .filter(crate::entities::groups::Column::Id.ne(id.0))
+                    .exec(&txn)
+                    .await
+                {
+                    return SaveGroupResponse::Error(Json(e.to_string()));
+                }
+            }
+            active.is_default = Set(is_def);
+        }
         active.traffic_limit = Set(req.0.traffic_limit as i64);
         active.speed_limit = Set(req.0.speed_limit as i32);
         active.sessions_limit = Set(req.0.sessions_limit as i32);

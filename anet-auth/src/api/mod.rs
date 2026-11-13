@@ -10,7 +10,10 @@ pub mod rule_providers;
 pub mod servers;
 pub mod statistics;
 pub mod users;
+pub mod admin_billing;
+pub mod freekassa;
 pub mod imap_mailboxes;
+pub mod user_cabinet;
 
 use poem_openapi::OpenApi;
 use sea_orm::DatabaseConnection;
@@ -34,6 +37,8 @@ pub fn get_api(
         compiled_rules::CompiledRulesApi { db: db.clone() },
         rule_providers::RuleProvidersApi { db: db.clone() },
         custom_overrides::CustomOverridesApi { db: db.clone() },
-        imap_mailboxes::ImapMailboxesApi { db },
+        imap_mailboxes::ImapMailboxesApi { db: db.clone() },
+        user_cabinet::UserCabinetApi::new(db.clone()),
+        admin_billing::AdminBillingApi::new(db),
     )
 }

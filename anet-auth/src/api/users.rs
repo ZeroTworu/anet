@@ -231,6 +231,12 @@ impl UsersApi {
             public_key: Set(Some(encrypted_public_key)),
             route_map_id: Set(req.0.route_map_id),
             group_id: Set(req.0.group_id),
+            email: Set(None),
+            password_hash: Set(None),
+            telegram_id: Set(None),
+            balance: Set(0.0),
+            activated_at: Set(None),
+            expires_at: Set(None),
         };
 
         if let Err(e) = new_user.insert(&self.db).await {

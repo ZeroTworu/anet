@@ -10,6 +10,7 @@ serde = { workspace = true, features = ["derive"] }
 log = { workspace = true }
 env_logger = { workspace = true }
 dotenvy = "0.15"
+serde_json = "1"
 
 poem = "3.1.8"
 poem-openapi = { version = "5.1.12", features = ["swagger-ui", "uuid"] }

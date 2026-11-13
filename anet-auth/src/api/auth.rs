@@ -5,16 +5,15 @@ use crate::api::dto::{
 use crate::entities::{admins, sessions, users};
 use anet_common::dto::BillingType;
 use bcrypt::verify;
+use chrono::Datelike;
 use jsonwebtoken::{encode, EncodingKey, Header};
 use poem::Result;
 use poem_openapi::{payload::Json, OpenApi};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, Set,
-    QueryFilter, QuerySelect,
+    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QuerySelect, Set,
+    TransactionTrait,
 };
-use std::env;
 use uuid::Uuid;
-use chrono::Datelike;
 
 pub struct AuthApi {
     pub db: DatabaseConnection,
@@ -35,7 +34,7 @@ impl AuthApi {
         };
 
         if !verify(&req.0.password, &admin_entry.pass_hash).unwrap_or(false) {
-            return LoginResponse::Unauthorized(Json("Invalid pass".into()))
+            return LoginResponse::Unauthorized(Json("Invalid pass".into()));
         }
 
         let token_id = Uuid::new_v4();
@@ -57,21 +56,21 @@ impl AuthApi {
             sub: admin_entry.id.to_string(),
             exp: expiration.timestamp() as usize,
         };
-        let secret = env::var("JWT_SECRET").unwrap_or_else(|_| "secret_na_chushpana".into());
+
+        let secret = crate::config::jwt_secret();
         let token = encode(
             &Header::default(),
             &claims,
             &EncodingKey::from_secret(secret.as_bytes()),
         )
-            .unwrap_or_default();
+        .unwrap_or_default();
 
         LoginResponse::Ok(Json(AuthTokens {
             access_token: token,
         }))
     }
 
-    /// Проверка VPN Сервера при Handshake
-    /// Проверка VPN Сервера при Handshake
+    /// Проверка VPN Сервера при Handshake (Smart Activation & Priority Ladder)
     #[oai(path = "/check_access", method = "post")]
     async fn check_access(
         &self,
@@ -79,14 +78,21 @@ impl AuthApi {
     ) -> Result<Json<CheckAccessResponse>> {
         let fingerprint = &req.0.fingerprint;
 
-        let user = match users::Entity::find()
+        // ---------------------------------------------------------------------
+        // АТОМАРНАЯ ТРАНЗАКЦИЯ БД: Исключает Race Condition при одновременных
+        // хэндшейках с разных устройств (ноутбук + телефон).
+        // ---------------------------------------------------------------------
+        let txn = self.db.begin().await.map_err(poem::error::InternalServerError)?;
+
+        let mut user = match users::Entity::find()
             .filter(users::Column::Fingerprint.eq(fingerprint))
-            .one(&self.db)
+            .one(&txn)
             .await
             .map_err(poem::error::InternalServerError)?
         {
             Some(u) => u,
             None => {
+                let _ = txn.rollback().await;
                 return Ok(Json(CheckAccessResponse {
                     allowed: false,
                     message: "Not found".into(),
@@ -100,11 +106,12 @@ impl AuthApi {
                     active_sessions: None,
                     allowed_sessions: None,
                     expires_at: None,
-                }))
+                }));
             }
         };
 
         if !user.is_active {
+            let _ = txn.rollback().await;
             return Ok(Json(CheckAccessResponse {
                 allowed: false,
                 message: "Учетная запись заблокирована".into(),
@@ -121,16 +128,9 @@ impl AuthApi {
             }));
         }
 
-        // Загружаем индивидуальный тариф (если есть)
-        let rate_opt = crate::entities::rates::Entity::find()
-            .filter(crate::entities::rates::Column::UserId.eq(user.id))
-            .one(&self.db)
-            .await
-            .unwrap_or(None);
-
-        // Загружаем группу (если привязана)
-        let group_opt = if let Some(group_id) = user.group_id {
-            match crate::entities::groups::Entity::find_by_id(group_id).one(&self.db).await {
+        // Загружаем привязанную группу
+        let mut group_opt = if let Some(group_id) = user.group_id {
+            match crate::entities::groups::Entity::find_by_id(group_id).one(&txn).await {
                 Ok(g) => g,
                 Err(e) => {
                     log::error!("[check_access] Ошибка загрузки группы {}: {}", group_id, e);
@@ -141,26 +141,114 @@ impl AuthApi {
             None
         };
 
-        let now = chrono::Utc::now().naive_utc();
+        let now_utc = chrono::Utc::now();
+        let now_naive = now_utc.naive_utc();
+
+        // =====================================================================
+        // 1. SMART ACTIVATION: Момент первой сетевой активности (Раздел 1.3)
+        // Если тариф оплачен (group_id задан), но activated_at равен None —
+        // фиксируем точный момент старта и рассчитываем дедлайн подписки.
+        // =====================================================================
+        if user.activated_at.is_none() && user.group_id.is_some() {
+            if let Some(ref group) = group_opt {
+                if group.duration_days > 0 {
+                    let expiration = now_utc + chrono::Duration::days(group.duration_days as i64);
+                    let mut active_user: users::ActiveModel = user.clone().into();
+                    active_user.activated_at = Set(Some(now_utc));
+                    active_user.expires_at = Set(Some(expiration));
+                    active_user.updated_at = Set(now_naive);
+
+                    match active_user.update(&txn).await {
+                        Ok(updated) => {
+                            log::info!(
+                                "[check_access] Smart Activation активирована для user {}: activated_at={:?}, expires_at={:?}",
+                                updated.id, updated.activated_at, updated.expires_at
+                            );
+                            user = updated;
+                        }
+                        Err(e) => {
+                            log::error!("[check_access] Ошибка записи Smart Activation: {}", e);
+                        }
+                    }
+                }
+            }
+        }
+
+        // =====================================================================
+        // 2. ПРОВЕРКА ИСТЕЧЕНИЯ ПОДПИСКИ & ПЕРЕКЛЮЧЕНИЕ НА DEFAULT-ГРУППУ
+        // =====================================================================
+        if let Some(exp) = user.expires_at {
+            if now_utc > exp {
+                log::warn!(
+                    "[check_access] Подписка user {} истекла ({:?}). Поиск дефолтной группы...",
+                    user.id, exp
+                );
+                let default_group = match crate::entities::groups::Entity::find()
+                    .filter(crate::entities::groups::Column::IsDefault.eq(true))
+                    .one(&txn)
+                    .await
+                {
+                    Ok(dg) => dg,
+                    Err(e) => {
+                        log::error!("[check_access] Ошибка поиска default-группы: {}", e);
+                        None
+                    }
+                };
+
+                let mut active_user: users::ActiveModel = user.clone().into();
+                active_user.group_id = Set(default_group.as_ref().map(|g| g.id));
+                active_user.expires_at = Set(None);
+                active_user.updated_at = Set(now_naive);
+
+                if let Ok(updated) = active_user.update(&txn).await {
+                    user = updated;
+                    group_opt = default_group;
+                }
+
+                // Если в группе по умолчанию доступ закрыт (sessions_limit == 0)
+                if group_opt.as_ref().map(|g| g.sessions_limit).unwrap_or(0) == 0 {
+                    let _ = txn.commit().await;
+                    return Ok(Json(CheckAccessResponse {
+                        allowed: false,
+                        message: "Время действия подписки истекло. Продлите тариф в Личном Кабинете".into(),
+                        static_ip: None,
+                        user_id: None,
+                        speed_limit_kbps: None,
+                        billing_type: None,
+                        group_name: group_opt.as_ref().map(|g| g.name.clone()),
+                        traffic_limit: None,
+                        traffic_consumed: None,
+                        active_sessions: None,
+                        allowed_sessions: Some(0),
+                        expires_at: Some(exp.naive_utc().format("%Y-%m-%d %H:%M").to_string()),
+                    }));
+                }
+            }
+        }
+
+        // Загружаем индивидуальный тариф rates (если есть)
+        let rate_opt = crate::entities::rates::Entity::find()
+            .filter(crate::entities::rates::Column::UserId.eq(user.id))
+            .one(&txn)
+            .await
+            .unwrap_or(None);
 
         // 1. Дефолтные границы по календарному месяцу
-        let first_day_current_month = chrono::NaiveDate::from_ymd_opt(now.year(), now.month(), 1)
+        let first_day_current_month = chrono::NaiveDate::from_ymd_opt(now_naive.year(), now_naive.month(), 1)
             .unwrap()
             .and_hms_opt(0, 0, 0)
             .unwrap();
 
-        let (next_year, next_month) = if now.month() == 12 {
-            (now.year() + 1, 1)
+        let (next_year, next_month) = if now_naive.month() == 12 {
+            (now_naive.year() + 1, 1)
         } else {
-            (now.year(), now.month() + 1)
+            (now_naive.year(), now_naive.month() + 1)
         };
         let first_day_next_month = chrono::NaiveDate::from_ymd_opt(next_year, next_month, 1)
             .unwrap()
             .and_hms_opt(0, 0, 0)
             .unwrap();
 
-        // Объявляем переменные без холостой инициализации — компилятор проверит,
-        // что каждая из них гарантированно заполнится в ветках if / else
         let expiration_date: chrono::NaiveDateTime;
         let cycle_start: chrono::NaiveDateTime;
         let check_expiration: bool;
@@ -169,20 +257,21 @@ impl AuthApi {
         let speed_limit: i32;
         let has_limits: bool;
         let billing_type: BillingType;
-
         let group_name = group_opt.as_ref().map(|g| g.name.clone());
 
-        // =========================================================================
-        // ЛЕСТНИЦА ПРИОРИТЕТОВ: Рейт -> Группа -> Анлим
-        // =========================================================================
-        if let Some(ref rate) = rate_opt {
-            // --- ПРИОРИТЕТ 1: Персональный тариф ---
+        // =====================================================================
+        // ЛЕСТНИЦА ПРИОРИТЕТОВ: Активный Рейт (Override) -> Группа -> Анлим
+        // =====================================================================
+        if let Some(ref rate) = rate_opt
+            .as_ref()
+            .filter(|r| r.date_end > now_naive || group_opt.is_none())
+        {
+            // --- ПРИОРИТЕТ 1: Персональный тариф (полное переопределение) ---
             billing_type = if group_opt.is_some() {
                 BillingType::GroupAndIndividual
             } else {
                 BillingType::Individual
             };
-
             expiration_date = rate.date_end;
             check_expiration = true;
 
@@ -191,22 +280,28 @@ impl AuthApi {
                 .map(|g| g.duration_days)
                 .filter(|&d| d > 0)
                 .unwrap_or(30) as i64;
-            cycle_start = expiration_date - chrono::Duration::days(duration_days);
 
+            cycle_start = expiration_date - chrono::Duration::days(duration_days);
             allowed_sessions = rate.sessions;
             max_traffic = rate.traffic_limit;
             speed_limit = rate.speed_limit;
             has_limits = true;
         } else if let Some(ref group) = group_opt {
-            // --- ПРИОРИТЕТ 2: Группа (без персонального тарифа) ---
+            // --- ПРИОРИТЕТ 2: Группа (базовый тарифный план) ---
             billing_type = BillingType::Group;
 
-            if group.duration_days > 0 {
+            if let Some(exp) = user.expires_at {
+                check_expiration = true;
+                expiration_date = exp.naive_utc();
+                cycle_start = user
+                    .activated_at
+                    .map(|d| d.naive_utc())
+                    .unwrap_or(user.created_at);
+            } else if group.duration_days > 0 {
                 check_expiration = true;
                 let duration = chrono::Duration::days(group.duration_days as i64);
-
-                cycle_start = user.updated_at;
-                expiration_date = user.updated_at + duration;
+                cycle_start = user.activated_at.map(|d| d.naive_utc()).unwrap_or(now_naive);
+                expiration_date = cycle_start + duration;
             } else {
                 check_expiration = false;
                 cycle_start = first_day_current_month;
@@ -236,8 +331,8 @@ impl AuthApi {
             .node_id
             .as_deref()
             .and_then(|s| Uuid::parse_str(s).ok());
-        if let (Some(node_uuid), Some(node_cnt)) = (requesting_node_id, req.0.node_active_sessions)
-        {
+
+        if let (Some(node_uuid), Some(node_cnt)) = (requesting_node_id, req.0.node_active_sessions) {
             crate::api::api::set_live_node_session_for_fingerprint(
                 node_uuid,
                 &user.fingerprint,
@@ -248,7 +343,7 @@ impl AuthApi {
         // Подсчет активных сессий пользователя (с приоритетом декларативного live-состояния от нод)
         let db_sessions = crate::entities::active_sessions::Entity::find()
             .filter(crate::entities::active_sessions::Column::UserId.eq(user.id))
-            .one(&self.db)
+            .one(&txn)
             .await
             .ok()
             .flatten()
@@ -265,13 +360,18 @@ impl AuthApi {
             .filter(
                 sea_orm::Condition::any()
                     .add(crate::entities::traffic_hourly::Column::UserId.eq(user.id))
-                    .add(crate::entities::traffic_hourly::Column::Fingerprint.eq(&user.fingerprint))
+                    .add(crate::entities::traffic_hourly::Column::Fingerprint.eq(&user.fingerprint)),
             )
             .filter(crate::entities::traffic_hourly::Column::BucketStart.gte(cycle_start))
             .select_only()
-            .column_as(sea_orm::sea_query::Expr::cust("CAST(COALESCE(SUM(rx_bytes), 0) + COALESCE(SUM(tx_bytes), 0) AS BIGINT)"), "total")
+            .column_as(
+                sea_orm::sea_query::Expr::cust(
+                    "CAST(COALESCE(SUM(rx_bytes), 0) + COALESCE(SUM(tx_bytes), 0) AS BIGINT)",
+                ),
+                "total",
+            )
             .into_tuple::<Option<i64>>()
-            .one(&self.db)
+            .one(&txn)
             .await;
 
         if let Ok(Some(Some(total_bytes))) = sum_result {
@@ -288,7 +388,8 @@ impl AuthApi {
         // 4. Проверка ограничений (если есть лимиты)
         if has_limits {
             // Проверка срока действия
-            if check_expiration && chrono::Utc::now().naive_utc() > expiration_date {
+            if check_expiration && now_naive > expiration_date {
+                let _ = txn.commit().await;
                 return Ok(Json(CheckAccessResponse {
                     allowed: false,
                     message: "Время действия подписки истекло".into(),
@@ -309,6 +410,7 @@ impl AuthApi {
             if max_traffic > 0 {
                 if let Some(total_bytes) = traffic_consumed {
                     if total_bytes >= max_traffic {
+                        let _ = txn.commit().await;
                         return Ok(Json(CheckAccessResponse {
                             allowed: false,
                             message: "Лимит трафика на этот период исчерпан".into(),
@@ -328,7 +430,11 @@ impl AuthApi {
             }
 
             // Проверка лимита одновременных подключений (allowed_sessions > 0; 0 = безлимит)
+            // ПРИМЕЧАНИЕ [AI-PROMPT Раздел 1.2]: Без сбора HWID автоматическое FIFO-выбивание
+            // старых сокетов вызывает шторм взаимного выбивания (осцилляцию). При достижении
+            // лимита возвращается отказ; сброс зависшей сессии доступен по кнопке в Личном Кабинете.
             if allowed_sessions > 0 && current_sessions >= allowed_sessions {
+                let _ = txn.commit().await;
                 return Ok(Json(CheckAccessResponse {
                     allowed: false,
                     message: "Достигнут лимит одновременных подключений".into(),
@@ -365,23 +471,26 @@ impl AuthApi {
 
         if let Ok(Some(sess_row)) = crate::entities::active_sessions::Entity::find()
             .filter(crate::entities::active_sessions::Column::UserId.eq(user.id))
-            .one(&self.db)
+            .one(&txn)
             .await
         {
             let mut editable: crate::entities::active_sessions::ActiveModel = sess_row.into();
             editable.sessions = Set(reported_active);
-            editable.updated_at = Set(now);
-            let _ = editable.update(&self.db).await;
+            editable.updated_at = Set(now_naive);
+            let _ = editable.update(&txn).await;
         } else {
             let new_sess = crate::entities::active_sessions::ActiveModel {
                 id: Set(Uuid::new_v4()),
                 user_id: Set(user.id),
                 sessions: Set(reported_active),
-                created_at: Set(now),
-                updated_at: Set(now),
+                created_at: Set(now_naive),
+                updated_at: Set(now_naive),
             };
-            let _ = new_sess.insert(&self.db).await;
+            let _ = new_sess.insert(&txn).await;
         }
+
+        // Успешно фиксируем транзакцию в БД
+        txn.commit().await.map_err(poem::error::InternalServerError)?;
 
         Ok(Json(CheckAccessResponse {
             allowed: true,

@@ -8,6 +8,7 @@ pub struct Model {
     pub id: Uuid,
     #[sea_orm(unique, column_type = "Text")]
     pub name: String,
+    pub is_default: bool,        // Группа по умолчанию при регистрации и истечении подписки
     pub traffic_limit: i64,      // Лимит трафика в байтах (0 - безлимит)
     pub speed_limit: i32,        // Лимит скорости в kbps (0 - безлимит)
     pub sessions_limit: i32,     // Максимум сессий
