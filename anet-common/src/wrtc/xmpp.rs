@@ -136,15 +136,47 @@ async fn open_xmpp_ws_stream(
                     }
                 }
                 Err(_) => {
-                    log::debug!(
-                        "[XMPP] TCP connect attempt {}/{} to {}:443 timed out after {:?} (hopping source port)",
-                        attempt,
-                        hop_attempts,
-                        domain,
-                        connect_timeout
-                    );
-                    last_err = Some(anyhow::anyhow!("XMPP TCP connect to {domain}:443 timed out"));
-                    continue;
+                    if let Some(ip) = fallback_ip {
+                        if let Ok(Ok(s)) = tokio::time::timeout(
+                            connect_timeout,
+                            tokio::net::TcpStream::connect((ip, 443)),
+                        )
+                        .await
+                        {
+                            log::info!(
+                                "[XMPP] DNS/TCP connect to {}:443 timed out after {:?}, succeeded via cached IP {}:443",
+                                domain,
+                                connect_timeout,
+                                ip
+                            );
+                            s
+                        } else {
+                            log::debug!(
+                                "[XMPP] TCP connect attempt {}/{} to {}:443 timed out after {:?} and fallback {} failed",
+                                attempt,
+                                hop_attempts,
+                                domain,
+                                connect_timeout,
+                                ip
+                            );
+                            last_err = Some(anyhow::anyhow!(
+                                "XMPP TCP connect to {domain}:443 timed out"
+                            ));
+                            continue;
+                        }
+                    } else {
+                        log::debug!(
+                            "[XMPP] TCP connect attempt {}/{} to {}:443 timed out after {:?} (hopping source port)",
+                            attempt,
+                            hop_attempts,
+                            domain,
+                            connect_timeout
+                        );
+                        last_err = Some(anyhow::anyhow!(
+                            "XMPP TCP connect to {domain}:443 timed out"
+                        ));
+                        continue;
+                    }
                 }
             };
 
@@ -366,7 +398,7 @@ impl XmppSession {
                     "wss://{clean_domain}/jitsi/xmpp-websocket?room={conference_id}&sessionToken={session_token}"
                 ),
                 format!(
-                    "wss://{clean_domain}/xmpp-websocket?room={conference_id}&token={session_token}& Lists=true"
+                    "wss://{clean_domain}/xmpp-websocket?room={conference_id}&token={session_token}&lists=true"
                 ),
             ]
         } else {

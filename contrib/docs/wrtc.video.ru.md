@@ -15,7 +15,7 @@
 
 ---
 
-## 2. Структура сетевого пакета (Wire Format, протокол `video_v2`)
+## 2. Структура сетевого пакета (Wire Format)
 
 Каждый зашифрованный сетевой пакет (или микро-батч пакетов) передаётся внутри RTP-пакета видеодорожки VP8 с 26-байтным префиксом (`VP8_ASTP_PREFIX_LEN = 26`):
 
@@ -45,13 +45,14 @@
    * `payload[2..4]` — 15-битный монотонно растущий `PictureID` с установленным старшим битом `M=1` (`0x8000 | pic_id`).
    * На приёмной стороне дескриптор произвольной длины разбирается и отсекается по стандарту RFC 7741 функцией `strip_vp8_payload_descriptor()`.
 2. **VP8 Frame Header (`20 байт`):**
-   * В режиме `video_v2 = true` чередуются два типа заголовков с разрешением `1920x1080` (FullHD):
-     * **`VP8_KEYFRAME_1080P_HEADER`** (`0x30, 0x01, 0x00, 0x9d, 0x01, 0x2a, 0x80, 0x07, 0x38, 0x04, ...`, бит `P=0`) — ключевой кадр (I-frame). Отправляется в стартовой пачке (`WRTC_INITIAL_FORCE_KEYFRAMES = 16`), по запросу `force_next_keyframe()`, каждый 32-й пакет (`(frame_num & WRTC_KEYFRAME_INTERVAL_MASK) == 0`), а также после паузы простоя $\ge 15\text{ мс}$. Заявленное в заголовке разрешение `1920x1080` предотвращает искусственное занижение пропускной способности контроллером `BitrateController` внутри JVB.
+   * Чередуются два типа валидных заголовков с разрешением `1920x1080` (FullHD):
+     * **`VP8_KEYFRAME_1080P_HEADER`** (`0x30, 0x01, 0x00, 0x9d, 0x01, 0x2a, 0x80, 0x07, 0x38, 0x04, ...`, бит `P=0`) — ключевой кадр (I-frame). Отправляется в стартовой пачке (`WRTC_INITIAL_FORCE_KEYFRAMES = 8`), при повторном запросе `force_next_keyframe()` (`WRTC_REASSERT_FORCE_KEYFRAMES = 16`), каждый 32-й пакет (`(frame_num & WRTC_KEYFRAME_INTERVAL_MASK) == 0`, где маска `= 31`), а также после паузы простоя $\ge 15\text{ мс}$. Заявленное в заголовке разрешение `1920x1080` предотвращает искусственное занижение пропускной способности контроллером `BitrateController` внутри JVB.
      * **`VP8_INTERFRAME_HEADER`** (`0x31, ...`, бит `P=1`) — межкадровый пакет (P-frame). Отправляется для всех остальных кадров, чтобы SFU JVB не сбрасывал `Vp8FrameMap` и не пересоздавал контекст проекции видеопотока на каждом RTP-пакете.
    * На приёме заголовок проверяется функцией `is_valid_vp8_frame_header()` по стартовым байтам и 10-байтной сигнатуре хвоста `VP8_HEADER_TAIL_MAGIC`.
-   * **Согласование `ReceiverVideoConstraints` без гонки перезаписи:**
-     * При инициализации `WrtcPeer` активные ограничения инициализируются значением `ReceiverVideoConstraints::new_all(WRTC_DEFAULT_MAX_VIDEO_HEIGHT)` (`maxHeight = 2160`, `lastN = -1`, `assumedBandwidthBps = 10_000_000`).
-     * Когда узел узнаёт целевой `endpoint_id` и `video_ssrc` пира, он обновляет `active_video_constraints` таргетированным пакетом (`selectedSources` / `onStageSources`). Фоновая задача повторной отправки (`WRTC_CONSTRAINTS_RETRY_ATTEMPTS = 6` каждые `1500 мс`) на каждой итерации считывает актуальное значение из `active_video_constraints`, благодаря чему таргетированная подписка на видеопоток никогда не затирается широковещательным шаблоном по умолчанию.
+   * **Согласование `ReceiverVideoConstraints` и пакетный `add_remote_ssrcs`:**
+     * В `WrtcPeer::create` регистрируются `configure_rtcp_reports(Registry::new())` и `configure_twcc_receiver_only(registry, &mut media_engine)?`, чтобы браузерный/JVB стек корректно получал RTCP SR/RR и TWCC feedback вместо падения с ошибкой на призрачных источниках.
+     * Новые `audio` и `video` SSRC из `session-initiate` / `source-add` инжектируются в SDP за **одну общую транзакцию** `add_remote_ssrcs(&audio_ssrcs, &video_ssrcs)` вместо N последовательных перегенераций SDP, а удаление участников (`source-remove`) очищает `ReceiverVideoConstraints`.
+     * Когда узел узнаёт целевой `endpoint_id` и `video_ssrc` пира, он обновляет `active_video_constraints` таргетированным пакетом (`selectedSources` / `onStageSources`). Фоновая задача повторной отправки (`WRTC_CONSTRAINTS_RETRY_ATTEMPTS = 30` каждые `100 мс`) и периодический `reassert` на клиенте (`WRTC_CLIENT_CONSTRAINTS_REASSERT_COUNT = 10` каждые `2 с`) считывают актуальное значение из `active_video_constraints`.
    * **Двустороннее подтверждение прогрева видеоканала (`VIDEO_WARMUP_PAYLOAD` и `VIDEO_WARMUP_ACK_PAYLOAD`) и защита от флуда XMPP:**
      * `VIDEO_WARMUP_PAYLOAD` (`[0x00, 0xFF, 0xFF, 0x00, ...]`, 16 байт) — зонд прогрева без подтверждения обратного канала. Как только ICE/DTLS переходит в состояние `Connected`, клиент мгновенно (с шагом опроса 100 мс, не дожидаясь 2-секундного тика watchdog) отправляет серию из 3 ключевых кадров `VIDEO_WARMUP_PAYLOAD` и продолжает слать их каждые 500 мс до получения подтверждения от сервера.
      * `VIDEO_WARMUP_ACK_PAYLOAD` (`[0x00, 0xFF, 0xFF, 0x01, ...]`, 16 байт, `byte[3] == 1`) — кадр подтверждения двусторонней готовности RTP Video от сервера. Сервер отправляет его мгновенно при успешной расшифровке первого видеокадра от клиента в `video_uplink_task` и далее каждые 2 секунды, пока от клиента поступают видеокадры (в окне последних 5 секунд).
@@ -68,7 +69,7 @@
      * Сервер по `client_tag` за $O(1)$ находит контекст клиента в `clients_by_tag: Arc<DashMap<u16, Arc<ClientTransportInfo>>>`.
 
 ### 2.2. Формат полезной нагрузки внутри ASTP (одиночный пакет и микро-батчинг)
-В режиме `video_v2` перед шифрованием ChaCha20-Poly1305 отключён случайный паддинг, а малые IP-пакеты автоматически агрегируются в микро-батчи:
+Перед шифрованием ChaCha20-Poly1305 в видеоканале отключён случайный паддинг, а малые IP-пакеты автоматически агрегируются в микро-батчи:
 * **Одиночный IP-пакет:** начинается со стандартного заголовка IPv4 (`0x4x`) или IPv6 (`0x6x`).
 * **Микро-батч (`VIDEO_BATCH_MARKER = 0x00`):** если в очереди туннеля есть несколько пакетов и суммарный размер не превышает `max_video_batch_bytes` (по умолчанию `1260` байт для прямого подключения и `960` байт при маршрутизации через Cloudflare WARP; до `video_batch_max_packets = 16` пакетов за раз), формируется буфер:
   ```text
@@ -81,9 +82,10 @@
 $$\text{WRTC\_TUN\_MTU} = \min\Big(\max\big(\text{max\_video\_batch\_bytes} + 30,\; \text{min\_tun\_mtu}\big),\; \text{network.mtu}\Big)$$
 Полный сетевой оверхед `video_mtu_overhead = 110` байт включает:
 * `20 байт` (внешний заголовок IPv4) + `8 байт` (UDP) + `16 байт` (SRTP Auth Tag / MKI) + `12 байт` (RTP Header) + `24 байта` (VP8 Descriptor + Frame Header) + `2 байта` (`client_tag`) + `28 байт` (ASTP Nonce + Poly1305 MAC) = **110 байт**.
+* **Ограничение одиночного кадра (`max_single_video_pkt_bytes = video_tun_mtu`):** и на сервере, и на клиенте пакеты длиннее эффективного `video_tun_mtu` принудительно направляются в резервный батчер `Colibri-WS`/`DataChannel`, чтобы ни при каких всплесках не переполнить MTU `1280` в `wgcf-profile`.
 * Серверный интерфейс `TUN` и все классические транспорты (`SSH`, `QUIC`, `VNC`, `WS`) работают на полном `[network] mtu = 1400`.
-* Для клиентов `WRTC` сервер передаёт в `AuthResponse` индивидуальный `wrtc_Effective_mtu`:
-  * При прямом соединении (`max_video_batch_bytes = 1260`) эффективный MTU туннеля `WRTC` составляет `1290` байт.
+* Для клиентов `WRTC` сервер передаёт в `AuthResponse` индивидуальный MTU с учётом `max_video_batch_bytes`:
+  * При прямом соединении (`max_video_batch_bytes = 1230` на сервере) эффективный MTU туннеля `WRTC` составляет `1260` байт.
   * При маршрутизации через Cloudflare WARP (`max_video_batch_bytes = 960`, `wgcf-profile` MTU `1280`) эффективный MTU туннеля `WRTC` составляет `990` байт, гарантируя прохождение каждого RTP-пакета внутри WireGuard без фрагментации и без просадки скорости на `SSH`/`QUIC`.
 
 ---
@@ -99,18 +101,18 @@ $$\text{WRTC\_TUN\_MTU} = \min\Big(\max\big(\text{max\_video\_batch\_bytes} + 30
 
 ### 3.2. Строгая сериализация RTP `(seq, pic_id, timestamp)` при многопоточной отправке
 Когда несколько асинхронных задач параллельно отправляют видеокадры, несинхронизированный инкремент счётчика и вызов `write_rtp()` приводили бы к тому, что пакет с `seq = N+1` попадал в сокет раньше `seq = N`. На стороне SFU JVB и в `wgcf-profile` это вызывало ложные срабатывания детектора потерь (NACK) и сброс кадров в `Vp8FrameMap`.
-* В `WrtcPeer::send_video_frame_preallocated()` генерация `(sequence_number, pic_id, timestamp)` и вызов `video_track.write_rtp()` выполняются строго атомарно внутри критической секции `video_send_lock`:
+* В `WrtcPeer::send_video_frame_preallocated()` генерация `(sequence_number, pic_id, timestamp)` и вызов `video_track.write_rtp()` выполняются строго атомарно внутри критической секции `video_write_lock`:
   * `sequence_number = (frame_num & 0xFFFF) as u16`
   * `pic_id = (frame_num & 0x7FFF) as u16`
-  * `timestamp = frame_num.wrapping_mul(300)` (шаг 300 тиков при частоте 90 кГц)
+  * `timestamp` привязан к реальным монотонным часам **90 кГц** (`((start_instant.elapsed().as_micros() * 90) / 1000) as u32`) с гарантией строгого монотонного роста при пакетах внутри одной 11 мкс единицы.
 
-### 3.3. Микро-пейсер EDT (Earliest Departure Time) с горизонтом под 1 мс таймер Tokio
-При чтении пачки пакетов из TUN (`uplink_burst_max_packets = 64`) мгновенный залп десятков UDP-пакетов за несколько микросекунд переполняет входные очереди сетевой карты, сокета `wgcf-profile` или буфера JVB.
-В `anet-client-core/src/transport/wrtc.rs` и `anet-server/src/servers/wrtc.rs` внедрён **EDT-пейсер**, применяемый **безусловно для каждого отправляемого RTP-видеокадра** (как на стадии прогрева до `video_warmed_up`, так и в основном режиме):
+### 3.3. Мягкий микро-пейсер EDT (Earliest Departure Time) с горизонтом 3 мс
+При чтении пачки пакетов из TUN (`uplink_burst_max_packets = 64`) мгновенный залп десятков UDP-пакетов за несколько микросекунд способен переполнить входной буфер сокета `wgcf-profile` (MTU 1280) или очередь `SO_RCVBUF` на клиенте.
+В `anet-client-core/src/transport/wrtc.rs` и `anet-server/src/servers/wrtc.rs` применяется **мягкий EDT-пейсер**:
 * Каждому отправляемому кадру длиной $L$ байт назначается расчётное время отправки:
-  * **Uplink (клиент $\to$ JVB):** `WRTC_UPLINK_PACING_NS_PER_BYTE = 45` нс/байт (~177 Мбит/с).
-  * **Downlink (сервер $\to$ JVB):** `WRTC_DOWNLINK_PACING_NS_PER_BYTE = 38` нс/байт (~210 Мбит/с).
-* Поскольку стандартное колесо таймеров Tokio имеет разрешение **1 мс**, вызов `tokio::time::sleep` на каждые 50 мкс ограничивал бы скорость до ~10 Мбит/с. Поэтому используется **горизонт коалесценции `WRTC_PACING_HORIZON_NS = 2_500_000` (2.5 мс)**: пакеты уходят без ожидания, пока накопленный «долг» времени отправки не превысит 2.5 мс, после чего выполняется один точный `sleep_until` на ~1–2 мс. Это обеспечивает плавный поток UDP на скоростях до 200 Мбит/с без микровсплесков.
+  * **Uplink (клиент $\to$ JVB):** `WRTC_UPLINK_PACING_NS_PER_BYTE = 22` нс/байт (~363 Мбит/с потолок).
+  * **Downlink (сервер $\to$ JVB):** `WRTC_DOWNLINK_PACING_NS_PER_BYTE = 18` нс/байт (~444 Мбит/с потолок).
+* Поскольку стандартное колесо таймеров Tokio имеет разрешение **1 мс**, используется **горизонт коалесценции `WRTC_PACING_HORIZON_NS = 3_000_000` (3 мс)**: одиночные пакеты и короткие пачки уходят без ожидания, а при длинных затяжных бёрстах выполняется короткий `sleep_until`, сглаживающий пики UDP без ограничения реальной пропускной способности.
 
 ### 3.4. Жадное неблокирующее чтение `FrameReader`, буфер `WRTC_DUPLEX_BUFFER_SIZE` и тюнинг 1-vCPU VPS
 * **Жадная вычитка `FrameReader::read_next_packet` (`anet-common/src/stream_framing.rs`):** Буфер чтения увеличен до `65 536` байт (`64 КиБ`), а после первого `reader.read().await` выполняется неблокирующий цикл `poll_read` (`Poll::Ready`), забирающий все готовые байты из `DuplexStream` (до `64 КиБ` за раз). Благодаря этому `frame_reader.try_next_packet()` не обрывает цикл `uplink_burst_max_packets = 64` и микро-батчинг каждые 8 КБ.
@@ -129,10 +131,10 @@ $$\text{WRTC\_TUN\_MTU} = \min\Big(\max\big(\text{max\_video\_batch\_bytes} + 30
   1. Если из `Colibri-WS` нет входящих кадров дольше `colibri_ws_read_timeout_secs` (`25 с`), фоновая задача тихо переоткрывает WebSocket к тому же URL JVB (с быстрым перебором исходных TCP-портов) и заново отправляет `ReceiverVideoConstraints`.
   2. Пока по UDP продолжают поступать видеокадры (`last_video_rx_ms` обновляется не реже чем раз в 15 секунд), сторожевой таймер `check_dead_reason()` **не разрывает** сессию `WrtcPeer` даже при временной недоступности `Colibri-WS`.
 
-### 4.2. Автоматическое переключение `MediaVideo` $\leftrightarrow$ `Colibri-WS` при потере UDP
-Если на маршруте клиента возникают проблемы с прохождением UDP-пакетов:
-1. **На стороне клиента:** признак активности видеоканала (`video_warmed_up`) требует одновременного выполнения трёх условий: получен хотя бы один видеокадр от сервера, активно UDP ICE-соединение (`peer.is_connected == true`) и с момента последнего входящего UDP-видеокадра прошло не более **5 секунд**. При нарушении любого условия клиент мгновенно переводит отправку в `PacketBatcher` поверх `Colibri-WS` (`WrtcMessage::AstpBatch`).
-2. **На стороне сервера (защита от асимметричной потери UDP):** при получении от клиента любого пакета `AstpBatch` по `Colibri-WS` сервер фиксирует метку `client_last_ws_batch_ms`, сбрасывает `client_video_warmed_up` для данного `client_tag` и направляет ответный Downlink-трафик через `Colibri-WS` (`AstpBatch`), сохраняя двустороннюю связь.
+### 4.2. Автоматическое переключение `MediaVideo` $\leftrightarrow$ `Colibri-WS` при потере или асимметричном застое UDP
+Если на маршруте возникают проблемы с прохождением UDP-пакетов (включая **одностороннюю деградацию**, когда клиент шлёт видео на JVB, а JVB перестаёт отдавать VP8-поток клиенту):
+1. **На стороне клиента:** признак активности видеоканала (`video_warmed_up`) требует одновременного выполнения трёх условий: получен хотя бы один видеокадр от сервера, активно UDP ICE-соединение (`peer.is_connected == true`) и с момента последнего входящего UDP-видеокадра прошло не более **5 секунд**. Дополнительно клиент отслеживает `peer.video_rx_age_ms()`: если открыт `Colibri-WS` / `DataChannel`, а входящих RTP-видеопакетов нет $\ge 3\text{ с}$ (`dl_video_stalled`), клиент переводит Uplink в `PacketBatcher` (`AstpBatch`) и отправляет серверу сигнал `WrtcMessage::VideoRxStall { stalled: true }` (повторяя раз в 4 секунды до восстановления видео, после чего шлёт `stalled: false`).
+2. **На стороне сервера (защита от асимметричной потери UDP):** при получении от клиента `WrtcMessage::VideoRxStall { stalled: true }` либо `AstpBatch` при неактивном видеосервер сбрасывает `client_video_warmed_up`, немедленно переводит Downlink на `Colibri-WS`/`DataChannel` (`AstpBatch`) и продолжает слать прогревные ключевые кадры `VIDEO_WARMUP_PAYLOAD` до получения `stalled: false` или истечения окна 15 с.
 
 ### 4.3. Корректный выход из комнаты (`leave_room`) и защита от «призрачных» источников
 * При завершении сессии метод `XmppSession::leave_room()` отправляет в Jicofo:
@@ -148,12 +150,12 @@ $$\text{WRTC\_TUN\_MTU} = \min\Big(\max\big(\text{max\_video\_batch\_bytes} + 30
 ### Быстрая проверка в консоли:
 ```bash
 # Проверка наличия RTP-заголовков (байт 0x80/0x90) на портах медиа-моста Ktalk
-sudo tcpdump -ni any "udp and (net 89.169.16.0/24 or port 34788) and greater 200" -c 20 -X
+sudo tcpdump -ni any "udp and (net 89.169.16.0/20 or net 213.189.204.0/24 or port 34788) and greater 200" -c 20 -X
 ```
 
 ### Характеристики трафика в дампе:
 1. **ICE/STUN согласование:** Обмен пакетами STUN Binding Request / Response с атрибутом `USERNAME` (стек `ice4j.org` на стороне JVB).
 2. **DTLS 1.2 Handshake:** Согласование ключей SRTP через `TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256`.
 3. **Медиа-поток (RTP over SRTP):**
-   * **Video Track:** Пакеты Payload Type `100` (или `96`, VP8) с тактовой частотой 90 кГц, строго монотонным приростом Sequence Number (+1) и Timestamp (+300 на пакет) и фоновым keepalive при простое.
+   * **Video Track:** Пакеты Payload Type `100` (или `96`, VP8) с тактовой частотой 90 кГц, строго монотонным приростом Sequence Number (+1), реальным 90 кГц wall-clock Timestamp и фоновым keepalive при простое.
    * **Audio Keepalive:** Пакеты Payload Type `111` (Opus silence `0xf8, 0xff, 0xfe`) размером ~70–90 байт с интервалом 20 мс (48 кГц).

@@ -68,7 +68,7 @@
    * Передаётся заголовок `Authorization: Session {token}`.
    * **Ответ Ktalk API:** возвращает внутренний идентификатор `conferenceId` вида `"{room_short_name}_{hex_hash}"`.
 3. **Параметры `RoomBootstrapInfo` для Контур.Толк:**
-   * Приоритетный URL сигнализации: `wss://{domain}/jitsi/xmpp-websocket?room={conferenceId}&sessionToken={token}` (с резервным `wss://{domain}/xmpp-websocket?room={conferenceId}&token={token}& Lists=true`).
+   * Приоритетный URL сигнализации: `wss://{domain}/jitsi/xmpp-websocket?room={conferenceId}&sessionToken={token}` (с резервным `wss://{domain}/xmpp-websocket?room={conferenceId}&token={token}&lists=true`).
    * Внутренний флаг провайдера `pre_allocate_before_muc = false` (вход в MUC выполняется строго до обращения к `focus.meet.jitsi`).
 
 ### 2.2. Провайдер `JitsiMeetProvider` (стандартный Jitsi Meet)
@@ -173,8 +173,6 @@ pub enum WrtcMessage {
         video_ssrc: Option<u32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         mode: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        video_v2: Option<bool>,
     },
     #[serde(rename = "e2ee-ack", alias = "anet_beacon")]
     Beacon {
@@ -183,13 +181,13 @@ pub enum WrtcMessage {
         signature: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         video_ssrc: Option<u32>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        video_v2: Option<bool>,
     },
     #[serde(rename = "ReceiverAudioSubscription", alias = "astp")]
     Astp { data: String },
     #[serde(rename = "dominant-speaker-stats", alias = "astp_batch")]
     AstpBatch { data: String },
+    #[serde(rename = "video-rx-stall", alias = "anet_video_stall")]
+    VideoRxStall { stalled: bool },
     #[serde(rename = "ice-offer", alias = "anet_p2p_offer")]
     P2pOffer { sdp: String, candidates: Vec<String> },
     #[serde(rename = "ice-answer", alias = "anet_p2p_answer")]
@@ -276,7 +274,7 @@ sctp_mtu = 1000                       # 1200 (прямой) | 1000 (CF WARP)
 receive_mtu = 1600
 video_mtu_overhead = 110
 min_tun_mtu = 900
-max_video_batch_bytes = 960           # 1260 (прямой) | 960  (CF WARP)
+max_video_batch_bytes = 960           # 1230/1260 (прямой) | 960 (CF WARP)
 video_batch_max_packets = 12          # 16   (прямой) | 12   (CF WARP)
 uplink_burst_max_packets = 32         # 64   (прямой) | 32   (CF WARP)
 ws_batcher_max_bytes = 4096           # 12288 (прямой)| 4096 (CF WARP)
@@ -314,7 +312,7 @@ server_idle_room_rotation_secs = 1800
 
 ### 8.2. Развязка жизнеспособности видеоканала от состояния `Colibri-WS` и UDP ICE
 * **Независимое переоткрытие `Colibri-WS` (`colibri_ws_read_timeout_secs = 25`):** если управляющий WebSocket к JVB перестаёт получать кадры дольше 25 секунд, он тихо переоткрывается в фоновой задаче без остановки видеопотока `media_video`.
-* **Автоматическое резервирование `MediaVideo` $\leftrightarrow$ `Colibri-WS`:** если на клиентской сети возникают потери UDP-пакетов до порта JVB `10000–10010` и входящие видеокадры не поступают дольше 5 секунд, клиент и сервер синхронно переключают передачу пакетов в `Colibri-WS` (`AstpBatch`) без разрыва туннельной сессии.
+* **Автоматическое резервирование `MediaVideo` $\leftrightarrow$ `Colibri-WS`:** если на клиентской сети возникают потери или односторонний застой входящих UDP-видеопакетов ($\ge 3\text{ с}$ при живом `Colibri-WS`/`DataChannel`), клиент отправляет `WrtcMessage::VideoRxStall { stalled: true }` и оба узла синхронно переключают передачу пакетов в `Colibri-WS`/`DataChannel` (`AstpBatch`) без разрыва туннельной сессии (с автоматическим возвратом на видео после возобновления RTP).
 
 ### 8.3. Неразделённый цикл ввода-вывода в `XMPP-WS` поверх `tokio_boring::SslStream`
 * Поток `ws_stream` в `XmppSession` обрабатывается в **единой задаче `io_handle` через `tokio::select!`** без разделения через `ws_stream.split()` (`BiLock`). Это исключает потерю уведомлений (`Waker`) чтения в `tokio_boring::SslStream` при одновременной отправке пингов и приёме входящих станз от сервера Prosody.
@@ -346,7 +344,7 @@ server_idle_room_rotation_secs = 1800
 
 #### Проблема 1. Захват маршрута по умолчанию стандартным профилем `wg-quick`
 * **Симптом:** При запуске `wg-quick up wgcf-profile` со стандартным конфигом весь исходящий трафик сервера уходит в интерфейс WARP, из-за чего пропадает доступ к серверу по SSH и перестают работать прямые клиентские подключения на внешний интерфейс `ens3`.
-* **Решение:** В конфигурацию `/etc/wireguard/wgcf-profile.conf` принудительно добавляются директивы `Table = off` и `MTU = 1280`. Маршрут в `wgcf-profile` создаётся в отдельной таблице маршрутизации `100` (`ip route replace default dev wgcf-profile table 100`), а через `ip -4 rule add to <CIDR> table 100 priority 100` в неё направляются только целевые подсети ВКС и облачных медиамостов JVB (`46.17.200.0/21`, `89.169.16.0/24`, `84.201.128.0/18`, `51.250.0.0/17`, `158.160.0.0/16`, `130.193.32.0/19`, `178.154.128.0/17`, `91.209.56.0/22`, `91.197.180.0/23`, `193.160.208.0/22`, `193.232.166.0/24`).
+* **Решение:** В конфигурацию `/etc/wireguard/wgcf-profile.conf` принудительно добавляются директивы `Table = off` и `MTU = 1280`. Маршрут в `wgcf-profile` создаётся в отдельной таблице маршрутизации `100` (`ip route replace default dev wgcf-profile mtu 1240 advmss 1160 table 100`), а через `ip -4 rule add to <CIDR> table 100 priority 100` в неё направляются только целевые подсети ВКС и облачных медиамостов JVB (`46.17.200.0/21`, `89.169.16.0/20`, `45.130.11.0/24`, `95.215.255.0/24`, `84.201.128.0/18`, `51.250.0.0/17`, `158.160.0.0/16`, `130.193.32.0/19`, `178.154.128.0/17`, `91.209.56.0/22`, `91.197.180.0/23`, `193.160.208.0/22`, `193.232.166.0/24`, `195.88.208.0/23`, `213.189.204.0/24`, `213.59.255.0/24`).
 
 #### Проблема 2. Сброс пакетов фильтром обратного пути (`rp_filter`) и отсутствие форвардинга из `anet+`
 * **Симптом:** Даже после поднятия `wgcf-profile` и добавления `iptables -t nat -A POSTROUTING -o ens3 -j MASQUERADE` трафик клиентов внутри туннеля (`172.112.224.x`) не проходил во внешнюю сеть, либо терялись пакеты при асимметричной маршрутизации между `ens3` и `wgcf-profile`.
@@ -363,7 +361,7 @@ server_idle_room_rotation_secs = 1800
 * **Решение:**
   1. В `server.toml` отключено использование TURN для соединения с JVB: `jvb_use_turn = false`.
   2. Выстроен изолированный каскад MTU для `WRTC` без занижения MTU остальных транспортов (`SSH`, `QUIC`, `VNC`, `WS`):
-     * На интерфейсе `wgcf-profile`: `MTU = 1280`, планировщик `fq_codel` и `TCPMSS --set-mss 1080`.
+     * На интерфейсе `wgcf-profile`: `MTU = 1280`, планировщик `fq_codel`, маршрутный `mtu 1240 advmss 1160` и `TCPMSS --set-mss 1160` (и `1040` для `anet+`).
      * В `server.toml`: глобальный `[network] mtu = 1400` остаётся полным для `SSH`/`QUIC`/`VNC`, а в секции `[wrtc]` задаются `video_mtu_overhead = 110`, `min_tun_mtu = 900`, `max_video_batch_bytes = 960`. Сервер автоматически вычисляет MTU для `WRTC`-сессий по формуле `(max_video_batch_bytes + 30).max(min_tun_mtu).min(network.mtu) = 990` байт, благодаря чему каждый зашифрованный VP8 RTP-кадр укладывается в `~1070–1150` байт и проходит через WireGuard WARP без единого фрагментированного пакета.
 
 #### Проблема 4. Ошибка `XMPP MUC handshake timed out after 20s` при входе сервера `FN` в комнату Ktalk
@@ -394,8 +392,8 @@ sudo ./contrib/scripts/setup_warp_ktalk.sh
 2. Перезапускает интерфейс `wgcf-profile` и очищает старые правила маршрутизации.
 3. Устанавливает `mtu 1280`, `txqueuelen 1000` и дисциплину очереди `fq_codel` на `wgcf-profile`.
 4. Включает `net.ipv4.ip_forward=1` и `rp_filter=2` (Loose Reverse Path Filtering) на всех сетевых адаптерах.
-5. Настраивает таблицу маршрутизации `100` (`default dev wgcf-profile table 100`) и направляет в неё префиксы Контур.Толк (AS49675) и облачных медиамостов JVB.
-6. Добавляет правила `iptables` (`FORWARD` для `anet+`, `MASQUERADE` для `ens3` и `wgcf-profile`, а также `TCPMSS --set-mss 1080` и `--clamp-mss-to-pmtu`).
+5. Настраивает таблицу маршрутизации `100` (`default dev wgcf-profile mtu 1240 advmss 1160 table 100`) и направляет в неё актуальные префиксы Контур.Толк (AS49675) и облачных медиамостов JVB (включая `213.189.204.0/24`).
+6. Добавляет правила `iptables` (`FORWARD` для `anet+`, отключение транзитного QUIC `UDP:443`, `MASQUERADE` для `ens3` и `wgcf-profile`, а также двусторонний `TCPMSS --set-mss 1160`/`1040`).
 
 ---
 

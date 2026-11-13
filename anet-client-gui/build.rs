@@ -48,12 +48,44 @@ fn main() {
     // Записываем всё в промежуточный файл
     writeln!(f, "pub const GIT_TAG: &str = \"{}\";", git_tag).unwrap();
     writeln!(f, "pub const COMMIT_HASH: &str = \"{}\";", commit_hash).unwrap();
+    emit_git_rerun_hints();
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=src");
     println!("cargo:rerun-if-changed=../anet-common/src");
     println!("cargo:rerun-if-changed=../anet-client-core/src");
-    println!("cargo:rerun-if-changed=../.git/HEAD");
-    println!("cargo:rerun-if-changed=../.git/refs");
-    println!("cargo:rerun-if-changed=../.git/index");
-    println!("cargo:rerun-if-changed=../.git/packed-refs");
+}
+
+fn emit_git_watch_dir(dir: &Path) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            println!("cargo:rerun-if-changed={}", path.display());
+            if path.is_dir() {
+                emit_git_watch_dir(&path);
+            }
+        }
+    }
+}
+
+fn emit_git_rerun_hints() {
+    let git_dir = Command::new("git")
+        .args(["rev-parse", "--git-dir"])
+        .output()
+        .ok()
+        .and_then(|o| {
+            if o.status.success() {
+                let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                (!s.is_empty()).then(|| std::path::PathBuf::from(s))
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| std::path::PathBuf::from("../.git"));
+
+    for rel in ["HEAD", "logs/HEAD", "FETCH_HEAD", "index", "packed-refs"] {
+        println!("cargo:rerun-if-changed={}", git_dir.join(rel).display());
+    }
+    let refs_dir = git_dir.join("refs");
+    println!("cargo:rerun-if-changed={}", refs_dir.display());
+    emit_git_watch_dir(&refs_dir);
 }

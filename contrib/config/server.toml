@@ -500,12 +500,13 @@ receive_mtu = 1600
 # VP8 Payload Descriptor/Header (24B) + тег маршрутизации JVB (2B) + заголовок ASTP (28B) = 110 байт.
 # Гарантирует отсутствие IP-фрагментации и черных дыр PMTU на магистралях хостинг-провайдеров.
 video_mtu_overhead = 110
-# video_mtu_overhead = 110 # для CF WARP (при [network] mtu = 1100 дает эффективный MTU туннеля 990 Б)
+# video_mtu_overhead = 110 # для CF WARP (при max_video_batch_bytes = 960 дает эффективный MTU туннеля 990 Б)
 
-# Нижний допустимый предел автоматического расчета эффективного MTU туннеля (`network.mtu - video_mtu_overhead`) в байтах.
-# Значение `900` позволяет честному расчету работать универсально:
-#   - при `[network] mtu = 1250` (чистый коннект) эффективный MTU = `1140 Б` (`TCP MSS = 1100`);
-#   - при `[network] mtu = 1100` (CF WARP, `wgcf-profile` MTU 1280) эффективный MTU = `990 Б` (`TCP MSS = 950`).
+# Нижний допустимый предел автоматического расчета эффективного MTU туннеля в байтах:
+#   clamp(min(network.mtu - video_mtu_overhead, max_video_batch_bytes + 30), min_tun_mtu).
+# Значение `900` позволяет расчету работать универсально при неизменном `[network] mtu = 1400`:
+#   - на прямом соединении (`max_video_batch_bytes = 1230`): эффективный MTU = `1260 Б` (`TCP MSS = 1220`);
+#   - через CF WARP (`max_video_batch_bytes = 960`, `wgcf-profile` MTU 1280): эффективный MTU = `990 Б` (`TCP MSS = 950`).
 min_tun_mtu = 900
 
 # Жесткий верхний предел размера одного склеенного VP8 RTP микро-батча (в байтах).

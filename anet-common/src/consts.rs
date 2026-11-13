@@ -48,6 +48,15 @@ pub const VP8_KEYFRAME_1080P_HEADER: [u8; 20] = [
     0x99, 0x84, 0x88, 0xfc,
 ];
 
+/// Валидный заголовок межкадра VP8 (Interframe, бит `P=1`, `0x31`) с теми же параметрами 1920x1080.
+/// Чередуется с ключевыми кадрами (`VP8_KEYFRAME_1080P_HEADER`), чтобы SFU JVB не сбрасывал
+/// `Vp8FrameMap` и не пересоздавал контекст проекции потока на каждом пакете.
+pub const VP8_INTERFRAME_HEADER: [u8; 20] = [
+    0x31, 0x01, 0x00, 0x9d, 0x01, 0x2a, 0x80, 0x07,
+    0x38, 0x04, 0x00, 0x47, 0x08, 0x85, 0x85, 0x88,
+    0x99, 0x84, 0x88, 0xfc,
+];
+
 /// Общая 10-байтная сигнатура хвоста заголовка ANet VP8 (байты 10..20).
 pub const VP8_HEADER_TAIL_MAGIC: [u8; 10] = [
     0x00, 0x47, 0x08, 0x85, 0x85, 0x88, 0x99, 0x84, 0x88, 0xfc,
@@ -66,7 +75,7 @@ pub const MAX_VIDEO_BATCH_BYTES: usize = 1260;
 pub const WRTC_VIDEO_MTU_OVERHEAD: u16 = 110;
 
 /// Минимально допустимый MTU TUN-интерфейса после вычета заголовков WebRTC Video.
-pub const WRTC_MIN_TUN_MTU: i32 = 1200;
+pub const WRTC_MIN_TUN_MTU: i32 = 900;
 
 /// Размер префикса VP8 + Client Tag перед зашифрованным ASTP-кадром в RTP-пакете:
 /// 4B (VP8 Payload Descriptor) + 20B (VP8 Frame Header) + 2B (Client Tag) = 26 байт.
@@ -96,6 +105,14 @@ pub const WRTC_DEFAULT_MAX_VIDEO_HEIGHT: u32 = 2160;
 /// Параметры генерации ключевых кадров VP8 для прохождения фильтрации JVB SFU.
 pub const WRTC_INITIAL_FORCE_KEYFRAMES: u32 = 8;
 pub const WRTC_REASSERT_FORCE_KEYFRAMES: u32 = 16;
+pub const WRTC_KEYFRAME_INTERVAL_MASK: u32 = 31;
+
+/// Мягкий EDT micro-pacer для сглаживания мгновенных микровсплесков TUN -> UDP:
+/// предотвращает переполнение буфера приёма клиента (`SO_RCVBUF`) и очереди `wgcf-profile`,
+/// сохраняя высокий потолок пропускной способности (~360–440 Мбит/с).
+pub const WRTC_UPLINK_PACING_NS_PER_BYTE: u64 = 22;
+pub const WRTC_DOWNLINK_PACING_NS_PER_BYTE: u64 = 18;
+pub const WRTC_PACING_HORIZON_NS: u64 = 3_000_000;
 
 /// Размеры внутренних очередей и буферов подсистемы WebRTC.
 pub const WRTC_COLIBRI_CHANNEL_CAPACITY: usize = 16384;

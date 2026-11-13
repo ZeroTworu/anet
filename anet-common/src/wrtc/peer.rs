@@ -1,10 +1,10 @@
 use crate::config::WrtcConfig;
 use crate::consts::{
-    TAG_UNTAGGED, VP8_ASTP_PREFIX_LEN, VP8_KEYFRAME_1080P_HEADER,
+    TAG_UNTAGGED, VP8_ASTP_PREFIX_LEN, VP8_INTERFRAME_HEADER, VP8_KEYFRAME_1080P_HEADER,
     WRTC_COLIBRI_CHANNEL_CAPACITY, WRTC_CONSTRAINTS_RETRY_ATTEMPTS,
     WRTC_CONSTRAINTS_RETRY_INTERVAL_MS, WRTC_DC_SEND_MAX_RETRIES, WRTC_DC_SEND_RETRY_DELAY_MS,
     WRTC_DEFAULT_MAX_VIDEO_HEIGHT, WRTC_ICE_GATHER_POLL_ATTEMPTS, WRTC_ICE_GATHER_POLL_INTERVAL_MS,
-    WRTC_INITIAL_FORCE_KEYFRAMES, WRTC_OPUS_CHANNELS,
+    WRTC_INITIAL_FORCE_KEYFRAMES, WRTC_KEYFRAME_INTERVAL_MASK, WRTC_OPUS_CHANNELS,
     WRTC_OPUS_CLOCK_RATE, WRTC_OPUS_PAYLOAD_TYPE, WRTC_OPUS_SILENCE_FRAME,
     WRTC_P2P_CHANNEL_CAPACITY, WRTC_REASSERT_FORCE_KEYFRAMES, WRTC_VIDEO_CHANNEL_CAPACITY,
     WRTC_VP8_CLOCK_RATE, WRTC_VP8_FALLBACK_PAYLOAD_TYPE, WRTC_VP8_PRIMARY_PAYLOAD_TYPE,
@@ -16,8 +16,8 @@ use crate::wrtc::colibri::{
     is_valid_vp8_frame_header, ColibriMessage, ReceiverVideoConstraints, WrtcMessage, WrtcMode,
 };
 use crate::wrtc::jingle::{
-    append_remote_audio_ssrc_to_sdp, append_remote_video_ssrc_to_sdp, is_valid_jvb_candidate_ip,
-    parse_sdp_answer, JingleSession,
+    append_remote_audio_ssrc_to_sdp, append_remote_ssrcs_to_sdp, append_remote_video_ssrc_to_sdp,
+    is_valid_jvb_candidate_ip, parse_sdp_answer, JingleSession,
 };
 use crate::wrtc::stealth::generate_random_uuid_v4;
 use crate::wrtc::turns_proxy::{spawn_turns_udp_proxy, TurnsProxyHandle};
@@ -32,7 +32,9 @@ use log::{info, trace, warn};
 use rand::random;
 use rtc::interceptor::Registry;
 use rtc::media_stream::MediaStreamTrack;
-use rtc::peer_connection::configuration::interceptor_registry::register_default_interceptors;
+use rtc::peer_connection::configuration::interceptor_registry::{
+    configure_rtcp_reports, configure_twcc_receiver_only, register_default_interceptors,
+};
 use rtc::peer_connection::configuration::media_engine::{MediaEngine, MIME_TYPE_OPUS, MIME_TYPE_VP8};
 use rtc::peer_connection::configuration::setting_engine::SettingEngineBuilder;
 use rtc::peer_connection::configuration::{RTCConfigurationBuilder, RTCIceServer};
@@ -379,6 +381,7 @@ struct PeerEvents {
     video_incoming_tx: mpsc::Sender<Bytes>,
     expected_peer_video_ssrc: Arc<AtomicU32>,
     first_video_rx: Arc<AtomicBool>,
+    last_video_rx_ms: Arc<AtomicU64>,
     local_video_ssrc: u32,
     bg_tasks: Arc<StdMutex<Vec<AbortHandle>>>,
     xmpp_endpoints: Arc<StdMutex<HashSet<String>>>,
@@ -433,6 +436,8 @@ impl PeerConnectionEventHandler for PeerEvents {
             let in_tx = self.video_incoming_tx.clone();
             let expected_ssrc = self.expected_peer_video_ssrc.clone();
             let first_rx = self.first_video_rx.clone();
+            let last_rx_ms = self.last_video_rx_ms.clone();
+            let start_inst = self.start_instant;
             let local_v_ssrc = self.local_video_ssrc;
             let t = tokio::spawn(async move {
                 while let Some(event) = track.poll().await {
@@ -459,6 +464,10 @@ impl PeerConnectionEventHandler for PeerEvents {
                                     continue;
                                 }
 
+                                last_rx_ms.store(
+                                    (start_inst.elapsed().as_millis() as u64).max(1),
+                                    Ordering::Relaxed,
+                                );
                                 if first_rx.swap(false, Ordering::Relaxed) {
                                     info!(
                                         "[WRTC Media Video IN] First video frame received (SSRC: {}, len: {} bytes)",
@@ -1074,6 +1083,7 @@ pub struct WrtcPeer {
     pub first_video_rx: Arc<AtomicBool>,
     pub first_video_tx: Arc<AtomicBool>,
     pub start_instant: Instant,
+    pub last_video_rx_ms: Arc<AtomicU64>,
     pub last_video_tx_ms: Arc<AtomicU64>,
     pub force_keyframe_remaining: Arc<AtomicU32>,
     pub video_write_lock: Arc<Mutex<u32>>,
@@ -1132,6 +1142,7 @@ impl WrtcPeer {
         let expected_peer_video_ssrc = Arc::new(AtomicU32::new(0));
         let _remote_ssrc = 0;
         let start_instant = Instant::now();
+        let last_video_rx_ms = Arc::new(AtomicU64::new(0));
         let last_video_tx_ms = Arc::new(AtomicU64::new(0));
         let force_keyframe_remaining = Arc::new(AtomicU32::new(WRTC_INITIAL_FORCE_KEYFRAMES));
         let video_write_lock = Arc::new(Mutex::new(0u32));
@@ -1541,10 +1552,10 @@ impl WrtcPeer {
                     let _ = media_engine.register_codec(fallback_vcodec2, RtpCodecKind::Video);
                 }
 
-                // Отключаем стандартные RTP-интерцепторы (NackResponder, NackGenerator, TWCC),
-                // чтобы исключить клонирование каждого пакета в кольцевой буфер ретрансляции
-                // и блокировки мьютексов BWE/TWCC внутри webrtc-rs при высокоскоростном потоке.
-                let registry = Registry::new();
+                // Включаем RTCP SR/RR и TWCC receiver feedback без NACK-буферов ретрансляции,
+                // чтобы JVB корректно оценивал канал и не зажимал поток без телеметрии.
+                let registry = configure_rtcp_reports(Registry::new());
+                let registry = configure_twcc_receiver_only(registry, &mut media_engine)?;
 
                 let tier_servers_clone = tier.servers.clone();
                 let config = RTCConfigurationBuilder::new()
@@ -1582,6 +1593,7 @@ impl WrtcPeer {
                     video_incoming_tx: video_incoming_tx.clone(),
                     expected_peer_video_ssrc: expected_peer_video_ssrc.clone(),
                     first_video_rx: first_video_rx.clone(),
+                    last_video_rx_ms: last_video_rx_ms.clone(),
                     local_video_ssrc,
                     bg_tasks: bg_tasks.clone(),
                     xmpp_endpoints: xmpp_endpoints.clone(),
@@ -2278,6 +2290,7 @@ impl WrtcPeer {
             first_video_rx,
             first_video_tx,
             start_instant,
+            last_video_rx_ms,
             last_video_tx_ms,
             force_keyframe_remaining,
             video_write_lock,
@@ -2476,6 +2489,87 @@ impl WrtcPeer {
         }
     }
 
+    pub fn video_rx_age_ms(&self) -> Option<u64> {
+        let last = self.last_video_rx_ms.load(Ordering::Relaxed);
+        if last == 0 {
+            None
+        } else {
+            let now = self.start_instant.elapsed().as_millis() as u64;
+            Some(now.saturating_sub(last))
+        }
+    }
+
+    pub async fn add_remote_ssrcs(&self, audio_ssrcs: &[u32], video_ssrcs: &[u32]) {
+        let filtered_audio: Vec<u32> = audio_ssrcs
+            .iter()
+            .copied()
+            .filter(|&s| s != 0 && s != self.ssrc && s != 10001)
+            .collect();
+        let filtered_video: Vec<u32> = if matches!(self.mode, WrtcMode::MediaVideo | WrtcMode::Auto) {
+            video_ssrcs
+                .iter()
+                .copied()
+                .filter(|&s| s != 0 && s != self.video_ssrc && s != 10002)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if filtered_audio.is_empty() && filtered_video.is_empty() {
+            return;
+        }
+        let Some(ref pc) = self.peer_connection else {
+            return;
+        };
+        let mut sdp_guard = self.remote_sdp.lock().await;
+        if sdp_guard.is_empty() {
+            return;
+        }
+        let updated_sdp = append_remote_ssrcs_to_sdp(
+            &sdp_guard,
+            &filtered_audio,
+            &filtered_video,
+            self.video_payload_type,
+        );
+        if updated_sdp == *sdp_guard {
+            if !filtered_video.is_empty() {
+                self.force_next_keyframe();
+            }
+            return;
+        }
+        match RTCSessionDescription::offer(updated_sdp.clone()) {
+            Ok(offer) => {
+                if let Err(e) = pc.set_remote_description(offer).await {
+                    warn!("[WRTC Media] add_remote_ssrcs set_remote_description error: {e}");
+                    return;
+                }
+                match pc.create_answer(None).await {
+                    Ok(answer) => {
+                        if let Err(e) = pc.set_local_description(answer).await {
+                            warn!(
+                                "[WRTC Media] add_remote_ssrcs set_local_description error: {e}"
+                            );
+                            return;
+                        }
+                        *sdp_guard = updated_sdp;
+                        if !filtered_video.is_empty() {
+                            self.force_next_keyframe();
+                        }
+                        info!(
+                            "[WRTC Media] Batched remote SDP update applied (audio: {:?}, video: {:?})",
+                            filtered_audio, filtered_video
+                        );
+                    }
+                    Err(e) => {
+                        warn!("[WRTC Media] add_remote_ssrcs create_answer error: {e}");
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("[WRTC Media] add_remote_ssrcs invalid SDP offer: {e}");
+            }
+        }
+    }
+
     pub async fn send_video_frame(&self, astp_data: &[u8]) -> AnyhowResult<()> {
         self.send_video_frame_tagged(TAG_UNTAGGED, astp_data).await
     }
@@ -2522,7 +2616,7 @@ impl WrtcPeer {
         self.video_seq.store(seq.wrapping_add(1), Ordering::Relaxed);
         let pic_id = (frame_num & 0x7FFF) as u16;
         let wall_ts = ((self.start_instant.elapsed().as_micros() * 90) / 1000) as u32;
-        let ts = if wall_ts <= *last_ts_guard {
+        let ts = if (wall_ts.wrapping_sub(*last_ts_guard) as i32) <= 0 {
             last_ts_guard.wrapping_add(1)
         } else {
             wall_ts
@@ -2530,13 +2624,32 @@ impl WrtcPeer {
         *last_ts_guard = ts;
 
         let elapsed_ms = self.start_instant.elapsed().as_millis() as u64;
-        self.last_video_tx_ms.store(elapsed_ms, Ordering::Relaxed);
+        let prev_tx_ms = self.last_video_tx_ms.swap(elapsed_ms, Ordering::Relaxed);
+        let idle_ms = elapsed_ms.saturating_sub(prev_tx_ms);
+        let force_kf = self
+            .force_keyframe_remaining
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                if n > 0 {
+                    Some(n - 1)
+                } else {
+                    None
+                }
+            })
+            .is_ok();
+        let vp8_header = if force_kf
+            || (frame_num & WRTC_KEYFRAME_INTERVAL_MASK) == 0
+            || idle_ms >= 15
+        {
+            &VP8_KEYFRAME_1080P_HEADER
+        } else {
+            &VP8_INTERFRAME_HEADER
+        };
 
         payload[0] = 0x90;
         payload[1] = 0x80;
         payload[2] = 0x80 | ((pic_id >> 8) as u8);
         payload[3] = (pic_id & 0xFF) as u8;
-        payload[4..24].copy_from_slice(&VP8_KEYFRAME_1080P_HEADER);
+        payload[4..24].copy_from_slice(vp8_header);
         payload[24..26].copy_from_slice(&client_tag.to_be_bytes());
 
         let frozen = payload.freeze();

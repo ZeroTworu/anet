@@ -485,6 +485,28 @@ pub fn append_remote_video_ssrc_to_sdp(current_sdp: &str, new_ssrc: u32, video_p
     updated
 }
 
+/// Appends any missing `audio_ssrcs` and `video_ssrcs` to `current_sdp` in a single pass
+/// so the PeerConnection only runs one SDP offer/answer renegotiation per Jingle stanza.
+pub fn append_remote_ssrcs_to_sdp(
+    current_sdp: &str,
+    audio_ssrcs: &[u32],
+    video_ssrcs: &[u32],
+    video_pt: u8,
+) -> String {
+    let mut updated = current_sdp.to_string();
+    for &a_ssrc in audio_ssrcs {
+        if a_ssrc != 0 && a_ssrc != 10001 {
+            updated = append_remote_audio_ssrc_to_sdp(&updated, a_ssrc);
+        }
+    }
+    for &v_ssrc in video_ssrcs {
+        if v_ssrc != 0 && v_ssrc != 10002 {
+            updated = append_remote_video_ssrc_to_sdp(&updated, v_ssrc, video_pt);
+        }
+    }
+    updated
+}
+
 /// Фильтрует SDP для режима `p2p_direct` (Relay-Only):
 /// удаляет все локальные (`typ host`) и STUN (`typ srflx`) ICE-кандидаты,
 /// оставляя исключительно релейные кандидаты (`typ relay`) через TURN/TURNS-серверы Ktalk,

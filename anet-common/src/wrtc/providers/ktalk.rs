@@ -256,7 +256,7 @@ impl KonturTalkProvider {
         let conference_id = room_info.conference_id;
         let session_token = auth.token;
         let ws_urls = vec![format!(
-            "wss://{domain}/xmpp-websocket?room={conference_id}&token={session_token}& Lists=true"
+            "wss://{domain}/xmpp-websocket?room={conference_id}&token={session_token}&lists=true"
         )];
 
         let default_ice_servers = vec![

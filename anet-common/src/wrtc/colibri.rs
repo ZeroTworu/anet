@@ -221,6 +221,10 @@ pub enum WrtcMessage {
     P2pCandidate {
         candidate: String,
     },
+    #[serde(rename = "video-rx-stall", alias = "anet_video_stall")]
+    VideoRxStall {
+        stalled: bool,
+    },
     #[serde(rename = "keepalive", alias = "anet_ping")]
     Ping,
     #[serde(rename = "keepalive-ack", alias = "anet_pong")]
@@ -356,6 +360,13 @@ impl ColibriMessage {
         Self::new_endpoint_message(
             Some(to),
             WrtcMessage::P2pCandidate { candidate },
+        )
+    }
+
+    pub fn video_rx_stall(to: String, stalled: bool) -> Self {
+        Self::new_endpoint_message(
+            Some(to),
+            WrtcMessage::VideoRxStall { stalled },
         )
     }
 

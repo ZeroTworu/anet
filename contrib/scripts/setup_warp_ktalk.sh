@@ -46,53 +46,73 @@ sysctl -w net.ipv4.conf.default.rp_filter=2 >/dev/null
 sysctl -w "net.ipv4.conf.${WG_IF}.rp_filter=2" >/dev/null
 sysctl -w "net.ipv4.conf.${EXT_IF}.rp_filter=2" >/dev/null
 
-echo "[5/6] Настраиваем таблицу маршрутизации 100 для подсетей ВКС и медиамостов JVB через WARP..."
-ip route replace default dev "$WG_IF" table 100
+echo "[5/6] Настраиваем таблицу маршрутизации 100 для подсетей ВКС и медиамостов JVB через WARP (MTU 1240 / advmss 1160)..."
+ip route replace default dev "$WG_IF" mtu 1240 advmss 1160 table 100
 
 # Целевые подсети инфраструктуры Контур.Толк (AS49675) и облачных медиамостов JVB / STUN / TURN
 KTALK_CIDRS=(
     "46.17.200.0/21"
+    "89.169.16.0/20"
     "89.169.16.0/24"
+    "45.130.11.0/24"
+    "95.215.255.0/24"
+    "91.209.56.0/22"
+    "91.197.180.0/23"
+    "193.160.208.0/22"
+    "193.232.166.0/24"
+    "195.88.208.0/23"
+    "213.189.204.0/24"
     "84.201.128.0/18"
     "51.250.0.0/17"
     "158.160.0.0/16"
     "130.193.32.0/19"
     "178.154.128.0/17"
-    "91.209.56.0/22"
-    "91.197.180.0/23"
-    "193.160.208.0/22"
-    "193.232.166.0/24"
     "213.59.255.0/24"
 )
 
 for cidr in "${KTALK_CIDRS[@]}"; do
+    ip route replace "$cidr" dev "$WG_IF" scope link mtu 1240 advmss 1160
     ip -4 rule add to "$cidr" table 100 priority 100
 done
 
 ip route flush cache
 
-echo "[6/6] Настраиваем iptables (FORWARD для anet+, NAT на ${EXT_IF} + ${WG_IF} и TCP MSS Clamping)..."
-# Разрешаем прохождение пакетов между TUN-интерфейсом (anet-test / anet-server) и внешними интерфейсами
-iptables -D FORWARD -i anet+ -j ACCEPT 2>/dev/null || true
-iptables -D FORWARD -o anet+ -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
-iptables -I FORWARD 1 -i anet+ -j ACCEPT
-iptables -I FORWARD 2 -o anet+ -m state --state RELATED,ESTABLISHED -j ACCEPT
+echo "[6/6] Настраиваем iptables (FORWARD для anet+, отключение QUIC UDP:443, NAT на ${EXT_IF} + ${WG_IF} и TCP MSS Clamping)..."
+# Разрешаем прохождение пакетов между TUN-интерфейсом (anet-test / anet-server) и внешними интерфейсами, отключаем транзитный QUIC
+while iptables -D FORWARD -i anet+ -p udp --dport 443 -j REJECT --reject-with icmp-port-unreachable 2>/dev/null; do :; done
+while iptables -D FORWARD -i anet+ -j ACCEPT 2>/dev/null; do :; done
+while iptables -D FORWARD -o anet+ -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null; do :; done
+
+iptables -I FORWARD 1 -i anet+ -p udp --dport 443 -j REJECT --reject-with icmp-port-unreachable
+iptables -I FORWARD 2 -i anet+ -j ACCEPT
+iptables -I FORWARD 3 -o anet+ -m state --state RELATED,ESTABLISHED -j ACCEPT
 
 # Маскарадинг клиентского трафика из туннельной подсети ANet на основном интерфейсе
-iptables -t nat -D POSTROUTING -s "$ANET_SUBNET" -o "$EXT_IF" -j MASQUERADE 2>/dev/null || true
+while iptables -t nat -D POSTROUTING -s "$ANET_SUBNET" -o "$EXT_IF" -j MASQUERADE 2>/dev/null; do :; done
 iptables -t nat -A POSTROUTING -s "$ANET_SUBNET" -o "$EXT_IF" -j MASQUERADE
 
 # Маскарадинг пакетов, уходящих в интерфейс Cloudflare WARP
-iptables -t nat -D POSTROUTING -o "$WG_IF" -j MASQUERADE 2>/dev/null || true
+while iptables -t nat -D POSTROUTING -o "$WG_IF" -j MASQUERADE 2>/dev/null; do :; done
 iptables -t nat -A POSTROUTING -o "$WG_IF" -j MASQUERADE
 
-# Зажатие TCP MSS для исключения фрагментации пакетов внутри туннеля с MTU 1280
-iptables -t mangle -D OUTPUT -o "$WG_IF" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1160 2>/dev/null || true
-iptables -t mangle -D OUTPUT -o "$WG_IF" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1080 2>/dev/null || true
-iptables -t mangle -I OUTPUT 1 -o "$WG_IF" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1080
+# Двустороннее зажатие TCP MSS для исключения фрагментации внутри WARP (MTU 1280) и WRTC туннеля
+for mss_val in 1160 1080; do
+    while iptables -t mangle -D OUTPUT -o "$WG_IF" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$mss_val" 2>/dev/null; do :; done
+    while iptables -t mangle -D FORWARD -o "$WG_IF" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$mss_val" 2>/dev/null; do :; done
+    while iptables -t mangle -D FORWARD -i "$WG_IF" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$mss_val" 2>/dev/null; do :; done
+done
+for mss_val in 1040 1000; do
+    while iptables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$mss_val" 2>/dev/null; do :; done
+    while iptables -t mangle -D FORWARD -i anet+ -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$mss_val" 2>/dev/null; do :; done
+    while iptables -t mangle -D FORWARD -o anet+ -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$mss_val" 2>/dev/null; do :; done
+done
+while iptables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null; do :; done
 
-iptables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
-iptables -t mangle -I FORWARD 1 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+iptables -t mangle -I OUTPUT 1 -o "$WG_IF" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1160
+iptables -t mangle -I FORWARD 1 -o "$WG_IF" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1160
+iptables -t mangle -I FORWARD 2 -i "$WG_IF" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1160
+iptables -t mangle -I FORWARD 3 -i anet+ -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1040
+iptables -t mangle -I FORWARD 4 -o anet+ -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1040
 
-echo "[+] Настройка завершена. Проверка маршрута до медиамоста JVB (89.169.16.6):"
-ip route get 89.169.16.6 || true
+echo "[+] Настройка завершена. Проверка маршрута до медиамоста JVB (213.189.204.15):"
+ip route get 213.189.204.15 || true
