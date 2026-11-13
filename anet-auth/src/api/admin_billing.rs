@@ -143,6 +143,9 @@ impl AdminBillingApi {
 
 #[OpenApi]
 impl AdminBillingApi {
+    /// Список всех тарифов и продуктов витрины биллинга (включая скрытые)
+    ///
+    /// Возвращает все записи из таблицы `products`, отсортированные по `sort_order` (требует `AdminToken`).
     #[oai(path = "/admin/products", method = "get")]
     async fn list_products(&self, auth: AdminToken) -> poem::Result<Json<Vec<AdminProductDto>>> {
         self.ensure_admin(&auth).await?;
@@ -155,6 +158,9 @@ impl AdminBillingApi {
         Ok(Json(items.into_iter().map(AdminProductDto::from).collect()))
     }
 
+    /// Создание нового продукта или подписки для витрины Личного Кабинета
+    ///
+    /// Создаёт запись тарифа/услуги (`group_subscription`, `rate_extension`, `feature`) с ценой, валютой и бейджем (требует `AdminToken`).
     #[oai(path = "/admin/products", method = "post")]
     async fn create_product(
         &self,
@@ -187,6 +193,9 @@ impl AdminBillingApi {
         Ok(Json(AdminProductDto::from(inserted)))
     }
 
+    /// Частичное редактирование параметров, цены и активности продукта
+    ///
+    /// Обновляет только переданные поля продукта; для `target_id`, `badge` и `metadata` поддерживается явный сброс в `null` (требует `AdminToken`).
     #[oai(path = "/admin/products/:id", method = "patch")]
     async fn update_product(
         &self,
@@ -242,6 +251,9 @@ impl AdminBillingApi {
         Ok(Json(AdminProductDto::from(updated)))
     }
 
+    /// Удаление продукта из витрины биллинга по ID
+    ///
+    /// Удаляет продукт по UUID из таблицы `products` (требует `AdminToken`).
     #[oai(path = "/admin/products/:id", method = "delete")]
     async fn delete_product(&self, auth: AdminToken, id: Path<Uuid>) -> poem::Result<Json<bool>> {
         self.ensure_admin(&auth).await?;
@@ -253,6 +265,9 @@ impl AdminBillingApi {
         Ok(Json(true))
     }
 
+    /// Журнал заказов пользователей с пагинацией и фильтром по статусу
+    ///
+    /// Поддерживает query-параметры `page` (по умолчанию 1), `page_size` (по умолчанию 20) и `status` (требует `AdminToken`).
     #[oai(path = "/admin/orders", method = "get")]
     async fn list_orders(
         &self,
@@ -302,6 +317,9 @@ impl AdminBillingApi {
         }))
     }
 
+    /// Аудит платёжных транзакций и сырых уведомлений от шлюзов
+    ///
+    /// Возвращает историю подтверждённых транзакций (`transactions`) с пагинацией `page` и `page_size` (требует `AdminToken`).
     #[oai(path = "/admin/transactions", method = "get")]
     async fn list_transactions(
         &self,
