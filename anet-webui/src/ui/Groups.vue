@@ -136,7 +136,10 @@ onMounted(() => {
       @click:row="(_: unknown, data: { item: UserGroup }) => goToDetail(data.item.id)"
     >
       <template #item.name="{ item }">
-        <span class="font-weight-bold">{{ item.name }}</span>
+        <div class="d-flex align-center ga-2">
+          <span class="font-weight-bold">{{ item.name }}</span>
+          <v-chip v-if="item.is_default" size="x-small" color="primary" variant="tonal">Default</v-chip>
+        </div>
       </template>
 
       <template #item.pool_ids="{ item }">
@@ -215,3 +218,5 @@ onMounted(() => {
   padding: 24px;
 }
 </style>
+
+

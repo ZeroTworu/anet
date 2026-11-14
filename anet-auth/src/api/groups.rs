@@ -232,23 +232,7 @@ impl GroupsApi {
 
         let mut dto_list = Vec::new();
         for (m, r) in members {
-            dto_list.push(crate::api::dto::VpnUserDto {
-                id: m.id,
-                fingerprint: m.fingerprint,
-                uid: m.uid,
-                is_active: m.is_active,
-                created_at: m.created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
-                rate: r.map(|rate_model| crate::api::dto::RateDto {
-                    id: rate_model.id,
-                    sessions: rate_model.sessions as i32,
-                    date_end: rate_model.date_end.format("%Y-%m-%d-%H:%M").to_string(),
-                }),
-                static_ip: m.static_ip.map(|ip| ip.parse().ok()).flatten(),
-                server_ids: Vec::new(),        
-                pool_ids: Vec::new(),         
-                route_map_id: m.route_map_id,  
-                group_id: m.group_id,
-            });
+            dto_list.push(crate::api::users::user_model_to_dto(m, r));
         }
 
         GetGroupMembersResponse::Ok(Json(PaginatedUsers {

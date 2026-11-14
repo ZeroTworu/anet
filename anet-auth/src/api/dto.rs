@@ -305,6 +305,10 @@ pub struct AdminToken(pub Bearer);
 pub struct RateReqDto {
     pub sessions: i32,
     pub date_end: String,
+    #[oai(default)]
+    pub traffic_limit: Option<i64>,
+    #[oai(default)]
+    pub speed_limit: Option<i32>,
 }
 
 #[derive(Object, Debug, Serialize, Deserialize, Clone)]
@@ -312,6 +316,8 @@ pub struct RateDto {
     pub id: uuid::Uuid,
     pub sessions: i32,
     pub date_end: String,
+    pub traffic_limit: i64,
+    pub speed_limit: i32,
 }
 
 #[derive(Object)]
@@ -323,10 +329,13 @@ pub struct VpnUserDto {
     pub created_at: String,
     pub rate: Option<RateDto>,
     pub static_ip: Option<Ipv4Addr>,
-    pub server_ids: Vec<uuid::Uuid>,
-    pub pool_ids: Vec<uuid::Uuid>,
-    pub route_map_id: Option<uuid::Uuid>,
     pub group_id: Option<uuid::Uuid>,
+    pub email: Option<String>,
+    pub has_password: bool,
+    pub telegram_id: Option<i64>,
+    pub balance: f64,
+    pub activated_at: Option<String>,
+    pub expires_at: Option<String>,
 }
 
 #[derive(Object)]
@@ -361,10 +370,9 @@ pub enum GetUserApiResult {
 pub struct AddUserRequest {
     pub uid: String,
     pub rate: Option<RateReqDto>,
-    pub server_ids: Option<Vec<uuid::Uuid>>,
-    pub pool_ids: Option<Vec<uuid::Uuid>>,
-    pub route_map_id: Option<uuid::Uuid>,
     pub group_id: Option<uuid::Uuid>,
+    pub email: Option<String>,
+    pub password: Option<String>,
 }
 
 #[derive(Object)]
@@ -381,6 +389,8 @@ pub struct AddUserResponse {
 pub enum AddUserApiResult {
     #[oai(status = 200)]
     Ok(Json<AddUserResponse>),
+    #[oai(status = 400)]
+    BadRequest(Json<String>),
     #[oai(status = 401)]
     Unauthorized(Json<String>),
     #[oai(status = 500)]
@@ -392,12 +402,12 @@ pub struct UpdateUserRequest {
     pub uid: Option<String>,
     pub is_active: Option<bool>,
     pub static_ip: Option<String>,
-    pub server_ids: Option<Vec<uuid::Uuid>>,
-    pub pool_ids: Option<Vec<uuid::Uuid>>,
-    pub route_map_id: Option<uuid::Uuid>,
-    pub clear_route_map: Option<bool>,
     pub group_id: Option<uuid::Uuid>,
     pub clear_group: Option<bool>,
+    pub email: Option<String>,
+    pub clear_email: Option<bool>,
+    pub password: Option<String>,
+    pub clear_password: Option<bool>,
 }
 
 #[derive(Object, Debug, Clone, Serialize, Deserialize)]
@@ -557,6 +567,8 @@ pub enum UpdateUserApiResult {
 pub struct UpdateRateRequest {
     pub sessions: Option<i32>,
     pub date_end: Option<String>,
+    pub traffic_limit: Option<i64>,
+    pub speed_limit: Option<i32>,
 }
 
 #[derive(ApiResponse)]
@@ -587,6 +599,18 @@ pub enum AddRateApiResult {
     Ok(Json<RateDto>),
     #[oai(status = 400)]
     BadRequest(Json<String>),
+    #[oai(status = 401)]
+    Unauthorized(Json<String>),
+    #[oai(status = 404)]
+    NotFound(Json<String>),
+    #[oai(status = 500)]
+    Error(Json<String>),
+}
+
+#[derive(ApiResponse)]
+pub enum DeleteRateApiResult {
+    #[oai(status = 200)]
+    Ok(Json<bool>),
     #[oai(status = 401)]
     Unauthorized(Json<String>),
     #[oai(status = 404)]

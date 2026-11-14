@@ -35,6 +35,11 @@ anet-common = { path = "../anet-common", features = ["poem"] }
 anet-filter-core = { path = "../anet-filter-core" }
 reqwest = { workspace = true }
 
+[dev-dependencies]
+sea-orm = { version = "2.0", features = ["mock"] }
+
 [[bin]]
 name = "anet-auth"
 path = "src/main.rs"
+
+

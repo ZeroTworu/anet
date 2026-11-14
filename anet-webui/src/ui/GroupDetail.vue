@@ -40,6 +40,7 @@ const searchResults = ref<User[]>([])
 // Временные поля ввода группы в удобных пользователю величинах
 const form = ref<{
   name: string
+  is_default: boolean
   traffic_limit_gb: number
   speed_limit_mbps: number
   sessions_limit: number
@@ -47,6 +48,7 @@ const form = ref<{
   pool_ids: string[]
 }>({
   name: '',
+  is_default: false,
   traffic_limit_gb: 0,
   speed_limit_mbps: 0,
   sessions_limit: 0,
@@ -76,6 +78,7 @@ const loadGroupData = async () => {
     availablePools.value = poolsData.filter(p => p.is_active)
     form.value = {
       name: data.name || '',
+      is_default: Boolean(data.is_default),
       traffic_limit_gb: !data.traffic_limit ? 0 : Math.round(data.traffic_limit / (1024 * 1024 * 1024)),
       speed_limit_mbps: !data.speed_limit ? 0 : Math.round(data.speed_limit / 1024),
       sessions_limit: data.sessions_limit ?? 0,
@@ -152,6 +155,7 @@ const saveGroupSettings = async () => {
   try {
     const payload: SaveGroupRequest = {
       name: form.value.name.trim(),
+      is_default: form.value.is_default,
       traffic_limit: (form.value.traffic_limit_gb || 0) * 1024 * 1024 * 1024,
       speed_limit: (form.value.speed_limit_mbps || 0) * 1024,
       sessions_limit: form.value.sessions_limit ?? 0,
@@ -279,6 +283,13 @@ onMounted(() => {
                 hint="Если пусто — выдаются все доступные серверы"
                 persistent-hint
             />
+            <v-switch
+                v-model="form.is_default"
+                label="Группа по умолчанию"
+                color="primary"
+                hide-details
+                class="mb-4"
+            />
             <v-btn
                 color="primary"
                 block
@@ -351,7 +362,7 @@ onMounted(() => {
                   variant="text"
                   color="error"
                   size="small"
-                  @click="removeMember(item.id, item.uid)"
+                  @click="removeMember(item.id, item.uid || item.email || 'Без имени')"
               />
             </template>
           </v-data-table-server>
@@ -367,7 +378,7 @@ onMounted(() => {
           <v-autocomplete
               ref="autocompleteRef"
               v-model:search="searchInput"
-              :items="searchResults.map(u => ({ title: u.uid || 'No Name', value: u.id }))"
+              :items="searchResults.map(u => ({ title: u.uid || u.email || 'No Name', value: u.id }))"
               item-title="title"
               item-value="value"
               :loading="searchLoading"
@@ -399,3 +410,5 @@ onMounted(() => {
   font-size: 13px;
 }
 </style>
+
+

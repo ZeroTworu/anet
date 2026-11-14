@@ -44,3 +44,6 @@ pub fn get_api(
         admin_billing::AdminBillingApi::new(db),
     )
 }
+
+#[cfg(test)]
+mod tests;

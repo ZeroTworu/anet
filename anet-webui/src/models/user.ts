@@ -8,32 +8,35 @@ export type UsersResponse = {
 export type User = {
   id: string
   fingerprint: string
-  uid: string
+  uid: string | null
   is_active: boolean
   created_at: string
   rate: Rate | null
   static_ip: string | null
-  server_ids: string[]
-  pool_ids: string[]
-  route_map_id: string | null
   group_id: string | null
+  email: string | null
+  has_password: boolean
+  telegram_id: number | null
+  balance: number
+  activated_at: string | null
+  expires_at: string | null
 }
 
 export type UpdateUserRequest = {
-  uid: string
-  is_active: boolean
-  static_ip: string | null
-  server_ids: string[]
-  pool_ids: string[]
-  route_map_id?: string
-  clear_route_map?: boolean
-  group_id?: string
+  uid?: string
+  is_active?: boolean
+  static_ip?: string | null
+  group_id?: string | null
   clear_group?: boolean
+  email?: string | null
+  clear_email?: boolean
+  password?: string
+  clear_password?: boolean
 }
 
 export type RegenerateUserRequest = {
   id: string
-  uid: string
+  uid: string | null
   fingerprint: string
   private_key: string
   public_key: string
@@ -41,8 +44,16 @@ export type RegenerateUserRequest = {
 
 export type CreateUserRequest = {
   uid: string
-  server_ids: string[]
-  pool_ids: string[]
-  route_map_id: string | null
   group_id: string | null
+  email?: string | null
+  password?: string | null
+}
+
+export type AddUserResponse = {
+  id: string
+  uid: string
+  fingerprint: string
+  private_key: string
+  public_key: string
+  rate: Rate | null
 }

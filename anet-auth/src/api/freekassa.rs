@@ -68,7 +68,7 @@ pub(crate) fn hmac_sha256_hex(key: &[u8], data: &[u8]) -> String {
 }
 
 /// Чистая реализация RFC 1321 MD5 (для SCI и входящего вебхука FreeKassa)
-fn md5_hex(data: &[u8]) -> String {
+pub(crate) fn md5_hex(data: &[u8]) -> String {
     const S: [u32; 64] = [
         7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
         5,  9, 14, 20, 5,  9, 14, 20, 5,  9, 14, 20, 5,  9, 14, 20,

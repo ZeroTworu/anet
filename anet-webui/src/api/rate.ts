@@ -1,8 +1,8 @@
-import type { Rate, RateReqRequest } from '@/models/rate'
+import type { Rate, RateReqRequest, UpdateRateRequest } from '@/models/rate'
 import { api } from './client'
 import { toQuery } from '@/utils'
 
-export async function UpdateRate(id: string, data: RateReqRequest): Promise<Rate> {
+export async function UpdateRate(id: string, data: UpdateRateRequest): Promise<Rate> {
   return api<Rate>(`/rate/${id}`, {
     method: 'PATCH',
     data,
@@ -16,5 +16,11 @@ export async function AddRate(user_id: string, data: RateReqRequest): Promise<Ra
   return api<Rate>(`/addrate?${params}`, {
     method: 'POST',
     data,
+  })
+}
+
+export async function DeleteRate(id: string): Promise<boolean> {
+  return api<boolean>(`/rate/${id}`, {
+    method: 'DELETE',
   })
 }

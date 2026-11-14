@@ -2,9 +2,8 @@
 import { computed, onMounted, ref, watch } from 'vue'
 import { GetUsers } from '@/api/users'
 import { GetGroups } from '@/api/groups'
-import type { UsersResponse, User } from '@/models/user'
+import type { UsersResponse } from '@/models/user'
 import type { UserGroup } from '@/models/group'
-
 import UserModal from '@/components/UserModal.vue'
 import CreateUserModal from '@/components/CreateUserModal.vue'
 
@@ -18,12 +17,13 @@ const groups = ref<UserGroup[]>([])
 const options = ref({
   page: 1,
   itemsPerPage: 10,
-  sortBy: [] as { key: string; order: string }[] // <-- Сюда Vuetify пишет активную сортировку
+  sortBy: [] as { key: string; order: string }[],
 })
 
 const headers = [
   { title: 'UID (User Name)', key: 'uid', sortable: true },
-  { title: 'Группа', key: 'group_name', sortable: false }, // По этой связи сортировка отключена
+  { title: 'Email', key: 'email', sortable: true },
+  { title: 'Группа', key: 'group_name', sortable: false },
   { title: 'UUID (ID)', key: 'id', sortable: true },
   { title: 'Status', key: 'is_active', sortable: true, align: 'center' as const },
   { title: 'Действия', key: 'actions', sortable: false, align: 'center' as const },
@@ -31,24 +31,22 @@ const headers = [
 
 const items = computed(() => data.value?.items ?? [])
 const total = computed(() => data.value?.total ?? 0)
-
-const groupMap = computed(() => new Map(groups.value.map(g => [g.id, g])))
-const groupOptions = computed(() => groups.value.map(g => ({ title: g.name, value: g.id })))
+const groupMap = computed(() => new Map(groups.value.map((g) => [g.id, g])))
+const groupOptions = computed(() => groups.value.map((g) => ({ title: g.name, value: g.id })))
 
 // Загрузка пользователей
 const loadUsers = async (
-    page = options.value.page,
-    itemsPerPage = options.value.itemsPerPage,
-    search = searchQuery.value,
-    groupIds = selectedGroupIds.value,
-    sortBy = options.value.sortBy
+  page = options.value.page,
+  itemsPerPage = options.value.itemsPerPage,
+  search = searchQuery.value,
+  groupIds = selectedGroupIds.value,
+  sortBy = options.value.sortBy,
 ) => {
   loading.value = true
   try {
     const offset = (page - 1) * itemsPerPage
-    const sortField = sortBy[0]?.key // Извлекаем поле сортировки
-    const isDesc = sortBy[0]?.order === 'desc' // Извлекаем направление
-
+    const sortField = sortBy[0]?.key
+    const isDesc = sortBy[0]?.order === 'desc'
     data.value = await GetUsers(offset, itemsPerPage, search, groupIds, sortField, isDesc)
   } finally {
     loading.value = false
@@ -68,7 +66,6 @@ const handleOptions = (opts: any) => {
   options.value.page = opts.page
   options.value.itemsPerPage = opts.itemsPerPage
   options.value.sortBy = opts.sortBy || []
-
   loadUsers(opts.page, opts.itemsPerPage, searchQuery.value, selectedGroupIds.value, opts.sortBy)
 }
 
@@ -107,7 +104,7 @@ onMounted(() => {
     <div class="d-flex justify-space-between align-center flex-wrap ga-4 mb-4">
       <v-list-item
         class="px-0"
-        subtitle="Управление учетными записями пользователей, тарифами и привязками к группам"
+        subtitle="Управление учетными записями пользователей, Email/паролями, тарифами и привязками к группам"
       >
         <template #title>
           <h1 class="text-h5 font-weight-bold">ANet VPN Clients (Пользователи)</h1>
@@ -120,12 +117,12 @@ onMounted(() => {
         <v-text-field
           v-model="searchQuery"
           prepend-inner-icon="mdi-magnify"
-          label="Поиск по UID..."
+          label="Поиск по UID, Email или Fingerprint..."
           variant="outlined"
           density="compact"
           hide-details
           single-line
-          style="max-width: 280px"
+          style="max-width: 320px"
         />
 
         <v-select
@@ -172,6 +169,27 @@ onMounted(() => {
         <span class="font-weight-bold">{{ item.uid || 'No Name' }}</span>
       </template>
 
+      <template #item.email="{ item }">
+        <div class="d-flex align-center ga-2">
+          <span v-if="item.email">{{ item.email }}</span>
+          <span v-else class="text-caption text-medium-emphasis">—</span>
+          <v-icon
+            v-if="item.has_password"
+            icon="mdi-lock-check-outline"
+            size="small"
+            color="success"
+            title="Пароль установлен"
+          />
+          <v-icon
+            v-if="item.telegram_id"
+            icon="mdi-send-circle-outline"
+            size="small"
+            color="info"
+            :title="`Telegram ID: ${item.telegram_id}`"
+          />
+        </div>
+      </template>
+
       <template #item.group_name="{ item }">
         <v-chip
           v-if="item.group_id && groupMap.has(item.group_id)"
@@ -213,7 +231,6 @@ onMounted(() => {
       @updated="loadUsers"
       @close="closeModal"
     />
-
     <CreateUserModal v-model="showCreate" @created="loadUsers" />
   </v-container>
 </template>

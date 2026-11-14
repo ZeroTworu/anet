@@ -7,7 +7,6 @@ import type { NodePool } from '@/models/pool'
 import { useAppMessage } from '@/composables/useAppMessage'
 
 const show = defineModel<boolean>()
-
 const emit = defineEmits<{
   (e: 'saved'): void
   (e: 'close'): void
@@ -20,6 +19,7 @@ const message = useAppMessage()
 // Поля ввода новой группы
 const form = ref<{
   name: string
+  is_default: boolean
   traffic_limit_gb: number
   speed_limit_mbps: number
   sessions_limit: number
@@ -27,6 +27,7 @@ const form = ref<{
   pool_ids: string[]
 }>({
   name: '',
+  is_default: false,
   traffic_limit_gb: 0,
   speed_limit_mbps: 0,
   sessions_limit: 0,
@@ -37,7 +38,7 @@ const form = ref<{
 const loadPools = async () => {
   try {
     const pools = await GetPools()
-    availablePools.value = pools.filter(p => p.is_active)
+    availablePools.value = pools.filter((p) => p.is_active)
   } catch (e) {
     console.error('Failed to load pools', e)
   }
@@ -46,6 +47,7 @@ const loadPools = async () => {
 const resetForm = () => {
   form.value = {
     name: '',
+    is_default: false,
     traffic_limit_gb: 0,
     speed_limit_mbps: 0,
     sessions_limit: 0,
@@ -71,13 +73,13 @@ const save = async () => {
   try {
     const payload: SaveGroupRequest = {
       name: form.value.name.trim(),
+      is_default: form.value.is_default,
       traffic_limit: (form.value.traffic_limit_gb || 0) * 1024 * 1024 * 1024,
       speed_limit: (form.value.speed_limit_mbps || 0) * 1024,
       sessions_limit: form.value.sessions_limit ?? 0,
       duration_days: form.value.duration_days ?? 0,
       pool_ids: form.value.pool_ids,
     }
-
     await CreateGroup(payload)
     message.success('Новая группа пользователей создана')
     emit('saved')
@@ -108,21 +110,21 @@ const close = () => {
           <v-row class="mb-1">
             <v-col cols="12" sm="8">
               <v-text-field
-                  v-model="form.name"
-                  label="Название группы"
-                  placeholder="e.g. Администраторы, VIP, Гости"
-                  variant="filled"
-                  hide-details
+                v-model="form.name"
+                label="Название группы"
+                placeholder="e.g. Администраторы, VIP, Гости"
+                variant="filled"
+                hide-details
               />
             </v-col>
             <v-col cols="12" sm="4">
               <v-text-field
-                  v-model.number="form.sessions_limit"
-                  type="number"
-                  label="Сессий (0 - без лимита)"
-                  min="0"
-                  variant="filled"
-                  hide-details
+                v-model.number="form.sessions_limit"
+                type="number"
+                label="Сессий (0 - без лимита)"
+                min="0"
+                variant="filled"
+                hide-details
               />
             </v-col>
           </v-row>
@@ -131,22 +133,22 @@ const close = () => {
           <v-row class="mb-1">
             <v-col cols="12" sm="6">
               <v-text-field
-                  v-model.number="form.traffic_limit_gb"
-                  type="number"
-                  label="Ограничение трафика (ГБ)"
-                  placeholder="0 - безлимитный трафик"
-                  variant="filled"
-                  hide-details
+                v-model.number="form.traffic_limit_gb"
+                type="number"
+                label="Ограничение трафика (ГБ)"
+                placeholder="0 - безлимитный трафик"
+                variant="filled"
+                hide-details
               />
             </v-col>
             <v-col cols="12" sm="6">
               <v-text-field
-                  v-model.number="form.speed_limit_mbps"
-                  type="number"
-                  label="Ограничение скорости (Мбит/с)"
-                  placeholder="0 - максимальная скорость"
-                  variant="filled"
-                  hide-details
+                v-model.number="form.speed_limit_mbps"
+                type="number"
+                label="Ограничение скорости (Мбит/с)"
+                placeholder="0 - максимальная скорость"
+                variant="filled"
+                hide-details
               />
             </v-col>
           </v-row>
@@ -155,13 +157,13 @@ const close = () => {
           <v-row class="mb-2">
             <v-col cols="12">
               <v-text-field
-                  v-model.number="form.duration_days"
-                  type="number"
-                  label="Срок действия доступа при активации (в днях)"
-                  min="0"
-                  placeholder="0 - бессрочный доступ"
-                  variant="filled"
-                  hide-details
+                v-model.number="form.duration_days"
+                type="number"
+                label="Срок действия доступа при активации (в днях)"
+                min="0"
+                placeholder="0 - бессрочный доступ"
+                variant="filled"
+                hide-details
               />
             </v-col>
           </v-row>
@@ -170,21 +172,29 @@ const close = () => {
           <v-row class="mb-2">
             <v-col cols="12">
               <v-select
-                  v-model="form.pool_ids"
-                  :items="availablePools"
-                  item-title="name"
-                  item-value="id"
-                  label="Привязанные группы серверов (Node Pools)"
-                  placeholder="Выберите группы серверов"
-                  multiple
-                  chips
-                  closable-chips
-                  variant="filled"
-                  hint="Если группы не выбраны, для участников действует стандартный список серверов"
-                  persistent-hint
+                v-model="form.pool_ids"
+                :items="availablePools"
+                item-title="name"
+                item-value="id"
+                label="Привязанные группы серверов (Node Pools)"
+                placeholder="Выберите группы серверов"
+                multiple
+                chips
+                closable-chips
+                variant="filled"
+                hint="Если группы не выбраны, для участников действует стандартный список серверов"
+                persistent-hint
               />
             </v-col>
           </v-row>
+
+          <v-switch
+            v-model="form.is_default"
+            label="Группа по умолчанию (назначается при регистрации и после истечения подписки)"
+            color="primary"
+            hide-details
+            class="mt-2"
+          />
         </v-form>
       </v-card-text>
 
@@ -192,11 +202,11 @@ const close = () => {
         <v-spacer />
         <v-btn variant="text" @click="close">Отмена</v-btn>
         <v-btn
-            color="primary"
-            variant="flat"
-            :loading="loading"
-            :disabled="!form.name.trim() || form.sessions_limit < 0 || form.duration_days < 0"
-            @click="save"
+          color="primary"
+          variant="flat"
+          :loading="loading"
+          :disabled="!form.name.trim() || form.sessions_limit < 0 || form.duration_days < 0"
+          @click="save"
         >
           Создать группу
         </v-btn>

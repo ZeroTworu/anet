@@ -1,18 +1,15 @@
-use crate::api::api::{
-    compiled_routes_for_user, resolve_client_servers, user_pool_ids, user_route_map_id,
-    validate_admin_session,
-};
+use crate::api::api::{compiled_routes_for_user, resolve_client_servers, validate_admin_session};
 use crate::api::dto::{
     AddRateApiResult, AddRateRequest, AddUserApiResult, AddUserRequest, AddUserResponse,
-    AdminToken, DownloadConfigResponse, GetUserApiResult, GetUsersResponse, PaginatedUsers,
+    AdminToken, DeleteRateApiResult, DownloadConfigResponse, GetUserApiResult, GetUsersResponse, PaginatedUsers,
     QrPageResponse, RateDto, RegenerateUserApiResult, RegenerateUserResponse, UpdateRateApiResult,
     UpdateRateRequest, UpdateUserApiResult, UpdateUserRequest, VpnUserDto,
 };
 use crate::crypto::DbEncryptor;
 use crate::entities::{
-    group_node_pools, groups, node_pool_members, node_pools, servers, user_node_pools,
-    user_servers, users, ProtocolType,
+    group_node_pools, groups, node_pool_members, node_pools, servers, users, ProtocolType,
 };
+use bcrypt::{hash, DEFAULT_COST};
 use crate::route_compiler::toml_string_array;
 use chrono::{NaiveDateTime, Utc};
 use log::{error, info, warn};
@@ -602,6 +599,55 @@ pub async fn build_client_toml_for_user(
     Ok((final_output, client_name))
 }
 
+pub(crate) fn rate_model_to_dto(r: crate::entities::rates::Model) -> RateDto {
+    RateDto {
+        id: r.id,
+        sessions: r.sessions,
+        date_end: r.date_end.format("%Y-%m-%d-%H:%M").to_string(),
+        traffic_limit: r.traffic_limit,
+        speed_limit: r.speed_limit,
+    }
+}
+
+pub(crate) fn user_model_to_dto(
+    u: users::Model,
+    r: Option<crate::entities::rates::Model>,
+) -> VpnUserDto {
+    let has_password = u.password_hash.is_some();
+    VpnUserDto {
+        id: u.id,
+        fingerprint: u.fingerprint,
+        uid: u.uid,
+        is_active: u.is_active,
+        created_at: u.created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+        rate: r.map(rate_model_to_dto),
+        static_ip: u.static_ip.and_then(|ip| ip.parse().ok()),
+        group_id: u.group_id,
+        email: u.email,
+        has_password,
+        telegram_id: u.telegram_id,
+        balance: u.balance,
+        activated_at: u.activated_at.map(|dt| dt.to_rfc3339()),
+        expires_at: u.expires_at.map(|dt| dt.to_rfc3339()),
+    }
+}
+
+fn validate_and_normalize_email(raw: &str) -> Result<String, String> {
+    let email = raw.trim().to_lowercase();
+    if email.len() < 5 || !email.contains('@') || !email.contains('.') || email.contains(' ') {
+        return Err("Некорректный формат Email".to_string());
+    }
+    Ok(email)
+}
+
+fn validate_and_hash_password(raw: &str) -> Result<String, String> {
+    let min_len = crate::config::get().cabinet.web.min_password_length;
+    if raw.chars().count() < min_len {
+        return Err(format!("Минимальная длина пароля: {} символов", min_len));
+    }
+    hash(raw, DEFAULT_COST).map_err(|e| format!("Ошибка хэширования пароля: {}", e))
+}
+
 pub struct UsersApi {
     pub db: DatabaseConnection,
     pub client_template_path: String,
@@ -639,6 +685,7 @@ impl UsersApi {
                     sea_orm::Condition::any()
                         .add(users::Column::Uid.ilike(&pattern))
                         .add(users::Column::Fingerprint.ilike(&pattern))
+                        .add(users::Column::Email.ilike(&pattern)),
                 );
             }
         }
@@ -663,6 +710,7 @@ impl UsersApi {
         // Логика динамической сортировки Sea-ORM
         let order_col = match sort_by.0.as_deref() {
             Some("uid") => users::Column::Uid,
+            Some("email") => users::Column::Email,
             Some("id") => users::Column::Id,
             Some("is_active") => users::Column::IsActive,
             _ => users::Column::CreatedAt, // По умолчанию
@@ -686,23 +734,7 @@ impl UsersApi {
 
         let mut dto_list = Vec::new();
         for (m, r) in users {
-            dto_list.push(VpnUserDto {
-                id: m.id,
-                fingerprint: m.fingerprint,
-                uid: m.uid,
-                is_active: m.is_active,
-                created_at: m.created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
-                rate: r.map(|rate_model| RateDto {
-                    id: rate_model.id,
-                    sessions: rate_model.sessions as i32,
-                    date_end: rate_model.date_end.format("%Y-%m-%d-%H:%M").to_string(),
-                }),
-                static_ip: m.static_ip.map(|ip| ip.parse().ok()).flatten(),
-                server_ids: Vec::new(),
-                pool_ids: Vec::new(),
-                route_map_id: m.route_map_id,
-                group_id: m.group_id,
-            });
+            dto_list.push(user_model_to_dto(m, r));
         }
 
         GetUsersResponse::Ok(Json(PaginatedUsers {
@@ -730,36 +762,7 @@ impl UsersApi {
             Err(e) => return GetUserApiResult::Error(Json(e.to_string())),
         };
 
-        let s_ids = user_servers::Entity::find()
-            .filter(user_servers::Column::UserId.eq(result.0.id))
-            .all(&self.db)
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .map(|us| us.server_id)
-            .collect();
-        let p_ids = user_pool_ids(&self.db, result.0.id).await;
-        let route_map_id = user_route_map_id(&self.db, result.0.id).await;
-
-        let rate_dto = result.1.map(|rate_model| RateDto {
-            id: rate_model.id,
-            sessions: rate_model.sessions as i32,
-            date_end: rate_model.date_end.format("%Y-%m-%d-%H:%M").to_string(),
-        });
-
-        GetUserApiResult::Ok(Json(VpnUserDto {
-            id: result.0.id,
-            fingerprint: result.0.fingerprint,
-            uid: result.0.uid,
-            is_active: result.0.is_active,
-            created_at: result.0.created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
-            rate: rate_dto,
-            static_ip: result.0.static_ip.map(|ip| ip.parse().ok()).flatten(),
-            server_ids: s_ids,
-            pool_ids: p_ids,
-            route_map_id,
-            group_id: result.0.group_id,
-        }))
+        GetUserApiResult::Ok(Json(user_model_to_dto(result.0, result.1)))
     }
 
     /// Создание нового VPN-Клиента
@@ -768,6 +771,50 @@ impl UsersApi {
         if let Err(err) = validate_admin_session(&self.db, &auth.0.token).await {
             return AddUserApiResult::Unauthorized(Json(err));
         }
+
+        let email_opt = match req.0.email.as_deref().map(str::trim).filter(|e| !e.is_empty()) {
+            Some(raw) => {
+                let norm = match validate_and_normalize_email(raw) {
+                    Ok(e) => e,
+                    Err(msg) => return AddUserApiResult::BadRequest(Json(msg)),
+                };
+                match users::Entity::find()
+                    .filter(users::Column::Email.eq(&norm))
+                    .one(&self.db)
+                    .await
+                {
+                    Ok(Some(_)) => {
+                        return AddUserApiResult::BadRequest(Json(
+                            "Email уже используется другим пользователем".to_string(),
+                        ));
+                    }
+                    Ok(None) => Some(norm),
+                    Err(e) => return AddUserApiResult::Error(Json(e.to_string())),
+                }
+            }
+            None => None,
+        };
+
+        let password_hash_opt = match req.0.password.as_deref().filter(|p| !p.is_empty()) {
+            Some(raw_pwd) => match validate_and_hash_password(raw_pwd) {
+                Ok(h) => Some(h),
+                Err(msg) => return AddUserApiResult::BadRequest(Json(msg)),
+            },
+            None => None,
+        };
+
+        let explicit_rate_date = if let Some(ref r) = req.0.rate {
+            match chrono::NaiveDateTime::parse_from_str(&r.date_end, "%Y-%m-%d-%H:%M") {
+                Ok(d) => Some(d),
+                Err(_) => {
+                    return AddUserApiResult::BadRequest(Json(
+                        "Неверный формат даты тарифа. Ожидается YYYY-MM-DD-HH:MM".to_string(),
+                    ));
+                }
+            }
+        } else {
+            None
+        };
 
         let identity = crate::keygen::generate_identity();
         let user_id = Uuid::new_v4();
@@ -792,10 +839,10 @@ impl UsersApi {
             static_ip: Set(None),
             private_key: Set(Some(encrypted_private_key)),
             public_key: Set(Some(encrypted_public_key)),
-            route_map_id: Set(req.0.route_map_id),
+            route_map_id: Set(None),
             group_id: Set(req.0.group_id),
-            email: Set(None),
-            password_hash: Set(None),
+            email: Set(email_opt),
+            password_hash: Set(password_hash_opt),
             telegram_id: Set(None),
             balance: Set(0.0),
             activated_at: Set(None),
@@ -807,7 +854,23 @@ impl UsersApi {
             return AddUserApiResult::Error(Json("Ошибка записи в БД".to_string()));
         }
 
-        if let Some(group_id) = req.0.group_id {
+        let mut created_rate_dto: Option<RateDto> = None;
+        if let (Some(rate_req), Some(date_end)) = (&req.0.rate, explicit_rate_date) {
+            let now = Utc::now().naive_utc();
+            let new_rate = crate::entities::rates::ActiveModel {
+                id: Set(Uuid::new_v4()),
+                user_id: Set(user_id),
+                sessions: Set(rate_req.sessions),
+                traffic_limit: Set(rate_req.traffic_limit.unwrap_or(0)),
+                speed_limit: Set(rate_req.speed_limit.unwrap_or(0)),
+                date_end: Set(date_end),
+                created_at: Set(now),
+                updated_at: Set(now),
+            };
+            if let Ok(inserted_rate) = new_rate.insert(&self.db).await {
+                created_rate_dto = Some(rate_model_to_dto(inserted_rate));
+            }
+        } else if let Some(group_id) = req.0.group_id {
             if let Ok(Some(group)) = groups::Entity::find_by_id(group_id).one(&self.db).await {
                 let now = Utc::now().naive_utc();
                 let date_end = now + chrono::Duration::days(group.duration_days as i64);
@@ -822,31 +885,8 @@ impl UsersApi {
                     created_at: Set(now),
                     updated_at: Set(now),
                 };
-                let _ = new_rate.insert(&self.db).await;
-            }
-        }
-
-        if let Some(ids) = &req.0.server_ids {
-            for sid in ids {
-                let link = user_servers::ActiveModel {
-                    user_id: Set(user_id),
-                    server_id: Set(*sid),
-                };
-                if let Err(e) = link.insert(&self.db).await {
-                    error!("Failed to bind server to user: {}", e);
-                }
-            }
-        }
-        if let Some(ids) = &req.0.pool_ids {
-            for pool_id in ids {
-                if let Err(e) = (user_node_pools::ActiveModel {
-                    user_id: Set(user_id),
-                    pool_id: Set(*pool_id),
-                })
-                    .insert(&self.db)
-                    .await
-                {
-                    error!("Failed to bind pool to user: {}", e);
+                if let Ok(inserted_rate) = new_rate.insert(&self.db).await {
+                    created_rate_dto = Some(rate_model_to_dto(inserted_rate));
                 }
             }
         }
@@ -857,11 +897,11 @@ impl UsersApi {
             fingerprint: identity.fingerprint,
             private_key: identity.private_key,
             public_key: identity.public_key,
-            rate: None,
+            rate: created_rate_dto,
         }))
     }
 
-    /// Редактировать настройки профиля (PATCH)
+    /// Редактировать настройки профиля, Email, пароль и группу (PATCH)
     #[oai(path = "/user/:id", method = "patch")]
     async fn update_user(
         &self,
@@ -885,12 +925,7 @@ impl UsersApi {
             Err(e) => return UpdateUserApiResult::Error(Json(e.to_string())),
         };
 
-        let rate_dto = rate_model.map(|r_model| RateDto {
-            id: r_model.id,
-            sessions: r_model.sessions as i32,
-            date_end: r_model.date_end.format("%Y-%m-%d-%H:%M").to_string(),
-        });
-
+        let existing_snapshot = user_model.clone();
         let mut editable_user = user_model.into_active_model();
         let mut something_changed = false;
 
@@ -903,47 +938,64 @@ impl UsersApi {
             something_changed = true;
         }
         if let Some(static_ip) = req.0.static_ip {
-            editable_user.static_ip = Set(Some(static_ip));
+            let trimmed = static_ip.trim();
+            if trimmed.is_empty() {
+                editable_user.static_ip = Set(None);
+            } else {
+                editable_user.static_ip = Set(Some(trimmed.to_string()));
+            }
             something_changed = true;
         }
 
-        if let Some(ref ids) = req.0.server_ids {
-            let _ = user_servers::Entity::delete_many()
-                .filter(user_servers::Column::UserId.eq(id.0))
-                .exec(&self.db)
-                .await;
+        if req.0.clear_group.unwrap_or(false) {
+            editable_user.group_id = Set(None);
+            something_changed = true;
+        } else if let Some(group_id) = req.0.group_id {
+            editable_user.group_id = Set(Some(group_id));
+            something_changed = true;
+        }
 
-            for sid in ids {
-                let link = user_servers::ActiveModel {
-                    user_id: Set(id.0),
-                    server_id: Set(*sid),
+        if req.0.clear_email.unwrap_or(false)
+            || matches!(&req.0.email, Some(e) if e.trim().is_empty())
+        {
+            editable_user.email = Set(None);
+            something_changed = true;
+        } else if let Some(ref raw_email) = req.0.email {
+            let norm = match validate_and_normalize_email(raw_email) {
+                Ok(e) => e,
+                Err(msg) => return UpdateUserApiResult::BadRequest(Json(msg)),
+            };
+            match users::Entity::find()
+                .filter(users::Column::Email.eq(&norm))
+                .filter(users::Column::Id.ne(id.0))
+                .one(&self.db)
+                .await
+            {
+                Ok(Some(_)) => {
+                    return UpdateUserApiResult::BadRequest(Json(
+                        "Этот Email уже используется другим пользователем".to_string(),
+                    ));
+                }
+                Ok(None) => {
+                    editable_user.email = Set(Some(norm));
+                    something_changed = true;
+                }
+                Err(e) => return UpdateUserApiResult::Error(Json(e.to_string())),
+            }
+        }
+
+        if req.0.clear_password.unwrap_or(false) {
+            editable_user.password_hash = Set(None);
+            something_changed = true;
+        } else if let Some(ref raw_pwd) = req.0.password {
+            if !raw_pwd.is_empty() {
+                let hashed = match validate_and_hash_password(raw_pwd) {
+                    Ok(h) => h,
+                    Err(msg) => return UpdateUserApiResult::BadRequest(Json(msg)),
                 };
-                let _ = link.insert(&self.db).await;
+                editable_user.password_hash = Set(Some(hashed));
+                something_changed = true;
             }
-            something_changed = true;
-        }
-        if let Some(ref ids) = req.0.pool_ids {
-            let _ = user_node_pools::Entity::delete_many()
-                .filter(user_node_pools::Column::UserId.eq(id.0))
-                .exec(&self.db)
-                .await;
-            for pool_id in ids {
-                let _ = (user_node_pools::ActiveModel {
-                    user_id: Set(id.0),
-                    pool_id: Set(*pool_id),
-                })
-                    .insert(&self.db)
-                    .await;
-            }
-            something_changed = true;
-        }
-
-        if req.0.clear_route_map.unwrap_or(false) {
-            editable_user.route_map_id = Set(None);
-            something_changed = true;
-        } else if let Some(route_map_id) = req.0.route_map_id {
-            editable_user.route_map_id = Set(Some(route_map_id));
-            something_changed = true;
         }
 
         if something_changed {
@@ -951,33 +1003,10 @@ impl UsersApi {
 
             match editable_user.update(&self.db).await {
                 Ok(updated_data) => {
-                    let s_ids = user_servers::Entity::find()
-                        .filter(user_servers::Column::UserId.eq(updated_data.id))
-                        .all(&self.db)
-                        .await
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|us| us.server_id)
-                        .collect();
-                    let p_ids = user_pool_ids(&self.db, updated_data.id).await;
-                    let route_map_id = user_route_map_id(&self.db, updated_data.id).await;
-
-                    return UpdateUserApiResult::Ok(Json(VpnUserDto {
-                        id: updated_data.id,
-                        fingerprint: updated_data.fingerprint,
-                        uid: updated_data.uid,
-                        is_active: updated_data.is_active,
-                        created_at: updated_data
-                            .created_at
-                            .format("%Y-%m-%d %H:%M:%S")
-                            .to_string(),
-                        rate: rate_dto,
-                        static_ip: updated_data.static_ip.map(|ip| ip.parse().ok()).flatten(),
-                        server_ids: s_ids,
-                        pool_ids: p_ids,
-                        route_map_id,
-                        group_id: updated_data.group_id,
-                    }));
+                    return UpdateUserApiResult::Ok(Json(user_model_to_dto(
+                        updated_data,
+                        rate_model,
+                    )));
                 }
                 Err(e) => {
                     error!("[DB CRASH] Editing user payload: {}", e);
@@ -986,39 +1015,7 @@ impl UsersApi {
             }
         }
 
-        let s_ids = user_servers::Entity::find()
-            .filter(user_servers::Column::UserId.eq(editable_user.id.clone().unwrap()))
-            .all(&self.db)
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .map(|us| us.server_id)
-            .collect();
-        let editable_user_id = editable_user.id.clone().unwrap();
-        let p_ids = user_pool_ids(&self.db, editable_user_id).await;
-        let route_map_id = user_route_map_id(&self.db, editable_user_id).await;
-
-        UpdateUserApiResult::Ok(Json(VpnUserDto {
-            id: editable_user.id.unwrap(),
-            fingerprint: editable_user.fingerprint.unwrap(),
-            uid: editable_user.uid.unwrap(),
-            is_active: editable_user.is_active.unwrap(),
-            created_at: editable_user
-                .created_at
-                .unwrap()
-                .format("%Y-%m-%d %H:%M:%S")
-                .to_string(),
-            rate: rate_dto,
-            static_ip: editable_user
-                .static_ip
-                .unwrap()
-                .map(|ip| ip.parse().ok())
-                .flatten(),
-            server_ids: s_ids,
-            pool_ids: p_ids,
-            route_map_id,
-            group_id: editable_user.group_id.unwrap(),
-        }))
+        UpdateUserApiResult::Ok(Json(user_model_to_dto(existing_snapshot, rate_model)))
     }
 
     /// Обнулить конфиг: (Удаление старых ключей) по ID клиента
@@ -1082,7 +1079,7 @@ impl UsersApi {
         }))
     }
 
-    /// Настройки тарифа: Обновление количества сессий и даты окончания.
+    /// Настройки индивидуального тарифа: обновление сессий, даты окончания, лимита трафика и скорости
     #[oai(path = "/rate/:id", method = "patch")]
     async fn update_rate(
         &self,
@@ -1108,6 +1105,7 @@ impl UsersApi {
             }
         };
 
+        let snapshot = rate_model.clone();
         let mut editable_rate = rate_model.into_active_model();
         let mut something_changed = false;
 
@@ -1130,16 +1128,22 @@ impl UsersApi {
             something_changed = true;
         }
 
+        if let Some(new_traffic_limit) = req.0.traffic_limit {
+            editable_rate.traffic_limit = Set(new_traffic_limit);
+            something_changed = true;
+        }
+
+        if let Some(new_speed_limit) = req.0.speed_limit {
+            editable_rate.speed_limit = Set(new_speed_limit);
+            something_changed = true;
+        }
+
         if something_changed {
             editable_rate.updated_at = Set(Utc::now().naive_utc());
 
             match editable_rate.update(&self.db).await {
                 Ok(updated_data) => {
-                    return UpdateRateApiResult::Ok(Json(RateDto {
-                        id: updated_data.id,
-                        sessions: updated_data.sessions as i32,
-                        date_end: updated_data.date_end.format("%Y-%m-%d-%H:%M").to_string(),
-                    }));
+                    return UpdateRateApiResult::Ok(Json(rate_model_to_dto(updated_data)));
                 }
                 Err(e) => {
                     error!("[DB CRASH] Editing rate payload: {}", e);
@@ -1150,18 +1154,10 @@ impl UsersApi {
             }
         }
 
-        UpdateRateApiResult::Ok(Json(RateDto {
-            id: editable_rate.id.unwrap(),
-            sessions: editable_rate.sessions.unwrap() as i32,
-            date_end: editable_rate
-                .date_end
-                .unwrap()
-                .format("%Y-%m-%d-%H:%M")
-                .to_string(),
-        }))
+        UpdateRateApiResult::Ok(Json(rate_model_to_dto(snapshot)))
     }
 
-    /// Добавление тарифа
+    /// Создание индивидуального тарифа (rate) для пользователя
     #[oai(path = "/addrate", method = "post")]
     async fn add_rate(
         &self,
@@ -1202,29 +1198,73 @@ impl UsersApi {
         };
 
         let new_sessions = req.0.sessions.unwrap_or(0);
+        let new_traffic_limit = req.0.traffic_limit.unwrap_or(0);
+        let new_speed_limit = req.0.speed_limit.unwrap_or(0);
+        let now = Utc::now().naive_utc();
+
+        if let Ok(Some(existing_rate)) = crate::entities::rates::Entity::find()
+            .filter(crate::entities::rates::Column::UserId.eq(user_id.0))
+            .one(&self.db)
+            .await
+        {
+            let mut editable = existing_rate.into_active_model();
+            editable.sessions = Set(new_sessions);
+            editable.date_end = Set(date_parsed);
+            editable.traffic_limit = Set(new_traffic_limit);
+            editable.speed_limit = Set(new_speed_limit);
+            editable.updated_at = Set(now);
+
+            return match editable.update(&self.db).await {
+                Ok(updated) => AddRateApiResult::Ok(Json(rate_model_to_dto(updated))),
+                Err(e) => {
+                    error!("[DB ERROR] Update existing rate failed: {}", e);
+                    AddRateApiResult::Error(Json("Ошибка обновления тарифа в БД!".to_string()))
+                }
+            };
+        }
 
         let new_rate = crate::entities::rates::ActiveModel {
             id: Set(rate_id),
             user_id: Set(user_id.0),
             sessions: Set(new_sessions),
             date_end: Set(date_parsed),
-            traffic_limit: Set(req.0.traffic_limit.unwrap_or(0)),
-            speed_limit: Set(req.0.speed_limit.unwrap_or(0)),
-            created_at: Set(Utc::now().naive_utc()),
-            updated_at: Set(Utc::now().naive_utc()),
+            traffic_limit: Set(new_traffic_limit),
+            speed_limit: Set(new_speed_limit),
+            created_at: Set(now),
+            updated_at: Set(now),
         };
 
         match new_rate.insert(&self.db).await {
-            Ok(added_data) => {
-                AddRateApiResult::Ok(Json(RateDto {
-                    id: added_data.id,
-                    sessions: added_data.sessions as i32,
-                    date_end: added_data.date_end.format("%Y-%m-%d-%H:%M").to_string(),
-                }))
-            }
+            Ok(added_data) => AddRateApiResult::Ok(Json(rate_model_to_dto(added_data))),
             Err(e) => {
                 error!("[DB ERROR] Add rate failed: {}", e);
                 AddRateApiResult::Error(Json("Ошибка добавления тарифа в БД!".to_string()))
+            }
+        }
+    }
+
+    /// Удаление индивидуального тарифа (сброс на ограничения группы пользователя)
+    #[oai(path = "/rate/:id", method = "delete")]
+    async fn delete_rate(
+        &self,
+        auth: AdminToken,
+        id: poem_openapi::param::Path<Uuid>,
+    ) -> DeleteRateApiResult {
+        if let Err(err) = validate_admin_session(&self.db, &auth.0.token).await {
+            return DeleteRateApiResult::Unauthorized(Json(err));
+        }
+
+        match crate::entities::rates::Entity::delete_by_id(id.0)
+            .exec(&self.db)
+            .await
+        {
+            Ok(res) if res.rows_affected == 0 => {
+                DeleteRateApiResult::NotFound(Json("Тариф не найден в базе!".to_string()))
+            }
+            Ok(_) => DeleteRateApiResult::Ok(Json(true)),
+            Err(e) => {
+                error!("[DB CRASH] Deleting rate payload: {}", e);
+                DeleteRateApiResult::Error(Json("Ошибка удаления тарифа из БД!".to_string()))
             }
         }
     }
