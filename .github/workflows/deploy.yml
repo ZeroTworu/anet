@@ -25,11 +25,11 @@ jobs:
             echo "🚀 Starting deployment. Reason: ${{ github.event.inputs.reason }}"
             cd /opt/anet
             
-            docker-compose pull
+            docker compose pull
             
-            docker-compose down --remove-orphans
+            docker compose down --remove-orphans
             
-            docker-compose up -d --force-recreate
+            docker compose up -d --force-recreate
 
             docker image prune -f
             
