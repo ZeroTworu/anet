@@ -162,11 +162,15 @@ anet-server (Нода)                         anet-auth (Control Plane)
 
 #### Как это решается чисто и безопасно (Ревью схемы из двух режимов):
 
-1. **Идентификация `anet-auth` до первого запроса (`auth_pub_key`):**
-   - У `anet-auth` появляется своя постоянная Ed25519-пара (`auth_signing_key` / `auth_pub_key`).
-   - Из ЛК (`UserCabinetApi`) или админки ссылка/QR для клиента содержит `#pk=<base64url_auth_pub_key>` в URL-фрагменте (например, `https://service.example.com/sub/<token>#pk=<auth_pub_key>` или `anet://...`).  
-     *Плюс фрагмента `#pk=...`*: согласно стандарту HTTP, часть после `#` **никогда не передаётся на сервер и не светится в HTTP-запросе/прокси**, но мгновенно читается клиентом (Desktop / Android).
-   - Дополнительно в клиенты (Android / Desktop) можно вшить дефолтный `auth_pub_key` проекта как fallback для старых ссылок без `#pk=`.
+1. **Трёхуровневая модель доверия к `auth_pub_key` (под любые сценарии раздачи):**
+   У `anet-auth` появляется своя постоянная Ed25519-пара (`auth_signing_key` / `auth_pub_key`). Откуда клиент её берёт:
+   - **Уровень 1 — Вшитый `auth_pub_key` (официальный клиент Google Play / релизный бинарник):**
+     - Для сценария «скачал клиент -> нажал *Регистрация* без ввода email/ТГ -> сразу попал в встроенный ЛК внутри приложения» ключ твоего `anet-auth` зашит прямо в бинарник клиента. MITM исключён с нулевого байта.
+   - **Уровень 2 — Ссылка / QR с `#pk=<base64url_auth_pub_key>` (почта, Telegram, ЛК, кастомный инстанс):**
+     - Если ссылка пришла через третий канал или это сторонний `anet-auth`, клиент берёт ключ из фрагмента `#pk=...` (который по стандарту HTTP не уходит на сервер и не светится в прокси).
+   - **Уровень 3 — «Дикий fallback» (обычная ссылка БЕЗ `#pk=`, в БД нет ни email, ни ТГ, ключ не вшит):**
+     - В `anet-common/src/boring_tls.rs` (`http_help.rs`) для запросов к `anet-auth` включается режим **strict WebPKI-only**: проверка только по встроенным в исходники `webpki_root_certs` (**без** системных корневых УЦ ОС вроде Минцифры/Kaspersky и **без** `verify_peer = false`).
+     - На первом обмене `anet-auth` отдаёт `auth_pub_key` внутри TLS-подтверждённого ответа, клиент сохраняет его по модели **TOFU (Trust On First Use)** в свой зашифрованный кэш — и начиная со 2-го запроса проверяет подписи жёстко по этому ключу независимо от TLS.
 
 2. **Жёсткое разделение прав двух режимов рукопожатия с `anet-auth`:**
 
@@ -211,8 +215,13 @@ private_key = "<base64 Ed25519 приватный ключ клиента>"
 
 [[groups]]
 id = "<node_pool.id (группа серверов)>"
-name = "Нидерланды · Auto"
-protocols = ["wrtc_video", "ahttp", "ws", "quic"]
+# Название свободно задаётся в админке:
+#   "[WRTC: VIDEO]: Все локации", "[WRTC: VIDEO]: NL / FN", "Нидерланды · Auto"
+name = "[WRTC: VIDEO]: NL / FN"
+protocols = ["wrtc_video"]
+# Уникальный список кодов локаций живых нод внутри группы серверов
+# (агрегируется из нового поля servers.location в БД, например ["nl", "fn"])
+locations = ["nl", "fn"]
 strategy = "smart_load"
 health = "online"          # online | degraded | offline
 load_pct = 24              # 0..100 (сводная загрузка группы)
@@ -278,24 +287,80 @@ message AuthInnerPayload {
   }
 }
 
+// === Строгие перечисления (Enum в Protobuf, Rust и SeaORM/Postgres) ===
+
+enum OsPlatform {
+  OS_PLATFORM_UNSPECIFIED = 0;
+  OS_PLATFORM_WINDOWS = 1;
+  OS_PLATFORM_LINUX = 2;
+  OS_PLATFORM_ANDROID = 3;
+  OS_PLATFORM_MACOS = 4;
+}
+
+enum GroupHealth {
+  GROUP_HEALTH_UNSPECIFIED = 0;
+  GROUP_HEALTH_ONLINE = 1;
+  GROUP_HEALTH_DEGRADED = 2;
+  GROUP_HEALTH_OFFLINE = 3;
+}
+
+enum TransportProtocol {
+  TRANSPORT_PROTOCOL_UNSPECIFIED = 0;
+  TRANSPORT_PROTOCOL_QUIC = 1;
+  TRANSPORT_PROTOCOL_SSH = 2;
+  TRANSPORT_PROTOCOL_VNC = 3;
+  TRANSPORT_PROTOCOL_WS = 4;
+  TRANSPORT_PROTOCOL_AHTTP = 5;
+  TRANSPORT_PROTOCOL_WRTC = 6;
+  TRANSPORT_PROTOCOL_WRTC_WS = 7;
+  TRANSPORT_PROTOCOL_WRTC_VIDEO = 8;
+  TRANSPORT_PROTOCOL_WRTC_DC = 9;
+  TRANSPORT_PROTOCOL_WRTC_P2P = 10;
+  TRANSPORT_PROTOCOL_IMAP = 11;
+}
+
+enum WrtcMode {
+  WRTC_MODE_UNSPECIFIED = 0;
+  WRTC_MODE_MEDIA_VIDEO = 1;
+  WRTC_MODE_DATACHANNEL = 2;
+  WRTC_MODE_P2P_DIRECT = 3;
+}
+
+enum BalanceStrategy {
+  BALANCE_STRATEGY_UNSPECIFIED = 0;
+  BALANCE_STRATEGY_SMART_LOAD = 1;
+}
+
+enum AuthErrorCode {
+  AUTH_ERROR_CODE_UNSPECIFIED = 0;
+  AUTH_ERROR_CODE_UNAUTHORIZED = 1;
+  AUTH_ERROR_CODE_EXPIRED = 2;
+  AUTH_ERROR_CODE_QUOTA_EXCEEDED = 3;
+  AUTH_ERROR_CODE_GROUP_NOT_FOUND = 4;
+  AUTH_ERROR_CODE_NO_HEALTHY_NODES = 5;
+  AUTH_ERROR_CODE_BOOTSTRAP_FORBIDDEN = 6;
+  AUTH_ERROR_CODE_RATE_LIMITED = 7;
+}
+
 // === Бизнес-сообщения внутри AuthEncryptedFrame ===
 
 message ClientConfigRequest {
   string config_token = 1;            // Передаётся ТОЛЬКО внутри шифроканала
   string etag = 2;
   string client_version = 3;
-  string os_platform = 4;             // "windows" | "linux" | "android" | "macos"
+  OsPlatform os_platform = 4;
   uint64 known_manifest_seq = 5;
 }
 
 message ServerGroupSummary {
   string group_id = 1;                // node_pools.id (группа серверов)
-  string name = 2;
-  repeated string protocols = 3;
-  string strategy = 4;
-  string health = 5;                  // "online" | "degraded" | "offline"
-  uint32 load_pct = 6;                // Сводная загрузка пула 0..100%
-  uint32 available_nodes = 7;         // Живых нод в пуле (без IP)
+  string name = 2;                    // Задаётся админом, напр. "[WRTC: VIDEO]: NL / FN"
+  repeated TransportProtocol protocols = 3;
+  repeated string locations = 4;      // Коды локаций активных нод пула, напр. ["nl", "fn"]
+  BalanceStrategy strategy = 5;
+  GroupHealth health = 6;
+  uint32 load_pct = 7;                // Сводная загрузка пула 0..100%
+  uint32 available_nodes = 8;         // Живых нод в пуле (без IP)
 }
 
 message AuthEndpointManifest {
@@ -303,14 +368,14 @@ message AuthEndpointManifest {
   uint64 issued_at = 2;
   uint64 expires_at = 3;
   repeated string endpoints = 4;      // Актуальные URL зеркал anet-auth
-  repeated string doh_txt_records = 5;// Домены TXT-записей (резервное обнаружение при падении)
-  repeated string dead_drop_urls = 6; // Резервные площадки с подписанным манифестом
-  bytes active_auth_pub_key = 7;      // Позволяет планово ротировать ключ без поломки клиентов
+  repeated string doh_txt_records = 5;// (TODO на будущее) Домены TXT-записей
+  repeated string dead_drop_urls = 6; // (TODO на будущее) Резервные площадки
+  bytes active_auth_pub_key = 7;      // Для плановой ротации ключа без поломки клиентов
 }
 
 message SignedAuthManifest {
   bytes payload_bytes = 1;            // Сериализованный AuthEndpointManifest
-  bytes auth_signature = 2;           // Подпись auth_signing_key (проверяется известным auth_pub_key)
+  bytes auth_signature = 2;           // Подпись auth_signing_key
 }
 
 message ClientConfigResponse {
@@ -319,31 +384,34 @@ message ClientConfigResponse {
   string config_toml = 3;             // Профили и [keys].private_key (БЕЗ [[servers]]!)
   repeated ServerGroupSummary groups = 4;
   SignedAuthManifest auth_manifest = 5;
-  string user_status = 6;
-  int64 traffic_limit_bytes = 7;
-  int64 traffic_used_bytes = 8;
-  uint64 expires_at_unix = 9;
+  bytes auth_pub_key = 6;             // Для сохранения при TOFU ("дикий fallback")
+  string user_status = 7;
+  int64 traffic_limit_bytes = 8;
+  int64 traffic_used_bytes = 9;
+  uint64 expires_at_unix = 10;
 }
 
 message AllocateNodeRequest {
   string group_id = 1;                // Выбранная пользователем группа серверов (node_pool.id)
-  repeated string preferred_protocols = 2;
-  repeated string exclude_server_ids = 3; // Упавшие ноды для failover
-  string client_version = 4;
-  string os_platform = 5;
-  uint64 known_manifest_seq = 6;
+  repeated TransportProtocol preferred_protocols = 2;
+  repeated string preferred_locations = 3; // Опционально: фильтр по локациям внутри группы
+  repeated string exclude_server_ids = 4;  // Упавшие ноды для failover
+  string client_version = 5;
+  OsPlatform os_platform = 6;
+  uint64 known_manifest_seq = 7;
 }
 
 message AllocatedServerEndpoint {
   string server_id = 1;
   string server_name = 2;
-  string protocol = 3;                // "quic" | "ssh" | "vnc" | "ws" | "ahttp" | "wrtc*" | "imap"
-  string dsn = 4;
-  string server_pub_key = 5;          // Base64 Ed25519 ключ ЭТОЙ ноды
-  string wrtc_mode = 6;
-  string ssh_user = 7;
-  string tls_pin_sha256 = 8;
-  uint32 score_hint = 9;
+  string location = 3;                // Локация выбранной ноды ("nl", "fn", ...)
+  TransportProtocol protocol = 4;
+  string dsn = 5;
+  string server_pub_key = 6;          // Base64 Ed25519 ключ ЭТОЙ ноды
+  WrtcMode wrtc_mode = 7;
+  string ssh_user = 8;
+  string tls_pin_sha256 = 9;
+  uint32 score_hint = 10;
 }
 
 message AllocateNodeResponse {
@@ -354,10 +422,12 @@ message AllocateNodeResponse {
 }
 
 message AuthError {
-  uint32 code = 1;                    // 401, 403 (EXPIRED/QUOTA/BOOTSTRAP_FORBIDDEN), 404, 503
+  AuthErrorCode code = 1;
   string message = 2;
 }
 ```
+
+> **Принцип строгих `Enum`:** все закрытые множества значений (`OsPlatform`, `GroupHealth`, `TransportProtocol`, `WrtcMode`, `BalanceStrategy`, `AuthErrorCode`) описываются строго как `Enum` — в `protocol.proto`, в Rust DTO и в PostgreSQL/SeaORM-миграциях (в т.ч. перевести `node_pools.strategy` и `servers.wrtc_mode` со строк на Postgres Enum). Коды локаций (`"nl"`, `"fn"`, ...) остаются короткими строками в `servers.location`, чтобы админ мог заводить новые страны без миграций БД.
 
 ---
 
@@ -367,9 +437,9 @@ message AuthError {
 
 Чтобы не копипастить криптографию в `anet-auth`, выносим в `anet-common` (новый модуль `anet_common::dh_handshake` или расширение `crypto_utils.rs`) транспортно-независимое ядро:
 
-1. **Единый транскрипт с `domain_tag`:**
-   `build_dh_transcript(domain_tag: &[u8], client_eph: &[u8; 32], server_eph: &[u8; 32], client_nonce: &[u8], server_nonce: &[u8], timestamp: u64)`  
-   - Для VPN-туннеля передаётся `b"ANET-ASTP-V1"`, для `Client <-> anet-auth` — `b"ANET-AUTH-HTTPS-V1"`. Это гарантирует криптографическую изоляцию (cross-protocol replay исключён).
+1. **Единый транскрипт без сигнатур проекта в бинарнике:**
+   `build_dh_transcript(context: DhContext, signer_pub: &[u8; 32], client_eph: &[u8; 32], server_eph: &[u8; 32], client_nonce: &[u8], server_nonce: &[u8], timestamp: u64)`  
+   - **Никаких захардкоженных ASCII-строк вроде `"ANET-..."`!** Для изоляции подписей между нодой и `anet-auth` достаточно 1-байтового перечисления `#[repr(u8)] enum DhContext { Tunnel = 0x01, Control = 0x02 }` **+** включения публичного ключа самого подписанта (`signer_pub`) в подписываемый транскрипт. И в бинарнике нет лишних палевных сигнатур, и cross-protocol replay полностью невозможен.
    - Туда же выносится единая проверка окна `verify_timestamp_window(ts, max_skew_secs = 120)`.
 2. **`ServerDhResponder` (общий для `anet-server` и `anet-auth`):**
    - Принимает `client_ephemeral_pub`, опциональную подпись/публичный ключ клиента (или флаг `allow_bootstrap`), проверяет окно времени и подпись клиента.
@@ -388,88 +458,64 @@ message AuthError {
 
 ## 5. Подводные камни: блокировка и падение `anet-auth` (п. 3.1 и 3.2)
 
-### 5.1. Единый локальный кэш в `anet-client-core` (база для 3.1 и 3.2)
+### Что реализуем СЕЙЧАС (в текущей итерации)
+
+#### 5.1. Единый локальный кэш в `anet-client-core` (необходимая база для п. 5.3)
 
 Зашифрованный бандл (`EncryptedServerConfigBundle`) переносится из `anet-client-gui` в `anet-client-core` (через трейт хранилища для Desktop и Android через `anet-mobile`). В кэше сохраняются:
-- последний валидный `ClientConfigResponse` (настройки, `[keys].private_key`, список **групп серверов**, `SignedAuthManifest`);
+- последний валидный `ClientConfigResponse` (профили, `[keys].private_key`, `auth_pub_key`, список **групп серверов**, `endpoints`);
 - **кэш последних выданных нод по каждой группе серверов** (`last_allocated_by_group`: до 2–3 последних рабочих нод — `primary` + `fallbacks`, куда клиент реально успешно подключался).
 
-Если при попытке коннекта `anet-auth` недоступен — клиент **автоматически** подключается по последней рабочей ноде выбранной группы серверов.
+#### 5.2 (База) Перебор зеркал `endpoints`
 
-### 5.2. Сценарий 3.1: `anet-auth` жив, но заблокирован в стране (по IP, SNI/домену или DNS)
+В `[auth].endpoints` сразу закладывается массив URL (основной + зеркала/прокси) через `http_help.rs` (`BrowserProfile` + **strict WebPKI-only**, без доверия системным УЦ ОС). При недоступности первого URL клиент перебирает список `endpoints`.
 
-Простая смена `A`-записи в DNS спасает только от бана по IP, но **бессильна против бана домена/SNI на ТСПУ**. Решение — многослойный обход:
+#### 5.3. Сценарий 3.2: `anet-auth` упал полностью (Redis grace-кэш на ноде + переезд панели)
 
-1. **Зеркала и CDN/Proxy-фронты в `AuthManifest`:**
-   - В `endpoints` хранится не 1 адрес, а список: основной домен, запасные домены-зеркала, обратный прокси за CDN/нейтральным хостингом.
-   - Поскольку всё полезное содержимое завернуто в E2E DH + Protobuf, прокси/CDN не видит ни `config_token`, ни `private_key`, ни выбранную группу.
-   - При каждом запросе используются `BrowserProfile` (JA3/JA4 мимикрия + ECH GREASE) и DNS-over-HTTPS (DoH из уже существующего модуля в `anet-client-core`) на случай подмены системного DNS.
-2. **«Сначала туннель — потом Auth» (In-Tunnel Sync):**
-   - Важно отличие от `rules_url` в `anet-client-core/src/client.rs:604-628`, который сейчас жёстко пускается в `bypass` мимо туннеля.
-   - Для `anet-auth`: если клиент не может достучаться до `anet-auth` напрямую перед стартом (домен забанен в стране), но в кэше есть последняя рабочая нода — клиент **сначала поднимает VPN-туннель на кэшированной ноде**, а уже **внутри туннеля** синхронизирует `ClientConfig` / `AllocateNode` и получает актуальные настройки!
-3. **Опционально (резерв следующего уровня): проксирование через живую VPN-ноду (`client_relay`):**
-   - Каждая нода и так связана с `anet-auth` по `[control_plane]` (WS + HTTP). В крайнем случае клиент может пробросить зашифрованный `AuthEnvelope` на любую доступную VPN-ноду, а нода передаст его в `anet-auth` и вернёт ответ обратно. Нода расшифровать payload не сможет.
-
-### 5.3. Сценарий 3.2: `anet-auth` упал полностью (DDoS, техработы, потеря ДЦ)
-
-#### А. Как ноды пускают клиентов при мёртвом `anet-auth` (убиваем ручной костыль с `allowed_clients`)
-
-Раньше при падении `anet-auth` приходилось руками вписывать `root-fingerprint` в `[authentication].allowed_clients` на сервере и писать всем пользователям в Telegram, на какой ключ переключаться. Это не масштабируется и небезопасно.
-
-**Решение на основе Redis-кэша на ноде + кэша последней ноды у клиента:**
+**Главный фокус реализации в этой задаче:** клиенты и живые ноды должны спокойно переживать падение `anet-auth` **без ручного прописывания `allowed_clients` и рассылок в Telegram**.
 
 ```
 Нормальная работа:
   Клиент -> Подключается к Ноде X -> Нода X спрашивает /check_access у anet-auth
   Если allowed = true  -> Нода X пишет в локальный Redis:
-                          SET auth_grace:<fingerprint> "{limits, expires_at}" EX 86400 (напр. 12-24ч)
+                          SET auth_grace:<fingerprint> "{limits, expires_at}" EX 86400 (12-24ч)
   Если allowed = false -> Нода X удаляет ключ: DEL auth_grace:<fingerprint>
   Если админ/ЛК кикнул или забанил юзера -> anet-auth по WS мгновенно шлёт ноде Revoke(fingerprint) -> DEL из Redis
 
 Когда anet-auth упал:
-  1. Клиент берёт из своего кэша последнюю ноду, к которой уже ходил (Нода X).
+  1. Клиент не достучался до anet-auth -> берёт из своего кэша последнюю ноду, куда он ходил (Нода X).
   2. Нода X стучится в /check_access -> anet-auth не отвечает (timeout / 5xx).
   3. Нода X проверяет свой локальный Redis по fingerprint клиента:
      - Запись есть И текущий момент < expires_at -> ПУСКАЕМ в grace-режиме с теми же лимитами скорости (eBPF)!
      - Записи нет или подписка уже истекла (expires_at < now) -> отказ.
 ```
 
-- **Почему именно Redis на ноде (а не только RAM процесса `anet-server`):** кэш не сгорает при рестарте/обновлении `anet-server`, а если несколько нод стоят в одном ДЦ/кластере, они вообще могут смотреть в один общий Redis этого ДЦ. Если Redis не поднят — мягкий fallback на in-memory `DashMap` внутри процесса.
-- **Итог:** существующие пользователи вообще не замечают падения `anet-auth` — клиент автоматически стучится в последнюю известную ноду, а эта нода уже знает его по Redis! Ручной `allowed_clients` больше не нужен для аварий.
+- **Почему именно Redis на ноде (а не только RAM процесса `anet-server`):** кэш переживает рестарт/обновление `anet-server`, а несколько нод в одном ДЦ могут делить один локальный Redis. При недоступности Redis — мягкий fallback на `DashMap` в памяти.
+- **Переезд `anet-auth` без лишних ключей:** `auth_signing_key` (32 байта Ed25519) переносится вместе с бэкапом панели, поэтому клиенты с уже известным/кэшированным `auth_pub_key` бесшовно примут новый сервер после обновления DNS `A`-записи или зеркала в `endpoints`.
 
-#### Б. Как клиенты узнают новый адрес/домен `anet-auth`, если старый сервер сгорел/переехал
+### Отложенные механизмы устойчивости (`TODO` для человека и для AI — НЕ делать сейчас)
 
-Упрощённый вариант без лишней церемонии лишнего ключа (пересмотрено по итогам ревью п. 8.4):
-
-1. **Ключ подписи переносится вместе с панелью:**  
-   `auth_signing_key` (32 байта Ed25519) хранится в бэкапе вместе с конфигом/БД панели. При переезде на новый сервер или новый домен поднимается новый `anet-auth` с **тем же самым `auth_signing_key`**.
-2. **Анонс нового `SignedAuthManifest` (подписанного `auth_signing_key` с возрастающим `seq`):**
-   Если все старые URL `endpoints` молчат, клиент по очереди опрашивает 3 резервных источника:
-   - **Канал 1 — Push через живые VPN-ноды:** ноды перенацеливаются на новый `[control_plane].url` (или сами получают новый `SignedAuthManifest`), и при подключении клиента в туннеле/ASTP передают ему подписанный манифест с новыми адресами `anet-auth`.
-   - **Канал 2 — DNS TXT через DoH:** запасной домен с TXT-записью, содержащей base64 от `SignedAuthManifest` (меняется быстро, опрашивается через `1.1.1.1`/`8.8.8.8` DoH).
-   - **Канал 3 — Независимый публичный URL («Dead Drop»):** статический файл с тем же подписанным `SignedAuthManifest` (например, GitHub Raw/Gist, S3, Cloudflare Workers). Подменить его злоумышленник не сможет — клиент проверяет подпись известным ему `auth_pub_key` и сравнивает `manifest.seq > local_manifest_seq`.
+> ⚠️ **`TODO [AI/Human]` — вынесено за рамки текущей задачи, реализовать отдельным этапом:**
+> 1. **In-Tunnel Sync (п. 3.1):** режим «сначала поднять туннель на кэшированной ноде -> затем синхронизировать `ClientConfig` / `AllocateNode` внутри туннеля» (потребует пересмотра логики bypass-маршрутов в `anet-client-core/src/client.rs:604-628`).
+> 2. **Node Proxy Relay (`POST /api/v1/control/client_relay`):** проброс зашифрованного `AuthEnvelope` через любую живую VPN-ноду в `anet-auth`, если сам домен `anet-auth` заблокирован в стране клиента.
+> 3. **Внеполосное обнаружение нового `SignedAuthManifest` при бане самого домена и падении всех зеркал:**
+>    - Push свежего `SignedAuthManifest` от живых VPN-нод клиентам прямо внутри ASTP-сессии;
+>    - Опрос резервных `DNS TXT` записей через DoH (`1.1.1.1` / `8.8.8.8`);
+>    - Чтение подписанного блоба с публичных площадок («Dead Drops»: GitHub Raw/Gist, S3, Cloudflare Workers).
 
 ---
 
 ## 6. Влияние на клиентские подсистемы и ответы по UI/Mobile/Server
 
-### 6.1. `NodeProbeMonitor` и `node_selector.rs` (статус и «средний пинг» групп серверов)
+### 6.1. `NodeProbeMonitor` и `node_selector.rs` (Выбран Вариант 1)
 
-**Вопрос из ревью:** *«просто сводка по живым узлам + усреднённый пинг до них?»*
+По итогам обсуждения зафиксирован **Вариант 1** (без фонового пробирования и без отдельных маяков-приманок):
 
-Здесь есть важный сетевой нюанс: **`anet-auth` видит нагрузку ноды (CPU/RAM/LAN/сессии), но `anet-auth` НЕ знает сетевой пинг (RTT) от провайдера конкретного клиента в РФ/Европе до конкретной ноды**. Сетевой пинг индивидуален для маршрута каждого клиента.
-
-При скрытии списка `[[servers]]` есть ровно два рабочих варианта отображения списка групп серверов в UI:
-
-1. **Рекомендуемый (максимальная безопасность и приватность топологии):**
-   - **До подключения (в списке групп серверов):** клиент показывает сводку от `anet-auth` (`ServerGroupSummary`):
-     - зелёный/жёлтый/красный индикатор (`online` / `degraded` / `offline`),
-     - количество живых нод в группе (`4 nodes`) и суммарную загрузку группы (`24% load`),
-     - **средний/последний реальный пинг (`~42 ms`) из локального кэша клиента** — обновляется автоматически по реальному замеру `icmp_probe` после каждого подключения к этой группе (до первого коннекта для группы показывается `"—"`).
-   - **Плюс:** НИ ОДИН IP и порт ноды не утекает наружу до момента реального коннекта, `NodeProbeMonitor` перестаёт бомбить все ноды фоновым трафиком каждые несколько секунд (меньше палева для DPI и меньше нагрузка на батарею Android).
-2. **Альтернатива (если пинг до подключения нужен обязательно «здесь и сейчас»):**
-   - В `ServerGroupSummary` добавлять 1 обезличенный lightweight echo/TLS-маяк (`probe_target`) на регион/группу серверов. Тогда `NodeProbeMonitor` пробирует только 1 маяк на группу и показывает живой клиентский пинг до подключения, но этот адрес теоретически может попасть под блокировку или светить ДЦ группы.  
-   **Итог:** Вариант 1 (сводка живых узлов + кэшированный реальный RTT последних подключений по группе) проще, безопаснее и не грузит сеть.
+- **До подключения (в списке групп серверов в UI):** клиент показывает сводку от `anet-auth` (`ServerGroupSummary`):
+  - индикатор статуса (`GroupHealth`: зелёный / жёлтый / красный),
+  - количество живых нод в группе (`available_nodes`), локации (`locations`) и сводную загрузку (`load_pct`),
+  - **последний / усреднённый реальный RTT (`~42 ms`) из локального кэша клиента**, который автоматически замеряется через внутритуннельный `icmp_probe` во время реальных подключений к этой группе (до первого коннекта для группы показывается `"—"`).
+- **Преимущество:** ни один IP/порт ноды не раскрывается до подключения, а `NodeProbeMonitor` не создаёт лишнего фонового трафика на ноды (ниже заметность для DPI и расход батареи на Android).
 
 ### 6.2. Цикл переключения нод при обрыве (`AnetClient::start()`)
 
@@ -493,40 +539,43 @@ message AuthError {
 ## 7. Поэтапный план реализации и `TODO` на следующие итерации
 
 ### Этап 1. Криптографическое ядро и Protobuf (`anet-common`, `anet-auth/Cargo.toml`)
-1. В `anet-common/proto/protocol.proto` добавить `AuthEnvelope`, `AuthDhInitRequest/Response`, `AuthEncryptedFrame`, `AuthInnerPayload`, `ClientConfigRequest/Response`, `ServerGroupSummary`, `AllocateNodeRequest/Response`, `AllocatedServerEndpoint`, `AuthEndpointManifest`, `SignedAuthManifest`.
-2. Вынести в `anet-common` чистые `ClientDhInitiator`, `ServerDhResponder`, `AstpEnvelopeCipher`, `build_dh_transcript` (с `domain_tag`) и проверку timestamp; перевести на них `anet-server/src/auth_handler.rs` и `anet-client-core/src/auth.rs`.
-3. Подключить к `anet-auth` зависимости из workspace (`x25519-dalek`, `chacha20poly1305`, `prost`).
+1. В `anet-common/proto/protocol.proto` добавить `AuthEnvelope`, `AuthDhInitRequest/Response`, `AuthEncryptedFrame`, `AuthInnerPayload`, `ClientConfigRequest/Response`, `ServerGroupSummary`, `AllocateNodeRequest/Response`, `AllocatedServerEndpoint`, `AuthEndpointManifest`, `SignedAuthManifest` со строгими `enum` (`OsPlatform`, `GroupHealth`, `TransportProtocol`, `WrtcMode`, `BalanceStrategy`, `AuthErrorCode`).
+2. Вынести в `anet-common` чистые `ClientDhInitiator`, `ServerDhResponder`, `AstpEnvelopeCipher`, `build_dh_transcript` (без ASCII-сигнатур проекта — с байтовым `DhContext` + `signer_pub`) и проверку timestamp; перевести на них `anet-server/src/auth_handler.rs` и `anet-client-core/src/auth.rs`.
+3. В `anet-common/src/boring_tls.rs` добавить флаг режима **strict WebPKI-only** (отключение загрузки системных корневых сертификатов ОС для обращений к `anet-auth`).
+4. Подключить к `anet-auth` зависимости из workspace (`x25519-dalek`, `chacha20poly1305`, `prost`).
 
-### Этап 2. Телеметрия, WebSocket-линк и балансировщик (`anet-server`, `anet-auth`, `anet-webui`)
+### Этап 2. Телеметрия, WebSocket-линк, Redis и балансировщик (`anet-server`, `anet-auth`, `anet-webui`)
 1. Выпилить старые AI-заглушки `anet-auth/src/balancer.rs` и `resolve_client_servers()` в `api.rs`.
 2. На `anet-server`:
    - Реализовать сбор метрик CPU %, CPU cores, LoadAvg, RAM, LAN RX/TX Mbps на внешнем интерфейсе + `nic_capacity_mbps` с EMA-сглаживанием; расширить `NodeHeartbeatRequest`.
-   - Добавить исходящий WebSocket-клиент до `anet-auth` (`/api/v1/control/nodes/ws`) для push-телеметрии (1–2с / по событию) и приёма живых команд (`KickSession`, `RevokeFingerprint`, `Drain`, `PushManifest`), оставив HTTP heartbeat как железобетонный fallback.
-   - В `AuthProvider` (`anet-server/src/auth_provider.rs`) добавить локальный **Redis-кэш** разрешённых `fingerprint` с TTL (и удалением при отказе/WS-отзыве) + fallback в память, чтобы выживать при падении `anet-auth` без ручного `allowed_clients`.
+   - Добавить исходящий WebSocket-клиент до `anet-auth` (`/api/v1/control/nodes/ws`) для push-телеметрии (1–2с / по событию) и приёма живых команд (`KickSession`, `RevokeFingerprint`, `Drain`), оставив HTTP heartbeat как железобетонный fallback.
+   - В `AuthProvider` (`anet-server/src/auth_provider.rs`) добавить **Redis grace-кэш** разрешённых `fingerprint` с TTL (и удалением при отказе/WS-отзыве) + fallback в `DashMap`, чтобы переживать падение `anet-auth` без ручного `allowed_clients`.
 3. На `anet-auth`:
-   - SeaORM-миграция для `node_runtime_states` (CPU/RAM/LAN/`load_score`/`ws_connected`).
+   - SeaORM-миграции: `servers.location`, перевод `node_pools.strategy` и `servers.wrtc_mode` на PostgreSQL `Enum`, расширение `node_runtime_states` (CPU/RAM/LAN/`load_score`/`ws_connected`).
    - Обработчики WS + обновлённый HTTP heartbeat.
-   - Новый балансировщик `smart_load` (admission filter + композитная формула LAN/CPU/RAM/Conns + `pending_leases` + `exclude_server_ids`).
-4. На `anet-webui`: вывести CPU/RAM/LAN/% канала/статус WS в `Overview.vue` и `Servers.vue`, выбор стратегии `smart_load` в `Pools.vue`.
+   - Новый балансировщик `smart_load` (admission filter + композитная формула LAN/CPU/RAM/Conns + `pending_leases` + `exclude_server_ids` + агрегация `locations` пула).
+4. На `anet-webui`: поле `location` у серверов, отображение CPU/RAM/LAN/% канала/статуса WS в `Overview.vue` и `Servers.vue`, выбор стратегии `smart_load` в `Pools.vue`.
 
 ### Этап 3. Защищённый протокол `Client <-> anet-auth` и ЛК (`anet-auth`)
 1. Добавить `auth_signing_key` (Ed25519) в конфиг/инициализацию `anet-auth`.
 2. Реализовать `POST /api/v1/client/exchange` с `BrowserProfile`-совместимым бинарным ответом и картой краткоживущих DH-сессий.
 3. Реализовать внутри шифрованного канала:
-   - `ClientConfigRequest` (допускается в `bootstrap_mode = true` и в Режиме 1, отдаёт конфиг без `[[servers]]`, `ServerGroupSummary[]`, статус подписки/лимитов как в `billing_and_cabinet.ru.md`, и `SignedAuthManifest`);
+   - `ClientConfigRequest` (допускается в `bootstrap_mode = true` и в Режиме 1, отдаёт конфиг без `[[servers]]`, `ServerGroupSummary[]` с `locations` и `Enum`-ами, статус подписки/лимитов как в `billing_and_cabinet.ru.md`, и `auth_pub_key` для TOFU);
    - `AllocateNodeRequest` (**только в Режиме 1 с подписью клиента!** Проверяет права и лимиты, выбирает ноду по `smart_load`, отдаёт `primary` + `fallbacks` + `server_pub_key` каждой ноды).
 4. Обновить генерацию ссылок/QR (`#pk=<auth_pub_key>`), оставив старый `GET /api/v1/config/:id` в режиме legacy для команды.
 
 ### Этап 4. Клиентское ядро и интерфейсы (`anet-client-core`, `anet-client-gui`, `anet-mobile`)
 1. Перенести и расширить `EncryptedServerConfigBundle` + `last_allocated_by_group` в `anet-client-core`.
-2. Реализовать `AuthApiClient` (DH с проверкой `auth_pub_key`, кэш сессии, `BrowserProfile` HTTPS, failover по зеркалам из `SignedAuthManifest`, DoH-резолв, fallback «сначала туннель по кэшу — затем sync внутри туннеля», чтение резервных TXT/dead-drop манифестов и push-манифеста от ноды).
+2. Реализовать `AuthApiClient` (3 уровня доверия к `auth_pub_key`: вшитый ключ -> `#pk=` -> TOFU на строгом WebPKI-only; кэш DH-сессии; `BrowserProfile` HTTPS; перебор зеркал `endpoints`; откат на кэш `last_allocated_by_group` при падении `anet-auth`).
 3. Обновить `CoreConfig::sanitize()` и `AnetClient` (`NodeAllocator` + локальный failover на `fallbacks`).
-4. В `anet-client-gui`: перевести `node_selector.rs` для групповых конфигов на `ServerGroupSummary` + кэшированный реальный RTT по группе (с индикацией offline/кэш-режима при недоступности `anet-auth`).
-5. В `anet-mobile`: вынести FFI-обвязку для `ZeroTworu/anet-android`, убрав загрузку/кэширование конфигов из Kotlin внутрь Rust-ядра.
+4. В `anet-client-gui`: перевести `node_selector.rs` для групповых конфигов на **Вариант 1** (`ServerGroupSummary` с локациями/нагрузкой + кэшированный реальный RTT по группе; индикатор кэш-режима при недоступности `anet-auth`).
+5. В `anet-mobile`: вынести FFI-обвязку для `ZeroTworu/anet-android` (включая базу для встроенной регистрации без email/ТГ через вшитый `auth_pub_key`), убрав загрузку/кэширование конфигов из Kotlin внутрь Rust-ядра.
 
-### Отложенные задачи (`TODO` на следующие итерации)
+### Отложенные задачи (`TODO` для человека и для AI — НЕ делать в этой итерации)
 - **`TODO #1` (Унификация `server.toml`):** удалить `[authentication].auth_servers` и `auth_server_token`, перевести `AuthProvider` полностью на секцию `[control_plane]` (`url`, `token`, `node_id`) + единый список зеркал.
-- **`TODO #2` (Генерация клиентских ключей на устройстве):** перейти от выдачи `[keys].private_key` с сервера при `bootstrap_mode = true` к генерации Ed25519-ключей локально на устройстве клиента при первом входе и регистрации только `public_key` по одноразовому invite-токену из ЛК (чтобы приватный ключ клиента вообще никогда не покидал устройство и не хранился в БД `anet-auth`).
+- **`TODO #2` (Генерация клиентских ключей на устройстве):** перейти от выдачи `[keys].private_key` с сервера при `bootstrap_mode = true` к генерации Ed25519-ключей локально на устройстве клиента при первом входе и регистрации только `public_key` по одноразовому invite-токену из ЛК.
+- **`TODO #3` (Сценарий 3.1 — обход блокировки живого `anet-auth`):** In-Tunnel Sync (сначала туннель по кэшу -> потом sync внутри туннеля в обход bypass-маршрутов `client.rs:604-628`) и проксирование `AuthEnvelope` через живую VPN-ноду (`POST /api/v1/control/client_relay`).
+- **`TODO #4` (Резервное обнаружение `SignedAuthManifest` при смерти домена и всех зеркал):** доставка `SignedAuthManifest` через ASTP-тракт живых нод, опрос `DNS TXT` через DoH и чтение с публичных Dead Drops (GitHub Raw/Gist, S3, Cloudflare Workers).
 
 ---
 
