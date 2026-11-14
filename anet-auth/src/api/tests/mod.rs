@@ -1,6 +1,6 @@
 use chrono::{Duration as ChronoDuration, NaiveDateTime, Utc};
 use jsonwebtoken::{encode, EncodingKey, Header};
-use poem::{http::{Method, StatusCode}, Endpoint, IntoResponse, Request, Route};
+use poem::{http::{Method, StatusCode}, Endpoint, EndpointExt, Request, Response, Route};
 use poem_openapi::OpenApiService;
 use sea_orm::sea_query::Value;
 use sea_orm::{DatabaseBackend, DatabaseConnection, MockDatabase};
@@ -48,7 +48,7 @@ pub fn init_test_env() {
 pub fn build_test_app(
     db: DatabaseConnection,
     client_template_path: String,
-) -> impl Endpoint {
+) -> impl Endpoint<Output = Response> {
     let api_service = OpenApiService::new(
         crate::api::get_api(db.clone(), client_template_path),
         "ANet Auth API",
@@ -65,7 +65,7 @@ pub fn build_test_app(
 }
 
 pub async fn send_request(
-    app: &impl Endpoint,
+    app: &impl Endpoint<Output = Response>,
     method: Method,
     uri: &str,
     bearer: Option<&str>,
@@ -98,7 +98,7 @@ pub async fn send_request(
 }
 
 pub async fn send_json(
-    app: &impl Endpoint,
+    app: &impl Endpoint<Output = Response>,
     method: Method,
     uri: &str,
     bearer: Option<&str>,
