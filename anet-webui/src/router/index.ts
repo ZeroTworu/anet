@@ -1,5 +1,4 @@
 import { createRouter, createWebHistory } from 'vue-router'
-
 import Auth from '@/ui/Auth.vue'
 
 const Users = () => import('@/ui/Users.vue')
@@ -8,10 +7,12 @@ const Statistics = () => import('@/ui/Statistics.vue')
 const Pools = () => import('@/ui/Pools.vue')
 const RouteMaps = () => import('@/ui/RouteMaps.vue')
 const Overview = () => import('@/ui/Overview.vue')
-
 const Groups = () => import('@/ui/Groups.vue')
 const GroupDetail = () => import('@/ui/GroupDetail.vue')
 const Mailboxes = () => import('@/ui/Mailboxes.vue')
+const Products = () => import('@/ui/Products.vue')
+const Orders = () => import('@/ui/Orders.vue')
+const Transactions = () => import('@/ui/Transactions.vue')
 
 const router = createRouter({
   history: createWebHistory(),
@@ -30,12 +31,14 @@ const router = createRouter({
     { path: '/groups', component: Groups, meta: { title: 'User Groups' } },
     { path: '/groups/:id', component: GroupDetail, meta: { title: 'Параметры группы' } },
     { path: '/mailboxes', component: Mailboxes, meta: { title: 'IMAP Mailboxes' } },
+    { path: '/products', component: Products, meta: { title: 'Products' } },
+    { path: '/orders', component: Orders, meta: { title: 'Orders' } },
+    { path: '/transactions', component: Transactions, meta: { title: 'Transactions' } },
   ],
 })
 
 router.beforeEach((to) => {
   const token = localStorage.getItem('token')
-
   if (!to.meta.isAuth && !token) {
     return '/'
   }

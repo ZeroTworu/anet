@@ -3,6 +3,7 @@ import { computed } from 'vue'
 import { useRouter } from 'vue-router'
 
 defineProps<{ modelValue: boolean }>()
+
 const emit = defineEmits<{
   'update:modelValue': [value: boolean]
   logout: []
@@ -18,8 +19,12 @@ const navigation = [
   { label: 'IMAP Mailboxes', path: '/mailboxes', icon: 'mdi-email-outline', group: 'Management' },
   { label: 'Route Maps', path: '/route-maps', icon: 'mdi-map-marker-path', group: 'Management' },
   { label: 'User Groups', path: '/groups', icon: 'mdi-wallet-membership', group: 'Management' },
+  { label: 'Products', path: '/products', icon: 'mdi-package-variant-closed', group: 'Billing' },
+  { label: 'Orders', path: '/orders', icon: 'mdi-receipt-text-outline', group: 'Billing' },
+  { label: 'Transactions', path: '/transactions', icon: 'mdi-swap-horizontal', group: 'Billing' },
   { label: 'Traffic', path: '/statistics', icon: 'mdi-chart-line', group: 'Observability' },
 ]
+
 const groups = computed(() => [...new Set(navigation.map(item => item.group))])
 </script>
 
@@ -30,9 +35,7 @@ const groups = computed(() => [...new Set(navigation.map(item => item.group))])
         <v-avatar color="primary" size="34">A</v-avatar>
       </template>
     </v-list-item>
-
     <v-divider />
-
     <v-list nav density="comfortable" color="primary">
       <template v-for="group in groups" :key="group">
         <v-list-subheader>{{ group }}</v-list-subheader>
@@ -45,7 +48,6 @@ const groups = computed(() => [...new Set(navigation.map(item => item.group))])
         />
       </template>
     </v-list>
-
     <template #append>
       <v-divider />
       <div class="pa-3">
