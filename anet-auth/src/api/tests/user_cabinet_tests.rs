@@ -8,7 +8,7 @@ use crate::api::tests::{
     sample_group, sample_node_command, sample_order, sample_product, sample_rate, sample_server,
     sample_traffic_hourly, sample_traffic_total, sample_user, send_json,
 };
-use crate::entities::{billing_enums::OrderStatus, rates};
+use crate::entities::{billing_enums::OrderStatus, rates, user_node_pools};
 
 #[tokio::test]
 async fn test_user_me_rates_override_and_group_smart_activation_pending() {
@@ -20,6 +20,7 @@ async fn test_user_me_rates_override_and_group_smart_activation_pending() {
     let rate1 = sample_rate(Uuid::new_v4(), uid1, 7, Utc::now().naive_utc() + ChronoDuration::days(20));
     let group1 = sample_group(gid1, "Base Group", false, 30, 2);
     let sess1 = sample_active_session(uid1, 2);
+    set_live_node_session_for_fingerprint(Uuid::new_v4(), &user1.fingerprint, 2);
 
     let db1 = new_pg_mock()
         .append_query_results([vec![user1.clone()]])
@@ -239,6 +240,8 @@ async fn test_user_config_returns_decrypted_toml_and_qr_url() {
         .append_query_results([vec![(user.clone(), Some(srv))]])
         // compiled_routes_for_user: users::Entity::find_by_id
         .append_query_results([vec![user]])
+        // resolve_client_servers: user_node_pools::Entity::find
+        .append_query_results([vec![] as Vec<user_node_pools::Model>])
         .into_connection();
     let app = build_test_app(db, tpl_path.to_string_lossy().to_string());
 
