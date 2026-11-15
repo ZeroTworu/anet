@@ -523,6 +523,20 @@ impl ServerConfig {
         Ok(format!("{}:{}", host, port))
     }
 
+    pub fn websocket_pool_size(&self) -> usize {
+        let mut pool = anet_common::consts::WS_DEFAULT_POOL_SIZE;
+        if let Ok(parsed) = reqwest::Url::parse(&self.dsn) {
+            for (k, v) in parsed.query_pairs() {
+                if matches!(k.as_ref(), "pool" | "mux") {
+                    if let Ok(val) = v.trim().parse::<usize>() {
+                        pool = val.clamp(1, anet_common::consts::WS_MAX_POOL_SIZE);
+                    }
+                }
+            }
+        }
+        pool
+    }
+
     pub fn websocket_url(&self) -> anyhow::Result<String> {
         let mode = self.mode()?;
         anyhow::ensure!(mode == TransportMode::Websocket, "DSN '{}' is not a websocket endpoint", self.dsn);
@@ -544,6 +558,8 @@ impl ServerConfig {
                                 | "tls_frag_length"
                                 | "tdelay"
                                 | "tls_frag_delay_ms"
+                                | "pool"
+                                | "mux"
                         )
                     })
                     .map(|(k, v)| (k.into_owned(), v.into_owned()))
@@ -961,13 +977,25 @@ mod tests {
         assert!(!eff2.verify_peer);
 
         let ws_with_query = ServerConfig {
-            dsn: "wss://node2.example.com/socket?fp=firefox&verify=1&tls_frag=1&tfrag=12..24&tdelay=1..3".to_string(),
+            dsn: "wss://node2.example.com/socket?pool=6&fp=firefox&verify=1&tls_frag=1&tfrag=12..24&tdelay=1..3".to_string(),
             ..Default::default()
         };
         assert_eq!(
             ws_with_query.websocket_url().unwrap(),
             "wss://node2.example.com/socket"
         );
+        assert_eq!(ws_with_query.websocket_pool_size(), 6);
+        let ws_default_pool = ServerConfig {
+            dsn: "wss://node2.example.com/socket".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(ws_default_pool.websocket_pool_size(), 4);
+        let ws_clamped_pool = ServerConfig {
+            dsn: "wss://node2.example.com/socket?mux=99".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(ws_clamped_pool.websocket_pool_size(), 8);
+        assert_eq!(ws_clamped_pool.websocket_url().unwrap(), "wss://node2.example.com/socket");
         let eff_ws = ws_with_query.effective_tls_config(&cfg.stealth);
         assert!(eff_ws.tls_frag.enabled);
         assert_eq!(eff_ws.tls_frag.min_len, 12);

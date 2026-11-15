@@ -125,8 +125,8 @@ pub fn wrap_packet_padded(
     wrap_packet_slice(cipher, nonce_prefix, sequence, &payload, padding)
 }
 
-/// Расшифровывает пакет, полученный от сервера (одна аллокация + decrypt_in_place)
-pub fn unwrap_packet(cipher: &Cipher, raw_packet: &[u8]) -> Result<Bytes> {
+/// Расшифровывает пакет, полученный от удаленной стороны, и возвращает `(sequence, payload)`.
+pub fn unwrap_packet_with_seq(cipher: &Cipher, raw_packet: &[u8]) -> Result<(u64, Bytes)> {
     if raw_packet.len() < NONCE_LEN + 10 + 16 {
         return Err(anyhow!("Packet too short"));
     }
@@ -140,6 +140,7 @@ pub fn unwrap_packet(cipher: &Cipher, raw_packet: &[u8]) -> Result<Bytes> {
         return Err(anyhow!("Payload too short"));
     }
 
+    let seq = u64::from_be_bytes(buf[..8].try_into().unwrap());
     let raw_len = u16::from_be_bytes([buf[8], buf[9]]);
     let data_len = if raw_len == LARGE_PACKET_LEN_SENTINEL
         && plaintext_len >= 10 + usize::from(LARGE_PACKET_LEN_SENTINEL)
@@ -153,7 +154,12 @@ pub fn unwrap_packet(cipher: &Cipher, raw_packet: &[u8]) -> Result<Bytes> {
     }
 
     buf.truncate(10 + data_len);
-    Ok(buf.freeze().slice(10..10 + data_len))
+    Ok((seq, buf.freeze().slice(10..10 + data_len)))
+}
+
+/// Расшифровывает пакет, полученный от сервера (одна аллокация + decrypt_in_place)
+pub fn unwrap_packet(cipher: &Cipher, raw_packet: &[u8]) -> Result<Bytes> {
+    unwrap_packet_with_seq(cipher, raw_packet).map(|(_, payload)| payload)
 }
 
 /// Расшифровывает пакет на месте (без выделения памяти).
@@ -319,5 +325,14 @@ mod in_place_tests {
         let dec_s2c = unwrap_packet(&cipher, &s2c_pkt).expect("unwrap s2c");
         assert_eq!(dec_c2s.as_ref(), b"uplink");
         assert_eq!(dec_s2c.as_ref(), b"downlink");
+
+        let (seq_c2s, payload_c2s) =
+            unwrap_packet_with_seq(&cipher, &c2s_pkt).expect("unwrap_with_seq c2s");
+        let (seq_s2c, payload_s2c) =
+            unwrap_packet_with_seq(&cipher, &s2c_pkt).expect("unwrap_with_seq s2c");
+        assert_eq!(seq_c2s, CLIENT_SEQUENCE_START);
+        assert_eq!(seq_s2c, SERVER_SEQUENCE_START);
+        assert_eq!(payload_c2s.as_ref(), b"uplink");
+        assert_eq!(payload_s2c.as_ref(), b"downlink");
     }
 }

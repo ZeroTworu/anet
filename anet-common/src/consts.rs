@@ -249,3 +249,20 @@ pub fn normalize_ssh_banner(custom: Option<&str>) -> String {
 /// Максимальное количество пакетов в очереди джиттера до принудительного сброса.
 pub const MAX_PENDING_JITTER_PACKETS: usize = 256;
 
+// =========================================================================
+// Константы пула WebSocket-транспорта (WSS ?pool=N)
+// =========================================================================
+
+/// Магический заголовок кадра привязки вторичного сокета к существующей сессии WS (`MUX_BIND`).
+pub const WS_MUX_BIND_MAGIC: &[u8; 8] = b"ANETMUX1";
+/// Магический заголовок подтверждения привязки вторичного сокета (`MUX_ACK`).
+pub const WS_MUX_ACK_MAGIC: &[u8; 8] = b"ANETOK01";
+/// Количество параллельных WebSocket-соединений в пуле по умолчанию и потолок.
+pub const WS_DEFAULT_POOL_SIZE: usize = 4;
+pub const WS_MAX_POOL_SIZE: usize = 8;
+/// Бюджет коалесценции на один сокет при активном мульти-сокетном пуле (16 КБ позволяет
+/// распределять крупные пачки параллельно между всеми сокетами пула).
+pub const WS_POOL_COALESCE_BUDGET_BYTES: usize = 16 * 1024;
+/// Параметры окна переупорядочивания входящих пакетов для пула WebSocket.
+pub const WS_REASSEMBLY_QUEUE_MAX_SIZE: usize = 2048;
+pub const WS_REASSEMBLY_GAP_TIMEOUT_MS: u64 = 60;
