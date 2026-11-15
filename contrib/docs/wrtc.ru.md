@@ -1,5 +1,7 @@
 # Архитектура и спецификация транспорта `wrtc` (WebRTC over Ktalk / Jitsi SFU)
 
+> Актуально на @981f6e2
+
 ---
 
 ## 1. Введение и архитектурная концепция
@@ -145,8 +147,10 @@
 2. **Привязка UDP-сокетов WebRTC к физическому сетевому адаптеру (`detect_physical_bind_addr`) и пул сокетов (`udp_ice_socket_count = 6`):**
    * До создания маршрутов TUN функция `detect_physical_bind_addr()` открывает пробный UDP-сокет к IP медиамоста JVB, определяя точный локальный IPv4-адрес исходящего интерфейса (например, `192.168.1.x` или адрес туннельного интерфейса `172.16.0.2` при табличной маршрутизации через WARP).
    * В `PeerConnectionBuilder::with_udp_addrs` передаётся сразу `udp_ice_socket_count` (по умолчанию `6`) локальных адресов `ip:0`. Стек `webrtc-rs` открывает 6 независимых UDP-сокетов с разными эфемерными портами источника (`src_port`), что позволяет ICE-агенту автоматически выбрать наиболее стабильный L4-маршрут при наличии ECMP/LAG-балансировки на промежуточных узлах сети.
-3. **Приоритет прямого UDP к JVB (`jvb_use_turn = false`):**
-   * По умолчанию параметр `jvb_use_turn` установлен в `false`: для связи с медиамостом JVB используются прямые UDP-кандидаты (`Tier 0: STUN` и `host`-кандидаты моста). Это исключает двойное релейное проксирование через TCP-TURN (`turns_proxy`), предотвращает просадку скорости из-за TCP Head-of-Line blocking и исключает таймауты `TURN transaction timed out`.
+3. **Приоритет прямого UDP к JVB и режим «БС» (`jvb_use_turn` / `turns_proxy_priority`):**
+   * По умолчанию параметры `jvb_use_turn` и `turns_proxy_priority` установлены в `false`: для связи с медиамостом JVB используются прямые UDP-кандидаты (`Tier 0: STUN` и `host`-кандидаты моста). Это исключает двойное релейное проксирование через TCP-TURN (`turns_proxy`), предотвращает просадку скорости из-за TCP Head-of-Line blocking и исключает таймауты `TURN transaction timed out`.
+   * В режиме «Белые Списки» («БС» / жёсткая блокировка UDP), когда прямой UDP и UDP-TURN до JVB/STUN режутся, установка `turns_proxy_priority = true` в `[wrtc]` (или `wrtc_turns_priority = true` на уровне ноды в `[[servers]]`) автоматически разрешает сбор TURN-кандидатов даже при `jvb_use_turn = false` и выводит `TURNS Proxy` (`TCP:443`) в приоритетный `Tier 1` перед UDP-TURN. В режиме `p2p_direct` (`require_turn = true`) `TURNS TCP:443` приоритизируется всегда автоматически.
+   * На всех исходящих TLS-соединениях `WRTC` (REST API, XMPP-WS, Colibri-WS, `TURNS Proxy`) — как на клиенте, так и на сервере (`set_default_tls_config(config.stealth.to_tls_client_config())`) — поддерживается L4 TCP-фрагментация `ClientHello` (`tls_frag_enabled`, `tls_frag_length`, `tls_frag_delay_ms`).
 
 ### 3.3. Защита от петли маршрутизации (`bypass_ips`)
 Чтобы туннель не перехватил собственный сигнальный или медиатрафик после поднятия маршрутов `0.0.0.0/0`, модуль WebRTC собирает `bypass_ips` сразу из нескольких независимых источников:
@@ -233,7 +237,7 @@ mask = "255.255.255.0"
 gateway = "172.112.224.1"
 self_ip = "172.112.224.2"
 if_name = "anet-server"
-# Базовый MTU серверного TUN и классических транспортов (SSH/QUIC/VNC/WS): 1400.
+# Базовый MTU серверного TUN и классических транспортов (SSH/QUIC/VNC/WS): 1400 (на полном WARP-хосте снижайте до 1100 / <= 1200).
 # Для WRTC эффективный MTU рассчитывается отдельно от [wrtc] max_video_batch_bytes!
 mtu = 1400
 
@@ -267,6 +271,7 @@ ice_failed_timeout_ms = 35000         # 25000 (прямой) | 35000 (CF WARP)
 ice_keepalive_interval_ms = 1500      # 2000  (прямой) | 1500  (CF WARP)
 turn_refresh_interval_secs = 90
 jvb_use_turn = false
+turns_proxy_priority = false          # true для режима «БС» / приоритета TURNS TCP:443 (Tier 1)
 
 # --- Параметры MTU, микро-батчинга VP8 (media_video) и коалесценции пакетов ---
 sctp_max_receive_buffer_size = 8388608

@@ -1,6 +1,6 @@
 # Архитектура и спецификация транспорта `quic` (ASTP over Obfuscated QUIC)
 
-Документация актуальна для ветки `master`.
+> Актуально на @981f6e2
 
 ---
 
@@ -83,7 +83,7 @@
 ```
 
 * Если `frag_enabled = false`, отправляется одна датаграмма с заголовком `[0x00, 0x01]`.
-* Если `frag_enabled = true`, пакет режется в случайных точках (`random_split_points` через `OsRng` без выравнивания по кратным границам) на `frag_min_chunks..=frag_max_chunks` частей с задержкой `min_jitter_ns..=max_jitter_ns` между отправками.
+* Если `frag_enabled = true`, пакет режется в случайных точках (`random_split_points` через `OsRng` без выравнивания по кратным границам) на число частей из диапазона `frag_chunks = "2..4"` (синтаксис `Xcore`, имеет приоритет над `frag_min_chunks..=frag_max_chunks`) с задержкой `min_jitter_ns..=max_jitter_ns` между отправками. *(Опция `tls_frag_enabled` / `tlshello` относится только к L4 TCP-рукопожатию в TLS-транспортах и на `quic` не влияет.)*
 * На сервере `MultiKeyAnetUdpSocket` хранит `DashMap<SocketAddr, (Instant, DatagramReassembler)>` с таймаутом самоочистки `QUIC_REASSEMBLY_TIMEOUT = 5s` (`anet-common/src/consts.rs`). Как только все части собраны (`parts.len() == total`) и суммарная длина $\ge \text{MIN\_HANDSHAKE\_LEN}$ (`78` байт), собранный буфер отправляется в асинхронный воркер `serve_udp_auth_layer`.
 * Ответы сервера (Phase II и Phase IV) отправляются одиночными UDP-датаграммами напрямую через `socket.send_to(&resp, remote_addr)`.
 
@@ -202,7 +202,8 @@ idle_timeout_seconds = 60           # На клиенте ограничивае
 padding_step = 64                   # Выравнивание размера UDP-датаграмм (до 1450 байт)
 min_jitter_ns = 0
 max_jitter_ns = 0
-frag_enabled = true                 # Фрагментация UDP-датаграмм хендшейка (Phase I / Phase III)
+frag_enabled = true                 # Старая ASTP-фрагментация UDP-датаграмм хендшейка (Phase I / Phase III)
+frag_chunks = "2..4"                # Диапазон числа чанков в стиле Xcore (приоритет над min/max)
 frag_min_chunks = 2
 frag_max_chunks = 4
 ```
@@ -213,7 +214,7 @@ frag_max_chunks = 4
 quic_bind_to = "0.0.0.0:8443"       # Пустая строка "" отключает QUIC-сервер
 
 [network]
-mtu = 1400
+mtu = 1400                          # На прямом канале 1400; при работе сервера через CF WARP (MTU 1280) снижайте до 1100 (<= 1200)
 
 [crypto]
 server_signing_key = "<BASE64_ED25519_PRIVATE_KEY>"

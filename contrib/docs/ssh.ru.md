@@ -1,6 +1,6 @@
 # Архитектура и спецификация транспорта `ssh` (ASTP over SSHv2 Exec Channel)
 
-Документация актуальна для ветки `master`.
+> Актуально на @981f6e2
 
 ---
 
@@ -13,13 +13,12 @@
 1. Открывается обычное TCP-соединение (по умолчанию порт `22` на клиенте при отсутствии порта в DSN, либо любой настроенный порт `server.ssh_bind_to`, например `822` или `22`).
 2. Выполняется полноценный обмен версиями SSH-2.0, согласование алгоритмов (KEX) и проверка ключа хоста.
 3. Клиент проходит SSH-аутентификацию (`none`) под заданным именем пользователя (`ssh_user`) и открывает сессионный канал (`channel_open_session`) с вызовом команды **`exec "anet-vpn"`**.
-4. Внутри открытого SSH-канала поверх уже защищённого SSH-соединения выполняется стандартное криптографическое рукопожатие **ASTP** (Phase I–IV) с опциональной TCP-фрагментацией первого пакета и далее передаётся поток дополнительно зашифрованных пакетов (`ChaCha20-Poly1305` + `padding_step` + микробатчинг до `16 КБ`).
+4. Внутри открытого SSH-канала поверх уже защищённого SSH-соединения выполняется стандартное криптографическое рукопожатие **ASTP** (Phase I–IV) и далее передаётся поток дополнительно зашифрованных пакетов (`ChaCha20-Poly1305` + `padding_step` + микробатчинг до `16 КБ`).
 
 ### 1.2. Ключевые файлы реализации
-* **Клиент:** `anet-client-core/src/transport/ssh.rs` (`SshTransport`, `ClientHandler`).
+* **Клиент:** `anet-client-core/src/transport/ssh.rs` (`SshTransport`, `ClientHandler`, плановая ротация сессии).
 * **Сервер:** `anet-server/src/servers/ssh.rs` (`run_ssh_server`, `AnetSshHandler`, `handle_ssh_vpn_session`).
 * **Потоковый конвейер шифрования и батчинга:** `anet-common/src/jitter.rs` (`bridge_crypto_stream_with_jitter`, `receive_crypto_stream`), `anet-common/src/stream_framing.rs` (`frame_packet`, `frame_packet_into`, `read_next_packet`).
-* **Фрагментация рукопожатия:** `anet-common/src/handshake_fragmentation.rs` (`write_fragmented`).
 
 ---
 
@@ -51,7 +50,7 @@
                   |                                                               |    -> channel_success + into_stream()
                   |                                                               |
                   | 9. ASTP Handshake (authenticate_once via StreamAuthChannel)   |
-                  |    [u16 BE len][ASTP Phase I..IV] (with write_fragmented)     | 10. Server authenticate()
+                  |    [u16 BE len][ASTP Phase I..IV]                             | 10. Server authenticate()
                   |<=============================================================>|     (timeout = 30s)
                   |                                                               |
                   | 11. Encrypted Data Plane (bridge_crypto_stream_with_jitter)   |
@@ -59,17 +58,22 @@
                   |<=============================================================>|
 ```
 
-### 2.1. Изоляция и безопасность SSH-обработчика на сервере (`AnetSshHandler`)
-Сервер `anet-server` реализует минималистичный и защищённый обработчик `russh::server::Handler`:
-* **Запрет интерактивного шелла:** Метод `shell_request` всегда возвращает `session.channel_failure(channel)`, не позволяя открыть терминал.
-* **Строгий фильтр команд в `exec_request`:** Если запрошенная команда отлична от байтовой строки `b"anet-vpn"`, сервер удаляет канал из `pending_channels`, отправляет `channel_failure(channel_id)` и немедленно закрывает канал `session.close(channel_id)`.
+### 2.1. Изоляция и защита от активного пробинга (`AnetSshHandler`)
+Сервер `anet-server` реализует минималистичный и защищённый от активного пробинга (Active Probing) обработчик `russh::server::Handler`:
+* **Запрет интерактивного шелла без баннера-заглушки:** Метод `shell_request` всегда отвечает `session.channel_failure(channel)` и немедленно закрывает канал `session.close(channel)` **без вывода** каких-либо нестандартных баннеров вроде `"Welcome to Simple SSH Server."`.
+* **Строгий фильтр команд в `exec_request`:** Если запрошенная команда отлична от байтовой строки `b"anet-vpn"`, сервер удаляет канал из `pending_channels`, отправляет стандартный статус выхода `session.exit_status_request(channel, 127)`, `session.eof(channel)` и закрывает канал `session.close(channel)`, имитируя поведение обычного OpenSSH без интерактивного шелла.
 * **Корректная обработка `channel_eof`:** При получении `SSH_MSG_CHANNEL_EOF` от клиента метод `AnetSshHandler::channel_eof` немедленно удаляет канал из `pending_channels` и вызывает `session.close(channel)`, гарантируя освобождение дескрипторов и завершение `handle_ssh_vpn_session` без зависших полуоткрытых потоков.
 * **Двойная криптографическая верификация:** Хотя `auth_none` на уровне SSH возвращает `Auth::Accept`, а клиентский `ClientHandler::check_server_key` принимает любой SSH-ключ хоста (с таймаутом установки TCP-соединения `SSH_CONNECT_TIMEOUT = 15s`), доступ к VPN-сети невозможен без прохождения 4-фазного рукопожатия **ASTP** (с проверкой подписей Ed25519 обеих сторон и тайм-аутом `ASTP_AUTH_TIMEOUT = 30s`). Если клиент не завершает ASTP за 30 секунд, сессия принудительно разрывается.
 
-### 2.2. Однократная попытка рукопожатия на потоке (`authenticate_once`)
+### 2.2. Однократная попытка рукопожатия на потоке (`authenticate_once`) и отказ от внутренней фрагментации
 В отличие от UDP/QUIC, где потеря датаграммы компенсируется повторными попытками (`authenticate`), для SSH используется `auth_handler.authenticate_once(&auth_channel)`:
 * При отказе сервера или разрыве TCP/SSH-потока повторная отправка в тот же закрытый поток бессмысленна и лишь задерживает переключение на следующую ноду (failover).
-* При включённом `[stealth] frag_enabled = true` метод `StreamAuthChannel::send` вызывает `write_fragmented(&mut *stream, &framed, frag)`, разбивая фрейм рукопожатия `[u16 len][ASTP payload]` на несколько отдельных записей `write_all + flush` со случайными границами и джиттером. Поскольку на TCP-сокете включён `set_nodelay(true)` (`TCP_NODELAY`), каждый кусок уходит в отдельном пакете SSH/TCP.
+* Поскольку канал внутри SSHv2 уже полностью зашифрован на уровне транспорта (`SSH_MSG_CHANNEL_DATA`), дробление `ASTP Phase I..IV` функцией `write_fragmented` внутри `StreamAuthChannel::send` невидимо на проводе и **удалено** — фрейм `[u16 BE len][ASTP payload]` отправляется напрямую одним `write_all + flush`. Для обхода DPI на проводе в SSH-транспорте используются маскировка баннера OpenSSH и плановая ротация TCP/SSH-сессий.
+
+### 2.3. Плановая ротация сессии (`ssh_min_session_secs` .. `ssh_max_session_secs`)
+Чтобы не держать одно долгоживущее TCP/SSH-соединение часами (что триггерит поведенческие детекторы ТСПУ), в `SshTransport` работает супервизор плановой ротации:
+* По истечении случайного интервала `[ssh_min_session_secs..=ssh_max_session_secs]` (по умолчанию `480..1500` сек; `0` отключает ротацию) супервизор ставит `health_pause = true`, аккуратно останавливает текущую пару `outbound`/`inbound` воркеров с сохранением `tunnel_reader`, `tunnel_writer` и `FrameReader`.
+* После короткой рандомизированной паузы (`350..1200` мс) клиент переподключается к тому же SSH-узлу с `AuthHandler::new_with_resume(..., Some(logical_session_id))`, сохраняя прежний туннельный IP/шлюз без сброса `TUN` и маршрутов.
 
 ---
 
@@ -163,6 +167,8 @@ name = "SSH Node"
 dsn = "ssh://vpn.example.com:22"    # Если порт не указан (ssh://host), по умолчанию используется порт 22
 ssh_user = "deploy"                 # Опциональное переопределение пользователя SSH для конкретной ноды
 # ssh_banner = "SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13.5"
+ssh_min_session_secs = 480          # Мин. время жизни SSH-сессии до плановой ротации (сек, 0 — отключить)
+ssh_max_session_secs = 1500         # Макс. время жизни SSH-сессии до плановой ротации (сек, 0 — отключить)
 timeout_secs = 15
 server_pub_key = "<BASE64_ED25519_PUBLIC_KEY>"
 
@@ -170,9 +176,9 @@ server_pub_key = "<BASE64_ED25519_PUBLIC_KEY>"
 padding_step = 64                   # Выравнивание каждого зашифрованного пакета внутри потока
 min_jitter_ns = 0
 max_jitter_ns = 0
-frag_enabled = true                 # TCP-фрагментация первого пакета рукопожатия ASTP внутри SSH-канала
-frag_min_chunks = 2
-frag_max_chunks = 3
+# Внимание: frag_enabled (старая ASTP-фрагментация) в SSH не используется, т.к. канал уже зашифрован SSHv2.
+# Опции frag_enabled / frag_chunks актуальны для QUIC/VNC, а tls_frag_enabled (tlshello) — для TLS-транспортов.
+frag_enabled = false
 ```
 
 ### 6.2. Настройка сервера (`server.toml`)

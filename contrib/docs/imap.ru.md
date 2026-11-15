@@ -1,4 +1,7 @@
 # Архитектура и спецификация транспорта `imap` (ASTP over IMAPS:993)
+
+> Актуально на @981f6e2
+
 Спецификация верифицирована серией нагрузочных тестов на боевом сервере `imap.mail.ru:993`, включая 30-минутный High-Throughput Soak-Test (346.13 МиБ суммарного трафика, 128 КБ батчи, ~0.81 Mbps Uplink / ~0.80 Mbps Downlink, 99.5% доставка, 0 ошибок, 0 троттлингов).
 
 ---
@@ -359,7 +362,7 @@ pub struct Model {
 
 ### 7.1. Никаких внешних IMAP-крейтов с `rustls`!
 Транспорт **не использует** крейт `async-imap` (так как `async-imap` теряет нетегированные `* EXISTS` во время `UID FETCH` и тянет `rustls`).
-Вместо этого в `anet-common/src/imap_conn.rs` реализуется нативный асинхронный `ImapConn` поверх `tokio::io::BufReader<tokio_boring::SslStream<TcpStream>>`, использующий штатный **BoringSSL** коннектор из `anet-common/src/boring_tls.rs`.
+Вместо этого в `anet-common/src/imap_conn.rs` реализуется нативный асинхронный `ImapConn` поверх `tokio::io::BufReader<AnetTlsStream<TcpStream>>` (где `AnetTlsStream<S> = tokio_boring::SslStream<TlsHelloFragStream<S>>`), использующий штатный **BoringSSL** коннектор из `anet-common/src/boring_tls.rs` с поддержкой L4-фрагментации `ClientHello` (`[stealth].tls_frag_*`).
 
 ### 7.1.1. Эталонный TLS-фингерпринт почтового клиента (KMail / OpenSSL 3.x)
 В результате реального сниффинга сессии десктопного почтового клиента `KMail` (KDE / Qt6 / OpenSSL 3.x) на порт `993` (`imap.gmail.com:993`) зафиксирован эталонный сетевой отпечаток почтового трафика:
@@ -410,12 +413,13 @@ pub async fn connect_email_tls_with_config<S>(
     domain: &str,
     stream: S,
     cfg: &TlsClientConfig,
-) -> anyhow::Result<tokio_boring::SslStream<S>>
+) -> anyhow::Result<AnetTlsStream<S>>
 where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Sync + Unpin,
 {
     let builder = build_email_ssl_connector_with_config(cfg)?;
     let ssl = builder.build().configure()?.into_ssl(domain)?;
+    let stream = TlsHelloFragStream::new(stream, cfg.tls_frag.clone());
     tokio_boring::connect(ssl, stream).await
         .map_err(|e| anyhow::anyhow!("BoringSSL Email TLS handshake failed for {domain}: {e}"))
 }

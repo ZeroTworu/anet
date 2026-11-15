@@ -1,5 +1,7 @@
 # Транспорт `ws://` / `wss://` (WebSocket): топология, режимы работы и настройка
 
+> Актуально на @981f6e2
+
 ## 1. Режимы развёртывания: напрямую и через CDN / Edge-прокси
 
 Транспорт WebSocket (`ws://` и `wss://`) поддерживает **оба режима эксплуатации** без необходимости пересборки клиента или сервера:
@@ -196,15 +198,23 @@ tls_fingerprint = "auto"
 # Защита от активного спуфинга ТСПУ (по умолчанию: true — разрывает соединение на этапе TLS Handshake
 # при подмене сертификата до отправки HTTP Upgrade / Sec-WebSocket-Key и пути /socket)
 tls_verify_peer = true
+# L4 TCP-фрагментация TLS ClientHello (`tlshello`) для обхода DPI по открытому SNI:
+# режет первый пакет 0x16 0x03 на фрагменты заданного диапазона байт (синтаксис Xcore "X..Y")
+tls_frag_enabled = false
+tls_frag_length = "10..20"
+tls_frag_delay_ms = "0"
 
 [[servers]]
 name = "Direct or CDN Node [WSS]"
 # Схема wss:// (через Nginx/CDN с TLS) или ws:// (без TLS)
 # Дополнительные query-параметры (опционально):
-#   ?pool=4        — количество параллельных WebSocket-соединений в пуле (по умолчанию 4, макс. 8)
-#   ?fp=firefox    — переопределение TLS-профиля ("auto", "chrome", "firefox", "safari", "randomized")
-#   ?verify=1      — управление проверкой сертификата (по умолчанию включена)
-#   ?pin=<SHA256>  — SHA-256 пиннинг сертификата или SPKI публичного ключа
+#   ?pool=4            — количество параллельных WebSocket-соединений в пуле (по умолчанию 4, макс. 8)
+#   ?fp=firefox        — переопределение TLS-профиля ("auto", "chrome", "firefox", "safari", "randomized")
+#   ?verify=1          — управление проверкой сертификата (по умолчанию включена)
+#   ?pin=<SHA256>      — SHA-256 пиннинг сертификата или SPKI публичного ключа
+#   ?tls_frag=1        — включить L4 TCP-фрагментацию ClientHello (`tlshello`) для этой ноды
+#   ?tfrag=10..20      — диапазон длины фрагмента в байтах (`X..Y` или `N`)
+#   ?tdelay=0          — задержка между фрагментами ClientHello в мс (`X..Y` или `N`)
 dsn = "wss://example.com/socket?pool=4"
 timeout_secs = 10
 server_pub_key = "<BASE64_ED25519_PUBLIC_KEY>"
@@ -212,6 +222,9 @@ server_pub_key = "<BASE64_ED25519_PUBLIC_KEY>"
 # tls_fingerprint = "randomized"
 # tls_verify_peer = true
 # tls_pin_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+# tls_frag_enabled = true
+# tls_frag_length = "10..20"
+# tls_frag_delay_ms = "0"
 
 # Интервал плановой ротации долгоживущих WebSocket-соединений (в секундах)
 websocket_min_session_secs = 900

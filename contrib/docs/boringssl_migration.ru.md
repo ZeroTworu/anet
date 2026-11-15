@@ -1,6 +1,8 @@
+> Актуально на @981f6e2
+
 ## 1. Введение и модель угроз ТСПУ (`tspu-detect.svg`)
 
-Все клиентские TCP/TLS-транспорты (`AHTTP`, `WebSocket`, сигнальные и резервные каналы `WRTC`: REST API Контур.Толк, XMPP-WS, Colibri-WS, локальный мост `TURNS`, а также фоновые службы `Updater` и `RuleCacheManager`) работают поверх нативной криптографической библиотеки Google **`boring` (BoringSSL)**.
+Все клиентские TCP/TLS-транспорты (`AHTTP`, `WebSocket`, `IMAPS`, сигнальные и резервные каналы `WRTC`: REST API Контур.Толк, XMPP-WS, Colibri-WS, локальный мост `TURNS`, а также фоновые службы `Updater` и `RuleCacheManager`) работают поверх нативной криптографической библиотеки Google **`boring` (BoringSSL)**.
 
 Согласно актуальной архитектуре детектов ТСПУ и результатам полевых тестов, TLS-клиент должен защищаться от четырёх векторов обнаружения:
 
@@ -68,13 +70,35 @@ tls_verify_peer = true
 # Опциональный пользовательский корневой/серверный сертификат (путь к PEM или inline PEM):
 # tls_ca_cert = "/etc/anet/ca.pem"
 
+# L4 TCP-фрагментация TLS ClientHello (`tlshello`) в стиле Xcore:
+tls_frag_enabled = false
+tls_frag_length = "10..20"
+tls_frag_delay_ms = "0"
+
 [[servers]]
 name = "Pinned Chrome AHTTP Node"
 dsn = "https://example.com/api/v2/telemetry"
 tls_fingerprint = "chrome"
 tls_verify_peer = true
 tls_pin_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+# tls_frag_enabled = true
+# tls_frag_length = "10..20"
+# tls_frag_delay_ms = "0"
 ```
+
+---
+
+## 3.1. L4 TCP-фрагментация `TLS ClientHello` (`tlshello`) и отличие от старой ASTP-фрагментации
+
+Для обхода DPI/ТСПУ, фильтрующих подключения по открытому `SNI` или сигнатуре первого TLS-пакета, добавлена опциональная L4-фрагментация **`ClientHello` (`tlshello`)**:
+* **Обёртка потока на проводе:**
+  * В `anet-common/src/boring_tls.rs` реализован адаптер `TlsHelloFragStream<S>` (типизированный алиас `AnetTlsStream<S> = tokio_boring::SslStream<TlsHelloFragStream<S>>`), используемый всеми коннекторами `connect_ws_tls_with_config`, `connect_chrome_ws_tls`, `connect_raw_tls_with_config`, `connect_email_tls_with_config` (`WSS`, `IMAPS`, `WRTC` XMPP/Colibri-WS, `TURNS Proxy`).
+  * В `patches/reqwest-boring` реализован адаптер `FragStream<S>` (`boring_connector.rs`, `connect.rs`, `async_impl/client.rs`), подключаемый методом `.tls_hello_fragment(...)` из `BrowserProfile::build_reqwest_builder` для `AHTTP` и HTTP API `WRTC`.
+* **Алгоритм работы без накладных расходов на Data Plane:**
+  * Адаптер отслеживает первый исходящий `poll_write`. Если буфер начинается с TLS Record Handshake (`0x16 0x03`), пакет разрезается на куски случайного размера из диапазона `tls_frag_length` (с возможной задержкой `tls_frag_delay_ms` между отправками через неблокирующий `tokio::time::sleep`).
+  * Сразу после отправки фрагментированного `ClientHello` адаптер отключает флаг фрагментации (`FragPhase::PassThrough`) и передаёт дальнейшие `poll_read`/`poll_write` напрямую в базовый сокет с нулевым оверхедом.
+* **Отличие от старой ASTP-фрагментации (`frag_enabled` / `frag_chunks`):** старая ASTP-фрагментация (`handshake_fragmentation.rs`) режет первый фрейм уже после установки транспорта (используется для не-TLS транспортов `quic` и `vnc`) и на TLS `ClientHello` не влияет.
+* **Синтаксис и настройка:** поддерживаются диапазоны `Xcore` (`"X..Y"` или `"N"`) в `[stealth]` (`tls_frag_enabled`, `tls_frag_length`, `tls_frag_delay_ms`), переопределения в `[[servers]]` и query-параметры DSN (`?tls_frag=1&tfrag=10..20&tdelay=0`). Автотест нарезки: `test_tls_hello_frag_stream_splits_client_hello_cleanly`.
 
 ### Команды `openssl` для получения `tls_pin_sha256` вашего сервера:
 

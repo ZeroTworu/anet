@@ -1,6 +1,6 @@
 # Архитектура и спецификация транспорта `vnc` (ASTP over RFB 3.8 Clipboard Channel)
 
-Документация актуальна для ветки `master`.
+> Актуально на @981f6e2
 
 ---
 
@@ -125,10 +125,11 @@
 
 ## 4. Особенности Data Plane, коалесценции и Stealth-режима
 
-### 4.1. Отсутствие открытых маркеров фрагментации в TCP-потоке (`write_fragmented`)
+### 4.1. Отсутствие открытых маркеров фрагментации в TCP-потоке (`write_fragmented`) и плановая ротация
 В отличие от UDP-транспорта, где датаграммы требуют 2-байтного заголовка `[frag_index, frag_total]`, в потоковом транспорте `VNC` (`VncAuthChannel::send`) используется **`write_fragmented(&mut *stream, &frame, fragmentation)`** без каких-либо дополнительных байтовых префиксов:
 * При `frag_enabled = false` кадр `ClientCutText` отправляется одним вызовом `write_all` без сигнатурного маркера `[0x00, 0x01]`.
-* При `frag_enabled = true` первый `ClientCutText`-фрейм разрезается на уровне TCP-сегментов (`TCP_NODELAY = true`) в случайных точках с наносекундным джиттером, оставаясь на 100% валидным потоком RFB 3.8 для любого анализатора протокола.
+* При `frag_enabled = true` первый `ClientCutText`-фрейм разрезается на уровне TCP-сегментов (`TCP_NODELAY = true`) на количество частей из диапазона `frag_chunks = "2..4"` (или `frag_min_chunks..=frag_max_chunks`) со случайными границами и наносекундным джиттером, оставаясь на 100% валидным потоком RFB 3.8.
+* **Плановая ротация сессии (`vnc_min_session_secs` .. `vnc_max_session_secs`):** чтобы исключить поведенческое обнаружение бесконечных TCP/VNC-сессий, клиентский супервизор каждые `480..1500` секунд (настраивается в `[[servers]]`, `0` — отключить) ставит `health_pause = true`, закрывает текущий сокет, выдерживает короткую паузу `350..1200` мс и переподключается с `resume_session_id` (`logical_session_id`), сохраняя прежний туннельный IP без разрыва `TUN`.
 
 ### 4.2. Правдоподобный стартовый кадр экрана и коалесценция RFB-фреймов (`CRYPTO_COALESCE_BUDGET_BYTES = 16 КБ`)
 Сразу после обмена `ClientInit` / `ServerInit` клиент отправляет стандартные сообщения настройки сессии (`SetPixelFormat`, `SetEncodings`, `FramebufferUpdateRequest` на весь экран `1024x768`), а сервер в `emulate_rfb_server_handshake` отвечает полным первичным кадром `FramebufferUpdate (0x00)` с чёрным экраном (`VNC_RFB_BLACK_SCREEN_TOTAL_BYTES = 1024 * 768 * 4 = 3 145 728` байт, передаваемым чанками по `VNC_RFB_BLACK_SCREEN_CHUNK_SIZE = 65 536` байт).
@@ -153,6 +154,8 @@
 [[servers]]
 name = "VNC Node"
 dsn = "vnc://vpn.example.com:5900"  # Если порт не указан (vnc://host), по умолчанию используется стандартный порт 5900
+vnc_min_session_secs = 480          # Мин. время жизни VNC-сессии до плановой ротации (сек, 0 — отключить)
+vnc_max_session_secs = 1500         # Макс. время жизни VNC-сессии до плановой ротации (сек, 0 — отключить)
 timeout_secs = 15
 server_pub_key = "<BASE64_ED25519_PUBLIC_KEY>"
 
@@ -160,7 +163,8 @@ server_pub_key = "<BASE64_ED25519_PUBLIC_KEY>"
 padding_step = 64                   # Выравнивание размера зашифрованного пакета внутри RFB-кадра
 min_jitter_ns = 0
 max_jitter_ns = 0
-frag_enabled = true                 # TCP-фрагментация пакетов рукопожатия ClientCutText
+frag_enabled = true                 # Старая ASTP TCP-фрагментация пакетов рукопожатия ClientCutText
+frag_chunks = "2..4"                # Диапазон числа чанков в стиле Xcore (имеет приоритет над min/max)
 frag_min_chunks = 2
 frag_max_chunks = 3
 ```

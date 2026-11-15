@@ -1,5 +1,7 @@
 # Транспорт `ahttp` (`http://` / `https://`): архитектура, режимы работы и настройка
 
+> Актуально на @981f6e2
+
 ## 1. Назначение и два режима работы (Напрямую и через CDN)
 
 Транспорт `ahttp` (`Asymmetric HTTP Stream` / Stateless Packet-Exchange) инкапсулирует шифрованный трафик ASTP в серию стандартных HTTP/1.1 и HTTP/2 запросов (`POST`, `GET`, `PUT`) без использования заголовков `Upgrade: websocket`. Для внешнего наблюдателя, корпоративного прокси или ТСПУ обмен выглядит как обычная отправка телеметрии или подгрузка медиа-фрагментов (`video/mp4`, `application/octet-stream`) современным браузером.
@@ -189,7 +191,8 @@ server {
 * `?pool=4` — переопределение числа TCP/TLS соединений в пуле (`tcp_pool_size`);
 * `?method=POST` — переопределение HTTP-метода отправки (`POST`, `PUT` и т.д.);
 * `?fp=auto|chrome|firefox|safari|randomized` — переопределение профиля TLS ClientHello (BoringSSL) и синхронизированных с ним HTTP-заголовков;
-* `?verify=1|0` и `?pin=<SHA256>` — управление защитой от активного спуфинга ТСПУ (по умолчанию `tls_verify_peer = true`).
+* `?verify=1|0` и `?pin=<SHA256>` — управление защитой от активного спуфинга ТСПУ (по умолчанию `tls_verify_peer = true`);
+* `?tls_frag=1` (`?tls_frag=0`), `?tfrag=10..20`, `?tdelay=0` — включение и настройка L4 TCP-фрагментации первого TLS `ClientHello` (`tlshello` внутри `reqwest-boring::FragStream`) для обхода DPI по открытому SNI.
 
 ```toml
 [stealth]
@@ -198,6 +201,10 @@ server {
 tls_fingerprint = "auto"
 # Защита от активного спуфинга ТСПУ (подмены сертификата на этапе TLS Handshake). По умолчанию: true
 tls_verify_peer = true
+# L4 TCP-фрагментация TLS ClientHello (`tlshello`) в стиле Xcore:
+tls_frag_enabled = false
+tls_frag_length = "10..20"
+tls_frag_delay_ms = "0"
 
 # Пример 1: Прямое подключение к серверу (без CDN) с валидным сертификатом Let's Encrypt
 [[servers]]
