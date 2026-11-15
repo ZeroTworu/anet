@@ -1,14 +1,109 @@
-use crate::boring_tls::{TlsClientConfig, TlsFingerprint};
+use crate::boring_tls::{TlsClientConfig, TlsFingerprint, TlsFragConfig};
 use crate::consts::{
     MAX_VIDEO_BATCH_BYTES, WRTC_BATCHER_MAX_BYTES, WRTC_BATCHER_MAX_DELAY_MS,
     WRTC_COLIBRI_WS_READ_TIMEOUT_SECS, WRTC_MIN_TUN_MTU, WRTC_TCP_PORT_HOP_ATTEMPTS,
     WRTC_TCP_PORT_HOP_TIMEOUT_MS, WRTC_UDP_ICE_SOCKET_COUNT, WRTC_UPLINK_BURST_MAX_PACKETS,
     WRTC_VIDEO_BATCH_MAX_PACKETS, WRTC_VIDEO_MTU_OVERHEAD,
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 fn default_tls_verify_peer() -> bool {
     true
+}
+
+fn default_tls_frag_length() -> String {
+    "10..20".to_string()
+}
+
+fn default_tls_frag_delay_ms() -> String {
+    "0".to_string()
+}
+
+/// Разбирает диапазон в стиле Xcore (`"10..20"`, `"10-20"`, `"16"`), возвращая `(min, max)`.
+/// Некорректные или пустые значения откатываются к `(default_lo, default_hi)` с нижней границей `min_allowed`.
+pub fn parse_range_pair(
+    raw: &str,
+    default_lo: u64,
+    default_hi: u64,
+    min_allowed: u64,
+) -> (u64, u64) {
+    let trimmed = raw.trim();
+    let (def_lo, def_hi) = (
+        default_lo.max(min_allowed),
+        default_hi.max(default_lo).max(min_allowed),
+    );
+    if trimmed.is_empty() {
+        return (def_lo, def_hi);
+    }
+
+    let parsed = if let Some((a, b)) = trimmed.split_once("..") {
+        match (a.trim().parse::<u64>(), b.trim().parse::<u64>()) {
+            (Ok(x), Ok(y)) => Some((x, y)),
+            _ => None,
+        }
+    } else if let Some((a, b)) = trimmed.split_once('-') {
+        match (a.trim().parse::<u64>(), b.trim().parse::<u64>()) {
+            (Ok(x), Ok(y)) => Some((x, y)),
+            _ => None,
+        }
+    } else if let Ok(v) = trimmed.parse::<u64>() {
+        Some((v, v))
+    } else {
+        None
+    };
+
+    match parsed {
+        Some((a, b)) => {
+            let lo = a.min(b).max(min_allowed);
+            let hi = a.max(b).max(lo);
+            (lo, hi)
+        }
+        None => (def_lo, def_hi),
+    }
+}
+
+fn deserialize_range_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum RangeOrInt {
+        Str(String),
+        Uint(u64),
+        Int(i64),
+    }
+    match RangeOrInt::deserialize(deserializer)? {
+        RangeOrInt::Str(s) => Ok(s),
+        RangeOrInt::Uint(u) => Ok(u.to_string()),
+        RangeOrInt::Int(i) => Ok(i.max(0).to_string()),
+    }
+}
+
+fn deserialize_opt_range_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OptRangeOrInt {
+        Str(String),
+        Uint(u64),
+        Int(i64),
+    }
+    match Option::<OptRangeOrInt>::deserialize(deserializer)? {
+        None => Ok(None),
+        Some(OptRangeOrInt::Str(s)) => {
+            let t = s.trim();
+            if t.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(t.to_string()))
+            }
+        }
+        Some(OptRangeOrInt::Uint(u)) => Ok(Some(u.to_string())),
+        Some(OptRangeOrInt::Int(i)) => Ok(Some(i.max(0).to_string())),
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -21,13 +116,34 @@ pub struct StealthConfig {
     /// Шаг выравнивания паддинга (байты)
     pub padding_step: u16,
 
-    /// Фрагментировать самый первый пакет рукопожатия (до появления
-    /// сессионного ключа, поэтому вне обычного padding/jitter-конвейера).
+    /// Старая ASTP-фрагментация первого пакета рукопожатия (уровень L4 поверх UDP/TCP для QUIC и VNC).
+    /// НЕ влияет на TLS ClientHello — для разрезки TLS рукопожатия используйте `tls_frag_enabled`.
     pub frag_enabled: bool,
-    /// Минимальное число частей, на которое дробится хендшейк.
+    /// Минимальное число частей старой ASTP-фрагментации.
     pub frag_min_chunks: u8,
-    /// Максимальное число частей, на которое дробится хендшейк.
+    /// Максимальное число частей старой ASTP-фрагментации.
     pub frag_max_chunks: u8,
+    /// Диапазон числа частей старой ASTP-фрагментации в стиле Xcore (`"2..4"`).
+    /// Если задан — имеет приоритет над `frag_min_chunks` / `frag_max_chunks`.
+    #[serde(default, deserialize_with = "deserialize_opt_range_string")]
+    pub frag_chunks: Option<String>,
+
+    /// Включить L4 TCP-фрагментацию исходящего TLS `ClientHello` (`tlshello`) для обхода DPI/ТСПУ,
+    /// режущего соединения по SNI или размеру первого TLS-рекорда (WSS, AHTTP, IMAPS, WRTC, TURNS).
+    pub tls_frag_enabled: bool,
+    /// Длина кусков TLS `ClientHello` в байтах в формате `"X..Y"` или `"N"` (по умолчанию `"10..20"`).
+    #[serde(
+        default = "default_tls_frag_length",
+        deserialize_with = "deserialize_range_string"
+    )]
+    pub tls_frag_length: String,
+    /// Межфрагментная пауза между кусками TLS `ClientHello` в миллисекундах (`"0"` или `"1..5"`).
+    /// При `"0"` клиент всё равно сбрасывает и уступает управление планировщику, чтобы сегменты уходили раздельно.
+    #[serde(
+        default = "default_tls_frag_delay_ms",
+        deserialize_with = "deserialize_range_string"
+    )]
+    pub tls_frag_delay_ms: String,
 
     /// Профиль TLS-отпечатка ClientHello и синхронизированных HTTP-заголовков:
     /// "auto" | "chrome" | "firefox" | "safari" | "randomized"
@@ -54,6 +170,10 @@ impl Default for StealthConfig {
             frag_enabled: false,
             frag_min_chunks: 2,
             frag_max_chunks: 3,
+            frag_chunks: None,
+            tls_frag_enabled: false,
+            tls_frag_length: default_tls_frag_length(),
+            tls_frag_delay_ms: default_tls_frag_delay_ms(),
             tls_fingerprint: TlsFingerprint::Auto,
             tls_verify_peer: true,
             tls_pin_sha256: None,
@@ -63,6 +183,18 @@ impl Default for StealthConfig {
 }
 
 impl StealthConfig {
+    pub fn to_tls_frag_config(&self) -> TlsFragConfig {
+        let (min_len, max_len) = parse_range_pair(&self.tls_frag_length, 10, 20, 1);
+        let (min_delay_ms, max_delay_ms) = parse_range_pair(&self.tls_frag_delay_ms, 0, 0, 0);
+        TlsFragConfig {
+            enabled: self.tls_frag_enabled,
+            min_len: min_len as usize,
+            max_len: max_len as usize,
+            min_delay_ms,
+            max_delay_ms,
+        }
+    }
+
     pub fn to_tls_client_config(&self) -> TlsClientConfig {
         TlsClientConfig {
             fingerprint: self.tls_fingerprint,
@@ -70,6 +202,7 @@ impl StealthConfig {
             verify_peer: self.tls_verify_peer,
             pin_sha256: self.tls_pin_sha256.clone(),
             ca_cert: self.tls_ca_cert.clone(),
+            tls_frag: self.to_tls_frag_config(),
         }
     }
 }
@@ -115,6 +248,9 @@ pub struct WrtcConfig {
     /// При `false` для связи с JVB используются только прямые UDP кандидаты (`host` + STUN `srflx`),
     /// что исключает двойной релей через TURN/TCP-прокси и таймауты `TURN transaction timed out` при работе через WARP.
     pub jvb_use_turn: bool,
+    /// Режим приоритета `TURNS Proxy` (TLS 1.3 поверх TCP:443, RFC 5766) для условий «БС» / жесткого бана UDP.
+    /// При `true` автоматически поднимает локальный прокси TURNS TCP:443 в приоритетном `Tier 2` (вместо заслона `Tier 0: STUN`).
+    pub turns_proxy_priority: bool,
 
     /// Максимальный размер буфера приёма SCTP DataChannel (в байтах).
     pub sctp_max_receive_buffer_size: u32,
@@ -176,6 +312,7 @@ impl Default for WrtcConfig {
             ice_keepalive_interval_ms: 2_000,
             turn_refresh_interval_secs: 90,
             jvb_use_turn: false,
+            turns_proxy_priority: false,
             sctp_max_receive_buffer_size: 8 * 1024 * 1024,
             sctp_mtu: 1200,
             receive_mtu: 1600,
@@ -371,4 +508,41 @@ pub struct BrowserProfileConfig {
     pub h2_initial_connection_window_size: Option<u32>,
     /// Максимальный размер списка заголовков HTTP/2 (`SETTINGS_MAX_HEADER_LIST_SIZE`).
     pub h2_max_header_list_size: Option<u32>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_range_pair_supports_xcore_syntax() {
+        assert_eq!(parse_range_pair("10..20", 8, 16, 1), (10, 20));
+        assert_eq!(parse_range_pair(" 20 .. 10 ", 8, 16, 1), (10, 20));
+        assert_eq!(parse_range_pair("5-15", 8, 16, 1), (5, 15));
+        assert_eq!(parse_range_pair("16", 8, 16, 1), (16, 16));
+        assert_eq!(parse_range_pair("0", 10, 20, 1), (1, 1));
+        assert_eq!(parse_range_pair("", 10, 20, 1), (10, 20));
+        assert_eq!(parse_range_pair("bad", 10, 20, 1), (10, 20));
+    }
+
+    #[test]
+    fn stealth_config_deserializes_tlshello_and_astp_ranges() {
+        let raw = r#"
+            frag_enabled = true
+            frag_chunks = "3..6"
+            tls_frag_enabled = true
+            tls_frag_length = "12..24"
+            tls_frag_delay_ms = "1..3"
+        "#;
+        let cfg: StealthConfig = toml::from_str(raw).unwrap();
+        assert!(cfg.frag_enabled);
+        assert_eq!(cfg.frag_chunks.as_deref(), Some("3..6"));
+        assert!(cfg.tls_frag_enabled);
+        let tls_frag = cfg.to_tls_frag_config();
+        assert!(tls_frag.enabled);
+        assert_eq!(tls_frag.min_len, 12);
+        assert_eq!(tls_frag.max_len, 24);
+        assert_eq!(tls_frag.min_delay_ms, 1);
+        assert_eq!(tls_frag.max_delay_ms, 3);
+    }
 }

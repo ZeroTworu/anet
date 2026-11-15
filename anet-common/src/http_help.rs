@@ -490,7 +490,7 @@ impl BrowserProfile {
                 .pin_sha256
                 .as_ref()
                 .is_none_or(|p| p.trim().is_empty());
-        let builder = reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder()
             .use_preconfigured_tls(ssl_builder)
             .tls_danger_accept_invalid_certs(!self.tls_config.verify_peer)
             .tls_danger_accept_invalid_hostnames(!verify_hostname)
@@ -501,6 +501,14 @@ impl BrowserProfile {
             .http2_max_header_list_size(self.h2_max_header_list_size)
             .connect_timeout(std::time::Duration::from_secs(5))
             .tcp_nodelay(true);
+        if self.tls_config.tls_frag.enabled {
+            builder = builder.tls_hello_fragment(
+                self.tls_config.tls_frag.min_len,
+                self.tls_config.tls_frag.max_len,
+                self.tls_config.tls_frag.min_delay_ms,
+                self.tls_config.tls_frag.max_delay_ms,
+            );
+        }
         Ok(builder)
     }
 
@@ -510,7 +518,7 @@ impl BrowserProfile {
         &self,
         domain: &str,
         stream: S,
-    ) -> anyhow::Result<tokio_boring::SslStream<S>>
+    ) -> anyhow::Result<crate::boring_tls::AnetTlsStream<S>>
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {

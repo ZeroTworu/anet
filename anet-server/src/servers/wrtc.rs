@@ -88,6 +88,7 @@ pub async fn run_wrtc_server(
     );
 
     loop {
+        anet_common::boring_tls::set_default_tls_config(config.stealth.to_tls_client_config());
         let browser_profile = BrowserProfile::with_tls_config(config.stealth.to_tls_client_config());
         let guest_name = generate_random_guest_name();
 
@@ -1069,11 +1070,14 @@ pub async fn run_wrtc_server(
                                                                 .map(|m| matches!(m.as_str(), "media_video" | "auto"))
                                                                 .unwrap_or(true);
                                                             let has_video = client_video_ep_dl.contains(&target_client_id);
+                                                            let has_text_fallback = peer_downlink.has_ws.load(Ordering::Relaxed)
+                                                                || peer_downlink.dc_is_open.load(Ordering::Relaxed);
                                                             let now_ms = peer_downlink.start_instant.elapsed().as_millis() as u64;
-                                                            let dl_stalled = client_dl_stalled_dl
-                                                                .get(&client_tag)
-                                                                .map(|t| now_ms.saturating_sub(*t) <= 15_000)
-                                                                .unwrap_or(false);
+                                                            let dl_stalled = has_text_fallback
+                                                                && client_dl_stalled_dl
+                                                                    .get(&client_tag)
+                                                                    .map(|t| now_ms.saturating_sub(*t) <= 8_000)
+                                                                    .unwrap_or(false);
                                                             let video_warmed_up = !dl_stalled
                                                                 && client_video_warmed_dl.contains(&client_tag)
                                                                 && client_last_video_rx_dl
@@ -1470,7 +1474,7 @@ pub async fn run_wrtc_server(
                                         .unwrap_or(false);
                                     let dl_stalled = client_dl_video_stalled
                                         .get(&c_tag)
-                                        .map(|ts| now_ms.saturating_sub(*ts) <= 15_000)
+                                        .map(|ts| now_ms.saturating_sub(*ts) <= 8_000)
                                         .unwrap_or(false);
                                     if !video_active || dl_stalled {
                                         if !video_active {

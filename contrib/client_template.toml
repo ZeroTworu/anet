@@ -121,9 +121,31 @@ auth_path = "/auth"
 traffic_path = "/traffic"
 
 [stealth]
-frag_enabled = true
+# -------------------------------------------------------------------------
+# L4 TCP-фрагментация TLS ClientHello (`tlshello`)
+# -------------------------------------------------------------------------
+# ЧЕМ ОТЛИЧАЕТСЯ ОТ СТАРОЙ ASTP-ФРАГМЕНТАЦИИ (`frag_enabled`):
+#   - `tls_frag_*` (`tlshello`) работает НА ПРОВОДЕ ДО ШИФРОВАНИЯ (L4 TCP): режет первый TLS ClientHello
+#     (`0x16 0x03`, открытый SNI) на мелкие TCP-чанки длиной `tls_frag_length` (с паузой `tls_frag_delay_ms`)
+#     для обхода DPI по SNI во всех TLS-транспортах (WSS, AHTTP, IMAPS, WRTC, TURNS Proxy).
+#   - Старая ASTP-фрагментация (`frag_enabled`) режет первый фрейм ПОСЛЕ установки транспорта —
+#     подходит только для не-TLS транспортов `quic` и `vnc` (в SSH внутри шифрованного канала отключена).
+# Формат диапазонов (как в Xcore): "X..Y" или одиночное число "N".
+tls_frag_enabled = false
+tls_frag_length = "10..20"
+tls_frag_delay_ms = "0"
+
+# Старая ASTP-фрагментация первого пакета (QUIC / VNC); `frag_chunks` имеет приоритет над min/max
+frag_enabled = false
+frag_chunks = "2..4"
 frag_min_chunks = 2
 frag_max_chunks = 3
+
+# Готовые пресеты маскировки (при необходимости раскомментируйте нужный блок вместо значений выше):
+# Пресет 1 (Жёсткий ТСПУ / режим «БС»): tls_frag_enabled = true, tls_frag_length = "8..16", tls_frag_delay_ms = "1..3", frag_enabled = false (+ [wrtc].turns_proxy_priority = true)
+# Пресет 2 (Мягкий DPI, без задержек):   tls_frag_enabled = true, tls_frag_length = "10..20", tls_frag_delay_ms = "0", frag_enabled = false
+# Пресет 3 (QUIC / VNC ASTP-резка):      tls_frag_enabled = false, frag_enabled = true, frag_chunks = "2..4"
+
 min_jitter_ns = 1000000   # 1 ms
 max_jitter_ns = 5000000   # 5 ms
 padding_step = 64
@@ -271,6 +293,10 @@ turn_refresh_interval_secs = 90
 #     и вызывает обрыв сессии по ошибке "TURN transaction timed out" при ротации аллокации на 90-й секунде.
 jvb_use_turn = false
 # jvb_use_turn = true # включать ТОЛЬКО если провайдер полностью блокирует прямой UDP до JVB (10000-10010/udp)
+
+# Включить для режима «БС» (белые списки / блокировка UDP) — ставит TURNS TCP:443 (`turns_proxy`) в приоритетный Tier 1
+turns_proxy_priority = false
+# turns_proxy_priority = true # для режима «БС»
 
 # --- Параметры MTU, микро-батчинга VP8 (media_video) и коалесценции пакетов ---
 

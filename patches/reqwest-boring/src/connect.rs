@@ -571,7 +571,10 @@ impl ConnectorService {
                     let host = host.trim_start_matches('[').trim_end_matches(']');
                     let port = dst.port_u16().unwrap_or(443);
                     let conn = socks::connect(proxy, dst, dns, &self.resolver, http).await?;
-                    let conn = TokioIo::new(TokioIo::new(conn));
+                    let conn = crate::boring_connector::FragStream::new(
+                        TokioIo::new(TokioIo::new(conn)),
+                        tls.tls_frag,
+                    );
                     let io = tokio_boring::connect(tls.configure(host, port)?, host, conn).await?;
                     let io = TokioIo::new(io);
                     return Ok(Conn {
@@ -670,7 +673,7 @@ impl ConnectorService {
 
                 if let crate::boring_connector::MaybeHttpsStream::Https(stream) = io {
                     if !self.nodelay {
-                        let io = stream.inner().get_ref();
+                        let io = stream.inner().get_ref().inner();
                         io.inner().inner().set_nodelay(false)?;
                     }
                     Ok(Conn {
@@ -864,7 +867,10 @@ impl ConnectorService {
                     let io = tokio_boring::connect(
                         tls.configure(host, dst.port_u16().unwrap_or(443))?,
                         host,
-                        TokioIo::new(tunneled),
+                        crate::boring_connector::FragStream::new(
+                            TokioIo::new(tunneled),
+                            tls.tls_frag,
+                        ),
                     )
                     .await?;
 
@@ -1015,24 +1021,7 @@ impl TlsInfoFactory for hyper_tls::MaybeHttpsStream<TokioIo<tokio::net::TcpStrea
 }
 
 #[cfg(feature = "__rustls")]
-impl TlsInfoFactory for tokio_boring::SslStream<TokioIo<TokioIo<tokio::net::TcpStream>>> {
-    fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
-        let conn = self.ssl();
-        let peer_certificate = conn.peer_certificate().and_then(|cert| cert.to_der().ok());
-        let version = conn.version2().and_then(crate::tls::Version::from_boring);
-        Some(crate::tls::TlsInfo {
-            peer_certificate,
-            version,
-        })
-    }
-}
-
-#[cfg(feature = "__rustls")]
-impl TlsInfoFactory
-    for tokio_boring::SslStream<
-        TokioIo<crate::boring_connector::MaybeHttpsStream<TokioIo<tokio::net::TcpStream>>>,
-    >
-{
+impl<S> TlsInfoFactory for tokio_boring::SslStream<crate::boring_connector::FragStream<S>> {
     fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
         let conn = self.ssl();
         let peer_certificate = conn.peer_certificate().and_then(|cert| cert.to_der().ok());
@@ -1113,37 +1102,6 @@ impl TlsInfoFactory for hyper_tls::MaybeHttpsStream<TokioIo<tokio::net::UnixStre
     }
 }
 
-#[cfg(feature = "__rustls")]
-#[cfg(unix)]
-impl TlsInfoFactory for tokio_boring::SslStream<TokioIo<TokioIo<tokio::net::UnixStream>>> {
-    fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
-        let conn = self.ssl();
-        let peer_certificate = conn.peer_certificate().and_then(|cert| cert.to_der().ok());
-        let version = conn.version2().and_then(crate::tls::Version::from_boring);
-        Some(crate::tls::TlsInfo {
-            peer_certificate,
-            version,
-        })
-    }
-}
-
-#[cfg(feature = "__rustls")]
-#[cfg(unix)]
-impl TlsInfoFactory
-    for tokio_boring::SslStream<
-        TokioIo<crate::boring_connector::MaybeHttpsStream<TokioIo<tokio::net::UnixStream>>>,
-    >
-{
-    fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
-        let conn = self.ssl();
-        let peer_certificate = conn.peer_certificate().and_then(|cert| cert.to_der().ok());
-        let version = conn.version2().and_then(crate::tls::Version::from_boring);
-        Some(crate::tls::TlsInfo {
-            peer_certificate,
-            version,
-        })
-    }
-}
 
 #[cfg(feature = "__rustls")]
 #[cfg(unix)]
@@ -1223,43 +1181,6 @@ impl TlsInfoFactory
     }
 }
 
-#[cfg(feature = "__rustls")]
-#[cfg(target_os = "windows")]
-impl TlsInfoFactory
-    for tokio_boring::SslStream<TokioIo<TokioIo<tokio::net::windows::named_pipe::NamedPipeClient>>>
-{
-    fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
-        let conn = self.ssl();
-        let peer_certificate = conn.peer_certificate().and_then(|cert| cert.to_der().ok());
-        let version = conn.version2().and_then(crate::tls::Version::from_boring);
-        Some(crate::tls::TlsInfo {
-            peer_certificate,
-            version,
-        })
-    }
-}
-
-#[cfg(feature = "__rustls")]
-#[cfg(target_os = "windows")]
-impl TlsInfoFactory
-    for tokio_boring::SslStream<
-        TokioIo<
-            crate::boring_connector::MaybeHttpsStream<
-                TokioIo<tokio::net::windows::named_pipe::NamedPipeClient>,
-            >,
-        >,
-    >
-{
-    fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
-        let conn = self.ssl();
-        let peer_certificate = conn.peer_certificate().and_then(|cert| cert.to_der().ok());
-        let version = conn.version2().and_then(crate::tls::Version::from_boring);
-        Some(crate::tls::TlsInfo {
-            peer_certificate,
-            version,
-        })
-    }
-}
 
 #[cfg(feature = "__rustls")]
 #[cfg(target_os = "windows")]
@@ -1672,70 +1593,8 @@ mod boring_tls_conn {
         }
     }
 
-    impl Connection for BoringTlsConn<TokioIo<TokioIo<TcpStream>>> {
-        fn connected(&self) -> Connected {
-            if self.inner.inner().ssl().selected_alpn_protocol() == Some(b"h2") {
-                self.inner
-                    .inner()
-                    .get_ref()
-                    .inner()
-                    .connected()
-                    .negotiated_h2()
-            } else {
-                self.inner.inner().get_ref().inner().connected()
-            }
-        }
-    }
-    impl Connection for BoringTlsConn<TokioIo<MaybeHttpsStream<TokioIo<TcpStream>>>> {
-        fn connected(&self) -> Connected {
-            if self.inner.inner().ssl().selected_alpn_protocol() == Some(b"h2") {
-                self.inner
-                    .inner()
-                    .get_ref()
-                    .inner()
-                    .connected()
-                    .negotiated_h2()
-            } else {
-                self.inner.inner().get_ref().inner().connected()
-            }
-        }
-    }
-
-    #[cfg(unix)]
-    impl Connection for BoringTlsConn<TokioIo<TokioIo<tokio::net::UnixStream>>> {
-        fn connected(&self) -> Connected {
-            if self.inner.inner().ssl().selected_alpn_protocol() == Some(b"h2") {
-                self.inner
-                    .inner()
-                    .get_ref()
-                    .inner()
-                    .connected()
-                    .negotiated_h2()
-            } else {
-                self.inner.inner().get_ref().inner().connected()
-            }
-        }
-    }
-
-    #[cfg(unix)]
-    impl Connection for BoringTlsConn<TokioIo<MaybeHttpsStream<TokioIo<tokio::net::UnixStream>>>> {
-        fn connected(&self) -> Connected {
-            if self.inner.inner().ssl().selected_alpn_protocol() == Some(b"h2") {
-                self.inner
-                    .inner()
-                    .get_ref()
-                    .inner()
-                    .connected()
-                    .negotiated_h2()
-            } else {
-                self.inner.inner().get_ref().inner().connected()
-            }
-        }
-    }
-
-    #[cfg(target_os = "windows")]
     impl Connection
-        for BoringTlsConn<TokioIo<TokioIo<tokio::net::windows::named_pipe::NamedPipeClient>>>
+        for BoringTlsConn<crate::boring_connector::FragStream<TokioIo<TokioIo<TcpStream>>>>
     {
         fn connected(&self) -> Connected {
             if self.inner.inner().ssl().selected_alpn_protocol() == Some(b"h2") {
@@ -1743,18 +1602,17 @@ mod boring_tls_conn {
                     .inner()
                     .get_ref()
                     .inner()
+                    .inner()
                     .connected()
                     .negotiated_h2()
             } else {
-                self.inner.inner().get_ref().inner().connected()
+                self.inner.inner().get_ref().inner().inner().connected()
             }
         }
     }
-
-    #[cfg(target_os = "windows")]
     impl Connection
         for BoringTlsConn<
-            TokioIo<MaybeHttpsStream<TokioIo<tokio::net::windows::named_pipe::NamedPipeClient>>>,
+            crate::boring_connector::FragStream<TokioIo<MaybeHttpsStream<TokioIo<TcpStream>>>>,
         >
     {
         fn connected(&self) -> Connected {
@@ -1763,10 +1621,101 @@ mod boring_tls_conn {
                     .inner()
                     .get_ref()
                     .inner()
+                    .inner()
                     .connected()
                     .negotiated_h2()
             } else {
-                self.inner.inner().get_ref().inner().connected()
+                self.inner.inner().get_ref().inner().inner().connected()
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Connection
+        for BoringTlsConn<
+            crate::boring_connector::FragStream<TokioIo<TokioIo<tokio::net::UnixStream>>>,
+        >
+    {
+        fn connected(&self) -> Connected {
+            if self.inner.inner().ssl().selected_alpn_protocol() == Some(b"h2") {
+                self.inner
+                    .inner()
+                    .get_ref()
+                    .inner()
+                    .inner()
+                    .connected()
+                    .negotiated_h2()
+            } else {
+                self.inner.inner().get_ref().inner().inner().connected()
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Connection
+        for BoringTlsConn<
+            crate::boring_connector::FragStream<
+                TokioIo<MaybeHttpsStream<TokioIo<tokio::net::UnixStream>>>,
+            >,
+        >
+    {
+        fn connected(&self) -> Connected {
+            if self.inner.inner().ssl().selected_alpn_protocol() == Some(b"h2") {
+                self.inner
+                    .inner()
+                    .get_ref()
+                    .inner()
+                    .inner()
+                    .connected()
+                    .negotiated_h2()
+            } else {
+                self.inner.inner().get_ref().inner().inner().connected()
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    impl Connection
+        for BoringTlsConn<
+            crate::boring_connector::FragStream<
+                TokioIo<TokioIo<tokio::net::windows::named_pipe::NamedPipeClient>>,
+            >,
+        >
+    {
+        fn connected(&self) -> Connected {
+            if self.inner.inner().ssl().selected_alpn_protocol() == Some(b"h2") {
+                self.inner
+                    .inner()
+                    .get_ref()
+                    .inner()
+                    .inner()
+                    .connected()
+                    .negotiated_h2()
+            } else {
+                self.inner.inner().get_ref().inner().inner().connected()
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    impl Connection
+        for BoringTlsConn<
+            crate::boring_connector::FragStream<
+                TokioIo<MaybeHttpsStream<TokioIo<tokio::net::windows::named_pipe::NamedPipeClient>>>,
+            >,
+        >
+    {
+        fn connected(&self) -> Connected {
+            if self.inner.inner().ssl().selected_alpn_protocol() == Some(b"h2") {
+                self.inner
+                    .inner()
+                    .get_ref()
+                    .inner()
+                    .inner()
+                    .connected()
+                    .negotiated_h2()
+            } else {
+                self.inner.inner().get_ref().inner().inner().connected()
             }
         }
     }

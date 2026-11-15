@@ -169,6 +169,8 @@ struct Config {
     tls_sni: bool,
     #[cfg(feature = "__rustls")]
     tls_sslkeylogfile: bool,
+    #[cfg(feature = "__rustls")]
+    tls_hello_frag: Option<crate::boring_tls::TlsHelloFragConfig>,
     connect_timeout: Option<Duration>,
     connection_verbose: bool,
     pool_idle_timeout: Option<Duration>,
@@ -394,6 +396,8 @@ impl ClientBuilder {
                 unix_socket: None,
                 #[cfg(target_os = "windows")]
                 windows_named_pipe: None,
+                #[cfg(feature = "__rustls")]
+                tls_hello_frag: None,
             },
         }
     }
@@ -642,6 +646,7 @@ impl ClientBuilder {
                     let mut conn = crate::boring_tls::Config::preconfigured(conn);
                     conn.verify_hostname = config.hostname_verification && config.certs_verification;
                     conn.enable_sni = config.tls_sni;
+                    conn.tls_frag = config.tls_hello_frag;
                     #[cfg(feature = "http3")]
                     {
                         let mut h3_tls = conn.clone();
@@ -690,6 +695,7 @@ impl ClientBuilder {
                     let mut conn = crate::boring_tls::Config::preconfigured_builder(builder)?;
                     conn.verify_hostname = config.hostname_verification && config.certs_verification;
                     conn.enable_sni = config.tls_sni;
+                    conn.tls_frag = config.tls_hello_frag;
                     #[cfg(feature = "http3")]
                     {
                         let mut h3_tls = conn.clone();
@@ -747,6 +753,7 @@ impl ClientBuilder {
                         max: config.max_tls_version,
                         keylog: config.tls_sslkeylogfile,
                     })?;
+                    tls.tls_frag = config.tls_hello_frag;
 
                     // ALPN protocol
                     match config.http_version_pref {
@@ -2191,6 +2198,29 @@ impl ClientBuilder {
         self
     }
 
+    /// Enable L4 TCP fragmentation of the outbound TLS ClientHello record.
+    #[cfg(feature = "__rustls")]
+    pub fn tls_hello_fragment(
+        mut self,
+        min_len: usize,
+        max_len: usize,
+        min_delay_ms: u64,
+        max_delay_ms: u64,
+    ) -> ClientBuilder {
+        let lo = min_len.max(1);
+        let hi = max_len.max(lo);
+        let d_lo = min_delay_ms;
+        let d_hi = max_delay_ms.max(d_lo);
+        self.config.tls_hello_frag = Some(crate::boring_tls::TlsHelloFragConfig {
+            enabled: true,
+            min_len: lo,
+            max_len: hi,
+            min_delay_ms: d_lo,
+            max_delay_ms: d_hi,
+        });
+        self
+    }
+
     /// Restrict the Client to be used with HTTPS only requests.
     ///
     /// Defaults to false.
@@ -2826,6 +2856,9 @@ impl Config {
         #[cfg(feature = "__rustls")]
         {
             f.field("tls_sslkeylogfile", &self.tls_sslkeylogfile);
+            if let Some(ref frag) = self.tls_hello_frag {
+                f.field("tls_hello_frag", frag);
+            }
         }
 
         #[cfg(all(feature = "default-tls", feature = "__rustls"))]

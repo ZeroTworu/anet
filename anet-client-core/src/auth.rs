@@ -3,7 +3,7 @@ use crate::events::{status, warn};
 use anet_common::consts::{MAX_PACKET_SIZE, NONCE_LEN, PROTO_PAD_FIELD_OVERHEAD};
 use anet_common::crypto_utils::{self, derive_shared_key, generate_key_fingerprint, sign_data};
 use anet_common::encryption::Cipher;
-use anet_common::handshake_fragmentation::{FragmentConfig, send_fragmented_datagrams, write_fragmented};
+use anet_common::handshake_fragmentation::{FragmentConfig, send_fragmented_datagrams};
 use anet_common::padding_utils::{calculate_padding_needed, generate_random_padding};
 use anet_common::protocol::{
     AuthRequest, AuthResponse, DhClientExchange, EncryptedAuthRequest, EncryptedAuthResponse,
@@ -22,7 +22,7 @@ use rand::rngs::OsRng;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 use tokio::time::sleep;
@@ -110,13 +110,13 @@ impl<S> StreamAuthChannel<S> {
 
 #[async_trait]
 impl<S: AsyncRead + AsyncWrite + Unpin + Send> AuthChannel for StreamAuthChannel<S> {
-    async fn send(&self, data: Bytes, frag: &FragmentConfig) -> Result<()> {
+    async fn send(&self, data: Bytes, _frag: &FragmentConfig) -> Result<()> {
         let mut stream = self.stream.lock().await;
         let framed = frame_packet(data);
-        // Получателю не нужны никакие изменения: поток (TCP/SSH/VNC, в
-        // гарантирует доставку байт по порядку независимо от
-        // того, сколькими сегментами это было разбито на передаче.
-        write_fragmented(&mut *stream, &framed, frag).await?;
+        // Поверх уже зашифрованного SSH-канала (russh) L4-фрагментация на проводе не видна;
+        // для реального обхода DPI используются write_fragmented в VncAuthChannel / QUIC и tlshello для TLS.
+        stream.write_all(&framed).await?;
+        stream.flush().await?;
         Ok(())
     }
 

@@ -53,8 +53,19 @@ impl Default for FragmentConfig {
 
 impl FragmentConfig {
     pub fn from_stealth(cfg: &StealthConfig) -> Self {
-        let min_chunks = cfg.frag_min_chunks.max(2);
-        let max_chunks = cfg.frag_max_chunks.max(min_chunks);
+        let (min_chunks, max_chunks) = if let Some(ref raw) = cfg.frag_chunks {
+            let (lo, hi) = crate::config::parse_range_pair(
+                raw,
+                u64::from(cfg.frag_min_chunks.max(2)),
+                u64::from(cfg.frag_max_chunks.max(2)),
+                2,
+            );
+            (lo.min(u8::MAX as u64) as u8, hi.min(u8::MAX as u64) as u8)
+        } else {
+            let lo = cfg.frag_min_chunks.max(2);
+            let hi = cfg.frag_max_chunks.max(lo);
+            (lo, hi)
+        };
         Self {
             enabled: cfg.frag_enabled,
             min_chunks,
@@ -425,5 +436,19 @@ mod tests {
         assert!(reassembler.feed(&[]).is_none());
         assert!(reassembler.feed(&[0]).is_none()); // короче заголовка
         assert!(reassembler.feed(&[5, 2, 1, 2, 3]).is_none()); // index >= total
+    }
+
+    #[test]
+    fn from_stealth_prefers_xcore_frag_chunks_range() {
+        let mut stealth = StealthConfig::default();
+        stealth.frag_enabled = true;
+        stealth.frag_min_chunks = 2;
+        stealth.frag_max_chunks = 2;
+        stealth.frag_chunks = Some("3..5".to_string());
+
+        let fc = FragmentConfig::from_stealth(&stealth);
+        assert!(fc.enabled);
+        assert_eq!(fc.min_chunks, 3);
+        assert_eq!(fc.max_chunks, 5);
     }
 }

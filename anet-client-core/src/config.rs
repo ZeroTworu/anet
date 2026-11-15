@@ -285,6 +285,18 @@ pub struct ServerConfig {
     #[serde(default, deserialize_with = "deserialize_weight")]
     pub weigth: Option<i32>,
 
+    /// Bounds for SSH session rotation (0 disables rotation).
+    #[serde(default = "default_ssh_min_session_secs")]
+    pub ssh_min_session_secs: u64,
+    #[serde(default = "default_ssh_max_session_secs")]
+    pub ssh_max_session_secs: u64,
+
+    /// Bounds for VNC session rotation (0 disables rotation).
+    #[serde(default = "default_vnc_min_session_secs")]
+    pub vnc_min_session_secs: u64,
+    #[serde(default = "default_vnc_max_session_secs")]
+    pub vnc_max_session_secs: u64,
+
     /// Bounds for a browser-like WebSocket session rotation.
     #[serde(default = "default_websocket_min_session_secs")]
     pub websocket_min_session_secs: u64,
@@ -304,10 +316,26 @@ pub struct ServerConfig {
     #[serde(default)]
     pub wrtc_use_turn: Option<bool>,
 
+    /// Принудительный приоритет TURNS Proxy (TCP:443) над UDP STUN/TURN для условий БС
+    #[serde(default)]
+    pub wrtc_turns_priority: Option<bool>,
+
     /// Опциональное переопределение TLS-отпечатка для конкретного сервера:
     /// "auto" | "chrome" | "firefox" | "safari" | "randomized"
     #[serde(default)]
     pub tls_fingerprint: Option<anet_common::boring_tls::TlsFingerprint>,
+
+    /// Опциональное включение L4-фрагментации TLS ClientHello (`tlshello`) для данного сервера
+    #[serde(default)]
+    pub tls_frag_enabled: Option<bool>,
+
+    /// Опциональный размер куска `tlshello` в стиле Xcore (`"10..20"`, `"16"`) для данного сервера
+    #[serde(default)]
+    pub tls_frag_length: Option<String>,
+
+    /// Опциональная пауза между кусками `tlshello` в мс (`"0"`, `"1..5"`) для данного сервера
+    #[serde(default)]
+    pub tls_frag_delay_ms: Option<String>,
 
     /// Опциональное переопределение защиты от активного спуфинга ТСПУ для этого сервера.
     #[serde(default)]
@@ -335,6 +363,10 @@ impl Default for ServerConfig {
             group_id: None,
             weight: None,
             weigth: None,
+            ssh_min_session_secs: default_ssh_min_session_secs(),
+            ssh_max_session_secs: default_ssh_max_session_secs(),
+            vnc_min_session_secs: default_vnc_min_session_secs(),
+            vnc_max_session_secs: default_vnc_max_session_secs(),
             websocket_min_session_secs: default_websocket_min_session_secs(),
             websocket_max_session_secs: default_websocket_max_session_secs(),
             wrtc_media_keepalive_interval_ms: None,
@@ -343,7 +375,11 @@ impl Default for ServerConfig {
             wrtc_fallback_jvb_port: None,
             wrtc_mode: None,
             wrtc_use_turn: None,
+            wrtc_turns_priority: None,
             tls_fingerprint: None,
+            tls_frag_enabled: None,
+            tls_frag_length: None,
+            tls_frag_delay_ms: None,
             tls_verify_peer: None,
             tls_pin_sha256: None,
             tls_ca_cert: None,
@@ -404,6 +440,29 @@ impl ServerConfig {
         if let Some(ref ca) = self.tls_ca_cert {
             cfg.ca_cert = Some(ca.clone());
         }
+        if let Some(enabled) = self.tls_frag_enabled {
+            cfg.tls_frag.enabled = enabled;
+        }
+        if let Some(ref raw_len) = self.tls_frag_length {
+            let (min_len, max_len) = anet_common::config::parse_range_pair(
+                raw_len,
+                cfg.tls_frag.min_len as u64,
+                cfg.tls_frag.max_len as u64,
+                1,
+            );
+            cfg.tls_frag.min_len = min_len as usize;
+            cfg.tls_frag.max_len = max_len as usize;
+        }
+        if let Some(ref raw_delay) = self.tls_frag_delay_ms {
+            let (min_d, max_d) = anet_common::config::parse_range_pair(
+                raw_delay,
+                cfg.tls_frag.min_delay_ms,
+                cfg.tls_frag.max_delay_ms,
+                0,
+            );
+            cfg.tls_frag.min_delay_ms = min_d;
+            cfg.tls_frag.max_delay_ms = max_d;
+        }
 
         if let Ok(parsed_url) = reqwest::Url::parse(&self.dsn) {
             for (k, v) in parsed_url.query_pairs() {
@@ -423,6 +482,32 @@ impl ServerConfig {
                         if !v.trim().is_empty() {
                             cfg.pin_sha256 = Some(v.into_owned());
                         }
+                    }
+                    "tls_frag" | "tls_frag_enabled" => {
+                        cfg.tls_frag.enabled = !matches!(
+                            v.trim().to_ascii_lowercase().as_str(),
+                            "0" | "false" | "no" | "off"
+                        );
+                    }
+                    "tfrag" | "tls_frag_length" => {
+                        let (min_len, max_len) = anet_common::config::parse_range_pair(
+                            &v,
+                            cfg.tls_frag.min_len as u64,
+                            cfg.tls_frag.max_len as u64,
+                            1,
+                        );
+                        cfg.tls_frag.min_len = min_len as usize;
+                        cfg.tls_frag.max_len = max_len as usize;
+                    }
+                    "tdelay" | "tls_frag_delay_ms" => {
+                        let (min_d, max_d) = anet_common::config::parse_range_pair(
+                            &v,
+                            cfg.tls_frag.min_delay_ms,
+                            cfg.tls_frag.max_delay_ms,
+                            0,
+                        );
+                        cfg.tls_frag.min_delay_ms = min_d;
+                        cfg.tls_frag.max_delay_ms = max_d;
                     }
                     _ => {}
                 }
@@ -448,7 +533,17 @@ impl ServerConfig {
                     .filter(|(k, _)| {
                         !matches!(
                             k.as_ref(),
-                            "fp" | "tls_fingerprint" | "verify" | "tls_verify_peer" | "pin" | "tls_pin_sha256"
+                            "fp" | "tls_fingerprint"
+                                | "verify"
+                                | "tls_verify_peer"
+                                | "pin"
+                                | "tls_pin_sha256"
+                                | "tls_frag"
+                                | "tls_frag_enabled"
+                                | "tfrag"
+                                | "tls_frag_length"
+                                | "tdelay"
+                                | "tls_frag_delay_ms"
                         )
                     })
                     .map(|(k, v)| (k.into_owned(), v.into_owned()))
@@ -510,6 +605,10 @@ fn default_timeout_secs() -> u64 {
     10
 }
 
+fn default_ssh_min_session_secs() -> u64 { 8 * 60 }
+fn default_ssh_max_session_secs() -> u64 { 25 * 60 }
+fn default_vnc_min_session_secs() -> u64 { 8 * 60 }
+fn default_vnc_max_session_secs() -> u64 { 25 * 60 }
 fn default_websocket_min_session_secs() -> u64 { 8 * 60 }
 fn default_websocket_max_session_secs() -> u64 { 25 * 60 }
 
@@ -862,13 +961,19 @@ mod tests {
         assert!(!eff2.verify_peer);
 
         let ws_with_query = ServerConfig {
-            dsn: "wss://node2.example.com/socket?fp=firefox&verify=1".to_string(),
+            dsn: "wss://node2.example.com/socket?fp=firefox&verify=1&tls_frag=1&tfrag=12..24&tdelay=1..3".to_string(),
             ..Default::default()
         };
         assert_eq!(
             ws_with_query.websocket_url().unwrap(),
             "wss://node2.example.com/socket"
         );
+        let eff_ws = ws_with_query.effective_tls_config(&cfg.stealth);
+        assert!(eff_ws.tls_frag.enabled);
+        assert_eq!(eff_ws.tls_frag.min_len, 12);
+        assert_eq!(eff_ws.tls_frag.max_len, 24);
+        assert_eq!(eff_ws.tls_frag.min_delay_ms, 1);
+        assert_eq!(eff_ws.tls_frag.max_delay_ms, 3);
     }
 
     #[test]

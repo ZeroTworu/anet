@@ -132,6 +132,15 @@ impl Settings {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TlsHelloFragConfig {
+    pub enabled: bool,
+    pub min_len: usize,
+    pub max_len: usize,
+    pub min_delay_ms: u64,
+    pub max_delay_ms: u64,
+}
+
 #[derive(Clone)]
 pub(crate) struct Config {
     pub connector: SslConnector,
@@ -139,6 +148,7 @@ pub(crate) struct Config {
     pub alpn_protocols: Vec<Vec<u8>>,
     pub enable_sni: bool,
     pub verify_hostname: bool,
+    pub tls_frag: Option<TlsHelloFragConfig>,
     #[cfg(feature = "http3")]
     pub enable_early_data: bool,
     #[cfg(feature = "http3")]
@@ -170,6 +180,7 @@ impl Config {
             alpn_protocols: Vec::new(),
             enable_sni: settings.sni,
             verify_hostname: settings.verify_hostname && settings.verify_certs,
+            tls_frag: None,
             #[cfg(feature = "http3")]
             enable_early_data: false,
             #[cfg(feature = "http3")]
@@ -185,6 +196,7 @@ impl Config {
             alpn_protocols: Vec::new(),
             enable_sni: true,
             verify_hostname: true,
+            tls_frag: None,
             #[cfg(feature = "http3")]
             enable_early_data: false,
             #[cfg(feature = "http3")]
@@ -214,6 +226,7 @@ impl Config {
             alpn_protocols: Vec::new(),
             enable_sni: true,
             verify_hostname: true,
+            tls_frag: None,
             #[cfg(feature = "http3")]
             enable_early_data: false,
             #[cfg(feature = "http3")]

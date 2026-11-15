@@ -203,7 +203,7 @@ pub fn parse_capability_flags(line: &str) -> (bool, bool) {
 }
 
 /// Асинхронное IMAP-соединение напрямую поверх `tokio::io::BufReader<S>` (раздел 3.1 / 7.1 спецификации).
-pub struct ImapConn<S = tokio_boring::SslStream<TcpStream>> {
+pub struct ImapConn<S = crate::boring_tls::AnetTlsStream<TcpStream>> {
     stream: BufReader<S>,
     tag_counter: u64,
     /// Флаг «Слепого окна»: взводится при получении `* <N> EXISTS` вне или внутри IDLE.
@@ -1039,10 +1039,11 @@ where
     }
 }
 
-impl ImapConn<tokio_boring::SslStream<TcpStream>> {
+impl ImapConn<crate::boring_tls::AnetTlsStream<TcpStream>> {
     /// Возвращает фактический удаленный IP-адрес открытого TCP-соединения.
     pub fn peer_ip(&self) -> Option<std::net::IpAddr> {
         self.stream
+            .get_ref()
             .get_ref()
             .get_ref()
             .peer_addr()

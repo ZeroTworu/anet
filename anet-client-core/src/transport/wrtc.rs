@@ -119,6 +119,9 @@ impl ClientTransport for WrtcTransport {
         if let Some(use_turn) = self.server.wrtc_use_turn {
             wrtc_cfg.jvb_use_turn = use_turn;
         }
+        if let Some(turns_prio) = self.server.wrtc_turns_priority {
+            wrtc_cfg.turns_proxy_priority = turns_prio;
+        }
 
         let provider_kind = WrtcProviderRegistry::detect(&domain);
         info!(
@@ -1000,7 +1003,12 @@ impl ClientTransport for WrtcTransport {
                             let rx_age_ms = peer_tx.video_rx_age_ms();
                             let warmed_ever = !first_client_rx_tx.load(Ordering::Relaxed);
                             let next_stalled = if warmed_ever || uplink_started_at.elapsed() >= Duration::from_secs(4) {
-                                rx_age_ms.unwrap_or(u64::MAX) >= 3_000
+                                let age = rx_age_ms.unwrap_or(u64::MAX);
+                                if dl_video_stalled {
+                                    age >= 2_000
+                                } else {
+                                    age >= 4_000
+                                }
                             } else {
                                 false
                             };
@@ -1011,6 +1019,7 @@ impl ClientTransport for WrtcTransport {
                                     warn!("[WRTC Client] Downlink VP8 video stalled (age={rx_age_ms:?} ms); reporting stall & switching uplink to Colibri-WS/DC");
                                 } else {
                                     info!("[WRTC Client] Downlink VP8 video recovered; clearing stall state");
+                                    peer_tx.force_next_keyframe();
                                 }
                                 let _ = peer_tx
                                     .send(ColibriMessage::video_rx_stall(
@@ -1262,7 +1271,12 @@ impl ClientTransport for WrtcTransport {
                             if has_text_fallback {
                                 let warmed_ever = !first_client_rx_tx.load(Ordering::Relaxed);
                                 let next_stalled = if warmed_ever || uplink_started_at.elapsed() >= Duration::from_secs(4) {
-                                    rx_age_ms.unwrap_or(u64::MAX) >= 3_000
+                                    let age = rx_age_ms.unwrap_or(u64::MAX);
+                                    if dl_video_stalled {
+                                        age >= 2_000
+                                    } else {
+                                        age >= 4_000
+                                    }
                                 } else {
                                     false
                                 };
@@ -1273,6 +1287,7 @@ impl ClientTransport for WrtcTransport {
                                         warn!("[WRTC Client] Downlink VP8 video stalled (age={rx_age_ms:?} ms); reporting stall & switching uplink to Colibri-WS/DC");
                                     } else {
                                         info!("[WRTC Client] Downlink VP8 video recovered; clearing stall state");
+                                        peer_tx.force_next_keyframe();
                                     }
                                     let _ = peer_tx
                                         .send(ColibriMessage::video_rx_stall(

@@ -2,11 +2,17 @@ use base64::prelude::*;
 use boring::ssl::{SslConnector, SslConnectorBuilder, SslMethod, SslVerifyMode, SslVersion};
 use boring::x509::store::X509StoreBuilder;
 use boring::x509::X509;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::{LazyLock, RwLock};
+use std::task::{Context, Poll};
+use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 /// Режим маскировки TLS-отпечатка (ClientHello JA3 / JA4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -113,6 +119,186 @@ impl<'de> Deserialize<'de> for TlsFingerprint {
     }
 }
 
+/// Настройки L4 TCP-фрагментации исходящего TLS `ClientHello` (`tlshello`).
+/// Режет только первую TLS Handshake-запись (`0x16 0x03 ...`) на мелкие TCP-сегменты
+/// (например `10..20` байт), после чего отключает перехват и работает с нулевым оверхедом.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TlsFragConfig {
+    pub enabled: bool,
+    pub min_len: usize,
+    pub max_len: usize,
+    pub min_delay_ms: u64,
+    pub max_delay_ms: u64,
+}
+
+impl Default for TlsFragConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            min_len: 10,
+            max_len: 20,
+            min_delay_ms: 0,
+            max_delay_ms: 0,
+        }
+    }
+}
+
+enum FragPhase {
+    Armed {
+        cfg: TlsFragConfig,
+    },
+    Fragmenting {
+        cfg: TlsFragConfig,
+        remaining: usize,
+        chunk_rem: usize,
+        sleep: Option<Pin<Box<tokio::time::Sleep>>>,
+        yield_next: bool,
+    },
+    Done,
+}
+
+/// Прозрачная L4-обёртка над потоком перед `tokio_boring::connect` для фрагментации `TLS ClientHello`.
+pub struct TlsHelloFragStream<S> {
+    inner: S,
+    phase: FragPhase,
+}
+
+impl<S> TlsHelloFragStream<S> {
+    pub fn new(inner: S, cfg: TlsFragConfig) -> Self {
+        let phase = if cfg.enabled {
+            FragPhase::Armed { cfg }
+        } else {
+            FragPhase::Done
+        };
+        Self { inner, phase }
+    }
+
+    pub fn get_ref(&self) -> &S {
+        &self.inner
+    }
+
+    pub fn get_mut(&mut self) -> &mut S {
+        &mut self.inner
+    }
+
+    pub fn into_inner(self) -> S {
+        self.inner
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for TlsHelloFragStream<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for TlsHelloFragStream<S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        if buf.is_empty() {
+            return Pin::new(&mut self.inner).poll_write(cx, buf);
+        }
+
+        if let FragPhase::Armed { cfg } = self.phase {
+            if cfg.enabled && buf.len() >= 5 && buf[0] == 0x16 && buf[1] == 0x03 {
+                let record_len = u16::from_be_bytes([buf[3], buf[4]]) as usize;
+                self.phase = FragPhase::Fragmenting {
+                    cfg,
+                    remaining: 5 + record_len,
+                    chunk_rem: 0,
+                    sleep: None,
+                    yield_next: false,
+                };
+            } else {
+                self.phase = FragPhase::Done;
+            }
+        }
+
+        match &mut self.phase {
+            FragPhase::Done | FragPhase::Armed { .. } => {
+                Pin::new(&mut self.inner).poll_write(cx, buf)
+            }
+            FragPhase::Fragmenting {
+                cfg,
+                remaining,
+                chunk_rem,
+                sleep,
+                yield_next,
+            } => {
+                if let Some(s) = sleep.as_mut() {
+                    match s.as_mut().poll(cx) {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(()) => *sleep = None,
+                    }
+                }
+
+                if *yield_next {
+                    *yield_next = false;
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
+
+                if *chunk_rem == 0 {
+                    let lo = cfg.min_len.max(1);
+                    let hi = cfg.max_len.max(lo);
+                    *chunk_rem = if hi > lo {
+                        rand::thread_rng().gen_range(lo..=hi)
+                    } else {
+                        lo
+                    };
+                }
+
+                let to_write = buf.len().min(*remaining).min(*chunk_rem).max(1);
+                match Pin::new(&mut self.inner).poll_write(cx, &buf[..to_write]) {
+                    Poll::Pending => Poll::Pending,
+                    Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+                    Poll::Ready(Ok(0)) => Poll::Ready(Ok(0)),
+                    Poll::Ready(Ok(n)) => {
+                        *remaining = remaining.saturating_sub(n);
+                        *chunk_rem = chunk_rem.saturating_sub(n);
+                        if *remaining == 0 {
+                            self.phase = FragPhase::Done;
+                        } else if *chunk_rem == 0 {
+                            let d_lo = cfg.min_delay_ms;
+                            let d_hi = cfg.max_delay_ms.max(d_lo);
+                            let delay = if d_hi > d_lo {
+                                rand::thread_rng().gen_range(d_lo..=d_hi)
+                            } else {
+                                d_lo
+                            };
+                            if delay > 0 {
+                                *sleep =
+                                    Some(Box::pin(tokio::time::sleep(Duration::from_millis(delay))));
+                            } else {
+                                *yield_next = true;
+                            }
+                        }
+                        Poll::Ready(Ok(n))
+                    }
+                }
+            }
+        }
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// Псевдоним TLS-потока BoringSSL поверх адаптера `TlsHelloFragStream`.
+pub type AnetTlsStream<S> = tokio_boring::SslStream<TlsHelloFragStream<S>>;
+
 /// Конфигурация клиентского TLS-движка и защиты от активного спуфинга ТСПУ.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TlsClientConfig {
@@ -128,6 +314,8 @@ pub struct TlsClientConfig {
     pub pin_sha256: Option<String>,
     /// Опциональный пользовательский корневой/серверный сертификат (путь к PEM-файлу или inline PEM).
     pub ca_cert: Option<String>,
+    /// Настройки L4-фрагментации TLS `ClientHello` (`tlshello`).
+    pub tls_frag: TlsFragConfig,
 }
 
 impl Default for TlsClientConfig {
@@ -138,6 +326,7 @@ impl Default for TlsClientConfig {
             verify_peer: true,
             pin_sha256: None,
             ca_cert: None,
+            tls_frag: TlsFragConfig::default(),
         }
     }
 }
@@ -762,7 +951,7 @@ pub async fn connect_ws_tls_with_config<S>(
     domain: &str,
     stream: S,
     cfg: &TlsClientConfig,
-) -> anyhow::Result<tokio_boring::SslStream<S>>
+) -> anyhow::Result<AnetTlsStream<S>>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -776,7 +965,8 @@ where
         && cfg.verify_peer
         && cfg.pin_sha256.as_ref().is_none_or(|p| p.trim().is_empty());
     ssl_config.set_verify_hostname(verify_hostname);
-    tokio_boring::connect(ssl_config, domain, stream)
+    let wrapped = TlsHelloFragStream::new(stream, cfg.tls_frag);
+    tokio_boring::connect(ssl_config, domain, wrapped)
         .await
         .map_err(|e| anyhow::anyhow!("BoringSSL TLS handshake failed: {e}"))
 }
@@ -786,7 +976,7 @@ where
 pub async fn connect_chrome_ws_tls<S>(
     domain: &str,
     stream: S,
-) -> anyhow::Result<tokio_boring::SslStream<S>>
+) -> anyhow::Result<AnetTlsStream<S>>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -808,7 +998,7 @@ pub async fn connect_raw_tls_with_config<S>(
     domain: &str,
     stream: S,
     cfg: &TlsClientConfig,
-) -> anyhow::Result<tokio_boring::SslStream<S>>
+) -> anyhow::Result<AnetTlsStream<S>>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -822,7 +1012,8 @@ where
         && cfg.verify_peer
         && cfg.pin_sha256.as_ref().is_none_or(|p| p.trim().is_empty());
     ssl_config.set_verify_hostname(verify_hostname);
-    tokio_boring::connect(ssl_config, domain, stream)
+    let wrapped = TlsHelloFragStream::new(stream, cfg.tls_frag);
+    tokio_boring::connect(ssl_config, domain, wrapped)
         .await
         .map_err(|e| anyhow::anyhow!("BoringSSL raw TLS handshake failed: {e}"))
 }
@@ -832,7 +1023,7 @@ where
 pub async fn connect_raw_tls<S>(
     domain: &str,
     stream: S,
-) -> anyhow::Result<tokio_boring::SslStream<S>>
+) -> anyhow::Result<AnetTlsStream<S>>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -894,7 +1085,7 @@ pub async fn connect_email_tls_with_config<S>(
     domain: &str,
     stream: S,
     cfg: &TlsClientConfig,
-) -> anyhow::Result<tokio_boring::SslStream<S>>
+) -> anyhow::Result<AnetTlsStream<S>>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -911,7 +1102,8 @@ where
         && cfg.pin_sha256.as_ref().is_none_or(|p| p.trim().is_empty());
     ssl_config.set_verify_hostname(verify_hostname);
 
-    tokio_boring::connect(ssl_config, domain, stream)
+    let wrapped = TlsHelloFragStream::new(stream, cfg.tls_frag);
+    tokio_boring::connect(ssl_config, domain, wrapped)
         .await
         .map_err(|e| anyhow::anyhow!("BoringSSL Email IMAPS TLS handshake failed for {domain}: {e}"))
 }
@@ -1136,6 +1328,7 @@ mod tests {
             verify_peer: false,
             pin_sha256: None,
             ca_cert: None,
+            tls_frag: TlsFragConfig::default(),
         };
         let ch_chrome = capture_client_hello(
             build_ssl_connector_with_config(&chrome_cfg).unwrap(),
@@ -1183,6 +1376,7 @@ mod tests {
             verify_peer: false,
             pin_sha256: None,
             ca_cert: None,
+            tls_frag: TlsFragConfig::default(),
         };
         let ch_ff = capture_client_hello(
             build_ws_ssl_connector_with_config(&ff_cfg).unwrap(),
@@ -1222,6 +1416,7 @@ mod tests {
             verify_peer: false,
             pin_sha256: None,
             ca_cert: None,
+            tls_frag: TlsFragConfig::default(),
         };
         let ch_safari = capture_client_hello(
             build_ssl_connector_with_config(&safari_cfg).unwrap(),
@@ -1261,6 +1456,7 @@ mod tests {
                 verify_peer: false,
                 pin_sha256: None,
                 ca_cert: None,
+                tls_frag: TlsFragConfig::default(),
             };
             let ch = capture_client_hello(
                 build_ssl_connector_with_config(&rand_cfg).unwrap(),
@@ -1328,6 +1524,7 @@ mod tests {
             verify_peer: true,
             pin_sha256: None,
             ca_cert: None,
+            tls_frag: TlsFragConfig::default(),
         };
         let tcp = TcpStream::connect(spoof_addr).await.unwrap();
         let res = connect_ws_tls_with_config("secure.example.com", tcp, &default_cfg).await;
@@ -1348,6 +1545,7 @@ mod tests {
             verify_peer: true,
             pin_sha256: Some(real_spki_hex.clone()),
             ca_cert: None,
+            tls_frag: TlsFragConfig::default(),
         };
         let tcp = TcpStream::connect(spoof_addr).await.unwrap();
         let res = connect_ws_tls_with_config("secure.example.com", tcp, &pinned_cfg).await;
@@ -1411,6 +1609,7 @@ mod tests {
             verify_peer: true,
             pin_sha256: None,
             ca_cert: Some(real_pem),
+            tls_frag: TlsFragConfig::default(),
         };
         let tcp = TcpStream::connect(real_addr).await.unwrap();
         let _ = connect_ws_tls_with_config("secure.example.com", tcp, &ca_cfg)
@@ -1459,6 +1658,7 @@ mod tests {
                 verify_peer: false,
                 pin_sha256: None,
                 ca_cert: None,
+                tls_frag: TlsFragConfig::default(),
             };
             let ch = capture_client_hello(
                 build_email_ssl_connector_with_config(&cfg).unwrap(),
@@ -1525,5 +1725,59 @@ mod tests {
                 baseline_groups = Some(ch.supported_groups);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_tls_hello_frag_stream_splits_client_hello_cleanly() {
+        let (_cert, key, pem) = generate_test_cert("frag.example.com");
+        let cert_obj = X509::from_pem(pem.as_bytes()).unwrap();
+
+        let mut acc_builder = SslAcceptor::mozilla_intermediate(SslMethod::tls()).unwrap();
+        acc_builder.set_private_key(&key).unwrap();
+        acc_builder.set_certificate(&cert_obj).unwrap();
+        acc_builder.set_alpn_select_callback(|_ssl, client_protos| {
+            boring::ssl::select_next_proto(b"\x08http/1.1", client_protos)
+                .ok_or(boring::ssl::AlpnError::NOACK)
+        });
+        let acceptor = Arc::new(acc_builder.build());
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            if let Ok((tcp, _)) = listener.accept().await {
+                if let Ok(mut tls) = tokio_boring::accept(&acceptor, tcp).await {
+                    let mut buf = [0u8; 4];
+                    if tls.read_exact(&mut buf).await.is_ok() {
+                        let _ = tls.write_all(&buf).await;
+                    }
+                }
+            }
+        });
+
+        let cfg = TlsClientConfig {
+            fingerprint: TlsFingerprint::Chrome,
+            random_seed: 777,
+            verify_peer: true,
+            pin_sha256: None,
+            ca_cert: Some(pem),
+            tls_frag: TlsFragConfig {
+                enabled: true,
+                min_len: 10,
+                max_len: 20,
+                min_delay_ms: 0,
+                max_delay_ms: 0,
+            },
+        };
+
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let _ = tcp.set_nodelay(true);
+        let mut tls = connect_ws_tls_with_config("frag.example.com", tcp, &cfg)
+            .await
+            .expect("TLS handshake with tlshello fragmentation must succeed");
+        tls.write_all(b"ECHO").await.unwrap();
+        let mut out = [0u8; 4];
+        tls.read_exact(&mut out).await.unwrap();
+        assert_eq!(&out, b"ECHO");
     }
 }

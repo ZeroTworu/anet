@@ -757,6 +757,7 @@ fn build_ice_server_tiers(
     discovered: &[XmppIceServer],
     wrtc_cfg: &WrtcConfig,
     allow_turn: bool,
+    prioritize_turns_proxy: bool,
 ) -> (Vec<IceTierEntry>, Vec<TurnsProxyHandle>) {
     let mut proxies: Vec<TurnsProxyHandle> = Vec::new();
     let connect_timeout = Duration::from_secs(wrtc_cfg.http_connect_timeout_secs.max(5));
@@ -846,12 +847,22 @@ fn build_ice_server_tiers(
         (list, display_urls, has_turn)
     };
 
+    let tier_order: [(&'static str, bool, bool); 3] = if prioritize_turns_proxy {
+        [
+            ("Tier 2: STUN + TURN + TURNS (priority)", true, true),
+            ("Tier 1: UDP STUN + UDP TURN", true, false),
+            ("Tier 0: STUN", false, false),
+        ]
+    } else {
+        [
+            ("Tier 0: STUN", false, false),
+            ("Tier 1: UDP STUN + UDP TURN", true, false),
+            ("Tier 2: STUN + TURN + TURNS", true, true),
+        ]
+    };
+
     let mut tiers: Vec<IceTierEntry> = Vec::with_capacity(4);
-    for (tier_label, inc_turn, inc_tcp) in [
-        ("Tier 0: STUN", false, false),
-        ("Tier 1: UDP STUN + UDP TURN", true, false),
-        ("Tier 2: STUN + TURN + TURNS", true, true),
-    ] {
+    for (tier_label, inc_turn, inc_tcp) in tier_order {
         if inc_turn && !allow_turn {
             continue;
         }
@@ -909,7 +920,7 @@ pub async fn create_p2p_channel(
         "[P2P Direct] Pinned P2P UDP socket to physical interface: {effective_bind_addr}"
     );
 
-    let (tiers, turns_proxies) = build_ice_server_tiers(ice_servers_info, wrtc_cfg, true);
+    let (tiers, turns_proxies) = build_ice_server_tiers(ice_servers_info, wrtc_cfg, true, true);
     let mut last_err = None;
     let mut built_pc = None;
     let mut active_ice_servers: Vec<RTCIceServer> = Vec::new();
@@ -1527,8 +1538,13 @@ impl WrtcPeer {
             let dc_open_notify = Arc::new(Notify::new());
 
             let discovered_ice = xmpp.get_ice_servers();
-            let (tiers, built_proxies) =
-                build_ice_server_tiers(&discovered_ice, wrtc_cfg, wrtc_cfg.jvb_use_turn);
+            let allow_turn = wrtc_cfg.jvb_use_turn || wrtc_cfg.turns_proxy_priority;
+            let (tiers, built_proxies) = build_ice_server_tiers(
+                &discovered_ice,
+                wrtc_cfg,
+                allow_turn,
+                wrtc_cfg.turns_proxy_priority,
+            );
             turns_proxies = built_proxies;
             let mut built_pc = None;
             let mut has_turn_configured = false;

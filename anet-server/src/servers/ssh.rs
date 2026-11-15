@@ -86,10 +86,11 @@ impl Handler for AnetSshHandler {
         session: &mut Session,
     ) -> Result<(), Self::Error> {
         if command != b"anet-vpn" {
-            // Защита от активного сканирования/зондирования ТСПУ:
-            // При попытке выполнения сторонней команды выдаем стандартный баннер и закрываем канал
+            // Защита от активного зондирования ТСПУ: закрываем канал со стандартным кодом 127 (command not found)
+            // без демаскирующих строк вроде "Simple SSH Server".
             self.pending_channels.remove(&channel_id);
-            let _ = session.data(channel_id, &b"Welcome to Simple SSH Server.\r\n"[..]);
+            let _ = session.exit_status_request(channel_id, 127);
+            let _ = session.eof(channel_id);
             let _ = session.close(channel_id);
             return Ok(());
         }
@@ -143,14 +144,15 @@ impl Handler for AnetSshHandler {
         Ok(())
     }
 
-    /// Обработка интерактивного входа по SSH (зондирование сканерами ТСПУ / nmap).
-    /// Выдает приветственный баннер и штатно закрывает канал, маскируя сервер под легитимный OpenSSH / Dropbear.
+    /// Обработка интерактивного shell (зондирование сканерами ТСПУ / nmap).
+    /// Штатно отклоняет PTY/shell-запрос и закрывает канал без демаскирующих баннеров.
     async fn shell_request(
         &mut self,
         channel: ChannelId,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        let _ = session.data(channel, &b"Welcome to Simple SSH Server.\r\n"[..]);
+        self.pending_channels.remove(&channel);
+        let _ = session.channel_failure(channel);
         let _ = session.close(channel);
         Ok(())
     }
