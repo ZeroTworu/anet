@@ -1,6 +1,7 @@
 use crate::wrtc::colibri::ColibriMessage;
 use crate::wrtc::jingle::{
-    JingleAction, JingleCandidate, JingleSession, JingleTransportInfo, is_valid_jvb_candidate_ip,
+    JingleAction, JingleCandidate, JinglePayloadType, JingleSession, JingleTransportInfo,
+    is_valid_jvb_candidate_ip,
 };
 use crate::wrtc::stealth::generate_random_uuid_v4;
 use roxmltree::{Document, Node};
@@ -464,8 +465,13 @@ pub fn parse_jingle_node(
     let mut video_sources = Vec::new();
     let mut video_source_owners = Vec::new();
     let mut video_payload_type: u8 = 100;
+    let mut audio_payload_types: Vec<JinglePayloadType> = Vec::new();
+    let mut video_payload_types: Vec<JinglePayloadType> = Vec::new();
+    let mut rtx_pairs: Vec<(u32, u32)> = Vec::new();
+    let mut secondary_repair_ssrcs: Vec<u32> = Vec::new();
     let mut has_data_channel = false;
     let mut has_video = false;
+    let mut vp8_pt_found = false;
 
     for content in jingle_node.children().filter(|n| n.has_tag_name("content")) {
         let content_name = content.attribute("name").unwrap_or_default();
@@ -482,22 +488,96 @@ pub fn parse_jingle_node(
             if desc.tag_name().namespace() == Some("urn:xmpp:jingle:apps:sctp:1") {
                 has_data_channel = true;
             }
-            if is_video || desc.attribute("media") == Some("video") {
+            let desc_media = desc.attribute("media").unwrap_or_default();
+            let content_is_video = is_video || desc_media == "video";
+            let content_is_audio = content_name == "audio" || desc_media == "audio";
+            if content_is_video {
                 has_video = true;
-                let mut vp8_pt_found = false;
+            }
+
+            if content_is_video || content_is_audio {
                 for pt in desc.children().filter(|n| n.has_tag_name("payload-type")) {
-                    if pt
-                        .attribute("name")
-                        .map(|s| s.eq_ignore_ascii_case("vp8"))
-                        .unwrap_or(false)
-                    {
-                        if let Some(id_str) = pt.attribute("id") {
-                            if let Ok(id) = id_str.parse::<u8>() {
-                                if !vp8_pt_found {
-                                    video_payload_type = id;
-                                    vp8_pt_found = true;
-                                }
-                            }
+                    let Some(id) = pt.attribute("id").and_then(|s| s.trim().parse::<u8>().ok())
+                    else {
+                        continue;
+                    };
+                    if id == 0 {
+                        continue;
+                    }
+                    let Some(name_raw) = pt.attribute("name") else {
+                        continue;
+                    };
+                    let name = name_raw.trim().to_string();
+                    if name.is_empty() {
+                        continue;
+                    }
+                    let clock_rate = pt
+                        .attribute("clockrate")
+                        .and_then(|s| s.trim().parse::<u32>().ok())
+                        .unwrap_or(if content_is_video { 90000 } else { 48000 });
+                    let channels = pt
+                        .attribute("channels")
+                        .and_then(|s| s.trim().parse::<u16>().ok())
+                        .unwrap_or(if content_is_audio && name.eq_ignore_ascii_case("opus") {
+                            2
+                        } else {
+                            0
+                        });
+                    let apt = pt
+                        .children()
+                        .filter(|c| c.has_tag_name("parameter"))
+                        .find(|c| {
+                            c.attribute("name")
+                                .map(|n| n.eq_ignore_ascii_case("apt"))
+                                .unwrap_or(false)
+                        })
+                        .and_then(|c| c.attribute("value"))
+                        .and_then(|v| v.trim().parse::<u8>().ok());
+                    let parsed_pt = JinglePayloadType {
+                        id,
+                        name: name.clone(),
+                        clock_rate,
+                        channels,
+                        apt,
+                    };
+                    if content_is_video {
+                        if name.eq_ignore_ascii_case("vp8") && !vp8_pt_found {
+                            video_payload_type = id;
+                            vp8_pt_found = true;
+                        }
+                        if !video_payload_types.iter().any(|p| p.id == id) {
+                            video_payload_types.push(parsed_pt);
+                        }
+                    } else if content_is_audio && !audio_payload_types.iter().any(|p| p.id == id) {
+                        audio_payload_types.push(parsed_pt);
+                    }
+                }
+            }
+
+            for grp in desc.children().filter(|n| n.has_tag_name("ssrc-group")) {
+                let semantics = grp.attribute("semantics").unwrap_or_default().trim();
+                let is_repair_group = semantics.eq_ignore_ascii_case("FID")
+                    || semantics.eq_ignore_ascii_case("FEC")
+                    || semantics.eq_ignore_ascii_case("FEC-FR");
+                if !is_repair_group {
+                    continue;
+                }
+                let grp_ssrcs: Vec<u32> = grp
+                    .children()
+                    .filter(|c| c.has_tag_name("source"))
+                    .filter_map(|c| c.attribute("ssrc")?.trim().parse::<u32>().ok())
+                    .filter(|&s| s != 0)
+                    .collect();
+                if grp_ssrcs.len() >= 2 {
+                    let primary = grp_ssrcs[0];
+                    for &repair in &grp_ssrcs[1..] {
+                        if !secondary_repair_ssrcs.contains(&repair) {
+                            secondary_repair_ssrcs.push(repair);
+                        }
+                        if semantics.eq_ignore_ascii_case("FID")
+                            && !rtx_pairs.iter().any(|&(p, r)| p == primary && r == repair)
+                        {
+                            rtx_pairs.push((primary, repair));
                         }
                     }
                 }
@@ -506,7 +586,7 @@ pub fn parse_jingle_node(
             for src in desc.children().filter(|n| n.has_tag_name("source")) {
                 if let Some(ssrc_str) = src.attribute("ssrc") {
                     if let Ok(ssrc) = ssrc_str.parse::<u32>() {
-                        if is_video || desc.attribute("media") == Some("video") {
+                        if content_is_video {
                             if !video_sources.contains(&ssrc) {
                                 video_sources.push(ssrc);
                             }
@@ -659,11 +739,69 @@ pub fn parse_jingle_node(
                                     }
                                 }
                             }
+                            for group_idx in [1usize, 3usize] {
+                                if let Some(g_list) =
+                                    arr.get(group_idx).and_then(|v| v.as_array())
+                                {
+                                    for grp in g_list {
+                                        let semantics = grp
+                                            .get("s")
+                                            .or_else(|| grp.get("semantics"))
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or_default()
+                                            .trim();
+                                        let is_repair = semantics.eq_ignore_ascii_case("FID")
+                                            || semantics.eq_ignore_ascii_case("FEC")
+                                            || semantics.eq_ignore_ascii_case("FEC-FR");
+                                        if !is_repair {
+                                            continue;
+                                        }
+                                        if let Some(ssrcs_arr) = grp
+                                            .get("ss")
+                                            .or_else(|| grp.get("ssrcs"))
+                                            .and_then(|v| v.as_array())
+                                        {
+                                            let parsed_ssrcs: Vec<u32> = ssrcs_arr
+                                                .iter()
+                                                .filter_map(|v| {
+                                                    v.as_u64()
+                                                        .or_else(|| {
+                                                            v.as_str()?.trim().parse::<u64>().ok()
+                                                        })
+                                                        .map(|n| n as u32)
+                                                })
+                                                .filter(|&s| s != 0)
+                                                .collect();
+                                            if parsed_ssrcs.len() >= 2 {
+                                                let primary = parsed_ssrcs[0];
+                                                for &repair in &parsed_ssrcs[1..] {
+                                                    if !secondary_repair_ssrcs.contains(&repair) {
+                                                        secondary_repair_ssrcs.push(repair);
+                                                    }
+                                                    if semantics.eq_ignore_ascii_case("FID")
+                                                        && !rtx_pairs
+                                                            .iter()
+                                                            .any(|&(p, r)| p == primary && r == repair)
+                                                    {
+                                                        rtx_pairs.push((primary, repair));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
             }
         }
+    }
+
+    if !secondary_repair_ssrcs.is_empty() {
+        sources.retain(|s| !secondary_repair_ssrcs.contains(s));
+        video_sources.retain(|s| !secondary_repair_ssrcs.contains(s));
+        video_source_owners.retain(|(s, _)| !secondary_repair_ssrcs.contains(s));
     }
 
     if transport_info.candidates.is_empty()
@@ -693,6 +831,9 @@ pub fn parse_jingle_node(
         video_sources,
         video_source_owners,
         video_payload_type,
+        audio_payload_types,
+        video_payload_types,
+        rtx_pairs,
         has_data_channel,
         has_video,
     })

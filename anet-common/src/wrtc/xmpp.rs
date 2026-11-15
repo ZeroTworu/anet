@@ -965,11 +965,18 @@ impl XmppSession {
                                                     Some(target) => target == my_ep,
                                                 };
                                                 if for_me {
-                                                    if let Some(ref from_ep) = c_msg.from {
-                                                        if let Ok(t_guard) = xmpp_tracker_bg.lock() {
-                                                            if let Some(ref set_arc) = *t_guard {
-                                                                if let Ok(mut set) = set_arc.lock() {
-                                                                    set.insert(from_ep.clone());
+                                                    let is_discovery = matches!(
+                                                        c_msg.msg_payload,
+                                                        crate::wrtc::colibri::WrtcMessage::Discover { .. }
+                                                            | crate::wrtc::colibri::WrtcMessage::Beacon { .. }
+                                                    );
+                                                    if !is_discovery {
+                                                        if let Some(ref from_ep) = c_msg.from {
+                                                            if let Ok(t_guard) = xmpp_tracker_bg.lock() {
+                                                                if let Some(ref set_arc) = *t_guard {
+                                                                    if let Ok(mut set) = set_arc.lock() {
+                                                                        set.insert(from_ep.clone());
+                                                                    }
                                                                 }
                                                             }
                                                         }

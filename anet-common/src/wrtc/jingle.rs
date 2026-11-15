@@ -93,6 +93,16 @@ pub fn is_valid_jvb_candidate_ip(ip_str: &str) -> bool {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JinglePayloadType {
+    pub id: u8,
+    pub name: String,
+    pub clock_rate: u32,
+    pub channels: u16,
+    #[serde(default)]
+    pub apt: Option<u8>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JingleSession {
     pub iq_id: Option<String>,
@@ -110,6 +120,12 @@ pub struct JingleSession {
     pub video_source_owners: Vec<(u32, String)>,
     #[serde(default = "default_vp8_pt")]
     pub video_payload_type: u8,
+    #[serde(default)]
+    pub audio_payload_types: Vec<JinglePayloadType>,
+    #[serde(default)]
+    pub video_payload_types: Vec<JinglePayloadType>,
+    #[serde(default)]
+    pub rtx_pairs: Vec<(u32, u32)>,
     #[serde(default)]
     pub has_data_channel: bool,
     #[serde(default)]
@@ -220,29 +236,187 @@ impl JingleSession {
         let astream_id = crate::wrtc::stealth::generate_random_uuid_v4();
         let atrack_id = crate::wrtc::stealth::generate_random_uuid_v4();
 
+        let mut audio_pts: Vec<u8> = vec![111];
+        let mut audio_fmt_lines = String::from("a=rtpmap:111 opus/48000/2\r\n");
+        for apt_item in &self.audio_payload_types {
+            if apt_item.id == 0
+                || audio_pts.contains(&apt_item.id)
+                || apt_item.name.is_empty()
+                || apt_item.name.eq_ignore_ascii_case("rtx")
+            {
+                continue;
+            }
+            audio_pts.push(apt_item.id);
+            let clock = if apt_item.clock_rate > 0 {
+                apt_item.clock_rate
+            } else {
+                48000
+            };
+            if apt_item.channels > 1 {
+                audio_fmt_lines.push_str(&format!(
+                    "a=rtpmap:{} {}/{}/{}\r\n",
+                    apt_item.id, apt_item.name, clock, apt_item.channels
+                ));
+            } else {
+                audio_fmt_lines.push_str(&format!(
+                    "a=rtpmap:{} {}/{}\r\n",
+                    apt_item.id, apt_item.name, clock
+                ));
+            }
+        }
+        let mut audio_has_rtx = false;
+        for apt_item in &self.audio_payload_types {
+            if apt_item.id == 0
+                || audio_pts.contains(&apt_item.id)
+                || !apt_item.name.eq_ignore_ascii_case("rtx")
+            {
+                continue;
+            }
+            if let Some(apt) = apt_item.apt {
+                if audio_pts.contains(&apt) {
+                    audio_pts.push(apt_item.id);
+                    audio_has_rtx = true;
+                    let clock = if apt_item.clock_rate > 0 {
+                        apt_item.clock_rate
+                    } else {
+                        48000
+                    };
+                    audio_fmt_lines.push_str(&format!(
+                        "a=rtpmap:{} rtx/{}\r\na=fmtp:{} apt={}\r\n",
+                        apt_item.id, clock, apt_item.id, apt
+                    ));
+                }
+            }
+        }
+        let audio_pts_str = audio_pts
+            .iter()
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        let audio_ssrc_lines = if audio_has_rtx {
+            if let Some((_, rtx_ssrc)) = self.rtx_pairs.iter().find(|(p, _)| *p == remote_audio_ssrc)
+            {
+                format!(
+                    "a=ssrc-group:FID {remote_audio_ssrc} {rtx_ssrc}\r\n\
+                     a=ssrc:{remote_audio_ssrc} cname:{astream_id}\r\n\
+                     a=ssrc:{remote_audio_ssrc} msid:{astream_id} {atrack_id}\r\n\
+                     a=ssrc:{rtx_ssrc} cname:{astream_id}\r\n"
+                )
+            } else {
+                format!(
+                    "a=ssrc:{remote_audio_ssrc} cname:{astream_id}\r\n\
+                     a=ssrc:{remote_audio_ssrc} msid:{astream_id} {atrack_id}\r\n"
+                )
+            }
+        } else {
+            format!(
+                "a=ssrc:{remote_audio_ssrc} cname:{astream_id}\r\n\
+                 a=ssrc:{remote_audio_ssrc} msid:{astream_id} {atrack_id}\r\n"
+            )
+        };
+
         let video_section = if include_video {
             let pt = if self.video_payload_type != 0 {
                 self.video_payload_type
             } else {
                 100
             };
-            format!(
-                "m=video {primary_port} UDP/TLS/RTP/SAVPF {pt}\r\n\
-                 c=IN IP4 {primary_ip}\r\n\
-                 a=rtcp-mux\r\n\
-                 a=rtpmap:{pt} VP8/90000\r\n\
+            let mut video_pts: Vec<u8> = vec![pt];
+            let mut video_fmt_lines = format!(
+                "a=rtpmap:{pt} VP8/90000\r\n\
                  a=rtcp-fb:{pt} goog-remb\r\n\
                  a=rtcp-fb:{pt} ccm fir\r\n\
                  a=rtcp-fb:{pt} nack\r\n\
-                 a=rtcp-fb:{pt} nack pli\r\n\
+                 a=rtcp-fb:{pt} nack pli\r\n"
+            );
+            for vpt in &self.video_payload_types {
+                if vpt.id == 0
+                    || video_pts.contains(&vpt.id)
+                    || vpt.name.is_empty()
+                    || vpt.name.eq_ignore_ascii_case("rtx")
+                {
+                    continue;
+                }
+                video_pts.push(vpt.id);
+                let clock = if vpt.clock_rate > 0 {
+                    vpt.clock_rate
+                } else {
+                    90000
+                };
+                video_fmt_lines.push_str(&format!(
+                    "a=rtpmap:{} {}/{}\r\n\
+                     a=rtcp-fb:{} goog-remb\r\n\
+                     a=rtcp-fb:{} ccm fir\r\n\
+                     a=rtcp-fb:{} nack\r\n\
+                     a=rtcp-fb:{} nack pli\r\n",
+                    vpt.id, vpt.name, clock, vpt.id, vpt.id, vpt.id, vpt.id
+                ));
+            }
+            let mut video_has_rtx = false;
+            for vpt in &self.video_payload_types {
+                if vpt.id == 0
+                    || video_pts.contains(&vpt.id)
+                    || !vpt.name.eq_ignore_ascii_case("rtx")
+                {
+                    continue;
+                }
+                if let Some(apt) = vpt.apt {
+                    if video_pts.contains(&apt) {
+                        video_pts.push(vpt.id);
+                        video_has_rtx = true;
+                        let clock = if vpt.clock_rate > 0 {
+                            vpt.clock_rate
+                        } else {
+                            90000
+                        };
+                        video_fmt_lines.push_str(&format!(
+                            "a=rtpmap:{} rtx/{}\r\na=fmtp:{} apt={}\r\n",
+                            vpt.id, clock, vpt.id, apt
+                        ));
+                    }
+                }
+            }
+            let video_pts_str = video_pts
+                .iter()
+                .map(|p| p.to_string())
+                .collect::<Vec<_>>()
+                .join(" ");
+            let video_ssrc_lines = if video_has_rtx {
+                if let Some((_, rtx_ssrc)) =
+                    self.rtx_pairs.iter().find(|(p, _)| *p == primary_video_ssrc)
+                {
+                    format!(
+                        "a=ssrc-group:FID {primary_video_ssrc} {rtx_ssrc}\r\n\
+                         a=ssrc:{primary_video_ssrc} cname:{vstream_id}\r\n\
+                         a=ssrc:{primary_video_ssrc} msid:{vstream_id} {vtrack_id}\r\n\
+                         a=ssrc:{rtx_ssrc} cname:{vstream_id}\r\n"
+                    )
+                } else {
+                    format!(
+                        "a=ssrc:{primary_video_ssrc} cname:{vstream_id}\r\n\
+                         a=ssrc:{primary_video_ssrc} msid:{vstream_id} {vtrack_id}\r\n"
+                    )
+                }
+            } else {
+                format!(
+                    "a=ssrc:{primary_video_ssrc} cname:{vstream_id}\r\n\
+                     a=ssrc:{primary_video_ssrc} msid:{vstream_id} {vtrack_id}\r\n"
+                )
+            };
+
+            format!(
+                "m=video {primary_port} UDP/TLS/RTP/SAVPF {video_pts_str}\r\n\
+                 c=IN IP4 {primary_ip}\r\n\
+                 a=rtcp-mux\r\n\
+                 {video_fmt_lines}\
                  a=ice-ufrag:{ufrag}\r\n\
                  a=ice-pwd:{pwd}\r\n\
                  a=fingerprint:{fp_hash} {fp}\r\n\
                  a=setup:{setup}\r\n\
                  a=mid:video\r\n\
                  a=sendrecv\r\n\
-                 a=ssrc:{primary_video_ssrc} cname:{vstream_id}\r\n\
-                 a=ssrc:{primary_video_ssrc} msid:{vstream_id} {vtrack_id}\r\n\
+                 {video_ssrc_lines}\
                  {candidate_lines}"
             )
         } else {
@@ -274,18 +448,17 @@ impl JingleSession {
              a=ice-pwd:{pwd}\r\n\
              a=fingerprint:{fp_hash} {fp}\r\n\
              a=group:BUNDLE {bundle_str}\r\n\
-             m=audio {primary_port} UDP/TLS/RTP/SAVPF 111\r\n\
+             m=audio {primary_port} UDP/TLS/RTP/SAVPF {audio_pts_str}\r\n\
              c=IN IP4 {primary_ip}\r\n\
              a=rtcp-mux\r\n\
-             a=rtpmap:111 opus/48000/2\r\n\
+             {audio_fmt_lines}\
              a=ice-ufrag:{ufrag}\r\n\
              a=ice-pwd:{pwd}\r\n\
              a=fingerprint:{fp_hash} {fp}\r\n\
              a=setup:{setup}\r\n\
              a=mid:audio\r\n\
              a=sendrecv\r\n\
-             a=ssrc:{remote_audio_ssrc} cname:{astream_id}\r\n\
-             a=ssrc:{remote_audio_ssrc} msid:{astream_id} {atrack_id}\r\n\
+             {audio_ssrc_lines}\
              {candidate_lines}\
              {video_section}\
              {data_section}"
@@ -305,13 +478,52 @@ impl JingleSession {
                     && extra_ssrc != primary_video_ssrc
                     && extra_ssrc != _video_ssrc
                 {
-                    sdp = append_remote_video_ssrc_to_sdp(&sdp, extra_ssrc, self.video_payload_type);
+                    let rtx_opt = self
+                        .rtx_pairs
+                        .iter()
+                        .find(|(p, _)| *p == extra_ssrc)
+                        .map(|(_, r)| *r);
+                    sdp = append_remote_video_ssrc_with_rtx_to_sdp(
+                        &sdp,
+                        extra_ssrc,
+                        rtx_opt,
+                        self.video_payload_type,
+                    );
                 }
             }
         }
 
         sdp
     }
+}
+
+fn extract_first_media_formats(current_sdp: &str, media_prefix: &str) -> (Option<String>, String) {
+    let mut in_target_media = false;
+    let mut pt_list: Option<String> = None;
+    let mut fmt_lines = String::new();
+    for raw_line in current_sdp.lines() {
+        let line = raw_line.trim();
+        if line.starts_with("m=") {
+            if in_target_media {
+                break;
+            }
+            if line.starts_with(media_prefix) {
+                in_target_media = true;
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 4 {
+                    pt_list = Some(parts[3..].join(" "));
+                }
+            }
+        } else if in_target_media
+            && (line.starts_with("a=rtpmap:")
+                || line.starts_with("a=fmtp:")
+                || line.starts_with("a=rtcp-fb:"))
+        {
+            fmt_lines.push_str(line);
+            fmt_lines.push_str("\r\n");
+        }
+    }
+    (pt_list, fmt_lines)
 }
 
 /// Appends a dedicated `m=audio` (`a=mid:a_<ssrc>`, `a=sendonly`) section to the remote SDP
@@ -364,6 +576,14 @@ pub fn append_remote_audio_ssrc_to_sdp(current_sdp: &str, new_ssrc: u32) -> Stri
         }
     }
 
+    let (inherited_pts, inherited_fmts) = extract_first_media_formats(current_sdp, "m=audio ");
+    let pts_str = inherited_pts.unwrap_or_else(|| "111".to_string());
+    let fmt_lines = if !inherited_fmts.is_empty() {
+        inherited_fmts
+    } else {
+        "a=rtpmap:111 opus/48000/2\r\n".to_string()
+    };
+
     let stream_uuid = crate::wrtc::stealth::generate_random_uuid_v4();
     let track_uuid = crate::wrtc::stealth::generate_random_uuid_v4();
 
@@ -379,10 +599,10 @@ pub fn append_remote_audio_ssrc_to_sdp(current_sdp: &str, new_ssrc: u32) -> Stri
     }
 
     updated.push_str(&format!(
-        "m=audio {primary_port} UDP/TLS/RTP/SAVPF 111\r\n\
+        "m=audio {primary_port} UDP/TLS/RTP/SAVPF {pts_str}\r\n\
          {c_line}\r\n\
          a=rtcp-mux\r\n\
-         a=rtpmap:111 opus/48000/2\r\n\
+         {fmt_lines}\
          a=ice-ufrag:{ufrag}\r\n\
          a=ice-pwd:{pwd}\r\n\
          a=fingerprint:{fingerprint}\r\n\
@@ -401,6 +621,15 @@ pub fn append_remote_audio_ssrc_to_sdp(current_sdp: &str, new_ssrc: u32) -> Stri
 /// so `rtc-0.21.0` creates a dedicated `Recvonly` transceiver and `TrackRemote` for `new_ssrc`
 /// without overwriting any existing active video transceiver.
 pub fn append_remote_video_ssrc_to_sdp(current_sdp: &str, new_ssrc: u32, video_pt: u8) -> String {
+    append_remote_video_ssrc_with_rtx_to_sdp(current_sdp, new_ssrc, None, video_pt)
+}
+
+pub fn append_remote_video_ssrc_with_rtx_to_sdp(
+    current_sdp: &str,
+    new_ssrc: u32,
+    rtx_ssrc: Option<u32>,
+    video_pt: u8,
+) -> String {
     let mid_tag = format!("v_{new_ssrc}");
     if current_sdp.contains(&format!("a=mid:{mid_tag}\r\n"))
         || current_sdp.contains(&format!("a=ssrc:{new_ssrc} "))
@@ -448,8 +677,35 @@ pub fn append_remote_video_ssrc_to_sdp(current_sdp: &str, new_ssrc: u32, video_p
     }
 
     let pt = if video_pt != 0 { video_pt } else { 100 };
+    let (inherited_pts, inherited_fmts) = extract_first_media_formats(current_sdp, "m=video ");
+    let pts_str = inherited_pts.unwrap_or_else(|| pt.to_string());
+    let fmt_lines = if !inherited_fmts.is_empty() {
+        inherited_fmts
+    } else {
+        format!(
+            "a=rtpmap:{pt} VP8/90000\r\n\
+             a=rtcp-fb:{pt} goog-remb\r\n\
+             a=rtcp-fb:{pt} ccm fir\r\n\
+             a=rtcp-fb:{pt} nack\r\n\
+             a=rtcp-fb:{pt} nack pli\r\n"
+        )
+    };
+    let has_rtx = fmt_lines.contains("rtx/");
+
     let stream_uuid = crate::wrtc::stealth::generate_random_uuid_v4();
     let track_uuid = crate::wrtc::stealth::generate_random_uuid_v4();
+    let ssrc_lines = match (has_rtx, rtx_ssrc) {
+        (true, Some(rtx)) if rtx != 0 => format!(
+            "a=ssrc-group:FID {new_ssrc} {rtx}\r\n\
+             a=ssrc:{new_ssrc} cname:{stream_uuid}\r\n\
+             a=ssrc:{new_ssrc} msid:{stream_uuid} {track_uuid}\r\n\
+             a=ssrc:{rtx} cname:{stream_uuid}\r\n"
+        ),
+        _ => format!(
+            "a=ssrc:{new_ssrc} cname:{stream_uuid}\r\n\
+             a=ssrc:{new_ssrc} msid:{stream_uuid} {track_uuid}\r\n"
+        ),
+    };
 
     let mut updated = String::with_capacity(current_sdp.len() + 640);
     for raw_line in current_sdp.lines() {
@@ -463,22 +719,17 @@ pub fn append_remote_video_ssrc_to_sdp(current_sdp: &str, new_ssrc: u32, video_p
     }
 
     updated.push_str(&format!(
-        "m=video {primary_port} UDP/TLS/RTP/SAVPF {pt}\r\n\
+        "m=video {primary_port} UDP/TLS/RTP/SAVPF {pts_str}\r\n\
          {c_line}\r\n\
          a=rtcp-mux\r\n\
-         a=rtpmap:{pt} VP8/90000\r\n\
-         a=rtcp-fb:{pt} goog-remb\r\n\
-         a=rtcp-fb:{pt} ccm fir\r\n\
-         a=rtcp-fb:{pt} nack\r\n\
-         a=rtcp-fb:{pt} nack pli\r\n\
+         {fmt_lines}\
          a=ice-ufrag:{ufrag}\r\n\
          a=ice-pwd:{pwd}\r\n\
          a=fingerprint:{fingerprint}\r\n\
          a=setup:{setup}\r\n\
          a=mid:{mid_tag}\r\n\
          a=sendonly\r\n\
-         a=ssrc:{new_ssrc} cname:{stream_uuid}\r\n\
-         a=ssrc:{new_ssrc} msid:{stream_uuid} {track_uuid}\r\n\
+         {ssrc_lines}\
          {candidate_lines}"
     ));
 
@@ -493,6 +744,16 @@ pub fn append_remote_ssrcs_to_sdp(
     video_ssrcs: &[u32],
     video_pt: u8,
 ) -> String {
+    append_remote_ssrcs_with_rtx_to_sdp(current_sdp, audio_ssrcs, video_ssrcs, &[], video_pt)
+}
+
+pub fn append_remote_ssrcs_with_rtx_to_sdp(
+    current_sdp: &str,
+    audio_ssrcs: &[u32],
+    video_ssrcs: &[u32],
+    rtx_pairs: &[(u32, u32)],
+    video_pt: u8,
+) -> String {
     let mut updated = current_sdp.to_string();
     for &a_ssrc in audio_ssrcs {
         if a_ssrc != 0 && a_ssrc != 10001 {
@@ -501,7 +762,11 @@ pub fn append_remote_ssrcs_to_sdp(
     }
     for &v_ssrc in video_ssrcs {
         if v_ssrc != 0 && v_ssrc != 10002 {
-            updated = append_remote_video_ssrc_to_sdp(&updated, v_ssrc, video_pt);
+            let rtx_opt = rtx_pairs
+                .iter()
+                .find(|(p, _)| *p == v_ssrc)
+                .map(|(_, r)| *r);
+            updated = append_remote_video_ssrc_with_rtx_to_sdp(&updated, v_ssrc, rtx_opt, video_pt);
         }
     }
     updated

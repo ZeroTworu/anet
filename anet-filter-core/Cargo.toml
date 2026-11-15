@@ -10,9 +10,7 @@ rkyv = { workspace = true, features = ["validation", "alloc"] }
 bytecheck = "0.6.12"
 ipnet = { workspace = true }
 anyhow = { workspace = true }
-bytes = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
-log = { workspace = true }
 ahash = "0.8"
 
 [dev-dependencies]

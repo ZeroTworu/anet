@@ -16,8 +16,8 @@ use crate::wrtc::colibri::{
     is_valid_vp8_frame_header, ColibriMessage, ReceiverVideoConstraints, WrtcMessage, WrtcMode,
 };
 use crate::wrtc::jingle::{
-    append_remote_audio_ssrc_to_sdp, append_remote_ssrcs_to_sdp, append_remote_video_ssrc_to_sdp,
-    is_valid_jvb_candidate_ip, parse_sdp_answer, JingleSession,
+    append_remote_audio_ssrc_to_sdp, append_remote_ssrcs_with_rtx_to_sdp,
+    append_remote_video_ssrc_to_sdp, is_valid_jvb_candidate_ip, parse_sdp_answer, JingleSession,
 };
 use crate::wrtc::stealth::generate_random_uuid_v4;
 use crate::wrtc::turns_proxy::{spawn_turns_udp_proxy, TurnsProxyHandle};
@@ -855,9 +855,9 @@ fn build_ice_server_tiers(
         ]
     } else {
         [
-            ("Tier 0: STUN", false, false),
             ("Tier 1: UDP STUN + UDP TURN", true, false),
             ("Tier 2: STUN + TURN + TURNS", true, true),
+            ("Tier 0: STUN", false, false),
         ]
     };
 
@@ -920,7 +920,8 @@ pub async fn create_p2p_channel(
         "[P2P Direct] Pinned P2P UDP socket to physical interface: {effective_bind_addr}"
     );
 
-    let (tiers, turns_proxies) = build_ice_server_tiers(ice_servers_info, wrtc_cfg, true, true);
+    let (tiers, mut turns_proxies) =
+        build_ice_server_tiers(ice_servers_info, wrtc_cfg, true, true);
     let mut last_err = None;
     let mut built_pc = None;
     let mut active_ice_servers: Vec<RTCIceServer> = Vec::new();
@@ -1004,6 +1005,11 @@ pub async fn create_p2p_channel(
         Some(pc) => pc,
         None => return Err(anyhow!("Failed to build P2P PeerConnection: {:?}", last_err)),
     };
+    turns_proxies.retain(|p| {
+        active_ice_servers
+            .iter()
+            .any(|srv| srv.urls.iter().any(|u| u == &p.local_turn_url))
+    });
 
     let pc: Arc<dyn PeerConnection> = Arc::new(pc_res);
 
@@ -1538,7 +1544,8 @@ impl WrtcPeer {
             let dc_open_notify = Arc::new(Notify::new());
 
             let discovered_ice = xmpp.get_ice_servers();
-            let allow_turn = wrtc_cfg.jvb_use_turn || wrtc_cfg.turns_proxy_priority;
+            let allow_turn =
+                mode != WrtcMode::Ws && (wrtc_cfg.jvb_use_turn || wrtc_cfg.turns_proxy_priority);
             let (tiers, built_proxies) = build_ice_server_tiers(
                 &discovered_ice,
                 wrtc_cfg,
@@ -1557,12 +1564,129 @@ impl WrtcPeer {
                 media_engine.register_codec(audio_codec.clone(), RtpCodecKind::Audio)?;
                 media_engine.register_codec(video_codec.clone(), RtpCodecKind::Video)?;
 
-                if video_pt != WRTC_VP8_FALLBACK_PAYLOAD_TYPE {
+                let mut registered_audio_pts: HashSet<u8> = HashSet::from([WRTC_OPUS_PAYLOAD_TYPE]);
+                let mut registered_video_pts: HashSet<u8> = HashSet::from([video_pt]);
+
+                for pt in &session.audio_payload_types {
+                    if pt.id == 0
+                        || registered_audio_pts.contains(&pt.id)
+                        || pt.name.eq_ignore_ascii_case("rtx")
+                    {
+                        continue;
+                    }
+                    let mime = match pt.name.to_ascii_lowercase().as_str() {
+                        "opus" => MIME_TYPE_OPUS.to_owned(),
+                        "telephone-event" => "audio/telephone-event".to_owned(),
+                        other => format!("audio/{other}"),
+                    };
+                    let clock = if pt.clock_rate > 0 { pt.clock_rate } else { 48000 };
+                    let param = RTCRtpCodecParameters {
+                        rtp_codec: RTCRtpCodec {
+                            mime_type: mime,
+                            clock_rate: clock,
+                            channels: pt.channels,
+                            sdp_fmtp_line: String::new(),
+                            rtcp_feedback: vec![],
+                        },
+                        payload_type: pt.id,
+                        ..Default::default()
+                    };
+                    if media_engine.register_codec(param, RtpCodecKind::Audio).is_ok() {
+                        registered_audio_pts.insert(pt.id);
+                    }
+                }
+                for pt in &session.audio_payload_types {
+                    if pt.id == 0
+                        || registered_audio_pts.contains(&pt.id)
+                        || !pt.name.eq_ignore_ascii_case("rtx")
+                    {
+                        continue;
+                    }
+                    if let Some(apt) = pt.apt {
+                        if registered_audio_pts.contains(&apt) {
+                            let clock = if pt.clock_rate > 0 { pt.clock_rate } else { 48000 };
+                            let param = RTCRtpCodecParameters {
+                                rtp_codec: RTCRtpCodec {
+                                    mime_type: "audio/rtx".to_owned(),
+                                    clock_rate: clock,
+                                    channels: 0,
+                                    sdp_fmtp_line: format!("apt={apt}"),
+                                    rtcp_feedback: vec![],
+                                },
+                                payload_type: pt.id,
+                                ..Default::default()
+                            };
+                            if media_engine.register_codec(param, RtpCodecKind::Audio).is_ok() {
+                                registered_audio_pts.insert(pt.id);
+                            }
+                        }
+                    }
+                }
+
+                for pt in &session.video_payload_types {
+                    if pt.id == 0
+                        || registered_video_pts.contains(&pt.id)
+                        || pt.name.eq_ignore_ascii_case("rtx")
+                    {
+                        continue;
+                    }
+                    let mime = match pt.name.to_ascii_lowercase().as_str() {
+                        "vp8" => MIME_TYPE_VP8.to_owned(),
+                        "vp9" => "video/VP9".to_owned(),
+                        "h264" => "video/H264".to_owned(),
+                        "av1" => "video/AV1".to_owned(),
+                        other => format!("video/{other}"),
+                    };
+                    let clock = if pt.clock_rate > 0 { pt.clock_rate } else { 90000 };
+                    let param = RTCRtpCodecParameters {
+                        rtp_codec: RTCRtpCodec {
+                            mime_type: mime,
+                            clock_rate: clock,
+                            channels: 0,
+                            sdp_fmtp_line: String::new(),
+                            rtcp_feedback: vec![],
+                        },
+                        payload_type: pt.id,
+                        ..Default::default()
+                    };
+                    if media_engine.register_codec(param, RtpCodecKind::Video).is_ok() {
+                        registered_video_pts.insert(pt.id);
+                    }
+                }
+                for pt in &session.video_payload_types {
+                    if pt.id == 0
+                        || registered_video_pts.contains(&pt.id)
+                        || !pt.name.eq_ignore_ascii_case("rtx")
+                    {
+                        continue;
+                    }
+                    if let Some(apt) = pt.apt {
+                        if registered_video_pts.contains(&apt) {
+                            let clock = if pt.clock_rate > 0 { pt.clock_rate } else { 90000 };
+                            let param = RTCRtpCodecParameters {
+                                rtp_codec: RTCRtpCodec {
+                                    mime_type: "video/rtx".to_owned(),
+                                    clock_rate: clock,
+                                    channels: 0,
+                                    sdp_fmtp_line: format!("apt={apt}"),
+                                    rtcp_feedback: vec![],
+                                },
+                                payload_type: pt.id,
+                                ..Default::default()
+                            };
+                            if media_engine.register_codec(param, RtpCodecKind::Video).is_ok() {
+                                registered_video_pts.insert(pt.id);
+                            }
+                        }
+                    }
+                }
+
+                if !registered_video_pts.contains(&WRTC_VP8_FALLBACK_PAYLOAD_TYPE) {
                     let mut fallback_vcodec = video_codec.clone();
                     fallback_vcodec.payload_type = WRTC_VP8_FALLBACK_PAYLOAD_TYPE;
                     let _ = media_engine.register_codec(fallback_vcodec, RtpCodecKind::Video);
                 }
-                if video_pt != WRTC_VP8_PRIMARY_PAYLOAD_TYPE {
+                if !registered_video_pts.contains(&WRTC_VP8_PRIMARY_PAYLOAD_TYPE) {
                     let mut fallback_vcodec2 = video_codec.clone();
                     fallback_vcodec2.payload_type = WRTC_VP8_PRIMARY_PAYLOAD_TYPE;
                     let _ = media_engine.register_codec(fallback_vcodec2, RtpCodecKind::Video);
@@ -1656,6 +1780,11 @@ impl WrtcPeer {
                     }
                 }
             }
+            turns_proxies.retain(|p| {
+                active_ice_servers
+                    .iter()
+                    .any(|srv| srv.urls.iter().any(|u| u == &p.local_turn_url))
+            });
 
             if let Some(pc_impl) = built_pc {
                 let pc: Arc<dyn PeerConnection> = Arc::new(pc_impl);
@@ -1819,10 +1948,15 @@ impl WrtcPeer {
                                         final_sdp = desc.sdp;
                                         let has_srflx = final_sdp.contains("typ srflx");
                                         let has_relay = final_sdp.contains("typ relay");
-                                        if (has_srflx && (!has_turn_configured || has_relay))
-                                            || ((has_srflx || has_relay) && attempt >= 15)
-                                            || attempt >= 25
-                                        {
+                                        let done = if has_turn_configured {
+                                            (has_srflx && has_relay)
+                                                || (has_relay && attempt >= 15)
+                                                || ((has_srflx || has_relay) && attempt >= 35)
+                                        } else {
+                                            has_srflx
+                                                || (final_sdp.contains("typ host") && attempt >= 15)
+                                        };
+                                        if done {
                                             break;
                                         }
                                     }
@@ -1909,23 +2043,27 @@ impl WrtcPeer {
                     );
 
                     loop {
-                        let (json_str, msg_to_opt, is_batch, is_astp, is_keepalive) = tokio::select! {
+                        let (json_str, msg_to_opt, is_batch, is_astp, is_keepalive, is_discovery) = tokio::select! {
                             msg_opt = outgoing_rx.recv() => {
                                 match msg_opt {
                                     Some(msg) => {
                                         let is_batch = matches!(msg.msg_payload, WrtcMessage::AstpBatch { .. });
                                         let is_astp = matches!(msg.msg_payload, WrtcMessage::Astp { .. });
                                         let is_keepalive = matches!(msg.msg_payload, WrtcMessage::Ping | WrtcMessage::Pong);
+                                        let is_discovery = matches!(
+                                            msg.msg_payload,
+                                            WrtcMessage::Discover { .. } | WrtcMessage::Beacon { .. }
+                                        );
                                         let msg_to_opt = msg.to.clone();
                                         let Ok(json_str) = serde_json::to_string(&msg) else { continue; };
-                                        (json_str, msg_to_opt, is_batch, is_astp, is_keepalive)
+                                        (json_str, msg_to_opt, is_batch, is_astp, is_keepalive, is_discovery)
                                     }
                                     None => break,
                                 }
                             }
                             raw_opt = raw_outgoing_rx.recv() => {
                                 match raw_opt {
-                                    Some(raw) => (raw, None, false, false, false),
+                                    Some(raw) => (raw, None, false, false, false, false),
                                     None => break,
                                 }
                             }
@@ -2021,6 +2159,7 @@ impl WrtcPeer {
                         // Резервная доставка через XMPP MUC `<json-message>`, когда ни SCTP DataChannel, ни Colibri-WS
                         // недоступны (например, под Белыми Списками, когда `*.ktalk.host` заблокирован, а сигналинг `*.ktalk.ru` жив),
                         // либо когда целевой пир (`target_is_xmpp_only`) общается через XMPP MUC.
+                        let mut xmpp_sent = false;
                         if !sent && !is_constraints {
                             if is_astp || is_batch || is_keepalive {
                                 trace!("[XMPP MUC JSON OUT]: {json_str}");
@@ -2029,7 +2168,13 @@ impl WrtcPeer {
                             }
                             if xmpp_json_sender.try_send_json(msg_to_opt.as_deref(), &json_str) {
                                 sent = true;
+                                xmpp_sent = true;
                             }
+                        }
+
+                        if is_discovery && !xmpp_sent {
+                            trace!("[XMPP MUC JSON MIRROR OUT]: {json_str}");
+                            let _ = xmpp_json_sender.try_send_json(msg_to_opt.as_deref(), &json_str);
                         }
 
                         if !sent && is_constraints {
@@ -2516,6 +2661,16 @@ impl WrtcPeer {
     }
 
     pub async fn add_remote_ssrcs(&self, audio_ssrcs: &[u32], video_ssrcs: &[u32]) {
+        self.add_remote_ssrcs_with_rtx(audio_ssrcs, video_ssrcs, &[])
+            .await;
+    }
+
+    pub async fn add_remote_ssrcs_with_rtx(
+        &self,
+        audio_ssrcs: &[u32],
+        video_ssrcs: &[u32],
+        rtx_pairs: &[(u32, u32)],
+    ) {
         let filtered_audio: Vec<u32> = audio_ssrcs
             .iter()
             .copied()
@@ -2540,10 +2695,11 @@ impl WrtcPeer {
         if sdp_guard.is_empty() {
             return;
         }
-        let updated_sdp = append_remote_ssrcs_to_sdp(
+        let updated_sdp = append_remote_ssrcs_with_rtx_to_sdp(
             &sdp_guard,
             &filtered_audio,
             &filtered_video,
+            rtx_pairs,
             self.video_payload_type,
         );
         if updated_sdp == *sdp_guard {

@@ -462,7 +462,12 @@ impl ClientTransport for WrtcTransport {
                                         peer.set_expected_peer_video_ssrc(v_ssrc);
                                         info!("[WRTC Client] Jicofo announced server video SSRC during discovery: {v_ssrc}");
                                     }
-                                    peer.add_remote_ssrcs(&j_sess.sources, &filtered_video_ssrcs).await;
+                                    peer.add_remote_ssrcs_with_rtx(
+                                        &j_sess.sources,
+                                        &filtered_video_ssrcs,
+                                        &j_sess.rtx_pairs,
+                                    )
+                                    .await;
                                 }
                             }
                         }
@@ -603,12 +608,14 @@ impl ClientTransport for WrtcTransport {
         let nonce_prefix: [u8; 4] = auth_response.nonce_prefix.as_slice().try_into()?;
         let sequence = Arc::new(AtomicU64::new(0));
 
+        let first_client_rx = Arc::new(AtomicBool::new(true));
         let p2p_session_opt: Arc<Mutex<Option<Arc<P2pSession>>>> = Arc::new(Mutex::new(None));
         let p2p_negotiating = Arc::new(AtomicBool::new(false));
         let p2p_xmpp_rot = p2p_session_opt.clone();
         let xmpp_arc = Arc::new(Mutex::new(xmpp));
         let xmpp_bg = Arc::clone(&xmpp_arc);
         let peer_xmpp = Arc::clone(&shared_peer);
+        let first_rx_xmpp = Arc::clone(&first_client_rx);
         let target_srv_xmpp = target_server_id.clone();
         let fb_ip_owned = fallback_ip.to_string();
         let xmpp_jingle_task = tokio::spawn(async move {
@@ -667,10 +674,16 @@ impl ClientTransport for WrtcTransport {
                                                 peer_xmpp.set_expected_peer_video_ssrc(v_ssrc);
                                             }
                                             peer_xmpp
-                                                .add_remote_ssrcs(&jingle.sources, &filtered_video_ssrcs)
+                                                .add_remote_ssrcs_with_rtx(
+                                                    &jingle.sources,
+                                                    &filtered_video_ssrcs,
+                                                    &jingle.rtx_pairs,
+                                                )
                                                 .await;
                                             if matches!(wrtc_mode, WrtcMode::MediaVideo | WrtcMode::Auto) {
-                                                if !filtered_video_ssrcs.is_empty() {
+                                                let needs_constraints = first_rx_xmpp.load(Ordering::Relaxed)
+                                                    || peer_xmpp.video_rx_age_ms().map_or(true, |a| a >= 5_000);
+                                                if !filtered_video_ssrcs.is_empty() && needs_constraints {
                                                     let constraints = ReceiverVideoConstraints::for_endpoint(
                                                         &target_srv_xmpp,
                                                         WRTC_DEFAULT_MAX_VIDEO_HEIGHT,
@@ -712,12 +725,16 @@ impl ClientTransport for WrtcTransport {
                                 } => {
                                     info!("[WRTC Client] Jicofo acknowledged Jingle IQ {ack_id}");
                                     if matches!(wrtc_mode, WrtcMode::MediaVideo | WrtcMode::Auto) {
-                                        let constraints = ReceiverVideoConstraints::for_endpoint(
-                                            &target_srv_xmpp,
-                                            WRTC_DEFAULT_MAX_VIDEO_HEIGHT,
-                                        );
-                                        let _ = peer_xmpp.send_video_constraints(&constraints).await;
-                                        peer_xmpp.force_next_keyframe();
+                                        let needs_constraints = first_rx_xmpp.load(Ordering::Relaxed)
+                                            || peer_xmpp.video_rx_age_ms().map_or(true, |a| a >= 5_000);
+                                        if needs_constraints {
+                                            let constraints = ReceiverVideoConstraints::for_endpoint(
+                                                &target_srv_xmpp,
+                                                WRTC_DEFAULT_MAX_VIDEO_HEIGHT,
+                                            );
+                                            let _ = peer_xmpp.send_video_constraints(&constraints).await;
+                                            peer_xmpp.force_next_keyframe();
+                                        }
                                     } else {
                                         let mute_constraints = ReceiverVideoConstraints::new_all(0);
                                         let _ = peer_xmpp.send_video_constraints(&mute_constraints).await;
@@ -918,7 +935,6 @@ impl ClientTransport for WrtcTransport {
         let sequence_tx = sequence.clone();
         let padding_step = self.config.stealth.padding_step;
         let p2p_uplink = p2p_session_opt.clone();
-        let first_client_rx = Arc::new(AtomicBool::new(true));
         let first_client_rx_tx = first_client_rx.clone();
         let last_video_rx_secs = Arc::new(AtomicU64::new(0));
         let last_video_rx_tx = last_video_rx_secs.clone();
@@ -945,7 +961,6 @@ impl ClientTransport for WrtcTransport {
             let mut video_batch_buf = BytesMut::with_capacity(max_video_batch_bytes + 64);
             let mut cached_p2p: Option<Arc<P2pSession>> = None;
             let mut dl_video_stalled = false;
-            let mut last_stall_report_at: Option<TokioInstant> = None;
             let uplink_started_at = TokioInstant::now();
             let mut pacing_next_at = TokioInstant::now();
             let pacing_horizon = Duration::from_nanos(WRTC_PACING_HORIZON_NS);
@@ -1002,19 +1017,18 @@ impl ClientTransport for WrtcTransport {
                         {
                             let rx_age_ms = peer_tx.video_rx_age_ms();
                             let warmed_ever = !first_client_rx_tx.load(Ordering::Relaxed);
-                            let next_stalled = if warmed_ever || uplink_started_at.elapsed() >= Duration::from_secs(4) {
+                            let next_stalled = if warmed_ever || uplink_started_at.elapsed() >= Duration::from_secs(8) {
                                 let age = rx_age_ms.unwrap_or(u64::MAX);
                                 if dl_video_stalled {
-                                    age >= 2_000
+                                    age >= 3_000
                                 } else {
-                                    age >= 4_000
+                                    age >= 10_000
                                 }
                             } else {
                                 false
                             };
                             if next_stalled != dl_video_stalled {
                                 dl_video_stalled = next_stalled;
-                                last_stall_report_at = Some(TokioInstant::now());
                                 if dl_video_stalled {
                                     warn!("[WRTC Client] Downlink VP8 video stalled (age={rx_age_ms:?} ms); reporting stall & switching uplink to Colibri-WS/DC");
                                 } else {
@@ -1030,16 +1044,16 @@ impl ClientTransport for WrtcTransport {
                             }
                         } else if dl_video_stalled {
                             dl_video_stalled = false;
-                            last_stall_report_at = None;
                         }
                         let can_video_mode = !p2p_active
                             && !dl_video_stalled
                             && (wrtc_mode == WrtcMode::MediaVideo || wrtc_mode == WrtcMode::Auto);
                         let last_v_rx = last_video_rx_tx.load(Ordering::Relaxed);
-                        let video_warmed_up = !first_client_rx_tx.load(Ordering::Relaxed)
+                        let video_warmed_up = !dl_video_stalled
+                            && !first_client_rx_tx.load(Ordering::Relaxed)
                             && peer_tx.is_connected.load(Ordering::Relaxed)
                             && (last_v_rx > 0
-                                && current_timestamp_secs().saturating_sub(last_v_rx) <= 5);
+                                && current_timestamp_secs().saturating_sub(last_v_rx) <= 10);
 
                         for _burst_idx in 0..uplink_burst_max_packets {
                             if packet.len() >= WRTC_MIN_IP_PACKET_LEN {
@@ -1270,19 +1284,18 @@ impl ClientTransport for WrtcTransport {
                             let rx_age_ms = peer_tx.video_rx_age_ms();
                             if has_text_fallback {
                                 let warmed_ever = !first_client_rx_tx.load(Ordering::Relaxed);
-                                let next_stalled = if warmed_ever || uplink_started_at.elapsed() >= Duration::from_secs(4) {
+                                let next_stalled = if warmed_ever || uplink_started_at.elapsed() >= Duration::from_secs(8) {
                                     let age = rx_age_ms.unwrap_or(u64::MAX);
                                     if dl_video_stalled {
-                                        age >= 2_000
+                                        age >= 3_000
                                     } else {
-                                        age >= 4_000
+                                        age >= 10_000
                                     }
                                 } else {
                                     false
                                 };
                                 if next_stalled != dl_video_stalled {
                                     dl_video_stalled = next_stalled;
-                                    last_stall_report_at = Some(TokioInstant::now());
                                     if dl_video_stalled {
                                         warn!("[WRTC Client] Downlink VP8 video stalled (age={rx_age_ms:?} ms); reporting stall & switching uplink to Colibri-WS/DC");
                                     } else {
@@ -1293,17 +1306,6 @@ impl ClientTransport for WrtcTransport {
                                         .send(ColibriMessage::video_rx_stall(
                                             target_srv_tx.clone(),
                                             dl_video_stalled,
-                                        ))
-                                        .await;
-                                } else if dl_video_stalled
-                                    && last_stall_report_at
-                                        .map_or(true, |t| t.elapsed() >= Duration::from_secs(4))
-                                {
-                                    last_stall_report_at = Some(TokioInstant::now());
-                                    let _ = peer_tx
-                                        .send(ColibriMessage::video_rx_stall(
-                                            target_srv_tx.clone(),
-                                            true,
                                         ))
                                         .await;
                                 }
@@ -1530,10 +1532,15 @@ impl ClientTransport for WrtcTransport {
                 // RTP Video Uplink (Client -> Server) серией ключевых кадров VIDEO_WARMUP_PAYLOAD,
                 // не дожидаясь 2-секундного тика watchdog.
                 for _ in 0..50 {
-                    if peer_reassert.is_connected.load(Ordering::Relaxed) {
+                    if !first_rx_clone.load(Ordering::Relaxed)
+                        || peer_reassert.is_connected.load(Ordering::Relaxed)
+                    {
                         break;
                     }
                     sleep(Duration::from_millis(100)).await;
+                }
+                if !first_rx_clone.load(Ordering::Relaxed) {
+                    return;
                 }
                 if peer_reassert.is_connected.load(Ordering::Relaxed) {
                     peer_reassert.force_next_keyframe();
@@ -1575,6 +1582,9 @@ impl ClientTransport for WrtcTransport {
                         }
                     }
                     if (tick + 1) % ticks_per_reassert == 0 {
+                        if !first_rx_clone.load(Ordering::Relaxed) {
+                            break;
+                        }
                         let constraints = ReceiverVideoConstraints::for_endpoint(
                             &srv_ep_reassert,
                             WRTC_DEFAULT_MAX_VIDEO_HEIGHT,

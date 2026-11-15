@@ -299,6 +299,8 @@ pub async fn run_wrtc_server(
             Arc::new(DashMap::new());
         let client_modes: Arc<DashMap<String, String>> =
             Arc::new(DashMap::new());
+        let last_discover_nonces: Arc<DashMap<String, (String, Instant)>> =
+            Arc::new(DashMap::new());
         let client_video_endpoints: Arc<DashSet<String>> =
             Arc::new(DashSet::new());
         let known_client_video_ssrcs: Arc<DashSet<u32>> =
@@ -551,7 +553,11 @@ pub async fn run_wrtc_server(
                                         if !jingle.sources.is_empty() || !filtered_video_ssrcs.is_empty() {
                                             let _ = timeout(
                                                 Duration::from_secs(WRTC_SDP_RENEGOTIATE_TIMEOUT_SECS),
-                                                shared_peer.add_remote_ssrcs(&jingle.sources, &filtered_video_ssrcs),
+                                                shared_peer.add_remote_ssrcs_with_rtx(
+                                                    &jingle.sources,
+                                                    &filtered_video_ssrcs,
+                                                    &jingle.rtx_pairs,
+                                                ),
                                             )
                                             .await;
                                         }
@@ -606,17 +612,24 @@ pub async fn run_wrtc_server(
                                 ..
                             } => {
                                 info!("[WRTC Server] Jicofo acknowledged Jingle IQ {ack_id}");
-                                let video_eps: Vec<String> = client_video_endpoints
-                                    .iter()
-                                    .map(|e| e.key().clone())
-                                    .collect();
-                                if !video_eps.is_empty() {
-                                    let constraints = ReceiverVideoConstraints::for_endpoints(
-                                        &video_eps,
-                                        WRTC_DEFAULT_MAX_VIDEO_HEIGHT,
-                                    );
-                                    let _ = shared_peer.send_video_constraints(&constraints).await;
-                                    shared_peer.force_next_keyframe();
+                                let needs_warmup = clients_map.is_empty()
+                                    || clients_map.iter().any(|entry| {
+                                        let c_tag = client_tag_from_ip(&entry.value().assigned_ip);
+                                        !client_video_warmed_up.contains(&c_tag)
+                                    });
+                                if needs_warmup {
+                                    let video_eps: Vec<String> = client_video_endpoints
+                                        .iter()
+                                        .map(|e| e.key().clone())
+                                        .collect();
+                                    if !video_eps.is_empty() {
+                                        let constraints = ReceiverVideoConstraints::for_endpoints(
+                                            &video_eps,
+                                            WRTC_DEFAULT_MAX_VIDEO_HEIGHT,
+                                        );
+                                        let _ = shared_peer.send_video_constraints(&constraints).await;
+                                        shared_peer.force_next_keyframe();
+                                    }
                                 }
                             }
                             InboundXmpp::ExtdiscoServices(fresh_ice) => {
@@ -636,6 +649,7 @@ pub async fn run_wrtc_server(
                                         self_removed = true;
                                     } else if occupant_id != "focus" {
                                         client_modes.remove(occupant_id);
+                                        last_discover_nonces.remove(occupant_id);
                                         let removed_video_ep = client_video_endpoints.remove(occupant_id).is_some();
                                         if let Some((_, old_p2p)) = p2p_clients.remove(occupant_id) {
                                             old_p2p.close().await;
@@ -705,45 +719,63 @@ pub async fn run_wrtc_server(
 
             match msg.msg_payload {
                 WrtcMessage::Discover { client_nonce, video_ssrc, mode } => {
-                    let pref_mode = mode.unwrap_or_else(|| {
-                        if video_ssrc.is_some() {
-                            "media_video".to_string()
-                        } else {
-                            "ws".to_string()
+                    let is_dup_discover = last_discover_nonces
+                        .get(&from_endpoint)
+                        .map(|entry| {
+                            entry.value().0 == client_nonce
+                                && entry.value().1.elapsed() < Duration::from_millis(1500)
+                        })
+                        .unwrap_or(false);
+                    if is_dup_discover {
+                        trace!(
+                            "[WRTC Server] Ignoring duplicate anet_discover from client {from_endpoint} (nonce: {client_nonce}); re-answering beacon only"
+                        );
+                    } else {
+                        last_discover_nonces.insert(
+                            from_endpoint.clone(),
+                            (client_nonce.clone(), Instant::now()),
+                        );
+                        let pref_mode = mode.unwrap_or_else(|| {
+                            if video_ssrc.is_some() {
+                                "media_video".to_string()
+                            } else {
+                                "ws".to_string()
+                            }
+                        });
+                        info!(
+                            "[WRTC Server] Received anet_discover from client {from_endpoint} (nonce: {client_nonce}, mode: {pref_mode}, video_ssrc: {video_ssrc:?})! Answering beacon..."
+                        );
+                        client_modes.insert(from_endpoint.clone(), pref_mode.clone());
+
+                        if let Some(c_v_ssrc) = video_ssrc {
+                            if matches!(pref_mode.as_str(), "media_video" | "auto") {
+                                known_client_video_ssrcs.insert(c_v_ssrc);
+                                let already_in_jingle = room_jingle_video_ssrcs.contains(&c_v_ssrc);
+                                info!(
+                                    "[WRTC Server] Registered client video SSRC: {c_v_ssrc} for {from_endpoint} (already_in_jingle={already_in_jingle})"
+                                );
+
+                                // Привязываем видео SSRC клиента к выделенному Recvonly трансиверу
+                                let _ = timeout(
+                                    Duration::from_secs(WRTC_SDP_RENEGOTIATE_TIMEOUT_SECS),
+                                    shared_peer.add_remote_video_ssrc(c_v_ssrc),
+                                )
+                                .await;
+
+                                client_video_endpoints.insert(from_endpoint.clone());
+                                let video_eps: Vec<String> = client_video_endpoints
+                                    .iter()
+                                    .map(|e| e.key().clone())
+                                    .collect();
+                                let constraints = ReceiverVideoConstraints::for_endpoints(
+                                    &video_eps,
+                                    WRTC_DEFAULT_MAX_VIDEO_HEIGHT,
+                                );
+                                let _ = shared_peer.send_video_constraints(&constraints).await;
+                            }
                         }
-                    });
-                    info!(
-                        "[WRTC Server] Received anet_discover from client {from_endpoint} (nonce: {client_nonce}, mode: {pref_mode}, video_ssrc: {video_ssrc:?})! Answering beacon..."
-                    );
-                    client_modes.insert(from_endpoint.clone(), pref_mode.clone());
-
-                    if let Some(c_v_ssrc) = video_ssrc {
-                        if matches!(pref_mode.as_str(), "media_video" | "auto") {
-                            known_client_video_ssrcs.insert(c_v_ssrc);
-                            let already_in_jingle = room_jingle_video_ssrcs.contains(&c_v_ssrc);
-                            info!(
-                                "[WRTC Server] Registered client video SSRC: {c_v_ssrc} for {from_endpoint} (already_in_jingle={already_in_jingle})"
-                            );
-
-                            // Привязываем видео SSRC клиента к выделенному Recvonly трансиверу
-                            let _ = timeout(
-                                Duration::from_secs(WRTC_SDP_RENEGOTIATE_TIMEOUT_SECS),
-                                shared_peer.add_remote_video_ssrc(c_v_ssrc),
-                            ).await;
-
-                            client_video_endpoints.insert(from_endpoint.clone());
-                            let video_eps: Vec<String> = client_video_endpoints
-                                .iter()
-                                .map(|e| e.key().clone())
-                                .collect();
-                            let constraints = ReceiverVideoConstraints::for_endpoints(
-                                &video_eps,
-                                WRTC_DEFAULT_MAX_VIDEO_HEIGHT,
-                            );
-                            let _ = shared_peer.send_video_constraints(&constraints).await;
-                        }
+                        shared_peer.force_next_keyframe();
                     }
-                    shared_peer.force_next_keyframe();
                     let signature = sign_beacon(&signing_key_bytes, &client_nonce, &srv_id);
                     let beacon_msg = ColibriMessage::beacon(
                         from_endpoint.clone(),
@@ -794,7 +826,6 @@ pub async fn run_wrtc_server(
                                     );
                                 }
                                 client_dl_video_stalled.insert(c_tag, now_ms);
-                                client_video_warmed_up.remove(&c_tag);
                             } else {
                                 if client_dl_video_stalled.remove(&c_tag).is_some() {
                                     info!(
@@ -1021,7 +1052,7 @@ pub async fn run_wrtc_server(
                                                 );
                                                 batch_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
                                                 let mut warmup_probe_interval = interval(
-                                                    Duration::from_secs(2),
+                                                    Duration::from_secs(1),
                                                 );
                                                 warmup_probe_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
                                                 let mut batch_buf = BytesMut::with_capacity(MAX_PACKET_SIZE);
@@ -1082,7 +1113,7 @@ pub async fn run_wrtc_server(
                                                                 && client_video_warmed_dl.contains(&client_tag)
                                                                 && client_last_video_rx_dl
                                                                     .get(&client_tag)
-                                                                    .map(|t| now_ms.saturating_sub(*t) <= 5_000)
+                                                                    .map(|t| now_ms.saturating_sub(*t) <= 10_000)
                                                                     .unwrap_or(false);
 
                                                             let p2p_session = if is_p2p_pref {
@@ -1388,13 +1419,13 @@ pub async fn run_wrtc_server(
                                                                 let now_ms = peer_downlink.start_instant.elapsed().as_millis() as u64;
                                                                 let dl_stalled = client_dl_stalled_dl
                                                                     .get(&client_tag)
-                                                                    .map(|t| now_ms.saturating_sub(*t) <= 15_000)
+                                                                    .map(|t| now_ms.saturating_sub(*t) <= 8_000)
                                                                     .unwrap_or(false);
                                                                 let is_warmed = !dl_stalled
                                                                     && client_video_warmed_dl.contains(&client_tag)
                                                                     && client_last_video_rx_dl
                                                                         .get(&client_tag)
-                                                                        .map(|t| now_ms.saturating_sub(*t) <= 5_000)
+                                                                        .map(|t| now_ms.saturating_sub(*t) <= 10_000)
                                                                         .unwrap_or(false);
                                                                 if !is_warmed {
                                                                     let video_eps: Vec<String> = client_video_ep_dl
@@ -1470,16 +1501,13 @@ pub async fn run_wrtc_server(
                                         shared_peer.start_instant.elapsed().as_millis() as u64;
                                     let video_active = client_last_video_rx_ms
                                         .get(&c_tag)
-                                        .map(|ts| now_ms.saturating_sub(*ts) <= 4000)
+                                        .map(|ts| now_ms.saturating_sub(*ts) <= 5_000)
                                         .unwrap_or(false);
                                     let dl_stalled = client_dl_video_stalled
                                         .get(&c_tag)
                                         .map(|ts| now_ms.saturating_sub(*ts) <= 8_000)
                                         .unwrap_or(false);
                                     if !video_active || dl_stalled {
-                                        if !video_active {
-                                            client_video_warmed_up.remove(&c_tag);
-                                        }
                                         for enc_pkt in packets {
                                             match unwrap_packet_bytes(
                                                 &client_info.cipher,
