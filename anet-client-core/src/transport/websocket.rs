@@ -229,17 +229,17 @@ async fn connect_authenticated(
 async fn connect_pool_member(
     server: &ServerConfig,
     profile: &BrowserProfile,
-    gen: &PoolGeneration,
+    pool_gen: &PoolGeneration,
 ) -> Result<ClientSocket> {
     let timeout_dur = Duration::from_secs(server.timeout_secs.max(5));
     tokio::time::timeout(timeout_dur, async {
         let (mut socket, _) = open_ws_socket(server, profile).await?;
-        let sid_bytes = gen.session_id.as_bytes();
-        let claim = format!("BIND:{}", gen.session_id);
-        let seq = gen.tx_sequence.fetch_add(1, Ordering::Relaxed);
+        let sid_bytes = pool_gen.session_id.as_bytes();
+        let claim = format!("BIND:{}", pool_gen.session_id);
+        let seq = pool_gen.tx_sequence.fetch_add(1, Ordering::Relaxed);
         let proof = wrap_packet_slice(
-            &gen.cipher,
-            &gen.nonce_prefix,
+            &pool_gen.cipher,
+            &pool_gen.nonce_prefix,
             seq,
             claim.as_bytes(),
             0,
@@ -261,7 +261,7 @@ async fn connect_pool_member(
                         ack.starts_with(WS_MUX_ACK_MAGIC),
                         "Unexpected WS_MUX_BIND response magic"
                     );
-                    let payload = unwrap_packet(&gen.cipher, &ack[WS_MUX_ACK_MAGIC.len()..])
+                    let payload = unwrap_packet(&pool_gen.cipher, &ack[WS_MUX_ACK_MAGIC.len()..])
                         .context("Failed to decrypt WS_MUX_ACK proof")?;
                     anyhow::ensure!(
                         payload.as_ref() == sid_bytes,
@@ -314,6 +314,25 @@ async fn close_browser_session(socket: &mut ClientSocket) {
     .await;
 }
 
+fn apply_downlink_batch(
+    gid: u64,
+    batch: Vec<(u64, Bytes)>,
+    current_gen_id: &mut u64,
+    reassembler: &mut ReassemblyQueue,
+    downlink_buf: &mut BytesMut,
+) {
+    if gid < *current_gen_id {
+        return;
+    }
+    if gid > *current_gen_id {
+        reassembler.reset(0);
+        *current_gen_id = gid;
+    }
+    for pkt in reassembler.insert_batch(batch) {
+        frame_packet_into(downlink_buf, &pkt);
+    }
+}
+
 async fn run_downlink_sink(
     mut tunnel_write: tokio::io::WriteHalf<tokio::io::DuplexStream>,
     mut downlink_rx: mpsc::Receiver<(u64, Vec<(u64, Bytes)>)>,
@@ -353,26 +372,25 @@ async fn run_downlink_sink(
                 };
                 downlink_buf.clear();
 
-                let mut apply_batch = |gid: u64, b: Vec<(u64, Bytes)>| {
-                    if gid < current_gen_id {
-                        return;
-                    }
-                    if gid > current_gen_id {
-                        reassembler.reset(0);
-                        current_gen_id = gid;
-                    }
-                    for pkt in reassembler.insert_batch(b) {
-                        frame_packet_into(&mut downlink_buf, &pkt);
-                    }
-                };
-
-                apply_batch(gen_id, batch);
+                apply_downlink_batch(
+                    gen_id,
+                    batch,
+                    &mut current_gen_id,
+                    &mut reassembler,
+                    &mut downlink_buf,
+                );
 
                 let mut extra = 0usize;
                 while extra < 16 && downlink_buf.len() < COALESCE_BUDGET_BYTES {
                     match downlink_rx.try_recv() {
                         Ok((gid, b)) => {
-                            apply_batch(gid, b);
+                            apply_downlink_batch(
+                                gid,
+                                b,
+                                &mut current_gen_id,
+                                &mut reassembler,
+                                &mut downlink_buf,
+                            );
                             extra += 1;
                         }
                         Err(_) => break,
@@ -398,7 +416,7 @@ async fn run_downlink_sink(
 
 async fn run_client_socket(
     socket: ClientSocket,
-    gen: Arc<PoolGeneration>,
+    pool_gen: Arc<PoolGeneration>,
     shared_tx_rx: Arc<Mutex<mpsc::Receiver<Bytes>>>,
     downlink_tx: mpsc::Sender<(u64, Vec<(u64, Bytes)>)>,
     mut global_stop_rx: watch::Receiver<bool>,
@@ -406,14 +424,14 @@ async fn run_client_socket(
     rotation_dur: Duration,
     slot_idx: usize,
 ) -> SocketExit {
-    gen.active_slots.fetch_add(1, Ordering::AcqRel);
+    pool_gen.active_slots.fetch_add(1, Ordering::AcqRel);
 
     let (mut ws_sink, mut ws_stream) = socket.split();
     let (ctrl_tx, mut ctrl_rx) = mpsc::channel::<Message>(16);
     let (socket_stop_tx, mut socket_stop_rx) = watch::channel(false);
 
-    let reader_gen = gen.clone();
-    let mut reader_cancel_rx = gen.cancel_tx.subscribe();
+    let reader_gen = pool_gen.clone();
+    let mut reader_cancel_rx = pool_gen.cancel_tx.subscribe();
     let mut reader_global_stop_rx = global_stop_rx.clone();
     let mut reader_stop_rx = socket_stop_tx.subscribe();
     let reader_stop_tx = socket_stop_tx.clone();
@@ -500,7 +518,7 @@ async fn run_client_socket(
         let _ = reader_stop_tx.send(true);
     });
 
-    let mut gen_cancel_rx = gen.cancel_tx.subscribe();
+    let mut gen_cancel_rx = pool_gen.cancel_tx.subscribe();
     let mut rotation = Box::pin(tokio::time::sleep(rotation_dur));
     let mut ping_timer = Box::pin(tokio::time::sleep(random_client_ping_interval()));
     let mut raw_batch: Vec<Bytes> = Vec::with_capacity(64);
@@ -645,7 +663,7 @@ async fn run_client_socket(
             break 'writer;
         };
 
-        let budget = if gen.active_slots.load(Ordering::Relaxed) > 1 {
+        let budget = if pool_gen.active_slots.load(Ordering::Relaxed) > 1 {
             WS_POOL_COALESCE_BUDGET_BYTES
         } else {
             COALESCE_BUDGET_BYTES
@@ -670,7 +688,8 @@ async fn run_client_socket(
         }
 
         let base_seq = if !raw_batch.is_empty() {
-            gen.tx_sequence
+            pool_gen
+                .tx_sequence
                 .fetch_add(raw_batch.len() as u64, Ordering::Relaxed)
         } else {
             0
@@ -682,8 +701,8 @@ async fn run_client_socket(
             for (idx, raw) in raw_batch.drain(..).enumerate() {
                 let seq = base_seq + idx as u64;
                 if let Ok(encrypted) = wrap_packet_padded(
-                    &gen.cipher,
-                    &gen.nonce_prefix,
+                    &pool_gen.cipher,
+                    &pool_gen.nonce_prefix,
                     seq,
                     raw,
                     padding_step,
@@ -715,7 +734,7 @@ async fn run_client_socket(
 
     let _ = socket_stop_tx.send(true);
     let _ = reader_task.await;
-    gen.active_slots.fetch_sub(1, Ordering::AcqRel);
+    pool_gen.active_slots.fetch_sub(1, Ordering::AcqRel);
 
     exit_reason
 }

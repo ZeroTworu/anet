@@ -554,7 +554,7 @@ async fn handle_session(
                 shutdown_tx,
             });
 
-            if let Some((_, old_pool)) = ws_pools.insert(session_id, pool.clone()) {
+            if let Some(old_pool) = ws_pools.insert(session_id, pool.clone()) {
                 old_pool.evicted.store(true, Ordering::Release);
                 let _ = old_pool.shutdown_tx.send(true);
             }
