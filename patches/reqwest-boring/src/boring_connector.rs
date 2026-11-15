@@ -93,18 +93,19 @@ impl<S: AsyncRead + Unpin> AsyncRead for FragStream<S> {
 
 impl<S: AsyncWrite + Unpin> AsyncWrite for FragStream<S> {
     fn poll_write(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
         if buf.is_empty() {
-            return Pin::new(&mut self.inner).poll_write(cx, buf);
+            return Pin::new(&mut this.inner).poll_write(cx, buf);
         }
 
-        if let FragPhase::Armed(cfg) = self.phase {
+        if let FragPhase::Armed(cfg) = this.phase {
             if cfg.enabled && buf.len() >= 5 && buf[0] == 0x16 && buf[1] == 0x03 {
                 let record_len = u16::from_be_bytes([buf[3], buf[4]]) as usize;
-                self.phase = FragPhase::Fragmenting {
+                this.phase = FragPhase::Fragmenting {
                     cfg,
                     remaining: 5 + record_len,
                     chunk_rem: 0,
@@ -112,12 +113,13 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for FragStream<S> {
                     yield_next: false,
                 };
             } else {
-                self.phase = FragPhase::Done;
+                this.phase = FragPhase::Done;
             }
         }
 
-        match &mut self.phase {
-            FragPhase::Done | FragPhase::Armed(_) => Pin::new(&mut self.inner).poll_write(cx, buf),
+        let mut finished = false;
+        let res = match &mut this.phase {
+            FragPhase::Done | FragPhase::Armed(_) => Pin::new(&mut this.inner).poll_write(cx, buf),
             FragPhase::Fragmenting {
                 cfg,
                 remaining,
@@ -145,7 +147,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for FragStream<S> {
                 }
 
                 let to_write = buf.len().min(*remaining).min(*chunk_rem).max(1);
-                match Pin::new(&mut self.inner).poll_write(cx, &buf[..to_write]) {
+                match Pin::new(&mut this.inner).poll_write(cx, &buf[..to_write]) {
                     Poll::Pending => Poll::Pending,
                     Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
                     Poll::Ready(Ok(0)) => Poll::Ready(Ok(0)),
@@ -153,7 +155,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for FragStream<S> {
                         *remaining = remaining.saturating_sub(n);
                         *chunk_rem = chunk_rem.saturating_sub(n);
                         if *remaining == 0 {
-                            self.phase = FragPhase::Done;
+                            finished = true;
                         } else if *chunk_rem == 0 {
                             let delay = next_rand_range(
                                 cfg.min_delay_ms,
@@ -170,7 +172,11 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for FragStream<S> {
                     }
                 }
             }
+        };
+        if finished {
+            this.phase = FragPhase::Done;
         }
+        res
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
