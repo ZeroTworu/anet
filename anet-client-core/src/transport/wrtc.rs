@@ -10,8 +10,7 @@ use anet_common::consts::{
     WRTC_DEFAULT_FALLBACK_JVB_PORT, WRTC_DEFAULT_MAX_VIDEO_HEIGHT,
     WRTC_DISCOVER_BROADCAST_INTERVAL_SECS, WRTC_DUPLEX_BUFFER_SIZE, WRTC_ICE_GATHER_POLL_ATTEMPTS,
     WRTC_MIN_ASTP_VIDEO_FRAME_LEN, WRTC_MIN_IP_PACKET_LEN, WRTC_P2P_ICE_GATHER_POLL_INTERVAL_MS,
-    WRTC_PACING_HORIZON_NS, WRTC_UPLINK_PACING_NS_PER_BYTE, WRTC_VIDEO_CHANNEL_CAPACITY,
-    WRTC_WATCHDOG_TICK_SECS,
+    WRTC_VIDEO_CHANNEL_CAPACITY, WRTC_WATCHDOG_TICK_SECS,
 };
 use anet_common::encryption::Cipher;
 use anet_common::handshake_fragmentation::FragmentConfig;
@@ -955,6 +954,9 @@ impl ClientTransport for WrtcTransport {
         let last_pong_video = last_pong.clone();
         let mut batcher = PacketBatcher::new(ws_batcher_max_bytes, ws_batcher_max_delay_ms);
 
+        let uplink_pacing_ns_per_byte = self.config.wrtc.uplink_pacing_ns_per_byte;
+        let pacing_horizon = Duration::from_nanos(self.config.wrtc.pacing_horizon_ns);
+
         let uplink_task = tokio::spawn(async move {
             let mut frame_reader = FrameReader::new();
             let mut pending_packet: Option<Bytes> = None;
@@ -963,7 +965,6 @@ impl ClientTransport for WrtcTransport {
             let mut dl_video_stalled = false;
             let uplink_started_at = TokioInstant::now();
             let mut pacing_next_at = TokioInstant::now();
-            let pacing_horizon = Duration::from_nanos(WRTC_PACING_HORIZON_NS);
 
             if wrtc_mode == WrtcMode::MediaVideo || wrtc_mode == WrtcMode::Auto {
                 peer_tx.force_next_keyframe();
@@ -1116,20 +1117,22 @@ impl ClientTransport for WrtcTransport {
                                         VP8_ASTP_PREFIX_LEN,
                                     ) {
                                         Ok(enc_buf) => {
-                                            let frame_wire_bytes = enc_buf.len() as u64;
-                                            let pace_now = TokioInstant::now();
-                                            let pace_start = pacing_next_at.max(pace_now);
-                                            let pace_sched = pace_start
-                                                + Duration::from_nanos(
-                                                    frame_wire_bytes
-                                                        .saturating_mul(WRTC_UPLINK_PACING_NS_PER_BYTE),
-                                                );
-                                            if pace_sched.saturating_duration_since(pace_now)
-                                                > pacing_horizon
-                                            {
-                                                sleep_until(pace_sched).await;
+                                            if uplink_pacing_ns_per_byte > 0 {
+                                                let frame_wire_bytes = enc_buf.len() as u64;
+                                                let pace_now = TokioInstant::now();
+                                                let pace_start = pacing_next_at.max(pace_now);
+                                                let pace_sched = pace_start
+                                                    + Duration::from_nanos(
+                                                        frame_wire_bytes
+                                                            .saturating_mul(uplink_pacing_ns_per_byte),
+                                                    );
+                                                if pace_sched.saturating_duration_since(pace_now)
+                                                    > pacing_horizon
+                                                {
+                                                    sleep_until(pace_sched).await;
+                                                }
+                                                pacing_next_at = pace_sched;
                                             }
-                                            pacing_next_at = pace_sched;
 
                                             match peer_tx
                                                 .send_video_frame_preallocated(my_client_tag, enc_buf)

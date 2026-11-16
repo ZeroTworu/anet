@@ -1,8 +1,9 @@
 use crate::boring_tls::{TlsClientConfig, TlsFingerprint, TlsFragConfig};
 use crate::consts::{
     MAX_VIDEO_BATCH_BYTES, WRTC_BATCHER_MAX_BYTES, WRTC_BATCHER_MAX_DELAY_MS,
-    WRTC_COLIBRI_WS_READ_TIMEOUT_SECS, WRTC_MIN_TUN_MTU, WRTC_TCP_PORT_HOP_ATTEMPTS,
-    WRTC_TCP_PORT_HOP_TIMEOUT_MS, WRTC_UDP_ICE_SOCKET_COUNT, WRTC_UPLINK_BURST_MAX_PACKETS,
+    WRTC_COLIBRI_WS_READ_TIMEOUT_SECS, WRTC_DOWNLINK_PACING_NS_PER_BYTE, WRTC_MIN_TUN_MTU,
+    WRTC_PACING_HORIZON_NS, WRTC_TCP_PORT_HOP_ATTEMPTS, WRTC_TCP_PORT_HOP_TIMEOUT_MS,
+    WRTC_UDP_ICE_SOCKET_COUNT, WRTC_UPLINK_BURST_MAX_PACKETS, WRTC_UPLINK_PACING_NS_PER_BYTE,
     WRTC_VIDEO_BATCH_MAX_PACKETS, WRTC_VIDEO_MTU_OVERHEAD,
 };
 use serde::{Deserialize, Deserializer, Serialize};
@@ -276,6 +277,12 @@ pub struct WrtcConfig {
     pub ws_batcher_max_delay_ms: u64,
     /// Интервал отправки фоновых пустых ключевых кадров VP8 во время простоя туннеля (в миллисекундах).
     pub video_keepalive_interval_ms: u64,
+    /// Пейсинг EDT micro-pacer на Downlink сервером (нc/байт; `18` ≈ 444 Мбит/с, `0` — отключить pacing).
+    pub downlink_pacing_ns_per_byte: u64,
+    /// Пейсинг EDT micro-pacer на Uplink клиентом (нc/байт; `22` ≈ 363 Мбит/с, `0` — отключить pacing).
+    pub uplink_pacing_ns_per_byte: u64,
+    /// Горизонт накопления EDT micro-pacer в наносекундах (по умолчанию `3_000_000`, т.е. 3 мс).
+    pub pacing_horizon_ns: u64,
 
     /// Время нахождения PeerConnection в состоянии `Disconnected` (в секундах),
     /// после которого сторожевой таймер принудительно пересоздаёт сессию.
@@ -324,6 +331,9 @@ impl Default for WrtcConfig {
             ws_batcher_max_bytes: WRTC_BATCHER_MAX_BYTES,
             ws_batcher_max_delay_ms: WRTC_BATCHER_MAX_DELAY_MS,
             video_keepalive_interval_ms: 1000,
+            downlink_pacing_ns_per_byte: WRTC_DOWNLINK_PACING_NS_PER_BYTE,
+            uplink_pacing_ns_per_byte: WRTC_UPLINK_PACING_NS_PER_BYTE,
+            pacing_horizon_ns: WRTC_PACING_HORIZON_NS,
             watchdog_disconnected_timeout_secs: 8,
             watchdog_channel_grace_secs: 12,
             peer_close_timeout_secs: 3,

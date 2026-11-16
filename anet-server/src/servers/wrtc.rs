@@ -5,11 +5,10 @@ use anet_common::consts::{
     MAX_PACKET_SIZE, VIDEO_BATCH_MARKER, VIDEO_WARMUP_ACK_PAYLOAD, VIDEO_WARMUP_MARKER_HI,
     VIDEO_WARMUP_MARKER_LO, VIDEO_WARMUP_PAYLOAD, VP8_ASTP_PREFIX_LEN,
     WRTC_COLIBRI_CHANNEL_CAPACITY, WRTC_DEFAULT_FALLBACK_JVB_IP, WRTC_DEFAULT_MAX_VIDEO_HEIGHT,
-    WRTC_DOWNLINK_PACING_NS_PER_BYTE, WRTC_HANDSHAKE_PROCESS_TIMEOUT_SECS,
-    WRTC_ICE_GATHER_POLL_ATTEMPTS, WRTC_MIN_ASTP_VIDEO_FRAME_LEN, WRTC_MIN_IP_PACKET_LEN,
-    WRTC_P2P_ICE_GATHER_POLL_INTERVAL_MS, WRTC_PACING_HORIZON_NS,
-    WRTC_SDP_RENEGOTIATE_TIMEOUT_SECS, WRTC_SERVER_RECONNECT_PAUSE_SECS,
-    WRTC_SERVER_RETRY_DELAY_SECS, WRTC_WATCHDOG_TICK_SECS,
+    WRTC_HANDSHAKE_PROCESS_TIMEOUT_SECS, WRTC_ICE_GATHER_POLL_ATTEMPTS,
+    WRTC_MIN_ASTP_VIDEO_FRAME_LEN, WRTC_MIN_IP_PACKET_LEN,
+    WRTC_P2P_ICE_GATHER_POLL_INTERVAL_MS, WRTC_SDP_RENEGOTIATE_TIMEOUT_SECS,
+    WRTC_SERVER_RECONNECT_PAUSE_SECS, WRTC_SERVER_RETRY_DELAY_SECS, WRTC_WATCHDOG_TICK_SECS,
 };
 use anet_common::http_help::BrowserProfile;
 use anet_common::icmp_probe::{clamp_tcp_mss_bytes, handle_in_tunnel_icmp_probe};
@@ -1041,6 +1040,10 @@ pub async fn run_wrtc_server(
                                             let max_video_batch_bytes = video_tun_mtu
                                                 .saturating_sub(30)
                                                 .min(cfg_max_video_batch_bytes);
+                                            let downlink_pacing_ns_per_byte =
+                                                config.wrtc.downlink_pacing_ns_per_byte;
+                                            let dl_pacing_horizon =
+                                                Duration::from_nanos(config.wrtc.pacing_horizon_ns);
 
                                             let downlink_handle = tokio::spawn(async move {
                                                 let mut batcher = PacketBatcher::new(
@@ -1058,7 +1061,6 @@ pub async fn run_wrtc_server(
                                                 let mut batch_buf = BytesMut::with_capacity(MAX_PACKET_SIZE);
                                                 let mut pending_packet: Option<Bytes> = None;
                                                 let mut dl_pacing_next_at = Instant::now();
-                                                let dl_pacing_horizon = Duration::from_nanos(WRTC_PACING_HORIZON_NS);
 
                                                 if (srv_mode == WrtcMode::MediaVideo
                                                     || srv_mode == WrtcMode::Auto)
@@ -1196,20 +1198,22 @@ pub async fn run_wrtc_server(
                                                                                 payload_slice,
                                                                                 VP8_ASTP_PREFIX_LEN,
                                                                             ) {
-                                                                                let frame_wire_bytes = enc_buf.len() as u64;
-                                                                                let pace_now = Instant::now();
-                                                                                let pace_start = dl_pacing_next_at.max(pace_now);
-                                                                                let pace_sched = pace_start
-                                                                                    + Duration::from_nanos(
-                                                                                        frame_wire_bytes
-                                                                                            .saturating_mul(WRTC_DOWNLINK_PACING_NS_PER_BYTE),
-                                                                                    );
-                                                                                if pace_sched.saturating_duration_since(pace_now)
-                                                                                    > dl_pacing_horizon
-                                                                                {
-                                                                                    sleep_until(pace_sched).await;
+                                                                                if downlink_pacing_ns_per_byte > 0 {
+                                                                                    let frame_wire_bytes = enc_buf.len() as u64;
+                                                                                    let pace_now = Instant::now();
+                                                                                    let pace_start = dl_pacing_next_at.max(pace_now);
+                                                                                    let pace_sched = pace_start
+                                                                                        + Duration::from_nanos(
+                                                                                            frame_wire_bytes
+                                                                                                .saturating_mul(downlink_pacing_ns_per_byte),
+                                                                                        );
+                                                                                    if pace_sched.saturating_duration_since(pace_now)
+                                                                                        > dl_pacing_horizon
+                                                                                    {
+                                                                                        sleep_until(pace_sched).await;
+                                                                                    }
+                                                                                    dl_pacing_next_at = pace_sched;
                                                                                 }
-                                                                                dl_pacing_next_at = pace_sched;
 
                                                                                 let _ = peer_downlink
                                                                                     .send_video_frame_preallocated(client_tag, enc_buf)
@@ -1225,20 +1229,22 @@ pub async fn run_wrtc_server(
                                                                                 &packet,
                                                                                 VP8_ASTP_PREFIX_LEN,
                                                                             ) {
-                                                                                let frame_wire_bytes = enc_buf.len() as u64;
-                                                                                let pace_now = Instant::now();
-                                                                                let pace_start = dl_pacing_next_at.max(pace_now);
-                                                                                let pace_sched = pace_start
-                                                                                    + Duration::from_nanos(
-                                                                                        frame_wire_bytes
-                                                                                            .saturating_mul(WRTC_DOWNLINK_PACING_NS_PER_BYTE),
-                                                                                    );
-                                                                                if pace_sched.saturating_duration_since(pace_now)
-                                                                                    > dl_pacing_horizon
-                                                                                {
-                                                                                    sleep_until(pace_sched).await;
+                                                                                if downlink_pacing_ns_per_byte > 0 {
+                                                                                    let frame_wire_bytes = enc_buf.len() as u64;
+                                                                                    let pace_now = Instant::now();
+                                                                                    let pace_start = dl_pacing_next_at.max(pace_now);
+                                                                                    let pace_sched = pace_start
+                                                                                        + Duration::from_nanos(
+                                                                                            frame_wire_bytes
+                                                                                                .saturating_mul(downlink_pacing_ns_per_byte),
+                                                                                        );
+                                                                                    if pace_sched.saturating_duration_since(pace_now)
+                                                                                        > dl_pacing_horizon
+                                                                                    {
+                                                                                        sleep_until(pace_sched).await;
+                                                                                    }
+                                                                                    dl_pacing_next_at = pace_sched;
                                                                                 }
-                                                                                dl_pacing_next_at = pace_sched;
 
                                                                                 if let Ok(frozen) = peer_downlink
                                                                                     .send_video_frame_preallocated(client_tag, enc_buf)

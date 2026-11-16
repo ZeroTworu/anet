@@ -349,6 +349,17 @@ ws_batcher_max_delay_ms = 2
 video_keepalive_interval_ms = 1000
 # video_keepalive_interval_ms = 500 # для CF WARP (более частый прогрев медиа-тракта через NAT WARP)
 
+# --- Мягкий EDT micro-pacer для сглаживания мгновенных микровсплесков TUN -> UDP ---
+
+# Шаг пейсинга Uplink на клиенте (нс/байт: 22 ≈ 363 Мбит/с, 0 — полностью отключить pacing)
+uplink_pacing_ns_per_byte = 22
+
+# Шаг пейсинга Downlink (серверный параметр, нс/байт: 18 ≈ 444 Мбит/с, 0 — отключить)
+downlink_pacing_ns_per_byte = 18
+
+# Горизонт коалесценции/ожидания micro-pacer (в наносекундах, по умолчанию 3 мс = 3000000)
+pacing_horizon_ns = 3000000
+
 # --- Сторожевые таймеры (watchdog) контроля целостности WebRTC и внутритуннельного тракта (в секундах) ---
 
 # Время нахождения PeerConnection в состоянии Disconnected до принудительного пересоздания сессии
