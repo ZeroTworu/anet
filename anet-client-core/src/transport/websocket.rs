@@ -524,7 +524,7 @@ async fn run_client_socket(
     let mut raw_batch: Vec<Bytes> = Vec::with_capacity(64);
     let mut batch_buf = BytesMut::with_capacity(COALESCE_BUDGET_BYTES + 2048);
 
-    let mut exit_reason = SocketExit::Disconnected;
+    let exit_reason;
 
     'writer: loop {
         if *global_stop_rx.borrow() {

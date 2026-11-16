@@ -533,12 +533,36 @@ pub fn parse_jingle_node(
                         })
                         .and_then(|c| c.attribute("value"))
                         .and_then(|v| v.trim().parse::<u8>().ok());
+                    let mut fmtp_parts: Vec<String> = Vec::new();
+                    for c in pt.children().filter(|c| c.has_tag_name("parameter")) {
+                        let Some(p_name) = c
+                            .attribute("name")
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                        else {
+                            continue;
+                        };
+                        if p_name.eq_ignore_ascii_case("apt") {
+                            continue;
+                        }
+                        let p_val = c
+                            .attribute("value")
+                            .map(|v| v.trim().trim_matches(';').trim())
+                            .unwrap_or("");
+                        if p_val.is_empty() {
+                            fmtp_parts.push(p_name.to_string());
+                        } else {
+                            fmtp_parts.push(format!("{p_name}={p_val}"));
+                        }
+                    }
+                    let fmtp = fmtp_parts.join(";");
                     let parsed_pt = JinglePayloadType {
                         id,
                         name: name.clone(),
                         clock_rate,
                         channels,
                         apt,
+                        fmtp,
                     };
                     if content_is_video {
                         if name.eq_ignore_ascii_case("vp8") && !vp8_pt_found {

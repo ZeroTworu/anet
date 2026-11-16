@@ -101,6 +101,39 @@ pub struct JinglePayloadType {
     pub channels: u16,
     #[serde(default)]
     pub apt: Option<u8>,
+    #[serde(default)]
+    pub fmtp: String,
+}
+
+impl JinglePayloadType {
+    pub fn effective_sdp_fmtp(&self) -> String {
+        let trimmed = self.fmtp.trim().trim_matches(';').trim();
+        if self.name.eq_ignore_ascii_case("h264") {
+            // rtc-0.21.1's H264Fmtp::match_fmtp requires BOTH `profile-level-id`
+            // and `packetization-mode` to be present in both local MediaEngine
+            // and remote SDP; otherwise H264 (and its apt= RTX PT) falls back to
+            // CodecMatch::Partial and gets dropped from negotiated_video_codecs.
+            let lower = trimmed.to_ascii_lowercase();
+            let has_plid = lower.contains("profile-level-id=");
+            let has_pmode = lower.contains("packetization-mode=");
+            let mut out = trimmed.to_string();
+            if !has_plid {
+                if !out.is_empty() {
+                    out.push(';');
+                }
+                out.push_str("profile-level-id=42e01f");
+            }
+            if !has_pmode {
+                if !out.is_empty() {
+                    out.push(';');
+                }
+                out.push_str("packetization-mode=1");
+            }
+            out
+        } else {
+            trimmed.to_string()
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -263,6 +296,10 @@ impl JingleSession {
                     apt_item.id, apt_item.name, clock
                 ));
             }
+            let afmtp = apt_item.effective_sdp_fmtp();
+            if !afmtp.is_empty() {
+                audio_fmt_lines.push_str(&format!("a=fmtp:{} {}\r\n", apt_item.id, afmtp));
+            }
         }
         let mut audio_has_rtx = false;
         for apt_item in &self.audio_payload_types {
@@ -345,12 +382,19 @@ impl JingleSession {
                     90000
                 };
                 video_fmt_lines.push_str(&format!(
-                    "a=rtpmap:{} {}/{}\r\n\
-                     a=rtcp-fb:{} goog-remb\r\n\
+                    "a=rtpmap:{} {}/{}\r\n",
+                    vpt.id, vpt.name, clock
+                ));
+                let vfmtp = vpt.effective_sdp_fmtp();
+                if !vfmtp.is_empty() {
+                    video_fmt_lines.push_str(&format!("a=fmtp:{} {}\r\n", vpt.id, vfmtp));
+                }
+                video_fmt_lines.push_str(&format!(
+                    "a=rtcp-fb:{} goog-remb\r\n\
                      a=rtcp-fb:{} ccm fir\r\n\
                      a=rtcp-fb:{} nack\r\n\
                      a=rtcp-fb:{} nack pli\r\n",
-                    vpt.id, vpt.name, clock, vpt.id, vpt.id, vpt.id, vpt.id
+                    vpt.id, vpt.id, vpt.id, vpt.id
                 ));
             }
             let mut video_has_rtx = false;
