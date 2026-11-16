@@ -454,9 +454,14 @@ impl PeerConnectionEventHandler for PeerEvents {
                                     continue;
                                 }
 
+                                let now_ms = (start_inst.elapsed().as_millis() as u64).max(1);
                                 let exp = expected_ssrc.load(Ordering::Relaxed);
-                                if exp != 0 && pkt.header.ssrc != exp {
-                                    continue;
+                                let mismatched_ssrc = exp != 0 && pkt.header.ssrc != exp;
+                                if mismatched_ssrc {
+                                    let last = last_rx_ms.load(Ordering::Relaxed);
+                                    if last != 0 && now_ms.saturating_sub(last) < 3_000 {
+                                        continue;
+                                    }
                                 }
 
                                 data = data.slice(VP8_KEYFRAME_1080P_HEADER.len()..);
@@ -464,15 +469,14 @@ impl PeerConnectionEventHandler for PeerEvents {
                                     continue;
                                 }
 
-                                last_rx_ms.store(
-                                    (start_inst.elapsed().as_millis() as u64).max(1),
-                                    Ordering::Relaxed,
-                                );
-                                if first_rx.swap(false, Ordering::Relaxed) {
-                                    info!(
-                                        "[WRTC Media Video IN] First video frame received (SSRC: {}, len: {} bytes)",
-                                        pkt.header.ssrc, data.len()
-                                    );
+                                if !mismatched_ssrc {
+                                    last_rx_ms.store(now_ms, Ordering::Relaxed);
+                                    if first_rx.swap(false, Ordering::Relaxed) {
+                                        info!(
+                                            "[WRTC Media Video IN] First video frame received (SSRC: {}, len: {} bytes)",
+                                            pkt.header.ssrc, data.len()
+                                        );
+                                    }
                                 }
                                 let _ = in_tx.try_send(data);
                             }
@@ -1087,6 +1091,7 @@ pub struct WrtcPeer {
     pub video_ts: Arc<AtomicU32>,
     pub expected_peer_video_ssrc: Arc<AtomicU32>,
     pub outgoing_tx: mpsc::Sender<ColibriMessage>,
+    pub ctrl_outgoing_tx: mpsc::Sender<ColibriMessage>,
     pub raw_outgoing_tx: mpsc::Sender<String>,
     pub incoming_rx: Mutex<mpsc::Receiver<ColibriMessage>>,
     pub video_incoming_rx: Mutex<mpsc::Receiver<Bytes>>,
@@ -1135,6 +1140,7 @@ impl WrtcPeer {
             mpsc::channel::<Bytes>(WRTC_VIDEO_CHANNEL_CAPACITY);
         let (outgoing_tx, mut outgoing_rx) =
             mpsc::channel::<ColibriMessage>(WRTC_COLIBRI_CHANNEL_CAPACITY);
+        let (ctrl_outgoing_tx, mut ctrl_outgoing_rx) = mpsc::channel::<ColibriMessage>(1024);
         let (raw_outgoing_tx, mut raw_outgoing_rx) =
             mpsc::channel::<String>(WRTC_COLIBRI_CHANNEL_CAPACITY);
         let (connected_tx, _connected_rx) = mpsc::channel::<()>(1);
@@ -2044,8 +2050,9 @@ impl WrtcPeer {
 
                     loop {
                         let (json_str, msg_to_opt, is_batch, is_astp, is_keepalive, is_discovery) = tokio::select! {
-                            msg_opt = outgoing_rx.recv() => {
-                                match msg_opt {
+                            biased;
+                            ctrl_opt = ctrl_outgoing_rx.recv() => {
+                                match ctrl_opt {
                                     Some(msg) => {
                                         let is_batch = matches!(msg.msg_payload, WrtcMessage::AstpBatch { .. });
                                         let is_astp = matches!(msg.msg_payload, WrtcMessage::Astp { .. });
@@ -2064,6 +2071,23 @@ impl WrtcPeer {
                             raw_opt = raw_outgoing_rx.recv() => {
                                 match raw_opt {
                                     Some(raw) => (raw, None, false, false, false, false),
+                                    None => break,
+                                }
+                            }
+                            msg_opt = outgoing_rx.recv() => {
+                                match msg_opt {
+                                    Some(msg) => {
+                                        let is_batch = matches!(msg.msg_payload, WrtcMessage::AstpBatch { .. });
+                                        let is_astp = matches!(msg.msg_payload, WrtcMessage::Astp { .. });
+                                        let is_keepalive = matches!(msg.msg_payload, WrtcMessage::Ping | WrtcMessage::Pong);
+                                        let is_discovery = matches!(
+                                            msg.msg_payload,
+                                            WrtcMessage::Discover { .. } | WrtcMessage::Beacon { .. }
+                                        );
+                                        let msg_to_opt = msg.to.clone();
+                                        let Ok(json_str) = serde_json::to_string(&msg) else { continue; };
+                                        (json_str, msg_to_opt, is_batch, is_astp, is_keepalive, is_discovery)
+                                    }
                                     None => break,
                                 }
                             }
@@ -2159,8 +2183,16 @@ impl WrtcPeer {
                         // Резервная доставка через XMPP MUC `<json-message>`, когда ни SCTP DataChannel, ни Colibri-WS
                         // недоступны (например, под Белыми Списками, когда `*.ktalk.host` заблокирован, а сигналинг `*.ktalk.ru` жив),
                         // либо когда целевой пир (`target_is_xmpp_only`) общается через XMPP MUC.
+                        let is_bulk_data = is_batch;
+                        let has_fast_text_channel = !target_is_xmpp_only
+                            && (has_ws_out.load(Ordering::SeqCst)
+                                || (use_sctp_dc
+                                    && dc_is_open_out.load(Ordering::SeqCst)
+                                    && is_connected_out.load(Ordering::SeqCst)));
+                        let allow_xmpp_fallback = !is_constraints
+                            && (!is_bulk_data || (!has_fast_text_channel && mode != WrtcMode::MediaVideo));
                         let mut xmpp_sent = false;
-                        if !sent && !is_constraints {
+                        if !sent && allow_xmpp_fallback {
                             if is_astp || is_batch || is_keepalive {
                                 trace!("[XMPP MUC JSON OUT]: {json_str}");
                             } else {
@@ -2438,6 +2470,7 @@ impl WrtcPeer {
             video_ts,
             expected_peer_video_ssrc,
             outgoing_tx,
+            ctrl_outgoing_tx,
             raw_outgoing_tx,
             incoming_rx: Mutex::new(incoming_rx),
             video_incoming_rx: Mutex::new(video_incoming_rx),
@@ -2660,6 +2693,16 @@ impl WrtcPeer {
         }
     }
 
+    pub fn mark_video_rx_verified(&self) {
+        let now_ms = (self.start_instant.elapsed().as_millis() as u64).max(1);
+        let prev = self.last_video_rx_ms.swap(now_ms, Ordering::Relaxed);
+        if prev == 0 || now_ms.saturating_sub(prev) >= 3_000 {
+            if self.expected_peer_video_ssrc.swap(0, Ordering::Relaxed) != 0 {
+                info!("[WRTC Media] Re-bound video RX SSRC dynamically after primary SSRC silence");
+            }
+        }
+    }
+
     pub async fn add_remote_ssrcs(&self, audio_ssrcs: &[u32], video_ssrcs: &[u32]) {
         self.add_remote_ssrcs_with_rtx(audio_ssrcs, video_ssrcs, &[])
             .await;
@@ -2875,10 +2918,28 @@ impl WrtcPeer {
     }
 
     pub async fn send(&self, msg: ColibriMessage) -> AnyhowResult<()> {
-        self.outgoing_tx
-            .send(msg)
-            .await
-            .map_err(|_| anyhow!("WebRTC DataChannel write channel closed"))
+        match &msg.msg_payload {
+            WrtcMessage::AstpBatch { .. } => match self.outgoing_tx.try_send(msg) {
+                Ok(()) => Ok(()),
+                Err(TrySendError::Full(_)) => {
+                    trace!("[WRTC] Bulk outgoing queue full; tail-dropping AstpBatch");
+                    Ok(())
+                }
+                Err(TrySendError::Closed(_)) => {
+                    Err(anyhow!("WebRTC DataChannel write channel closed"))
+                }
+            },
+            WrtcMessage::Astp { .. } => self
+                .outgoing_tx
+                .send(msg)
+                .await
+                .map_err(|_| anyhow!("WebRTC DataChannel write channel closed")),
+            _ => self
+                .ctrl_outgoing_tx
+                .send(msg)
+                .await
+                .map_err(|_| anyhow!("WebRTC DataChannel control channel closed")),
+        }
     }
 
     pub async fn recv(&self) -> Option<ColibriMessage> {

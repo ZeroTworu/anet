@@ -1109,7 +1109,7 @@ pub async fn run_wrtc_server(
                                                             let dl_stalled = has_text_fallback
                                                                 && client_dl_stalled_dl
                                                                     .get(&client_tag)
-                                                                    .map(|t| now_ms.saturating_sub(*t) <= 8_000)
+                                                                    .map(|t| now_ms.saturating_sub(*t) <= 12_000)
                                                                     .unwrap_or(false);
                                                             let video_warmed_up = !dl_stalled
                                                                 && client_video_warmed_dl.contains(&client_tag)
@@ -1425,14 +1425,14 @@ pub async fn run_wrtc_server(
                                                                 let now_ms = peer_downlink.start_instant.elapsed().as_millis() as u64;
                                                                 let dl_stalled = client_dl_stalled_dl
                                                                     .get(&client_tag)
-                                                                    .map(|t| now_ms.saturating_sub(*t) <= 8_000)
+                                                                    .map(|t| now_ms.saturating_sub(*t) <= 12_000)
                                                                     .unwrap_or(false);
-                                                                let is_warmed = !dl_stalled
-                                                                    && client_video_warmed_dl.contains(&client_tag)
+                                                                let uplink_video_ok = client_video_warmed_dl.contains(&client_tag)
                                                                     && client_last_video_rx_dl
                                                                         .get(&client_tag)
                                                                         .map(|t| now_ms.saturating_sub(*t) <= 10_000)
                                                                         .unwrap_or(false);
+                                                                let is_warmed = !dl_stalled && uplink_video_ok;
                                                                 if !is_warmed {
                                                                     let video_eps: Vec<String> = client_video_ep_dl
                                                                         .iter()
@@ -1447,22 +1447,25 @@ pub async fn run_wrtc_server(
                                                                     }
                                                                     peer_downlink.force_next_keyframe();
                                                                 }
-                                                                let probe_payload = if is_warmed {
+                                                                let probe_payload = if uplink_video_ok {
                                                                     &VIDEO_WARMUP_ACK_PAYLOAD
                                                                 } else {
                                                                     &VIDEO_WARMUP_PAYLOAD
                                                                 };
-                                                                let seq = c_info.sequence.fetch_add(1, Ordering::Relaxed);
-                                                                if let Ok(enc_buf) = wrap_packet_slice_with_headroom(
-                                                                    &c_info.cipher,
-                                                                    &c_info.nonce_prefix,
-                                                                    seq,
-                                                                    probe_payload,
-                                                                    VP8_ASTP_PREFIX_LEN,
-                                                                ) {
-                                                                    let _ = peer_downlink
-                                                                        .send_video_frame_preallocated(client_tag, enc_buf)
-                                                                        .await;
+                                                                let probe_count = if dl_stalled { 2 } else { 1 };
+                                                                for _ in 0..probe_count {
+                                                                    let seq = c_info.sequence.fetch_add(1, Ordering::Relaxed);
+                                                                    if let Ok(enc_buf) = wrap_packet_slice_with_headroom(
+                                                                        &c_info.cipher,
+                                                                        &c_info.nonce_prefix,
+                                                                        seq,
+                                                                        probe_payload,
+                                                                        VP8_ASTP_PREFIX_LEN,
+                                                                    ) {
+                                                                        let _ = peer_downlink
+                                                                            .send_video_frame_preallocated(client_tag, enc_buf)
+                                                                            .await;
+                                                                    }
                                                                 }
                                                             }
                                                         }
@@ -1511,7 +1514,7 @@ pub async fn run_wrtc_server(
                                         .unwrap_or(false);
                                     let dl_stalled = client_dl_video_stalled
                                         .get(&c_tag)
-                                        .map(|ts| now_ms.saturating_sub(*ts) <= 8_000)
+                                        .map(|ts| now_ms.saturating_sub(*ts) <= 12_000)
                                         .unwrap_or(false);
                                     if !video_active || dl_stalled {
                                         for enc_pkt in packets {

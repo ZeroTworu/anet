@@ -964,6 +964,7 @@ impl ClientTransport for WrtcTransport {
             let mut cached_p2p: Option<Arc<P2pSession>> = None;
             let mut dl_video_stalled = false;
             let uplink_started_at = TokioInstant::now();
+            let mut last_stall_check_at = TokioInstant::now();
             let mut pacing_next_at = TokioInstant::now();
 
             if wrtc_mode == WrtcMode::MediaVideo || wrtc_mode == WrtcMode::Auto {
@@ -1016,42 +1017,43 @@ impl ClientTransport for WrtcTransport {
                             && peer_tx.is_connected.load(Ordering::Relaxed)
                             && has_text_fallback
                         {
-                            let rx_age_ms = peer_tx.video_rx_age_ms();
-                            let warmed_ever = !first_client_rx_tx.load(Ordering::Relaxed);
-                            let next_stalled = if warmed_ever || uplink_started_at.elapsed() >= Duration::from_secs(8) {
-                                let age = rx_age_ms.unwrap_or(u64::MAX);
-                                if dl_video_stalled {
-                                    age >= 3_000
+                            if last_stall_check_at.elapsed() >= Duration::from_millis(500) {
+                                last_stall_check_at = TokioInstant::now();
+                                let rx_age_ms = peer_tx.video_rx_age_ms();
+                                let warmed_ever = !first_client_rx_tx.load(Ordering::Relaxed);
+                                let next_stalled = if warmed_ever || uplink_started_at.elapsed() >= Duration::from_secs(15) {
+                                    let age = rx_age_ms.unwrap_or(u64::MAX);
+                                    if dl_video_stalled {
+                                        age >= 3_000
+                                    } else {
+                                        age >= 10_000
+                                    }
                                 } else {
-                                    age >= 10_000
+                                    false
+                                };
+                                if next_stalled != dl_video_stalled {
+                                    dl_video_stalled = next_stalled;
+                                    if dl_video_stalled {
+                                        warn!("[WRTC Client] Downlink VP8 video stalled (age={rx_age_ms:?} ms); reporting stall to fallback downlink to Colibri-WS/DC");
+                                    } else {
+                                        info!("[WRTC Client] Downlink VP8 video recovered; clearing stall state");
+                                        peer_tx.force_next_keyframe();
+                                    }
+                                    let _ = peer_tx
+                                        .send(ColibriMessage::video_rx_stall(
+                                            target_srv_tx.clone(),
+                                            dl_video_stalled,
+                                        ))
+                                        .await;
                                 }
-                            } else {
-                                false
-                            };
-                            if next_stalled != dl_video_stalled {
-                                dl_video_stalled = next_stalled;
-                                if dl_video_stalled {
-                                    warn!("[WRTC Client] Downlink VP8 video stalled (age={rx_age_ms:?} ms); reporting stall & switching uplink to Colibri-WS/DC");
-                                } else {
-                                    info!("[WRTC Client] Downlink VP8 video recovered; clearing stall state");
-                                    peer_tx.force_next_keyframe();
-                                }
-                                let _ = peer_tx
-                                    .send(ColibriMessage::video_rx_stall(
-                                        target_srv_tx.clone(),
-                                        dl_video_stalled,
-                                    ))
-                                    .await;
                             }
                         } else if dl_video_stalled {
                             dl_video_stalled = false;
                         }
                         let can_video_mode = !p2p_active
-                            && !dl_video_stalled
                             && (wrtc_mode == WrtcMode::MediaVideo || wrtc_mode == WrtcMode::Auto);
                         let last_v_rx = last_video_rx_tx.load(Ordering::Relaxed);
-                        let video_warmed_up = !dl_video_stalled
-                            && !first_client_rx_tx.load(Ordering::Relaxed)
+                        let video_warmed_up = !first_client_rx_tx.load(Ordering::Relaxed)
                             && peer_tx.is_connected.load(Ordering::Relaxed)
                             && (last_v_rx > 0
                                 && current_timestamp_secs().saturating_sub(last_v_rx) <= 10);
@@ -1286,8 +1288,9 @@ impl ClientTransport for WrtcTransport {
                                 || peer_tx.dc_is_open.load(Ordering::Relaxed);
                             let rx_age_ms = peer_tx.video_rx_age_ms();
                             if has_text_fallback {
+                                last_stall_check_at = TokioInstant::now();
                                 let warmed_ever = !first_client_rx_tx.load(Ordering::Relaxed);
-                                let next_stalled = if warmed_ever || uplink_started_at.elapsed() >= Duration::from_secs(8) {
+                                let next_stalled = if warmed_ever || uplink_started_at.elapsed() >= Duration::from_secs(15) {
                                     let age = rx_age_ms.unwrap_or(u64::MAX);
                                     if dl_video_stalled {
                                         age >= 3_000
@@ -1300,7 +1303,7 @@ impl ClientTransport for WrtcTransport {
                                 if next_stalled != dl_video_stalled {
                                     dl_video_stalled = next_stalled;
                                     if dl_video_stalled {
-                                        warn!("[WRTC Client] Downlink VP8 video stalled (age={rx_age_ms:?} ms); reporting stall & switching uplink to Colibri-WS/DC");
+                                        warn!("[WRTC Client] Downlink VP8 video stalled (age={rx_age_ms:?} ms); reporting stall to fallback downlink to Colibri-WS/DC");
                                     } else {
                                         info!("[WRTC Client] Downlink VP8 video recovered; clearing stall state");
                                         peer_tx.force_next_keyframe();
@@ -1613,6 +1616,7 @@ impl ClientTransport for WrtcTransport {
                             let raw_len = raw_astp.len();
                             match unwrap_packet_bytes(&cipher_video, raw_astp) {
                                 Ok(decrypted) => {
+                                    peer_video_rx.mark_video_rx_verified();
                                     let now_secs = current_timestamp_secs();
                                     last_pong_video.store(now_secs, Ordering::Relaxed);
 
