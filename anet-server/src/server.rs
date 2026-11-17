@@ -56,7 +56,10 @@ impl ANetServer {
         let sign_key = SigningKey::from_bytes(&sk_bytes.try_into().unwrap());
 
 
-        let reg = Arc::new(ClientRegistry::new(pl));
+        let reg = Arc::new(
+            ClientRegistry::new(pl)
+                .with_resume_window(Duration::from_secs(cfg_ref.websocket.resume_window_secs.max(5))),
+        );
         let dh = Arc::new(DashMap::new());
 
         let node_id = (!cfg_ref.control_plane.node_id.trim().is_empty())
@@ -78,7 +81,8 @@ impl ANetServer {
             reg.clone(), dh.clone(), a_prov, sign_key,
             cfg_ref.crypto.quic_cert.clone(), cfg_ref.stealth.padding_step,
         )
-        .with_wrtc_mtu_cap(wrtc_mtu_cap);
+        .with_wrtc_mtu_cap(wrtc_mtu_cap)
+        .with_resume_allow_fresh_fallback(cfg_ref.websocket.resume_allow_fresh_fallback);
 
         Ok(Self { cfg: Arc::new(cfg_ref.clone()), registry: reg, temp_dh_map: dh, tun_manager: TunManager::new(t_prm)?, auth_handler_core: ac })
     }

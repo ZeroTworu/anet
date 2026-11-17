@@ -723,6 +723,170 @@ impl Default for AhttpConfig {
     }
 }
 
+/// Конфигурация транспорта WebSocket на стороне клиента (секция `[websocket]` в `client.toml`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct WebSocketConfig {
+    /// Максимальный размер скользящего окна переупорядочивания входящих пакетов (`ReassemblyQueue`)
+    /// при работе мульти-сокетного пула `WSS ?pool=N`.
+    pub reassembly_queue_max_size: usize,
+    /// Таймаут ожидания пропавшего/задержанного пакета при разрыве последовательности (мс).
+    pub reassembly_gap_timeout_ms: u64,
+    /// Таймаут отправки одного WebSocket-фрейма (мс). Защищает от зависания на «чёрной дыре» TCP.
+    pub write_timeout_ms: u64,
+    /// Таймаут закрытия WebSocket-сокета (мс).
+    pub close_timeout_ms: u64,
+    /// Таймаут TCP + TLS + HTTP Upgrade (и `WS_MUX_BIND`) одного WebSocket-соединения (сек).
+    pub handshake_timeout_secs: u64,
+    /// Минимальный интервал отправки клиентского keepalive Ping (сек).
+    pub ping_interval_min_secs: u64,
+    /// Максимальный интервал отправки клиентского keepalive Ping (сек).
+    pub ping_interval_max_secs: u64,
+    /// Емкость исходящей очереди пакетов клиента из TUN в WS-пул (защита от bufferbloat).
+    pub tx_queue_capacity: usize,
+    /// Емкость входящей очереди батчей из WS-пула в `ReassemblyQueue`.
+    pub downlink_queue_capacity: usize,
+    /// Бюджет коалесценции пакетов на один сокет при `active_slots > 1` (байт).
+    pub pool_coalesce_budget_bytes: usize,
+    /// Бюджет коалесценции пакетов при одном активном сокете (байт).
+    pub single_coalesce_budget_bytes: usize,
+    /// Максимальный размер одного WebSocket-сообщения/фрейма `tokio-tungstenite` (байт).
+    pub max_message_size: usize,
+    /// Размер буфера чтения WebSocket-потока (байт).
+    pub read_buffer_size: usize,
+    /// Стартовый размер буфера записи WebSocket-потока (байт).
+    pub write_buffer_size: usize,
+    /// Верхний лимит буфера записи WebSocket-потока (байт).
+    pub max_write_buffer_size: usize,
+    /// Максимум подряд неудачных попыток `WS_MUX_BIND` при `active_slots > 0` до эскалации
+    /// к полному ASTP-переподключению (`0` — не ограничивать).
+    pub bind_max_retries: u32,
+    /// Максимум явных отклонений `WS_MUX_BIND` сервером при `active_slots > 0` до эскалации
+    /// к полному ASTP-переподключению (`0` — не ограничивать).
+    pub bind_reject_max_retries: u32,
+    /// Минимальная пауза перед повтором `WS_MUX_BIND` (мс).
+    pub bind_retry_min_ms: u64,
+    /// Максимальная пауза перед повтором `WS_MUX_BIND` (мс).
+    pub bind_retry_max_ms: u64,
+    /// Общий таймаут цикла `reconnect_astp_session` (сек).
+    /// При `None` вычисляется как `server.timeout_secs.max(10) * 3`.
+    pub reconnect_timeout_secs: Option<u64>,
+    /// Минимальная пауза между попытками `reconnect_astp_session` (мс).
+    pub reconnect_retry_min_ms: u64,
+    /// Максимальная пауза между попытками `reconnect_astp_session` (мс).
+    pub reconnect_retry_max_ms: u64,
+    /// Немедленно прерывать цикл `reconnect_astp_session`, если сервер выдал новый
+    /// туннельный IP/шлюз (чтобы ядро клиента сразу перенастроило TUN).
+    pub abort_on_ip_change: bool,
+}
+
+impl Default for WebSocketConfig {
+    fn default() -> Self {
+        Self {
+            reassembly_queue_max_size: anet_common::consts::WS_REASSEMBLY_QUEUE_MAX_SIZE,
+            reassembly_gap_timeout_ms: anet_common::consts::WS_REASSEMBLY_GAP_TIMEOUT_MS,
+            write_timeout_ms: anet_common::consts::WS_DEFAULT_WRITE_TIMEOUT_MS,
+            close_timeout_ms: anet_common::consts::WS_DEFAULT_CLOSE_TIMEOUT_MS,
+            handshake_timeout_secs: anet_common::consts::WS_DEFAULT_HANDSHAKE_TIMEOUT_SECS,
+            ping_interval_min_secs: anet_common::consts::WS_DEFAULT_CLIENT_PING_MIN_SECS,
+            ping_interval_max_secs: anet_common::consts::WS_DEFAULT_CLIENT_PING_MAX_SECS,
+            tx_queue_capacity: anet_common::consts::WS_DEFAULT_TX_QUEUE_CAPACITY,
+            downlink_queue_capacity: anet_common::consts::WS_DEFAULT_DOWNLINK_QUEUE_CAPACITY,
+            pool_coalesce_budget_bytes: anet_common::consts::WS_POOL_COALESCE_BUDGET_BYTES,
+            single_coalesce_budget_bytes:
+                anet_common::consts::WS_DEFAULT_SINGLE_COALESCE_BUDGET_BYTES,
+            max_message_size: anet_common::consts::WS_DEFAULT_MAX_MESSAGE_SIZE,
+            read_buffer_size: anet_common::consts::WS_DEFAULT_READ_BUFFER_SIZE,
+            write_buffer_size: anet_common::consts::WS_DEFAULT_WRITE_BUFFER_SIZE,
+            max_write_buffer_size: anet_common::consts::WS_DEFAULT_MAX_WRITE_BUFFER_SIZE,
+            bind_max_retries: anet_common::consts::WS_DEFAULT_BIND_MAX_RETRIES,
+            bind_reject_max_retries: anet_common::consts::WS_DEFAULT_BIND_REJECT_MAX_RETRIES,
+            bind_retry_min_ms: anet_common::consts::WS_DEFAULT_BIND_RETRY_MIN_MS,
+            bind_retry_max_ms: anet_common::consts::WS_DEFAULT_BIND_RETRY_MAX_MS,
+            reconnect_timeout_secs: None,
+            reconnect_retry_min_ms: anet_common::consts::WS_DEFAULT_RECONNECT_RETRY_MIN_MS,
+            reconnect_retry_max_ms: anet_common::consts::WS_DEFAULT_RECONNECT_RETRY_MAX_MS,
+            abort_on_ip_change: true,
+        }
+    }
+}
+
+impl WebSocketConfig {
+    pub fn write_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.write_timeout_ms.max(100))
+    }
+
+    pub fn close_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.close_timeout_ms.max(100))
+    }
+
+    pub fn handshake_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.handshake_timeout_secs.max(1))
+    }
+
+    pub fn random_ping_interval(&self) -> std::time::Duration {
+        use rand::Rng;
+        let min = self.ping_interval_min_secs.max(1);
+        let max = self.ping_interval_max_secs.max(min);
+        std::time::Duration::from_secs(rand::rngs::OsRng.gen_range(min..=max))
+    }
+
+    pub fn random_bind_retry_delay(&self) -> std::time::Duration {
+        use rand::Rng;
+        let min = self.bind_retry_min_ms.max(50);
+        let max = self.bind_retry_max_ms.max(min);
+        std::time::Duration::from_millis(rand::rngs::OsRng.gen_range(min..=max))
+    }
+
+    pub fn random_reconnect_retry_delay(&self) -> std::time::Duration {
+        use rand::Rng;
+        let min = self.reconnect_retry_min_ms.max(50);
+        let max = self.reconnect_retry_max_ms.max(min);
+        std::time::Duration::from_millis(rand::rngs::OsRng.gen_range(min..=max))
+    }
+
+    pub fn effective_reconnect_timeout(&self, server_timeout_secs: u64) -> std::time::Duration {
+        let secs = self
+            .reconnect_timeout_secs
+            .unwrap_or_else(|| server_timeout_secs.max(10) * 3)
+            .max(1);
+        std::time::Duration::from_secs(secs)
+    }
+
+    pub fn effective_tx_queue_capacity(&self) -> usize {
+        self.tx_queue_capacity.max(16)
+    }
+
+    pub fn effective_downlink_queue_capacity(&self) -> usize {
+        self.downlink_queue_capacity.max(16)
+    }
+
+    pub fn effective_pool_coalesce_budget(&self) -> usize {
+        self.pool_coalesce_budget_bytes.max(1500)
+    }
+
+    pub fn effective_single_coalesce_budget(&self) -> usize {
+        self.single_coalesce_budget_bytes.max(1500)
+    }
+
+    pub fn effective_max_message_size(&self) -> usize {
+        self.max_message_size.max(4096)
+    }
+
+    pub fn effective_read_buffer_size(&self) -> usize {
+        self.read_buffer_size.max(4096)
+    }
+
+    pub fn effective_write_buffer_size(&self) -> usize {
+        self.write_buffer_size.max(4096)
+    }
+
+    pub fn effective_max_write_buffer_size(&self) -> usize {
+        self.max_write_buffer_size
+            .max(self.effective_write_buffer_size())
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct RoutingConfig {
     /// Опциональный URL для скачивания скомпилированного кэша правил rules.abc
@@ -760,6 +924,9 @@ pub struct CoreConfig {
 
     #[serde(default)]
     pub ahttp: AhttpConfig,
+
+    #[serde(default)]
+    pub websocket: WebSocketConfig,
 
     #[serde(default)]
     pub routing: RoutingConfig,
@@ -1041,5 +1208,103 @@ mod tests {
             Some(6_291_456)
         );
         anet_common::boring_tls::set_browser_profiles(Vec::new());
+    }
+
+    #[test]
+    fn websocket_reassembly_config_defaults_and_overrides() {
+        use super::CoreConfig;
+        use std::time::Duration;
+
+        let default_toml = r#"
+            [[servers]]
+            name = "WS Node"
+            dsn = "wss://node.example.com/socket?pool=4"
+        "#;
+        let default_cfg: CoreConfig = toml::from_str(default_toml).unwrap();
+        assert_eq!(
+            default_cfg.websocket.reassembly_queue_max_size,
+            anet_common::consts::WS_REASSEMBLY_QUEUE_MAX_SIZE
+        );
+        assert_eq!(
+            default_cfg.websocket.reassembly_gap_timeout_ms,
+            anet_common::consts::WS_REASSEMBLY_GAP_TIMEOUT_MS
+        );
+        assert_eq!(
+            default_cfg.websocket.write_timeout(),
+            Duration::from_millis(anet_common::consts::WS_DEFAULT_WRITE_TIMEOUT_MS)
+        );
+        assert_eq!(
+            default_cfg.websocket.close_timeout(),
+            Duration::from_millis(anet_common::consts::WS_DEFAULT_CLOSE_TIMEOUT_MS)
+        );
+        assert_eq!(
+            default_cfg.websocket.handshake_timeout(),
+            Duration::from_secs(anet_common::consts::WS_DEFAULT_HANDSHAKE_TIMEOUT_SECS)
+        );
+        assert_eq!(
+            default_cfg.websocket.bind_max_retries,
+            anet_common::consts::WS_DEFAULT_BIND_MAX_RETRIES
+        );
+        assert_eq!(
+            default_cfg.websocket.bind_reject_max_retries,
+            anet_common::consts::WS_DEFAULT_BIND_REJECT_MAX_RETRIES
+        );
+        assert_eq!(
+            default_cfg.websocket.effective_reconnect_timeout(8),
+            Duration::from_secs(30)
+        );
+        assert!(default_cfg.websocket.abort_on_ip_change);
+
+        let custom_toml = r#"
+            [websocket]
+            reassembly_queue_max_size = 8192
+            reassembly_gap_timeout_ms = 90
+            write_timeout_ms = 6000
+            close_timeout_ms = 1200
+            handshake_timeout_secs = 20
+            ping_interval_min_secs = 30
+            ping_interval_max_secs = 30
+            tx_queue_capacity = 1024
+            downlink_queue_capacity = 2048
+            pool_coalesce_budget_bytes = 32768
+            single_coalesce_budget_bytes = 98304
+            max_message_size = 524288
+            read_buffer_size = 262144
+            write_buffer_size = 262144
+            max_write_buffer_size = 1048576
+            bind_max_retries = 5
+            bind_reject_max_retries = 3
+            bind_retry_min_ms = 300
+            bind_retry_max_ms = 300
+            reconnect_timeout_secs = 45
+            reconnect_retry_min_ms = 250
+            reconnect_retry_max_ms = 250
+            abort_on_ip_change = false
+
+            [[servers]]
+            name = "WS Node"
+            dsn = "wss://node.example.com/socket?pool=4"
+        "#;
+        let custom_cfg: CoreConfig = toml::from_str(custom_toml).unwrap();
+        assert_eq!(custom_cfg.websocket.reassembly_queue_max_size, 8192);
+        assert_eq!(custom_cfg.websocket.reassembly_gap_timeout_ms, 90);
+        assert_eq!(custom_cfg.websocket.write_timeout(), Duration::from_millis(6000));
+        assert_eq!(custom_cfg.websocket.close_timeout(), Duration::from_millis(1200));
+        assert_eq!(custom_cfg.websocket.handshake_timeout(), Duration::from_secs(20));
+        assert_eq!(custom_cfg.websocket.random_ping_interval(), Duration::from_secs(30));
+        assert_eq!(custom_cfg.websocket.effective_tx_queue_capacity(), 1024);
+        assert_eq!(custom_cfg.websocket.effective_downlink_queue_capacity(), 2048);
+        assert_eq!(custom_cfg.websocket.effective_pool_coalesce_budget(), 32768);
+        assert_eq!(custom_cfg.websocket.effective_single_coalesce_budget(), 98304);
+        assert_eq!(custom_cfg.websocket.effective_max_message_size(), 524288);
+        assert_eq!(custom_cfg.websocket.effective_read_buffer_size(), 262144);
+        assert_eq!(custom_cfg.websocket.effective_write_buffer_size(), 262144);
+        assert_eq!(custom_cfg.websocket.effective_max_write_buffer_size(), 1048576);
+        assert_eq!(custom_cfg.websocket.bind_max_retries, 5);
+        assert_eq!(custom_cfg.websocket.bind_reject_max_retries, 3);
+        assert_eq!(custom_cfg.websocket.random_bind_retry_delay(), Duration::from_millis(300));
+        assert_eq!(custom_cfg.websocket.effective_reconnect_timeout(8), Duration::from_secs(45));
+        assert_eq!(custom_cfg.websocket.random_reconnect_retry_delay(), Duration::from_millis(250));
+        assert!(!custom_cfg.websocket.abort_on_ip_change);
     }
 }

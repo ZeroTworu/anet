@@ -40,6 +40,7 @@ pub struct ServerAuthHandler {
     quic_cert_pem: String,
     padding_step: u16,
     wrtc_mtu_cap: Option<u16>,
+    resume_allow_fresh_fallback: bool,
 }
 
 #[cfg(test)]
@@ -166,6 +167,108 @@ mod tests {
         assert_eq!(resumed_response.ip, first_response.ip);
         assert_eq!(resumed_response.gateway, first_response.gateway);
     }
+
+    #[tokio::test]
+    async fn expired_resume_falls_back_to_fresh_session_when_enabled() {
+        let client_signing = SigningKey::generate(&mut OsRng);
+        let server_signing = SigningKey::generate(&mut OsRng);
+        let fingerprint = generate_key_fingerprint(&client_signing.verifying_key());
+        let auth_provider = Arc::new(AuthProvider::new(
+            vec![fingerprint],
+            vec![],
+            String::new(),
+        ));
+        let registry = Arc::new(ClientRegistry::new(IpPool::new(
+            "10.0.0.0".parse().unwrap(),
+            "255.255.255.0".parse().unwrap(),
+            "10.0.0.1".parse().unwrap(),
+            "10.0.0.2".parse().unwrap(),
+            1400,
+        )));
+        let server = ServerAuthHandler::new(
+            registry,
+            Arc::new(DashMap::new()),
+            auth_provider,
+            server_signing.clone(),
+            "test-quic-cert".to_string(),
+            128,
+        )
+        .with_resume_allow_fresh_fallback(true);
+
+        let mut config: CoreConfig = toml::from_str("").unwrap();
+        config.keys.private_key = BASE64_STANDARD.encode(client_signing.to_bytes());
+        config.keys.server_pub_key =
+            BASE64_STANDARD.encode(server_signing.verifying_key().to_bytes());
+
+        let fallback_channel = channel(server, 21003);
+        let fallback_auth = AuthHandler::new_with_resume(
+            &config,
+            None,
+            Some("expired-or-missing-session".to_string()),
+        )
+        .unwrap();
+        let (response, _) = tokio::time::timeout(
+            Duration::from_secs(2),
+            fallback_auth.authenticate(&fallback_channel),
+        )
+        .await
+        .expect("fallback authentication timed out")
+        .unwrap();
+
+        assert_ne!(response.session_id, "expired-or-missing-session");
+        assert!(!response.session_id.is_empty());
+        assert!(fallback_channel.authenticated.lock().unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn expired_resume_denies_when_fallback_disabled() {
+        let client_signing = SigningKey::generate(&mut OsRng);
+        let server_signing = SigningKey::generate(&mut OsRng);
+        let fingerprint = generate_key_fingerprint(&client_signing.verifying_key());
+        let auth_provider = Arc::new(AuthProvider::new(
+            vec![fingerprint],
+            vec![],
+            String::new(),
+        ));
+        let registry = Arc::new(ClientRegistry::new(IpPool::new(
+            "10.0.0.0".parse().unwrap(),
+            "255.255.255.0".parse().unwrap(),
+            "10.0.0.1".parse().unwrap(),
+            "10.0.0.2".parse().unwrap(),
+            1400,
+        )));
+        let server = ServerAuthHandler::new(
+            registry,
+            Arc::new(DashMap::new()),
+            auth_provider,
+            server_signing.clone(),
+            "test-quic-cert".to_string(),
+            128,
+        )
+        .with_resume_allow_fresh_fallback(false);
+
+        let mut config: CoreConfig = toml::from_str("").unwrap();
+        config.keys.private_key = BASE64_STANDARD.encode(client_signing.to_bytes());
+        config.keys.server_pub_key =
+            BASE64_STANDARD.encode(server_signing.verifying_key().to_bytes());
+
+        let denied_channel = channel(server, 21004);
+        let denied_auth = AuthHandler::new_with_resume(
+            &config,
+            None,
+            Some("missing-session".to_string()),
+        )
+        .unwrap();
+        let err = tokio::time::timeout(
+            Duration::from_secs(2),
+            denied_auth.authenticate(&denied_channel),
+        )
+        .await
+        .expect("denied authentication timed out")
+        .unwrap_err();
+
+        assert!(err.downcast_ref::<anet_client_core::auth::AuthDenyError>().is_some());
+    }
 }
 
 impl ServerAuthHandler {
@@ -189,11 +292,17 @@ impl ServerAuthHandler {
             quic_cert_pem,
             padding_step,
             wrtc_mtu_cap: None,
+            resume_allow_fresh_fallback: true,
         }
     }
 
     pub fn with_wrtc_mtu_cap(mut self, wrtc_mtu_cap: u16) -> Self {
         self.wrtc_mtu_cap = Some(wrtc_mtu_cap);
+        self
+    }
+
+    pub fn with_resume_allow_fresh_fallback(mut self, allow: bool) -> Self {
+        self.resume_allow_fresh_fallback = allow;
         self
     }
 
@@ -302,21 +411,24 @@ impl ServerAuthHandler {
         let resume_allowed = self
             .registry
             .can_resume(&req.resume_session_id, &client_fingerprint);
-        let access = if resume_allowed {
-            Ok(AccessGrant {
-                static_ip: None,
-                user_id: None,
-                speed_limit_kbps: None,
-                billing_type: None,
-                group_name: None,
-                traffic_limit: None,
-                traffic_consumed: None,
-                allowed_sessions: None,
-                active_sessions: None,
-                expires_at: None,
-            })
+        let (has_auth_grant, access) = if resume_allowed {
+            (
+                false,
+                Ok(AccessGrant {
+                    static_ip: None,
+                    user_id: None,
+                    speed_limit_kbps: None,
+                    billing_type: None,
+                    group_name: None,
+                    traffic_limit: None,
+                    traffic_consumed: None,
+                    allowed_sessions: None,
+                    active_sessions: None,
+                    expires_at: None,
+                }),
+            )
         } else if !self.registry.is_accepting_connections() {
-            Err("Node is not accepting new connections".to_string())
+            (true, Err("Node is not accepting new connections".to_string()))
         } else {
             // Очищаем мёртвые сессии данного ключа, от которых не было пакетов/зондов > 10 секунд
             // (живые клиенты отправляют внутритуннельные ICMP-зонды каждые 2 секунды).
@@ -326,9 +438,12 @@ impl ServerAuthHandler {
             let local_active = self
                 .registry
                 .active_session_count_for_fingerprint(&client_fingerprint);
-            self.auth_provider
-                .is_client_allowed(&client_fingerprint, Some(local_active))
-                .await
+            (
+                true,
+                self.auth_provider
+                    .is_client_allowed(&client_fingerprint, Some(local_active))
+                    .await,
+            )
         };
 
         match access {
@@ -369,6 +484,7 @@ impl ServerAuthHandler {
                         allowed_sessions: grant.allowed_sessions,
                         active_sessions: grant.active_sessions,
                         expires_at: grant.expires_at,
+                        has_auth_grant,
                     },
                 );
 
@@ -422,7 +538,7 @@ impl ServerAuthHandler {
         AnetMessage,
         Option<(Arc<ClientTransportInfo>, AuthResponse)>,
     )> {
-        let temp_info = self
+        let mut temp_info = self
             .temp_dh_map
             .remove(&remote_addr)
             .map(|(_, v)| v)
@@ -448,7 +564,91 @@ impl ServerAuthHandler {
             .registry
             .take_suspended(&req.resume_session_id, &temp_info.client_fingerprint);
         if !req.resume_session_id.is_empty() && resumed.is_none() {
-            anyhow::bail!("Requested VPN session is not available for resume");
+            if !self.resume_allow_fresh_fallback {
+                warn!(
+                    "[AUTH] Phase 3 denied for {}: resume session {} is unavailable and fallback is disabled (FP {})",
+                    remote_addr, req.resume_session_id, temp_info.client_fingerprint
+                );
+                let mut deny_msg = AnetMessage {
+                    content: Some(Content::AuthError(AuthDenyNotification {
+                        message: "Requested VPN session is not available for resume".to_string(),
+                    })),
+                    padding: vec![],
+                };
+                let wire_len = deny_msg.encoded_len() + NONCE_LEN + PROTO_PAD_FIELD_OVERHEAD;
+                deny_msg.padding = generate_random_padding(calculate_padding_needed(
+                    wire_len,
+                    self.padding_step,
+                ));
+                return Ok((deny_msg, None));
+            }
+
+            warn!(
+                "[AUTH] Requested resume session {} unavailable for {} (FP {}); falling back to fresh session",
+                req.resume_session_id, remote_addr, temp_info.client_fingerprint
+            );
+
+            // Если старая полумёртвая сессия с тем же session_id ещё числится активной,
+            // освобождаем её до проверки лимита сессий и выделения нового IP.
+            self.registry
+                .remove_active_session_if_matching(
+                    &req.resume_session_id,
+                    &temp_info.client_fingerprint,
+                )
+                .await;
+
+            // Если в Phase 1 проверка AuthProvider была пропущена из-за resume_allowed == true,
+            // но к Phase 3 suspended-сессия уже истекла или была вытеснена, перепроверяем права доступа.
+            if !temp_info.has_auth_grant {
+                let access = if !self.registry.is_accepting_connections() {
+                    Err("Node is not accepting new connections".to_string())
+                } else {
+                    self.registry
+                        .cleanup_inactive_for_fingerprint(&temp_info.client_fingerprint, 10)
+                        .await;
+                    let local_active = self
+                        .registry
+                        .active_session_count_for_fingerprint(&temp_info.client_fingerprint);
+                    self.auth_provider
+                        .is_client_allowed(&temp_info.client_fingerprint, Some(local_active))
+                        .await
+                };
+
+                match access {
+                    Ok(grant) => {
+                        temp_info.static_ip = grant.static_ip;
+                        temp_info.user_id = grant.user_id;
+                        temp_info.speed_limit_kbps = grant.speed_limit_kbps;
+                        temp_info.billing_type = grant.billing_type;
+                        temp_info.group_name = grant.group_name;
+                        temp_info.traffic_limit = grant.traffic_limit;
+                        temp_info.traffic_consumed = grant.traffic_consumed;
+                        temp_info.allowed_sessions = grant.allowed_sessions;
+                        temp_info.active_sessions = grant.active_sessions;
+                        temp_info.expires_at = grant.expires_at;
+                        temp_info.has_auth_grant = true;
+                    }
+                    Err(reason) => {
+                        warn!(
+                            "[AUTH] Phase 3 fallback denied for {} (FP {}): {}",
+                            remote_addr, temp_info.client_fingerprint, reason
+                        );
+                        let mut deny_msg = AnetMessage {
+                            content: Some(Content::AuthError(AuthDenyNotification {
+                                message: reason,
+                            })),
+                            padding: vec![],
+                        };
+                        let wire_len =
+                            deny_msg.encoded_len() + NONCE_LEN + PROTO_PAD_FIELD_OVERHEAD;
+                        deny_msg.padding = generate_random_padding(calculate_padding_needed(
+                            wire_len,
+                            self.padding_step,
+                        ));
+                        return Ok((deny_msg, None));
+                    }
+                }
+            }
         }
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::SystemTime::UNIX_EPOCH)

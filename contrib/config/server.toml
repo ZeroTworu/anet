@@ -95,6 +95,45 @@ coalesce_budget_bytes = 131072
 # Рекомендуемый диапазон: 20 - 30 мс.
 poll_timeout_ms = 25
 
+[websocket]
+# Максимальный размер окна переупорядочивания входящих пакетов (`ReassemblyQueue`)
+# при работе мульти-сокетного пула `WSS ?pool=N`.
+# Для каналов 250+ Мбит/с рекомендуется увеличивать до 4096..8192.
+reassembly_queue_max_size = 2048
+
+# Таймаут ожидания задержавшегося/потерянного пакета на дыре последовательности (мс).
+reassembly_gap_timeout_ms = 60
+
+# Таймаут записи одного WebSocket-фрейма (мс). Защищает от зависания на «чёрной дыре» TCP / NAT.
+write_timeout_ms = 10000
+
+# Таймаут штатного закрытия WebSocket-сокета (мс).
+close_timeout_ms = 2000
+
+# Таймаут HTTP Upgrade и фаз ASTP-рукопожатия / `WS_MUX_BIND` на сервере (сек).
+handshake_timeout_secs = 15
+
+# Диапазон случайного интервала отправки серверных keepalive Ping-фреймов (сек).
+ping_interval_min_secs = 22
+ping_interval_max_secs = 52
+
+# Бюджет коалесценции пакетов на один сокет при active_sockets > 1 (байт) и при одиночном сокете (байт).
+pool_coalesce_budget_bytes = 16384
+single_coalesce_budget_bytes = 65536
+
+# Лимит размера одного WebSocket-сообщения/фрейма и буферов `tokio-tungstenite` (байт).
+max_message_size = 262144
+read_buffer_size = 131072
+write_buffer_size = 131072
+max_write_buffer_size = 524288
+
+# Окно удержания suspended-сессии для `resume_session_id` после обрыва всех сокетов (сек).
+resume_window_secs = 45
+
+# Разрешать ли создание новой сессии (с перепроверкой AuthProvider и освобождением
+# старой полумёртвой записи с тем же session_id), если resume_session_id уже истёк/отсутствует.
+resume_allow_fresh_fallback = true
+
 # =========================================================================
 # ANET Server: Аутентификация и авторизация
 # =========================================================================

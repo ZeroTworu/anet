@@ -263,6 +263,35 @@ pub const WS_MAX_POOL_SIZE: usize = 8;
 /// Бюджет коалесценции на один сокет при активном мульти-сокетном пуле (16 КБ позволяет
 /// распределять крупные пачки параллельно между всеми сокетами пула).
 pub const WS_POOL_COALESCE_BUDGET_BYTES: usize = 16 * 1024;
+/// Бюджет коалесценции при одном активном сокете (64 КБ).
+pub const WS_DEFAULT_SINGLE_COALESCE_BUDGET_BYTES: usize = COALESCE_BUDGET_BYTES;
 /// Параметры окна переупорядочивания входящих пакетов для пула WebSocket.
 pub const WS_REASSEMBLY_QUEUE_MAX_SIZE: usize = 2048;
 pub const WS_REASSEMBLY_GAP_TIMEOUT_MS: u64 = 60;
+/// Таймауты записи, закрытия и рукопожатия WebSocket.
+pub const WS_DEFAULT_WRITE_TIMEOUT_MS: u64 = 10_000;
+pub const WS_DEFAULT_CLOSE_TIMEOUT_MS: u64 = 2_000;
+pub const WS_DEFAULT_HANDSHAKE_TIMEOUT_SECS: u64 = 15;
+/// Интервалы keepalive Ping для сервера и клиента WebSocket.
+pub const WS_DEFAULT_SERVER_PING_MIN_SECS: u64 = 22;
+pub const WS_DEFAULT_SERVER_PING_MAX_SECS: u64 = 52;
+pub const WS_DEFAULT_CLIENT_PING_MIN_SECS: u64 = 25;
+pub const WS_DEFAULT_CLIENT_PING_MAX_SECS: u64 = 50;
+/// Размеры фреймов и буферов tokio-tungstenite WebSocket.
+pub const WS_DEFAULT_MAX_MESSAGE_SIZE: usize = 256 * 1024;
+pub const WS_DEFAULT_READ_BUFFER_SIZE: usize = 128 * 1024;
+pub const WS_DEFAULT_WRITE_BUFFER_SIZE: usize = 128 * 1024;
+pub const WS_DEFAULT_MAX_WRITE_BUFFER_SIZE: usize = 512 * 1024;
+/// Размеры клиентских очередей пакетов для WebSocket-транспорта.
+pub const WS_DEFAULT_TX_QUEUE_CAPACITY: usize = 512;
+pub const WS_DEFAULT_DOWNLINK_QUEUE_CAPACITY: usize = 1024;
+/// Лимиты и задержки ретраев `WS_MUX_BIND` до эскалации к полному ASTP-реконнекту.
+pub const WS_DEFAULT_BIND_MAX_RETRIES: u32 = 3;
+pub const WS_DEFAULT_BIND_REJECT_MAX_RETRIES: u32 = 2;
+pub const WS_DEFAULT_BIND_RETRY_MIN_MS: u64 = 500;
+pub const WS_DEFAULT_BIND_RETRY_MAX_MS: u64 = 1_500;
+/// Задержки между попытками `reconnect_astp_session` и окно resume-сессии на сервере.
+pub const WS_DEFAULT_RECONNECT_RETRY_MIN_MS: u64 = 350;
+pub const WS_DEFAULT_RECONNECT_RETRY_MAX_MS: u64 = 1_400;
+pub const WS_DEFAULT_RESUME_WINDOW_SECS: u64 = 45;
+

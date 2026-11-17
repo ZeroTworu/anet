@@ -51,6 +51,8 @@ pub struct TempDHInfo {
     pub active_sessions: Option<i32>,
     pub allowed_sessions: Option<i32>,
     pub expires_at: Option<String>,
+    /// `true`, если в Phase 1 уже выполнялась авторизация через `AuthProvider`.
+    pub has_auth_grant: bool,
 }
 
 pub type HandshakeData = (Bytes, SocketAddr);

@@ -1,17 +1,15 @@
 use crate::auth_handler::ServerAuthHandler;
 use crate::client_registry::{ClientRegistry, ClientTransportInfo};
-use crate::config::Config;
+use crate::config::{Config, WebSocketServerConfig};
 use anet_common::consts::{
-    CHANNEL_BUFFER_SIZE, CLIENT_SEQUENCE_START, COALESCE_BUDGET_BYTES,
-    WS_MUX_ACK_MAGIC, WS_MUX_BIND_MAGIC, WS_POOL_COALESCE_BUDGET_BYTES,
-    WS_REASSEMBLY_GAP_TIMEOUT_MS, WS_REASSEMBLY_QUEUE_MAX_SIZE,
+    CHANNEL_BUFFER_SIZE, CLIENT_SEQUENCE_START, WS_MUX_ACK_MAGIC, WS_MUX_BIND_MAGIC,
 };
 use anet_common::reassembly::ReassemblyQueue;
 use anet_common::transport::{unwrap_packet, unwrap_packet_with_seq, wrap_packet_slice};
 use anyhow::{Context, Result};
 use bytes::{BufMut, Bytes, BytesMut};
 use dashmap::DashMap;
-use futures::{SinkExt, StreamExt};
+use futures::{Sink, SinkExt, StreamExt};
 use log::{debug, info, warn};
 use rand::Rng;
 use std::net::SocketAddr;
@@ -27,8 +25,28 @@ use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::http::StatusCode;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
-const MAX_WS_MESSAGE_SIZE: usize = 256 * 1024; // Увеличено для коалесценции
 const MAX_MUX_SESSION_ID_LEN: usize = 128;
+
+async fn send_ws_with_timeout<S>(
+    sink: &mut S,
+    msg: Message,
+    timeout: Duration,
+) -> Result<()>
+where
+    S: Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+{
+    tokio::time::timeout(timeout, sink.send(msg))
+        .await
+        .context("WebSocket write timed out")?
+        .map_err(Into::into)
+}
+
+async fn close_ws_with_timeout<S>(sink: &mut S, timeout: Duration)
+where
+    S: Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+{
+    let _ = tokio::time::timeout(timeout, sink.close()).await;
+}
 
 struct WsSessionPool {
     client_info: Arc<ClientTransportInfo>,
@@ -44,6 +62,7 @@ async fn upgrade(
     stream: TcpStream,
     expected_path: String,
     fallback_addr: SocketAddr,
+    ws_cfg: &WebSocketServerConfig,
 ) -> Result<(tokio_tungstenite::WebSocketStream<TcpStream>, SocketAddr)> {
     let real_addr_out = Arc::new(std::sync::Mutex::new(fallback_addr));
     let real_addr_cb = real_addr_out.clone();
@@ -64,13 +83,19 @@ async fn upgrade(
             .insert("cache-control", HeaderValue::from_static("no-store"));
         Ok(response)
     };
+    let max_msg_size = ws_cfg.effective_max_message_size();
     let ws_config = WebSocketConfig::default()
-        .read_buffer_size(128 * 1024)
-        .write_buffer_size(128 * 1024)
-        .max_write_buffer_size(512 * 1024)
-        .max_message_size(Some(MAX_WS_MESSAGE_SIZE))
-        .max_frame_size(Some(MAX_WS_MESSAGE_SIZE));
-    let ws_stream = accept_hdr_async_with_config(stream, callback, Some(ws_config)).await?;
+        .read_buffer_size(ws_cfg.effective_read_buffer_size())
+        .write_buffer_size(ws_cfg.effective_write_buffer_size())
+        .max_write_buffer_size(ws_cfg.effective_max_write_buffer_size())
+        .max_message_size(Some(max_msg_size))
+        .max_frame_size(Some(max_msg_size));
+    let ws_stream = tokio::time::timeout(
+        ws_cfg.handshake_timeout(),
+        accept_hdr_async_with_config(stream, callback, Some(ws_config)),
+    )
+    .await
+    .context("WebSocket HTTP upgrade timed out")??;
     let real_addr = real_addr_out.lock().map(|g| *g).unwrap_or(fallback_addr);
     Ok((ws_stream, real_addr))
 }
@@ -81,11 +106,13 @@ async fn run_uplink_sink(
     tun_tx: mpsc::Sender<Bytes>,
     registry: Arc<ClientRegistry>,
     client_info: Arc<ClientTransportInfo>,
+    reassembly_queue_max_size: usize,
+    reassembly_gap_timeout_ms: u64,
 ) {
     let mut reassembler = ReassemblyQueue::with_config(
-        WS_REASSEMBLY_QUEUE_MAX_SIZE,
+        reassembly_queue_max_size.max(1),
         CLIENT_SEQUENCE_START,
-        Duration::from_millis(WS_REASSEMBLY_GAP_TIMEOUT_MS),
+        Duration::from_millis(reassembly_gap_timeout_ms.max(1)),
     );
 
     loop {
@@ -209,6 +236,7 @@ async fn run_pool_socket(
     pool: Arc<WsSessionPool>,
     ws_pools: Arc<DashMap<String, Arc<WsSessionPool>>>,
     registry: Arc<ClientRegistry>,
+    ws_cfg: WebSocketServerConfig,
 ) -> Result<()> {
     let (mut ws_sink, mut ws_stream) = socket.split();
     let (ctrl_tx, mut ctrl_rx) = mpsc::channel::<Message>(16);
@@ -286,20 +314,27 @@ async fn run_pool_socket(
         let _ = reader_stop_tx.send(true);
     });
 
+    let write_timeout = ws_cfg.write_timeout();
+    let close_timeout = ws_cfg.close_timeout();
+    let pool_budget = ws_cfg.effective_pool_coalesce_budget();
+    let single_budget = ws_cfg.effective_single_coalesce_budget();
     let mut pool_shutdown_rx = pool.shutdown_tx.subscribe();
     let cipher = pool.client_info.cipher.clone();
     let nonce_prefix = pool.client_info.nonce_prefix;
     let padding_step = pool.padding_step;
-    let mut ping_timer = Box::pin(tokio::time::sleep(random_ping_interval()));
+    let mut ping_timer = Box::pin(tokio::time::sleep(ws_cfg.random_ping_interval()));
     let mut raw_batch: Vec<Bytes> = Vec::with_capacity(64);
-    let mut batch_buf = BytesMut::with_capacity(COALESCE_BUDGET_BYTES + 2048);
+    let mut batch_buf = BytesMut::with_capacity(single_budget + 2048);
 
     'writer: loop {
         if *pool_shutdown_rx.borrow() || *socket_stop_rx.borrow() {
             break 'writer;
         }
         while let Ok(ctrl_msg) = ctrl_rx.try_recv() {
-            if ws_sink.send(ctrl_msg).await.is_err() {
+            if send_ws_with_timeout(&mut ws_sink, ctrl_msg, write_timeout)
+                .await
+                .is_err()
+            {
                 break 'writer;
             }
         }
@@ -321,7 +356,10 @@ async fn run_pool_socket(
             ctrl = ctrl_rx.recv() => {
                 match ctrl {
                     Some(msg) => {
-                        if ws_sink.send(msg).await.is_err() {
+                        if send_ws_with_timeout(&mut ws_sink, msg, write_timeout)
+                            .await
+                            .is_err()
+                        {
                             break 'writer;
                         }
                     }
@@ -331,10 +369,13 @@ async fn run_pool_socket(
             }
             _ = &mut ping_timer => {
                 let ping_payload = rand::rngs::OsRng.r#gen::<u32>().to_be_bytes().to_vec();
-                if ws_sink.send(Message::Ping(ping_payload.into())).await.is_err() {
+                if send_ws_with_timeout(&mut ws_sink, Message::Ping(ping_payload.into()), write_timeout)
+                    .await
+                    .is_err()
+                {
                     break 'writer;
                 }
-                ping_timer.as_mut().reset(tokio::time::Instant::now() + random_ping_interval());
+                ping_timer.as_mut().reset(tokio::time::Instant::now() + ws_cfg.random_ping_interval());
                 continue;
             }
             guard = pool.rx_router.lock() => guard,
@@ -358,7 +399,10 @@ async fn run_pool_socket(
                 drop(rx_guard);
                 match ctrl {
                     Some(msg) => {
-                        if ws_sink.send(msg).await.is_err() {
+                        if send_ws_with_timeout(&mut ws_sink, msg, write_timeout)
+                            .await
+                            .is_err()
+                        {
                             break 'writer;
                         }
                     }
@@ -369,10 +413,13 @@ async fn run_pool_socket(
             _ = &mut ping_timer => {
                 drop(rx_guard);
                 let ping_payload = rand::rngs::OsRng.r#gen::<u32>().to_be_bytes().to_vec();
-                if ws_sink.send(Message::Ping(ping_payload.into())).await.is_err() {
+                if send_ws_with_timeout(&mut ws_sink, Message::Ping(ping_payload.into()), write_timeout)
+                    .await
+                    .is_err()
+                {
                     break 'writer;
                 }
-                ping_timer.as_mut().reset(tokio::time::Instant::now() + random_ping_interval());
+                ping_timer.as_mut().reset(tokio::time::Instant::now() + ws_cfg.random_ping_interval());
                 continue;
             }
             pkt = rx_guard.recv() => pkt,
@@ -385,9 +432,9 @@ async fn run_pool_socket(
         };
 
         let budget = if pool.active_sockets.load(Ordering::Relaxed) > 1 {
-            WS_POOL_COALESCE_BUDGET_BYTES
+            pool_budget
         } else {
-            COALESCE_BUDGET_BYTES
+            single_budget
         };
 
         raw_batch.clear();
@@ -435,7 +482,10 @@ async fn run_pool_socket(
             if !batch_buf.is_empty() {
                 let out_bytes = batch_buf.split().freeze();
                 batch_buf.reserve(budget + 2048);
-                if ws_sink.send(Message::Binary(out_bytes)).await.is_err() {
+                if send_ws_with_timeout(&mut ws_sink, Message::Binary(out_bytes), write_timeout)
+                    .await
+                    .is_err()
+                {
                     break 'writer;
                 }
             }
@@ -443,7 +493,7 @@ async fn run_pool_socket(
     }
 
     let _ = socket_stop_tx.send(true);
-    let _ = ws_sink.close().await;
+    close_ws_with_timeout(&mut ws_sink, close_timeout).await;
     let _ = reader_task.await;
 
     let prev = pool.active_sockets.fetch_sub(1, Ordering::AcqRel);
@@ -472,16 +522,28 @@ async fn handle_session(
     auth_handler: ServerAuthHandler,
     ws_pools: Arc<DashMap<String, Arc<WsSessionPool>>>,
 ) -> Result<()> {
+    let ws_cfg = config.websocket.clone();
+    let write_timeout = ws_cfg.write_timeout();
+    let close_timeout = ws_cfg.close_timeout();
+    let handshake_timeout = ws_cfg.handshake_timeout();
+
     let (mut socket, remote_addr) =
-        upgrade(stream, config.server.websocket_path.clone(), remote_addr).await?;
+        upgrade(stream, config.server.websocket_path.clone(), remote_addr, &ws_cfg).await?;
     info!("ASTP[WebSocket] HTTP upgrade complete: {}", remote_addr);
 
     let mut handshake_phase = 1u8;
     loop {
         let payload = loop {
-            match socket.next().await {
+            let incoming = tokio::time::timeout(handshake_timeout, socket.next())
+                .await
+                .with_context(|| {
+                    format!("WebSocket ASTP handshake phase {} read timed out", handshake_phase)
+                })?;
+            match incoming {
                 Some(Ok(Message::Binary(data))) => break data,
-                Some(Ok(Message::Ping(data))) => socket.send(Message::Pong(data)).await?,
+                Some(Ok(Message::Ping(data))) => {
+                    send_ws_with_timeout(&mut socket, Message::Pong(data), write_timeout).await?;
+                }
                 Some(Ok(Message::Close(_))) | None => return Ok(()),
                 Some(Err(error)) => return Err(error.into()),
                 _ => {}
@@ -491,7 +553,13 @@ async fn handle_session(
         if handshake_phase == 1 && payload.starts_with(WS_MUX_BIND_MAGIC) {
             match try_bind_mux_socket(&payload, &ws_pools, &registry) {
                 Ok((pool, ack_frame)) => {
-                    if let Err(err) = socket.send(Message::Binary(ack_frame)).await {
+                    if let Err(err) = send_ws_with_timeout(
+                        &mut socket,
+                        Message::Binary(ack_frame),
+                        write_timeout,
+                    )
+                    .await
+                    {
                         let prev = pool.active_sockets.fetch_sub(1, Ordering::AcqRel);
                         if prev == 1 {
                             let removed = ws_pools.remove_if(&pool.client_info.session_id, |_, existing| {
@@ -505,7 +573,7 @@ async fn handle_session(
                                 }
                             }
                         }
-                        return Err(err.into());
+                        return Err(err);
                     }
                     info!(
                         "[WebSocket] Attached pooled socket {} to session {} (active: {})",
@@ -513,10 +581,11 @@ async fn handle_session(
                         pool.client_info.session_id,
                         pool.active_sockets.load(Ordering::Relaxed)
                     );
-                    return run_pool_socket(socket, remote_addr, pool, ws_pools, registry).await;
+                    return run_pool_socket(socket, remote_addr, pool, ws_pools, registry, ws_cfg)
+                        .await;
                 }
                 Err(err) => {
-                    let _ = socket.close(None).await;
+                    close_ws_with_timeout(&mut socket, close_timeout).await;
                     return Err(err);
                 }
             }
@@ -527,13 +596,6 @@ async fn handle_session(
             .process_handshake_packet(payload, remote_addr, "ws")
             .await
             .with_context(|| format!("WebSocket ASTP handshake phase {}", handshake_phase))?;
-        if let Some(response) = response {
-            socket.send(Message::Binary(response)).await?;
-        }
-        if is_probe {
-            let _ = socket.close(None).await;
-            return Ok(());
-        }
 
         if let Some((client_info, _)) = result {
             let assigned_ip = client_info.assigned_ip.clone();
@@ -554,9 +616,25 @@ async fn handle_session(
                 shutdown_tx,
             });
 
-            if let Some(old_pool) = ws_pools.insert(session_id, pool.clone()) {
+            // Регистрируем пул ДО отправки финального AuthResponse клиенту,
+            // чтобы соседние слоты пула, пришедшие с WS_MUX_BIND сразу после AuthResponse,
+            // всегда находили уже инициализированный WsSessionPool.
+            if let Some(old_pool) = ws_pools.insert(session_id.clone(), pool.clone()) {
                 old_pool.evicted.store(true, Ordering::Release);
                 let _ = old_pool.shutdown_tx.send(true);
+            }
+
+            if let Some(response) = response {
+                if let Err(err) =
+                    send_ws_with_timeout(&mut socket, Message::Binary(response), write_timeout)
+                        .await
+                {
+                    pool.evicted.store(true, Ordering::Release);
+                    let _ = pool.shutdown_tx.send(true);
+                    ws_pools.remove_if(&session_id, |_, existing| Arc::ptr_eq(existing, &pool));
+                    registry.remove_client(&client_info).await;
+                    return Err(err);
+                }
             }
 
             tokio::spawn(run_uplink_sink(
@@ -565,16 +643,22 @@ async fn handle_session(
                 tun_tx,
                 registry.clone(),
                 client_info,
+                ws_cfg.reassembly_queue_max_size,
+                ws_cfg.reassembly_gap_timeout_ms,
             ));
 
-            return run_pool_socket(socket, remote_addr, pool, ws_pools, registry).await;
+            return run_pool_socket(socket, remote_addr, pool, ws_pools, registry, ws_cfg).await;
+        }
+
+        if let Some(response) = response {
+            send_ws_with_timeout(&mut socket, Message::Binary(response), write_timeout).await?;
+        }
+        if is_probe {
+            close_ws_with_timeout(&mut socket, close_timeout).await;
+            return Ok(());
         }
         handshake_phase = 3;
     }
-}
-
-fn random_ping_interval() -> Duration {
-    Duration::from_secs(rand::rngs::OsRng.gen_range(22..=52))
 }
 
 pub async fn run_websocket_server(

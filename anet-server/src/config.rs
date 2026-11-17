@@ -217,6 +217,112 @@ impl Default for AhttpServerConfig {
     }
 }
 
+/// Конфигурация транспорта WebSocket на стороне сервера (секция `[websocket]` в `server.toml`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct WebSocketServerConfig {
+    /// Максимальный размер скользящего окна переупорядочивания входящих пакетов (`ReassemblyQueue`)
+    /// при работе мульти-сокетного пула `WSS ?pool=N`.
+    pub reassembly_queue_max_size: usize,
+    /// Таймаут ожидания пропавшего/задержанного пакета при разрыве последовательности (мс).
+    pub reassembly_gap_timeout_ms: u64,
+    /// Таймаут отправки одного WebSocket-фрейма (мс). Защищает от зависания на «чёрной дыре» TCP.
+    pub write_timeout_ms: u64,
+    /// Таймаут закрытия WebSocket-сокета (мс).
+    pub close_timeout_ms: u64,
+    /// Таймаут HTTP Upgrade и фаз ASTP-рукопожатия / `WS_MUX_BIND` на сервере (сек).
+    pub handshake_timeout_secs: u64,
+    /// Минимальный интервал отправки keepalive Ping от сервера к клиенту (сек).
+    pub ping_interval_min_secs: u64,
+    /// Максимальный интервал отправки keepalive Ping от сервера к клиенту (сек).
+    pub ping_interval_max_secs: u64,
+    /// Бюджет коалесценции пакетов на один сокет при `active_sockets > 1` (байт).
+    pub pool_coalesce_budget_bytes: usize,
+    /// Бюджет коалесценции пакетов при одном активном сокете (байт).
+    pub single_coalesce_budget_bytes: usize,
+    /// Максимальный размер одного WebSocket-сообщения/фрейма `tokio-tungstenite` (байт).
+    pub max_message_size: usize,
+    /// Размер буфера чтения WebSocket-потока (байт).
+    pub read_buffer_size: usize,
+    /// Стартовый размер буфера записи WebSocket-потока (байт).
+    pub write_buffer_size: usize,
+    /// Верхний лимит буфера записи WebSocket-потока (байт).
+    pub max_write_buffer_size: usize,
+    /// Окно удержания suspended-сессии для `resume_session_id` после обрыва всех сокетов (сек).
+    pub resume_window_secs: u64,
+    /// Разрешать ли создание новой сессии с перепроверкой прав, если `resume_session_id` уже истёк/отсутствует.
+    pub resume_allow_fresh_fallback: bool,
+}
+
+impl Default for WebSocketServerConfig {
+    fn default() -> Self {
+        Self {
+            reassembly_queue_max_size: anet_common::consts::WS_REASSEMBLY_QUEUE_MAX_SIZE,
+            reassembly_gap_timeout_ms: anet_common::consts::WS_REASSEMBLY_GAP_TIMEOUT_MS,
+            write_timeout_ms: anet_common::consts::WS_DEFAULT_WRITE_TIMEOUT_MS,
+            close_timeout_ms: anet_common::consts::WS_DEFAULT_CLOSE_TIMEOUT_MS,
+            handshake_timeout_secs: anet_common::consts::WS_DEFAULT_HANDSHAKE_TIMEOUT_SECS,
+            ping_interval_min_secs: anet_common::consts::WS_DEFAULT_SERVER_PING_MIN_SECS,
+            ping_interval_max_secs: anet_common::consts::WS_DEFAULT_SERVER_PING_MAX_SECS,
+            pool_coalesce_budget_bytes: anet_common::consts::WS_POOL_COALESCE_BUDGET_BYTES,
+            single_coalesce_budget_bytes:
+                anet_common::consts::WS_DEFAULT_SINGLE_COALESCE_BUDGET_BYTES,
+            max_message_size: anet_common::consts::WS_DEFAULT_MAX_MESSAGE_SIZE,
+            read_buffer_size: anet_common::consts::WS_DEFAULT_READ_BUFFER_SIZE,
+            write_buffer_size: anet_common::consts::WS_DEFAULT_WRITE_BUFFER_SIZE,
+            max_write_buffer_size: anet_common::consts::WS_DEFAULT_MAX_WRITE_BUFFER_SIZE,
+            resume_window_secs: anet_common::consts::WS_DEFAULT_RESUME_WINDOW_SECS,
+            resume_allow_fresh_fallback: true,
+        }
+    }
+}
+
+impl WebSocketServerConfig {
+    pub fn write_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.write_timeout_ms.max(100))
+    }
+
+    pub fn close_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.close_timeout_ms.max(100))
+    }
+
+    pub fn handshake_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.handshake_timeout_secs.max(1))
+    }
+
+    pub fn random_ping_interval(&self) -> std::time::Duration {
+        use rand::Rng;
+        let min = self.ping_interval_min_secs.max(1);
+        let max = self.ping_interval_max_secs.max(min);
+        std::time::Duration::from_secs(rand::rngs::OsRng.gen_range(min..=max))
+    }
+
+    pub fn effective_pool_coalesce_budget(&self) -> usize {
+        self.pool_coalesce_budget_bytes.max(1500)
+    }
+
+    pub fn effective_single_coalesce_budget(&self) -> usize {
+        self.single_coalesce_budget_bytes.max(1500)
+    }
+
+    pub fn effective_max_message_size(&self) -> usize {
+        self.max_message_size.max(4096)
+    }
+
+    pub fn effective_read_buffer_size(&self) -> usize {
+        self.read_buffer_size.max(4096)
+    }
+
+    pub fn effective_write_buffer_size(&self) -> usize {
+        self.write_buffer_size.max(4096)
+    }
+
+    pub fn effective_max_write_buffer_size(&self) -> usize {
+        self.max_write_buffer_size
+            .max(self.effective_write_buffer_size())
+    }
+}
+
 // Конфигурация транспорта IMAP на сервере (секция [imap] в server.toml)
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -309,6 +415,9 @@ pub struct Config {
     pub ahttp: AhttpServerConfig,
 
     #[serde(default)]
+    pub websocket: WebSocketServerConfig,
+
+    #[serde(default)]
     pub wrtc: WrtcConfig,
 
     #[serde(default)]
@@ -342,3 +451,66 @@ pub async fn load() -> anyhow::Result<Config> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::Config;
+    use std::time::Duration;
+
+    #[test]
+    fn websocket_server_config_defaults_and_overrides() {
+        let default_cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(
+            default_cfg.websocket.reassembly_queue_max_size,
+            anet_common::consts::WS_REASSEMBLY_QUEUE_MAX_SIZE
+        );
+        assert_eq!(
+            default_cfg.websocket.write_timeout(),
+            Duration::from_millis(anet_common::consts::WS_DEFAULT_WRITE_TIMEOUT_MS)
+        );
+        assert_eq!(
+            default_cfg.websocket.close_timeout(),
+            Duration::from_millis(anet_common::consts::WS_DEFAULT_CLOSE_TIMEOUT_MS)
+        );
+        assert_eq!(
+            default_cfg.websocket.handshake_timeout(),
+            Duration::from_secs(anet_common::consts::WS_DEFAULT_HANDSHAKE_TIMEOUT_SECS)
+        );
+        assert!(default_cfg.websocket.resume_allow_fresh_fallback);
+
+        let custom_toml = r#"
+            [websocket]
+            reassembly_queue_max_size = 4096
+            reassembly_gap_timeout_ms = 90
+            write_timeout_ms = 5000
+            close_timeout_ms = 1500
+            handshake_timeout_secs = 20
+            ping_interval_min_secs = 15
+            ping_interval_max_secs = 15
+            pool_coalesce_budget_bytes = 32768
+            single_coalesce_budget_bytes = 98304
+            max_message_size = 524288
+            read_buffer_size = 262144
+            write_buffer_size = 262144
+            max_write_buffer_size = 1048576
+            resume_window_secs = 90
+            resume_allow_fresh_fallback = false
+        "#;
+        let custom_cfg: Config = toml::from_str(custom_toml).unwrap();
+        assert_eq!(custom_cfg.websocket.reassembly_queue_max_size, 4096);
+        assert_eq!(custom_cfg.websocket.reassembly_gap_timeout_ms, 90);
+        assert_eq!(custom_cfg.websocket.write_timeout(), Duration::from_millis(5000));
+        assert_eq!(custom_cfg.websocket.close_timeout(), Duration::from_millis(1500));
+        assert_eq!(custom_cfg.websocket.handshake_timeout(), Duration::from_secs(20));
+        assert_eq!(custom_cfg.websocket.random_ping_interval(), Duration::from_secs(15));
+        assert_eq!(custom_cfg.websocket.effective_pool_coalesce_budget(), 32768);
+        assert_eq!(custom_cfg.websocket.effective_single_coalesce_budget(), 98304);
+        assert_eq!(custom_cfg.websocket.effective_max_message_size(), 524288);
+        assert_eq!(custom_cfg.websocket.effective_read_buffer_size(), 262144);
+        assert_eq!(custom_cfg.websocket.effective_write_buffer_size(), 262144);
+        assert_eq!(custom_cfg.websocket.effective_max_write_buffer_size(), 1048576);
+        assert_eq!(custom_cfg.websocket.resume_window_secs, 90);
+        assert!(!custom_cfg.websocket.resume_allow_fresh_fallback);
+    }
+}
+

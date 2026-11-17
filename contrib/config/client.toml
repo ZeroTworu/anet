@@ -264,6 +264,63 @@ handshake_path = "/handshake"
 auth_path = "/auth"
 traffic_path = "/traffic"
 
+[websocket]
+# Максимальный размер скользящего окна переупорядочивания пакетов (`ReassemblyQueue`) для пула `WSS ?pool=N`.
+# Для каналов 250+ Мбит/с рекомендуется увеличивать до 4096..8192.
+reassembly_queue_max_size = 2048
+
+# Таймаут ожидания задержавшегося/потерянного пакета на дыре последовательности (мс).
+reassembly_gap_timeout_ms = 60
+
+# Таймаут отправки одного WebSocket-фрейма (мс). Защищает от зависания на «чёрной дыре» TCP.
+write_timeout_ms = 10000
+
+# Таймаут закрытия WebSocket-сокета (мс).
+close_timeout_ms = 2000
+
+# Таймаут TCP + TLS + HTTP Upgrade (и `WS_MUX_BIND`) одного сокета пула (сек).
+handshake_timeout_secs = 15
+
+# Диапазон случайного интервала клиентских keepalive Ping-фреймов (сек).
+ping_interval_min_secs = 25
+ping_interval_max_secs = 50
+
+# Емкость очереди исходящих пакетов (TUN -> WS-пул) и входящих батчей (WS-пул -> ReassemblyQueue).
+tx_queue_capacity = 512
+downlink_queue_capacity = 1024
+
+# Бюджет коалесценции пакетов на один сокет при active_slots > 1 (байт) и при одиночном сокете (байт).
+pool_coalesce_budget_bytes = 16384
+single_coalesce_budget_bytes = 65536
+
+# Лимит размера одного WebSocket-сообщения/фрейма и буферов `tokio-tungstenite` (байт).
+max_message_size = 262144
+read_buffer_size = 131072
+write_buffer_size = 131072
+max_write_buffer_size = 524288
+
+# Пороги эскалации `WS_MUX_BIND` при `active_slots > 0` до полного ASTP-переподключения (0 — без лимита):
+#   - bind_max_retries: максимум подряд любых неудачных попыток bind;
+#   - bind_reject_max_retries: максимум явных отклонений bind сервером.
+bind_max_retries = 3
+bind_reject_max_retries = 2
+
+# Случайная задержка перед повтором `WS_MUX_BIND` (мс).
+bind_retry_min_ms = 500
+bind_retry_max_ms = 1500
+
+# Общий бюджет времени на цикл `reconnect_astp_session` (сек).
+# Если закомментировано (`None`), вычисляется как `max(server.timeout_secs, 10) * 3`.
+# reconnect_timeout_secs = 30
+
+# Случайная задержка между попытками `reconnect_astp_session` (мс).
+reconnect_retry_min_ms = 350
+reconnect_retry_max_ms = 1400
+
+# Немедленно прерывать `reconnect_astp_session`, если сервер выдал новый туннельный IP/шлюз,
+# чтобы ядро клиента сразу пересоздало TUN и маршруты вместо ожидания до конца `reconnect_timeout_secs`.
+abort_on_ip_change = true
+
 # 1. Первая попытка: Сверхбыстрый и плавный UDP-транспорт (QUIC)
 [[servers]]
 name = "GM Primary [QUIC]"

@@ -184,7 +184,7 @@ struct SuspendedSession {
     expires_at: Instant,
 }
 
-const RESUME_WINDOW: Duration = Duration::from_secs(45);
+const RESUME_WINDOW: Duration = Duration::from_secs(anet_common::consts::WS_DEFAULT_RESUME_WINDOW_SECS);
 
 #[derive(Clone)]
 pub struct ClientRegistry {
@@ -194,6 +194,7 @@ pub struct ClientRegistry {
     quic_router: Arc<DashMap<String, StreamSender>>,
     ipv4_router: Arc<DashMap<Ipv4Addr, (StreamSender, Option<Arc<TrafficCounters>>)>>,
     suspended_sessions: Arc<DashMap<String, SuspendedSession>>,
+    resume_window: Duration,
     ip_pool: IpPool,
     accepting_connections: Arc<AtomicBool>,
     traffic_totals: Arc<DashMap<String, Arc<TrafficCounters>>>,
@@ -210,12 +211,18 @@ impl ClientRegistry {
             quic_router: Arc::new(DashMap::new()),
             ipv4_router: Arc::new(DashMap::new()),
             suspended_sessions: Arc::new(DashMap::new()),
+            resume_window: RESUME_WINDOW,
             ip_pool,
             accepting_connections: Arc::new(AtomicBool::new(true)),
             traffic_totals: Arc::new(DashMap::new()),
             shaper: Arc::new(ArcSwapOption::empty()),
             state_changed: Arc::new(Notify::new()),
         }
+    }
+
+    pub fn with_resume_window(mut self, resume_window: Duration) -> Self {
+        self.resume_window = resume_window;
+        self
     }
 
     pub async fn wait_state_changed(&self) {
@@ -227,6 +234,37 @@ impl ClientRegistry {
             .iter()
             .find(|entry| entry.value().session_id == session_id)
             .map(|entry| entry.value().clone())
+    }
+
+    /// Удаляет активную (возможно полумёртвую) сессию, если она принадлежит
+    /// тому же `fingerprint` и имеет ровно указанный `session_id`.
+    pub async fn remove_active_session_if_matching(
+        &self,
+        session_id: &str,
+        fingerprint: &str,
+    ) -> bool {
+        if session_id.is_empty() {
+            return false;
+        }
+        let target = self
+            .clients_by_ip
+            .iter()
+            .find(|entry| {
+                entry.value().session_id == session_id
+                    && entry.value().fingerprint == fingerprint
+            })
+            .map(|entry| entry.value().clone());
+
+        if let Some(client) = target {
+            info!(
+                "[Registry] Displacing active session {} (IP: {}, proto: {}) for FP {} during reconnect",
+                client.session_id, client.assigned_ip, client.protocol, fingerprint
+            );
+            self.remove_client(&client).await;
+            true
+        } else {
+            false
+        }
     }
 
     pub fn set_shaper(&self, shaper: Arc<Shaper>) {
@@ -664,7 +702,7 @@ impl ClientRegistry {
             client_info.session_id.clone(),
             SuspendedSession {
                 client_info,
-                expires_at: Instant::now() + RESUME_WINDOW,
+                expires_at: Instant::now() + self.resume_window,
             },
         );
         self.state_changed.notify_one();
