@@ -1,6 +1,6 @@
 # Транспорт `ws://` / `wss://` (WebSocket): топология, режимы работы и настройка
 
-> Актуально на @64295da
+> Актуально на @bde0050
 
 ## 1. Режимы развёртывания: напрямую и через CDN / Edge-прокси
 
@@ -47,21 +47,24 @@
 
 1. **Полнодуплексный Split-конвейер (Full-Duplex Reader/Writer):**
    * Каждый сокет пула делится (`StreamExt::split`) на полностью независимые асинхронные задачи чтения и записи: чтение входящих кадров больше не блокируется на время записи/ожидания ответа, а доставка в TUN идёт через честный асинхронный `tun_tx.send(...).await` (естественный TCP backpressure без дропов `try_send`).
-   * Буферы сокета WebSocket расширены (`read_buffer_size = 128 КБ`, `write_buffer_size = 128 КБ`, `max_write_buffer_size = 512 КБ`, `MAX_WS_MESSAGE_SIZE = 256 КБ`).
+   * Буферы сокета WebSocket расширены и настраиваются через `[websocket]` (по умолчанию `read_buffer_size = 128 КБ`, `write_buffer_size = 128 КБ`, `max_write_buffer_size = 512 КБ`, `max_message_size = 256 КБ`).
+   * Все блокирующие сетевые операции записи, закрытия и рукопожатия (`ws_sink.send` для данных/Ping/Pong/Close, `close`, HTTP Upgrade и фазы ASTP/MUX) защищены настраиваемыми таймаутами (`write_timeout_ms`, `close_timeout_ms`, `handshake_timeout_secs`), чтобы полуоткрытый («чёрная дыра») TCP-сокет за CDN/NAT не замораживал задачу отправки или реконнекта навсегда.
 2. **Отсутствие двойного фреймирования (Zero Redundant Framing):**
    * Протокол WebSocket (RFC 6455) уже содержит собственную длину каждого бинарного фрейма (`Message::Binary`).
    * Поэтому между клиентом и сервером в каждом `Message::Binary` передаётся один или несколько склеенных пакетов с 2-байтовым префиксом длины `[len: u16 BE][encrypted_astp_packet]` без лишних внешних обёрток.
 3. **Адаптивная агрегация пакетов на отправке (Coalescing 16–64 КБ):**
    * Если в очереди накопилась пачка пакетов, воркер отправки вычитывает их через `try_recv()` и отправляет **одним** WebSocket-фреймом за один системный вызов.
-   * При одном активном сокете используется бюджет **64 КБ** (`COALESCE_BUDGET_BYTES`); при активном мульти-сокетном пуле (`active_sockets > 1`) — **16 КБ** (`WS_POOL_COALESCE_BUDGET_BYTES`), чтобы пачки равномерно разбирались несколькими воркерами, а не уходили целиком в один сокет.
+   * При одном активном сокете используется `single_coalesce_budget_bytes` (по умолчанию **64 КБ**); при активном мульти-сокетном пуле (`active_sockets > 1`) — `pool_coalesce_budget_bytes` (по умолчанию **16 КБ**), чтобы пачки равномерно разбирались несколькими воркерами, а не уходили целиком в один сокет.
 4. **Раздельные AEAD-полупространства и Reassembly-окно:**
    * Клиент нумерует исходящие пакеты начиная с `CLIENT_SEQUENCE_START = 1 << 63`, сервер — с `SERVER_SEQUENCE_START = 0`, что полностью исключает коллизию `(Key, Nonce)` при параллельной передаче через несколько сокетов.
-   * На принимающей стороне `ReassemblyQueue` (окно `2048` пакетов, `gap_timeout = 60 мс`) восстанавливает порядок IP-пакетов, если соседние кадры пришли по разным сокетам пула с отличающимся RTT.
+   * На принимающей стороне `ReassemblyQueue` (по умолчанию окно `2048` пакетов, `gap_timeout = 60 мс`; настраивается через `[websocket]`) восстанавливает порядок IP-пакетов, если соседние кадры пришли по разным сокетам пула с отличающимся RTT.
 5. **Принудительный `TCP_NODELAY = true`:**
    * И на клиенте (`connect_async_with_config(..., true)`), и на сервере (`stream.set_nodelay(true)`) алгоритм Нейгла принудительно отключён, что исключает 40-миллисекундные задержки TCP ACK при обмене мелкими фреймами.
-6. **Пул параллельных WebSocket-соединений (`?pool=N` / `?mux=N`):**
+6. **Пул параллельных WebSocket-соединений (`?pool=N` / `?mux=N`), защита от рассинхрона и Resume:**
    * Клиент по умолчанию открывает пул из **4 параллельных WebSocket-соединений** (максимум `8`) в рамках одной ASTP-сессии.
-   * Первый слот выполняет полное ASTP-рукопожатие, а остальные подключаются за **1 RTT** по протоколу `WS_MUX_BIND` (`ANETMUX1` / `ANETOK01`) с привязкой к уже существующей сессии — без вытеснения клиента в `ClientRegistry`. Плановая ротация слотов смещена по времени, чтобы туннель не терял пропускную способность при переподключении одного из сокетов.
+   * Первый слот выполняет полное ASTP-рукопожатие, а остальные подключаются за **1 RTT** по протоколу `WS_MUX_BIND` (`ANETMUX1` / `ANETOK01`). На сервере `WsSessionPool` и маршруты `ClientRegistry` регистрируются **до** отправки финального `AuthResponse`, исключая гонку при мгновенном старте `WS_MUX_BIND` от соседних слотов (при сбое отправки `AuthResponse` выполняется откат регистрации).
+   * Если серверный пул потерян (например, из-за перезапуска узла или протухания сессии) или отклонён по `WS_MUX_BIND`, даже при локально ненулевом `active_slots` воркер слота по достижении порогов `bind_reject_max_retries` / `bind_max_retries` отменяет устаревшее поколение (`cancel_tx`) и запускает восстановление ASTP-сессии с актуальным `cur_gen.session_id`.
+   * На сервере `resume_window_secs` (по умолчанию `45` с) задаёт время удержания suspended-сессии. Если к моменту Phase 3 `resume_session_id` уже недоступен, при `resume_allow_fresh_fallback = true` сервер освобождает возможную полумёртвую запись с тем же `session_id`, при необходимости перепроверяет права доступа у `AuthProvider` и выдаёт новую сессию (либо сразу возвращает `AuthError` при `resume_allow_fresh_fallback = false`). Если при этом сменился туннельный IP/шлюз и на клиенте включён `abort_on_ip_change = true`, транспорт немедленно завершает `reconnect_astp_session`, позволяя `ANetClient` сразу пересоздать TUN и маршруты.
 
 ### 3.1. Зачем вообще нужен пул параллельных соединений («нафига параллелиться»)
 
@@ -256,6 +259,47 @@ server_pub_key = "<BASE64_ED25519_PUBLIC_KEY>"
 # Интервал плановой ротации долгоживущих WebSocket-соединений (в секундах)
 websocket_min_session_secs = 900
 websocket_max_session_secs = 1800
+
+[websocket]
+# Размер скользящего окна ReassemblyQueue и таймаут дыры последовательности (мс).
+# Для каналов 250+ Мбит/с рекомендуется увеличивать окно до 4096..8192.
+reassembly_queue_max_size = 2048
+reassembly_gap_timeout_ms = 60
+
+# Таймауты операций WebSocket (мс / сек)
+write_timeout_ms = 10000
+close_timeout_ms = 2000
+handshake_timeout_secs = 15
+
+# Диапазон случайного интервала клиентского keepalive Ping (сек)
+ping_interval_min_secs = 25
+ping_interval_max_secs = 50
+
+# Емкость очереди исходящих пакетов и входящих батчей
+tx_queue_capacity = 512
+downlink_queue_capacity = 1024
+
+# Бюджеты коалесценции (байт): для пула (>1 сокета) и для одиночного сокета
+pool_coalesce_budget_bytes = 16384
+single_coalesce_budget_bytes = 65536
+
+# Буферы и лимит сообщения tokio-tungstenite (байт)
+max_message_size = 262144
+read_buffer_size = 131072
+write_buffer_size = 131072
+max_write_buffer_size = 524288
+
+# Эскалация WS_MUX_BIND при локально активных слотах (0 — без лимита) и задержки повторов (мс)
+bind_max_retries = 3
+bind_reject_max_retries = 2
+bind_retry_min_ms = 500
+bind_retry_max_ms = 1500
+
+# Бюджет и паузы цикла reconnect_astp_session, а также мгновенный сброс при смене IP/шлюза
+# reconnect_timeout_secs = 30 # по умолчанию: max(server.timeout_secs, 10) * 3
+reconnect_retry_min_ms = 350
+reconnect_retry_max_ms = 1400
+abort_on_ip_change = true
 ```
 
 *Примечание по проверке сертификата, порядку заголовков Upgrade и защите от активного спуфинга ТСПУ:* клиентский TLS-коннектор WebSocket на базе BoringSSL анонсирует в ALPN строго `["http/1.1"]`, формирует порядок HTTP/1.1 Upgrade-заголовков строго по профилю браузера (`ws_headers_order` из `[[browser_profiles]]`) и по умолчанию (`tls_verify_peer = true`) проверяет цепочку доверия сертификата (WebPKI + совпадение домена SNI) либо сверяет криптографический пин `tls_pin_sha256`. Если ТСПУ пытается перехватить TLS-сессию поддельным сертификатом, рукопожатие обрывается на уровне TLS до отправки заголовка `Upgrade: websocket` и пути `/socket`. Подробные команды `tcpdump` / `tshark` и описание `[[browser_profiles]]` приведены в [`boringssl_migration.ru.md`](./boringssl_migration.ru.md).
@@ -268,4 +312,33 @@ websocket_max_session_secs = 1800
 websocket_bind_to = "127.0.0.1:8080"
 # Путь должен совпадать с location в Nginx и путём в dsn клиента
 websocket_path = "/socket"
+
+[websocket]
+# Окно переупорядочивания входящего uplink-трафика на сервере (по умолчанию 2048 / 60 мс).
+# Для каналов 250+ Мбит/с рекомендуется 4096..8192.
+reassembly_queue_max_size = 2048
+reassembly_gap_timeout_ms = 60
+
+# Таймауты записи, закрытия и HTTP Upgrade / ASTP-рукопожатия (мс / сек)
+write_timeout_ms = 10000
+close_timeout_ms = 2000
+handshake_timeout_secs = 15
+
+# Диапазон случайного интервала серверного keepalive Ping (сек)
+ping_interval_min_secs = 22
+ping_interval_max_secs = 52
+
+# Бюджеты коалесценции (байт): для пула (>1 сокета) и для одиночного сокета
+pool_coalesce_budget_bytes = 16384
+single_coalesce_budget_bytes = 65536
+
+# Буферы и лимит сообщения tokio-tungstenite (байт)
+max_message_size = 262144
+read_buffer_size = 131072
+write_buffer_size = 131072
+max_write_buffer_size = 524288
+
+# Окно resume_session_id (сек) и fallback на новую сессию при истечении/отсутствии suspended-сессии
+resume_window_secs = 45
+resume_allow_fresh_fallback = true
 ```
