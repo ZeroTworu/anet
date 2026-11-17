@@ -268,6 +268,7 @@ impl KonturTalkProvider {
                 port: 34788,
                 is_turn: false,
                 is_tcp_or_tls: false,
+                resolved_ips: Vec::new(),
             },
             crate::wrtc::xmpp_xml::XmppIceServer {
                 urls: vec!["stun:stun3.ktalk.host:34788".to_string()],
@@ -277,6 +278,7 @@ impl KonturTalkProvider {
                 port: 34788,
                 is_turn: false,
                 is_tcp_or_tls: false,
+                resolved_ips: Vec::new(),
             },
         ];
 

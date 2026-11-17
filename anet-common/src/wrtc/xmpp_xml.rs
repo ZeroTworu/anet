@@ -31,6 +31,7 @@ pub struct XmppIceServer {
     pub port: u16,
     pub is_turn: bool,
     pub is_tcp_or_tls: bool,
+    pub resolved_ips: Vec<std::net::IpAddr>,
 }
 
 #[derive(Debug, Clone)]
@@ -358,6 +359,10 @@ fn parse_single_element(
                         _ => continue,
                     };
 
+                    let resolved_ips = host
+                        .parse::<std::net::IpAddr>()
+                        .map(|ip| vec![ip])
+                        .unwrap_or_default();
                     ice_servers.push(XmppIceServer {
                         urls: vec![url],
                         username,
@@ -366,6 +371,7 @@ fn parse_single_element(
                         port,
                         is_turn,
                         is_tcp_or_tls,
+                        resolved_ips,
                     });
                 }
                 if !ice_servers.is_empty() {

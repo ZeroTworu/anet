@@ -1,6 +1,6 @@
 use bytes::BytesMut;
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -56,6 +56,7 @@ impl Drop for TurnsProxyHandle {
 /// что исключает ошибку `437 Allocation Mismatch` при мультисокетном ICE (`udp_ice_socket_count > 1`).
 pub fn spawn_turns_udp_proxy(
     host: String,
+    resolved_ips: Vec<IpAddr>,
     port: u16,
     use_tls: bool,
     remote_url: String,
@@ -74,12 +75,13 @@ pub fn spawn_turns_udp_proxy(
     let local_turn_url = format!("turn:{local_addr}");
 
     log::info!(
-        "[WRTC TURNS Proxy] Bound local UDP bridge {} -> {} (TLS={}, SNI={}:{})",
+        "[WRTC TURNS Proxy] Bound local UDP bridge {} -> {} (TLS={}, SNI={}:{}, pre_resolved_ips={:?})",
         local_turn_url,
         remote_url,
         use_tls,
         host,
-        port
+        port,
+        resolved_ips
     );
 
     let remote_url_log = remote_url.clone();
@@ -90,6 +92,7 @@ pub fn spawn_turns_udp_proxy(
         run_turns_proxy_loop(
             udp_sock,
             host,
+            resolved_ips,
             port,
             use_tls,
             remote_url_log,
@@ -108,9 +111,11 @@ pub fn spawn_turns_udp_proxy(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_turns_proxy_loop(
     udp_sock: Arc<UdpSocket>,
     host: String,
+    resolved_ips: Vec<IpAddr>,
     port: u16,
     use_tls: bool,
     remote_url: String,
@@ -138,6 +143,7 @@ async fn run_turns_proxy_loop(
                         &mut sessions,
                         &udp_sock,
                         &host,
+                        &resolved_ips,
                         port,
                         use_tls,
                         &remote_url,
@@ -164,6 +170,7 @@ async fn run_turns_proxy_loop(
             &mut sessions,
             &udp_sock,
             &host,
+            &resolved_ips,
             port,
             use_tls,
             &remote_url,
@@ -186,6 +193,7 @@ fn spawn_client_turn_session(
     sessions: &mut HashMap<SocketAddr, mpsc::Sender<Vec<u8>>>,
     udp_sock: &Arc<UdpSocket>,
     host: &str,
+    resolved_ips: &[IpAddr],
     port: u16,
     use_tls: bool,
     remote_url: &str,
@@ -197,35 +205,65 @@ fn spawn_client_turn_session(
 
     let udp_sock_c = Arc::clone(udp_sock);
     let host_c = host.to_string();
+    let mut ips_c = resolved_ips.to_vec();
+    // Приоритизируем IPv4 перед IPv6, чтобы исключить неработающий IPv6 при перехвате маршрутов
+    ips_c.sort_by_key(|ip| if ip.is_ipv4() { 0u8 } else { 1u8 });
     let remote_url_c = remote_url.to_string();
 
     let handle = tokio::spawn(async move {
         let target_addr_str = format!("{host_c}:{port}");
-        let connect_res = tokio::time::timeout(connect_timeout, async {
-            let tcp = TcpStream::connect(&target_addr_str).await?;
-            let _ = tcp.set_nodelay(true);
-            let sock_ref = socket2::SockRef::from(&tcp);
-            let _ = sock_ref.set_recv_buffer_size(4 * 1024 * 1024);
-            let _ = sock_ref.set_send_buffer_size(4 * 1024 * 1024);
-            Ok::<TcpStream, std::io::Error>(tcp)
-        })
-        .await;
+        let mut tcp_opt: Option<TcpStream> = None;
+        let mut last_err_str: Option<String> = None;
 
-        let tcp_stream = match connect_res {
-            Ok(Ok(s)) => s,
-            Ok(Err(e)) => {
-                log::warn!(
-                    "[WRTC TURNS Proxy] TCP connect to {remote_url_c} ({target_addr_str}) for {src} failed: {e}"
-                );
-                return;
+        for ip in &ips_c {
+            let sock_addr = SocketAddr::new(*ip, port);
+            let per_ip_timeout = connect_timeout.min(Duration::from_secs(3));
+            match tokio::time::timeout(per_ip_timeout, TcpStream::connect(sock_addr)).await {
+                Ok(Ok(tcp)) => {
+                    let _ = tcp.set_nodelay(true);
+                    let sock_ref = socket2::SockRef::from(&tcp);
+                    let _ = sock_ref.set_recv_buffer_size(4 * 1024 * 1024);
+                    let _ = sock_ref.set_send_buffer_size(4 * 1024 * 1024);
+                    tcp_opt = Some(tcp);
+                    break;
+                }
+                Ok(Err(e)) => {
+                    last_err_str = Some(format!("{sock_addr}: {e}"));
+                }
+                Err(_) => {
+                    last_err_str = Some(format!("{sock_addr}: timed out after {per_ip_timeout:?}"));
+                }
             }
-            Err(_) => {
-                log::warn!(
-                    "[WRTC TURNS Proxy] TCP connect to {remote_url_c} ({target_addr_str}) for {src} timed out after {:?}",
-                    connect_timeout
-                );
-                return;
+        }
+
+        if tcp_opt.is_none() {
+            let connect_res = tokio::time::timeout(connect_timeout, async {
+                let tcp = TcpStream::connect(&target_addr_str).await?;
+                let _ = tcp.set_nodelay(true);
+                let sock_ref = socket2::SockRef::from(&tcp);
+                let _ = sock_ref.set_recv_buffer_size(4 * 1024 * 1024);
+                let _ = sock_ref.set_send_buffer_size(4 * 1024 * 1024);
+                Ok::<TcpStream, std::io::Error>(tcp)
+            })
+            .await;
+
+            match connect_res {
+                Ok(Ok(s)) => tcp_opt = Some(s),
+                Ok(Err(e)) => {
+                    last_err_str = Some(format!("{target_addr_str}: {e}"));
+                }
+                Err(_) => {
+                    last_err_str = Some(format!("{target_addr_str}: timed out after {connect_timeout:?}"));
+                }
             }
+        }
+
+        let Some(tcp_stream) = tcp_opt else {
+            log::warn!(
+                "[WRTC TURNS Proxy] TCP connect to {remote_url_c} ({target_addr_str}) for {src} failed: {}",
+                last_err_str.unwrap_or_else(|| "unknown error".to_string())
+            );
+            return;
         };
 
         let remote_peer_ip = tcp_stream.peer_addr().ok();

@@ -1,11 +1,11 @@
 use crate::config::WrtcConfig;
 use crate::consts::{
     TAG_UNTAGGED, VP8_ASTP_PREFIX_LEN, VP8_INTERFRAME_HEADER, VP8_KEYFRAME_1080P_HEADER,
-    WRTC_COLIBRI_CHANNEL_CAPACITY, WRTC_CONSTRAINTS_RETRY_ATTEMPTS,
-    WRTC_CONSTRAINTS_RETRY_INTERVAL_MS, WRTC_DC_SEND_MAX_RETRIES, WRTC_DC_SEND_RETRY_DELAY_MS,
-    WRTC_DEFAULT_MAX_VIDEO_HEIGHT, WRTC_ICE_GATHER_POLL_ATTEMPTS, WRTC_ICE_GATHER_POLL_INTERVAL_MS,
-    WRTC_INITIAL_FORCE_KEYFRAMES, WRTC_KEYFRAME_INTERVAL_MASK, WRTC_OPUS_CHANNELS,
-    WRTC_OPUS_CLOCK_RATE, WRTC_OPUS_PAYLOAD_TYPE, WRTC_OPUS_SILENCE_FRAME,
+    WRTC_COLIBRI_CHANNEL_CAPACITY, WRTC_COLIBRI_WS_PROBE_TIMEOUT_SECS,
+    WRTC_CONSTRAINTS_RETRY_ATTEMPTS, WRTC_CONSTRAINTS_RETRY_INTERVAL_MS, WRTC_DC_SEND_MAX_RETRIES,
+    WRTC_DC_SEND_RETRY_DELAY_MS, WRTC_DEFAULT_MAX_VIDEO_HEIGHT, WRTC_ICE_GATHER_POLL_ATTEMPTS,
+    WRTC_ICE_GATHER_POLL_INTERVAL_MS, WRTC_INITIAL_FORCE_KEYFRAMES, WRTC_KEYFRAME_INTERVAL_MASK,
+    WRTC_OPUS_CHANNELS, WRTC_OPUS_CLOCK_RATE, WRTC_OPUS_PAYLOAD_TYPE, WRTC_OPUS_SILENCE_FRAME,
     WRTC_P2P_CHANNEL_CAPACITY, WRTC_REASSERT_FORCE_KEYFRAMES, WRTC_VIDEO_CHANNEL_CAPACITY,
     WRTC_VP8_CLOCK_RATE, WRTC_VP8_FALLBACK_PAYLOAD_TYPE, WRTC_VP8_PRIMARY_PAYLOAD_TYPE,
     WRTC_WS_FALLBACK_CHANNEL_CAPACITY,
@@ -37,7 +37,9 @@ use rtc::peer_connection::configuration::interceptor_registry::{
 };
 use rtc::peer_connection::configuration::media_engine::{MediaEngine, MIME_TYPE_OPUS, MIME_TYPE_VP8};
 use rtc::peer_connection::configuration::setting_engine::SettingEngineBuilder;
-use rtc::peer_connection::configuration::{RTCConfigurationBuilder, RTCIceServer};
+use rtc::peer_connection::configuration::{
+    RTCConfigurationBuilder, RTCIceServer, RTCIceTransportPolicy,
+};
 use rtc::peer_connection::sdp::RTCSessionDescription;
 use rtc::peer_connection::transport::RTCDtlsRole;
 use rtc::rtp::{Header as RtpHeader, Packet as RtpPacket};
@@ -46,14 +48,14 @@ use rtc::rtp_transceiver::rtp_sender::{
     RtpCodecKind,
 };
 use socket2::{SockRef, TcpKeepalive};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::io::{IoSliceMut, Result as IoResult};
 use std::net::{IpAddr, SocketAddr, TcpListener, UdpSocket};
 use std::pin::Pin;
 use std::str::from_utf8;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::task::{Context as TaskContext, Poll};
 use std::thread::available_parallelism;
 use std::time::{Duration, Instant};
@@ -71,7 +73,8 @@ use webrtc::media_stream::track_local::static_rtp::TrackLocalStaticRTP;
 use webrtc::media_stream::track_local::TrackLocal;
 use webrtc::media_stream::track_remote::{TrackRemote, TrackRemoteEvent};
 use webrtc::peer_connection::{
-    PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler, RTCPeerConnectionState,
+    PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler, RTCIceCandidateInit,
+    RTCIceCandidateType, RTCPeerConnectionIceEvent, RTCPeerConnectionState,
 };
 use webrtc::runtime::{
     AsyncInterval, AsyncTcpListener, AsyncTcpStream, AsyncUdpSocket, JoinHandle as WrtcJoinHandle,
@@ -79,6 +82,114 @@ use webrtc::runtime::{
 };
 
 const _: () = assert!(rtc::turn::ANET_RTC_TURN_PATCHED);
+
+static ICE_HOST_IP_CACHE: OnceLock<StdMutex<HashMap<String, Vec<IpAddr>>>> = OnceLock::new();
+
+fn ice_ip_cache() -> &'static StdMutex<HashMap<String, Vec<IpAddr>>> {
+    ICE_HOST_IP_CACHE.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+/// Сохраняет предварительно разрешённые IP-адреса ICE/TURN/Colibri-WS хостов до подъёма TUN-маршрутов.
+pub fn cache_resolved_ice_host(host: &str, ips: &[IpAddr]) {
+    let key = host.trim().to_ascii_lowercase();
+    if key.is_empty() || ips.is_empty() {
+        return;
+    }
+    if let Ok(mut guard) = ice_ip_cache().lock() {
+        guard.insert(key, ips.to_vec());
+    }
+}
+
+/// Возвращает кэшированные IP-адреса хоста (или парсит IP-литерал напрямую).
+pub fn get_cached_ice_ips(host: &str) -> Vec<IpAddr> {
+    let key = host.trim().to_ascii_lowercase();
+    if key.is_empty() {
+        return Vec::new();
+    }
+    if let Ok(ip) = key.parse::<IpAddr>() {
+        return vec![ip];
+    }
+    ice_ip_cache()
+        .lock()
+        .ok()
+        .and_then(|g| g.get(&key).cloned())
+        .unwrap_or_default()
+}
+
+/// Асинхронно предразрешает доменные имена STUN/TURN серверов с коротким таймаутом и сохраняет их в кэш.
+pub async fn pre_resolve_ice_servers(servers: &mut [XmppIceServer]) {
+    let mut missing_hosts: Vec<(String, u16)> = Vec::new();
+    for s in servers.iter_mut() {
+        if s.resolved_ips.is_empty() {
+            let cached = get_cached_ice_ips(&s.host);
+            if !cached.is_empty() {
+                s.resolved_ips = cached;
+            } else if !s.host.trim().is_empty()
+                && !missing_hosts
+                    .iter()
+                    .any(|(h, _)| h.eq_ignore_ascii_case(&s.host))
+            {
+                missing_hosts.push((s.host.clone(), s.port.max(1)));
+            }
+        } else {
+            cache_resolved_ice_host(&s.host, &s.resolved_ips);
+        }
+    }
+    if missing_hosts.is_empty() {
+        return;
+    }
+    let mut resolved_map: HashMap<String, Vec<IpAddr>> = HashMap::new();
+    for (host, port) in missing_hosts {
+        if let Ok(Ok(addrs)) = timeout(
+            Duration::from_millis(800),
+            tokio::net::lookup_host((host.as_str(), port)),
+        )
+        .await
+        {
+            let mut ips: Vec<IpAddr> = Vec::new();
+            for addr in addrs {
+                if !ips.contains(&addr.ip()) {
+                    ips.push(addr.ip());
+                }
+            }
+            if !ips.is_empty() {
+                ips.sort_by_key(|ip| if ip.is_ipv4() { 0u8 } else { 1u8 });
+                cache_resolved_ice_host(&host, &ips);
+                resolved_map.insert(host.to_ascii_lowercase(), ips);
+            }
+        }
+    }
+    for s in servers.iter_mut() {
+        if s.resolved_ips.is_empty() {
+            if let Some(ips) = resolved_map.get(&s.host.trim().to_ascii_lowercase()) {
+                s.resolved_ips = ips.clone();
+            }
+        }
+    }
+}
+
+fn rewrite_ice_url_with_ip(url: &str, host: &str, ips: &[IpAddr]) -> Option<String> {
+    let ip = ips.iter().find(|ip| ip.is_ipv4()).or_else(|| ips.first())?;
+    if host.is_empty() || host.parse::<IpAddr>().is_ok() {
+        return Some(url.to_string());
+    }
+    let ip_str = match ip {
+        IpAddr::V4(v4) => v4.to_string(),
+        IpAddr::V6(v6) => format!("[{v6}]"),
+    };
+    let colon_host = format!(":{host}:");
+    if url.contains(&colon_host) {
+        Some(url.replacen(&colon_host, &format!(":{ip_str}:"), 1))
+    } else if let Some(pos) = url.find(host) {
+        let mut out = String::with_capacity(url.len() + ip_str.len());
+        out.push_str(&url[..pos]);
+        out.push_str(&ip_str);
+        out.push_str(&url[pos + host.len()..]);
+        Some(out)
+    } else {
+        None
+    }
+}
 
 #[derive(Debug)]
 struct HybridAsyncUdpSocket {
@@ -571,10 +682,33 @@ struct P2pEvents {
     is_failed: Arc<AtomicBool>,
     disconnected_at_ms: Arc<AtomicU64>,
     start_instant: Instant,
+    relay_only: bool,
+    candidate_tx: mpsc::UnboundedSender<String>,
 }
 
 #[async_trait]
 impl PeerConnectionEventHandler for P2pEvents {
+    async fn on_ice_candidate(&self, event: RTCPeerConnectionIceEvent) {
+        if self.relay_only && event.candidate.typ != RTCIceCandidateType::Relay {
+            return;
+        }
+        let addr = &event.candidate.address;
+        if addr.is_empty()
+            || addr.starts_with("127.")
+            || addr.starts_with("172.112.")
+            || addr == "::1"
+        {
+            return;
+        }
+        if let Ok(init) = event.candidate.to_json() {
+            if !init.candidate.is_empty()
+                && (!self.relay_only || init.candidate.contains(" typ relay"))
+            {
+                let _ = self.candidate_tx.send(init.candidate);
+            }
+        }
+    }
+
     async fn on_connection_state_change(&self, state: RTCPeerConnectionState) {
         info!("[P2P Direct] WebRTC PeerConnection state: {state:?}");
         match state {
@@ -614,6 +748,10 @@ pub struct P2pSession {
     pub incoming_rx: Mutex<mpsc::Receiver<Bytes>>,
     pub turns_proxies: Vec<TurnsProxyHandle>,
     pub active_ice_servers: StdMutex<Vec<RTCIceServer>>,
+    pub relay_only_policy: bool,
+    pub remote_desc_set: AtomicBool,
+    pub pending_remote_candidates: Mutex<Vec<String>>,
+    pub candidate_rx: StdMutex<Option<mpsc::UnboundedReceiver<String>>>,
     pub bg_tasks: StdMutex<Vec<AbortHandle>>,
     pub peer_close_timeout_secs: u64,
     pub pc_closed: AtomicBool,
@@ -625,6 +763,67 @@ impl P2pSession {
         self.is_open.load(Ordering::Relaxed)
             && self.is_connected.load(Ordering::Relaxed)
             && !self.is_failed.load(Ordering::Relaxed)
+    }
+
+    pub fn take_candidate_rx(&self) -> Option<mpsc::UnboundedReceiver<String>> {
+        self.candidate_rx.lock().ok().and_then(|mut g| g.take())
+    }
+
+    pub async fn set_remote_description_and_flush(
+        &self,
+        desc: RTCSessionDescription,
+    ) -> AnyhowResult<()> {
+        self.pc
+            .set_remote_description(desc)
+            .await
+            .map_err(|e| anyhow!("P2P set_remote_description error: {e}"))?;
+        let buffered = {
+            let mut pending = self.pending_remote_candidates.lock().await;
+            self.remote_desc_set.store(true, Ordering::SeqCst);
+            std::mem::take(&mut *pending)
+        };
+        for cand in buffered {
+            let init = RTCIceCandidateInit {
+                candidate: cand,
+                sdp_mid: Some(String::new()),
+                sdp_mline_index: Some(0),
+                ..Default::default()
+            };
+            if let Err(e) = self.pc.add_ice_candidate(init).await {
+                trace!("[P2P Direct] add_ice_candidate (buffered) warning: {e}");
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn add_remote_candidate(&self, cand_line: String) {
+        let trimmed = cand_line
+            .trim()
+            .strip_prefix("a=")
+            .unwrap_or(cand_line.trim())
+            .to_string();
+        if trimmed.is_empty() {
+            return;
+        }
+        if self.relay_only_policy && !trimmed.contains(" typ relay") {
+            return;
+        }
+        {
+            let mut pending = self.pending_remote_candidates.lock().await;
+            if !self.remote_desc_set.load(Ordering::SeqCst) {
+                pending.push(trimmed);
+                return;
+            }
+        }
+        let init = RTCIceCandidateInit {
+            candidate: trimmed,
+            sdp_mid: Some(String::new()),
+            sdp_mline_index: Some(0),
+            ..Default::default()
+        };
+        if let Err(e) = self.pc.add_ice_candidate(init).await {
+            trace!("[P2P Direct] add_ice_candidate warning: {e}");
+        }
     }
 
     pub fn should_renegotiate(&self, disconnected_timeout_ms: u64, handshake_timeout_ms: u64) -> bool {
@@ -696,9 +895,11 @@ impl P2pSession {
             }
             guard.clone()
         };
-        let new_cfg = RTCConfigurationBuilder::new()
-            .with_ice_servers(updated_servers)
-            .build();
+        let mut cfg_builder = RTCConfigurationBuilder::new().with_ice_servers(updated_servers);
+        if self.relay_only_policy {
+            cfg_builder = cfg_builder.with_ice_transport_policy(RTCIceTransportPolicy::Relay);
+        }
+        let new_cfg = cfg_builder.build();
         if let Err(e) = self.pc.set_configuration(new_cfg).await {
             warn!("[P2P Direct] TURN credential rotation warning: {e}");
         } else {
@@ -778,8 +979,14 @@ fn build_ice_server_tiers(
                 .first()
                 .cloned()
                 .unwrap_or_else(|| format!("turns:{}:{}", s.host, s.port));
+            let resolved_ips = if !s.resolved_ips.is_empty() {
+                s.resolved_ips.clone()
+            } else {
+                get_cached_ice_ips(&s.host)
+            };
             match spawn_turns_udp_proxy(
                 s.host.clone(),
+                resolved_ips,
                 s.port,
                 use_tls,
                 remote_url.clone(),
@@ -813,27 +1020,15 @@ fn build_ice_server_tiers(
                 continue;
             }
             if s.is_tcp_or_tls {
-                if include_turn && s.is_turn {
-                    if include_tcp_tls {
-                        if let Some((ref local_url, ref disp)) = proxy_by_idx[idx] {
-                            has_turn = true;
-                            list.push(RTCIceServer {
-                                urls: vec![local_url.clone()],
-                                username: s.username.clone(),
-                                credential: s.credential.clone(),
-                            });
-                            display_urls.push(disp.clone());
-                        }
-                    }
-                    if s.port == 443 && s.host.ends_with(".ktalk.host") {
-                        let udp_ktalk_turn = format!("turn:{}:34788", s.host);
+                if include_turn && s.is_turn && include_tcp_tls {
+                    if let Some((ref local_url, ref disp)) = proxy_by_idx[idx] {
                         has_turn = true;
                         list.push(RTCIceServer {
-                            urls: vec![udp_ktalk_turn.clone()],
+                            urls: vec![local_url.clone()],
                             username: s.username.clone(),
                             credential: s.credential.clone(),
                         });
-                        display_urls.push(udp_ktalk_turn);
+                        display_urls.push(disp.clone());
                     }
                 }
                 continue;
@@ -841,9 +1036,19 @@ fn build_ice_server_tiers(
             if s.is_turn {
                 has_turn = true;
             }
-            display_urls.extend(s.urls.iter().cloned());
+            let cached_ips = if !s.resolved_ips.is_empty() {
+                &s.resolved_ips[..]
+            } else {
+                &get_cached_ice_ips(&s.host)[..]
+            };
+            let rewritten_urls: Vec<String> = s
+                .urls
+                .iter()
+                .map(|u| rewrite_ice_url_with_ip(u, &s.host, cached_ips).unwrap_or_else(|| u.clone()))
+                .collect();
+            display_urls.extend(rewritten_urls.iter().cloned());
             list.push(RTCIceServer {
-                urls: s.urls.clone(),
+                urls: rewritten_urls,
                 username: s.username.clone(),
                 credential: s.credential.clone(),
             });
@@ -924,11 +1129,16 @@ pub async fn create_p2p_channel(
         "[P2P Direct] Pinned P2P UDP socket to physical interface: {effective_bind_addr}"
     );
 
+    let mut resolved_ice = ice_servers_info.to_vec();
+    pre_resolve_ice_servers(&mut resolved_ice).await;
+
     let (tiers, mut turns_proxies) =
-        build_ice_server_tiers(ice_servers_info, wrtc_cfg, true, true);
+        build_ice_server_tiers(&resolved_ice, wrtc_cfg, true, true);
     let mut last_err = None;
     let mut built_pc = None;
     let mut active_ice_servers: Vec<RTCIceServer> = Vec::new();
+    let mut relay_only_policy = false;
+    let mut chosen_candidate_rx: Option<mpsc::UnboundedReceiver<String>> = None;
 
     for tier in tiers {
         let tier_label = tier.label;
@@ -938,9 +1148,11 @@ pub async fn create_p2p_channel(
         let mut media_engine = MediaEngine::default();
         let registry = register_default_interceptors(Registry::new(), &mut media_engine)?;
 
-        let config = RTCConfigurationBuilder::new()
-            .with_ice_servers(tier.servers)
-            .build();
+        let mut cfg_builder = RTCConfigurationBuilder::new().with_ice_servers(tier.servers);
+        if tier_has_turn {
+            cfg_builder = cfg_builder.with_ice_transport_policy(RTCIceTransportPolicy::Relay);
+        }
+        let config = cfg_builder.build();
 
         let setting_engine = SettingEngineBuilder::new()
             .with_ice_timeouts(
@@ -956,12 +1168,15 @@ pub async fn create_p2p_channel(
             .with_receive_mtu(wrtc_cfg.receive_mtu)
             .build();
 
+        let (candidate_tx, candidate_rx) = mpsc::unbounded_channel::<String>();
         let handler = Arc::new(P2pEvents {
             is_open: is_open.clone(),
             is_connected: is_connected.clone(),
             is_failed: is_failed.clone(),
             disconnected_at_ms: disconnected_at_ms.clone(),
             start_instant,
+            relay_only: tier_has_turn,
+            candidate_tx,
         });
 
         match PeerConnectionBuilder::new()
@@ -989,10 +1204,12 @@ pub async fn create_p2p_channel(
         {
             Ok(pc_res) => {
                 info!(
-                    "[P2P Direct] PeerConnection built with {tier_label} (TURN={tier_has_turn}): {:?}",
+                    "[P2P Direct] PeerConnection built with {tier_label} (TURN={tier_has_turn}, relay_only={tier_has_turn}): {:?}",
                     tier_urls
                 );
                 active_ice_servers = tier_servers_clone;
+                relay_only_policy = tier_has_turn;
+                chosen_candidate_rx = Some(candidate_rx);
                 built_pc = Some(pc_res);
                 break;
             }
@@ -1073,6 +1290,10 @@ pub async fn create_p2p_channel(
         incoming_rx: Mutex::new(incoming_rx),
         turns_proxies,
         active_ice_servers: StdMutex::new(active_ice_servers),
+        relay_only_policy,
+        remote_desc_set: AtomicBool::new(false),
+        pending_remote_candidates: Mutex::new(Vec::new()),
+        candidate_rx: StdMutex::new(chosen_candidate_rx),
         bg_tasks: StdMutex::new(vec![dc_task.abort_handle()]),
         peer_close_timeout_secs: wrtc_cfg.peer_close_timeout_secs.max(1),
         pc_closed: AtomicBool::new(false),
@@ -1098,6 +1319,7 @@ pub struct WrtcPeer {
     pub mode: WrtcMode,
     pub dc_is_open: Arc<AtomicBool>,
     pub has_ws: Arc<AtomicBool>,
+    pub p2p_alive: Arc<AtomicBool>,
     pub is_connected: Arc<AtomicBool>,
     pub is_failed: Arc<AtomicBool>,
     pub disconnected_at_ms: Arc<AtomicU64>,
@@ -1174,7 +1396,10 @@ impl WrtcPeer {
         let (ws_fallback_tx, mut ws_fallback_rx) =
             mpsc::channel::<String>(WRTC_WS_FALLBACK_CHANNEL_CAPACITY);
         let has_ws = Arc::new(AtomicBool::new(false));
+        let p2p_alive = Arc::new(AtomicBool::new(false));
         let ws_open_notify = Arc::new(Notify::new());
+        let ws_last_inbound_ms = Arc::new(AtomicU64::new(0));
+        let ws_ping_probe_ms = Arc::new(AtomicU64::new(0));
         let xmpp_endpoints: Arc<StdMutex<HashSet<String>>> =
             Arc::new(StdMutex::new(HashSet::new()));
         let colibri_ws_ip: Arc<StdMutex<Option<IpAddr>>> = Arc::new(StdMutex::new(None));
@@ -1194,6 +1419,9 @@ impl WrtcPeer {
                 let in_tx_ws = incoming_tx.clone();
                 let has_ws_c = has_ws.clone();
                 let ws_open_notify_c = ws_open_notify.clone();
+                let ws_last_inbound_c = ws_last_inbound_ms.clone();
+                let ws_probe_c = ws_ping_probe_ms.clone();
+                let ws_start_instant = start_instant;
                 let xmpp_eps_ws = xmpp_endpoints.clone();
                 let colibri_ws_ip_c = colibri_ws_ip.clone();
                 let active_constraints_ws = active_video_constraints.clone();
@@ -1246,39 +1474,86 @@ impl WrtcPeer {
                             .and_then(|u| u.port_u16())
                             .unwrap_or(if is_wss { 443 } else { 80 });
 
+                        let cached_ws_ip = colibri_ws_ip_c
+                            .lock()
+                            .ok()
+                            .and_then(|g| *g)
+                            .or_else(|| get_cached_ice_ips(&target_host).into_iter().next());
+
                         let connect_res = timeout(
                             Duration::from_secs(colibri_connect_timeout),
                             async {
                                 let mut connected_tcp = None;
-                                for attempt in 1..=hop_attempts {
-                                    match timeout(
-                                        hop_timeout,
-                                        TcpStream::connect((target_host.as_str(), target_port)),
-                                    )
-                                    .await
-                                    {
-                                        Ok(Ok(s)) => {
+                                if reconnect_attempts > 0 {
+                                    if let Some(ip) = cached_ws_ip {
+                                        if let Ok(Ok(s)) = timeout(
+                                            hop_timeout,
+                                            TcpStream::connect((ip, target_port)),
+                                        )
+                                        .await
+                                        {
                                             connected_tcp = Some(s);
-                                            break;
                                         }
-                                        Ok(Err(e)) => {
-                                            warn!(
-                                                "[WRTC WS] Colibri TCP connect attempt {attempt}/{hop_attempts} error: {e}"
-                                            );
-                                        }
-                                        Err(_) => {
-                                            warn!(
-                                                "[WRTC WS] Colibri TCP port-hop attempt {attempt}/{hop_attempts} timed out after {:?}, hopping port...",
-                                                hop_timeout
-                                            );
+                                    }
+                                }
+                                if connected_tcp.is_none() {
+                                    for attempt in 1..=hop_attempts {
+                                        match timeout(
+                                            hop_timeout,
+                                            TcpStream::connect((target_host.as_str(), target_port)),
+                                        )
+                                        .await
+                                        {
+                                            Ok(Ok(s)) => {
+                                                connected_tcp = Some(s);
+                                                break;
+                                            }
+                                            Ok(Err(e)) => {
+                                                if let Some(ip) = cached_ws_ip {
+                                                    if let Ok(Ok(s)) = timeout(
+                                                        hop_timeout,
+                                                        TcpStream::connect((ip, target_port)),
+                                                    )
+                                                    .await
+                                                    {
+                                                        connected_tcp = Some(s);
+                                                        break;
+                                                    }
+                                                }
+                                                warn!(
+                                                    "[WRTC WS] Colibri TCP connect attempt {attempt}/{hop_attempts} error: {e}"
+                                                );
+                                            }
+                                            Err(_) => {
+                                                if let Some(ip) = cached_ws_ip {
+                                                    if let Ok(Ok(s)) = timeout(
+                                                        hop_timeout,
+                                                        TcpStream::connect((ip, target_port)),
+                                                    )
+                                                    .await
+                                                    {
+                                                        connected_tcp = Some(s);
+                                                        break;
+                                                    }
+                                                }
+                                                warn!(
+                                                    "[WRTC WS] Colibri TCP port-hop attempt {attempt}/{hop_attempts} timed out after {:?}, hopping port...",
+                                                    hop_timeout
+                                                );
+                                            }
                                         }
                                     }
                                 }
                                 let tcp = match connected_tcp {
                                     Some(s) => s,
                                     None => {
-                                        TcpStream::connect((target_host.as_str(), target_port))
-                                            .await?
+                                        if let Some(ip) = cached_ws_ip {
+                                            TcpStream::connect((ip, target_port)).await?
+                                        } else {
+                                            anyhow::bail!(
+                                                "Colibri-WS TCP connect to {target_host}:{target_port} failed after {hop_attempts} attempts"
+                                            );
+                                        }
                                     }
                                 };
                                 let peer_ip = tcp.peer_addr().ok().map(|a| a.ip());
@@ -1307,7 +1582,13 @@ impl WrtcPeer {
                                 if let Ok(mut g) = colibri_ws_ip_c.lock() {
                                     *g = Some(ip);
                                 }
+                                cache_resolved_ice_host(&target_host, &[ip]);
                             }
+                            ws_last_inbound_c.store(
+                                (ws_start_instant.elapsed().as_millis() as u64).max(1),
+                                Ordering::Relaxed,
+                            );
+                            ws_probe_c.store(0, Ordering::SeqCst);
                             has_ws_c.store(true, Ordering::SeqCst);
                             ws_open_notify_c.notify_waiters();
                             info!(
@@ -1349,6 +1630,8 @@ impl WrtcPeer {
 
                             let mut ws_ping_interval = interval(Duration::from_secs(10));
                             ws_ping_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+                            let mut probe_check_interval = interval(Duration::from_secs(1));
+                            probe_check_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
                             let mut last_inbound_at = TokioInstant::now();
                             let mut channel_closed = false;
 
@@ -1358,6 +1641,11 @@ impl WrtcPeer {
                                         match msg_opt {
                                             Some(Ok(WsMessage::Text(text))) => {
                                                 last_inbound_at = TokioInstant::now();
+                                                ws_last_inbound_c.store(
+                                                    (ws_start_instant.elapsed().as_millis() as u64).max(1),
+                                                    Ordering::Relaxed,
+                                                );
+                                                ws_probe_c.store(0, Ordering::SeqCst);
                                                 if let Ok(c_msg) = serde_json::from_str::<ColibriMessage>(&text) {
                                                     if let Some(ref sender) = c_msg.from {
                                                         if let Ok(mut set) = xmpp_eps_ws.lock() {
@@ -1369,6 +1657,11 @@ impl WrtcPeer {
                                             }
                                             Some(Ok(WsMessage::Binary(bin))) => {
                                                 last_inbound_at = TokioInstant::now();
+                                                ws_last_inbound_c.store(
+                                                    (ws_start_instant.elapsed().as_millis() as u64).max(1),
+                                                    Ordering::Relaxed,
+                                                );
+                                                ws_probe_c.store(0, Ordering::SeqCst);
                                                 if let Ok(c_msg) = serde_json::from_slice::<ColibriMessage>(&bin) {
                                                     if let Some(ref sender) = c_msg.from {
                                                         if let Ok(mut set) = xmpp_eps_ws.lock() {
@@ -1380,6 +1673,10 @@ impl WrtcPeer {
                                             }
                                             Some(Ok(WsMessage::Ping(data))) => {
                                                 last_inbound_at = TokioInstant::now();
+                                                ws_last_inbound_c.store(
+                                                    (ws_start_instant.elapsed().as_millis() as u64).max(1),
+                                                    Ordering::Relaxed,
+                                                );
                                                 let pong_res = timeout(
                                                     Duration::from_secs(ws_write_timeout),
                                                     ws_stream.send(WsMessage::Pong(data)),
@@ -1392,6 +1689,10 @@ impl WrtcPeer {
                                             }
                                             Some(Ok(WsMessage::Pong(_))) => {
                                                 last_inbound_at = TokioInstant::now();
+                                                ws_last_inbound_c.store(
+                                                    (ws_start_instant.elapsed().as_millis() as u64).max(1),
+                                                    Ordering::Relaxed,
+                                                );
                                             }
                                             Some(Ok(WsMessage::Close(frame))) => {
                                                 warn!("[WRTC WS] Colibri-WS closed by JVB: {frame:?}");
@@ -1413,15 +1714,17 @@ impl WrtcPeer {
                                             channel_closed = true;
                                             break;
                                         };
+                                        let mut drained_count = 1usize;
                                         let send_res = timeout(
                                             Duration::from_secs(ws_write_timeout),
                                             async {
                                                 ws_stream
                                                     .feed(WsMessage::Text(json_text.into()))
                                                     .await?;
-                                                for _ in 0..15 {
+                                                for _ in 0..3 {
                                                     match ws_fallback_rx.try_recv() {
                                                         Ok(more_text) => {
+                                                            drained_count += 1;
                                                             ws_stream
                                                                 .feed(WsMessage::Text(
                                                                     more_text.into(),
@@ -1439,6 +1742,9 @@ impl WrtcPeer {
                                             warn!("[WRTC WS] Colibri-WS write failed or timed out");
                                             break;
                                         }
+                                        if drained_count >= 4 {
+                                            tokio::task::yield_now().await;
+                                        }
                                     }
                                     _ = ws_ping_interval.tick() => {
                                         let ping_res = timeout(
@@ -1449,6 +1755,24 @@ impl WrtcPeer {
                                         if ping_res.map_or(true, |r| r.is_err()) {
                                             warn!("[WRTC WS] Colibri-WS keepalive ping failed or timed out");
                                             break;
+                                        }
+                                    }
+                                    _ = probe_check_interval.tick() => {
+                                        let probe_ms = ws_probe_c.load(Ordering::Relaxed);
+                                        if probe_ms > 0 {
+                                            let now_ms = ws_start_instant.elapsed().as_millis() as u64;
+                                            let probe_timeout_ms = WRTC_COLIBRI_WS_PROBE_TIMEOUT_SECS * 1000;
+                                            if now_ms.saturating_sub(probe_ms) >= probe_timeout_ms
+                                                && !dc_open_ws.load(Ordering::Relaxed)
+                                                && !(has_video_flag && is_connected_ws.load(Ordering::Relaxed))
+                                            {
+                                                warn!(
+                                                    "[WRTC WS] Colibri-WS active probe timed out after {}ms without peer response; reconnecting background socket...",
+                                                    now_ms.saturating_sub(probe_ms)
+                                                );
+                                                ws_probe_c.store(0, Ordering::SeqCst);
+                                                break;
+                                            }
                                         }
                                     }
                                     _ = sleep_until(last_inbound_at + colibri_read_timeout) => {
@@ -1549,7 +1873,13 @@ impl WrtcPeer {
             let remote_dc: Arc<Mutex<Option<Arc<dyn DataChannel>>>> = Arc::new(Mutex::new(None));
             let dc_open_notify = Arc::new(Notify::new());
 
-            let discovered_ice = xmpp.get_ice_servers();
+            let mut discovered_ice = xmpp.get_ice_servers();
+            pre_resolve_ice_servers(&mut discovered_ice).await;
+            for s in &discovered_ice {
+                if !s.resolved_ips.is_empty() {
+                    xmpp.cache_resolved_ice_ips(&s.host, &s.resolved_ips);
+                }
+            }
             let allow_turn =
                 mode != WrtcMode::Ws && (wrtc_cfg.jvb_use_turn || wrtc_cfg.turns_proxy_priority);
             let (tiers, built_proxies) = build_ice_server_tiers(
@@ -1757,7 +2087,11 @@ impl WrtcPeer {
                     }))
                     .with_udp_addrs(allocate_distinct_udp_bind_addrs(
                         &bind_addr,
-                        wrtc_cfg.udp_ice_socket_count.clamp(1, 16),
+                        if mode == WrtcMode::Ws {
+                            1
+                        } else {
+                            wrtc_cfg.udp_ice_socket_count.clamp(1, 16)
+                        },
                     ))
                     .with_dedicated_reactor_pool_size(
                         available_parallelism()
@@ -1944,7 +2278,7 @@ impl WrtcPeer {
 
                             let mut final_sdp = answer.sdp.clone();
                             let gather_attempts = if mode == WrtcMode::Ws {
-                                4
+                                2
                             } else {
                                 WRTC_ICE_GATHER_POLL_ATTEMPTS
                             };
@@ -2022,6 +2356,9 @@ impl WrtcPeer {
                 let dc_open_notify_out = dc_open_notify.clone();
                 let has_ws_out = has_ws.clone();
                 let ws_open_notify_out = ws_open_notify.clone();
+                let ws_last_inbound_out = ws_last_inbound_ms.clone();
+                let ws_probe_out = ws_ping_probe_ms.clone();
+                let start_instant_out = start_instant;
                 let ws_fallback_tx_out = ws_fallback_tx.clone();
                 let xmpp_eps_out = xmpp_endpoints.clone();
                 let active_constraints_out = active_video_constraints.clone();
@@ -2049,7 +2386,17 @@ impl WrtcPeer {
                     );
 
                     loop {
-                        let (json_str, msg_to_opt, is_batch, is_astp, is_keepalive, is_discovery) = tokio::select! {
+                        let (
+                            json_str,
+                            msg_to_opt,
+                            is_batch,
+                            is_astp,
+                            is_keepalive,
+                            is_probe,
+                            is_discovery,
+                            is_p2p_sig,
+                            is_video_stall,
+                        ) = tokio::select! {
                             biased;
                             ctrl_opt = ctrl_outgoing_rx.recv() => {
                                 match ctrl_opt {
@@ -2057,20 +2404,28 @@ impl WrtcPeer {
                                         let is_batch = matches!(msg.msg_payload, WrtcMessage::AstpBatch { .. });
                                         let is_astp = matches!(msg.msg_payload, WrtcMessage::Astp { .. });
                                         let is_keepalive = matches!(msg.msg_payload, WrtcMessage::Ping | WrtcMessage::Pong);
+                                        let is_probe = matches!(msg.msg_payload, WrtcMessage::Ping | WrtcMessage::Astp { .. });
                                         let is_discovery = matches!(
                                             msg.msg_payload,
                                             WrtcMessage::Discover { .. } | WrtcMessage::Beacon { .. }
                                         );
+                                        let is_p2p_sig = matches!(
+                                            msg.msg_payload,
+                                            WrtcMessage::P2pOffer { .. }
+                                                | WrtcMessage::P2pAnswer { .. }
+                                                | WrtcMessage::P2pCandidate { .. }
+                                        );
+                                        let is_video_stall = matches!(msg.msg_payload, WrtcMessage::VideoRxStall { .. });
                                         let msg_to_opt = msg.to.clone();
                                         let Ok(json_str) = serde_json::to_string(&msg) else { continue; };
-                                        (json_str, msg_to_opt, is_batch, is_astp, is_keepalive, is_discovery)
+                                        (json_str, msg_to_opt, is_batch, is_astp, is_keepalive, is_probe, is_discovery, is_p2p_sig, is_video_stall)
                                     }
                                     None => break,
                                 }
                             }
                             raw_opt = raw_outgoing_rx.recv() => {
                                 match raw_opt {
-                                    Some(raw) => (raw, None, false, false, false, false),
+                                    Some(raw) => (raw, None, false, false, false, false, false, false, false),
                                     None => break,
                                 }
                             }
@@ -2080,13 +2435,21 @@ impl WrtcPeer {
                                         let is_batch = matches!(msg.msg_payload, WrtcMessage::AstpBatch { .. });
                                         let is_astp = matches!(msg.msg_payload, WrtcMessage::Astp { .. });
                                         let is_keepalive = matches!(msg.msg_payload, WrtcMessage::Ping | WrtcMessage::Pong);
+                                        let is_probe = matches!(msg.msg_payload, WrtcMessage::Ping | WrtcMessage::Astp { .. });
                                         let is_discovery = matches!(
                                             msg.msg_payload,
                                             WrtcMessage::Discover { .. } | WrtcMessage::Beacon { .. }
                                         );
+                                        let is_p2p_sig = matches!(
+                                            msg.msg_payload,
+                                            WrtcMessage::P2pOffer { .. }
+                                                | WrtcMessage::P2pAnswer { .. }
+                                                | WrtcMessage::P2pCandidate { .. }
+                                        );
+                                        let is_video_stall = matches!(msg.msg_payload, WrtcMessage::VideoRxStall { .. });
                                         let msg_to_opt = msg.to.clone();
                                         let Ok(json_str) = serde_json::to_string(&msg) else { continue; };
-                                        (json_str, msg_to_opt, is_batch, is_astp, is_keepalive, is_discovery)
+                                        (json_str, msg_to_opt, is_batch, is_astp, is_keepalive, is_probe, is_discovery, is_p2p_sig, is_video_stall)
                                     }
                                     None => break,
                                 }
@@ -2104,9 +2467,21 @@ impl WrtcPeer {
                             .unwrap_or(false);
 
                         let mut sent = false;
+                        let mut xmpp_sent = false;
+                        // Сигнализация P2P Direct (Offer/Answer/Candidate) идёт в первую очередь через надёжный XMPP MUC,
+                        // чтобы провисания Colibri-WS или UDP/SCTP никогда не срывали обмен SDP/ICE.
+                        if is_p2p_sig {
+                            info!("[XMPP MUC JSON OUT (P2P SIG)]: {json_str}");
+                            if xmpp_json_sender.try_send_json(msg_to_opt.as_deref(), &json_str) {
+                                sent = true;
+                                xmpp_sent = true;
+                            }
+                        }
+
                         // Используем SCTP DataChannel ТОЛЬКО когда разрешён SCTP (use_sctp_dc), живы и SCTP (dc_is_open), и UDP ICE (is_connected),
                         // И при этом удалённый пир НЕ находится в режиме только XMPP MUC (target_is_xmpp_only == false).
-                        if !target_is_xmpp_only
+                        if !sent
+                            && !target_is_xmpp_only
                             && use_sctp_dc
                             && dc_is_open_out.load(Ordering::SeqCst)
                             && is_connected_out.load(Ordering::SeqCst)
@@ -2153,10 +2528,23 @@ impl WrtcPeer {
                             } else {
                                 info!("[JVB WS OUT]: {json_str}");
                             }
+                            if is_probe {
+                                let now_ms = (start_instant_out.elapsed().as_millis() as u64).max(1);
+                                let _ = ws_probe_out.compare_exchange(
+                                    0,
+                                    now_ms,
+                                    Ordering::SeqCst,
+                                    Ordering::SeqCst,
+                                );
+                            }
                             if let Err(e) = ws_fallback_tx_out.try_send(json_str.clone()) {
                                 match e {
                                     TrySendError::Full(_) => {
-                                        warn!("[WRTC WS] Fallback queue full, frame dropped");
+                                        if is_batch {
+                                            trace!("[WRTC WS] Fallback queue full, batch dropped");
+                                        } else {
+                                            warn!("[WRTC WS] Fallback queue full for control frame, routing to XMPP fallback");
+                                        }
                                     }
                                     TrySendError::Closed(_) => {}
                                 }
@@ -2191,7 +2579,6 @@ impl WrtcPeer {
                                     && is_connected_out.load(Ordering::SeqCst)));
                         let allow_xmpp_fallback = !is_constraints
                             && (!is_bulk_data || (!has_fast_text_channel && mode != WrtcMode::MediaVideo));
-                        let mut xmpp_sent = false;
                         if !sent && allow_xmpp_fallback {
                             if is_astp || is_batch || is_keepalive {
                                 trace!("[XMPP MUC JSON OUT]: {json_str}");
@@ -2204,7 +2591,13 @@ impl WrtcPeer {
                             }
                         }
 
-                        if is_discovery && !xmpp_sent {
+                        let ws_last_ms = ws_last_inbound_out.load(Ordering::Relaxed);
+                        let now_ms = start_instant_out.elapsed().as_millis() as u64;
+                        let ws_stale = ws_last_ms > 0 && now_ms.saturating_sub(ws_last_ms) >= 5_000;
+                        let mirror_control_to_xmpp = !xmpp_sent
+                            && (is_discovery
+                                || (ws_stale && (is_keepalive || is_astp || is_video_stall)));
+                        if mirror_control_to_xmpp {
                             trace!("[XMPP MUC JSON MIRROR OUT]: {json_str}");
                             let _ = xmpp_json_sender.try_send_json(msg_to_opt.as_deref(), &json_str);
                         }
@@ -2477,6 +2870,7 @@ impl WrtcPeer {
             mode,
             dc_is_open,
             has_ws,
+            p2p_alive,
             is_connected,
             is_failed,
             disconnected_at_ms,
@@ -2511,9 +2905,19 @@ impl WrtcPeer {
         self.colibri_ws_ip.lock().ok().and_then(|g| *g)
     }
 
+    pub fn set_p2p_alive(&self, alive: bool) {
+        self.p2p_alive.store(alive, Ordering::SeqCst);
+    }
+
     pub fn check_dead_reason(&self) -> Option<&'static str> {
         if self.is_failed.load(Ordering::SeqCst) {
             return Some("PeerConnection or Colibri-WS failed/closed");
+        }
+        // Если активен прямой P2P DataChannel, транзиентные обрывы JVB/Colibri-WS не должны рвать туннель.
+        if matches!(self.mode, WrtcMode::P2pDirect | WrtcMode::Auto)
+            && self.p2p_alive.load(Ordering::SeqCst)
+        {
+            return None;
         }
         // Если активен TCP/TLS канал Colibri-WS (has_ws == true), проседание или блокировка
         // UDP ICE (например, при активных Белых Списках оператора) НЕ должны рвать живую сессию!

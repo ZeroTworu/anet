@@ -124,7 +124,7 @@ pub const WRTC_XMPP_RAW_WS_CHANNEL_CAPACITY: usize = 32;
 pub const WRTC_DUPLEX_BUFFER_SIZE: usize = 4 * 1024 * 1024;
 
 /// Параметры микро-батчирования и коалесценции пакетов в WebRTC.
-pub const WRTC_BATCHER_MAX_BYTES: usize = 16384;
+pub const WRTC_BATCHER_MAX_BYTES: usize = 4096;
 pub const WRTC_BATCHER_MAX_DELAY_MS: u64 = 2;
 pub const WRTC_VIDEO_BATCH_MAX_PACKETS: usize = 16;
 pub const WRTC_UPLINK_BURST_MAX_PACKETS: usize = 64;
@@ -132,6 +132,7 @@ pub const WRTC_UPLINK_BURST_MAX_PACKETS: usize = 64;
 /// Внутренние интервалы опроса ICE, ретраев DataChannel и фоновых задач.
 pub const WRTC_ICE_GATHER_POLL_ATTEMPTS: usize = 50;
 pub const WRTC_ICE_GATHER_POLL_INTERVAL_MS: u64 = 30;
+pub const WRTC_P2P_ICE_GATHER_POLL_ATTEMPTS: usize = 60;
 pub const WRTC_P2P_ICE_GATHER_POLL_INTERVAL_MS: u64 = 50;
 pub const WRTC_DC_SEND_MAX_RETRIES: usize = 3;
 pub const WRTC_DC_SEND_RETRY_DELAY_MS: u64 = 10;
@@ -147,7 +148,9 @@ pub const WRTC_HANDSHAKE_PROCESS_TIMEOUT_SECS: u64 = 10;
 pub const WRTC_SDP_RENEGOTIATE_TIMEOUT_SECS: u64 = 5;
 
 /// Таймаут чтения входящих кадров из канала Colibri WebSocket до его фонового переподключения (в секундах).
-pub const WRTC_COLIBRI_WS_READ_TIMEOUT_SECS: u64 = 25;
+pub const WRTC_COLIBRI_WS_READ_TIMEOUT_SECS: u64 = 15;
+/// Таймаут ожидания входящего ответа/трафика по Colibri WebSocket после отправки активного зонда (Ping / ASTP).
+pub const WRTC_COLIBRI_WS_PROBE_TIMEOUT_SECS: u64 = 6;
 
 /// Параметры обхода L4 ECMP / LAG Hash Slicing (Fast TCP Ephemeral Port Hopping и Multi-Socket UDP ICE).
 pub const WRTC_TCP_PORT_HOP_ATTEMPTS: usize = 8;

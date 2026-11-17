@@ -8,7 +8,8 @@ use crate::wrtc::stealth::generate_random_guest_name;
 use crate::wrtc::xmpp_xml::{parse_xmpp_stanzas, InboundXmpp, XmppBuilder, XmppIceServer};
 use futures::{SinkExt, StreamExt};
 use rand::Rng;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -51,6 +52,7 @@ pub struct XmppSession {
     pub remote_ip: Option<std::net::IpAddr>,
     pub occupants: Arc<Mutex<HashSet<String>>>,
     pub discovered_ice_servers: Arc<Mutex<Vec<XmppIceServer>>>,
+    ice_ip_cache: Arc<Mutex<HashMap<String, Vec<IpAddr>>>>,
     colibri_sink: Arc<Mutex<Option<mpsc::Sender<crate::wrtc::colibri::ColibriMessage>>>>,
     xmpp_endpoints_tracker: Arc<Mutex<Option<Arc<Mutex<HashSet<String>>>>>>,
     default_ice_servers: Vec<XmppIceServer>,
@@ -342,13 +344,42 @@ impl XmppSession {
         occ.iter().cloned().collect()
     }
 
-    pub fn get_ice_servers(&self) -> Vec<XmppIceServer> {
-        let servers = self.discovered_ice_servers.lock().unwrap();
-        if !servers.is_empty() {
-            servers.clone()
-        } else {
-            self.default_ice_servers.clone()
+    pub fn cache_resolved_ice_ips(&self, host: &str, ips: &[IpAddr]) {
+        let key = host.trim().to_ascii_lowercase();
+        if key.is_empty() || ips.is_empty() {
+            return;
         }
+        if let Ok(mut cache) = self.ice_ip_cache.lock() {
+            cache.insert(key.clone(), ips.to_vec());
+        }
+        if let Ok(mut servers) = self.discovered_ice_servers.lock() {
+            for s in servers.iter_mut() {
+                if s.host.trim().eq_ignore_ascii_case(&key) && s.resolved_ips.is_empty() {
+                    s.resolved_ips = ips.to_vec();
+                }
+            }
+        }
+    }
+
+    pub fn get_ice_servers(&self) -> Vec<XmppIceServer> {
+        let mut servers = {
+            let guard = self.discovered_ice_servers.lock().unwrap();
+            if !guard.is_empty() {
+                guard.clone()
+            } else {
+                self.default_ice_servers.clone()
+            }
+        };
+        if let Ok(cache) = self.ice_ip_cache.lock() {
+            for s in &mut servers {
+                if s.resolved_ips.is_empty() {
+                    if let Some(cached) = cache.get(&s.host.trim().to_ascii_lowercase()) {
+                        s.resolved_ips = cached.clone();
+                    }
+                }
+            }
+        }
+        servers
     }
 
     pub fn get_stun_servers(&self) -> Vec<String> {
@@ -494,6 +525,17 @@ impl XmppSession {
             .unwrap_or_else(Self::generate_endpoint_id);
         let occupants = Arc::new(Mutex::new(HashSet::new()));
         let discovered_ice_servers = Arc::new(Mutex::new(Vec::new()));
+        let ice_ip_cache: Arc<Mutex<HashMap<String, Vec<IpAddr>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        {
+            if let Ok(mut cache) = ice_ip_cache.lock() {
+                for s in &bootstrap.default_ice_servers {
+                    if !s.resolved_ips.is_empty() {
+                        cache.insert(s.host.trim().to_ascii_lowercase(), s.resolved_ips.clone());
+                    }
+                }
+            }
+        }
         let colibri_sink: Arc<Mutex<Option<mpsc::Sender<crate::wrtc::colibri::ColibriMessage>>>> =
             Arc::new(Mutex::new(None));
         let xmpp_endpoints_tracker: Arc<Mutex<Option<Arc<Mutex<HashSet<String>>>>>> =
@@ -507,6 +549,7 @@ impl XmppSession {
         let timeout = Duration::from_secs(handshake_timeout_secs);
         let occ_track = occupants.clone();
         let discovered_ice_hs = discovered_ice_servers.clone();
+        let ice_ip_cache_hs = ice_ip_cache.clone();
         let my_ep = endpoint_id.clone();
         let conf_muc = format!("{conference_id}@muc.meet.jitsi/");
         let pre_allocate_before_muc = bootstrap.pre_allocate_before_muc;
@@ -626,7 +669,18 @@ impl XmppSession {
                                     joined = true;
                                 }
                             }
-                            InboundXmpp::ExtdiscoServices(ice_servers) => {
+                            InboundXmpp::ExtdiscoServices(mut ice_servers) => {
+                                if let Ok(cache) = ice_ip_cache_hs.lock() {
+                                    for s in &mut ice_servers {
+                                        if s.resolved_ips.is_empty() {
+                                            if let Some(cached) =
+                                                cache.get(&s.host.trim().to_ascii_lowercase())
+                                            {
+                                                s.resolved_ips = cached.clone();
+                                            }
+                                        }
+                                    }
+                                }
                                 let urls: Vec<String> = ice_servers
                                     .iter()
                                     .flat_map(|s| s.urls.clone())
@@ -824,6 +878,7 @@ impl XmppSession {
 
         let occ_track_bg = occupants.clone();
         let discovered_ice_bg = discovered_ice_servers.clone();
+        let ice_ip_cache_bg = ice_ip_cache.clone();
         let colibri_sink_bg = colibri_sink.clone();
         let xmpp_tracker_bg = xmpp_endpoints_tracker.clone();
         let domain_owned = domain.to_string();
@@ -945,8 +1000,19 @@ impl XmppSession {
                                         InboundXmpp::JingleAck { .. } => {
                                             forward_to_app = true;
                                         }
-                                        InboundXmpp::ExtdiscoServices(ice_servers) => {
+                                        InboundXmpp::ExtdiscoServices(mut ice_servers) => {
                                             forward_to_app = true;
+                                            if let Ok(cache) = ice_ip_cache_bg.lock() {
+                                                for s in &mut ice_servers {
+                                                    if s.resolved_ips.is_empty() {
+                                                        if let Some(cached) = cache
+                                                            .get(&s.host.trim().to_ascii_lowercase())
+                                                        {
+                                                            s.resolved_ips = cached.clone();
+                                                        }
+                                                    }
+                                                }
+                                            }
                                             let urls: Vec<String> = ice_servers
                                                 .iter()
                                                 .flat_map(|s| s.urls.clone())
@@ -965,12 +1031,18 @@ impl XmppSession {
                                                     Some(target) => target == my_ep,
                                                 };
                                                 if for_me {
-                                                    let is_discovery = matches!(
+                                                    let is_signaling_only = matches!(
                                                         c_msg.msg_payload,
                                                         crate::wrtc::colibri::WrtcMessage::Discover { .. }
                                                             | crate::wrtc::colibri::WrtcMessage::Beacon { .. }
+                                                            | crate::wrtc::colibri::WrtcMessage::P2pOffer { .. }
+                                                            | crate::wrtc::colibri::WrtcMessage::P2pAnswer { .. }
+                                                            | crate::wrtc::colibri::WrtcMessage::P2pCandidate { .. }
+                                                            | crate::wrtc::colibri::WrtcMessage::VideoRxStall { .. }
+                                                            | crate::wrtc::colibri::WrtcMessage::Ping
+                                                            | crate::wrtc::colibri::WrtcMessage::Pong
                                                     );
-                                                    if !is_discovery {
+                                                    if !is_signaling_only {
                                                         if let Some(ref from_ep) = c_msg.from {
                                                             if let Ok(t_guard) = xmpp_tracker_bg.lock() {
                                                                 if let Some(ref set_arc) = *t_guard {
@@ -1166,6 +1238,7 @@ impl XmppSession {
             remote_ip,
             occupants,
             discovered_ice_servers,
+            ice_ip_cache,
             colibri_sink,
             xmpp_endpoints_tracker,
             default_ice_servers: bootstrap.default_ice_servers.clone(),

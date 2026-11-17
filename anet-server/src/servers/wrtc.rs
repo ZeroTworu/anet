@@ -5,8 +5,8 @@ use anet_common::consts::{
     MAX_PACKET_SIZE, VIDEO_BATCH_MARKER, VIDEO_WARMUP_ACK_PAYLOAD, VIDEO_WARMUP_MARKER_HI,
     VIDEO_WARMUP_MARKER_LO, VIDEO_WARMUP_PAYLOAD, VP8_ASTP_PREFIX_LEN,
     WRTC_COLIBRI_CHANNEL_CAPACITY, WRTC_DEFAULT_FALLBACK_JVB_IP, WRTC_DEFAULT_MAX_VIDEO_HEIGHT,
-    WRTC_HANDSHAKE_PROCESS_TIMEOUT_SECS, WRTC_ICE_GATHER_POLL_ATTEMPTS,
-    WRTC_MIN_ASTP_VIDEO_FRAME_LEN, WRTC_MIN_IP_PACKET_LEN,
+    WRTC_HANDSHAKE_PROCESS_TIMEOUT_SECS,
+    WRTC_MIN_ASTP_VIDEO_FRAME_LEN, WRTC_MIN_IP_PACKET_LEN, WRTC_P2P_ICE_GATHER_POLL_ATTEMPTS,
     WRTC_P2P_ICE_GATHER_POLL_INTERVAL_MS, WRTC_SDP_RENEGOTIATE_TIMEOUT_SECS,
     WRTC_SERVER_RECONNECT_PAUSE_SECS, WRTC_SERVER_RETRY_DELAY_SECS, WRTC_WATCHDOG_TICK_SECS,
 };
@@ -36,17 +36,28 @@ use ed25519_dalek::SigningKey;
 use http::Uri;
 use log::{info, trace, warn};
 use rtc::peer_connection::sdp::RTCSessionDescription;
+use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 use tokio::task::{yield_now, AbortHandle};
 use tokio::time::{interval, sleep, sleep_until, timeout, Instant, MissedTickBehavior};
 
 fn endpoint_to_socket_addr(ep: &str) -> SocketAddr {
     let num = u32::from_str_radix(ep, 16).unwrap_or(0);
     SocketAddr::new(IpAddr::V4(Ipv4Addr::from(num)), 0)
+}
+
+fn extract_sdp_ice_ufrag(sdp: &str) -> Option<String> {
+    for line in sdp.lines() {
+        let trimmed = line.trim();
+        if let Some(ufrag) = trimmed.strip_prefix("a=ice-ufrag:") {
+            return Some(ufrag.trim().to_string());
+        }
+    }
+    None
 }
 
 pub async fn run_wrtc_server(
@@ -295,6 +306,10 @@ pub async fn run_wrtc_server(
         let clients_by_tag: Arc<DashMap<u16, Arc<ClientTransportInfo>>> =
             Arc::new(DashMap::new());
         let p2p_clients: Arc<DashMap<String, Arc<P2pSession>>> =
+            Arc::new(DashMap::new());
+        let pending_p2p_candidates: Arc<DashMap<String, Vec<String>>> =
+            Arc::new(DashMap::new());
+        let last_p2p_offer_ufrag: Arc<DashMap<String, String>> =
             Arc::new(DashMap::new());
         let client_modes: Arc<DashMap<String, String>> =
             Arc::new(DashMap::new());
@@ -649,6 +664,8 @@ pub async fn run_wrtc_server(
                                     } else if occupant_id != "focus" {
                                         client_modes.remove(occupant_id);
                                         last_discover_nonces.remove(occupant_id);
+                                        pending_p2p_candidates.remove(occupant_id);
+                                        last_p2p_offer_ufrag.remove(occupant_id);
                                         let removed_video_ep = client_video_endpoints.remove(occupant_id).is_some();
                                         if let Some((_, old_p2p)) = p2p_clients.remove(occupant_id) {
                                             old_p2p.close().await;
@@ -698,6 +715,8 @@ pub async fn run_wrtc_server(
                     break;
                 }
                 _ = health_watchdog.tick() => {
+                    let any_p2p_ready = p2p_clients.iter().any(|entry| entry.value().is_ready());
+                    shared_peer.set_p2p_alive(any_p2p_ready);
                     if let Some(reason) = shared_peer.check_dead_reason() {
                         warn!("[WRTC Server] Watchdog detected dead session ({reason}). Re-establishing server session...");
                         break;
@@ -992,6 +1011,8 @@ pub async fn run_wrtc_server(
                                                 client_last_video_rx_ms.remove(&old_tag);
                                                 client_dl_video_stalled.remove(&old_tag);
                                                 clients_map.remove(&ep);
+                                                pending_p2p_candidates.remove(&ep);
+                                                last_p2p_offer_ufrag.remove(&ep);
                                                 if let Some((_, old_p2p)) = p2p_clients.remove(&ep) {
                                                     old_p2p.close().await;
                                                 }
@@ -1616,9 +1637,36 @@ pub async fn run_wrtc_server(
                         }
                     }
                 }
+                WrtcMessage::P2pCandidate { candidate } => {
+                    if let Some(p2p) = p2p_clients.get(&from_endpoint).map(|e| e.value().clone()) {
+                        tokio::spawn(async move {
+                            p2p.add_remote_candidate(candidate).await;
+                        });
+                    } else {
+                        pending_p2p_candidates
+                            .entry(from_endpoint.clone())
+                            .or_default()
+                            .push(candidate);
+                    }
+                }
                 WrtcMessage::P2pOffer { sdp, .. } => {
+                    let offer_ufrag = extract_sdp_ice_ufrag(&sdp);
+                    if let Some(ref ufrag) = offer_ufrag {
+                        let is_dup = last_p2p_offer_ufrag
+                            .get(&from_endpoint)
+                            .map(|prev| prev.value() == ufrag)
+                            .unwrap_or(false);
+                        if is_dup {
+                            trace!("[P2P Direct] Ignoring duplicate ice-offer (ufrag={ufrag}) from {from_endpoint}");
+                            continue;
+                        }
+                        last_p2p_offer_ufrag.insert(from_endpoint.clone(), ufrag.clone());
+                    }
+
                     info!("[P2P Direct] Received ice-offer from client {from_endpoint}! Setting up Relay-Only P2P DataChannel...");
                     let p2p_map_c = p2p_clients.clone();
+                    let pending_p2p_c = pending_p2p_candidates.clone();
+                    let ufrag_map_c = last_p2p_offer_ufrag.clone();
                     let peer_c = shared_peer.clone();
                     let tun_tx_c = tun_clone.clone();
                     let clients_map_c = clients_map.clone();
@@ -1631,22 +1679,94 @@ pub async fn run_wrtc_server(
                         match create_p2p_channel(&ice_servers, &wrtc_cfg_p2p, &peer_c.bind_addr).await {
                             Ok(p2p) => {
                                 let p2p_arc = Arc::new(p2p);
+                                if let Some(prev_p2p) =
+                                    p2p_map_c.insert(client_ep.clone(), p2p_arc.clone())
+                                {
+                                    tokio::spawn(async move {
+                                        prev_p2p.close().await;
+                                    });
+                                }
+                                if let Some((_, buffered_cands)) = pending_p2p_c.remove(&client_ep) {
+                                    for c in buffered_cands {
+                                        p2p_arc.add_remote_candidate(c).await;
+                                    }
+                                }
+
+                                let answer_sent_notify = Arc::new(Notify::new());
+                                let answer_aborted = Arc::new(AtomicBool::new(false));
+                                let sent_cands: Arc<StdMutex<HashSet<String>>> =
+                                    Arc::new(StdMutex::new(HashSet::new()));
+                                if let Some(mut cand_rx) = p2p_arc.take_candidate_rx() {
+                                    let notify_c = answer_sent_notify.clone();
+                                    let aborted_c = answer_aborted.clone();
+                                    let sent_cands_c = sent_cands.clone();
+                                    let peer_sig_c = peer_c.clone();
+                                    let client_ep_c = client_ep.clone();
+                                    let cand_task = tokio::spawn(async move {
+                                        if timeout(Duration::from_secs(10), notify_c.notified())
+                                            .await
+                                            .is_err()
+                                            || aborted_c.load(Ordering::SeqCst)
+                                        {
+                                            return;
+                                        }
+                                        while let Some(cand) = cand_rx.recv().await {
+                                            let norm = cand
+                                                .trim()
+                                                .strip_prefix("a=")
+                                                .unwrap_or(cand.trim())
+                                                .to_string();
+                                            let already_sent = sent_cands_c
+                                                .lock()
+                                                .map(|mut s| !s.insert(norm.clone()))
+                                                .unwrap_or(false);
+                                            if already_sent {
+                                                continue;
+                                            }
+                                            let msg = ColibriMessage::p2p_candidate(
+                                                client_ep_c.clone(),
+                                                norm,
+                                            );
+                                            if peer_sig_c.send(msg).await.is_err() {
+                                                break;
+                                            }
+                                        }
+                                    });
+                                    if let Ok(mut tasks) = p2p_arc.bg_tasks.lock() {
+                                        tasks.push(cand_task.abort_handle());
+                                    }
+                                }
+
                                 let relay_offer_sdp = filter_p2p_sdp_relay_only(&sdp);
                                 match RTCSessionDescription::offer(relay_offer_sdp) {
                                     Ok(offer_desc) => {
-                                        if let Err(e) = p2p_arc.pc.set_remote_description(offer_desc).await {
+                                        if let Err(e) = p2p_arc.set_remote_description_and_flush(offer_desc).await {
                                             warn!("[P2P Direct] Server set_remote_description error: {e}");
+                                            answer_aborted.store(true, Ordering::SeqCst);
+                                            answer_sent_notify.notify_waiters();
+                                            p2p_map_c.remove_if(&client_ep, |_, v| Arc::ptr_eq(v, &p2p_arc));
+                                            if let Some(ref u) = offer_ufrag {
+                                                ufrag_map_c.remove_if(&client_ep, |_, v| v == u);
+                                            }
+                                            p2p_arc.close().await;
                                             return;
                                         }
                                         match p2p_arc.pc.create_answer(None).await {
                                             Ok(answer) => {
                                                 if let Err(e) = p2p_arc.pc.set_local_description(answer.clone()).await {
                                                     warn!("[P2P Direct] Server set_local_description error: {e}");
+                                                    answer_aborted.store(true, Ordering::SeqCst);
+                                                    answer_sent_notify.notify_waiters();
+                                                    p2p_map_c.remove_if(&client_ep, |_, v| Arc::ptr_eq(v, &p2p_arc));
+                                                    if let Some(ref u) = offer_ufrag {
+                                                        ufrag_map_c.remove_if(&client_ep, |_, v| v == u);
+                                                    }
+                                                    p2p_arc.close().await;
                                                     return;
                                                 }
 
                                                 let mut answer_sdp = answer.sdp.clone();
-                                                for _ in 0..WRTC_ICE_GATHER_POLL_ATTEMPTS {
+                                                for _ in 0..WRTC_P2P_ICE_GATHER_POLL_ATTEMPTS {
                                                     if let Some(desc) = p2p_arc.pc.local_description().await {
                                                         if desc.sdp.contains("a=candidate:") {
                                                             answer_sdp = desc.sdp;
@@ -1666,24 +1786,38 @@ pub async fn run_wrtc_server(
                                                     }
                                                 }
                                                 let relay_answer_sdp = filter_p2p_sdp_relay_only(&answer_sdp);
+                                                if let Ok(mut set) = sent_cands.lock() {
+                                                    for line in relay_answer_sdp.lines() {
+                                                        let trimmed = line.trim();
+                                                        if trimmed.starts_with("a=candidate:") {
+                                                            let norm = trimmed
+                                                                .strip_prefix("a=")
+                                                                .unwrap_or(trimmed)
+                                                                .to_string();
+                                                            set.insert(norm);
+                                                        }
+                                                    }
+                                                }
 
                                                 let answer_msg = ColibriMessage::p2p_answer(client_ep.clone(), relay_answer_sdp, vec![]);
                                                 if let Err(e) = peer_c.send(answer_msg).await {
                                                     warn!("[P2P Direct] Failed to send ice-answer: {e}");
+                                                    answer_aborted.store(true, Ordering::SeqCst);
+                                                    answer_sent_notify.notify_waiters();
+                                                    p2p_map_c.remove_if(&client_ep, |_, v| Arc::ptr_eq(v, &p2p_arc));
+                                                    if let Some(ref u) = offer_ufrag {
+                                                        ufrag_map_c.remove_if(&client_ep, |_, v| v == u);
+                                                    }
+                                                    p2p_arc.close().await;
                                                     return;
                                                 }
+                                                answer_sent_notify.notify_waiters();
                                                 info!("[P2P Direct] Sent Relay-Only ice-answer to client {client_ep}");
-
-                                                if let Some(prev_p2p) =
-                                                    p2p_map_c.insert(client_ep.clone(), p2p_arc.clone())
-                                                {
-                                                    prev_p2p.close().await;
-                                                }
 
                                                 // Воркер чтения пакетов из прямого DataChannel клиента в TUN
                                                 let p2p_read = p2p_arc.clone();
                                                 let client_id_read = client_ep.clone();
-                                                tokio::spawn(async move {
+                                                let rx_task = tokio::spawn(async move {
                                                     while let Some(first_bytes) = p2p_read.recv_packet().await {
                                                         let mut current_raw = Some(first_bytes);
                                                         while let Some(raw_bytes) = current_raw.take() {
@@ -1771,24 +1905,44 @@ pub async fn run_wrtc_server(
                                                     }
                                                 }
                                                 info!("[P2P Direct] Receiver loop stopped for {client_id_read}");
-                                            });
-                                        }
-                                        Err(e) => {
-                                            warn!("[P2P Direct] Server create_answer error: {e}");
+                                                });
+                                                if let Ok(mut tasks) = p2p_arc.bg_tasks.lock() {
+                                                    tasks.push(rx_task.abort_handle());
+                                                }
+                                            }
+                                            Err(e) => {
+                                                warn!("[P2P Direct] Server create_answer error: {e}");
+                                                answer_aborted.store(true, Ordering::SeqCst);
+                                                answer_sent_notify.notify_waiters();
+                                                p2p_map_c.remove_if(&client_ep, |_, v| Arc::ptr_eq(v, &p2p_arc));
+                                                if let Some(ref u) = offer_ufrag {
+                                                    ufrag_map_c.remove_if(&client_ep, |_, v| v == u);
+                                                }
+                                                p2p_arc.close().await;
+                                            }
                                         }
                                     }
+                                    Err(e) => {
+                                        warn!("[P2P Direct] Invalid remote offer SDP from {client_ep}: {e}");
+                                        answer_aborted.store(true, Ordering::SeqCst);
+                                        answer_sent_notify.notify_waiters();
+                                        p2p_map_c.remove_if(&client_ep, |_, v| Arc::ptr_eq(v, &p2p_arc));
+                                        if let Some(ref u) = offer_ufrag {
+                                            ufrag_map_c.remove_if(&client_ep, |_, v| v == u);
+                                        }
+                                        p2p_arc.close().await;
+                                    }
                                 }
-                                Err(e) => {
-                                    warn!("[P2P Direct] Invalid remote offer SDP from {client_ep}: {e}");
+                            }
+                            Err(e) => {
+                                warn!("[P2P Direct] Failed to create server P2P channel: {e:#}");
+                                if let Some(ref u) = offer_ufrag {
+                                    ufrag_map_c.remove_if(&client_ep, |_, v| v == u);
                                 }
                             }
                         }
-                        Err(e) => {
-                            warn!("[P2P Direct] Failed to create server P2P channel: {e:#}");
-                        }
-                    }
-                });
-            }
+                    });
+                }
             _ => {}
         }
     }
@@ -1807,6 +1961,8 @@ pub async fn run_wrtc_server(
         p2p.close().await;
     }
     p2p_clients.clear();
+    pending_p2p_candidates.clear();
+    last_p2p_offer_ufrag.clear();
     xmpp.leave_room().await;
     let _ = shared_peer.close().await;
 
