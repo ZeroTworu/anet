@@ -174,58 +174,97 @@ block = []
 
 [ahttp]
 # =========================================================================
-# ANET Client: Транспорт AHTTP (оптимизировано для работы напрямую без CDN)
+# ANET Client: Транспорт AHTTP (напрямую, Cloudflare / CDNVideo)
 # =========================================================================
-# Поддерживает два режима работы (можно переключать глобально здесь или
-# точечно через query-параметры в dsn конкретной ноды [[servers]]):
-#   - Напрямую к серверу (Direct): dsn = "https://example.com/api/v2/telemetry"
-#     (использует полный бюджет коалесценции 128 КБ и адаптивное окно HTTP/2)
-#   - Через CDN (CDNVideo и др.): dsn = "https://cdn.example.com/api/v2/telemetry?cdn=1"
+# Поддерживает работу как напрямую к Nginx, так и через Cloudflare / CDN:
+#   - Напрямую / Cloudflare: dsn = "https://example.com/api/v2/telemetry"
+#   - Через жёсткие CDN (CDNVideo и др.): dsn = "https://cdn.example.com/api/v2/telemetry?cdn=1"
 #     (ограничивает Uplink-батч до 48 КБ под окно CDN без ожидания WINDOW_UPDATE)
 # Также в dsn поддерживаются query-параметры:
-#   ?method=POST (или PUT), ?cdn=1, ?budget=49152, ?pool=4
+#   ?method=POST (или PUT / GET), ?cdn=1, ?budget=49152, ?pool=4
 #   ?tls_frag=1 (включить L4 tlshello-фрагментацию ClientHello), ?tfrag=10..20, ?tdelay=0..2
 
 # --- Параметры параллельности и коалесценции пакетов ---
 
 # Количество параллельно открываемых HTTP/2 запросов (потоков)
 concurrency = 12
-# concurrency = 8 # для CDN
+# concurrency = 8 # для CDN / Cloudflare (оптимальный баланс без 429)
 
 # Количество постоянных независимых TCP/TLS соединений (HTTP/2 клиентов) в Round-Robin пуле
 tcp_pool_size = 4
-# tcp_pool_size = 2 # для CDN
+# tcp_pool_size = 2 # для CDN / Cloudflare
 
-# Максимальный размер пачки пакетов в байтах (общий бюджет коалесценции: 128 КБ напрямую под серверный лимит)
+# Максимальный размер пачки пакетов в байтах (общий бюджет коалесценции: 128 КБ напрямую)
 coalesce_budget_bytes = 131072
 # coalesce_budget_bytes = 65536 # для CDN
 
 # Отдельный лимит размера Uplink POST-батча (напрямую не ограничиваем — используется coalesce_budget_bytes)
-# uplink_coalesce_budget_bytes = 49152 # для CDN (48 КБ, чтобы POST уходил за 1 RTT в стартовом окне HTTP/2 65535 Б)
+# uplink_coalesce_budget_bytes = 49152 # для CDNVideo (48 КБ под стартовое окно HTTP/2 65535 Б)
 
-# Интервал фонового опроса сервера в мс (при активном скачивании работает self-clocking без ожидания таймера)
-poll_timeout_ms = 5
-# poll_timeout_ms = 15 # для CDN (снижает фоновый RPS, чтобы не триггерить rate-limit на edge-нодах)
+# Микро-коалесценция тяжелого uplink-трафика (длительность в мкс и порог активации в байтах)
+micro_coalesce_us = 500
+micro_coalesce_min_bytes = 256
 
-# Максимальный размер скользящего окна переупорядочивания пакетов (ReassemblyQueue)
+# --- Управление фоновым опросом (защита от idle RPS-флуда на Cloudflare / CDN) ---
+
+# Пауза перед запуском опроса при появлении свободного окна без активного скачивания (мс)
+poll_timeout_ms = 10
+
+# Максимум одновременно открытых пустых idle long-poll запросов (1 оптимально для CF/CDN; 0 = без лимита)
+max_idle_polls = 1
+
+# Базовая пауза после пустого ответа сервера и потолок адаптивного idle backoff (мс)
+idle_poll_interval_ms = 25
+idle_backoff_max_ms = 500
+
+# --- Очереди и скользящее окно переупорядочивания ---
+
+# Емкость очереди исходящих пакетов (TUN -> AHTTP) и входящих батчей (AHTTP -> ReassemblyQueue)
+tx_queue_capacity = 256
+downlink_queue_capacity = 512
+
+# Максимальный размер скользящего окна ReassemblyQueue и таймаут дыры последовательности (мс)
 reassembly_queue_max_size = 2048
 # reassembly_queue_max_size = 1024 # для CDN
+reassembly_gap_timeout_ms = 150
+
+# --- Устойчивость к сбоям, rate-limit (429/503) и восстановление сессии ---
+
+# Число повторов HTTP-транзакции и экспоненциальный backoff с джиттером (мс, с учётом Retry-After)
+max_retries = 4
+retry_base_ms = 100
+retry_max_ms = 3000
+
+# Порог подряд идущих проваленных транзакций до запуска переподключения ASTP-сессии (при 401/404 срабатывает сразу)
+max_consecutive_failures = 6
+
+# Параметры цикла переподключения ASTP-сессии и пересоздания TUN при смене VPN IP
+# reconnect_timeout_secs = 30 # по умолчанию server.timeout_secs * 3
+reconnect_retry_min_ms = 350
+reconnect_retry_max_ms = 1500
+abort_on_ip_change = true
+
+# Передача session_id в HTTP-заголовке (рекомендуется для Cloudflare / Nginx logs) или через query-параметр
+send_session_in_header = false
+# send_session_in_header = true # рекомендуется для Cloudflare / Nginx access logs
+session_id_header = "X-Session-Id"
+session_id_query_param = "session_id"
 
 # --- Тонкая настройка HTTP/2 на уровне сетевого движка ---
 
 # Автоматическое динамическое расширение окна HTTP/2 под BDP канала (Adaptive Flow Control Window)
 http2_adaptive_window = true
-# http2_adaptive_window = false # для CDN (при жёстком лимите окна на edge-узле CDNVideo)
+# http2_adaptive_window = false # для CDNVideo (при жёстком лимите окна на edge-узле)
 
 # Ручные окна потока и соединения HTTP/2 (применяются ТОЛЬКО если http2_adaptive_window = false)
 # http2_initial_stream_window_size = 2097152     # без CDN (2 МБ, если http2_adaptive_window = false)
 # http2_initial_connection_window_size = 8388608 # без CDN (8 МБ, если http2_adaptive_window = false)
-# http2_initial_stream_window_size = 49152       # для CDN (48 КБ под окно CDNVideo)
-# http2_initial_connection_window_size = 49152   # для CDN (48 КБ под окно CDNVideo)
+# http2_initial_stream_window_size = 49152       # для CDNVideo (48 КБ под окно CDNVideo)
+# http2_initial_connection_window_size = 49152   # для CDNVideo (48 КБ под окно CDNVideo)
 
 # Максимальный размер одного HTTP/2 DATA-фрейма (64 КБ напрямую снижает оверхед заголовков фреймов в 4 раза)
 http2_max_frame_size = 65536
-# http2_max_frame_size = 16384 # для CDN (стандартный RFC 7540 фрейм 16 КБ для строгих CDN)
+# http2_max_frame_size = 16384 # для строгих CDN (RFC 7540 фрейм 16 КБ)
 
 # Максимальный размер входящих HTTP-заголовков (в байтах)
 http2_max_header_list_size = 65536
@@ -233,11 +272,10 @@ http2_max_header_list_size = 65536
 
 # Период отправки фоновых Keep-Alive PING кадров HTTP/2 (в секундах)
 http2_keep_alive_interval_secs = 20
-# http2_keep_alive_interval_secs = 15 # для CDN
+# http2_keep_alive_interval_secs = 15 # для CDN / Cloudflare
 
 # Таймаут ожидания ответа на HTTP/2 PING-кадр (в секундах)
 http2_keep_alive_timeout_secs = 10
-# http2_keep_alive_timeout_secs = 10 # для CDN
 
 # Отправлять ли HTTP/2 PING-кадры, когда в туннеле нет активных запросов (Idle-режим)
 http2_keep_alive_while_idle = true
@@ -246,23 +284,24 @@ http2_keep_alive_while_idle = true
 
 # Максимальное количество удерживаемых открытыми (idle) сокетов на каждый клиент пула (должно быть >= concurrency)
 pool_max_idle_per_host = 16
-# pool_max_idle_per_host = 8 # для CDN
+# pool_max_idle_per_host = 8 # для CDN / Cloudflare
 
 # Время простоя соединения в пуле перед его автоматическим закрытием (в секундах)
 pool_idle_timeout_secs = 90
-# pool_idle_timeout_secs = 45 # для CDN
+# pool_idle_timeout_secs = 45 # для CDN / Cloudflare
 
 # Отключение алгоритма Nagle (TCP_NODELAY) для мгновенной отправки фреймов
 tcp_nodelay = true
 
 # Тайм-аут на выполнение одной HTTP-транзакции обмена батчем (в секундах)
 timeout_secs = 10
-# timeout_secs = 15 # для CDN
+# timeout_secs = 15 # для CDN / Cloudflare
 
 # Пути эндпоинтов (прибавляются к базовому пути из dsn; должны совпадать с server.toml)
 handshake_path = "/handshake"
 auth_path = "/auth"
 traffic_path = "/traffic"
+
 
 [websocket]
 # Максимальный размер скользящего окна переупорядочивания пакетов (`ReassemblyQueue`) для пула `WSS ?pool=N`.
@@ -862,17 +901,6 @@ ws_batcher_max_delay_ms = 2
 # Необходим, чтобы медиа-мост Jitsi (JVB) не замораживал и не отключал видео-трек.
 video_keepalive_interval_ms = 1000
 # video_keepalive_interval_ms = 500 # для CF WARP (более частый прогрев медиа-потока и NAT-таблиц Cloudflare WARP)
-
-# --- Мягкий EDT micro-pacer для сглаживания мгновенных микровсплесков TUN -> UDP ---
-
-# Шаг пейсинга Uplink на клиенте (нс/байт: `22` ≈ 363 Мбит/с, `0` — полностью отключить pacing).
-uplink_pacing_ns_per_byte = 22
-
-# Шаг пейсинга Downlink (используется на сервере, нс/байт: `18` ≈ 444 Мбит/с, `0` — отключить).
-downlink_pacing_ns_per_byte = 18
-
-# Горизонт коалесценции/ожидания micro-pacer (в наносекундах, по умолчанию 3 мс = 3000000).
-pacing_horizon_ns = 3000000
 
 # --- Сторожевые таймеры (watchdog) и проверка живого тракта (в секундах) ---
 

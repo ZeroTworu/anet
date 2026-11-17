@@ -182,7 +182,7 @@ impl Default for ShaperConfig {
     }
 }
 
-// Новая структура для настройки HTTP-транспорта на стороне сервера
+// Конфигурация HTTP-транспорта на стороне сервера (секция `[ahttp]` в `server.toml`)
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct AhttpServerConfig {
@@ -191,28 +191,116 @@ pub struct AhttpServerConfig {
     pub traffic_path: String,
     pub response_headers: String,
     pub max_header_bytes: usize,
+    /// Максимальный допустимый размер тела входящего HTTP-запроса (для Content-Length и Transfer-Encoding: chunked).
+    pub max_body_bytes: usize,
+    /// Таймаут чтения HTTP-заголовков/тела после начала приёма данных (мс).
+    pub read_timeout_ms: u64,
+    /// Таймаут записи и flush HTTP-ответа (мс).
+    pub write_timeout_ms: u64,
+    /// Таймаут ожидания первого байта нового запроса на idle keep-alive соединении (сек).
+    pub idle_keepalive_timeout_secs: u64,
+    /// Период фоновой очистки устаревших сессий `active_sessions` в AHTTP-транспорте (сек).
+    pub session_gc_interval_secs: u64,
     pub reassembly_queue_max_size: usize,
+    /// Таймаут ожидания пропавшего/задержанного пакета при разрыве последовательности (мс).
+    pub reassembly_gap_timeout_ms: u64,
     pub coalesce_budget_bytes: usize,
+    /// Время удержания запроса при мелком непустом uplink-пакете в ожидании downlink-данных (мс).
     pub poll_timeout_ms: u64,
+    /// Время удержания пустого poll-запроса (long-poll, мс, 0 = использовать `poll_timeout_ms`, макс. 60000).
+    pub idle_poll_timeout_ms: u64,
+    /// Порог размера uplink-тела (байт), выше которого сервер отвечает без ожидания poll-таймаута.
+    pub heavy_uplink_threshold_bytes: usize,
+    /// Максимальное окно добора downlink-пакетов после появления первого пакета (мс).
+    pub coalesce_max_wait_ms: u64,
+    /// Максимальная пауза между соседними пакетами при коалесценции downlink (мкс).
+    pub coalesce_gap_timeout_us: u64,
+    /// HTTP-заголовок, из которого сервер также может извлекать `session_id` (помимо query).
+    pub session_id_header: String,
+    /// Имя query-параметра URL для извлечения `session_id` (если не передан в `session_id_header`).
+    pub session_id_query_param: String,
 }
 
 impl Default for AhttpServerConfig {
     fn default() -> Self {
         Self {
-            handshake_path: "/handshake".to_string(),
-            auth_path: "/auth".to_string(),
-            traffic_path: "/traffic".to_string(),
-            max_header_bytes: 16384,
+            handshake_path: anet_common::consts::AHTTP_DEFAULT_HANDSHAKE_PATH.to_string(),
+            auth_path: anet_common::consts::AHTTP_DEFAULT_AUTH_PATH.to_string(),
+            traffic_path: anet_common::consts::AHTTP_DEFAULT_TRAFFIC_PATH.to_string(),
+            max_header_bytes: anet_common::consts::AHTTP_DEFAULT_MAX_HEADER_BYTES,
+            max_body_bytes: anet_common::consts::AHTTP_DEFAULT_MAX_BODY_BYTES,
+            read_timeout_ms: anet_common::consts::AHTTP_DEFAULT_READ_TIMEOUT_MS,
+            write_timeout_ms: anet_common::consts::AHTTP_DEFAULT_WRITE_TIMEOUT_MS,
+            idle_keepalive_timeout_secs:
+                anet_common::consts::AHTTP_DEFAULT_IDLE_KEEPALIVE_TIMEOUT_SECS,
+            session_gc_interval_secs: anet_common::consts::AHTTP_DEFAULT_SESSION_GC_INTERVAL_SECS,
             response_headers: "HTTP/1.1 200 OK\r\n\
                                Content-Type: video/mp4\r\n\
                                Cache-Control: no-cache, no-transform, private, must-revalidate\r\n\
                                Pragma: no-cache\r\n\
                                X-Accel-Buffering: no\r\n\
                                Content-Length: {}\r\n\
-                               Connection: keep-alive\r\n\r\n".to_string(),
-            reassembly_queue_max_size: 1024,
-            coalesce_budget_bytes: 131072,
-            poll_timeout_ms: 25,
+                               Connection: keep-alive\r\n\r\n"
+                .to_string(),
+            reassembly_queue_max_size:
+                anet_common::consts::AHTTP_DEFAULT_REASSEMBLY_QUEUE_MAX_SIZE,
+            reassembly_gap_timeout_ms:
+                anet_common::consts::AHTTP_DEFAULT_REASSEMBLY_GAP_TIMEOUT_MS,
+            coalesce_budget_bytes: anet_common::consts::AHTTP_DEFAULT_SERVER_COALESCE_BUDGET_BYTES,
+            poll_timeout_ms: anet_common::consts::AHTTP_DEFAULT_SERVER_POLL_TIMEOUT_MS,
+            idle_poll_timeout_ms: anet_common::consts::AHTTP_DEFAULT_SERVER_IDLE_POLL_TIMEOUT_MS,
+            heavy_uplink_threshold_bytes:
+                anet_common::consts::AHTTP_DEFAULT_SERVER_HEAVY_UPLINK_THRESHOLD_BYTES,
+            coalesce_max_wait_ms: anet_common::consts::AHTTP_DEFAULT_SERVER_COALESCE_MAX_WAIT_MS,
+            coalesce_gap_timeout_us:
+                anet_common::consts::AHTTP_DEFAULT_SERVER_COALESCE_GAP_TIMEOUT_US,
+            session_id_header: anet_common::consts::AHTTP_DEFAULT_SESSION_ID_HEADER.to_string(),
+            session_id_query_param: anet_common::consts::AHTTP_DEFAULT_SESSION_ID_QUERY_PARAM
+                .to_string(),
+        }
+    }
+}
+
+impl AhttpServerConfig {
+    pub fn read_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.read_timeout_ms.max(500))
+    }
+
+    pub fn write_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.write_timeout_ms.max(500))
+    }
+
+    pub fn idle_keepalive_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.idle_keepalive_timeout_secs.max(5))
+    }
+
+    pub fn effective_max_body_bytes(&self) -> usize {
+        self.max_body_bytes.max(64 * 1024)
+    }
+
+    pub fn effective_reassembly_gap_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.reassembly_gap_timeout_ms.max(1))
+    }
+
+    pub fn effective_idle_poll_timeout(&self) -> std::time::Duration {
+        let ms = if self.idle_poll_timeout_ms == 0 {
+            self.poll_timeout_ms.max(20)
+        } else {
+            self.idle_poll_timeout_ms
+        };
+        std::time::Duration::from_millis(ms.clamp(20, 60_000))
+    }
+
+    pub fn effective_active_poll_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.poll_timeout_ms.clamp(1, 60_000))
+    }
+
+    pub fn effective_session_id_query_param(&self) -> &str {
+        let trimmed = self.session_id_query_param.trim();
+        if trimmed.is_empty() {
+            anet_common::consts::AHTTP_DEFAULT_SESSION_ID_QUERY_PARAM
+        } else {
+            trimmed
         }
     }
 }
@@ -512,5 +600,50 @@ mod tests {
         assert_eq!(custom_cfg.websocket.resume_window_secs, 90);
         assert!(!custom_cfg.websocket.resume_allow_fresh_fallback);
     }
-}
 
+    #[test]
+    fn ahttp_server_config_defaults_and_overrides() {
+        let default_cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(
+            default_cfg.ahttp.max_body_bytes,
+            anet_common::consts::AHTTP_DEFAULT_MAX_BODY_BYTES
+        );
+        assert_eq!(
+            default_cfg.ahttp.effective_idle_poll_timeout(),
+            Duration::from_millis(anet_common::consts::AHTTP_DEFAULT_SERVER_IDLE_POLL_TIMEOUT_MS)
+        );
+        assert_eq!(default_cfg.ahttp.session_id_header, "X-Session-Id");
+        assert_eq!(default_cfg.ahttp.effective_session_id_query_param(), "session_id");
+
+        let custom_toml = r#"
+            [ahttp]
+            max_body_bytes = 8388608
+            read_timeout_ms = 20000
+            write_timeout_ms = 25000
+            idle_keepalive_timeout_secs = 90
+            session_gc_interval_secs = 30
+            reassembly_gap_timeout_ms = 120
+            poll_timeout_ms = 35
+            idle_poll_timeout_ms = 2500
+            heavy_uplink_threshold_bytes = 16384
+            coalesce_max_wait_ms = 6
+            coalesce_gap_timeout_us = 1500
+            session_id_header = "X-Client-Token"
+            session_id_query_param = "sid"
+        "#;
+        let custom_cfg: Config = toml::from_str(custom_toml).unwrap();
+        assert_eq!(custom_cfg.ahttp.effective_max_body_bytes(), 8_388_608);
+        assert_eq!(custom_cfg.ahttp.read_timeout(), Duration::from_millis(20_000));
+        assert_eq!(custom_cfg.ahttp.write_timeout(), Duration::from_millis(25_000));
+        assert_eq!(custom_cfg.ahttp.idle_keepalive_timeout(), Duration::from_secs(90));
+        assert_eq!(custom_cfg.ahttp.session_gc_interval_secs, 30);
+        assert_eq!(custom_cfg.ahttp.effective_reassembly_gap_timeout(), Duration::from_millis(120));
+        assert_eq!(custom_cfg.ahttp.effective_active_poll_timeout(), Duration::from_millis(35));
+        assert_eq!(custom_cfg.ahttp.effective_idle_poll_timeout(), Duration::from_millis(2500));
+        assert_eq!(custom_cfg.ahttp.heavy_uplink_threshold_bytes, 16_384);
+        assert_eq!(custom_cfg.ahttp.coalesce_max_wait_ms, 6);
+        assert_eq!(custom_cfg.ahttp.coalesce_gap_timeout_us, 1500);
+        assert_eq!(custom_cfg.ahttp.session_id_header, "X-Client-Token");
+        assert_eq!(custom_cfg.ahttp.effective_session_id_query_param(), "sid");
+    }
+}

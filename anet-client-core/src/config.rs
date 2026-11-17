@@ -666,7 +666,7 @@ where
     deserializer.deserialize_option(WeightVisitor)
 }
 
-// Новая расширенная структура для настройки HTTP-транспорта на стороне клиента
+// Расширенная конфигурация HTTP-транспорта на стороне клиента (секция `[ahttp]` в `client.toml`)
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct AhttpConfig {
@@ -683,6 +683,44 @@ pub struct AhttpConfig {
     pub poll_timeout_ms: u64,
     pub concurrency: usize,
     pub reassembly_queue_max_size: usize,
+    /// Таймаут ожидания пропавшего/задержанного пакета при разрыве последовательности (мс).
+    pub reassembly_gap_timeout_ms: u64,
+    /// Емкость исходящей очереди пакетов (TUN -> AHTTP, защита от bufferbloat).
+    pub tx_queue_capacity: usize,
+    /// Емкость входящей очереди батчей (AHTTP -> ReassemblyQueue).
+    pub downlink_queue_capacity: usize,
+    /// Длительность микро-коалесценции тяжелого uplink-трафика (мкс, 0 отключает).
+    pub micro_coalesce_us: u64,
+    /// Минимальный размер накопленного батча (байт), при котором срабатывает `micro_coalesce_us`.
+    pub micro_coalesce_min_bytes: usize,
+    /// Максимум одновременных пустых idle long-poll запросов (`1` для CDN/CF, `0` — без ограничения).
+    pub max_idle_polls: usize,
+    /// Базовая пауза после пустого ответа сервера без данных (мс).
+    pub idle_poll_interval_ms: u64,
+    /// Потолок адаптивного backoff в состоянии полного простоя (мс).
+    pub idle_backoff_max_ms: u64,
+    /// Максимум повторных попыток одного HTTP-запроса при ошибках CDN (`429`/`502`/`503`/`52x`/сеть).
+    pub max_retries: u32,
+    /// Начальная задержка экспоненциального отката при ретрае HTTP-запроса (мс).
+    pub retry_base_ms: u64,
+    /// Максимальная задержка экспоненциального отката и потолок учёта `Retry-After` (мс).
+    pub retry_max_ms: u64,
+    /// Порог подряд идущих проваленных транзакций до запуска переподключения ASTP-сессии.
+    pub max_consecutive_failures: u32,
+    /// Общий таймаут цикла ASTP session-resume/reconnect (сек). При `None`: `server.timeout_secs.max(10) * 3`.
+    pub reconnect_timeout_secs: Option<u64>,
+    /// Минимальная пауза между попытками переподключения ASTP-сессии (мс).
+    pub reconnect_retry_min_ms: u64,
+    /// Максимальная пауза между попытками переподключения ASTP-сессии (мс).
+    pub reconnect_retry_max_ms: u64,
+    /// Прерывать транспорт и пересоздавать TUN, если после реконнекта сервер выдал новый IP/шлюз.
+    pub abort_on_ip_change: bool,
+    /// Передавать `session_id` в HTTP-заголовке (`session_id_header`) вместо query-параметра URL.
+    pub send_session_in_header: bool,
+    /// Имя HTTP-заголовка для `session_id` при `send_session_in_header = true`.
+    pub session_id_header: String,
+    /// Имя query-параметра URL для `session_id` при `send_session_in_header = false`.
+    pub session_id_query_param: String,
 
     pub http2_adaptive_window: bool,
     pub http2_initial_stream_window_size: Option<u32>,
@@ -702,14 +740,36 @@ impl Default for AhttpConfig {
             tcp_pool_size: Some(1),
             tcp_nodelay: true,
             timeout_secs: 10,
-            handshake_path: "/handshake".to_string(),
-            auth_path: "/auth".to_string(),
-            traffic_path: "/traffic".to_string(),
+            handshake_path: anet_common::consts::AHTTP_DEFAULT_HANDSHAKE_PATH.to_string(),
+            auth_path: anet_common::consts::AHTTP_DEFAULT_AUTH_PATH.to_string(),
+            traffic_path: anet_common::consts::AHTTP_DEFAULT_TRAFFIC_PATH.to_string(),
             coalesce_budget_bytes: 65536,
             uplink_coalesce_budget_bytes: None,
             poll_timeout_ms: 10,
             concurrency: 8,
-            reassembly_queue_max_size: 1024,
+            reassembly_queue_max_size:
+                anet_common::consts::AHTTP_DEFAULT_REASSEMBLY_QUEUE_MAX_SIZE,
+            reassembly_gap_timeout_ms:
+                anet_common::consts::AHTTP_DEFAULT_REASSEMBLY_GAP_TIMEOUT_MS,
+            tx_queue_capacity: anet_common::consts::AHTTP_DEFAULT_TX_QUEUE_CAPACITY,
+            downlink_queue_capacity: anet_common::consts::AHTTP_DEFAULT_DOWNLINK_QUEUE_CAPACITY,
+            micro_coalesce_us: anet_common::consts::AHTTP_DEFAULT_MICRO_COALESCE_US,
+            micro_coalesce_min_bytes: anet_common::consts::AHTTP_DEFAULT_MICRO_COALESCE_MIN_BYTES,
+            max_idle_polls: anet_common::consts::AHTTP_DEFAULT_MAX_IDLE_POLLS,
+            idle_poll_interval_ms: anet_common::consts::AHTTP_DEFAULT_IDLE_POLL_INTERVAL_MS,
+            idle_backoff_max_ms: anet_common::consts::AHTTP_DEFAULT_IDLE_BACKOFF_MAX_MS,
+            max_retries: anet_common::consts::AHTTP_DEFAULT_MAX_RETRIES,
+            retry_base_ms: anet_common::consts::AHTTP_DEFAULT_RETRY_BASE_MS,
+            retry_max_ms: anet_common::consts::AHTTP_DEFAULT_RETRY_MAX_MS,
+            max_consecutive_failures: anet_common::consts::AHTTP_DEFAULT_MAX_CONSECUTIVE_FAILURES,
+            reconnect_timeout_secs: None,
+            reconnect_retry_min_ms: anet_common::consts::AHTTP_DEFAULT_RECONNECT_RETRY_MIN_MS,
+            reconnect_retry_max_ms: anet_common::consts::AHTTP_DEFAULT_RECONNECT_RETRY_MAX_MS,
+            abort_on_ip_change: true,
+            send_session_in_header: false,
+            session_id_header: anet_common::consts::AHTTP_DEFAULT_SESSION_ID_HEADER.to_string(),
+            session_id_query_param: anet_common::consts::AHTTP_DEFAULT_SESSION_ID_QUERY_PARAM
+                .to_string(),
 
             http2_adaptive_window: false,
             http2_initial_stream_window_size: None,
@@ -719,6 +779,56 @@ impl Default for AhttpConfig {
             http2_keep_alive_interval_secs: Some(20),
             http2_keep_alive_timeout_secs: Some(10),
             http2_keep_alive_while_idle: true,
+        }
+    }
+}
+
+impl AhttpConfig {
+    pub fn effective_reassembly_gap_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.reassembly_gap_timeout_ms.max(1))
+    }
+
+    pub fn effective_tx_queue_capacity(&self) -> usize {
+        self.tx_queue_capacity.max(16)
+    }
+
+    pub fn effective_downlink_queue_capacity(&self) -> usize {
+        self.downlink_queue_capacity.max(16)
+    }
+
+    pub fn effective_micro_coalesce(&self) -> std::time::Duration {
+        std::time::Duration::from_micros(self.micro_coalesce_us)
+    }
+
+    pub fn effective_retry_base_ms(&self) -> u64 {
+        self.retry_base_ms.max(10)
+    }
+
+    pub fn effective_retry_max_ms(&self) -> u64 {
+        self.retry_max_ms.max(self.effective_retry_base_ms())
+    }
+
+    pub fn effective_reconnect_timeout(&self, server_timeout_secs: u64) -> std::time::Duration {
+        let secs = self
+            .reconnect_timeout_secs
+            .unwrap_or_else(|| server_timeout_secs.max(10) * 3)
+            .max(1);
+        std::time::Duration::from_secs(secs)
+    }
+
+    pub fn random_reconnect_retry_delay(&self) -> std::time::Duration {
+        use rand::Rng;
+        let min = self.reconnect_retry_min_ms.max(50);
+        let max = self.reconnect_retry_max_ms.max(min);
+        std::time::Duration::from_millis(rand::rngs::OsRng.gen_range(min..=max))
+    }
+
+    pub fn effective_session_id_query_param(&self) -> &str {
+        let trimmed = self.session_id_query_param.trim();
+        if trimmed.is_empty() {
+            anet_common::consts::AHTTP_DEFAULT_SESSION_ID_QUERY_PARAM
+        } else {
+            trimmed
         }
     }
 }
@@ -1307,4 +1417,96 @@ mod tests {
         assert_eq!(custom_cfg.websocket.random_reconnect_retry_delay(), Duration::from_millis(250));
         assert!(!custom_cfg.websocket.abort_on_ip_change);
     }
+
+    #[test]
+    fn ahttp_config_defaults_and_overrides() {
+        use super::CoreConfig;
+        use std::time::Duration;
+
+        let default_cfg: CoreConfig = toml::from_str(
+            r#"
+            [[servers]]
+            name = "AHTTP Node"
+            dsn = "https://cdn.example.com/api/v2/telemetry"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            default_cfg.ahttp.max_idle_polls,
+            anet_common::consts::AHTTP_DEFAULT_MAX_IDLE_POLLS
+        );
+        assert_eq!(
+            default_cfg.ahttp.effective_reassembly_gap_timeout(),
+            Duration::from_millis(anet_common::consts::AHTTP_DEFAULT_REASSEMBLY_GAP_TIMEOUT_MS)
+        );
+        assert_eq!(
+            default_cfg.ahttp.effective_reconnect_timeout(10),
+            Duration::from_secs(30)
+        );
+        assert!(default_cfg.ahttp.abort_on_ip_change);
+        assert!(!default_cfg.ahttp.send_session_in_header);
+        assert_eq!(default_cfg.ahttp.session_id_header, "X-Session-Id");
+        assert_eq!(default_cfg.ahttp.effective_session_id_query_param(), "session_id");
+
+        let custom_cfg: CoreConfig = toml::from_str(
+            r#"
+            [ahttp]
+            reassembly_gap_timeout_ms = 90
+            tx_queue_capacity = 512
+            downlink_queue_capacity = 1024
+            micro_coalesce_us = 300
+            micro_coalesce_min_bytes = 512
+            max_idle_polls = 2
+            idle_poll_interval_ms = 40
+            idle_backoff_max_ms = 800
+            max_retries = 6
+            retry_base_ms = 150
+            retry_max_ms = 5000
+            max_consecutive_failures = 10
+            reconnect_timeout_secs = 45
+            reconnect_retry_min_ms = 200
+            reconnect_retry_max_ms = 200
+            abort_on_ip_change = false
+            send_session_in_header = true
+            session_id_header = "X-Client-Token"
+            session_id_query_param = "sid"
+
+            [[servers]]
+            name = "AHTTP Node"
+            dsn = "https://cdn.example.com/api/v2/telemetry"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            custom_cfg.ahttp.effective_reassembly_gap_timeout(),
+            Duration::from_millis(90)
+        );
+        assert_eq!(custom_cfg.ahttp.effective_tx_queue_capacity(), 512);
+        assert_eq!(custom_cfg.ahttp.effective_downlink_queue_capacity(), 1024);
+        assert_eq!(
+            custom_cfg.ahttp.effective_micro_coalesce(),
+            Duration::from_micros(300)
+        );
+        assert_eq!(custom_cfg.ahttp.micro_coalesce_min_bytes, 512);
+        assert_eq!(custom_cfg.ahttp.max_idle_polls, 2);
+        assert_eq!(custom_cfg.ahttp.idle_poll_interval_ms, 40);
+        assert_eq!(custom_cfg.ahttp.idle_backoff_max_ms, 800);
+        assert_eq!(custom_cfg.ahttp.max_retries, 6);
+        assert_eq!(custom_cfg.ahttp.effective_retry_base_ms(), 150);
+        assert_eq!(custom_cfg.ahttp.effective_retry_max_ms(), 5000);
+        assert_eq!(custom_cfg.ahttp.max_consecutive_failures, 10);
+        assert_eq!(
+            custom_cfg.ahttp.effective_reconnect_timeout(10),
+            Duration::from_secs(45)
+        );
+        assert_eq!(
+            custom_cfg.ahttp.random_reconnect_retry_delay(),
+            Duration::from_millis(200)
+        );
+        assert!(!custom_cfg.ahttp.abort_on_ip_change);
+        assert!(custom_cfg.ahttp.send_session_in_header);
+        assert_eq!(custom_cfg.ahttp.session_id_header, "X-Client-Token");
+        assert_eq!(custom_cfg.ahttp.effective_session_id_query_param(), "sid");
+    }
 }
+
