@@ -296,6 +296,7 @@ async fn connect_pool_member(
             claim.as_bytes(),
             0,
         )
+        .context("Failed to encrypt WS_MUX_BIND proof")
         .map_err(MuxBindError::Transport)?;
 
         let mut bind_frame =
