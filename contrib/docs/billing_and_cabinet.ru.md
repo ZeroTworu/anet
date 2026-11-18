@@ -1,6 +1,6 @@
 # Архитектура коммерческого модуля (Личный Кабинет, Биллинг, Лимиты)
 
-Документация актуальна для ветки `master`.
+Документация актуальна для ветки `master` (коммит `530c40a`) и синхронизирована с текущим состоянием кода `anet-auth` и `anet-webui`.
 
 ---
 
@@ -8,15 +8,15 @@
 
 Архитектура строится на принципе **«Один пользователь = Один криптографический ключ = Один профиль доступа»**. В системе нет привязки к оборудованию (HWID).
 
-Сущность `User` (таблица `users`) объединяет в себе:
-1. **Сетевую идентичность:** Криптографические ключи (ASTP), Fingerprint, выделенный статический IP (если назначен).
-2. **Пользовательскую идентичность:** Email, Пароль, Telegram ID, Баланс.
+Сущность `User` (таблица `users`, `anet-auth/src/entities/users.rs`) объединяет в себе:
+1. **Сетевую идентичность:** Криптографические ключи (ASTP, зашифрованы в БД через `DbEncryptor`), `fingerprint`, выделенный статический IP (`static_ip`).
+2. **Пользовательскую идентичность:** `email`, `password_hash`, `telegram_id`, `balance`.
 3. **Статус подписки:** `group_id` (текущая группа доступа), `activated_at` (момент первой сетевой активности), `expires_at` (момент окончания платного периода).
 
 Пользователь использует один и тот же конфигурационный файл (`client.toml` или QR-код) на всех своих устройствах (ноутбук, смартфон, роутер). Ограничение потребления ресурсов строится **исключительно на количестве одновременных сессий, лимите скорости и лимите трафика**.
 
-Публичный Личный Кабинет пользователей обслуживается на домене сервиса (задается в конфигурации `server.toml` как `public_domain`, например: `https://service.example.com`).  
-*(Внутренняя панель управления администратора доступна на отдельном поддомене `cp.example.com` и закрыта от обычных пользователей)*.
+Публичный домен сервиса задаётся через переменную окружения `PUBLIC_DOMAIN` (fallback `ANET_PUBLIC_URL`, например: `https://service.example.com`) и используется при генерации ссылок подтверждения Email и URL QR-кода.  
+*(Внутренняя панель управления администратора `anet-webui` развёртывается отдельно и защищена административным JWT `AdminToken` с проверкой активной сессии в таблице `sessions`)*.
 
 ---
 
@@ -27,7 +27,8 @@
 ```
                   ┌────────────────────────────────────────────────────────┐
                   │                 UserModel (users)                      │
-                  │   - id, fingerprint, email, balance, group_id          │
+                  │   - id, fingerprint, email, telegram_id, balance       │
+                  │   - group_id: Option<Uuid>                             │
                   │   - activated_at: Option<DateTimeUtc>                  │
                   │   - expires_at: Option<DateTimeUtc>                    │
                   └───────────────────────────┬────────────────────────────┘
@@ -38,12 +39,12 @@
       │       groups (План)       │                      │   rates (Кастом/Оверрайд) │
       ├───────────────────────────┤                      ├───────────────────────────┤
       │ Predefined в админке      │                      │ Персональная запись       │
-      │ - is_default: bool        │                      │ (может быть создана/      │
-      │ - duration_days: i32      │                      │  обновлена под user_id)   │
+      │ - is_default: bool        │                      │ (POST /addrate,           │
+      │ - duration_days: i32      │                      │  PATCH/DELETE /rate/:id)  │
       │ - sessions_limit: i32     │                      │ - sessions: i32           │
       │ - traffic_limit: i64      │                      │ - speed_limit: i32        │
       │ - speed_limit: i32        │                      │ - traffic_limit: i64      │
-      │ - Node Pools (привязка)   │                      │ - date_end: DateTime      │
+      │ - Node Pools (привязка)   │                      │ - date_end: NaiveDateTime │
       └───────────────────────────┘                      └───────────────────────────┘
                     ▲                                                  ▲
                     │                                                  │
@@ -52,21 +53,21 @@
 ```
 
 1. **Группы (`groups` — Предопределенные тарифные планы):**
-   * Создаются и настраиваются администратором в Admin WebUI (например: тариф *«Бояре»*, *«Базовый»*, *«Гость»*).
+   * Создаются и настраиваются администратором в `anet-webui` (`/groups`, `/groups/:id`).
    * Содержат в себе предустановленные параметры:
-     * `is_default: bool` — флаг группы по умолчанию. Назначается новому пользователю при регистрации, а также активируется, когда у пользователя истекает оплаченный период (`expires_at < now`).
-     * `duration_days: i32` — срок действия подписки (дельта в днях при активации).
-     * `sessions_limit: i32` — количество одновременных сессий (0 = без лимита).
-     * `traffic_limit: i64` — лимит трафика в байтах (0 = безлимит).
-     * `speed_limit: i32` — ограничение скорости в kbps / Мбит/с (0 = максимальная скорость).
+     * `is_default: bool` — флаг группы по умолчанию. Назначается новому пользователю при регистрации (Email или Telegram TMA), а также активируется, когда у пользователя истекает оплаченный период (`expires_at < now`). При установке `is_default = true` в `POST /api/v1/groups` или `PATCH /api/v1/groups/:id` флаг автоматически снимается с остальных групп.
+     * `duration_days: i32` — срок действия подписки (дельта в днях при активации; `0` = бессрочный доступ).
+     * `sessions_limit: i32` — количество одновременных сессий (`0` = без лимита).
+     * `traffic_limit: i64` — лимит трафика в байтах (`0` = безлимит).
+     * `speed_limit: i32` — ограничение скорости в kbps (`0` = максимальная скорость; в `anet-webui` ввод/вывод пересчитывается в Мбит/с).
      * Привязка к пулам серверов (`group_node_pools`).
-   * В каталоге товаров (`ProductModel`) базовый тариф оформляется как `ProductType::GroupSubscription`, где `target_id = Some(group_id)`. Все лимиты и длительность наследуются напрямую из связанной группы `groups`.
+   * В каталоге товаров (`products`) базовый тариф оформляется как `ProductType::GroupSubscription`, где `target_id = Some(group_id)`. Все лимиты и длительность наследуются напрямую из связанной группы `groups`.
 
 2. **Индивидуальные тарифы (`rates` — Оверрайд лимитов / Кастом):**
-   * Запись в `rates` привязана к `user_id` (1-к-1) и **может быть создана или обновлена** через API (`POST /addrate`, `PATCH /rate/:id`).
-   * В биллинге `rates` используется для **динамического конструктора тарифов** (Phase 2): когда пользователь на витрине сам собирает себе индивидуальный пакет.
-   * **Правило приоритета (Лестница приоритетов в `anet-auth/src/api/auth.rs`):**
-     При авторизации клиента (`check_access`), если у пользователя существует активная запись в `rates` (`date_end > now()`), ее лимиты **полностью переопределяют (override)** любые групповые лимиты из `groups`!
+   * Запись в `rates` привязана к `user_id` (1-к-1), создаётся через `POST /api/v1/addrate`, обновляется через `PATCH /api/v1/rate/:id` и удаляется через `DELETE /api/v1/rate/:id` (в том числе из карточки пользователя в `anet-webui`).
+   * В биллинге `rates` также зарезервирован для **динамического конструктора тарифов** (Backlog / Phase 2).
+   * **Правило приоритета (Лестница приоритетов в `anet-auth/src/api/auth.rs` и `anet-auth/src/api/user_cabinet.rs`):**
+     При авторизации клиента (`check_access`) и при запросе профиля ЛК (`/api/v1/user/me`), если у пользователя существует активная запись в `rates` (`date_end > now`), её лимиты **полностью переопределяют (override)** любые групповые лимиты из `groups`.
 
 ---
 
@@ -75,8 +76,6 @@
 В системе действует фундаментальный принцип приватности: **никаких `device_id`, HWID или аппаратных идентификаторов нет и не будет**. Пользователь идентифицируется исключительно своим криптографическим ключом (`fingerprint`).
 
 В режиме передачи данных (`data pass`) клиент передает зашифрованный туннельный трафик. Инспекция заголовков каждого IP-пакета ради команд управления **недопустима** (убийство скорости и батареи). Сервер может разорвать соединение только одним способом — физически закрыв сокет (`kill tx/rx`).
-
----
 
 #### Суть проблемы: Неотличимость сценариев для серверного кода
 
@@ -89,11 +88,15 @@
 
 **К чему приводят наивные попытки решения в коде:**
 * **Если сервер всегда блокирует новое подключение при занятом слоте:**  
-  При смене Wi-Fi -> LTE старый сокет еще 10 секунд числится живым в `ClientRegistry`. Сервер блокирует легитимного владельца на его же собственном телефоне (*«Достигнут лимит подключений»*), либо рапортует ложные `Сессии: 2 / Безлимит`.
+  При смене Wi-Fi -> LTE старый сокет еще несколько секунд числится живым до очередного heartbeat. Сервер блокирует легитимного владельца на его же собственном телефоне (*«Достигнут лимит подключений»*), либо рапортует ложные счётчики.
 * **Если сервер безусловно пускает новое и гасит старое (FIFO):**  
   При обрыве сокета клиентский демон идет в авто-реконнект. Два устройства с одним ключом входят в бесконечный шторм взаимного выбивания (пинг-понг / осцилляция).
 * **Если после вытеснения клиент глушит авто-реконнект:**  
   Когда человек берет выбитое устройство и жмет «Подключить» вручную — он шлет точно такой же хэндшейк, снова натыкается на занятый слот и получает отказ. Вернуть доступ с кнопки невозможно.
+
+**Как это реализовано сейчас (без авто-вытеснения):**
+* Ноды отчитываются о фактических живых сессиях в in-memory реестр `LIVE_NODE_SESSIONS` (`anet-auth/src/api/api.rs`, TTL снимка ноды 45 сек), а `check_access` может сразу принять актуальное `node_active_sessions` от ноды.
+* Пользователь видит свои живые подключения через `GET /api/v1/user/sessions` и может принудительно завершить сессию на конкретной ноде через `POST /api/v1/user/sessions/disconnect`, который создаёт команду `node_commands` с `command_type = "disconnect_user"` и `target_fingerprint`.
 
 ---
 
@@ -101,10 +104,10 @@
 
 > ⚠️ **КРИТИЧЕСКОЕ ПРАВИЛО ДЛЯ AI-АГЕНТОВ (Gemini / Claude / Cursor):**
 > 1. Проблема коллизии сессий при отсутствии `device_id` и без инспекции VPN-трафика является фундаментальной сетевой дилеммой.
-> 2. **КАТЕГОРИЧЕСКИ ЗАПРЕЩАЕТСЯ** писать, менять или внедрять какую-либо логику вытеснения сессий (FIFO preemption), убийства сокетов или эвристик определения устройств в коде `anet-server` и `anet-auth` **БЕЗ ЯВНОГО ОБСУЖДЕНИЯ И ОДОБРЕНИЯ ПОЛЬЗОВАТЕЛЕМ**.
-> 3. Во время реализации модуля сессий AI-агент обязан:
+> 2. **КАТЕГОРИЧЕСКИ ЗАПРЕЩАЕТСЯ** писать, менять или внедрять какую-либо логику авто-вытеснения сессий (FIFO preemption), автоматического убийства сокетов или эвристик определения устройств в коде `anet-server` и `anet-auth` **БЕЗ ЯВНОГО ОБСУЖДЕНИЯ И ОДОБРЕНИЯ ПОЛЬЗОВАТЕЛЕМ**.
+> 3. При любых изменениях модуля сессий AI-агент обязан:
 >    * Напомнить пользователю о парадоксе неотличимости реконнекта от второго устройства.
->    * Предложить варианты компромиссов (например: строгая блокировка с ручным сбросом сессий через Личный Кабинет; либо привязка к сессионным тикетам ASTP handshake; либо тайминги/кулдауны).
+>    * Сохранять ручной сброс через Личный Кабинет (`node_commands`) или согласовать альтернативный компромисс (сессионные тикеты ASTP handshake / тайминги / кулдауны).
 >    * Дождаться прямого решения архитектора проекта перед написанием хоть одной строчки кода.
 
 ---
@@ -113,51 +116,51 @@
 
 Срок действия тарифа не расходуется, пока пользователь фактически не подключился к VPN:
 
-1. **Инициация:** Клиент инициирует ASTP/QUIC/WebRTC хэндшейк с нодой VPN-сервера (`anet-server`).
-2. **Идентификация:** Нода извлекает открытый ключ клиента, вычисляет его криптографический `fingerprint` и отправляет авторизационный запрос на Auth-сервер:
-   `POST /check_access` с телом `{"fingerprint": "...", "node_id": "...", "node_active_sessions": ...}`.
+1. **Инициация:** Клиент инициирует подключение к ноде VPN-сервера (`anet-server`).
+2. **Идентификация:** Нода извлекает открытый ключ клиента, вычисляет криптографический `fingerprint` и отправляет авторизационный запрос на `anet-auth`:
+   `POST /api/v1/check_access` с заголовком `X-Auth-Key` и телом `{"fingerprint": "...", "node_id": "...", "node_active_sessions": ...}`.
 3. **Обработка в `anet-auth/src/api/auth.rs`:**
-   * По `fingerprint` находится запись пользователя в `users`.
-   * **Атомарность и транзакции БД:** Все операции проверки и изменения статуса пользователя обязательно оборачиваются в транзакцию БД (`let txn = self.db.begin().await? ... txn.commit().await?`). Это исключает гонку (Race Condition) при одновременном включении VPN на телефоне и ноутбуке:
-     * Если `user.activated_at` равен `None` (первое подключение после оплаты):
+   * **Атомарность и транзакции БД:** Вся проверка и обновление состояния пользователя выполняются внутри транзакции БД (`let txn = self.db.begin().await? ... txn.commit().await?`), что исключает гонку (Race Condition) при одновременном подключении нескольких устройств:
+     * Если `user.activated_at` равен `None`, задан `user.group_id` и у группы `duration_days > 0`:
        * Фиксируется момент старта: `user.activated_at = Some(Utc::now())`.
        * Вычисляется дедлайн: `user.expires_at = Some(Utc::now() + Duration::days(group.duration_days))`.
-       * Запись сохраняется в транзакции: `user_active.update(&txn).await?`.
+       * Запись сохраняется в транзакции.
      * Если `user.expires_at` задан и `Utc::now() > expires_at`:
        * Платный период завершен.
-       * `user.group_id` переключается на группу с флагом `is_default = true`.
-       * Если в дефолтной группе доступ заблокирован (`sessions_limit == 0`), возвращается `{ allowed: false, message: "Подписка истекла" }`.
-     * Проверяются персональные оверрайды: если у пользователя есть активная запись `rates` (`date_end > Utc::now()`), её параметры переопределяют групповые.
+       * `user.group_id` переключается на группу с флагом `is_default = true`, `expires_at` сбрасывается в `None`.
+       * Если в дефолтной группе доступ заблокирован (`sessions_limit == 0`), возвращается `{ allowed: false, message: "Время действия подписки истекло. Продлите тариф в Личном Кабинете" }`.
+     * Если нода передала `node_id` и `node_active_sessions`, обновляется `LIVE_NODE_SESSIONS` (`set_live_node_session_for_fingerprint`).
+     * Проверяются персональные оверрайды: активная запись `rates` (`date_end > now_naive`) переопределяет параметры группы.
    * Транзакция фиксируется (`txn.commit().await?`).
-4. **Ответ и шейпинг:** Auth-сервер возвращает структуру `CheckAccessResponse`. Нода применяет выданные параметры скорости через eBPF-шейпер на TUN-интерфейсе и успешно завершает сетевой хэндшейк.
+4. **Ответ и шейпинг:** `anet-auth` возвращает `CheckAccessResponse`. Нода применяет выданные ограничения (`speed_limit_kbps`, `allowed_sessions`, `traffic_limit`) и завершает хэндшейк.
 
 ---
 
-## 2. Модель монетизации и Товары (Products)
+## 2. Модель монетизации, Товары (Products) и Статус этапов
 
-Архитектура биллинга строится вокруг сущности **Product (Товар)**.
+Архитектура биллинга строится вокруг сущности **Product (Товар)** (`products`), связанной с заказами (`orders`), транзакциями (`transactions`) и ваучерами (`vouchers`).
 
-### 2.1. Этапы внедрения (Roadmap)
+### 2.1. Текущее состояние реализации (коммит `530c40a`)
 
-* **Phase 1 (MVP — Текущий фокус):**
-  1. Пользователь может зарегистрироваться в Web (Email + ссылка подтверждения / пароль).
-  2. Пользователь может выбрать и купить себе готовую «группу» (тариф) через FreeKassa.
-  3. Полноценное API FreeKassa (создание платежа, защищенный вебхук, фоновая сверка).
-  4. Личный кабинет пользователя (User Dashboard):
-     - Карточка тарифа (группы), срок действия, статус.
-     - Скачивание `client.toml` и QR-код для мобильных клиентов.
-     - Цифры статистики (активные сессии, использованный трафик, скорость).
-     - Интерактивные графики потребления трафика (Rx / Tx по часам и дням).
-     - Список активных сессий с кнопкой принудительного разрыва.
-* **Phase 2 (Backlog — Расширение):**
-  * Интерактивный калькулятор лимитов (Subway sandwich).
-  * Покупка в подарок (`is_gift = true`) и интерфейс ваучеров в ЛК.
-  * Реестр ваучеров в панели администратора.
-  * Telegram-бот и TMA.
+* **Реализовано в `anet-auth` (Backend) и `anet-webui` (Admin Panel):**
+  1. Конфигурация коммерческого модуля через переменные окружения (`.env.example.auth`, `--env-file` / `ANET_ENV_FILE`, `src/config.rs`).
+  2. Полная схема БД и SeaORM-миграции (`000034`, `000035`) + сущности (`products`, `orders`, `transactions`, `vouchers`, `verification_tokens`, поля в `users` и `groups.is_default`).
+  3. Регистрация и вход пользователей (`/api/v1/user/auth/*`): одноразовые ссылки на Email через `EMAIL_WEBHOOK_URL`, установка пароля (`bcrypt`), вход по Email+паролю, привязка Email (`link-email`) и вход/авторегистрация через Telegram Mini App (`HMAC-SHA256`).
+  4. Полноценное API Личного Кабинета (`/api/v1/user/*`): профиль и действующие лимиты (`/user/me`), витрина продуктов (`/user/products`), создание и история заказов (`/user/orders`), реальные активные сессии (`/user/sessions`, `/user/sessions/disconnect`), графики трафика из `traffic_hourly` (`/user/traffic-history`), генерация `client.toml` и QR URL (`/user/config`).
+  5. Интеграция FreeKassa (`src/api/freekassa.rs`): SCI, API v1 `orders/create`, вебхук `/billing/freekassa/notify`, атомарный `fulfill_order` (включая генерацию ваучера `ANET-GIFT-...` при `is_gift = true`), фоновый воркер сверки `cron_sync_freekassa`.
+  6. Административное API биллинга (`/api/v1/admin/products`, `/api/v1/admin/orders`, `/api/v1/admin/transactions`) + расширенные админ-эндпоинты `users`, `groups`, `rate`.
+  7. Admin WebUI (`anet-webui`): управление пользователями (Email/пароль/группа), расширенное управление `Rate` (трафик, скорость, удаление), поддержка `groups.is_default`, а также раздел **Billing** (`Products`, `Orders`, `Transactions`).
+  8. Набор HTTP/unit-тестов API с `sea_orm::MockDatabase` (`anet-auth/src/api/tests/*`).
+
+* **Остаётся в Backlog (Phase 2 — дальнейшее развитие):**
+  1. Публичный фронтенд Личного Кабинета пользователя (User WebUI) и интерфейс Telegram Mini App поверх уже готового API `/api/v1/user/*`.
+  2. Активация подарочных ваучеров пользователем (API погашения кода `ANET-GIFT-...` + UI в ЛК) и реестр `Vouchers` в `anet-webui`.
+  3. Интерактивный калькулятор/конструктор тарифов (`ProductType::RateExtension`, `fulfill_order` пока содержит заглушку с логированием).
+  4. Поддержка платёжных шлюзов Telegram Stars / Aaio / YooMoney (enum в БД уже подготовлены) и алертов мониторинга.
 
 ---
 
-## 3. Схема Базы Данных (SeaORM Entities)
+## 3. Схема Базы Данных (SeaORM Entities & Migrations)
 
 ### [AI-PROMPT]: Обязательное создание SeaORM миграций параллельно с сущностями
 
@@ -165,6 +168,12 @@
 > 1. При создании или модификации любой структуры в `anet-auth/src/entities/` **ОБЯЗАТЕЛЬНО ПАРАЛЛЕЛЬНО** создавайте файл миграции в `anet-auth/src/migration/` (формат имени: `mYYYYMMDD_HHMMSS_<описание>.rs`).
 > 2. Созданная миграция **ДОЛЖНА БЫТЬ СРАЗУ ЗАРЕГИСТРИРОВАНА** в векторе `Migrator::migrations()` внутри `anet-auth/src/migration/mod.rs`.
 > 3. Миграции описываются строго через SeaQuery DSL (`Table::create()`, `Table::alter()`) либо через типизированный DDL. Никогда не оставляйте сущности без миграций!
+
+**Актуальные миграции коммерческого модуля (`anet-auth/src/migration/`):**
+* `m20261112_000034_create_billing_and_user_cabinet.rs` — PostgreSQL ENUM (`currency`, `payment_system`, `order_status`, `product_type`, `voucher_status`), колонка `groups.is_default`, поля `users` (`email`, `password_hash`, `telegram_id`, `balance`, `activated_at`, `expires_at`), таблицы `products`, `orders`, `transactions`, `vouchers`.
+* `m20261113_000035_create_verification_tokens.rs` — таблица `verification_tokens` для одноразовых ссылок подтверждения Email.
+
+### Код сущностей в `anet-auth/src/entities/`
 
 ```rust
 // ============================================================================
@@ -191,6 +200,17 @@ pub enum Currency {
     /// Звезды Telegram Stars
     #[sea_orm(string_value = "STARS")]
     Stars,
+}
+
+impl Currency {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Rub => "RUB",
+            Self::Usd => "USD",
+            Self::Eur => "EUR",
+            Self::Stars => "STARS",
+        }
+    }
 }
 
 /// Поддерживаемые платежные шлюзы
@@ -278,91 +298,37 @@ pub enum LimitSource {
     #[oai(rename = "unlimited")]
     Unlimited,
 }
+```
 
+> 📌 **Важно про сериализацию enum в OpenAPI / JSON:**  
+> У `Currency`, `PaymentSystem`, `OrderStatus` и `ProductType` нет `#[oai(rename_all = ...)]`, поэтому в REST JSON (и в `anet-webui`) они сериализуются в PascalCase:
+> * `Currency`: `"Rub" | "Usd" | "Eur" | "Stars"`
+> * `ProductType`: `"GroupSubscription" | "RateExtension" | "Feature"`
+> * `OrderStatus`: `"Pending" | "Paid" | "Failed" | "Cancelled" | "Refunded"`
+> * `PaymentSystem`: `"FreeKassa" | "Aaio" | "YooMoney" | "TelegramStars"`
+
+```rust
 // ============================================================================
-// anet-auth/src/entities/protocol_type.rs (Уже существует в кодовой базе)
+// anet-auth/src/entities/users.rs (коммерческие поля) и groups.rs
 // ============================================================================
 
-/// Сетевые протоколы подключения клиентов к нодам (PostgreSQL ENUM: `protocol_type`).
-/// Единый источник правды: используется в `node_pool_members`, `traffic_hourly`, 
-/// `traffic_totals`, генерации конфигов и `ActiveSessionDto`.
-/// 
-/// Базовое значение `Wrtc` сохраняется:
-/// 1. Для 100% обратной совместимости с существующими строками в БД (ALTER TYPE protocol_type ADD VALUE 'wrtc').
-/// 2. Для удобной группировки и агрегации всех wrtc_* протоколов в одну общую выборку на графиках и в биллинге.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, EnumIter, DeriveActiveEnum, Serialize, Deserialize, Enum)]
-#[sea_orm(rs_type = "String", db_type = "Enum", enum_name = "protocol_type")]
-#[oai(rename_all = "lowercase")]
-#[serde(rename_all = "lowercase")]
-pub enum ProtocolType {
-    #[sea_orm(string_value = "quic")]
-    Quic,
-    #[sea_orm(string_value = "ssh")]
-    Ssh,
-    #[sea_orm(string_value = "vnc")]
-    Vnc,
-    #[sea_orm(string_value = "ws")]
-    Ws,
-    #[sea_orm(string_value = "ahttp")]
-    Ahttp,
-    /// Базовый WebRTC (legacy / агрегатор)
-    #[sea_orm(string_value = "wrtc")]
-    Wrtc,
-    /// WebRTC через WebSocket сигнальный канал
-    #[sea_orm(string_value = "wrtc_ws")]
-    WrtcWs,
-    /// WebRTC Video RTP/SRTP медиа-канал
-    #[sea_orm(string_value = "wrtc_video")]
-    WrtcVideo,
-    /// WebRTC DataChannel (SCTP)
-    #[sea_orm(string_value = "wrtc_dc")]
-    WrtcDc,
-    /// WebRTC Direct P2P (прямой туннель)
-    #[sea_orm(string_value = "wrtc_p2p")]
-    WrtcDirectP2p,
-}
+// В anet-auth/src/entities/users.rs:
+    #[sea_orm(unique, nullable)]
+    pub email: Option<String>,
+    #[sea_orm(nullable)]
+    pub password_hash: Option<String>,
+    #[sea_orm(unique, nullable)]
+    pub telegram_id: Option<i64>,
+    pub balance: f64,
+    pub activated_at: Option<DateTimeUtc>,
+    pub expires_at: Option<DateTimeUtc>,
 
-impl ProtocolType {
-    /// Проверка, относится ли протокол к семейству WebRTC
-    pub fn is_wrtc(&self) -> bool {
-        matches!(
-            self,
-            Self::Wrtc | Self::WrtcWs | Self::WrtcVideo | Self::WrtcDc | Self::WrtcDirectP2p
-        )
-    }
-
-    pub fn from_str(s: &str) -> Self {
-        match s.to_lowercase().as_str() {
-            "ssh" => Self::Ssh,
-            "vnc" => Self::Vnc,
-            "ws" | "wss" => Self::Ws,
-            "ahttp" => Self::Ahttp,
-            "wrtc" => Self::Wrtc,
-            "wrtc_ws" => Self::WrtcWs,
-            "wrtc_video" => Self::WrtcVideo,
-            "wrtc_dc" => Self::WrtcDc,
-            "wrtc_p2p" => Self::WrtcDirectP2p,
-            _ => Self::Quic,
-        }
-    }
-
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Quic => "quic",
-            Self::Ssh => "ssh",
-            Self::Vnc => "vnc",
-            Self::Ws => "ws",
-            Self::Ahttp => "ahttp",
-            Self::Wrtc => "wrtc",
-            Self::WrtcWs => "wrtc_ws",
-            Self::WrtcVideo => "wrtc_video",
-            Self::WrtcDc => "wrtc_dc",
-            Self::WrtcDirectP2p => "wrtc_p2p",
-        }
-    }
-}
-
-
+// В anet-auth/src/entities/groups.rs:
+    pub is_default: bool,        // Группа по умолчанию при регистрации и истечении подписки
+    pub traffic_limit: i64,      // Лимит трафика в байтах (0 - безлимит)
+    pub speed_limit: i32,        // Лимит скорости в kbps (0 - безлимит)
+    pub sessions_limit: i32,     // Максимум сессий
+    pub duration_days: i32,      // Дельта подписки в днях при активации
 
 // ============================================================================
 // anet-auth/src/entities/products.rs
@@ -375,33 +341,20 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "products")]
 pub struct Model {
-    /// Уникальный идентификатор товара
     #[sea_orm(primary_key, auto_increment = false)]
     pub id: Uuid,
-    /// Витринное наименование товара
     pub name: String,
-    /// Подробное описание тарифа для карточки в ЛК
     pub description: String,
-    /// Стоимость товара
     pub price: f64,
-    /// Валюта стоимости
     pub currency: Currency,
-    /// Тип продукта (определяет логику начисления)
     pub product_type: ProductType,
-    /// Идентификатор целевой группы (для GroupSubscription)
     pub target_id: Option<Uuid>,
-    /// Порядок сортировки при выводе на витрине
     pub sort_order: i32,
-    /// Маркетинговый бейдж ("Хит", "-20%", "VIP")
     pub badge: Option<String>,
-    /// Дополнительные параметры продукта в формате JSONB
     #[sea_orm(column_type = "JsonBinary", nullable)]
     pub metadata: Option<serde_json::Value>,
-    /// Доступен ли товар к покупке
     pub is_active: bool,
-    /// Время создания товара
     pub created_at: DateTimeUtc,
-    /// Время последнего обновления
     pub updated_at: DateTimeUtc,
 }
 
@@ -434,27 +387,17 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "orders")]
 pub struct Model {
-    /// Внутренний уникальный идентификатор заказа
     #[sea_orm(primary_key, auto_increment = false)]
     pub id: Uuid,
-    /// Идентификатор покупателя
     pub user_id: Uuid,
-    /// Идентификатор приобретаемого продукта
     pub product_id: Uuid,
-    /// Зафиксированная сумма к оплате
     pub amount: f64,
-    /// Валюта оплаты
     pub currency: Currency,
-    /// Текущий статус заказа
     pub status: OrderStatus,
-    /// Флаг покупки в подарок (генерация промокода Voucher)
     pub is_gift: bool,
-    /// Параметры кастомных тарифов в формате JSONB
     #[sea_orm(column_type = "JsonBinary", nullable)]
     pub metadata: Option<serde_json::Value>,
-    /// Время оформления заказа
     pub created_at: DateTimeUtc,
-    /// Время изменения статуса заказа
     pub updated_at: DateTimeUtc,
 }
 
@@ -499,21 +442,14 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "transactions")]
 pub struct Model {
-    /// Внутренний ID записи аудита транзакции
     #[sea_orm(primary_key, auto_increment = false)]
     pub id: Uuid,
-    /// Ссылка на оплаченный заказ (если удалось сопоставить)
     pub order_id: Option<Uuid>,
-    /// Платежный шлюз, обработавший перевод
     pub payment_system: PaymentSystem,
-    /// Внешний ID платежа на стороне шлюза (intid)
     pub external_tx_id: String,
-    /// Фактически зачисленная сумма
     pub amount_received: f64,
-    /// Полный сырой дамп тела входящего вебхука для аудита
     #[sea_orm(column_type = "JsonBinary")]
     pub raw_request: serde_json::Value,
-    /// Время получения уведомления от платежного шлюза
     pub created_at: DateTimeUtc,
 }
 
@@ -546,26 +482,17 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "vouchers")]
 pub struct Model {
-    /// Уникальный идентификатор ваучера
     #[sea_orm(primary_key, auto_increment = false)]
     pub id: Uuid,
-    /// Уникальный промокод для передачи (например, "ANET-GIFT-A8F2-99C1")
     #[sea_orm(unique)]
     pub code: String,
-    /// Идентификатор продукта, который активирует ваучер
     pub product_id: Uuid,
-    /// Пользователь, оплативший ваучер
     pub buyer_user_id: Option<Uuid>,
-    /// Пользователь, активировавший ваучер на свой профиль
     pub claimed_by_user_id: Option<Uuid>,
-    /// Текущее состояние ваучера
     pub status: VoucherStatus,
-    /// Резервное поле для будущих кастомных тарифов (RateExtension в подарок)
     #[sea_orm(column_type = "JsonBinary", nullable)]
     pub metadata: Option<serde_json::Value>,
-    /// Время фактической активации промокода
     pub claimed_at: Option<DateTimeUtc>,
-    /// Время создания промокода
     pub created_at: DateTimeUtc,
 }
 
@@ -577,11 +504,65 @@ pub enum Relation {
         to = "super::products::Column::Id"
     )]
     Product,
+    #[sea_orm(
+        belongs_to = "super::users::Entity",
+        from = "Column::BuyerUserId",
+        to = "super::users::Column::Id"
+    )]
+    Buyer,
 }
 
 impl Related<super::products::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::Product.def()
+    }
+}
+
+impl Related<super::users::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::Buyer.def()
+    }
+}
+
+impl ActiveModelBehavior for ActiveModel {}
+
+// ============================================================================
+// anet-auth/src/entities/verification_tokens.rs
+// ============================================================================
+
+use sea_orm::entity::prelude::*;
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize)]
+#[sea_orm(table_name = "verification_tokens")]
+pub struct Model {
+    #[sea_orm(primary_key, auto_increment = false)]
+    pub id: Uuid,
+    pub user_id: Option<Uuid>,
+    #[sea_orm(column_type = "Text")]
+    pub email: String,
+    #[sea_orm(unique, column_type = "Text")]
+    pub token_hash: String,
+    pub expires_at: DateTimeUtc,
+    pub used_at: Option<DateTimeUtc>,
+    pub created_at: DateTimeUtc,
+}
+
+#[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+pub enum Relation {
+    #[sea_orm(
+        belongs_to = "super::users::Entity",
+        from = "Column::UserId",
+        to = "super::users::Column::Id",
+        on_update = "Cascade",
+        on_delete = "Cascade"
+    )]
+    User,
+}
+
+impl Related<super::users::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::User.def()
     }
 }
 
@@ -592,147 +573,115 @@ impl ActiveModelBehavior for ActiveModel {}
 
 ## 4. Конфигурация, Регистрация и Авторизация
 
-### 4.1. Параметры конфигурации (`contrib/config/server.toml`)
+### 4.1. Переменные окружения (`anet-auth/src/config.rs`, `.env.example.auth`)
 
-Все таймауты, длительности токенов и ключи выносятся в конфигурационный файл сервера (никакого хардкода в коде):
+Вместо `server.toml` вся конфигурация коммерческого модуля читается строго из переменных окружения (`.env`, опция `--env-file` / `ANET_ENV_FILE`, либо `environment` в `contrib/docker/docker-compose.auth.preset.billing.yaml`) и инициализируется через `config::init_config()`:
 
-```toml
-[cabinet.web]
-# Публичный домен веб-кабинета для генерации ссылок в письмах
-public_domain = "https://service.example.com"
-# Время жизни одноразового токена подтверждения Email (в минутах)
-verification_token_ttl_mins = 15
-# Минимальная длина пароля при регистрации
-min_password_length = 5
+```dotenv
+DATABASE_URL=postgres://user:password@localhost:5432/anet_auth_db
+AUTH_BACKEND_KEY=super_secret_vpn_key_2025
+BIND_TO=127.0.0.1:3000
+DB_ENCRYPTION_KEY=test_test
+CLIENT_TEMPLATE_PATH=/opt/anet/client_template.toml
 
-[cabinet.telegram]
-# Токен бота Telegram для валидации TMA
-bot_token = ""
-# Ключ для вычисления промежуточного HMAC по спецификации Telegram API
-web_app_data_key = "WebAppData"
+# --- Личный Кабинет и JWT ([cabinet.web]) ---
+APP_ENV=production
+JWT_SECRET=change_me_to_long_random_secret
+USER_JWT_TTL_HOURS=168
+PUBLIC_DOMAIN=https://service.example.com
+VERIFICATION_TOKEN_TTL_MINS=15
+MIN_PASSWORD_LENGTH=5
+EMAIL_WEBHOOK_URL=
+EMAIL_WEBHOOK_TOKEN=
 
-[billing.freekassa]
-# Интервал запуска фонового опроса незавершенных заказов (в секундах)
-sync_interval_secs = 900
-# Возраст заказа со статусом Pending для начала проверки через getOrders (в минутах)
-pending_threshold_mins = 15
+# --- Telegram Bot / Mini App ([cabinet.telegram]) ---
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_WEB_APP_DATA_KEY=WebAppData
+
+# --- Платежный шлюз FreeKassa ([billing.freekassa]) ---
+FK_SHOP_ID=
+FK_SECRET1=
+FK_SECRET2=
+FK_API_KEY=
+FK_PAY_URL=https://pay.freekassa.ru/
+FK_API_URL=https://api.fk.life/v1
+FK_SYNC_INTERVAL_SECS=900
+FK_PENDING_THRESHOLD_MINS=15
 ```
 
-### 4.2. Авторизация по Email (Пароли и ссылки)
+### 4.2. Авторизация по Email (`anet-auth/src/api/user_auth.rs`)
 
-1. **Запрос ссылки:** Пользователь указывает Email на странице входа Личного Кабинета.
-2. **Токен подтверждения:** Бэкенд генерирует одноразовый токен со временем жизни `verification_token_ttl_mins`, сохраняет его в таблице `verification_tokens` и отправляет письмо со ссылкой на публичный сервис:
-   `https://service.example.com/auth/verify?token=XYZ`
-3. **Установка пароля:** Пользователь вводит пароль (валидируется только длина $\ge min\_password\_length$).
-4. **Создание профиля:**
-   * Создается `UserModel`.
-   * Генерируется ключевая пара ASTP и `fingerprint`.
-   * Пользователю привязывается группа по умолчанию (`is_default = true`).
-   * Поля `activated_at` и `expires_at` устанавливаются в `None` (ждет первого входа).
-   * Возвращается сессионный JWT.
+Все маршруты `UserAuthApi` смонтированы в `OpenApiService` под префиксом `/api/v1`:
 
-### 4.3. Связка аккаунтов (Telegram TMA $\to$ Web-кабинет)
+1. **`POST /api/v1/user/auth/request-link`** (`RequestEmailLinkRequest { email }`):
+   * Нормализует email (lowercase/trim), проверяет базовый формат (`400 Bad Request`).
+   * Если пользователь с таким Email существует и заблокирован (`is_active == false`) — возвращает `403 Forbidden`.
+   * Генерирует 32-байтовый криптослучайный токен (`URL_SAFE_NO_PAD`), сохраняет в `verification_tokens` его `SHA-256` хэш (`token_hash`) со сроком `VERIFICATION_TOKEN_TTL_MINS`.
+   * Формирует ссылку `{PUBLIC_DOMAIN}/auth/verify?token={raw_token}`.
+   * Если задан `EMAIL_WEBHOOK_URL`, отправляет HTTP `POST` JSON `{ to, subject, verify_url, expires_in_mins, text }` (с заголовком `Authorization: Bearer <EMAIL_WEBHOOK_TOKEN>`, если токен задан).
+   * Если `EMAIL_WEBHOOK_URL` не задан: логирует ссылку; при `APP_ENV=development` дополнительно возвращает её в поле `dev_verify_url`.
+2. **`POST /api/v1/user/auth/verify`** (`VerifyEmailRequest { token, password }`):
+   * Проверяет `password.len() >= MIN_PASSWORD_LENGTH` (`400 Bad Request`).
+   * В транзакции ищет запись в `verification_tokens` по `SHA-256(token)`, проверяет `used_at.is_none()` (`400`) и `expires_at > now` (`400`), помечает `used_at = Some(now)`.
+   * Хэширует пароль через `bcrypt`.
+   * Если в токене есть `user_id` — привязывает `email` + `password_hash` к существующему аккаунту (проверяя конфликт Email `409 Conflict`). Иначе обновляет существующего пользователя с этим Email или создаёт нового (`create_new_user_with_default_group`), генерирует ASTP-ключи (`DbEncryptor`) и привязывает группу с `is_default = true` (`activated_at = None`, `expires_at = None`).
+   * Выпускает JWT (`UserAuthTokenResponse`).
+3. **`POST /api/v1/user/auth/login`** (`UserLoginRequest { email, password }`):
+   * Проверяет `is_active` (`403`) и `bcrypt::verify`, возвращает JWT (`UserAuthTokenResponse`).
 
-Если пользователь изначально зарегистрировался через Telegram-бота или Telegram Mini App (TMA):
-1. Профиль создается мгновенно с `telegram_id: Some(id)`, а поля `email` и `password_hash` остаются `None` (пользователю не нужно придумывать пароль в Telegram).
-2. Если в дальнейшем пользователь захочет войти в Личный Кабинет через браузер на компьютере:
-   * В интерфейсе TMA (или по запросу боту) пользователь указывает свой рабочий Email.
-   * Бэкенд генерирует токен верификации и отправляет на указанную почту ссылку для установки пароля:  
-     `https://service.example.com/auth/verify?token=XYZ`
-   * Пользователь переходит по ссылке и задает постоянный пароль.
-   * Бэкенд сохраняет `email` и `password_hash` в существующую запись `users`.
-   * Теперь учетная запись едина: пользователь может входить как через Telegram TMA в один клик, так и в браузере по логину и паролю.
+### 4.3. Связка аккаунтов (Telegram TMA -> Web-кабинет)
+
+1. **`POST /api/v1/user/auth/telegram`** (`TelegramAuthRequest { init_data }`):
+   * Проверяет подпись `init_data` по спецификации Telegram Mini App: `HMAC-SHA256(key = HMAC-SHA256(web_app_data_key, bot_token), data_check_string)` с `constant_time_eq` и проверкой `auth_date` (не старше 86 400 секунд).
+   * По `telegram_id` находит существующего пользователя или создаёт нового без пароля с группой по умолчанию (`is_default = true`) и `uid = tg_<username|id>`, возвращает JWT.
+2. **`POST /api/v1/user/auth/link-email`** (`UserAuth` + `RequestEmailLinkRequest { email }`):
+   * Проверяет, что Email не занят другим пользователем (`409 Conflict`), и создаёт запись в `verification_tokens` с `user_id = Some(claims.user_id)`.
+   * После перехода по ссылке и вызова `POST /api/v1/user/auth/verify` к профилю добавляются `email` и `password_hash`, что даёт единый вход как через TMA, так и через веб-форму.
 
 ---
 
-## 5. Спецификация платежного шлюза FreeKassa (API v1 & Webhook)
+## 5. Спецификация платёжного шлюза FreeKassa (`anet-auth/src/api/freekassa.rs`)
+
+Криптография (`md5_hex` по RFC 1321 и `hmac_sha256_hex` по RFC 2104 поверх `sha2`) реализована непосредственно в `anet-auth/src/api/freekassa.rs` без добавления внешних крейтов.
 
 ### 5.1. Алгоритмы формирования и проверки подписей
 
-1. **Генерация ссылки на оплату (SCI Form URL):**
-   * URL: `https://pay.freekassa.ru/`
-   * Строка подписи: `merchant_id:amount:secret1:currency:order_id`
-   * Хэш: `md5(sign_string)` в нижнем регистре.
-2. **Входящий вебхук уведомления (`/billing/freekassa/notify`):**
-   * Строка подписи: `merchant_id:amount:secret2:order_id`
-   * Хэш: `md5(sign_string)` в нижнем регистре.
-   * **КРИТИЧЕСКИ ВАЖНО (Форматирование суммы в MD5):** Поле `form.amount` подставляется в строку подписи **СТРОГО как исходная сырая строка из тела POST-запроса от FreeKassa** (например, `"100.00"` или `"100"`). Ни в коем случае нельзя конвертировать сумму во `f64` или переформатировать перед генерацией хэша, иначе подпись не сойдется.
-   * **Сверка суммы с заказом:** Для защиты от недоплаты сумма парсится во `f64` с допуском погрешности округления:
-     ```rust
-     let received_amount: f64 = form.amount.parse().unwrap_or(0.0);
-     if (received_amount - order.amount).abs() > 0.01 {
-         return Err(poem::Error::from_string("Amount mismatch", StatusCode::BAD_REQUEST));
-     }
-     ```
-   * **Атомарность (Database Transactions):** Обработка вебхука обязательно оборачивается в транзакцию БД (`let txn = self.db.begin().await? ... txn.commit().await?`). В рамках одной неделимой транзакции:
-     1. Записывается аудит в таблицу `transactions` (включая `raw_request: JsonBinary`).
-     2. Статус заказа в `orders` меняется на `Paid`.
-     3. Начисляется услуга (назначается `user.group_id` с `activated_at = None`, либо продлевается срок `user.expires_at`).
-     Если любая из операций завершилась с ошибкой, транзакция целиком откатывается, защищая БД от рассинхронизации.
-   * Белый список IP-адресов FreeKassa: `168.119.157.136`, `168.119.60.227`, `138.201.88.124`, `178.154.197.79`.
-   * Ответ шлюзу при успехе: строго строка `YES` с HTTP статусом 200.
-3. **Фоновая проверка заказов через FreeKassa API v1 (`https://api.fk.life/v1/orders`):**
-   * Согласно спецификации FreeKassa API (`getOrders`), подпись формируется по алгоритму **HMAC-SHA256**:
-     1. Все поля запроса (кроме `signature`) сортируются в алфавитном порядке по ключам.
-     2. Значения полей склеиваются через символ пайпа `|` (например: `nonce|orderId|shopId`).
-     3. От полученной строки вычисляется `HMAC-SHA256` с использованием секретного `apiKey` (API-ключ из настроек ЛК FreeKassa).
+1. **Создание заказа через SCI Form URL (`build_sci_payment_url`):**
+   * Вызывается из `POST /api/v1/user/orders`, если `payment_system_id` не передан.
+   * URL: `{FK_PAY_URL}/?m={shop_id}&oa={amount:.2}&currency={currency}&o={order_id}&s={sign}`
+   * Строка подписи: `shop_id:amount_str:secret1:cur_str:order_id` -> `md5_hex`.
+2. **Создание заказа через FreeKassa API v1 (`create_fk_api_order`):**
+   * Вызывается из `POST /api/v1/user/orders`, если передан `payment_system_id`.
+   * Эндпоинт: `POST {FK_API_URL}/orders/create`.
+   * Ключи `amount`, `currency`, `email`, `i`, `ip`, `nonce`, `paymentId`, `shopId` сортируются по алфавиту, значения склеиваются через `|`, подписываются `HMAC-SHA256(FK_API_KEY)`.
+3. **Входящий вебхук уведомления (`POST /billing/freekassa/notify`):**
+   * Смонтирован вне `/api/v1` в `main.rs` (`poem::post(freekassa_notify_handler).data(db)`), проходит через `ApiKeyMiddleware` (который требует `X-Auth-Key` только для `/check_access` и `/session/*`).
+   * **Извлечение и проверка IP:** Если peer — доверенный локальный или Docker-прокси (`is_trusted_proxy_peer`), реальный IP извлекается из `X-Real-IP` / `X-Forwarded-For` и проверяется по `FK_TRUSTED_IPS`: `168.119.157.136`, `168.119.60.227`, `138.201.88.124`, `178.154.197.79` (в `APP_ENV=development` проверка IP отключается).
+   * **Проверка `MERCHANT_ID` и MD5-подписи:**
+     Строка подписи: `MERCHANT_ID:AMOUNT:secret2:MERCHANT_ORDER_ID`.  
+     **КРИТИЧЕСКИ ВАЖНО:** Поле `form.amount` подставляется в строку подписи **строго как исходная сырая строка из тела POST-запроса**.
+   * **Атомарное начисление (`fulfill_order`):**
+     1. Внутри транзакции БД проверяется статус заказа — если уже `OrderStatus::Paid`, выполняется идемпотентный выход `Ok(())`.
+     2. Проверяется сумма: `(received_amount - order.amount).abs() <= 0.01`.
+     3. Записывается аудит в `transactions` (включая `raw_request`).
+     4. Статус заказа обновляется на `OrderStatus::Paid`.
+     5. Если `order.is_gift == true` — создаётся ваучер `ANET-GIFT-XXXXXXXX` (`VoucherStatus::Created`). Иначе для `ProductType::GroupSubscription`:
+        * Если у пользователя уже активна та же `group_id` и задан `expires_at` — `expires_at` продлевается на `group.duration_days`.
+        * Если выбран новый тариф — назначается `group_id`, а `activated_at` и `expires_at` сбрасываются в `None` (ожидание Smart Activation).
+   * Ответ шлюзу при успехе: `200 OK`, тело `"YES"`.
 
-### 5.2. Строго типизированный воркер FreeKassa
+### 5.2. Фоновый воркер сверки `cron_sync_freekassa`
 
 ```rust
-use std::time::Duration;
-use chrono::{Duration as ChronoDuration, Utc};
-use hmac::{Hmac, Mac};
-use sea_orm::{ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set};
-use serde::{Deserialize, Serialize};
-use sha2::Sha256;
-use tokio::time::sleep;
-
-use crate::entities::billing_enums::OrderStatus;
-use crate::entities::orders::{
-    ActiveModel as OrderActiveModel, Column as OrderColumn, Entity as Orders,
-};
-
-type HmacSha256 = Hmac<Sha256>;
-
-/// Статусы заказов по спецификации FreeKassa API v1 (getOrders)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(i32)]
-pub enum FkApiOrderStatus {
-    /// Новый заказ (ожидает оплаты)
-    New = 0,
-    /// Успешно оплачен
-    Paid = 1,
-    /// Ошибка проведения платежа
-    Error = 8,
-    /// Заказ отменен
-    Cancelled = 9,
-}
-
-#[derive(Deserialize, Debug)]
-pub struct FkOrdersApiResponse {
-    pub r#type: String,
-    #[serde(default)]
-    pub orders: Option<Vec<FkOrderRecord>>,
-    #[serde(default)]
-    pub message: Option<String>,
-}
-
-#[derive(Deserialize, Debug, Serialize)]
-pub struct FkOrderRecord {
-    pub id: i64,
-    pub merchant_order_id: String,
-    pub status: i32,
-    pub amount: f64,
-}
-
 pub async fn cron_sync_freekassa(db: DatabaseConnection) {
-    let shop_id = std::env::var("FK_SHOP_ID").unwrap_or_default();
-    let api_key = std::env::var("FK_API_KEY").unwrap_or_default();
-    let sync_interval_secs: u64 = std::env::var("FK_SYNC_INTERVAL_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(900);
-    let pending_threshold_mins: i64 = std::env::var("FK_PENDING_THRESHOLD_MINS").ok().and_then(|v| v.parse().ok()).unwrap_or(15);
+    let fk = &crate::config::get().billing.freekassa;
+    let shop_id = fk.shop_id.trim().to_string();
+    let api_key = fk.api_key.trim().to_string();
+    let sync_interval_secs = fk.sync_interval_secs.max(30);
+    let pending_threshold_mins = fk.pending_threshold_mins.max(1);
 
     if shop_id.is_empty() || api_key.is_empty() {
+        log::warn!("[FreeKassa Sync] [billing.freekassa] shop_id или api_key не заданы, воркер отключен");
         return;
     }
 
@@ -740,21 +689,21 @@ pub async fn cron_sync_freekassa(db: DatabaseConnection) {
         .timeout(Duration::from_secs(10))
         .build()
         .unwrap();
+    let orders_endpoint = format!("{}/orders", fk.api_url.trim_end_matches('/'));
 
     loop {
         sleep(Duration::from_secs(sync_interval_secs)).await;
-
         let threshold = Utc::now() - ChronoDuration::minutes(pending_threshold_mins);
-        
-        let pending_orders = match Orders::find()
-            .filter(OrderColumn::Status.eq(OrderStatus::Pending))
-            .filter(OrderColumn::CreatedAt.lt(threshold))
+
+        let pending_orders = match orders::Entity::find()
+            .filter(orders::Column::Status.eq(OrderStatus::Pending))
+            .filter(orders::Column::CreatedAt.lt(threshold))
             .all(&db)
-            .await 
+            .await
         {
             Ok(orders) => orders,
             Err(e) => {
-                tracing::error!("[FreeKassa Sync] DB error querying pending orders: {:?}", e);
+                log::error!("[FreeKassa Sync] DB error querying pending orders: {:?}", e);
                 continue;
             }
         };
@@ -762,63 +711,11 @@ pub async fn cron_sync_freekassa(db: DatabaseConnection) {
         for order in pending_orders {
             let nonce = Utc::now().timestamp_millis();
             let order_id_str = order.id.to_string();
-
-            // Сортировка по ключам: nonce, orderId, shopId -> значения через "|"
             let sign_data = format!("{}|{}|{}", nonce, order_id_str, shop_id);
-            
-            let mut mac = match HmacSha256::new_from_slice(api_key.as_bytes()) {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-            mac.update(sign_data.as_bytes());
-            let signature = hex::encode(mac.finalize().into_bytes());
-
-            let request_body = serde_json::json!({
-                "shopId": shop_id.parse::<i64>().unwrap_or(0),
-                "nonce": nonce,
-                "orderId": order_id_str,
-                "signature": signature
-            });
-
-            let resp = client.post("https://api.fk.life/v1/orders")
-                .json(&request_body)
-                .send()
-                .await;
-
-            match resp {
-                Ok(res) => {
-                    let text = res.text().await.unwrap_or_default();
-                    match serde_json::from_str::<FkOrdersApiResponse>(&text) {
-                        Ok(parsed) if parsed.r#type == "success" => {
-                            if let Some(records) = parsed.orders {
-                                if let Some(record) = records.iter().find(|r| r.merchant_order_id == order_id_str) {
-                                    if record.status == FkApiOrderStatus::Paid as i32 {
-                                        tracing::info!("[FreeKassa Sync] Order {} confirmed paid", order.id);
-                                        let raw_json = serde_json::to_value(record).unwrap_or_default();
-                                        let _ = fulfill_order(&db, order.id, "CRON_SYNC", raw_json).await;
-                                    } else if record.status == FkApiOrderStatus::Error as i32 || record.status == FkApiOrderStatus::Cancelled as i32 {
-                                        tracing::warn!("[FreeKassa Sync] Order {} cancelled (status {})", order.id, record.status);
-                                        let mut active: OrderActiveModel = order.into();
-                                        active.status = Set(OrderStatus::Cancelled);
-                                        let _ = active.update(&db).await;
-                                    }
-                                }
-                            }
-                        }
-                        Ok(parsed) => {
-                            tracing::error!("[FreeKassa Sync] Gateway returned non-success response: {:?}", parsed.message);
-                            // [AI-PROMPT / Phase 2 TODO]: Отправка алерта в Telegram/ELK админу при аномальных ответах шлюза
-                        }
-                        Err(e) => {
-                            tracing::error!("[FreeKassa Sync] Deserialization failure! Body: {}. Error: {}", text, e);
-                            // [AI-PROMPT / Phase 2 TODO]: Отправка алерта в Telegram/ELK админу при получении невалидного JSON
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::error!("[FreeKassa Sync] Network error connecting to FreeKassa API: {}", e);
-                }
-            }
+            let signature = hmac_sha256_hex(api_key.as_bytes(), sign_data.as_bytes());
+            // POST {FK_API_URL}/orders -> при status == 1 вызывает fulfill_order(..., "fk_sync_{id}", ...)
+            // при status == 8 || status == 9 переводит заказ в OrderStatus::Cancelled
+            ...
         }
     }
 }
@@ -826,82 +723,27 @@ pub async fn cron_sync_freekassa(db: DatabaseConnection) {
 
 ---
 
-## 6. Прототипы API Личного Кабинета (`anet-auth/src/api/user_cabinet.rs`)
+## 6. Реализация API Личного Кабинета (`anet-auth/src/api/user_cabinet.rs`)
+
+Все маршруты защищены `UserAuth` (проверка пользовательского JWT, активности `users.is_active` и валидности субъекта в `ensure_user`) и смонтированы под `/api/v1`:
+
+### Основные DTO
 
 ```rust
-// ============================================================================
-// anet-auth/src/api/user_cabinet.rs
-// ============================================================================
-
-use chrono::{DateTime, Utc};
-use poem::http::StatusCode;
-use poem_openapi::{
-    auth::Bearer,
-    payload::{Binary, Json},
-    ApiResponse, Object, OpenApi, SecurityScheme,
-};
-use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait,
-    QueryFilter, QueryOrder, Set, TransactionTrait,
-};
-use serde::{Deserialize, Serialize};
-use uuid::Uuid;
-
-use crate::entities::{
-    billing_enums::{Currency, LimitSource, OrderStatus, PaymentSystem, ProductType, VoucherStatus},
-    groups, orders, products, rates, transactions, users, vouchers, ProtocolType,
-};
-
-#[derive(SecurityScheme)]
-#[oai(
-    type = "bearer",
-    key_name = "Authorization",
-    in = "header",
-    checker = "user_auth_checker"
-)]
-pub struct UserAuth(pub UserClaims);
-
-#[derive(Clone, Debug)]
-pub struct UserClaims {
-    pub user_id: Uuid,
-    pub fingerprint: String,
-}
-
-async fn user_auth_checker(_req: &poem::Request, bearer: Bearer) -> Option<UserClaims> {
-    let secret = std::env::var("JWT_SECRET").unwrap_or_else(|_| "secret".into());
-    let mut validation = jsonwebtoken::Validation::default();
-    validation.validate_exp = true;
-
-    let token_data = jsonwebtoken::decode::<serde_json::Value>(
-        &bearer.token,
-        &jsonwebtoken::DecodingKey::from_secret(secret.as_bytes()),
-        &validation,
-    ).ok()?;
-
-    let sub = token_data.claims.get("sub")?.as_str()?;
-    let fp = token_data.claims.get("fp").and_then(|v| v.as_str()).unwrap_or_default();
-
-    Some(UserClaims {
-        user_id: Uuid::parse_str(sub).ok()?,
-        fingerprint: fp.to_string(),
-    })
-}
-
-// ----------------------------------------------------------------------------
-// DTOs
-// ----------------------------------------------------------------------------
-
 #[derive(Object, Debug, Serialize, Deserialize)]
 pub struct UserProfileResponse {
     pub id: Uuid,
     pub email: Option<String>,
+    pub telegram_id: Option<i64>,
     pub fingerprint: String,
     pub balance: f64,
     pub is_active: bool,
     pub group_name: Option<String>,
-    pub activated_at: Option<DateTime<Utc>>,
-    pub expires_at: Option<DateTime<Utc>>,
+    pub activated_at: Option<String>,
+    pub expires_at: Option<String>,
     pub is_smart_activation_pending: bool,
+    pub active_sessions_count: i32,
+    pub traffic_used_bytes: i64,
     pub effective_limits: EffectiveLimitsDto,
 }
 
@@ -922,7 +764,8 @@ pub struct ActiveSessionDto {
     pub protocol: ProtocolType,
     pub rx_bytes: i64,
     pub tx_bytes: i64,
-    pub connected_at: DateTime<Utc>,
+    pub connection_count: i32,
+    pub connected_at: String,
 }
 
 #[derive(Object, Debug, Serialize, Deserialize)]
@@ -932,8 +775,8 @@ pub struct DisconnectSessionRequest {
 }
 
 #[derive(Object, Debug, Serialize, Deserialize)]
-pub struct TrafficHistoryPointDto {
-    pub timestamp: DateTime<Utc>,
+pub struct CabinetTrafficHistoryPointDto {
+    pub timestamp: String,
     pub rx_bytes: i64,
     pub tx_bytes: i64,
 }
@@ -943,204 +786,47 @@ pub struct ClientConfigResponse {
     pub client_toml: String,
     pub qr_code_url: String,
 }
-
-// ----------------------------------------------------------------------------
-// API Controller
-// ----------------------------------------------------------------------------
-
-pub struct UserCabinetApi {
-    db: DatabaseConnection,
-}
-
-impl UserCabinetApi {
-    pub fn new(db: DatabaseConnection) -> Self {
-        Self { db }
-    }
-}
-
-#[OpenApi]
-impl UserCabinetApi {
-    /// Получение профиля, баланса и действующих лимитов пользователя
-    #[oai(path = "/api/v1/user/me", method = "get")]
-    async fn get_me(&self, auth: UserAuth) -> poem::Result<Json<UserProfileResponse>> {
-        let user = users::Entity::find_by_id(auth.0.user_id)
-            .one(&self.db)
-            .await
-            .map_err(|e| poem::Error::from_string(e.to_string(), StatusCode::INTERNAL_SERVER_ERROR))?
-            .ok_or_else(|| poem::Error::from_string("User not found", StatusCode::NOT_FOUND))?;
-
-        // 1. Проверяем наличие индивидуального тарифа rates
-        let user_rate = rates::Entity::find()
-            .filter(rates::Column::UserId.eq(user.id))
-            .one(&self.db)
-            .await
-            .unwrap_or(None);
-
-        let now = Utc::now().naive_utc();
-        let (effective_limits, group_name) = if let Some(rate) = user_rate.filter(|r| r.date_end > now) {
-            (
-                EffectiveLimitsDto {
-                    source: LimitSource::Rates,
-                    sessions_limit: rate.sessions,
-                    speed_limit_kbps: rate.speed_limit,
-                    traffic_limit_bytes: rate.traffic_limit,
-                },
-                Some("Индивидуальный тариф".into()),
-            )
-        } else if let Some(group_id) = user.group_id {
-            let group = groups::Entity::find_by_id(group_id).one(&self.db).await.unwrap_or(None);
-            if let Some(g) = group {
-                (
-                    EffectiveLimitsDto {
-                        source: LimitSource::Groups,
-                        sessions_limit: g.sessions_limit,
-                        speed_limit_kbps: g.speed_limit,
-                        traffic_limit_bytes: g.traffic_limit,
-                    },
-                    Some(g.name),
-                )
-            } else {
-                (
-                    EffectiveLimitsDto {
-                        source: LimitSource::Default,
-                        sessions_limit: 1,
-                        speed_limit_kbps: 0,
-                        traffic_limit_bytes: 0,
-                    },
-                    None,
-                )
-            }
-        } else {
-            (
-                EffectiveLimitsDto {
-                    source: LimitSource::Unlimited,
-                    sessions_limit: 0,
-                    speed_limit_kbps: 0,
-                    traffic_limit_bytes: 0,
-                },
-                None,
-            )
-        };
-
-        let is_pending = user.activated_at.is_none() && user.group_id.is_some();
-
-        Ok(Json(UserProfileResponse {
-            id: user.id,
-            email: user.email,
-            fingerprint: user.fingerprint,
-            balance: user.balance,
-            is_active: user.is_active,
-            group_name,
-            activated_at: user.activated_at,
-            expires_at: user.expires_at,
-            is_smart_activation_pending: is_pending,
-            effective_limits,
-        }))
-    }
-
-    /// Активные сессии пользователя со всех серверов
-    #[oai(path = "/api/v1/user/sessions", method = "get")]
-    async fn get_active_sessions(&self, auth: UserAuth) -> poem::Result<Json<Vec<ActiveSessionDto>>> {
-        // [AI-PROMPT]: Возвращает активные сессии пользователя по его fingerprint из ClientRegistry
-        Ok(Json(vec![]))
-    }
-
-    /// Принудительный сброс конкретной сессии
-    #[oai(path = "/api/v1/user/sessions/disconnect", method = "post")]
-    async fn disconnect_session(
-        &self,
-        auth: UserAuth,
-        req: Json<DisconnectSessionRequest>,
-    ) -> poem::Result<Json<bool>> {
-        // [AI-PROMPT]: Отправка DisconnectCommand на ноду
-        Ok(Json(true))
-    }
-
-    /// График потребления трафика пользователем (Rx / Tx по часам/дням)
-    #[oai(path = "/api/v1/user/traffic-history", method = "get")]
-    async fn get_traffic_history(&self, auth: UserAuth) -> poem::Result<Json<Vec<TrafficHistoryPointDto>>> {
-        // [AI-PROMPT]: Агрегация данных потребления трафика из таблицы статистики за последние 30 дней
-        Ok(Json(vec![]))
-    }
-
-    /// Получение client.toml и ссылки на QR-код
-    #[oai(path = "/api/v1/user/config", method = "get")]
-    async fn get_client_config(&self, auth: UserAuth) -> poem::Result<Json<ClientConfigResponse>> {
-        let user = users::Entity::find_by_id(auth.0.user_id)
-            .one(&self.db)
-            .await
-            .map_err(|e| poem::Error::from_string(e.to_string(), StatusCode::INTERNAL_SERVER_ERROR))?
-            .ok_or_else(|| poem::Error::from_string("User not found", StatusCode::NOT_FOUND))?;
-
-        let auth_host = std::env::var("PUBLIC_DOMAIN").unwrap_or_else(|_| "https://service.example.com".into());
-        let toml_content = format!(
-            "# Anet Client Config\nfingerprint = \"{}\"\nauth_server = \"{}\"\n",
-            user.fingerprint, auth_host
-        );
-
-        Ok(Json(ClientConfigResponse {
-            client_toml: toml_content,
-            qr_code_url: format!("{}/api/v1/config/qr/{}", auth_host, user.fingerprint),
-        }))
-    }
-}
 ```
+
+### Реализованные эндпоинты `UserCabinetApi`
+
+1. **`GET /api/v1/user/me`** — возвращает `UserProfileResponse`:
+   * Действующие лимиты (`EffectiveLimitsDto`) по лестнице приоритетов (`rates` -> `groups` -> `Unlimited`).
+   * Число активных сессий `active_sessions_count` (из `LIVE_NODE_SESSIONS` с fallback на `active_sessions`).
+   * Использованный трафик `traffic_used_bytes` за текущий расчётный цикл (сумма `rx_bytes + tx_bytes` из `traffic_hourly`).
+2. **`GET /api/v1/user/products`** — список активных продуктов (`is_active == true`, сортировка по `sort_order`).
+3. **`GET /api/v1/user/orders`** — последние 50 заказов текущего пользователя (`UserOrderDto`).
+4. **`POST /api/v1/user/orders`** (`CreateOrderRequest { product_id, is_gift, payment_system_id }`) — создаёт заказ в статусе `Pending` и возвращает `CreateOrderResponse { order_id, amount, currency, payment_url }` (FreeKassa API v1 или SCI).
+5. **`GET /api/v1/user/sessions`** — агрегирует реальные активные сессии пользователя с нод из `LIVE_NODE_SESSIONS` с добавлением статистики `rx_bytes`, `tx_bytes` и `protocol` из `traffic_totals`.
+6. **`POST /api/v1/user/sessions/disconnect`** — проверяет наличие ноды (`servers`) и вставляет запись в `node_commands` (`command_type = "disconnect_user"`, `target_fingerprint = Some(claims.fingerprint)`, `status = "pending"`).
+7. **`GET /api/v1/user/traffic-history?hours=24&bucket_hours=1`** — агрегирует почасовую/посуточную историю `rx_bytes` и `tx_bytes` из `traffic_hourly` за период от 1 часа до 90 суток (`clamp(1, 24 * 90)`).
+8. **`GET /api/v1/user/config`** — собирает и расшифровывает полноценный `client.toml` через `build_client_toml_for_user` (с учётом серверов привязанных пулов, fallback на `Host`/`X-Forwarded-*` и `PUBLIC_DOMAIN`) + возвращает `qr_code_url`.
 
 ---
 
-## 7. Прототипы API Администратора (`anet-auth/src/api/admin_billing.rs`)
+## 7. API Администратора (`anet-auth/src/api/admin_billing.rs`, `users.rs`, `groups.rs`)
 
-Все эндпоинты защищены административным JWT (`AdminAuth`).
+Все административные эндпоинты защищены схемой безопасности `AdminToken` (`Bearer`) с проверкой активной сессии в таблице `sessions` через `validate_admin_session`.
+
+### 7.1. Биллинг-контроллер `AdminBillingApi` (`anet-auth/src/api/admin_billing.rs`)
 
 ```rust
-// ============================================================================
-// anet-auth/src/api/admin_billing.rs
-// ============================================================================
-
-use chrono::{DateTime, Utc};
-use poem::http::StatusCode;
-use poem_openapi::{
-    auth::Bearer,
-    param::Query,
-    payload::Json,
-    ApiResponse, Object, OpenApi, SecurityScheme,
-};
-use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait,
-    QueryFilter, QueryOrder, Set,
-};
-use serde::{Deserialize, Serialize};
-use uuid::Uuid;
-
-use crate::entities::{
-    billing_enums::{Currency, OrderStatus, PaymentSystem, ProductType},
-    orders, products, transactions, vouchers,
-};
-
-#[derive(SecurityScheme)]
-#[oai(
-    type = "bearer",
-    key_name = "Authorization",
-    in = "header",
-    checker = "admin_auth_checker"
-)]
-pub struct AdminAuth(pub Uuid);
-
-async fn admin_auth_checker(_req: &poem::Request, bearer: Bearer) -> Option<Uuid> {
-    let secret = std::env::var("JWT_SECRET").unwrap_or_else(|_| "secret".into());
-    let token_data = jsonwebtoken::decode::<serde_json::Value>(
-        &bearer.token,
-        &jsonwebtoken::DecodingKey::from_secret(secret.as_bytes()),
-        &jsonwebtoken::Validation::default(),
-    ).ok()?;
-
-    let sub = token_data.claims.get("sub")?.as_str()?;
-    Uuid::parse_str(sub).ok()
+#[derive(Object, Debug, Serialize, Deserialize)]
+pub struct AdminProductDto {
+    pub id: Uuid,
+    pub name: String,
+    pub description: String,
+    pub price: f64,
+    pub currency: Currency,
+    pub product_type: ProductType,
+    pub target_id: Option<Uuid>,
+    pub sort_order: i32,
+    pub badge: Option<String>,
+    pub metadata: Option<serde_json::Value>,
+    pub is_active: bool,
+    pub created_at: String,
+    pub updated_at: String,
 }
-
-// ----------------------------------------------------------------------------
-// DTOs
-// ----------------------------------------------------------------------------
 
 #[derive(Object, Debug, Serialize, Deserialize)]
 pub struct CreateProductRequest {
@@ -1171,253 +857,84 @@ pub struct UpdateProductRequest {
 }
 
 #[derive(Object, Debug, Serialize, Deserialize)]
-pub struct AdminOrderDto {
-    pub id: Uuid,
-    pub user_id: Uuid,
-    pub product_id: Uuid,
-    pub amount: f64,
-    pub currency: Currency,
-    pub status: OrderStatus,
-    pub is_gift: bool,
-    pub metadata: Option<serde_json::Value>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-}
-
-#[derive(Object, Debug, Serialize, Deserialize)]
-pub struct PaginatedResponse<T: poem_openapi::types::Type + Send + Sync + 'static> {
-    pub items: Vec<T>,
+pub struct PaginatedOrdersResponse {
+    pub items: Vec<AdminOrderDto>,
     pub total: u64,
     pub page: u64,
     pub page_size: u64,
 }
 
 #[derive(Object, Debug, Serialize, Deserialize)]
-pub struct AdminTransactionDto {
-    pub id: Uuid,
-    pub order_id: Option<Uuid>,
-    pub payment_system: PaymentSystem,
-    pub external_tx_id: String,
-    pub amount_received: f64,
-    pub raw_request: serde_json::Value,
-    pub created_at: DateTime<Utc>,
-}
-
-// ----------------------------------------------------------------------------
-// API Controller
-// ----------------------------------------------------------------------------
-
-pub struct AdminBillingApi {
-    db: DatabaseConnection,
-}
-
-impl AdminBillingApi {
-    pub fn new(db: DatabaseConnection) -> Self {
-        Self { db }
-    }
-}
-
-#[OpenApi]
-impl AdminBillingApi {
-    // ------------------------------------------------------------------------
-    // CRUD: Products
-    // ------------------------------------------------------------------------
-
-    #[oai(path = "/api/v1/admin/products", method = "get")]
-    async fn list_products(&self, _auth: AdminAuth) -> poem::Result<Json<Vec<products::Model>>> {
-        let items = products::Entity::find()
-            .order_by_asc(products::Column::SortOrder)
-            .all(&self.db)
-            .await
-            .map_err(|e| poem::Error::from_string(e.to_string(), StatusCode::INTERNAL_SERVER_ERROR))?;
-        Ok(Json(items))
-    }
-
-    #[oai(path = "/api/v1/admin/products", method = "post")]
-    async fn create_product(
-        &self,
-        _auth: AdminAuth,
-        req: Json<CreateProductRequest>,
-    ) -> poem::Result<Json<products::Model>> {
-        let now = Utc::now();
-        let new_prod = products::ActiveModel {
-            id: Set(Uuid::new_v4()),
-            name: Set(req.name.clone()),
-            description: Set(req.description.clone()),
-            price: Set(req.price),
-            currency: Set(req.currency),
-            product_type: Set(req.product_type),
-            target_id: Set(req.target_id),
-            sort_order: Set(req.sort_order.unwrap_or(0)),
-            badge: Set(req.badge.clone()),
-            metadata: Set(req.metadata.clone()),
-            is_active: Set(req.is_active),
-            created_at: Set(now),
-            updated_at: Set(now),
-        };
-
-        let inserted = new_prod.insert(&self.db).await
-            .map_err(|e| poem::Error::from_string(e.to_string(), StatusCode::INTERNAL_SERVER_ERROR))?;
-        Ok(Json(inserted))
-    }
-
-    #[oai(path = "/api/v1/admin/products/:id", method = "patch")]
-    async fn update_product(
-        &self,
-        _auth: AdminAuth,
-        id: poem_openapi::param::Path<Uuid>,
-        req: Json<UpdateProductRequest>,
-    ) -> poem::Result<Json<products::Model>> {
-        let prod = products::Entity::find_by_id(id.0)
-            .one(&self.db)
-            .await
-            .map_err(|e| poem::Error::from_string(e.to_string(), StatusCode::INTERNAL_SERVER_ERROR))?
-            .ok_or_else(|| poem::Error::from_string("Product not found", StatusCode::NOT_FOUND))?;
-
-        let mut active: products::ActiveModel = prod.into();
-        if let Some(v) = &req.name { active.name = Set(v.clone()); }
-        if let Some(v) = &req.description { active.description = Set(v.clone()); }
-        if let Some(v) = req.price { active.price = Set(v); }
-        if let Some(v) = req.currency { active.currency = Set(v); }
-        if let Some(v) = req.product_type { active.product_type = Set(v); }
-        if let Some(v) = req.target_id { active.target_id = Set(v); }
-        if let Some(v) = req.sort_order { active.sort_order = Set(v); }
-        if let Some(v) = &req.badge { active.badge = Set(v.clone()); }
-        if let Some(v) = &req.metadata { active.metadata = Set(v.clone()); }
-        if let Some(v) = req.is_active { active.is_active = Set(v); }
-        active.updated_at = Set(Utc::now());
-
-        let updated = active.update(&self.db).await
-            .map_err(|e| poem::Error::from_string(e.to_string(), StatusCode::INTERNAL_SERVER_ERROR))?;
-        Ok(Json(updated))
-    }
-
-    #[oai(path = "/api/v1/admin/products/:id", method = "delete")]
-    async fn delete_product(
-        &self,
-        _auth: AdminAuth,
-        id: poem_openapi::param::Path<Uuid>,
-    ) -> poem::Result<Json<bool>> {
-        products::Entity::delete_by_id(id.0).exec(&self.db).await
-            .map_err(|e| poem::Error::from_string(e.to_string(), StatusCode::INTERNAL_SERVER_ERROR))?;
-        Ok(Json(true))
-    }
-
-    // ------------------------------------------------------------------------
-    // Журнал Заказов (Orders)
-    // ------------------------------------------------------------------------
-
-    #[oai(path = "/api/v1/admin/orders", method = "get")]
-    async fn list_orders(
-        &self,
-        _auth: AdminAuth,
-        page: Query<Option<u64>>,
-        page_size: Query<Option<u64>>,
-        status: Query<Option<OrderStatus>>,
-    ) -> poem::Result<Json<PaginatedResponse<AdminOrderDto>>> {
-        let page = page.0.unwrap_or(1);
-        let page_size = page_size.0.unwrap_or(20);
-
-        let mut query = orders::Entity::find();
-        if let Some(st) = status.0 {
-            query = query.filter(orders::Column::Status.eq(st));
-        }
-
-        let paginator = query.order_by_desc(orders::Column::CreatedAt).paginate(&self.db, page_size);
-        let total = paginator.num_items().await.unwrap_or(0);
-        let items = paginator.fetch_page(page.saturating_sub(1)).await
-            .map_err(|e| poem::Error::from_string(e.to_string(), StatusCode::INTERNAL_SERVER_ERROR))?
-            .into_iter()
-            .map(|o| AdminOrderDto {
-                id: o.id,
-                user_id: o.user_id,
-                product_id: o.product_id,
-                amount: o.amount,
-                currency: o.currency,
-                status: o.status,
-                is_gift: o.is_gift,
-                metadata: o.metadata,
-                created_at: o.created_at,
-                updated_at: o.updated_at,
-            })
-            .collect();
-
-        Ok(Json(PaginatedResponse { items, total, page, page_size }))
-    }
-
-    // ------------------------------------------------------------------------
-    // Журнал Транзакций и Аудита (Transactions)
-    // ------------------------------------------------------------------------
-
-    #[oai(path = "/api/v1/admin/transactions", method = "get")]
-    async fn list_transactions(
-        &self,
-        _auth: AdminAuth,
-        page: Query<Option<u64>>,
-        page_size: Query<Option<u64>>,
-    ) -> poem::Result<Json<PaginatedResponse<AdminTransactionDto>>> {
-        let page = page.0.unwrap_or(1);
-        let page_size = page_size.0.unwrap_or(20);
-
-        let paginator = transactions::Entity::find()
-            .order_by_desc(transactions::Column::CreatedAt)
-            .paginate(&self.db, page_size);
-
-        let total = paginator.num_items().await.unwrap_or(0);
-        let items = paginator.fetch_page(page.saturating_sub(1)).await
-            .map_err(|e| poem::Error::from_string(e.to_string(), StatusCode::INTERNAL_SERVER_ERROR))?
-            .into_iter()
-            .map(|t| AdminTransactionDto {
-                id: t.id,
-                order_id: t.order_id,
-                payment_system: t.payment_system,
-                external_tx_id: t.external_tx_id,
-                amount_received: t.amount_received,
-                raw_request: t.raw_request,
-                created_at: t.created_at,
-            })
-            .collect();
-
-        Ok(Json(PaginatedResponse { items, total, page, page_size }))
-    }
+pub struct PaginatedTransactionsResponse {
+    pub items: Vec<AdminTransactionDto>,
+    pub total: u64,
+    pub page: u64,
+    pub page_size: u64,
 }
 ```
 
+**Маршруты `AdminBillingApi`:**
+* `GET /api/v1/admin/products` — список всех продуктов (`order_by_asc(SortOrder)`).
+* `POST /api/v1/admin/products` — создание продукта.
+* `PATCH /api/v1/admin/products/:id` — частичное обновление (передача `null` в `target_id`, `badge`, `metadata` явно сбрасывает поле в `None`).
+* `DELETE /api/v1/admin/products/:id` — удаление продукта (`Json<bool>`).
+* `GET /api/v1/admin/orders?page=1&page_size=20&status=<OrderStatus>` — журнал заказов с пагинацией и фильтром по статусу.
+* `GET /api/v1/admin/transactions?page=1&page_size=20` — аудит платёжных транзакций с пагинацией и `raw_request`.
+
+### 7.2. Расширения в `users.rs`, `groups.rs` и `dto.rs`
+
+* **Пользователи:** `AdminUserDto` содержит `email`, `has_password`, `telegram_id`, `balance`, `activated_at`, `expires_at`, `group_id`. `UpdateUserRequest` (`PATCH /api/v1/user/:id`) поддерживает `email`, `clear_email`, `password`, `clear_password`, `group_id`, `clear_group`.
+* **Индивидуальные тарифы (`rates`):** `POST /api/v1/addrate` и `PATCH /api/v1/rate/:id` принимают `traffic_limit`, `speed_limit`, `sessions`, `date_end`; добавлен `DELETE /api/v1/rate/:id`.
+* **Группы:** `CreateGroupRequest`, `UpdateGroupRequest` и `GroupDto` включают `is_default: bool`.
+
+### 7.3. Покрытие тестами (`anet-auth/src/api/tests/`)
+
+Реализованы 6 тестовых модулей на базе `sea_orm::MockDatabase` и `poem::Endpoint::call`:
+* `mod.rs` — сборщик тестового `Route` (OpenAPI + `/billing/freekassa/notify`), генераторы мок-моделей и JWT.
+* `user_auth_tests.rs` — Email-ссылки, верификация, `login`, `link-email`, проверка `HMAC-SHA256` Telegram TMA.
+* `user_cabinet_tests.rs` — `/user/me`, `/user/products`, `/user/orders`, `/user/sessions`, `/user/sessions/disconnect`, `/user/traffic-history`, `/user/config`.
+* `admin_billing_tests.rs` — CRUD `/admin/products`, пагинация `/admin/orders` и `/admin/transactions`, проверка `401` для неадминского JWT.
+* `freekassa_tests.rs` — RFC-векторы MD5/HMAC-SHA256, проверка IP whitelist и подписи вебхука, идемпотентность и проверка суммы, создание ваучера при `is_gift`.
+* `users_groups_auth_tests.rs` — админ-управление пользователями/тарифами/группами (`is_default`) и Smart Activation в `check_access`.
+
 ---
 
-## 8. Пользовательский интерфейс (User WebUI & Admin Panel)
+## 8. Пользовательский интерфейс (`User WebUI` & `Admin WebUI`)
 
-### 8.1. Личный кабинет пользователя (User Dashboard) — Phase 1 MVP
-* **Карточка активного тарифа:**
-  * Название подключенной группы.
-  * Индикатор срока действия: точная дата истечения (либо бейдж *«Активируется при первом подключении»*).
-  * Статус профиля (Активен / Ожидает оплаты).
-* **Конфигурация устройства:**
-  * Кнопка *«Скачать client.toml»*.
-  * Модальное окно с отображением QR-кода для мобильных клиентов.
-* **Статистика и метрики:**
-  * Количество активных сессий (например: `1 / 3 устройств онлайн`).
-  * Потребление трафика: израсходовано из лимита (или отметка *«Безлимит»*).
-  * Ограничение скорости (Мбит/с).
-  * **Интерактивные графики трафика:** Визуализация объемов загрузки и отдачи (Rx / Tx) по часам за последние сутки и по дням за месяц.
-* **Управление активными сессиями:**
-  * Таблица подключенных устройств (IP клиента, протокол транспорта, объем переданных данных, время онлайн).
-  * Кнопка *«Завершить сессию»* для принудительного разрыва конкретного туннеля.
-* **Витрина тарифов:**
-  * Карточки доступных базовых групп (`ProductType::GroupSubscription`) с перечнем включенных опций.
-  * Кнопка *«Купить тариф»*, инициирующая создание заказа и переход на шлюз FreeKassa.
+### 8.1. Личный кабинет пользователя (`User WebUI`) — в Backlog (бэкенд готов)
 
-### 8.2. Панель управления администратора (Admin WebUI) — Phase 1 MVP
-* **Раздел Products:** CRUD-интерфейс каталога тарифов. Настройка цен, валюты, бейджей и привязка к существующим `groups`.
-* **Раздел Orders:** Журнал заказов с фильтрами по статусам (`Pending`, `Paid`, `Failed`, `Cancelled`) и поиском по ID пользователя.
-* **Раздел Transactions:** Единый аудит-лог поступивших оплат. Возможность просмотра сырого тела запроса (`raw_request`) в формате JSONB для мгновенного разбора спорных ситуаций.
+Бэкенд `/api/v1/user/*` полностью готов для интеграции фронтенда Личного Кабинета:
+* Авторизация по Email-ссылке / паролю и Telegram Mini App (`initData`).
+* Карточка тарифа и состояния Smart Activation (`is_smart_activation_pending`, `activated_at`, `expires_at`).
+* Получение `client.toml` и QR-кода (`/api/v1/user/config`).
+* График потребления трафика (`/api/v1/user/traffic-history`) и активные сессии с кнопкой разрыва (`/api/v1/user/sessions*`).
+* Витрина тарифов и переход на оплату FreeKassa (`/api/v1/user/products`, `/api/v1/user/orders`).
+
+### 8.2. Панель управления администратора (`anet-webui`) — Реализовано
+
+В `anet-webui` (Vue 3 + Vuetify 3 + TypeScript) реализованы и проверены (`oxlint`, `eslint`, `vue-tsc --build`, `vite build`):
+
+1. **Актуализация пользователей, тарифов и групп:**
+   * Удалены устаревшие поля `server_ids`, `pool_ids`, `route_map_id` / `clear_route_map` (`src/models/user.ts`, `src/composables/useUser.ts`, `src/components/UserForm.vue`, `src/components/CreateUserModal.vue`).
+   * В `src/ui/Users.vue`, `src/components/UserModal.vue` и `src/components/UserForm.vue` добавлены:
+     * привязка/изменение/очистка `email` (`clear_email`);
+     * установка/смена/удаление пароля ЛК (`password`, `clear_password`, индикатор `has_password`);
+     * передача `group_id` и `clear_group`;
+     * просмотр `telegram_id`, `balance`, `activated_at`, `expires_at`;
+     * столбец Email с индикаторами пароля и Telegram и расширенный поиск по UID / Email / Fingerprint.
+   * В `src/models/rate.ts`, `src/api/rate.ts`, `src/composables/useRate.ts`, `src/components/RateCreateForm.vue`, `src/components/RateEditForm.vue` добавлены `traffic_limit` (ГБ -> байты), `speed_limit` (Мбит/с -> kbps), удаление индивидуального `Rate` (`DELETE /api/v1/rate/:id`) и преобразование `date_end` между `datetime-local` и форматом `YYYY-MM-DD-HH:mm`.
+   * В `src/models/group.ts`, `src/components/GroupModal.vue`, `src/ui/Groups.vue` и `src/ui/GroupDetail.vue` добавлены переключатель и бейдж группы по умолчанию (`is_default`).
+2. **Раздел Billing в боковом меню (`src/components/Navigation.vue`, `src/router/index.ts`, `src/models/billing.ts`, `src/api/billing.ts`):**
+   * **Products (`/products` -> `src/ui/Products.vue`, `src/components/ProductModal.vue`):** CRUD каталога продуктов, выбор группы при `GroupSubscription`, цена, валюта (`Rub`, `Usd`, `Eur`, `Stars`), порядок сортировки `sort_order`, бейдж, JSON `metadata`, флаг `is_active`, явный сброс очищенных опциональных полей в `null`.
+   * **Orders (`/orders` -> `src/ui/Orders.vue`):** серверная пагинация (`v-data-table-server`), фильтр по `OrderStatus`, подстановка названия продукта, пометка `Подарок` / `Себе` (`is_gift`), копирование UUID и диалог просмотра JSON `metadata`.
+   * **Transactions (`/transactions` -> `src/ui/Transactions.vue`):** серверная пагинация аудит-лога платёжных шлюзов (`FreeKassa`, `Aaio`, `YooMoney`, `TelegramStars`), копирование `external_tx_id` и `order_id`, просмотр и копирование сырого `raw_request` JSON.
 
 ---
 
 ## 9. Функционал Phase 2 (Backlog / Дальнейшее развитие)
 
-Следующие возможности заложены на уровне моделей базы данных, но сознательно вынесены за рамки Phase 1 MVP для скорейшего запуска базового биллинга:
-1. **Индивидуальный конструктор тарифов (Subway sandwich):** Ползунки количества сессий, трафика и скорости с динамическим расчетом цены и записью в `rates`.
-2. **Подарочные ваучеры (`is_gift`):** Покупка подарка в один клик, генерация промокодов `ANET-GIFT-...`, витрина неактивированных кодов и форма ввода ваучера в ЛК.
-3. **Раздел Vouchers в панели администратора:** Учет выданных подарочных кодов.
-4. **Telegram-бот и Mini App (TMA):** Вход без пароля через `initData` и оплата через Telegram Stars.
+Следующие возможности заложены на уровне моделей базы данных и энумов, но вынесены в следующий этап:
+1. **Фронтенд Личного Кабинета (User WebUI) и Telegram Mini App** поверх готового API `/api/v1/user/*`.
+2. **Активация подарочных ваучеров и админ-реестр `Vouchers`:** API активации сгенерированного `ANET-GIFT-...`, интерфейс погашения в ЛК и раздел управления ваучерами в `anet-webui`.
+3. **Индивидуальный конструктор тарифов (Subway sandwich):** ползунки количества сессий, трафика и скорости с динамическим расчётом цены и записью в `rates`.
+4. **Дополнительные платёжные шлюзы:** интеграция Telegram Stars, Aaio и YooMoney.

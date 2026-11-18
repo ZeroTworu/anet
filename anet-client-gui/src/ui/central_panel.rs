@@ -7,7 +7,7 @@ use egui::RichText;
 use crate::{
     app::ANetApp,
     theme::Colors,
-    //types::ConnectionState,
+    types::ConnectionState,
     ui::{
         connect_button::render_connect_button,
         node_selector::render_node_selector,
@@ -32,21 +32,33 @@ pub fn render_central_panel(app: &mut ANetApp, ctx: &egui::Context) {
         .frame(main_frame)
         .show(ctx, |ui| {
             let state = lock_ignore_poison(&app.shared).state;
+            let controls_enabled = !matches!(
+                state,
+                ConnectionState::Connecting | ConnectionState::Connected
+            );
+            let disabled_color = Colors::GREY.gamma_multiply(0.45);
+            let disabled_tooltip = "Недоступно во время подключения или активного соединения";
 
             // Верхняя шапка: Кнопка Update, Заголовок по центру, Кнопка Settings
-            ui.horizontal(|ui| {
-                  let button_col_width = 60.0;
-                  let spacing_x = ui.spacing().item_spacing.x;
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::TOP), |ui| {
+                let button_col_width = 60.0;
+                let header_height = 50.0;
+                let spacing_x = ui.spacing().item_spacing.x;
 
                 // Кнопка Update
                 ui.allocate_ui_with_layout(
-                    egui::vec2(button_col_width, 38.0),
+                    egui::vec2(button_col_width, header_height),
                     egui::Layout::top_down(egui::Align::Center),
                     |ui| {
+                        ui.spacing_mut().item_spacing.y = 2.0;
                         let anim_id = ui.id().with("update_btn_color");
                         let hover_t: f32 = ui.data(|d| d.get_temp(anim_id)).unwrap_or(0.0);
 
-                        let current_color = lerp_color(Colors::WHITE, Colors::GOLD, hover_t);
+                        let current_color = if controls_enabled {
+                            lerp_color(Colors::WHITE, Colors::GOLD, hover_t)
+                        } else {
+                            disabled_color
+                        };
 
                         let icon = egui::Image::new(egui::include_image!("../assets/update.svg"))
                             .fit_to_exact_size(button_icon_size)
@@ -58,9 +70,14 @@ pub fn render_central_panel(app: &mut ANetApp, ctx: &egui::Context) {
                             .frame(false)
                             .corner_radius(button_size.y / 2.0);
 
-                        let response = ui.add(menu_button).on_hover_cursor(egui::CursorIcon::PointingHand);
+                        let mut response = ui.add_enabled(controls_enabled, menu_button);
+                        if controls_enabled {
+                            response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+                        } else {
+                            response = response.on_disabled_hover_text(disabled_tooltip);
+                        }
 
-                        let target_t = if response.hovered() { 1.0 } else { 0.0 };
+                        let target_t = if controls_enabled && response.hovered() { 1.0 } else { 0.0 };
                         let dt = ui.input(|i| i.stable_dt);
                         let speed = 1.0 / 0.2;
                         let new_t = if hover_t < target_t {
@@ -75,12 +92,16 @@ pub fn render_central_panel(app: &mut ANetApp, ctx: &egui::Context) {
                             ui.ctx().request_repaint();
                         }
 
-                        if response.clicked() {
+                        if controls_enabled && response.clicked() {
                             app.check_for_updates();
                         }
 
                         ui.add_space(1.0);
-                        ui.label(RichText::new("UPDATE").size(label_size).color(Colors::GREY));
+                        ui.label(
+                            RichText::new("UPDATE")
+                                .size(label_size)
+                                .color(if controls_enabled { Colors::GREY } else { disabled_color }),
+                        );
                     }
                 );
 
@@ -91,7 +112,7 @@ pub fn render_central_panel(app: &mut ANetApp, ctx: &egui::Context) {
 
                 // Логотип ANet VPN
                 ui.allocate_ui_with_layout(
-                    egui::vec2(center_width, 38.0),
+                    egui::vec2(center_width, header_height),
                     egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
                     |ui| {
                         let mut job = LayoutJob::default();
@@ -115,13 +136,18 @@ pub fn render_central_panel(app: &mut ANetApp, ctx: &egui::Context) {
 
                 // Кнопка Settings
                 ui.allocate_ui_with_layout(
-                    egui::vec2(button_col_width, 38.0),
+                    egui::vec2(button_col_width, header_height),
                     egui::Layout::top_down(egui::Align::Center),
                     |ui| {
+                        ui.spacing_mut().item_spacing.y = 2.0;
                         let anim_id = ui.id().with("settings_gear_btn_color");
                         let hover_t: f32 = ui.data(|d| d.get_temp(anim_id)).unwrap_or(0.0);
 
-                        let current_color = lerp_color(Colors::WHITE, Colors::GOLD, hover_t);
+                        let current_color = if controls_enabled {
+                            lerp_color(Colors::WHITE, Colors::GOLD, hover_t)
+                        } else {
+                            disabled_color
+                        };
 
                         let icon = egui::Image::new(egui::include_image!("../assets/gear_3.svg"))
                             .fit_to_exact_size(button_icon_size)
@@ -133,9 +159,14 @@ pub fn render_central_panel(app: &mut ANetApp, ctx: &egui::Context) {
                             .frame(false)
                             .corner_radius(button_size.y / 2.0);
 
-                        let response = ui.add(menu_button).on_hover_cursor(egui::CursorIcon::PointingHand);
+                        let mut response = ui.add_enabled(controls_enabled, menu_button);
+                        if controls_enabled {
+                            response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+                        } else {
+                            response = response.on_disabled_hover_text(disabled_tooltip);
+                        }
 
-                        let target_t = if response.hovered() { 1.0 } else { 0.0 };
+                        let target_t = if controls_enabled && response.hovered() { 1.0 } else { 0.0 };
                         let dt = ui.input(|i| i.stable_dt);
                         let speed = 1.0 / 0.2;
                         let new_t = if hover_t < target_t {
@@ -150,7 +181,7 @@ pub fn render_central_panel(app: &mut ANetApp, ctx: &egui::Context) {
                             ui.ctx().request_repaint();
                         }
 
-                        if response.clicked() {  
+                        if controls_enabled && response.clicked() {  
                             app.settingsbar_open = !app.settingsbar_open;
                             if app.settingsbar_open {
                                 app.sidebar_open = false;                                    
@@ -160,7 +191,11 @@ pub fn render_central_panel(app: &mut ANetApp, ctx: &egui::Context) {
                         }
 
                         ui.add_space(1.0);
-                        ui.label(RichText::new("SETTINGS").size(label_size).color(Colors::GREY));                            
+                        ui.label(
+                            RichText::new("SETTINGS")
+                                .size(label_size)
+                                .color(if controls_enabled { Colors::GREY } else { disabled_color }),
+                        );                            
                     } 
                 );
             });

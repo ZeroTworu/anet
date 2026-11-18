@@ -15,32 +15,54 @@ pub fn render_error_modal(app: &mut ANetApp, ctx: &egui::Context) {
     }
 
     let screen_rect = ctx.content_rect();
+    const TITLEBAR_HEIGHT: f32 = 38.0;
 
-    // Отступы от границ родительского окна:
+    let backdrop_rect = egui::Rect::from_min_max(
+        egui::pos2(
+            screen_rect.min.x,
+            (screen_rect.min.y + TITLEBAR_HEIGHT).min(screen_rect.max.y),
+        ),
+        screen_rect.max,
+    );
+
+    // Отступы от границ области под titlebar:
     // 16 px по бокам (слева/справа) и 20 px сверху/снизу
     let margin_x = 16.0;
     let margin_y = 20.0;
 
-    let modal_width = (screen_rect.width() - margin_x * 2.0).clamp(260.0, 360.0);
-    let max_modal_height = (screen_rect.height() - margin_y * 2.0).max(200.0);
+    let modal_width = (backdrop_rect.width() - margin_x * 2.0).clamp(260.0, 360.0);
+    let max_modal_height = (backdrop_rect.height() - margin_y * 2.0).max(200.0);
 
-    // 1. Полупрозрачное затемнение фона (Backdrop)
-    egui::Area::new(egui::Id::new("error_modal_backdrop"))
+    let mut close_modal = false;
+
+    // 1. Полупрозрачное затемнение фона (Backdrop) только ниже titlebar
+    let backdrop_area = egui::Area::new(egui::Id::new("error_modal_backdrop"))
         .order(egui::Order::Foreground)
-        .fixed_pos(egui::pos2(0.0, 0.0))
+        .fixed_pos(backdrop_rect.min)
         .interactable(true)
         .show(ctx, |ui| {
-            ui.allocate_exact_size(screen_rect.size(), egui::Sense::click());
+            let (_, resp) = ui.allocate_exact_size(backdrop_rect.size(), egui::Sense::click());
             ui.painter().rect_filled(
-                screen_rect,
-                14.0, // Скругление под безрамочное окно
+                backdrop_rect,
+                egui::CornerRadius {
+                    nw: 0,
+                    ne: 0,
+                    sw: 14,
+                    se: 14,
+                }, // Скругление только для нижних углов безрамочного окна
                 egui::Color32::from_rgba_unmultiplied(10, 12, 16, 200),
             );
+            resp
         });
 
+    if backdrop_area.inner.clicked() {
+        close_modal = true;
+    }
+
     // 2. Основная карточка модального окна с гарантированными отступами
-    egui::Window::new("ERROR_SYSTEM_WINDOW")
-        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+    let window_resp = egui::Window::new("ERROR_SYSTEM_WINDOW")
+        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, TITLEBAR_HEIGHT * 0.5))
+        .constrain_to(backdrop_rect)
         .collapsible(false)
         .resizable(false)
         .title_bar(false)
@@ -135,7 +157,7 @@ pub fn render_error_modal(app: &mut ANetApp, ctx: &egui::Context) {
 
                 ui.add_space(18.0);
 
-                // Кнопки управления: «Копировать» и «Понятно»
+                // Кнопки управления: «Копировать» и «Ок»
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 10.0;
 
@@ -171,10 +193,18 @@ pub fn render_error_modal(app: &mut ANetApp, ctx: &egui::Context) {
                         let enter_pressed = ui.input(|i| i.key_pressed(egui::Key::Enter));
 
                         if clicked || enter_pressed {
-                            app.error_modal = None;
+                            close_modal = true;
                         }
                     });
                 });
             });
         });
+
+    if let Some(ref win) = window_resp {
+        ctx.move_to_top(win.response.layer_id);
+    }
+
+    if close_modal {
+        app.error_modal = None;
+    }
 }
