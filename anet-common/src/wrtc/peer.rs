@@ -3247,7 +3247,7 @@ impl WrtcPeer {
         let idle_ms = elapsed_ms.saturating_sub(prev_tx_ms);
         let force_kf = self
             .force_keyframe_remaining
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
                 if n > 0 {
                     Some(n - 1)
                 } else {
