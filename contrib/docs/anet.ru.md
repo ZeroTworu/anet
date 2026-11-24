@@ -219,18 +219,18 @@ services:
     container_name: anet-db
     environment:
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: password
+      POSTGRES_PASSWORD: password # Установите пароль ( openssl rand -hex 32 )
       POSTGRES_DB: db
     volumes:
       - pg_data:/var/lib/postgresql/data
-    ports:
-      - "5557:5432"
     healthcheck:
       test: [ "CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB" ]
       interval: 2s
       timeout: 5s
       retries: 5
     restart: unless-stopped
+    networks:
+      - anet_net
 
   anet-auth:
     image: ghcr.io/zerotworu/anet-auth:latest
@@ -239,13 +239,15 @@ services:
       - DATABASE_URL=postgres://postgres:password@postgres:5432/db
       - BIND_TO=0.0.0.0:3000
       - AUTH_BACKEND_KEY=super_secret_vpn_key_2025 # Ключ для связи основного сервера с бэкендом
-      - JWT_SECRET=secret_na_chushpana
+      - JWT_SECRET=secret_na_chushpana # Установите JWT-секрет ( Для генерации: openssl rand -hex 32 )
     depends_on:
       postgres:
         condition: service_healthy
     ports:
       - "3000:3000"
     restart: unless-stopped
+    networks:
+      - anet_net
 
   anet-webui:
     image: ghcr.io/zerotworu/anet-webui:latest
@@ -255,9 +257,14 @@ services:
     depends_on:
       - anet-auth
     restart: unless-stopped
+    networks:
+      - anet_net
 
 volumes:
   pg_data:
+networks:
+  anet_net:
+    driver: bridge
 ```
 
 2. Запусти стек одной командой:
